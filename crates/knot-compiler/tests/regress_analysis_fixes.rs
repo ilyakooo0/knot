@@ -166,6 +166,52 @@ main = println (show v)
 }
 
 #[test]
+fn constrained_annotation_defers_unit_composition() {
+    // B12: with an explicit `Num a =>` constraint the scheme goes through the
+    // `has_constraints` branch, which rebuilds the type from the annotation
+    // with fresh vars. The deferred `x * y` unit-binop was captured against
+    // the body-check skolems, which vanish from the rebuilt type, so at each
+    // call site the binop's result floated free of the return type and
+    // resolution degraded to a vacuous unify — the M^2 product was wrongly
+    // accepted as Float<M>. Re-mapping the skolems onto the fresh vars ties
+    // the product back to `a`, so `M * M` used at `M` is a unit mismatch.
+    let src = r#"unit M
+scale : Num a => a -> a -> a
+scale = \x y -> x * y
+v = (scale 3.0<M> 4.0<M>) + 1.0<M>
+main = println (show v)
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "unit mismatch"),
+        "M * M from a `Num a =>`-constrained scale used at M must be a unit \
+         mismatch (M^2 vs M), got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn constrained_annotation_dimensionless_use_still_ok() {
+    // Companion to B12: the same constrained function must remain usable at
+    // dimensionless numeric types, and each call site must freshen its own
+    // deferred composition (Int and Float uses independently).
+    let src = r#"scale : Num a => a -> a -> a
+scale = \x y -> x * y
+i = scale 3 4
+f = scale 5.0 6.0
+main = do
+  println (show i)
+  println (show f)
+"#;
+    let diags = check_src(src);
+    assert!(
+        diags.is_empty(),
+        "constrained scale at dimensionless types must type-check, got: {:?}",
+        diags
+    );
+}
+
+#[test]
 fn var_times_var_accepts_mixed_units() {
     // Float<M> * Float<S> through an unannotated lambda must be ACCEPTED
     // (the old code unified both operands and falsely rejected).
@@ -364,6 +410,29 @@ main = println "ok"
         env.source_schemas["boxes"], "value:int",
         "Box Int must substitute Int for the type parameter (got {:?})",
         env.source_schemas["boxes"]
+    );
+}
+
+#[test]
+fn alias_applying_later_declared_parameterized_data_type_resolves() {
+    // B32: a type alias that *applies* a parameterized data type declared
+    // AFTER the alias must still resolve to the correct shape. During the
+    // first resolution pass `Box` is not yet registered, so `Box Int`
+    // collapses to `Named("unknown")` and the alias would ship the
+    // meaningless `_value:text` schema. The re-resolve pass must recover the
+    // application from the alias's original AST once `Box` is known, yielding
+    // `value:int`.
+    let src = r#"type Wrapped = [Box Int]
+data Box a = Box {value: a}
+*w : Wrapped
+main = println "ok"
+"#;
+    let module = parse(src);
+    let env = knot_compiler::types::TypeEnv::from_module(&module);
+    assert_eq!(
+        env.source_schemas["w"], "value:int",
+        "alias applying later-declared `Box Int` must resolve to value:int (got {:?})",
+        env.source_schemas["w"]
     );
 }
 

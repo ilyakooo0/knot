@@ -1870,19 +1870,66 @@ impl Infer {
                     merged.extend(e2.iter().cloned());
                     let unified_inner = self.apply(&a);
                     let merged_io =
-                        Ty::IO(merged, None, Box::new(unified_inner));
+                        Ty::IO(merged.clone(), None, Box::new(unified_inner));
                     // Bind at the *end* of each var's substitution chain
                     // (via bind_var, which checks skolems/occurs) so any
                     // aliases along the chain keep seeing the widened IO —
                     // a raw insert at the root var would orphan them.
-                    if let Some(v) = var1 {
-                        let root = self.var_chain_end(v);
+                    //
+                    // The REQUIRED-side var is a fresh result accumulator
+                    // (an if/case result var, or a do-block's sequencing
+                    // var): it legitimately absorbs the union of the
+                    // branches' effects, so overwriting it is correct.
+                    //
+                    // The PROVIDED-side var is an actual branch *value*.
+                    // Widening fires whenever a side was *syntactically* a
+                    // `Ty::Var` — but that var may already be bound (through
+                    // the substitution) to a concrete closed IO by an
+                    // earlier, already-discharged obligation (e.g. `g act`
+                    // pinning `act : IO {} {}`, or a lambda parameter fixed
+                    // by a prior call). Overwriting that chain-end binding
+                    // with the widened effect set would relabel a value whose
+                    // type was already fixed, laundering the extra effects
+                    // past both the effect annotation and the atomic gate,
+                    // since that obligation is never revisited. So resolve
+                    // the provided-side var through `self.subst`: if it is
+                    // already bound, preserve the binding and only validate
+                    // compatibility via `unify_io_effects` (which does not
+                    // rebind in the closed/closed case, mirroring
+                    // `merge_do_io_row`'s unify-don't-clobber merge — its
+                    // effects are ⊆ the union by construction, so merging a
+                    // pure branch with an effectful one is still accepted);
+                    // only a genuinely unbound provided-side var is bound to
+                    // the widened IO.
+                    let (provided_var, required_var, provided_effects) =
+                        if t1_provided {
+                            (var1, var2, &e1)
+                        } else {
+                            (var2, var1, &e2)
+                        };
+
+                    let required_root =
+                        required_var.map(|v| self.var_chain_end(v));
+                    if let Some(root) = required_root {
                         self.bind_var(root, merged_io.clone(), span);
                     }
-                    if let Some(v) = var2 {
+                    if let Some(v) = provided_var {
                         let root = self.var_chain_end(v);
-                        if Some(root) != var1.map(|v1| self.var_chain_end(v1)) {
-                            self.bind_var(root, merged_io, span);
+                        if Some(root) != required_root {
+                            if self.subst.contains_key(&root) {
+                                // Already bound to a concrete closed IO:
+                                // preserve it, only checking compatibility.
+                                self.unify_io_effects(
+                                    provided_effects,
+                                    None,
+                                    &merged,
+                                    None,
+                                    span,
+                                    true,
+                                );
+                            } else {
+                                self.bind_var(root, merged_io, span);
+                            }
                         }
                     }
                 } else {
@@ -3653,6 +3700,27 @@ impl Infer {
                                 .into_iter()
                                 .map(|v| (v, self.fresh()))
                                 .collect();
+                            // These freshly-minted alias-body vars must be
+                            // quantified in the enclosing annotation's scheme.
+                            // Without registering them in `annotation_vars`,
+                            // the pre-registered scheme leaves them unquantified
+                            // and shares them across every call site — the first
+                            // use pins the alias (e.g. `Box` to `{val: Int}`) and
+                            // later uses at other types are falsely rejected. The
+                            // bug surfaced only when the annotated decl was
+                            // declared after its first caller, so re-generalization
+                            // (which never happens for constrained functions)
+                            // couldn't paper over it (bug B21). Guarded on
+                            // `in_type_annotation` so only scheme-building callers
+                            // are affected, not alias-definition collection.
+                            if self.in_type_annotation {
+                                for fresh in mapping.values() {
+                                    if let Ty::Var(v) = fresh {
+                                        self.annotation_vars
+                                            .insert(format!("__alias_fv#{v}"), *v);
+                                    }
+                                }
+                            }
                             self.subst_ty(&aliased, &mapping)
                         };
                         // Wrap nullary alias references so the name flows
@@ -4545,13 +4613,18 @@ impl Infer {
                         // result. When both are still-open *distinct* row
                         // variables, `r1.or(r2)` would silently drop one, so
                         // effects later flowing into the dropped tail would
-                        // vanish from the if-expression's type. Unify the two
-                        // tails (the same merge `unify_io_effects` performs for
-                        // distinct rows) so neither is lost.
+                        // vanish from the if-expression's type. Merge the two
+                        // tails the same way a sequenced do-block does: a direct
+                        // `unify` of two *rigid* signature skolems (as in a
+                        // declared `IO {| r1 \/ r2}` union) fails with "cannot
+                        // unify rigid type variables"; `merge_do_io_row` instead
+                        // records a pending `\/` effect-union constraint (and
+                        // still falls back to `unify` for the flexible cases).
                         let row = match (*r1, *r2) {
                             (Some(a), Some(b)) if a != b => {
-                                self.unify(&Ty::Var(a), &Ty::Var(b), expr.span);
-                                Some(a)
+                                let mut merged_row = Some(a);
+                                self.merge_do_io_row(&mut merged_row, b, expr.span);
+                                merged_row
                             }
                             (a, b) => a.or(b),
                         };
@@ -4769,6 +4842,10 @@ impl Infer {
                     }
                 }
             }
+
+            // `2 seconds` is inference-identical to its desugared `2 * 1000`;
+            // infer the wrapped multiplication directly.
+            ast::ExprKind::TimeUnitLit { value, .. } => self.infer_expr(value),
 
             ast::ExprKind::Annot { expr: inner, ty } => {
                 let inner_ty = self.infer_expr(inner);
@@ -5275,12 +5352,18 @@ impl Infer {
         }
 
         // Infer the constructor's record payload (request fields only).
+        // A bare nullary route constructor (`fetch url Ctor`) carries no
+        // record argument — inferring the Constructor node as an expression
+        // yields the ADT type, which would spuriously fail to unify against
+        // the (empty) expected record. Skip payload unification for it; the
+        // response type below is resolved from route metadata regardless.
         let ctor_arg = args.last().unwrap();
         let record_arg = match &ctor_arg.node {
-            ast::ExprKind::App { arg, .. } => arg.as_ref(),
-            _ => ctor_arg,
+            ast::ExprKind::App { arg, .. } => Some(arg.as_ref()),
+            ast::ExprKind::Constructor(_) => None,
+            _ => Some(*ctor_arg),
         };
-        let record_ty = self.infer_expr(record_arg);
+        let record_ty = record_arg.map(|r| self.infer_expr(r));
 
         // Build the expected request fields from the route entry. Save and
         // restore annotation_vars so fetch inference doesn't corrupt the
@@ -5292,13 +5375,15 @@ impl Infer {
                 let v = self.fresh_var();
                 self.annotation_vars.insert(p.clone(), v);
             }
-            let field_tys: BTreeMap<String, Ty> = info
-                .fields
-                .iter()
-                .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
-                .collect();
-            let expected_record = Ty::Record(field_tys, None);
-            self.unify(&record_ty, &expected_record, ctor_arg.span);
+            if let Some(record_ty) = &record_ty {
+                let field_tys: BTreeMap<String, Ty> = info
+                    .fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
+                    .collect();
+                let expected_record = Ty::Record(field_tys, None);
+                self.unify(record_ty, &expected_record, ctor_arg.span);
+            }
         }
 
         // Build the return type: IO {network} (Result {status, message} ResponseTy)
@@ -6185,7 +6270,7 @@ impl Infer {
                 })
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io_prescan(body),
-            ast::ExprKind::UnitLit { value, .. } => self.expr_is_io_prescan(value),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.expr_is_io_prescan(value),
             ast::ExprKind::Annot { expr, .. } => self.expr_is_io_prescan(expr),
             ast::ExprKind::Refine(inner) => self.expr_is_io_prescan(inner),
             _ => false,
@@ -7087,10 +7172,14 @@ impl Infer {
                             self.fetch_response_types
                                 .insert(entry.constructor.clone(), resp_ty.clone());
                         }
-                        if !entry.response_headers.is_empty() {
-                            self.fetch_response_headers
-                                .insert(entry.constructor.clone(), entry.response_headers.clone());
-                        }
+                        // Always insert (even when empty) so a later route
+                        // entry that reuses this constructor name but declares
+                        // no response headers overwrites an earlier one that
+                        // did — otherwise the stale headers survive and fetch
+                        // infers a chimera {body, headers} response type. Empty
+                        // is treated as "no headers" at the use site.
+                        self.fetch_response_headers
+                            .insert(entry.constructor.clone(), entry.response_headers.clone());
                     }
                 }
                 ast::DeclKind::RouteComposite { name, .. } => {
@@ -8594,24 +8683,64 @@ impl Infer {
                             // annotation variable, so each call-site
                             // instantiation gets its own fresh composition
                             // (mirrors `generalize`).
-                            let skolem_set: std::collections::HashSet<TyVar> = fresh_skolems.iter().copied().collect();
-                            let unit_skolem_set: std::collections::HashSet<UnitVar> = fresh_unit_skolems.iter().copied().collect();
+                            //
+                            // The scheme's type was just rebuilt from the
+                            // annotation with *fresh* vars (`ann_ty`), so the
+                            // body-check skolems these binops reference no
+                            // longer occur anywhere in it. Build a
+                            // skolem→fresh-var map by walking the skolemised
+                            // body type (`inferred`) against `ann_ty` in
+                            // parallel — they share the annotation's structure
+                            // — and re-point each captured binop at the vars
+                            // that actually appear in the scheme. Without this
+                            // the binop's result floats free of the return type
+                            // at instantiation and end-of-inference resolution
+                            // degrades to a vacuous `unify`, silently
+                            // mis-typing e.g. `scale 3.0<M> 4.0<M>` as
+                            // `Float<M>` instead of the `Float<M^2>` that
+                            // contradicts the `a -> a -> a` signature. (B12)
+                            let skolem_set: HashSet<TyVar> = fresh_skolems.iter().copied().collect();
+                            let unit_skolem_set: HashSet<UnitVar> = fresh_unit_skolems.iter().copied().collect();
+                            let mut walk_ty: HashMap<TyVar, TyVar> = HashMap::new();
+                            let mut walk_unit: HashMap<UnitVar, UnitVar> = HashMap::new();
+                            correspond_vars(&inferred, &ann_ty, &mut walk_ty, &mut walk_unit);
+                            // Restrict the remaps to the body-check skolems: only
+                            // those vanish from the rebuilt type. Other vars in an
+                            // operand are outer-scope and must be left untouched.
+                            let skolem_ty_subst: HashMap<TyVar, Ty> = walk_ty
+                                .iter()
+                                .filter(|(k, _)| skolem_set.contains(k))
+                                .map(|(k, v)| (*k, Ty::Var(*v)))
+                                .collect();
+                            let skolem_unit_subst: HashMap<UnitVar, UnitVar> = walk_unit
+                                .iter()
+                                .filter(|(k, _)| unit_skolem_set.contains(k))
+                                .map(|(k, v)| (*k, *v))
+                                .collect();
+                            let remapped_unit_targets: HashSet<UnitVar> =
+                                skolem_unit_subst.values().copied().collect();
                             let pending_binops = std::mem::take(&mut self.deferred_unit_binops);
                             let mut captured_binops: Vec<DeferredUnitBinop> = Vec::new();
                             for b in pending_binops {
                                 let resolved_result = self.apply(&Ty::Var(b.result));
                                 if let Ty::Var(v) = &resolved_result
-                                    && skolem_set.contains(v) {
-                                        let lhs = self.apply(&b.lhs);
-                                        let rhs = self.apply(&b.rhs);
-                                        if !vars.contains(v) {
-                                            vars.push(*v);
+                                    && skolem_set.contains(v)
+                                    && let Some(Ty::Var(fresh_result)) =
+                                        skolem_ty_subst.get(v).cloned() {
+                                        let mut lhs = self.subst_ty(&self.apply(&b.lhs), &skolem_ty_subst);
+                                        let mut rhs = self.subst_ty(&self.apply(&b.rhs), &skolem_ty_subst);
+                                        if !skolem_unit_subst.is_empty() {
+                                            lhs = self.subst_unit_vars_in_ty(&lhs, &skolem_unit_subst);
+                                            rhs = self.subst_unit_vars_in_ty(&rhs, &skolem_unit_subst);
+                                        }
+                                        if !vars.contains(&fresh_result) {
+                                            vars.push(fresh_result);
                                         }
                                         let mut all_uv = Vec::new();
                                         collect_unit_vars_ordered(&lhs, &mut all_uv);
                                         collect_unit_vars_ordered(&rhs, &mut all_uv);
                                         for uv in &all_uv {
-                                            if unit_skolem_set.contains(uv) && !unit_vars.contains(uv) {
+                                            if remapped_unit_targets.contains(uv) && !unit_vars.contains(uv) {
                                                 unit_vars.push(*uv);
                                             }
                                         }
@@ -8619,7 +8748,7 @@ impl Infer {
                                             op: b.op,
                                             lhs,
                                             rhs,
-                                            result: *v,
+                                            result: fresh_result,
                                             span: b.span,
                                         });
                                         continue;
@@ -9193,6 +9322,115 @@ fn collect_unit_vars_ordered(ty: &Ty, out: &mut Vec<UnitVar>) {
     }
 }
 
+/// Walk two structurally-parallel types, recording how the type and unit
+/// variables in `from` correspond to those in `to`. Both must derive from the
+/// same annotation AST — they differ only in variable identities — as happens
+/// when a scheme's type is rebuilt from its annotation with fresh vars: the
+/// skolemised body-check type and the rebuilt type share their shape. Used to
+/// re-point deferred unit-binops captured against body-check skolems onto the
+/// rebuilt scheme's fresh vars (see the `has_constraints` branch of
+/// `infer_declarations`, B12).
+fn correspond_vars(
+    from: &Ty,
+    to: &Ty,
+    ty_map: &mut HashMap<TyVar, TyVar>,
+    unit_map: &mut HashMap<UnitVar, UnitVar>,
+) {
+    match (from, to) {
+        (Ty::Var(a), Ty::Var(b)) => {
+            ty_map.entry(*a).or_insert(*b);
+        }
+        (Ty::Fun(p1, r1), Ty::Fun(p2, r2)) => {
+            correspond_vars(p1, p2, ty_map, unit_map);
+            correspond_vars(r1, r2, ty_map, unit_map);
+        }
+        (Ty::Relation(a), Ty::Relation(b)) => {
+            correspond_vars(a, b, ty_map, unit_map)
+        }
+        (Ty::Con(_, a1), Ty::Con(_, a2)) => {
+            for (x, y) in a1.iter().zip(a2) {
+                correspond_vars(x, y, ty_map, unit_map);
+            }
+        }
+        (Ty::App(f1, a1), Ty::App(f2, a2)) => {
+            correspond_vars(f1, f2, ty_map, unit_map);
+            correspond_vars(a1, a2, ty_map, unit_map);
+        }
+        (Ty::Record(f1, r1), Ty::Record(f2, r2)) => {
+            for (k, v) in f1 {
+                if let Some(w) = f2.get(k) {
+                    correspond_vars(v, w, ty_map, unit_map);
+                }
+            }
+            if let (Some(a), Some(b)) = (r1, r2) {
+                ty_map.entry(*a).or_insert(*b);
+            }
+        }
+        (Ty::Variant(c1, r1), Ty::Variant(c2, r2)) => {
+            for (k, v) in c1 {
+                if let Some(w) = c2.get(k) {
+                    correspond_vars(v, w, ty_map, unit_map);
+                }
+            }
+            if let (Some(a), Some(b)) = (r1, r2) {
+                ty_map.entry(*a).or_insert(*b);
+            }
+        }
+        (Ty::IO(_, r1, i1), Ty::IO(_, r2, i2)) => {
+            if let (Some(a), Some(b)) = (r1, r2) {
+                ty_map.entry(*a).or_insert(*b);
+            }
+            correspond_vars(i1, i2, ty_map, unit_map);
+        }
+        (Ty::IntUnit(u1), Ty::IntUnit(u2))
+        | (Ty::FloatUnit(u1), Ty::FloatUnit(u2)) => {
+            correspond_unit_vars(u1, u2, unit_map);
+        }
+        (Ty::Forall(_, i1), Ty::Forall(_, i2)) => {
+            correspond_vars(i1, i2, ty_map, unit_map)
+        }
+        (Ty::Alias(_, i1), Ty::Alias(_, i2)) => {
+            correspond_vars(i1, i2, ty_map, unit_map)
+        }
+        // Look through a one-sided alias so shapes still line up.
+        (Ty::Alias(_, i1), other) => {
+            correspond_vars(i1, other, ty_map, unit_map)
+        }
+        (other, Ty::Alias(_, i2)) => {
+            correspond_vars(other, i2, ty_map, unit_map)
+        }
+        (Ty::Assoc(_, i1), Ty::Assoc(_, i2)) => {
+            correspond_vars(i1, i2, ty_map, unit_map)
+        }
+        _ => {}
+    }
+}
+
+/// Pair the unit variables of two structurally-parallel units by exponent
+/// (see `correspond_vars`). The common shape is a single variable per unit
+/// (`Float<u>`), which pairs unambiguously; ties within one exponent pair in
+/// `BTreeMap` iteration order.
+fn correspond_unit_vars(
+    from: &UnitTy,
+    to: &UnitTy,
+    unit_map: &mut HashMap<UnitVar, UnitVar>,
+) {
+    let mut targets_by_exp: BTreeMap<i32, Vec<UnitVar>> = BTreeMap::new();
+    for (&v, &e) in &to.vars {
+        targets_by_exp.entry(e).or_default().push(v);
+    }
+    let mut next: BTreeMap<i32, usize> = BTreeMap::new();
+    for (&v, &e) in &from.vars {
+        if let Some(candidates) = targets_by_exp.get(&e) {
+            let idx = next.entry(e).or_insert(0);
+            if let Some(&target) = candidates.get(*idx) {
+                unit_map.entry(v).or_insert(target);
+                *idx += 1;
+            }
+        }
+    }
+}
+
 fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
     match ty {
         Ty::Var(v)
@@ -9673,7 +9911,7 @@ fn value_references_source_inner(
                 inner, source_name, aliases, let_bindings, visited,
             )
         }
-        ast::ExprKind::UnitLit { value, .. } => value_references_source_inner(
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => value_references_source_inner(
             value, source_name, aliases, let_bindings, visited,
         ),
         ast::ExprKind::Annot { expr, .. } => value_references_source_inner(

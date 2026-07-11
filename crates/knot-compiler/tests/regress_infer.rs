@@ -500,6 +500,32 @@ main = f
     );
 }
 
+#[test]
+fn if_widening_does_not_launder_bound_provided_var() {
+    // B10: `act` is a fresh param that `g act` pins to `IO {} {}`. Using it as
+    // one branch of an `if` whose other branch has `console` must NOT overwrite
+    // `act`'s binding with the widened `IO {console} {}`. Before the fix, the
+    // widening arm relabelled `act` to `IO {console} {}`, so the later
+    // `check act` (which also requires `IO {} {}`) spuriously failed — the
+    // earlier `g act` obligation was discharged against the narrower binding
+    // and never revisited. `act` must stay `IO {} {}`, so this type-checks.
+    let src = r#"g : IO {} {} -> IO {} {}
+g = \a -> a
+check : IO {} {} -> IO {} {}
+check = \a -> a
+runIt = \act -> do
+  first <- g act
+  logIt <- if true then println "hi" else act
+  check act
+"#;
+    let diags = check_src(src);
+    assert!(
+        diags.is_empty(),
+        "widening must not launder the bound provided var: {:?}",
+        diags
+    );
+}
+
 // ── 10. Unit-composition guard must cover polymorphic unit variables ──
 
 #[test]
@@ -696,6 +722,39 @@ combine = \a b -> do
   a
   b
 main = combine (println "left") (println "right")
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "cannot unify rigid type variables"),
+        "rigid rows must not silently merge without a `\\/` union: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn user_annotated_effect_union_if_branches_accepted() {
+    // Regression (B22): an `if` in *infer* position (here as the argument of
+    // `id`, so the callee doesn't push an expected type back down) whose two
+    // branches carry *distinct* rigid effect rows (`r1`, `r2`) must satisfy
+    // the declared union `r1 \/ r2`. Previously the If arm's row merge called
+    // `unify` on the two rigid skolems directly, bypassing the effect-union
+    // escape and rejecting with "cannot unify rigid type variables".
+    let src = r#"combine : Bool -> IO {| r1} {} -> IO {| r2} {} -> IO {| r1 \/ r2} {}
+combine = \c a b -> id (if c then a else b)
+main = combine true (println "left") (println "right")
+"#;
+    let diags = check_src(src);
+    assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+}
+
+#[test]
+fn effect_row_equality_without_union_still_rejected_in_if() {
+    // The `if` merge must NOT silently collapse two distinct rigid rows into
+    // a single-row result absent a declared `\/` union — the fix delegates to
+    // `merge_do_io_row`, which still falls back to `unify` here.
+    let src = r#"combine : Bool -> IO {| r1} {} -> IO {| r2} {} -> IO {| r1} {}
+combine = \c a b -> id (if c then a else b)
+main = combine true (println "left") (println "right")
 "#;
     let diags = check_src(src);
     assert!(

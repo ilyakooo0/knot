@@ -351,7 +351,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // owns the field.
     if let Some(field_at) = &field_at_cursor {
         let owner_source = match &field_at.receiver {
-            ReceiverKind::Var(name) => resolve_var_to_source(&doc.module, name),
+            ReceiverKind::Var(name) => resolve_var_to_source(&doc.module, name, lookup_offset),
             ReceiverKind::SourceRef(name) | ReceiverKind::DerivedRef(name) => Some(name.clone()),
             ReceiverKind::Other => None,
         };
@@ -883,6 +883,51 @@ main = do
         assert!(
             text.contains(">= 0") || text.contains(">=0"),
             "expected predicate text; got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn hover_field_refinement_scopes_to_cursor_decl() {
+        // Regression (bug B74): two do-blocks in different decls both bind the
+        // variable `p`, each from a different source. Field-refinement hover
+        // must attribute `p.amount` to the source bound in the *enclosing*
+        // decl, not to whichever decl binds `p` first module-wide. The two
+        // sources share the field name `amount` but carry distinct predicates,
+        // so a mis-resolution surfaces the wrong predicate.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open(
+            "main",
+            r#"*alpha : [{amount: Int where \x -> x >= 100}]
+*beta : [{amount: Int where \x -> x >= 200}]
+
+fromAlpha = do
+  p <- *alpha
+  yield p.amount
+
+fromBeta = do
+  p <- *beta
+  yield p.amount
+"#,
+        );
+        let doc = ws.doc(&uri);
+        // Hover on `amount` in the SECOND do-block (`fromBeta`), which binds
+        // `p` from `*beta`. Before the fix, resolution found `fromAlpha`'s
+        // binding first and reported `beta`'s field with alpha's predicate.
+        let off = doc.source.rfind("p.amount").expect("field use in fromBeta") + "p.".len();
+        let pos = offset_to_position(&doc.source, off);
+        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
+        let text = hover_text(hover);
+        assert!(
+            text.contains("Field refinement"),
+            "expected field-refinement section; got:\n{text}"
+        );
+        assert!(
+            text.contains(">= 200") || text.contains(">=200"),
+            "expected beta's predicate (>= 200) for the cursor's decl; got:\n{text}"
+        );
+        assert!(
+            !text.contains(">= 100") && !text.contains(">=100"),
+            "must not surface alpha's predicate from an unrelated decl; got:\n{text}"
         );
     }
 

@@ -10,7 +10,7 @@ use knot::ast::*;
 use knot::diagnostic::Diagnostic;
 
 use crate::codegen::{
-    divisor_is_nonzero_int_literal, divisor_is_nonzero_literal, expr_has_tag_column,
+    beta_reduce, divisor_is_nonzero_int_literal, divisor_is_nonzero_literal, expr_has_tag_column,
     expr_refs_var, infer_sql_expr_type,
     lookup_col_type_from_schema,
     minmax_pushdown_type_ok, sortby_projection_pushable, sql_comparison_cast_mode, type_name_to_tag,
@@ -60,18 +60,31 @@ pub fn check(module: &Module, type_env: &TypeEnv) -> Vec<Diagnostic> {
         })
         .collect();
 
+    // Collect top-level function bodies so the pipe-chain lint can mirror
+    // codegen's beta-reduction: a filter/aggregate lambda that calls a user
+    // function (`\i -> isGood i`) is inlined before codegen's SQL-pushdown
+    // check, so the lint must inline it too before deciding runtime fallback.
+    let fun_bodies: HashMap<String, Expr> = module
+        .decls
+        .iter()
+        .filter_map(|d| match &d.node {
+            DeclKind::Fun { name, body: Some(body), .. } => Some((name.clone(), body.clone())),
+            _ => None,
+        })
+        .collect();
+
     let mut diags = Vec::new();
 
     for decl in &module.decls {
         match &decl.node {
             DeclKind::Fun { body: Some(body), .. } => {
-                lint_expr(body, &type_env.source_schemas, &views, &mut diags);
+                lint_expr(body, &type_env.source_schemas, &views, &fun_bodies, &mut diags);
             }
             DeclKind::Derived { body, .. } => {
-                lint_expr(body, &type_env.source_schemas, &views, &mut diags);
+                lint_expr(body, &type_env.source_schemas, &views, &fun_bodies, &mut diags);
             }
             DeclKind::View { body, .. } => {
-                lint_expr(body, &type_env.source_schemas, &views, &mut diags);
+                lint_expr(body, &type_env.source_schemas, &views, &fun_bodies, &mut diags);
             }
             _ => {}
         }
@@ -85,6 +98,7 @@ fn lint_expr(
     expr: &Expr,
     source_schemas: &HashMap<String, String>,
     views: &HashSet<&str>,
+    fun_bodies: &HashMap<String, Expr>,
     diags: &mut Vec<Diagnostic>,
 ) {
     match &expr.node {
@@ -93,7 +107,7 @@ fn lint_expr(
                 if let Some(schema) = source_schemas.get(name) {
                     lint_set_expr(name, schema, value, source_schemas, views, diags);
                 }
-                lint_expr(target, source_schemas, views, diags);
+                lint_expr(target, source_schemas, views, fun_bodies, diags);
                 // Recurse into the value so sub-expressions referencing
                 // OTHER sources (e.g. `set *a = (*b |> filter f)`) are still
                 // linted. For a top-level do-block value, lint_set_expr
@@ -106,24 +120,24 @@ fn lint_expr(
                 if let ExprKind::Do(stmts) = &value.node {
                     lint_do_block_skipping(stmts, Some(name), source_schemas, views, diags);
                     for stmt in stmts {
-                        lint_stmt(stmt, source_schemas, views, diags);
+                        lint_stmt(stmt, source_schemas, views, fun_bodies, diags);
                     }
                 } else {
-                    lint_expr(value, source_schemas, views, diags);
+                    lint_expr(value, source_schemas, views, fun_bodies, diags);
                 }
             } else {
-                lint_expr(target, source_schemas, views, diags);
-                lint_expr(value, source_schemas, views, diags);
+                lint_expr(target, source_schemas, views, fun_bodies, diags);
+                lint_expr(value, source_schemas, views, fun_bodies, diags);
             }
         }
         ExprKind::ReplaceSet { target, value } => {
-            lint_expr(target, source_schemas, views, diags);
-            lint_expr(value, source_schemas, views, diags);
+            lint_expr(target, source_schemas, views, fun_bodies, diags);
+            lint_expr(value, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::Do(stmts) => {
             lint_do_block(stmts, source_schemas, views, diags);
             for stmt in stmts {
-                lint_stmt(stmt, source_schemas, views, diags);
+                lint_stmt(stmt, source_schemas, views, fun_bodies, diags);
             }
         }
         ExprKind::BinOp {
@@ -131,84 +145,88 @@ fn lint_expr(
             lhs,
             rhs,
         } => {
-            lint_pipe_chain(expr, source_schemas, views, diags);
-            // `lint_pipe_chain` flattens the entire chain (walking `lhs`
-            // through every nested `BinOp::Pipe`) and emits one diagnostic
-            // per failing operation. Recursing into `lhs` via `lint_expr`
-            // would re-enter the `BinOp::Pipe` arm and re-lint the sub-chain,
-            // producing duplicate diagnostics. Only recurse into `rhs` (the
-            // last operation's argument, e.g. a lambda body) and skip `lhs`
-            // when it is itself a pipe (already covered by the flatten).
-            if !matches!(&lhs.node, ExprKind::BinOp { op: BinOp::Pipe, .. }) {
-                lint_expr(lhs, source_schemas, views, diags);
+            let chain_covered = lint_pipe_chain(expr, source_schemas, views, fun_bodies, diags);
+            // When `lint_pipe_chain` covers the chain it flattens the entire
+            // thing (walking `lhs` through every nested `BinOp::Pipe`) and
+            // emits one diagnostic per failing operation. In that case
+            // recursing into `lhs` via `lint_expr` would re-enter this arm and
+            // re-lint the sub-chain, producing duplicate diagnostics — so skip
+            // `lhs` when it is itself a pipe (already covered by the flatten).
+            // But when `lint_pipe_chain` bails (flatten fails, non-source head,
+            // view/ADT schema) it lints nothing; skipping `lhs` there would
+            // leave the inner sub-chain and its middle-stage lambda bodies
+            // entirely unlinted, so recurse into `lhs` to lint it generically.
+            let lhs_is_pipe = matches!(&lhs.node, ExprKind::BinOp { op: BinOp::Pipe, .. });
+            if !(chain_covered && lhs_is_pipe) {
+                lint_expr(lhs, source_schemas, views, fun_bodies, diags);
             }
-            lint_expr(rhs, source_schemas, views, diags);
+            lint_expr(rhs, source_schemas, views, fun_bodies, diags);
         }
         // Recurse into all sub-expressions
         ExprKind::BinOp { lhs, rhs, .. } => {
-            lint_expr(lhs, source_schemas, views, diags);
-            lint_expr(rhs, source_schemas, views, diags);
+            lint_expr(lhs, source_schemas, views, fun_bodies, diags);
+            lint_expr(rhs, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::UnaryOp { operand, .. } => {
-            lint_expr(operand, source_schemas, views, diags);
+            lint_expr(operand, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::App { func, arg } => {
             lint_app_form(func, arg, source_schemas, views, diags);
-            lint_expr(func, source_schemas, views, diags);
-            lint_expr(arg, source_schemas, views, diags);
+            lint_expr(func, source_schemas, views, fun_bodies, diags);
+            lint_expr(arg, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::If {
             cond,
             then_branch,
             else_branch,
         } => {
-            lint_expr(cond, source_schemas, views, diags);
-            lint_expr(then_branch, source_schemas, views, diags);
-            lint_expr(else_branch, source_schemas, views, diags);
+            lint_expr(cond, source_schemas, views, fun_bodies, diags);
+            lint_expr(then_branch, source_schemas, views, fun_bodies, diags);
+            lint_expr(else_branch, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::Lambda { body, .. } => {
-            lint_expr(body, source_schemas, views, diags);
+            lint_expr(body, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::Case { scrutinee, arms } => {
-            lint_expr(scrutinee, source_schemas, views, diags);
+            lint_expr(scrutinee, source_schemas, views, fun_bodies, diags);
             for arm in arms {
-                lint_expr(&arm.body, source_schemas, views, diags);
+                lint_expr(&arm.body, source_schemas, views, fun_bodies, diags);
             }
         }
         ExprKind::Record(fields) => {
             for f in fields {
-                lint_expr(&f.value, source_schemas, views, diags);
+                lint_expr(&f.value, source_schemas, views, fun_bodies, diags);
             }
         }
         ExprKind::RecordUpdate { base, fields } => {
-            lint_expr(base, source_schemas, views, diags);
+            lint_expr(base, source_schemas, views, fun_bodies, diags);
             for f in fields {
-                lint_expr(&f.value, source_schemas, views, diags);
+                lint_expr(&f.value, source_schemas, views, fun_bodies, diags);
             }
         }
         ExprKind::List(elems) => {
             for e in elems {
-                lint_expr(e, source_schemas, views, diags);
+                lint_expr(e, source_schemas, views, fun_bodies, diags);
             }
         }
         ExprKind::FieldAccess { expr: inner, .. } => {
-            lint_expr(inner, source_schemas, views, diags);
+            lint_expr(inner, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::Atomic(inner) => {
-            lint_expr(inner, source_schemas, views, diags);
+            lint_expr(inner, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::Annot { expr: inner, .. } => {
-            lint_expr(inner, source_schemas, views, diags);
+            lint_expr(inner, source_schemas, views, fun_bodies, diags);
         }
-        ExprKind::UnitLit { value, .. } => {
-            lint_expr(value, source_schemas, views, diags);
+        ExprKind::UnitLit { value, .. } | ExprKind::TimeUnitLit { value, .. } => {
+            lint_expr(value, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::Refine(inner) => {
-            lint_expr(inner, source_schemas, views, diags);
+            lint_expr(inner, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::Serve { handlers, .. } => {
             for h in handlers {
-                lint_expr(&h.body, source_schemas, views, diags);
+                lint_expr(&h.body, source_schemas, views, fun_bodies, diags);
             }
         }
         // Terminals — nothing to recurse into
@@ -224,13 +242,14 @@ fn lint_stmt(
     stmt: &Stmt,
     source_schemas: &HashMap<String, String>,
     views: &HashSet<&str>,
+    fun_bodies: &HashMap<String, Expr>,
     diags: &mut Vec<Diagnostic>,
 ) {
     match &stmt.node {
-        StmtKind::Bind { expr, .. } => lint_expr(expr, source_schemas, views, diags),
-        StmtKind::Let { expr, .. } => lint_expr(expr, source_schemas, views, diags),
-        StmtKind::Where { cond } => lint_expr(cond, source_schemas, views, diags),
-        StmtKind::Expr(e) => lint_expr(e, source_schemas, views, diags),
+        StmtKind::Bind { expr, .. } => lint_expr(expr, source_schemas, views, fun_bodies, diags),
+        StmtKind::Let { expr, .. } => lint_expr(expr, source_schemas, views, fun_bodies, diags),
+        StmtKind::Where { cond } => lint_expr(cond, source_schemas, views, fun_bodies, diags),
+        StmtKind::Expr(e) => lint_expr(e, source_schemas, views, fun_bodies, diags),
         StmtKind::GroupBy { .. } => {}
     }
 }
@@ -403,33 +422,40 @@ fn lint_set_expr(
 
 /// Check pipe chains like `*source |> filter f |> map g` for operations
 /// that will fall back to runtime.
+/// Lint a pipe chain for SQL-pushdown fallbacks. Returns `true` when the chain
+/// was actually covered — i.e. it flattened to a plain-source head and either
+/// walked every operation or emitted the operation-order diagnostic. Returns
+/// `false` on every bail path (flatten fails, non-source head, view/ADT/nested
+/// schema): in those cases nothing was linted, so the caller must fall back to
+/// recursing into the sub-chain generically or its diagnostics are lost.
 fn lint_pipe_chain(
     expr: &Expr,
     source_schemas: &HashMap<String, String>,
     views: &HashSet<&str>,
+    fun_bodies: &HashMap<String, Expr>,
     diags: &mut Vec<Diagnostic>,
-) {
+) -> bool {
     let (source, ops) = match flatten_pipe_chain(expr) {
         Some(v) => v,
-        None => return,
+        None => return false,
     };
     if ops.is_empty() {
-        return;
+        return false;
     }
 
     let source_name = match &source.node {
         ExprKind::SourceRef(name) => name,
-        _ => return,
+        _ => return false,
     };
     if views.contains(source_name.as_str()) {
-        return;
+        return false;
     }
     let schema = match source_schemas.get(source_name) {
         Some(s) => s,
-        None => return,
+        None => return false,
     };
     if schema.starts_with('#') || schema.contains('[') {
-        return;
+        return false;
     }
 
     // Mirror codegen's pipe operation-order check: out-of-order chains
@@ -446,13 +472,26 @@ fn lint_pipe_chain(
                  (filter, then sortBy, then map, then drop, then take)",
             ),
         );
-        return;
+        // The whole flattened chain was analyzed and flagged as one unit.
+        return true;
     }
+
+    // Mirror codegen's beta-reduction before its SQL-pushdown check: codegen
+    // fully inlines a filter/aggregate lambda (expanding calls to user
+    // functions like `\i -> isGood i`) before deciding whether the operation
+    // compiles to SQL. Reduce the body here too so the lint's runtime-fallback
+    // claims match what codegen actually emits — otherwise a lambda that calls
+    // a user function is wrongly flagged as runtime-evaluated even though its
+    // inlined body is a plain column comparison that pushes down to SQL.
+    // Pipe-op bodies live at module scope, so there are no `let` bindings in
+    // play; an empty map is the correct binding environment.
+    let no_lets: HashMap<String, Expr> = HashMap::new();
 
     for op in &ops {
         match op {
             LintPipeOp::Filter { bind_var, body, span } => {
-                if try_compile_sql_expr(bind_var, body, schema).is_none() {
+                let reduced = beta_reduce(body, fun_bodies, &no_lets);
+                if try_compile_sql_expr(bind_var, &reduced, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe filter will be evaluated at runtime instead of SQL WHERE",
@@ -462,7 +501,8 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::SortBy { bind_var, body, span } => {
-                if try_sql_sortby_expr(bind_var, body, schema).is_none() {
+                let reduced = beta_reduce(body, fun_bodies, &no_lets);
+                if try_sql_sortby_expr(bind_var, &reduced, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe sortBy will be evaluated at runtime instead of SQL ORDER BY",
@@ -472,7 +512,8 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::Sum { bind_var, body, span } => {
-                if try_sql_column_expr(bind_var, body, schema).is_none() {
+                let reduced = beta_reduce(body, fun_bodies, &no_lets);
+                if try_sql_column_expr(bind_var, &reduced, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe sum will be evaluated at runtime instead of SQL SUM",
@@ -482,7 +523,8 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::Avg { bind_var, body, span } => {
-                if try_sql_column_expr(bind_var, body, schema).is_none() {
+                let reduced = beta_reduce(body, fun_bodies, &no_lets);
+                if try_sql_column_expr(bind_var, &reduced, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe avg will be evaluated at runtime instead of SQL AVG",
@@ -492,7 +534,8 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::Min { bind_var, body, span } => {
-                if try_sql_minmax_expr(bind_var, body, schema).is_none() {
+                let reduced = beta_reduce(body, fun_bodies, &no_lets);
+                if try_sql_minmax_expr(bind_var, &reduced, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe minOn will be evaluated at runtime instead of SQL MIN",
@@ -502,7 +545,8 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::Max { bind_var, body, span } => {
-                if try_sql_minmax_expr(bind_var, body, schema).is_none() {
+                let reduced = beta_reduce(body, fun_bodies, &no_lets);
+                if try_sql_minmax_expr(bind_var, &reduced, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe maxOn will be evaluated at runtime instead of SQL MAX",
@@ -512,7 +556,8 @@ fn lint_pipe_chain(
                 }
             }
             LintPipeOp::CountWhere { bind_var, body, span } => {
-                if try_compile_sql_expr(bind_var, body, schema).is_none() {
+                let reduced = beta_reduce(body, fun_bodies, &no_lets);
+                if try_compile_sql_expr(bind_var, &reduced, schema).is_none() {
                     diags.push(
                         Diagnostic::info(
                             "pipe countWhere will be evaluated at runtime instead of SQL COUNT",
@@ -527,6 +572,8 @@ fn lint_pipe_chain(
             | LintPipeOp::Drop { .. } => {}
         }
     }
+    // Every operation in the flattened chain was linted above.
+    true
 }
 
 // ── Application form lint ──────────────────────────────────────────
@@ -900,13 +947,10 @@ fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
 /// arithmetic expression. (LENGTH() is no longer pushed down, so App
 /// expressions never need the cast here.)
 fn atom_would_need_cast(expr: &Expr) -> bool {
-    match &expr.node {
-        ExprKind::BinOp {
-            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat,
-            ..
-        } => true,
-        _ => false,
-    }
+    matches!(&expr.node, ExprKind::BinOp {
+        op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat,
+        ..
+    })
 }
 
 /// Look up a column's schema type. Delegates to codegen's
@@ -1078,7 +1122,7 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         ExprKind::Atomic(inner) | ExprKind::Refine(inner) => {
             references_source(inner, source_name)
         }
-        ExprKind::UnitLit { value, .. } => references_source(value, source_name),
+        ExprKind::UnitLit { value, .. } | ExprKind::TimeUnitLit { value, .. } => references_source(value, source_name),
         ExprKind::Serve { handlers, .. } => {
             handlers.iter().any(|h| references_source(&h.body, source_name))
         }
@@ -1581,14 +1625,15 @@ mod tests {
     fn lint_on_set_value_pipe_over_other_source() {
         // `set *a = (*b |> filter complex)` — the value's pipe chain over a
         // DIFFERENT source must still be linted (previously the Set arm never
-        // recursed into the value).
+        // recursed into the value). The filter uses `toUpper`, which codegen
+        // never pushes down (SQLite UPPER is ASCII-only), so this stays a
+        // genuine runtime-fallback case even after beta-reduction.
         let diags = lint(
             "type T = {name: Text, score: Int}\n\
-             isGood = \\x -> x.score > 50\n\
              *a : [T]\n\
              *b : [T]\n\
              sync = do\n  \
-               *a = (*b |> filter (\\i -> isGood i))\n",
+               *a = (*b |> filter (\\i -> toUpper i.name == \"BOB\"))\n",
         );
         assert!(
             !diags.is_empty(),
@@ -1623,7 +1668,10 @@ mod tests {
 
     #[test]
     fn lint_on_pipe_filter_complex() {
-        // Pipe filter with function call — can't be SQL WHERE.
+        // Pipe filter calling a user function — codegen beta-reduces
+        // `\i -> isGood i` to `i.score > 50`, which pushes down to SQL WHERE.
+        // The lint mirrors that inlining, so it must NOT warn about runtime
+        // fallback (regression for B55).
         let diags = lint(
             "type T = {name: Text, score: Int}\n\
              isGood = \\x -> x.score > 50\n\
@@ -1631,8 +1679,11 @@ mod tests {
              main = do\n  \
                yield (*items |> filter (\\i -> isGood i))\n",
         );
-        assert!(!diags.is_empty(), "expected diagnostics for complex pipe filter");
-        assert!(diags.iter().any(|d| d.message.contains("runtime")));
+        assert!(
+            diags.is_empty(),
+            "expected no diagnostics — inlined filter pushes down to SQL, got: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -1772,7 +1823,11 @@ mod tests {
 
     #[test]
     fn lint_on_complex_min_lambda() {
-        // minOn with non-SQL-compilable lambda body — falls back to runtime.
+        // minOn calling a user function — codegen beta-reduces
+        // `\i -> classify i.salary` to `i.salary + 100`, an Int column
+        // arithmetic projection that pushes down to SQL MIN. The lint mirrors
+        // that inlining, so it must NOT warn about runtime fallback
+        // (regression for B55).
         let diags = lint(
             "type T = {salary: Int}\n\
              classify = \\x -> x + 100\n\
@@ -1780,8 +1835,11 @@ mod tests {
              main = do\n  \
                yield (*items |> minOn (\\i -> classify i.salary))\n",
         );
-        assert!(!diags.is_empty(), "expected diagnostic for non-SQL minOn");
-        assert!(diags.iter().any(|d| d.message.contains("MIN")));
+        assert!(
+            diags.is_empty(),
+            "expected no diagnostics — inlined minOn pushes down to SQL, got: {:?}",
+            diags
+        );
     }
 
     #[test]
@@ -1799,13 +1857,14 @@ mod tests {
 
     #[test]
     fn lint_on_count_where_complex() {
-        // countWhere with non-SQL-compilable predicate — falls back to runtime.
+        // countWhere with a genuinely non-SQL-compilable predicate — `toUpper`
+        // is not pushed down (SQLite UPPER is ASCII-only), so even after
+        // beta-reduction the predicate falls back to runtime.
         let diags = lint(
-            "type T = {salary: Int}\n\
-             isHigh = \\x -> x.salary > 50\n\
+            "type T = {salary: Int, name: Text}\n\
              *items : [T]\n\
              main = do\n  \
-               yield (*items |> countWhere (\\i -> isHigh i))\n",
+               yield (*items |> countWhere (\\i -> toUpper i.name == \"BOB\"))\n",
         );
         assert!(!diags.is_empty(), "expected diagnostic for non-SQL countWhere");
         assert!(diags.iter().any(|d| d.message.contains("COUNT")));

@@ -26,6 +26,15 @@ pub struct Parser {
     /// Used by `parse_application` to allow multi-line function application
     /// when continuation lines are indented past the block indent.
     block_indent: usize,
+    /// The `delimiter_depth` at which the current `block_indent` was
+    /// established. A do/case block establishes a layout context whose
+    /// statement boundaries stay layout-sensitive even inside parens — but
+    /// only while that block is the innermost active one at the *current*
+    /// delimiter depth. When an outer block's indent merely leaks into a
+    /// deeper paren scope (`foo = (a\n+ b)`), `block_delim < delimiter_depth`,
+    /// and the layout boundary check is skipped so a parenthesized multi-line
+    /// expression still continues freely across newlines.
+    block_delim: usize,
     /// Nesting depth inside delimiters (parens, brackets, braces).
     /// When > 0, the column-0 check in `parse_expr_bp` is suppressed so that
     /// operators at column 0 inside grouped expressions are not mistaken for
@@ -72,6 +81,7 @@ impl Parser {
             stop_type_at_headers: false,
             stop_type_at_migrate_clauses: false,
             block_indent: usize::MAX,
+            block_delim: 0,
             delimiter_depth: 0,
             recursion_depth: 0,
             bound_vars: Vec::new(),
@@ -123,6 +133,39 @@ impl Parser {
         self.token_cols.get(self.pos).copied().unwrap_or(self.eof_col)
     }
 
+    /// After a newline was crossed mid-expression, decide whether the current
+    /// token begins a new top-level declaration or a new statement/item of an
+    /// enclosing layout block — in which case it does NOT continue the current
+    /// expression (operator or application continuation stops here).
+    ///
+    /// Two independent rules:
+    ///
+    /// * A token at column 0 begins a new top-level declaration — but only
+    ///   outside delimiters, where a closing delimiter (not layout) would
+    ///   otherwise terminate the expression. Inside parens a column-0 operator
+    ///   is a legitimate continuation (`foo = (a\n+ b)`), so this is gated on
+    ///   `delimiter_depth == 0`.
+    ///
+    /// * A token at or under the enclosing block's indent starts a new block
+    ///   item (a do statement, a case arm, ...). This is layout-sensitive and
+    ///   holds *regardless of paren nesting* — statement boundaries inside a
+    ///   parenthesized `do`/`case` block must still be respected, otherwise the
+    ///   formatter's parenthesized rendering of e.g. `do\n  let a = 1\n  -2`
+    ///   reparses with the statements glued into `let a = 1 - 2`. It applies
+    ///   only when the block was opened at the *current* delimiter depth
+    ///   (`block_delim == delimiter_depth`); an outer block whose indent merely
+    ///   leaked into a deeper paren scope must not terminate a legitimate
+    ///   parenthesized continuation.
+    fn at_layout_boundary(&self) -> bool {
+        let col = self.cur_column();
+        if self.delimiter_depth == 0 && col == 0 {
+            return true;
+        }
+        self.block_indent != usize::MAX
+            && self.block_delim == self.delimiter_depth
+            && col <= self.block_indent
+    }
+
     pub fn parse_module(mut self) -> (Module, Vec<Diagnostic>) {
         self.skip_newlines();
 
@@ -137,7 +180,9 @@ impl Parser {
 
         // Set block_indent so that multiline expressions inside declarations
         // can continue across newlines (parse_application checks column > block_indent).
+        // Top-level declarations live at delimiter depth 0.
         self.block_indent = 0;
+        self.block_delim = 0;
         // Pre-scan for top-level declaration names that collide with
         // time-unit words so `maybe_time_unit` doesn't silently rewrite
         // `2 ms` as `2 * 1` when `ms` is a user-defined top-level value.
@@ -261,6 +306,7 @@ impl Parser {
     ///   * selectively imported item names (`import ./time (ms)`),
     ///   * trait/impl method names (indented `name :`/`name =` inside a
     ///     `trait …`/`impl …` block body).
+    ///
     /// Without the latter two, `import ./time (ms)` then `g = f 2 ms` would
     /// silently parse as `f (2 * 1)`, dropping the `ms` argument.
     fn scan_top_level_names(&self, imports: &[Import]) -> HashSet<String> {
@@ -792,7 +838,9 @@ impl Parser {
             return vec![];
         }
         let prev_block_indent = self.block_indent;
+        let prev_block_delim = self.block_delim;
         self.block_indent = indent;
+        self.block_delim = self.delimiter_depth;
         let mut items = vec![];
         loop {
             if self.at_eof() {
@@ -875,6 +923,7 @@ impl Parser {
             }
         }
         self.block_indent = prev_block_indent;
+        self.block_delim = prev_block_delim;
         items
     }
 }
@@ -2263,13 +2312,10 @@ impl Parser {
         // the following declaration as this expression's head and dropping it.
         // Mirrors the operator-RHS and application-continuation guards, which
         // use the same column rule for mid-expression continuation.
-        if self.delimiter_depth == 0 && self.pos != saved.0 {
-            let col = self.cur_column();
-            if col == 0 || (self.block_indent != usize::MAX && col <= self.block_indent) {
-                self.error("expected expression");
-                self.restore(saved);
-                return None;
-            }
+        if self.pos != saved.0 && self.at_layout_boundary() {
+            self.error("expected expression");
+            self.restore(saved);
+            return None;
         }
         match self.peek() {
             TokenKind::Backslash => self.parse_lambda(),
@@ -2365,19 +2411,19 @@ impl Parser {
             let saved_pos = self.save();
             self.skip_newlines();
 
-            // If the next token starts a new line and we're NOT inside
-            // delimiters, it only continues this expression as a binary
-            // operator when it is indented PAST the enclosing block's indent
-            // — the same rule parse_application uses for multi-line
-            // continuation. A token at column 0 is a new declaration; a token
-            // at (or before) the block indent starts a new block item (a do
-            // statement like `-1`, a case arm like `-1 -> ...`, etc.).
-            if self.delimiter_depth == 0 && self.pos != saved_pos.0 {
-                let col = self.cur_column();
-                if col == 0 || (self.block_indent != usize::MAX && col <= self.block_indent) {
-                    self.restore(saved_pos);
-                    break;
-                }
+            // If the next token starts a new line, it only continues this
+            // expression as a binary operator when it stays past the enclosing
+            // block's indent — the same rule parse_application uses for
+            // multi-line continuation. A token at column 0 (outside delimiters)
+            // is a new declaration; a token at (or before) the block indent
+            // starts a new block item (a do statement like `-1`, a case arm
+            // like `-1 -> ...`, etc.). The block-item rule holds even inside
+            // parens for a `do`/`case` block opened at this delimiter depth, so
+            // a parenthesized `do\n  let a = 1\n  -2` does not glue its
+            // statements into `let a = 1 - 2` on reparse.
+            if self.pos != saved_pos.0 && self.at_layout_boundary() {
+                self.restore(saved_pos);
+                break;
             }
 
             // `*name` is a source reference, not multiplication — but only when
@@ -2469,12 +2515,9 @@ impl Parser {
             // line-leading declaration/block item. Gating on that also avoids
             // calling the O(line-length) `column_of` once per operator, which
             // made a long single-line `1+1+…+1` chain parse in O(n²).
-            if self.delimiter_depth == 0 && self.pos != pos_before_rhs {
-                let col = self.cur_column();
-                if col == 0 || (self.block_indent != usize::MAX && col <= self.block_indent) {
-                    self.error("expected expression after binary operator");
-                    break;
-                }
+            if self.pos != pos_before_rhs && self.at_layout_boundary() {
+                self.error("expected expression after binary operator");
+                break;
             }
             // Allow let/if/case/do/lambda/atomic/refine on the RHS of
             // binary operators.  These are handled by `parse_expr` but not by
@@ -2775,7 +2818,10 @@ impl Parser {
 
     /// If the next token is a time-unit identifier (`ms`, `seconds`, `minutes`,
     /// `hours`, `days`, `weeks`), consume it and desugar `n unit` into `n * factor`
-    /// where factor is the millisecond equivalent.
+    /// where factor is the millisecond equivalent. The multiplication is wrapped
+    /// in an `ExprKind::TimeUnitLit` that also records the original unit word, so
+    /// the formatter can re-render `n unit` instead of the raw `n * factor`
+    /// (inference and codegen unwrap the wrapper and see only the multiplication).
     fn maybe_time_unit(&mut self, lit: Expr) -> Option<Expr> {
         let factor: Option<&str> = match self.peek() {
             // A locally-bound variable named like a time unit is NOT unit
@@ -2795,7 +2841,12 @@ impl Parser {
         match factor {
             Some(f) => {
                 let unit_tok = self.advance();
-                let span = Span::new(lit.span.start, unit_tok.span.end);
+                let unit_span = unit_tok.span;
+                let unit_name = match unit_tok.kind {
+                    TokenKind::Lower(u) => u,
+                    _ => unreachable!("time-unit suffix is always a Lower token"),
+                };
+                let span = Span::new(lit.span.start, unit_span.end);
                 // Match the factor literal's kind to the operand's so the
                 // multiplication stays homogeneous. A Float operand
                 // (`2.5 seconds`) with an Int factor would produce a
@@ -2806,14 +2857,25 @@ impl Parser {
                 } else {
                     Literal::Int(f.to_string())
                 };
-                Some(Spanned::new(
+                // Keep the desugared multiplication as `value` so inference and
+                // codegen treat `2 seconds` exactly like `2 * 1000`, but wrap it
+                // in `TimeUnitLit` so the formatter can recover the surface form
+                // (`2 seconds`) instead of rewriting it to raw multiplication.
+                let mul = Spanned::new(
                     ExprKind::BinOp {
                         op: BinOp::Mul,
                         lhs: Box::new(lit),
                         rhs: Box::new(Spanned::new(
                             ExprKind::Lit(factor_lit),
-                            unit_tok.span,
+                            unit_span,
                         )),
+                    },
+                    span,
+                );
+                Some(Spanned::new(
+                    ExprKind::TimeUnitLit {
+                        value: Box::new(mul),
+                        unit_name,
                     },
                     span,
                 ))
@@ -4437,10 +4499,25 @@ impl Parser {
         let saved = self.save();
         let diag_count = self.diagnostics.len();
         if let Some(effects) = self.try_parse_effects() {
-            self.expect(&TokenKind::RBrace, "expected '}' to close effect set")
+            let close = self
+                .expect(&TokenKind::RBrace, "expected '}' to close effect set")
                 .ok()?;
-            // Now parse the effectful type body.
-            let ty = self.parse_type()?;
+            // If a type atom follows, parse it as the effectful body (e.g.
+            // `{console} Int`). Otherwise `{effects}` is terminal — before a
+            // closing paren, `->`, end of type, or newline — so treat it as a
+            // complete effectful type with an empty (Unit) body. This is the
+            // form written in `Server Api {console}` type annotations.
+            let ty = if self.can_start_type_atom() {
+                self.parse_type()?
+            } else {
+                Spanned::new(
+                    TypeKind::Record {
+                        fields: vec![],
+                        rest: None,
+                    },
+                    close.span,
+                )
+            };
             let span = Span::new(start.start, ty.span.end);
             return Some(Spanned::new(
                 TypeKind::Effectful {

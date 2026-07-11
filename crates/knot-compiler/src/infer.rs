@@ -492,6 +492,15 @@ struct Infer {
     /// those vars rather than monomorphic to a leaked unification var.
     skolems: HashSet<TyVar>,
 
+    /// TyVars minted to freshen the free variables of a type alias body
+    /// (the `a` in `type Box = {val: a}`). They are quantified in the
+    /// enclosing scheme so each *reference* to the alias gets its own copy,
+    /// but they are not universals the annotation promises: `b1 : Box` says
+    /// "some `val` type", not "every `val` type", so checking `b1 = {val: 1}`
+    /// must be free to solve the copy to `Int`. `skolemise_scheme` therefore
+    /// instantiates these flexibly instead of turning them rigid.
+    alias_free_vars: HashSet<TyVar>,
+
     /// Scoped variable environment (functions, let-bindings, params).
     scopes: Vec<HashMap<String, Scheme>>,
 
@@ -724,6 +733,7 @@ impl Infer {
             next_var: 0,
             subst: HashMap::new(),
             skolems: HashSet::new(),
+            alias_free_vars: HashSet::new(),
             scopes: vec![HashMap::new()],
             constructors: HashMap::new(),
             data_types: HashMap::new(),
@@ -3097,8 +3107,18 @@ impl Infer {
         let mut mapping: HashMap<TyVar, Ty> = HashMap::new();
         for v in &scheme.vars {
             let s = self.fresh_var();
-            self.skolems.insert(s);
-            fresh_skolems.push(s);
+            // Vars freshened out of a type-alias body are quantified so each
+            // alias reference gets its own copy, but the annotation never
+            // promised the body works for *every* instantiation of them —
+            // `b1 : Box` with `type Box = {val: a}` lets the body pick `val`'s
+            // type. Keep those flexible; skolemising them would reject
+            // `b1 = {val: 1}` as a rigid-variable escape.
+            if self.alias_free_vars.contains(v) {
+                self.alias_free_vars.insert(s);
+            } else {
+                self.skolems.insert(s);
+                fresh_skolems.push(s);
+            }
             mapping.insert(*v, Ty::Var(s));
         }
         for c in &scheme.constraints {
@@ -3980,11 +4000,17 @@ impl Infer {
                             // couldn't paper over it (bug B21). Guarded on
                             // `in_type_annotation` so only scheme-building callers
                             // are affected, not alias-definition collection.
+                            // They are quantified, but not *universally
+                            // promised* by the annotation: `b1 : Box` leaves
+                            // `val`'s type open for the body to choose, so the
+                            // vars are recorded here and instantiated flexibly
+                            // (not skolemised) when the body is checked.
                             if self.in_type_annotation {
                                 for fresh in mapping.values() {
                                     if let Ty::Var(v) = fresh {
                                         self.annotation_vars
                                             .insert(format!("__alias_fv#{v}"), *v);
+                                        self.alias_free_vars.insert(*v);
                                     }
                                 }
                             }

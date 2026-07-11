@@ -561,13 +561,19 @@ fn render_decl_with_fallback(source: &str, d: &Decl, comments: &[Comment<'_>]) -
 /// whole-file fallback silently reverts all formatting). Escaped quotes (`\"`)
 /// and other backslash escapes are handled so a `\"` inside a string does not
 /// terminate the string-tracking state.
+///
+/// String tracking also skips `--` comments, mirroring the lexer: a lone `"` in
+/// a comment must not flip the state, or every tab after it would be preserved
+/// as if it were inside a string literal.
 fn normalize_source_slice(s: &str) -> String {
     // Replace tabs outside of string literals with a single space, preserving
     // tabs that appear inside `"…"` string literals verbatim.
     let mut tab_normalized = String::with_capacity(s.len());
     let mut in_string = false;
+    let mut in_comment = false;
     let mut prev_backslash = false;
-    for ch in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
         if in_string {
             tab_normalized.push(ch);
             if prev_backslash {
@@ -579,6 +585,15 @@ fn normalize_source_slice(s: &str) -> String {
             } else if ch == '"' {
                 in_string = false;
             }
+        } else if in_comment {
+            // The lexer ends a line comment at `\n` or `\r`.
+            if ch == '\n' || ch == '\r' {
+                in_comment = false;
+            }
+            tab_normalized.push(if ch == '\t' { ' ' } else { ch });
+        } else if ch == '-' && chars.peek() == Some(&'-') {
+            in_comment = true;
+            tab_normalized.push(ch);
         } else if ch == '"' {
             in_string = true;
             tab_normalized.push(ch);

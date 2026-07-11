@@ -124,6 +124,29 @@ fn round_trip_route_rate_limit() {
     check_str("rate_limit_route", src);
 }
 
+/// A `"` inside a `--` comment must not put the verbatim-copy path into
+/// string-tracking mode: it would rewrite the literal tab in the string below
+/// to a space, the reparse safety net would reject the output, and the whole
+/// file would come back unformatted.
+#[test]
+fn comment_with_odd_quote_still_formats() {
+    let src = "greeting   =   \"hi\"\n\nmain = do\n  -- prints a \"quoted greeting\n  println \"a\tb\"\n";
+    let m = parse(src).expect("parse");
+    let out = knot::format::format_module(src, &m);
+
+    assert!(
+        out.contains("greeting = \"hi\""),
+        "formatter no-opped on a comment containing an odd quote:\n{}",
+        out
+    );
+    assert!(
+        out.contains("\"a\tb\""),
+        "tab inside the string literal was not preserved:\n{}",
+        out.escape_debug()
+    );
+    check_str("comment_odd_quote", src);
+}
+
 #[test]
 fn round_trip_examples() {
     let dir = examples_dir();

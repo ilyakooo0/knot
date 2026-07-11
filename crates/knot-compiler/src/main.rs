@@ -574,15 +574,14 @@ fn find_runtime() -> PathBuf {
             if let Some(exe_dir) = std::env::current_exe()
                 .ok()
                 .and_then(|e| e.parent().map(|p| p.to_path_buf()))
+                && is_runtime_stale(&p, &exe_dir)
             {
-                if is_runtime_stale(&p, &exe_dir) {
                     eprintln!(
                         "Warning: KNOT_RUNTIME_LIB archive '{}' is older than \
                          crates/knot-runtime/src/ — rebuild knot-runtime to \
                          pick up source changes",
                         path
                     );
-                }
             }
             return p;
         }

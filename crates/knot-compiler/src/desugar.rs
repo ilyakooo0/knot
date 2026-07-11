@@ -460,13 +460,13 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
 
     // Now check if this expression is a desugaring-eligible Do block.
     // Check eligibility with immutable borrows first to avoid borrow conflicts.
-    let (sql_compilable, pure_comp) = if let ExprKind::Do(stmts) = &expr.node {
+    let (sql_compilable, kind) = if let ExprKind::Do(stmts) = &expr.node {
         (
             is_sql_compilable(stmts, source_vars),
-            is_pure_comprehension(stmts, io_fns),
+            classify_do(stmts, io_fns),
         )
     } else {
-        (false, false)
+        (false, DoDesugar::Direct)
     };
 
     if sql_compilable {
@@ -475,12 +475,17 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
         // recurse_into_children above.
         return;
     }
-    if pure_comp
-        && let ExprKind::Do(stmts) = &expr.node {
-            let span = expr.span;
-            let desugared = desugar_stmts(stmts, span);
+    if let ExprKind::Do(stmts) = &expr.node {
+        let span = expr.span;
+        let desugared = match kind {
+            DoDesugar::Comprehension => Some(desugar_stmts(stmts, span)),
+            DoDesugar::SequentialLet => Some(desugar_let_chain(stmts, span)),
+            DoDesugar::Direct => None,
+        };
+        if let Some(desugared) = desugared {
             *expr = desugared;
         }
+    }
 }
 
 /// Recurse into all child expressions of a node (except Do blocks handled
@@ -834,13 +839,29 @@ fn is_bound_field_access(expr: &Expr, bind_vars: &std::collections::HashSet<&str
     false
 }
 
+/// How a `do` block is rewritten by the desugarer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoDesugar {
+    /// A pure comprehension: rewritten to a `__bind`/`__yield`/`__empty` chain
+    /// that dispatches on the block's monad (`[]`, `Maybe`, `IO`, …).
+    Comprehension,
+    /// Only `let` bindings before a final bare expression: rewritten to nested
+    /// `(\pat -> rest) expr` applications whose value is the final expression.
+    SequentialLet,
+    /// Left as a `Do` node for direct codegen (IO blocks, `groupBy`, refutable
+    /// binds, …).
+    Direct,
+}
+
+/// Classify a do block for desugaring.
+///
 /// A do block is a "pure comprehension" if:
 /// 1. It contains at least one Bind or Where statement
 /// 2. All non-final statements are Bind, Where, or Let
 /// 3. The final statement is Expr(Yield(..))
-fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
+fn classify_do(stmts: &[Stmt], io_fns: &IoFns) -> DoDesugar {
     if stmts.is_empty() {
-        return false;
+        return DoDesugar::Direct;
     }
 
     // Need at least one Bind/Where (relational comprehension) or multiple
@@ -864,13 +885,13 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
             Some(StmtKind::Expr(e)) if e.node.as_yield_arg().is_some()
         );
         if !lone_yield {
-            return false;
+            return DoDesugar::Direct;
         }
     }
 
     // GroupBy requires loop-based codegen — not eligible for desugaring
     if stmts.iter().any(|s| matches!(&s.node, StmtKind::GroupBy { .. })) {
-        return false;
+        return DoDesugar::Direct;
     }
 
     // Do-local let-bound lambdas whose bodies perform IO make applications
@@ -905,7 +926,7 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
         StmtKind::Where { cond } => expr_is_io(cond, io_base),
         _ => false,
     }) {
-        return false;
+        return DoDesugar::Direct;
     }
 
     // Trait-method IO is invisible to codegen's `is_io_do_block` (it scans
@@ -926,7 +947,7 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     });
     if has_trait_only_io {
         if stmts.iter().any(|s| matches!(&s.node, StmtKind::Where { .. })) {
-            return false;
+            return DoDesugar::Direct;
         }
         // The desugared IO chain requires every `Bind` source and every
         // non-final bare `Expr` to be IO (they become `__bind` arguments).
@@ -943,7 +964,7 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
                 _ => false,
             }
         }) {
-            return false;
+            return DoDesugar::Direct;
         }
     }
 
@@ -961,7 +982,7 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
         &s.node,
         StmtKind::Bind { pat, .. } if pat_is_refutable(&pat.node)
     )) {
-        return false;
+        return DoDesugar::Direct;
     }
 
     // Non-final statements must be Bind/Where/Let or a bare Expr (sequenced
@@ -972,10 +993,35 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     for stmt in &stmts[..stmts.len() - 1] {
         match &stmt.node {
             StmtKind::Bind { .. } | StmtKind::Where { .. } | StmtKind::Let { .. } | StmtKind::Expr(_) => {}
-            _ => return false,
+            _ => return DoDesugar::Direct,
         }
     }
-    matches!(stmts.last().unwrap().node, StmtKind::Expr(_))
+    let last = stmts.last().unwrap();
+    if !matches!(last.node, StmtKind::Expr(_)) {
+        return DoDesugar::Direct;
+    }
+
+    // A block with no `<-` bind and no `where` guard has nothing to iterate or
+    // filter — `do { let y = x + 1; y > 0 }` is a sequential `let … in` whose
+    // value is just the final expression. Wrapping that in `__yield`
+    // (Applicative.pure) would type it as `m a` and hand back `[True]` instead
+    // of `True`. An explicit `yield e` still asks to be lifted into the monad,
+    // so those keep the comprehension path — that is what makes
+    // `do { let x = 1; yield x }` a `Just 1` in the Maybe monad. Trait-method
+    // IO also keeps it: the `__bind`/`__yield` chain is the only path that runs
+    // such IO (see above).
+    let final_is_yield = matches!(
+        &last.node,
+        StmtKind::Expr(e) if e.node.as_yield_arg().is_some()
+    );
+    let only_lets = stmts[..stmts.len() - 1]
+        .iter()
+        .all(|s| matches!(&s.node, StmtKind::Let { .. }));
+    if !has_bind_or_where && !has_trait_only_io && only_lets && !final_is_yield {
+        return DoDesugar::SequentialLet;
+    }
+
+    DoDesugar::Comprehension
 }
 
 /// Whether a bind pattern can fail to match a given value. Irrefutable
@@ -1178,6 +1224,37 @@ pub(crate) fn synth_span_origin(span: Span) -> Option<Span> {
 
 fn spanned<T>(node: T, span: Span) -> Spanned<T> {
     Spanned::new(node, span)
+}
+
+/// Desugar a `let`-only do block into nested `(\pat -> rest) expr`
+/// applications, with the final bare expression as the result. Unlike
+/// `desugar_stmts` there is no `__yield` wrapper: the block's value is the
+/// final expression itself, not `m a` (see `classify_do`).
+fn desugar_let_chain(stmts: &[Stmt], span: Span) -> Expr {
+    let (last, lets) = stmts.split_last().expect("non-empty do block");
+    let mut body = match &last.node {
+        StmtKind::Expr(e) => e.clone(),
+        _ => unreachable!("SequentialLet requires a final bare expression"),
+    };
+    for stmt in lets.iter().rev() {
+        let StmtKind::Let { pat, expr } = &stmt.node else {
+            unreachable!("SequentialLet requires `let` statements before the result");
+        };
+        body = spanned(
+            ExprKind::App {
+                func: Box::new(spanned(
+                    ExprKind::Lambda {
+                        params: vec![pat.clone()],
+                        body: Box::new(body),
+                    },
+                    span,
+                )),
+                arg: Box::new(expr.clone()),
+            },
+            span,
+        );
+    }
+    body
 }
 
 /// Desugar a list of statements into a single expression.

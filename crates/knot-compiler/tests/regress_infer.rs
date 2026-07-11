@@ -426,14 +426,15 @@ main = println (callGreet true)
 }
 
 #[test]
-fn unannotated_fn_ord_constraint_checked_at_use_site() {
+fn unannotated_fn_ord_comparison_is_structural() {
+    // Eq/Ord traits removed from comparison operators — < is structural, no constraint needed.
     let src = r#"myMin = \a b -> if a < b then a else b
 main = println (show (myMin true false))
 "#;
     let diags = check_src(src);
     assert!(
-        has_error(&diags, "no implementation of trait 'Ord' for type 'Bool'"),
-        "Ord obligation must follow the generalized scheme: {:?}",
+        diags.is_empty(),
+        "structural < should not require Ord: {:?}",
         diags
     );
 }
@@ -453,16 +454,16 @@ main = println (callGreet 1)
 }
 
 #[test]
-fn do_let_generalized_constraint_checked_at_use_site() {
-    // The do-`let` generalization path must capture constraints too.
+fn do_let_generalized_structural_comparison() {
+    // Eq/Ord traits removed from comparison operators — < is structural, no constraint needed.
     let src = r#"main = do
   let cmp = \a b -> a < b
   println (show (cmp true false))
 "#;
     let diags = check_src(src);
     assert!(
-        has_error(&diags, "no implementation of trait 'Ord' for type 'Bool'"),
-        "do-let generalization dropped the Ord constraint: {:?}",
+        diags.is_empty(),
+        "structural < in do-let should not require Ord: {:?}",
         diags
     );
 }

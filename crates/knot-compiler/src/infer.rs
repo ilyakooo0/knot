@@ -5275,12 +5275,18 @@ impl Infer {
         }
 
         // Infer the constructor's record payload (request fields only).
+        // A bare nullary route constructor (`fetch url Ctor`) carries no
+        // record argument — inferring the Constructor node as an expression
+        // yields the ADT type, which would spuriously fail to unify against
+        // the (empty) expected record. Skip payload unification for it; the
+        // response type below is resolved from route metadata regardless.
         let ctor_arg = args.last().unwrap();
         let record_arg = match &ctor_arg.node {
-            ast::ExprKind::App { arg, .. } => arg.as_ref(),
-            _ => ctor_arg,
+            ast::ExprKind::App { arg, .. } => Some(arg.as_ref()),
+            ast::ExprKind::Constructor(_) => None,
+            _ => Some(*ctor_arg),
         };
-        let record_ty = self.infer_expr(record_arg);
+        let record_ty = record_arg.map(|r| self.infer_expr(r));
 
         // Build the expected request fields from the route entry. Save and
         // restore annotation_vars so fetch inference doesn't corrupt the
@@ -5292,13 +5298,15 @@ impl Infer {
                 let v = self.fresh_var();
                 self.annotation_vars.insert(p.clone(), v);
             }
-            let field_tys: BTreeMap<String, Ty> = info
-                .fields
-                .iter()
-                .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
-                .collect();
-            let expected_record = Ty::Record(field_tys, None);
-            self.unify(&record_ty, &expected_record, ctor_arg.span);
+            if let Some(record_ty) = &record_ty {
+                let field_tys: BTreeMap<String, Ty> = info
+                    .fields
+                    .iter()
+                    .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
+                    .collect();
+                let expected_record = Ty::Record(field_tys, None);
+                self.unify(record_ty, &expected_record, ctor_arg.span);
+            }
         }
 
         // Build the return type: IO {network} (Result {status, message} ResponseTy)

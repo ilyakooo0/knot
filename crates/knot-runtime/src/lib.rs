@@ -11170,9 +11170,31 @@ fn init_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &Rec
     }
 }
 
+/// Separator between a parent table's name and a nested field name when
+/// forming a child table's physical name (`_knot_<source>__/<field>`).
+///
+/// It begins with `__` so that the DELETE cascade's `LIKE '<parent>__%'`
+/// descendant discovery and `__`-boundary parent resolution keep working
+/// unchanged. The trailing `/` — which is not a legal character in a Knot
+/// identifier — guarantees a child table name can never collide with a *main*
+/// source table `_knot_<name>`: source names are identifiers, so `_knot_<name>`
+/// can never contain `/`, whereas every child table name does. Without this,
+/// source `users` with nested field `archive` (child table `_knot_users__archive`)
+/// and an independent source `users__archive` (main table `_knot_users__archive`)
+/// mapped to the same physical table, and the second `CREATE TABLE IF NOT EXISTS`
+/// silently reused the first — causing `no such column` errors or intermixed
+/// rows (bug B26).
+const CHILD_TABLE_SEP: &str = "__/";
+
+/// Physical name of the child table holding a nested relation `field` of the
+/// relation stored in `parent_table`. See [`CHILD_TABLE_SEP`].
+fn child_table_name(parent_table: &str, field: &str) -> String {
+    format!("{}{}{}", parent_table, CHILD_TABLE_SEP, field)
+}
+
 /// Create a child table for a nested relation field, recursing for deeper nesting.
 fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &NestedField) {
-    let child_table_name = format!("{}__{}", parent_table, nf.name);
+    let child_table_name = child_table_name(parent_table, &nf.name);
     let child_table = quote_ident(&child_table_name);
     let has_children = !nf.nested.is_empty();
 

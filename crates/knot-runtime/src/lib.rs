@@ -8245,13 +8245,39 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
         // Wait for an outcome — but don't join the loser.  The loser runs
         // to its next safe point in the background, tracked by
         // ACTIVE_FORKS for the program-exit join.
-        let g = state.lock().unwrap_or_else(|e| e.into_inner());
-        let g = cvar.wait_while(g, |s| s.outcome.is_none()).unwrap_or_else(|e| e.into_inner());
-        let outcome = match g.outcome.as_ref().cloned() {
-            Some(o) => o,
-            None => panic!("knot runtime: race: both workers panicked before producing an outcome"),
+        //
+        // Poll on a timeout instead of an unbounded `wait_while`: this
+        // parent may itself be a worker of an *enclosing* race, in which
+        // case its thread carries that outer race's `CancelToken`. That
+        // token's `cancel()` wakes the token's own condvar, not this local
+        // `cvar`, so an unbounded wait here would never observe outer
+        // cancellation — stranding the inner workers and blocking program
+        // exit (e.g. `race x (race (sleep huge) (sleep huge))` resolves
+        // instantly yet `knot_threads_join` would wait out the sleeps).
+        // Between waits we consult this thread's own cancel token; when it
+        // fires we stop both inner workers (so their sleeps wake at once)
+        // and unwind with `Cancelled`, exactly like every other
+        // cancellation checkpoint — the panic is silenced by the hook
+        // installed above.
+        const RACE_CANCEL_POLL: Duration = Duration::from_millis(50);
+        let outcome = {
+            let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(o) = g.outcome.as_ref().cloned() {
+                    break o;
+                }
+                if cancel_requested() {
+                    drop(g);
+                    cancel_a.cancel();
+                    cancel_b.cancel();
+                    std::panic::panic_any(Cancelled);
+                }
+                g = cvar
+                    .wait_timeout_while(g, RACE_CANCEL_POLL, |s| s.outcome.is_none())
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
         };
-        drop(g);
 
         let (is_left, raw_ptr) = match outcome {
             RaceOutcome::Winner(is_left, raw_ptr) => (is_left, raw_ptr),
@@ -16272,7 +16298,23 @@ fn http_serve_loop(
 
                     // Open a DB connection for this thread
                     let db_path = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    // Guard the deep-cloned handler tree across knot_db_open,
+                    // which can panic (`.expect` on open/collation/pragma
+                    // failures) and unwind past every manual
+                    // `deep_drop_value(handler)` below — leaking the whole
+                    // handler subtree. Mirrors the IoDropGuard hardening in
+                    // knot_fork_io and the race worker. `forget`ten once the
+                    // open succeeds so the manual drops keep sole ownership.
+                    struct HandlerDropGuard(*mut Value);
+                    impl Drop for HandlerDropGuard {
+                        fn drop(&mut self) {
+                            unsafe { deep_drop_value(self.0); }
+                        }
+                    }
+                    let handler_guard = HandlerDropGuard(handler);
                     let db = knot_db_open(db_path.as_ptr(), db_path.len());
+                    // Past the panic window; the manual drops below own it now.
+                    std::mem::forget(handler_guard);
 
                     let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<*mut Value, (u16, String, Option<i64>)> {
                     // Build record from path params, query params, and body

@@ -580,3 +580,55 @@ main = do
         "expected the valid row to persist, got:\n{stdout}"
     );
 }
+
+// ── groupBy phase-1 use-after-free with a non-equi-join multi-bind ──
+
+#[test]
+fn groupby_non_equi_join_multibind_survives_arena_reset() {
+    // A multi-bind do-block whose primary bind (`c <- *children`) is
+    // materialized inside the enclosing `p` loop, joined by a NON-equi
+    // condition (`c.bound < p.pid`) that `match_equi_join` does not match —
+    // so no hash-join hoist and `c` really is a nested loop.
+    //
+    // Phase 1 of groupBy pushes each `c` row into a temp relation, then
+    // closes the pre-group loops, whose continue blocks run
+    // `knot_arena_reset_to` per iteration. Before the fix the temp push did
+    // NOT `knot_arena_promote` the row (unlike the yield path), so the reset
+    // freed each row out from under the temp relation and
+    // `knot_relation_group_by` read dangling memory — garbage keys/counts or
+    // a crash. Promoting the row before the push pins it past the reset.
+    let (stdout, stderr, ok) = compile_and_run(
+        "groupby_non_equi_multibind",
+        r#"*parents : [{pid: Int}]
+*children : [{owner: Text, bound: Int}]
+
+main = do
+  replace *parents = [{pid: 100}]
+  replace *children = [
+    {owner: "alice", bound: 3},
+    {owner: "alice", bound: 5},
+    {owner: "bob", bound: 7}
+  ]
+  let grouped = do
+    p <- *parents
+    c <- *children
+    where c.bound < p.pid
+    groupBy {c.owner}
+    yield {owner: c.owner, n: count c}
+  g <- grouped
+  println (g.owner ++ ":" ++ show g.n)
+  yield {}
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    // All three children pass `bound < 100`; grouped by owner that is
+    // alice → 2, bob → 1. A use-after-free corrupts the keys or counts.
+    assert!(
+        stdout.contains("alice:2"),
+        "expected alice's two rows to group correctly, got:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("bob:1"),
+        "expected bob's single row to group correctly, got:\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}

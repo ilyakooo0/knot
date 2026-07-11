@@ -12664,12 +12664,18 @@ fn adt_row_to_params(
                     "knot runtime: unknown constructor tag '{}' in ADT source write (known: {})",
                     tag, adt.constructors.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
                 ));
-            let ctor_field_names: HashSet<&str> = ctor
-                .fields.iter().map(|f| f.name.as_str()).collect();
+            // Map each of this constructor's field names to its *per-constructor*
+            // column type. `adt.all_fields` only carries the first constructor's
+            // type for a reused field name, so serializing with it corrupts a
+            // conflicting field (e.g. `A:value=int | B:value=text` writing `B`
+            // through `A`'s int type). The per-constructor read path decodes with
+            // this same constructor-specific type, so the write must match it.
+            let ctor_field_types: HashMap<&str, ColType> = ctor
+                .fields.iter().map(|f| (f.name.as_str(), f.ty)).collect();
 
             // For each field in the wide table
             for field in &adt.all_fields {
-                if ctor_field_names.contains(field.name.as_str()) {
+                if let Some(&ctor_ty) = ctor_field_types.get(field.name.as_str()) {
                     // This field belongs to this constructor — extract from payload
                     let payload_ref = unsafe { as_ref(*payload) };
                     match payload_ref {
@@ -12677,7 +12683,7 @@ fn adt_row_to_params(
                             let val = fields
                                 .iter()
                                 .find(|f| &*f.name == field.name.as_str())
-                                .map(|f| value_to_sqlite(f.value, field.ty))
+                                .map(|f| value_to_sqlite(f.value, ctor_ty))
                                 .unwrap_or(rusqlite::types::Value::Null);
                             params.push(val);
                         }
@@ -20697,6 +20703,44 @@ mod _bugfix_batch_tests {
             .unwrap();
         assert_eq!(out, data);
         knot_set_http_max_body_bytes(0); // restore env-or-default resolution
+    }
+
+    // ── Fix: ADT writes serialize with the per-constructor column type ──
+
+    #[test]
+    fn adt_row_to_params_uses_per_constructor_field_type() {
+        // `data Event = Meta {info: {n: Int}} | Flag {info: Status}` — the field
+        // `info` is Json under the FIRST constructor (Meta) but Tag under the
+        // second (Flag). `all_fields` keeps only Meta's Json type, so the write
+        // path used to serialize a `Flag` value's Tag field through Json,
+        // producing JSON text instead of the bare tag name — which the
+        // per-constructor read path (decoding with Tag) then reconstructs into
+        // the wrong constructor. The write must use each constructor's own type.
+        let adt = parse_adt_schema("#Meta:info=json|Flag:info=tag");
+        assert!(adt.conflicting_fields.contains("info"));
+
+        // Writing `Flag {info: Active}` must serialize the Tag column as the bare
+        // tag name "Active", matching how `read_sql_column(.., Tag)` reads it.
+        let flag = ctor("Flag", &[("info", ctor("Active", &[]))]);
+        let params = adt_row_to_params(flag, &adt);
+        assert_eq!(params[0], rusqlite::types::Value::Text("Flag".to_string()));
+        assert_eq!(
+            params[1],
+            rusqlite::types::Value::Text("Active".to_string()),
+            "Flag's Tag `info` must serialize as the bare tag, not first-ctor Json"
+        );
+
+        // The first constructor (Meta, the type kept in `all_fields`) must still
+        // serialize its Record `info` as Json.
+        let meta = ctor("Meta", &[("info", rec(&[("n", int(3))]))]);
+        let meta_params = adt_row_to_params(meta, &adt);
+        assert_eq!(meta_params[0], rusqlite::types::Value::Text("Meta".to_string()));
+        let record = rec(&[("n", int(3))]);
+        assert_eq!(
+            meta_params[1],
+            value_to_sqlite(record, ColType::Json),
+            "Meta's Json `info` must still round-trip as Json"
+        );
     }
 
     // ── Fix B42: listen response-body cap estimated before encoding ──

@@ -2431,7 +2431,7 @@ mod tests {
             "unexpected parse errors: {:?}",
             diags
         );
-        fn find_do<'a>(e: &'a Expr) -> Option<&'a [Stmt]> {
+        fn find_do(e: &Expr) -> Option<&[Stmt]> {
             match &e.node {
                 ExprKind::Do(stmts) => Some(stmts),
                 ExprKind::App { func, arg } => find_do(arg).or_else(|| find_do(func)),

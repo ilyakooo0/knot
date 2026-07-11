@@ -4395,10 +4395,25 @@ impl Parser {
         let saved = self.save();
         let diag_count = self.diagnostics.len();
         if let Some(effects) = self.try_parse_effects() {
-            self.expect(&TokenKind::RBrace, "expected '}' to close effect set")
+            let close = self
+                .expect(&TokenKind::RBrace, "expected '}' to close effect set")
                 .ok()?;
-            // Now parse the effectful type body.
-            let ty = self.parse_type()?;
+            // If a type atom follows, parse it as the effectful body (e.g.
+            // `{console} Int`). Otherwise `{effects}` is terminal — before a
+            // closing paren, `->`, end of type, or newline — so treat it as a
+            // complete effectful type with an empty (Unit) body. This is the
+            // form written in `Server Api {console}` type annotations.
+            let ty = if self.can_start_type_atom() {
+                self.parse_type()?
+            } else {
+                Spanned::new(
+                    TypeKind::Record {
+                        fields: vec![],
+                        rest: None,
+                    },
+                    close.span,
+                )
+            };
             let span = Span::new(start.start, ty.span.end);
             return Some(Spanned::new(
                 TypeKind::Effectful {

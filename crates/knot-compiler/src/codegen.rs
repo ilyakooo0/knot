@@ -168,6 +168,14 @@ pub struct Codegen {
     // Route entries: route_name -> entries (for HTTP codegen)
     route_entries: HashMap<String, Vec<ast::RouteEntry>>,
 
+    // Route entry chosen for each fetch constructor: ctor_name -> entry.
+    // Populated last-wins in source declaration order so distinct routes that
+    // legally share a constructor name resolve to the SAME entry that infer's
+    // fetch_response_types/fetch_response_headers picked — otherwise a fetch
+    // could typecheck against one route and compile the HTTP call against
+    // another (B38).
+    fetch_route_entries: HashMap<String, ast::RouteEntry>,
+
     // Type aliases for resolving response types in OpenAPI descriptors
     type_aliases: HashMap<String, ResolvedType>,
 
@@ -832,6 +840,7 @@ impl Codegen {
             recursive_derived: HashSet::new(),
             recursive_body_fns: HashMap::new(),
             route_entries: HashMap::new(),
+            fetch_route_entries: HashMap::new(),
             type_aliases: HashMap::new(),
             user_fn_trampolines: HashMap::new(),
             monad_info: HashMap::new(),
@@ -1763,6 +1772,14 @@ impl Codegen {
                 }
                 ast::DeclKind::Route { name, entries } => {
                     self.route_entries.insert(name.clone(), entries.clone());
+                    // Last route entry (in source declaration order) with a
+                    // given constructor name wins, matching infer's fetch
+                    // metadata resolution so typecheck and codegen agree on
+                    // which route a fetch compiles against (B38).
+                    for entry in entries {
+                        self.fetch_route_entries
+                            .insert(entry.constructor.clone(), entry.clone());
+                    }
                 }
                 ast::DeclKind::RouteComposite { name, components } => {
                     // Deferred: resolved to a fixpoint after the loop so
@@ -6819,12 +6836,14 @@ impl Codegen {
             None => self.call_rt(builder, "knot_value_unit", &[]),
         };
 
-        // Look up route entry for this constructor
+        // Look up the route entry for this constructor. Resolved last-wins in
+        // source declaration order (see `fetch_route_entries`) so it matches
+        // the entry infer typechecked against — iterating `route_entries`
+        // (a HashMap) and taking the first match would pick a nondeterministic
+        // route when distinct routes legally share a constructor name (B38).
         let entry = self
-            .route_entries
-            .values()
-            .flat_map(|entries| entries.iter())
-            .find(|e| e.constructor == ctor_name)
+            .fetch_route_entries
+            .get(&ctor_name)
             .cloned()
             .unwrap_or_else(|| {
                 panic!("fetch: no route entry found for constructor '{}'", ctor_name)

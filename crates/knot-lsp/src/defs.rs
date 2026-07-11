@@ -52,6 +52,26 @@ fn advance_past_field_block(source: &str, from: usize, end: usize) -> usize {
     from
 }
 
+/// Canonical definition span of trait method `method` as declared by the trait
+/// named `trait_name` in this module, if any. Mirrors the scope-0 registration
+/// in `resolve_definitions` (the `Trait` arm), which anchors a method on its
+/// *first* `TraitItem::Method` entry — the signature token for a defaulted
+/// method. Used to link an `impl`'s method token to the trait method it
+/// implements. Resolves precisely through `trait_name` rather than the
+/// name-keyed scope map, which can't disambiguate two traits that declare a
+/// method of the same name.
+fn trait_method_def_span(module: &Module, trait_name: &str, method: &str) -> Option<Span> {
+    module.decls.iter().find_map(|d| match &d.node {
+        DeclKind::Trait { name, items, .. } if name == trait_name => {
+            items.iter().find_map(|it| match it {
+                ast::TraitItem::Method { name: m, name_span, .. } if m == method => Some(*name_span),
+                _ => None,
+            })
+        }
+        _ => None,
+    })
+}
+
 /// Definition resolution result: name → def span, (use span, def span)
 /// references, and (literal span, type name) pairs.
 type Definitions = (HashMap<String, Span>, Vec<(Span, Span)>, Vec<(Span, String)>);
@@ -266,7 +286,20 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                 }
                 for item in items {
                     match item {
-                        ast::ImplItem::Method { params, body, .. } => {
+                        ast::ImplItem::Method { name, name_span, params, body } => {
+                            // Link the method's definition token to the trait
+                            // method it implements, so find-references/goto from
+                            // the trait method reach every impl in this file
+                            // (rename.rs already does this out-of-band; without
+                            // the link, references.rs' local path — which relies
+                            // solely on these refs — misses impl definitions).
+                            // Resolve precisely through this impl's `trait_name`
+                            // rather than the ambiguous scope-0 name map.
+                            if let Some(def_span) =
+                                trait_method_def_span(module, trait_name, name)
+                            {
+                                resolver.refs.push((*name_span, def_span));
+                            }
                             resolver.push_scope();
                             for p in params {
                                 resolver.define_pat(p);
@@ -726,7 +759,7 @@ impl<'a> DefResolver<'a> {
                 };
                 self.literals.push((expr.span, ty.to_string()));
             }
-            ast::ExprKind::UnitLit { value, .. } => self.resolve_expr(value),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.resolve_expr(value),
             ast::ExprKind::Annot { expr: inner, ty } => {
                 self.resolve_type(ty, self.source);
                 self.resolve_expr(inner);

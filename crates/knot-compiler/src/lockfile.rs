@@ -291,12 +291,38 @@ fn classify_record_change(old: &str, new: &str) -> SchemaChange {
     let old_fields = parse_record_fields(old);
     let new_fields = parse_record_fields(new);
 
+    // Adding the *first* nested-relation field to a source is breaking, even
+    // though every old field is preserved. Nested `[T]` fields live in child
+    // tables keyed by a `_parent_id` FK, which requires the parent table to
+    // gain an `_id INTEGER PRIMARY KEY` column. SQLite's ALTER TABLE cannot
+    // add a PRIMARY KEY column to an existing table, so the runtime cannot
+    // apply this in place — it must go through a migrate block (table rebuild).
+    // Once the parent already has at least one nested field (and thus an
+    // `_id`), further nested fields only add new child tables (a CREATE TABLE),
+    // which is a safe addition. `classify_child_schema_change` enforces the
+    // same rule one level down, for a leaf child gaining a sub-relation.
+    let old_has_nested = old_fields.iter().any(|(_, ty)| is_nested_field(ty));
+    let new_has_nested = new_fields.iter().any(|(_, ty)| is_nested_field(ty));
+    if new_has_nested && !old_has_nested {
+        return SchemaChange::Breaking;
+    }
+
     // Compare field-by-field, recursing into nested child-table schemas
     // (`field:[...]`) rather than treating their bracketed descriptors as opaque
     // strings: a reorder or a safe column addition inside a nested relation is
     // Safe (the runtime's `auto_apply_child_change` applies it), only a column
-    // removal or a type change is Breaking.
+    // removal or a type change is Breaking. The field-set comparison binds exact
+    // `(name, type)` pairs before falling back to name-only matching, so
+    // duplicate field names cannot mask a breaking change on a duplicate.
     classify_field_set(&old_fields, &new_fields)
+}
+
+/// A nested-relation field's type descriptor is bracketed (`[child_schema]`),
+/// distinguishing it from inline record fields (`{...}`) and scalars. Nested
+/// relations are stored in child tables and require a `_id` primary key on the
+/// parent — see `classify_record_change`.
+fn is_nested_field(ty: &str) -> bool {
+    ty.trim_start().starts_with('[')
 }
 
 fn parse_lockfile(lock_path: &Path) -> Result<SchemaInfo, String> {
@@ -806,6 +832,57 @@ mod tests {
                 "items:[name:text,tags:[label:text]]",
                 "items:[name:text,tags:[label:text],notes:[body:text]]"
             ),
+            SchemaChange::Safe
+        );
+    }
+
+    // --- Parent `_id` requirement for a source's first nested field ----------
+
+    #[test]
+    fn first_nested_field_added_is_breaking() {
+        // Adding the first nested `[T]` field requires the parent table to
+        // gain an `_id INTEGER PRIMARY KEY`, which ALTER TABLE cannot do —
+        // the runtime would panic at startup. It must go through a migrate
+        // block, so classify it as Breaking (not Safe).
+        assert_eq!(
+            classify_schema_change("name:text", "name:text,todos:[title:text,done:int]"),
+            SchemaChange::Breaking
+        );
+    }
+
+    #[test]
+    fn second_nested_field_added_is_safe() {
+        // Once the parent already has a nested field (and thus an `_id`),
+        // adding another nested field only creates a new child table — a
+        // safe CREATE TABLE that needs no migrate block.
+        assert_eq!(
+            classify_schema_change(
+                "name:text,todos:[title:text]",
+                "name:text,todos:[title:text],tags:[tag:text]"
+            ),
+            SchemaChange::Safe
+        );
+    }
+
+    #[test]
+    fn scalar_field_added_alongside_existing_nested_is_safe() {
+        // A parent that already has a nested field can still take plain
+        // nullable scalar additions safely.
+        assert_eq!(
+            classify_schema_change(
+                "name:text,todos:[title:text]",
+                "name:text,todos:[title:text],age:int"
+            ),
+            SchemaChange::Safe
+        );
+    }
+
+    #[test]
+    fn inline_record_field_added_is_safe() {
+        // Inline record fields (`{...}`) are stored as JSON columns, not child
+        // tables, so they don't need an `_id` on the parent — still Safe.
+        assert_eq!(
+            classify_schema_change("name:text", "name:text,addr:{city:text,zip:text}"),
             SchemaChange::Safe
         );
     }

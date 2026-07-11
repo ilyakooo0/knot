@@ -491,8 +491,12 @@ fn unbound_time_unit_sugar_still_desugars() {
         panic!("expected App, got {:?}", b);
     };
     assert!(
-        matches!(&arg.node, ExprKind::BinOp { op: BinOp::Mul, .. }),
-        "expected `2 ms` to desugar to multiplication, got {:?}",
+        matches!(
+            &arg.node,
+            ExprKind::TimeUnitLit { value, .. }
+                if matches!(&value.node, ExprKind::BinOp { op: BinOp::Mul, .. })
+        ),
+        "expected `2 ms` to desugar to a TimeUnitLit wrapping multiplication, got {:?}",
         arg
     );
 }
@@ -509,10 +513,67 @@ fn time_unit_sugar_unaffected_after_binder_scope_ends() {
         panic!("expected App, got {:?}", b);
     };
     assert!(
-        matches!(&arg.node, ExprKind::BinOp { op: BinOp::Mul, .. }),
-        "expected `3 seconds` to desugar to multiplication, got {:?}",
+        matches!(
+            &arg.node,
+            ExprKind::TimeUnitLit { value, .. }
+                if matches!(&value.node, ExprKind::BinOp { op: BinOp::Mul, .. })
+        ),
+        "expected `3 seconds` to desugar to a TimeUnitLit wrapping multiplication, got {:?}",
         arg
     );
+}
+
+// ── 5b. B51: `knot fmt` preserves time-unit sugar, not raw multiply ──
+
+#[test]
+fn b51_time_unit_sugar_survives_formatting() {
+    // Regression for B51: `2 seconds` must round-trip through the formatter
+    // as `2 seconds`, not the desugared `2 * 1000`. `check_str` also asserts
+    // the output reparses to the same AST and is idempotent.
+    let out = check_str("b51_seconds", "main = sleep (2 seconds)\n");
+    assert!(
+        out.contains("2 seconds"),
+        "time-unit sugar was rewritten to raw multiplication:\n{}",
+        out
+    );
+    assert!(
+        !out.contains('*'),
+        "formatter leaked the desugared multiplication factor:\n{}",
+        out
+    );
+    // The juxtaposition reads like an application, so it stays parenthesized
+    // in argument position.
+    assert!(
+        out.contains("sleep (2 seconds)"),
+        "expected parenthesized argument `sleep (2 seconds)`:\n{}",
+        out
+    );
+}
+
+#[test]
+fn b51_time_unit_sugar_all_units_survive_formatting() {
+    for (src, rendered) in [
+        ("main = sleep (500 ms)\n", "500 ms"),
+        ("main = sleep (30 minutes)\n", "30 minutes"),
+        ("main = sleep (2 hours)\n", "2 hours"),
+        ("main = sleep (365 days)\n", "365 days"),
+        ("main = sleep (2 weeks)\n", "2 weeks"),
+        ("main = sleep (1.5 hours)\n", "1.5 hours"),
+    ] {
+        let out = check_str("b51_units", src);
+        assert!(
+            out.contains(rendered),
+            "expected `{}` preserved in formatter output, got:\n{}",
+            rendered,
+            out
+        );
+        assert!(
+            !out.contains('*'),
+            "formatter leaked a multiplication factor for `{}`:\n{}",
+            rendered,
+            out
+        );
+    }
 }
 
 // ── 6. `yield` keeps parens in argument position ────────────────────

@@ -168,7 +168,7 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
         ExprKind::Set { .. } | ExprKind::ReplaceSet { .. } => true,
         ExprKind::Atomic(_) => true,
-        ExprKind::UnitLit { value, .. } => expr_contains_io(value, builtins, io_fns),
+        ExprKind::UnitLit { value, .. } | ExprKind::TimeUnitLit { value, .. } => expr_contains_io(value, builtins, io_fns),
         ExprKind::Annot { expr, .. } => expr_contains_io(expr, builtins, io_fns),
         ExprKind::Refine(inner) => expr_contains_io(inner, builtins, io_fns),
         ExprKind::App { func, arg } => {
@@ -569,7 +569,7 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
             desugar_expr(value, io_fns, source_vars);
         }
         ExprKind::Atomic(inner) => desugar_expr(inner, io_fns, source_vars),
-        ExprKind::UnitLit { value, .. } => desugar_expr(value, io_fns, source_vars),
+        ExprKind::UnitLit { value, .. } | ExprKind::TimeUnitLit { value, .. } => desugar_expr(value, io_fns, source_vars),
         ExprKind::Annot { expr, .. } => desugar_expr(expr, io_fns, source_vars),
         ExprKind::Refine(inner) => desugar_expr(inner, io_fns, source_vars),
         ExprKind::Serve { handlers, .. } => {
@@ -586,11 +586,15 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
 fn unwrap_wrappers_mut(expr: &mut Expr) -> &mut Expr {
     if matches!(
         &expr.node,
-        ExprKind::Annot { .. } | ExprKind::UnitLit { .. } | ExprKind::Refine(_)
+        ExprKind::Annot { .. }
+            | ExprKind::UnitLit { .. }
+            | ExprKind::TimeUnitLit { .. }
+            | ExprKind::Refine(_)
     ) {
         let inner = match &mut expr.node {
             ExprKind::Annot { expr: inner, .. }
-            | ExprKind::UnitLit { value: inner, .. } => inner.as_mut(),
+            | ExprKind::UnitLit { value: inner, .. }
+            | ExprKind::TimeUnitLit { value: inner, .. } => inner.as_mut(),
             ExprKind::Refine(inner) => inner.as_mut(),
             _ => unreachable!(),
         };
@@ -942,9 +946,10 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     }
 
     // Non-final statements must be Bind/Where/Let or a bare Expr (sequenced
-    // monadically as `_ <- e`). Final statement must be a bare Expr — yield
-    // is one option, but any expression of monad type is valid (its value
-    // becomes the do-block's result).
+    // monadically as `_ <- e`). Final statement must be a bare Expr — either
+    // an explicit `yield e` or any other expression. `desugar_stmts` wraps the
+    // final in `__yield` (Applicative.pure) either way, so a plain value `a`
+    // becomes the monadic result `m a`.
     for stmt in &stmts[..stmts.len() - 1] {
         match &stmt.node {
             StmtKind::Bind { .. } | StmtKind::Where { .. } | StmtKind::Let { .. } | StmtKind::Expr(_) => {}
@@ -1002,7 +1007,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
             expr_is_io(lhs, io_fns) || expr_is_io(rhs, io_fns)
         }
         ExprKind::UnaryOp { operand, .. } => expr_is_io(operand, io_fns),
-        ExprKind::UnitLit { value, .. } => expr_is_io(value, io_fns),
+        ExprKind::UnitLit { value, .. } | ExprKind::TimeUnitLit { value, .. } => expr_is_io(value, io_fns),
         ExprKind::Annot { expr, .. } => expr_is_io(expr, io_fns),
         ExprKind::Refine(inner) => expr_is_io(inner, io_fns),
         ExprKind::If { cond, then_branch, else_branch, .. } => {
@@ -1052,6 +1057,7 @@ fn lambda_chain_body_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
             _ => expr_is_io(body, io_fns),
         },
         ExprKind::UnitLit { value, .. }
+        | ExprKind::TimeUnitLit { value, .. }
         | ExprKind::Annot { expr: value, .. }
         | ExprKind::Refine(value) => lambda_chain_body_is_io(value, io_fns),
         _ => false,
@@ -1070,6 +1076,7 @@ fn applied_lambda_body_is_io(func: &Expr, io_fns: &HashSet<String>) -> bool {
         // Curried application: `(\a b -> body) x y` — keep peeling.
         ExprKind::App { func, .. } => applied_lambda_body_is_io(func, io_fns),
         ExprKind::UnitLit { value, .. }
+        | ExprKind::TimeUnitLit { value, .. }
         | ExprKind::Annot { expr: value, .. }
         | ExprKind::Refine(value) => applied_lambda_body_is_io(value, io_fns),
         _ => false,
@@ -1158,18 +1165,24 @@ fn spanned<T>(node: T, span: Span) -> Spanned<T> {
 fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
     assert!(!stmts.is_empty());
 
-    // Base case: single statement
+    // Base case: single statement — the do-block's final result.
     if stmts.len() == 1 {
         return match &stmts[0].node {
             StmtKind::Expr(e) => {
-                // Transform yield e -> __yield(e) for generic monad support
-                if let Some(inner) = e.node.as_yield_arg() {
-                    mk_yield(inner.clone(), span)
-                } else {
-                    e.clone()
+                // The final bare expression is the yielded result and must be
+                // wrapped in `__yield` (Applicative.pure) so the do-block has
+                // monad type `m a`, not the bare `a`. An explicit `yield e`
+                // wraps its inner argument; a bare `e` (e.g. `show x` in
+                // `do { x <- ioAction; show x }`) is wrapped as-is. Without
+                // this, a trait-only-IO chain returns `Text` instead of the
+                // expected `IO Text` and fails to type-check against the gate
+                // (see `is_pure_comprehension`).
+                match e.node.as_yield_arg() {
+                    Some(inner) => mk_yield(inner.clone(), span),
+                    None => mk_yield(e.clone(), span),
                 }
             }
-            // Shouldn't happen for valid pure comprehensions (last must be yield)
+            // Shouldn't happen for valid pure comprehensions (last must be Expr)
             _ => mk_empty(span),
         };
     }

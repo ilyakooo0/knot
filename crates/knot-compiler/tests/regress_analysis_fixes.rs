@@ -368,6 +368,29 @@ main = println "ok"
 }
 
 #[test]
+fn alias_applying_later_declared_parameterized_data_type_resolves() {
+    // B32: a type alias that *applies* a parameterized data type declared
+    // AFTER the alias must still resolve to the correct shape. During the
+    // first resolution pass `Box` is not yet registered, so `Box Int`
+    // collapses to `Named("unknown")` and the alias would ship the
+    // meaningless `_value:text` schema. The re-resolve pass must recover the
+    // application from the alias's original AST once `Box` is known, yielding
+    // `value:int`.
+    let src = r#"type Wrapped = [Box Int]
+data Box a = Box {value: a}
+*w : Wrapped
+main = println "ok"
+"#;
+    let module = parse(src);
+    let env = knot_compiler::types::TypeEnv::from_module(&module);
+    assert_eq!(
+        env.source_schemas["w"], "value:int",
+        "alias applying later-declared `Box Int` must resolve to value:int (got {:?})",
+        env.source_schemas["w"]
+    );
+}
+
+#[test]
 fn parameterized_single_variant_data_type_substitutes_record_arg() {
     // Substitution must recurse into structured arguments, producing the
     // "json" column type for a record-typed parameter.

@@ -1130,6 +1130,7 @@ impl Codegen {
         self.declare_rt("knot_json_decode_maybe", &[p], &[p]);
         self.declare_rt("knot_json_decode_typed_maybe", &[p, p, p], &[p]);
         self.declare_rt("knot_register_to_json", &[p], &[]);
+        self.declare_rt("knot_register_ord_compare", &[p], &[]);
 
         // Bytes value constructor and standard library
         self.declare_rt("knot_value_bytes", &[p, p], &[p]);
@@ -3749,6 +3750,13 @@ impl Codegen {
         let all_routes: Vec<(String, Vec<ast::RouteEntry>)> =
             self.route_entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let to_json_dispatcher_id = self.trait_dispatcher_fns.get("toJson").copied();
+        // Only when a user `Ord` impl exists, matching `compile_comparison`'s
+        // gate for `<`/`>`. Without one the runtime's structural comparison is
+        // both the same answer and one indirect call cheaper.
+        let ord_compare_dispatcher_id = self
+            .has_user_impls("compare")
+            .then(|| self.trait_dispatcher_fns.get("compare").copied())
+            .flatten();
         let alias_ast = self.alias_ast.clone();
 
         self.build_function(main_id, sig, |cg, builder, entry| {
@@ -3918,6 +3926,14 @@ impl Codegen {
                         &[name_ptr, name_len, ctors_ptr, ctors_len],
                     );
                 }
+            }
+
+            // Register compare dispatcher so sortBy/minOn/maxOn order keys
+            // through user Ord impls, as `<`/`>` already do
+            if let Some(dispatcher_id) = ord_compare_dispatcher_id {
+                let func_ref = cg.module.declare_func_in_func(dispatcher_id, builder.func);
+                let func_addr = builder.ins().func_addr(cg.ptr_type, func_ref);
+                cg.call_rt_void(builder, "knot_register_ord_compare", &[func_addr]);
             }
 
             // Apply pending migrations (before source init)

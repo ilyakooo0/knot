@@ -3267,6 +3267,17 @@ fn stm_track_write(name: &str) {
 
 static TO_JSON_FN: AtomicUsize = AtomicUsize::new(0);
 
+// ── Ord dispatcher ───────────────────────────────────────────────
+//
+// Stores the compiled `compare` trait dispatcher so the order-taking builtins
+// (`sortBy`/`minOn`/`maxOn`) order values the same way the `<`/`>` operators
+// do: through a user `Ord` impl when one exists, structurally otherwise.
+// Only registered when a user `Ord` impl exists; a zero here means "no user
+// impls", and `compare_keys` falls back to `compare_values` directly.
+// Written once during program init, read by handler threads.
+
+static ORD_COMPARE_FN: AtomicUsize = AtomicUsize::new(0);
+
 fn debug_sql(sql: &str) {
     log_debug!("[SQL] {}", sql);
 }
@@ -5963,10 +5974,7 @@ pub extern "C-unwind" fn knot_relation_sort_by(
             (row, key)
         })
         .collect();
-    // `sortBy` dispatches past any `Ord` impl, so it only orders primitive
-    // keys (aborting on ADTs rather than guessing a structural order that
-    // might contradict a user `Ord`).
-    indexed.sort_by(|(_, a), (_, b)| compare_values_primitive(*a, *b));
+    indexed.sort_by(|(_, a), (_, b)| compare_keys(db, *a, *b));
     let sorted: Vec<*mut Value> = indexed.into_iter().map(|(row, _)| row).collect();
     alloc(Value::Relation(sorted))
 }
@@ -7101,42 +7109,41 @@ fn cmp_int_float(x: i64, y: f64) -> std::cmp::Ordering {
     }
 }
 
-/// Ordering for the primitive types the order-taking builtins can compare
-/// without an `Ord` impl in hand (Text + numbers). Panics on everything else
-/// — notably ADTs and records, whose only correct order would come from a
-/// (possibly user-defined) `Ord` impl that builtins like `maxOn`/`minOn`/
-/// `sortBy` dispatch *past*. Aborting there keeps those builtins from silently
-/// returning a structural answer that contradicts the user's `Ord`. The
-/// `<`/`>` operators, which DO dispatch through `Ord`, use the structural
-/// `compare_values` below instead so `deriving (Ord)` types are orderable.
-fn compare_values_primitive(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
-    // Nullable encoding: null represents the "none" variant (Nothing).
-    // Handle nulls before calling as_ref, which panics on null pointers.
-    // Mirrors values_equal's null handling. Nothing < Just x (like Haskell).
-    if a.is_null() && b.is_null() {
-        return std::cmp::Ordering::Equal;
+/// Register the compiled `compare` trait dispatcher. Called once during program
+/// init, and only when the program defines a user `Ord` impl.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_register_ord_compare(fn_ptr: *const u8) {
+    ORD_COMPARE_FN.store(fn_ptr as usize, Ordering::Release);
+}
+
+/// Ordering used by the order-taking builtins (`sortBy`/`minOn`/`maxOn`) for
+/// the keys their key function returns.
+///
+/// These builtins are plain runtime calls, so unlike `<`/`>` they have no
+/// compile-time `Ord` dispatch of their own. Going straight to the structural
+/// `compare_values` would order a key by the *structural* order (for
+/// constructors, their declaration order) even when the program defines a user
+/// `Ord` impl saying otherwise — e.g. an impl ranking `Low | Medium | High` by
+/// severity descending — silently disagreeing with `<` on the same two values.
+/// So when the program has a user `Ord` impl, `main` hands us the `compare`
+/// dispatcher and we route keys through it, exactly as `compile_comparison`
+/// does for `<`. The dispatcher itself falls back to `knot_value_compare`
+/// (i.e. `compare_values`) for types with no impl, so records, lists and
+/// payload-carrying constructors stay orderable either way.
+fn compare_keys(db: *mut c_void, a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
+    // Nullable encoding: null represents the "none" variant (Nothing). Handle
+    // nulls up front — the dispatcher tag-dispatches on its argument and cannot
+    // read a tag off a null. `compare_values` orders Nothing < Just x.
+    let fn_ptr = ORD_COMPARE_FN.load(Ordering::Acquire);
+    if fn_ptr == 0 || a.is_null() || b.is_null() {
+        return compare_values(a, b);
     }
-    if a.is_null() {
-        return std::cmp::Ordering::Less;
-    }
-    if b.is_null() {
-        return std::cmp::Ordering::Greater;
-    }
-    let av = unsafe { as_ref(a) };
-    let bv = unsafe { as_ref(b) };
-    if let (Value::Text(x), Value::Text(y)) = (av, bv) {
-        return x.cmp(y);
-    }
-    match (to_num_view(av), to_num_view(bv)) {
-        (Some(NumView::Int(x)), Some(NumView::Int(y))) => x.cmp(&y),
-        (Some(NumView::Float(x)), Some(NumView::Float(y))) => x.total_cmp(&y),
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => cmp_int_float(x, y),
-        (Some(NumView::Float(x)), Some(NumView::Int(y))) => cmp_int_float(y, x).reverse(),
-        _ => panic!(
-            "knot runtime: cannot compare {} with {}",
-            type_name(a),
-            type_name(b)
-        ),
+    let f: extern "C-unwind" fn(*mut c_void, *mut Value, *mut Value) -> *mut Value =
+        unsafe { std::mem::transmute(fn_ptr) };
+    match knot_ordering_tag_i32(f(db, a, b)) {
+        0 => std::cmp::Ordering::Less,
+        2 => std::cmp::Ordering::Greater,
+        _ => std::cmp::Ordering::Equal,
     }
 }
 
@@ -7243,9 +7250,10 @@ enum CmpFrame {
     Pair(*mut Value, *mut Value),
     /// Compare two record-field names; on mismatch returns the ordering.
     FieldName(std::sync::Arc<str>, std::sync::Arc<str>),
-    /// Final length comparison for two records with equal field names and
-    /// values up to the shorter length.
-    RecordLen(usize, usize),
+    /// Final length comparison for two records (equal field names and values up
+    /// to the shorter length) or two relations (equal rows up to the shorter
+    /// length), i.e. the shorter one sorts first.
+    Len(usize, usize),
 }
 
 /// Iterative structural ordering. Uses an explicit work stack so a deeply
@@ -7262,7 +7270,7 @@ fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
                 Ordering::Equal => {}
                 o => return o,
             },
-            CmpFrame::RecordLen(a_len, b_len) => match a_len.cmp(&b_len) {
+            CmpFrame::Len(a_len, b_len) => match a_len.cmp(&b_len) {
                 Ordering::Equal => {}
                 o => return o,
             },
@@ -7324,10 +7332,34 @@ fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
                         o => return o,
                     },
                     (Value::Unit, Value::Unit) => {}
+                    (Value::Relation(ra), Value::Relation(rb)) => {
+                        // `values_equal` compares relations as *sets* (order
+                        // insensitive, duplicates ignored), and `Eq` is `Ord`'s
+                        // supertrait, so ordering has to agree with it: two
+                        // set-equal relations must compare Equal. Canonicalize
+                        // each side to sorted, deduped rows, then compare
+                        // row-by-row and finally by length.
+                        //
+                        // Sorting recurses into compare_values, costing one
+                        // native frame per level of relation *nesting*
+                        // (typically 1-2), not per row — the same trade-off
+                        // value_to_hash_bytes makes to canonicalize a relation.
+                        let canon = |rows: &Vec<*mut Value>| -> Vec<*mut Value> {
+                            let mut v = rows.clone();
+                            v.sort_by(|x, y| compare_values(*x, *y));
+                            v.dedup_by(|x, y| compare_values(*x, *y) == Ordering::Equal);
+                            v
+                        };
+                        let (ca, cb) = (canon(ra), canon(rb));
+                        stack.push(CmpFrame::Len(ca.len(), cb.len()));
+                        for (x, y) in ca.iter().zip(cb.iter()).rev() {
+                            stack.push(CmpFrame::Pair(*x, *y));
+                        }
+                    }
                     (Value::Record(fa), Value::Record(fb)) => {
                         // Push the final length-comparison frame first (it
                         // runs last, after all fields are compared).
-                        stack.push(CmpFrame::RecordLen(fa.len(), fb.len()));
+                        stack.push(CmpFrame::Len(fa.len(), fb.len()));
                         // For each field in reverse, push value-Pair then
                         // FieldName so they pop name-first, value-second, in
                         // forward field order. Recursive version checks
@@ -9787,7 +9819,7 @@ pub extern "C-unwind" fn knot_relation_min(
     let mut best = knot_value_call(db, f, rows[0]);
     for &row in &rows[1..] {
         let val = knot_value_call(db, f, row);
-        if compare_values_primitive(val, best) == std::cmp::Ordering::Less {
+        if compare_keys(db, val, best) == std::cmp::Ordering::Less {
             best = val;
         }
     }
@@ -9815,7 +9847,7 @@ pub extern "C-unwind" fn knot_relation_max(
     let mut best = knot_value_call(db, f, rows[0]);
     for &row in &rows[1..] {
         let val = knot_value_call(db, f, row);
-        if compare_values_primitive(val, best) == std::cmp::Ordering::Greater {
+        if compare_keys(db, val, best) == std::cmp::Ordering::Greater {
             best = val;
         }
     }
@@ -21569,6 +21601,220 @@ mod _fk_migration_listen_tests {
             compare_values(nullary_ctor("Large"), nullary_ctor("Small")),
             std::cmp::Ordering::Greater
         );
+    }
+
+    // ── Regression: sortBy/minOn/maxOn on non-primitive keys ──
+    //
+    // These builtins are plain runtime calls with no compile-time Ord dispatch,
+    // and used to compare keys with a primitives-only comparator that aborted on
+    // anything else ("cannot compare Record with Record"). So sorting by a key
+    // that was itself a record, a payload-carrying constructor, or a list killed
+    // the program. They now compare through `compare_keys`, which honours a user
+    // Ord impl when the program registered one and otherwise falls back to the
+    // structural `compare_values`.
+
+    /// Key function for the tests below: pulls the `key` field off a record row.
+    extern "C-unwind" fn test_key_of(
+        _db: *mut c_void,
+        _env: *mut Value,
+        arg: *mut Value,
+    ) -> *mut Value {
+        match unsafe { as_ref(arg) } {
+            Value::Record(fs) => fs.iter().find(|f| &*f.name == "key").unwrap().value,
+            _ => arg,
+        }
+    }
+
+    fn test_key_fn() -> *mut Value {
+        alloc(Value::Function(Box::new(FunctionInner {
+            fn_ptr: test_key_of as *const u8,
+            env: std::ptr::null_mut(),
+            source: intern_str("test_key_of"),
+        })))
+    }
+
+    /// `{key: <k>, name: <name>}`, field-sorted like real records.
+    fn test_row(key: *mut Value, name: &str) -> *mut Value {
+        let mut fs = vec![
+            RecordField { name: intern_str("key"), value: key },
+            RecordField { name: intern_str("name"), value: alloc(Value::Text(intern_str(name))) },
+        ];
+        fs.sort_by(|a, b| a.name.cmp(&b.name));
+        alloc(Value::Record(fs))
+    }
+
+    fn row_names(rel: *mut Value) -> Vec<String> {
+        match unsafe { as_ref(rel) } {
+            Value::Relation(rows) => rows
+                .iter()
+                .map(|&r| match unsafe { as_ref(r) } {
+                    Value::Record(fs) => {
+                        let v = fs.iter().find(|f| &*f.name == "name").unwrap().value;
+                        match unsafe { as_ref(v) } {
+                            Value::Text(s) => (**s).to_string(),
+                            _ => panic!("expected Text name, got {}", brief_value(v)),
+                        }
+                    }
+                    _ => panic!("expected Record row, got {}", brief_value(r)),
+                })
+                .collect(),
+            _ => panic!("expected Relation"),
+        }
+    }
+
+    /// `{city: <city>, zip: <zip>}` — a record used *as a sort key*.
+    fn addr(city: &str, zip: i64) -> *mut Value {
+        let mut fs = vec![
+            RecordField { name: intern_str("city"), value: alloc(Value::Text(intern_str(city))) },
+            RecordField { name: intern_str("zip"), value: alloc_int(zip) },
+        ];
+        fs.sort_by(|a, b| a.name.cmp(&b.name));
+        alloc(Value::Record(fs))
+    }
+
+    #[test]
+    fn sort_by_orders_record_keys() {
+        let db = std::ptr::null_mut();
+        let rel = alloc(Value::Relation(vec![
+            test_row(addr("Boston", 2101), "carol"),
+            test_row(addr("Austin", 73301), "alice"),
+            // Same city as Boston, lower zip — tie broken by the second field.
+            test_row(addr("Boston", 1000), "bob"),
+        ]));
+        let sorted = knot_relation_sort_by(db, test_key_fn(), rel);
+        // Records order field-by-field in canonical (name-sorted) order:
+        // city first, then zip.
+        assert_eq!(row_names(sorted), vec!["alice", "bob", "carol"]);
+    }
+
+    #[test]
+    fn sort_by_orders_constructor_payload_keys() {
+        let db = std::ptr::null_mut();
+        let just = |n: i64| {
+            let mut fs = vec![RecordField { name: intern_str("value"), value: alloc_int(n) }];
+            fs.sort_by(|a, b| a.name.cmp(&b.name));
+            alloc(Value::Constructor(intern_str("Just"), alloc(Value::Record(fs))))
+        };
+        let rel = alloc(Value::Relation(vec![
+            test_row(just(3), "three"),
+            test_row(just(1), "one"),
+            test_row(just(2), "two"),
+        ]));
+        let sorted = knot_relation_sort_by(db, test_key_fn(), rel);
+        // Same tag → ordered by payload.
+        assert_eq!(row_names(sorted), vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn sort_by_orders_list_keys() {
+        let db = std::ptr::null_mut();
+        let list = |xs: &[&str]| {
+            alloc(Value::Relation(
+                xs.iter().map(|s| alloc(Value::Text(intern_str(s)))).collect(),
+            ))
+        };
+        let rel = alloc(Value::Relation(vec![
+            test_row(list(&["zeta"]), "carol"),
+            test_row(list(&["alpha", "beta"]), "alice"),
+            test_row(list(&["alpha"]), "bob"),
+        ]));
+        let sorted = knot_relation_sort_by(db, test_key_fn(), rel);
+        // Lexicographic by row, then shorter-first: [alpha] < [alpha, beta] < [zeta].
+        assert_eq!(row_names(sorted), vec!["bob", "alice", "carol"]);
+    }
+
+    #[test]
+    fn compare_values_orders_relations_as_sets() {
+        let list = |xs: &[i64]| {
+            alloc(Value::Relation(xs.iter().map(|&n| alloc_int(n)).collect()))
+        };
+        // Ord must agree with Eq's set semantics: same set, different order and
+        // duplicate count → Equal.
+        assert_eq!(compare_values(list(&[2, 1]), list(&[1, 2])), std::cmp::Ordering::Equal);
+        assert_eq!(compare_values(list(&[1, 1, 2]), list(&[2, 1])), std::cmp::Ordering::Equal);
+        // Genuinely different sets order lexicographically over sorted rows.
+        assert_eq!(compare_values(list(&[1, 2]), list(&[1, 3])), std::cmp::Ordering::Less);
+        // Prefix sorts before the longer relation that extends it.
+        assert_eq!(compare_values(list(&[1]), list(&[1, 2])), std::cmp::Ordering::Less);
+        assert_eq!(compare_values(list(&[]), list(&[1])), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn min_max_on_handle_non_primitive_keys() {
+        let db = std::ptr::null_mut();
+        let rows = vec![
+            test_row(addr("Boston", 2101), "carol"),
+            test_row(addr("Austin", 73301), "alice"),
+            test_row(addr("Chicago", 60601), "bob"),
+        ];
+        let rel = alloc(Value::Relation(rows));
+        // minOn/maxOn return the *key*, not the row.
+        let lo = knot_relation_min(db, test_key_fn(), rel);
+        let hi = knot_relation_max(db, test_key_fn(), rel);
+        assert_eq!(compare_values(lo, addr("Austin", 73301)), std::cmp::Ordering::Equal);
+        assert_eq!(compare_values(hi, addr("Chicago", 60601)), std::cmp::Ordering::Equal);
+    }
+
+    // A user Ord impl must win over the structural order, exactly as it does for
+    // the `<`/`>` operators — otherwise sortBy would silently disagree with `<`
+    // on the very same pair of values. The tags below are deliberately *not* in
+    // the CTOR_ORDER registry, so structural order falls back to tag name
+    // (TestHigh < TestLow < TestMedium) — a different answer from the impl's
+    // TestLow < TestMedium < TestHigh, which is what lets the test tell the two
+    // paths apart. (For a registered type, structural order is the declaration
+    // order; the impl still has to win, it just wins less visibly.)
+    extern "C-unwind" fn test_priority_compare(
+        _db: *mut c_void,
+        a: *mut Value,
+        b: *mut Value,
+    ) -> *mut Value {
+        // Rank by declaration order; delegate anything else to the structural
+        // comparison, mirroring the real dispatcher's `knot_value_compare`
+        // fallback so a concurrently-running test is unaffected.
+        let rank = |v: *mut Value| -> Option<i32> {
+            match unsafe { as_ref(v) } {
+                Value::Constructor(tag, _) => match &**tag {
+                    "TestLow" => Some(0),
+                    "TestMedium" => Some(1),
+                    "TestHigh" => Some(2),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let tag = match (rank(a), rank(b)) {
+            (Some(x), Some(y)) => match x.cmp(&y) {
+                std::cmp::Ordering::Less => "LT",
+                std::cmp::Ordering::Equal => "EQ",
+                std::cmp::Ordering::Greater => "GT",
+            },
+            _ => return knot_value_compare(a, b),
+        };
+        alloc(Value::Constructor(intern_str(tag), alloc(Value::Unit)))
+    }
+
+    #[test]
+    fn sort_by_honours_registered_ord_impl() {
+        let db = std::ptr::null_mut();
+        let pri = |tag: &str| alloc(Value::Constructor(intern_str(tag), alloc(Value::Unit)));
+        let rel = alloc(Value::Relation(vec![
+            test_row(pri("TestHigh"), "t-high"),
+            test_row(pri("TestLow"), "t-low"),
+            test_row(pri("TestMedium"), "t-med"),
+        ]));
+
+        // Without a registered dispatcher, keys fall back to structural order —
+        // unregistered constructors order by tag name: High < Low < Medium.
+        assert_eq!(ORD_COMPARE_FN.load(Ordering::Acquire), 0);
+        let structural = knot_relation_sort_by(db, test_key_fn(), rel);
+        assert_eq!(row_names(structural), vec!["t-high", "t-low", "t-med"]);
+
+        // With the Ord dispatcher registered (as `main` does when the program
+        // has a user Ord impl), sortBy follows the impl: Low < Medium < High.
+        ORD_COMPARE_FN.store(test_priority_compare as *const u8 as usize, Ordering::Release);
+        let by_impl = knot_relation_sort_by(db, test_key_fn(), rel);
+        ORD_COMPARE_FN.store(0, Ordering::Release);
+        assert_eq!(row_names(by_impl), vec!["t-low", "t-med", "t-high"]);
     }
 
     // ── Fix B24: a full replace (`set`/`replace`) is DELETE-all + INSERT-all. ──

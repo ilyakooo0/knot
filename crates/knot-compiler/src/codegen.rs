@@ -8593,8 +8593,32 @@ impl Codegen {
                         && let ast::ExprKind::SourceRef(source_name) = &expr.node {
                             self.source_var_binds.insert(var_name.clone(), source_name.clone());
                         }
-                    let io_val = self.compile_expr(builder, expr, env, db);
-                    // Run the IO action to get the result
+                    // A comprehension over relation sources (`xs <- do { r <-
+                    // *rel; where …; yield … }`) is IO only because of the
+                    // relation reads, and inference types it as the relation
+                    // itself. Its `where` is a per-row FILTER, but the generic
+                    // `compile_expr` path would route the do-block through
+                    // `compile_io_do` (is_io_do_block sees the SourceRef bind),
+                    // where `where` is a GUARD over the whole relation value and
+                    // `r.v` silently means "first row's v" — a false guard then
+                    // skips the rest of the block and binds `{}`, losing every
+                    // row. Compile it through the relational loop path instead,
+                    // exactly as the Let arm does for `let xs = do { … }`.
+                    let relation_only_comprehension = matches!(
+                        &expr.node,
+                        ast::ExprKind::Do(do_stmts)
+                            if Self::do_block_is_comprehension(do_stmts)
+                    ) && self.expr_is_io(expr)
+                        && !self.expr_has_external_io(expr);
+                    let io_val = match &expr.node {
+                        ast::ExprKind::Do(do_stmts) if relation_only_comprehension => {
+                            self.compile_do(builder, do_stmts, env, db)
+                        }
+                        _ => self.compile_expr(builder, expr, env, db),
+                    };
+                    // Run the IO action to get the result. `knot_io_run` is the
+                    // identity on non-IO values, so the relation produced above
+                    // passes through untouched.
                     let result = self.call_rt(builder, "knot_io_run", &[db, io_val]);
                     // Bind the result to the pattern. Inside a bind-loop's
                     // rest, a mismatch skips the current row instead of

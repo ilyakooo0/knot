@@ -10508,7 +10508,16 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
         // forged `Value::Bytes` here would let a peer smuggle bytes into a
         // `Text` field (coerce_json_field never converts Bytes->Text), so the
         // handler would run string ops on a Bytes value.
-        "text" | "tag" => matches!(unsafe { as_ref(v) }, Value::Text(_)),
+        "text" => matches!(unsafe { as_ref(v) }, Value::Text(_)),
+        // A tag must additionally *name a constructor of the declared ADT*.
+        // `coerce_json_field` turns the string into a `Value::Constructor`
+        // verbatim, so an unchecked `"priority": "Fake"` reaches the handler as
+        // a constructor of no type and panics its exhaustive `case` — a 500 for
+        // what is a malformed body. Reject it here, where the caller gets 400.
+        t if is_tag_type(t) => match unsafe { as_ref(v) } {
+            Value::Text(s) => tag_is_known(s, t),
+            _ => false,
+        },
         // `Bytes` has exactly one wire form: the `{"__knot_bytes":"<base64>"}`
         // object that `json_to_value_impl` reconstructs into a real
         // `Value::Bytes` *before* this check runs. A bare JSON string is NOT a
@@ -16182,6 +16191,56 @@ fn hex_val(b: u8) -> Option<u8> {
 
 
 
+/// The constructors an enum-like (all-nullary ADT) wire descriptor declares.
+/// The compiler emits `tag(Low|Medium|High|Critical)` for such a route field,
+/// so the accepted set travels with the descriptor. A bare `tag` names no ADT
+/// and yields `None`.
+fn tag_desc_ctors(ty: &str) -> Option<&str> {
+    ty.strip_prefix("tag(")?.strip_suffix(')')
+}
+
+/// True when `ty` is an enum-like ADT wire descriptor — `tag(A|B|C)` or the
+/// bare `tag`.
+fn is_tag_type(ty: &str) -> bool {
+    ty == "tag" || tag_desc_ctors(ty).is_some()
+}
+
+/// Whether `s` names a constructor the descriptor accepts.
+///
+/// A tag arriving on the wire is a *string chosen by the caller*, and it is
+/// turned into a `Value::Constructor` with that string as its tag. Unvalidated,
+/// `?priority=Fake` forges a constructor of no declared type: the handler's
+/// exhaustive `case` matches nothing, panics, and the worker's `catch_unwind`
+/// reports HTTP 500 for what is plainly a bad request. Check the tag here so
+/// the caller gets a 400 like every other malformed param.
+///
+/// `tag(A|B|C)` accepts exactly A, B, or C. A bare `tag` carries no list (a
+/// hand-written descriptor, or one from a producer that predates the list), so
+/// fall back to the CTOR_ORDER registry — every `data` declaration registers
+/// its constructors at init, so an unknown tag is still rejected; only
+/// cross-ADT confusion (a real constructor of the wrong type) slips through.
+fn tag_is_known(s: &str, ty: &str) -> bool {
+    match tag_desc_ctors(ty) {
+        Some(ctors) => ctors.split('|').any(|c| c == s),
+        None => CTOR_ORDER
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(s),
+    }
+}
+
+/// Render a wire type descriptor for a client-facing 400. "not a valid tag"
+/// tells the caller nothing actionable, so an enum-like descriptor spells out
+/// the constructors it accepts.
+fn describe_wire_type(ty: &str) -> String {
+    match tag_desc_ctors(ty) {
+        Some(ctors) if !ctors.is_empty() => {
+            format!("tag (expected one of: {})", ctors.replace('|', ", "))
+        }
+        _ => ty.to_string(),
+    }
+}
+
 /// Parse an HTTP header / path / query string into a typed `Value`, returning
 /// `None` when `s` does not parse as `ty`. Used wherever a typed string input
 /// crosses the wire (path/query params, response headers) so the server can
@@ -16203,7 +16262,11 @@ fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
             "false" | "False" | "0" => Some(alloc_bool(false)),
             _ => None,
         },
-        "tag" => Some(alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)))),
+        // Only a declared constructor may become a `Value::Constructor` — an
+        // unknown tag is a malformed param (400), not a forged constructor
+        // handed to the handler (see `tag_is_known`).
+        t if is_tag_type(t) => tag_is_known(s, t)
+            .then(|| alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)))),
         "text" | "uuid" => Some(alloc(Value::Text(Arc::from(s)))),
         _ => None,
     }
@@ -16211,8 +16274,10 @@ fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
 
 /// Coerce a JSON-parsed value to match the expected field type.
 /// JSON strings become Constructors for "tag"-typed fields (all-nullary ADTs).
+/// The tag itself is validated upstream in `apply_wire_type_checked`, which has
+/// the failure channel this infallible coercion lacks.
 fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
-    if ty == "tag"
+    if is_tag_type(ty)
         && let Value::Text(s) = unsafe { as_ref(v) } {
             return alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)));
         }
@@ -17044,7 +17109,7 @@ fn http_serve_loop(
                             Some(v) => v,
                             None => return Err((400, format!(
                                 "invalid path parameter '{}': '{}' is not a valid {}",
-                                name, val, inner_ty
+                                name, val, describe_wire_type(inner_ty)
                             ), None)),
                         };
                         let value = if is_maybe { make_just(value) } else { value };
@@ -17067,7 +17132,7 @@ fn http_serve_loop(
                                         Some(iv) => iv,
                                         None => return Err((400, format!(
                                             "invalid query parameter '{}': '{}' is not a valid {}",
-                                            qname, v, inner_ty
+                                            qname, v, describe_wire_type(inner_ty)
                                         ), None)),
                                     };
                                     alloc(Value::Constructor(
@@ -17094,7 +17159,7 @@ fn http_serve_loop(
                                 Some(v) => v,
                                 None => return Err((400, format!(
                                     "invalid query parameter '{}': '{}' is not a valid {}",
-                                    qname, raw, inner_ty
+                                    qname, raw, describe_wire_type(inner_ty)
                                 ), None)),
                             }
                         };
@@ -17234,7 +17299,7 @@ fn http_serve_loop(
                                         Some(iv) => iv,
                                         None => return Err((400, format!(
                                             "invalid header '{}': '{}' is not a valid {}",
-                                            http_name, v, inner_ty
+                                            http_name, v, describe_wire_type(inner_ty)
                                         ), None)),
                                     };
                                     alloc(Value::Constructor(
@@ -17252,7 +17317,7 @@ fn http_serve_loop(
                                     Some(iv) => iv,
                                     None => return Err((400, format!(
                                         "invalid header '{}': '{}' is not a valid {}",
-                                        http_name, v, inner_ty
+                                        http_name, v, describe_wire_type(inner_ty)
                                     ), None)),
                                 },
                                 None => return Err((400, format!(
@@ -18283,7 +18348,7 @@ fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
         // `value_to_json` here would emit the `{"__knot_ctor":...}` storage
         // marker, which the server rejects with HTTP 400.
         let bare_ty = ty.strip_prefix('?').unwrap_or(&ty);
-        let is_tag = bare_ty == "tag";
+        let is_tag = is_tag_type(bare_ty);
         let encode = |v: *mut Value| -> String {
             if is_tag {
                 match fetch_value_to_text_opt(v) {
@@ -18704,16 +18769,27 @@ fn openapi_path(parts: &[PathPart]) -> String {
     s
 }
 
-fn type_to_openapi_schema(ty: &str) -> &'static str {
+fn type_to_openapi_schema(ty: &str) -> String {
     // `?` marks Maybe-typed (optional) fields — optionality is expressed via
     // the `required` flag/array, not the schema, so strip it before mapping.
     let ty = ty.strip_prefix('?').unwrap_or(ty);
     match ty {
-        "int" => "{ \"type\": \"integer\" }",
-        "float" => "{ \"type\": \"number\" }",
-        "bool" => "{ \"type\": \"boolean\" }",
-        "text" => "{ \"type\": \"string\" }",
-        _ => "{ \"type\": \"string\" }",
+        "int" => "{ \"type\": \"integer\" }".to_string(),
+        "float" => "{ \"type\": \"number\" }".to_string(),
+        "bool" => "{ \"type\": \"boolean\" }".to_string(),
+        // An enum-like ADT param accepts exactly its declared constructors (the
+        // server 400s on anything else), so publish them as an OpenAPI enum
+        // instead of an unconstrained string.
+        _ => match tag_desc_ctors(ty).filter(|c| !c.is_empty()) {
+            Some(ctors) => {
+                let vals: Vec<String> = ctors
+                    .split('|')
+                    .map(|c| format!("\"{}\"", json_escape(c)))
+                    .collect();
+                format!("{{ \"type\": \"string\", \"enum\": [{}] }}", vals.join(", "))
+            }
+            None => "{ \"type\": \"string\" }".to_string(),
+        },
     }
 }
 
@@ -19507,6 +19583,103 @@ mod _maybe_json_tests {
         // wire form and must still be accepted.
         let u = alloc(Value::Text(Arc::from("018f...")));
         assert!(apply_wire_type_checked(u, "uuid").is_some());
+    }
+
+    #[test]
+    fn tag_param_rejects_undeclared_constructor() {
+        // A tag param is a caller-chosen string that becomes a
+        // `Value::Constructor` verbatim. Unvalidated, `?priority=Fake` forged a
+        // constructor of no declared type: the handler's exhaustive `case`
+        // matched nothing and panicked, and the worker reported HTTP 500 for
+        // what is plainly a bad request (a bad *Int* param already 400s).
+        // The descriptor carries the declaring ADT's constructors, so an
+        // undeclared tag must fail to parse (→ 400).
+        let desc = "tag(Low|Medium|High|Critical)";
+        match unsafe { as_ref(try_string_to_value("High", desc).expect("declared tag")) } {
+            Value::Constructor(t, _) => assert_eq!(&**t, "High"),
+            _ => panic!("expected Constructor(High)"),
+        }
+        assert!(try_string_to_value("Fake", desc).is_none());
+        // Tags are case-sensitive, and a constructor of a *different* ADT is no
+        // more valid than a made-up one.
+        assert!(try_string_to_value("high", desc).is_none());
+        assert!(try_string_to_value("Just", desc).is_none());
+        assert!(try_string_to_value("", desc).is_none());
+
+        // The 400 message names the accepted constructors — "not a valid tag"
+        // alone tells the caller nothing actionable.
+        let msg = describe_wire_type(desc);
+        assert!(msg.contains("Low, Medium, High, Critical"), "got: {msg}");
+
+        // A bare `tag` (no constructor list) has no declaring ADT to check
+        // against, so it falls back to the registry every `data` declaration
+        // populates at init: known tags pass, unknown ones are still rejected.
+        register_ctor_order("TagParamTestAdt", &["AlphaTPT", "BetaTPT"]);
+        assert!(try_string_to_value("AlphaTPT", "tag").is_some());
+        assert!(try_string_to_value("NoSuchCtorAnywhere", "tag").is_none());
+    }
+
+    #[test]
+    fn tag_body_field_rejects_undeclared_constructor() {
+        // Same forged-tag hole on the JSON body path, where the descriptor is
+        // consulted by `apply_wire_type_checked`: a declared constructor decodes
+        // to a `Value::Constructor`, an undeclared one fails the whole record
+        // (→ HTTP 400 "does not match its declared type") instead of reaching
+        // the handler.
+        let body = "{priority:tag(Low|Medium|High|Critical)}";
+        let ok = record(vec![("priority", alloc(Value::Text(Arc::from("Critical"))))]);
+        let decoded = apply_wire_type_checked(ok, body).expect("declared tag decodes");
+        match unsafe { as_ref(field(decoded, "priority")) } {
+            Value::Constructor(t, _) => assert_eq!(&**t, "Critical"),
+            _ => panic!("expected Constructor(Critical)"),
+        }
+        let forged = record(vec![("priority", alloc(Value::Text(Arc::from("Fake"))))]);
+        assert!(apply_wire_type_checked(forged, body).is_none());
+
+        // A tag position still requires a genuine JSON string...
+        let wrong_shape = record(vec![("priority", alloc_int(3))]);
+        assert!(apply_wire_type_checked(wrong_shape, body).is_none());
+
+        // ...and an optional (`Maybe`) tag field keeps its Nothing/Just
+        // normalization while validating the present case.
+        let opt = "{priority:?tag(Low|High)}";
+        let absent = record(vec![]);
+        let decoded = apply_wire_type_checked(absent, opt).expect("absent Maybe → Nothing");
+        match unsafe { as_ref(field(decoded, "priority")) } {
+            Value::Constructor(t, _) => assert_eq!(&**t, "Nothing"),
+            _ => panic!("expected Nothing"),
+        }
+        let bad_opt = record(vec![("priority", alloc(Value::Text(Arc::from("Fake"))))]);
+        assert!(apply_wire_type_checked(bad_opt, opt).is_none());
+    }
+
+    #[test]
+    fn tag_descriptor_with_ctor_list_keeps_wire_encoding_and_openapi() {
+        // The descriptor grew a constructor list (`tag` → `tag(A|B)`), so every
+        // consumer that matched the bare token must still recognize it: `fetch`
+        // encodes a tag body field as a bare JSON string (not the `__knot_ctor`
+        // storage marker, which a Knot server rejects with 400)...
+        let payload = record(vec![(
+            "status",
+            alloc(Value::Constructor(intern_str("Active"), alloc(Value::Unit))),
+        )]);
+        assert_eq!(
+            fetch_build_body("status:tag(Active|Inactive)", payload),
+            r#"{"status":"Active"}"#
+        );
+        // ...and the generated OpenAPI spec publishes the accepted constructors
+        // as an enum rather than an unconstrained string, matching what the
+        // server actually accepts.
+        assert_eq!(
+            type_to_openapi_schema("tag(Low|High)"),
+            r#"{ "type": "string", "enum": ["Low", "High"] }"#
+        );
+        // Optional (`?`) tag params document the same enum.
+        assert_eq!(
+            type_to_openapi_schema("?tag(Low|High)"),
+            r#"{ "type": "string", "enum": ["Low", "High"] }"#
+        );
+        assert_eq!(type_to_openapi_schema("tag"), r#"{ "type": "string" }"#);
     }
 
     #[test]

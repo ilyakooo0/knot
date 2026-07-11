@@ -16569,6 +16569,16 @@ fn fields_to_descriptor(
         .join(",")
 }
 
+/// Wire descriptor for an enum-like (all-nullary) ADT route field:
+/// `tag(Low|Medium|High|Critical)`. The constructor list travels with the
+/// descriptor so the runtime can reject an undeclared tag on the wire with HTTP
+/// 400. A bare `tag` would leave it no way to tell `Fake` from `Low`, and the
+/// forged constructor would reach the handler and panic its exhaustive `case`.
+fn tag_descriptor(ctors: &[(String, Vec<(String, ResolvedType)>)]) -> String {
+    let names: Vec<&str> = ctors.iter().map(|(n, _)| n.as_str()).collect();
+    format!("tag({})", names.join("|"))
+}
+
 fn ast_type_to_descriptor_type(
     ty: &ast::Type,
     aliases: &std::collections::HashMap<String, ResolvedType>,
@@ -16592,7 +16602,7 @@ fn ast_type_to_descriptor_type(
                 Some(ResolvedType::Adt(ctors))
                     if ctors.iter().all(|(_, fields)| fields.is_empty()) =>
                 {
-                    "tag".to_string()
+                    tag_descriptor(ctors)
                 }
                 // An alias to a compound shape (record, relation, Maybe, or a
                 // non-nullary ADT) must carry its structural descriptor —

@@ -6989,13 +6989,12 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Value {
-        let val = self.compile_expr(builder, inner, env, db);
-
         // Look up which refined type this refine targets
         let type_name = match self.refine_targets.get(&span) {
             Some(name) => name.clone(),
             None => {
                 // No target resolved — wrap in Ok {value: val} as pass-through
+                let val = self.compile_expr(builder, inner, env, db);
                 return self.build_ok_result(builder, val);
             }
         };
@@ -7003,8 +7002,38 @@ impl Codegen {
         // Compile the predicate expression (a lambda) in the current env
         let predicate_expr = match self.refined_types.get(&type_name) {
             Some(pred) => pred.clone(),
-            None => return self.build_ok_result(builder, val),
+            None => {
+                let val = self.compile_expr(builder, inner, env, db);
+                return self.build_ok_result(builder, val);
+            }
         };
+
+        // Const-fold: if the inner expression is a literal, evaluate the
+        // refinement predicate at compile time and skip the runtime check.
+        if let Some(lit) = extract_literal(inner) {
+            match eval_refine_predicate(&predicate_expr, &lit) {
+                Some(true) => {
+                    let val = self.compile_expr(builder, inner, env, db);
+                    return self.build_ok_result(builder, val);
+                }
+                Some(false) => {
+                    self.diagnostics.push(
+                        knot::diagnostic::Diagnostic::error(
+                            format!(
+                                "refine: value {} does not satisfy predicate for type `{}`",
+                                lit.display(),
+                                type_name
+                            ),
+                        ).label(span, "refinement predicate fails at compile time"),
+                    );
+                    let _ = self.compile_expr(builder, inner, env, db);
+                    return self.build_refinement_err(builder, &type_name);
+                }
+                None => { /* fall through to runtime check */ }
+            }
+        }
+
+        let val = self.compile_expr(builder, inner, env, db);
         let pred_fn = self.compile_expr(builder, &predicate_expr, env, db);
 
         // Call the predicate: pred(val) -> Bool
@@ -7781,6 +7810,15 @@ impl Codegen {
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
         for decl in decls {
             match &decl.node {
+                ast::DeclKind::Fun { name, body: Some(body), ty: Some(ts), .. } => {
+                    // Seed IO functions from type annotations (same as desugar's fun_sig_io).
+                    // Functions like `forEach` whose IO comes from trait-method calls
+                    // (yield) are not detected by body scan alone.
+                    if Self::type_returns_io_codegen(&ts.ty) {
+                        self.io_functions.insert(name.clone());
+                    }
+                    fun_bodies.push((name.clone(), body));
+                }
                 ast::DeclKind::Fun { name, body: Some(body), .. } => {
                     fun_bodies.push((name.clone(), body));
                 }
@@ -7827,6 +7865,16 @@ impl Codegen {
             if !changed {
                 break;
             }
+        }
+    }
+
+    /// Whether a declared type's final return type is `IO ...` (walking through
+    /// curried function arrows). Mirrors desugar's `type_returns_io`.
+    fn type_returns_io_codegen(ty: &ast::Type) -> bool {
+        match &ty.node {
+            ast::TypeKind::Function { result, .. } => Self::type_returns_io_codegen(result),
+            ast::TypeKind::IO { .. } => true,
+            _ => false,
         }
     }
 
@@ -16528,6 +16576,118 @@ fn resolved_type_to_descriptor(ty: &ResolvedType) -> String {
         }
         ResolvedType::Named(n) => n.to_lowercase(),
         _ => "text".to_string(),
+    }
+}
+
+/// A literal value extracted from an AST expression, for compile-time
+/// refinement checking.
+enum CompileLit {
+    Int(i64),
+    Float(f64),
+    Text(String),
+    Bool(bool),
+}
+
+impl CompileLit {
+    fn display(&self) -> String {
+        match self {
+            CompileLit::Int(n) => n.to_string(),
+            CompileLit::Float(f) => f.to_string(),
+            CompileLit::Text(s) => format!("{:?}", s),
+            CompileLit::Bool(b) => b.to_string(),
+        }
+    }
+}
+
+/// Extract a literal from an AST expression (peeling annotations).
+fn extract_literal(expr: &ast::Expr) -> Option<CompileLit> {
+    match &expr.node {
+        ast::ExprKind::Lit(ast::Literal::Int(s)) => s.parse::<i64>().ok().map(CompileLit::Int),
+        ast::ExprKind::Lit(ast::Literal::Float(f)) => Some(CompileLit::Float(*f)),
+        ast::ExprKind::Lit(ast::Literal::Text(s)) => Some(CompileLit::Text(s.clone())),
+        ast::ExprKind::Lit(ast::Literal::Bool(b)) => Some(CompileLit::Bool(*b)),
+        ast::ExprKind::Annot { expr, .. } => extract_literal(expr),
+        ast::ExprKind::UnitLit { value, .. } => extract_literal(value),
+        _ => None,
+    }
+}
+
+/// Evaluate a refinement predicate (a lambda `\x -> pred`) against a
+/// compile-time literal. Returns `Some(true)` if the predicate is
+/// satisfied, `Some(false)` if it fails, or `None` if it can't be
+/// evaluated at compile time.
+fn eval_refine_predicate(pred: &ast::Expr, lit: &CompileLit) -> Option<bool> {
+    // The predicate is a lambda `\x -> body`. Extract the body.
+    let body = match &pred.node {
+        ast::ExprKind::Lambda { params, body } => {
+            if params.len() != 1 { return None; }
+            body
+        }
+        _ => return None,
+    };
+    // Evaluate the body with the parameter bound to the literal.
+    eval_expr_bool(body, lit)
+}
+
+/// Evaluate an expression to a boolean, with the refinement variable
+/// bound to `lit`. Returns `None` if the expression can't be evaluated.
+fn eval_expr_bool(expr: &ast::Expr, lit: &CompileLit) -> Option<bool> {
+    match &expr.node {
+        ast::ExprKind::Lit(ast::Literal::Bool(b)) => Some(*b),
+        ast::ExprKind::BinOp { op, lhs, rhs, .. } => {
+            let lv = eval_expr_num(lhs, lit)?;
+            let rv = eval_expr_num(rhs, lit)?;
+            match op {
+                ast::BinOp::Lt => Some(lv < rv),
+                ast::BinOp::Gt => Some(lv > rv),
+                ast::BinOp::Le => Some(lv <= rv),
+                ast::BinOp::Ge => Some(lv >= rv),
+                ast::BinOp::Eq => Some(lv == rv),
+                ast::BinOp::Neq => Some(lv != rv),
+                ast::BinOp::And => {
+                    Some(eval_expr_bool(lhs, lit)? && eval_expr_bool(rhs, lit)?)
+                }
+                ast::BinOp::Or => {
+                    Some(eval_expr_bool(lhs, lit)? || eval_expr_bool(rhs, lit)?)
+                }
+                _ => None,
+            }
+        }
+        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Not, operand, .. } => {
+            Some(!eval_expr_bool(operand, lit)?)
+        }
+        _ => None,
+    }
+}
+
+/// Evaluate an expression to an f64 (for numeric comparisons), with the
+/// refinement variable bound to `lit`.
+fn eval_expr_num(expr: &ast::Expr, lit: &CompileLit) -> Option<f64> {
+    match &expr.node {
+        ast::ExprKind::Lit(ast::Literal::Int(s)) => s.parse::<f64>().ok(),
+        ast::ExprKind::Lit(ast::Literal::Float(f)) => Some(*f),
+        ast::ExprKind::Var(_) => {
+            // The lambda parameter — return the literal value
+            match lit {
+                CompileLit::Int(n) => Some(*n as f64),
+                CompileLit::Float(f) => Some(*f),
+                _ => None,
+            }
+        }
+        ast::ExprKind::Annot { expr, .. } => eval_expr_num(expr, lit),
+        ast::ExprKind::UnitLit { value, .. } => eval_expr_num(value, lit),
+        ast::ExprKind::BinOp { op, lhs, rhs, .. } => {
+            let lv = eval_expr_num(lhs, lit)?;
+            let rv = eval_expr_num(rhs, lit)?;
+            match op {
+                ast::BinOp::Add => Some(lv + rv),
+                ast::BinOp::Sub => Some(lv - rv),
+                ast::BinOp::Mul => Some(lv * rv),
+                ast::BinOp::Div => Some(lv / rv),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

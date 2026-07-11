@@ -1419,12 +1419,19 @@ impl EffectChecker {
     /// thing the opaque call ends up invoking, so reject conservatively.
     fn reachable_io_lambda_from(&self, roots: &[&ast::Expr]) -> Option<Span> {
         let mut seen: HashSet<String> = HashSet::new();
-        let mut worklist: Vec<&ast::Expr> = roots.to_vec();
+        // The flag marks an expression that is itself in *executed* position:
+        // true for the roots (the atomic body and the enclosing declaration's
+        // body — both are run), false for a declaration body pulled in through
+        // a reference, which is reached as a *value* and so is a candidate for
+        // being the thing the opaque call invokes.
+        let mut worklist: Vec<(&ast::Expr, bool)> = roots.iter().map(|e| (*e, true)).collect();
         let mut found: Option<Span> = None;
-        while let Some(e) = worklist.pop() {
+        while let Some((e, executed)) = worklist.pop() {
             if found.is_some() {
                 break;
             }
+            let mut called: Vec<Span> = Vec::new();
+            executed_builtin_calls(e, executed, &mut called);
             let mut referenced: Vec<String> = Vec::new();
             walk_expr(e, &mut |node| {
                 match &node.node {
@@ -1439,10 +1446,16 @@ impl EffectChecker {
                     // a record field; the opaque call ends up invoking it, so
                     // reject conservatively, mirroring the Lambda arm above and
                     // the shadow-unaware convention of `contains_atomic_disallowed_ref`.
+                    // A builtin *called* in statement position (`called`) is not
+                    // such a value — it performs its IO where it stands, outside
+                    // the atomic block (an IO call *inside* the block is already
+                    // rejected by the `gate_effects.has_io()` check that guards
+                    // this scan), so flagging it rejects valid programs.
                     ast::ExprKind::Var(name)
                         if found.is_none()
                             && crate::builtins::ATOMIC_DISALLOWED_BUILTINS
-                                .contains(&name.as_str()) =>
+                                .contains(&name.as_str())
+                            && !called.contains(&node.span) =>
                     {
                         found = Some(node.span);
                     }
@@ -1453,7 +1466,7 @@ impl EffectChecker {
             for name in referenced {
                 if seen.insert(name.clone())
                     && let Some(body) = self.decl_bodies.get(&name) {
-                        worklist.push(body);
+                        worklist.push((body, false));
                     }
             }
         }
@@ -2103,6 +2116,49 @@ fn lambda_param_names(expr: &ast::Expr) -> HashSet<String> {
 /// Purely syntactic and shadow-unaware — used only for the conservative
 /// opaque-callee scan inside atomic bodies, where false positives are
 /// acceptable (atomic bodies are supposed to be DB-only).
+/// Spans of the atomic-disallowed IO builtins that `expr` *calls* in statement
+/// position — a do-block statement, or (when `executed` is set) the expression
+/// itself. Such a reference performs its IO where it stands and cannot flow
+/// anywhere else, so `reachable_io_lambda_from` must not mistake it for a
+/// callable laundered into an opaque call: `main = do { …; atomic (r.fn {});
+/// println (show c) }` is a valid program.
+///
+/// Everything else is left out, so a builtin applied in a *value* position —
+/// `r = {fn: writeFile "log"}`, later invoked as `r.fn "x"` inside atomic — is
+/// still flagged. `executed` is false for a declaration body reached through a
+/// reference, since that body is being inspected as a value.
+fn executed_builtin_calls(expr: &ast::Expr, executed: bool, out: &mut Vec<Span>) {
+    match &expr.node {
+        // Statements run wherever the block sits, so this arm ignores `executed`.
+        ast::ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                if let ast::StmtKind::Expr(e) | ast::StmtKind::Bind { expr: e, .. } = &stmt.node {
+                    executed_builtin_calls(e, true, out);
+                }
+            }
+        }
+        ast::ExprKind::Atomic(inner) => executed_builtin_calls(inner, executed, out),
+        ast::ExprKind::If { then_branch, else_branch, .. } if executed => {
+            executed_builtin_calls(then_branch, true, out);
+            executed_builtin_calls(else_branch, true, out);
+        }
+        ast::ExprKind::Case { arms, .. } if executed => {
+            for arm in arms {
+                executed_builtin_calls(&arm.body, true, out);
+            }
+        }
+        ast::ExprKind::App { .. } if executed => {
+            let (head, _) = app_spine(expr);
+            if let ast::ExprKind::Var(name) = &head.node
+                && crate::builtins::ATOMIC_DISALLOWED_BUILTINS.contains(&name.as_str())
+            {
+                out.push(head.span);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn contains_atomic_disallowed_ref(expr: &ast::Expr) -> bool {
     // Argument subtrees of `fork (<action>)` are exempt: forked IO runs on an
     // independent connection and is intentionally permitted inside `atomic`, so

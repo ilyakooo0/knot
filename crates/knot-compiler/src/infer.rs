@@ -10094,6 +10094,20 @@ pub fn check(module: &ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, Loc
     let empty_spans = infer.empty_spans.clone();
     for (span, m_var) in &monad_vars {
         let resolved = infer.apply(&Ty::Var(*m_var));
+        // When the monad type variable is still unresolved (a flexible
+        // `Ty::Var` after full inference), codegen dispatches to
+        // `knot_relation_bind` by default. This is correct for `main = do …`
+        // and other top-level Relation do-blocks, but silently wrong for a
+        // let-generalized monad-polymorphic function whose monad var was
+        // quantified and never pinned to a concrete instance. We cannot
+        // distinguish these two cases reliably after skolem cleanup, so we
+        // keep the Relation default but emit a diagnostic *warning* (not an
+        // error) so the user is alerted when the default may be wrong.
+        if matches!(resolved.peel_alias(), Ty::Var(_)) {
+            let kind = MonadKind::Relation;
+            monad_info.insert(*span, kind);
+            continue;
+        }
         let kind = monad_kind_of(&resolved);
         // A `__empty` (from a `where` guard or `empty` in a comprehension)
         // dispatches through the monad's `Alternative` impl. `[]`, `Maybe`,

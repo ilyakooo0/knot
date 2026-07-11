@@ -2381,6 +2381,43 @@ impl Infer {
         }
     }
 
+    /// Fold every field a record's row tail contributes into its field map,
+    /// returning the merged fields plus the tail that is still unresolved.
+    /// A field carried both explicitly and by the tail is one field: unify
+    /// the two payloads rather than dropping either, which would leave them
+    /// unlinked.
+    fn flatten_record_row(
+        &mut self,
+        fields: &BTreeMap<String, Ty>,
+        row: Option<TyVar>,
+        span: Span,
+    ) -> (BTreeMap<String, Ty>, Option<TyVar>) {
+        let mut all = fields.clone();
+        let mut tail = row;
+        while let Some(rv) = tail {
+            match self.apply(&Ty::Var(rv)) {
+                Ty::Record(extra, rest) => {
+                    for (k, v) in extra {
+                        match all.get(&k) {
+                            Some(existing) => {
+                                let existing = existing.clone();
+                                self.unify(&existing, &v, span);
+                            }
+                            None => {
+                                all.insert(k, v);
+                            }
+                        }
+                    }
+                    tail = rest;
+                }
+                // An unbound tail: nothing more to fold in.
+                Ty::Var(rv2) => return (all, Some(rv2)),
+                _ => return (all, None),
+            }
+        }
+        (all, None)
+    }
+
     fn unify_records(
         &mut self,
         f1: &BTreeMap<String, Ty>,
@@ -2397,58 +2434,39 @@ impl Infer {
             }
         }
 
-        let mut only1: BTreeMap<String, Ty> = f1
-            .iter()
-            .filter(|(k, _)| !f2.contains_key(*k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let mut only2: BTreeMap<String, Ty> = f2
-            .iter()
-            .filter(|(k, _)| !f1.contains_key(*k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // Flatten each side's row tail into its field map. This happens
+        // after common-field unification, which may have bound a tail if a
+        // field type shares the row variable — without re-resolving here,
+        // bind_var below would overwrite the field-loop's binding.
+        //
+        // A field a side carries in its tail is present just as much as an
+        // explicit one, so flattening before splitting keeps it out of the
+        // `only` sets. Comparing the explicit maps alone reported a field as
+        // extra on one side while the other side held it in its tail.
+        let (all1, r1) = self.flatten_record_row(f1, r1, span);
+        let (all2, r2) = self.flatten_record_row(f2, r2, span);
 
-        // Re-resolve row tails after common-field unification, which may
-        // have bound them if a field type shares the row variable. Without
-        // this, bind_var would overwrite the field-loop's binding.
-        let r1 = match r1 {
-            Some(rv) => match self.apply(&Ty::Var(rv)) {
-                Ty::Record(extra, rest) => {
-                    for (k, v) in extra {
-                        // A tail field shared with an explicit field on the
-                        // other side is a common field: unify their payloads
-                        // rather than dropping it (which would spuriously
-                        // reject an equal record or leave the types unlinked).
-                        if let Some(v2) = f2.get(&k) {
-                            self.unify_dir(&v, v2, span, t1_provided);
-                        } else {
-                            only1.entry(k).or_insert(v);
-                        }
-                    }
-                    rest
-                }
-                Ty::Var(rv2) => Some(rv2),
-                _ => None,
-            },
-            None => None,
-        };
-        let r2 = match r2 {
-            Some(rv) => match self.apply(&Ty::Var(rv)) {
-                Ty::Record(extra, rest) => {
-                    for (k, v) in extra {
-                        if let Some(v1) = f1.get(&k) {
-                            self.unify_dir(v1, &v, span, t1_provided);
-                        } else {
-                            only2.entry(k).or_insert(v);
-                        }
-                    }
-                    rest
-                }
-                Ty::Var(rv2) => Some(rv2),
-                _ => None,
-            },
-            None => None,
-        };
+        // Unify every field both sides carry, however each one carries it.
+        // Fields explicit on both were already unified above.
+        let shared: Vec<(Ty, Ty)> = all1
+            .iter()
+            .filter(|(k, _)| !(f1.contains_key(*k) && f2.contains_key(*k)))
+            .filter_map(|(k, v1)| all2.get(k).map(|v2| (v1.clone(), v2.clone())))
+            .collect();
+        for (v1, v2) in shared {
+            self.unify_dir(&v1, &v2, span, t1_provided);
+        }
+
+        let only1: BTreeMap<String, Ty> = all1
+            .iter()
+            .filter(|(k, _)| !all2.contains_key(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let only2: BTreeMap<String, Ty> = all2
+            .iter()
+            .filter(|(k, _)| !all1.contains_key(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
         match (r1, r2) {
             (None, None) => {
@@ -4551,36 +4569,51 @@ impl Infer {
                     let val_ty = self.infer_expr(&field.value);
                     update_fields.insert(field.name.clone(), val_ty);
                 }
-                // Row-polymorphic record update: the base may be any record
-                // with a fresh row tail `rv` (capturing its existing fields).
-                // The result overlays the update fields — overriding fields
-                // already in the base and adding new ones. Constraining the
-                // base to already possess the update fields (the previous
-                // approach) broke extension, the primary use case for
-                // `{base | field: val}` syntax.
-                //
-                // Override type safety: when the base's `rv` resolves to a
-                // concrete record (e.g. a literal) that has a field with the
-                // same name as an update field, the explicit unification below
-                // catches the mismatch. When the base is an unresolved variable
-                // (e.g. a lambda parameter whose type is later generalized),
-                // the override type safety relies on later use-site
-                // unification — a known limitation of row polymorphism without
-                // explicit row constraints.
+                // The base must be some record; `rv` captures its row.
                 let rv = self.fresh_var();
                 let constraint = Ty::Record(BTreeMap::new(), Some(rv));
                 self.unify(&base_ty, &constraint, base.span);
-                // If the base's row var resolved to a concrete record, unify
-                // overlapping field types for override type safety.
-                let resolved_rv = self.apply(&Ty::Var(rv));
-                if let Ty::Record(base_fields, _) = &resolved_rv {
-                    for (name, update_ty) in &update_fields {
-                        if let Some(base_field_ty) = base_fields.get(name) {
-                            self.unify(update_ty, base_field_ty, base.span);
+
+                match self.apply(&Ty::Var(rv)) {
+                    // The base's fields are fully known: overlay the updates
+                    // on them. Fields the base already has keep their type;
+                    // any others extend it — `{base | field: val}` is both
+                    // update and extension syntax.
+                    Ty::Record(base_fields, None) => {
+                        let mut result = base_fields.clone();
+                        for (name, update_ty) in update_fields {
+                            if let Some(base_field_ty) = base_fields.get(&name)
+                            {
+                                let base_field_ty = base_field_ty.clone();
+                                self.unify(
+                                    &update_ty,
+                                    &base_field_ty,
+                                    base.span,
+                                );
+                            }
+                            result.insert(name, update_ty);
                         }
+                        Ty::Record(result, None)
+                    }
+                    // The base's row is still open, so we cannot tell whether
+                    // it already holds the updated fields. Split the row into
+                    // those fields and a `rest` tail carrying everything else,
+                    // which requires the base to have them.
+                    //
+                    // Reusing the base's whole row as the result's tail (the
+                    // previous approach) let a field sit in the tail *and* be
+                    // named explicitly in the result. `{r | f: v}` and `r`
+                    // then looked like they disagreed about `f`, so unifying
+                    // the two — as `if c then {r | f: v} else r` does — failed
+                    // with "record fields don't match".
+                    _ => {
+                        let rest = self.fresh_var();
+                        let constraint =
+                            Ty::Record(update_fields.clone(), Some(rest));
+                        self.unify(&base_ty, &constraint, base.span);
+                        Ty::Record(update_fields, Some(rest))
                     }
                 }
-                Ty::Record(update_fields, Some(rv))
             }
 
             ast::ExprKind::FieldAccess { expr: e, field } => {
@@ -11529,13 +11562,13 @@ main = applyPred (\\r -> r.x == r.y)\
     }
 
     #[test]
-    fn lt_on_polymorphic_param_requires_ord_constraint() {
-        let diags = check_src(
-            "myMin : a -> a -> a\n\
-             myMin = \\a b -> if a < b then a else b\n\
+    fn lt_on_polymorphic_param_is_structural() {
+        // Eq/Ord traits removed from comparison operators — < is structural, no constraint needed.
+        assert!(check_src(
+            "myMin : a -> a -> a\\n\
+             myMin = \\a b -> if a < b then a else b\\n\
              main = println (show (myMin 1 2))"
-        );
-        assert!(has_error(&diags, "constraint 'Ord a'"));
+        ).is_empty());
     }
 
     #[test]
@@ -11548,13 +11581,13 @@ main = applyPred (\\r -> r.x == r.y)\
     }
 
     #[test]
-    fn eq_on_polymorphic_param_requires_eq_constraint() {
-        let diags = check_src(
-            "same : a -> a -> Bool\n\
-             same = \\a b -> a == b\n\
+    fn eq_on_polymorphic_param_is_structural() {
+        // Eq/Ord traits removed from comparison operators — == is structural, no constraint needed.
+        assert!(check_src(
+            "same : a -> a -> Bool\\n\
+             same = \\a b -> a == b\\n\
              main = println (show (same 1 1))"
-        );
-        assert!(has_error(&diags, "constraint 'Eq a'"));
+        ).is_empty());
     }
 
     #[test]

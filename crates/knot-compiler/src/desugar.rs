@@ -74,8 +74,19 @@ fn detect_io_functions(decls: &[Decl]) -> IoFns {
     let mut fun_bodies: Vec<(&str, &Expr)> = Vec::new();
     let mut method_bodies: Vec<(&str, &Expr)> = Vec::new();
     let mut trait_sig_io: HashSet<String> = HashSet::new();
+    // Collect function names whose declared type returns IO, so the
+    // fixpoint seed recognizes them even when the body's IO is only
+    // through trait-method calls (e.g. `yield`) that expr_contains_io
+    // can't see. Mirrors the trait-signature seeding for `trait_sig_io`.
+    let mut fun_sig_io: HashSet<String> = HashSet::new();
     for decl in decls {
         match &decl.node {
+            DeclKind::Fun { name, body: Some(body), ty: Some(ts), .. } => {
+                if type_returns_io(&ts.ty) {
+                    fun_sig_io.insert(name.clone());
+                }
+                fun_bodies.push((name, body));
+            }
             DeclKind::Fun { name, body: Some(body), .. } => {
                 fun_bodies.push((name, body));
             }
@@ -137,6 +148,7 @@ fn detect_io_functions(decls: &[Decl]) -> IoFns {
     let mut all_bodies = fun_bodies;
     all_bodies.extend(method_bodies);
     let mut base = HashSet::new();
+    base.extend(fun_sig_io.clone());
     fixpoint(&all_bodies, &io_builtins, &mut base);
 
     // Full set: additionally seeded with trait-signature IO methods (a
@@ -145,6 +157,7 @@ fn detect_io_functions(decls: &[Decl]) -> IoFns {
     // functions calling such methods are recognized too.
     let mut all = base.clone();
     all.extend(trait_sig_io);
+    all.extend(fun_sig_io);
     fixpoint(&all_bodies, &io_builtins, &mut all);
 
     IoFns { base, all }

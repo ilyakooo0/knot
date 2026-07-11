@@ -1206,7 +1206,7 @@ impl EffectChecker {
                 effects
             }
 
-            ast::ExprKind::UnitLit { value, .. } => self.infer_effects(value),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.infer_effects(value),
             ast::ExprKind::Annot { expr: inner, .. } => self.infer_effects(inner),
             ast::ExprKind::Refine(inner) => self.infer_effects(inner),
 
@@ -1322,6 +1322,7 @@ impl EffectChecker {
             // Unwrap annotation-style wrappers around the callee.
             while let ast::ExprKind::Annot { expr: inner, .. }
             | ast::ExprKind::UnitLit { value: inner, .. }
+            | ast::ExprKind::TimeUnitLit { value: inner, .. }
             | ast::ExprKind::Refine(inner) = &head.node
             {
                 head = inner;
@@ -1554,6 +1555,7 @@ impl EffectChecker {
     fn callback_arg_latent_effects(&self, arg: &ast::Expr) -> Option<EffectSet> {
         match &arg.node {
             ast::ExprKind::UnitLit { value, .. }
+            | ast::ExprKind::TimeUnitLit { value, .. }
             | ast::ExprKind::Annot { expr: value, .. }
             | ast::ExprKind::Refine(value) => self.callback_arg_latent_effects(value),
             ast::ExprKind::Var(name) => {
@@ -1650,7 +1652,7 @@ impl EffectChecker {
             // Without this, an annotated lambda like `(\x -> println x : Type) y`
             // would fall through to infer_effects, which treats Lambda as pure
             // (creating a lambda IS pure), missing the body's call effects.
-            ast::ExprKind::UnitLit { value, .. } => self.callee_effects(value),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.callee_effects(value),
             ast::ExprKind::Annot { expr, .. } => self.callee_effects(expr),
             ast::ExprKind::Refine(inner) => self.callee_effects(inner),
 
@@ -1698,7 +1700,7 @@ impl EffectChecker {
                 effects
             }
             // Wrappers: unwrap to find the lambda (if any) inside.
-            ast::ExprKind::UnitLit { value, .. } => self.head_call_effects(value, args),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.head_call_effects(value, args),
             ast::ExprKind::Annot { expr, .. } => self.head_call_effects(expr, args),
             ast::ExprKind::Refine(inner) => self.head_call_effects(inner, args),
             _ => self.callee_effects(head),
@@ -1716,7 +1718,7 @@ impl EffectChecker {
                 effects
             }
             // Wrapper expressions: unwrap to find the lambda chain inside.
-            ast::ExprKind::UnitLit { value, .. } => self.fun_body_effects(value),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.fun_body_effects(value),
             ast::ExprKind::Annot { expr, .. } => self.fun_body_effects(expr),
             ast::ExprKind::Refine(inner) => self.fun_body_effects(inner),
             _ => self
@@ -1804,6 +1806,7 @@ fn is_lambda_arg(arg: &ast::Expr) -> bool {
     match &arg.node {
         ast::ExprKind::Lambda { .. } => true,
         ast::ExprKind::UnitLit { value, .. }
+        | ast::ExprKind::TimeUnitLit { value, .. }
         | ast::ExprKind::Annot { expr: value, .. }
         | ast::ExprKind::Refine(value) => is_lambda_arg(value),
         _ => false,
@@ -1876,7 +1879,7 @@ fn walk_expr(expr: &ast::Expr, f: &mut impl FnMut(&ast::Expr)) {
             walk_expr(value, f);
         }
         ast::ExprKind::Atomic(inner) => walk_expr(inner, f),
-        ast::ExprKind::UnitLit { value, .. } => walk_expr(value, f),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => walk_expr(value, f),
         ast::ExprKind::Annot { expr: inner, .. } => walk_expr(inner, f),
         ast::ExprKind::Refine(inner) => walk_expr(inner, f),
         ast::ExprKind::Serve { handlers, .. } => {
@@ -2021,7 +2024,7 @@ fn collect_unshadowed_disallowed(
             collect_unshadowed_disallowed(value, shadowed, out);
         }
         ast::ExprKind::Atomic(inner) => collect_unshadowed_disallowed(inner, shadowed, out),
-        ast::ExprKind::UnitLit { value, .. } => collect_unshadowed_disallowed(value, shadowed, out),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => collect_unshadowed_disallowed(value, shadowed, out),
         ast::ExprKind::Annot { expr: inner, .. } => {
             collect_unshadowed_disallowed(inner, shadowed, out);
         }
@@ -2130,7 +2133,9 @@ fn app_spine(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
 fn is_lambda_head(expr: &ast::Expr) -> bool {
     match &expr.node {
         ast::ExprKind::Lambda { .. } => true,
-        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::Annot { expr: value, .. } => {
+        ast::ExprKind::UnitLit { value, .. }
+        | ast::ExprKind::TimeUnitLit { value, .. }
+        | ast::ExprKind::Annot { expr: value, .. } => {
             is_lambda_head(value)
         }
         ast::ExprKind::Refine(inner) => is_lambda_head(inner),
@@ -2144,7 +2149,9 @@ fn head_name(expr: &ast::Expr) -> Option<&str> {
     match &expr.node {
         ast::ExprKind::Var(name) => Some(name.as_str()),
         ast::ExprKind::App { func, .. } => head_name(func),
-        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::Annot { expr: value, .. } => {
+        ast::ExprKind::UnitLit { value, .. }
+        | ast::ExprKind::TimeUnitLit { value, .. }
+        | ast::ExprKind::Annot { expr: value, .. } => {
             head_name(value)
         }
         // Match the wrapper set unwrapped by is_lambda_arg/fun_body_effects.
@@ -2191,7 +2198,8 @@ fn unwrap_lambda_params<'a>(
             unwrap_lambda_params(body, params)
         }
         ast::ExprKind::Annot { expr: inner, .. }
-        | ast::ExprKind::UnitLit { value: inner, .. } => unwrap_lambda_params(inner, params),
+        | ast::ExprKind::UnitLit { value: inner, .. }
+        | ast::ExprKind::TimeUnitLit { value: inner, .. } => unwrap_lambda_params(inner, params),
         ast::ExprKind::Refine(inner) => unwrap_lambda_params(inner, params),
         _ => expr,
     }
@@ -2221,7 +2229,8 @@ fn fork_call_arg_var(expr: &ast::Expr) -> Option<&str> {
             None
         }
         ast::ExprKind::Annot { expr: inner, .. }
-        | ast::ExprKind::UnitLit { value: inner, .. } => fork_call_arg_var(inner),
+        | ast::ExprKind::UnitLit { value: inner, .. }
+        | ast::ExprKind::TimeUnitLit { value: inner, .. } => fork_call_arg_var(inner),
         ast::ExprKind::Refine(inner) => fork_call_arg_var(inner),
         _ => None,
     }

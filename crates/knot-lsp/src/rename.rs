@@ -270,10 +270,78 @@ pub(crate) fn handle_rename(
         *edits = kept;
     }
 
+    // Capture/shadowing guard (B71): if renaming into (or out of) a scope that
+    // already binds `new_name` would silently change name resolution, don't
+    // hand the client a set of edits it will apply blind. Flag the whole edit
+    // for user confirmation with an explanatory annotation instead. The check
+    // runs against the originating document — the file the cursor is in, where
+    // local-binding renames (the B71 case) are always confined.
+    let mut conflicts: Vec<Span> = Vec::new();
+    collect_shadowed_names(&doc.module, &old_name, new_name, &mut conflicts);
+    let has_edits = changes.values().any(|edits| !edits.is_empty());
+    if has_edits && !conflicts.is_empty() {
+        return Some(workspace_edit_with_conflict_warning(changes, &old_name, new_name));
+    }
+
     Some(WorkspaceEdit {
         changes: Some(changes),
         ..Default::default()
     })
+}
+
+/// Wrap computed rename `changes` in a `WorkspaceEdit` that flags every edit
+/// for user confirmation with a name-capture warning. A bare `changes` map
+/// cannot reference a change annotation, so we mirror the edits into
+/// `document_changes` as `AnnotatedTextEdit`s pointing at a single
+/// `needs_confirmation` annotation. `changes` is retained too: clients that
+/// don't advertise `documentChanges`/`changeAnnotationSupport` fall back to it
+/// and apply the rename exactly as before (just unwarned), while capable
+/// clients surface the confirmation prompt before touching the buffer.
+fn workspace_edit_with_conflict_warning(
+    changes: HashMap<Uri, Vec<TextEdit>>,
+    old_name: &str,
+    new_name: &str,
+) -> WorkspaceEdit {
+    const ANNOTATION_ID: &str = "knot.rename.capture";
+    let document_changes = DocumentChanges::Edits(
+        changes
+            .iter()
+            .map(|(uri, edits)| TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: None,
+                },
+                edits: edits
+                    .iter()
+                    .cloned()
+                    .map(|text_edit| {
+                        OneOf::Right(AnnotatedTextEdit {
+                            text_edit,
+                            annotation_id: ANNOTATION_ID.to_string(),
+                        })
+                    })
+                    .collect(),
+            })
+            .collect(),
+    );
+    let mut change_annotations = HashMap::new();
+    change_annotations.insert(
+        ANNOTATION_ID.to_string(),
+        ChangeAnnotation {
+            label: format!("Rename '{old_name}' → '{new_name}' shadows an existing binding"),
+            needs_confirmation: Some(true),
+            description: Some(format!(
+                "'{new_name}' is already bound in a scope where '{old_name}' is used. \
+                 Applying this rename will capture or shadow that binding and may change \
+                 the program's meaning."
+            )),
+        },
+    );
+    WorkspaceEdit {
+        changes: Some(changes),
+        document_changes: Some(document_changes),
+        change_annotations: Some(change_annotations),
+    }
 }
 
 /// The canonical owner of a symbol — the file path and span where the symbol
@@ -933,6 +1001,191 @@ fn pat_binds_name(pat: &ast::Pat, name: &str) -> bool {
         ast::PatKind::List(pats) => pats.iter().any(|p| pat_binds_name(p, name)),
         ast::PatKind::Cons { head, tail } => {
             pat_binds_name(head, name) || pat_binds_name(tail, name)
+        }
+    }
+}
+
+/// Detect lexical name-capture / shadowing conflicts that renaming `old_name`
+/// to `new_name` would introduce within `module`, pushing the span of each
+/// offending site into `out`. A rename is a conflict when it silently changes
+/// which binding a name resolves to. Three shapes are caught:
+///
+///   * a use of `old_name` whose nearest enclosing binder-of-interest is a
+///     `new_name` binder — after the rename the use resolves to that inner
+///     binder instead of the renamed one (the reported B71 capture:
+///     `f = \x -> \y -> x + y`, renaming `x` to `y` yields
+///     `\y -> \y -> y + y`);
+///   * a use of `new_name` whose nearest enclosing binder-of-interest is an
+///     `old_name` binder — the renamed binder would capture that use
+///     (`f = \y -> \x -> y + x`, renaming `x` to `y`);
+///   * a single scope that binds both names — the rename collapses them into a
+///     duplicate binder (`\x y -> …`, renaming `x` to `y`).
+///
+/// The walk is lexical and scope-precise: it tracks a stack of the enclosing
+/// binder scopes (lambda params, `case` arms, `do` binds/lets, impl and trait
+/// method params) and, for each use, inspects only the *nearest* relevant
+/// binder — so an inner rebinding of the same name correctly shields outer
+/// scopes from a false positive. It never reports a rename that leaves name
+/// resolution unchanged, and never misses a genuine capture. An empty `out`
+/// means the rename is capture-free.
+pub(crate) fn collect_shadowed_names(
+    module: &Module,
+    old_name: &str,
+    new_name: &str,
+    out: &mut Vec<Span>,
+) {
+    // The binder stack runs outer→inner; `stack.last()` is the innermost
+    // scope. Each frame records whether it binds the old and/or new name.
+    // `nearest_is_new`/`nearest_is_old` scan inward-out and stop at the first
+    // frame binding either name — that frame is the one a use resolves to.
+    fn nearest_is_new(stack: &[(bool, bool)]) -> bool {
+        for &(binds_old, binds_new) in stack.iter().rev() {
+            if binds_new {
+                return true;
+            }
+            if binds_old {
+                return false;
+            }
+        }
+        false
+    }
+    fn nearest_is_old(stack: &[(bool, bool)]) -> bool {
+        for &(binds_old, binds_new) in stack.iter().rev() {
+            if binds_old {
+                return true;
+            }
+            if binds_new {
+                return false;
+            }
+        }
+        false
+    }
+    fn walk(
+        expr: &ast::Expr,
+        old_name: &str,
+        new_name: &str,
+        stack: &mut Vec<(bool, bool)>,
+        out: &mut Vec<Span>,
+    ) {
+        match &expr.node {
+            ast::ExprKind::Var(n) => {
+                // A renamed `old_name` use captured by an inner `new_name`
+                // binder, or an existing `new_name` use the renamed binder
+                // would capture — both silently change resolution.
+                if (n == old_name && nearest_is_new(stack))
+                    || (n == new_name && nearest_is_old(stack))
+                {
+                    out.push(expr.span);
+                }
+                return;
+            }
+            ast::ExprKind::Lambda { params, body } => {
+                let binds_old = params.iter().any(|p| pat_binds_name(p, old_name));
+                let binds_new = params.iter().any(|p| pat_binds_name(p, new_name));
+                // Siblings collapsing into one name is a duplicate binder even
+                // with no body use (`\x y -> …` → `\y y -> …`).
+                if binds_old && binds_new {
+                    out.push(expr.span);
+                }
+                stack.push((binds_old, binds_new));
+                walk(body, old_name, new_name, stack, out);
+                stack.pop();
+                return;
+            }
+            ast::ExprKind::Case { scrutinee, arms } => {
+                walk(scrutinee, old_name, new_name, stack, out);
+                for arm in arms {
+                    let binds_old = pat_binds_name(&arm.pat, old_name);
+                    let binds_new = pat_binds_name(&arm.pat, new_name);
+                    if binds_old && binds_new {
+                        out.push(arm.pat.span);
+                    }
+                    stack.push((binds_old, binds_new));
+                    walk(&arm.body, old_name, new_name, stack, out);
+                    stack.pop();
+                }
+                return;
+            }
+            ast::ExprKind::Do(stmts) => {
+                // A `do` bind/let extends the scope for *subsequent* statements
+                // only; its own RHS sees the pre-bind scope. Model each bind as
+                // its own frame pushed in statement order, so a later bind is
+                // "inner" to an earlier one and shadows it.
+                let mut pushed = 0usize;
+                for stmt in stmts {
+                    match &stmt.node {
+                        ast::StmtKind::Bind { pat, expr }
+                        | ast::StmtKind::Let { pat, expr } => {
+                            walk(expr, old_name, new_name, stack, out);
+                            let binds_old = pat_binds_name(pat, old_name);
+                            let binds_new = pat_binds_name(pat, new_name);
+                            if binds_old && binds_new {
+                                out.push(pat.span);
+                            }
+                            stack.push((binds_old, binds_new));
+                            pushed += 1;
+                        }
+                        ast::StmtKind::Where { cond } | ast::StmtKind::Expr(cond) => {
+                            walk(cond, old_name, new_name, stack, out);
+                        }
+                        ast::StmtKind::GroupBy { key } => {
+                            walk(key, old_name, new_name, stack, out);
+                        }
+                    }
+                }
+                for _ in 0..pushed {
+                    stack.pop();
+                }
+                return;
+            }
+            _ => {}
+        }
+        // Non-scope nodes: descend without touching the binder stack.
+        recurse_expr(expr, |child| walk(child, old_name, new_name, stack, out));
+    }
+
+    for decl in &module.decls {
+        match &decl.node {
+            DeclKind::Fun { body: Some(body), .. }
+            | DeclKind::View { body, .. }
+            | DeclKind::Derived { body, .. } => {
+                walk(body, old_name, new_name, &mut Vec::new(), out);
+            }
+            DeclKind::Impl { items, .. } => {
+                for item in items {
+                    if let ast::ImplItem::Method { params, body, .. } = item {
+                        let binds_old = params.iter().any(|p| pat_binds_name(p, old_name));
+                        let binds_new = params.iter().any(|p| pat_binds_name(p, new_name));
+                        if binds_old && binds_new {
+                            out.push(body.span);
+                        }
+                        walk(body, old_name, new_name, &mut vec![(binds_old, binds_new)], out);
+                    }
+                }
+            }
+            DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method {
+                        default_params,
+                        default_body: Some(body),
+                        ..
+                    } = item
+                    {
+                        let binds_old =
+                            default_params.iter().any(|p| pat_binds_name(p, old_name));
+                        let binds_new =
+                            default_params.iter().any(|p| pat_binds_name(p, new_name));
+                        if binds_old && binds_new {
+                            out.push(body.span);
+                        }
+                        walk(body, old_name, new_name, &mut vec![(binds_old, binds_new)], out);
+                    }
+                }
+            }
+            DeclKind::Migrate { using_fn, .. } => {
+                walk(using_fn, old_name, new_name, &mut Vec::new(), out);
+            }
+            _ => {}
         }
     }
 }
@@ -2720,6 +2973,113 @@ mod tests {
             out.replace_range(start..end, text);
         }
         out
+    }
+
+    #[test]
+    fn collect_shadowed_names_flags_inner_capture() {
+        // B71: renaming `x` to `y` in `\x -> \y -> x + y` captures the `x` use
+        // under the inner `\y` binder. `collect_shadowed_names` must report it.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\x -> \\y -> x + y\n");
+        let mut conflicts = Vec::new();
+        collect_shadowed_names(&ws.doc(&uri).module, "x", "y", &mut conflicts);
+        assert!(
+            !conflicts.is_empty(),
+            "capture of `x` by inner `y` binder must be flagged"
+        );
+    }
+
+    #[test]
+    fn collect_shadowed_names_ignores_safe_rename() {
+        // Renaming `x` to a fresh name never bound anywhere is capture-free.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\x -> \\y -> x + y\n");
+        let mut conflicts = Vec::new();
+        collect_shadowed_names(&ws.doc(&uri).module, "x", "z", &mut conflicts);
+        assert!(
+            conflicts.is_empty(),
+            "renaming to an unbound name should not warn; got {conflicts:?}"
+        );
+    }
+
+    #[test]
+    fn collect_shadowed_names_ignores_disjoint_scopes() {
+        // The `y` binder's scope (`\y -> y`) does not enclose the `x` use, so
+        // renaming `x` to `y` here is safe — no false positive.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "g = \\x -> (\\y -> y) + x\n");
+        let mut conflicts = Vec::new();
+        collect_shadowed_names(&ws.doc(&uri).module, "x", "y", &mut conflicts);
+        assert!(
+            conflicts.is_empty(),
+            "disjoint `y` scope must not trigger a capture warning; got {conflicts:?}"
+        );
+    }
+
+    #[test]
+    fn collect_shadowed_names_flags_reverse_capture() {
+        // Renaming the inner `x` to `y` makes the renamed binder capture the
+        // outer `y` reference: `\y -> \x -> y + x` → `\y -> \y -> y + y`.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\y -> \\x -> y + x\n");
+        let mut conflicts = Vec::new();
+        collect_shadowed_names(&ws.doc(&uri).module, "x", "y", &mut conflicts);
+        assert!(
+            !conflicts.is_empty(),
+            "renamed binder capturing the outer `y` use must be flagged"
+        );
+    }
+
+    #[test]
+    fn rename_flags_capture_conflict_for_confirmation() {
+        // End to end: renaming `x` to `y` in the B71 program still produces the
+        // edits (so the rename can proceed) but marks them `needs_confirmation`
+        // via a change annotation, warning the user of the capture.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\x -> \\y -> x + y\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("\\x").expect("outer binder") + 1;
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "y"))
+            .expect("rename still emits edits");
+        let annotations = edit
+            .change_annotations
+            .as_ref()
+            .expect("capture rename must carry a change annotation");
+        assert_eq!(annotations.len(), 1, "one confirmation annotation expected");
+        let annotation = annotations.values().next().unwrap();
+        assert_eq!(
+            annotation.needs_confirmation,
+            Some(true),
+            "the annotation must require user confirmation"
+        );
+        // The edits are still delivered (via both `changes` and the annotated
+        // `document_changes`), so a client that confirms can apply the rename.
+        assert!(edit.changes.is_some(), "changes retained for fallback clients");
+        assert!(
+            matches!(&edit.document_changes, Some(DocumentChanges::Edits(edits)) if !edits.is_empty()),
+            "annotated document_changes must be present"
+        );
+    }
+
+    #[test]
+    fn rename_without_conflict_is_unannotated() {
+        // A capture-free rename returns a plain edit with no confirmation
+        // annotation — the common case is unaffected by the guard.
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "f = \\x -> \\y -> x + y\n");
+        let doc = ws.doc(&uri);
+        let off = doc.source.find("\\x").expect("outer binder") + 1;
+        let pos = offset_to_position(&doc.source, off);
+        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "z"))
+            .expect("rename emits edits");
+        assert!(
+            edit.change_annotations.is_none(),
+            "safe rename must not carry a confirmation annotation"
+        );
+        let changes = edit.changes.expect("changes present");
+        let out = apply_edits(&doc.source, changes.get(&uri).expect("edits"));
+        assert_eq!(out, "f = \\z -> \\y -> z + y\n");
     }
 
     #[test]

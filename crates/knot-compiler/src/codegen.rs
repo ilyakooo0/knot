@@ -4979,7 +4979,9 @@ impl Codegen {
                 arms,
             } => self.compile_case(builder, scrutinee, arms, env, db),
 
-            ast::ExprKind::UnitLit { value, .. } => {
+            // `2 seconds` compiles exactly like its desugared `2 * 1000`.
+            ast::ExprKind::UnitLit { value, .. }
+            | ast::ExprKind::TimeUnitLit { value, .. } => {
                 self.compile_expr(builder, value, env, db)
             }
 
@@ -5388,7 +5390,7 @@ impl Codegen {
                 self.collect_direct_write_targets(inner, out)
             }
             UnaryOp { operand, .. } => self.collect_direct_write_targets(operand, out),
-            UnitLit { value, .. } => self.collect_direct_write_targets(value, out),
+            UnitLit { value, .. } | TimeUnitLit { value, .. } => self.collect_direct_write_targets(value, out),
             Annot { expr: e, .. } => self.collect_direct_write_targets(e, out),
             FieldAccess { expr: e, .. } => self.collect_direct_write_targets(e, out),
             App { func, arg } => {
@@ -7706,6 +7708,7 @@ impl Codegen {
             // Unwrap wrapper expressions to find the do-block inside.
             // E.g. `set *rel = (do { ... } : [T])` wraps the Do in Annot.
             ast::ExprKind::UnitLit { value: inner, .. }
+            | ast::ExprKind::TimeUnitLit { value: inner, .. }
             | ast::ExprKind::Annot { expr: inner, .. } => {
                 self.compile_set_value_expr(builder, inner, env, db)
             }
@@ -7835,7 +7838,7 @@ impl Codegen {
             // they don't produce IO even if they contain IO values as
             // subexpressions. A function like `f x = {result: println x}`
             // returns a record, not IO.
-            ast::ExprKind::UnitLit { value, .. } => Self::expr_contains_io(value, builtins, io_fns),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => Self::expr_contains_io(value, builtins, io_fns),
             ast::ExprKind::Annot { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
             ast::ExprKind::Refine(inner) => Self::expr_contains_io(inner, builtins, io_fns),
             ast::ExprKind::Record(_)
@@ -8048,7 +8051,7 @@ impl Codegen {
                 Self::expr_contains_writes(scrutinee, write_fns, known_fns, passthrough_fns)
                     || arms.iter().any(|arm| Self::expr_contains_writes(&arm.body, write_fns, known_fns, passthrough_fns))
             }
-            ast::ExprKind::UnitLit { value, .. } => Self::expr_contains_writes(value, write_fns, known_fns, passthrough_fns),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => Self::expr_contains_writes(value, write_fns, known_fns, passthrough_fns),
             ast::ExprKind::Annot { expr, .. } => Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns),
             ast::ExprKind::Refine(inner) => Self::expr_contains_writes(inner, write_fns, known_fns, passthrough_fns),
             ast::ExprKind::Record(fields) => fields
@@ -8108,7 +8111,7 @@ impl Codegen {
                 })
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io(body),
-            ast::ExprKind::UnitLit { value, .. } => self.expr_is_io(value),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.expr_is_io(value),
             ast::ExprKind::Annot { expr, .. } => self.expr_is_io(expr),
             ast::ExprKind::Refine(inner) => self.expr_is_io(inner),
             _ => false,
@@ -8210,7 +8213,7 @@ impl Codegen {
                 })
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_has_external_io(body),
-            ast::ExprKind::UnitLit { value, .. } => self.expr_has_external_io(value),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.expr_has_external_io(value),
             ast::ExprKind::Annot { expr, .. } => self.expr_has_external_io(expr),
             ast::ExprKind::Refine(inner) => self.expr_has_external_io(inner),
             _ => false,
@@ -10591,7 +10594,7 @@ impl Codegen {
                     || Self::references_source(value, source_name)
             }
             ast::ExprKind::Atomic(inner) => Self::references_source(inner, source_name),
-            ast::ExprKind::UnitLit { value, .. } => Self::references_source(value, source_name),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => Self::references_source(value, source_name),
             ast::ExprKind::Annot { expr, .. } => Self::references_source(expr, source_name),
             ast::ExprKind::Refine(inner) => Self::references_source(inner, source_name),
             ast::ExprKind::Serve { handlers, .. } => handlers
@@ -13011,7 +13014,7 @@ fn expr_has_user_calls(expr: &ast::Expr, user_fns: &HashMap<String, (FuncId, usi
         ast::ExprKind::FieldAccess { expr, .. } => expr_has_user_calls(expr, user_fns),
         ast::ExprKind::Lambda { body, .. } => expr_has_user_calls(body, user_fns),
         ast::ExprKind::Annot { expr, .. } => expr_has_user_calls(expr, user_fns),
-        ast::ExprKind::UnitLit { value, .. } => expr_has_user_calls(value, user_fns),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => expr_has_user_calls(value, user_fns),
         ast::ExprKind::Refine(inner) => expr_has_user_calls(inner, user_fns),
         ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
             ast::StmtKind::Bind { expr, .. } => expr_has_user_calls(expr, user_fns),
@@ -13063,7 +13066,7 @@ fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
                     .iter()
                     .any(|f| expr_references_var(&f.value, var_name))
         }
-        ast::ExprKind::UnitLit { value, .. } => expr_references_var(value, var_name),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => expr_references_var(value, var_name),
         ast::ExprKind::Annot { expr, .. } => expr_references_var(expr, var_name),
         ast::ExprKind::Refine(inner) => expr_references_var(inner, var_name),
         // Conservatively return true for complex expressions
@@ -13172,7 +13175,7 @@ fn expr_contains_if(expr: &ast::Expr) -> bool {
         }
         ast::ExprKind::FieldAccess { expr: inner, .. } => expr_contains_if(inner),
         ast::ExprKind::Annot { expr: inner, .. } => expr_contains_if(inner),
-        ast::ExprKind::UnitLit { value, .. } => expr_contains_if(value),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => expr_contains_if(value),
         _ => false,
     }
 }
@@ -14152,7 +14155,7 @@ fn beta_reduce_inner(
         // we keep them unchanged: SQL pushdown never sees these inside the
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | Case { .. } | Do(_)
-        | Set { .. } | ReplaceSet { .. } | Atomic(_) | UnitLit { .. }
+        | Set { .. } | ReplaceSet { .. } | Atomic(_) | UnitLit { .. } | TimeUnitLit { .. }
         | Annot { .. } | Refine(_) | Serve { .. } => return expr.clone(),
     };
     ast::Spanned { node: new_node, span }
@@ -14246,6 +14249,10 @@ fn substitute_inner(
             value: Box::new(substitute_inner(v, var, value, value_fv)?),
             unit: unit.clone(),
         },
+        TimeUnitLit { value: v, unit_name } => TimeUnitLit {
+            value: Box::new(substitute_inner(v, var, value, value_fv)?),
+            unit_name: unit_name.clone(),
+        },
         Annot { expr: e, ty } => Annot {
             expr: Box::new(substitute_inner(e, var, value, value_fv)?),
             ty: ty.clone(),
@@ -14318,7 +14325,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
             expr_mentions_var(target, var) || expr_mentions_var(value, var)
         }
         Atomic(inner) | Refine(inner) => expr_mentions_var(inner, var),
-        UnitLit { value, .. } => expr_mentions_var(value, var),
+        UnitLit { value, .. } | TimeUnitLit { value, .. } => expr_mentions_var(value, var),
         Annot { expr: e, .. } => expr_mentions_var(e, var),
         Serve { handlers, .. } => {
             handlers.iter().any(|h| expr_mentions_var(&h.body, var))
@@ -14380,7 +14387,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             collect_free_vars_set(then_branch, bound, free);
             collect_free_vars_set(else_branch, bound, free);
         }
-        UnitLit { value: v, .. } => collect_free_vars_set(v, bound, free),
+        UnitLit { value: v, .. } | TimeUnitLit { value: v, .. } => collect_free_vars_set(v, bound, free),
         Annot { expr: e, .. } => collect_free_vars_set(e, bound, free),
         Refine(e) => collect_free_vars_set(e, bound, free),
         Serve { handlers, .. } => {
@@ -15366,7 +15373,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
             expr_contains_derived_ref(target, name) || expr_contains_derived_ref(value, name)
         }
-        ast::ExprKind::UnitLit { value, .. } => expr_contains_derived_ref(value, name),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => expr_contains_derived_ref(value, name),
         ast::ExprKind::Annot { expr, .. } => expr_contains_derived_ref(expr, name),
         ast::ExprKind::Refine(inner) => expr_contains_derived_ref(inner, name),
         ast::ExprKind::Serve { handlers, .. } => handlers
@@ -15520,7 +15527,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::Atomic(inner) => {
             collect_free_vars(inner, bound, free);
         }
-        ast::ExprKind::UnitLit { value, .. } => {
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => {
             collect_free_vars(value, bound, free);
         }
         ast::ExprKind::Annot { expr, .. } => {
@@ -15650,7 +15657,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
             expr_refs_var(target, var) || expr_refs_var(value, var)
         }
         ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => expr_refs_var(inner, var),
-        ast::ExprKind::UnitLit { value, .. } => expr_refs_var(value, var),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => expr_refs_var(value, var),
         ast::ExprKind::Annot { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::Serve { handlers, .. } => {
             handlers.iter().any(|h| expr_refs_var(&h.body, var))
@@ -15693,7 +15700,7 @@ pub(crate) enum SqlCastMode {
 fn strip_expr_wrappers(expr: &ast::Expr) -> &ast::Expr {
     match &expr.node {
         ast::ExprKind::Annot { expr: inner, .. } => strip_expr_wrappers(inner),
-        ast::ExprKind::UnitLit { value, .. } => strip_expr_wrappers(value),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => strip_expr_wrappers(value),
         _ => expr,
     }
 }
@@ -15987,7 +15994,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
             )
         }
         ast::ExprKind::Atomic(e) => format!("atomic ({})", pretty_expr(e)),
-        ast::ExprKind::UnitLit { value, .. } => pretty_expr(value),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => pretty_expr(value),
         ast::ExprKind::Annot { expr, .. } => pretty_expr(expr),
         ast::ExprKind::Refine(inner) => format!("refine {}", pretty_expr(inner)),
         ast::ExprKind::Serve { api, handlers, .. } => {

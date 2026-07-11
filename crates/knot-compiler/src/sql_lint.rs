@@ -900,13 +900,10 @@ fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
 /// arithmetic expression. (LENGTH() is no longer pushed down, so App
 /// expressions never need the cast here.)
 fn atom_would_need_cast(expr: &Expr) -> bool {
-    match &expr.node {
-        ExprKind::BinOp {
-            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat,
-            ..
-        } => true,
-        _ => false,
-    }
+    matches!(&expr.node, ExprKind::BinOp {
+        op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat,
+        ..
+    })
 }
 
 /// Look up a column's schema type. Delegates to codegen's

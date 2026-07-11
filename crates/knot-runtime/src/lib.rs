@@ -16193,20 +16193,47 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 /// `Nothing` serializes as `null`, `Just x` serializes as `x`'s JSON.
 /// Used for everything user-facing (toJson, HTTP request/response bodies).
 fn value_to_json(v: *mut Value) -> String {
-    serde_json::to_string(&value_to_serde_json(v)).unwrap_or_else(|_| "null".to_string())
+    let mut out = String::new();
+    write_value_json(v, true, &mut out);
+    out
 }
 
 /// Storage JSON encoding: `Maybe` keeps the `__knot_ctor` marker so SQLite
 /// JSON columns round-trip constructors faithfully (the schema-less DB read
 /// path can't Just-wrap bare values, and existing databases hold the marker).
 fn value_to_json_db(v: *mut Value) -> String {
-    serde_json::to_string(&value_to_serde_json_impl(v, false))
-        .unwrap_or_else(|_| "null".to_string())
+    let mut out = String::new();
+    write_value_json(v, false, &mut out);
+    out
 }
 
-/// Convert a Knot *mut Value into a serde_json::Value (wire encoding).
-fn value_to_serde_json(v: *mut Value) -> serde_json::Value {
-    value_to_serde_json_impl(v, true)
+/// Append `s` as a quoted, escaped JSON string.
+///
+/// The common case (no escapes needed) copies straight through; anything else
+/// defers to serde_json so the escaping stays byte-identical to the JSON this
+/// runtime used to emit. Bytes >= 0x20 need no escaping except `"` and `\`,
+/// and every UTF-8 continuation byte is >= 0x80, so the fast-path scan is safe
+/// on non-ASCII text.
+fn push_json_string(out: &mut String, s: &str) {
+    if s.bytes().all(|b| b >= 0x20 && b != b'"' && b != b'\\') {
+        out.push('"');
+        out.push_str(s);
+        out.push('"');
+    } else {
+        match serde_json::to_string(s) {
+            Ok(escaped) => out.push_str(&escaped),
+            Err(_) => out.push_str("\"\""),
+        }
+    }
+}
+
+/// Append a finite `f64` in JSON's number syntax. Goes through serde_json so
+/// floats format exactly as before (`3.0`, not Rust's `3`).
+fn push_json_float(out: &mut String, n: f64) {
+    match serde_json::to_string(&n) {
+        Ok(s) => out.push_str(&s),
+        Err(_) => out.push_str("null"),
+    }
 }
 
 /// True when a constructor value is the built-in `Nothing {}` (nullary tag
@@ -16233,41 +16260,52 @@ fn just_ctor_value(tag: &str, payload: *mut Value) -> Option<*mut Value> {
     }
 }
 
-fn value_to_serde_json_impl(v: *mut Value, wire: bool) -> serde_json::Value {
-    use serde_json::Value as Json;
+/// Write `v`'s JSON encoding into `out`. `wire` selects the Maybe convention
+/// (see `value_to_json` / `value_to_json_db`).
+///
+/// Iterative pre-order writer over an explicit work stack, emitting JSON text
+/// straight into `out`. A deeply right-nested Constructor/Record spine — e.g. a
+/// 200k-element `Cons`-list stored as Constructor→Record→Constructor→… — drives
+/// one native frame per level through *any* recursive walk, and SIGSEGV's on
+/// Rust's default 8MB stack. That includes the intermediate `serde_json::Value`
+/// tree this used to build: even with an iterative builder, `serde_json`'s
+/// serializer (and the tree's own `Drop`) recurse per level. Writing text
+/// directly removes the tree, so no step of the encode is depth-sensitive. The
+/// sibling eq/hash/compare and `show` paths use the same work-stack technique.
+///
+/// Compound values push their closing punctuation (and any separators) as
+/// `Lit` jobs *before* their children, so popping the stack replays the JSON in
+/// order.
+fn write_value_json(v: *mut Value, wire: bool, out: &mut String) {
+    use std::fmt::Write;
 
-    // Iterative post-order builder over an explicit work stack. A deeply
-    // right-nested Constructor/Record spine — e.g. a 100k-element `Cons`-list
-    // stored as Constructor→Record→Constructor→… — previously drove one native
-    // frame per level through the direct `value_to_serde_json_impl(*payload)`
-    // recursion and SIGSEGV'd on Rust's default 8MB stack. The sibling
-    // eq/hash/compare and `show` paths use this same technique. Leaves push a
-    // finished `Json` onto `results`; compound kinds push a `Finish*` marker
-    // plus child `Emit` jobs, and the marker folds the children (already on
-    // `results`) into the parent. Every `Emit` job nets exactly one `results`
-    // entry, so a `Finish*` marker always finds its children on top.
     enum Job {
         Emit(*mut Value),
-        FinishRecord(Vec<Arc<str>>), // field names, in source order
-        FinishRelation(usize),       // row count
-        FinishCtor(Arc<str>),        // constructor tag
+        Lit(&'static str), // punctuation: separator or closer
+        Key(Arc<str>),     // record field name, written as `"name":`
     }
 
     let mut work: Vec<Job> = vec![Job::Emit(v)];
-    let mut results: Vec<Json> = Vec::new();
 
     while let Some(job) = work.pop() {
         match job {
+            Job::Lit(s) => out.push_str(s),
+            Job::Key(name) => {
+                push_json_string(out, &name);
+                out.push(':');
+            }
             Job::Emit(v) => {
                 if v.is_null() {
-                    results.push(Json::Null);
+                    out.push_str("null");
                     continue;
                 }
                 match unsafe { as_ref(v) } {
-                    Value::Int(n) => results.push(Json::Number((*n).into())),
+                    Value::Int(n) => {
+                        let _ = write!(out, "{}", n);
+                    }
                     Value::Float(n) => {
                         if n.is_finite() {
-                            results.push(serde_json::json!(*n));
+                            push_json_float(out, *n);
                         } else if wire {
                             // JSON has no representation for NaN/±Infinity. On the
                             // HTTP wire path encode them as `null` (matching JS
@@ -16276,7 +16314,7 @@ fn value_to_serde_json_impl(v: *mut Value, wire: bool) -> serde_json::Value {
                             // *outside* the handler's `catch_unwind`, so a panic
                             // here would crash the worker thread and drop the
                             // connection with no response.
-                            results.push(Json::Null);
+                            out.push_str("null");
                         } else {
                             // Storage path (`value_to_json_db`): a non-finite
                             // Float in a JSON column would round-trip Float →
@@ -16291,27 +16329,36 @@ fn value_to_serde_json_impl(v: *mut Value, wire: bool) -> serde_json::Value {
                             );
                         }
                     }
-                    Value::Text(s) => results.push(Json::String((**s).to_string())),
-                    Value::Bool(b) => results.push(Json::Bool(*b)),
+                    Value::Text(s) => push_json_string(out, s),
+                    Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
                     Value::Bytes(b) => {
-                        let mut map = serde_json::Map::with_capacity(1);
-                        map.insert("__knot_bytes".into(), Json::String(base64_encode(b)));
-                        results.push(Json::Object(map));
+                        out.push_str("{\"__knot_bytes\":");
+                        push_json_string(out, &base64_encode(b));
+                        out.push('}');
                     }
-                    Value::Unit => results.push(Json::Null),
+                    Value::Unit => out.push_str("null"),
                     Value::Record(fields) => {
-                        // Push Finish then child Emits in reverse so children pop
-                        // in forward order and land on `results` in field order.
-                        let names: Vec<Arc<str>> = fields.iter().map(|f| f.name.clone()).collect();
-                        work.push(Job::FinishRecord(names));
-                        for f in fields.iter().rev() {
+                        // Fields are already sorted by name (the invariant
+                        // `knot_record_field`'s binary search relies on), which is
+                        // also the order serde_json's BTreeMap-backed `Map` emitted.
+                        out.push('{');
+                        work.push(Job::Lit("}"));
+                        for (i, f) in fields.iter().enumerate().rev() {
                             work.push(Job::Emit(f.value));
+                            work.push(Job::Key(f.name.clone()));
+                            if i > 0 {
+                                work.push(Job::Lit(","));
+                            }
                         }
                     }
                     Value::Relation(rows) => {
-                        work.push(Job::FinishRelation(rows.len()));
-                        for r in rows.iter().rev() {
+                        out.push('[');
+                        work.push(Job::Lit("]"));
+                        for (i, r) in rows.iter().enumerate().rev() {
                             work.push(Job::Emit(*r));
+                            if i > 0 {
+                                work.push(Job::Lit(","));
+                            }
                         }
                     }
                     Value::Constructor(tag, payload) => {
@@ -16321,7 +16368,7 @@ fn value_to_serde_json_impl(v: *mut Value, wire: bool) -> serde_json::Value {
                         // convention.)
                         if wire {
                             if is_nothing_ctor(tag, *payload) {
-                                results.push(Json::Null);
+                                out.push_str("null");
                                 continue;
                             }
                             if let Some(inner) = just_ctor_value(tag, *payload) {
@@ -16332,44 +16379,21 @@ fn value_to_serde_json_impl(v: *mut Value, wire: bool) -> serde_json::Value {
                         // Wrap in `__knot_ctor` so parseJson can reconstruct
                         // without colliding with user records that happen to use
                         // `tag`/`value` keys.
-                        work.push(Job::FinishCtor(tag.clone()));
+                        out.push_str("{\"__knot_ctor\":{\"tag\":");
+                        push_json_string(out, tag);
+                        out.push_str(",\"value\":");
+                        work.push(Job::Lit("}}"));
                         work.push(Job::Emit(*payload));
                     }
                     Value::Function(f) => {
-                        results.push(Json::String(format!("<function: {}>", &*f.source)))
+                        push_json_string(out, &format!("<function: {}>", &*f.source))
                     }
-                    Value::IO(_, _) => results.push(Json::String("<<IO>>".into())),
-                    Value::Pair(_, _) => results.push(Json::String("<<Pair>>".into())),
+                    Value::IO(_, _) => out.push_str("\"<<IO>>\""),
+                    Value::Pair(_, _) => out.push_str("\"<<Pair>>\""),
                 }
-            }
-            Job::FinishRecord(names) => {
-                let start = results.len() - names.len();
-                let children = results.split_off(start); // forward (field) order
-                let mut map = serde_json::Map::with_capacity(names.len());
-                for (name, child) in names.iter().zip(children) {
-                    map.insert(name.to_string(), child);
-                }
-                results.push(Json::Object(map));
-            }
-            Job::FinishRelation(n) => {
-                let start = results.len() - n;
-                let children = results.split_off(start); // forward (row) order
-                results.push(Json::Array(children));
-            }
-            Job::FinishCtor(tag) => {
-                let payload_json = results.pop().expect("ctor payload result");
-                let mut inner = serde_json::Map::with_capacity(2);
-                inner.insert("tag".into(), Json::String(tag.to_string()));
-                inner.insert("value".into(), payload_json);
-                let mut map = serde_json::Map::with_capacity(1);
-                map.insert("__knot_ctor".into(), Json::Object(inner));
-                results.push(Json::Object(map));
             }
         }
     }
-
-    debug_assert_eq!(results.len(), 1, "value_to_serde_json_impl must produce one root value");
-    results.pop().unwrap_or(Json::Null)
 }
 
 /// Call the compiled toJson dispatcher for a sub-value, returning the JSON string.
@@ -18111,25 +18135,29 @@ fn fetch_build_url(base: &str, path_pattern: &str, payload: *mut Value) -> Strin
 
 /// Build a JSON body string from a field descriptor and record payload.
 fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
-    let mut map = serde_json::Map::new();
+    let mut fields: Vec<(String, String)> = Vec::new();
     // Bracket-aware split: field types can be structural (`addr:{city:text}`).
     for (name, ty) in parse_descriptor(body_desc) {
         let is_maybe = ty.starts_with('?');
         // An enum-like (all-nullary ADT) field carries the `tag` descriptor.
         // It must serialize as a bare JSON string (e.g. `"Active"`) — the
         // server's `tag` decode arm only accepts a string. Using the generic
-        // `value_to_serde_json` here would emit the `{"__knot_ctor":...}`
-        // storage marker, which the server rejects with HTTP 400.
+        // `value_to_json` here would emit the `{"__knot_ctor":...}` storage
+        // marker, which the server rejects with HTTP 400.
         let bare_ty = ty.strip_prefix('?').unwrap_or(&ty);
         let is_tag = bare_ty == "tag";
-        let encode = |v: *mut Value| -> serde_json::Value {
+        let encode = |v: *mut Value| -> String {
             if is_tag {
                 match fetch_value_to_text_opt(v) {
-                    Some(s) => serde_json::Value::String(s),
-                    None => serde_json::Value::Null,
+                    Some(s) => {
+                        let mut out = String::new();
+                        push_json_string(&mut out, &s);
+                        out
+                    }
+                    None => "null".to_string(),
                 }
             } else {
-                value_to_serde_json(v)
+                value_to_json(v)
             }
         };
         let field_val = knot_record_field(payload, name.as_ptr(), name.len());
@@ -18139,13 +18167,26 @@ fn fetch_build_body(body_desc: &str, payload: *mut Value) -> String {
             // both an absent Maybe field and an explicit `null` as
             // Nothing, so omission is the lighter equivalent.
             if let Some(inner) = unwrap_maybe(field_val) {
-                map.insert(name.to_string(), encode(inner));
+                fields.push((name.to_string(), encode(inner)));
             }
         } else {
-            map.insert(name.to_string(), encode(field_val));
+            fields.push((name.to_string(), encode(field_val)));
         }
     }
-    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+    // Emit in sorted-key order: this used to build a `serde_json::Map`, which is
+    // a BTreeMap, so that is the ordering the wire format has always had.
+    fields.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut out = String::from("{");
+    for (i, (name, json)) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(&mut out, name);
+        out.push(':');
+        out.push_str(json);
+    }
+    out.push('}');
+    out
 }
 
 /// Build a query string from a field descriptor and record payload.

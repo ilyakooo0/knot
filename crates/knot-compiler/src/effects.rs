@@ -2443,17 +2443,19 @@ fn extract_effects(ty: &ast::Type) -> Option<EffectSet> {
 /// Per-declaration effect information: maps declaration names to their inferred effects.
 pub type EffectInfo = HashMap<String, EffectSet>;
 
+/// Runs on a grown stack — the effect walker recurses through the `__bind`
+/// chain a desugared `do` block expands into.
 pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
-    let mut checker = EffectChecker::new();
-    checker.run(module);
-    checker.diagnostics
+    check_with_effects(module).0
 }
 
 /// Like `check` but also returns per-declaration effect information.
 pub fn check_with_effects(module: &ast::Module) -> (Vec<Diagnostic>, EffectInfo) {
-    let mut checker = EffectChecker::new();
-    checker.run(module);
-    (checker.diagnostics, checker.decl_effects)
+    crate::stack::grow(|| {
+        let mut checker = EffectChecker::new();
+        checker.run(module);
+        (checker.diagnostics, checker.decl_effects)
+    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────

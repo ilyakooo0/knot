@@ -85,6 +85,29 @@ fn enforce_import_cache_cap(cache: &mut ImportCache) {
     }
 }
 
+/// LRU eviction for `InferenceCache`. Drops the least-recently-accessed
+/// entries until the cache is back under `MAX_INFERENCE_CACHE_ENTRIES`.
+/// The in-place insertion path (`analyze_document`) evicts before it inserts,
+/// but merge-back in `analysis_worker` only inserts into the shared cache and
+/// never evicts, so the shared map grew unbounded across a long session (each
+/// task then clones the whole map, driving RSS and per-keystroke latency up).
+/// Mirrors `enforce_import_cache_cap` so growth stays bounded regardless of
+/// which path inserts.
+fn enforce_inference_cache_cap(cache: &mut InferenceCache) {
+    while cache.len() > MAX_INFERENCE_CACHE_ENTRIES {
+        let victim = cache
+            .iter()
+            .min_by_key(|(_, s)| s.access_clock)
+            .map(|(k, _)| k.clone());
+        match victim {
+            Some(k) => {
+                cache.remove(&k);
+            }
+            None => break,
+        }
+    }
+}
+
 /// Extract a `<unit>` annotation from a formatted local type string. Returns
 /// `None` for dimensionless types or types without unit info.
 fn extract_unit_from_local_type(ty: &str) -> Option<String> {
@@ -239,6 +262,11 @@ pub fn analysis_worker(
                             shared.entry(k).or_insert(v);
                         }
                     }
+                    // Merge-back only inserts, so the shared inference cache
+                    // could drift over the cap the same way the import cache
+                    // did. Re-enforce the LRU cap here so growth stays bounded
+                    // across sessions regardless of which path inserts.
+                    enforce_inference_cache_cap(&mut shared);
                 }
             }
 
@@ -507,8 +535,28 @@ pub fn analyze_document(
 
         let mut analysis_module = module.clone();
 
+        // Byte ranges in the inlined module that come from *imported* files.
+        // `resolve_imports` prepends copies of imported declarations whose
+        // spans index a *different* file's source. A diagnostic anchored in
+        // one of those foreign spans can, by numeric coincidence, fall inside
+        // one of this file's own decl spans and slip past `anchored_in_user`
+        // as a phantom squiggle. Recording the imported spans lets the filter
+        // reject any diagnostic whose label lands in foreign content, since a
+        // foreign label points into the same coordinate space as the imported
+        // decl it belongs to.
+        let mut imported_regions: Vec<Span> = Vec::new();
         if let Some(path) = uri_to_path(uri) {
+            // Count this file's own decls before inlining; `resolve_imports`
+            // prepends imported decls, leaving the own decls as the trailing
+            // entries (see `modules::resolve_recursive`). The prefix is
+            // therefore exactly the inlined imported content.
+            let own_decl_count = module.decls.len();
             let _ = knot_compiler::modules::resolve_imports(&mut analysis_module, &path);
+            let imported_count = analysis_module.decls.len().saturating_sub(own_decl_count);
+            imported_regions = analysis_module.decls[..imported_count]
+                .iter()
+                .map(|d| d.span)
+                .collect();
         }
 
         knot_compiler::base::inject_prelude(&mut analysis_module);
@@ -530,17 +578,23 @@ pub fn analyze_document(
         // (`module` is the pre-injection parse of this file). Mirrors
         // `workspace_diagnostics`' `anchored_in_importer` filter.
         let user_decl_spans: Vec<Span> = module.decls.iter().map(|d| d.span).collect();
-        let in_user_decl = |s: &Span| {
-            user_decl_spans
+        // A span that lands inside an imported decl's range belongs to foreign
+        // content, even when it *also* numerically falls inside a user decl
+        // span. Treat imported-region membership as the decisive signal so a
+        // foreign span never counts as "in the user's source".
+        let in_imported_region = |s: &Span| {
+            imported_regions
                 .iter()
-                .any(|d| d.start <= s.start && s.end <= d.end)
+                .any(|r| r.start <= s.start && s.end <= r.end)
+        };
+        let in_user_decl = |s: &Span| {
+            !in_imported_region(s)
+                && user_decl_spans
+                    .iter()
+                    .any(|d| d.start <= s.start && s.end <= d.end)
         };
         let anchored_in_user = |d: &Diagnostic| -> bool {
-            d.labels.iter().any(|l| {
-                user_decl_spans
-                    .iter()
-                    .any(|u| u.start <= l.span.start && l.span.end <= u.end)
-            })
+            d.labels.iter().any(|l| in_user_decl(&l.span))
         };
 
         let (
@@ -1150,6 +1204,54 @@ mod tests {
         let min_surviving = cache
             .values()
             .map(|e| e.access_clock)
+            .min()
+            .unwrap_or_default();
+        assert!(
+            min_surviving >= 10,
+            "expected the 10 oldest entries to be evicted; min surviving clock is {min_surviving}"
+        );
+    }
+
+    #[test]
+    fn inference_cache_cap_evicts_least_recently_used() {
+        // Regression for B76: merge-back only inserted into the shared
+        // inference cache and never evicted, so it grew unbounded. Insert
+        // beyond the cap, then verify `enforce_inference_cache_cap` keeps only
+        // the freshest `MAX_INFERENCE_CACHE_ENTRIES` entries.
+        use crate::state::InferenceSnapshot;
+
+        let mut cache: InferenceCache = HashMap::new();
+        for i in 0..MAX_INFERENCE_CACHE_ENTRIES + 10 {
+            let key = (PathBuf::from(format!("/tmp/inf{i}.knot")), i as u64);
+            cache.insert(
+                key,
+                InferenceSnapshot {
+                    diagnostics: Vec::new(),
+                    type_info: HashMap::new(),
+                    local_type_info: HashMap::new(),
+                    effect_info: HashMap::new(),
+                    effect_sets: HashMap::new(),
+                    refined_types: HashMap::new(),
+                    refine_targets: HashMap::new(),
+                    source_refinements: HashMap::new(),
+                    monad_info: HashMap::new(),
+                    unit_info: HashMap::new(),
+                    fingerprint: ModuleFingerprint {
+                        decl_hashes: HashMap::new(),
+                        decl_signature_hashes: HashMap::new(),
+                        decl_deps: HashMap::new(),
+                        structure_hash: 0,
+                    },
+                    access_clock: i as u64,
+                },
+            );
+        }
+        enforce_inference_cache_cap(&mut cache);
+        assert_eq!(cache.len(), MAX_INFERENCE_CACHE_ENTRIES);
+        // The oldest 10 entries (clocks 0..9) should be the ones evicted.
+        let min_surviving = cache
+            .values()
+            .map(|s| s.access_clock)
             .min()
             .unwrap_or_default();
         assert!(

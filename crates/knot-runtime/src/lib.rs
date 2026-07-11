@@ -7493,59 +7493,102 @@ pub extern "C-unwind" fn knot_guard_failed() {
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
-    fn show_inner(v: *mut Value) -> String {
-        if v.is_null() {
-            return "null".to_string();
-        }
-        match unsafe { as_ref(v) } {
-            Value::Int(n) => n.to_string(),
-            Value::Float(n) => {
-                if n.is_nan() || n.is_infinite() {
-                    format!("{}", n)
-                } else if n.fract() == 0.0 {
-                    format!("{:.1}", n)
-                } else {
-                    n.to_string()
+    // Iterative rendering over an explicit work stack. A deeply right-nested
+    // ADT spine — e.g. a 100k-element list `Cons 0 (Cons 1 … Nil)`, stored as
+    // Constructor→Record→Constructor→… — previously drove one native frame per
+    // level through the recursive `show_inner` payload path and SIGSEGV'd on
+    // Rust's default 8MB stack around 100k deep. The sibling `values_equal`
+    // and `value_to_hash_bytes` paths were already converted to this same
+    // work-stack technique; the output here is byte-for-byte identical to the
+    // former recursive formulation. Note the Constructor case can only avoid
+    // the deep recursion if the intermediate `Record` (which holds the spine's
+    // `tail`) is traversed through the stack too — hence every compound kind
+    // pushes its children as tasks rather than recursing.
+    enum Task {
+        // Render this value: append leaves directly, or push child `Render`
+        // tasks (interleaved with `Lit` punctuation) for compound kinds.
+        Render(*mut Value),
+        // Emit a ready-made literal (braces, separators, field names, tags),
+        // letting us wrap structure around child renders without recursing.
+        Lit(String),
+    }
+
+    let mut out = String::new();
+    let mut stack: Vec<Task> = vec![Task::Render(v)];
+    while let Some(task) = stack.pop() {
+        match task {
+            Task::Lit(s) => out.push_str(&s),
+            Task::Render(v) => {
+                if v.is_null() {
+                    out.push_str("null");
+                    continue;
+                }
+                match unsafe { as_ref(v) } {
+                    Value::Int(n) => out.push_str(&n.to_string()),
+                    Value::Float(n) => {
+                        if n.is_nan() || n.is_infinite() {
+                            out.push_str(&format!("{}", n));
+                        } else if n.fract() == 0.0 {
+                            out.push_str(&format!("{:.1}", n));
+                        } else {
+                            out.push_str(&n.to_string());
+                        }
+                    }
+                    Value::Text(s) => out.push_str(s),
+                    Value::Bytes(b) => {
+                        use std::fmt::Write;
+                        for byte in b.iter() {
+                            let _ = write!(out, "{:02x}", byte);
+                        }
+                    }
+                    Value::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
+                    Value::Unit => out.push_str("{}"),
+                    Value::Record(fields) => {
+                        // {name: v, name: v} — push in reverse so tasks pop in
+                        // forward (source) order.
+                        stack.push(Task::Lit("}".to_string()));
+                        for (i, f) in fields.iter().enumerate().rev() {
+                            stack.push(Task::Render(f.value));
+                            let sep = if i == 0 {
+                                format!("{}: ", f.name)
+                            } else {
+                                format!(", {}: ", f.name)
+                            };
+                            stack.push(Task::Lit(sep));
+                        }
+                        stack.push(Task::Lit("{".to_string()));
+                    }
+                    Value::Relation(rows) => {
+                        stack.push(Task::Lit("]".to_string()));
+                        for (i, r) in rows.iter().enumerate().rev() {
+                            stack.push(Task::Render(*r));
+                            if i != 0 {
+                                stack.push(Task::Lit(", ".to_string()));
+                            }
+                        }
+                        stack.push(Task::Lit("[".to_string()));
+                    }
+                    Value::Constructor(tag, payload) => {
+                        // Nullary payload (`Unit` or empty `Record`) renders as
+                        // `tag {}` — exactly the former `p == "{}"` check, made
+                        // structural so the payload string isn't materialized
+                        // first and the spine's tail never recurses.
+                        if !payload.is_null() && is_nullary_payload(*payload) {
+                            out.push_str(tag);
+                            out.push_str(" {}");
+                        } else {
+                            stack.push(Task::Render(*payload));
+                            stack.push(Task::Lit(format!("{} ", tag)));
+                        }
+                    }
+                    Value::Function(f) => out.push_str(&f.source),
+                    Value::IO(_, _) => out.push_str("<<IO>>"),
+                    Value::Pair(_, _) => out.push_str("<<Pair>>"),
                 }
             }
-            Value::Text(s) => (**s).to_string(),
-            Value::Bytes(b) => {
-                let mut hex = String::with_capacity(b.len() * 2);
-                for byte in b.iter() {
-                    use std::fmt::Write;
-                    let _ = write!(hex, "{:02x}", byte);
-                }
-                hex
-            }
-            Value::Bool(b) => {
-                if *b { "True".to_string() } else { "False".to_string() }
-            }
-            Value::Unit => "{}".to_string(),
-            Value::Record(fields) => {
-                let inner: Vec<String> = fields
-                    .iter()
-                    .map(|f| format!("{}: {}", f.name, show_inner(f.value)))
-                    .collect();
-                format!("{{{}}}", inner.join(", "))
-            }
-            Value::Relation(rows) => {
-                let inner: Vec<String> = rows.iter().map(|r| show_inner(*r)).collect();
-                format!("[{}]", inner.join(", "))
-            }
-            Value::Constructor(tag, payload) => {
-                let p = show_inner(*payload);
-                if p == "{}" {
-                    format!("{} {{}}", tag)
-                } else {
-                    format!("{} {}", tag, p)
-                }
-            }
-            Value::Function(f) => f.source.to_string(),
-            Value::IO(_, _) => "<<IO>>".to_string(),
-            Value::Pair(_, _) => "<<Pair>>".to_string(),
         }
     }
-    alloc(Value::Text(Arc::from(show_inner(v))))
+    alloc(Value::Text(Arc::from(out)))
 }
 
 // ── IO monad ─────────────────────────────────────────────────────
@@ -8245,13 +8288,39 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
         // Wait for an outcome — but don't join the loser.  The loser runs
         // to its next safe point in the background, tracked by
         // ACTIVE_FORKS for the program-exit join.
-        let g = state.lock().unwrap_or_else(|e| e.into_inner());
-        let g = cvar.wait_while(g, |s| s.outcome.is_none()).unwrap_or_else(|e| e.into_inner());
-        let outcome = match g.outcome.as_ref().cloned() {
-            Some(o) => o,
-            None => panic!("knot runtime: race: both workers panicked before producing an outcome"),
+        //
+        // Poll on a timeout instead of an unbounded `wait_while`: this
+        // parent may itself be a worker of an *enclosing* race, in which
+        // case its thread carries that outer race's `CancelToken`. That
+        // token's `cancel()` wakes the token's own condvar, not this local
+        // `cvar`, so an unbounded wait here would never observe outer
+        // cancellation — stranding the inner workers and blocking program
+        // exit (e.g. `race x (race (sleep huge) (sleep huge))` resolves
+        // instantly yet `knot_threads_join` would wait out the sleeps).
+        // Between waits we consult this thread's own cancel token; when it
+        // fires we stop both inner workers (so their sleeps wake at once)
+        // and unwind with `Cancelled`, exactly like every other
+        // cancellation checkpoint — the panic is silenced by the hook
+        // installed above.
+        const RACE_CANCEL_POLL: Duration = Duration::from_millis(50);
+        let outcome = {
+            let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(o) = g.outcome.as_ref().cloned() {
+                    break o;
+                }
+                if cancel_requested() {
+                    drop(g);
+                    cancel_a.cancel();
+                    cancel_b.cancel();
+                    std::panic::panic_any(Cancelled);
+                }
+                g = cvar
+                    .wait_timeout_while(g, RACE_CANCEL_POLL, |s| s.outcome.is_none())
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
         };
-        drop(g);
 
         let (is_left, raw_ptr) = match outcome {
             RaceOutcome::Winner(is_left, raw_ptr) => (is_left, raw_ptr),
@@ -9991,6 +10060,54 @@ fn json_encode_value(db: *mut c_void, v: *mut Value) -> String {
     }
 }
 
+/// Estimate the JSON-serialized byte length of a `Relation` response
+/// *without* materializing the full string, so an oversized response can
+/// be rejected before `json_encode_value` allocates it in full.
+///
+/// The listen response path historically checked `json.len() > max` only
+/// *after* `json_encode_value` had already built the entire string — a
+/// post-hoc guard, not a memory bound: a handler returning a multi-GB
+/// relation OOMs the server before the length check ever runs. The
+/// inbound request path, by contrast, caps while streaming the body. This
+/// closes that asymmetry for the common OOM case — a handler returning a
+/// large source relation.
+///
+/// Estimation samples up to `SAMPLE_ROWS` rows, encodes each to measure
+/// its real serialized length (so any custom `ToJSON` impl is respected
+/// via `json_encode_value`), and extrapolates `avg_row_len * row_count`
+/// plus the enclosing `[`/`]` brackets and inter-row `,` framing.
+/// Encoding a bounded sample is itself bounded, so the estimate can't OOM.
+///
+/// Returns `None` for non-`Relation` values — ordinary handler output
+/// (records, scalars) is bounded and still covered by the precise
+/// post-encode cap that follows the call sites.
+fn estimate_relation_json_size(db: *mut c_void, v: *mut Value) -> Option<u64> {
+    const SAMPLE_ROWS: usize = 16;
+    let rows = match unsafe { as_ref(v) } {
+        Value::Relation(rows) => rows,
+        _ => return None,
+    };
+    let row_count = rows.len() as u64;
+    if row_count == 0 {
+        return Some(2); // "[]"
+    }
+    let sample_n = rows.len().min(SAMPLE_ROWS);
+    let mut sample_bytes: u64 = 0;
+    for row in rows.iter().take(sample_n) {
+        sample_bytes =
+            sample_bytes.saturating_add(json_encode_value(db, *row).len() as u64);
+    }
+    // Round the per-row average up so the estimate never undershoots the
+    // true size purely from integer truncation (ceil division; sample_n ≥ 1).
+    let avg_row = sample_bytes.saturating_add(sample_n as u64 - 1) / sample_n as u64;
+    // row_count rows, (row_count - 1) commas between them, 2 brackets.
+    let estimate = avg_row
+        .saturating_mul(row_count)
+        .saturating_add(row_count.saturating_sub(1))
+        .saturating_add(2);
+    Some(estimate)
+}
+
 /// toJson(value) — convert any Knot value to its JSON text representation
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_json_encode(v: *mut Value) -> *mut Value {
@@ -10984,11 +11101,6 @@ fn parse_record_schema(spec: &str) -> RecordSchema {
     RecordSchema { columns, nested }
 }
 
-/// Backward-compatible: parse a flat schema (no nested fields) into Vec<ColumnSpec>.
-fn parse_schema(spec: &str) -> Vec<ColumnSpec> {
-    parse_record_schema(spec).columns
-}
-
 /// Build a COALESCE expression that maps NULL to a sentinel value for use in
 /// UNIQUE indexes (SQLite treats NULLs as distinct, so we need a non-NULL stand-in).
 ///
@@ -11149,9 +11261,31 @@ fn init_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &Rec
     }
 }
 
+/// Separator between a parent table's name and a nested field name when
+/// forming a child table's physical name (`_knot_<source>__/<field>`).
+///
+/// It begins with `__` so that the DELETE cascade's `LIKE '<parent>__%'`
+/// descendant discovery and `__`-boundary parent resolution keep working
+/// unchanged. The trailing `/` — which is not a legal character in a Knot
+/// identifier — guarantees a child table name can never collide with a *main*
+/// source table `_knot_<name>`: source names are identifiers, so `_knot_<name>`
+/// can never contain `/`, whereas every child table name does. Without this,
+/// source `users` with nested field `archive` (child table `_knot_users__archive`)
+/// and an independent source `users__archive` (main table `_knot_users__archive`)
+/// mapped to the same physical table, and the second `CREATE TABLE IF NOT EXISTS`
+/// silently reused the first — causing `no such column` errors or intermixed
+/// rows (bug B26).
+const CHILD_TABLE_SEP: &str = "__/";
+
+/// Physical name of the child table holding a nested relation `field` of the
+/// relation stored in `parent_table`. See [`CHILD_TABLE_SEP`].
+fn child_table_name(parent_table: &str, field: &str) -> String {
+    format!("{}{}{}", parent_table, CHILD_TABLE_SEP, field)
+}
+
 /// Create a child table for a nested relation field, recursing for deeper nesting.
 fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &NestedField) {
-    let child_table_name = format!("{}__{}", parent_table, nf.name);
+    let child_table_name = child_table_name(parent_table, &nf.name);
     let child_table = quote_ident(&child_table_name);
     let has_children = !nf.nested.is_empty();
 
@@ -11954,13 +12088,20 @@ pub extern "C-unwind" fn knot_source_query_value(
                     } else {
                         // Int columns are stored as TEXT COLLATE KNOT_INT, so a
                         // MIN/MAX over an Int column comes back as Text. Parse
-                        // it back to a numeric value (same logic as query_sum).
+                        // it back to an Int. A value that doesn't fit i64 is a
+                        // legacy BigInt-era value the runtime's i64 ints cannot
+                        // represent — panic with the same clear migration
+                        // message as `read_sql_column` rather than silently
+                        // degrading to a lossy Float.
                         if let Ok(n) = s.parse::<i64>() {
                             Ok(alloc_int(n))
-                        } else if let Ok(f) = s.parse::<f64>() {
-                            Ok(alloc_float(f))
                         } else {
-                            Ok(alloc(Value::Text(Arc::from(s))))
+                            panic!(
+                                "knot runtime: integer value '{}' does not fit in a 64-bit Int. \
+                                 This database was likely written by an older Knot build with unbounded \
+                                 integers; values beyond ±9223372036854775807 cannot be read.",
+                                s
+                            );
                         }
                     }
                 }
@@ -13334,16 +13475,17 @@ pub extern "C-unwind" fn knot_source_diff_write(
 
 /// Check whether a SQLite table has a column with the given name.
 fn table_has_column(conn: &rusqlite::Connection, table: &str, col: &str) -> bool {
+    table_column_names(conn, table).iter().any(|n| n == col)
+}
+
+/// List a SQLite table's column names in declaration order.
+fn table_column_names(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
     let sql = format!("PRAGMA table_info({})", quote_ident(table));
     if let Ok(mut stmt) = conn.prepare(&sql)
         && let Ok(names) = stmt.query_map([], |row| row.get::<_, String>(1)) {
-            for name in names.flatten() {
-                if name == col {
-                    return true;
-                }
-            }
+            return names.flatten().collect();
         }
-    false
+    Vec::new()
 }
 
 /// DELETE rows that don't match a WHERE condition.
@@ -14469,16 +14611,51 @@ pub extern "C-unwind" fn knot_constraint_register(
                 "uniqueness constraint violated: *{} <= *{}.{}",
                 sub_rel, sup_rel, sf
             ).replace('\'', "''");
+            // A set-semantics re-append (`set *rel = union *rel [...]`)
+            // re-inserts rows that already exist verbatim. `write_record_rows`
+            // uses INSERT OR IGNORE, so such a duplicate is silently deduped by
+            // the table's `_unique` full-row index. But SQLite fires this BEFORE
+            // INSERT trigger — and its RAISE(ABORT) — *before* the OR IGNORE
+            // conflict resolution, so an unconditional key check aborts an
+            // idempotent no-op (panicking on the second run of the same binary).
+            // Skip the abort when a full-row duplicate already exists: the insert
+            // would have been ignored, not a genuine key collision. The full-row
+            // key mirrors `init_record_table`'s `_unique` index — `_content_hash`
+            // for tables with nested children, else every scalar column (matched
+            // with `IS` for the same NULL-equality the index's coalescing gives).
+            let cols = table_column_names(&db_ref.conn, &format!("_knot_{}", sub_rel));
+            let full_row_match = if cols.iter().any(|c| c == "_content_hash") {
+                let ch = quote_ident("_content_hash");
+                format!("{ch} IS NEW.{ch}")
+            } else {
+                cols.iter()
+                    .filter(|c| c.as_str() != "_id" && c.as_str() != "_parent_id")
+                    .map(|c| {
+                        let q = quote_ident(c);
+                        format!("{q} IS NEW.{q}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            };
+            // Empty only for degenerate column-less tables, which never carry a
+            // field-level uniqueness constraint; fall back to the bare key check.
+            let dup_guard = if full_row_match.is_empty() {
+                String::new()
+            } else {
+                format!(" AND NOT EXISTS (SELECT 1 FROM {table} WHERE {full_row_match})")
+            };
+
             let trigger_sql = format!(
                 "CREATE TRIGGER IF NOT EXISTS {trg} \
                  BEFORE INSERT ON {table} \
                  FOR EACH ROW \
-                 WHEN EXISTS (SELECT 1 FROM {table} WHERE {col} = NEW.{col}) \
+                 WHEN EXISTS (SELECT 1 FROM {table} WHERE {col} = NEW.{col}){dup_guard} \
                  BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
                 trg = quote_ident(&format!("_knot_uniq_{}_{}_ins", sub_rel, sf)),
                 table = table,
                 col = col,
                 msg = msg,
+                dup_guard = dup_guard,
             );
             debug_sql(&trigger_sql);
             db_ref.conn.execute_batch(&trigger_sql)
@@ -14842,7 +15019,12 @@ pub extern "C-unwind" fn knot_view_read(
     let name = unsafe { str_from_raw(name_ptr, name_len) };
     let view_schema = unsafe { str_from_raw(schema_ptr, schema_len) };
     let filter_where = unsafe { str_from_raw(filter_ptr, filter_len) };
-    let cols = parse_schema(view_schema);
+    // Parse the FULL record schema, keeping `field:[...]` nested descriptors, so
+    // views exposing nested relation columns join their child tables — mirroring
+    // the write side (`knot_view_write`) and `read_record_table` (used by
+    // `knot_source_read`). Taking only the scalar columns here would omit the
+    // nested field, and first access would panic with "field not found".
+    let rec_schema = parse_record_schema(view_schema);
 
     // Inside `atomic`, register the view's UNDERLYING SOURCE table in the
     // STM read set (codegen passes `view.source_name` as `name` here), so a
@@ -14860,26 +15042,33 @@ pub extern "C-unwind" fn knot_view_read(
         ),
     };
 
-    let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+    // Build the SELECT column list. When the view exposes nested relation
+    // fields (stored in child tables `_knot_<name>__<field>`), also select the
+    // parent `_id` so each row can be joined to its child rows — the same shape
+    // `read_record_table` and `knot_view_write` use for nested sources.
+    let table_name = format!("_knot_{}", name);
+    let has_children = !rec_schema.nested.is_empty();
+
+    let mut select_cols: Vec<String> = Vec::new();
+    if has_children {
+        select_cols.push(quote_ident("_id"));
+    }
+    for c in &rec_schema.columns {
+        select_cols.push(quote_ident(&c.name));
+    }
+    let select_list = if select_cols.is_empty() {
+        "1".to_string()
+    } else {
+        select_cols.join(", ")
+    };
+
     let sql = if filter_where.is_empty() {
-        format!(
-            "SELECT {} FROM {}",
-            if col_names.is_empty() {
-                "1".to_string()
-            } else {
-                col_names.join(", ")
-            },
-            quote_ident(&format!("_knot_{}", name))
-        )
+        format!("SELECT {} FROM {}", select_list, quote_ident(&table_name))
     } else {
         format!(
             "SELECT {} FROM {} WHERE {}",
-            if col_names.is_empty() {
-                "1".to_string()
-            } else {
-                col_names.join(", ")
-            },
-            quote_ident(&format!("_knot_{}", name)),
+            select_list,
+            quote_ident(&table_name),
             filter_where
         )
     };
@@ -14904,16 +15093,32 @@ pub extern "C-unwind" fn knot_view_read(
         .query(param_refs.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: view_read exec error: {}", e));
 
+    // Scalar columns start after the leading `_id` when children are present.
+    let col_offset = if has_children { 1 } else { 0 };
     while let Some(row) = result_rows
         .next()
         .unwrap_or_else(|e| panic!("knot runtime: view_read fetch error: {}", e))
     {
-        let record = knot_record_empty(cols.len());
-        for (i, col) in cols.iter().enumerate() {
-            let val = read_sql_column(row, i, col.ty);
+        let total_fields = rec_schema.columns.len() + rec_schema.nested.len();
+        let record = knot_record_empty(total_fields);
+
+        for (i, col) in rec_schema.columns.iter().enumerate() {
+            let val = read_sql_column(row, i + col_offset, col.ty);
             let name_bytes = col.name.as_bytes();
             knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
         }
+
+        // Nested relation fields, joined from their child tables by `_id`.
+        if has_children {
+            let parent_id: i64 = row.get(0).unwrap();
+            for nf in &rec_schema.nested {
+                let child_table_name = format!("{}__{}", table_name, nf.name);
+                let val = read_child_table(&db_ref.conn, &child_table_name, nf, parent_id);
+                let name_bytes = nf.name.as_bytes();
+                knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
+            }
+        }
+
         rows.push(record);
     }
 
@@ -15729,78 +15934,142 @@ fn just_ctor_value(tag: &str, payload: *mut Value) -> Option<*mut Value> {
 }
 
 fn value_to_serde_json_impl(v: *mut Value, wire: bool) -> serde_json::Value {
-    if v.is_null() {
-        return serde_json::Value::Null;
+    use serde_json::Value as Json;
+
+    // Iterative post-order builder over an explicit work stack. A deeply
+    // right-nested Constructor/Record spine — e.g. a 100k-element `Cons`-list
+    // stored as Constructor→Record→Constructor→… — previously drove one native
+    // frame per level through the direct `value_to_serde_json_impl(*payload)`
+    // recursion and SIGSEGV'd on Rust's default 8MB stack. The sibling
+    // eq/hash/compare and `show` paths use this same technique. Leaves push a
+    // finished `Json` onto `results`; compound kinds push a `Finish*` marker
+    // plus child `Emit` jobs, and the marker folds the children (already on
+    // `results`) into the parent. Every `Emit` job nets exactly one `results`
+    // entry, so a `Finish*` marker always finds its children on top.
+    enum Job {
+        Emit(*mut Value),
+        FinishRecord(Vec<Arc<str>>), // field names, in source order
+        FinishRelation(usize),       // row count
+        FinishCtor(Arc<str>),        // constructor tag
     }
-    match unsafe { as_ref(v) } {
-        Value::Int(n) => serde_json::Value::Number((*n).into()),
-        Value::Float(n) => {
-            if n.is_finite() {
-                serde_json::json!(*n)
-            } else if wire {
-                // JSON has no representation for NaN/±Infinity. On the HTTP wire
-                // path encode them as `null` (matching JS `JSON.stringify`)
-                // rather than panicking: this serializer runs on the success-
-                // response path *outside* the handler's `catch_unwind`, so a
-                // panic here would crash the worker thread and drop the
-                // connection with no response.
-                serde_json::Value::Null
-            } else {
-                // Storage path (`value_to_json_db`): a non-finite Float in a
-                // JSON column would round-trip Float → null → Unit on read,
-                // silently changing the value *and* its type. Panic to protect
-                // the round-trip, matching `float_to_sqlite_real`'s guard for
-                // scalar columns.
-                panic!(
-                    "knot runtime: cannot store non-finite Float ({}) in a JSON \
-                     column — it would round-trip to Unit, breaking round-trips",
-                    n
-                );
-            }
-        }
-        Value::Text(s) => serde_json::Value::String((**s).to_string()),
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Bytes(b) => {
-            let mut map = serde_json::Map::with_capacity(1);
-            map.insert("__knot_bytes".into(), serde_json::Value::String(base64_encode(b)));
-            serde_json::Value::Object(map)
-        }
-        Value::Unit => serde_json::Value::Null,
-        Value::Record(fields) => {
-            let mut map = serde_json::Map::with_capacity(fields.len());
-            for f in fields {
-                map.insert(f.name.to_string(), value_to_serde_json_impl(f.value, wire));
-            }
-            serde_json::Value::Object(map)
-        }
-        Value::Relation(rows) => {
-            serde_json::Value::Array(rows.iter().map(|r| value_to_serde_json_impl(*r, wire)).collect())
-        }
-        Value::Constructor(tag, payload) => {
-            // Wire encoding maps the built-in Maybe to JSON's native optional:
-            // Nothing → null, Just x → x. (`Just Nothing` collapses to null —
-            // the usual lossiness of this convention.)
-            if wire {
-                if is_nothing_ctor(tag, *payload) {
-                    return serde_json::Value::Null;
+
+    let mut work: Vec<Job> = vec![Job::Emit(v)];
+    let mut results: Vec<Json> = Vec::new();
+
+    while let Some(job) = work.pop() {
+        match job {
+            Job::Emit(v) => {
+                if v.is_null() {
+                    results.push(Json::Null);
+                    continue;
                 }
-                if let Some(inner) = just_ctor_value(tag, *payload) {
-                    return value_to_serde_json_impl(inner, wire);
+                match unsafe { as_ref(v) } {
+                    Value::Int(n) => results.push(Json::Number((*n).into())),
+                    Value::Float(n) => {
+                        if n.is_finite() {
+                            results.push(serde_json::json!(*n));
+                        } else if wire {
+                            // JSON has no representation for NaN/±Infinity. On the
+                            // HTTP wire path encode them as `null` (matching JS
+                            // `JSON.stringify`) rather than panicking: this
+                            // serializer runs on the success-response path
+                            // *outside* the handler's `catch_unwind`, so a panic
+                            // here would crash the worker thread and drop the
+                            // connection with no response.
+                            results.push(Json::Null);
+                        } else {
+                            // Storage path (`value_to_json_db`): a non-finite
+                            // Float in a JSON column would round-trip Float →
+                            // null → Unit on read, silently changing the value
+                            // *and* its type. Panic to protect the round-trip,
+                            // matching `float_to_sqlite_real`'s guard for scalar
+                            // columns.
+                            panic!(
+                                "knot runtime: cannot store non-finite Float ({}) in a JSON \
+                                 column — it would round-trip to Unit, breaking round-trips",
+                                n
+                            );
+                        }
+                    }
+                    Value::Text(s) => results.push(Json::String((**s).to_string())),
+                    Value::Bool(b) => results.push(Json::Bool(*b)),
+                    Value::Bytes(b) => {
+                        let mut map = serde_json::Map::with_capacity(1);
+                        map.insert("__knot_bytes".into(), Json::String(base64_encode(b)));
+                        results.push(Json::Object(map));
+                    }
+                    Value::Unit => results.push(Json::Null),
+                    Value::Record(fields) => {
+                        // Push Finish then child Emits in reverse so children pop
+                        // in forward order and land on `results` in field order.
+                        let names: Vec<Arc<str>> = fields.iter().map(|f| f.name.clone()).collect();
+                        work.push(Job::FinishRecord(names));
+                        for f in fields.iter().rev() {
+                            work.push(Job::Emit(f.value));
+                        }
+                    }
+                    Value::Relation(rows) => {
+                        work.push(Job::FinishRelation(rows.len()));
+                        for r in rows.iter().rev() {
+                            work.push(Job::Emit(*r));
+                        }
+                    }
+                    Value::Constructor(tag, payload) => {
+                        // Wire encoding maps the built-in Maybe to JSON's native
+                        // optional: Nothing → null, Just x → x. (`Just Nothing`
+                        // collapses to null — the usual lossiness of this
+                        // convention.)
+                        if wire {
+                            if is_nothing_ctor(tag, *payload) {
+                                results.push(Json::Null);
+                                continue;
+                            }
+                            if let Some(inner) = just_ctor_value(tag, *payload) {
+                                work.push(Job::Emit(inner));
+                                continue;
+                            }
+                        }
+                        // Wrap in `__knot_ctor` so parseJson can reconstruct
+                        // without colliding with user records that happen to use
+                        // `tag`/`value` keys.
+                        work.push(Job::FinishCtor(tag.clone()));
+                        work.push(Job::Emit(*payload));
+                    }
+                    Value::Function(f) => {
+                        results.push(Json::String(format!("<function: {}>", &*f.source)))
+                    }
+                    Value::IO(_, _) => results.push(Json::String("<<IO>>".into())),
+                    Value::Pair(_, _) => results.push(Json::String("<<Pair>>".into())),
                 }
             }
-            // Wrap in `__knot_ctor` so parseJson can reconstruct without
-            // colliding with user records that happen to use `tag`/`value` keys.
-            let mut inner = serde_json::Map::with_capacity(2);
-            inner.insert("tag".into(), serde_json::Value::String(tag.to_string()));
-            inner.insert("value".into(), value_to_serde_json_impl(*payload, wire));
-            let mut map = serde_json::Map::with_capacity(1);
-            map.insert("__knot_ctor".into(), serde_json::Value::Object(inner));
-            serde_json::Value::Object(map)
+            Job::FinishRecord(names) => {
+                let start = results.len() - names.len();
+                let children = results.split_off(start); // forward (field) order
+                let mut map = serde_json::Map::with_capacity(names.len());
+                for (name, child) in names.iter().zip(children) {
+                    map.insert(name.to_string(), child);
+                }
+                results.push(Json::Object(map));
+            }
+            Job::FinishRelation(n) => {
+                let start = results.len() - n;
+                let children = results.split_off(start); // forward (row) order
+                results.push(Json::Array(children));
+            }
+            Job::FinishCtor(tag) => {
+                let payload_json = results.pop().expect("ctor payload result");
+                let mut inner = serde_json::Map::with_capacity(2);
+                inner.insert("tag".into(), Json::String(tag.to_string()));
+                inner.insert("value".into(), payload_json);
+                let mut map = serde_json::Map::with_capacity(1);
+                map.insert("__knot_ctor".into(), Json::Object(inner));
+                results.push(Json::Object(map));
+            }
         }
-        Value::Function(f) => serde_json::Value::String(format!("<function: {}>", &*f.source)),
-        Value::IO(_, _) => serde_json::Value::String("<<IO>>".into()),
-        Value::Pair(_, _) => serde_json::Value::String("<<Pair>>".into()),
     }
+
+    debug_assert_eq!(results.len(), 1, "value_to_serde_json_impl must produce one root value");
+    results.pop().unwrap_or(Json::Null)
 }
 
 /// Call the compiled toJson dispatcher for a sub-value, returning the JSON string.
@@ -16272,7 +16541,23 @@ fn http_serve_loop(
 
                     // Open a DB connection for this thread
                     let db_path = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    // Guard the deep-cloned handler tree across knot_db_open,
+                    // which can panic (`.expect` on open/collation/pragma
+                    // failures) and unwind past every manual
+                    // `deep_drop_value(handler)` below — leaking the whole
+                    // handler subtree. Mirrors the IoDropGuard hardening in
+                    // knot_fork_io and the race worker. `forget`ten once the
+                    // open succeeds so the manual drops keep sole ownership.
+                    struct HandlerDropGuard(*mut Value);
+                    impl Drop for HandlerDropGuard {
+                        fn drop(&mut self) {
+                            unsafe { deep_drop_value(self.0); }
+                        }
+                    }
+                    let handler_guard = HandlerDropGuard(handler);
                     let db = knot_db_open(db_path.as_ptr(), db_path.len());
+                    // Past the panic window; the manual drops below own it now.
+                    std::mem::forget(handler_guard);
 
                     let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<*mut Value, (u16, String, Option<i64>)> {
                     // Build record from path params, query params, and body
@@ -16668,6 +16953,41 @@ fn http_serve_loop(
                                     return;
                                 }
                             };
+                            // Pre-encoding size guard for Relation responses.
+                            // The cap below (`json.len() > max`) only fires
+                            // *after* `json_encode_value` materializes the
+                            // whole string — a post-hoc guard, not a memory
+                            // bound — so a handler returning a multi-GB
+                            // relation OOMs the server before that check runs.
+                            // Estimate the serialized size from a row sample
+                            // and reject with 413 *before* encoding when the
+                            // estimate exceeds the cap. Non-Relation values
+                            // fall through to the precise post-encode cap.
+                            let max = http_max_body_bytes();
+                            let est = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                estimate_relation_json_size(db, body_field)
+                            }))
+                            .unwrap_or(None);
+                            if let Some(est) = est
+                                && est > max
+                            {
+                                    log_error!(
+                                        "[HTTP] estimated response body ~{} bytes exceeds {} byte limit; returning 413",
+                                        est, max
+                                    );
+                                    let body = "{\"error\":\"response too large\"}".to_string();
+                                    let response = tiny_http::Response::from_string(&body)
+                                        .with_status_code(413)
+                                        .with_header(
+                                            "Content-Type: application/json"
+                                                .parse::<tiny_http::Header>()
+                                                .unwrap(),
+                                        );
+                                    let _ = request.respond(response);
+                                    knot_db_close(db);
+                                    unsafe { deep_drop_value(handler); }
+                                    return;
+                            }
                             let json = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 json_encode_value(db, body_field)
                             })) {
@@ -16792,6 +17112,37 @@ fn http_serve_loop(
                             log_debug!("[HTTP] --> {} {}", status_code, json);
                             let _ = request.respond(response);
                         } else {
+                            // Pre-encoding size guard for Relation responses
+                            // (see the headers path above): estimate the
+                            // serialized size from a row sample and reject
+                            // with 413 *before* `json_encode_value` allocates
+                            // the whole string, so a handler returning a
+                            // multi-GB relation can't OOM the server.
+                            let max = http_max_body_bytes();
+                            let est = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                estimate_relation_json_size(db, body_val)
+                            }))
+                            .unwrap_or(None);
+                            if let Some(est) = est
+                                && est > max
+                            {
+                                    log_error!(
+                                        "[HTTP] estimated response body ~{} bytes exceeds {} byte limit; returning 413",
+                                        est, max
+                                    );
+                                    let body = "{\"error\":\"response too large\"}".to_string();
+                                    let response = tiny_http::Response::from_string(&body)
+                                        .with_status_code(413)
+                                        .with_header(
+                                            "Content-Type: application/json"
+                                                .parse::<tiny_http::Header>()
+                                                .unwrap(),
+                                        );
+                                    let _ = request.respond(response);
+                                    knot_db_close(db);
+                                    unsafe { deep_drop_value(handler); }
+                                    return;
+                            }
                             let json = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 json_encode_value(db, body_val)
                             })) {
@@ -20134,6 +20485,48 @@ mod _bugfix_batch_tests {
         assert_eq!(out, data);
         knot_set_http_max_body_bytes(0); // restore env-or-default resolution
     }
+
+    // ── Fix B42: listen response-body cap estimated before encoding ──
+
+    #[test]
+    fn estimate_relation_json_size_extrapolates_from_sample() {
+        // Non-Relation values are out of scope for the pre-encode guard:
+        // ordinary handler output is bounded and covered by the precise
+        // post-encode cap. estimate_relation_json_size returns None so the
+        // caller falls through to that path.
+        let scalar = alloc(Value::Int(42));
+        assert_eq!(
+            estimate_relation_json_size(std::ptr::null_mut(), scalar),
+            None
+        );
+
+        // An empty relation encodes to "[]" (2 bytes).
+        let empty = alloc(Value::Relation(vec![]));
+        assert_eq!(
+            estimate_relation_json_size(std::ptr::null_mut(), empty),
+            Some(2)
+        );
+
+        // A relation of many identical rows should estimate ~N * per-row
+        // size — far above a tiny cap — so the listen path can reject it
+        // with 413 *before* json_encode_value materializes the full string.
+        let mk_row = || {
+            alloc(Value::Record(vec![RecordField {
+                name: Arc::from("name"),
+                value: alloc(Value::Text(Arc::from("abcdefghijklmnopqrstuvwxyz"))),
+            }]))
+        };
+        let rows: Vec<*mut Value> = (0..1000).map(|_| mk_row()).collect();
+        let rel = alloc(Value::Relation(rows));
+        let est = estimate_relation_json_size(std::ptr::null_mut(), rel)
+            .expect("relation should produce an estimate");
+        // One row: {"name":"abcdefghijklmnopqrstuvwxyz"} is ~35 bytes, so
+        // 1000 rows must clear a 1 KiB cap by a wide margin.
+        assert!(est > 1024, "estimate {} should exceed 1 KiB", est);
+        // Estimation extrapolates from a bounded 16-row sample, so it must
+        // hold even though only a fraction of the rows were encoded.
+        assert!(est >= 1000, "estimate {} too small for 1000 rows", est);
+    }
 }
 
 #[cfg(test)]
@@ -20613,6 +21006,65 @@ mod _deep_nesting_iterative_tests {
         let mut direct = Vec::new();
         value_to_hash_bytes(deep, &mut direct);
         assert_eq!(bytes, direct);
+    }
+
+    /// Read the `Value::Text` a `knot_value_show` call produced.
+    fn show_text(v: *mut Value) -> String {
+        match unsafe { as_ref(knot_value_show(v)) } {
+            Value::Text(s) => (**s).to_string(),
+            other => panic!("expected Text, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn value_show_handles_deep_ctors() {
+        // A 200k-deep spine would overflow the previous recursive `show_inner`
+        // (Constructor→Record→Constructor per level). The work-stack version
+        // completes and starts with the outermost `Cons`.
+        let deep = deep_spine(200_000);
+        assert!(show_text(deep).starts_with("Cons {head: 0, tail: "));
+    }
+
+    #[test]
+    fn value_show_small_spine_matches_recursive_format() {
+        // Byte-for-byte equal to the former recursive formulation: constructor
+        // tag + space + payload; nullary payload renders as `tag {}`; record
+        // fields render in sorted (head < tail) order.
+        assert_eq!(show_text(deep_spine(0)), "Nil {}");
+        assert_eq!(
+            show_text(deep_spine(2)),
+            "Cons {head: 0, tail: Cons {head: 1, tail: Nil {}}}"
+        );
+    }
+
+    #[test]
+    fn value_to_json_handles_deep_ctors() {
+        // Same deep-spine SIGSEGV in the JSON encoder (`value_to_serde_json_impl`
+        // recursed directly on the Constructor payload); the iterative builder
+        // completes.
+        let deep = deep_spine(200_000);
+        let json = value_to_json(deep);
+        assert!(json.starts_with("{\"__knot_ctor\""));
+    }
+
+    #[test]
+    fn value_to_json_small_spine_matches_recursive_shape() {
+        // Compare as parsed JSON so object-key ordering (BTreeMap vs
+        // preserve_order) doesn't matter — only the structure must match the
+        // former recursive output: `__knot_ctor` wrapping, nested payload, and
+        // the nullary `Nil` payload encoded as null.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&value_to_json(deep_spine(1))).unwrap();
+        let expected = serde_json::json!({
+            "__knot_ctor": {
+                "tag": "Cons",
+                "value": {
+                    "head": 0,
+                    "tail": { "__knot_ctor": { "tag": "Nil", "value": serde_json::Value::Null } }
+                }
+            }
+        });
+        assert_eq!(parsed, expected);
     }
 }
 

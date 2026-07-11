@@ -2172,66 +2172,90 @@ fn multiline_expression_continuation() {
 #[test]
 fn time_unit_days() {
     match fun_body("x = 365 days") {
-        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+        ExprKind::TimeUnitLit { value, unit_name } => {
+            assert_eq!(unit_name, "days");
+            let ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } = &value.node else {
+                panic!("expected Mul inside TimeUnitLit, got {:?}", value.node);
+            };
             assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "365"));
             assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "86400000"));
         }
-        other => panic!("expected Mul, got {:?}", other),
+        other => panic!("expected TimeUnitLit, got {:?}", other),
     }
 }
 
 #[test]
 fn time_unit_hours() {
     match fun_body("x = 2 hours") {
-        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+        ExprKind::TimeUnitLit { value, unit_name } => {
+            assert_eq!(unit_name, "hours");
+            let ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } = &value.node else {
+                panic!("expected Mul inside TimeUnitLit, got {:?}", value.node);
+            };
             assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "2"));
             assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "3600000"));
         }
-        other => panic!("expected Mul, got {:?}", other),
+        other => panic!("expected TimeUnitLit, got {:?}", other),
     }
 }
 
 #[test]
 fn time_unit_minutes() {
     match fun_body("x = 30 minutes") {
-        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+        ExprKind::TimeUnitLit { value, unit_name } => {
+            assert_eq!(unit_name, "minutes");
+            let ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } = &value.node else {
+                panic!("expected Mul inside TimeUnitLit, got {:?}", value.node);
+            };
             assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "30"));
             assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "60000"));
         }
-        other => panic!("expected Mul, got {:?}", other),
+        other => panic!("expected TimeUnitLit, got {:?}", other),
     }
 }
 
 #[test]
 fn time_unit_seconds() {
     match fun_body("x = 10 seconds") {
-        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+        ExprKind::TimeUnitLit { value, unit_name } => {
+            assert_eq!(unit_name, "seconds");
+            let ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } = &value.node else {
+                panic!("expected Mul inside TimeUnitLit, got {:?}", value.node);
+            };
             assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "10"));
             assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "1000"));
         }
-        other => panic!("expected Mul, got {:?}", other),
+        other => panic!("expected TimeUnitLit, got {:?}", other),
     }
 }
 
 #[test]
 fn time_unit_ms() {
     match fun_body("x = 500 ms") {
-        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+        ExprKind::TimeUnitLit { value, unit_name } => {
+            assert_eq!(unit_name, "ms");
+            let ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } = &value.node else {
+                panic!("expected Mul inside TimeUnitLit, got {:?}", value.node);
+            };
             assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "500"));
             assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "1"));
         }
-        other => panic!("expected Mul, got {:?}", other),
+        other => panic!("expected TimeUnitLit, got {:?}", other),
     }
 }
 
 #[test]
 fn time_unit_weeks() {
     match fun_body("x = 2 weeks") {
-        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+        ExprKind::TimeUnitLit { value, unit_name } => {
+            assert_eq!(unit_name, "weeks");
+            let ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } = &value.node else {
+                panic!("expected Mul inside TimeUnitLit, got {:?}", value.node);
+            };
             assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Int(n)) if n == "2"));
             assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "604800000"));
         }
-        other => panic!("expected Mul, got {:?}", other),
+        other => panic!("expected TimeUnitLit, got {:?}", other),
     }
 }
 
@@ -2241,11 +2265,15 @@ fn time_unit_with_float() {
     // homogeneous (`Float * Float`); a `Float * Int` node would be rejected
     // by `Num`'s same-type `mul`.
     match fun_body("x = 1.5 hours") {
-        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
+        ExprKind::TimeUnitLit { value, unit_name } => {
+            assert_eq!(unit_name, "hours");
+            let ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } = &value.node else {
+                panic!("expected Mul inside TimeUnitLit, got {:?}", value.node);
+            };
             assert!(matches!(&lhs.node, ExprKind::Lit(Literal::Float(f)) if *f == 1.5));
             assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Float(f)) if *f == 3600000.0));
         }
-        other => panic!("expected Mul, got {:?}", other),
+        other => panic!("expected TimeUnitLit, got {:?}", other),
     }
 }
 

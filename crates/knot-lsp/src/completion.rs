@@ -292,7 +292,7 @@ pub(crate) fn handle_completion(
             let receiver_var = receiver_ident_before_dot(latest_source, expr_end);
             let owner_source = receiver_var
                 .as_deref()
-                .and_then(|name| resolve_var_to_source(&doc.module, name));
+                .and_then(|name| resolve_var_to_source(&doc.module, name, analyzed_offset));
             for name in fields {
                 let mut item = CompletionItem {
                     label: name.clone(),

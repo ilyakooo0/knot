@@ -174,6 +174,14 @@ pub struct Codegen {
     // Route entries: route_name -> entries (for HTTP codegen)
     route_entries: HashMap<String, Vec<ast::RouteEntry>>,
 
+    // Route entry chosen for each fetch constructor: ctor_name -> entry.
+    // Populated last-wins in source declaration order so distinct routes that
+    // legally share a constructor name resolve to the SAME entry that infer's
+    // fetch_response_types/fetch_response_headers picked — otherwise a fetch
+    // could typecheck against one route and compile the HTTP call against
+    // another (B38).
+    fetch_route_entries: HashMap<String, ast::RouteEntry>,
+
     // Type aliases for resolving response types in OpenAPI descriptors
     type_aliases: HashMap<String, ResolvedType>,
 
@@ -839,6 +847,7 @@ impl Codegen {
             recursive_derived: HashSet::new(),
             recursive_body_fns: HashMap::new(),
             route_entries: HashMap::new(),
+            fetch_route_entries: HashMap::new(),
             type_aliases: HashMap::new(),
             user_fn_trampolines: HashMap::new(),
             monad_info: HashMap::new(),
@@ -1796,6 +1805,14 @@ impl Codegen {
                 }
                 ast::DeclKind::Route { name, entries } => {
                     self.route_entries.insert(name.clone(), entries.clone());
+                    // Last route entry (in source declaration order) with a
+                    // given constructor name wins, matching infer's fetch
+                    // metadata resolution so typecheck and codegen agree on
+                    // which route a fetch compiles against (B38).
+                    for entry in entries {
+                        self.fetch_route_entries
+                            .insert(entry.constructor.clone(), entry.clone());
+                    }
                 }
                 ast::DeclKind::RouteComposite { name, components } => {
                     // Deferred: resolved to a fixpoint after the loop so
@@ -4066,6 +4083,35 @@ impl Codegen {
                 if let Some(&val) = env.bindings.get(name.as_str()) {
                     return val;
                 }
+                // A user-defined top-level declaration whose name collides with
+                // one of the zero-arg builtins below (`now`, `randomFloat`,
+                // `retry`, …) shadows the builtin. None of those names are
+                // stdlib functions, so a `user_fns` hit here is always a genuine
+                // user declaration, never a stdlib registration. The applied-call
+                // path already consults `user_fns` before its builtin special
+                // cases; the bare reference must too, or the user's declaration
+                // is compiled but never referenced — e.g. `now = 5` would emit
+                // `knot_now_io` here, producing an `IO` value where the type
+                // checker inferred `Int` (a runtime panic when later used).
+                if let Some((func_id, n_params)) = self.user_fns.get(name).copied() {
+                    if n_params == 0 {
+                        // 0-param function is a constant — call it directly
+                        let func_ref =
+                            self.module.declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(func_ref, &[db]);
+                        return builder.inst_results(call)[0];
+                    } else {
+                        // Create a trampoline that bridges (db, env, arg) calling
+                        // convention to the user function's (db, arg1, ...) convention.
+                        let trampoline_id = self.get_or_create_trampoline(name, n_params);
+                        let func_ref =
+                            self.module.declare_func_in_func(trampoline_id, builder.func);
+                        let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
+                        let null = builder.ins().iconst(self.ptr_type, 0);
+                        let (src_ptr, src_len) = self.string_ptr(builder, name);
+                        return self.call_rt(builder, "knot_value_function", &[fn_addr, null, src_ptr, src_len]);
+                    }
+                }
                 if name == "now" {
                     return self.call_rt(builder, "knot_now_io", &[]);
                 }
@@ -4118,31 +4164,9 @@ impl Codegen {
                     }
                     return self.call_rt(builder, "knot_stm_retry", &[]);
                 }
-                if let Some(&val) = env.bindings.get(name) {
-                    val
-                } else if let Some((func_id, n_params)) =
-                    self.user_fns.get(name).copied()
-                {
-                    if n_params == 0 {
-                        // 0-param function is a constant — call it directly
-                        let func_ref =
-                            self.module.declare_func_in_func(func_id, builder.func);
-                        let call = builder.ins().call(func_ref, &[db]);
-                        builder.inst_results(call)[0]
-                    } else {
-                        // Create a trampoline that bridges (db, env, arg) calling
-                        // convention to the user function's (db, arg1, ...) convention.
-                        let trampoline_id = self.get_or_create_trampoline(name, n_params);
-                        let func_ref =
-                            self.module.declare_func_in_func(trampoline_id, builder.func);
-                        let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
-                        let null = builder.ins().iconst(self.ptr_type, 0);
-                        let (src_ptr, src_len) = self.string_ptr(builder, name);
-                        self.call_rt(builder, "knot_value_function", &[fn_addr, null, src_ptr, src_len])
-                    }
-                } else {
-                    panic!("codegen: undefined variable '{}'", name)
-                }
+                // `env` and `user_fns` were both consulted above; anything
+                // reaching here is a genuinely undefined variable.
+                panic!("codegen: undefined variable '{}'", name)
             }
 
             ast::ExprKind::Constructor(name) => {
@@ -4346,10 +4370,21 @@ impl Codegen {
 
             ast::ExprKind::BinOp { op, lhs, rhs } => {
                 if matches!(op, ast::BinOp::Pipe) {
-                    // Check for: source |> match Constructor → SQL-level match
+                    // Check for: source |> match Constructor → SQL-level match.
+                    // Only when `match` is NOT shadowed — a locally-bound name
+                    // (lambda param, `let`, do-bind, captured free var) or a
+                    // user-declared top-level `match` must win over the builtin,
+                    // mirroring `compile_app` (env-locals first) and the non-pipe
+                    // `match` special form (guarded on `user_shadows_special`).
+                    // Without this, `\match -> xs |> match Ctor` would call the
+                    // builtin instead of the local value. When shadowed, fall
+                    // through to `try_compile_pipe_sql`/`compile_app` below, which
+                    // resolve the shadowing name correctly.
                     if let ast::ExprKind::App { func: match_fn, arg: match_arg } = &rhs.node
                         && let (ast::ExprKind::Var(fn_name), ast::ExprKind::Constructor(ctor_name)) = (&match_fn.node, &match_arg.node)
-                            && fn_name == "match" {
+                            && fn_name == "match"
+                            && !env.bindings.contains_key(fn_name)
+                            && !(self.top_fn_names.contains(fn_name) && self.user_fns.contains_key(fn_name)) {
                                 if let ast::ExprKind::SourceRef(source_name) = &lhs.node
                                     && let Some(schema) = self.source_schemas.get(source_name).cloned() {
                                         let (name_ptr, name_len) =
@@ -4577,7 +4612,17 @@ impl Codegen {
                         // handler (HTTP body fields) — locally constructed
                         // rows (e.g. `union rows [{v: -5}]`) would otherwise
                         // bypass refined-type validation entirely.
-                        let new_rows = self.compile_expr(builder, new_rows_expr, env, db);
+                        let mut new_rows = self.compile_expr(builder, new_rows_expr, env, db);
+                        // A do-block that binds from a source is classified as
+                        // IO, so compile_expr produced a deferred Value::IO
+                        // thunk rather than a Relation. knot_source_append needs
+                        // a concrete Relation, so force the thunk with
+                        // knot_io_run first (identity on non-IO values).
+                        if let ast::ExprKind::Do(stmts) = &new_rows_expr.node
+                            && self.is_io_do_block(stmts)
+                        {
+                            new_rows = self.call_rt(builder, "knot_io_run", &[db, new_rows]);
+                        }
                         self.emit_refinement_checks(builder, name, new_rows, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
                         let (schema_ptr, schema_len) =
@@ -4967,7 +5012,9 @@ impl Codegen {
                 arms,
             } => self.compile_case(builder, scrutinee, arms, env, db),
 
-            ast::ExprKind::UnitLit { value, .. } => {
+            // `2 seconds` compiles exactly like its desugared `2 * 1000`.
+            ast::ExprKind::UnitLit { value, .. }
+            | ast::ExprKind::TimeUnitLit { value, .. } => {
                 self.compile_expr(builder, value, env, db)
             }
 
@@ -5376,7 +5423,7 @@ impl Codegen {
                 self.collect_direct_write_targets(inner, out)
             }
             UnaryOp { operand, .. } => self.collect_direct_write_targets(operand, out),
-            UnitLit { value, .. } => self.collect_direct_write_targets(value, out),
+            UnitLit { value, .. } | TimeUnitLit { value, .. } => self.collect_direct_write_targets(value, out),
             Annot { expr: e, .. } => self.collect_direct_write_targets(e, out),
             FieldAccess { expr: e, .. } => self.collect_direct_write_targets(e, out),
             App { func, arg } => {
@@ -6824,12 +6871,14 @@ impl Codegen {
             None => self.call_rt(builder, "knot_value_unit", &[]),
         };
 
-        // Look up route entry for this constructor
+        // Look up the route entry for this constructor. Resolved last-wins in
+        // source declaration order (see `fetch_route_entries`) so it matches
+        // the entry infer typechecked against — iterating `route_entries`
+        // (a HashMap) and taking the first match would pick a nondeterministic
+        // route when distinct routes legally share a constructor name (B38).
         let entry = self
-            .route_entries
-            .values()
-            .flat_map(|entries| entries.iter())
-            .find(|e| e.constructor == ctor_name)
+            .fetch_route_entries
+            .get(&ctor_name)
             .cloned()
             .unwrap_or_else(|| {
                 panic!("fetch: no route entry found for constructor '{}'", ctor_name)
@@ -7692,6 +7741,7 @@ impl Codegen {
             // Unwrap wrapper expressions to find the do-block inside.
             // E.g. `set *rel = (do { ... } : [T])` wraps the Do in Annot.
             ast::ExprKind::UnitLit { value: inner, .. }
+            | ast::ExprKind::TimeUnitLit { value: inner, .. }
             | ast::ExprKind::Annot { expr: inner, .. } => {
                 self.compile_set_value_expr(builder, inner, env, db)
             }
@@ -7821,7 +7871,7 @@ impl Codegen {
             // they don't produce IO even if they contain IO values as
             // subexpressions. A function like `f x = {result: println x}`
             // returns a record, not IO.
-            ast::ExprKind::UnitLit { value, .. } => Self::expr_contains_io(value, builtins, io_fns),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => Self::expr_contains_io(value, builtins, io_fns),
             ast::ExprKind::Annot { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
             ast::ExprKind::Refine(inner) => Self::expr_contains_io(inner, builtins, io_fns),
             ast::ExprKind::Record(_)
@@ -8034,7 +8084,7 @@ impl Codegen {
                 Self::expr_contains_writes(scrutinee, write_fns, known_fns, passthrough_fns)
                     || arms.iter().any(|arm| Self::expr_contains_writes(&arm.body, write_fns, known_fns, passthrough_fns))
             }
-            ast::ExprKind::UnitLit { value, .. } => Self::expr_contains_writes(value, write_fns, known_fns, passthrough_fns),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => Self::expr_contains_writes(value, write_fns, known_fns, passthrough_fns),
             ast::ExprKind::Annot { expr, .. } => Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns),
             ast::ExprKind::Refine(inner) => Self::expr_contains_writes(inner, write_fns, known_fns, passthrough_fns),
             ast::ExprKind::Record(fields) => fields
@@ -8094,7 +8144,7 @@ impl Codegen {
                 })
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io(body),
-            ast::ExprKind::UnitLit { value, .. } => self.expr_is_io(value),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.expr_is_io(value),
             ast::ExprKind::Annot { expr, .. } => self.expr_is_io(expr),
             ast::ExprKind::Refine(inner) => self.expr_is_io(inner),
             _ => false,
@@ -8196,7 +8246,7 @@ impl Codegen {
                 })
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_has_external_io(body),
-            ast::ExprKind::UnitLit { value, .. } => self.expr_has_external_io(value),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.expr_has_external_io(value),
             ast::ExprKind::Annot { expr, .. } => self.expr_has_external_io(expr),
             ast::ExprKind::Refine(inner) => self.expr_has_external_io(inner),
             _ => false,
@@ -8367,7 +8417,20 @@ impl Codegen {
                     let rhs_iterates = (!self.expr_is_io(expr)
                         && (matches!(&expr.node, ast::ExprKind::List(_))
                             || self.expr_is_known_relation(expr)
-                            || self.expr_is_relation_var(expr)))
+                            || self.expr_is_relation_var(expr)
+                            // A pure comprehension over the relation monad is
+                            // desugared before codegen into an `App` spine of
+                            // `__bind`/`__yield` (no longer an `ExprKind::Do`),
+                            // and inference types the bind pattern as the
+                            // ELEMENT type. The Let arm recognizes this shape
+                            // (via `desugared_monad_kind`, ~line 8434) to mark
+                            // the binding relation-valued; mirror it here so
+                            // `x <- do { a <- [1,2,3]; yield a }` iterates
+                            // per-row (x : element) instead of binding the whole
+                            // relation value (which prints the list once and
+                            // panics on field access).
+                            || self.desugared_monad_kind(expr)
+                                == Some(MonadKind::Relation)))
                         || (pat_filters_rows && rhs_is_io_relation_source);
                     // Names (re)bound by this pattern are rows from here on,
                     // not the relation-valued lets they may have shadowed.
@@ -8433,6 +8496,28 @@ impl Codegen {
                                 && Self::do_block_is_comprehension(stmts) =>
                         {
                             self.compile_do(builder, stmts, env, db)
+                        }
+                        // An `atomic` block compiles *eagerly* — the Atomic arm
+                        // of compile_expr emits the savepoint/retry loop inline
+                        // rather than producing a deferred IO thunk. Binding it
+                        // with the general `compile_expr` path below would run
+                        // the whole transaction once, right here at the `let`,
+                        // and bind the name to the transaction's *result value*.
+                        // Later uses (`let bump = atomic do {…}; bump; bump`)
+                        // would then be plain values, and each `knot_io_run` on
+                        // them a no-op — so the transaction fires once instead of
+                        // per use. Wrap the atomic in an IO thunk instead: the
+                        // bound name holds a deferred `Value::IO(fn_ptr, env)`,
+                        // and each use re-runs the whole transaction when
+                        // `knot_io_run` executes it (the thunk body compiles the
+                        // atomic eagerly via compile_io_do_eager → compile_expr,
+                        // but only when invoked).
+                        ast::ExprKind::Atomic(_) => {
+                            let do_stmts = vec![ast::Spanned::new(
+                                ast::StmtKind::Expr(expr.clone()),
+                                expr.span,
+                            )];
+                            self.compile_io_do_as_thunk(builder, &do_stmts, env, db)
                         }
                         _ => {
                             let v = self.compile_expr(builder, expr, env, db);
@@ -10557,7 +10642,7 @@ impl Codegen {
                     || Self::references_source(value, source_name)
             }
             ast::ExprKind::Atomic(inner) => Self::references_source(inner, source_name),
-            ast::ExprKind::UnitLit { value, .. } => Self::references_source(value, source_name),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => Self::references_source(value, source_name),
             ast::ExprKind::Annot { expr, .. } => Self::references_source(expr, source_name),
             ast::ExprKind::Refine(inner) => Self::references_source(inner, source_name),
             ast::ExprKind::Serve { handlers, .. } => handlers
@@ -12977,7 +13062,7 @@ fn expr_has_user_calls(expr: &ast::Expr, user_fns: &HashMap<String, (FuncId, usi
         ast::ExprKind::FieldAccess { expr, .. } => expr_has_user_calls(expr, user_fns),
         ast::ExprKind::Lambda { body, .. } => expr_has_user_calls(body, user_fns),
         ast::ExprKind::Annot { expr, .. } => expr_has_user_calls(expr, user_fns),
-        ast::ExprKind::UnitLit { value, .. } => expr_has_user_calls(value, user_fns),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => expr_has_user_calls(value, user_fns),
         ast::ExprKind::Refine(inner) => expr_has_user_calls(inner, user_fns),
         ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
             ast::StmtKind::Bind { expr, .. } => expr_has_user_calls(expr, user_fns),
@@ -13029,7 +13114,7 @@ fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
                     .iter()
                     .any(|f| expr_references_var(&f.value, var_name))
         }
-        ast::ExprKind::UnitLit { value, .. } => expr_references_var(value, var_name),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => expr_references_var(value, var_name),
         ast::ExprKind::Annot { expr, .. } => expr_references_var(expr, var_name),
         ast::ExprKind::Refine(inner) => expr_references_var(inner, var_name),
         // Conservatively return true for complex expressions
@@ -13105,16 +13190,23 @@ pub(crate) fn sum_result_is_float(
 
 /// Whether a `sortBy` projection is safe to push to SQL `ORDER BY`: not an
 /// Int-typed CASE (collation loss, see `int_case_projection_pushable`) and not
-/// Float (SQLite orders floats differently from Knot's `total_cmp` — NaN sorts
-/// as NULL and -0.0/+0.0 are conflated). Float sort keys fall back to the
-/// faithful in-memory sort, mirroring the float comparison policy.
+/// Float/tag/bool. Float sort keys fall back to the faithful in-memory sort
+/// because SQLite orders floats differently from Knot's `total_cmp` (NaN sorts
+/// as NULL and -0.0/+0.0 are conflated). `tag` and `bool` keys likewise fall
+/// back: SQLite would order them by their TEXT/`1`/`0` storage, which does not
+/// match the declared `Ord` for those types — the same reason
+/// `minmax_pushdown_type_ok` and `try_compile_sql_comparison` treat tag/bool
+/// ordering as unsound and keep it in memory.
 pub(crate) fn sortby_projection_pushable(
     bind_var: &str,
     body: &ast::Expr,
     schema: &str,
 ) -> bool {
     int_case_projection_pushable(bind_var, body, schema)
-        && infer_sql_expr_type(bind_var, body, schema).as_deref() != Some("float")
+        && !matches!(
+            infer_sql_expr_type(bind_var, body, schema).as_deref(),
+            Some("float") | Some("tag") | Some("bool")
+        )
 }
 
 /// True when an expression tree contains an if/then/else node (which
@@ -13131,7 +13223,7 @@ fn expr_contains_if(expr: &ast::Expr) -> bool {
         }
         ast::ExprKind::FieldAccess { expr: inner, .. } => expr_contains_if(inner),
         ast::ExprKind::Annot { expr: inner, .. } => expr_contains_if(inner),
-        ast::ExprKind::UnitLit { value, .. } => expr_contains_if(value),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => expr_contains_if(value),
         _ => false,
     }
 }
@@ -13943,7 +14035,7 @@ fn extract_filter_on_source(
 // substituted value, we abandon that branch of substitution and leave the
 // expression unchanged, which is sound (just less optimized).
 
-fn beta_reduce(
+pub(crate) fn beta_reduce(
     expr: &ast::Expr,
     fun_bodies: &HashMap<String, ast::Expr>,
     let_bindings: &HashMap<String, ast::Expr>,
@@ -14111,7 +14203,7 @@ fn beta_reduce_inner(
         // we keep them unchanged: SQL pushdown never sees these inside the
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | Case { .. } | Do(_)
-        | Set { .. } | ReplaceSet { .. } | Atomic(_) | UnitLit { .. }
+        | Set { .. } | ReplaceSet { .. } | Atomic(_) | UnitLit { .. } | TimeUnitLit { .. }
         | Annot { .. } | Refine(_) | Serve { .. } => return expr.clone(),
     };
     ast::Spanned { node: new_node, span }
@@ -14205,6 +14297,10 @@ fn substitute_inner(
             value: Box::new(substitute_inner(v, var, value, value_fv)?),
             unit: unit.clone(),
         },
+        TimeUnitLit { value: v, unit_name } => TimeUnitLit {
+            value: Box::new(substitute_inner(v, var, value, value_fv)?),
+            unit_name: unit_name.clone(),
+        },
         Annot { expr: e, ty } => Annot {
             expr: Box::new(substitute_inner(e, var, value, value_fv)?),
             ty: ty.clone(),
@@ -14277,7 +14373,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
             expr_mentions_var(target, var) || expr_mentions_var(value, var)
         }
         Atomic(inner) | Refine(inner) => expr_mentions_var(inner, var),
-        UnitLit { value, .. } => expr_mentions_var(value, var),
+        UnitLit { value, .. } | TimeUnitLit { value, .. } => expr_mentions_var(value, var),
         Annot { expr: e, .. } => expr_mentions_var(e, var),
         Serve { handlers, .. } => {
             handlers.iter().any(|h| expr_mentions_var(&h.body, var))
@@ -14339,7 +14435,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             collect_free_vars_set(then_branch, bound, free);
             collect_free_vars_set(else_branch, bound, free);
         }
-        UnitLit { value: v, .. } => collect_free_vars_set(v, bound, free),
+        UnitLit { value: v, .. } | TimeUnitLit { value: v, .. } => collect_free_vars_set(v, bound, free),
         Annot { expr: e, .. } => collect_free_vars_set(e, bound, free),
         Refine(e) => collect_free_vars_set(e, bound, free),
         Serve { handlers, .. } => {
@@ -15325,7 +15421,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
             expr_contains_derived_ref(target, name) || expr_contains_derived_ref(value, name)
         }
-        ast::ExprKind::UnitLit { value, .. } => expr_contains_derived_ref(value, name),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => expr_contains_derived_ref(value, name),
         ast::ExprKind::Annot { expr, .. } => expr_contains_derived_ref(expr, name),
         ast::ExprKind::Refine(inner) => expr_contains_derived_ref(inner, name),
         ast::ExprKind::Serve { handlers, .. } => handlers
@@ -15479,7 +15575,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::Atomic(inner) => {
             collect_free_vars(inner, bound, free);
         }
-        ast::ExprKind::UnitLit { value, .. } => {
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => {
             collect_free_vars(value, bound, free);
         }
         ast::ExprKind::Annot { expr, .. } => {
@@ -15609,7 +15705,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
             expr_refs_var(target, var) || expr_refs_var(value, var)
         }
         ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => expr_refs_var(inner, var),
-        ast::ExprKind::UnitLit { value, .. } => expr_refs_var(value, var),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => expr_refs_var(value, var),
         ast::ExprKind::Annot { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::Serve { handlers, .. } => {
             handlers.iter().any(|h| expr_refs_var(&h.body, var))
@@ -15652,7 +15748,7 @@ pub(crate) enum SqlCastMode {
 fn strip_expr_wrappers(expr: &ast::Expr) -> &ast::Expr {
     match &expr.node {
         ast::ExprKind::Annot { expr: inner, .. } => strip_expr_wrappers(inner),
-        ast::ExprKind::UnitLit { value, .. } => strip_expr_wrappers(value),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => strip_expr_wrappers(value),
         _ => expr,
     }
 }
@@ -15946,7 +16042,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
             )
         }
         ast::ExprKind::Atomic(e) => format!("atomic ({})", pretty_expr(e)),
-        ast::ExprKind::UnitLit { value, .. } => pretty_expr(value),
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => pretty_expr(value),
         ast::ExprKind::Annot { expr, .. } => pretty_expr(expr),
         ast::ExprKind::Refine(inner) => format!("refine {}", pretty_expr(inner)),
         ast::ExprKind::Serve { api, handlers, .. } => {

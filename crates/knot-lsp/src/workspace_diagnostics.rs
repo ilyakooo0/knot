@@ -787,17 +787,35 @@ fn analyze_unopened_file_inner(
         // declarations.
         let own_ranges: Vec<(usize, usize)> =
             module.decls.iter().map(|d| (d.span.start, d.span.end)).collect();
-        let anchored_in_importer = |d: &diagnostic::Diagnostic| -> bool {
-            d.labels.iter().any(|l| {
-                own_ranges
-                    .iter()
-                    .any(|(s, e)| *s <= l.span.start && l.span.end <= *e)
-            })
-        };
 
         let mut analysis_module = module.clone();
 
+        // Track the byte ranges of the inlined imported declarations. A foreign
+        // diagnostic's span coincidentally falling inside one of the importer's
+        // own decl ranges must still be rejected, so imported-region membership
+        // overrides the `own_ranges` numeric containment below. `resolve_imports`
+        // prepends imported decls, so this file's own decls remain the trailing
+        // `own_decl_count` entries and the prefix is exactly the imported content.
+        let own_decl_count = module.decls.len();
         let _ = knot_compiler::modules::resolve_imports(&mut analysis_module, path);
+        let imported_count = analysis_module.decls.len().saturating_sub(own_decl_count);
+        let imported_ranges: Vec<(usize, usize)> = analysis_module.decls[..imported_count]
+            .iter()
+            .map(|d| (d.span.start, d.span.end))
+            .collect();
+
+        let anchored_in_importer = |d: &diagnostic::Diagnostic| -> bool {
+            d.labels.iter().any(|l| {
+                let in_imported = imported_ranges
+                    .iter()
+                    .any(|(s, e)| *s <= l.span.start && l.span.end <= *e);
+                !in_imported
+                    && own_ranges
+                        .iter()
+                        .any(|(s, e)| *s <= l.span.start && l.span.end <= *e)
+            })
+        };
+
         knot_compiler::base::inject_prelude(&mut analysis_module);
         knot_compiler::desugar::desugar(&mut analysis_module);
 

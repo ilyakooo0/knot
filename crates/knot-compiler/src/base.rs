@@ -10,6 +10,12 @@
 use knot::ast;
 use std::collections::HashSet;
 
+/// Byte offset added to every parsed prelude span so prelude spans can never
+/// collide with user-file spans (bug B39). Chosen far above any plausible real
+/// file size and above `desugar::SYNTH_SPAN_BASE` (1 << 31) so it also clears
+/// the synthesized monad-span range.
+pub(crate) const PRELUDE_SPAN_OFFSET: usize = 1 << 40;
+
 /// Knot source for built-in trait declarations and simple implementations.
 /// Complex [] impls for HKT traits are registered directly in codegen.
 const PRELUDE_SOURCE: &str = r#"
@@ -176,7 +182,25 @@ pub fn inject_prelude(module: &mut ast::Module) {
     let lexer = knot::lexer::Lexer::new(PRELUDE_SOURCE);
     let (tokens, _) = lexer.tokenize();
     let parser = knot::parser::Parser::new(PRELUDE_SOURCE.to_string(), tokens);
-    let (prelude_module, _) = parser.parse_module();
+    let (mut prelude_module, _) = parser.parse_module();
+
+    // Bug B39: shift every prelude span into a high range that no real source
+    // file can reach. The prelude is parsed from its own string constant, so
+    // its byte offsets start at 0 and alias user-file offsets. `monad_info` (in
+    // infer.rs) is keyed by raw `Span`, and prelude constructs feed it real
+    // spans: the bare `yield {}` in when/unless/forEach becomes a `yield`
+    // monad-var keyed by its offset, and the forEach do-block aliases its origin
+    // span in. When a user expression lands at the same byte offset,
+    // `monad_info.insert`'s last-write-wins re-dispatches one side's `yield`
+    // through the other's Applicative (e.g. the prelude's IO `yield` compiled as
+    // a Relation/Maybe pure). Shifting happens *after* parsing — the layout-
+    // sensitive parser computes columns by matching token offsets against the
+    // source string, so shifting tokens beforehand would break indentation. The
+    // offset sits far above `desugar::SYNTH_SPAN_BASE` (1 << 31) so a prelude
+    // span also can't alias a synthesized `__bind`/`__yield` monad span.
+    for decl in &mut prelude_module.decls {
+        shift_decl_spans(decl, PRELUDE_SPAN_OFFSET);
+    }
 
     // Filter out traits/impls that the user already defines
     let filtered: Vec<ast::Decl> = prelude_module
@@ -213,5 +237,240 @@ fn impl_arg_type_name(ty: &ast::Type) -> Option<String> {
         ast::TypeKind::Named(name) => Some(name.clone()),
         ast::TypeKind::Relation(_) => Some("[]".into()),
         _ => None,
+    }
+}
+
+// ── Prelude span shifting (bug B39) ──────────────────────────────────
+//
+// Add `offset` to every declaration/expression/statement/pattern span in a
+// prelude decl so prelude spans can never alias user-file spans in
+// `monad_info` (and the other span-keyed inference maps). Type spans are left
+// alone — they never key `monad_info`. Mirrors the AST shape walked by
+// `unused::walk_decl`; keep the two in sync when the AST grows a node.
+
+fn shift_decl_spans(decl: &mut ast::Decl, offset: usize) {
+    use ast::DeclKind::*;
+    decl.span.start += offset;
+    decl.span.end += offset;
+    match &mut decl.node {
+        Fun { body, .. } => {
+            if let Some(b) = body {
+                shift_expr_spans(b, offset);
+            }
+        }
+        View { body, .. } | Derived { body, .. } => shift_expr_spans(body, offset),
+        Trait { items, .. } => {
+            for item in items {
+                if let ast::TraitItem::Method { default_params, default_body, .. } = item {
+                    for p in default_params {
+                        shift_pat_spans(p, offset);
+                    }
+                    if let Some(b) = default_body {
+                        shift_expr_spans(b, offset);
+                    }
+                }
+            }
+        }
+        Impl { items, .. } => {
+            for item in items {
+                if let ast::ImplItem::Method { params, body, .. } = item {
+                    for p in params {
+                        shift_pat_spans(p, offset);
+                    }
+                    shift_expr_spans(body, offset);
+                }
+            }
+        }
+        Route { entries, .. } => {
+            for e in entries {
+                if let Some(expr) = &mut e.rate_limit {
+                    shift_expr_spans(expr, offset);
+                }
+            }
+        }
+        Migrate { using_fn, .. } => shift_expr_spans(using_fn, offset),
+        // No embedded expressions to shift.
+        Data { .. } | TypeAlias { .. } | Source { .. } | RouteComposite { .. }
+        | SubsetConstraint { .. } | UnitDecl { .. } => {}
+    }
+}
+
+fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
+    use ast::ExprKind::*;
+    e.span.start += offset;
+    e.span.end += offset;
+    match &mut e.node {
+        Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
+        Record(fields) => {
+            for f in fields {
+                shift_expr_spans(&mut f.value, offset);
+            }
+        }
+        RecordUpdate { base, fields } => {
+            shift_expr_spans(base, offset);
+            for f in fields {
+                shift_expr_spans(&mut f.value, offset);
+            }
+        }
+        FieldAccess { expr, .. } => shift_expr_spans(expr, offset),
+        List(items) => {
+            for it in items {
+                shift_expr_spans(it, offset);
+            }
+        }
+        Lambda { params, body } => {
+            for p in params {
+                shift_pat_spans(p, offset);
+            }
+            shift_expr_spans(body, offset);
+        }
+        App { func, arg } => {
+            shift_expr_spans(func, offset);
+            shift_expr_spans(arg, offset);
+        }
+        BinOp { lhs, rhs, .. } => {
+            shift_expr_spans(lhs, offset);
+            shift_expr_spans(rhs, offset);
+        }
+        UnaryOp { operand, .. } => shift_expr_spans(operand, offset),
+        If { cond, then_branch, else_branch } => {
+            shift_expr_spans(cond, offset);
+            shift_expr_spans(then_branch, offset);
+            shift_expr_spans(else_branch, offset);
+        }
+        Case { scrutinee, arms } => {
+            shift_expr_spans(scrutinee, offset);
+            for arm in arms {
+                shift_pat_spans(&mut arm.pat, offset);
+                shift_expr_spans(&mut arm.body, offset);
+            }
+        }
+        Do(stmts) => {
+            for s in stmts {
+                shift_stmt_spans(s, offset);
+            }
+        }
+        Set { target, value } | ReplaceSet { target, value } => {
+            shift_expr_spans(target, offset);
+            shift_expr_spans(value, offset);
+        }
+        Atomic(inner) | Refine(inner) => shift_expr_spans(inner, offset),
+        UnitLit { value, .. } | TimeUnitLit { value, .. } => shift_expr_spans(value, offset),
+        Annot { expr, .. } => shift_expr_spans(expr, offset),
+        Serve { handlers, .. } => {
+            for h in handlers {
+                h.endpoint_span.start += offset;
+                h.endpoint_span.end += offset;
+                shift_expr_spans(&mut h.body, offset);
+            }
+        }
+    }
+}
+
+fn shift_stmt_spans(s: &mut ast::Stmt, offset: usize) {
+    use ast::StmtKind::*;
+    s.span.start += offset;
+    s.span.end += offset;
+    match &mut s.node {
+        Bind { pat, expr } | Let { pat, expr } => {
+            shift_pat_spans(pat, offset);
+            shift_expr_spans(expr, offset);
+        }
+        Where { cond } => shift_expr_spans(cond, offset),
+        GroupBy { key } => shift_expr_spans(key, offset),
+        Expr(e) => shift_expr_spans(e, offset),
+    }
+}
+
+fn shift_pat_spans(p: &mut ast::Pat, offset: usize) {
+    use ast::PatKind::*;
+    p.span.start += offset;
+    p.span.end += offset;
+    match &mut p.node {
+        Var(_) | Wildcard | Lit(_) => {}
+        Constructor { payload, .. } => shift_pat_spans(payload, offset),
+        Record(fields) => {
+            for fp in fields {
+                if let Some(inner) = &mut fp.pattern {
+                    shift_pat_spans(inner, offset);
+                }
+            }
+        }
+        List(items) => {
+            for it in items {
+                shift_pat_spans(it, offset);
+            }
+        }
+        Cons { head, tail } => {
+            shift_pat_spans(head, offset);
+            shift_pat_spans(tail, offset);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smallest `span.start` anywhere in an expression subtree.
+    fn min_expr_span(e: &ast::Expr) -> usize {
+        use ast::ExprKind::*;
+        let children: Vec<&ast::Expr> = match &e.node {
+            App { func, arg } => vec![func, arg],
+            Lambda { body, .. } => vec![body],
+            If { cond, then_branch, else_branch } => vec![cond, then_branch, else_branch],
+            _ => vec![],
+        };
+        children
+            .iter()
+            .map(|c| min_expr_span(c))
+            .fold(e.span.start, usize::min)
+    }
+
+    /// Bug B39: the prelude is parsed from its own string constant, so its byte
+    /// offsets start at 0 and alias user-file offsets. `monad_info` (infer.rs)
+    /// is keyed by raw `Span`, and prelude constructs feed it real spans — the
+    /// bare `yield {}` in when/unless/forEach is a `yield` monad-var keyed by
+    /// its offset. When a user expression lands at the same offset,
+    /// last-write-wins on `monad_info.insert` re-dispatches one side's `yield`
+    /// through the other's Applicative. Shifting every prelude span past
+    /// `PRELUDE_SPAN_OFFSET` guarantees they can never collide with user spans.
+    #[test]
+    fn prelude_spans_shifted_out_of_user_range() {
+        let mut module = ast::Module { imports: vec![], decls: vec![] };
+        inject_prelude(&mut module);
+
+        // Every decl came from the prelude (the user module was empty), so all
+        // of their spans — down to the nested `yield` expressions that feed
+        // `monad_info` — must be lifted past the offset.
+        assert!(!module.decls.is_empty(), "prelude should inject decls");
+        let mut saw_when_yield = false;
+        for decl in &module.decls {
+            assert!(
+                decl.span.start >= PRELUDE_SPAN_OFFSET,
+                "prelude decl span {} not shifted past PRELUDE_SPAN_OFFSET",
+                decl.span.start,
+            );
+            // Reach into `when`'s body and confirm the bare `yield {}` span —
+            // the exact node that collides in `monad_info` — is shifted too.
+            if let ast::DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+                && name == "when"
+            {
+                assert!(
+                    min_expr_span(body) >= PRELUDE_SPAN_OFFSET,
+                    "when body has an unshifted span",
+                );
+                saw_when_yield = true;
+            }
+        }
+        assert!(saw_when_yield, "prelude should define `when` with a body");
+
+        // The offset must also clear the synthesized monad-span range
+        // (`desugar::SYNTH_SPAN_BASE` = 1 << 31) so a prelude span can't alias a
+        // desugared `__bind`/`__yield` helper span either.
+        // (Clippy: assertions_on_constants — use a const check instead.)
+        const _: () = {
+            assert!(PRELUDE_SPAN_OFFSET > (1usize << 31));
+        };
     }
 }

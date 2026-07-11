@@ -317,11 +317,11 @@ main = do
     assert!(stdout.contains("upper: 1"), "toUpper must be Unicode-aware, got: {stdout}");
 }
 
-// ── Finding 9: division by zero must panic, not silently drop rows ──
+// ── Finding 9: division by zero must not silently drop rows ──
 
 #[test]
-fn division_by_zero_in_where_panics_like_in_memory() {
-    let (_stdout, stderr, ok) = compile_and_run(
+fn float_division_by_zero_in_where_keeps_ieee_semantics() {
+    let (stdout, stderr, ok) = compile_and_run(
         "div_zero",
         r#"type M = {v: Float}
 *m : [M]
@@ -334,9 +334,34 @@ main = do
   yield {}
 "#,
     );
+    assert!(ok, "float division by zero must not abort: {stderr}");
+    // IEEE 754 (and knot_value_div): 10.0/0.0 = inf > 1.0 (true), 10.0/4.0 =
+    // 2.5 > 1.0 (true) → 2. Only *integer* division by zero panics.
+    // SQLite evaluates 10.0/0.0 as NULL, so pushing this down would drop the
+    // zero-divisor row and return 1. Two independent rules keep it in memory:
+    // the divisor is not a nonzero literal, and Float comparisons never push
+    // down at all. Either one alone suffices; this pins the observable result.
+    assert!(stdout.contains("n: 2"), "got: {stdout}");
+}
+
+#[test]
+fn int_division_by_zero_in_where_panics_like_in_memory() {
+    let (_stdout, stderr, ok) = compile_and_run(
+        "div_zero_int",
+        r#"type M = {v: Int}
+*m : [M]
+
+main = do
+  replace *m = [{v: 0}, {v: 4}]
+  rows <- *m
+  let n = countWhere (\r -> 10 / r.v > 1) rows
+  println ("n: " ++ show n)
+  yield {}
+"#,
+    );
     // SQL NULL semantics would silently return 1; the in-memory semantics
-    // (division by zero panics) must be preserved.
-    assert!(!ok, "division by zero must abort the program");
+    // (integer division by zero panics) must be preserved.
+    assert!(!ok, "integer division by zero must abort the program");
     assert!(
         stderr.contains("division by zero"),
         "expected division-by-zero panic, got: {stderr}"

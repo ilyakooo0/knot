@@ -84,6 +84,15 @@ struct ResultMarker {
     arg: Ty,
     /// Span of the final expression, for the mismatch diagnostic.
     arg_span: Span,
+    /// The rigid signature vars, and the `\/` unions declared over them, in
+    /// force where the marker was written. `resolve_result_markers` runs long
+    /// after the enclosing declaration dropped both, but the unify it performs
+    /// *is* the do-block's sequencing step: re-checked in a context where
+    /// nothing is rigid any more, two distinct signature rows (`IO {| r1}`
+    /// sequenced with `IO {| r2}`) would merge silently and one row's effects
+    /// would vanish from the declared result.
+    skolems: Vec<TyVar>,
+    effect_unions: Vec<EffectUnion>,
 }
 
 /// Maps `refine` expression spans to their resolved refined type name.
@@ -445,6 +454,13 @@ struct DeferredUnitBinop {
 struct EffectUnion {
     result: TyVar,
     sources: Vec<TyVar>,
+    /// True when the constraint comes from a `\/` the user actually wrote
+    /// (a signature's `IO {| r1 \/ r2}`, or a builtin like `race` declared
+    /// the same way). Only a declared union licenses merging two *rigid*
+    /// rows: constraints synthesised while checking a body (`merge_do_io_row`)
+    /// must not license further merges, or a body could invent the very
+    /// permission its signature withheld.
+    declared: bool,
 }
 
 // ── Constructor and data type metadata ────────────────────────────
@@ -2880,6 +2896,44 @@ impl Infer {
         })
     }
 
+    /// Like `effect_union_sanctions`, but only a `\/` the user actually
+    /// wrote counts. `merge_do_io_row` builds its own union constraints
+    /// while checking a body; consulting those would be circular — the
+    /// first merge would license the second, and a signature declaring a
+    /// single row (`IO {| r1}`) could absorb a second rigid row for free.
+    fn declared_union_sanctions(&self, a: TyVar, b: TyVar) -> bool {
+        let root = |v: TyVar| -> TyVar {
+            match self.apply(&Ty::Var(v)) {
+                Ty::Var(x) => x,
+                _ => v,
+            }
+        };
+        let a = root(a);
+        let b = root(b);
+        self.pending_effect_unions
+            .iter()
+            .filter(|u| u.declared)
+            .any(|u| {
+                let result = root(u.result);
+                let sources: Vec<TyVar> =
+                    u.sources.iter().map(|&s| root(s)).collect();
+                (sources.contains(&a) && sources.contains(&b))
+                    || (result == a && sources.contains(&b))
+                    || (result == b && sources.contains(&a))
+            })
+    }
+
+    /// Whether the rigid row `r` may join the sources of the pending union at
+    /// `idx` — it may only when a declared `\/` puts `r` in a union with every
+    /// source already there (`r1 \/ r2 \/ r3` admits `r3` into a `r1`+`r2`
+    /// merge; a signature declaring only `r1 \/ r2` does not).
+    fn union_admits_source(&self, idx: usize, r: TyVar) -> bool {
+        self.pending_effect_unions[idx]
+            .sources
+            .iter()
+            .all(|&s| s == r || self.declared_union_sanctions(s, r))
+    }
+
     /// Expand a nominal ADT (`Con(name, args)`) to a structural `Variant`.
     fn con_to_variant(
         &mut self,
@@ -2980,7 +3034,11 @@ impl Infer {
             };
             let result = fresh_var(u.result);
             let sources = u.sources.iter().copied().map(fresh_var).collect();
-            self.pending_effect_unions.push(EffectUnion { result, sources });
+            self.pending_effect_unions.push(EffectUnion {
+                result,
+                sources,
+                declared: u.declared,
+            });
         }
         // Freshen unit variables so each instantiation gets independent units.
         let unit_mapping: HashMap<UnitVar, UnitVar> = scheme
@@ -3071,7 +3129,11 @@ impl Infer {
             };
             let result = fresh_var(u.result);
             let sources = u.sources.iter().copied().map(fresh_var).collect();
-            self.pending_effect_unions.push(EffectUnion { result, sources });
+            self.pending_effect_unions.push(EffectUnion {
+                result,
+                sources,
+                declared: u.declared,
+            });
         }
         // Freshen unit variables to fresh *skolems* (rigid): the body must hold
         // for every unit, so it may not narrow `∀u` to a concrete unit. Marking
@@ -3506,7 +3568,11 @@ impl Infer {
             let result_resolved = self.apply(&Ty::Var(u.result));
             match result_resolved {
                 Ty::Var(v) if gen_set.contains(&v) => {
-                    effect_unions.push(EffectUnion { result: v, sources: u.sources });
+                    effect_unions.push(EffectUnion {
+                        result: v,
+                        sources: u.sources,
+                        declared: u.declared,
+                    });
                 }
                 Ty::Var(_) => {
                     // Result var is env-bound or already moved by another
@@ -3515,6 +3581,7 @@ impl Infer {
                     self.pending_effect_unions.push(EffectUnion {
                         result: u.result,
                         sources: u.sources,
+                        declared: u.declared,
                     });
                 }
                 _ => {
@@ -4045,6 +4112,7 @@ impl Infer {
                         self.pending_effect_unions.push(EffectUnion {
                             result,
                             sources,
+                            declared: true,
                         });
                         Some(result)
                     }
@@ -4691,6 +4759,8 @@ impl Infer {
                         elem: a,
                         arg: arg_ty,
                         arg_span: arg.span,
+                        skolems: self.skolems.iter().copied().collect(),
+                        effect_unions: self.pending_effect_unions.clone(),
                     });
                     return Ty::App(
                         Box::new(Ty::Var(m)),
@@ -6052,7 +6122,11 @@ impl Infer {
                         for u in pending {
                             match self.apply(&Ty::Var(u.result)) {
                                 Ty::Var(v) if var_set.contains(&v) => {
-                                    effect_unions.push(EffectUnion { result: v, sources: u.sources });
+                                    effect_unions.push(EffectUnion {
+                                        result: v,
+                                        sources: u.sources,
+                                        declared: u.declared,
+                                    });
                                 }
                                 _ => remaining_eu.push(u),
                             }
@@ -6569,6 +6643,12 @@ impl Infer {
     /// forcing them equal rejects every user-annotated `\/` function.
     /// Mirror the way `race`'s builtin registration types `\/`: a fresh
     /// result row bound by a pending effect-union constraint.
+    ///
+    /// The union is only available when the signature *declared* it. Two
+    /// rigid rows the user never joined with `\/` stay unmergeable, so the
+    /// `unify` fallback rejects them the same way it does everywhere else:
+    /// a body sequencing `IO {| r1}` with `IO {| r2}` cannot be typed
+    /// `IO {| r1}`, which would drop `r2`'s effects on the floor.
     fn merge_do_io_row(
         &mut self,
         io_row: &mut Option<TyVar>,
@@ -6597,37 +6677,48 @@ impl Infer {
                 let e_rigid = self.skolems.contains(&e);
                 let r_rigid = self.skolems.contains(&r);
                 if e_rigid && r_rigid {
+                    if !self.declared_union_sanctions(e, r) {
+                        self.unify(&Ty::Var(existing), &Ty::Var(rv), span);
+                        return;
+                    }
                     let result = self.fresh_var();
                     self.pending_effect_unions.push(EffectUnion {
                         result,
                         sources: vec![e, r],
+                        declared: false,
                     });
                     *io_row = Some(result);
                     return;
                 }
                 // The accumulated row may already be a union result var;
                 // fold further rigid rows into its sources rather than
-                // aliasing the union var to a skolem.
+                // aliasing the union var to a skolem. Folding is subject to
+                // the same rule as the merge above: the new row may only join
+                // a union whose every other source the signature already
+                // declared it unionable with, so a third rigid row can't slip
+                // into a two-row `\/`.
                 if r_rigid {
                     let idx = self.pending_effect_unions.iter().position(|u| self.var_chain_end(u.result) == e);
-                    if let Some(idx) = idx {
-                        let u = &mut self.pending_effect_unions[idx];
-                        if !u.sources.contains(&r) {
-                            u.sources.push(r);
+                    if let Some(idx) = idx
+                        && self.union_admits_source(idx, r) {
+                            let u = &mut self.pending_effect_unions[idx];
+                            if !u.sources.contains(&r) {
+                                u.sources.push(r);
+                            }
+                            return;
                         }
-                        return;
-                    }
                 }
                 if e_rigid {
                     let idx = self.pending_effect_unions.iter().position(|u| self.var_chain_end(u.result) == r);
-                    if let Some(idx) = idx {
-                        let u = &mut self.pending_effect_unions[idx];
-                        if !u.sources.contains(&e) {
-                            u.sources.push(e);
+                    if let Some(idx) = idx
+                        && self.union_admits_source(idx, e) {
+                            let u = &mut self.pending_effect_unions[idx];
+                            if !u.sources.contains(&e) {
+                                u.sources.push(e);
+                            }
+                            *io_row = Some(rv);
+                            return;
                         }
-                        *io_row = Some(rv);
-                        return;
-                    }
                 }
             }
         self.unify(&Ty::Var(existing), &Ty::Var(rv), span);
@@ -10593,6 +10684,18 @@ fn resolve_result_markers(infer: &mut Infer, module: &mut ast::Module) {
             // otherwise-unconstrained block. Only trust the comparison when
             // the monad actually resolved to something.
             && !matches!(monad, Ty::Var(_));
+
+        // Restore the rigidity context the marker was written in: this unify
+        // stands in for a step of the do-block's body, and the body's rigid
+        // signature vars (with whatever `\/` unions were declared over them)
+        // must still constrain it. See `ResultMarker::skolems`.
+        let saved_skolems = infer.skolems.clone();
+        let saved_unions = std::mem::replace(
+            &mut infer.pending_effect_unions,
+            m.effect_unions.clone(),
+        );
+        infer.skolems.extend(m.skolems.iter().copied());
+
         if is_action {
             let action_ty = Ty::App(
                 Box::new(Ty::Var(m.monad)),
@@ -10603,6 +10706,9 @@ fn resolve_result_markers(infer: &mut Infer, module: &mut ast::Module) {
             pure_spans.insert(m.span);
             infer.unify(&Ty::Var(m.elem), &arg, m.arg_span);
         }
+
+        infer.skolems = saved_skolems;
+        infer.pending_effect_unions = saved_unions;
     }
 
     for decl in &mut module.decls {

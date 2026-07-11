@@ -733,6 +733,27 @@ main = combine (println "left") (println "right")
 }
 
 #[test]
+fn effect_row_equality_without_union_still_rejected_with_io_builtin() {
+    // As above, but the `println` keeps the block out of the desugarer, so the
+    // rows are sequenced by `infer_do`/`merge_do_io_row` rather than by the
+    // deferred `__result` marker. That path must withhold the `\/` union too:
+    // it may only union two rigid rows the signature actually joined.
+    let src = r#"combine : IO {| r1} {} -> IO {| r2} {} -> IO {console | r1} {}
+combine = \a b -> do
+  println "seq"
+  a
+  b
+main = combine (println "left") (println "right")
+"#;
+    let diags = check_src(src);
+    assert!(
+        has_error(&diags, "cannot unify rigid type variables"),
+        "rigid rows must not silently merge without a `\\/` union: {:?}",
+        diags
+    );
+}
+
+#[test]
 fn user_annotated_effect_union_if_branches_accepted() {
     // Regression (B22): an `if` in *infer* position (here as the argument of
     // `id`, so the callee doesn't push an expected type back down) whose two
@@ -879,3 +900,4 @@ main = 1
     let refs = refinements_for(src, "people");
     assert!(refs.is_empty(), "got: {:?}", refs);
 }
+

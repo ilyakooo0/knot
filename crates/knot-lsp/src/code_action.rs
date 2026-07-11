@@ -1245,13 +1245,21 @@ fn find_add_wildcard_arm_at(
             // indent that would terminate the layout-sensitive case block.
             let indent = arm_indentation(expr, arms, source);
 
-            let case_text = source.get(expr.span.start..expr.span.end)?;
-            let mut rewritten = case_text.to_string();
-            // Append the new arm. `todo` is intentionally an undefined name so
-            // the user gets a clear "fill me in" diagnostic.
+            // Insert the new arm right after the last arm's body, NOT at
+            // `expr.span.end`. When the case is wrapped in parens
+            // (`show (case c of Red {} -> 1)`), the parser folds the enclosing
+            // parens into the case node's span, so `expr.span.end` points past
+            // the closing `)`; inserting there would land the arm outside the
+            // parens and break the parse. The last arm's body always ends
+            // inside the parens. `arms` is guaranteed non-empty here (the
+            // empty-arms case returned above).
+            let insert_at = arms.last()?.body.span.end;
+            // The new arm. `todo` is intentionally an undefined name so the
+            // user gets a clear "fill me in" diagnostic.
+            let mut rewritten = String::new();
             rewritten.push_str(&indent);
             rewritten.push_str("_ -> todo");
-            return Some((expr.span, rewritten));
+            return Some((Span::new(insert_at, insert_at), rewritten));
         }
         let mut found = None;
         crate::utils::recurse_expr(expr, |child| {
@@ -1630,7 +1638,19 @@ fn find_case_actions(
                             .map(|c| build_case_arm(c, &arm_indent))
                             .collect();
 
-                        let insert_pos = offset_to_position(&doc.source, expr.span.end);
+                        // Insert after the last arm's body rather than at
+                        // `expr.span.end`. A parenthesized case
+                        // (`show (case c of Red {} -> 1)`) has its enclosing
+                        // parens folded into the case node's span by the
+                        // parser, so `expr.span.end` points past the closing
+                        // `)`; the last arm's body always ends inside the
+                        // parens. Falls back to `expr.span.end` only for the
+                        // (parser-impossible) empty-arms case.
+                        let insert_offset = arms
+                            .last()
+                            .map(|a| a.body.span.end)
+                            .unwrap_or(expr.span.end);
+                        let insert_pos = offset_to_position(&doc.source, insert_offset);
                         let mut changes = HashMap::new();
                         changes.insert(
                             uri.clone(),
@@ -3290,7 +3310,7 @@ fn find_pipe_conversion_at(
         offset: usize,
         best: &mut Option<(Span, String)>,
         is_app_head: bool,
-        under_operator: bool,
+        needs_parens: bool,
     ) {
         if expr.span.start > offset || offset > expr.span.end {
             return;
@@ -3323,12 +3343,18 @@ fn find_pipe_conversion_at(
                     } else {
                         arg_text.to_string()
                     };
-                    // `|>` has the lowest precedence, so splicing a bare pipe
-                    // into an operator operand re-associates the expression:
-                    // `1 + double x` → `1 + x |> double` parses as
-                    // `(1 + x) |> double`. Parenthesize the pipe whenever the
-                    // application is an operand of a Bin/UnaryOp.
-                    let replacement = if under_operator {
+                    // `|>` has the lowest precedence, so a bare pipe
+                    // re-associates whenever it lands in a position that binds
+                    // tighter than it. Two such positions need parens:
+                    //   - an operand of a Bin/UnaryOp: `1 + double x` →
+                    //     `1 + x |> double` parses as `(1 + x) |> double`.
+                    //   - the argument of an enclosing application: the source
+                    //     `g (f x)` gives the inner `App` a span that swallows
+                    //     the parens, so replacing it with `x |> f` yields
+                    //     `g x |> f`, i.e. `f (g x)` — application order
+                    //     silently reversed.
+                    // Parenthesize the pipe in either case.
+                    let replacement = if needs_parens {
                         format!("({arg_part} |> {func_text})")
                     } else {
                         format!("{arg_part} |> {func_text}")
@@ -3337,16 +3363,18 @@ fn find_pipe_conversion_at(
                 }
             }
             // Recurse manually so the function side knows it is an
-            // application head. An application's argument slot is atomic
-            // (complex args are parenthesized in the source), so neither
-            // child inherits the operator context.
+            // application head. The argument slot binds tighter than `|>`:
+            // a complex arg is parenthesized in the source and the `App`
+            // span covers those parens, so a pipe spliced there must be
+            // re-parenthesized to preserve application order.
             walk(func, source, offset, best, true, false);
-            walk(arg, source, offset, best, false, false);
+            walk(arg, source, offset, best, false, true);
             return;
         }
         // Operator operands need the flag so a converted App inside them is
         // parenthesized; everything else resets it (their children sit in
-        // delimited or otherwise pipe-safe positions).
+        // delimited or otherwise pipe-safe positions where a bare pipe does
+        // not re-associate).
         match &expr.node {
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 walk(lhs, source, offset, best, false, true);
@@ -4852,6 +4880,28 @@ mod regress_fixes_batch2_tests {
         let (_, replacement) =
             find_pipe_conversion_at(&module, src, off).expect("pipe action offered");
         assert_eq!(replacement, "x |> show");
+    }
+
+    /// B63: converting the inner application of `g (f x)` to pipe form must
+    /// parenthesize the pipe. The parser gives the inner `App` a span that
+    /// covers the source parens, so an unparenthesized `x |> f` would replace
+    /// `(f x)` with `x |> f`, producing `g x |> f` — which parses as
+    /// `f (g x)`, silently reversing the application order.
+    #[test]
+    fn pipe_conversion_parenthesizes_in_argument_position() {
+        let src = "k = \\x -> g (f x)\n";
+        let module = parse_module(src);
+        let off = src.find("f x").expect("inner application"); // on `f`
+        let (span, replacement) =
+            find_pipe_conversion_at(&module, src, off).expect("pipe action offered");
+        assert_eq!(replacement, "(x |> f)");
+        let mut out = src.to_string();
+        out.replace_range(span.start..span.end, &replacement);
+        assert!(parses_cleanly(&out), "pipe rewrite must reparse: {out}");
+        assert!(
+            out.contains("g (x |> f)"),
+            "application order must be preserved: {out}"
+        );
     }
 
     /// Bug 2: adding a wildcard arm to a case whose first arm sits inline on

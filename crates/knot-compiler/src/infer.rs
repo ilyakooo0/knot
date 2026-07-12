@@ -118,6 +118,13 @@ pub type RefinedTypeInfoMap = HashMap<String, knot::ast::Expr>;
 /// genuinely unknown until run time.
 pub type TraitCallTargets = HashMap<(Span, String), String>;
 
+/// Maps `show` call-site spans to the canonical unit string of the argument
+/// (e.g. `"M"`, `"M/S^2"`). Only concrete units appear: units are erased at
+/// runtime, so this is the sole channel by which the unit reaches the emitted
+/// code. Codegen emits `knot_value_show_unit` for spans found here and plain
+/// `knot_value_show` for the rest.
+pub type ShowUnitStrings = HashMap<Span, String>;
+
 /// Maps declaration names to their inferred type display strings.
 pub type TypeInfo = HashMap<String, String>;
 
@@ -593,6 +600,12 @@ struct Infer {
     /// Each entry records (app_span, return_type_var).
     from_json_calls: Vec<(Span, TyVar)>,
 
+    /// Tracks `show` application sites so their argument's unit of measure can
+    /// be resolved after inference. Each entry records (app_span, arg_ty); the
+    /// arg type is recorded unresolved because a unit variable may only be
+    /// solved by a later constraint. See `show_unit_strings`.
+    show_calls: Vec<(Span, Ty)>,
+
     /// Trait method → trait name mapping (e.g. "display" → "Display").
     trait_method_traits: HashMap<String, String>,
 
@@ -705,9 +718,6 @@ struct Infer {
     /// Whether we are currently processing a type annotation (so undeclared
     /// unit names are treated as polymorphic unit variables).
     in_type_annotation: bool,
-    /// Maps show call-site spans to their unit display strings (for codegen).
-    #[allow(dead_code)]
-    pub show_unit_strings: HashMap<Span, String>,
 
     // ── Refined types ─────────────────────────────────────────────
     /// Refined type metadata: type_name → (base Ty, predicate Expr).
@@ -775,6 +785,7 @@ impl Infer {
             traverse_calls: Vec::new(),
             from_json_calls: Vec::new(),
             trait_call_vars: Vec::new(),
+            show_calls: Vec::new(),
             trait_method_traits: HashMap::new(),
             trait_method_param_vars: HashMap::new(),
             known_impls: HashSet::new(),
@@ -800,7 +811,6 @@ impl Infer {
             declared_units: HashMap::new(),
             annotation_unit_vars: HashMap::new(),
             in_type_annotation: false,
-            show_unit_strings: HashMap::new(),
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
             suppress_refine_intro: None,
@@ -4942,6 +4952,16 @@ impl Infer {
                         && let Ty::Var(v) = &result_ty {
                             self.from_json_calls.push((expr.span, *v));
                         }
+
+                // Track `show` calls so the argument's unit can be resolved
+                // once inference finishes and handed to codegen — the unit is
+                // erased before runtime, so this is the only chance to capture
+                // it. Recorded unresolved: `show (a * b)` may not know its unit
+                // until a later constraint solves the operands' unit vars.
+                if let ast::ExprKind::Var(name) = &func.node
+                    && name == "show" {
+                        self.show_calls.push((expr.span, arg_ty.clone()));
+                    }
 
                 // Track full `traverse f rel` applications: the resolved
                 // result type names the applicative, which codegen passes to
@@ -10370,11 +10390,11 @@ fn value_references_source_inner(
 ///
 /// Runs on a grown stack: a desugared `do` block nests one `__bind` per
 /// statement, and `infer_expr` recurses through every level.
-pub fn check(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk, TraitCallTargets) {
+pub fn check(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk, TraitCallTargets, ShowUnitStrings) {
     crate::stack::grow(|| check_inner(module))
 }
 
-fn check_inner(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk, TraitCallTargets) {
+fn check_inner(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk, TraitCallTargets, ShowUnitStrings) {
     let mut infer = Infer::new();
 
     // Phase 1: Collect type aliases, data types, constructors
@@ -10675,11 +10695,34 @@ fn check_inner(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInf
         }
     }
 
+    // Phase 8: Resolve the unit of measure at each `show` call site. Units are
+    // a compile-time overlay — fully erased by codegen — so a unit suffix can
+    // only be printed if it is captured here and emitted as a constant.
+    let mut show_unit_strings = ShowUnitStrings::new();
+    for (span, ty) in std::mem::take(&mut infer.show_calls) {
+        // Peel aliases so a refined/aliased numeric (`type Metres = Float<M>`)
+        // still shows its unit.
+        let resolved = infer.apply(&ty);
+        let unit = match resolved.peel_alias() {
+            Ty::IntUnit(u) | Ty::FloatUnit(u) => infer.apply_unit(u),
+            _ => continue,
+        };
+        // A unit still carrying variables is polymorphic — inside a unit-generic
+        // function the concrete unit is not known at this call site, and DESIGN
+        // specifies `show` prints just the number there. `apply` already folds a
+        // dimensionless unit back to plain `Int`/`Float`, so the emptiness check
+        // is only a guard against a hand-built `IntUnit(dimensionless)`.
+        if !unit.vars.is_empty() || unit.is_dimensionless() {
+            continue;
+        }
+        show_unit_strings.insert(span, unit.display());
+    }
+
     let type_info = infer.extract_type_info();
     let local_type_info = infer.extract_local_type_info();
     let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings)
 }
 
 
@@ -11115,14 +11158,14 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls) = check(&mut module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units) = check(&mut module);
         diags
     }
 
     fn type_info_for(src: &str) -> TypeInfo {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls) = check(&mut module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units) = check(&mut module);
         type_info
     }
 

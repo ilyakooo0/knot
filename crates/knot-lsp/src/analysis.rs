@@ -607,6 +607,7 @@ pub fn analyze_document(
             _from_json,
             _elem_pushdown,
             _trait_calls,
+            _show_units,
         ) = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_user));
         type_info = inferred_types;

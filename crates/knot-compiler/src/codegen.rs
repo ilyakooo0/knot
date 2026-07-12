@@ -305,6 +305,12 @@ pub struct Codegen {
     // path: `literal` (the `IN (?, …)` list form) and `dynamic` (the
     // `IN (SELECT value FROM json_each(?))` form). See `infer::ElemPushdownOk`.
     elem_pushdown_ok: crate::infer::ElemPushdownOk,
+
+    // `show` call sites whose argument has a concrete unit of measure:
+    // app_span -> canonical unit string (e.g. "M", "M/S^2"). Units are erased
+    // here, so the string from inference is the only carrier of the unit into
+    // the emitted code.
+    show_unit_strings: crate::infer::ShowUnitStrings,
 }
 
 /// A top-level constant declared as a signature with no body
@@ -602,6 +608,7 @@ pub fn compile(
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     trait_call_targets: &crate::infer::TraitCallTargets,
+    show_unit_strings: &crate::infer::ShowUnitStrings,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     crate::stack::grow(|| {
@@ -616,6 +623,7 @@ pub fn compile(
             type_info,
             elem_pushdown_ok,
             trait_call_targets,
+            show_unit_strings,
             compile_time_overrides,
         )
     })
@@ -633,6 +641,7 @@ fn compile_inner(
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     trait_call_targets: &crate::infer::TraitCallTargets,
+    show_unit_strings: &crate::infer::ShowUnitStrings,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
@@ -667,6 +676,7 @@ fn compile_inner(
         .collect();
     cg.from_json_targets = from_json_targets.clone();
     cg.elem_pushdown_ok = elem_pushdown_ok.clone();
+    cg.show_unit_strings = show_unit_strings.clone();
     cg.source_refinements = type_env.source_refinements.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
@@ -937,6 +947,7 @@ impl Codegen {
             source_refinements: HashMap::new(),
             from_json_targets: HashMap::new(),
             elem_pushdown_ok: crate::infer::ElemPushdownOk::default(),
+            show_unit_strings: HashMap::new(),
         }
     }
 
@@ -1024,6 +1035,7 @@ impl Codegen {
         self.declare_rt("knot_print", &[p], &[p]);
         self.declare_rt("knot_println", &[p], &[p]);
         self.declare_rt("knot_value_show", &[p], &[p]);
+        self.declare_rt("knot_value_show_unit", &[p, p, p], &[p]);
         self.declare_rt("knot_guard_failed", &[], &[]);
 
         // Constructor declaration order (backs structural `Ord` on ADTs)
@@ -6679,7 +6691,21 @@ impl Codegen {
             }
             ast::ExprKind::Var(name) if name == "show" => {
                 if compiled_args.len() == 1 {
-                    self.call_rt(builder, "knot_value_show", &[compiled_args[0]])
+                    // A `show` whose argument's type carried a concrete unit
+                    // gets the unit appended: `show 42.0<M>` → "42.0 M". The
+                    // unit is erased from the value, so inference resolved it
+                    // per call site and it is emitted as a string constant.
+                    match self.show_unit_strings.get(&expr.span).cloned() {
+                        Some(unit) => {
+                            let (unit_ptr, unit_len) = self.string_ptr(builder, &unit);
+                            self.call_rt(
+                                builder,
+                                "knot_value_show_unit",
+                                &[compiled_args[0], unit_ptr, unit_len],
+                            )
+                        }
+                        None => self.call_rt(builder, "knot_value_show", &[compiled_args[0]]),
+                    }
                 } else {
                     self.call_rt(builder, "knot_value_unit", &[])
                 }

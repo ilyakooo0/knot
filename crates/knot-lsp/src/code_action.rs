@@ -40,21 +40,11 @@ pub(crate) fn handle_code_action(
     // The LSP spec doesn't guarantee `range.start <= range.end`; a buggy
     // client can send an inverted range. Normalize so the offsets are ordered
     // (the extract-variable path slices `doc.source[range_start..range_end]`,
-    // which panics when `range_start > range_end`). `sel_range` is the
-    // correspondingly-normalized LSP range used in the generated TextEdits
-    // (an inverted range inside a TextEdit is itself invalid per the spec).
-    let (range_start, range_end, sel_range) = {
+    // which panics when `range_start > range_end`).
+    let (range_start, range_end) = {
         let a = position_to_offset(&doc.source, params.range.start);
         let b = position_to_offset(&doc.source, params.range.end);
-        if a <= b {
-            (a, b, params.range)
-        } else {
-            (
-                b,
-                a,
-                lsp_types::Range { start: params.range.end, end: params.range.start },
-            )
-        }
+        if a <= b { (a, b) } else { (b, a) }
     };
 
     for decl in &doc.module.decls {
@@ -590,6 +580,21 @@ pub(crate) fn handle_code_action(
     if range_start != range_end {
         let selected_text = &doc.source[range_start..range_end.min(doc.source.len())];
         let trimmed = selected_text.trim();
+        // The extracted text is the TRIMMED selection, so the replacement must
+        // cover exactly the trimmed span — not the raw one. Replacing the raw
+        // span would delete the surrounding whitespace along with the
+        // expression; for a selection that runs to the end of a line that means
+        // eating the trailing newline, gluing the call site onto the next
+        // declaration and breaking the layout-sensitive parse. The trimmed
+        // offsets also keep the enclosing-decl / do-statement lookups below from
+        // being thrown off by whitespace that spills past the node's span.
+        let sel_start =
+            range_start + (selected_text.len() - selected_text.trim_start().len());
+        let sel_end = sel_start + trimmed.len();
+        let sel_range = Range {
+            start: offset_to_position(&doc.source, sel_start),
+            end: offset_to_position(&doc.source, sel_end),
+        };
         // Only offer for non-trivial selections (not just a name or empty) that
         // line up exactly with a whole expression node. Replacing the selection
         // with a variable/call only preserves meaning when the selection IS a
@@ -600,7 +605,7 @@ pub(crate) fn handle_code_action(
         if !trimmed.is_empty()
             && trimmed.len() > 1
             && !trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
-            && selection_matches_expr_node(&doc.module, &doc.source, range_start, range_end)
+            && selection_matches_expr_node(&doc.module, &doc.source, sel_start, sel_end)
         {
             // Pick fresh names that don't collide with anything in scope. Stable
             // numbering keeps the result deterministic and easy to test.
@@ -613,7 +618,7 @@ pub(crate) fn handle_code_action(
             // the START of that enclosing statement (not the cursor's line)
             // so multi-line statements aren't split mid-expression.
             if let Some(stmt_start) =
-                enclosing_do_stmt_start(&doc.module, range_start, range_end)
+                enclosing_do_stmt_start(&doc.module, sel_start, sel_end)
             {
                 let line_start = doc.source[..stmt_start]
                     .rfind('\n')
@@ -685,7 +690,7 @@ pub(crate) fn handle_code_action(
             // Top-level Knot functions take parameters via lambdas
             // (`name = \x y -> body`), NOT via parameters on the left-hand
             // side — `name x = body` is a parse error at top level.
-            let free_vars = find_free_vars_in_selection(doc, range_start, range_end);
+            let free_vars = find_free_vars_in_selection(doc, sel_start, sel_end);
             let helper_decl = if free_vars.is_empty() {
                 format!("{fn_name} = {trimmed}\n\n")
             } else {
@@ -712,7 +717,7 @@ pub(crate) fn handle_code_action(
                 .module
                 .decls
                 .iter()
-                .find(|d| d.span.start <= range_start && range_end <= d.span.end)
+                .find(|d| d.span.start <= sel_start && sel_end <= d.span.end)
                 .map(|d| include_export_prefix(&doc.source, d.span.start))
                 .unwrap_or(0);
             let fn_insert_pos = offset_to_position(&doc.source, fn_insert_offset);
@@ -4649,6 +4654,80 @@ mod regress_fixes_tests {
             "call site must not be a bare `show extracted_fn n`; got:\n{out}"
         );
         // The result must round-trip through the parser cleanly.
+        let lexer = knot::lexer::Lexer::new(&out);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(out.clone(), tokens);
+        let (_, diags) = parser.parse_module();
+        assert!(
+            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
+            "extracted result must parse; got {diags:?}\nsource:\n{out}"
+        );
+    }
+
+    /// A full-line selection carries the line's trailing newline. The extracted
+    /// helper is built from the TRIMMED text, so the replacement must cover only
+    /// the trimmed span — replacing the raw selection deletes the newline and
+    /// glues the call site onto the next declaration (`f = extracted_fng = 3`),
+    /// which no longer parses.
+    #[test]
+    fn extract_function_preserves_trailing_newline_of_full_line_selection() {
+        let mut tw = TestWorkspace::new();
+        let src = "f = 1 + 2\ng = 3\n";
+        let uri = tw.open("main", src);
+        // Selection runs to the start of the next line, newline included.
+        let range = selection(src, "1 + 2\n");
+        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
+            .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
+            .expect("extract-to-function offered");
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        assert!(
+            out.contains("f = extracted_fn\n"),
+            "the selection's trailing newline must survive the replacement; got:\n{out}"
+        );
+        assert!(
+            out.contains("\ng = 3"),
+            "the following declaration must stay on its own line; got:\n{out}"
+        );
+        // The glued-together form is exactly what the raw-range replacement
+        // produced, so pin it explicitly.
+        assert!(
+            !out.contains("extracted_fng"),
+            "call site must not be glued to the next decl; got:\n{out}"
+        );
+        let lexer = knot::lexer::Lexer::new(&out);
+        let (tokens, _) = lexer.tokenize();
+        let parser = knot::parser::Parser::new(out.clone(), tokens);
+        let (_, diags) = parser.parse_module();
+        assert!(
+            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
+            "extracted result must parse; got {diags:?}\nsource:\n{out}"
+        );
+    }
+
+    /// Same trailing-newline hazard on the let path: eating the newline would
+    /// pull the next do-statement onto the `let` line and break the layout.
+    #[test]
+    fn extract_to_let_preserves_trailing_newline_of_full_line_selection() {
+        let mut tw = TestWorkspace::new();
+        let src = "main = do\n  let a = 1 + 2\n  println (show a)\n";
+        let uri = tw.open("main", src);
+        let range = selection(src, "1 + 2\n");
+        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
+            .unwrap_or_default();
+        let action = action_titled(&actions, |t| t.starts_with("Extract to let"))
+            .expect("extract-to-let offered");
+        let edits = edits_for(action, &uri);
+        let out = apply_edits_to(src, edits);
+        assert!(
+            out.contains("let a = extracted\n"),
+            "the selection's trailing newline must survive the replacement; got:\n{out}"
+        );
+        assert!(
+            out.contains("\n  println (show a)"),
+            "the next do-statement must stay on its own line; got:\n{out}"
+        );
         let lexer = knot::lexer::Lexer::new(&out);
         let (tokens, _) = lexer.tokenize();
         let parser = knot::parser::Parser::new(out.clone(), tokens);

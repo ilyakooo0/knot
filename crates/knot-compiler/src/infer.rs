@@ -101,6 +101,23 @@ pub type RefineTargets = HashMap<Span, String>;
 /// Refined type info exported for codegen: type_name → predicate expression.
 pub type RefinedTypeInfoMap = HashMap<String, knot::ast::Expr>;
 
+/// Resolved static dispatch types for trait method references, keyed by the
+/// span of the method's `Var` occurrence and the trait it belongs to.
+///
+/// Trait dispatch cannot key on a value's runtime constructor tag: two ADTs
+/// may declare the same constructor name (`data Shape = Circle … `,
+/// `data Blob = Circle …`), so a tag alone does not identify the type whose
+/// impl should run. Inference already resolves the trait's parameter to a
+/// concrete type at every monomorphic call site; recording it here lets
+/// codegen call that impl directly instead of guessing from the tag.
+///
+/// Keying on `(span, trait_name)` — not span alone — keeps a method's own
+/// trait separate from any supertrait or bound constraints instantiated at
+/// the same occurrence. A span is absent when the site is still polymorphic
+/// (e.g. inside a `Area a => a -> Float` function body), where the type is
+/// genuinely unknown until run time.
+pub type TraitCallTargets = HashMap<(Span, String), String>;
+
 /// Maps declaration names to their inferred type display strings.
 pub type TypeInfo = HashMap<String, String>;
 
@@ -588,6 +605,11 @@ struct Infer {
 
     /// Deferred trait constraint checks, resolved after inference.
     deferred_constraints: Vec<DeferredConstraint>,
+
+    /// Trait constraint instantiation sites: (occurrence span, trait name,
+    /// freshened trait-param var). Resolved after inference into
+    /// `TraitCallTargets` so codegen can dispatch on the static type.
+    trait_call_vars: Vec<(Span, String, TyVar)>,
     /// Next sequence number to stamp onto a pushed `DeferredConstraint`.
     next_constraint_seq: u64,
 
@@ -752,6 +774,7 @@ impl Infer {
             unify_depth: 0,
             traverse_calls: Vec::new(),
             from_json_calls: Vec::new(),
+            trait_call_vars: Vec::new(),
             trait_method_traits: HashMap::new(),
             trait_method_param_vars: HashMap::new(),
             known_impls: HashSet::new(),
@@ -3031,6 +3054,14 @@ impl Infer {
                 span,
                 seq,
             });
+            // The same variable that decides *whether* an impl exists also
+            // decides *which* impl runs. Remember it so codegen can dispatch
+            // on the static type rather than the value's constructor tag.
+            self.trait_call_vars.push((
+                span,
+                c.trait_name.clone(),
+                target_var,
+            ));
         }
         // Freshen effect-union constraints alongside the type — each
         // instantiation gets its own copy so a polymorphic `\/`-typed
@@ -10339,11 +10370,11 @@ fn value_references_source_inner(
 ///
 /// Runs on a grown stack: a desugared `do` block nests one `__bind` per
 /// statement, and `infer_expr` recurses through every level.
-pub fn check(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk) {
+pub fn check(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk, TraitCallTargets) {
     crate::stack::grow(|| check_inner(module))
 }
 
-fn check_inner(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk) {
+fn check_inner(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk, TraitCallTargets) {
     let mut infer = Infer::new();
 
     // Phase 1: Collect type aliases, data types, constructors
@@ -10507,6 +10538,21 @@ fn check_inner(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInf
     // Phase 4d: Compress substitution chains for faster resolution
     infer.compress_substitution();
 
+    // Phase 4e: Resolve trait constraint sites to the concrete type whose impl
+    // should run there. Sites that stay polymorphic are left out — codegen
+    // falls back to runtime dispatch for those.
+    let mut trait_call_targets = TraitCallTargets::new();
+    let trait_call_vars = std::mem::take(&mut infer.trait_call_vars);
+    for (span, trait_name, var) in trait_call_vars {
+        let resolved = infer.apply(&Ty::Var(var));
+        if matches!(resolved.peel_alias(), Ty::Var(_)) {
+            continue;
+        }
+        if let Some(type_name) = infer.type_name_of(&resolved) {
+            trait_call_targets.insert((span, trait_name), type_name);
+        }
+    }
+
     // Phase 5: Resolve monad types from desugared do-blocks
     let mut monad_info = MonadInfo::new();
     let monad_vars = infer.monad_vars.clone();
@@ -10633,7 +10679,7 @@ fn check_inner(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInf
     let local_type_info = infer.extract_local_type_info();
     let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets)
 }
 
 
@@ -11069,14 +11115,14 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown) = check(&mut module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls) = check(&mut module);
         diags
     }
 
     fn type_info_for(src: &str) -> TypeInfo {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown) = check(&mut module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls) = check(&mut module);
         type_info
     }
 

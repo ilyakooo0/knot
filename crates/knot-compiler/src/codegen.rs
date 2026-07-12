@@ -14536,10 +14536,9 @@ fn extract_filter_on_source(
 //      function), and
 //   2. Beta-reducing `App(Lambda, arg)` into the lambda body with the
 //      parameter substituted by `arg`.
-// Continues until no more reductions apply. Recursion through `Var`s is
-// guarded by a `visited` set so recursive functions terminate (we leave
-// recursive references as-is rather than expanding them — pushdown will
-// fall back to runtime).
+// Continues until no more reductions apply. Recursive functions are left
+// unexpanded — see `recursive_names`, which seeds the `visited` set that the
+// `Var` case consults; pushdown falls back to runtime for calls to them.
 //
 // Substitution is capture-avoiding: when entering a `Lambda` (or `Case`
 // arm pattern, etc.) whose bound names overlap with the free vars of the
@@ -14551,7 +14550,11 @@ pub(crate) fn beta_reduce(
     fun_bodies: &HashMap<String, ast::Expr>,
     let_bindings: &HashMap<String, ast::Expr>,
 ) -> ast::Expr {
-    let mut visited = HashSet::new();
+    // Seeded with the names that can reach themselves through the call graph,
+    // so the `Var` case below leaves every recursive reference alone. The set
+    // is never popped for those names (only names inserted by the `Var` case
+    // are), so the block holds for the whole reduction.
+    let mut visited = recursive_names(fun_bodies, let_bindings);
     // Fuel bounds work to prevent exponential expansion when substituted
     // bodies contain repeated occurrences of their parameter — re-reducing
     // the substituted result can multiply work at each level. On budget
@@ -14559,6 +14562,73 @@ pub(crate) fn beta_reduce(
     // sound (callers fall back to None when the shape isn't recognized).
     let mut fuel: usize = 50_000;
     beta_reduce_inner(expr, fun_bodies, let_bindings, &mut visited, &mut fuel)
+}
+
+/// Names whose definition can reach itself through the call graph — directly
+/// (`f` mentions `f`) or mutually (`f` mentions `g`, `g` mentions `f`).
+/// `beta_reduce` must not expand these.
+///
+/// Its `visited` set alone does not stop them: it blocks re-entering a name
+/// only *while* that name's body is being reduced, and pops it as soon as the
+/// expansion returns. The body it just substituted still holds a self-
+/// reference, so the next reduction step expands it again, and the next, with
+/// nothing bounding the unrolling. `fuel` caps the number of steps but not the
+/// size of what each step builds: `substitute` copies the argument into every
+/// occurrence of the parameter, so each unroll multiplies the term rather than
+/// growing it by a constant, and the reduction never finishes in practice.
+///
+/// Leaving them unexpanded costs no pushdown. Beta reduction does not evaluate
+/// the base-case condition, so unrolling a recursive function never bottoms
+/// out — a self-reference always survives in the recursive branch, and no SQL
+/// fragment can compile that. Pushdown falls back to evaluating the call at
+/// runtime, which is where it ended up anyway once the fuel ran out.
+fn recursive_names(
+    fun_bodies: &HashMap<String, ast::Expr>,
+    let_bindings: &HashMap<String, ast::Expr>,
+) -> HashSet<String> {
+    let names: HashSet<&str> = fun_bodies
+        .keys()
+        .chain(let_bindings.keys())
+        .map(String::as_str)
+        .collect();
+
+    let callees: HashMap<&str, Vec<&str>> = names
+        .iter()
+        .map(|&name| {
+            // A `let` shadows a top-level function of the same name, mirroring
+            // the lookup order in `beta_reduce_inner`'s `Var` case.
+            let body = let_bindings.get(name).or_else(|| fun_bodies.get(name));
+            let calls = body
+                .map(|body| {
+                    compute_free_vars(body)
+                        .iter()
+                        .filter_map(|v| names.get(v.as_str()).copied())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (name, calls)
+        })
+        .collect();
+
+    names
+        .iter()
+        .filter(|&&name| {
+            let mut stack: Vec<&str> = callees[name].clone();
+            let mut seen: HashSet<&str> = stack.iter().copied().collect();
+            while let Some(callee) = stack.pop() {
+                if callee == name {
+                    return true;
+                }
+                for &next in &callees[callee] {
+                    if seen.insert(next) {
+                        stack.push(next);
+                    }
+                }
+            }
+            false
+        })
+        .map(|&name| name.to_string())
+        .collect()
 }
 
 fn beta_reduce_inner(
@@ -17501,6 +17571,79 @@ mod tests {
         match &reduced.node {
             ast::ExprKind::Lit(ast::Literal::Int(n)) => assert_eq!(n, "2"),
             other => panic!("expected literal 2, got {:?}", other),
+        }
+    }
+
+    /// A non-recursive top-level function is still inlined, so the SQL
+    /// matchers see through a named predicate to its definition.
+    #[test]
+    fn beta_reduce_inlines_non_recursive_functions() {
+        let mut fun_bodies = HashMap::new();
+        fun_bodies.insert("isAdult".to_string(), parse_expr("\\p -> p.age > 18"));
+
+        let reduced = beta_reduce(&parse_expr("isAdult r"), &fun_bodies, &HashMap::new());
+        match &reduced.node {
+            ast::ExprKind::BinOp { op: ast::BinOp::Gt, lhs, .. } => match &lhs.node {
+                ast::ExprKind::FieldAccess { field, .. } => assert_eq!(field, "age"),
+                other => panic!("expected r.age on the left, got {:?}", other),
+            },
+            other => panic!("expected the predicate body, got {:?}", other),
+        }
+    }
+
+    /// Issue #71: a self-recursive function must be left alone. Substituting
+    /// its body reintroduces the call, and every unroll copies the argument
+    /// into each occurrence of the parameter, so the term grows multiplicatively
+    /// and the reduction never finishes — the compiler used to hang here.
+    #[test]
+    fn beta_reduce_leaves_self_recursive_calls_unexpanded() {
+        let mut fun_bodies = HashMap::new();
+        fun_bodies.insert(
+            "afterChar".to_string(),
+            parse_expr(
+                "\\sep s -> if s == \"\" then \"\" \
+                 else if take 1 s == sep then drop 1 s \
+                 else afterChar sep (drop 1 s)",
+            ),
+        );
+
+        // Partially applied (`afterChar ","`), which is the shape that made the
+        // reduction blow up: the remaining binder is reduced under, unrolling
+        // the recursive call before the outer argument is substituted in.
+        let reduced = beta_reduce(&parse_expr("afterChar \",\" s"), &fun_bodies, &HashMap::new());
+        match &reduced.node {
+            ast::ExprKind::App { func, .. } => match &func.node {
+                ast::ExprKind::App { func: inner, .. } => match &inner.node {
+                    ast::ExprKind::Var(name) => assert_eq!(name, "afterChar"),
+                    other => panic!("expected Var(afterChar), got {:?}", other),
+                },
+                other => panic!("expected nested App, got {:?}", other),
+            },
+            other => panic!("expected the call left in place, got {:?}", other),
+        }
+    }
+
+    /// Mutual recursion is a cycle in the call graph just the same, and unrolls
+    /// just as endlessly.
+    #[test]
+    fn beta_reduce_leaves_mutually_recursive_calls_unexpanded() {
+        let mut fun_bodies = HashMap::new();
+        fun_bodies.insert(
+            "isEven".to_string(),
+            parse_expr("\\n -> if n == 0 then true else isOdd (n - 1)"),
+        );
+        fun_bodies.insert(
+            "isOdd".to_string(),
+            parse_expr("\\n -> if n == 0 then false else isEven (n - 1)"),
+        );
+
+        let reduced = beta_reduce(&parse_expr("isEven k"), &fun_bodies, &HashMap::new());
+        match &reduced.node {
+            ast::ExprKind::App { func, .. } => match &func.node {
+                ast::ExprKind::Var(name) => assert_eq!(name, "isEven"),
+                other => panic!("expected Var(isEven), got {:?}", other),
+            },
+            other => panic!("expected the call left in place, got {:?}", other),
         }
     }
 

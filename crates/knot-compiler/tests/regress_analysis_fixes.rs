@@ -12,11 +12,13 @@
 //! 11. expr_is_io and do-local let-bound IO lambdas
 //! 12. unused-source detection for relations referenced only by `migrate`
 //! 13. `traverse f []` empty-input result per applicative
+//! 14. unbounded inlining of a recursive helper hung codegen
 
 use knot::diagnostic::Diagnostic;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 fn parse(src: &str) -> knot::ast::Module {
     let lexer = knot::lexer::Lexer::new(src);
@@ -915,5 +917,118 @@ main = do
     assert!(
         stdout.contains("got: 2"),
         "non-empty traverse unchanged, got: {stdout}"
+    );
+}
+
+// ── 14. recursive helpers must not be inlined by the pushdown matchers ──
+//
+// Codegen's `beta_reduce` inlines named functions so the SQL matchers can see
+// through them. It used to unroll a *recursive* function without bound: each
+// unroll substitutes the body, which reintroduces the call, and copies the
+// argument into every occurrence of the parameter — so the term grows
+// multiplicatively and the compile never finishes. A partially applied helper
+// (`afterChar ","`) hits the multi-param path, which reduces under the
+// remaining binder and blows up fastest; the one-parameter shape merely grew
+// quadratically and finished. Both must now compile promptly (issue #71).
+
+/// `knot build`, failed rather than left hanging if it runs long — a
+/// regression here is a non-terminating compile, not a wrong answer.
+fn compile_within(test_name: &str, source: &str, limit: Duration) -> Compiled {
+    let dir = std::env::temp_dir().join(format!(
+        "knot_regress_analysis_{}_{}",
+        test_name,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let src_path = dir.join("prog.knot");
+    fs::write(&src_path, source).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_knot"))
+        .arg("build")
+        .arg(&src_path)
+        .current_dir(&dir)
+        .spawn()
+        .expect("failed to spawn knot compiler");
+
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait().expect("failed to poll knot compiler") {
+            Some(status) => {
+                assert!(status.success(), "knot build failed for {test_name}");
+                break;
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "knot build did not finish within {limit:?} for {test_name} — \
+                     the recursive helper is being inlined without bound again"
+                );
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let exe = dir.join("prog");
+    Compiled { dir, exe }
+}
+
+#[test]
+fn partially_applied_recursive_helper_compiles() {
+    let c = compile_within(
+        "recursive_partial_app",
+        r#"afterChar : Text -> Text -> Text
+afterChar = \sep s -> if s == ""
+  then ""
+  else if take 1 s == sep
+  then drop 1 s
+  else afterChar sep (drop 1 s)
+
+splitOnComma : Text -> [Text]
+splitOnComma = \s -> if s == ""
+  then ([] : [Text])
+  else union [afterChar "," s] (splitOnComma (afterChar "," s))
+
+main = do
+  yield (splitOnComma "a,b,c")
+"#,
+        Duration::from_secs(120),
+    );
+    let (stdout, stderr, ok) = run(&c);
+    assert!(ok, "program failed: {stderr}");
+    assert!(
+        stdout.contains("b,c") && stdout.contains("\"c\""),
+        "recursive split must still produce its suffixes, got: {stdout}"
+    );
+}
+
+/// The single-argument helper — the shape that already compiled, but only after
+/// burning the whole inlining budget. Pinned so the fix keeps it working.
+#[test]
+fn directly_recursive_helper_compiles() {
+    let c = compile_within(
+        "recursive_direct",
+        r#"afterComma : Text -> Text
+afterComma = \s -> if s == ""
+  then ""
+  else if take 1 s == ","
+  then drop 1 s
+  else afterComma (drop 1 s)
+
+splitOnComma : Text -> [Text]
+splitOnComma = \s -> if s == ""
+  then ([] : [Text])
+  else union [afterComma s] (splitOnComma (afterComma s))
+
+main = do
+  yield (splitOnComma "a,b,c")
+"#,
+        Duration::from_secs(120),
+    );
+    let (stdout, stderr, ok) = run(&c);
+    assert!(ok, "program failed: {stderr}");
+    assert!(
+        stdout.contains("b,c") && stdout.contains("\"c\""),
+        "recursive split must still produce its suffixes, got: {stdout}"
     );
 }

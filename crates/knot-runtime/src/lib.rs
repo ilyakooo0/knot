@@ -7164,6 +7164,7 @@ fn compare_keys(db: *mut c_void, a: *mut Value, b: *mut Value) -> std::cmp::Orde
 /// variants — see the note in infer.rs), so a tag maps to *every* `(type,
 /// index)` pair that declares it and a comparison picks the type that declares
 /// both tags.
+#[allow(clippy::type_complexity)]
 static CTOR_ORDER: std::sync::LazyLock<RwLock<HashMap<Arc<str>, Vec<(Arc<str>, u32)>>>> =
     std::sync::LazyLock::new(|| {
         let mut map: HashMap<Arc<str>, Vec<(Arc<str>, u32)>> = HashMap::new();
@@ -22231,7 +22232,7 @@ mod _fk_migration_listen_tests {
         assert_eq!(compare_values(high, high), std::cmp::Ordering::Equal);
 
         // Alphabetical order would have produced Critical < High < Low < Medium.
-        let mut sorted = vec![critical, low, high, medium];
+        let mut sorted = [critical, low, high, medium];
         sorted.sort_by(|a, b| compare_values(*a, *b));
         let tags: Vec<&str> = sorted
             .iter()
@@ -23037,7 +23038,7 @@ mod _deep_nesting_iterative_tests {
         // Codegen routes dimensionless and unit-polymorphic arguments to plain
         // `knot_value_show`, but an empty unit string must not produce a
         // trailing space if one ever reaches here.
-        let v = alloc(Value::Float(3.14));
+        let v = alloc(Value::Float(std::f64::consts::PI));
         assert_eq!(show_unit_text(v, ""), "3.14");
         assert_eq!(show_unit_text(v, ""), show_text(v));
     }

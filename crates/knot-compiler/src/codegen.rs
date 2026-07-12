@@ -189,6 +189,15 @@ pub struct Codegen {
     // Trampolines for user functions used as values: fn_name -> trampoline_func_id
     user_fn_trampolines: HashMap<String, FuncId>,
 
+    // Do-blocks sitting in the value position of a `set`/`replace`, keyed by
+    // span. These are relational comprehensions even when they bind from a
+    // source (`x <- *rel`), which `is_io_do_block` would otherwise read as IO.
+    // A do-block directly under the `=` is handled by `compile_set_value_expr`,
+    // but one nested inside an `if`/`case` branch is reached through the
+    // generic `compile_expr` path, which has no way to know it is producing the
+    // relation being written — hence the span set.
+    relational_do_spans: HashSet<ast::Span>,
+
     // Resolved monad types for desugared do-blocks (from type inference)
     monad_info: MonadInfo,
     /// Static dispatch type per trait-method occurrence, from inference.
@@ -920,6 +929,7 @@ impl Codegen {
             fetch_route_entries: HashMap::new(),
             type_aliases: HashMap::new(),
             user_fn_trampolines: HashMap::new(),
+            relational_do_spans: HashSet::new(),
             monad_info: HashMap::new(),
             trait_call_targets: HashMap::new(),
             trait_method_traits: HashMap::new(),
@@ -4674,7 +4684,11 @@ impl Codegen {
             }
 
             ast::ExprKind::Do(stmts) => {
-                if self.is_io_do_block(stmts) {
+                if self.relational_do_spans.contains(&expr.span) {
+                    // Produces the relation written by an enclosing
+                    // set/replace, even if it binds from a source.
+                    self.compile_do(builder, stmts, env, db)
+                } else if self.is_io_do_block(stmts) {
                     self.compile_io_do(builder, stmts, env, db)
                 } else if self.in_io_eager
                     && !stmts.iter().any(|s| matches!(&s.node, ast::StmtKind::Bind { .. }))
@@ -7923,7 +7937,46 @@ impl Codegen {
             ast::ExprKind::Refine(inner) => {
                 self.compile_set_value_expr(builder, inner, env, db)
             }
+            // `if`/`case` in set-value position: each branch is itself a
+            // set value, so a do-block in a branch is a relational
+            // comprehension too. The branches are compiled by the generic
+            // `compile_expr` path, so record their do-block spans first and
+            // let the `Do` arm of `compile_expr` consult the set.
+            ast::ExprKind::If { .. } | ast::ExprKind::Case { .. } => {
+                Self::collect_relational_do_spans(value, &mut self.relational_do_spans);
+                self.compile_expr(builder, value, env, db)
+            }
             _ => self.compile_expr(builder, value, env, db),
+        }
+    }
+
+    /// Record the spans of do-blocks that a set/replace value produces its
+    /// relation from. Result position extends through type/unit wrappers and
+    /// through `if`/`case` branches (which may nest arbitrarily), so the walk
+    /// mirrors `compile_set_value_expr`'s own recursion.
+    fn collect_relational_do_spans(value: &ast::Expr, spans: &mut HashSet<ast::Span>) {
+        match &value.node {
+            ast::ExprKind::Do(_) => {
+                spans.insert(value.span);
+            }
+            ast::ExprKind::UnitLit { value: inner, .. }
+            | ast::ExprKind::TimeUnitLit { value: inner, .. }
+            | ast::ExprKind::Annot { expr: inner, .. }
+            | ast::ExprKind::Refine(inner) => Self::collect_relational_do_spans(inner, spans),
+            ast::ExprKind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                Self::collect_relational_do_spans(then_branch, spans);
+                Self::collect_relational_do_spans(else_branch, spans);
+            }
+            ast::ExprKind::Case { arms, .. } => {
+                for arm in arms {
+                    Self::collect_relational_do_spans(&arm.body, spans);
+                }
+            }
+            _ => {}
         }
     }
 

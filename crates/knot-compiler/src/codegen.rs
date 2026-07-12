@@ -311,6 +311,11 @@ pub struct Codegen {
     // here, so the string from inference is the only carrier of the unit into
     // the emitted code.
     show_unit_strings: crate::infer::ShowUnitStrings,
+
+    // Spans of full `sum f rel` calls whose result is a Float. Passed to the
+    // runtime as `is_float` so an EMPTY relation sums to `Float 0.0` rather
+    // than `Int 0`. See `infer::SumFloatSpans`.
+    sum_float_spans: crate::infer::SumFloatSpans,
 }
 
 /// A top-level constant declared as a signature with no body
@@ -609,6 +614,7 @@ pub fn compile(
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     trait_call_targets: &crate::infer::TraitCallTargets,
     show_unit_strings: &crate::infer::ShowUnitStrings,
+    sum_float_spans: &crate::infer::SumFloatSpans,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     crate::stack::grow(|| {
@@ -624,6 +630,7 @@ pub fn compile(
             elem_pushdown_ok,
             trait_call_targets,
             show_unit_strings,
+            sum_float_spans,
             compile_time_overrides,
         )
     })
@@ -642,6 +649,7 @@ fn compile_inner(
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     trait_call_targets: &crate::infer::TraitCallTargets,
     show_unit_strings: &crate::infer::ShowUnitStrings,
+    sum_float_spans: &crate::infer::SumFloatSpans,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
@@ -677,6 +685,7 @@ fn compile_inner(
     cg.from_json_targets = from_json_targets.clone();
     cg.elem_pushdown_ok = elem_pushdown_ok.clone();
     cg.show_unit_strings = show_unit_strings.clone();
+    cg.sum_float_spans = sum_float_spans.clone();
     cg.source_refinements = type_env.source_refinements.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
@@ -948,6 +957,7 @@ impl Codegen {
             from_json_targets: HashMap::new(),
             elem_pushdown_ok: crate::infer::ElemPushdownOk::default(),
             show_unit_strings: HashMap::new(),
+            sum_float_spans: crate::infer::SumFloatSpans::new(),
         }
     }
 
@@ -1160,6 +1170,7 @@ impl Codegen {
         self.declare_rt("knot_relation_diff", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_inter", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_sum", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_sum_typed", &[p, p, p, types::I64], &[p]);
         self.declare_rt("knot_relation_avg", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_min", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_max", &[p, p, p], &[p]);
@@ -6533,6 +6544,30 @@ impl Codegen {
                         builder,
                         "knot_relation_traverse_kind",
                         &[db, f_val, rel_val, k_ptr, k_len],
+                    );
+                }
+
+        // Special case: `sum f rel` that did not push down to SQL above — pass
+        // the statically inferred numeric type so an EMPTY relation sums to the
+        // right zero. The runtime otherwise takes the type from the summands,
+        // of which there are none, and returns `Int 0` even for a `[Float]`
+        // (the SQL pushdown paths pass the same `is_float` flag, derived from
+        // the column type). Inference records the span only when the result is
+        // a Float; a user-defined `sum` skips this and dispatches normally.
+        if let ast::ExprKind::Var(name) = &func_expr.node
+            && name == "sum"
+                && args.len() == 2
+                && !user_shadows_special {
+                    let f_val = self.compile_expr(builder, args[0], env, db);
+                    let rel_val = self.compile_expr(builder, args[1], env, db);
+                    let is_float = builder.ins().iconst(
+                        types::I64,
+                        self.sum_float_spans.contains(&expr.span) as i64,
+                    );
+                    return self.call_rt(
+                        builder,
+                        "knot_relation_sum_typed",
+                        &[db, f_val, rel_val, is_float],
                     );
                 }
 

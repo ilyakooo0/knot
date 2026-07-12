@@ -9733,12 +9733,43 @@ pub extern "C-unwind" fn knot_relation_inter(
     alloc(Value::Relation(result))
 }
 
-/// sum(f, rel) — sum of f(x) for each x in rel
+/// sum(f, rel) — sum of f(x) for each x in rel.
+///
+/// The numeric type of the result comes from the summands, so an EMPTY
+/// relation falls back to `Int 0` — there is nothing to take it from. Used
+/// only where the compiler has no static type for the call (`sum` as a
+/// first-class value); a fully-applied `sum f rel` compiles to
+/// `knot_relation_sum_typed` instead.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_sum(
     db: *mut c_void,
     f: *mut Value,
     rel: *mut Value,
+) -> *mut Value {
+    relation_sum(db, f, rel, false)
+}
+
+/// Like `knot_relation_sum`, but with the result's numeric type supplied
+/// statically by the compiler. `is_float` is used ONLY to pick the
+/// EMPTY-input zero: with no summands the runtime cannot tell a `[Float]`
+/// from an `[Int]`, so `sum f []` over Floats would yield `Int 0` and print
+/// as `0` (or panic in a Float context) instead of `0.0`. The SQL-pushdown
+/// path (`knot_source_query_sum`) takes the same flag for the same reason.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_relation_sum_typed(
+    db: *mut c_void,
+    f: *mut Value,
+    rel: *mut Value,
+    is_float: i64,
+) -> *mut Value {
+    relation_sum(db, f, rel, is_float != 0)
+}
+
+fn relation_sum(
+    db: *mut c_void,
+    f: *mut Value,
+    rel: *mut Value,
+    is_float: bool,
 ) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
@@ -9747,7 +9778,10 @@ pub extern "C-unwind" fn knot_relation_sum(
             type_name(rel)
         ),
     };
-    let mut acc = alloc_int(0);
+    // Only the zero carries the type when the relation is empty: for non-empty
+    // input `Int 0 + Float x` already promotes to Float, so seeding with the
+    // Float zero changes nothing there.
+    let mut acc = if is_float { alloc_float(0.0) } else { alloc_int(0) };
     for &row in rows {
         let val = knot_value_call(db, f, row);
         acc = knot_value_add(acc, val);
@@ -19262,6 +19296,100 @@ pub extern "C-unwind" fn knot_crypto_encrypt_io(public_key: *mut Value, plaintex
         knot_crypto_encrypt(public_key, plaintext)
     }
     alloc(Value::IO(thunk as *const u8, env))
+}
+
+#[cfg(test)]
+mod _sum_tests {
+    use super::*;
+
+    /// The projection `\x -> x`, so the summands are the rows themselves.
+    fn identity_fn() -> *mut Value {
+        extern "C-unwind" fn call(
+            _db: *mut c_void,
+            _env: *mut Value,
+            arg: *mut Value,
+        ) -> *mut Value {
+            arg
+        }
+        let src = "\\x -> x";
+        knot_value_function(
+            call as *const u8,
+            alloc(Value::Unit),
+            src.as_ptr(),
+            src.len(),
+        )
+    }
+
+    fn sum_typed(rows: Vec<*mut Value>, is_float: i64) -> *mut Value {
+        knot_relation_sum_typed(
+            std::ptr::null_mut(),
+            identity_fn(),
+            alloc(Value::Relation(rows)),
+            is_float,
+        )
+    }
+
+    #[test]
+    fn empty_float_sum_is_float_zero() {
+        // The regression: with no summands the runtime has nothing to take the
+        // numeric type from, so it used to return `Int 0` for a `[Float]` —
+        // which then shows as "0" and serializes as an integer.
+        let out = sum_typed(vec![], 1);
+        assert!(
+            matches!(unsafe { as_ref(out) }, Value::Float(f) if *f == 0.0),
+            "sum over an empty [Float] must be Float 0.0, got {}",
+            type_name(out)
+        );
+    }
+
+    #[test]
+    fn empty_int_sum_is_int_zero() {
+        let out = sum_typed(vec![], 0);
+        assert!(
+            matches!(unsafe { as_ref(out) }, Value::Int(0)),
+            "sum over an empty [Int] must stay Int 0, got {}",
+            type_name(out)
+        );
+    }
+
+    #[test]
+    fn non_empty_float_sum_adds() {
+        let out = sum_typed(vec![alloc_float(1.5), alloc_float(2.25)], 1);
+        assert!(
+            matches!(unsafe { as_ref(out) }, Value::Float(f) if *f == 3.75),
+            "expected Float 3.75, got {}",
+            show_text(out)
+        );
+    }
+
+    #[test]
+    fn non_empty_int_sum_adds() {
+        let out = sum_typed(vec![alloc_int(2), alloc_int(3)], 0);
+        assert!(
+            matches!(unsafe { as_ref(out) }, Value::Int(5)),
+            "expected Int 5, got {}",
+            show_text(out)
+        );
+    }
+
+    #[test]
+    fn untyped_sum_falls_back_to_int_zero() {
+        // `sum` as a first-class value carries no static type, so the empty
+        // case keeps the historical `Int 0`.
+        let out = knot_relation_sum(
+            std::ptr::null_mut(),
+            identity_fn(),
+            alloc(Value::Relation(vec![])),
+        );
+        assert!(matches!(unsafe { as_ref(out) }, Value::Int(0)));
+    }
+
+    fn show_text(v: *mut Value) -> String {
+        match unsafe { as_ref(knot_value_show(v)) } {
+            Value::Text(t) => t.to_string(),
+            _ => panic!("show returned a non-Text value"),
+        }
+    }
 }
 
 #[cfg(test)]

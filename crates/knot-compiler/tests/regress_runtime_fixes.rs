@@ -5,6 +5,8 @@
 //! - SQL-pushed `minOn`/`maxOn` on an Int column (stored as TEXT COLLATE
 //!   KNOT_INT) must parse the result back to an Int so subsequent arithmetic
 //!   works, instead of returning a Text value that panics on `+ 1`.
+//! - In-memory `sum` over an EMPTY `[Float]` must be `Float 0.0`, not `Int 0`:
+//!   with no summands the numeric type has to come from the compiler.
 //!
 //! Each test compiles a small Knot program with the real `knot` binary into
 //! its own scratch directory (so `knot.db` lands there) and asserts on the
@@ -197,5 +199,47 @@ main = do
     assert!(
         stderr.contains("subset constraint violated"),
         "expected a subset-constraint abort, got:\nstderr: {stderr}"
+    );
+}
+
+// In-memory `sum` takes the result's numeric type from its summands, so an
+// empty relation used to fall back to `Int 0` — a `[Float]` sum then showed as
+// "0" and serialized as an integer. A fully-applied `sum f rel` now carries the
+// inferred type down to the runtime, the way the SQL-pushdown path always has.
+// (These relations are in-memory literals, so no pushdown is involved.)
+#[test]
+fn sum_over_empty_float_relation_is_float_zero() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "sum_empty_float",
+        r#"prices = [{amount: 1.5}, {amount: 2.5}]
+counts = [{qty: 2}, {qty: 3}]
+
+main = do
+  let noPrices = filter (\p -> p.amount > 100.0) prices
+  let noCounts = filter (\c -> c.qty > 100) counts
+  println ("empty_float: " ++ show (sum (\p -> p.amount) noPrices))
+  println ("empty_int: " ++ show (sum (\c -> c.qty) noCounts))
+  println ("float: " ++ show (sum (\p -> p.amount) prices))
+  println ("int: " ++ show (sum (\c -> c.qty) counts))
+  println ("piped_empty_float: " ++ show (noPrices |> sum (\p -> p.amount)))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("empty_float: 0.0"),
+        "sum over an empty [Float] must be Float 0.0:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("piped_empty_float: 0.0"),
+        "the `|> sum f` pipe form must agree with `sum f rel`:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("empty_int: 0"),
+        "sum over an empty [Int] must stay Int 0:\n{stdout}"
+    );
+    // Non-empty sums are unchanged.
+    assert!(
+        stdout.contains("float: 4.0") && stdout.contains("int: 5"),
+        "non-empty sums must still add up:\n{stdout}"
     );
 }

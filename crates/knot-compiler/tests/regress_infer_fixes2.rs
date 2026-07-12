@@ -41,7 +41,7 @@ fn check_src(src: &str) -> Vec<Diagnostic> {
     let mut module = parse(src);
     knot_compiler::base::inject_prelude(&mut module);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, _targets, _refined, _json, _elem, _trait_calls, _show_units) =
+    let (diags, _monad, _type_info, _local, _targets, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats) =
         knot_compiler::infer::check(&mut module);
     diags
 }

@@ -221,6 +221,35 @@ pub struct Token {
     pub span: Span,
 }
 
+/// Digits of `i64::MIN` without its sign — the one magnitude that is only
+/// valid under a prefix `-`.
+const I64_MIN_MAGNITUDE: &str = "9223372036854775808";
+
+/// Whether the token just before the one being lexed is a prefix (unary) `-`.
+/// A `-` is prefix unless the token before it can end an expression, in which
+/// case it is binary subtraction.
+fn follows_prefix_minus(prev: &[Token]) -> bool {
+    let mut back = prev.iter().rev().map(|t| &t.kind);
+    if !matches!(back.next(), Some(TokenKind::Minus)) {
+        return false;
+    }
+    !matches!(
+        back.next(),
+        Some(
+            TokenKind::Int(_)
+                | TokenKind::Float(_)
+                | TokenKind::Text(_)
+                | TokenKind::Bytes(_)
+                | TokenKind::Bool(_)
+                | TokenKind::Lower(_)
+                | TokenKind::Upper(_)
+                | TokenKind::RParen
+                | TokenKind::RBracket
+                | TokenKind::RBrace
+        )
+    )
+}
+
 // ── Lexer ───────────────────────────────────────────────────────────
 
 pub struct Lexer<'src> {
@@ -291,6 +320,10 @@ impl<'src> Lexer<'src> {
             let span = self.span_from(start);
 
             if let Some(kind) = kind {
+                if let TokenKind::Int(raw) = &kind {
+                    let raw = raw.clone();
+                    self.check_int_range(&raw, span, &tokens);
+                }
                 last_was_newline = matches!(kind, TokenKind::Newline);
                 tokens.push(Token { kind, span });
             } else {
@@ -486,6 +519,30 @@ impl<'src> Lexer<'src> {
                 }
             }
         }
+    }
+
+    /// Reject integer literals that do not fit in an `i64`.
+    ///
+    /// `i64::MIN` has no positive counterpart, so its magnitude
+    /// (`9223372036854775808`) is accepted when it sits directly under a
+    /// prefix `-`: the parser folds the two tokens into a single negative
+    /// literal. Anywhere else — including as the right operand of a binary
+    /// `-` — that magnitude overflows and is reported.
+    fn check_int_range(&mut self, raw: &str, span: Span, prev: &[Token]) {
+        if raw.parse::<i64>().is_ok() {
+            return;
+        }
+        let magnitude = raw.trim_start_matches('0');
+        if magnitude == I64_MIN_MAGNITUDE && follows_prefix_minus(prev) {
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::error("integer literal is out of range").label(
+                span,
+                "does not fit in a 64-bit signed integer \
+                 (-9223372036854775808 to 9223372036854775807)",
+            ),
+        );
     }
 
     fn lex_number(&mut self) -> TokenKind {

@@ -325,6 +325,20 @@ pub struct Codegen {
     // runtime as `is_float` so an EMPTY relation sums to `Float 0.0` rather
     // than `Int 0`. See `infer::SumFloatSpans`.
     sum_float_spans: crate::infer::SumFloatSpans,
+
+    // Spans of field accesses whose field type is a relation (`t.members` where
+    // `members : [{who: Text}]`). A record's field types are unreachable from
+    // the AST, so this is the only way codegen can tell a nested-relation field
+    // from a scalar one. See `infer::RelationFieldSpans`.
+    relation_fields: crate::infer::RelationFieldSpans,
+
+    // Set by `compile_io_do_eager` when the statements it compiled ended in an
+    // iterating bind, i.e. its value is that loop's relation of per-row results
+    // rather than one row's value. An enclosing `compile_io_bind_loop` reads it
+    // right after compiling its body to decide whether to splice those rows into
+    // its own result (`m <- t.members` under `t <- *teams` yields one flat
+    // relation of members) or push the value as a single row.
+    io_do_tail_iterated: bool,
 }
 
 /// A top-level constant declared as a signature with no body
@@ -624,6 +638,7 @@ pub fn compile(
     trait_call_targets: &crate::infer::TraitCallTargets,
     show_unit_strings: &crate::infer::ShowUnitStrings,
     sum_float_spans: &crate::infer::SumFloatSpans,
+    relation_fields: &crate::infer::RelationFieldSpans,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     crate::stack::grow(|| {
@@ -640,6 +655,7 @@ pub fn compile(
             trait_call_targets,
             show_unit_strings,
             sum_float_spans,
+            relation_fields,
             compile_time_overrides,
         )
     })
@@ -659,6 +675,7 @@ fn compile_inner(
     trait_call_targets: &crate::infer::TraitCallTargets,
     show_unit_strings: &crate::infer::ShowUnitStrings,
     sum_float_spans: &crate::infer::SumFloatSpans,
+    relation_fields: &crate::infer::RelationFieldSpans,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
@@ -695,6 +712,7 @@ fn compile_inner(
     cg.elem_pushdown_ok = elem_pushdown_ok.clone();
     cg.show_unit_strings = show_unit_strings.clone();
     cg.sum_float_spans = sum_float_spans.clone();
+    cg.relation_fields = relation_fields.clone();
     cg.source_refinements = type_env.source_refinements.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
@@ -968,6 +986,8 @@ impl Codegen {
             elem_pushdown_ok: crate::infer::ElemPushdownOk::default(),
             show_unit_strings: HashMap::new(),
             sum_float_spans: crate::infer::SumFloatSpans::new(),
+            relation_fields: crate::infer::RelationFieldSpans::new(),
+            io_do_tail_iterated: false,
         }
     }
 
@@ -1005,10 +1025,12 @@ impl Codegen {
         // Relation operations
         self.declare_rt("knot_relation_empty", &[], &[p]);
         self.declare_rt("knot_relation_with_capacity", &[p], &[p]);
+        self.declare_rt("knot_relation_dedup", &[p], &[p]);
         self.declare_rt("knot_relation_singleton", &[p], &[p]);
         self.declare_rt("knot_scalar_source_unwrap", &[p], &[p]);
         self.declare_rt("knot_scalar_source_wrap", &[p], &[p]);
         self.declare_rt("knot_relation_push", &[p, p], &[]);
+        self.declare_rt("knot_relation_extend", &[p, p], &[]);
         self.declare_rt("knot_relation_len", &[p], &[p]);
         self.declare_rt("knot_relation_get", &[p, p], &[p]);
         self.declare_rt("knot_relation_tail", &[p], &[p]);
@@ -4514,7 +4536,14 @@ impl Codegen {
                     let val = self.compile_expr(builder, elem, env, db);
                     self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
                 }
-                rel
+                if elems.len() > 1 {
+                    // A relation is a set: `[1, 1, 2]` holds two rows, not
+                    // three. Every other path that builds a relation (union,
+                    // map, comprehensions, writes) already dedups.
+                    self.call_rt(builder, "knot_relation_dedup", &[rel])
+                } else {
+                    rel
+                }
             }
 
             ast::ExprKind::BinOp { op, lhs, rhs } => {
@@ -8677,6 +8706,10 @@ impl Codegen {
     ) -> Value {
         let prev_io_eager = self.in_io_eager;
         self.in_io_eager = true;
+        // Cleared here and set only by the bind-loop hand-off below, so the
+        // value an enclosing bind loop reads after this call describes THIS
+        // block (see the field's doc comment).
+        self.io_do_tail_iterated = false;
         // Save source_var_binds to restore after — but DON'T clear, so
         // inner do-blocks (else branches, nested blocks) inherit entries
         // from the enclosing scope.
@@ -8804,7 +8837,10 @@ impl Codegen {
                             env,
                             db,
                         );
-                        // The remaining statements were consumed by the loop.
+                        // The remaining statements were consumed by the loop, so
+                        // this block's value is the loop's relation of per-row
+                        // results — tell an enclosing loop to splice, not nest.
+                        self.io_do_tail_iterated = true;
                         break;
                     }
                     // Track source read bindings for SQL optimization:
@@ -9084,6 +9120,11 @@ impl Codegen {
         } else {
             self.compile_io_do_eager(builder, rest, &mut body_env, db)
         };
+        // When the tail is itself a comprehension loop (`t <- *teams; m <-
+        // t.members; yield m.who`), its value is that loop's per-row results —
+        // rows of THIS comprehension, not a single nested row. Splice them in,
+        // or the result comes out one relation deep per nesting level.
+        let tail_iterated = !rest.is_empty() && self.io_do_tail_iterated;
         self.io_loop_skip_block = prev_skip;
         builder.ins().jump(continue_blk, &[row_val.into()]);
 
@@ -9093,7 +9134,11 @@ impl Codegen {
         builder.switch_to_block(continue_blk);
         builder.seal_block(continue_blk);
         let cont_val = builder.block_params(continue_blk)[0];
-        self.call_rt_void(builder, "knot_relation_push", &[result, cont_val]);
+        if tail_iterated {
+            self.call_rt_void(builder, "knot_relation_extend", &[result, cont_val]);
+        } else {
+            self.call_rt_void(builder, "knot_relation_push", &[result, cont_val]);
+        }
         builder.ins().jump(skip_blk, &[cont_val.into()]);
 
         builder.switch_to_block(skip_blk);
@@ -12819,6 +12864,11 @@ impl Codegen {
         match &expr.node {
             // Pipe into filter/map/take/drop/diff/inter/union always yields a relation
             ast::ExprKind::BinOp { op: ast::BinOp::Pipe, .. } => true,
+            // A nested-relation field (`t.members` where `members : [{who: Text}]`).
+            // Inference recorded which field accesses are relation-typed; a
+            // scalar field (`t.status`) is not in the set, so `InProgress ip <-
+            // t.status` keeps its bind-the-value semantics.
+            ast::ExprKind::FieldAccess { .. } => self.relation_fields.contains(&expr.span),
             // Application of known relation-returning stdlib functions
             ast::ExprKind::App { func, .. } => {
                 if let ast::ExprKind::Var(name) = &func.node {

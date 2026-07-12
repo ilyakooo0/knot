@@ -115,7 +115,7 @@ fn deep_do_block_reaches_codegen_without_overflow() {
     knot_compiler::desugar::desugar(&mut module);
 
     let type_env = knot_compiler::types::TypeEnv::from_module(&module);
-    let (diags, monad_info, type_info, _local, refine_targets, refined, from_json, elem, trait_calls, show_units, sum_floats) =
+    let (diags, monad_info, type_info, _local, refine_targets, refined, from_json, elem, trait_calls, show_units, sum_floats, relation_fields) =
         knot_compiler::infer::check(&mut module);
     assert!(errors(&diags).is_empty(), "{:?}", errors(&diags));
 
@@ -132,6 +132,7 @@ fn deep_do_block_reaches_codegen_without_overflow() {
         &trait_calls,
         &show_units,
         &sum_floats,
+        &relation_fields,
         &std::collections::HashMap::new(),
     )
     .expect("codegen should succeed on a deep do block");

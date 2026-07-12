@@ -13,7 +13,7 @@
 //!    adjacent and in Reads-then-Writes order — exactly what `rw *x`
 //!    reparses to — preserving effect-list order in the AST.
 
-use knot::ast::{BinOp, DeclKind, ExprKind, StmtKind, UnaryOp};
+use knot::ast::{BinOp, DeclKind, ExprKind, Literal, StmtKind};
 use knot::diagnostic::Severity;
 
 fn parse(source: &str) -> Result<knot::ast::Module, String> {
@@ -285,12 +285,16 @@ fn do_block_negative_statement_at_block_indent() {
                 }
                 other => panic!("expected Let, got {:?}", other),
             }
+            // A prefix `-` over an integer literal folds into a single negative
+            // literal at parse time (that is the only way to write `i64::MIN`),
+            // so the statement is `Lit(-1)`, not `Neg(Lit(1))`.
             assert!(
                 matches!(
                     &stmts[1].node,
-                    StmtKind::Expr(e) if matches!(&e.node, ExprKind::UnaryOp { op: UnaryOp::Neg, .. })
+                    StmtKind::Expr(e)
+                        if matches!(&e.node, ExprKind::Lit(Literal::Int(n)) if n == "-1")
                 ),
-                "second stmt is not unary negation: {:?}",
+                "second stmt is not the negative literal -1: {:?}",
                 stmts[1].node
             );
         }

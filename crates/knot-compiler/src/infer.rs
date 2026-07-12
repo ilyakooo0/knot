@@ -144,6 +144,13 @@ pub struct FromJsonTarget {
 /// Maps parseJson call-site spans to their resolved target info.
 pub type FromJsonTargets = HashMap<Span, FromJsonTarget>;
 
+/// Spans of field-access expressions (`t.members`) whose field type is a
+/// relation. Codegen cannot re-derive this — a record's field types are not
+/// reachable from the AST — yet it must know: a do-bind whose right-hand side
+/// is relation-typed iterates the rows (which is how inference types it), while
+/// any other right-hand side binds the value whole.
+pub type RelationFieldSpans = HashSet<Span>;
+
 /// Spans of full `sum f rel` applications (including the `rel |> sum f` pipe
 /// form) whose result type is a Float. Codegen passes this as an `is_float`
 /// flag to the runtime, which needs it ONLY for an EMPTY relation: with no
@@ -735,6 +742,11 @@ struct Infer {
     refined_types: HashMap<String, (Ty, knot::ast::Expr)>,
     /// Refine expression type vars: (span, alpha_var, inner_ty) for post-inference resolution.
     refine_vars: Vec<(Span, TyVar, Ty)>,
+
+    /// Field-access expressions: (span, field type). The field's type is often
+    /// still an unsolved variable when the access is inferred, so the relation-
+    /// valued ones are sieved out post-inference into `RelationFieldSpans`.
+    field_accesses: Vec<(Span, Ty)>,
     /// Refined-type names for which the directional refined-type check (which
     /// otherwise rejects implicitly introducing a refinement, e.g. a raw `Int`
     /// flowing where a `Nat` is required) is suppressed. `None` = suppress
@@ -825,6 +837,7 @@ impl Infer {
             in_type_annotation: false,
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
+            field_accesses: Vec::new(),
             suppress_refine_intro: None,
             deferred_unit_binops: Vec::new(),
             elem_pushdown_ok: ElemPushdownOk::default(),
@@ -4781,6 +4794,7 @@ impl Infer {
                     Some(rv),
                 );
                 self.unify(&base_ty, &constraint, e.span);
+                self.field_accesses.push((expr.span, field_ty.clone()));
                 field_ty
             }
 
@@ -10440,6 +10454,7 @@ pub type CheckOutput = (
     TraitCallTargets,
     ShowUnitStrings,
     SumFloatSpans,
+    RelationFieldSpans,
 );
 
 /// Run type inference on a parsed module. Returns diagnostics,
@@ -10738,6 +10753,17 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
         }
     }
 
+    // Phase 5d: Sieve the field accesses whose field turned out to be a
+    // relation. `t.members : [{who: Text}]` makes `m <- t.members` a relation
+    // bind (inference types `m` as the ELEMENT), so codegen has to iterate the
+    // rows there rather than bind the relation whole.
+    let mut relation_fields = RelationFieldSpans::new();
+    for (span, ty) in &infer.field_accesses {
+        if matches!(infer.apply(ty).peel_alias(), Ty::Relation(_)) {
+            relation_fields.insert(*span);
+        }
+    }
+
     // Export refined type predicates for codegen
     let refined_type_info: RefinedTypeInfoMap = infer
         .refined_types
@@ -10801,7 +10827,7 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
     let local_type_info = infer.extract_local_type_info();
     let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans, relation_fields)
 }
 
 
@@ -11237,14 +11263,14 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats) = check(&mut module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields) = check(&mut module);
         diags
     }
 
     fn type_info_for(src: &str) -> TypeInfo {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats) = check(&mut module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields) = check(&mut module);
         type_info
     }
 

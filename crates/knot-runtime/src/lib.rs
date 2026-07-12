@@ -5848,6 +5848,22 @@ pub extern "C-unwind" fn knot_relation_with_capacity(cap: usize) -> *mut Value {
     alloc(Value::Relation(take_relation_vec(cap)))
 }
 
+/// Drop duplicate rows from a relation, in place. A relation is a set, so the
+/// construction paths that can introduce duplicates (relation literals; the
+/// derived paths already funnel through `in_memory_dedup`) must collapse them
+/// before the value is observable — otherwise `count [1, 1]` disagrees with
+/// `[1, 1] == [1]`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_relation_dedup(rel: *mut Value) -> *mut Value {
+    if let Value::Relation(rows) = unsafe { &mut *rel }
+        && rows.len() > 1
+    {
+        let taken = std::mem::take(rows);
+        *rows = in_memory_dedup(taken);
+    }
+    rel
+}
+
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_singleton(v: *mut Value) -> *mut Value {
     let mut buf = take_relation_vec(1);
@@ -5890,6 +5906,22 @@ pub extern "C-unwind" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
     match r {
         Value::Relation(rows) => rows.push(row),
         _ => panic!("knot runtime: expected Relation in push, got {}", type_name(rel)),
+    }
+}
+
+/// Append every row of `src` to `rel`. Used by nested comprehension loops: the
+/// inner loop's per-row results are rows of the enclosing comprehension, not a
+/// single nested row, so the outer loop splices them in rather than pushing the
+/// inner relation whole.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_relation_extend(rel: *mut Value, src: *mut Value) {
+    let rows: Vec<*mut Value> = match unsafe { as_ref(src) } {
+        Value::Relation(rows) => rows.clone(),
+        _ => vec![src],
+    };
+    match unsafe { &mut *rel } {
+        Value::Relation(dst) => dst.extend(rows),
+        _ => panic!("knot runtime: expected Relation in extend, got {}", type_name(rel)),
     }
 }
 

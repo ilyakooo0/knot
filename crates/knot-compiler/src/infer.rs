@@ -8897,7 +8897,9 @@ impl Infer {
             )),
         );
 
-        // bytesGet : ∀u1 u2. Int<u1> -> Bytes -> Int<u2>
+        // bytesGet : ∀u1 u2. Int<u1> -> Bytes -> Maybe Int<u2>
+        // `Maybe`, not a bare `Int`: the index is often attacker-supplied, so an
+        // out-of-bounds read yields `Nothing {}` instead of aborting the process.
         {
             let u1 = self.fresh_unit_var();
             let u2 = self.fresh_unit_var();
@@ -8913,7 +8915,10 @@ impl Infer {
                     unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(int_u1),
-                        Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(int_u2))),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Bytes),
+                            Box::new(Ty::Con("Maybe".into(), vec![int_u2])),
+                        )),
                     ),
                 },
             );
@@ -8938,33 +8943,45 @@ impl Infer {
             Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(key_pair_record)),
         ));
 
-        // encrypt : Bytes -> Bytes -> IO {random} Bytes
+        // The three fallible crypto primitives return `Maybe Bytes` rather than a
+        // bare `Bytes`. Keys and ciphertexts routinely arrive from untrusted
+        // sources, and a wrong-length key or tampered ciphertext must surface as
+        // `Nothing {}` for the caller to handle — never as a process abort, which
+        // in a server is a remote DoS. `verify` already returns `Bool` for the
+        // same reason.
+        let maybe_bytes = Ty::Con("Maybe".into(), vec![Ty::Bytes]);
+
+        // encrypt : Bytes -> Bytes -> IO {random} (Maybe Bytes)
         self.bind_top(
             "encrypt",
             Scheme::mono(Ty::Fun(
                 Box::new(Ty::Bytes),
                 Box::new(Ty::Fun(
                     Box::new(Ty::Bytes),
-                    Box::new(Ty::IO(BTreeSet::from([IoEffect::Random]), None, Box::new(Ty::Bytes))),
+                    Box::new(Ty::IO(
+                        BTreeSet::from([IoEffect::Random]),
+                        None,
+                        Box::new(maybe_bytes.clone()),
+                    )),
                 )),
             )),
         );
 
-        // decrypt : Bytes -> Bytes -> Bytes
+        // decrypt : Bytes -> Bytes -> Maybe Bytes
         self.bind_top(
             "decrypt",
             Scheme::mono(Ty::Fun(
                 Box::new(Ty::Bytes),
-                Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Bytes))),
+                Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(maybe_bytes.clone()))),
             )),
         );
 
-        // sign : Bytes -> Bytes -> Bytes
+        // sign : Bytes -> Bytes -> Maybe Bytes
         self.bind_top(
             "sign",
             Scheme::mono(Ty::Fun(
                 Box::new(Ty::Bytes),
-                Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Bytes))),
+                Box::new(Ty::Fun(Box::new(Ty::Bytes), Box::new(maybe_bytes))),
             )),
         );
 

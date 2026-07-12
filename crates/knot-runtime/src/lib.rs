@@ -7164,10 +7164,11 @@ fn compare_keys(db: *mut c_void, a: *mut Value, b: *mut Value) -> std::cmp::Orde
 /// variants — see the note in infer.rs), so a tag maps to *every* `(type,
 /// index)` pair that declares it and a comparison picks the type that declares
 /// both tags.
-#[allow(clippy::type_complexity)]
-static CTOR_ORDER: std::sync::LazyLock<RwLock<HashMap<Arc<str>, Vec<(Arc<str>, u32)>>>> =
+type CtorOrderMap = HashMap<Arc<str>, Vec<(Arc<str>, u32)>>;
+
+static CTOR_ORDER: std::sync::LazyLock<RwLock<CtorOrderMap>> =
     std::sync::LazyLock::new(|| {
-        let mut map: HashMap<Arc<str>, Vec<(Arc<str>, u32)>> = HashMap::new();
+        let mut map: CtorOrderMap = HashMap::new();
         // ADTs the runtime constructs itself (`race`/`fetch` results, `compare`
         // results, nullable decoding). Compiled programs never declare these,
         // so nothing else would register them.
@@ -10213,23 +10214,25 @@ pub extern "C-unwind" fn knot_hash(v: *mut Value) -> *mut Value {
     alloc(Value::Bytes(Arc::from(digest.as_bytes().to_vec())))
 }
 
-/// bytesGet(index, bytes) — get byte at index as Int (0-255)
+/// bytesGet(index, bytes) — byte at index as `Maybe Int` (0-255).
+/// Returns `Just {value: n}` for an in-bounds index and `Nothing {}` for a
+/// negative or past-the-end one. The index is routinely attacker-derived (an
+/// offset parsed out of a request body), so an out-of-bounds read is an
+/// ordinary absent value the program can branch on, not a crash. Wrong-type
+/// input (caller bug — unreachable from well-typed Knot) still panics.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) -> *mut Value {
     let i = match unsafe { as_ref(index) } {
         Value::Int(n) if *n >= 0 => *n as usize,
-        // A negative index is genuinely out of bounds (not index 0); report it
-        // accurately rather than via int_as_usize's misleading "expected Int".
-        Value::Int(n) => panic!("knot runtime: bytesGet index {} out of bounds (negative)", n),
+        // A negative index is out of bounds, not index 0.
+        Value::Int(_) => return make_nothing(),
         _ => panic!("knot runtime: bytesGet expected Int as first arg, got {}", type_name(index)),
     };
     match unsafe { as_ref(bytes) } {
-        Value::Bytes(b) => {
-            if i >= b.len() {
-                panic!("knot runtime: bytesGet index {} out of bounds (length {})", i, b.len());
-            }
-            knot_value_int(b[i] as i64)
-        }
+        Value::Bytes(b) => match b.get(i) {
+            Some(byte) => make_just(knot_value_int(*byte as i64)),
+            None => make_nothing(),
+        },
         _ => panic!("knot runtime: bytesGet expected Bytes as second arg, got {}", type_name(bytes)),
     }
 }
@@ -19196,7 +19199,11 @@ fn derive_sealed_box_key(
 }
 
 /// Sealed-box encryption: X25519 ECDH + BLAKE3 KDF + ChaCha20-Poly1305.
-/// Takes (publicKey: Bytes, plaintext: Bytes), returns ciphertext Bytes.
+/// Takes (publicKey: Bytes, plaintext: Bytes), returns `Maybe Bytes` —
+/// `Just {value: ciphertext}` on success, `Nothing {}` if the public key is
+/// unusable (not 32 bytes, or a low-order point that would force a predictable
+/// shared secret). Keys reach this function from untrusted sources (a peer's
+/// key off the wire), so a bad one is a value the caller handles, not an abort.
 /// Format: [ephemeral_pub: 32][nonce: 12][encrypted + tag: len+16]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: *mut Value) -> *mut Value {
@@ -19212,8 +19219,9 @@ pub extern "C-unwind" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: 
         _ => panic!("knot runtime: encrypt expected Bytes for plaintext, got {}", type_name(plaintext)),
     };
 
-    let recipient_pub: [u8; 32] = (**pub_bytes).try_into()
-        .expect("knot runtime: encrypt publicKey must be 32 bytes");
+    let Ok(recipient_pub) = <[u8; 32]>::try_from(&**pub_bytes) else {
+        return make_nothing();
+    };
     let recipient_public = x25519_dalek::PublicKey::from(recipient_pub);
 
     // Generate ephemeral key pair
@@ -19227,7 +19235,7 @@ pub extern "C-unwind" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: 
     // a predictable all-zero secret.
     let shared = eph_secret.diffie_hellman(&recipient_public);
     if !shared.was_contributory() {
-        panic!("knot runtime: encrypt publicKey is a low-order point (non-contributory X25519 exchange)");
+        return make_nothing();
     }
     let key_bytes = derive_sealed_box_key(shared.as_bytes(), eph_public.as_bytes(), &recipient_pub);
     let key = chacha20poly1305::Key::from_slice(&key_bytes);
@@ -19238,19 +19246,25 @@ pub extern "C-unwind" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: 
     getrandom::fill(&mut nonce_bytes).expect("knot runtime: failed to generate nonce");
     let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
 
-    let ciphertext = cipher.encrypt(nonce, &**plain)
-        .expect("knot runtime: encryption failed");
+    let Ok(ciphertext) = cipher.encrypt(nonce, &**plain) else {
+        return make_nothing();
+    };
 
     // Pack: ephemeral_public (32) + nonce (12) + ciphertext
     let mut result = Vec::with_capacity(32 + 12 + ciphertext.len());
     result.extend_from_slice(eph_public.as_bytes());
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&ciphertext);
-    alloc(Value::Bytes(Arc::from(result)))
+    make_just(alloc(Value::Bytes(Arc::from(result))))
 }
 
 /// Sealed-box decryption: reverse of encrypt.
-/// Takes (privateKey: Bytes, ciphertext: Bytes), returns plaintext Bytes.
+/// Takes (privateKey: Bytes, ciphertext: Bytes), returns `Maybe Bytes` —
+/// `Just {value: plaintext}` on success, `Nothing {}` on any failure to
+/// recover it: a private key that isn't 32 bytes, a ciphertext too short to
+/// hold the header, a low-order ephemeral point, or a wrong key / tampered
+/// body failing the Poly1305 tag check. Ciphertext is untrusted by definition,
+/// so a forged one must not be able to take the process down.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext: *mut Value) -> *mut Value {
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
@@ -19266,14 +19280,15 @@ pub extern "C-unwind" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext
     };
 
     if ct.len() < 32 + 12 + 16 {
-        panic!("knot runtime: decrypt ciphertext too short (need at least 60 bytes, got {})", ct.len());
+        return make_nothing();
     }
 
-    let secret_bytes: [u8; 32] = (**priv_bytes).try_into()
-        .expect("knot runtime: decrypt privateKey must be 32 bytes");
+    let Ok(secret_bytes) = <[u8; 32]>::try_from(&**priv_bytes) else {
+        return make_nothing();
+    };
     let secret = x25519_dalek::StaticSecret::from(secret_bytes);
 
-    // Unpack
+    // Unpack — lengths are guaranteed by the bounds check above.
     let eph_pub_bytes: [u8; 32] = ct[..32].try_into().unwrap();
     let nonce_bytes: [u8; 12] = ct[32..44].try_into().unwrap();
     let encrypted = &ct[44..];
@@ -19283,7 +19298,7 @@ pub extern "C-unwind" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext
     // ciphertext header would force a predictable key (see encrypt).
     let shared = secret.diffie_hellman(&eph_public);
     if !shared.was_contributory() {
-        panic!("knot runtime: decryption failed (non-contributory X25519 exchange — low-order ephemeral point)");
+        return make_nothing();
     }
     let recipient_public = x25519_dalek::PublicKey::from(&secret);
     let key_bytes = derive_sealed_box_key(
@@ -19295,12 +19310,16 @@ pub extern "C-unwind" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext
     let cipher = ChaCha20Poly1305::new(key);
     let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
 
-    let plaintext = cipher.decrypt(nonce, encrypted)
-        .expect("knot runtime: decryption failed (invalid key or corrupted ciphertext)");
-    alloc(Value::Bytes(Arc::from(plaintext)))
+    // Wrong key or tampered ciphertext → tag check fails → Nothing.
+    let Ok(plaintext) = cipher.decrypt(nonce, encrypted) else {
+        return make_nothing();
+    };
+    make_just(alloc(Value::Bytes(Arc::from(plaintext))))
 }
 
-/// Ed25519 signing. Takes (privateKey: Bytes, message: Bytes), returns signature Bytes.
+/// Ed25519 signing. Takes (privateKey: Bytes, message: Bytes), returns
+/// `Maybe Bytes` — `Just {value: signature}` on success, `Nothing {}` if the
+/// private key isn't 32 bytes.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_crypto_sign(private_key: *mut Value, message: *mut Value) -> *mut Value {
     use ed25519_dalek::Signer;
@@ -19314,11 +19333,12 @@ pub extern "C-unwind" fn knot_crypto_sign(private_key: *mut Value, message: *mut
         _ => panic!("knot runtime: sign expected Bytes for message, got {}", type_name(message)),
     };
 
-    let secret_bytes: [u8; 32] = (**priv_bytes).try_into()
-        .expect("knot runtime: sign privateKey must be 32 bytes");
+    let Ok(secret_bytes) = <[u8; 32]>::try_from(&**priv_bytes) else {
+        return make_nothing();
+    };
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
     let signature = signing_key.sign(msg);
-    alloc(Value::Bytes(Arc::from(signature.to_bytes().to_vec())))
+    make_just(alloc(Value::Bytes(Arc::from(signature.to_bytes().to_vec()))))
 }
 
 /// Ed25519 verification. Takes (db, publicKey: Bytes, message: Bytes, signature: Bytes), returns Bool.
@@ -21655,6 +21675,25 @@ mod _bugfix_batch_tests {
 
     // ── Fix: sealed-box KDF + contributory check ──
 
+    /// Unwrap `Just {value: Bytes}`, failing the test on `Nothing {}`.
+    fn expect_just_bytes(v: *mut Value) -> Vec<u8> {
+        match unsafe { as_ref(v) } {
+            Value::Constructor(tag, inner) if &**tag == "Just" => {
+                let payload = knot_record_field(*inner, b"value".as_ptr(), 5);
+                match unsafe { as_ref(payload) } {
+                    Value::Bytes(b) => b.to_vec(),
+                    _ => panic!("expected Bytes inside Just, got {}", type_name(payload)),
+                }
+            }
+            _ => panic!("expected Just, got {}", type_name(v)),
+        }
+    }
+
+    /// True when `v` is `Nothing {}`.
+    fn is_nothing(v: *mut Value) -> bool {
+        matches!(unsafe { as_ref(v) }, Value::Constructor(tag, _) if &**tag == "Nothing")
+    }
+
     #[test]
     fn crypto_sealed_box_round_trip() {
         let pair = knot_crypto_generate_key_pair();
@@ -21663,32 +21702,126 @@ mod _bugfix_batch_tests {
 
         let plaintext = alloc(Value::Bytes(Arc::from(b"attack at dawn".to_vec())));
         let ct = knot_crypto_encrypt(public_key, plaintext);
-        let decrypted = knot_crypto_decrypt(private_key, ct);
-        match unsafe { as_ref(decrypted) } {
-            Value::Bytes(b) => assert_eq!(&**b, b"attack at dawn" as &[u8]),
-            _ => panic!("expected Bytes from decrypt"),
-        }
+        let ct_bytes = expect_just_bytes(ct);
+        let ct_val = alloc(Value::Bytes(Arc::from(ct_bytes)));
+        let decrypted = knot_crypto_decrypt(private_key, ct_val);
+        assert_eq!(expect_just_bytes(decrypted), b"attack at dawn".to_vec());
     }
 
     #[test]
-    #[should_panic(expected = "non-contributory")]
     fn crypto_encrypt_rejects_low_order_public_key() {
         // The identity point (all zeros) is the canonical low-order input:
         // DH with it yields an all-zero shared secret for ANY ephemeral key.
+        // Rejection is `Nothing {}`, not an abort — the key may come from a peer.
         let zero_pub = alloc(Value::Bytes(Arc::from(vec![0u8; 32])));
         let plaintext = alloc(Value::Bytes(Arc::from(b"x".to_vec())));
-        let _ = knot_crypto_encrypt(zero_pub, plaintext);
+        assert!(is_nothing(knot_crypto_encrypt(zero_pub, plaintext)));
     }
 
     #[test]
-    #[should_panic(expected = "non-contributory")]
     fn crypto_decrypt_rejects_low_order_ephemeral() {
         let pair = knot_crypto_generate_key_pair();
         let private_key = knot_record_field(pair, b"privateKey".as_ptr(), 10);
         // Forged ciphertext with an all-zero (low-order) ephemeral point.
         let ct = vec![0u8; 32 + 12 + 16];
         let ct_val = alloc(Value::Bytes(Arc::from(ct)));
-        let _ = knot_crypto_decrypt(private_key, ct_val);
+        assert!(is_nothing(knot_crypto_decrypt(private_key, ct_val)));
+    }
+
+    // ── Fix: encrypt/decrypt/sign return Nothing instead of aborting ──
+    //
+    // Every one of these inputs is attacker-reachable in a server that decrypts
+    // or signs request payloads. Before the fix each aborted the process
+    // (SIGABRT), turning malformed input into a remote DoS.
+
+    #[test]
+    fn crypto_decrypt_returns_nothing_on_tampered_ciphertext() {
+        let pair = knot_crypto_generate_key_pair();
+        let private_key = knot_record_field(pair, b"privateKey".as_ptr(), 10);
+        let public_key = knot_record_field(pair, b"publicKey".as_ptr(), 9);
+
+        let plaintext = alloc(Value::Bytes(Arc::from(b"attack at dawn".to_vec())));
+        let mut ct = expect_just_bytes(knot_crypto_encrypt(public_key, plaintext));
+        // Flip a bit in the AEAD-protected body: the Poly1305 tag check must fail.
+        let last = ct.len() - 1;
+        ct[last] ^= 0x01;
+
+        let tampered = alloc(Value::Bytes(Arc::from(ct)));
+        assert!(is_nothing(knot_crypto_decrypt(private_key, tampered)));
+    }
+
+    #[test]
+    fn crypto_decrypt_returns_nothing_on_short_ciphertext() {
+        let pair = knot_crypto_generate_key_pair();
+        let private_key = knot_record_field(pair, b"privateKey".as_ptr(), 10);
+        // Shorter than the 32+12+16 header, so it can't even be unpacked.
+        for len in [0usize, 1, 44, 59] {
+            let ct = alloc(Value::Bytes(Arc::from(vec![7u8; len])));
+            assert!(
+                is_nothing(knot_crypto_decrypt(private_key, ct)),
+                "ciphertext of length {len} must decrypt to Nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn crypto_decrypt_returns_nothing_on_wrong_length_private_key() {
+        let bad_key = alloc(Value::Bytes(Arc::from(vec![9u8; 16])));
+        let ct = alloc(Value::Bytes(Arc::from(vec![0u8; 64])));
+        assert!(is_nothing(knot_crypto_decrypt(bad_key, ct)));
+    }
+
+    #[test]
+    fn crypto_decrypt_returns_nothing_on_wrong_key() {
+        // A well-formed ciphertext addressed to someone else.
+        let alice = knot_crypto_generate_key_pair();
+        let alice_pub = knot_record_field(alice, b"publicKey".as_ptr(), 9);
+        let bob = knot_crypto_generate_key_pair();
+        let bob_priv = knot_record_field(bob, b"privateKey".as_ptr(), 10);
+
+        let plaintext = alloc(Value::Bytes(Arc::from(b"for alice only".to_vec())));
+        let ct = expect_just_bytes(knot_crypto_encrypt(alice_pub, plaintext));
+        let ct_val = alloc(Value::Bytes(Arc::from(ct)));
+        assert!(is_nothing(knot_crypto_decrypt(bob_priv, ct_val)));
+    }
+
+    #[test]
+    fn crypto_encrypt_returns_nothing_on_wrong_length_public_key() {
+        let plaintext = alloc(Value::Bytes(Arc::from(b"x".to_vec())));
+        for len in [0usize, 16, 31, 33, 64] {
+            let bad_pub = alloc(Value::Bytes(Arc::from(vec![1u8; len])));
+            assert!(
+                is_nothing(knot_crypto_encrypt(bad_pub, plaintext)),
+                "public key of length {len} must encrypt to Nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn crypto_sign_returns_nothing_on_wrong_length_private_key() {
+        let msg = alloc(Value::Bytes(Arc::from(b"hello".to_vec())));
+        for len in [0usize, 16, 31, 33, 64] {
+            let bad_key = alloc(Value::Bytes(Arc::from(vec![2u8; len])));
+            assert!(
+                is_nothing(knot_crypto_sign(bad_key, msg)),
+                "private key of length {len} must sign to Nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn crypto_sign_then_verify_round_trip() {
+        // The happy path still yields a signature `verify` accepts, now via Just.
+        let pair = knot_crypto_generate_signing_key_pair();
+        let private_key = knot_record_field(pair, b"privateKey".as_ptr(), 10);
+        let public_key = knot_record_field(pair, b"publicKey".as_ptr(), 9);
+        let msg = alloc(Value::Bytes(Arc::from(b"hello".to_vec())));
+
+        let sig_bytes = expect_just_bytes(knot_crypto_sign(private_key, msg));
+        assert_eq!(sig_bytes.len(), 64);
+        let sig = alloc(Value::Bytes(Arc::from(sig_bytes)));
+        let result = knot_crypto_verify(std::ptr::null_mut(), public_key, msg, sig);
+        assert!(matches!(unsafe { as_ref(result) }, Value::Bool(true)));
     }
 
     // ── Fix: verify() returns false on untrusted malformed input ──
@@ -21699,9 +21832,65 @@ mod _bugfix_batch_tests {
         let private_key = knot_record_field(pair, b"privateKey".as_ptr(), 10);
         let public_key = knot_record_field(pair, b"publicKey".as_ptr(), 9);
         let msg = alloc(Value::Bytes(Arc::from(b"hello".to_vec())));
-        let sig = knot_crypto_sign(private_key, msg);
+        let sig_bytes = expect_just_bytes(knot_crypto_sign(private_key, msg));
+        let sig = alloc(Value::Bytes(Arc::from(sig_bytes)));
         let result = knot_crypto_verify(std::ptr::null_mut(), public_key, msg, sig);
         assert!(matches!(unsafe { as_ref(result) }, Value::Bool(true)));
+    }
+
+    // ── Fix: bytesGet returns Maybe Int instead of aborting on OOB ──
+
+    /// Unwrap `Just {value: Int}`, failing the test on `Nothing {}`.
+    fn expect_just_int(v: *mut Value) -> i64 {
+        match unsafe { as_ref(v) } {
+            Value::Constructor(tag, inner) if &**tag == "Just" => {
+                let payload = knot_record_field(*inner, b"value".as_ptr(), 5);
+                match unsafe { as_ref(payload) } {
+                    Value::Int(n) => *n,
+                    _ => panic!("expected Int inside Just, got {}", type_name(payload)),
+                }
+            }
+            _ => panic!("expected Just, got {}", type_name(v)),
+        }
+    }
+
+    #[test]
+    fn bytes_get_returns_just_in_bounds() {
+        let b = alloc(Value::Bytes(Arc::from(b"hello".to_vec())));
+        for (i, expected) in [(0i64, 104i64), (1, 101), (4, 111)] {
+            let got = knot_bytes_get(knot_value_int(i), b);
+            assert_eq!(expect_just_int(got), expected, "byte at index {i}");
+        }
+    }
+
+    #[test]
+    fn bytes_get_returns_nothing_past_the_end() {
+        // The index is attacker-controlled in practice (an offset out of a
+        // request body); reading past the end must not abort the process.
+        let b = alloc(Value::Bytes(Arc::from(b"hello".to_vec())));
+        for i in [5i64, 10, i64::MAX] {
+            assert!(
+                is_nothing(knot_bytes_get(knot_value_int(i), b)),
+                "index {i} past the end must be Nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_get_returns_nothing_on_negative_index() {
+        let b = alloc(Value::Bytes(Arc::from(b"hello".to_vec())));
+        for i in [-1i64, -10, i64::MIN] {
+            assert!(
+                is_nothing(knot_bytes_get(knot_value_int(i), b)),
+                "negative index {i} must be Nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_get_returns_nothing_on_empty_bytes() {
+        let b = alloc(Value::Bytes(Arc::from(Vec::new())));
+        assert!(is_nothing(knot_bytes_get(knot_value_int(0), b)));
     }
 
     #[test]
@@ -23038,8 +23227,8 @@ mod _deep_nesting_iterative_tests {
         // Codegen routes dimensionless and unit-polymorphic arguments to plain
         // `knot_value_show`, but an empty unit string must not produce a
         // trailing space if one ever reaches here.
-        let v = alloc(Value::Float(std::f64::consts::PI));
-        assert_eq!(show_unit_text(v, ""), "3.14");
+        let v = alloc(Value::Float(1.25));
+        assert_eq!(show_unit_text(v, ""), "1.25");
         assert_eq!(show_unit_text(v, ""), show_text(v));
     }
 

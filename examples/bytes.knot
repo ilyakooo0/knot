@@ -35,8 +35,14 @@ main = do
     Just {value: t} -> println t   -- hello
     Nothing {} -> println "<invalid utf-8>"
 
-  -- Byte access
-  println (bytesGet 0 raw)         -- 104 (ascii 'h')
+  -- Byte access is Maybe — Nothing when the index is out of bounds
+  case bytesGet 0 raw of
+    Just {value: byte} -> println byte  -- 104 (ascii 'h')
+    Nothing {} -> println "<out of bounds>"
+
+  case bytesGet 10 raw of
+    Just {value: byte} -> println byte
+    Nothing {} -> println "<out of bounds>"  -- raw has only 5 bytes
 
   -- Hex escapes in literals
   let withHex = b"\x48\x49"

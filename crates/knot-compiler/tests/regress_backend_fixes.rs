@@ -137,11 +137,12 @@ main = do
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
-    // The outer `t` is a clock timestamp (a large integer), not a row.
+    // The outer `t` is a clock timestamp (a large integer), not a row. `now`
+    // is typed `IO {clock} Int<Ms>`, so `show` appends its unit: "<digits> Ms".
     let first = stdout.lines().next().unwrap_or("");
+    let digits = first.trim_matches('"').trim_end_matches(" Ms");
     assert!(
-        first.trim_matches('"').chars().all(|c| c.is_ascii_digit())
-            && !first.is_empty(),
+        !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()),
         "expected the outer `t` (timestamp) to be printed, got:\n{stdout}"
     );
 }

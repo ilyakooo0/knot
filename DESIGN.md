@@ -1489,7 +1489,9 @@ show 42.0<M>             -- "42.0 M"
 show 3.14                -- "3.14"
 ```
 
-When the unit is polymorphic (inside a unit-generic function), `show` prints just the number.
+`Int` units are appended the same way, including the built-in `Ms` that clock operations carry — `now : IO {clock} Int<Ms>`, so `show` on a timestamp reads `"1783814121719 Ms"`. Use `stripUnit` to print the bare number.
+
+When the unit is polymorphic (inside a unit-generic function), `show` prints just the number: the function body is compiled once, for every unit its caller may instantiate.
 
 The compiler uses a canonical form for unit strings: alphabetical numerator, alphabetical denominator, powers collapsed. This same canonical form determines type equality (`m * s` = `s * m`).
 

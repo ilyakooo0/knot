@@ -7719,6 +7719,36 @@ pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
     alloc(Value::Text(Arc::from(out)))
 }
 
+/// `show` on a value whose static type carries a concrete unit of measure
+/// (`Float<M>`, `Int<Usd>`). Units are erased at runtime — a `Float<M>` is an
+/// ordinary `Value::Float` — so the unit only exists in the type checker. It
+/// hands the canonical unit string (`"M"`, `"M/S^2"`) to codegen, which passes
+/// it here as a constant: `show 42.0<M>` renders `"42.0 M"`.
+///
+/// Codegen only routes a `show` through this entry point when the argument's
+/// type resolves to a concrete `IntUnit`/`FloatUnit`; a dimensionless or
+/// unit-polymorphic argument goes to plain `knot_value_show` and prints just
+/// the number. The empty-unit guard below is a belt-and-braces fallback for
+/// that same case.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_value_show_unit(
+    v: *mut Value,
+    unit_ptr: *const u8,
+    unit_len: usize,
+) -> *mut Value {
+    let shown = knot_value_show(v);
+    let unit = unsafe { str_from_raw(unit_ptr, unit_len) };
+    if unit.is_empty() {
+        return shown;
+    }
+    match unsafe { as_ref(shown) } {
+        Value::Text(s) => alloc(Value::Text(Arc::from(format!("{} {}", s, unit)))),
+        // `knot_value_show` always returns Text; anything else means the
+        // contract changed, and suffixing is meaningless. Pass it through.
+        _ => shown,
+    }
+}
+
 // ── IO monad ─────────────────────────────────────────────────────
 
 /// Create an IO value wrapping a thunk function pointer and captured environment.
@@ -22402,6 +22432,36 @@ mod _deep_nesting_iterative_tests {
             show_text(deep_spine(2)),
             "Cons {head: 0, tail: Cons {head: 1, tail: Nil {}}}"
         );
+    }
+
+    /// Read the `Value::Text` a `knot_value_show_unit` call produced.
+    fn show_unit_text(v: *mut Value, unit: &str) -> String {
+        let shown = knot_value_show_unit(v, unit.as_ptr(), unit.len());
+        match unsafe { as_ref(shown) } {
+            Value::Text(s) => (**s).to_string(),
+            other => panic!("expected Text, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn value_show_unit_appends_the_unit_suffix() {
+        // DESIGN: `show 42.0<M>` is "42.0 M" and `show 9.8<M / S^2>` is
+        // "9.8 M/S^2" — the number formats exactly as plain `show` would, with
+        // the canonical unit string appended after a single space.
+        assert_eq!(show_unit_text(alloc(Value::Float(42.0)), "M"), "42.0 M");
+        assert_eq!(show_unit_text(alloc(Value::Float(9.8)), "M/S^2"), "9.8 M/S^2");
+        // Ints carry units too (`Int<Usd>`).
+        assert_eq!(show_unit_text(alloc(Value::Int(1500)), "Usd"), "1500 Usd");
+    }
+
+    #[test]
+    fn value_show_unit_without_a_unit_is_plain_show() {
+        // Codegen routes dimensionless and unit-polymorphic arguments to plain
+        // `knot_value_show`, but an empty unit string must not produce a
+        // trailing space if one ever reaches here.
+        let v = alloc(Value::Float(3.14));
+        assert_eq!(show_unit_text(v, ""), "3.14");
+        assert_eq!(show_unit_text(v, ""), show_text(v));
     }
 
     #[test]

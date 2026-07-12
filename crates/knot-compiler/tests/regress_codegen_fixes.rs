@@ -10,6 +10,9 @@
 //!    unexecuted IO thunks (`expected Relation in len, got IO` at runtime).
 //! 5. Trampoline curry chains emitting unsorted env-record keys for
 //!    functions with >= 12 parameters ("10" sorts before "2").
+//! 6. Relation comprehensions in an `if`/`case` branch of a `set`/`replace`
+//!    value compiling as IO thunks rather than relations
+//!    (`source_write expects a Relation, got IO` at runtime).
 //!
 //! Each test compiles a small Knot program with the real `knot` binary into
 //! its own scratch directory (so `knot.db` lands there) and asserts on the
@@ -860,5 +863,113 @@ main = do
     assert!(
         stdout.contains("count: 3"),
         "a whole-relation bind must keep binding the relation, got:\n{stdout}"
+    );
+}
+
+// ── Finding 6: comprehensions in an if/case branch of a set value ──
+
+#[test]
+fn set_value_comprehension_inside_if_branch() {
+    // A do-block directly under `replace *rel =` is a relational
+    // comprehension, but one inside an `if` branch was reached through the
+    // generic expression path, where `is_io_do_block` sees the `x <- *other`
+    // bind and compiles it as an IO thunk. The thunk was then handed to
+    // `knot_source_write`, aborting with
+    // `source_write expects a Relation, got IO`.
+    let (stdout, stderr, ok) = compile_and_run(
+        "set_if_branch_comprehension",
+        r#"*other : [{name: Text}]
+*items : [{name: Text}]
+
+main = do
+  replace *other = [{name: "a"}, {name: "b"}]
+  replace *items =
+    if True
+      then do
+        x <- *other
+        where x.name == "a"
+        yield x
+      else []
+  rows <- *items
+  println ("then: " ++ show rows)
+
+  -- the same comprehension in the else branch, one level of nesting down
+  replace *items =
+    if False
+      then []
+      else if True
+        then do
+          x <- *other
+          yield x
+        else []
+  all <- *items
+  println ("else: " ++ show (count all))
+
+  -- a branch that is not a comprehension still writes its own rows
+  replace *items =
+    if False
+      then do
+        x <- *other
+        yield x
+      else [{name: "z"}]
+  lit <- *items
+  println ("lit: " ++ show lit)
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    // Each branch iterates the source's ROWS, exactly as the same do-block
+    // written directly under the `=` would.
+    assert!(
+        stdout.contains("then: [{name: a}]"),
+        "an if-branch comprehension must write the filtered rows, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("else: 2"),
+        "a nested else-branch comprehension must write every row, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("lit: [{name: z}]"),
+        "a non-comprehension branch must still write its own value, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn set_value_comprehension_inside_case_arm() {
+    // Same defect via `case`: the arm bodies are set values too.
+    let (stdout, stderr, ok) = compile_and_run(
+        "set_case_arm_comprehension",
+        r#"data Mode = Copy | Clear
+
+*other : [{name: Text}]
+*items : [{name: Text}]
+
+main = do
+  replace *other = [{name: "a"}, {name: "b"}]
+  replace *items =
+    case Copy of
+      Copy -> do
+        x <- *other
+        yield x
+      Clear -> []
+  copied <- *items
+  println ("copy: " ++ show (count copied))
+  replace *items =
+    case Clear of
+      Copy -> do
+        x <- *other
+        yield x
+      Clear -> []
+  cleared <- *items
+  println ("clear: " ++ show (count cleared))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("copy: 2"),
+        "a case-arm comprehension must write the source's rows, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("clear: 0"),
+        "the non-comprehension arm must still clear the relation, got:\n{stdout}"
     );
 }

@@ -11371,7 +11371,69 @@ fn sql_type(ty: ColType) -> &'static str {
     }
 }
 
-/// Read a column value from a SQLite row, returning null pointer for SQL NULL.
+/// The Knot value a SQL NULL reads back as, or `None` for a column type that
+/// has no meaningful default.
+///
+/// Knot has no NULL — every field of a record holds a value — but SQLite
+/// columns can still be NULL for rows that predate the column. Adding a field
+/// to a source's record type is a safe schema change, applied in place by
+/// `auto_apply_record_change` (and its ADT/child-table siblings) with
+/// `ALTER TABLE ADD COLUMN`, which leaves every existing row NULL there.
+/// Reading those rows must produce the type's empty value; handing user code a
+/// raw null pointer is what made the field read back as garbage.
+///
+/// `Json` columns carry `Maybe`, record, payload-ADT and relation fields alike
+/// — the schema descriptor records nothing about a json column beyond "json" —
+/// so NULL becomes `Nothing`. That is exactly right for `Maybe`, which is how
+/// an optional field is added, and the closest thing to "absent" for the rest.
+///
+/// `Tag` (an enum-like ADT such as `data Status = Todo | Done`) has no empty
+/// value: every constructor is a real choice, and picking one would invent
+/// data. Those columns return `None`, and `read_sql_column` reports the
+/// migration instead of guessing.
+fn sql_null_default(ty: ColType) -> Option<*mut Value> {
+    Some(match ty {
+        ColType::Int => alloc_int(0),
+        ColType::Float => alloc_float(0.0),
+        ColType::Text => alloc(Value::Text(Arc::from(""))),
+        ColType::Bool => alloc_bool(false),
+        ColType::Bytes => alloc(Value::Bytes(Arc::from(&[][..]))),
+        ColType::Json => make_nothing(),
+        ColType::Tag => return None,
+    })
+}
+
+/// `sql_null_default` as a SQL literal, used to backfill the rows that predate
+/// a column added by an auto-applied schema change.
+///
+/// Defaulting on read alone is not enough: queries push down to SQLite, so
+/// `filter (\u -> u.age == 0)` runs as `WHERE "age" = '0'` and would skip the
+/// very rows that read back as `age = 0` in memory. Backfilling keeps the
+/// stored column and the in-memory view telling the same story.
+///
+/// `None` for the column types `sql_null_default` has no value for.
+fn sql_null_default_literal(ty: ColType) -> Option<String> {
+    Some(match ty {
+        // Int columns are `TEXT COLLATE KNOT_INT` — the literal is text.
+        ColType::Int => "'0'".to_string(),
+        ColType::Float => "0.0".to_string(),
+        ColType::Text => "''".to_string(),
+        ColType::Bool => "0".to_string(),
+        ColType::Bytes => "X''".to_string(),
+        // `Nothing` in the storage JSON encoding, taken from the encoder itself
+        // so it cannot drift from what `read_sql_column` parses back out.
+        ColType::Json => sql_text_literal(&value_to_json_db(make_nothing())),
+        ColType::Tag => return None,
+    })
+}
+
+/// Quote a string as a SQL text literal (single quotes doubled).
+fn sql_text_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Read a column value from a SQLite row, mapping SQL NULL to the column
+/// type's default value (see `sql_null_default`).
 ///
 /// All `unwrap`s on `row.get_ref(i)` and `row.get(i)` are guarded by callers
 /// that pass a column index in range; if a schema migration drift makes one
@@ -11383,7 +11445,16 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
         i, ty
     );
     if matches!(row.get_ref(i).unwrap_or_else(|_| panic!("{}", mismatch())), ValueRef::Null) {
-        return std::ptr::null_mut();
+        return sql_null_default(ty).unwrap_or_else(|| {
+            let col = row.as_ref().column_name(i).unwrap_or("<unknown>");
+            panic!(
+                "knot runtime: column '{}' is NULL but its type is an enum, which has no \
+                 default value. The column was added to an existing relation without a \
+                 `migrate` block, so rows written before the change have no value for it. \
+                 Add a `migrate` block that fills in '{}' for the existing rows.",
+                col, col
+            )
+        });
     }
     match ty {
         ColType::Int => {
@@ -11582,6 +11653,42 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
     }
 }
 
+/// Add a column to an existing table and fill it in for the rows that predate
+/// it, so they hold the value `read_sql_column` defaults them to (see
+/// `sql_null_default_literal`). Returns false if the change could not be
+/// applied, which the caller reports as a breaking schema change.
+///
+/// For record and child tables only, where every column belongs to every row.
+/// `auto_apply_adt_change` adds columns to a wide ADT table without backfilling
+/// — see the comment there.
+fn add_column_backfilled(conn: &Connection, table: &str, col: &ColumnSpec) -> bool {
+    let sql = format!(
+        "ALTER TABLE {} ADD COLUMN {} {};",
+        quote_ident(table),
+        quote_ident(&col.name),
+        sql_type(col.ty)
+    );
+    debug_sql(&sql);
+    if conn.execute_batch(&sql).is_err() {
+        return false;
+    }
+
+    let Some(default) = sql_null_default_literal(col.ty) else {
+        // No default for this column type (an enum tag): leave the rows NULL.
+        // `read_sql_column` reports them, pointing at a `migrate` block.
+        return true;
+    };
+    let backfill = format!(
+        "UPDATE {} SET {} = {} WHERE {} IS NULL;",
+        quote_ident(table),
+        quote_ident(&col.name),
+        default,
+        quote_ident(&col.name)
+    );
+    debug_sql(&backfill);
+    conn.execute_batch(&backfill).is_ok()
+}
+
 /// Try to auto-apply a safe schema change (e.g. adding ADT constructors).
 /// Returns true if the change was applied, false if it's a breaking change.
 fn auto_apply_schema_change(
@@ -11648,7 +11755,15 @@ fn auto_apply_adt_change(
             }
     }
 
-    // Add new columns for new constructor fields
+    // Add new columns for new constructor fields. Unlike the record and child
+    // tables, these are deliberately NOT backfilled: control only reaches here
+    // when every *old* constructor kept exactly its old fields, so a new column
+    // can only belong to a new constructor — no stored row carries that tag and
+    // there is nothing to fill in. NULL in the wide table keeps meaning "this
+    // row is a different constructor", which the unknown-constructor read path
+    // relies on. (Adding a field to an *existing* constructor is rejected as
+    // breaking by the loop above, which is what sends the user to a `migrate`
+    // block.)
     let old_field_names: HashSet<&str> = old_adt.all_fields.iter().map(|f| f.name.as_str()).collect();
     for f in &new_adt.all_fields {
         if !old_field_names.contains(f.name.as_str()) {
@@ -11738,20 +11853,13 @@ fn auto_apply_child_change(
         return false;
     }
 
-    // Add new columns to the child table
+    // Add new columns to the child table, backfilling existing child rows
     let old_col_names: HashSet<&str> = old_nf.columns.iter().map(|c| c.name.as_str()).collect();
     for c in &new_nf.columns {
-        if !old_col_names.contains(c.name.as_str()) {
-            let sql = format!(
-                "ALTER TABLE {} ADD COLUMN {} {};",
-                quote_ident(&child_table),
-                quote_ident(&c.name),
-                sql_type(c.ty)
-            );
-            debug_sql(&sql);
-            if conn.execute_batch(&sql).is_err() {
-                return false;
-            }
+        if !old_col_names.contains(c.name.as_str())
+            && !add_column_backfilled(conn, &child_table, c)
+        {
+            return false;
         }
     }
 
@@ -11844,20 +11952,11 @@ fn auto_apply_record_change(
         }
     }
 
-    // Add new columns
+    // Add new columns, backfilling the rows written before the field existed
     let old_col_names: HashSet<&str> = old_rec.columns.iter().map(|c| c.name.as_str()).collect();
     for c in &new_rec.columns {
-        if !old_col_names.contains(c.name.as_str()) {
-            let sql = format!(
-                "ALTER TABLE {} ADD COLUMN {} {};",
-                quote_ident(table),
-                quote_ident(&c.name),
-                sql_type(c.ty)
-            );
-            debug_sql(&sql);
-            if conn.execute_batch(&sql).is_err() {
-                return false;
-            }
+        if !old_col_names.contains(c.name.as_str()) && !add_column_backfilled(conn, table, c) {
+            return false;
         }
     }
 
@@ -19335,6 +19434,357 @@ mod _adt_migration_tests {
         assert!(
             applied,
             "adding a constructor with only new field names must stay auto-applicable"
+        );
+    }
+}
+
+// ── Regression: a field added without a migrate block must not read back NULL ──
+//
+// Adding a field to a source's record type is a safe schema change: the runtime
+// applies it in place with `ALTER TABLE ADD COLUMN`, which leaves every row
+// written before the change with SQL NULL there. `read_sql_column` used to hand
+// those rows back as a raw null pointer, so the new field silently arrived as
+// nothing at all — not even `Nothing` for a `Maybe`. Every column type now reads
+// back as its default value, and the rows are backfilled in SQLite so the
+// pushed-down SQL sees the same value the in-memory read does.
+#[cfg(test)]
+mod _added_column_default_tests {
+    use super::*;
+
+    fn test_db() -> *mut c_void {
+        let conn = Connection::open_in_memory().unwrap();
+        // Same collation knot_db_open registers — Int columns are TEXT
+        // with COLLATE KNOT_INT.
+        conn.create_collation("KNOT_INT", |a: &str, b: &str| {
+            match (a.parse::<i64>(), b.parse::<i64>()) {
+                (Ok(pa), Ok(pb)) => pa.cmp(&pb),
+                (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                (Err(_), Err(_)) => a.cmp(b),
+            }
+        })
+        .unwrap();
+        let db = Box::into_raw(Box::new(KnotDb {
+            conn,
+            atomic_depth: std::cell::Cell::new(0),
+            indexed: RefCell::new(HashSet::new()),
+        })) as *mut c_void;
+        knot_schema_init(db);
+        db
+    }
+
+    fn conn_of(db: *mut c_void) -> &'static Connection {
+        &unsafe { &*(db as *mut KnotDb) }.conn
+    }
+
+    /// Compile-and-run a program against the source: `init` is what the
+    /// generated `main_init` calls for every source declaration, so calling it
+    /// twice with different schemas is exactly "run the program, add a field to
+    /// the record type, run it again".
+    fn init(db: *mut c_void, name: &str, schema: &str) {
+        knot_source_init(db, name.as_ptr(), name.len(), schema.as_ptr(), schema.len());
+    }
+
+    fn write(db: *mut c_void, name: &str, schema: &str, rows: Vec<*mut Value>) {
+        let rel = alloc(Value::Relation(rows));
+        knot_source_write(
+            db,
+            name.as_ptr(),
+            name.len(),
+            schema.as_ptr(),
+            schema.len(),
+            rel,
+        );
+    }
+
+    fn read(db: *mut c_void, name: &str, schema: &str) -> Vec<*mut Value> {
+        let rel = knot_source_read(db, name.as_ptr(), name.len(), schema.as_ptr(), schema.len());
+        match unsafe { as_ref(rel) } {
+            Value::Relation(rows) => rows.clone(),
+            other => panic!("expected a relation, got {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    fn record(fields: &[(&str, *mut Value)]) -> *mut Value {
+        let rec = knot_record_empty(fields.len());
+        for (name, value) in fields {
+            knot_record_set_field(rec, name.as_ptr(), name.len(), *value);
+        }
+        rec
+    }
+
+    fn field(rec: *mut Value, name: &str) -> *mut Value {
+        knot_record_field(rec, name.as_ptr(), name.len())
+    }
+
+    fn text(s: &str) -> *mut Value {
+        alloc(Value::Text(Arc::from(s)))
+    }
+
+    fn count(db: *mut c_void, sql: &str) -> i64 {
+        conn_of(db).query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn null_default_exists_for_every_type_except_enum_tags() {
+        let cases = [
+            (ColType::Int, alloc_int(0)),
+            (ColType::Float, alloc_float(0.0)),
+            (ColType::Text, text("")),
+            (ColType::Bool, alloc_bool(false)),
+            (ColType::Bytes, alloc(Value::Bytes(Arc::from(&[][..])))),
+            (ColType::Json, make_nothing()),
+        ];
+        for (ty, expected) in cases {
+            let got = sql_null_default(ty).unwrap_or_else(|| panic!("{:?} needs a default", ty));
+            assert!(
+                values_equal(got, expected),
+                "{:?} defaulted to {}, expected {}",
+                ty,
+                brief_value(got),
+                brief_value(expected)
+            );
+        }
+        // An enum tag has no empty value — every constructor is a real choice.
+        assert!(sql_null_default(ColType::Tag).is_none());
+        assert!(sql_null_default_literal(ColType::Tag).is_none());
+    }
+
+    #[test]
+    fn added_scalar_fields_read_back_as_defaults() {
+        let db = test_db();
+        init(db, "users", "name:text");
+        write(db, "users", "name:text", vec![record(&[("name", text("ada"))])]);
+
+        // The record type grows four fields. No migrate block.
+        let grown = "name:text,age:int,score:float,active:bool,avatar:bytes";
+        init(db, "users", grown);
+
+        let rows = read(db, "users", grown);
+        assert_eq!(rows.len(), 1, "the existing row must survive the change");
+        let row = rows[0];
+        assert!(values_equal(field(row, "name"), text("ada")), "old field preserved");
+        assert!(values_equal(field(row, "age"), alloc_int(0)), "Int defaults to 0");
+        assert!(values_equal(field(row, "score"), alloc_float(0.0)), "Float defaults to 0.0");
+        assert!(values_equal(field(row, "active"), alloc_bool(false)), "Bool defaults to False");
+        assert!(
+            values_equal(field(row, "avatar"), alloc(Value::Bytes(Arc::from(&[][..])))),
+            "Bytes defaults to empty"
+        );
+    }
+
+    #[test]
+    fn added_maybe_field_reads_back_as_nothing() {
+        let db = test_db();
+        init(db, "posts", "title:text");
+        write(db, "posts", "title:text", vec![record(&[("title", text("hello"))])]);
+
+        // `subtitle: Maybe Text` — a Maybe field is stored as a json column.
+        let grown = "title:text,subtitle:json";
+        init(db, "posts", grown);
+
+        let rows = read(db, "posts", grown);
+        assert_eq!(rows.len(), 1);
+        let subtitle = field(rows[0], "subtitle");
+        assert!(
+            values_equal(subtitle, make_nothing()),
+            "a Maybe field added to existing rows must read back as Nothing, got {}",
+            brief_value(subtitle)
+        );
+        match unsafe { as_ref(subtitle) } {
+            Value::Constructor(tag, _) => assert_eq!(&**tag, "Nothing"),
+            _ => panic!("expected a Nothing constructor, got {}", brief_value(subtitle)),
+        }
+
+        // A row written after the change still round-trips a `Just`, so the
+        // backfilled column is not just readable but still a live json column.
+        let just = alloc(Value::Constructor(
+            intern_str("Just"),
+            record(&[("value", text("a subtitle"))]),
+        ));
+        write(
+            db,
+            "posts",
+            grown,
+            vec![record(&[("title", text("hello")), ("subtitle", just)])],
+        );
+        let rows = read(db, "posts", grown);
+        assert_eq!(rows.len(), 1);
+        assert!(values_equal(field(rows[0], "subtitle"), just));
+    }
+
+    #[test]
+    fn added_fields_are_backfilled_in_sqlite() {
+        // Defaulting on read alone would leave pushed-down SQL out of step with
+        // the in-memory view: `filter (\u -> u.age == 0)` compiles to
+        // `WHERE "age" = '0'`, which no NULL row matches.
+        let db = test_db();
+        init(db, "users", "name:text");
+        write(db, "users", "name:text", vec![record(&[("name", text("ada"))])]);
+
+        let grown = "name:text,age:int,nickname:text,subscribed:bool";
+        init(db, "users", grown);
+
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM \"_knot_users\" WHERE \"age\" IS NULL"),
+            0,
+            "rows predating the column must not be left NULL"
+        );
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM \"_knot_users\" WHERE \"age\" = '0'"),
+            1,
+            "a pushed-down filter on the default value must find the row"
+        );
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM \"_knot_users\" WHERE \"nickname\" = ''"),
+            1
+        );
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM \"_knot_users\" WHERE \"subscribed\" = 0"),
+            1
+        );
+        // Int columns are TEXT COLLATE KNOT_INT: the backfilled literal has to
+        // be text, or SUM/ORDER BY would see a mistyped value.
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM \"_knot_users\" WHERE typeof(\"age\") = 'text'"),
+            1
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "is NULL but its type is an enum")]
+    fn added_enum_field_reports_the_missing_migration() {
+        // `status: Status` where `data Status = Todo | Done` is a `tag` column.
+        // No constructor is a defensible default, so the read must say so
+        // rather than invent one or hand back a null pointer.
+        let db = test_db();
+        init(db, "tasks", "title:text");
+        write(db, "tasks", "title:text", vec![record(&[("title", text("ship it"))])]);
+
+        let grown = "title:text,status:tag";
+        init(db, "tasks", grown);
+        read(db, "tasks", grown);
+    }
+
+    #[test]
+    fn rows_left_null_by_an_older_build_still_read_as_defaults() {
+        // The backfill only runs when *this* build applies the schema change. A
+        // database migrated by a build without it still holds NULLs, so the read
+        // path has to default them on its own — this is the case that turned a
+        // new field into a raw null pointer.
+        let db = test_db();
+        let schema = "name:text,age:int,nickname:json,active:bool";
+        init(db, "users", schema);
+        write(
+            db,
+            "users",
+            schema,
+            vec![record(&[
+                ("name", text("ada")),
+                ("age", alloc_int(36)),
+                ("nickname", make_nothing()),
+                ("active", alloc_bool(true)),
+            ])],
+        );
+        conn_of(db)
+            .execute_batch(
+                "UPDATE \"_knot_users\" \
+                 SET \"age\" = NULL, \"nickname\" = NULL, \"active\" = NULL;",
+            )
+            .unwrap();
+
+        let rows = read(db, "users", schema);
+        assert_eq!(rows.len(), 1);
+        let row = rows[0];
+        assert!(values_equal(field(row, "age"), alloc_int(0)));
+        assert!(values_equal(field(row, "nickname"), make_nothing()));
+        assert!(values_equal(field(row, "active"), alloc_bool(false)));
+    }
+
+    #[test]
+    fn new_adt_constructor_does_not_backfill_existing_rows() {
+        // A direct ADT relation is one wide table, so a new constructor's field
+        // is a new column — but the rows already in the table belong to *other*
+        // constructors, where NULL means "this row is not that constructor".
+        // Backfilling it (as the record path does) would fabricate a field on
+        // them, which the unknown-constructor read path would hand straight back.
+        let db = test_db();
+        let schema = "#Circle:radius=float";
+        init(db, "shapes", schema);
+        let circle = alloc(Value::Constructor(
+            intern_str("Circle"),
+            record(&[("radius", alloc_float(2.0))]),
+        ));
+        write(db, "shapes", schema, vec![circle]);
+
+        let grown = "#Circle:radius=float|Square:side=float";
+        init(db, "shapes", grown);
+
+        assert_eq!(
+            count(db, "SELECT COUNT(*) FROM \"_knot_shapes\" WHERE \"side\" IS NULL"),
+            1,
+            "the Circle row must keep NULL in another constructor's column"
+        );
+        let rows = read(db, "shapes", grown);
+        assert_eq!(rows.len(), 1);
+        match unsafe { as_ref(rows[0]) } {
+            Value::Constructor(tag, payload) => {
+                assert_eq!(&**tag, "Circle");
+                assert!(values_equal(field(*payload, "radius"), alloc_float(2.0)));
+            }
+            other => panic!("unexpected row {:?}", std::mem::discriminant(other)),
+        }
+    }
+
+    #[test]
+    fn field_added_to_an_existing_adt_constructor_stays_breaking() {
+        // The counterpart to the record case: the wide table has no way to tell
+        // a defaulted field from a field the constructor never had, so this
+        // change is refused rather than defaulted, and the user gets the
+        // "add a `migrate` block" error.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE \"_knot_shapes\" (\"_tag\" TEXT NOT NULL, \"radius\" REAL);")
+            .unwrap();
+        let applied = auto_apply_adt_change(
+            &conn,
+            "_knot_shapes",
+            "shapes",
+            "#Circle:radius=float",
+            "#Circle:radius=float;label=text",
+        );
+        assert!(!applied, "growing an existing constructor must demand a migrate block");
+    }
+
+    #[test]
+    fn field_added_to_a_nested_relation_reads_back_as_default() {
+        // Nested `[T]` fields live in a child table, migrated by
+        // `auto_apply_child_change` — same ALTER, same NULL rows.
+        let db = test_db();
+        let schema = "name:text,members:[name:text]";
+        init(db, "teams", schema);
+        let members = alloc(Value::Relation(vec![record(&[("name", text("ada"))])]));
+        write(
+            db,
+            "teams",
+            schema,
+            vec![record(&[("name", text("core")), ("members", members)])],
+        );
+
+        let grown = "name:text,members:[name:text,age:int]";
+        init(db, "teams", grown);
+
+        let rows = read(db, "teams", grown);
+        assert_eq!(rows.len(), 1);
+        let members = field(rows[0], "members");
+        let member_rows = match unsafe { as_ref(members) } {
+            Value::Relation(rows) => rows.clone(),
+            _ => panic!("members must be a relation"),
+        };
+        assert_eq!(member_rows.len(), 1);
+        assert!(values_equal(field(member_rows[0], "name"), text("ada")));
+        assert!(
+            values_equal(field(member_rows[0], "age"), alloc_int(0)),
+            "a field added inside a nested relation must default too"
         );
     }
 }

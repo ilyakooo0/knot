@@ -144,6 +144,13 @@ pub struct FromJsonTarget {
 /// Maps parseJson call-site spans to their resolved target info.
 pub type FromJsonTargets = HashMap<Span, FromJsonTarget>;
 
+/// Spans of full `sum f rel` applications (including the `rel |> sum f` pipe
+/// form) whose result type is a Float. Codegen passes this as an `is_float`
+/// flag to the runtime, which needs it ONLY for an EMPTY relation: with no
+/// summands there is nothing to take the numeric type from, so `sum` over an
+/// empty `[Float]` would otherwise return `Int 0` instead of `Float 0.0`.
+pub type SumFloatSpans = HashSet<Span>;
+
 /// Spans of `elem needle haystack` haystack arguments whose element type is a
 /// SQL-pushable scalar (peeling aliases & refined types). Codegen consults these
 /// sets to decide whether to push an `elem` down to SQL.
@@ -595,6 +602,10 @@ struct Infer {
     /// `monad_info` entry keyed by the call span so codegen can tell the
     /// runtime which applicative's `pure []` an EMPTY input must produce.
     traverse_calls: Vec<(Span, TyVar, TyVar)>,
+    /// Full `sum f rel` applications: (call span, result type var).
+    /// Post-inference, calls whose result is a Float land in `SumFloatSpans`
+    /// so codegen can tell the runtime which zero an EMPTY relation sums to.
+    sum_calls: Vec<(Span, TyVar)>,
 
     /// Tracks `parseJson` application sites for compile-time FromJSON dispatch.
     /// Each entry records (app_span, return_type_var).
@@ -783,6 +794,7 @@ impl Infer {
             result_markers: Vec::new(),
             unify_depth: 0,
             traverse_calls: Vec::new(),
+            sum_calls: Vec::new(),
             from_json_calls: Vec::new(),
             trait_call_vars: Vec::new(),
             show_calls: Vec::new(),
@@ -4974,6 +4986,16 @@ impl Infer {
                             self.traverse_calls.push((expr.span, *res_v, cont_v));
                         }
 
+                // Track full `sum f rel` applications: the resolved result type
+                // says whether this is a Float sum, which codegen hands to the
+                // runtime to pick the zero for an EMPTY relation (no summand
+                // there to infer the numeric type from).
+                if let ast::ExprKind::App { func: inner_f, .. } = &func.node
+                    && matches!(&inner_f.node, ast::ExprKind::Var(n) if n == "sum")
+                        && let Ty::Var(res_v) = &result_ty {
+                            self.sum_calls.push((expr.span, *res_v));
+                        }
+
                 // Track `elem needle haystack` haystack types for SQL pushdown.
                 // Curried: outer App's func is `App(Var("elem"), needle)`,
                 // outer App's arg is the haystack. Record only when the
@@ -5973,6 +5995,13 @@ impl Infer {
                     Box::new(result_ty.clone()),
                 );
                 self.unify(&rhs_ty, &fun_ty, span);
+                // `rel |> sum f` reaches codegen as an application carrying
+                // this pipe's span, so record it like the `sum f rel` form.
+                if let ast::ExprKind::App { func: inner_f, .. } = &rhs.node
+                    && matches!(&inner_f.node, ast::ExprKind::Var(n) if n == "sum")
+                        && let Ty::Var(res_v) = &result_ty {
+                            self.sum_calls.push((span, *res_v));
+                        }
                 result_ty
             }
         }
@@ -10378,6 +10407,24 @@ fn value_references_source_inner(
 
 // ── Public API ────────────────────────────────────────────────────
 
+/// What `check` hands to the later passes: diagnostics, the inferred types
+/// themselves, and the span-keyed facts codegen cannot re-derive on its own
+/// (monad kinds, refine/parseJson targets, `elem` pushdown eligibility, `show`
+/// units, `sum`'s numeric result type).
+pub type CheckOutput = (
+    Vec<Diagnostic>,
+    MonadInfo,
+    TypeInfo,
+    LocalTypeInfo,
+    RefineTargets,
+    RefinedTypeInfoMap,
+    FromJsonTargets,
+    ElemPushdownOk,
+    TraitCallTargets,
+    ShowUnitStrings,
+    SumFloatSpans,
+);
+
 /// Run type inference on a parsed module. Returns diagnostics,
 /// resolved monad info for desugared do-blocks, and inferred type info
 /// mapping declaration names to their display type strings.
@@ -10390,11 +10437,11 @@ fn value_references_source_inner(
 ///
 /// Runs on a grown stack: a desugared `do` block nests one `__bind` per
 /// statement, and `infer_expr` recurses through every level.
-pub fn check(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk, TraitCallTargets, ShowUnitStrings) {
+pub fn check(module: &mut ast::Module) -> CheckOutput {
     crate::stack::grow(|| check_inner(module))
 }
 
-fn check_inner(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInfo, LocalTypeInfo, RefineTargets, RefinedTypeInfoMap, FromJsonTargets, ElemPushdownOk, TraitCallTargets, ShowUnitStrings) {
+fn check_inner(module: &mut ast::Module) -> CheckOutput {
     let mut infer = Infer::new();
 
     // Phase 1: Collect type aliases, data types, constructors
@@ -10659,6 +10706,21 @@ fn check_inner(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInf
         monad_info.entry(*span).or_insert(kind);
     }
 
+    // Phase 5c: Resolve the numeric type of each full `sum f rel` call, keyed
+    // by the call span. Codegen passes it to the runtime, which uses it ONLY
+    // for the EMPTY-input result: no summands means no value to take the type
+    // from, and the zero must still be the one the program was checked against
+    // (`Float 0.0`, not `Int 0`).
+    let mut sum_float_spans = SumFloatSpans::new();
+    for (span, res_v) in &infer.sum_calls {
+        if matches!(
+            infer.apply(&Ty::Var(*res_v)).peel_alias(),
+            Ty::Float | Ty::FloatUnit(_)
+        ) {
+            sum_float_spans.insert(*span);
+        }
+    }
+
     // Export refined type predicates for codegen
     let refined_type_info: RefinedTypeInfoMap = infer
         .refined_types
@@ -10722,7 +10784,7 @@ fn check_inner(module: &mut ast::Module) -> (Vec<Diagnostic>, MonadInfo, TypeInf
     let local_type_info = infer.extract_local_type_info();
     let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans)
 }
 
 
@@ -11158,14 +11220,14 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units) = check(&mut module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats) = check(&mut module);
         diags
     }
 
     fn type_info_for(src: &str) -> TypeInfo {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units) = check(&mut module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats) = check(&mut module);
         type_info
     }
 

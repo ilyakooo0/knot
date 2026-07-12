@@ -3,8 +3,16 @@
 //! Resolves `import ./path` declarations by loading, parsing, and merging
 //! imported modules' declarations into the importing module. Import paths
 //! are relative to the importing file.
+//!
+//! Declarations from every reachable module are merged into one flat list,
+//! dependency-first, with the importing module's own declarations last. Each
+//! module contributes its declarations exactly once no matter how many paths
+//! reach it (diamond imports), and a module reached by both a selective
+//! (`import ./m (a)`) and a plain (`import ./m`) import contributes the union
+//! of what those imports ask for.
 
 use knot::ast;
+use knot::diagnostic::{Diagnostic, Severity};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -36,12 +44,37 @@ pub fn resolve_imports(
     let canonical = source_path
         .canonicalize()
         .unwrap_or_else(|_| source_path.to_path_buf());
+
+    let mut resolver = Resolver::default();
+    // The entry module's own declarations stay where they are, so nothing can
+    // be merged out of it — record it as fully merged. (An import of the entry
+    // file from one of its own imports is a cycle, caught by `in_flight`.)
+    resolver.merged.insert(canonical.clone(), Merged::Full);
+
     let mut in_flight = HashSet::new();
     in_flight.insert(canonical.clone());
-    let mut imported = HashSet::new();
-    imported.insert(canonical);
-    let mut snippets = ImportedSnippets::default();
-    resolve_recursive(module, source_path, &mut in_flight, &mut imported, &mut snippets)?;
+
+    let base_dir = source_path.parent().unwrap_or(Path::new("."));
+    for imp in std::mem::take(&mut module.imports) {
+        resolver.merge_import(&imp, base_dir, &mut in_flight);
+    }
+
+    // A name defined by two modules (or twice in one module) reaches codegen as
+    // two definitions of the same symbol, which used to abort the compiler with
+    // an unhandled `DuplicateDefinition` from Cranelift.
+    resolver.check_duplicates(&module.decls, &canonical);
+
+    if !resolver.errors.is_empty() {
+        return Err(resolver.errors);
+    }
+
+    // Imported declarations precede the module's own — the LSP relies on the
+    // module's own decls being the trailing entries of the merged list.
+    let mut decls = resolver.decls;
+    decls.append(&mut module.decls);
+    module.decls = decls;
+
+    let mut snippets = resolver.snippets;
     snippets.types.sort();
     snippets.types.dedup();
     snippets.sources.sort();
@@ -49,118 +82,168 @@ pub fn resolve_imports(
     Ok(snippets)
 }
 
-fn resolve_recursive(
-    module: &mut ast::Module,
-    source_path: &Path,
-    in_flight: &mut HashSet<PathBuf>,
-    imported: &mut HashSet<PathBuf>,
-    snippets: &mut ImportedSnippets,
-) -> Result<(), Vec<String>> {
-    if module.imports.is_empty() {
-        return Ok(());
-    }
+/// A parsed module, cached so that a second import of the same file neither
+/// re-parses it nor re-reports its diagnostics.
+struct Loaded {
+    source: String,
+    imports: Vec<ast::Import>,
+    /// The module's own declarations that cross an import boundary — i.e. what
+    /// survives its export filter.
+    visible: Vec<ast::Decl>,
+}
 
-    let base_dir = source_path.parent().unwrap_or(Path::new("."));
-    let raw_imports = std::mem::take(&mut module.imports);
+/// How much of a module's visible declarations have been merged so far.
+enum Merged {
+    /// All of them. A further import of this module has nothing left to add.
+    Full,
+    /// Only the visible declarations at these indices, as asked for by the
+    /// selective imports seen so far. A later import can still add the rest.
+    Partial(HashSet<usize>),
+}
 
-    // Coalesce repeated imports of the same module so their selective item
-    // lists union: `import ./util (valX)` followed by `import ./util (valY)`
-    // should make *both* visible. Without this, the diamond-dedup below skips
-    // the second import wholesale and its selected names are lost. A
-    // non-selective import (`items == None`) subsumes any selective import of
-    // the same module. Imports whose path fails to canonicalize are kept as-is
-    // so the main loop still reports their resolution error.
-    let imports: Vec<ast::Import> = {
-        let mut order: Vec<PathBuf> = Vec::new();
-        let mut by_canonical: HashMap<PathBuf, ast::Import> = HashMap::new();
-        let mut unresolved: Vec<ast::Import> = Vec::new();
-        for imp in raw_imports {
-            let full_path =
-                base_dir.join(PathBuf::from(&imp.path).with_extension("knot"));
-            match full_path.canonicalize() {
-                Ok(canon) => match by_canonical.get_mut(&canon) {
-                    Some(existing) => match (&mut existing.items, imp.items) {
-                        // Already non-selective — it subsumes everything.
-                        (None, _) => {}
-                        // A later non-selective import widens to the whole module.
-                        (_, None) => existing.items = None,
-                        // Union the two selective lists (dedup by name).
-                        (Some(ex), Some(new)) => {
-                            for it in new {
-                                if !ex.iter().any(|e| e.name == it.name) {
-                                    ex.push(it);
-                                }
-                            }
-                        }
-                    },
-                    None => {
-                        order.push(canon.clone());
-                        by_canonical.insert(canon, imp);
-                    }
-                },
-                Err(_) => unresolved.push(imp),
-            }
-        }
-        let mut merged: Vec<ast::Import> = order
-            .into_iter()
-            .map(|c| by_canonical.remove(&c).unwrap())
-            .collect();
-        merged.extend(unresolved);
-        merged
-    };
+#[derive(Default)]
+struct Resolver {
+    loaded: HashMap<PathBuf, Loaded>,
+    /// Modules that failed to load, so a second import doesn't re-report them.
+    failed: HashSet<PathBuf>,
+    /// Modules whose own imports have already been merged.
+    deps_merged: HashSet<PathBuf>,
+    merged: HashMap<PathBuf, Merged>,
+    /// Memoizes `reachable_names`.
+    reachable: HashMap<PathBuf, HashSet<String>>,
+    /// Guards `reachable_names` against import cycles.
+    reach_visiting: HashSet<PathBuf>,
+    /// The merged declarations, dependency-first, and the module each came from.
+    decls: Vec<ast::Decl>,
+    origins: Vec<PathBuf>,
+    snippets: ImportedSnippets,
+    errors: Vec<String>,
+}
 
-    let mut errors = Vec::new();
-    let mut imported_decls: Vec<ast::Decl> = Vec::new();
-
-    for imp in &imports {
-        // Resolve relative path to .knot file
-        let rel_path = PathBuf::from(&imp.path).with_extension("knot");
-        let full_path = base_dir.join(&rel_path);
-
+impl Resolver {
+    /// Merge the module `imp` names into the flat declaration list, along with
+    /// everything it transitively imports.
+    fn merge_import(
+        &mut self,
+        imp: &ast::Import,
+        base_dir: &Path,
+        in_flight: &mut HashSet<PathBuf>,
+    ) {
+        let full_path = base_dir.join(PathBuf::from(&imp.path).with_extension("knot"));
         let canonical = match full_path.canonicalize() {
             Ok(p) => p,
             Err(e) => {
-                errors.push(format!(
+                self.errors.push(format!(
                     "cannot resolve import '{}': {} (resolved to {})",
                     imp.path,
                     e,
                     full_path.display()
                 ));
-                continue;
+                return;
             }
         };
 
-        // Cycle detection: only an in-flight import (currently on the
-        // resolution stack) constitutes a cycle. A module that was already
-        // resolved via another sibling import is *not* a cycle — it's a
-        // diamond, and we silently skip the duplicate so its declarations
-        // aren't merged twice.
+        // Only an in-flight import — one currently on the resolution stack — is
+        // a cycle. A module already merged via a sibling import is a diamond,
+        // and the merge bookkeeping below keeps its decls from landing twice.
         if in_flight.contains(&canonical) {
-            errors.push(format!(
+            self.errors.push(format!(
                 "import cycle detected: '{}' has already been imported",
                 imp.path
             ));
-            continue;
+            return;
         }
-        if !imported.insert(canonical.clone()) {
-            // Diamond import — already merged via another path.
-            continue;
+        if self.failed.contains(&canonical) {
+            return;
         }
-        in_flight.insert(canonical.clone());
+        if !self.loaded.contains_key(&canonical) && !self.load(&canonical, &imp.path) {
+            self.failed.insert(canonical);
+            return;
+        }
 
-        // Read and parse the imported file
-        let source = match std::fs::read_to_string(&canonical) {
+        // Merge what this module imports before the module itself, so its
+        // declarations land after the ones they depend on.
+        if self.deps_merged.insert(canonical.clone()) {
+            in_flight.insert(canonical.clone());
+            let dep_base = canonical
+                .parent()
+                .unwrap_or(Path::new("."))
+                .to_path_buf();
+            for dep in self.loaded[&canonical].imports.clone() {
+                self.merge_import(&dep, &dep_base, in_flight);
+            }
+            in_flight.remove(&canonical);
+        }
+
+        self.merge_decls(&canonical, imp);
+    }
+
+    /// Merge the declarations this import asks for out of an already-loaded
+    /// module, skipping the ones an earlier import of it already contributed.
+    fn merge_decls(&mut self, canonical: &Path, imp: &ast::Import) {
+        if let Some(items) = &imp.items {
+            let reachable = self.reachable_names(canonical);
+            for item in items {
+                if !reachable.contains(&item.name) {
+                    self.errors.push(format!(
+                        "import '{}': '{}' not found in module",
+                        imp.path, item.name
+                    ));
+                }
+            }
+        }
+
+        // A module already merged in full has nothing left to give — including
+        // to a *selective* import of it, whose names are already in scope.
+        let mut merged_idx = match self.merged.get(canonical) {
+            Some(Merged::Full) => return,
+            Some(Merged::Partial(idx)) => idx.clone(),
+            None => HashSet::new(),
+        };
+
+        let (new_decls, total) = {
+            let visible = &self.loaded[canonical].visible;
+            let wanted: Vec<usize> = match &imp.items {
+                None => (0..visible.len()).collect(),
+                Some(items) => {
+                    let names = selected_names(visible, items);
+                    (0..visible.len())
+                        .filter(|&i| should_include_decl(&visible[i], &names))
+                        .collect()
+                }
+            };
+            let new_decls: Vec<ast::Decl> = wanted
+                .into_iter()
+                .filter(|&i| merged_idx.insert(i))
+                .map(|i| visible[i].clone())
+                .collect();
+            (new_decls, visible.len())
+        };
+
+        for decl in new_decls {
+            self.decls.push(decl);
+            self.origins.push(canonical.to_path_buf());
+        }
+        let record = if merged_idx.len() == total {
+            Merged::Full
+        } else {
+            Merged::Partial(merged_idx)
+        };
+        self.merged.insert(canonical.to_path_buf(), record);
+    }
+
+    /// Read, parse, and export-filter a module. Returns false if it could not
+    /// be loaded, in which case the reason is already in `self.errors`.
+    fn load(&mut self, canonical: &Path, import_path: &str) -> bool {
+        let source = match std::fs::read_to_string(canonical) {
             Ok(s) => s,
             Err(e) => {
-                errors.push(format!(
-                    "cannot read import '{}': {}",
-                    imp.path, e
-                ));
-                in_flight.remove(&canonical);
-                imported.remove(&canonical);
-                continue;
+                self.errors
+                    .push(format!("cannot read import '{}': {}", import_path, e));
+                return false;
             }
         };
+        let filename = canonical.display().to_string();
 
         let lexer = knot::lexer::Lexer::new(&source);
         let (tokens, lex_diags) = lexer.tokenize();
@@ -168,39 +251,29 @@ fn resolve_recursive(
         // errors, but filtering by severity (mirroring the parse-diagnostics
         // path below) future-proofs against lex warnings/info becoming
         // hard failures that abort the entire compilation.
-        if lex_diags.iter().any(|d| d.severity == knot::diagnostic::Severity::Error) {
-            for diag in &lex_diags {
-                if diag.severity == knot::diagnostic::Severity::Error {
-                    errors.push(format!(
-                        "in import '{}': {}",
-                        imp.path,
-                        diag.render(&source, &canonical.display().to_string())
-                    ));
-                }
-            }
+        for diag in lex_diags.iter().filter(|d| d.severity == Severity::Error) {
+            self.errors.push(format!(
+                "in import '{}': {}",
+                import_path,
+                diag.render(&source, &filename)
+            ));
         }
 
         let parser = knot::parser::Parser::new(source.clone(), tokens);
-        let (mut imported_module, parse_diags) = parser.parse_module();
-        let has_parse_errors = parse_diags
-            .iter()
-            .any(|d| d.severity == knot::diagnostic::Severity::Error);
-        if has_parse_errors {
+        let (imported_module, parse_diags) = parser.parse_module();
+        if parse_diags.iter().any(|d| d.severity == Severity::Error) {
             for diag in &parse_diags {
-                errors.push(format!(
+                self.errors.push(format!(
                     "in import '{}': {}",
-                    imp.path,
-                    diag.render(&source, &canonical.display().to_string())
+                    import_path,
+                    diag.render(&source, &filename)
                 ));
             }
-            in_flight.remove(&canonical);
-            imported.remove(&canonical);
-            continue;
+            return false;
         }
 
         // Collect type and source declaration snippets for the schema lockfile
-        // while this file's own decls still pair with its own source text (after
-        // the recursive merge below, decl spans may reference other files).
+        // while this module's decls still pair with its own source text.
         for d in &imported_module.decls {
             let is_type_decl = matches!(
                 &d.node,
@@ -208,142 +281,241 @@ fn resolve_recursive(
             ) || matches!(&d.node, ast::DeclKind::Data { .. });
             let is_source_decl = matches!(&d.node, ast::DeclKind::Source { .. });
             if is_type_decl
-                && let Some(text) = source.get(d.span.start..d.span.end) {
-                    snippets.types.push(text.to_string());
-                }
+                && let Some(text) = source.get(d.span.start..d.span.end)
+            {
+                self.snippets.types.push(text.to_string());
+            }
             if is_source_decl
-                && let Some(text) = source.get(d.span.start..d.span.end) {
-                    snippets.sources.push(text.to_string());
-                }
+                && let Some(text) = source.get(d.span.start..d.span.end)
+            {
+                self.snippets.sources.push(text.to_string());
+            }
         }
 
-        // Capture the boundary of this module's OWN declarations before the
-        // recursive resolve below prepends its transitively-imported decls.
-        // The merge only *prepends* (see the tail of `resolve_recursive`:
-        // `imported_decls.append(&mut module.decls)`), so the module's own
-        // decls remain the final `own_decl_count` entries in original order.
-        let own_decl_count = imported_module.decls.len();
-
-        // Recursively resolve imports of the imported module
-        let sub_result = resolve_recursive(
-            &mut imported_module,
-            &canonical,
-            in_flight,
-            imported,
-            snippets,
+        self.loaded.insert(
+            canonical.to_path_buf(),
+            Loaded {
+                source,
+                imports: imported_module.imports,
+                visible: export_filter(imported_module.decls),
+            },
         );
-        in_flight.remove(&canonical);
-        if let Err(sub_errors) = sub_result {
-            errors.extend(sub_errors);
-            imported.remove(&canonical);
-            continue;
+        true
+    }
+
+    /// Every name an importer can reach *through* this module: the names it
+    /// makes visible itself, plus the ones its own imports bring in (which are
+    /// merged into the same flat namespace). Used to validate selective imports.
+    fn reachable_names(&mut self, canonical: &Path) -> HashSet<String> {
+        if let Some(cached) = self.reachable.get(canonical) {
+            return cached.clone();
+        }
+        let (mut names, imports) = match self.loaded.get(canonical) {
+            Some(loaded) => (
+                loaded
+                    .visible
+                    .iter()
+                    .filter_map(|d| decl_name(&d.node))
+                    .collect::<HashSet<String>>(),
+                loaded.imports.clone(),
+            ),
+            None => return HashSet::new(),
+        };
+        // An import cycle is reported elsewhere; just don't chase it here.
+        if !self.reach_visiting.insert(canonical.to_path_buf()) {
+            return names;
         }
 
-        // Split the merged decls back into [transitively-imported | own].
-        // Transitively-imported decls were already filtered by their own
-        // module's export rules, so they pass through unchanged; only this
-        // module's own decls are subject to its export-visibility filter.
-        let mut merged_decls = imported_module.decls;
-        let own_decls = merged_decls.split_off(merged_decls.len() - own_decl_count);
-        let transitive_decls = merged_decls;
+        let base_dir = canonical.parent().unwrap_or(Path::new(".")).to_path_buf();
+        for imp in &imports {
+            match &imp.items {
+                Some(items) => names.extend(items.iter().map(|i| i.name.clone())),
+                None => {
+                    if let Ok(dep) = base_dir
+                        .join(PathBuf::from(&imp.path).with_extension("knot"))
+                        .canonicalize()
+                    {
+                        names.extend(self.reachable_names(&dep));
+                    }
+                }
+            }
+        }
 
-        // Filter by export visibility: if the imported module has any `export`
-        // declarations *of its own*, only those (plus always-visible items)
-        // pass through. If it has no own exports, everything is visible
-        // (backwards compat). Judging by own decls is essential — otherwise a
-        // transitively imported module's exports would flip a no-export module
-        // into "export-only" mode and silently drop all of its own decls.
-        let has_exports = own_decls.iter().any(|d| d.exported);
-        let visible_own: Vec<ast::Decl> = if has_exports {
-            let exported_names: HashSet<String> = own_decls
-                .iter()
-                .filter(|d| d.exported)
-                .filter_map(|d| decl_name(&d.node))
-                .collect();
-            own_decls
-                .into_iter()
-                .filter(|d| {
-                    d.exported
-                        || matches!(
-                            &d.node,
-                            ast::DeclKind::Migrate { .. } | ast::DeclKind::SubsetConstraint { .. }
-                        )
-                        || matches!(&d.node, ast::DeclKind::Impl { trait_name, .. } if exported_names.contains(trait_name))
-                })
-                .collect()
-        } else {
-            own_decls
-        };
-        // Transitively-imported decls (already export-filtered) precede this
-        // module's visible own decls, preserving the merged order.
-        let mut visible_decls = transitive_decls;
-        visible_decls.extend(visible_own);
+        self.reach_visiting.remove(canonical);
+        self.reachable.insert(canonical.to_path_buf(), names.clone());
+        names
+    }
 
-        // Filter declarations based on selective import list
-        let decls: Vec<ast::Decl> = if let Some(items) = &imp.items {
-            let mut names: HashSet<&str> = items.iter().map(|i| i.name.as_str()).collect();
-            // When a trait is selected, also include data types defined in
-            // the same module that the trait or its impls may depend on
-            // (e.g., `Ordering` for `Ord`). This prevents compilation
-            // failures when imported impls reference data types.
-            let data_names: Vec<String> = visible_decls.iter().filter_map(|d| {
-                if let ast::DeclKind::Data { name, .. } = &d.node {
-                    Some(name.clone())
-                } else { None }
-            }).collect();
-            // Collect additional data type names to include (owned, to avoid borrow conflict)
-            let mut extra_data: Vec<String> = Vec::new();
-            for d in &visible_decls {
-                if let ast::DeclKind::Trait { name: trait_name, items: trait_items, .. } = &d.node
-                    && names.contains(trait_name.as_str()) {
-                        for item in trait_items {
-                            if let ast::TraitItem::Method { ty, .. } = item {
-                                for data_name in &data_names {
-                                    if type_references_name(&ty.ty, data_name) {
-                                        extra_data.push(data_name.clone());
-                                    }
-                                }
-                            }
+    /// Report any name defined twice across the merged declarations. Two
+    /// definitions of one name compile to one symbol, which Cranelift rejects
+    /// with `DuplicateDefinition` — a panic, with no source location, long
+    /// after the point where the mistake is visible.
+    fn check_duplicates(&mut self, own_decls: &[ast::Decl], entry: &Path) {
+        let mut entry_source: Option<String> = None;
+        let mut seen: HashMap<(Namespace, String), PathBuf> = HashMap::new();
+
+        let merged = self.decls.iter().zip(self.origins.iter().map(|p| p.as_path()));
+        let own = own_decls.iter().zip(std::iter::repeat(entry));
+        let mut errors = Vec::new();
+
+        for (decl, origin) in merged.chain(own) {
+            let Some(key) = duplicate_key(&decl.node) else {
+                continue;
+            };
+            // The first definition stays the anchor for every later clash.
+            let Some(first) = seen.get(&key).cloned() else {
+                seen.insert(key, origin.to_path_buf());
+                continue;
+            };
+
+            let (_, name) = key;
+            let note = if first == origin {
+                format!("'{}' is already defined in this module", name)
+            } else {
+                format!("'{}' is already defined in {}", name, first.display())
+            };
+            let diag = Diagnostic::error(format!("duplicate definition of '{}'", name))
+                .label(decl.span, "redefined here")
+                .note(note);
+
+            let source = if origin == entry {
+                entry_source
+                    .get_or_insert_with(|| std::fs::read_to_string(entry).unwrap_or_default())
+                    .as_str()
+            } else {
+                self.loaded
+                    .get(origin)
+                    .map(|l| l.source.as_str())
+                    .unwrap_or("")
+            };
+            errors.push(diag.render(source, &origin.display().to_string()));
+        }
+
+        self.errors.extend(errors);
+    }
+}
+
+/// Restrict a module's own declarations to those that cross an import boundary.
+///
+/// A module that `export`s anything exposes only what it exports; one that
+/// exports nothing exposes everything (backwards compat). Judging by the
+/// module's *own* declarations is essential — otherwise a transitively imported
+/// module's exports would flip a no-export module into "export-only" mode and
+/// silently drop all of its own decls.
+fn export_filter(decls: Vec<ast::Decl>) -> Vec<ast::Decl> {
+    if !decls.iter().any(|d| d.exported) {
+        return decls;
+    }
+    let exported_names: HashSet<String> = decls
+        .iter()
+        .filter(|d| d.exported)
+        .filter_map(|d| decl_name(&d.node))
+        .collect();
+    let own_traits: HashSet<&str> = decls
+        .iter()
+        .filter_map(|d| match &d.node {
+            ast::DeclKind::Trait { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    decls
+        .iter()
+        .filter(|d| {
+            d.exported
+                || match &d.node {
+                    // Migrations, constraints, and unit declarations carry no
+                    // name to export: they are properties of the program, not
+                    // of a module's interface, and are always visible. Dropping
+                    // the unit declarations left the units their exported types
+                    // are written in (`Float<M/S^2>`) undefined at the import
+                    // site, which surfaced as bogus unit mismatches.
+                    ast::DeclKind::Migrate { .. }
+                    | ast::DeclKind::SubsetConstraint { .. }
+                    | ast::DeclKind::UnitDecl { .. } => true,
+                    // An impl is visible with the trait it implements. A trait
+                    // this module declares must be exported to carry its impls
+                    // out; a trait from anywhere else (another module, the
+                    // prelude) is already visible to the importer, so its impls
+                    // travel with the module that defines them.
+                    ast::DeclKind::Impl { trait_name, .. } => {
+                        !own_traits.contains(trait_name.as_str())
+                            || exported_names.contains(trait_name)
+                    }
+                    _ => false,
+                }
+        })
+        .cloned()
+        .collect()
+}
+
+/// The names a selective import pulls in: the ones it lists, plus data types
+/// defined in the same module that a selected trait's methods mention (e.g.
+/// `Ordering` for `Ord`), which imported impls would otherwise reference
+/// without a definition in scope.
+fn selected_names(visible: &[ast::Decl], items: &[ast::ImportItem]) -> HashSet<String> {
+    let mut names: HashSet<String> = items.iter().map(|i| i.name.clone()).collect();
+    let data_names: Vec<&str> = visible
+        .iter()
+        .filter_map(|d| match &d.node {
+            ast::DeclKind::Data { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut extra: Vec<String> = Vec::new();
+    for d in visible {
+        if let ast::DeclKind::Trait { name, items, .. } = &d.node
+            && names.contains(name.as_str())
+        {
+            for item in items {
+                if let ast::TraitItem::Method { ty, .. } = item {
+                    for data_name in &data_names {
+                        if type_references_name(&ty.ty, data_name) {
+                            extra.push((*data_name).to_string());
                         }
                     }
-            }
-            for name in &extra_data {
-                names.insert(name.as_str());
-            }
-            let decls: Vec<ast::Decl> = visible_decls
-                .into_iter()
-                .filter(|d| should_include_decl(d, &names))
-                .collect();
-            // Check for requested names that don't match any declaration
-            let found_names: HashSet<String> = decls
-                .iter()
-                .filter_map(|d| decl_name(&d.node))
-                .collect();
-            for item in items {
-                if !found_names.contains(&item.name) {
-                    errors.push(format!(
-                        "import '{}': '{}' not found in module",
-                        imp.path, item.name
-                    ));
                 }
             }
-            decls
-        } else {
-            visible_decls
-        };
-
-        imported_decls.extend(decls);
+        }
     }
+    names.extend(extra);
+    names
+}
 
-    if !errors.is_empty() {
-        return Err(errors);
+/// The namespace a declaration's name occupies. Names in different namespaces
+/// never collide: a source relation `*x` and a function `x` are addressed
+/// differently and compile to different things, while a function and a derived
+/// relation both compile to `knot_user_x`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Namespace {
+    Value,
+    Relation,
+    Type,
+    Trait,
+}
+
+/// The name a declaration *defines*, and the namespace it defines it in.
+/// `None` for declarations that define no name of their own.
+fn duplicate_key(decl: &ast::DeclKind) -> Option<(Namespace, String)> {
+    match decl {
+        // A bare signature (`f : Int -> Int` with the definition elsewhere or
+        // missing) defines nothing on its own.
+        ast::DeclKind::Fun { body: None, .. } => None,
+        ast::DeclKind::Fun { name, .. } | ast::DeclKind::Derived { name, .. } => {
+            Some((Namespace::Value, name.clone()))
+        }
+        ast::DeclKind::Source { name, .. } | ast::DeclKind::View { name, .. } => {
+            Some((Namespace::Relation, name.clone()))
+        }
+        ast::DeclKind::Data { name, .. }
+        | ast::DeclKind::TypeAlias { name, .. }
+        | ast::DeclKind::Route { name, .. }
+        | ast::DeclKind::RouteComposite { name, .. } => Some((Namespace::Type, name.clone())),
+        ast::DeclKind::Trait { name, .. } => Some((Namespace::Trait, name.clone())),
+        ast::DeclKind::Impl { .. }
+        | ast::DeclKind::Migrate { .. }
+        | ast::DeclKind::SubsetConstraint { .. }
+        | ast::DeclKind::UnitDecl { .. } => None,
     }
-
-    // Prepend imported declarations before the module's own declarations
-    imported_decls.append(&mut module.decls);
-    module.decls = imported_decls;
-
-    Ok(())
 }
 
 /// Extract the primary name from a declaration, if it has one.
@@ -393,7 +565,7 @@ fn type_references_name(ty: &ast::Type, name: &str) -> bool {
 }
 
 /// Check whether a declaration should be included based on a selective import list.
-fn should_include_decl(decl: &ast::Decl, names: &HashSet<&str>) -> bool {
+fn should_include_decl(decl: &ast::Decl, names: &HashSet<String>) -> bool {
     match &decl.node {
         ast::DeclKind::Data { name, .. } => names.contains(name.as_str()),
         ast::DeclKind::TypeAlias { name, .. } => names.contains(name.as_str()),

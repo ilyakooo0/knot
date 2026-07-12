@@ -32,6 +32,33 @@ enum NegCause {
     Aggregate,
 }
 
+impl NegCause {
+    /// How the offending operation is named in the headline and label
+    /// ("negates `&x` through {}").
+    fn operation(self) -> &'static str {
+        match self {
+            NegCause::Diff => "`diff`",
+            NegCause::Aggregate => "an aggregate (`count`/`sum`/`avg`/`minOn`/`maxOn`)",
+        }
+    }
+
+    /// The verb form used in the mutual-recursion note ("{} across a cycle").
+    fn gerund(self) -> &'static str {
+        match self {
+            NegCause::Diff => "negating",
+            NegCause::Aggregate => "aggregating",
+        }
+    }
+
+    /// The thing to extract in the fix-it note ("split the {} into …").
+    fn noun(self) -> &'static str {
+        match self {
+            NegCause::Diff => "negation",
+            NegCause::Aggregate => "aggregate",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Polarity {
     Positive,
@@ -612,34 +639,46 @@ fn check_inner(module: &ast::Module) -> Vec<Diagnostic> {
         for name in scc {
             if let Some(es) = edges.get(name) {
                 for edge in es {
-                    if matches!(edge.polarity, Polarity::Negative(_)) && scc_set.contains(&edge.target) {
+                    if let Polarity::Negative(cause) = edge.polarity
+                        && scc_set.contains(&edge.target)
+                    {
                         scc_has_negative = true;
                         let mut diag = Diagnostic::error(format!(
-                            "unstratifiable recursion: `&{}` negates `&{}` through `diff`",
-                            name, edge.target,
+                            "unstratifiable recursion: `&{}` negates `&{}` through {}",
+                            name,
+                            edge.target,
+                            cause.operation(),
                         ))
-                        .label(edge.span, "negative dependency via `diff`");
+                        .label(edge.span, format!("negative dependency via {}", cause.operation()));
 
                         if let Some(&decl_span) = decl_spans.get(name) {
                             diag = diag.label(decl_span, format!("`&{}` defined here", name));
                         }
 
                         if name == &edge.target {
-                            diag = diag.note(
-                                "a derived relation cannot subtract from itself in a recursive definition — \
-                                 the fixpoint would oscillate instead of converging",
-                            );
+                            diag = diag.note(match cause {
+                                NegCause::Diff =>
+                                    "a derived relation cannot subtract from itself in a recursive definition — \
+                                     the fixpoint would oscillate instead of converging",
+                                NegCause::Aggregate =>
+                                    "a derived relation cannot aggregate over itself in a recursive definition — \
+                                     the aggregate's value shifts as the relation grows, so the fixpoint \
+                                     oscillates instead of converging",
+                            });
                         } else {
                             diag = diag.note(format!(
-                                "`&{}` and `&{}` are mutually recursive; negating across a \
+                                "`&{}` and `&{}` are mutually recursive; {} across a \
                                  recursive cycle has no well-defined fixpoint",
-                                name, edge.target,
+                                name,
+                                edge.target,
+                                cause.gerund(),
                             ));
                         }
 
-                        diag = diag.note(
-                            "split the negation into a separate, non-recursive derived relation",
-                        );
+                        diag = diag.note(format!(
+                            "split the {} into a separate, non-recursive derived relation",
+                            cause.noun(),
+                        ));
 
                         diagnostics.push(diag);
                     }
@@ -786,6 +825,23 @@ mod tests {
         assert!(diags.is_empty(), "positive self-recursion should be fine");
     }
 
+    /// `count r` → `App(Var("count"), r)`
+    fn count(r: Expr) -> Expr {
+        app(var("count"), r)
+    }
+
+    fn where_stmt(cond: Expr) -> Spanned<StmtKind> {
+        spanned(StmtKind::Where { cond })
+    }
+
+    fn eq(lhs: Expr, rhs: Expr) -> Expr {
+        spanned(ExprKind::BinOp { lhs: Box::new(lhs), rhs: Box::new(rhs), op: BinOp::Eq })
+    }
+
+    fn int_lit(n: i64) -> Expr {
+        spanned(ExprKind::Lit(Literal::Int(n.to_string())))
+    }
+
     #[test]
     fn negative_self_recursion_is_rejected() {
         // &bad = diff *all &bad
@@ -796,6 +852,98 @@ mod tests {
         assert_eq!(diags.len(), 1);
         assert!(diags[0].message.contains("unstratifiable"));
         assert!(diags[0].message.contains("&bad"));
+        // The cause here really is `diff`, so it must be the one named.
+        assert!(diags[0].message.contains("`diff`"), "got: {}", diags[0].message);
+        assert!(!diags[0].message.contains("aggregate"), "got: {}", diags[0].message);
+    }
+
+    #[test]
+    fn aggregate_self_recursion_blames_the_aggregate_not_diff() {
+        // &bad = do
+        //   self <- &bad
+        //   where count self == 0
+        //   x    <- *items
+        //   yield x
+        //
+        // The negative edge comes from `count` collapsing the recursive relation
+        // to a scalar — there is no `diff` anywhere in this program, so the
+        // diagnostic must name the aggregate rather than blaming `diff`.
+        let body = do_expr(vec![
+            bind_stmt("self", derived_ref("bad")),
+            where_stmt(eq(count(var("self")), int_lit(0))),
+            bind_stmt("x", source_ref("items")),
+            yield_stmt(var("x")),
+        ]);
+        let m = module(vec![derived("bad", body)]);
+        let diags = check(&m);
+        assert_eq!(diags.len(), 1, "one unstratifiable-recursion error");
+
+        let diag = &diags[0];
+        assert!(diag.message.contains("unstratifiable"), "got: {}", diag.message);
+        assert!(diag.message.contains("&bad"), "got: {}", diag.message);
+        assert!(
+            diag.message.contains("aggregate") && diag.message.contains("count"),
+            "message must name the aggregate that caused the negative edge, got: {}",
+            diag.message
+        );
+        assert!(
+            !diag.message.contains("`diff`"),
+            "no `diff` in this program — it must not be blamed, got: {}",
+            diag.message
+        );
+        assert!(
+            diag.labels.iter().any(|l| l.message.contains("aggregate")),
+            "label must name the aggregate, got: {:?}",
+            diag.labels.iter().map(|l| &l.message).collect::<Vec<_>>()
+        );
+        assert!(
+            diag.notes.iter().any(|n| n.contains("aggregate over itself")),
+            "self-aggregate note expected, got: {:?}",
+            diag.notes
+        );
+        assert!(
+            diag.notes.iter().all(|n| !n.contains("subtract")),
+            "must not suggest a subtraction that isn't there, got: {:?}",
+            diag.notes
+        );
+    }
+
+    #[test]
+    fn pipe_aggregate_mutual_recursion_blames_the_aggregate() {
+        // &a = do { self <- &b; where (self |> count) == 0; x <- *items; yield x }
+        // &b = union *source &a
+        //
+        // Same cause reached through the pipe form, across a mutual cycle: the
+        // note must talk about aggregating, not negating.
+        let body = do_expr(vec![
+            bind_stmt("self", derived_ref("b")),
+            where_stmt(eq(
+                spanned(ExprKind::BinOp {
+                    lhs: Box::new(var("self")),
+                    rhs: Box::new(var("count")),
+                    op: BinOp::Pipe,
+                }),
+                int_lit(0),
+            )),
+            bind_stmt("x", source_ref("items")),
+            yield_stmt(var("x")),
+        ]);
+        let m = module(vec![
+            derived("a", body),
+            derived("b", union(source_ref("source"), derived_ref("a"))),
+        ]);
+        let diags = check(&m);
+        assert_eq!(diags.len(), 1, "one unstratifiable-recursion error");
+
+        let diag = &diags[0];
+        assert!(diag.message.contains("unstratifiable"), "got: {}", diag.message);
+        assert!(diag.message.contains("aggregate"), "got: {}", diag.message);
+        assert!(!diag.message.contains("`diff`"), "got: {}", diag.message);
+        assert!(
+            diag.notes.iter().any(|n| n.contains("aggregating across")),
+            "mutual-cycle note must describe aggregation, got: {:?}",
+            diag.notes
+        );
     }
 
     #[test]

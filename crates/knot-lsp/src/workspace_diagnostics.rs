@@ -819,7 +819,7 @@ fn analyze_unopened_file_inner(
         knot_compiler::base::inject_prelude(&mut analysis_module);
         knot_compiler::desugar::desugar(&mut analysis_module);
 
-        let (infer_diags, _, _, _, _, _, _, _) = knot_compiler::infer::check(&mut analysis_module);
+        let (infer_diags, _, _, _, _, _, _, _, _) = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_importer));
 
         let (effect_diags, _) = knot_compiler::effects::check_with_effects(&analysis_module);

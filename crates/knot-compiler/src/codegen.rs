@@ -7,6 +7,7 @@
 
 use crate::infer::{MonadInfo, MonadKind};
 use crate::types::{ResolvedType, TypeEnv};
+use knot::ast::Span;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, StackSlotData, StackSlotKind, Value};
@@ -190,6 +191,13 @@ pub struct Codegen {
 
     // Resolved monad types for desugared do-blocks (from type inference)
     monad_info: MonadInfo,
+    /// Static dispatch type per trait-method occurrence, from inference.
+    trait_call_targets: crate::infer::TraitCallTargets,
+    /// Trait method name → the trait that declares it.
+    trait_method_traits: HashMap<String, String>,
+    /// Trait method occurrences left to the runtime dispatcher because the site
+    /// is polymorphic. Checked for constructor-tag ambiguity after codegen.
+    dynamic_dispatch_sites: Vec<(String, Span)>,
 
     // Builtin relation impls that were actually registered (not already provided by user/prelude)
     registered_builtin_impls: HashSet<String>,
@@ -593,6 +601,7 @@ pub fn compile(
     from_json_targets: &crate::infer::FromJsonTargets,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
+    trait_call_targets: &crate::infer::TraitCallTargets,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     crate::stack::grow(|| {
@@ -606,6 +615,7 @@ pub fn compile(
             from_json_targets,
             type_info,
             elem_pushdown_ok,
+            trait_call_targets,
             compile_time_overrides,
         )
     })
@@ -622,6 +632,7 @@ fn compile_inner(
     from_json_targets: &crate::infer::FromJsonTargets,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
+    trait_call_targets: &crate::infer::TraitCallTargets,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
@@ -641,6 +652,7 @@ fn compile_inner(
     cg.type_aliases = type_env.aliases.clone();
     cg.subset_constraints = type_env.subset_constraints.clone();
     cg.monad_info = monad_info.clone();
+    cg.trait_call_targets = trait_call_targets.clone();
     cg.refine_targets = refine_targets.clone();
     cg.refined_types = refined_types.clone();
     cg.alias_ast = module
@@ -816,6 +828,7 @@ fn compile_inner(
             cg.define_trampoline(tramp);
         }
     }
+    cg.check_ambiguous_dynamic_dispatch();
     if !cg.diagnostics.is_empty() {
         return Err(cg.diagnostics);
     }
@@ -898,6 +911,9 @@ impl Codegen {
             type_aliases: HashMap::new(),
             user_fn_trampolines: HashMap::new(),
             monad_info: HashMap::new(),
+            trait_call_targets: HashMap::new(),
+            trait_method_traits: HashMap::new(),
+            dynamic_dispatch_sites: Vec::new(),
             registered_builtin_impls: HashSet::new(),
             nullable_ctors: HashMap::new(),
             io_functions: HashSet::new(),
@@ -1696,6 +1712,10 @@ impl Codegen {
                                     hkt_param_name.as_deref(),
                                     type_param_name.as_deref(),
                                     &ty.ty,
+                                );
+                                self.trait_method_traits.insert(
+                                    method_name.clone(),
+                                    trait_name.clone(),
                                 );
                                 self.trait_methods
                                     .entry(method_name.clone())
@@ -4182,7 +4202,14 @@ impl Codegen {
                 // is compiled but never referenced — e.g. `now = 5` would emit
                 // `knot_now_io` here, producing an `IO` value where the type
                 // checker inferred `Int` (a runtime panic when later used).
-                if let Some((func_id, n_params)) = self.user_fns.get(name).copied() {
+                // A trait method referenced as a value (`map area shapes`)
+                // boxes the impl its static type selects, not the runtime tag
+                // dispatcher — the tag cannot tell two ADTs apart when they
+                // share a constructor name.
+                let static_impl = self.resolve_trait_call(name, expr.span);
+                let fn_name: &str =
+                    static_impl.as_deref().unwrap_or(name.as_str());
+                if let Some((func_id, n_params)) = self.user_fns.get(fn_name).copied() {
                     if n_params == 0 {
                         // 0-param function is a constant — call it directly
                         let func_ref =
@@ -4192,12 +4219,12 @@ impl Codegen {
                     } else {
                         // Create a trampoline that bridges (db, env, arg) calling
                         // convention to the user function's (db, arg1, ...) convention.
-                        let trampoline_id = self.get_or_create_trampoline(name, n_params);
+                        let trampoline_id = self.get_or_create_trampoline(fn_name, n_params);
                         let func_ref =
                             self.module.declare_func_in_func(trampoline_id, builder.func);
                         let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
                         let null = builder.ins().iconst(self.ptr_type, 0);
-                        let (src_ptr, src_len) = self.string_ptr(builder, name);
+                        let (src_ptr, src_len) = self.string_ptr(builder, fn_name);
                         return self.call_rt(builder, "knot_value_function", &[fn_addr, null, src_ptr, src_len]);
                     }
                 }
@@ -6586,8 +6613,14 @@ impl Codegen {
             ast::ExprKind::Var(name)
                 if self.user_fns.contains_key(name) =>
             {
-                let (func_id, expected_params) =
-                    self.user_fns[name];
+                // A trait method call resolves to the impl its static type
+                // selects; only genuinely polymorphic sites are left to the
+                // runtime tag dispatcher.
+                let static_impl =
+                    self.resolve_trait_call(name, func_expr.span);
+                let fn_name: &str =
+                    static_impl.as_deref().unwrap_or(name.as_str());
+                let (func_id, expected_params) = self.user_fns[fn_name];
                 if compiled_args.len() == expected_params {
                     let func_ref = self
                         .module
@@ -12695,6 +12728,133 @@ impl Codegen {
             }
             _ => false,
         }
+    }
+
+    // ── Trait dispatch helpers ─────────────────────────────────────
+
+    /// Resolve a trait method occurrence to the mangled name of the impl its
+    /// static type selects (`area` at a `Blob` site → `Area_Blob_area`).
+    ///
+    /// The runtime dispatcher keys on the value's constructor tag, which does
+    /// not identify a type: two ADTs may share a constructor name, and the tag
+    /// chain then picks whichever impl was registered first. Inference resolves
+    /// the trait's parameter to a concrete type at every monomorphic site, so
+    /// prefer that impl and never consult the tag.
+    ///
+    /// Returns `None` — leaving the occurrence on the runtime dispatcher — when
+    /// the site is still polymorphic (inside an `Area a => a -> Float` body the
+    /// type is genuinely unknown until run time), when the resolved type has no
+    /// impl of this trait, or when a user top-level fn shadows the method name
+    /// (no dispatcher is built in that case, and that fn must keep winning).
+    fn static_impl_name(&self, method: &str, span: Span) -> Option<String> {
+        if !self.trait_dispatcher_fns.contains_key(method) {
+            return None;
+        }
+        let trait_name = self.trait_method_traits.get(method)?;
+        let type_name =
+            self.trait_call_targets.get(&(span, trait_name.clone()))?;
+        let info = self.trait_methods.get(method)?;
+        if !info.impls.iter().any(|e| &e.type_name == type_name) {
+            return None;
+        }
+        let mangled = format!("{}_{}_{}", trait_name, type_name, method);
+        // Every registered impl is also a `user_fns` entry under its mangled
+        // name. Requiring the arity to match the dispatcher's keeps the
+        // substitution transparent to call sites.
+        let (_, n_params) = self.user_fns.get(&mangled).copied()?;
+        (n_params == info.param_count).then_some(mangled)
+    }
+
+    /// `static_impl_name`, additionally noting occurrences that fall back to
+    /// the runtime dispatcher so `check_ambiguous_dynamic_dispatch` can verify
+    /// the tag chain is actually able to tell the impls apart.
+    fn resolve_trait_call(
+        &mut self,
+        method: &str,
+        span: Span,
+    ) -> Option<String> {
+        let resolved = self.static_impl_name(method, span);
+        if resolved.is_none()
+            && self.trait_dispatcher_fns.contains_key(method)
+            && self.trait_method_traits.contains_key(method)
+        {
+            self.dynamic_dispatch_sites
+                .push((method.to_string(), span));
+        }
+        resolved
+    }
+
+    /// Reject programs whose runtime trait dispatch cannot pick an impl.
+    ///
+    /// The dispatcher matches a value's constructor tag against each impl's
+    /// constructor set, so two ADTs declaring the same constructor name are
+    /// indistinguishable to it. Monomorphic call sites never reach it — they
+    /// resolve statically — but a polymorphic one (inside an `Area a => a ->
+    /// Float` body, say) has no static type, and the tag chain would silently
+    /// run whichever impl was registered first. Report that instead of
+    /// miscompiling it; the call needs a concrete type to dispatch on.
+    fn check_ambiguous_dynamic_dispatch(&mut self) {
+        let sites = std::mem::take(&mut self.dynamic_dispatch_sites);
+        let mut reported: HashSet<String> = HashSet::new();
+        let mut diags = Vec::new();
+        for (method, span) in sites {
+            if !reported.insert(method.clone()) {
+                continue;
+            }
+            let Some(info) = self.trait_methods.get(&method) else {
+                continue;
+            };
+            // Constructor name → the impl types that declare it.
+            let mut owners: HashMap<&str, Vec<&str>> = HashMap::new();
+            for e in &info.impls {
+                let Some(ctors) = self.data_constructors.get(&e.type_name)
+                else {
+                    continue;
+                };
+                for c in ctors {
+                    owners
+                        .entry(c.as_str())
+                        .or_default()
+                        .push(e.type_name.as_str());
+                }
+            }
+            let mut clashes: Vec<(&str, Vec<&str>)> = owners
+                .into_iter()
+                .filter(|(_, types)| types.len() > 1)
+                .collect();
+            clashes.sort();
+            let Some((ctor, types)) = clashes.first() else {
+                continue;
+            };
+            let trait_name = self
+                .trait_method_traits
+                .get(&method)
+                .cloned()
+                .unwrap_or_default();
+            diags.push(
+                knot::diagnostic::Diagnostic::error(format!(
+                    "cannot dispatch '{}' at run time: constructor '{}' is \
+                     declared by {}, which all implement '{}', so the value's \
+                     tag does not identify which impl to run",
+                    method,
+                    ctor,
+                    types
+                        .iter()
+                        .map(|t| format!("'{}'", t))
+                        .collect::<Vec<_>>()
+                        .join(" and "),
+                    trait_name,
+                ))
+                .label(
+                    span,
+                    format!(
+                        "this call is polymorphic, so '{}' has no static type here",
+                        method
+                    ),
+                ),
+            );
+        }
+        self.diagnostics.extend(diags);
     }
 
     // ── Operator trait dispatch helpers ────────────────────────────

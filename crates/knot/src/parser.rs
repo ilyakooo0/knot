@@ -2575,6 +2575,18 @@ impl Parser {
 
     fn parse_unary(&mut self) -> Option<Expr> {
         match self.peek() {
+            // Fold a prefix `-` over an integer literal into a single negative
+            // literal. `i64::MIN` has no positive counterpart, so
+            // `-9223372036854775808` is only expressible if the two tokens
+            // become one literal before the value is parsed.
+            TokenKind::Minus if matches!(self.peek_ahead(1), TokenKind::Int(_)) => {
+                let minus_tok = self.advance();
+                let tok = self.advance();
+                let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                let span = Span::new(minus_tok.span.start, tok.span.end);
+                let lit = Spanned::new(ExprKind::Lit(Literal::Int(format!("-{}", n))), span);
+                self.maybe_time_unit(lit)
+            }
             TokenKind::Minus => {
                 if !self.enter_recursion() { return None; }
                 let start = self.span();

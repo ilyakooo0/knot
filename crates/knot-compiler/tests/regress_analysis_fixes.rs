@@ -13,6 +13,9 @@
 //! 12. unused-source detection for relations referenced only by `migrate`
 //! 13. `traverse f []` empty-input result per applicative
 //! 14. unbounded inlining of a recursive helper hung codegen
+//! 15. int literals outside the i64 range (and the unwritable `i64::MIN`)
+//! 16. relation literals deduplicate — a relation is a set
+//! 17. binding a nested-relation field iterates every element
 
 use knot::diagnostic::Diagnostic;
 use std::fs;
@@ -36,7 +39,7 @@ fn parse(src: &str) -> knot::ast::Module {
 fn check_src(src: &str) -> Vec<Diagnostic> {
     let mut module = parse(src);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, _refine, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats) =
+    let (diags, _monad, _type_info, _local, _refine, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields) =
         knot_compiler::infer::check(&mut module);
     diags
 }
@@ -121,6 +124,40 @@ fn run(c: &Compiled) -> (String, String, bool) {
 fn compile_and_run(test_name: &str, source: &str) -> (String, String, bool) {
     let c = compile_files(test_name, source, &[]);
     run(&c)
+}
+
+/// Compile a program expected to FAIL to build; returns the compiler's stderr.
+fn compile_expect_error(test_name: &str, source: &str) -> String {
+    let dir = std::env::temp_dir().join(format!(
+        "knot_regress_analysis_{}_{}",
+        test_name,
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let src_path = dir.join("prog.knot");
+    fs::write(&src_path, source).unwrap();
+
+    let knot = env!("CARGO_BIN_EXE_knot");
+    let out = Command::new(knot)
+        .arg("build")
+        .arg(&src_path)
+        .current_dir(&dir)
+        .output()
+        .expect("failed to spawn knot compiler");
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let succeeded = out.status.success();
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        !succeeded,
+        "expected knot build to fail for {test_name}, but it succeeded"
+    );
+    stderr
+}
+
+fn lex_diags(src: &str) -> Vec<Diagnostic> {
+    let (_, diags) = knot::lexer::Lexer::new(src).tokenize();
+    diags
 }
 
 // ── 1. collect_free_unit_vars must follow the substitution ─────────
@@ -919,7 +956,6 @@ main = do
         "non-empty traverse unchanged, got: {stdout}"
     );
 }
-
 // ── 14. recursive helpers must not be inlined by the pushdown matchers ──
 //
 // Codegen's `beta_reduce` inlines named functions so the SQL matchers can see
@@ -1030,5 +1066,152 @@ main = do
     assert!(
         stdout.contains("b,c") && stdout.contains("\"c\""),
         "recursive split must still produce its suffixes, got: {stdout}"
+    );
+}
+
+// ── 15. Int literals outside the i64 range are a compile-time error ─
+//
+// The lexer hands the digits to the parser as a string and the runtime parsed
+// them with `i64::from_str`, so `99999999999999999999` built cleanly and then
+// aborted (SIGABRT) on the runtime's `unwrap`. The range check now runs in the
+// lexer, and a prefix `-` folds into the literal so `i64::MIN` is writable.
+
+#[test]
+fn out_of_range_int_literal_is_a_lex_error() {
+    let diags = lex_diags("main = do\n  let x = 99999999999999999999\n  yield {}\n");
+    assert!(
+        has_error(&diags, "integer literal is out of range"),
+        "expected an out-of-range diagnostic, got: {diags:?}"
+    );
+}
+
+#[test]
+fn out_of_range_int_literal_fails_the_build() {
+    let stderr = compile_expect_error(
+        "int_overflow",
+        "main = do\n  let x = 99999999999999999999\n  println (show x)\n  yield {}\n",
+    );
+    assert!(
+        stderr.contains("integer literal is out of range"),
+        "expected an out-of-range build error, got: {stderr}"
+    );
+}
+
+#[test]
+fn i64_min_magnitude_under_binary_minus_is_still_an_error() {
+    // Only a PREFIX `-` folds into the literal; as the right operand of a
+    // subtraction the magnitude genuinely overflows.
+    let diags = lex_diags("f = \\x -> x - 9223372036854775808\n");
+    assert!(
+        has_error(&diags, "integer literal is out of range"),
+        "expected an out-of-range diagnostic, got: {diags:?}"
+    );
+}
+
+#[test]
+fn i64_bounds_are_writable_and_run() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "int_bounds",
+        r#"main = do
+  println (show (-9223372036854775808))
+  println (show 9223372036854775807)
+  println (show (10 - -3))
+  yield {}
+"#,
+    );
+    assert!(ok, "program failed: {stderr}");
+    assert!(
+        stdout.contains("-9223372036854775808") && stdout.contains("9223372036854775807"),
+        "i64 bounds should round-trip, got: {stdout}"
+    );
+    assert!(stdout.contains("13"), "`10 - -3` should be 13, got: {stdout}");
+}
+
+// ── 16. Relation literals are sets, so they deduplicate ────────────
+//
+// `[1, 1, 2]` kept three rows while `==` and `union` compared it as a set, so
+// `count [1, 1, 2]` disagreed with `[1, 1, 2] == [1, 2]`.
+
+#[test]
+fn relation_literal_deduplicates() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "list_literal_dedup",
+        r#"main = do
+  println (show ([1, 1, 2] == [1, 2]))
+  println (show (count [1, 1, 2]))
+  println (show (count [{a: 1}, {a: 1}, {a: 2}]))
+  println (show (count [1, 2, 3]))
+  yield {}
+"#,
+    );
+    assert!(ok, "program failed: {stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines[0].contains("True"), "set equality unchanged: {stdout}");
+    assert!(lines[1].contains('2'), "count [1, 1, 2] should be 2: {stdout}");
+    assert!(
+        lines[2].contains('2'),
+        "duplicate records should collapse too: {stdout}"
+    );
+    assert!(
+        lines[3].contains('3'),
+        "distinct elements must all survive: {stdout}"
+    );
+}
+
+// ── 17. Binding a nested-relation field iterates every element ─────
+//
+// `m <- t.members` in an IO do-block kept only the first member: codegen could
+// not see that the field's type is a relation, so it bound the whole relation
+// instead of iterating it. Inference now records relation-typed field accesses,
+// and a nested comprehension loop splices its rows into the enclosing one
+// instead of nesting them one relation deep.
+
+#[test]
+fn nested_relation_field_bind_iterates_every_element() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "nested_field_bind",
+        r#"type Team = {name: Text, members: [{who: Text}]}
+
+*teams : [Team]
+
+main = do
+  replace *teams = [{name: "A", members: [{who: "x"}, {who: "y"}, {who: "z"}]}]
+  t <- *teams
+  m <- t.members
+  yield m.who
+"#,
+    );
+    assert!(ok, "program failed: {stderr}");
+    assert!(
+        stdout.contains(r#"["x", "y", "z"]"#),
+        "every member should be yielded, got: {stdout}"
+    );
+}
+
+#[test]
+fn nested_source_binds_yield_one_flat_relation() {
+    // The same loop-accumulation fix: a comprehension over two sources is one
+    // relation of pairs, not a relation of per-row relations.
+    let (stdout, stderr, ok) = compile_and_run(
+        "nested_source_binds",
+        r#"*names : [{n: Text}]
+*tags : [{t: Text}]
+
+main = do
+  replace *names = [{n: "A"}]
+  replace *tags = [{t: "p"}, {t: "q"}]
+  a <- *names
+  b <- *tags
+  yield {n: a.n, t: b.t}
+"#,
+    );
+    assert!(ok, "program failed: {stderr}");
+    assert!(
+        stdout.contains(r#"{n: "A", t: "p"}"#) && stdout.contains(r#"{n: "A", t: "q"}"#),
+        "both cross-join rows should appear, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("[["),
+        "the pairs must be one flat relation, not nested per outer row: {stdout}"
     );
 }

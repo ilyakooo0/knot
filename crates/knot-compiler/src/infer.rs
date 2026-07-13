@@ -589,6 +589,18 @@ struct Infer {
     /// user-defined monad lacking one gets a clean diagnostic instead of a
     /// missing-impl panic in codegen.
     empty_spans: std::collections::HashSet<Span>,
+    /// Spans of monad vars that were let-generalized (quantified into a
+    /// local let-binding's type scheme). Used at Phase 5 to emit a warning
+    /// when such a var stays unresolved and defaults to Relation dispatch —
+    /// a sign the monad was polymorphic but never pinned to a concrete
+    /// instance. Top-level function generalization is excluded (via
+    /// `in_top_level_generalize`) to avoid false positives on `main = do …`
+    /// and other top-level Relation do-blocks whose default is correct.
+    generalized_monad_spans: std::collections::HashSet<Span>,
+    /// Set to `true` while generalizing a top-level function body so that
+    /// `generalize_with_constraints` skips marking monad vars as
+    /// let-generalized. Reset to `false` afterwards.
+    in_top_level_generalize: bool,
     /// Synthesized `__result e` nodes — a desugared do-block's final bare
     /// expression, whose meaning (`pure e` vs. `e`) depends on types.
     /// Resolved and rewritten away by `resolve_result_markers`.
@@ -791,6 +803,8 @@ impl Infer {
             errors: Vec::new(),
             monad_vars: Vec::new(),
             empty_spans: std::collections::HashSet::new(),
+            generalized_monad_spans: std::collections::HashSet::new(),
+            in_top_level_generalize: false,
             result_markers: Vec::new(),
             unify_depth: 0,
             traverse_calls: Vec::new(),
@@ -3566,6 +3580,20 @@ impl Infer {
         let gen_vars: Vec<TyVar> =
             ty_fv.difference(&env_fv).copied().collect();
         let gen_set: HashSet<TyVar> = gen_vars.iter().copied().collect();
+        // B7: Track monad vars that are being let-generalized (quantified
+        // into a local let-binding's scheme). At Phase 5, if such a var is
+        // still unresolved it defaults to Relation dispatch — which is likely
+        // wrong for a monad-polymorphic function. We skip top-level function
+        // generalization (flagged by `in_top_level_generalize`) to avoid
+        // false positives on `main = do …` where the Relation default is
+        // correct.
+        if !self.in_top_level_generalize {
+            for (span, m_var) in &self.monad_vars {
+                if gen_set.contains(m_var) {
+                    self.generalized_monad_spans.insert(*span);
+                }
+            }
+        }
         // Deferred trait constraints (pushed by `require_trait` when the
         // body used e.g. `<` or a trait method on a still-polymorphic type)
         // whose variables are being quantified here must travel with the
@@ -8157,7 +8185,9 @@ impl Infer {
             let saved = std::mem::take(&mut self.annotation_vars);
             let race_ty = self.ast_type_to_ty(&race_ast);
             self.annotation_vars = saved;
+            self.in_top_level_generalize = true;
             let scheme = self.generalize(&race_ty);
+            self.in_top_level_generalize = false;
             self.bind_top("race", scheme);
         }
 
@@ -9241,7 +9271,9 @@ impl Infer {
                             );
                         } else {
                             let applied = self.apply(&inferred);
+                            self.in_top_level_generalize = true;
                             let scheme = self.generalize(&applied);
+                            self.in_top_level_generalize = false;
                             self.bind_top(name, scheme);
                         }
                     }
@@ -10636,6 +10668,18 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
         // keep the Relation default but emit a diagnostic *warning* (not an
         // error) so the user is alerted when the default may be wrong.
         if matches!(resolved.peel_alias(), Ty::Var(_)) {
+            // Only warn for monad vars that were let-generalized (quantified
+            // into a local let-binding's scheme), not for top-level do-blocks
+            // where the Relation default is correct.
+            if infer.generalized_monad_spans.contains(span) {
+                infer.errors.push((
+                    "do-block dispatches to Relation by default: the monad type \
+                     variable was generalized and never resolved to a concrete \
+                     monad. Add a type annotation to disambiguate."
+                        .to_string(),
+                    *span,
+                ));
+            }
             let kind = MonadKind::Relation;
             monad_info.insert(*span, kind);
             continue;

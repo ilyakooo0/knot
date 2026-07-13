@@ -489,6 +489,49 @@ type DispatcherInfo = Vec<(String, FuncId, usize, Option<usize>, Vec<(String, Fu
 /// `(bind var, condition expr, `(field, value-expr)` update assignments)`.
 type ConditionalUpdateMatch<'a> = (String, &'a ast::Expr, Vec<(&'a str, &'a ast::Expr)>);
 
+/// Resolve a constant's inferred type, as rendered by inference, to the scalar
+/// type the runtime knows how to parse from argv. Returns one of the eight
+/// strings `define_user_function` maps to a type tag, or `None` when the
+/// constant is not CLI-overridable.
+///
+/// A constant annotated with an alias of a scalar (`type Host = Text`) renders
+/// as the alias name, so matching the rendered string alone would drop it and
+/// leave the constant with no `knot_override_lookup` call — the flag would be
+/// accepted and silently ignored. Resolving through `type_aliases` keeps this
+/// in step with `classify_required_constant_type`, which already does so for
+/// body-less constants.
+///
+/// Refined aliases are deliberately excluded: nothing here runs their
+/// predicate, so honouring the flag would let a CLI value in through a check
+/// the type promises. (Body-less constants take the refined path instead,
+/// which validates via `knot_override_refinement_check`.)
+fn scalar_override_type(
+    ty_str: &str,
+    type_aliases: &HashMap<String, ResolvedType>,
+    refined_types: &HashMap<String, ast::Expr>,
+) -> Option<String> {
+    let (prefix, base) = match ty_str.strip_prefix("Maybe ") {
+        Some(rest) => ("Maybe ", rest),
+        None => ("", ty_str),
+    };
+    let resolved = match base {
+        "Int" | "Float" | "Text" | "Bool" => base,
+        name => {
+            if refined_types.contains_key(name) {
+                return None;
+            }
+            match type_aliases.get(name)? {
+                ResolvedType::Int => "Int",
+                ResolvedType::Float => "Float",
+                ResolvedType::Text => "Text",
+                ResolvedType::Bool => "Bool",
+                _ => return None,
+            }
+        }
+    };
+    Some(format!("{prefix}{resolved}"))
+}
+
 /// Classify the type annotation on a body-less constant declaration.
 ///
 /// Returns `Some((base_type_str, refinement))` when the type resolves to a
@@ -778,18 +821,15 @@ fn compile_inner(
                 continue;
             }
             if let Some((_, 0)) = cg.user_fns.get(name.as_str())
-                && let Some(ty_str) = type_info.get(name.as_str()) {
-                    match ty_str.as_str() {
-                        "Int" | "Float" | "Text" | "Bool"
-                        | "Maybe Int" | "Maybe Float" | "Maybe Text" | "Maybe Bool" => {
-                            cg.overridable_constants.insert(name.clone(), ty_str.clone());
-                            if let Some(disp) = format_default_value_display(body) {
-                                cg.overridable_defaults.insert(name.clone(), disp);
-                            }
-                        }
-                        _ => {}
-                    }
+                && let Some(ty_str) = type_info.get(name.as_str())
+                && let Some(base_type) =
+                    scalar_override_type(ty_str, &cg.type_aliases, &cg.refined_types)
+            {
+                cg.overridable_constants.insert(name.clone(), base_type);
+                if let Some(disp) = format_default_value_display(body) {
+                    cg.overridable_defaults.insert(name.clone(), disp);
                 }
+            }
         }
     }
     // Validate and store compile-time overrides

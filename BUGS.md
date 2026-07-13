@@ -518,7 +518,7 @@ replace/measure that widened span assuming it excludes parens:
   `show (x + 2)` → `show extracted_fn x` parses as `(show extracted_fn) x`.
   **Confidence: high.**
 
-- [ ] **B68. Monad-context inlay hint anchored mid-keyword for parenthesized do** — `crates/knot-lsp/src/inlay_hints.rs:1151`
+- [x] **B68. Monad-context inlay hint anchored mid-keyword for parenthesized do** — `crates/knot-lsp/src/inlay_hints.rs:1151`
   Anchors at `span.start + 2` assuming the span starts at `do`; for `f (do …)` the hint renders
   between `d` and `o`.
   **Confidence: medium-high.**

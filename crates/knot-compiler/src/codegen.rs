@@ -1406,6 +1406,10 @@ impl Codegen {
         rt_name: &str,
         rt_needs_db: bool,
     ) {
+        // User redefinition overrides the stdlib version (never registered).
+        if self.user_shadowed_stdlib.contains(name) {
+            return;
+        }
         let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
 
         // Define the outer function: passes arg1 directly as env (no record allocation)
@@ -1459,6 +1463,10 @@ impl Codegen {
         name: &str,
         rt_name: &str,
     ) {
+        // User redefinition overrides the stdlib version (never registered).
+        if self.user_shadowed_stdlib.contains(name) {
+            return;
+        }
         let middle_id = self.declare_closure_fn(&format!("__stdlib_{}_mid", name));
         let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
 

@@ -227,7 +227,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   alice referenced and re-inserted → panic.
   **Confidence: high** on mechanism, **medium** on intended contract.
 
-- [ ] **B25. Reading a view that exposes a nested relation column crashes** — `crates/knot-runtime/src/lib.rs:14797` (`knot_view_read`)
+- [x] **B25. Reading a view that exposes a nested relation column crashes** — `crates/knot-runtime/src/lib.rs:14797` (`knot_view_read`)
   Uses `parse_schema`, which silently discards `field:[…]` nested descriptors, so the SELECT omits
   the column; first access of the field panics "field not found". The write side
   (`knot_view_write`, lib.rs:14992) fully handles nested child tables; nothing compiler-side

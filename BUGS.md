@@ -242,7 +242,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   write have no collision detection.
   **Confidence: medium** (exotic naming, certain mechanism).
 
-- [ ] **B27. `minOn`/`maxOn` on legacy BigInt-era TEXT values silently degrades to lossy Float** — `crates/knot-runtime/src/lib.rs:11910` (`knot_source_query_value`)
+- [x] **B27. `minOn`/`maxOn` on legacy BigInt-era TEXT values silently degrades to lossy Float** — `crates/knot-runtime/src/lib.rs:11910` (`knot_source_query_value`)
   Inconsistent with `read_sql_column` (lib.rs:10996), which deliberately panics with a clear
   migration message for the same data.
   **Confidence: medium** (legacy databases only).

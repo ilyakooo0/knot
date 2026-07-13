@@ -1147,6 +1147,7 @@ impl Codegen {
         // Schema tracking
         self.declare_rt("knot_schema_init", &[p], &[]);
         self.declare_rt("knot_source_migrate", &[p, p, p, p, p, p, p, p], &[]);
+        self.declare_rt("knot_source_migrate_preview", &[p, p, p, p, p, p, p, p], &[p]);
 
         // Debug
         self.declare_rt("knot_debug_init", &[], &[]);
@@ -1468,6 +1469,10 @@ impl Codegen {
         rt_name: &str,
         rt_needs_db: bool,
     ) {
+        // User redefinition overrides the stdlib version (never registered).
+        if self.user_shadowed_stdlib.contains(name) {
+            return;
+        }
         let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
 
         // Define the outer function: passes arg1 directly as env (no record allocation)
@@ -1521,6 +1526,10 @@ impl Codegen {
         name: &str,
         rt_name: &str,
     ) {
+        // User redefinition overrides the stdlib version (never registered).
+        if self.user_shadowed_stdlib.contains(name) {
+            return;
+        }
         let middle_id = self.declare_closure_fn(&format!("__stdlib_{}_mid", name));
         let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
 
@@ -4103,6 +4112,36 @@ impl Codegen {
                             let mut env = Env::new();
                             let migrate_fn_val =
                                 cg.compile_expr(builder, using_fn, &mut env, db);
+
+                            // Validate refinements on the transformed rows
+                            // before committing the migration. Every other
+                            // write path (set/replace/append/view/scalar)
+                            // calls emit_refinement_checks; migrate was the
+                            // sole exception, so a `migrate … using` could
+                            // persist values violating a refined type (e.g.
+                            // negative into a Nat column). The runtime's
+                            // knot_source_migrate_preview returns the
+                            // transformed rows without writing, in the same
+                            // value shape set/replace validate; if there are
+                            // no refinements on this source the check is a
+                            // no-op.
+                            if cg.source_refinements.contains_key(relation) {
+                                let preview = cg.call_rt(
+                                    builder,
+                                    "knot_source_migrate_preview",
+                                    &[
+                                        db, name_ptr, name_len, old_ptr, old_len,
+                                        new_ptr, new_len, migrate_fn_val,
+                                    ],
+                                );
+                                cg.emit_refinement_checks(
+                                    builder,
+                                    relation,
+                                    preview,
+                                    &mut env,
+                                    db,
+                                );
+                            }
 
                             cg.call_rt_void(
                                 builder,

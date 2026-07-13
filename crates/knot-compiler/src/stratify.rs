@@ -79,11 +79,18 @@ struct Edge {
 /// forming an otherwise-invisible cycle `&d → *v → &d` that would bypass
 /// the codegen self-recursion detector and stack-overflow at runtime. We
 /// therefore treat both decl kinds as graph nodes and walk both bodies.
+///
+/// `diff_wrappers` maps user-defined function names whose body is exactly
+/// `\a b -> diff a b` (a curried alias of the `diff` builtin) to the
+/// positional parameter names, so a call like `minus self all` is
+/// recognized as negation rather than a pair of positive edges (B31).
 fn build_dependency_graph(module: &ast::Module) -> (HashSet<String>, HashMap<String, Vec<Edge>>) {
     let mut node_names = HashSet::new();
     let mut edges: HashMap<String, Vec<Edge>> = HashMap::new();
+    let mut diff_wrappers: HashMap<String, [String; 2]> = HashMap::new();
 
-    // First pass: collect all node names (derived relations and views).
+    // First pass: collect all node names (derived relations and views),
+    // and detect user functions that are curried aliases of `diff`.
     for decl in &module.decls {
         match &decl.node {
             ast::DeclKind::Derived { name, .. } => {
@@ -93,6 +100,11 @@ fn build_dependency_graph(module: &ast::Module) -> (HashSet<String>, HashMap<Str
             ast::DeclKind::View { name, .. } => {
                 node_names.insert(name.clone());
                 edges.entry(name.clone()).or_default();
+            }
+            ast::DeclKind::Fun { name, body: Some(body), .. } => {
+                if let Some(params) = is_diff_wrapper(body) {
+                    diff_wrappers.insert(name.clone(), params);
+                }
             }
             _ => {}
         }
@@ -105,14 +117,14 @@ fn build_dependency_graph(module: &ast::Module) -> (HashSet<String>, HashMap<Str
                 let mut found = Vec::new();
                 let env = HashMap::new();
                 let partial_diffs = HashMap::new();
-                collect_edges(body, Polarity::Positive, &node_names, &env, &partial_diffs, &mut found);
+                collect_edges(body, Polarity::Positive, &node_names, &env, &partial_diffs, &diff_wrappers, &mut found);
                 edges.get_mut(name).unwrap().extend(found);
             }
             ast::DeclKind::View { name, body, .. } => {
                 let mut found = Vec::new();
                 let env = HashMap::new();
                 let partial_diffs = HashMap::new();
-                collect_edges(body, Polarity::Positive, &node_names, &env, &partial_diffs, &mut found);
+                collect_edges(body, Polarity::Positive, &node_names, &env, &partial_diffs, &diff_wrappers, &mut found);
                 edges.get_mut(name).unwrap().extend(found);
             }
             _ => {}
@@ -120,6 +132,61 @@ fn build_dependency_graph(module: &ast::Module) -> (HashSet<String>, HashMap<Str
     }
 
     (node_names, edges)
+}
+
+/// Check if a lambda body is exactly `\a b -> diff a b` (a curried alias of
+/// the `diff` builtin). Returns the two parameter names in positional order
+/// `[base_param, sub_param]` if so, so a call `f x y` can be treated as
+/// `diff x y` (x positive, y negative). Also recognizes the pipe-desugared
+/// form `\a b -> b |> diff a` (which is `diff a b` after beta-reduction).
+fn is_diff_wrapper(body: &ast::Expr) -> Option<[String; 2]> {
+    if let ast::ExprKind::Lambda { params, body } = &body.node {
+        if params.len() != 2 {
+            return None;
+        }
+        let p0 = match &params[0].node {
+            ast::PatKind::Var(n) => n.clone(),
+            _ => return None,
+        };
+        let p1 = match &params[1].node {
+            ast::PatKind::Var(n) => n.clone(),
+            _ => return None,
+        };
+        // \a b -> diff a b  →  App(App(Var("diff"), Var(a)), Var(b))
+        if is_diff_app2(body, &p0, &p1) {
+            return Some([p0, p1]);
+        }
+        // \a b -> b |> diff a  →  BinOp(Var(b), Pipe, App(Var("diff"), Var(a)))
+        // which is semantically diff a b (a=base positive, b=subtracted negative)
+        if let ast::ExprKind::BinOp { lhs, rhs, op } = &body.node
+            && *op == ast::BinOp::Pipe
+            && matches!(&lhs.node, ast::ExprKind::Var(n) if n == &p1)
+        {
+            let rhs = strip_head_wrappers(rhs);
+            if let ast::ExprKind::App { func, arg } = &rhs.node
+                && matches!(&strip_head_wrappers(func).node, ast::ExprKind::Var(n) if n == "diff")
+                && matches!(&arg.node, ast::ExprKind::Var(n) if n == &p0)
+            {
+                return Some([p0, p1]);
+            }
+        }
+    }
+    None
+}
+
+/// Check if `expr` is `App(App(Var("diff"), Var(p0)), Var(p1))`.
+fn is_diff_app2(expr: &ast::Expr, p0: &str, p1: &str) -> bool {
+    let expr = strip_head_wrappers(expr);
+    if let ast::ExprKind::App { func, arg } = &expr.node {
+        let is_arg_p1 = matches!(&arg.node, ast::ExprKind::Var(n) if n == p1);
+        let inner = strip_head_wrappers(func);
+        if let ast::ExprKind::App { func: head, arg: first } = &inner.node {
+            let is_diff = matches!(&strip_head_wrappers(head).node, ast::ExprKind::Var(n) if n == "diff");
+            let is_first_p0 = matches!(&first.node, ast::ExprKind::Var(n) if n == p0);
+            return is_diff && is_first_p0 && is_arg_p1;
+        }
+    }
+    false
 }
 
 /// Walk an expression and collect derived-ref/view-ref edges with polarity.
@@ -141,6 +208,7 @@ fn collect_edges(
     node_names: &HashSet<String>,
     env: &HashMap<String, String>,
     partial_diffs: &HashMap<String, ast::Expr>,
+    diff_wrappers: &HashMap<String, [String; 2]>,
     out: &mut Vec<Edge>,
 ) {
     match &expr.node {
@@ -174,14 +242,30 @@ fn collect_edges(
         // `diff` is a curried 2-arg stdlib function. In the AST after
         // desugaring it appears as `App(App(Var("diff"), a), b)`.
         // `a` is the base set (positive), `b` is subtracted (negative).
+        //
+        // A user-defined wrapper like `minus = \a b -> diff a b` has the
+        // same call shape `App(App(Var("minus"), a), b)` — detect it via
+        // `diff_wrappers` and treat identically to a direct `diff` call
+        // (B31: negation laundered through a user wrapper).
         ast::ExprKind::App { func, arg } => {
+            // Fully-applied user diff-wrapper: `minus a b` → diff a b.
+            // The wrapper takes exactly 2 args; if the outer App's func is
+            // `App(Var("minus"), base)`, we have the full application.
+            if let ast::ExprKind::App { func: inner, arg: base } = &strip_head_wrappers(func).node
+                && let ast::ExprKind::Var(name) = &strip_head_wrappers(inner).node
+                && diff_wrappers.contains_key(name)
+            {
+                collect_edges(base, polarity, node_names, env, partial_diffs, diff_wrappers, out);
+                let neg = negate(polarity, NegCause::Diff);
+                collect_edges(arg, neg, node_names, env, partial_diffs, diff_wrappers, out);
+            }
             // Direct partial application: `(diff a) b` or `(d) b` where `d`
             // was bound to bare `diff` via `let d = diff`.
-            if let Some(first_arg) = is_diff_applied_once(func, env) {
+            else if let Some(first_arg) = is_diff_applied_once(func, env) {
                 // This is `(diff a) b` — `a` keeps polarity, `b` is negated.
-                collect_edges(first_arg, polarity, node_names, env, partial_diffs, out);
+                collect_edges(first_arg, polarity, node_names, env, partial_diffs, diff_wrappers, out);
                 let neg = negate(polarity, NegCause::Diff);
-                collect_edges(arg, neg, node_names, env, partial_diffs, out);
+                collect_edges(arg, neg, node_names, env, partial_diffs, diff_wrappers, out);
             }
             // Let-bound partial application: `let d = diff X` followed by
             // `d Y`. The App head is `Var("d")`, not an `App`, so the direct
@@ -191,9 +275,9 @@ fn collect_edges(
             else if let ast::ExprKind::Var(name) = &strip_head_wrappers(func).node
                 && let Some(bound_base) = partial_diffs.get(name)
             {
-                collect_edges(bound_base, polarity, node_names, env, partial_diffs, out);
+                collect_edges(bound_base, polarity, node_names, env, partial_diffs, diff_wrappers, out);
                 let neg = negate(polarity, NegCause::Diff);
-                collect_edges(arg, neg, node_names, env, partial_diffs, out);
+                collect_edges(arg, neg, node_names, env, partial_diffs, diff_wrappers, out);
             }
             // A non-monotone aggregate over the relation: `count self`,
             // `sum f self`, `minOn f self`, ... `arg` here is the aggregate's
@@ -203,32 +287,32 @@ fn collect_edges(
             // relation arg as a negative edge so the cycle is rejected.
             else if completes_aggregate_over_relation(func) {
                 // The selector/predicate arg (in `func`) stays positive.
-                collect_edges(func, polarity, node_names, env, partial_diffs, out);
+                collect_edges(func, polarity, node_names, env, partial_diffs, diff_wrappers, out);
                 let neg = negate(polarity, NegCause::Aggregate);
-                collect_edges(arg, neg, node_names, env, partial_diffs, out);
+                collect_edges(arg, neg, node_names, env, partial_diffs, diff_wrappers, out);
             } else {
-                collect_edges(func, polarity, node_names, env, partial_diffs, out);
-                collect_edges(arg, polarity, node_names, env, partial_diffs, out);
+                collect_edges(func, polarity, node_names, env, partial_diffs, diff_wrappers, out);
+                collect_edges(arg, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             }
         }
 
         ast::ExprKind::Record(fields) => {
             for f in fields {
-                collect_edges(&f.value, polarity, node_names, env, partial_diffs, out);
+                collect_edges(&f.value, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             }
         }
         ast::ExprKind::RecordUpdate { base, fields } => {
-            collect_edges(base, polarity, node_names, env, partial_diffs, out);
+            collect_edges(base, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             for f in fields {
-                collect_edges(&f.value, polarity, node_names, env, partial_diffs, out);
+                collect_edges(&f.value, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             }
         }
         ast::ExprKind::FieldAccess { expr, .. } => {
-            collect_edges(expr, polarity, node_names, env, partial_diffs, out);
+            collect_edges(expr, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
         ast::ExprKind::List(elems) => {
             for e in elems {
-                collect_edges(e, polarity, node_names, env, partial_diffs, out);
+                collect_edges(e, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             }
         }
         ast::ExprKind::Lambda { params, body } => {
@@ -241,16 +325,16 @@ fn collect_edges(
                     inner_partial.remove(v);
                 }
             }
-            collect_edges(body, polarity, node_names, &inner, &inner_partial, out);
+            collect_edges(body, polarity, node_names, &inner, &inner_partial, diff_wrappers, out);
         }
         ast::ExprKind::BinOp { lhs, rhs, op } => {
             // `a |> f` is `f a`. If `f` is a partially-applied `diff` (i.e.,
             // `diff base`), then `a` becomes the subtracted (negative) arg.
             if *op == ast::BinOp::Pipe
                 && let Some(base) = is_diff_applied_once(rhs, env) {
-                    collect_edges(base, polarity, node_names, env, partial_diffs, out);
+                    collect_edges(base, polarity, node_names, env, partial_diffs, diff_wrappers, out);
                     let neg = negate(polarity, NegCause::Diff);
-                    collect_edges(lhs, neg, node_names, env, partial_diffs, out);
+                    collect_edges(lhs, neg, node_names, env, partial_diffs, diff_wrappers, out);
                     return;
                 }
             // Pipe into a let-bound partial diff: `a |> d` where `let d = diff X`.
@@ -258,9 +342,9 @@ fn collect_edges(
                 && let ast::ExprKind::Var(name) = &strip_head_wrappers(rhs).node
                 && let Some(bound_base) = partial_diffs.get(name)
             {
-                collect_edges(bound_base, polarity, node_names, env, partial_diffs, out);
+                collect_edges(bound_base, polarity, node_names, env, partial_diffs, diff_wrappers, out);
                 let neg = negate(polarity, NegCause::Diff);
-                collect_edges(lhs, neg, node_names, env, partial_diffs, out);
+                collect_edges(lhs, neg, node_names, env, partial_diffs, diff_wrappers, out);
                 return;
             }
             // Pipe into a non-monotone aggregate: `self |> count`,
@@ -268,29 +352,43 @@ fn collect_edges(
             // one more argument to complete an aggregate, `lhs` is that
             // aggregate's relation argument — negative.
             if *op == ast::BinOp::Pipe && completes_aggregate_over_relation(rhs) {
-                collect_edges(rhs, polarity, node_names, env, partial_diffs, out);
+                collect_edges(rhs, polarity, node_names, env, partial_diffs, diff_wrappers, out);
                 let neg = negate(polarity, NegCause::Aggregate);
-                collect_edges(lhs, neg, node_names, env, partial_diffs, out);
+                collect_edges(lhs, neg, node_names, env, partial_diffs, diff_wrappers, out);
                 return;
             }
-            collect_edges(lhs, polarity, node_names, env, partial_diffs, out);
-            collect_edges(rhs, polarity, node_names, env, partial_diffs, out);
+            // Pipe into a user diff-wrapper: `a |> minus b` where
+            // `minus = \x y -> diff x y`. This is `minus b a` = `diff b a`,
+            // so `b` (the partial) is positive and `a` (the piped lhs) is
+            // the subtracted (negative) argument.
+            if *op == ast::BinOp::Pipe
+                && let ast::ExprKind::App { func: inner, arg: base } = &strip_head_wrappers(rhs).node
+                && let ast::ExprKind::Var(name) = &strip_head_wrappers(inner).node
+                && diff_wrappers.contains_key(name)
+            {
+                collect_edges(base, polarity, node_names, env, partial_diffs, diff_wrappers, out);
+                let neg = negate(polarity, NegCause::Diff);
+                collect_edges(lhs, neg, node_names, env, partial_diffs, diff_wrappers, out);
+                return;
+            }
+            collect_edges(lhs, polarity, node_names, env, partial_diffs, diff_wrappers, out);
+            collect_edges(rhs, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
         ast::ExprKind::UnaryOp { op: _, operand } => {
             // `not` is boolean negation (`Bool -> Bool`), not set complement —
             // it does not create negative dependencies. Only `diff` (set
             // difference) creates negative edges.
-            collect_edges(operand, polarity, node_names, env, partial_diffs, out);
+            collect_edges(operand, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
         ast::ExprKind::If { cond, then_branch, else_branch } => {
-            collect_edges(cond, polarity, node_names, env, partial_diffs, out);
-            collect_edges(then_branch, polarity, node_names, env, partial_diffs, out);
-            collect_edges(else_branch, polarity, node_names, env, partial_diffs, out);
+            collect_edges(cond, polarity, node_names, env, partial_diffs, diff_wrappers, out);
+            collect_edges(then_branch, polarity, node_names, env, partial_diffs, diff_wrappers, out);
+            collect_edges(else_branch, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
         ast::ExprKind::Case { scrutinee, arms } => {
-            collect_edges(scrutinee, polarity, node_names, env, partial_diffs, out);
+            collect_edges(scrutinee, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             for arm in arms {
-                collect_edges(&arm.body, polarity, node_names, env, partial_diffs, out);
+                collect_edges(&arm.body, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             }
         }
         ast::ExprKind::Do(stmts) => {
@@ -301,44 +399,44 @@ fn collect_edges(
             for s in stmts {
                 match &s.node {
                     ast::StmtKind::Bind { pat, expr } => {
-                        collect_edges(expr, polarity, node_names, &local_env, &local_partial, out);
+                        collect_edges(expr, polarity, node_names, &local_env, &local_partial, diff_wrappers, out);
                         bind_derived_alias(pat, expr, node_names, &mut local_env, &mut local_partial);
                     }
                     ast::StmtKind::Let { pat, expr } => {
-                        collect_edges(expr, polarity, node_names, &local_env, &local_partial, out);
+                        collect_edges(expr, polarity, node_names, &local_env, &local_partial, diff_wrappers, out);
                         bind_derived_alias(pat, expr, node_names, &mut local_env, &mut local_partial);
                     }
                     ast::StmtKind::Where { cond } => {
-                        collect_edges(cond, polarity, node_names, &local_env, &local_partial, out);
+                        collect_edges(cond, polarity, node_names, &local_env, &local_partial, diff_wrappers, out);
                     }
                     ast::StmtKind::GroupBy { key } => {
-                        collect_edges(key, polarity, node_names, &local_env, &local_partial, out);
+                        collect_edges(key, polarity, node_names, &local_env, &local_partial, diff_wrappers, out);
                     }
                     ast::StmtKind::Expr(e) => {
-                        collect_edges(e, polarity, node_names, &local_env, &local_partial, out);
+                        collect_edges(e, polarity, node_names, &local_env, &local_partial, diff_wrappers, out);
                     }
                 }
             }
         }
         ast::ExprKind::Atomic(inner) => {
-            collect_edges(inner, polarity, node_names, env, partial_diffs, out);
+            collect_edges(inner, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
         ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
-            collect_edges(target, polarity, node_names, env, partial_diffs, out);
-            collect_edges(value, polarity, node_names, env, partial_diffs, out);
+            collect_edges(target, polarity, node_names, env, partial_diffs, diff_wrappers, out);
+            collect_edges(value, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
         ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => {
-            collect_edges(value, polarity, node_names, env, partial_diffs, out);
+            collect_edges(value, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
         ast::ExprKind::Annot { expr: inner, .. } => {
-            collect_edges(inner, polarity, node_names, env, partial_diffs, out);
+            collect_edges(inner, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
         ast::ExprKind::Refine(inner) => {
-            collect_edges(inner, polarity, node_names, env, partial_diffs, out);
+            collect_edges(inner, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
         ast::ExprKind::Serve { handlers, .. } => {
             for h in handlers {
-                collect_edges(&h.body, polarity, node_names, env, partial_diffs, out);
+                collect_edges(&h.body, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             }
         }
     }
@@ -783,6 +881,18 @@ mod tests {
 
     fn view(name: &str, body: Expr) -> Decl {
         Decl { node: DeclKind::View { name: name.to_string(), ty: None, body }, span: span(), exported: false }
+    }
+
+    fn fun(name: &str, body: Expr) -> Decl {
+        Decl { node: DeclKind::Fun { name: name.to_string(), ty: None, body: Some(body) }, span: span(), exported: false }
+    }
+
+    fn lambda(params: Vec<&str>, body: Expr) -> Expr {
+        let params: Vec<Spanned<PatKind>> = params
+            .into_iter()
+            .map(|p| spanned(PatKind::Var(p.to_string())))
+            .collect();
+        spanned(ExprKind::Lambda { params, body: Box::new(body) })
     }
 
     fn derived_ref(name: &str) -> Expr {
@@ -1293,5 +1403,123 @@ mod tests {
             "expected mutual-recursion diagnostic, got: {}",
             diags[0].message
         );
+    }
+
+    #[test]
+    fn diff_wrapper_function_is_detected() {
+        // minus = \a b -> diff a b
+        // &bad = minus *all &bad
+        //
+        // The user-defined `minus` is a curried alias of `diff`; without
+        // expanding its body, `collect_edges` would see both args as positive
+        // and miss the negative self-edge — the unstratifiable recursion would
+        // only surface as a runtime "did not converge" panic (B31).
+        let minus_body = lambda(vec!["a", "b"], diff(var("a"), var("b")));
+        let m = module(vec![
+            fun("minus", minus_body),
+            derived("bad", app(app(var("minus"), source_ref("all")), derived_ref("bad"))),
+        ]);
+        let diags = check(&m);
+        assert!(
+            !diags.is_empty(),
+            "negation laundered through a user wrapper should be rejected"
+        );
+        assert!(diags[0].message.contains("unstratifiable"));
+        assert!(diags[0].message.contains("&bad"));
+    }
+
+    #[test]
+    fn diff_wrapper_through_do_bind_is_detected() {
+        // minus = \a b -> diff a b
+        // &bad = do
+        //   self <- &bad
+        //   all  <- *items
+        //   d    <- minus all self
+        //   yield d
+        //
+        // The wrapper is called on variables (aliases), not directly on the
+        // derived ref — the alias tracking must still attribute the negative
+        // edge to &bad through the wrapper.
+        let minus_body = lambda(vec!["a", "b"], diff(var("a"), var("b")));
+        let body = do_expr(vec![
+            bind_stmt("self", derived_ref("bad")),
+            bind_stmt("all", source_ref("items")),
+            bind_stmt("d", app(app(var("minus"), var("all")), var("self"))),
+            yield_stmt(var("d")),
+        ]);
+        let m = module(vec![
+            fun("minus", minus_body),
+            derived("bad", body),
+        ]);
+        let diags = check(&m);
+        assert!(
+            !diags.is_empty(),
+            "negation through a wrapper + do-bind alias should be rejected"
+        );
+        assert!(diags[0].message.contains("unstratifiable"));
+    }
+
+    #[test]
+    fn diff_wrapper_non_recursive_is_ok() {
+        // minus = \a b -> diff a b
+        // &a = *source
+        // &b = minus *all &a   (negating a non-recursive peer — fine)
+        let minus_body = lambda(vec!["a", "b"], diff(var("a"), var("b")));
+        let m = module(vec![
+            fun("minus", minus_body),
+            derived("a", source_ref("source")),
+            derived("b", app(app(var("minus"), source_ref("all")), derived_ref("a"))),
+        ]);
+        let diags = check(&m);
+        assert!(
+            diags.is_empty(),
+            "negating a non-recursive peer through a wrapper is fine: {:?}",
+            diags.first().map(|d| &d.message)
+        );
+    }
+
+    #[test]
+    fn non_diff_wrapper_is_not_negative() {
+        // myUnion = \a b -> union a b
+        // &reach = myUnion *edges &reach
+        //
+        // A wrapper around `union` (not `diff`) should NOT create negative
+        // edges — positive self-recursion through a union wrapper is fine.
+        let my_union_body = lambda(vec!["a", "b"], union(var("a"), var("b")));
+        let m = module(vec![
+            fun("myUnion", my_union_body),
+            derived("reach", app(app(var("myUnion"), source_ref("edges")), derived_ref("reach"))),
+        ]);
+        let diags = check(&m);
+        assert!(
+            diags.is_empty(),
+            "positive self-recursion through a union wrapper should be fine: {:?}",
+            diags.first().map(|d| &d.message)
+        );
+    }
+
+    #[test]
+    fn diff_wrapper_pipe_form_is_detected() {
+        // minus = \a b -> diff a b
+        // &bad = &bad |> minus *all
+        //
+        // The pipe form `x |> minus y` is `minus y x` = `diff y x` — `x`
+        // (the self-ref) is the subtracted (negative) argument.
+        let minus_body = lambda(vec!["a", "b"], diff(var("a"), var("b")));
+        let pipe = spanned(ExprKind::BinOp {
+            lhs: Box::new(derived_ref("bad")),
+            rhs: Box::new(app(var("minus"), source_ref("all"))),
+            op: BinOp::Pipe,
+        });
+        let m = module(vec![
+            fun("minus", minus_body),
+            derived("bad", pipe),
+        ]);
+        let diags = check(&m);
+        assert!(
+            !diags.is_empty(),
+            "pipe-form negation through a wrapper should be rejected"
+        );
+        assert!(diags[0].message.contains("unstratifiable"));
     }
 }

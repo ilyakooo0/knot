@@ -300,7 +300,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   changes the runtime's name-based `auto_apply_child_change` handles fine.
   **Confidence: high.**
 
-- [ ] **B35. Sources declared in imported modules bypass the lockfile entirely** — `crates/knot-compiler/src/main.rs:451` + `lockfile.rs:428` + `modules.rs:189`
+- [x] **B35. Sources declared in imported modules bypass the lockfile entirely** — `crates/knot-compiler/src/main.rs:451` + `lockfile.rs:428` + `modules.rs:189`
   `generate` uses only entry-module decls; `imported_type_snippets` covers only param-less
   TypeAlias/Data. Schema changes to imported sources surface only as a runtime startup panic.
   **Confidence: high.**

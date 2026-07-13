@@ -169,7 +169,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   `leak : IO {} [Item]` passes and the honest one warns "declared effects are not used".
   **Confidence: medium.**
 
-- [ ] **B18. Destructuring `let` records no latent-effect entry** — `crates/knot-compiler/src/effects.rs:1106` vs `1128`
+- [x] **B18. Destructuring `let` records no latent-effect entry** — `crates/knot-compiler/src/effects.rs:1106` vs `1128`
   `let {fn} = {fn: \u -> *items}` then `rows <- fn {}` drops `r *items` from the declaration's
   effects; r/w under-reporting has no backstop.
   **Confidence: medium.**

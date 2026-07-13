@@ -411,7 +411,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   mismatch → whole-file revert.
   **Confidence: high.**
 
-- [ ] **B51. `knot fmt` permanently rewrites time-unit sugar to raw multiplication** — `crates/knot/src/parser.rs:2750`
+- [x] **B51. `knot fmt` permanently rewrites time-unit sugar to raw multiplication** — `crates/knot/src/parser.rs:2750`
   `2 seconds` desugars at parse time to `BinOp::Mul(2, 1000)` with no AST marker, so
   `sleep (2 seconds)` formats to `sleep (2 * 1000)` (and `2.5 seconds` → `2.5 * 1000.0`) — passes
   the safety net, destroys surface syntax.

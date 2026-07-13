@@ -442,7 +442,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   `lint_on_complex_min_lambda`).
   **Confidence: high** (info-diagnostic impact only).
 
-- [ ] **B56. Nested-pipe lint skip loses diagnostics when chain flattening bails** — `crates/knot-compiler/src/sql_lint.rs:142`
+- [x] **B56. Nested-pipe lint skip loses diagnostics when chain flattening bails** — `crates/knot-compiler/src/sql_lint.rs:142`
   The double-report fix skips `lint_expr(lhs)` whenever lhs is a pipe, but `lint_pipe_chain` only
   covers the chain on successful flattening with a plain source head; on early return the inner
   sub-chain gets zero linting, and middle-stage lambda bodies are never generically recursed.

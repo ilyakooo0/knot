@@ -338,7 +338,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 
 ### Concurrency / HTTP runtime
 
-- [ ] **B40. Nested `race` is un-cancellable; outer cancellation never propagates** — `crates/knot-runtime/src/lib.rs:8200`
+- [x] **B40. Nested `race` is un-cancellable; outer cancellation never propagates** — `crates/knot-runtime/src/lib.rs:8200`
   The race parent parks on the outcome condvar without consulting `current_cancel_token()`, and
   inner workers get fresh tokens tied to nothing. `sleep` and STM wait were special-cased for
   cancellation; the race-parent wait was not.

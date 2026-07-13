@@ -319,7 +319,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   only inference rejects it (multi-endpoint routes only).
   **Confidence: high.**
 
-- [ ] **B38. fetch route metadata keyed by constructor name globally; infer and codegen disagree on the winner** — `crates/knot-compiler/src/infer.rs:7060`, `infer.rs:5225` vs `crates/knot-compiler/src/codegen.rs:6794`
+- [x] **B38. fetch route metadata keyed by constructor name globally; infer and codegen disagree on the winner** — `crates/knot-compiler/src/infer.rs:7060`, `infer.rs:5225` vs `crates/knot-compiler/src/codegen.rs:6794`
   Distinct ADTs may share constructor names (legal). `try_infer_fetch` uses last-wins
   (`constructors[ctor].last()`, `fetch_response_types` insert order); `compile_fetch` uses
   first-match in HashMap iteration order → a `fetch` can typecheck against route B and compile the

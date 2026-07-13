@@ -477,7 +477,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   stale archive.
   **Confidence: medium.**
 
-- [ ] **B61. build.rs ancestor walk for the runtime archive continues past the target directory to `/`** — `crates/knot-compiler/build.rs:68`
+- [x] **B61. build.rs ancestor walk for the runtime archive continues past target dir to `/`** — `crates/knot-compiler/build.rs:68`
   A stray `libknot_runtime.a` in any ancestor (e.g. `$HOME`) with a recent mtime gets embedded
   (mtime-only freshness).
   **Confidence: medium** (low likelihood).

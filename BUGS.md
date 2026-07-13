@@ -510,7 +510,7 @@ replace/measure that widened span assuming it excludes parens:
   exhaustiveness quickfix.
   **Confidence: high.**
 
-- [ ] **B66. "Negate condition"/"Convert if to case" on a parenthesized `if` in operand position swallow the trailing operand** — `crates/knot-lsp/src/code_action.rs:1368`, `code_action.rs:3161`
+- [x] **B66. "Negate condition"/"Convert if to case" on a parenthesized `if` in operand position swallow the trailing operand** — `crates/knot-lsp/src/code_action.rs:1368`, `code_action.rs:3161`
   `(if c then a else b) * 2` → `if not (c) then b else a * 2`.
   **Confidence: high.**
 

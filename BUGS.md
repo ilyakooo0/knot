@@ -195,7 +195,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   `f {val: 1}` pins the alias var to Int; `f {val: "s"}` errors. Declaring `f` first compiles.
   **Confidence: medium.**
 
-- [ ] **B22. Declared `r1 \/ r2` effect unions rejected for `if` in infer position** ⁂ — `crates/knot-compiler/src/infer.rs:4545`
+- [x] **B22. Declared `r1 \/ r2` effect unions rejected for `if` in infer position** ⁂ — `crates/knot-compiler/src/infer.rs:4545`
   The If arm's row merge calls `unify(Var r1, Var r2)` directly on two rigid skolems, bypassing
   the `effect_union_sanctions` escape that `unify_io_effects` (infer.rs:2553) and
   `merge_do_io_row` (infer.rs:6201) provide → "cannot unify rigid type variables".

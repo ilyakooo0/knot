@@ -625,3 +625,60 @@ fn refinements_nested_in_route_body_fields_are_validated() {
     let bad_top = r#"{"events":[],"top":"BAD"}"#;
     assert_eq!(post_json(port, "/gossip", bad_top).0, 400, "a top-level refined field");
 }
+
+// ── 13. Trait default-body placeholder overwrites real signature ────
+
+/// A trait method with both a signature and a default body caused the
+/// placeholder entry (TypeKind::Hole) to overwrite the real signature,
+/// pinning the method to a single unquantified type variable. The first
+/// call site bound it; the second failed with "type mismatch".
+#[test]
+fn trait_default_body_does_not_pin_method_type() {
+    let src = r#"trait Greet a where
+  greet : a -> Text
+  greet x = "hi"
+data Dog = Dog {}
+data Cat = Cat {}
+impl Greet Dog where
+impl Greet Cat where
+main = do
+  println (greet (Dog {}))
+  println (greet (Cat {}))
+  yield {}
+"#;
+    let c = compile("trait_default_monomorphic", src);
+    let out = Command::new(&c.exe)
+        .current_dir(&c.dir)
+        .output()
+        .expect("failed to run compiled program");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"hi\"") && stdout.matches("\"hi\"").count() == 2,
+        "both impls should use the default body, got: {stdout}",
+    );
+}
+
+/// `deriving` for a trait with a default body must work at multiple types.
+#[test]
+fn deriving_works_at_multiple_types() {
+    let src = r#"trait Describe a where
+  describe : a -> Text
+  describe x = "value: " ++ show x
+data Priority = Low {} | High {} deriving (Describe)
+data Color = Red {} | Blue {} deriving (Describe)
+main = do
+  println (describe (Low {}))
+  println (describe (Red {}))
+  yield {}
+"#;
+    let c = compile("deriving_multi_type", src);
+    let out = Command::new(&c.exe)
+        .current_dir(&c.dir)
+        .output()
+        .expect("failed to run compiled program");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Low") && stdout.contains("Red"),
+        "both derived impls should work, got: {stdout}",
+    );
+}

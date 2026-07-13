@@ -9026,11 +9026,20 @@ impl Infer {
 
         for item in items {
             if let ast::TraitItem::Method { name, ty, .. } = item {
-                // Skip default-body entries with placeholder types
-                if let ast::TypeKind::Named(n) = &ty.ty.node
-                    && n == "_" {
-                        continue;
-                    }
+                // Skip default-body entries with placeholder types.
+                // The parser emits these with `TypeKind::Hole` (not
+                // `Named("_")`), so the old guard never matched and the
+                // placeholder overwrote the real signature — pinning the
+                // method to a single unquantified type variable shared
+                // across all call sites (first use wins, second fails).
+                let is_placeholder = match &ty.ty.node {
+                    ast::TypeKind::Hole => true,
+                    ast::TypeKind::Named(n) => n == "_",
+                    _ => false,
+                };
+                if is_placeholder {
+                    continue;
+                }
                 self.annotation_vars.clear();
                 self.annotation_unit_vars.clear();
                 self.in_type_annotation = true;

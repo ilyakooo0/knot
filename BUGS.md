@@ -363,7 +363,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 
 ### IO / value runtime
 
-- [ ] **B43. IO-do bind from an inline desugared comprehension binds the whole relation instead of iterating** — `crates/knot-compiler/src/codegen.rs:8334` vs `codegen.rs:8434`
+- [x] **B43. IO-do bind from an inline desugared comprehension binds the whole relation instead of iterating** — `crates/knot-compiler/src/codegen.rs:8334` vs `codegen.rs:8434`
   `rhs_iterates` checks `List`/known-relation/relation-var but not
   `desugared_monad_kind(expr) == Relation` (which the Let arm consults). Infer types the pattern
   as the ELEMENT type.

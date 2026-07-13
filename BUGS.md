@@ -156,7 +156,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   passes all gates; `println` runs inside the savepoint.
   **Confidence: high.**
 
-- [ ] **B16. Impl-method / trait-default params are not pushed as shadowing binders during effect analysis** — `crates/knot-compiler/src/effects.rs:458` (also 469–479, 533–543, 616–622)
+- [x] **B16. Impl-method / trait-default params are not pushed as shadowing binders during effect analysis** — `crates/knot-compiler/src/effects.rs:458` (also 469–479, 533–543, 616–622)
   A parameter named after an IO builtin or effectful decl poisons the method's inferred effects.
   *Scenario:* `impl Pretty Int where pretty now = show now` infers `{clock}` → correct annotations
   fail "inferred effects exceed declared effects"; a param named `race` triggers the

@@ -430,7 +430,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 
 ### Desugar / sql_lint (diagnostics-level)
 
-- [ ] **B54. Trait-only-IO desugar gate breaks on a final bare expression** — `crates/knot-compiler/src/desugar.rs:909` vs `desugar.rs:1163`
+- [x] **B54. Trait-only-IO desugar gate breaks on a final bare expression** — `crates/knot-compiler/src/desugar.rs:909` vs `desugar.rs:1163`
   The gate's comment assumes the final bare expression is wrapped in `__yield`, but
   `desugar_stmts` only wraps literal `yield` syntax → `do { x <- traitIoMethod 1; show x }`
   desugars into a continuation returning `Text` instead of `IO Text` → spurious type error.

@@ -72,7 +72,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   panics at runtime.
   **Confidence: high.**
 
-- [ ] **B7. Do-blocks over a generalized monad type variable silently get Relation dispatch** — `crates/knot-compiler/src/infer.rs:9965` (with desugar.rs:1606, codegen.rs:6341)
+- [x] **B7. Do-blocks over a generalized monad type variable silently get Relation dispatch** — `crates/knot-compiler/src/infer.rs:9965` (with desugar.rs:1606, codegen.rs:6341)
   When the `__bind` span's monad var is unresolved at `monad_kind_of` time (let-generalized
   monad-polymorphic function), the `_ => MonadKind::Relation` default applies with no diagnostic;
   codegen emits `knot_relation_bind`, which panics or produces garbage when applied to `Maybe` —
@@ -81,7 +81,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   `Just {...}` → runtime panic on a program that typechecks.
   **Confidence: high.**
 
-- [ ] **B8. Time-unit sugar swallows imported values and trait-method names** — `crates/knot/src/parser.rs:2734` (`maybe_time_unit`) + `parser.rs:259` (`scan_top_level_names`)
+- [x] **B8. Time-unit sugar swallows imported values and trait-method names** — `crates/knot/src/parser.rs:2734` (`maybe_time_unit`) + `parser.rs:259` (`scan_top_level_names`)
   Suppression covers locally-bound vars and column-0 top-level declarations, but not import items
   or trait/impl method names.
   *Scenario:* `import ./time (ms)` then `g = f 2 ms` → parses as `f (2 * 1)`, silently dropping

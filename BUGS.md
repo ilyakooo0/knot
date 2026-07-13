@@ -218,7 +218,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   → first run succeeds, **second run of the same binary panics** on a set-semantics no-op.
   **Confidence: high.**
 
-- [ ] **B24. Referential-integrity trigger rejects transitionally-valid full replaces** — `crates/knot-runtime/src/lib.rs:14545` + `lib.rs:12768`
+- [x] **B24. Referential-integrity trigger rejects transitionally-valid full replaces** — `crates/knot-runtime/src/lib.rs:14545` + `lib.rs:12768`
   `replace`/`set` compile to DELETE-then-reinsert; the BEFORE-DELETE trigger aborts if any deleted
   row is referenced, even when the replacement re-inserts every referenced key — enforcement is
   per-statement, not on the final state the savepoint would commit (DESIGN.md says "validated at

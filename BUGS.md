@@ -545,7 +545,7 @@ replace/measure that widened span assuming it excludes parens:
   Selecting `a + b` inside `2 * a + b` extracts `2 * (a + b)` — different value, no diagnostic.
   **Confidence: medium.**
 
-- [ ] **B73. Find References misses impl-method definition tokens for trait methods (same file); returns None from the impl token** — `crates/knot-lsp/src/references.rs:157` (root cause `defs.rs:267`)
+- [x] **B73. Find References misses impl-method definition tokens for trait methods (same file); returns None from the impl token** — `crates/knot-lsp/src/references.rs:157` (root cause `defs.rs:267`)
   `resolve_definitions` never links `ImplItem::Method::name_span` to the trait method; rename.rs
   compensates (rename.rs:1510), references.rs does not; cross-file importer scans DO include impl
   tokens, so behavior flips on file layout.

@@ -525,7 +525,7 @@ replace/measure that widened span assuming it excludes parens:
 
 ### Other LSP
 
-- [ ] **B69. "Remove unused import"/"Organize imports" delete imports used in route compositions and `rateLimit` expressions** — `crates/knot-lsp/src/code_action.rs:1695` (`collect_referenced_names`)
+- [x] **B69. "Remove unused import"/"Organize imports" delete imports used in route compositions and `rateLimit` expressions** — `crates/knot-lsp/src/code_action.rs:1695` (`collect_referenced_names`)
   No `RouteComposite` arm; the `Route` arm walks types only, never `entry.rate_limit` (also
   misses `SubsetConstraint` relation names). Applying the action breaks compilation.
   **Confidence: high.**

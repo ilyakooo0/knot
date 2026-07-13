@@ -182,7 +182,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   `migrate *scores using \r -> {v: r.v - 100}` persists negative values into a `Nat` column.
   **Confidence: medium.**
 
-- [ ] **B20. Refinements under a type application are dropped from `source_refinements`** — `crates/knot-compiler/src/types.rs:605` (`value_predicates`, no `TypeKind::App` arm)
+- [x] **B20. Refinements under a type application are dropped from `source_refinements`** — `crates/knot-compiler/src/types.rs:605` (`value_predicates`, no `TypeKind::App` arm)
   *Scenario:* `*people : [{age: Maybe Nat}]` → `set *people [{age: Just {value: -5}}]` commits
   with no violation.
   **Confidence: high** on path, **medium** on intent.

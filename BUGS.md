@@ -34,7 +34,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   Affects `knot_source_write`, `_append`, `_diff_write`, `_migrate`.
   **Confidence: high** (confirmed by direct read).
 
-- [ ] **B3. User functions shadowing stdlib names silently discarded by codegen (infer uses the user's definition)** — `crates/knot-compiler/src/codegen.rs:1478`, `crates/knot-compiler/src/codegen.rs:2631`
+- [x] **B3. User functions shadowing stdlib names silently discarded by codegen (infer uses the user's definition)** — `crates/knot-compiler/src/codegen.rs:1478`, `crates/knot-compiler/src/codegen.rs:2631`
   `collect_declarations`/`define_functions` skip any `Fun` whose name is already in
   `user_fns`/`stdlib_fns` (`filter`, `length`, `sign`, `race`, …), but type inference binds the
   user's declaration after `register_builtins`, so the program typechecks against the user's
@@ -561,27 +561,27 @@ replace/measure that widened span assuming it excludes parens:
   same-named global's signature/doc.
   **Confidence: medium-high.**
 
-- [ ] **B76. Shared inference cache is unbounded; per-task clone grows with session length** — `crates/knot-lsp/src/analysis.rs:228` (merge), `analysis.rs:614` (eviction)
+- [x] **B76. Shared inference cache is unbounded; per-task clone grows with session length** — `crates/knot-lsp/src/analysis.rs:228` (merge), `analysis.rs:614` (eviction)
   The LRU cap applies only to the worker's local clone; merge-back only inserts. Each task clones
   the whole shared map (`analysis.rs:141`). Long sessions → hundreds of MB RSS and increasing
   per-keystroke latency. (The import cache gets `enforce_import_cache_cap`; this one gets
   nothing.)
   **Confidence: high.**
 
-- [ ] **B77. Imported-file diagnostics leak into the importer via numeric span containment** — `crates/knot-lsp/src/analysis.rs:532` (same pattern `workspace_diagnostics.rs:788`)
+- [x] **B77. Imported-file diagnostics leak into the importer via numeric span containment** — `crates/knot-lsp/src/analysis.rs:532` (same pattern `workspace_diagnostics.rs:788`)
   Inference runs on the import-inlined module; a foreign diagnostic whose byte offsets happen to
   fall inside an importer decl span passes `anchored_in_user` → phantom squiggle at an arbitrary
   position. Same leak for `local_type_info`/`monad_info` retains (ghost hovers/inlays).
   **Confidence: medium.**
 
-- [ ] **B78. Stale version published after a no-op didChange** — `crates/knot-lsp/src/main.rs:1284` + `main.rs:695`
+- [x] **B78. Stale version published after a no-op didChange** — `crates/knot-lsp/src/main.rs:1284` + `main.rs:695`
   `already_pending` refreshes only `pending.version`, but `apply_analysis_result` publishes
   `result.version` (the older task's). Version-checking clients (Helix) discard the publish; the
   dedup path (`main.rs:1581`) then suppresses every subsequent identical analysis → diagnostics
   stuck until the next real edit. Fix: use the pending entry's version when the source matches.
   **Confidence: medium.**
 
-- [ ] **B79. willRenameFiles resolves imports with `format!("{}.knot")` while everything else uses `with_extension`** — `crates/knot-lsp/src/main.rs:596`
+- [x] **B79. willRenameFiles resolves imports with `format!("{}.knot")` while everything else uses `with_extension`** — `crates/knot-lsp/src/main.rs:596`
   For `import ./lib.v2` the compiler loads `lib.knot` (`with_extension` replaces the suffix), but
   willRenameFiles resolves `lib.v2.knot` → file moves silently skip rewriting that importer.
   **Confidence: medium.**
@@ -590,7 +590,7 @@ replace/measure that widened span assuming it excludes parens:
   `map : (a -> b) -> f a -> f b` renders in hover/signature help as `(a -> b) -> f -> f`.
   **Confidence: medium.**
 
-- [ ] **B81. Added workspace folders dedup-checked pre-canonicalization** — `crates/knot-lsp/src/main.rs:1534`
+- [x] **B81. Added workspace folders dedup-checked pre-canonicalization** — `crates/knot-lsp/src/main.rs:1534`
   A symlinked spelling of an existing root is pushed again → duplicate scans (waste, not
   corruption).
   **Confidence: medium** (low impact).

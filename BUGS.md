@@ -346,7 +346,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   `knot_threads_join` blocks program exit ~1 hour (all three threads counted in ACTIVE_FORKS).
   **Confidence: high.**
 
-- [ ] **B41. HTTP worker leaks the deep-cloned handler tree if per-request `knot_db_open` panics** — `crates/knot-runtime/src/lib.rs:16226`
+- [x] **B41. HTTP worker leaks the deep-cloned handler tree if per-request `knot_db_open` panics** — `crates/knot-runtime/src/lib.rs:16226`
   `knot_db_open` panics via `.expect` (lib.rs:10431/10440/10442); the call sits after the
   body-read error paths but before the `catch_unwind`, with no drop guard for `handler` — unlike
   `knot_fork_io` (IoDropGuard, lib.rs:7886) and the race worker (lib.rs:8036), which were hardened

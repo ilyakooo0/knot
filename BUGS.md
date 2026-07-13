@@ -405,7 +405,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   round-trip safety net then reverts the entire file with no message. Uppercase units are fine.
   **Confidence: high.**
 
-- [ ] **B50. `knot fmt` silently no-ops files with parenthesized multi-line `do`/`case` whose next statement starts with `-`** — `crates/knot/src/format.rs:2199`, `format.rs:2041` vs `crates/knot/src/parser.rs:2330`
+- [x] **B50. `knot fmt` silently no-ops files with parenthesized multi-line `do`/`case` whose next statement starts with `-`** — `crates/knot/src/format.rs:2199`, `format.rs:2041` vs `crates/knot/src/parser.rs:2330`
   Inside parens `delimiter_depth > 0` disables the layout column guard, so the formatter's
   parenthesized rendering glues `let a = 1` and `-2` into `let a = 1 - 2` on reparse → AST
   mismatch → whole-file revert.

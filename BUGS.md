@@ -376,7 +376,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   (`user_shadows_special`, :5741), the pipe arm fires on the name before any shadow check.
   **Confidence: medium** (contrived trigger).
 
-- [ ] **B45. `show`/`println`/`toJson` still call-stack-recursive on constructor spines** — `crates/knot-runtime/src/lib.rs:7448`, `lib.rs:7291`, `lib.rs:15683` (also `value_to_json_with`, `value_contains_nonfinite_float` at :5650)
+- [x] **B45. `show`/`println`/`toJson` still call-stack-recursive on constructor spines** — `crates/knot-runtime/src/lib.rs:7448`, `lib.rs:7291`, `lib.rs:15683` (also `value_to_json_with`, `value_contains_nonfinite_float` at :5650)
   The recursive-spine class fixed for hash/eq/compare in commit 2e7620d still applies here: a
   ~50–100k-node `Cons` spine passes eq/hash then SIGSEGVs on `show`/`toJson`.
   **Confidence: medium** (mechanically certain; depth-dependent).

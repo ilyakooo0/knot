@@ -234,7 +234,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   rejects such views.
   **Confidence: medium.**
 
-- [ ] **B26. Child-table naming can collide with an unrelated source's main table** — `crates/knot-runtime/src/lib.rs:11105` vs `lib.rs:11520`
+- [x] **B26. Child-table naming can collide with an unrelated source's main table** — `crates/knot-runtime/src/lib.rs:11105` vs `lib.rs:11520`
   Source `users` with nested field `archive` and an independent source `users__archive` share the
   table name `_knot_users__archive`; second initializer inherits the other's columns (no-op
   `CREATE TABLE IF NOT EXISTS`) → "no such column" errors or intermixed rows. The delete cascade

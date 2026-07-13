@@ -11,7 +11,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 
 ## Tier 1 — Memory safety & silent wrong-code in compiled programs
 
-- [ ] **B1. `groupBy` phase-1 use-after-free with non-equi-join multi-bind** — `crates/knot-compiler/src/codegen.rs:9680`
+- [x] **B1. `groupBy` phase-1 use-after-free with non-equi-join multi-bind** — `crates/knot-compiler/src/codegen.rs:9680`
   In a multi-bind do-block whose primary bind is materialized inside an enclosing loop (cross
   join, non-equi `where c.pid < p.id`, or compound condition not matched by `match_equi_join`),
   phase 1 pushes the current row into the temp relation via `knot_relation_push` **without**
@@ -24,7 +24,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   with ≥2 parent rows → grouping keys read from freed `Value`s → garbage groups or crash.
   **Confidence: high** (mechanism confirmed by direct read).
 
-- [ ] **B2. ADT relation writes serialize fields with the *first* constructor's column type** — `crates/knot-runtime/src/lib.rs:12410` (`adt_row_to_params`)
+- [x] **B2. ADT relation writes serialize fields with the *first* constructor's column type** — `crates/knot-runtime/src/lib.rs:12410` (`adt_row_to_params`)
   The write loop uses `adt.all_fields[i].ty` (which keeps the first constructor's `ColType` per
   lib.rs:10764), while all read paths decode with the per-constructor type. Conflicting field
   types across constructors are an explicitly supported case (BLOB affinity, lib.rs:10769).

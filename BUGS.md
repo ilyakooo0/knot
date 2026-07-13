@@ -505,7 +505,7 @@ replace/measure that widened span assuming it excludes parens:
   `a / b * c` → `c * a / b` (0 vs 2 for 1,2,4); `f (a == b)` → `f b == a`.
   **Confidence: high.**
 
-- [ ] **B65. "Add missing case arms"/"Add wildcard arm" insert outside the closing paren** — `crates/knot-lsp/src/code_action.rs:1627`, `code_action.rs:1242`
+- [x] **B65. "Add missing case arms"/"Add wildcard arm" insert outside the closing paren** — `crates/knot-lsp/src/code_action.rs:1627`, `code_action.rs:1242`
   `show (case c of Red {} -> 1)` → arm inserted after the `)` → parse error introduced by the
   exhaustiveness quickfix.
   **Confidence: high.**

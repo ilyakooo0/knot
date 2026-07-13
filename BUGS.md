@@ -371,7 +371,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   `[1, 2, 3]` once instead of three lines; a field access on `x` would panic.
   **Confidence: medium.**
 
-- [ ] **B44. Pipe `|> match Ctor` bypasses local shadowing of `match`** — `crates/knot-compiler/src/codegen.rs:4317`
+- [x] **B44. Pipe `|> match Ctor` bypasses local shadowing of `match`** — `crates/knot-compiler/src/codegen.rs:4317`
   Unlike compile_app (env-locals first, :5487) and the non-pipe `match` form
   (`user_shadows_special`, :5741), the pipe arm fires on the name before any shadow check.
   **Confidence: medium** (contrived trigger).

@@ -502,6 +502,82 @@ fn a_refinement_predicate_reads_the_runtime_override_of_a_constant() {
     );
 }
 
+/// A constant annotated with an *alias* of a scalar (`type Host = Text`) was
+/// not overridable: the check that decides which constants get a
+/// `knot_override_lookup` call matched the rendered type string, which for an
+/// alias is the alias name (`"Host"`), not `"Text"`. The constant compiled to
+/// its default with no argv check at all, so `--host=…` was accepted (the
+/// runtime ignores unknown flags) and silently discarded, and the constant was
+/// missing from `--help`. The type string is now resolved through the alias
+/// table, matching what body-less constants already did.
+#[test]
+fn a_constant_typed_by_an_alias_of_a_scalar_is_overridable() {
+    let src = "type Host = Text\n\
+               type Port = Int\n\
+               host : Host\n\
+               host = \"localhost\"\n\
+               port : Port\n\
+               port = 8080\n\
+               main = println (host ++ \":\" ++ show port)\n";
+    let c = compile("override_alias", src);
+
+    let run = |args: &[&str]| -> String {
+        let out = Command::new(&c.exe)
+            .args(args)
+            .current_dir(&c.dir)
+            .output()
+            .expect("failed to run compiled program");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    assert!(
+        run(&[]).contains("localhost:8080"),
+        "the compiled-in defaults must still apply with no flags",
+    );
+    assert!(
+        run(&["--host=example.com", "--port=9999"]).contains("example.com:9999"),
+        "an alias-typed constant must take its value from the CLI override",
+    );
+
+    // `--help` (written to stderr) lists them under the base type the flag parses as.
+    let help = Command::new(&c.exe)
+        .arg("--help")
+        .current_dir(&c.dir)
+        .output()
+        .expect("failed to run compiled program");
+    let help = String::from_utf8_lossy(&help.stderr).into_owned();
+    assert!(
+        help.contains("--host") && help.contains("Text"),
+        "an alias-typed constant must be listed in --help under its base type, got: {help}",
+    );
+}
+
+/// The counterpart to the above: resolving a constant's type through the alias
+/// table must NOT sweep in *refined* aliases. Nothing on that path runs the
+/// predicate, so honouring `--limit=-5` for a `Nat` would smuggle a value in
+/// through the check the type promises. `limit` keeps its checked value.
+/// (`base` is body-less, so it takes the refined path, which does validate.)
+#[test]
+fn a_constant_typed_by_a_refined_alias_is_not_overridable() {
+    let src = "type Nat = Int where \\x -> x >= 0\n\
+               base : Nat\n\
+               limit : Nat\n\
+               limit = base\n\
+               main = println (\"limit=\" ++ show limit)\n";
+    let c = compile("override_refined_alias", src);
+
+    let out = Command::new(&c.exe)
+        .args(["--base=7", "--limit=-5"])
+        .current_dir(&c.dir)
+        .output()
+        .expect("failed to run compiled program");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("limit=7"),
+        "--limit=-5 must not bypass Nat's `>= 0` predicate, got: {stdout}",
+    );
+}
+
 // ── 12. Refinements nested inside route body fields ───────────────
 
 /// Only a body field's *own* top-level type was validated, so a refined type

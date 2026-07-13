@@ -210,7 +210,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 
 ### Relations / SQLite runtime
 
-- [ ] **B23. Uniqueness trigger panics on idempotent re-append** — `crates/knot-runtime/src/lib.rs:14424` (trigger) + `lib.rs:12856` (`knot_source_append`)
+- [x] **B23. Uniqueness trigger panics on idempotent re-append** — `crates/knot-runtime/src/lib.rs:14424` (trigger) + `lib.rs:12856` (`knot_source_append`)
   The BEFORE-INSERT trigger's `RAISE(ABORT)` fires before `INSERT OR IGNORE` dedup (SQLite does
   not suppress trigger aborts under `OR IGNORE` — verified against a real SQLite). The trigger's
   WHEN needs to exclude full-row matches.

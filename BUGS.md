@@ -249,7 +249,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 
 ### sortBy (three-way inconsistency, found independently by three reviewers ⁂)
 
-- [ ] **B28. `sortBy` SQL pushdown accepts tag/bool keys and orders them contrary to declared `Ord`; the in-memory path panics on the same keys** — `crates/knot-compiler/src/codegen.rs:13073` (`sortby_projection_pushable`), `crates/knot-compiler/src/sql_lint.rs:1271`, `crates/knot-runtime/src/lib.rs:5970` (`compare_values_primitive`)
+- [x] **B28. `sortBy` SQL pushdown accepts tag/bool keys and orders them contrary to declared `Ord`; the in-memory path panics on the same keys** — `crates/knot-compiler/src/codegen.rs:13073` (`sortby_projection_pushable`), `crates/knot-compiler/src/sql_lint.rs:1271`, `crates/knot-runtime/src/lib.rs:5970` (`compare_values_primitive`)
   The pushdown gate excludes only float and Int-CASE keys, though `minmax_pushdown_type_ok`
   (codegen.rs:13027) and `try_compile_sql_comparison` (codegen.rs:11830) both treat tag ordering
   as unsound. Meanwhile `sortBy` carries no `Ord` constraint (infer.rs:7730), and the runtime sort

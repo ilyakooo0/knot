@@ -400,7 +400,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   only `Server Api _` parses.
   **Confidence: medium.**
 
-- [ ] **B49. `knot fmt` silently no-ops whole files when lowercase unit literals lose parens** — `crates/knot/src/format.rs:1705`
+- [x] **B49. `knot fmt` silently no-ops whole files when lowercase unit literals lose parens** — `crates/knot/src/format.rs:1705`
   `f (999<usd>) 6` renders as `f 999<usd> 6`, which reparses as `(f 999 < usd) > 6`; the AST
   round-trip safety net then reverts the entire file with no message. Uppercase units are fine.
   **Confidence: high.**

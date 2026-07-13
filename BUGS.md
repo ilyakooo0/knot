@@ -295,7 +295,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   rewritten, so a later compile with a migrate block sees `Identical` and skips chain validation.
   **Confidence: high.**
 
-- [ ] **B34. Nested child-table schemas compared as opaque type strings → spurious Breaking** — `crates/knot-compiler/src/lockfile.rs:95`, `lockfile.rs:199`
+- [x] **B34. Nested child-table schemas compared as opaque type strings → spurious Breaking** — `crates/knot-compiler/src/lockfile.rs:95`, `lockfile.rs:199`
   A pure field reorder or safe column addition inside `items: [{…}]` demands a migrate block for
   changes the runtime's name-based `auto_apply_child_change` handles fine.
   **Confidence: high.**

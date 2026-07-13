@@ -354,7 +354,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   under a persistent DB failure grows memory without bound.
   **Confidence: high** (mechanism), **medium** (real-world trigger).
 
-- [ ] **B42. Listen response-body cap checked only after the full body is materialized** — `crates/knot-runtime/src/lib.rs:16643`, `lib.rs:16767`
+- [x] **B42. Listen response-body cap checked only after the full body is materialized** — `crates/knot-runtime/src/lib.rs:16643`, `lib.rs:16767`
   The comment claims the cap prevents a multi-GB relation from OOMing the server, but
   `json_encode_value` builds the complete string first; `json.len() > max` runs afterwards. The
   inbound path and `fetch_read_capped_body` cap during streaming; this is a post-hoc send-guard,

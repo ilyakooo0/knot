@@ -5658,19 +5658,39 @@ fn in_memory_dedup(rows: Vec<*mut Value>) -> Vec<*mut Value> {
 /// their operands and fall back to the in-memory hash path (the same basis
 /// `++`/`knot_value_concat` uses) when a non-finite float is present.
 fn value_contains_nonfinite_float(v: *mut Value) -> bool {
-    if v.is_null() {
-        return false;
-    }
-    match unsafe { as_ref(v) } {
-        Value::Float(f) => !f.is_finite(),
-        Value::Record(fields) => fields.iter().any(|f| value_contains_nonfinite_float(f.value)),
-        Value::Constructor(_, payload) => value_contains_nonfinite_float(*payload),
-        Value::Relation(rows) => rows.iter().any(|r| value_contains_nonfinite_float(*r)),
-        Value::Pair(a, b) => {
-            value_contains_nonfinite_float(*a) || value_contains_nonfinite_float(*b)
+    // Iterative over an explicit work stack so a deeply nested Constructor
+    // spine can't overflow the call stack. Mirrors the technique used by
+    // `values_equal`, `value_to_hash_bytes`, `compare_values`, etc.
+    let mut stack: Vec<*mut Value> = vec![v];
+    while let Some(v) = stack.pop() {
+        if v.is_null() {
+            continue;
         }
-        _ => false,
+        match unsafe { as_ref(v) } {
+            Value::Float(f) => {
+                if !f.is_finite() {
+                    return true;
+                }
+            }
+            Value::Record(fields) => {
+                for f in fields.iter() {
+                    stack.push(f.value);
+                }
+            }
+            Value::Constructor(_, payload) => stack.push(*payload),
+            Value::Relation(rows) => {
+                for r in rows.iter() {
+                    stack.push(*r);
+                }
+            }
+            Value::Pair(a, b) => {
+                stack.push(*a);
+                stack.push(*b);
+            }
+            _ => {}
+        }
     }
+    false
 }
 
 /// True if any value in `rows` contains a non-finite float. See
@@ -7464,63 +7484,110 @@ pub extern "C-unwind" fn knot_value_call(
 
 // ── Printing ──────────────────────────────────────────────────────
 
+/// Iterative rendering over an explicit work stack, mirroring the technique
+/// used by `knot_value_show`. A deeply right-nested Constructor spine
+/// (Constructor→Record→Constructor→…) previously drove one native frame per
+/// level through the recursive `format_value`/`format_value_field` payload
+/// path and SIGSEGV'd on Rust's default 8MB stack. The work-stack version
+/// completes without call-stack growth. `escape_text` selects whether `Text`
+/// values are JSON-escaped (field context) or printed raw (top-level `println`).
+fn format_value_iter(v: *mut Value, escape_text: bool) -> String {
+    enum FmtTask {
+        Render(*mut Value, bool), // value, escape_text-for-this-subtree
+        Lit(String),
+    }
+
+    let mut out = String::new();
+    let mut stack: Vec<FmtTask> = vec![FmtTask::Render(v, escape_text)];
+    while let Some(task) = stack.pop() {
+        match task {
+            FmtTask::Lit(s) => out.push_str(&s),
+            FmtTask::Render(v, esc) => {
+                if v.is_null() {
+                    out.push_str("null");
+                    continue;
+                }
+                match unsafe { as_ref(v) } {
+                    Value::Int(n) => out.push_str(&n.to_string()),
+                    Value::Float(n) => {
+                        if n.is_nan() || n.is_infinite() {
+                            out.push_str(&format!("{}", n));
+                        } else if n.fract() == 0.0 {
+                            out.push_str(&format!("{:.1}", n));
+                        } else {
+                            out.push_str(&n.to_string());
+                        }
+                    }
+                    Value::Text(s) => {
+                        out.push('"');
+                        if esc {
+                            out.push_str(&json_escape(s));
+                        } else {
+                            out.push_str(s);
+                        }
+                        out.push('"');
+                    }
+                    Value::Bytes(b) => {
+                        out.push_str("b\"");
+                        for byte in b.iter() {
+                            use std::fmt::Write;
+                            let _ = write!(out, "{:02x}", byte);
+                        }
+                        out.push('"');
+                    }
+                    Value::Bool(b) => {
+                        out.push_str(if *b { "True {}" } else { "False {}" });
+                    }
+                    Value::Unit => out.push_str("{}"),
+                    Value::Record(fields) => {
+                        // Push in reverse so tasks pop in forward order:
+                        // {field0: v0, field1: v1, ...}
+                        stack.push(FmtTask::Lit("}".to_string()));
+                        for (i, f) in fields.iter().enumerate().rev() {
+                            stack.push(FmtTask::Render(f.value, true));
+                            if i == 0 {
+                                stack.push(FmtTask::Lit(format!("{}: ", f.name)));
+                            } else {
+                                stack.push(FmtTask::Lit(format!(", {}: ", f.name)));
+                            }
+                        }
+                        stack.push(FmtTask::Lit("{".to_string()));
+                    }
+                    Value::Relation(rows) => {
+                        stack.push(FmtTask::Lit("]".to_string()));
+                        for (i, r) in rows.iter().enumerate().rev() {
+                            stack.push(FmtTask::Render(*r, esc));
+                            if i != 0 {
+                                stack.push(FmtTask::Lit(", ".to_string()));
+                            }
+                        }
+                        stack.push(FmtTask::Lit("[".to_string()));
+                    }
+                    Value::Constructor(tag, payload) => {
+                        if !payload.is_null() && is_nullary_payload(*payload) {
+                            out.push_str(tag);
+                            out.push_str(" {}");
+                        } else {
+                            // Field context for payload: the recursive
+                            // format_value_field was used for Constructor
+                            // payloads in both format_value and
+                            // format_value_field, so always escape.
+                            stack.push(FmtTask::Render(*payload, true));
+                            stack.push(FmtTask::Lit(format!("{} ", tag)));
+                        }
+                    }
+                    Value::Function(f) => out.push_str(&f.source),
+                    Value::IO(_, _) => out.push_str("<<IO>>"),
+                    Value::Pair(_, _) => out.push_str("<<Pair>>"),
+                }
+            }
+        }
+    }
+    out
+}
+
 fn format_value(v: *mut Value) -> String {
-    if v.is_null() {
-        return "null".to_string();
-    }
-    match unsafe { as_ref(v) } {
-        Value::Int(n) => n.to_string(),
-        Value::Float(n) => {
-            if n.is_nan() || n.is_infinite() {
-                format!("{}", n)
-            } else if n.fract() == 0.0 {
-                format!("{:.1}", n)
-            } else {
-                n.to_string()
-            }
-        }
-        Value::Text(s) => format!("\"{}\"", s),
-        Value::Bytes(b) => {
-            let mut hex = String::with_capacity(b.len() * 2 + 3);
-            hex.push_str("b\"");
-            for byte in b.iter() {
-                use std::fmt::Write;
-                let _ = write!(hex, "{:02x}", byte);
-            }
-            hex.push('"');
-            hex
-        }
-        Value::Bool(b) => {
-            if *b {
-                "True {}".to_string()
-            } else {
-                "False {}".to_string()
-            }
-        }
-        Value::Unit => "{}".to_string(),
-        Value::Record(fields) => {
-            let inner: Vec<String> = fields
-                .iter()
-                .map(|f| format!("{}: {}", f.name, format_value_field(f.value)))
-                .collect();
-            format!("{{{}}}", inner.join(", "))
-        }
-        Value::Relation(rows) => {
-            let inner: Vec<String> = rows.iter().map(|r| format_value(*r)).collect();
-            format!("[{}]", inner.join(", "))
-        }
-        Value::Constructor(tag, payload) => {
-            let p = format_value_field(*payload);
-            if p == "{}" {
-                format!("{} {{}}", tag)
-            } else {
-                format!("{} {}", tag, p)
-            }
-        }
-        Value::Function(f) => f.source.to_string(),
-        Value::IO(_, _) => "<<IO>>".to_string(),
-        Value::Pair(_, _) => "<<Pair>>".to_string(),
-    }
+    format_value_iter(v, false)
 }
 
 /// Like `format_value` but escapes `"` and `\` in `Text` values so that a
@@ -7529,32 +7596,7 @@ fn format_value(v: *mut Value) -> String {
 /// `println` of a `Text` value uses `format_value` directly (no escaping) so
 /// `println (toJson ...)` prints the raw JSON.
 fn format_value_field(v: *mut Value) -> String {
-    if v.is_null() {
-        return "null".to_string();
-    }
-    match unsafe { as_ref(v) } {
-        Value::Text(s) => format!("\"{}\"", json_escape(s)),
-        Value::Record(fields) => {
-            let inner: Vec<String> = fields
-                .iter()
-                .map(|f| format!("{}: {}", f.name, format_value_field(f.value)))
-                .collect();
-            format!("{{{}}}", inner.join(", "))
-        }
-        Value::Relation(rows) => {
-            let inner: Vec<String> = rows.iter().map(|r| format_value_field(*r)).collect();
-            format!("[{}]", inner.join(", "))
-        }
-        Value::Constructor(tag, payload) => {
-            let p = format_value_field(*payload);
-            if p == "{}" {
-                format!("{} {{}}", tag)
-            } else {
-                format!("{} {}", tag, p)
-            }
-        }
-        _ => format_value(v),
-    }
+    format_value_iter(v, true)
 }
 
 #[unsafe(no_mangle)]

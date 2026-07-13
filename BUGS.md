@@ -264,19 +264,19 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 
 ### Stratification / schema resolution / lockfile
 
-- [ ] **B29. Self-recursive view escapes stratification and panics at runtime** — `crates/knot-compiler/src/stratify.rs:588`
+- [x] **B29. Self-recursive view escapes stratification and panics at runtime** — `crates/knot-compiler/src/stratify.rs:588`
   A 1-node positive self-loop view (`*v = do { r <- *v; … }`) is excluded by
   `scc.len() >= 2 && !scc_has_negative` and isn't negative, yet only Derived has fixpoint codegen;
   `analyze_view` records the view as its own base source → runtime "no such table `_knot_v`"
   instead of a compile error (2-node view cycles are caught).
   **Confidence: medium.**
 
-- [ ] **B30. Non-monotone recursion through aggregates passes stratification** — `crates/knot-compiler/src/stratify.rs:92`
+- [x] **B30. Non-monotone recursion through aggregates passes stratification** — `crates/knot-compiler/src/stratify.rs:92`
   Only `diff` creates negative edges; `where count self == 0` compiles to a fixpoint that
   oscillates and panics "did not converge after 10000 iterations".
   **Confidence: medium.**
 
-- [ ] **B31. Negation laundered through a user wrapper defeats the polarity check** — `crates/knot-compiler/src/stratify.rs:131`
+- [x] **B31. Negation laundered through a user wrapper defeats the polarity check** — `crates/knot-compiler/src/stratify.rs:131`
   `minus = \a b -> diff a b`: `collect_edges` never expands function bodies (unlike codegen's
   `beta_reduce`), so `self` is collected positive → unstratifiable program compiles, panics after
   10000 iterations. Adjacent laundering forms (let-aliases, partial application, pipes) were

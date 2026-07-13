@@ -514,7 +514,7 @@ replace/measure that widened span assuming it excludes parens:
   `(if c then a else b) * 2` → `if not (c) then b else a * 2`.
   **Confidence: high.**
 
-- [ ] **B67. "Extract to function" call site never parenthesized** — `crates/knot-lsp/src/code_action.rs:719`
+- [x] **B67. "Extract to function" call site never parenthesized** — `crates/knot-lsp/src/code_action.rs:719`
   `show (x + 2)` → `show extracted_fn x` parses as `(show extracted_fn) x`.
   **Confidence: high.**
 

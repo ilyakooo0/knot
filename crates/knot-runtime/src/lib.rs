@@ -7595,6 +7595,7 @@ fn format_value(v: *mut Value) -> String {
 /// `{name: "a\"b"}` instead of the confusing `{name: "a"b"}`). Top-level
 /// `println` of a `Text` value uses `format_value` directly (no escaping) so
 /// `println (toJson ...)` prints the raw JSON.
+#[allow(dead_code)]
 fn format_value_field(v: *mut Value) -> String {
     format_value_iter(v, true)
 }

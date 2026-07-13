@@ -163,7 +163,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   "`race` cannot be used inside atomic" error on pure code.
   **Confidence: high.**
 
-- [ ] **B17. Closed-row callee absorbs a callback's relation effects without validating them** — `crates/knot-compiler/src/effects.rs:768`, `effects.rs:823`
+- [x] **B17. Closed-row callee absorbs a callback's relation effects without validating them** — `crates/knot-compiler/src/effects.rs:768`, `effects.rs:823`
   A `fixed_row` callee swallows its callback argument's reads/writes.
   *Scenario:* `leak = runCb (\n -> *secrets)` infers `{}`; the dishonest annotation
   `leak : IO {} [Item]` passes and the honest one warns "declared effects are not used".

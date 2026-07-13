@@ -149,7 +149,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   The direct `Con("Color")` form is correctly rejected.
   **Confidence: high.**
 
-- [ ] **B15. IO inside `atomic` escapes the effect gate via a bare builtin reference in a record field** — `crates/knot-compiler/src/effects.rs:1406` (`reachable_io_lambda_from`)
+- [x] **B15. IO inside `atomic` escapes the effect gate via a bare builtin reference in a record field** — `crates/knot-compiler/src/effects.rs:1406` (`reachable_io_lambda_from`)
   The opaque-callee backstop only detects IO inside `Lambda` nodes; a bare builtin reference is
   pure in the Var arm, and infer's `Atomic` arm never unifies the body's effect row with empty.
   *Scenario:* `r = {fn: println}; atomic (do { rows <- *items; _ <- r.fn "boom"; yield rows })`
@@ -289,7 +289,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   wrong table shape ships.
   **Confidence: high.**
 
-- [ ] **B33. Lockfile classifies the first nested-relation field as Safe, but the runtime refuses it** — `crates/knot-compiler/src/lockfile.rs:199` + `crates/knot-runtime/src/lib.rs:11416`
+- [x] **B33. Lockfile classifies the first nested-relation field as Safe, but the runtime refuses it** — `crates/knot-compiler/src/lockfile.rs:199` + `crates/knot-runtime/src/lib.rs:11416`
   Adding the first nested field needs an `_id INTEGER PRIMARY KEY` on the parent, which
   `ALTER TABLE` can't add → compile succeeds, program panics at startup; the lockfile was already
   rewritten, so a later compile with a migrate block sees `Identical` and skips chain validation.

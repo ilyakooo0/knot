@@ -174,7 +174,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   effects; r/w under-reporting has no backstop.
   **Confidence: medium.**
 
-- [ ] **B19. Refinement validation bypassed by `migrate … using`** — `crates/knot-compiler/src/codegen.rs:3835`
+- [x] **B19. Refinement validation bypassed by `migrate … using`** — `crates/knot-compiler/src/codegen.rs:3835`
   Every `set`/`replace`/view/scalar write path calls `emit_refinement_checks*` first; the
   `Migrate` arm calls `knot_source_migrate` with no check, and the runtime has no per-source
   refinement registry.

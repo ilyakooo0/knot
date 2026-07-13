@@ -541,7 +541,7 @@ replace/measure that widened span assuming it excludes parens:
   warning.
   **Confidence: medium.**
 
-- [ ] **B72. Extract actions accept selections that aren't expression nodes** — `crates/knot-lsp/src/code_action.rs:589`
+- [x] **B72. Extract actions accept selections that aren't expression nodes** — `crates/knot-lsp/src/code_action.rs:589`
   Selecting `a + b` inside `2 * a + b` extracts `2 * (a + b)` — different value, no diagnostic.
   **Confidence: medium.**
 

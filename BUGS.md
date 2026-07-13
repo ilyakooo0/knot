@@ -45,7 +45,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   Ed25519 closure's source text.
   **Confidence: high** (confirmed by direct read).
 
-- [ ] **B4. Bare references to user declarations named like zero-arg builtins are hijacked** — `crates/knot-compiler/src/codegen.rs:4036`
+- [x] **B4. Bare references to user declarations named like zero-arg builtins are hijacked** — `crates/knot-compiler/src/codegen.rs:4036`
   The bare-Var arm checks the zero-arg builtin special cases (`now`, `randomFloat`, `randomUuid`,
   `generateKeyPair`, `generateSigningKeyPair`, `readLine`, `retry`) **before** the `user_fns`
   lookup; these names are not in `stdlib_names`, so the user's declaration is compiled but never
@@ -54,7 +54,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   `knot_value_add(Value::IO, Int)` → runtime panic.
   **Confidence: medium.**
 
-- [ ] **B5. `let x = atomic (...)` executes the transaction at let-binding time** — `crates/knot-compiler/src/codegen.rs:8395` (Let arm) + `codegen.rs:4787` (Atomic arm)
+- [x] **B5. `let x = atomic (...)` executes the transaction at let-binding time** — `crates/knot-compiler/src/codegen.rs:8395` (Let arm) + `codegen.rs:4787` (Atomic arm)
   The IO-do Let arm's deferral assumes `compile_expr` yields a deferred IO for effectful
   expressions, but the `Atomic` arm is inherently eager (emits the savepoint/retry loop inline) —
   contradicting the arm's own comment at codegen.rs:8140 ("Writes and atomic blocks must not run
@@ -63,7 +63,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   statement re-runs `knot_io_run` on the already-computed result — a no-op.
   **Confidence: high.**
 
-- [ ] **B6. `set *rel = union *rel <do-block>` passes a deferred IO thunk to `knot_source_append`** — `crates/knot-compiler/src/codegen.rs:4540`
+- [x] **B6. `set *rel = union *rel <do-block>` passes a deferred IO thunk to `knot_source_append`** — `crates/knot-compiler/src/codegen.rs:4540`
   The append fast path compiles the "new rows" sub-expression with plain `compile_expr`; a
   do-block binding from a source is classified IO (`is_io_do_block`), so `compile_io_do` emits a
   `Value::IO` thunk which the runtime rejects: panic `"source_append expects a Relation, got …"`.

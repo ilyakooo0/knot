@@ -436,7 +436,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   desugars into a continuation returning `Text` instead of `IO Text` → spurious type error.
   **Confidence: medium.**
 
-- [ ] **B55. sql_lint doesn't mirror codegen's beta-reduction → false "will be evaluated at runtime" lints** — `crates/knot-compiler/src/sql_lint.rs:1237`
+- [x] **B55. sql_lint doesn't mirror codegen's beta-reduction → false "will be evaluated at runtime" lints** — `crates/knot-compiler/src/sql_lint.rs:1237`
   `*items |> filter (\i -> isGood i)` compiles to SQL WHERE, but the lint claims otherwise; the
   file's own tests codify the wrong claims (`lint_on_pipe_filter_complex`,
   `lint_on_complex_min_lambda`).

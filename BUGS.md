@@ -105,7 +105,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 
 ## Tier 2 — Type-system soundness
 
-- [ ] **B10. IO effect-widening rebinds an already-bound variable, laundering effects** — `crates/knot-compiler/src/infer.rs:1863` (`unify_dir` widening arm)
+- [x] **B10. IO effect-widening rebinds an already-bound variable, laundering effects** — `crates/knot-compiler/src/infer.rs:1863` (`unify_dir` widening arm)
   The widening path fires when either side was *syntactically* a `Ty::Var` even if already bound
   to a concrete closed `IO`, then overwrites the chain-end binding with the widened effect set.
   Obligations discharged against the old narrower binding are never revisited.

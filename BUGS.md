@@ -530,7 +530,7 @@ replace/measure that widened span assuming it excludes parens:
   misses `SubsetConstraint` relation names). Applying the action breaks compilation.
   **Confidence: high.**
 
-- [ ] **B70. Rename mid-debounce produces a partial workspace edit** — `crates/knot-lsp/src/rename.rs:633`
+- [x] **B70. Rename mid-debounce produces a partial workspace edit** — `crates/knot-lsp/src/rename.rs:633`
   A stale (pending-analysis) non-initiating open document is silently skipped and also marked
   `scanned` so the disk phase skips it too → importers renamed, owner declaration untouched.
   Should abort or retry instead.

@@ -501,7 +501,7 @@ replace/measure that widened span assuming it excludes parens:
   `g (f x)` → replaces `(f x)` with `x |> f` → `g x |> f` parses as `f (g x)`.
   **Confidence: high.**
 
-- [ ] **B64. "Flip operands" re-associates same-precedence neighbors and drops enclosing parens** — `crates/knot-lsp/src/code_action.rs:3245`
+- [x] **B64. "Flip operands" re-associates same-precedence neighbors and drops enclosing parens** — `crates/knot-lsp/src/code_action.rs:3245`
   `a / b * c` → `c * a / b` (0 vs 2 for 1,2,4); `f (a == b)` → `f b == a`.
   **Confidence: high.**
 

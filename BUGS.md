@@ -312,7 +312,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 
 ### Routes / fetch / serve
 
-- [ ] **B37. `fetch` with a bare nullary route constructor is spuriously rejected** — `crates/knot-compiler/src/infer.rs:5272` (`try_infer_fetch`)
+- [x] **B37. `fetch` with a bare nullary route constructor is spuriously rejected** — `crates/knot-compiler/src/infer.rs:5272` (`try_infer_fetch`)
   `record_arg` falls back to the `Constructor` node itself; `infer_expr(Constructor)` returns the
   ADT type, unified against the empty expected record → "expected {}, found API".
   `fetch_ctor_name` (infer.rs:10094) and `compile_fetch` (codegen.rs:6784) both support the form;
@@ -551,7 +551,7 @@ replace/measure that widened span assuming it excludes parens:
   tokens, so behavior flips on file layout.
   **Confidence: high.**
 
-- [ ] **B74. Field-refinement hover attributes fields to whichever decl first binds the variable name module-wide** — `crates/knot-lsp/src/hover.rs:352` (mechanism `shared.rs:1232`)
+- [x] **B74. Field-refinement hover attributes fields to whichever decl first binds the variable name module-wide** — `crates/knot-lsp/src/hover.rs:352` (mechanism `shared.rs:1232`)
   `resolve_var_to_source` walks decls in order, ignoring the cursor's decl — with two do-blocks
   both binding `p`, hover shows the other relation's refinement (or omits the real one).
   **Confidence: medium.**

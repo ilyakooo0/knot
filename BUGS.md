@@ -187,7 +187,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   with no violation.
   **Confidence: high** on path, **medium** on intent.
 
-- [ ] **B21. Annotation aliases with free type variables are order-dependent** — `crates/knot-compiler/src/infer.rs:3641` + `infer.rs:6970`
+- [x] **B21. Annotation aliases with free type variables are order-dependent** — `crates/knot-compiler/src/infer.rs:3641` + `infer.rs:6970`
   Fresh vars minted for alias-body free vars are not added to `annotation_vars`, so the
   pre-registered scheme leaves them unquantified and shared across call sites until the decl is
   re-generalized (never, for constrained functions).

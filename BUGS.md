@@ -328,7 +328,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   same-name entry keeps the earlier route's headers (chimera `{body, headers}` type).
   **Confidence: medium-high.**
 
-- [ ] **B39. `monad_info` keyed by raw byte spans collides with prelude spans** — `crates/knot-compiler/src/infer.rs:4138`, `infer.rs:9829` + `crates/knot-compiler/src/base.rs:202`
+- [x] **B39. `monad_info` keyed by raw byte spans collides with prelude spans** — `crates/knot-compiler/src/infer.rs:4138`, `infer.rs:9829` + `crates/knot-compiler/src/base.rs:202`
   Expression-position `yield` uses its real span; the prelude (`when`/`unless`/`forEach`) contains
   such nodes at offsets that overlap user files. Last-write-wins on `monad_info.insert` → a user
   `yield` at the exact same byte offset re-dispatches the prelude's `yield` through the wrong

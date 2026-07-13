@@ -536,7 +536,7 @@ replace/measure that widened span assuming it excludes parens:
   Should abort or retry instead.
   **Confidence: medium.**
 
-- [ ] **B71. Rename has no capture/conflict detection** — `crates/knot-lsp/src/rename.rs:138`
+- [x] **B71. Rename has no capture/conflict detection** — `crates/knot-lsp/src/rename.rs:138`
   `f = \x -> \y -> x + y` rename `x`→`y` yields `\y -> \y -> y + y` — silently wrong code, no
   warning.
   **Confidence: medium.**

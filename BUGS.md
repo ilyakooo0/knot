@@ -497,7 +497,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 The parser folds parentheses into the wrapped node's span (`parser.rs:2934`); these consumers
 replace/measure that widened span assuming it excludes parens:
 
-- [ ] **B63. "Convert to pipe" reverses application order** — `crates/knot-lsp/src/code_action.rs:3306`
+- [x] **B63. "Convert to pipe" reverses application order** — `crates/knot-lsp/src/code_action.rs:3306`
   `g (f x)` → replaces `(f x)` with `x |> f` → `g x |> f` parses as `f (g x)`.
   **Confidence: high.**
 

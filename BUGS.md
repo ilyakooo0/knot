@@ -122,7 +122,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   panic.
   **Confidence: high.**
 
-- [ ] **B12. A trait bound on an annotated function disables unit-of-measure soundness** — `crates/knot-compiler/src/infer.rs:8574`
+- [x] **B12. A trait bound on an annotated function disables unit-of-measure soundness** — `crates/knot-compiler/src/infer.rs:8574`
   In the `has_constraints` branch of `infer_declarations`, the scheme is rebuilt from the
   annotation with fresh vars, but captured `DeferredUnitBinop`s reference the body-check skolems,
   which never occur in the rebuilt type. On instantiation the binop floats free and end-of-
@@ -283,7 +283,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
   hardened.
   **Confidence: medium.**
 
-- [ ] **B32. Type alias applying a later-declared parameterized data type resolves to `unknown`** — `crates/knot-compiler/src/types.rs:875` (fallthrough at :981)
+- [x] **B32. Type alias applying a later-declared parameterized data type resolves to `unknown`** — `crates/knot-compiler/src/types.rs:875` (fallthrough at :981)
   `type Wrapped = [Box Int]` before `data Box a = …` silently yields a `_value:text` schema
   (re-resolve can't repair; application structure lost); inference accepts the program, so the
   wrong table shape ships.

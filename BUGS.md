@@ -556,7 +556,7 @@ replace/measure that widened span assuming it excludes parens:
   both binding `p`, hover shows the other relation's refinement (or omits the real one).
   **Confidence: medium.**
 
-- [ ] **B75. Field-token hover suppression blind in trait default bodies, `rateLimit` exprs, `migrate using` exprs** — `crates/knot-lsp/src/hover.rs:76` (mechanism `shared.rs:1203`)
+- [x] **B75. Field-token hover suppression blind in trait default bodies, `rateLimit` exprs, `migrate using` exprs** — `crates/knot-lsp/src/hover.rs:76` (mechanism `shared.rs:1203`)
   `find_field_access_at_offset` never visits those bodies, so hovering `r.count` there leaks a
   same-named global's signature/doc.
   **Confidence: medium-high.**

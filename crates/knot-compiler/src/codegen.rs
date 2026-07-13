@@ -8526,6 +8526,37 @@ impl Codegen {
             })
     }
 
+    /// Does a `where` in these statements filter on `name`'s FIELDS?
+    ///
+    /// Only a per-row reading gives such a `where` any meaning: as a guard over
+    /// the whole relation, `u.age` is the FIRST row's age (field access on a
+    /// relation delegates to its first element), so the guard either waves every
+    /// row through or drops the block entirely. Seeing one therefore settles
+    /// `x <- *rel` as a comprehension bind even when the name is also used as a
+    /// whole value — `yield u` yields the ROW.
+    ///
+    /// A `where` that uses `name` as a value (`where count people > 3`) is a
+    /// real guard on the relation and is deliberately not counted. The scan
+    /// stops at a statement that rebinds `name`, past which the uses belong to
+    /// a different binding.
+    fn where_filters_row_fields(stmts: &[ast::Stmt], name: &str) -> bool {
+        for stmt in stmts {
+            match &stmt.node {
+                ast::StmtKind::Where { cond } => {
+                    if expr_refs_var(cond, name) && !expr_uses_var_as_value(cond, name) {
+                        return true;
+                    }
+                }
+                ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. }
+                    if pat_bound_names(pat).iter().any(|n| n == name) => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Like `do_block_is_comprehension`, but also admits `groupBy`
     /// statements: a do-block ending in `yield` whose other statements are
     /// all Bind/Where/Let/GroupBy compiles through the relational loop
@@ -8830,9 +8861,30 @@ impl Codegen {
                     //                  yield (filter (\p -> p.age > 65) people) }`
                     // passes the name on as the whole relation, while the
                     // comprehension above only ever reads fields off it. Iterate
-                    // exactly when every use is a field access on the name —
-                    // referenced, but never as a value — which is meaningless
-                    // under whole-relation semantics anyway ("first row's age").
+                    // when every use is a field access on the name — referenced,
+                    // but never as a value — which is meaningless under
+                    // whole-relation semantics anyway ("first row's age").
+                    //
+                    // That rule alone misses the most ordinary comprehension of
+                    // all, `yield x` (yield the ROW):
+                    //
+                    //   &adults = do { u <- *users; where u.age >= 25; yield u }
+                    //
+                    // `yield u` uses the name as a value, so the block fell back
+                    // to whole-relation semantics and the `where` became a guard
+                    // on the FIRST row: `u.age >= 25` was true for row 1, the
+                    // guard passed, and `yield u` handed back the WHOLE relation
+                    // — every user, filter silently ignored. Flip the predicate
+                    // to one row 1 fails and the guard drops the whole block to
+                    // `{}`, so the caller's `count` panicked on a non-relation.
+                    //
+                    // A `where` that reads FIELDS off the bound name is itself
+                    // the proof that the bind iterates: as a whole-relation guard
+                    // it can only mean "the first row's field", which is never
+                    // what a filter means. So it settles the reading regardless
+                    // of how `yield` uses the name. A `where` over the name as a
+                    // VALUE (`where count people > 3`) is a genuine guard on the
+                    // relation and keeps the whole-relation reading.
                     let comprehension_tail = rhs_is_io_relation_source
                         && Self::do_block_is_comprehension(&stmts[stmt_idx..])
                         && match &pat.node {
@@ -8841,8 +8893,12 @@ impl Codegen {
                                     ast::ExprKind::Do(stmts[stmt_idx + 1..].to_vec()),
                                     stmt.span,
                                 );
-                                expr_refs_var(&tail, name)
-                                    && !expr_uses_var_as_value(&tail, name)
+                                (expr_refs_var(&tail, name)
+                                    && !expr_uses_var_as_value(&tail, name))
+                                    || Self::where_filters_row_fields(
+                                        &stmts[stmt_idx + 1..],
+                                        name,
+                                    )
                             }
                             _ => false,
                         };

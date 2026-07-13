@@ -682,3 +682,84 @@ main = do
         "both derived impls should work, got: {stdout}",
     );
 }
+
+// ── 13. `where` over a source relation, yielding the whole row ────
+
+/// `x <- *rel` reads either as a comprehension bind (iterate ROWS) or as a
+/// whole-relation bind, and codegen picks between them from how the block uses
+/// the name. `yield u` — the most ordinary comprehension there is — looks like
+/// a whole-relation use, so the block took the guard reading: `where u.age >=
+/// 25` asked the FIRST row's age, waved every row through, and `yield u` handed
+/// back the entire relation with the filter silently dropped.
+const ADULTS: &str = "type User = {name: Text, age: Int}\n\
+                      *users : [User]\n\
+                      &adults = do\n\
+                      \x20 u <- *users\n\
+                      \x20 where u.age >= 25\n\
+                      \x20 yield u\n";
+
+#[test]
+fn a_where_filters_the_rows_of_a_source_relation() {
+    let src = format!(
+        "{ADULTS}\
+         main = do\n\
+         \x20 replace *users = [{{name: \"Alice\", age: 30}}, {{name: \"Bob\", age: 20}}, {{name: \"Carol\", age: 40}}]\n\
+         \x20 a <- &adults\n\
+         \x20 forEach a (\\u -> println u.name)\n\
+         \x20 yield {{}}\n"
+    );
+    let (stdout, stderr, ok) = compile_and_run("where_filters_source", &src, &[]);
+    assert!(ok, "the program must run: {stderr}");
+    assert!(stdout.contains("Alice"), "a row passing the where must be yielded: {stdout:?}");
+    assert!(stdout.contains("Carol"), "a row passing the where must be yielded: {stdout:?}");
+    assert!(
+        !stdout.contains("Bob"),
+        "a row failing the where must be filtered out, got: {stdout:?}",
+    );
+}
+
+/// The same misreading, with a predicate the first row fails: the guard was
+/// false, so the whole block collapsed to `{}` and the caller's `count` met a
+/// Unit where it expected a relation ("expected Relation in len, got Unit").
+/// Filtering every row out must give an empty relation, not a non-relation.
+#[test]
+fn a_where_that_no_row_satisfies_yields_an_empty_relation() {
+    let src = "type User = {name: Text, age: Int}\n\
+               *users : [User]\n\
+               &adults = do\n\
+               \x20 u <- *users\n\
+               \x20 where u.age >= 99\n\
+               \x20 yield u\n\
+               main = do\n\
+               \x20 replace *users = [{name: \"Alice\", age: 30}]\n\
+               \x20 a <- &adults\n\
+               \x20 println (\"count: \" ++ show (count a))\n\
+               \x20 yield {}\n";
+    let (stdout, stderr, ok) = compile_and_run("where_matches_nothing", src, &[]);
+    assert!(ok, "filtering every row out must not panic: {stderr}");
+    assert!(stdout.contains("count: 0"), "the result must be empty, got: {stdout:?}");
+}
+
+/// The other reading of `x <- *rel` — bind the WHOLE relation and pass it on as
+/// a value (DESIGN.md's `&seniors`) — must survive the fix. Here a `where` over
+/// the name *as a value* is a genuine guard on the relation, not a row filter.
+#[test]
+fn a_where_over_the_relation_as_a_value_stays_a_guard() {
+    let src = "type Person = {name: Text, age: Int}\n\
+               *people : [Person]\n\
+               &seniorsIfCrowd = do\n\
+               \x20 people <- *people\n\
+               \x20 where count people > 1\n\
+               \x20 yield (filter (\\p -> p.age > 65) people)\n\
+               main = do\n\
+               \x20 replace *people = [{name: \"Alice\", age: 70}, {name: \"Bob\", age: 20}]\n\
+               \x20 s <- &seniorsIfCrowd\n\
+               \x20 forEach s (\\p -> println p.name)\n\
+               \x20 yield {}\n";
+    let (stdout, stderr, ok) = compile_and_run("where_as_relation_guard", src, &[]);
+    assert!(ok, "the program must run: {stderr}");
+    assert!(
+        stdout.contains("Alice") && !stdout.contains("Bob"),
+        "the whole relation must reach `filter`, which keeps only Alice, got: {stdout:?}",
+    );
+}

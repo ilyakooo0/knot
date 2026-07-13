@@ -394,7 +394,7 @@ Cross-corroborated findings (discovered independently by two reviewers) are mark
 
 ### Parser / formatter
 
-- [ ] **B48. `Server Api {console}` type annotation is unwritable** — `crates/knot/src/parser.rs:4386`
+- [x] **B48. `Server Api {console}` type annotation is unwritable** — `crates/knot/src/parser.rs:4386`
   A trailing `{console}` type atom always parses as an `Effectful` prefix requiring a body type →
   "expected type". The type the checker itself displays for `serve` values cannot be written back;
   only `Server Api _` parses.

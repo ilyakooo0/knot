@@ -620,6 +620,18 @@ pub(crate) fn find_enclosing_application(
                     }
                 }
             }
+            // `migrate … using <expr>` and route `rateLimit` expressions
+            // can contain applications that need signature help.
+            DeclKind::Migrate { using_fn, .. } => {
+                find_app_in_expr(using_fn, source, offset, &mut best);
+            }
+            DeclKind::Route { entries, .. } => {
+                for entry in entries {
+                    if let Some(rl) = &entry.rate_limit {
+                        find_app_in_expr(rl, source, offset, &mut best);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -776,6 +788,24 @@ pub(crate) fn find_enclosing_atomic_expr(
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
                         walk(body, source, offset, &mut best, 0);
+                    }
+                }
+            }
+            // Trait default method bodies can contain atomic expressions.
+            DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method { default_body: Some(body), .. } = item {
+                        walk(body, source, offset, &mut best, 0);
+                    }
+                }
+            }
+            // `migrate … using <expr>` — the using function is user code.
+            DeclKind::Migrate { using_fn, .. } => walk(using_fn, source, offset, &mut best, 0),
+            // Route `rateLimit` expressions are user-edited code.
+            DeclKind::Route { entries, .. } => {
+                for entry in entries {
+                    if let Some(rl) = &entry.rate_limit {
+                        walk(rl, source, offset, &mut best, 0);
                     }
                 }
             }

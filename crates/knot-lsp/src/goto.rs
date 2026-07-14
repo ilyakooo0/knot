@@ -298,6 +298,7 @@ pub(crate) fn handle_goto_implementation(
         let open_paths: HashSet<PathBuf> = state
             .documents
             .keys()
+            .chain(state.pending_sources.keys())
             .filter_map(uri_to_path)
             .filter_map(|p| p.canonicalize().ok())
             .collect();
@@ -381,6 +382,7 @@ pub(crate) fn handle_goto_implementation(
         let open_paths: HashSet<PathBuf> = state
             .documents
             .keys()
+            .chain(state.pending_sources.keys())
             .filter_map(uri_to_path)
             .filter_map(|p| p.canonicalize().ok())
             .collect();

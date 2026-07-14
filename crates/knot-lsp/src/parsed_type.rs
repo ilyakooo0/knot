@@ -257,7 +257,12 @@ impl<'a> Parser<'a> {
             let i = self.pos + offset;
             match *b {
                 b'(' | b'[' | b'{' | b'<' => depth += 1,
-                b')' | b']' | b'}' | b'>' => depth -= 1,
+                b')' | b']' | b'}' => depth -= 1,
+                // Don't decrement depth for `>` from `->` (function arrow).
+                // The `>` from a type-application `>` (e.g. `Map<k, v>`)
+                // does close a `<`, but `->`'s `>` must be skipped.
+                b'>' if i > 0 && self.src.as_bytes()[i - 1] == b'-' => {}
+                b'>' => depth -= 1,
                 b'=' if depth == 0
                     && i + 1 < self.src.len()
                     && self.src.as_bytes()[i + 1] == b'>' =>

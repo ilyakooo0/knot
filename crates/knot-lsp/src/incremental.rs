@@ -472,6 +472,13 @@ fn collect_decl_deps(decl: &ast::Decl) -> HashSet<String> {
         DeclKind::View { ty, body, .. } | DeclKind::Derived { ty, body, .. } => {
             if let Some(ts) = ty {
                 collect_type_names(&ts.ty, &mut deps);
+                // Collect constraint arg types — matches the Fun arm so
+                // changes to types used in view/derived constraints propagate.
+                for c in &ts.constraints {
+                    for arg in &c.args {
+                        collect_type_names(arg, &mut deps);
+                    }
+                }
             }
             collect_expr_names(body, &mut deps);
         }
@@ -488,21 +495,48 @@ fn collect_decl_deps(decl: &ast::Decl) -> HashSet<String> {
                 }
             }
         }
-        DeclKind::Impl { items, .. } => {
+        DeclKind::Impl { args, constraints, items, .. } => {
+            // Collect type names from impl type arguments and constraints
+            // so changes to those types propagate through the dirty closure.
+            for arg in args {
+                collect_type_names(arg, &mut deps);
+            }
+            for c in constraints {
+                for arg in &c.args {
+                    collect_type_names(arg, &mut deps);
+                }
+            }
             for item in items {
-                if let ast::ImplItem::Method { body, .. } = item {
-                    collect_expr_names(body, &mut deps);
+                match item {
+                    ast::ImplItem::Method { body, .. } => collect_expr_names(body, &mut deps),
+                    ast::ImplItem::AssociatedType { args, ty, .. } => {
+                        for arg in args {
+                            collect_type_names(arg, &mut deps);
+                        }
+                        collect_type_names(ty, &mut deps);
+                    }
                 }
             }
         }
-        DeclKind::Trait { items, .. } => {
+        DeclKind::Trait { supertraits, items, .. } => {
+            // Collect type names from supertrait constraints and method
+            // signatures so changes propagate.
+            for st in supertraits {
+                for arg in &st.args {
+                    collect_type_names(arg, &mut deps);
+                }
+            }
             for item in items {
-                if let ast::TraitItem::Method {
-                    default_body: Some(body),
-                    ..
-                } = item
-                {
-                    collect_expr_names(body, &mut deps);
+                if let ast::TraitItem::Method { ty, default_body, .. } = item {
+                    collect_type_names(&ty.ty, &mut deps);
+                    for c in &ty.constraints {
+                        for arg in &c.args {
+                            collect_type_names(arg, &mut deps);
+                        }
+                    }
+                    if let Some(body) = default_body {
+                        collect_expr_names(body, &mut deps);
+                    }
                 }
             }
         }

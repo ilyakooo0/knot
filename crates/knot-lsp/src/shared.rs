@@ -597,7 +597,7 @@ pub(crate) fn find_enclosing_application(
     let mut best: Option<(String, usize, usize)> = None; // (name, param_idx, span_size)
 
     for decl in &module.decls {
-        if decl.span.start > offset || offset > decl.span.end {
+        if decl.span.start > offset || offset >= decl.span.end {
             continue;
         }
         match &decl.node {
@@ -661,7 +661,7 @@ fn find_app_in_expr_at(
     if depth > MAX_WALK_DEPTH {
         return;
     }
-    if expr.span.start > offset || offset > expr.span.end {
+    if expr.span.start > offset || offset >= expr.span.end {
         return;
     }
 
@@ -750,7 +750,7 @@ pub(crate) fn find_enclosing_atomic_expr(
         if depth > MAX_WALK_DEPTH {
             return;
         }
-        if expr.span.start > offset || offset > expr.span.end {
+        if expr.span.start > offset || offset >= expr.span.end {
             return;
         }
         if let ast::ExprKind::Atomic(inner) = &expr.node {
@@ -777,7 +777,7 @@ pub(crate) fn find_enclosing_atomic_expr(
 
     let mut best: Option<(Span, String)> = None;
     for decl in &module.decls {
-        if decl.span.start > offset || offset > decl.span.end {
+        if decl.span.start > offset || offset >= decl.span.end {
             continue;
         }
         match &decl.node {

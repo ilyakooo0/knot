@@ -40,7 +40,7 @@ pub(crate) fn handle_linked_editing_range(
 
     // Find the enclosing declaration
     for decl in &doc.module.decls {
-        if decl.span.start > offset || offset > decl.span.end {
+        if decl.span.start > offset || offset >= decl.span.end {
             continue;
         }
 

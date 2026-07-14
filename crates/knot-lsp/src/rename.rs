@@ -1982,7 +1982,7 @@ fn field_position_at(
 ) -> Option<(String, Span)> {
     let mut found: Option<(String, Span)> = None;
     for decl in &module.decls {
-        if decl.span.start > offset || offset > decl.span.end {
+        if decl.span.start > offset || offset >= decl.span.end {
             continue;
         }
         field_sites_in_decl(decl, source, &mut |name, span| {

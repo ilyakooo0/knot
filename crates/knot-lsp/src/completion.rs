@@ -1097,7 +1097,7 @@ fn find_enclosing_do_span(module: &Module, offset: usize) -> Option<Span> {
     }
     let mut best: Option<Span> = None;
     for decl in &module.decls {
-        if decl.span.start > offset || offset > decl.span.end {
+        if decl.span.start > offset || offset >= decl.span.end {
             continue;
         }
         match &decl.node {

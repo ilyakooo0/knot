@@ -2104,14 +2104,25 @@ fn import_is_used(
             return true;
         }
     }
-    // Also check direct names from import_defs (in case origins aren't tracked)
+    // Also check import_defs directly — import_origins is last-write-wins
+    // (HashMap<String, String>), so when the same name is imported from two
+    // different modules, only the last import's path survives. If a name is
+    // in import_defs (meaning it was imported from SOME file) and is
+    // referenced, consider this import used if its path matches the stored
+    // origin OR if the name has no other origin that would match.
     for (name, (path, _)) in &doc.import_defs {
-        // Reconstruct the "origin" from path: this is best-effort, prefer origins
-        let origin = doc.import_origins.get(name);
-        if origin == Some(&imp.path) && referenced.contains(name) {
+        if !referenced.contains(name) {
+            continue;
+        }
+        // Direct path match (canonical path vs relative — may not match,
+        // but try as a fallback).
+        if path == &std::path::PathBuf::from(&imp.path) {
             return true;
         }
-        let _ = path;
+        // If import_origins maps this name to imp.path, it's used.
+        if doc.import_origins.get(name) == Some(&imp.path) {
+            return true;
+        }
     }
     false
 }
@@ -2825,8 +2836,7 @@ fn find_inline_actions(
                 // Check if cursor is on the let binding
                 if stmt.span.start <= cursor_offset && cursor_offset <= stmt.span.end
                     && let ast::PatKind::Var(var_name) = &pat.node {
-                        let value_text = &doc.source
-                            [value_expr.span.start..value_expr.span.end.min(doc.source.len())];
+                        let value_text = safe_slice(&doc.source, value_expr.span);
 
                         // Count usages of this variable in subsequent statements
                         let use_count = doc
@@ -3291,7 +3301,7 @@ fn find_if_to_case_at(
         offset: usize,
         best: &mut Option<(Span, String)>,
     ) {
-        if expr.span.start > offset || offset > expr.span.end {
+        if expr.span.start > offset || offset >= expr.span.end {
             return;
         }
         if let ast::ExprKind::If {
@@ -3370,7 +3380,7 @@ fn find_flip_binary_at(
         offset: usize,
         best: &mut Option<(Span, String)>,
     ) {
-        if expr.span.start > offset || offset > expr.span.end {
+        if expr.span.start > offset || offset >= expr.span.end {
             return;
         }
         if let ast::ExprKind::BinOp { op, lhs, rhs } = &expr.node {
@@ -3469,7 +3479,7 @@ fn find_pipe_conversion_at(
         is_app_head: bool,
         needs_parens: bool,
     ) {
-        if expr.span.start > offset || offset > expr.span.end {
+        if expr.span.start > offset || offset >= expr.span.end {
             return;
         }
         if let ast::ExprKind::App { func, arg } = &expr.node {

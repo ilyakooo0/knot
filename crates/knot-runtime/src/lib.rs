@@ -6027,7 +6027,15 @@ pub extern "C-unwind" fn knot_relation_sort_by(
         })
         .collect();
     indexed.sort_by(|(_, a), (_, b)| compare_keys(db, *a, *b));
-    let sorted: Vec<*mut Value> = indexed.into_iter().map(|(row, _)| row).collect();
+
+    // Dedup consecutive equal elements (sortBy semantics — result is a set).
+    let mut sorted: Vec<*mut Value> = Vec::with_capacity(indexed.len());
+    for (i, (row, _)) in indexed.iter().enumerate() {
+        if i > 0 && compare_values(indexed[i - 1].0, *row) == std::cmp::Ordering::Equal {
+            continue; // skip duplicate
+        }
+        sorted.push(*row);
+    }
     alloc(Value::Relation(sorted))
 }
 
@@ -6373,8 +6381,29 @@ pub extern "C-unwind" fn knot_relation_group_by(
                 .map(|i| row.get(i).unwrap())
                 .collect();
 
+            /// Compare two group-key vectors treating NaN floats as equal
+            /// to each other (NaN != NaN under IEEE 754 / rusqlite PartialEq,
+            /// which would split NaN-keyed rows into separate groups).
+            fn keys_equal(a: &[rusqlite::types::Value], b: &[rusqlite::types::Value]) -> bool {
+                if a.len() != b.len() {
+                    return false;
+                }
+                a.iter().zip(b.iter()).all(|(x, y)| {
+                    match (x, y) {
+                        (rusqlite::types::Value::Real(fa), rusqlite::types::Value::Real(fb)) => {
+                            if fa.is_nan() && fb.is_nan() {
+                                true
+                            } else {
+                                x == y
+                            }
+                        }
+                        _ => x == y,
+                    }
+                })
+            }
+
             if let Some(ref prev) = prev_keys
-                && keys != *prev {
+                && !keys_equal(&keys, prev) {
                     groups.push(std::mem::take(&mut current_group));
                 }
 
@@ -7570,7 +7599,7 @@ fn format_value_iter(v: *mut Value, escape_text: bool) -> String {
                         out.push('"');
                     }
                     Value::Bool(b) => {
-                        out.push_str(if *b { "True {}" } else { "False {}" });
+                        out.push_str(if *b { "True" } else { "False" });
                     }
                     Value::Unit => out.push_str("{}"),
                     Value::Record(fields) => {
@@ -8571,7 +8600,22 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
         // worker's arena); copy it into this thread's arena and free the
         // Box tree — otherwise every race leaks its winner's result.
         let winner_box = raw_ptr as *mut u8 as *mut Value;
+
+        // Guard: if deep_clone_into_arena panics, we still need to free the
+        // Box-allocated tree to avoid a leak. The guard calls deep_drop_value
+        // on drop, and is disarmed once the clone succeeds.
+        struct BoxDropGuard(*mut Value);
+        impl Drop for BoxDropGuard {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe { deep_drop_value(self.0) };
+                }
+            }
+        }
+        let guard = BoxDropGuard(winner_box);
         let winner_val = deep_clone_into_arena(winner_box);
+        // Clone succeeded — disarm the guard and manually drop the Box tree.
+        drop(guard);
         unsafe { deep_drop_value(winner_box); }
         let field_name = if is_left { "error" } else { "value" };
         let ctor_name = if is_left { "Err" } else { "Ok" };
@@ -12855,7 +12899,11 @@ pub extern "C-unwind" fn knot_source_match(
             .conn
             .query_row(&sql, rusqlite::params![tag], |row| row.get(0))
             .unwrap();
-        let mut rows = Vec::with_capacity(count as usize);
+        // Clamp negative counts (shouldn't happen but defensive) and cap
+        // allocation to avoid pathological memory usage.
+        let count = count.max(0) as usize;
+        let count = count.min(usize::MAX / 16);
+        let mut rows = Vec::with_capacity(count);
         for _ in 0..count {
             rows.push(alloc(Value::Unit));
         }
@@ -15545,13 +15593,28 @@ pub extern "C-unwind" fn knot_atomic_commit(db: *mut c_void) {
             // Bump versions first (cheap atomic adds) so any thread reading
             // the counter after wake sees the new value, then wake watchers.
             // Iterate once via drain to avoid a second pass over keys.
+            //
+            // The savepoint was already RELEASEd above, so the data is
+            // committed. If wake_matching_watchers panics, we must not lose
+            // the wakeup — wrap each notification in catch_unwind so a
+            // panicking watcher doesn't prevent remaining watchers from
+            // being notified.
             for (table, event) in t.writes.drain() {
                 bump_table_version(&table);
                 bump_global_writes();
                 if !table_has_watchers(&table) {
                     continue;
                 }
-                wake_matching_watchers(&table, &event);
+                let table_clone = table.clone();
+                let event_clone = event.clone();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    wake_matching_watchers(&table_clone, &event_clone);
+                })).is_err() {
+                    eprintln!(
+                        "knot runtime: watcher notification panicked for table '{}', event {:?}",
+                        table, event
+                    );
+                }
             }
         });
     }
@@ -15620,16 +15683,20 @@ pub extern "C-unwind" fn knot_record_update_batch(
     };
 
     // Parse update fields from flat array
-    let updates: Vec<(&str, *mut Value)> = (0..count)
+    let mut updates: Vec<(String, *mut Value)> = (0..count)
         .map(|i| {
             let offset = i * 3;
             let key_ptr = unsafe { *data.add(offset) as *const u8 };
             let key_len = unsafe { *data.add(offset + 1) };
             let value = unsafe { *data.add(offset + 2) as *mut Value };
-            let name = unsafe { str_from_raw(key_ptr, key_len) };
+            let name = unsafe { str_from_raw(key_ptr, key_len) }.to_string();
             (name, value)
         })
         .collect();
+
+    // Defensive sort by field name — codegen is expected to pre-sort, but a
+    // bug there would silently produce wrong merge results. Sort here too.
+    updates.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     // Merge sorted base fields with sorted update fields
     let mut result = Vec::with_capacity(base_fields.len() + count);
@@ -15638,7 +15705,7 @@ pub extern "C-unwind" fn knot_record_update_batch(
 
     while base_idx < base_fields.len() && upd_idx < updates.len() {
         let base_name: &str = &base_fields[base_idx].name;
-        let upd_name = updates[upd_idx].0;
+        let upd_name = updates[upd_idx].0.as_str();
         match base_name.cmp(upd_name) {
             std::cmp::Ordering::Less => {
                 result.push(RecordField {
@@ -15657,7 +15724,7 @@ pub extern "C-unwind" fn knot_record_update_batch(
             }
             std::cmp::Ordering::Greater => {
                 result.push(RecordField {
-                    name: intern_str(updates[upd_idx].0),
+                    name: intern_str(&updates[upd_idx].0),
                     value: updates[upd_idx].1,
                 });
                 upd_idx += 1;
@@ -15673,7 +15740,7 @@ pub extern "C-unwind" fn knot_record_update_batch(
     }
     while upd_idx < updates.len() {
         result.push(RecordField {
-            name: intern_str(updates[upd_idx].0),
+            name: intern_str(&updates[upd_idx].0),
             value: updates[upd_idx].1,
         });
         upd_idx += 1;

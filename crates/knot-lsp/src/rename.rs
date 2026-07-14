@@ -1698,6 +1698,20 @@ fn scan_disk_files(
         if already_scanned.contains(&path) {
             continue;
         }
+        // Skip non-owner files that have a pending (unsaved) source in the
+        // document cache — the on-disk content may differ from the editor's
+        // live buffer, so edits computed against disk bytes would have wrong
+        // positions. The owner is NOT skipped: when it's stale, the in-memory
+        // scan skipped it, and the disk phase must rename its declaration
+        // from the stable on-disk bytes (B70 regression test covers this).
+        let is_owner = path == owner.canonical_path;
+        if !is_owner {
+            if let Some(file_uri) = path_to_uri(&path) {
+                if state.pending_sources.get(&file_uri).is_some() {
+                    continue;
+                }
+            }
+        }
         let (module, file_source) =
             match get_or_parse_file_shared(&path, &state.import_cache) {
                 Some(v) => v,

@@ -6023,11 +6023,13 @@ impl Infer {
                 self.unify(&rhs_ty, &Ty::Bool, rhs.span);
                 Ty::Bool
             }
-            // Concat: both same type (Semigroup), result same type
+            // Concat: both same type (Semigroup), result same type — but
+            // degrade refinement, since `Short ++ Short` can exceed the
+            // length bound (mirrors Add/Sub/Mod and Mul/Div above).
             ast::BinOp::Concat => {
                 self.unify_symmetric(&lhs_ty, &rhs_ty, span);
                 self.require_trait("Semigroup", &lhs_ty, span);
-                lhs_ty
+                self.degrade_refinement(lhs_ty, span)
             }
             // Pipe: a |> f  =  f a
             ast::BinOp::Pipe => {

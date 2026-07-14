@@ -8614,8 +8614,9 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
         }
         let guard = BoxDropGuard(winner_box);
         let winner_val = deep_clone_into_arena(winner_box);
-        // Clone succeeded — disarm the guard and manually drop the Box tree.
-        drop(guard);
+        // Clone succeeded — disarm the guard (forget it so Drop doesn't fire)
+        // and manually drop the Box tree exactly once.
+        std::mem::forget(guard);
         unsafe { deep_drop_value(winner_box); }
         let field_name = if is_left { "error" } else { "value" };
         let ctor_name = if is_left { "Err" } else { "Ok" };
@@ -18960,6 +18961,16 @@ fn generate_openapi(name: &str, table: &RouteTable) -> String {
                     json_escape(qname),
                     !qty.starts_with('?'),
                     type_to_openapi_schema(qty)
+                ));
+            }
+            // Request headers — the server enforces these (400 on missing/
+            // invalid), so the spec must document them.
+            for (hname, hty) in &entry.request_headers {
+                params.push(format!(
+                    "{{ \"name\": \"{}\", \"in\": \"header\", \"required\": {}, \"schema\": {} }}",
+                    json_escape(hname),
+                    !hty.starts_with('?'),
+                    type_to_openapi_schema(hty)
                 ));
             }
 

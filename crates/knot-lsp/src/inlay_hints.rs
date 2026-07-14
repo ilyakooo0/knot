@@ -1166,7 +1166,7 @@ fn add_monad_context_hints(
         hints: &mut Vec<InlayHint>,
     ) {
         if let ast::ExprKind::Do(_) = &expr.node
-            && expr.span.start >= range_start && expr.span.start <= range_end
+            && expr.span.start >= range_start && expr.span.start < range_end
                 && let Some(monad) = doc.monad_info.get(&expr.span) {
                     let label = match monad {
                         MonadKind::Relation => "[Relation]".to_string(),

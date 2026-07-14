@@ -1022,7 +1022,7 @@ fn offset_in_route_rate_limit(module: &Module, offset: usize) -> bool {
         if let DeclKind::Route { entries, .. } = &decl.node {
             for entry in entries {
                 if let Some(rl) = &entry.rate_limit
-                    && rl.span.start <= offset && offset <= rl.span.end {
+                    && rl.span.start <= offset && offset < rl.span.end {
                         return true;
                     }
             }
@@ -1084,7 +1084,7 @@ fn route_completions(doc: &DocumentState) -> Vec<CompletionItem> {
 /// record fields, etc.
 fn find_enclosing_do_span(module: &Module, offset: usize) -> Option<Span> {
     fn walk(expr: &ast::Expr, offset: usize, best: &mut Option<Span>) {
-        if expr.span.start > offset || offset > expr.span.end {
+        if expr.span.start > offset || offset >= expr.span.end {
             return;
         }
         if let ast::ExprKind::Do(_) = &expr.node {
@@ -1204,7 +1204,7 @@ fn monad_for_do_span(
         .collect();
     if let Some((_, kind)) = contained
         .iter()
-        .filter(|(s, _)| s.start <= offset && offset <= s.end)
+        .filter(|(s, _)| s.start <= offset && offset < s.end)
         .min_by_key(|(s, _)| (s.end - s.start, s.start, s.end))
     {
         return Some((*kind).clone());

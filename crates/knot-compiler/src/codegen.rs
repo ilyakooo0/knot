@@ -12867,16 +12867,27 @@ impl Codegen {
                     if let Some(&v) = env.bindings.get(name.as_str()) {
                         v
                     } else {
-                        let var_expr = ast::Spanned::new(
-                            ast::ExprKind::Var(name.clone()),
-                            ast::Span::new(0, 0),
-                        );
-                        self.compile_expr(builder, &var_expr, env, db)
+                        // Check let_bindings first — a do-local let variable
+                        // would panic if resolved through compile_expr as a
+                        // top-level function.
+                        let let_expr = self.let_bindings.get(name).cloned();
+                        if let Some(let_expr) = let_expr {
+                            self.compile_expr(builder, &let_expr, env, db)
+                        } else {
+                            let var_expr = ast::Spanned::new(
+                                ast::ExprKind::Var(name.clone()),
+                                ast::Span::new(0, 0),
+                            );
+                            self.compile_expr(builder, &var_expr, env, db)
+                        }
                     }
                 }
                 SqlParamSource::FieldAccess(var, field) => {
+                    let let_expr = self.let_bindings.get(var).cloned();
                     let record = if let Some(&v) = env.bindings.get(var.as_str()) {
                         v
+                    } else if let Some(let_expr) = let_expr {
+                        self.compile_expr(builder, &let_expr, env, db)
                     } else {
                         let var_expr = ast::Spanned::new(
                             ast::ExprKind::Var(var.clone()),
@@ -17527,26 +17538,33 @@ fn extract_literal(expr: &ast::Expr) -> Option<CompileLit> {
 /// satisfied, `Some(false)` if it fails, or `None` if it can't be
 /// evaluated at compile time.
 fn eval_refine_predicate(pred: &ast::Expr, lit: &CompileLit) -> Option<bool> {
-    // The predicate is a lambda `\x -> body`. Extract the body.
-    let body = match &pred.node {
+    // The predicate is a lambda `\\x -> body`. Extract the parameter name
+    // and body so we only substitute for the actual parameter, not any
+    // other variable the predicate may reference (e.g. a top-level constant).
+    let (param_name, body) = match &pred.node {
         ast::ExprKind::Lambda { params, body } => {
             if params.len() != 1 { return None; }
-            body
+            let name = match &params[0].node {
+                ast::PatKind::Var(n) => n.clone(),
+                _ => return None,
+            };
+            (name, body)
         }
         _ => return None,
     };
     // Evaluate the body with the parameter bound to the literal.
-    eval_expr_bool(body, lit)
+    eval_expr_bool(body, lit, &param_name)
 }
 
 /// Evaluate an expression to a boolean, with the refinement variable
-/// bound to `lit`. Returns `None` if the expression can't be evaluated.
-fn eval_expr_bool(expr: &ast::Expr, lit: &CompileLit) -> Option<bool> {
+/// `param_name` bound to `lit`. Returns `None` if the expression can't be
+/// evaluated (e.g. references a variable other than `param_name`).
+fn eval_expr_bool(expr: &ast::Expr, lit: &CompileLit, param_name: &str) -> Option<bool> {
     match &expr.node {
         ast::ExprKind::Lit(ast::Literal::Bool(b)) => Some(*b),
         ast::ExprKind::BinOp { op, lhs, rhs, .. } => {
-            let lv = eval_expr_num(lhs, lit)?;
-            let rv = eval_expr_num(rhs, lit)?;
+            let lv = eval_expr_num(lhs, lit, param_name)?;
+            let rv = eval_expr_num(rhs, lit, param_name)?;
             match op {
                 ast::BinOp::Lt => Some(lv < rv),
                 ast::BinOp::Gt => Some(lv > rv),
@@ -17555,28 +17573,29 @@ fn eval_expr_bool(expr: &ast::Expr, lit: &CompileLit) -> Option<bool> {
                 ast::BinOp::Eq => Some(lv == rv),
                 ast::BinOp::Neq => Some(lv != rv),
                 ast::BinOp::And => {
-                    Some(eval_expr_bool(lhs, lit)? && eval_expr_bool(rhs, lit)?)
+                    Some(eval_expr_bool(lhs, lit, param_name)? && eval_expr_bool(rhs, lit, param_name)?)
                 }
                 ast::BinOp::Or => {
-                    Some(eval_expr_bool(lhs, lit)? || eval_expr_bool(rhs, lit)?)
+                    Some(eval_expr_bool(lhs, lit, param_name)? || eval_expr_bool(rhs, lit, param_name)?)
                 }
                 _ => None,
             }
         }
         ast::ExprKind::UnaryOp { op: ast::UnaryOp::Not, operand, .. } => {
-            Some(!eval_expr_bool(operand, lit)?)
+            Some(!eval_expr_bool(operand, lit, param_name)?)
         }
         _ => None,
     }
 }
 
 /// Evaluate an expression to an f64 (for numeric comparisons), with the
-/// refinement variable bound to `lit`.
-fn eval_expr_num(expr: &ast::Expr, lit: &CompileLit) -> Option<f64> {
+/// refinement variable `param_name` bound to `lit`. Returns `None` for any
+/// variable that isn't the refinement parameter.
+fn eval_expr_num(expr: &ast::Expr, lit: &CompileLit, param_name: &str) -> Option<f64> {
     match &expr.node {
         ast::ExprKind::Lit(ast::Literal::Int(s)) => s.parse::<f64>().ok(),
         ast::ExprKind::Lit(ast::Literal::Float(f)) => Some(*f),
-        ast::ExprKind::Var(_) => {
+        ast::ExprKind::Var(name) if name == param_name => {
             // The lambda parameter — return the literal value
             match lit {
                 CompileLit::Int(n) => Some(*n as f64),
@@ -17584,11 +17603,16 @@ fn eval_expr_num(expr: &ast::Expr, lit: &CompileLit) -> Option<f64> {
                 _ => None,
             }
         }
-        ast::ExprKind::Annot { expr, .. } => eval_expr_num(expr, lit),
-        ast::ExprKind::UnitLit { value, .. } => eval_expr_num(value, lit),
+        ast::ExprKind::Var(_) => {
+            // A different variable (e.g. a top-level constant) — can't
+            // evaluate at compile time, fall back to runtime check.
+            None
+        }
+        ast::ExprKind::Annot { expr, .. } => eval_expr_num(expr, lit, param_name),
+        ast::ExprKind::UnitLit { value, .. } => eval_expr_num(value, lit, param_name),
         ast::ExprKind::BinOp { op, lhs, rhs, .. } => {
-            let lv = eval_expr_num(lhs, lit)?;
-            let rv = eval_expr_num(rhs, lit)?;
+            let lv = eval_expr_num(lhs, lit, param_name)?;
+            let rv = eval_expr_num(rhs, lit, param_name)?;
             match op {
                 ast::BinOp::Add => Some(lv + rv),
                 ast::BinOp::Sub => Some(lv - rv),

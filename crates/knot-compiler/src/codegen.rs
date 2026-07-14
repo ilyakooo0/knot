@@ -13133,6 +13133,53 @@ impl Codegen {
                 .filter(|(_, types)| types.len() > 1)
                 .collect();
             clashes.sort();
+
+            // Also check for multiple nullable ADT impls: their null (none)
+            // variants are bare null pointers with no tag to distinguish them,
+            // so dispatching a null value to the correct impl is impossible.
+            // The constructor-name overlap check above does NOT catch this
+            // because different nullable ADTs have different constructor names
+            // (e.g. `NothingA` vs `NothingB`).
+            let nullable_impl_types: Vec<&str> = info
+                .impls
+                .iter()
+                .filter_map(|e| {
+                    let ctors = self.data_constructors.get(&e.type_name)?;
+                    let is_nullable = ctors
+                        .iter()
+                        .any(|c| self.nullable_ctors.contains_key(c));
+                    if is_nullable { Some(e.type_name.as_str()) } else { None }
+                })
+                .collect();
+            if nullable_impl_types.len() > 1 {
+                let trait_name = self
+                    .trait_method_traits
+                    .get(&method)
+                    .cloned()
+                    .unwrap_or_default();
+                diags.push(
+                    knot::diagnostic::Diagnostic::error(format!(
+                        "cannot dispatch '{}' at run time: multiple nullable ADT types \
+                         ({}) implement '{}', and their null values are indistinguishable",
+                        method,
+                        nullable_impl_types
+                            .iter()
+                            .map(|t| format!("'{}'", t))
+                            .collect::<Vec<_>>()
+                            .join(" and "),
+                        trait_name,
+                    ))
+                    .label(
+                        span,
+                        format!(
+                            "this call is polymorphic, so '{}' has no static type here",
+                            method
+                        ),
+                    ),
+                );
+                continue;
+            }
+
             let Some((ctor, types)) = clashes.first() else {
                 continue;
             };

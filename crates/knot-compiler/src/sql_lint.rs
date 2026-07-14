@@ -171,7 +171,7 @@ fn lint_expr(
             lint_expr(operand, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::App { func, arg } => {
-            lint_app_form(func, arg, source_schemas, views, diags);
+            lint_app_form(func, arg, source_schemas, views, fun_bodies, diags);
             lint_expr(func, source_schemas, views, fun_bodies, diags);
             lint_expr(arg, source_schemas, views, fun_bodies, diags);
         }
@@ -584,6 +584,7 @@ fn lint_app_form(
     arg: &Expr,
     source_schemas: &HashMap<String, String>,
     views: &HashSet<&str>,
+    fun_bodies: &HashMap<String, Expr>,
     diags: &mut Vec<Diagnostic>,
 ) {
     // Match: fn_name lambda_arg  (partially applied, the source comes later via pipe)
@@ -617,10 +618,16 @@ fn lint_app_form(
             Some(v) => v,
             None => return,
         };
+        // Beta-reduce the lambda body so inlined function calls (e.g.
+        // `filter (\i -> isGood i) *source` where `isGood = \x -> x.score > 50`)
+        // are correctly recognized as SQL-compilable, mirroring codegen's
+        // `extract_single_param_lambda` and `lint_pipe_chain`.
+        let no_lets: HashMap<String, Expr> = HashMap::new();
+        let reduced = beta_reduce(body, fun_bodies, &no_lets);
 
         match fn_name {
             "filter"
-                if try_compile_sql_expr(&bind_var, body, schema).is_none() => {
+                if try_compile_sql_expr(&bind_var, &reduced, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "filter will be evaluated at runtime instead of SQL WHERE",
@@ -632,7 +639,7 @@ fn lint_app_form(
                     );
                 }
             "sortBy"
-                if try_sql_sortby_expr(&bind_var, body, schema).is_none() => {
+                if try_sql_sortby_expr(&bind_var, &reduced, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "sortBy will be evaluated at runtime instead of SQL ORDER BY",
@@ -644,7 +651,7 @@ fn lint_app_form(
                     );
                 }
             "sum"
-                if try_sql_column_expr(&bind_var, body, schema).is_none() => {
+                if try_sql_column_expr(&bind_var, &reduced, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "sum will be evaluated at runtime instead of SQL SUM",
@@ -656,7 +663,7 @@ fn lint_app_form(
                     );
                 }
             "avg"
-                if try_sql_column_expr(&bind_var, body, schema).is_none() => {
+                if try_sql_column_expr(&bind_var, &reduced, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "avg will be evaluated at runtime instead of SQL AVG",
@@ -668,7 +675,7 @@ fn lint_app_form(
                     );
                 }
             "minOn"
-                if try_sql_minmax_expr(&bind_var, body, schema).is_none() => {
+                if try_sql_minmax_expr(&bind_var, &reduced, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "minOn will be evaluated at runtime instead of SQL MIN",
@@ -680,7 +687,7 @@ fn lint_app_form(
                     );
                 }
             "maxOn"
-                if try_sql_minmax_expr(&bind_var, body, schema).is_none() => {
+                if try_sql_minmax_expr(&bind_var, &reduced, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "maxOn will be evaluated at runtime instead of SQL MAX",
@@ -692,7 +699,7 @@ fn lint_app_form(
                     );
                 }
             "countWhere"
-                if try_compile_sql_expr(&bind_var, body, schema).is_none() => {
+                if try_compile_sql_expr(&bind_var, &reduced, schema).is_none() => {
                     diags.push(
                         Diagnostic::info(
                             "countWhere will be evaluated at runtime instead of SQL COUNT",

@@ -142,9 +142,11 @@ pub fn is_builtin(name: &str) -> bool {
 }
 
 /// True if `name` is an effectful builtin — i.e. calling it produces an IO
-/// value. Excludes `retry` (no IO) and `fork` (returns `IO {} {}`, but its
-/// argument's effects are decoupled from the caller).  `race` is included
-/// because the result IO inherits the effect row of its arguments.
+/// value. Excludes `retry` (the STM primitive, typed `∀a. a` — no IO).
+/// `fork` is included: it returns `IO {} {}` and its argument's effects are
+/// decoupled from the caller, but callers redundantly check `|| name == "fork"`
+/// to ensure it's recognized. `race` is included because the result IO
+/// inherits the effect row of its arguments.
 pub fn is_io_builtin(name: &str) -> bool {
     EFFECTFUL_BUILTINS.contains(&name) && !matches!(name, "retry")
 }

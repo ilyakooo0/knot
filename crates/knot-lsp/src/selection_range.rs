@@ -197,6 +197,17 @@ fn collect_containing_spans(expr: &ast::Expr, offset: usize, spans: &mut Vec<Spa
                 collect_containing_spans(e, offset, spans);
             }
         }
+        ast::ExprKind::Annot { expr, .. } => {
+            collect_containing_spans(expr, offset, spans);
+        }
+        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => {
+            collect_containing_spans(value, offset, spans);
+        }
+        ast::ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                collect_containing_spans(&h.body, offset, spans);
+            }
+        }
         _ => {}
     }
 }

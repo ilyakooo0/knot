@@ -9162,7 +9162,11 @@ impl Codegen {
                     self.invalidate_after_possible_writes(expr);
                 }
                 ast::StmtKind::GroupBy { .. } => {
-                    // groupBy doesn't make sense in IO do-blocks
+                    // groupBy in IO do-blocks is a type error — the type checker
+                    // rebinds variables from T to [T], but codegen silently drops
+                    // the grouping, producing incorrect results. Emit a clear
+                    // error instead of silently miscompiling.
+                    panic!("knot codegen: groupBy is not supported inside IO do-blocks");
                 }
             }
         }

@@ -48,6 +48,7 @@ fn parse_schema_kind(schema: &str) -> SchemaKind {
     if let Some(body) = schema.strip_prefix('#') {
         let mut ctors = Vec::new();
         for ctor_part in split_respecting_brackets(body, '|') {
+            if ctor_part.is_empty() { continue; }
             let mut parts = ctor_part.splitn(2, ':');
             let name = parts.next().unwrap().to_string();
             let fields = if let Some(field_spec) = parts.next() {

@@ -668,10 +668,11 @@ impl Printer {
         if self.at_line_start {
             self.indent
         } else {
-            // Column = bytes since last newline (sufficient for ASCII layout).
+            // Column = chars since last newline (Unicode-aware — the parser
+            // counts columns in scalar values, so the formatter must match).
             match self.out.rfind('\n') {
-                Some(i) => self.out.len() - i - 1,
-                None => self.out.len(),
+                Some(i) => self.out[i + 1..].chars().count(),
+                None => self.out.chars().count(),
             }
         }
     }

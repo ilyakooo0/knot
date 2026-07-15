@@ -76,7 +76,7 @@ fn parse_adt_constructors(spec: &str) -> Vec<(String, Vec<(String, String)>)> {
                 .map(|f| {
                     let mut fp = f.splitn(2, '=');
                     let fname = fp.next().unwrap().to_string();
-                    let fty = fp.next().unwrap_or("text").to_string();
+                    let fty = fp.next().unwrap_or("").to_string();
                     (fname, fty)
                 })
                 .collect()

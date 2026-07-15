@@ -2709,7 +2709,16 @@ fn wake_all_indexed_watchers(table: &str) {
 /// Returns `None` when no cross-type integer/float value is exactly equal.
 fn eq_cross_key(val: &SqlVal) -> Option<SqlValKey> {
     match val {
-        SqlVal::Int(n) => Some(SqlValKey::RealBits((*n as f64).to_bits())),
+        SqlVal::Int(n) => {
+            // Only emit the cross-type float key when the integer is exactly
+            // representable in f64 (|n| < 2^53); beyond that the `as f64` cast
+            // rounds and would forge a spurious `==` match.
+            if n.abs() < (1i64 << 53) {
+                Some(SqlValKey::RealBits((*n as f64).to_bits()))
+            } else {
+                None
+            }
+        }
         // Integers are stored in SQLite as TEXT, so an integer write row reaches
         // the wake path as `Text("5")`, not `Int(5)` (mirrors `to_key`'s
         // numeric-text parse). Probe its float-equivalent EQ key so a Real-keyed
@@ -4396,6 +4405,7 @@ unsafe fn as_ref<'a>(v: *mut Value) -> &'a Value {
         UNPACK_SCRATCH.with(|ring| {
             let cursor_cell = &ring.cursor;
             let idx = cursor_cell.get();
+            debug_assert!(idx < UNPACK_SCRATCH_SLOTS);
             cursor_cell.set((idx + 1) % UNPACK_SCRATCH_SLOTS);
             let slots = ring.slots.get();
             unsafe {
@@ -4416,7 +4426,7 @@ unsafe fn as_ref<'a>(v: *mut Value) -> &'a Value {
 /// wraps the cursor around while pattern-bound references are still
 /// live.  8 is generous — the observed maximum concurrent tagged
 /// derefs per call stack is 2 (binary op match patterns).
-const UNPACK_SCRATCH_SLOTS: usize = 8;
+const UNPACK_SCRATCH_SLOTS: usize = 32;
 
 struct UnpackScratchRing {
     slots: std::cell::UnsafeCell<[Value; UNPACK_SCRATCH_SLOTS]>,
@@ -4426,6 +4436,12 @@ struct UnpackScratchRing {
 thread_local! {
     static UNPACK_SCRATCH: UnpackScratchRing = const { UnpackScratchRing {
         slots: std::cell::UnsafeCell::new([
+            Value::Unit, Value::Unit, Value::Unit, Value::Unit,
+            Value::Unit, Value::Unit, Value::Unit, Value::Unit,
+            Value::Unit, Value::Unit, Value::Unit, Value::Unit,
+            Value::Unit, Value::Unit, Value::Unit, Value::Unit,
+            Value::Unit, Value::Unit, Value::Unit, Value::Unit,
+            Value::Unit, Value::Unit, Value::Unit, Value::Unit,
             Value::Unit, Value::Unit, Value::Unit, Value::Unit,
             Value::Unit, Value::Unit, Value::Unit, Value::Unit,
         ]),
@@ -4538,8 +4554,6 @@ const SMALL_INT_MAX: i64 = 127;
 struct ValueSingletons {
     small_ints: Vec<*mut Value>,
     unit: *mut Value,
-    bool_true: *mut Value,
-    bool_false: *mut Value,
     float_zero: *mut Value,
     float_one: *mut Value,
 }
@@ -4551,8 +4565,6 @@ impl Drop for ValueSingletons {
         }
         unsafe {
             let _ = Box::from_raw(self.unit);
-            let _ = Box::from_raw(self.bool_true);
-            let _ = Box::from_raw(self.bool_false);
             let _ = Box::from_raw(self.float_zero);
             let _ = Box::from_raw(self.float_one);
         }
@@ -4699,8 +4711,6 @@ thread_local! {
             .map(|n| Box::into_raw(Box::new(Value::Int(n))))
             .collect(),
         unit: Box::into_raw(Box::new(Value::Unit)),
-        bool_true: Box::into_raw(Box::new(Value::Bool(true))),
-        bool_false: Box::into_raw(Box::new(Value::Bool(false))),
         float_zero: Box::into_raw(Box::new(Value::Float(0.0))),
         float_one: Box::into_raw(Box::new(Value::Float(1.0))),
     };
@@ -4947,6 +4957,9 @@ pub extern "C-unwind" fn knot_record_set_field(
     key_len: usize,
     value: *mut Value,
 ) {
+    if record.is_null() {
+        return;
+    }
     let name_str = unsafe { str_from_raw(key_ptr, key_len) };
     let rec = unsafe { &mut *record };
     match rec {
@@ -5428,7 +5441,7 @@ fn read_temp_row(row: &rusqlite::Row, schema: &TempSchema) -> *mut Value {
         }
         TempSchema::Scalar(ty) => read_sql_column(row, 0, *ty),
         TempSchema::Adt { constructors, all_fields } => {
-            let tag: String = row.get(0).unwrap();
+            let tag: String = row.get(0).unwrap_or_default();
             let ctor = constructors.iter().find(|(t, _)| t == &tag);
             let payload = if let Some((_, fields)) = ctor {
                 if fields.is_empty() {
@@ -5561,7 +5574,7 @@ fn read_query_rows_params(
 ) -> Vec<*mut Value> {
     debug_sql(sql);
     let mut stmt = conn
-        .prepare(sql)
+        .prepare_cached(sql)
         .unwrap_or_else(|e| panic!("knot runtime: query error: {}\n  SQL: {}", e, sql));
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
@@ -5875,6 +5888,9 @@ pub extern "C-unwind" fn knot_relation_with_capacity(cap: usize) -> *mut Value {
 /// `[1, 1] == [1]`.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_dedup(rel: *mut Value) -> *mut Value {
+    if rel.is_null() {
+        return rel;
+    }
     if let Value::Relation(rows) = unsafe { &mut *rel }
         && rows.len() > 1
     {
@@ -5922,6 +5938,9 @@ pub extern "C-unwind" fn knot_scalar_source_wrap(val: *mut Value) -> *mut Value 
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
+    if rel.is_null() {
+        return;
+    }
     let r = unsafe { &mut *rel };
     match r {
         Value::Relation(rows) => rows.push(row),
@@ -6098,9 +6117,10 @@ pub extern "C-unwind" fn knot_relation_union(
         for &row in rows_b.iter() {
             buf.clear();
             value_to_hash_bytes(row, &mut buf);
-            if seen.insert(buf.clone()) {
+            if seen.insert(std::mem::take(&mut buf)) {
                 result.push(row);
             }
+            buf = Vec::with_capacity(128);
         }
         return alloc(Value::Relation(result));
     }
@@ -6376,9 +6396,9 @@ pub extern "C-unwind" fn knot_relation_group_by(
             .next()
             .unwrap_or_else(|e| panic!("knot runtime: groupby fetch error: {}", e))
         {
-            let idx: i64 = row.get(0).unwrap();
+            let idx: i64 = row.get(0).unwrap_or(0);
             let keys: Vec<rusqlite::types::Value> = (1..=key_specs.len())
-                .map(|i| row.get(i).unwrap())
+                .map(|i| row.get(i).unwrap_or(rusqlite::types::Value::Null))
                 .collect();
 
             /// Compare two group-key vectors treating NaN floats as equal
@@ -6407,7 +6427,9 @@ pub extern "C-unwind" fn knot_relation_group_by(
                     groups.push(std::mem::take(&mut current_group));
                 }
 
-            current_group.push(rows[idx as usize]);
+            if let Some(row) = rows.get(idx as usize) {
+                current_group.push(*row);
+            }
             prev_keys = Some(keys);
         }
 
@@ -7064,7 +7086,7 @@ pub extern "C-unwind" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut
         }
         (Value::Relation(rows_a), Value::Relation(rows_b)) => {
             // ++ on relations is union (in-memory hash-based dedup)
-            let total = rows_a.len() + rows_b.len();
+            let total = rows_a.len().saturating_add(rows_b.len());
             let mut seen = HashSet::with_capacity(total);
             let mut result = Vec::with_capacity(total);
             let mut buf = Vec::with_capacity(128);
@@ -12904,6 +12926,9 @@ pub extern "C-unwind" fn knot_source_match(
         // allocation to avoid pathological memory usage.
         let count = count.max(0) as usize;
         let count = count.min(usize::MAX / 16);
+        // A set of Unit has at most one element: every `Value::Unit` is equal
+        // to every other, so N matching nullary rows collapse to a single Unit.
+        let count = count.min(1);
         let mut rows = Vec::with_capacity(count);
         for _ in 0..count {
             rows.push(alloc(Value::Unit));
@@ -13846,7 +13871,7 @@ pub extern "C-unwind" fn knot_source_diff_write(
     };
 
     let table = quote_ident(&format!("_knot_{}", name));
-    let temp = quote_ident(&format!("_knot_{}_new", name));
+    let temp = quote_ident(&format!("_knot_diff_{}_tmp", name));
 
     db_ref
         .conn
@@ -13922,7 +13947,11 @@ pub extern "C-unwind" fn knot_source_diff_write(
             for f in &adt.all_fields {
                 col_defs.push(format!("{} {}", quote_ident(&f.name), adt.col_sql_type(f)));
             }
-            let create_temp = format!("CREATE TEMP TABLE {} ({});", temp, col_defs.join(", "));
+            let create_temp = format!(
+                "DROP TABLE IF EXISTS {t}; CREATE TEMP TABLE {t} ({});",
+                col_defs.join(", "),
+                t = temp
+            );
             debug_sql(&create_temp);
             db_ref.conn.execute_batch(&create_temp)
                 .expect("knot runtime: failed to create temp table");
@@ -14064,7 +14093,11 @@ pub extern "C-unwind" fn knot_source_diff_write(
             let col_defs: Vec<String> = cols.iter()
                 .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
                 .collect();
-            let create_temp = format!("CREATE TEMP TABLE {} ({});", temp, col_defs.join(", "));
+            let create_temp = format!(
+                "DROP TABLE IF EXISTS {t}; CREATE TEMP TABLE {t} ({});",
+                col_defs.join(", "),
+                t = temp
+            );
             debug_sql(&create_temp);
             db_ref.conn.execute_batch(&create_temp)
                 .expect("knot runtime: failed to create temp table");
@@ -14457,6 +14490,13 @@ pub extern "C-unwind" fn knot_source_update_where(
         None
     };
     let set_param_count = count_sql_placeholders(set_clause);
+    if set_param_count > param_refs.len() {
+        panic!(
+            "knot runtime: update_where: SET clause placeholder count {} exceeds total params {}",
+            set_param_count,
+            param_refs.len()
+        );
+    }
     let where_params: &[&dyn rusqlite::types::ToSql] = if set_param_count <= param_refs.len() {
         &param_refs[set_param_count..]
     } else {
@@ -14673,6 +14713,7 @@ pub extern "C-unwind" fn knot_sleep(ms_val: *mut Value) -> *mut Value {
         Value::Int(i) => u64::try_from(*i).expect("knot runtime: sleep duration must be non-negative"),
         _ => panic!("knot runtime: sleep expects Int argument"),
     };
+    let ms = ms.min(Duration::MAX.as_millis() as u64);
     let duration = Duration::from_millis(ms);
     if let Some(token) = current_cancel_token() {
         token.wait_for_cancel(duration);
@@ -14730,10 +14771,10 @@ pub extern "C-unwind" fn knot_random_float() -> *mut Value {
 /// operations (compare, hash, JSON, SQLite TEXT) just work.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_random_uuid() -> *mut Value {
-    let ms: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    // Reuse the shared clock helper so pre-epoch clocks are handled the same
+    // way everywhere; clamp its (possibly negative) result to a non-negative
+    // 48-bit-storable timestamp.
+    let ms: u64 = current_unix_ms().max(0) as u64;
     let mut rand = [0u8; 10];
     getrandom::fill(&mut rand).expect("knot runtime: failed to get random bytes");
 
@@ -15998,6 +16039,9 @@ pub extern "C-unwind" fn knot_view_write(
     let filter_where = unsafe { str_from_raw(filter_ptr, filter_len) };
     let rec_schema = parse_record_schema(schema);
 
+    if filter_params.is_null() {
+        panic!("knot runtime: view_write filter_params pointer is null");
+    }
     let filter_values = match unsafe { as_ref(filter_params) } {
         Value::Relation(rows) => rows,
         _ => panic!(
@@ -16006,6 +16050,9 @@ pub extern "C-unwind" fn knot_view_write(
         ),
     };
 
+    if new_relation.is_null() {
+        panic!("knot runtime: view_write new_relation pointer is null");
+    }
     let rows = match unsafe { as_ref(new_relation) } {
         Value::Relation(rows) => rows,
         _ => panic!(
@@ -16203,6 +16250,9 @@ pub extern "C-unwind" fn knot_relation_fixpoint(
     body: *const u8,
     initial: *mut Value,
 ) -> *mut Value {
+    if body.is_null() {
+        panic!("knot runtime: fixpoint body function pointer is null");
+    }
     let body_fn: extern "C-unwind" fn(*mut c_void, *mut Value) -> *mut Value =
         unsafe { std::mem::transmute(body) };
     let db_ref = unsafe { &*(db as *mut KnotDb) };
@@ -16320,13 +16370,13 @@ fn parse_descriptor(desc: &str) -> Vec<(String, String)> {
         let ty = split.next().unwrap_or("text").to_string();
         fields.push((name, ty));
     };
-    let mut depth = 0i32;
+    let mut depth = 0usize;
     let mut start = 0;
     let bytes = desc.as_bytes();
     for i in 0..bytes.len() {
         match bytes[i] {
             b'[' | b'{' => depth += 1,
-            b']' | b'}' => depth -= 1,
+            b']' | b'}' => depth = depth.saturating_sub(1),
             b',' if depth == 0 => {
                 push_part(&desc[start..i]);
                 start = i + 1;
@@ -16577,7 +16627,21 @@ fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
         // handed to the handler (see `tag_is_known`).
         t if is_tag_type(t) => tag_is_known(s, t)
             .then(|| alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)))),
-        "text" | "uuid" => Some(alloc(Value::Text(Arc::from(s)))),
+        "text" => Some(alloc(Value::Text(Arc::from(s)))),
+        // A uuid arrives as a string, but accepting any string would let a
+        // malformed value masquerade as a Uuid. Require the canonical
+        // 8-4-4-4-12 hex form (36 chars); otherwise return None → 400.
+        "uuid" => {
+            let valid = s.len() == 36
+                && s.as_bytes().iter().enumerate().all(|(i, &b)| {
+                    if i == 8 || i == 13 || i == 18 || i == 23 {
+                        b == b'-'
+                    } else {
+                        b.is_ascii_hexdigit()
+                    }
+                });
+            valid.then(|| alloc(Value::Text(Arc::from(s))))
+        }
         _ => None,
     }
 }
@@ -17079,7 +17143,9 @@ fn parse_byte_size(s: &str) -> Option<u64> {
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_http_config_init() {
     const FLAG: &str = "--http-max-body-bytes";
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     let mut value: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
@@ -17288,7 +17354,8 @@ fn http_serve_loop(
                 // loop let one slow client (slowloris) stall every other
                 // request for the duration of its upload.
                 let has_body = !entry.body_fields.is_empty()
-                    && entry.method != "GET" && entry.method != "HEAD";
+                    && !entry.method.eq_ignore_ascii_case("GET")
+                    && !entry.method.eq_ignore_ascii_case("HEAD");
 
                 // Collect request headers as owned strings
                 let req_headers: Vec<(String, String)> = request.headers().iter()
@@ -17481,7 +17548,8 @@ fn http_serve_loop(
 
                     // Body fields (JSON) — only parse for methods that carry a body
                     let has_body = !entry_body_fields.is_empty()
-                        && entry_method != "GET" && entry_method != "HEAD";
+                        && !entry_method.eq_ignore_ascii_case("GET")
+                        && !entry_method.eq_ignore_ascii_case("HEAD");
                     if has_body {
                         // Validate Content-Type for body-bearing requests
                         let ct_ok = request
@@ -17725,7 +17793,7 @@ fn http_serve_loop(
                                 let status_v = knot_record_field(err, b"status".as_ptr(), 6);
                                 let message_v = knot_record_field(err, b"message".as_ptr(), 7);
                                 let status = match unsafe { as_ref(status_v) } {
-                                    Value::Int(n) => (*n).clamp(100, 599) as u16,
+                                    Value::Int(n) => (*n).clamp(400, 599) as u16,
                                     _ => 500,
                                 };
                                 let message = match unsafe { as_ref(message_v) } {
@@ -17852,12 +17920,12 @@ fn http_serve_loop(
                             let max = http_max_body_bytes();
                             if json.len() as u64 > max {
                                 log_error!(
-                                    "[HTTP] response body exceeds {} byte limit; returning 500",
+                                    "[HTTP] response body exceeds {} byte limit; returning 413",
                                     max
                                 );
                                 let body = "{\"error\":\"response too large\"}".to_string();
                                 let response = tiny_http::Response::from_string(&body)
-                                    .with_status_code(500)
+                                    .with_status_code(413)
                                     .with_header(
                                         "Content-Type: application/json"
                                             .parse::<tiny_http::Header>()
@@ -18002,12 +18070,12 @@ fn http_serve_loop(
                             let max = http_max_body_bytes();
                             if json.len() as u64 > max {
                                 log_error!(
-                                    "[HTTP] response body exceeds {} byte limit; returning 500",
+                                    "[HTTP] response body exceeds {} byte limit; returning 413",
                                     max
                                 );
                                 let body = "{\"error\":\"response too large\"}".to_string();
                                 let response = tiny_http::Response::from_string(&body)
-                                    .with_status_code(500)
+                                    .with_status_code(413)
                                     .with_header(
                                         "Content-Type: application/json"
                                             .parse::<tiny_http::Header>()
@@ -18815,6 +18883,10 @@ pub extern "C-unwind" fn knot_api_register(
     let name = unsafe { str_from_raw(name_ptr, name_len) }.to_string();
     // Clone the table so the registry has its own independent copy,
     // allowing knot_http_listen to consume the original without use-after-free.
+    // The cloned box is intentionally leaked into API_REGISTRY (via Box::into_raw)
+    // for the remainder of the process: the registry is a process-lifetime global
+    // consulted by `knot_api_handle`, so it is never freed — this is deliberate,
+    // not a leak to fix.
     let table_ref = unsafe { &*(table as *const RouteTable) };
     let cloned = Box::into_raw(Box::new(table_ref.clone())) as *mut c_void;
     API_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push((name, SendPtr(cloned)));
@@ -18936,7 +19008,7 @@ fn generate_openapi(name: &str, table: &RouteTable) -> String {
             .collect();
         for (j, entry) in entries.iter().enumerate() {
             let method = entry.method.to_lowercase();
-            out.push_str(&format!("      \"{}\": {{\n", method));
+            out.push_str(&format!("      \"{}\": {{\n", json_escape(&method)));
             out.push_str(&format!(
                 "        \"operationId\": \"{}\",\n",
                 json_escape(&entry.constructor)
@@ -19273,6 +19345,9 @@ pub extern "C-unwind" fn knot_relation_index_lookup(
     index: *mut c_void,
     key: *mut Value,
 ) -> *mut Value {
+    if index.is_null() {
+        return alloc(Value::Relation(Vec::new()));
+    }
     let idx = unsafe { &*(index as *mut HashIndex) };
     let hash_key = serialize_value_for_hash(key);
     match idx.map.get(&hash_key) {

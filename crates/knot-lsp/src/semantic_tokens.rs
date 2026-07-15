@@ -596,6 +596,23 @@ impl<'a> TokenCollector<'a> {
             }
             ast::ExprKind::Record(fields) => {
                 for f in fields {
+                    // Emit a property token for the field name. The field name
+                    // appears in source before the `:` that separates it from
+                    // the value, so search backwards from the value's span start.
+                    let val_start = self.strip_parens(f.value.span).start;
+                    if val_start >= f.name.len() + 1 {
+                        // Look for `name:` before the value — find the last
+                        // occurrence of the field name before the value start.
+                        let search_end = val_start;
+                        let search_start = search_end.saturating_sub(f.name.len() + 1);
+                        if let Some(name_start) = self.source[search_start..search_end].rfind(f.name.as_str()) {
+                            let abs_start = search_start + name_start;
+                            let abs_end = abs_start + f.name.len();
+                            if self.source.get(abs_start..abs_end) == Some(f.name.as_str()) {
+                                self.add(Span::new(abs_start, abs_end), TOK_PROPERTY, 0);
+                            }
+                        }
+                    }
                     self.visit_expr(&f.value);
                 }
             }

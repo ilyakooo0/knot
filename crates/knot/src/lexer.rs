@@ -273,6 +273,13 @@ impl<'src> Lexer<'src> {
         let mut tokens = Vec::new();
         let mut last_was_newline = true; // suppress leading newlines
 
+        // Skip a leading UTF-8 BOM (0xEF 0xBB 0xBF) if present — some Windows
+        // editors prepend it, and without this check the BOM bytes would
+        // produce a spurious "unexpected character" diagnostic.
+        if self.bytes.starts_with(b"\xEF\xBB\xBF") {
+            self.pos += 3;
+        }
+
         loop {
             self.skip_whitespace();
 

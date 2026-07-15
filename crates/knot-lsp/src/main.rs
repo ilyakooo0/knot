@@ -29,6 +29,8 @@ mod references;
 #[cfg(test)]
 mod regress_sync_nav_fixes_tests;
 mod rename;
+#[cfg(test)]
+mod verification_pass4_tests;
 mod selection_range;
 mod semantic_tokens;
 mod shared;

@@ -15334,7 +15334,7 @@ fn check_rate_limit(
     if requests <= 0 || window_ms <= 0 {
         return Ok(());
     }
-    // Acquire the process-wide write lock so the BEGIN IMMEDIATE below
+    // Acquire the process-wide write lock so the SAVEPOINT below
     // doesn't contend at the SQLite level with other writers — every
     // other write path in the runtime is wrapped in this guard.
     let _guard = write_lock_guard();

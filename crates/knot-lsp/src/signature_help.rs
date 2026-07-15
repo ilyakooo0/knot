@@ -58,7 +58,7 @@ pub(crate) fn handle_signature_help(
         .decls
         .iter()
         .map(|d| d.span)
-        .find(|s| s.start <= offset && offset <= s.end);
+        .find(|s| s.start <= offset && offset < s.end);
     let local = lookup_local_binding_type(doc, &func_name, offset, enclosing);
     let type_str_owned: String;
     let type_str: &str = if let Some(local) = local {

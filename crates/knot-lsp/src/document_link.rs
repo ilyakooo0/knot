@@ -24,6 +24,9 @@ pub(crate) fn handle_document_link(
     let mut links = Vec::new();
 
     for imp in &doc.module.imports {
+        if imp.path.is_empty() {
+            continue;
+        }
         // `with_extension("knot")` replaces an existing extension if any —
         // covers both `./foo` (compiler-conventional) and `./foo.knot`
         // (sometimes written by hand). The extension always ends up exactly

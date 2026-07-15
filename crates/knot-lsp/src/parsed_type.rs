@@ -262,7 +262,7 @@ impl<'a> Parser<'a> {
                 // The `>` from a type-application `>` (e.g. `Map<k, v>`)
                 // does close a `<`, but `->`'s `>` must be skipped.
                 b'>' if i > 0 && self.src.as_bytes()[i - 1] == b'-' => {}
-                b'>' => depth -= 1,
+                b'>' => depth = (depth - 1).max(0),
                 b'=' if depth == 0
                     && i + 1 < self.src.len()
                     && self.src.as_bytes()[i + 1] == b'>' =>

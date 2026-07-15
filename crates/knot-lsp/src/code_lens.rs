@@ -54,7 +54,8 @@ pub(crate) fn handle_code_lens(
             | DeclKind::Derived { name, .. }
             | DeclKind::Data { name, .. }
             | DeclKind::Trait { name, .. }
-            | DeclKind::Route { name, .. } => name.as_str(),
+            | DeclKind::Route { name, .. }
+            | DeclKind::RouteComposite { name, .. } => name.as_str(),
             _ => continue,
         };
 

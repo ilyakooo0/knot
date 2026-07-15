@@ -149,8 +149,9 @@ pub(crate) fn handle_call_hierarchy_incoming(
             .iter()
             .find(|d| d.span == *decl_span)
             .map(|d| match &d.node {
-                DeclKind::Fun { .. } => SymbolKind::FUNCTION,
+                DeclKind::Fun { .. } | DeclKind::View { .. } | DeclKind::Derived { .. } => SymbolKind::FUNCTION,
                 DeclKind::Data { .. } => SymbolKind::STRUCT,
+                DeclKind::Trait { .. } => SymbolKind::INTERFACE,
                 _ => SymbolKind::VARIABLE,
             })
             .unwrap_or(SymbolKind::FUNCTION);
@@ -251,7 +252,7 @@ pub(crate) fn handle_call_hierarchy_outgoing(
             .iter()
             .find(|d| d.span == *def_span)
             .map(|d| match &d.node {
-                DeclKind::Fun { .. } => SymbolKind::FUNCTION,
+                DeclKind::Fun { .. } | DeclKind::View { .. } | DeclKind::Derived { .. } => SymbolKind::FUNCTION,
                 DeclKind::Data { .. } => SymbolKind::STRUCT,
                 DeclKind::Trait { .. } => SymbolKind::INTERFACE,
                 _ => SymbolKind::VARIABLE,

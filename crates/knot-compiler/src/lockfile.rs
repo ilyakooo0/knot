@@ -238,6 +238,44 @@ fn classify_adt_change(old: &str, new: &str) -> SchemaChange {
             return SchemaChange::Breaking;
         }
     }
+
+    // A newly-added constructor may reuse a field name that already exists in
+    // another constructor. Every *pre-existing* constructor is unchanged, but
+    // if the reused name now carries a type of a different column affinity, the
+    // existing wide-table column keeps its old affinity and the runtime's
+    // `auto_apply_adt_change` rejects the in-place migration. Classify that as
+    // Breaking so the user is sent to an explicit migrate block. Affinity is
+    // the runtime `ColType` mapping ("json" and nested "[...]" both round-trip
+    // as JSON, so they share one affinity).
+    fn field_affinity(ty: &str) -> &'static str {
+        match ty {
+            "int" => "int",
+            "float" => "float",
+            "text" => "text",
+            "bool" => "bool",
+            "bytes" => "bytes",
+            "tag" => "tag",
+            _ => "json",
+        }
+    }
+    let mut old_affinity: HashMap<&str, &'static str> = HashMap::new();
+    for (_, fields) in &old_ctors {
+        for (fname, fty) in fields {
+            old_affinity
+                .entry(fname.as_str())
+                .or_insert_with(|| field_affinity(fty));
+        }
+    }
+    for (_, fields) in &new_ctors {
+        for (fname, fty) in fields {
+            if let Some(old_aff) = old_affinity.get(fname.as_str())
+                && *old_aff != field_affinity(fty)
+            {
+                return SchemaChange::Breaking;
+            }
+        }
+    }
+
     // If no new constructors were added, the schemas are semantically
     // identical (field/constructor order is irrelevant — see comment above).
     if old_ctors.len() == new_ctors.len() {

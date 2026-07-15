@@ -156,6 +156,12 @@ fn cmd_fmt(args: &[String]) {
         eprintln!("Usage: knot fmt [--check] [--stdout] <file.knot>... (use '-' for stdin)");
         process::exit(2);
     }
+    // Writing multiple files to stdout would concatenate them without any
+    // delimiter, producing an unparseable blob — reject it instead.
+    if to_stdout && paths.len() > 1 {
+        eprintln!("error: --stdout cannot be used with multiple files");
+        process::exit(1);
+    }
 
     let mut any_diff = false;
     for path_str in &paths {

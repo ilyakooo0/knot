@@ -100,6 +100,13 @@ impl Parser {
         let mut chars = source.char_indices();
         let mut byte = 0usize; // byte offset of the next unconsumed char
         let mut col = 0usize; // column at `byte`
+        // Skip a leading UTF-8 BOM (0xEF 0xBB 0xBF) to match the lexer, which
+        // advances past it without counting it as a column; otherwise every
+        // token on line 1 would report a column one too high.
+        if source.as_bytes().starts_with(b"\xEF\xBB\xBF") {
+            chars.next();
+            byte += 3;
+        }
         for tok in tokens {
             let target = tok.span.start.min(source.len());
             while byte < target {
@@ -2585,7 +2592,12 @@ impl Parser {
                 let TokenKind::Int(n) = tok.kind else { unreachable!() };
                 let span = Span::new(minus_tok.span.start, tok.span.end);
                 let lit = Spanned::new(ExprKind::Lit(Literal::Int(format!("-{}", n))), span);
-                self.maybe_time_unit(lit)
+                // Feed the folded literal through the postfix and application
+                // layers so `-5 x` parses as `App(-5, x)` like `5 x`, instead
+                // of short-circuiting to just `-5`.
+                let lit = self.maybe_time_unit(lit)?;
+                let lit = self.parse_postfix_from(lit)?;
+                self.parse_application_from(lit)
             }
             TokenKind::Minus => {
                 if !self.enter_recursion() { return None; }
@@ -2624,8 +2636,14 @@ impl Parser {
     }
 
     fn parse_application(&mut self) -> Option<Expr> {
-        let mut func = self.parse_postfix()?;
+        let func = self.parse_postfix()?;
+        self.parse_application_from(func)
+    }
 
+    /// Continue an application chain from an already-parsed head expression.
+    /// Used both by `parse_application` and by the prefix-minus integer fold,
+    /// so `-5 x` parses as `App(-5, x)` just like `5 x`.
+    fn parse_application_from(&mut self, mut func: Expr) -> Option<Expr> {
         // Application chains (`f a b c …`) are built iteratively into a
         // left-spine, so — like the binop loop — they must charge the depth
         // budget per node and hold it until return, otherwise a pathological
@@ -2794,8 +2812,12 @@ impl Parser {
     }
 
     fn parse_postfix(&mut self) -> Option<Expr> {
-        let mut expr = self.parse_constructor_or_atom()?;
+        let expr = self.parse_constructor_or_atom()?;
+        self.parse_postfix_from(expr)
+    }
 
+    /// Continue a field-access chain from an already-parsed head expression.
+    fn parse_postfix_from(&mut self, mut expr: Expr) -> Option<Expr> {
         // Field-access chains (`x.a.b.c…`) build a left-spine iteratively, so —
         // like the binop and application loops — charge the depth budget per
         // node and hold it until return to bound the resulting AST depth (see
@@ -3977,6 +3999,7 @@ impl Parser {
         matches!(
             self.peek(),
             TokenKind::Lower(_)
+                | TokenKind::Upper(_)
                 | TokenKind::Underscore
                 | TokenKind::LBrace
                 | TokenKind::LBracket
@@ -4002,6 +4025,21 @@ impl Parser {
                 let tok = self.advance();
                 let TokenKind::Lower(name) = tok.kind else { unreachable!() };
                 Some(Spanned::new(PatKind::Var(name), tok.span))
+            }
+            TokenKind::Upper(_) => {
+                // A bare constructor used as a payload: `Just True`, `Ok Nothing`.
+                // Treat it as a nullary constructor (empty record payload) — do
+                // NOT consume a further payload atom here, so a constructor with
+                // arguments still requires parentheses.
+                let tok = self.advance();
+                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                Some(Spanned::new(
+                    PatKind::Constructor {
+                        name,
+                        payload: Box::new(Spanned::new(PatKind::Record(vec![]), tok.span)),
+                    },
+                    tok.span,
+                ))
             }
             TokenKind::LBrace => {
                 self.advance();
@@ -4276,7 +4314,14 @@ impl Parser {
             // continuation rule for expression application.
             let saved = self.save();
             self.skip_newlines();
+            // Don't absorb what is really the start of a new declaration: a
+            // lowercase identifier immediately followed by `=` or `:`. At top
+            // level `block_indent` is 0, so any indented line would otherwise
+            // extend the type application and silently swallow the next decl.
+            let next_starts_decl = matches!(self.peek(), TokenKind::Lower(_))
+                && matches!(self.peek_ahead(1), TokenKind::Eq | TokenKind::Colon);
             if !self.at_eof()
+                && !next_starts_decl
                 && self.cur_column() > self.block_indent
                 && self.can_start_type_atom()
             {

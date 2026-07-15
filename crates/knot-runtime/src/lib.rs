@@ -2754,6 +2754,19 @@ fn wake_all_int_less(idx: &RangeIndex) {
     }
 }
 
+/// Conservatively wake every watcher in a range index, regardless of its
+/// stored threshold. Used as an over-wake when a row's numeric value can't be
+/// compared exactly against float thresholds (an integer beyond f64's 2^53
+/// exact range), so precise range probing would be unreliable and might miss
+/// a genuine match.
+fn wake_all_range(idx: &RangeIndex) {
+    for dir in [&idx.lt, &idx.le, &idx.gt, &idx.ge] {
+        for v in dir.values() {
+            wake_weaks(v);
+        }
+    }
+}
+
 fn wake_range_index(idx: &RangeIndex, row_val: &SqlVal) {
     let primary = row_val.to_key();
     // A Real row more negative than every i64 threshold: the RealBits primary
@@ -2768,6 +2781,22 @@ fn wake_range_index(idx: &RangeIndex, row_val: &SqlVal) {
     {
         wake_range_keyed(idx, &primary);
         wake_all_int_less(idx);
+        return;
+    }
+    // Integer rows (native `Int` or the integer-valued TEXT storage form) are
+    // only exactly f64-representable when |n| < 2^53; beyond that `as f64`
+    // rounds, so the cross-type Real-threshold probe below would compare
+    // against a forged value and could miss a genuine wakeup. Over-wake every
+    // watcher on this column instead (mirrors `eq_cross_key`'s guard).
+    let int_row: Option<i64> = match row_val {
+        SqlVal::Int(n) => Some(*n),
+        SqlVal::Text(s) => s.parse::<i64>().ok(),
+        _ => None,
+    };
+    if let Some(n) = int_row
+        && n.abs() >= (1i64 << 53)
+    {
+        wake_all_range(idx);
         return;
     }
     let alt = match row_val {
@@ -3324,7 +3353,11 @@ pub extern "C-unwind" fn knot_override_lookup(
     let wrap_maybe = type_tag >= 4;
     let is_bool = base_tag == 3;
 
-    let args: Vec<String> = std::env::args().collect();
+    // Use args_os and skip non-UTF-8 entries: std::env::args() panics on
+    // non-UTF-8 argv, which would crash before any override lookup runs.
+    let args: Vec<String> = std::env::args_os()
+        .filter_map(|a| a.into_string().ok())
+        .collect();
     let mut value: Option<String> = None;
 
     let mut i = 1; // skip argv[0]
@@ -3531,13 +3564,17 @@ enum DefaultKind {
 /// If `--help` is found, prints usage and exits.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_override_check_help(desc_ptr: *const u8, desc_len: usize) {
-    let has_help = std::env::args().any(|a| a == "--help");
+    // args_os avoids the panic std::env::args() raises on non-UTF-8 argv.
+    let has_help = std::env::args_os().any(|a| a.to_str() == Some("--help"));
     if !has_help {
         return;
     }
 
     let desc = unsafe { str_from_raw(desc_ptr, desc_len) };
-    let exe = std::env::args().next().unwrap_or_else(|| "program".to_string());
+    let exe = std::env::args_os()
+        .next()
+        .and_then(|a| a.into_string().ok())
+        .unwrap_or_else(|| "program".to_string());
 
     let mut overrides: Vec<(&str, &str, DefaultKind)> = Vec::new();
     if !desc.is_empty() {
@@ -5127,7 +5164,10 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
     }
     let first = rows[0];
     if first.is_null() {
-        return Some(TempSchema::Scalar(ColType::Text));
+        // A null first row gives no shape to key the schema on, and later
+        // rows would still be materialized into params by callers — return
+        // None so they take the safe in-memory fallback.
+        return None;
     }
     match unsafe { as_ref(first) } {
         Value::Record(first_fields) => {
@@ -5208,7 +5248,10 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
             let mut tags: Vec<(String, Vec<String>, Vec<(Option<ColType>, bool)>)> = Vec::new();
 
             for row in rows {
-                if row.is_null() { continue; }
+                // A null row can't be materialized by adt_row_to_params — bail
+                // to the safe in-memory path rather than skip it (matches the
+                // Record branch's null handling).
+                if row.is_null() { return None; }
                 let (tag, payload) = match unsafe { as_ref(*row) } {
                     Value::Constructor(tag, payload) => (tag, payload),
                     _ => return None,
@@ -6546,19 +6589,25 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                         buf.push(7);
                         buf.extend_from_slice(&(tag.len() as u32).to_le_bytes());
                         buf.extend_from_slice(tag.as_bytes());
-                        // Nullary constructors have two runtime forms:
-                        // `Constructor(tag, Unit)` and `Constructor(tag, Record([]))`.
-                        // Canonicalize both to the same hash bytes (tag 5,
-                        // matching Unit) so set semantics agree.
-                        match unsafe { as_ref(*payload) } {
-                            Value::Unit => {
-                                buf.push(5);
-                            }
-                            Value::Record(r) if r.is_empty() => {
-                                buf.push(5);
-                            }
-                            _ => {
-                                stack.push(HashTask::Value(*payload));
+                        // Nullary constructors have three runtime forms:
+                        // `Constructor(tag, Unit)`, `Constructor(tag, Record([]))`,
+                        // and `Constructor(tag, null)`. Canonicalize all to the
+                        // same hash bytes (tag 5, matching Unit) so set semantics
+                        // agree — and so a null payload isn't dereferenced (which
+                        // would panic), matching the display path's null guard.
+                        if (*payload).is_null() {
+                            buf.push(5);
+                        } else {
+                            match unsafe { as_ref(*payload) } {
+                                Value::Unit => {
+                                    buf.push(5);
+                                }
+                                Value::Record(r) if r.is_empty() => {
+                                    buf.push(5);
+                                }
+                                _ => {
+                                    stack.push(HashTask::Value(*payload));
+                                }
                             }
                         }
                     }
@@ -6652,6 +6701,12 @@ fn record_content_hash_hex(row_ptr: *mut Value) -> String {
 /// Check if a value is a nullary constructor payload: `Unit` or an empty `Record([])`.
 /// Both forms represent the same conceptual "no payload" for nullary constructors.
 fn is_nullary_payload(v: *mut Value) -> bool {
+    // A null payload is the third nullary form (alongside `Unit` and empty
+    // `Record`); treat it as nullary so eq/compare don't deref null and panic,
+    // matching the display and hash paths.
+    if v.is_null() {
+        return true;
+    }
     match unsafe { as_ref(v) } {
         Value::Unit => true,
         Value::Record(r) => r.is_empty(),
@@ -6881,13 +6936,11 @@ pub extern "C-unwind" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Va
             alloc_float(x as f64 / y)
         }
         (Some(NumView::Float(x)), Some(NumView::Int(y))) => {
-            if y == 0 {
-                // Int divisor is zero — produce IEEE 754 result
-                if x == 0.0 { alloc_float(f64::NAN) }
-                else { alloc_float(if x > 0.0 { f64::INFINITY } else { f64::NEG_INFINITY }) }
-            } else {
-                alloc_float(x / y as f64)
-            }
+            // IEEE 754 float division: `x / 0.0` already yields the correct
+            // result for every x (NaN/0 = NaN, +x/0 = +inf, -x/0 = -inf,
+            // 0/0 = NaN). A manual y==0 branch mishandled NaN by returning
+            // -inf, so defer to the hardware division.
+            alloc_float(x / (y as f64))
         }
         _ => panic!("knot runtime: cannot divide {} / {}", type_name(a), type_name(b)),
     }
@@ -7404,7 +7457,17 @@ fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
                 }
                 if let Some(num_ord) = match (to_num_view(av), to_num_view(bv)) {
                     (Some(NumView::Int(x)), Some(NumView::Int(y))) => Some(x.cmp(&y)),
-                    (Some(NumView::Float(x)), Some(NumView::Float(y))) => Some(x.total_cmp(&y)),
+                    (Some(NumView::Float(x)), Some(NumView::Float(y))) => {
+                        // `values_equal` treats all NaN as equal, so `compare`
+                        // must agree (Eq ⊆ Ord): collapse the +/-NaN distinction
+                        // `total_cmp` would otherwise draw. A lone NaN keeps
+                        // `total_cmp`'s ordering (it sorts to one end).
+                        if x.is_nan() && y.is_nan() {
+                            Some(Ordering::Equal)
+                        } else {
+                            Some(x.total_cmp(&y))
+                        }
+                    }
                     (Some(NumView::Int(x)), Some(NumView::Float(y))) => Some(cmp_int_float(x, y)),
                     (Some(NumView::Float(x)), Some(NumView::Int(y))) => {
                         Some(cmp_int_float(y, x).reverse())
@@ -8405,6 +8468,16 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
 
                 CANCEL_FLAG.with(|c| *c.borrow_mut() = Some(my_cancel.clone()));
 
+                // Run the whole worker body — db open, IO execution, and the
+                // winning value's deep-clone — under catch_unwind. knot_db_open
+                // itself can panic (`.expect` on open/pragma failures); catching
+                // a *setup* panic here (not only an IO panic) is what lets the
+                // Err arm below record a loss, so two failing sides can't leave
+                // the parent parked on the outcome condvar forever. On success
+                // the closure returns the Box-cloned winner (or `None` when this
+                // side was already cancelled); db/io are freed by CleanupGuard as
+                // the closure scope ends, before we touch shared state.
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let io = io_raw as *mut u8 as *mut Value;
                 // Guard the deep-cloned IO tree before knot_db_open, which can
                 // panic (`.expect` on open/pragma failures) and unwind past
@@ -8437,16 +8510,21 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                 // it is not freed a second time when this scope ends.
                 std::mem::forget(io_guard);
 
+                let result = knot_io_run(db, io);
 
-                // Run the user IO under catch_unwind: a panicking side must
-                // record a loss instead of silently unwinding — otherwise two
-                // panicking sides leave the parent parked on the outcome
-                // condvar forever.
-                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    knot_io_run(db, io)
+                // If cancellation already fired, drop the result silently.
+                if my_cancel.is_cancelled() {
+                    return None;
+                }
+
+                // Deep-clone the winning value into Box-allocated storage
+                // so it outlives this thread's arena.
+                Some(deep_clone_value(result) as *mut u8 as usize)
                 }));
-                let result = match run {
-                    Ok(v) => v,
+
+                let cloned = match run {
+                    Ok(None) => return,
+                    Ok(Some(cloned)) => cloned,
                     Err(payload) => {
                         // Release any write locks the unwinding body may have
                         // held so other threads aren't deadlocked (no-op when
@@ -8456,7 +8534,8 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                         // `knot_atomic_begin` (the guard was `mem::forget`-en)
                         // — skipping the release would deadlock every writer
                         // in the process. The connection (and its open
-                        // savepoints) is discarded by `CleanupGuard` below.
+                        // savepoints) was discarded by `CleanupGuard` as the
+                        // closure unwound.
                         write_lock_force_release();
                         knot_stm_reset_tracking();
                         // Cooperative cancellation surfaces as a `Cancelled`
@@ -8496,15 +8575,6 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                         return;
                     }
                 };
-
-                // If cancellation already fired, drop the result silently.
-                if my_cancel.is_cancelled() {
-                    return;
-                }
-
-                // Deep-clone the winning value into Box-allocated storage
-                // so it outlives this thread's arena.
-                let cloned = deep_clone_value(result) as *mut u8 as usize;
 
                 let mut g = state.lock().unwrap_or_else(|e| e.into_inner());
                 if g.outcome.is_none() {
@@ -11909,9 +11979,13 @@ fn auto_apply_adt_change(
                 if old_ctor.fields.len() != new_ctor.fields.len() {
                     return false;
                 }
-                for (of, nf) in old_ctor.fields.iter().zip(&new_ctor.fields) {
-                    if of.name != nf.name || std::mem::discriminant(&of.ty) != std::mem::discriminant(&nf.ty) {
-                        return false;
+                // Match fields by name, not by position: the wide table is
+                // name-addressed, so reordering a constructor's fields is not a
+                // breaking change (mirrors `auto_apply_record_change`).
+                for of in &old_ctor.fields {
+                    match new_ctor.fields.iter().find(|nf| nf.name == of.name) {
+                        Some(nf) if std::mem::discriminant(&of.ty) == std::mem::discriminant(&nf.ty) => {}
+                        _ => return false,
                     }
                 }
             }
@@ -14001,8 +14075,14 @@ pub extern "C-unwind" fn knot_source_diff_write(
         // since the diff logic only handles scalar columns.
         if !rec_schema.nested.is_empty() {
             let table_name = format!("_knot_{}", name);
+            // Full clear + rewrite: suspend the per-row referential BEFORE
+            // DELETE triggers so they don't abort on the transient missing-key
+            // state, then restore them (which runs a whole-relation orphan
+            // scan) — mirrors knot_source_write (bug B24).
+            let suspended = suspend_del_triggers(&db_ref.conn, &table_name);
             delete_record_table(&db_ref.conn, &table_name, &rec_schema);
             write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
+            restore_del_triggers(&db_ref.conn, &table_name, &suspended);
 
             // Return from the closure only; the shared RELEASE SAVEPOINT +
             // relation-change notify after the guard runs exactly once.
@@ -14012,8 +14092,10 @@ pub extern "C-unwind" fn knot_source_diff_write(
         // Zero-column records have nothing to diff — fall back to clear + rewrite
         if rec_schema.columns.is_empty() {
             let table_name = format!("_knot_{}", name);
+            let suspended = suspend_del_triggers(&db_ref.conn, &table_name);
             delete_record_table(&db_ref.conn, &table_name, &rec_schema);
             write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
+            restore_del_triggers(&db_ref.conn, &table_name, &suspended);
 
             return;
         }
@@ -14229,9 +14311,15 @@ pub extern "C-unwind" fn knot_source_delete_where(
     let qt = quote_ident(&table);
     let mut descendant_tables: Vec<String> = {
         let prefix = format!("{}__", table);
-        let mut stmt = db_ref.conn.prepare(
+        let mut stmt = match db_ref.conn.prepare(
             "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?1"
-        ).unwrap();
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                rollback_delete_where(db_ref);
+                panic!("knot runtime: failed to prepare descendant table query: {}", e);
+            }
+        };
         stmt.query_map([format!("{}%", prefix)], |row| row.get::<_, String>(0))
             .into_iter()
             .flatten()
@@ -15546,6 +15634,7 @@ pub extern "C-unwind" fn knot_constraint_register(
                  BEFORE DELETE ON {sup_table} \
                  FOR EACH ROW \
                  WHEN EXISTS (SELECT 1 FROM {sub_table} WHERE {sub_col} = OLD.{sup_col}) \
+                 AND NOT EXISTS (SELECT 1 FROM {sup_table} WHERE {sup_col} = OLD.{sup_col} AND rowid <> OLD.rowid) \
                  BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
                 trg = quote_ident(&format!("_knot_fk_{}_del", trg_suffix)),
                 sup_table = sup_table,
@@ -15572,6 +15661,7 @@ pub extern "C-unwind" fn knot_constraint_register(
                  BEFORE UPDATE OF {sup_col} ON {sup_table} \
                  FOR EACH ROW \
                  WHEN NEW.{sup_col} IS NOT OLD.{sup_col} AND EXISTS (SELECT 1 FROM {sub_table} WHERE {sub_col} = OLD.{sup_col}) \
+                 AND NOT EXISTS (SELECT 1 FROM {sup_table} WHERE {sup_col} = OLD.{sup_col} AND rowid <> OLD.rowid) \
                  BEGIN SELECT RAISE(ABORT, '{msg}'); END;",
                 trg = quote_ident(&format!("_knot_fk_{}_supupd", trg_suffix)),
                 sup_table = sup_table,

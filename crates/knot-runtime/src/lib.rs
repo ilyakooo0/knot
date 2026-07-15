@@ -14544,6 +14544,20 @@ pub extern "C-unwind" fn knot_source_update_where(
     let table = format!("_knot_{}", name);
     db_ref.ensure_indexes_for_where(&table, where_clause);
 
+    // Run the UPDATE + pre/post-image SELECTs in a single savepoint (like
+    // every sibling write path) so a subset-constraint trigger ABORT or
+    // other failure doesn't leave the connection in an inconsistent state.
+    db_ref
+        .conn
+        .execute_batch("SAVEPOINT knot_update_where;")
+        .expect("knot runtime: failed to begin transaction");
+
+    fn rollback_update_where(db_ref: &KnotDb) {
+        let _ = db_ref.conn.execute_batch(
+            "ROLLBACK TO SAVEPOINT knot_update_where; RELEASE SAVEPOINT knot_update_where;",
+        );
+    }
+
     let param_values = match unsafe { as_ref(params) } {
         Value::Relation(rows) => rows,
         _ => panic!(
@@ -14609,7 +14623,10 @@ pub extern "C-unwind" fn knot_source_update_where(
     db_ref
         .conn
         .execute(&sql, param_refs.as_slice())
-        .unwrap_or_else(|e| panic!("knot runtime: update_where error: {}\n  SQL: {}", e, sql));
+        .unwrap_or_else(|e| {
+            rollback_update_where(db_ref);
+            panic!("knot runtime: update_where error: {}\n  SQL: {}", e, sql)
+        });
 
     // Post-image: re-SELECT the same rows by rowid. UPDATE may have changed
     // a column that a watcher filters on — pre-image captures the old value,
@@ -14664,6 +14681,12 @@ pub extern "C-unwind" fn knot_source_update_where(
         }
         _ => WriteEvent::Bulk,
     };
+
+    // Release the savepoint — the UPDATE and image captures committed.
+    db_ref
+        .conn
+        .execute_batch("RELEASE SAVEPOINT knot_update_where;")
+        .expect("knot runtime: failed to commit update_where transaction");
 
     if db_ref.atomic_depth.get() > 0 {
         stm_track_write_with_event(name, event);
@@ -15317,14 +15340,13 @@ fn check_rate_limit(
     let _guard = write_lock_guard();
     ensure_rate_limit_table(db);
     let now = current_unix_ms();
-    // BEGIN IMMEDIATE serializes concurrent same-key checks. If it fails
-    // (e.g. SQLITE_BUSY under contention), fail OPEN without touching the
-    // bucket: allowing a request through under transient DB pressure beats
-    // 429ing legitimate traffic, and skipping the accounting write keeps
-    // the stored token counts intact.
-    if let Err(e) = db.conn.execute_batch("BEGIN IMMEDIATE;") {
+    // Use a savepoint (not BEGIN/COMMIT/ROLLBACK) so this nests correctly
+    // inside an outer `atomic` block's savepoint stack. BEGIN would be a
+    // no-op (already in a transaction), and ROLLBACK would undo the entire
+    // outer transaction — not just the rate-limit check.
+    if let Err(e) = db.conn.execute_batch("SAVEPOINT knot_rate_limit;") {
         log_warn!(
-            "[HTTP] rate limiter: BEGIN failed ({}); allowing request without accounting",
+            "[HTTP] rate limiter: SAVEPOINT failed ({}); allowing request without accounting",
             e
         );
         return Ok(());
@@ -15346,7 +15368,7 @@ fn check_rate_limit(
                 "[HTTP] rate limiter: bucket read failed ({}); allowing request without accounting",
                 e
             );
-            let _ = db.conn.execute_batch("ROLLBACK;");
+            let _ = db.conn.execute_batch("ROLLBACK TO SAVEPOINT knot_rate_limit; RELEASE SAVEPOINT knot_rate_limit;");
             return Ok(());
         }
     };
@@ -15366,10 +15388,10 @@ fn check_rate_limit(
             "INSERT OR REPLACE INTO _knot_rate_limits (route, key, tokens, last_refill) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![route, key, tokens, now],
         );
-        let result = write.and_then(|_| db.conn.execute_batch("COMMIT;"));
+        let result = write.and_then(|_| db.conn.execute_batch("RELEASE SAVEPOINT knot_rate_limit;"));
         if let Err(e) = result {
             log_warn!("[HTTP] rate limiter: bucket write failed ({})", e);
-            let _ = db.conn.execute_batch("ROLLBACK;");
+            let _ = db.conn.execute_batch("ROLLBACK TO SAVEPOINT knot_rate_limit; RELEASE SAVEPOINT knot_rate_limit;");
         }
     };
     if tokens_before >= 1.0 {

@@ -47,12 +47,12 @@ fn parse_schema_kind(schema: &str) -> SchemaKind {
     }
     if let Some(body) = schema.strip_prefix('#') {
         let mut ctors = Vec::new();
-        for ctor_part in split_respecting_brackets(body, '|') {
+        for ctor_part in crate::split_respecting_brackets(body, '|') {
             if ctor_part.is_empty() { continue; }
             let mut parts = ctor_part.splitn(2, ':');
             let name = parts.next().unwrap().to_string();
             let fields = if let Some(field_spec) = parts.next() {
-                split_respecting_brackets(field_spec, ';')
+                crate::split_respecting_brackets(field_spec, ';')
                     .into_iter()
                     .map(|f| {
                         let mut fp = f.splitn(2, '=');
@@ -68,7 +68,7 @@ fn parse_schema_kind(schema: &str) -> SchemaKind {
         }
         SchemaKind::Adt(ctors)
     } else {
-        let fields: Vec<(String, String)> = split_respecting_brackets(schema, ',')
+        let fields: Vec<(String, String)> = crate::split_respecting_brackets(schema, ',')
             .into_iter()
             .filter_map(|part| {
                 let colon = part.find(':')?;
@@ -79,25 +79,6 @@ fn parse_schema_kind(schema: &str) -> SchemaKind {
             .collect();
         SchemaKind::Record(fields)
     }
-}
-
-fn split_respecting_brackets(s: &str, sep: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '[' => depth += 1,
-            ']' => depth = depth.saturating_sub(1),
-            c if c == sep && depth == 0 => {
-                parts.push(&s[start..i]);
-                start = i + c.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(&s[start..]);
-    parts
 }
 
 // ── Data loading ─────────────────────────────────────────────────

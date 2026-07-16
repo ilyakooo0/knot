@@ -423,8 +423,11 @@ impl<'src> Lexer<'src> {
             return Some(self.lex_byte_string());
         }
 
-        // Identifiers and keywords
-        if ch.is_ascii_alphabetic() || ch == b'_' {
+        // Identifiers and keywords. Accept non-ASCII Unicode letters as an
+        // identifier start (`café`, `α`) too — the byte-level gate uses the
+        // lead byte, and the full multi-byte character is then consumed by
+        // `is_ident_continue`.
+        if ch.is_ascii_alphabetic() || (ch >= 0x80 && char::from(ch).is_alphabetic()) || ch == b'_' {
             return Some(self.lex_identifier());
         }
 
@@ -499,7 +502,15 @@ impl<'src> Lexer<'src> {
     }
 
     fn is_ident_continue(&self) -> bool {
-        matches!(self.peek(), Some(b) if b.is_ascii_alphanumeric() || b == b'_' || b == b'\'')
+        // Any non-ASCII byte (`b >= 0x80`) continues an identifier: this covers
+        // every byte of a multi-byte UTF-8 letter — both the lead byte and its
+        // continuation bytes, which individually are not alphanumeric — so a
+        // Unicode identifier is consumed whole and `slice` stays on a char
+        // boundary. `'` continues identifiers too (`x'`).
+        matches!(
+            self.peek(),
+            Some(b) if b.is_ascii_alphanumeric() || b == b'_' || b == b'\'' || b >= 0x80
+        )
     }
 
     // ── Numbers ─────────────────────────────────────────────────────
@@ -1091,6 +1102,28 @@ mod tests {
                 TokenKind::Eof,
             ],
         );
+    }
+
+    #[test]
+    fn unicode_identifiers() {
+        // Regression (M3): the identifier gate was ASCII-only, so Unicode
+        // letters were rejected as "unexpected character". A leading Unicode
+        // letter now starts an identifier and its full multi-byte form is
+        // consumed intact (no mid-codepoint slice / no diagnostics).
+        assert_eq!(
+            kinds("let café = 1"),
+            vec![
+                TokenKind::Let,
+                TokenKind::Lower("café".into()),
+                TokenKind::Eq,
+                TokenKind::Int("1".into()),
+                TokenKind::Eof,
+            ],
+        );
+        // A word whose first character is itself non-ASCII lexes cleanly too.
+        let (toks, diags) = kinds_with_diags("α = 1");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(toks[0], TokenKind::Upper("α".into()));
     }
 
     #[test]

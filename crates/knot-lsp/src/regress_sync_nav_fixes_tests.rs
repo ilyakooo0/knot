@@ -256,6 +256,49 @@ fn call_hierarchy_incoming_excludes_self_declaration_token() {
     );
 }
 
+#[test]
+fn call_hierarchy_incoming_finds_cross_file_callers() {
+    // Regression (M4): incoming-calls only searched the target document, so a
+    // caller in another open file that imports the target was missed entirely.
+    // It now also walks the other open documents (mirroring find-references'
+    // origin discipline).
+    let mut tmp = TempWorkspace::new();
+    let owner_uri = tmp.write_and_open("owner.knot", "helper = \\x -> x\n");
+    let consumer_uri =
+        tmp.write_and_open("consumer.knot", "import ./owner\nrun = helper 1\n");
+    let owner_doc = tmp.workspace.doc(&owner_uri);
+    let helper_def = *owner_doc.definitions.get("helper").expect("helper defined");
+    let params = CallHierarchyIncomingCallsParams {
+        item: CallHierarchyItem {
+            name: "helper".to_string(),
+            kind: SymbolKind::FUNCTION,
+            tags: None,
+            detail: None,
+            uri: owner_uri.clone(),
+            range: crate::utils::span_to_range(helper_def, &owner_doc.source),
+            selection_range: crate::utils::span_to_range(helper_def, &owner_doc.source),
+            data: None,
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+    let incoming =
+        crate::call_hierarchy::handle_call_hierarchy_incoming(&tmp.workspace.state, &params)
+            .expect("helper has a cross-file incoming call from consumer.knot");
+    let from_consumer = incoming
+        .iter()
+        .find(|c| c.from.name == "run")
+        .expect("the cross-file caller `run` must be present");
+    assert_eq!(
+        from_consumer.from.uri, consumer_uri,
+        "the caller must be attributed to consumer.knot"
+    );
+    assert!(
+        !from_consumer.from_ranges.is_empty(),
+        "the call site range in consumer.knot must be reported"
+    );
+}
+
 // ── Finding 8: type-hierarchy whole-token supertype match ────────────
 
 fn th_supertypes_params(uri: &Uri, kind: &str, name: &str) -> TypeHierarchySupertypesParams {

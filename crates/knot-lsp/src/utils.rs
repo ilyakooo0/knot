@@ -28,10 +28,22 @@ pub fn offset_to_position(source: &str, offset: usize) -> Position {
     let bytes = source.as_bytes();
     let mut line: u32 = 0;
     let mut line_start: usize = 0;
-    for (i, &byte) in bytes.iter().enumerate().take(clamped) {
-        if byte == b'\n' {
-            line += 1;
-            line_start = i + 1;
+    for i in 0..clamped {
+        match bytes[i] {
+            b'\n' => {
+                line += 1;
+                line_start = i + 1;
+            }
+            // A lone `\r` (classic-Mac line ending) is its own line break,
+            // matching the lexer and `diagnostic::line_col`. A `\r` that is the
+            // first half of a CRLF pair is NOT counted here — the break is
+            // attributed to the following `\n`, and the trailing `\r` is
+            // stripped from the column count below.
+            b'\r' if bytes.get(i + 1) != Some(&b'\n') => {
+                line += 1;
+                line_start = i + 1;
+            }
+            _ => {}
         }
     }
     let mut safe_offset = clamped;
@@ -56,34 +68,50 @@ pub fn offset_to_position(source: &str, offset: usize) -> Position {
 }
 
 pub fn position_to_offset(source: &str, pos: Position) -> usize {
-    let mut offset = 0;
-    for (i, line) in source.split('\n').enumerate() {
-        if i == pos.line as usize {
-            // Strip a trailing \r only when it is the \r of a real CRLF line
-            // break — i.e. this segment is followed by a \n. On the final
-            // segment (no following \n) a trailing \r is a stray character and
-            // must count as a column, matching `offset_to_position`; stripping
-            // it there desynchronizes the round-trip by one byte.
-            let is_last_segment = offset + line.len() == source.len();
-            let line = if is_last_segment {
-                line
-            } else {
-                line.strip_suffix('\r').unwrap_or(line)
-            };
-            let mut utf16_count: u32 = 0;
-            let mut byte_pos: usize = 0;
-            for c in line.chars() {
-                if utf16_count >= pos.character {
-                    break;
-                }
-                utf16_count += c.len_utf16() as u32;
-                byte_pos += c.len_utf8();
+    let bytes = source.as_bytes();
+    // Advance to the byte where the target line begins, treating `\n`, a lone
+    // `\r`, and `\r\n` each as a single line break — matching the lexer and
+    // `offset_to_position` (a `split('\n')` here would miss `\r`-only endings).
+    let mut line: u32 = 0;
+    let mut i = 0;
+    let mut line_start = 0;
+    while i < bytes.len() && line < pos.line {
+        match bytes[i] {
+            b'\n' => {
+                i += 1;
+                line += 1;
+                line_start = i;
             }
-            return offset + byte_pos;
+            b'\r' => {
+                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                line += 1;
+                line_start = i;
+            }
+            _ => i += 1,
         }
-        offset += line.len() + 1;
     }
-    source.len()
+    if line < pos.line {
+        // The requested line is past the end of the document.
+        return source.len();
+    }
+    // Walk within the line up to `pos.character` (UTF-16 code units), stopping
+    // at the line terminator (`\n`, or a `\r` beginning a lone-CR or CRLF break).
+    let mut utf16_count: u32 = 0;
+    let mut byte_pos = line_start;
+    while byte_pos < bytes.len() {
+        let b = bytes[byte_pos];
+        if b == b'\n' || b == b'\r' {
+            break;
+        }
+        if utf16_count >= pos.character {
+            break;
+        }
+        // Decode one full character starting at the current byte.
+        let ch = source[byte_pos..].chars().next().unwrap();
+        utf16_count += ch.len_utf16() as u32;
+        byte_pos += ch.len_utf8();
+    }
+    byte_pos
 }
 
 pub fn word_at_position(source: &str, pos: Position) -> Option<&str> {
@@ -608,28 +636,47 @@ mod regress_fixes_tests {
     use super::*;
 
     #[test]
-    fn offset_to_position_counts_midline_stray_cr_as_column() {
-        // A stray \r that does NOT terminate the line is an ordinary
-        // character: offset 3 in "ab\rcd" is column 3, not 2.
+    fn offset_to_position_treats_lone_cr_as_line_break() {
+        // Regression (H1): a lone `\r` (classic-Mac line ending) is a real line
+        // break — matching the lexer and `diagnostic::line_col`. Offset 3 in
+        // "ab\rcd" is the start of line 1 (column 0), not column 3, so LSP
+        // positions stay in sync with lexer/diagnostic spans for `\r`-only files.
         let src = "ab\rcd";
-        assert_eq!(offset_to_position(src, 3), Position::new(0, 3));
-        assert_eq!(offset_to_position(src, 5), Position::new(0, 5));
+        assert_eq!(offset_to_position(src, 3), Position::new(1, 0));
+        assert_eq!(offset_to_position(src, 5), Position::new(1, 2));
     }
 
     #[test]
     fn round_trip_final_line_bare_cr() {
-        // A document whose last line ends in a bare CR (no LF): the trailing \r
-        // is stray content, so column 4 maps back to byte 4, not 3. Previously
-        // `position_to_offset` stripped it and returned 3, desyncing the pair.
+        // A document whose last line ends in a bare CR (no LF): the `\r` is a
+        // line break, so the byte after it is the start of a new (empty) line.
         let src = "abc\r";
-        assert_eq!(offset_to_position(src, 4), Position::new(0, 4));
-        assert_eq!(position_to_offset(src, Position::new(0, 4)), 4);
+        assert_eq!(offset_to_position(src, 4), Position::new(1, 0));
+        assert_eq!(position_to_offset(src, Position::new(1, 0)), 4);
         // A real CRLF terminator is still stripped from the column count, so
         // the second line starts at the byte after the \n.
         let crlf = "abc\r\ndef";
         assert_eq!(position_to_offset(crlf, Position::new(0, 3)), 3); // end of "abc"
         assert_eq!(position_to_offset(crlf, Position::new(1, 0)), 5); // start of "def"
         assert_eq!(position_to_offset(crlf, Position::new(1, 3)), 8); // end of "def"
+    }
+
+    #[test]
+    fn round_trips_lone_cr_line_endings() {
+        // Regression (H1): every char-boundary offset of a `\r`-only document
+        // round-trips through offset_to_position / position_to_offset.
+        let src = "ab\rcd\ref";
+        for offset in 0..=src.len() {
+            if !src.is_char_boundary(offset) {
+                continue;
+            }
+            let pos = offset_to_position(src, offset);
+            assert_eq!(position_to_offset(src, pos), offset, "offset {offset}");
+        }
+        // Spot-check the derived line/column numbering.
+        assert_eq!(offset_to_position(src, 0), Position::new(0, 0)); // 'a'
+        assert_eq!(offset_to_position(src, 3), Position::new(1, 0)); // 'c'
+        assert_eq!(offset_to_position(src, 6), Position::new(2, 0)); // 'e'
     }
 
     #[test]

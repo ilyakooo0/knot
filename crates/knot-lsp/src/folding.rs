@@ -103,6 +103,7 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
         | ast::ExprKind::Lambda { .. }
         | ast::ExprKind::Atomic { .. }
         | ast::ExprKind::Record(_)
+        | ast::ExprKind::Serve { .. }
             if range.end.line > range.start.line => {
                 ranges.push(FoldingRange {
                     start_line: range.start.line,

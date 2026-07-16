@@ -1668,8 +1668,19 @@ impl Infer {
         let mut cur = v;
         let mut steps = 0usize;
         while let Some(Ty::Var(next)) = self.subst.get(&cur) {
-            if *next == cur || steps > 10_000 {
+            if *next == cur {
                 break;
+            }
+            // A substitution chain this long can only mean an occurs-check bug
+            // left a cycle behind. Silently breaking here would return an
+            // interior variable and miscompile downstream, so fail loudly with a
+            // clear message rather than papering over the compiler bug.
+            if steps > 10_000 {
+                panic!(
+                    "knot type inference: substitution chain exceeds 10K steps for var {:?} \
+                     — possible occurs-check bug",
+                    cur
+                );
             }
             cur = *next;
             steps += 1;

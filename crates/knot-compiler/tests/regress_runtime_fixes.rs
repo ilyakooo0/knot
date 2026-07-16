@@ -243,3 +243,33 @@ main = do
         "non-empty sums must still add up:\n{stdout}"
     );
 }
+
+// ── M1: sortBy dedup uses compare_keys (respects user Ord), not structural ──
+
+#[test]
+fn sortby_dedup_respects_custom_ord() {
+    // Regression (M1): `knot_relation_sort_by` sorted by key with `compare_keys`
+    // (which honors a user `Ord` impl) but deduplicated consecutive rows with
+    // the structural `compare_values`. When the user order disagrees with the
+    // structural one, the two passes contradict each other. Here all three
+    // grades compare Equal under the custom `Ord`, so after sorting they are
+    // adjacent and dedup must collapse them to a single element.
+    let (stdout, stderr, ok) = compile_and_run(
+        "sortby_dedup_custom_ord",
+        r#"data Grade = A {} | B {} | C {}
+impl Eq Grade where
+  eq = \x y -> show x == show y
+impl Ord Grade where
+  compare = \x y -> EQ {}
+main = do
+  let items = [A {}, B {}, C {}]
+  let sorted = sortBy (\g -> g) items
+  println ("count: " ++ show (count sorted))
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("count: 1"),
+        "dedup must use the same custom Ord as the sort (all grades Equal → 1 element):\n{stdout}"
+    );
+}

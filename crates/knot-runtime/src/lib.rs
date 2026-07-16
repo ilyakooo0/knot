@@ -4285,6 +4285,10 @@ fn is_sql_clause_keyword(s: &str) -> bool {
             | "INTERSECT"
             | "WITH"
             | "AS"
+            | "WINDOW"
+            | "QUALIFY"
+            | "FETCH"
+            | "FOR"
     )
 }
 
@@ -6091,9 +6095,13 @@ pub extern "C-unwind" fn knot_relation_sort_by(
     indexed.sort_by(|(_, a), (_, b)| compare_keys(db, *a, *b));
 
     // Dedup consecutive equal elements (sortBy semantics — result is a set).
+    // Use the same `compare_keys` the sort used so a user `Ord` impl that
+    // disagrees with structural ordering stays consistent between ordering and
+    // deduplication (comparing structurally here would keep elements the sort
+    // considered equal, or vice versa).
     let mut sorted: Vec<*mut Value> = Vec::with_capacity(indexed.len());
     for (i, (row, _)) in indexed.iter().enumerate() {
-        if i > 0 && compare_values(indexed[i - 1].0, *row) == std::cmp::Ordering::Equal {
+        if i > 0 && compare_keys(db, indexed[i - 1].0, *row) == std::cmp::Ordering::Equal {
             continue; // skip duplicate
         }
         sorted.push(*row);
@@ -10972,8 +10980,16 @@ pub extern "C-unwind" fn knot_fs_list_dir(path: *mut Value) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_void {
     let path = unsafe { str_from_raw(path_ptr, path_len) };
-    // Store path globally so spawned threads can open their own connections
-    *DB_PATH.lock().unwrap_or_else(|e| e.into_inner()) = path.to_string();
+    // Store path globally so spawned threads can open their own connections.
+    // Only record it on the FIRST open: a later `knot_db_open` (e.g. the `db`
+    // explorer or a second connection) must not redirect the global path that
+    // already-spawned threads resolve their own connections from.
+    {
+        let mut db_path = DB_PATH.lock().unwrap_or_else(|e| e.into_inner());
+        if db_path.is_empty() {
+            *db_path = path.to_string();
+        }
+    }
     let conn = Connection::open(path).expect("knot runtime: failed to open database");
     conn.create_collation("KNOT_INT", |a: &str, b: &str| {
         match (a.parse::<i64>(), b.parse::<i64>()) {
@@ -11489,7 +11505,7 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
 }
 
 /// Split a string by `sep` while respecting `[...]` bracket nesting.
-fn split_respecting_brackets(s: &str, sep: char) -> Vec<&str> {
+pub(crate) fn split_respecting_brackets(s: &str, sep: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
     let mut start = 0;
@@ -12578,7 +12594,13 @@ pub extern "C-unwind" fn knot_source_query_sum(
                 ValueRef::Text(s) => {
                     let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in sum result");
                     if is_float != 0 {
-                        Ok(alloc_float(s.parse::<f64>().unwrap_or(0.0)))
+                        match s.parse::<f64>() {
+                            Ok(f) => Ok(alloc_float(f)),
+                            Err(_) => panic!(
+                                "knot runtime: float sum result '{}' does not parse as f64",
+                                s
+                            ),
+                        }
                     } else if let Ok(n) = s.parse::<i64>() {
                         Ok(alloc_int(n))
                     } else if let Ok(f) = s.parse::<f64>() {
@@ -19245,6 +19267,8 @@ fn type_to_openapi_schema(ty: &str) -> String {
         "int" => "{ \"type\": \"integer\" }".to_string(),
         "float" => "{ \"type\": \"number\" }".to_string(),
         "bool" => "{ \"type\": \"boolean\" }".to_string(),
+        "text" => "{ \"type\": \"string\" }".to_string(),
+        "bytes" => "{ \"type\": \"string\", \"format\": \"byte\" }".to_string(),
         // An enum-like ADT param accepts exactly its declared constructors (the
         // server 400s on anything else), so publish them as an OpenAPI enum
         // instead of an unconstrained string.
@@ -23623,5 +23647,41 @@ mod _base64_regress {
     #[test]
     fn ignores_whitespace_and_padding() {
         assert_eq!(base64_decode("aGVs bG8="), base64_decode("aGVsbG8="));
+    }
+}
+
+#[cfg(test)]
+mod _db_path_regress {
+    use super::{knot_db_close, knot_db_open, DB_PATH};
+
+    #[test]
+    fn db_open_does_not_overwrite_existing_db_path() {
+        // Regression (M6): the FIRST `knot_db_open` records the DB path globally
+        // so spawned threads open their own connections against it. A later open
+        // (the `db` explorer, a second connection, …) must NOT redirect that
+        // global path out from under already-running threads.
+        let dir = std::env::temp_dir().join(format!("knot_m6_dbpath_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let first = dir.join("first.db").to_string_lossy().into_owned();
+        let second = dir.join("second.db").to_string_lossy().into_owned();
+
+        // Save and restore the global so the test never strands a stale path.
+        let saved = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+        // Simulate the first open having recorded its path.
+        *DB_PATH.lock().unwrap_or_else(|e| e.into_inner()) = first.clone();
+
+        // A second open against a DIFFERENT path must leave DB_PATH untouched.
+        let db = knot_db_open(second.as_ptr(), second.len());
+        let after = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        knot_db_close(db);
+
+        *DB_PATH.lock().unwrap_or_else(|e| e.into_inner()) = saved;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            after, first,
+            "a second knot_db_open must not overwrite the already-recorded DB_PATH"
+        );
     }
 }

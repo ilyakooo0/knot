@@ -305,15 +305,15 @@ fn parse_record_fields(spec: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Split a string by `sep` while respecting `[...]` bracket nesting.
+/// Split a string by `sep` while respecting `[...]` and `{...}` bracket nesting.
 fn split_respecting_brackets(s: &str, sep: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
     let mut start = 0;
     for (i, c) in s.char_indices() {
         match c {
-            '[' => depth += 1,
-            ']' => depth = depth.saturating_sub(1),
+            '[' | '{' => depth += 1,
+            ']' | '}' => depth = depth.saturating_sub(1),
             c if c == sep && depth == 0 => {
                 parts.push(&s[start..i]);
                 start = i + c.len_utf8();

@@ -115,7 +115,14 @@ pub(crate) fn handle_document_highlight(
         if *usage_span == def_span {
             continue;
         }
-        if *target_span == def_span {
+        // Skip declaration-name tokens of multi-line decls: they are recorded as
+        // self-references so position-based resolution works from the body line,
+        // but they are *declarations*, not READ usages. `references.rs` and
+        // `code_lens.rs` apply the same filter — without it the `f =` body-line
+        // token of a `f : T` ⏎ `f = …` decl gets wrongly highlighted as a READ.
+        if *target_span == def_span
+            && !crate::references::is_declaration_token(&doc.source, *usage_span)
+        {
             highlights.push(DocumentHighlight {
                 range: span_to_range(*usage_span, &doc.source),
                 kind: Some(DocumentHighlightKind::READ),
@@ -182,5 +189,41 @@ mod tests {
             hls.iter().any(|h| h.range.start == use2),
             "second imported usage must be highlighted; got: {hls:?}"
         );
+    }
+
+    #[test]
+    fn does_not_highlight_two_line_decl_body_token_as_read() {
+        // Regression (M2): a decl written with a separate signature line
+        // (`greet : Text` ⏎ `greet = …`) records the body-line `greet` token as
+        // a self-reference so position-based resolution works from it. Document
+        // highlight must not emit that declaration token as a READ usage — only
+        // `references.rs` and `code_lens.rs` filtered it before.
+        use crate::test_support::TestWorkspace;
+        let mut ws = TestWorkspace::new();
+        let uri = ws.open("main", "greet : Text\ngreet = \"hi\"\nmain = println greet\n");
+        let doc = ws.doc(&uri);
+        // Cursor on the `greet` usage in `main`.
+        let use_off = doc.source.find("println greet").unwrap() + "println ".len();
+        let pos = offset_to_position(&doc.source, use_off);
+        let hls = handle_document_highlight(&ws.state, &highlight_params(&uri, pos))
+            .expect("highlights for local symbol");
+
+        // The `greet =` body-line token sits at line 1, column 0. It must not be
+        // highlighted (as READ or otherwise).
+        assert!(
+            hls.iter().all(|h| h.range.start.line != 1),
+            "the `greet =` declaration body token (line 1) must not be highlighted; got: {hls:?}"
+        );
+        // Exactly one READ usage: the call site in `main` (line 2).
+        let reads: Vec<_> = hls
+            .iter()
+            .filter(|h| h.kind == Some(DocumentHighlightKind::READ))
+            .collect();
+        assert_eq!(
+            reads.len(),
+            1,
+            "exactly one READ usage (the call in main) expected; got: {hls:?}"
+        );
+        assert_eq!(reads[0].range.start.line, 2, "the READ usage must be in `main`");
     }
 }

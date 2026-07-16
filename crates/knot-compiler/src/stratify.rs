@@ -682,7 +682,10 @@ impl<'a> Tarjan<'a> {
         if self.lowlink[v] == self.index[v] {
             let mut scc = Vec::new();
             loop {
-                let w = self.stack.pop().unwrap();
+                let w = self
+                    .stack
+                    .pop()
+                    .expect("Tarjan SCC: stack should not be empty when lowlink == index");
                 self.on_stack.remove(&w);
                 scc.push(w.clone());
                 if w == v {

@@ -693,7 +693,10 @@ impl<'a> TokenCollector<'a> {
             ast::TypeKind::UnitAnnotated { base, .. } => {
                 self.visit_type(base);
             }
-            _ => {}
+            // Leaves with no named sub-types. Listed explicitly (rather than a
+            // `_` wildcard) so a newly added `TypeKind` variant surfaces as a
+            // non-exhaustive-match error here instead of being silently skipped.
+            ast::TypeKind::Var(_) | ast::TypeKind::Hole => {}
         }
     }
 
@@ -935,14 +938,22 @@ fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> 
                 byte_cursor += 1;
                 line_start_byte = byte_cursor;
                 col_utf16 = 0;
-            } else if bytes[byte_cursor] == b'\r'
-                && bytes.get(byte_cursor + 1) == Some(&b'\n')
-            {
-                // Skip the \r of a CRLF pair — it's part of the line break
-                // and doesn't contribute a UTF-16 column. A stray mid-line
-                // \r is an ordinary character and must count as a column,
-                // matching `utils::offset_to_position`.
-                byte_cursor += 1;
+            } else if bytes[byte_cursor] == b'\r' {
+                if bytes.get(byte_cursor + 1) == Some(&b'\n') {
+                    // The \r of a CRLF pair is part of the line break and
+                    // doesn't contribute a UTF-16 column; the following \n
+                    // advances the line.
+                    byte_cursor += 1;
+                } else {
+                    // A lone \r (classic-Mac line ending) is its own line
+                    // break, matching `utils::offset_to_position` and the
+                    // lexer — so semantic-token positions stay in sync with the
+                    // rest of the LSP for `\r`-only files.
+                    line += 1;
+                    byte_cursor += 1;
+                    line_start_byte = byte_cursor;
+                    col_utf16 = 0;
+                }
             } else {
                 let mut next = byte_cursor + 1;
                 while next < source.len() && !source.is_char_boundary(next) {
@@ -1046,12 +1057,12 @@ mod regress_fixes_tests {
         assert_eq!(tokens[1].length, 3);
     }
 
-    /// A stray mid-line `\r` (not part of CRLF) is an ordinary character:
-    /// `delta_encode_tokens` must count it as a column, exactly like
-    /// `utils::offset_to_position` does — otherwise token columns drift by
-    /// one for every stray \r earlier in the line.
+    /// A lone `\r` (not part of CRLF) is a real line break, exactly like
+    /// `utils::offset_to_position` and the lexer treat it — so
+    /// `delta_encode_tokens` must advance the line (not the column) for it,
+    /// keeping semantic-token positions in sync for `\r`-only files.
     #[test]
-    fn delta_encode_counts_stray_cr_as_column() {
+    fn delta_encode_treats_lone_cr_as_line_break() {
         let source = "ab\rcd\r\nxy\n";
         // Token on `cd` (byte 3..5) and on `xy` (byte 7..9).
         let tokens = vec![
@@ -1060,16 +1071,16 @@ mod regress_fixes_tests {
         ];
         let encoded = delta_encode_tokens(&tokens, source);
         assert_eq!(encoded.len(), 2);
-        // `cd` starts at UTF-16 column 3 (a, b, stray \r all count) —
-        // matching offset_to_position.
+        // `cd` sits on line 1, column 0 — the lone `\r` before it is a line
+        // break. This must agree with offset_to_position byte-for-byte.
         let expected = crate::utils::offset_to_position(source, 3);
+        assert_eq!(expected, lsp_types::Position::new(1, 0));
         assert_eq!(encoded[0].delta_line, expected.line);
         assert_eq!(
             encoded[0].delta_start, expected.character,
-            "stray \\r must count as a column"
+            "a lone \\r must advance the line, matching offset_to_position"
         );
-        // `xy` is on the next line, column 0 — the CRLF \r is still part of
-        // the line break and contributes nothing.
+        // `xy` is one line further down (after the CRLF), column 0.
         assert_eq!(encoded[1].delta_line, 1);
         assert_eq!(encoded[1].delta_start, 0);
     }

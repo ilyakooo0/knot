@@ -471,10 +471,12 @@ impl Env {
         }
     }
 
-    fn get(&self, name: &str) -> Value {
-        *self.bindings.get(name).unwrap_or_else(|| {
-            panic!("codegen: undefined variable '{}'", name);
-        })
+    /// Look up a binding. Returns `None` for an unbound name — callers turn that
+    /// into a codegen diagnostic (via `Codegen::push_codegen_error`) rather than
+    /// panicking, since a well-typed program never reaches an unbound variable
+    /// but malformed input still could.
+    fn get(&self, name: &str) -> Option<Value> {
+        self.bindings.get(name).copied()
     }
 
     fn set(&mut self, name: &str, val: Value) {
@@ -4416,7 +4418,11 @@ impl Codegen {
                 }
                 // `env` and `user_fns` were both consulted above; anything
                 // reaching here is a genuinely undefined variable.
-                panic!("codegen: undefined variable '{}'", name)
+                self.push_codegen_error(
+                    builder,
+                    expr.span,
+                    format!("codegen: undefined variable '{}'", name),
+                )
             }
 
             ast::ExprKind::Constructor(name) => {
@@ -4533,7 +4539,11 @@ impl Codegen {
                     let call = builder.ins().call(func_ref, &[db]);
                     builder.inst_results(call)[0]
                 } else {
-                    panic!("codegen: undefined derived relation '&{}'", name)
+                    self.push_codegen_error(
+                        builder,
+                        expr.span,
+                        format!("codegen: undefined derived relation '&{}'", name),
+                    )
                 }
             }
 
@@ -5070,7 +5080,11 @@ impl Codegen {
                     }
                     self.call_rt(builder, "knot_value_unit", &[])
                 } else {
-                    panic!("codegen: set target must be a source reference")
+                    self.push_codegen_error(
+                        builder,
+                        target.span,
+                        "codegen: set target must be a source reference",
+                    )
                 }
             }
 
@@ -5119,7 +5133,11 @@ impl Codegen {
                     );
                     self.call_rt(builder, "knot_value_unit", &[])
                 } else {
-                    panic!("codegen: replace target must be a source reference")
+                    self.push_codegen_error(
+                        builder,
+                        target.span,
+                        "codegen: replace target must be a source reference",
+                    )
                 }
             }
 
@@ -7161,11 +7179,21 @@ impl Codegen {
                 if let ast::ExprKind::Constructor(name) = &func.node {
                     (name.clone(), Some(arg.as_ref()))
                 } else {
-                    panic!("fetch: expected constructor application as last argument");
+                    return self.push_codegen_error(
+                        builder,
+                        ctor_expr.span,
+                        "fetch: expected constructor application as last argument",
+                    );
                 }
             }
             ast::ExprKind::Constructor(name) => (name.clone(), None),
-            _ => panic!("fetch: expected constructor application as last argument"),
+            _ => {
+                return self.push_codegen_error(
+                    builder,
+                    ctor_expr.span,
+                    "fetch: expected constructor application as last argument",
+                );
+            }
         };
 
         // Compile just the record payload (skip the Constructor wrapper)
@@ -7179,13 +7207,16 @@ impl Codegen {
         // the entry infer typechecked against — iterating `route_entries`
         // (a HashMap) and taking the first match would pick a nondeterministic
         // route when distinct routes legally share a constructor name (B38).
-        let entry = self
-            .fetch_route_entries
-            .get(&ctor_name)
-            .cloned()
-            .unwrap_or_else(|| {
-                panic!("fetch: no route entry found for constructor '{}'", ctor_name)
-            });
+        let entry = match self.fetch_route_entries.get(&ctor_name).cloned() {
+            Some(e) => e,
+            None => {
+                return self.push_codegen_error(
+                    builder,
+                    ctor_expr.span,
+                    format!("fetch: no route entry found for constructor '{}'", ctor_name),
+                );
+            }
+        };
 
         let method_str = match entry.method {
             ast::HttpMethod::Get => "GET",
@@ -8740,7 +8771,14 @@ impl Codegen {
         let env_val = if free_vars.is_empty() {
             builder.ins().iconst(self.ptr_type, 0) // null env
         } else if free_vars.len() == 1 {
-            env.get(&free_vars[0])
+            match env.get(&free_vars[0]) {
+                Some(v) => v,
+                None => {
+                    let msg =
+                        format!("codegen: undefined captured variable '{}'", free_vars[0]);
+                    self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
+                }
+            }
         } else {
             let n = free_vars.len();
             let mut sorted_vars: Vec<&str> = free_vars.iter().map(|s| s.as_str()).collect();
@@ -8752,7 +8790,14 @@ impl Codegen {
                 StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
             );
             for (i, var_name) in sorted_vars.iter().enumerate() {
-                let val = env.get(var_name);
+                let val = match env.get(var_name) {
+                    Some(v) => v,
+                    None => {
+                        let msg =
+                            format!("codegen: undefined captured variable '{}'", var_name);
+                        self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
+                    }
+                };
                 let (key_ptr, key_len) = self.string_ptr(builder, var_name);
                 let base = (i as i32) * (3 * ptr_bytes);
                 builder.ins().stack_store(key_ptr, slot, base);
@@ -8820,6 +8865,13 @@ impl Codegen {
         // value an enclosing bind loop reads after this call describes THIS
         // block (see the field's doc comment).
         self.io_do_tail_iterated = false;
+        // Intermediate sub-compilations (a nested IO do-block in an if/case
+        // branch, a bound expression, …) can clobber `io_do_tail_iterated`. Track
+        // whether THIS block actually ended in the iterating-bind hand-off in a
+        // local, and write it back once at the very end — otherwise a clobbered
+        // `true` would leak to the enclosing `compile_io_bind_loop`, which reads
+        // the flag right after this call to choose splice-vs-push.
+        let mut ended_in_tail_iteration = false;
         // Save source_var_binds to restore after — but DON'T clear, so
         // inner do-blocks (else branches, nested blocks) inherit entries
         // from the enclosing scope.
@@ -8975,7 +9027,8 @@ impl Codegen {
                         // The remaining statements were consumed by the loop, so
                         // this block's value is the loop's relation of per-row
                         // results — tell an enclosing loop to splice, not nest.
-                        self.io_do_tail_iterated = true;
+                        // Recorded in the local and written to the field at exit.
+                        ended_in_tail_iteration = true;
                         break;
                     }
                     // Track source read bindings for SQL optimization:
@@ -9180,6 +9233,9 @@ impl Codegen {
         self.source_var_binds = prev_source_var_binds;
         self.let_bindings = prev_let_bindings;
         self.io_relation_vars = prev_io_relation_vars;
+        // Canonicalize the hand-off flag to describe exactly THIS block, undoing
+        // any clobber from intermediate sub-compilations (see the local's note).
+        self.io_do_tail_iterated = ended_in_tail_iteration;
         // Writes/rebinds inside this scope still invalidate outer entries.
         self.replay_source_bind_invalidations_since(invalidation_mark);
         done_param
@@ -9903,7 +9959,16 @@ impl Codegen {
                         let idx_val = prebuilt_indices[&stmt_idx];
 
                         // Look up matching rows via the pre-built hash index
-                        let outer_val = env.get(&plan.outer_var);
+                        let outer_val = match env.get(&plan.outer_var) {
+                            Some(v) => v,
+                            None => {
+                                let msg = format!(
+                                    "codegen: undefined join variable '{}'",
+                                    plan.outer_var
+                                );
+                                self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
+                            }
+                        };
                         let (fptr, flen) =
                             self.string_ptr(builder, &plan.outer_field);
                         let key =
@@ -10833,7 +10898,14 @@ impl Codegen {
             builder.ins().iconst(self.ptr_type, 0) // null env
         } else if free_vars.len() == 1 {
             // Single capture: pass value directly as env (no record allocation)
-            env.get(&free_vars[0])
+            match env.get(&free_vars[0]) {
+                Some(v) => v,
+                None => {
+                    let msg =
+                        format!("codegen: undefined captured variable '{}'", free_vars[0]);
+                    self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
+                }
+            }
         } else {
             let n = free_vars.len();
             // Sort free vars so index-based extraction matches
@@ -10846,7 +10918,14 @@ impl Codegen {
                 StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
             );
             for (i, var_name) in sorted_vars.iter().enumerate() {
-                let val = env.get(var_name);
+                let val = match env.get(var_name) {
+                    Some(v) => v,
+                    None => {
+                        let msg =
+                            format!("codegen: undefined captured variable '{}'", var_name);
+                        self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
+                    }
+                };
                 let (key_ptr, key_len) = self.string_ptr(builder, var_name);
                 let base = (i as i32) * (3 * ptr_bytes);
                 builder.ins().stack_store(key_ptr, slot, base);
@@ -11001,6 +11080,26 @@ impl Codegen {
         } else {
             inner
         }
+    }
+
+    // ── Diagnostics ───────────────────────────────────────────────
+
+    /// Record a codegen error and return a null placeholder value so IR
+    /// construction can continue without panicking. Compilation aborts with the
+    /// accumulated diagnostics before any object file is linked (`compile_inner`
+    /// returns `Err` when `self.diagnostics` is non-empty), so the null is never
+    /// executed — this only turns internal invariant violations that are still
+    /// reachable on malformed input into user-facing diagnostics instead of a
+    /// process abort.
+    fn push_codegen_error(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        span: ast::Span,
+        message: impl Into<String>,
+    ) -> Value {
+        self.diagnostics
+            .push(knot::diagnostic::Diagnostic::error(message).label(span, "here"));
+        builder.ins().iconst(self.ptr_type, 0)
     }
 
     // ── Runtime call helpers ──────────────────────────────────────

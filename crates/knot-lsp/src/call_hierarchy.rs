@@ -6,10 +6,11 @@ use lsp_types::*;
 
 use knot::ast::{self, DeclKind, Span};
 
+use crate::rename::collect_name_uses_in_decl;
 use crate::state::ServerState;
 use crate::utils::{
     find_word_in_source, ident_lookup_offset, position_to_offset, recurse_expr,
-    span_to_range, word_at_position,
+    span_to_range, uri_to_path, word_at_position,
 };
 
 // ── Call Hierarchy ───────────────────────────────────────────────────
@@ -169,6 +170,86 @@ pub(crate) fn handle_call_hierarchy_incoming(
             },
             from_ranges: sites.iter().map(|s| span_to_range(*s, &doc.source)).collect(),
         });
+    }
+
+    // Cross-file incoming calls: other open documents that import the target
+    // from its owning file and call it. Their usages are resolved as imported
+    // symbols, so (unlike module-local callers) they are NOT in the other doc's
+    // `references`; walk each declaration's AST with `collect_name_uses_in_decl`
+    // — scope-aware, so shadowed locals are skipped — mirroring `references.rs`.
+    let owner_path = uri_to_path(target_uri).and_then(|p| p.canonicalize().ok());
+    if let Some(owner_path) = owner_path {
+        // A trait method could over-collect across unrelated impls; call
+        // hierarchy incoming is dominated by ordinary function calls, so an
+        // empty trait scope (no confinement) is the safe, simple default.
+        let target_traits: HashSet<String> = HashSet::new();
+        for (other_uri, other_doc) in &state.documents {
+            if other_uri == target_uri {
+                continue;
+            }
+            // A file that declares its own same-named symbol resolves references
+            // locally — its callers are that symbol's, not ours.
+            if other_doc.definitions.contains_key(target_name) {
+                continue;
+            }
+            // Only importers of the target's owning file contribute.
+            let imports_owner = other_doc
+                .import_defs
+                .get(target_name)
+                .map(|(p, _)| *p == owner_path)
+                .unwrap_or(false);
+            if !imports_owner {
+                continue;
+            }
+            for decl in &other_doc.module.decls {
+                let caller_name = match &decl.node {
+                    DeclKind::Fun { name, .. }
+                    | DeclKind::View { name, .. }
+                    | DeclKind::Derived { name, .. } => name.clone(),
+                    _ => continue,
+                };
+                let mut sites: Vec<Span> = Vec::new();
+                collect_name_uses_in_decl(
+                    decl,
+                    target_name,
+                    &other_doc.source,
+                    &target_traits,
+                    &mut sites,
+                );
+                if sites.is_empty() {
+                    continue;
+                }
+
+                let range = span_to_range(decl.span, &other_doc.source);
+                let selection_range =
+                    find_word_in_source(&other_doc.source, &caller_name, decl.span.start, decl.span.end)
+                        .map(|s| span_to_range(s, &other_doc.source))
+                        .unwrap_or(range);
+                let kind = match &decl.node {
+                    DeclKind::Fun { .. } | DeclKind::View { .. } | DeclKind::Derived { .. } => {
+                        SymbolKind::FUNCTION
+                    }
+                    _ => SymbolKind::VARIABLE,
+                };
+
+                result.push(CallHierarchyIncomingCall {
+                    from: CallHierarchyItem {
+                        name: caller_name.clone(),
+                        kind,
+                        tags: None,
+                        detail: other_doc.type_info.get(&caller_name).cloned(),
+                        uri: other_uri.clone(),
+                        range,
+                        selection_range,
+                        data: None,
+                    },
+                    from_ranges: sites
+                        .iter()
+                        .map(|s| span_to_range(*s, &other_doc.source))
+                        .collect(),
+                });
+            }
+        }
     }
 
     if result.is_empty() { None } else { Some(result) }

@@ -139,13 +139,13 @@ fn diff_token_lists(
     if delete_count == 0 && replacement.is_empty() {
         return Vec::new();
     }
-    // Per the LSP spec, `start` and `deleteCount` are indices into the
-    // token-tuple array (each tuple is 5 u32s), NOT into the flat `uinteger[]`
-    // data array. Multiplying by 5 would offset `start` to the wrong token and
-    // delete 5× too many tokens, corrupting highlighting on every delta request.
+    // Per the LSP 3.16+ spec, `start` and `deleteCount` are offsets/counts
+    // into the **flat `uinteger[]` data array** (5 integers per token tuple),
+    // NOT into the logical token array. Multiply by 5 to convert from token
+    // units to flat-integer units.
     vec![SemanticTokensEdit {
-        start: start as u32,
-        delete_count,
+        start: (start * 5) as u32,
+        delete_count: (prev_end - start) as u32 * 5,
         data: Some(replacement),
     }]
 }
@@ -713,7 +713,12 @@ impl<'a> TokenCollector<'a> {
                 // starts at `(`.
                 let name_span = find_word_in_source(self.source, name, pat.span.start, pat.span.end)
                     .unwrap_or_else(|| Span::new(pat.span.start, pat.span.start + name.len()));
-                self.add(name_span, TOK_ENUM_MEMBER, 0);
+                // Guard against mid-codepoint slice: if the fallback span
+                // doesn't align to a char boundary, skip emitting the token
+                // rather than panicking on `&source[start..end]`.
+                if self.source.get(name_span.start..name_span.end) == Some(name) {
+                    self.add(name_span, TOK_ENUM_MEMBER, 0);
+                }
                 self.visit_pat(payload, false);
             }
             ast::PatKind::Record(fields) => {

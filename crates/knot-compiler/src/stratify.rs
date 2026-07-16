@@ -27,6 +27,9 @@ use std::collections::{HashMap, HashSet};
 enum NegCause {
     /// Set difference (`diff a b`) — the subtracted set `b`.
     Diff,
+    /// Boolean negation (`not`) wrapping a non-monotone check such as
+    /// `any`/`elem`/`contains` over a relation — negation-as-failure.
+    Not,
     /// A non-monotone aggregate (`count`/`sum`/`avg`/`minOn`/`maxOn`/`countWhere`)
     /// collapsing the relation to a scalar.
     Aggregate,
@@ -38,6 +41,7 @@ impl NegCause {
     fn operation(self) -> &'static str {
         match self {
             NegCause::Diff => "`diff`",
+            NegCause::Not => "`not`",
             NegCause::Aggregate => "an aggregate (`count`/`sum`/`avg`/`minOn`/`maxOn`)",
         }
     }
@@ -46,6 +50,7 @@ impl NegCause {
     fn gerund(self) -> &'static str {
         match self {
             NegCause::Diff => "negating",
+            NegCause::Not => "negating",
             NegCause::Aggregate => "aggregating",
         }
     }
@@ -54,6 +59,7 @@ impl NegCause {
     fn noun(self) -> &'static str {
         match self {
             NegCause::Diff => "negation",
+            NegCause::Not => "negation",
             NegCause::Aggregate => "aggregate",
         }
     }
@@ -374,11 +380,18 @@ fn collect_edges(
             collect_edges(lhs, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             collect_edges(rhs, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
-        ast::ExprKind::UnaryOp { op: _, operand } => {
-            // `not` is boolean negation (`Bool -> Bool`), not set complement —
-            // it does not create negative dependencies. Only `diff` (set
-            // difference) creates negative edges.
-            collect_edges(operand, polarity, node_names, env, partial_diffs, diff_wrappers, out);
+        ast::ExprKind::UnaryOp { op, operand } => {
+            // `not` is boolean negation. When it wraps a non-monotone
+            // check over a relation (e.g. `not (any p rel)`, `not (elem x rel)`),
+            // it is negation-as-failure and must create a negative edge —
+            // flip polarity before recursing, mirroring how `diff` works.
+            // Double negation (`not (not ...)`) cancels back to positive.
+            let child_polarity = if *op == ast::UnaryOp::Not {
+                negate(polarity, NegCause::Not)
+            } else {
+                polarity
+            };
+            collect_edges(operand, child_polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
         ast::ExprKind::If { cond, then_branch, else_branch } => {
             collect_edges(cond, polarity, node_names, env, partial_diffs, diff_wrappers, out);
@@ -550,14 +563,16 @@ fn negate(p: Polarity, cause: NegCause) -> Polarity {
     }
 }
 
-/// Check if an expression is a call to an aggregate builtin (count, sum,
-/// avg, minOn, maxOn, countWhere) — these are non-monotone when applied
-/// to a self-referential relation, so they must create negative edges.
+/// Check if an expression is a call to a non-monotone builtin over a
+/// relation: the six aggregates (count, sum, avg, minOn, maxOn,
+/// countWhere) and `all` (anti-monotone: ∀ over a growing set can flip
+/// true→false). These must create negative edges when applied to a
+/// self-referential relation.
 fn completes_aggregate_over_relation(expr: &ast::Expr) -> bool {
     let expr = strip_head_wrappers(expr);
     match &expr.node {
         ast::ExprKind::Var(name) => {
-            matches!(name.as_str(), "count" | "sum" | "avg" | "minOn" | "maxOn" | "countWhere")
+            matches!(name.as_str(), "count" | "sum" | "avg" | "minOn" | "maxOn" | "countWhere" | "all")
         }
         ast::ExprKind::App { func, .. } => completes_aggregate_over_relation(func),
         _ => false,
@@ -758,6 +773,10 @@ fn check_inner(module: &ast::Module) -> Vec<Diagnostic> {
                                 NegCause::Diff =>
                                     "a derived relation cannot subtract from itself in a recursive definition — \
                                      the fixpoint would oscillate instead of converging",
+                                NegCause::Not =>
+                                    "a derived relation cannot negate itself in a recursive definition — \
+                                     the negation is non-monotone, so the fixpoint \
+                                     oscillates instead of converging",
                                 NegCause::Aggregate =>
                                     "a derived relation cannot aggregate over itself in a recursive definition — \
                                      the aggregate's value shifts as the relation grows, so the fixpoint \
@@ -1168,10 +1187,10 @@ mod tests {
     }
 
     #[test]
-    fn boolean_not_in_mutual_recursion_is_ok() {
-        // &a depends on &b through `not`, and &b depends on &a — if `not`
-        // creates a negative edge, this would be rejected as unstratifiable.
-        // But `not` is boolean negation, so &b is read positively.
+    fn boolean_not_in_mutual_recursion_is_unstratifiable() {
+        // &a depends on &b through `not`, and &b depends on &a.
+        // `not` is negation-as-failure: it creates a negative edge.
+        // The cycle &a →(neg) &b →(pos) &a is unstratifiable.
         use knot::ast::{ExprKind, UnaryOp};
         let not_expr = spanned(ExprKind::UnaryOp {
             op: UnaryOp::Not,
@@ -1191,15 +1210,12 @@ mod tests {
             derived("b", union(source_ref("source"), derived_ref("a"))),
         ]);
         let diags = check(&m);
-        // The cycle is now rejected as *unsupported* mutual recursion, but the
-        // point of this test stands: `not` must NOT make it *unstratifiable*
-        // (a spurious negative edge). So there is exactly one diagnostic and it
-        // is the mutual-recursion one, never the negation one.
+        // `not` correctly creates a negative edge, so the cycle
+        // &a →(neg) &b →(pos) &a is unstratifiable.
         assert_eq!(diags.len(), 1);
         assert!(
-            diags[0].message.contains("mutually recursive")
-                && !diags[0].message.contains("unstratifiable"),
-            "boolean `not` must not create a negative edge: {}",
+            diags[0].message.contains("unstratifiable"),
+            "boolean `not` must create a negative edge: {}",
             diags[0].message
         );
     }

@@ -87,8 +87,14 @@ pub fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
             }
             b'\r' => {
                 line += 1;
-                // `\r\n` is one break, not two.
-                i += if before.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                // `\r\n` is one break, not two.  Consult the full source
+                // bytes (not the truncated `before`) when peeking ahead,
+                // because `i+1` may point past `offset` — e.g. when
+                // `offset` lands on the `\n` of a `\r\n`, `before` ends
+                // at the `\r` and `before.get(i+1)` returns `None`,
+                // wrongly treating the `\r` as a lone CR.
+                let full = source.as_bytes();
+                i += if full.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
                 line_start = i;
             }
             _ => i += 1,

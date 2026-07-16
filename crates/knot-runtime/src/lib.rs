@@ -7009,10 +7009,10 @@ pub extern "C-unwind" fn knot_value_neq_i32(a: *mut Value, b: *mut Value) -> i32
     !values_equal(a, b) as i32
 }
 
-/// Diagnostic for null operands in ordered comparisons. Shared by the
-/// `<`/`>` paths (via `compare_lt`/`compare_gt`) and the `<=`/`>=` wrappers,
-/// which must short-circuit BEFORE the negated compare call (a silent
-/// `!compare_gt(null, ..)` would otherwise return a wrong `true`).
+/// Diagnostic for null operands in ordered comparisons. Retained for
+/// potential future use; the operator wrappers now delegate to
+/// `compare_values` which handles nulls directly.
+#[allow(dead_code)]
 fn warn_null_comparison(a: *mut Value, b: *mut Value) {
     eprintln!("knot runtime: comparison with null value (a={}, b={})",
         if a.is_null() { "null".to_string() } else { brief_value(a) },
@@ -7020,78 +7020,56 @@ fn warn_null_comparison(a: *mut Value, b: *mut Value) {
 }
 
 fn compare_lt(a: *mut Value, b: *mut Value) -> bool {
-    if a.is_null() || b.is_null() {
-        warn_null_comparison(a, b);
-        return false;
-    }
+    // `compare_values` already defines the null-operand policy
+    // (null == null → Equal, null < Just x → Less), so no special
+    // null guard is needed here — delegating keeps lt/gt/le/ge and
+    // the `compare` entry points consistent.
     compare_values(a, b) == std::cmp::Ordering::Less
 }
 
 fn compare_gt(a: *mut Value, b: *mut Value) -> bool {
-    if a.is_null() || b.is_null() {
-        warn_null_comparison(a, b);
-        return false;
-    }
     compare_values(a, b) == std::cmp::Ordering::Greater
 }
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_lt(a: *mut Value, b: *mut Value) -> *mut Value {
-    if a.is_null() || b.is_null() { return alloc_bool(false); }
+    // `compare_values` handles nulls (null==null, null<Just x), so no
+    // special short-circuit — all operator wrappers delegate to it.
     alloc_bool(compare_lt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_gt(a: *mut Value, b: *mut Value) -> *mut Value {
-    if a.is_null() || b.is_null() { return alloc_bool(false); }
     alloc_bool(compare_gt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_le(a: *mut Value, b: *mut Value) -> *mut Value {
-    if a.is_null() || b.is_null() {
-        warn_null_comparison(a, b);
-        return alloc_bool(false);
-    }
     alloc_bool(!compare_gt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_ge(a: *mut Value, b: *mut Value) -> *mut Value {
-    if a.is_null() || b.is_null() {
-        warn_null_comparison(a, b);
-        return alloc_bool(false);
-    }
     alloc_bool(!compare_lt(a, b))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_lt_i32(a: *mut Value, b: *mut Value) -> i32 {
-    if a.is_null() || b.is_null() { return 0; }
     compare_lt(a, b) as i32
 }
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_gt_i32(a: *mut Value, b: *mut Value) -> i32 {
-    if a.is_null() || b.is_null() { return 0; }
     compare_gt(a, b) as i32
 }
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_le_i32(a: *mut Value, b: *mut Value) -> i32 {
-    if a.is_null() || b.is_null() {
-        warn_null_comparison(a, b);
-        return 0;
-    }
     !compare_gt(a, b) as i32
 }
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_ge_i32(a: *mut Value, b: *mut Value) -> i32 {
-    if a.is_null() || b.is_null() {
-        warn_null_comparison(a, b);
-        return 0;
-    }
     !compare_lt(a, b) as i32
 }
 
@@ -7161,16 +7139,9 @@ pub extern "C-unwind" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mut Value {
-    if a == b {
-        return alloc(Value::Constructor(intern_str("EQ"), alloc(Value::Unit)));
-    }
-    if a.is_null() || b.is_null() {
-        panic!(
-            "knot runtime: cannot compare {} with {}",
-            if a.is_null() { "null" } else { type_name(a) },
-            if b.is_null() { "null" } else { type_name(b) },
-        );
-    }
+    // Delegate to `compare_values`, which defines null-as-Nothing
+    // semantics (null == null → Equal, null < Just x → Less) — consistent
+    // with all operator wrappers and `sortBy`/`minOn`/`maxOn`.
     let ordering = compare_values(a, b);
     let tag = match ordering {
         std::cmp::Ordering::Less => "LT",
@@ -7187,16 +7158,8 @@ pub extern "C-unwind" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mu
 /// Avoids allocating an Ordering constructor for use in comparison operators.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_compare_ord(a: *mut Value, b: *mut Value) -> i32 {
-    if a == b {
-        return 0;
-    }
-    if a.is_null() || b.is_null() {
-        panic!(
-            "knot runtime: cannot compare {} with {}",
-            if a.is_null() { "null" } else { type_name(a) },
-            if b.is_null() { "null" } else { type_name(b) },
-        );
-    }
+    // Delegate to `compare_values` — handles nulls gracefully, consistent
+    // with `knot_value_compare` and all operator wrappers.
     match compare_values(a, b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -7229,17 +7192,13 @@ fn float_as_exact_i64(f: f64) -> Option<i64> {
 fn cmp_int_float(x: i64, y: f64) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     if y.is_nan() {
-        // Match `f64::total_cmp` used for Float↔Float: a positive NaN is the
-        // greatest value and a negative NaN the least. Returning `Equal`
-        // here (as the code historically did) would make both `le` and `ge`
-        // true — i.e. the int "equals" NaN for ordering — which contradicts
-        // `values_equal` (Int never equals NaN) and `total_cmp`. The int's
-        // exact magnitude is irrelevant because NaN sits at an extreme.
-        return if y.is_sign_negative() {
-            Ordering::Greater
-        } else {
-            Ordering::Less
-        };
+        // Match `compare_values`'s Float↔Float NaN policy: any NaN is
+        // Greater than any non-NaN value, irrespective of the sign bit.
+        // This keeps the total order consistent (Eq ⊆ Ord) with
+        // `values_equal`, which treats all NaN as equal and never equals
+        // Int. Returning `Equal` here would make both `le` and `ge` true
+        // (int "equals" NaN), contradicting `values_equal`.
+        return Ordering::Greater;
     }
     // If y is integral and fits in i64, compare exactly as integers.
     if let Some(yi) = float_as_exact_i64(y) {
@@ -7459,13 +7418,18 @@ fn compare_values(a: *mut Value, b: *mut Value) -> std::cmp::Ordering {
                     (Some(NumView::Int(x)), Some(NumView::Int(y))) => Some(x.cmp(&y)),
                     (Some(NumView::Float(x)), Some(NumView::Float(y))) => {
                         // `values_equal` treats all NaN as equal, so `compare`
-                        // must agree (Eq ⊆ Ord): collapse the +/-NaN distinction
-                        // `total_cmp` would otherwise draw. A lone NaN keeps
-                        // `total_cmp`'s ordering (it sorts to one end).
-                        if x.is_nan() && y.is_nan() {
-                            Some(Ordering::Equal)
-                        } else {
-                            Some(x.total_cmp(&y))
+                        // must agree (Eq ⊆ Ord).  To be a *consistent* total
+                        // order across signed NaNs, collapse any NaN to a
+                        // single fixed position: a NaN is Greater than any
+                        // finite value, and two NaNs are Equal — independent
+                        // of the sign bit.  This avoids the non-transitivity
+                        // that arises when `total_cmp`'s signed-NaN ordering
+                        // leaks in for the lone-NaN case.
+                        match (x.is_nan(), y.is_nan()) {
+                            (true, true) => Some(Ordering::Equal),
+                            (true, false) => Some(Ordering::Greater),
+                            (false, true) => Some(Ordering::Less),
+                            _ => Some(x.total_cmp(&y)),
                         }
                     }
                     (Some(NumView::Int(x)), Some(NumView::Float(y))) => Some(cmp_int_float(x, y)),
@@ -7712,7 +7676,7 @@ fn format_value_iter(v: *mut Value, escape_text: bool) -> String {
                         stack.push(FmtTask::Lit("[".to_string()));
                     }
                     Value::Constructor(tag, payload) => {
-                        if !payload.is_null() && is_nullary_payload(*payload) {
+                        if is_nullary_payload(*payload) {
                             out.push_str(tag);
                             out.push_str(" {}");
                         } else {
@@ -7892,7 +7856,7 @@ pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
                         // `tag {}` — exactly the former `p == "{}"` check, made
                         // structural so the payload string isn't materialized
                         // first and the spine's tail never recurses.
-                        if !payload.is_null() && is_nullary_payload(*payload) {
+                        if is_nullary_payload(*payload) {
                             out.push_str(tag);
                             out.push_str(" {}");
                         } else {

@@ -942,10 +942,17 @@ pub fn resolve_import_navigation(
                     import_defs.insert(name.clone(), (canonical.clone(), decl.span));
                     import_origins.insert(name.clone(), imp.path.clone());
                     for ctor in constructors {
+                        // Search from after the `=` in the decl span to avoid
+                        // matching the type name when constructor and type
+                        // share a name (e.g. `data Wrapper = Wrapper Int`).
+                        let search_start = source[decl.span.start..decl.span.end]
+                            .find('=')
+                            .map(|p| decl.span.start + p + 1)
+                            .unwrap_or(decl.span.start);
                         let ctor_span = find_word_in_source(
                             &source,
                             &ctor.name,
-                            decl.span.start,
+                            search_start,
                             decl.span.end,
                         )
                         .unwrap_or(decl.span);

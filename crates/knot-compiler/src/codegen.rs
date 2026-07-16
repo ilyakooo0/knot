@@ -3844,7 +3844,10 @@ impl Codegen {
                         let prev_count = total_args - 1;
                         let new_count = total_args;
                         let ptr_bytes = cg.ptr_type.bytes() as i32;
-                        let slot_size = (3 * new_count as u32) * ptr_bytes as u32;
+                        let slot_size = (3u32)
+                            .checked_mul(new_count as u32)
+                            .and_then(|n| n.checked_mul(ptr_bytes as u32))
+                            .expect("knot codegen: trampoline slot size overflow");
                         let slot = builder.create_sized_stack_slot(
                             StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
                         );

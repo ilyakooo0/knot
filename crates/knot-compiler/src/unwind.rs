@@ -24,7 +24,7 @@ use object::{RelocationEncoding, RelocationFlags};
 
 fn address_for_func(func_id: FuncId) -> Address {
     let symbol = func_id.as_u32();
-    assert!(symbol & 1 << 31 == 0);
+    assert!(symbol & (1u32 << 31) == 0, "function symbol bit 31 set");
     Address::Symbol { symbol: symbol as usize, addend: 0 }
 }
 

@@ -146,6 +146,7 @@ fn format_expr_brief_d(expr: &ast::ExprKind, depth: usize) -> String {
         ast::ExprKind::Lit(ast::Literal::Float(f)) => f.to_string(),
         ast::ExprKind::Lit(ast::Literal::Text(s)) => format!("\"{}\"", s),
         ast::ExprKind::Lit(ast::Literal::Bool(b)) => if *b { "true" } else { "false" }.into(),
+        ast::ExprKind::Lit(ast::Literal::Bytes(_)) => "b\"…\"".into(),
         ast::ExprKind::Lambda { params, body } => {
             let ps: Vec<String> = params.iter().map(|p| format_pat_brief_d(&p.node, d)).collect();
             format!("\\{} -> {}", ps.join(" "), format_expr_brief_d(&body.node, d))

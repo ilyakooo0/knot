@@ -14708,8 +14708,22 @@ fn count_sql_placeholders(sql: &str) -> usize {
     while i < bytes.len() {
         let b = bytes[i];
         match b {
-            b'"' if !in_single => in_double = !in_double,
-            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => {
+                // Handle escaped double-quote ("") inside identifiers
+                if in_double && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_double = !in_double;
+            }
+            b'\'' if !in_double => {
+                // Handle escaped single-quote ('') inside string literals
+                if in_single && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_single = !in_single;
+            }
             b'?' if !in_double && !in_single => count += 1,
             _ => {}
         }

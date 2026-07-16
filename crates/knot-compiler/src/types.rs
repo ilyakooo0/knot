@@ -55,6 +55,11 @@ pub struct TypeEnv {
     pub source_refinements: HashMap<String, Vec<(Option<String>, String, Expr)>>,
     /// Refined type aliases: type_name -> predicate expr
     pub refined_types: HashMap<String, Expr>,
+    /// Multi-variant parameterized data types: name -> (param names,
+    /// per-constructor raw field types). Used to substitute type arguments
+    /// at application sites.
+    #[allow(clippy::type_complexity)]
+    pub multi_variant_params: HashMap<String, (Vec<String>, Vec<(String, Vec<(String, Type)>)>)>,
 }
 
 impl TypeEnv {
@@ -79,6 +84,14 @@ impl TypeEnv {
         let mut single_variant_params: HashMap<String, (Vec<String>, Vec<(String, Type)>)> =
             HashMap::new();
 
+        // Multi-variant parameterized data types: name -> (param names,
+        // constructor field types as AST). Used to substitute type arguments
+        // at application sites (e.g. `Either Int Text`) so schema-dependent
+        // logic (refinement collection) sees the actual type arguments
+        // instead of the placeholder `Named("unknown")`.
+        let mut multi_variant_params: HashMap<String, (Vec<String>, Vec<(String, Vec<(String, Type)>)>)> =
+            HashMap::new();
+
         // First pass: collect type aliases and data types
         for decl in &module.decls {
             match &decl.node {
@@ -89,11 +102,11 @@ impl TypeEnv {
                         if let TypeKind::Refined { base, predicate } = &ty.node {
                             refined_types.insert(name.clone(), (**predicate).clone());
                             let resolved =
-                                resolve_type(base, &aliases, &associated_types, &single_variant_params);
+                                resolve_type(base, &aliases, &associated_types, &single_variant_params, &multi_variant_params);
                             aliases.insert(name.clone(), resolved);
                         } else {
                             let resolved =
-                                resolve_type(ty, &aliases, &associated_types, &single_variant_params);
+                                resolve_type(ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params);
                             aliases.insert(name.clone(), resolved);
                         }
                     }
@@ -117,6 +130,7 @@ impl TypeEnv {
                                         &aliases,
                                         &associated_types,
                                         &single_variant_params,
+                                        &multi_variant_params,
                                     ),
                                 )
                             })
@@ -166,6 +180,25 @@ impl TypeEnv {
                     } else {
                         // Multi-variant: register each constructor and create Adt alias
                         data_ctor_decls.insert(name.clone(), ctors.clone());
+                        // For parameterized multi-variant ADTs, store the raw
+                        // AST field types so application sites can substitute
+                        // type arguments (mirrors single_variant_params).
+                        if !params.is_empty() {
+                            let ctor_fields: Vec<(String, Vec<(String, Type)>)> = ctors
+                                .iter()
+                                .map(|c| {
+                                    (
+                                        c.name.clone(),
+                                        c.fields
+                                            .iter()
+                                            .map(|f| (f.name.clone(), f.value.clone()))
+                                            .collect(),
+                                    )
+                                })
+                                .collect();
+                            multi_variant_params
+                                .insert(name.clone(), (params.clone(), ctor_fields));
+                        }
                         let mut adt_ctors = Vec::new();
                         for ctor in ctors {
                             let fields: Vec<(String, ResolvedType)> = ctor
@@ -179,6 +212,7 @@ impl TypeEnv {
                                             &aliases,
                                             &associated_types,
                                             &single_variant_params,
+                                            &multi_variant_params,
                                         ),
                                     )
                                 })
@@ -246,7 +280,7 @@ impl TypeEnv {
             // resolved form is already correct).
             let from_ast = if contains_unknown(&resolved) {
                 alias_ast_types.get(name).map(|ast| {
-                    resolve_type(ast, &aliases, &associated_types, &single_variant_params)
+                    resolve_type(ast, &aliases, &associated_types, &single_variant_params, &multi_variant_params)
                 })
             } else {
                 None
@@ -274,7 +308,7 @@ impl TypeEnv {
             match &decl.node {
                 DeclKind::Source { name, ty } => {
                     let schema =
-                        schema_for_source(ty, &aliases, &associated_types, &single_variant_params);
+                        schema_for_source(ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params);
                     source_schemas.insert(name.clone(), schema);
                     // Collect refined field info from the source type
                     let refinements = collect_source_refinements(ty, &refined_types, &alias_ast_types, &data_ctor_decls);
@@ -297,10 +331,10 @@ impl TypeEnv {
                         other => other,
                     };
                     let old_resolved = unwrap_relation(
-                        resolve_type(from_ty, &aliases, &associated_types, &single_variant_params),
+                        resolve_type(from_ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params),
                     );
                     let new_resolved = unwrap_relation(
-                        resolve_type(to_ty, &aliases, &associated_types, &single_variant_params),
+                        resolve_type(to_ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params),
                     );
                     // Use `relation_inner_schema` (not bare `schema_descriptor`)
                     // so scalar element types are wrapped as `_value:<scalar>`,
@@ -319,7 +353,7 @@ impl TypeEnv {
                     // Compute schema for derived relations with type annotations
                     // so groupBy can use them
                     let schema =
-                        schema_for_source(&scheme.ty, &aliases, &associated_types, &single_variant_params);
+                        schema_for_source(&scheme.ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params);
                     source_schemas.insert(name.clone(), schema);
                 }
                 DeclKind::SubsetConstraint { sub, sup } => {
@@ -338,6 +372,7 @@ impl TypeEnv {
             subset_constraints,
             source_refinements,
             refined_types,
+            multi_variant_params,
         }
     }
 }
@@ -1073,6 +1108,7 @@ fn resolve_type(
     aliases: &HashMap<String, ResolvedType>,
     assoc_types: &HashMap<String, Vec<AssocTypeDef>>,
     single_variant_params: &HashMap<String, (Vec<String>, Vec<(String, Type)>)>,
+    multi_variant_params: &HashMap<String, (Vec<String>, Vec<(String, Vec<(String, Type)>)>)>,
 ) -> ResolvedType {
     match &ty.node {
         TypeKind::Named(name) => match name.as_str() {
@@ -1091,17 +1127,17 @@ fn resolve_type(
             let resolved: Vec<(String, ResolvedType)> = fields
                 .iter()
                 .map(|f| {
-                    (f.name.clone(), resolve_type(&f.value, aliases, assoc_types, single_variant_params))
+                    (f.name.clone(), resolve_type(&f.value, aliases, assoc_types, single_variant_params, multi_variant_params))
                 })
                 .collect();
             ResolvedType::Record(resolved)
         }
         TypeKind::Relation(inner) => ResolvedType::Relation(Box::new(
-            resolve_type(inner, aliases, assoc_types, single_variant_params),
+            resolve_type(inner, aliases, assoc_types, single_variant_params, multi_variant_params),
         )),
         TypeKind::Function { param, result } => ResolvedType::Function(
-            Box::new(resolve_type(param, aliases, assoc_types, single_variant_params)),
-            Box::new(resolve_type(result, aliases, assoc_types, single_variant_params)),
+            Box::new(resolve_type(param, aliases, assoc_types, single_variant_params, multi_variant_params)),
+            Box::new(resolve_type(result, aliases, assoc_types, single_variant_params, multi_variant_params)),
         ),
         TypeKind::Var(_) => ResolvedType::Named("unknown".into()),
         TypeKind::App { func, arg } => {
@@ -1137,7 +1173,7 @@ fn resolve_type(
                                 })
                             {
                                 let resolved_ty = apply_type_subst(&def.ty, &subst);
-                                return resolve_type(&resolved_ty, aliases, assoc_types, single_variant_params);
+                                return resolve_type(&resolved_ty, aliases, assoc_types, single_variant_params, multi_variant_params);
                             }
                         }
                     }
@@ -1153,7 +1189,7 @@ fn resolve_type(
                 // Built-in ADTs aren't in `aliases` — build their shapes
                 // directly, substituting the actual type argument.
                 if name == "Maybe" {
-                    let arg_ty = resolve_type(arg, aliases, assoc_types, single_variant_params);
+                    let arg_ty = resolve_type(arg, aliases, assoc_types, single_variant_params, multi_variant_params);
                     return ResolvedType::Adt(vec![
                         ("Nothing".into(), vec![]),
                         ("Just".into(), vec![("value".into(), arg_ty)]),
@@ -1163,8 +1199,8 @@ fn resolve_type(
             // `Result e a` arrives as App(App(Result, e), a).
             if let TypeKind::App { func: inner_func, arg: err_arg } = &func.node
                 && matches!(&inner_func.node, TypeKind::Named(n) if n == "Result") {
-                    let err_ty = resolve_type(err_arg, aliases, assoc_types, single_variant_params);
-                    let ok_ty = resolve_type(arg, aliases, assoc_types, single_variant_params);
+                    let err_ty = resolve_type(err_arg, aliases, assoc_types, single_variant_params, multi_variant_params);
+                    let ok_ty = resolve_type(arg, aliases, assoc_types, single_variant_params, multi_variant_params);
                     return ResolvedType::Adt(vec![
                         ("Err".into(), vec![("error".into(), err_ty)]),
                         ("Ok".into(), vec![("value".into(), ok_ty)]),
@@ -1198,7 +1234,7 @@ fn resolve_type(
                     .iter()
                     .map(|(fname, fty)| {
                         let substituted_ty = apply_type_subst(fty, &subst);
-                        (fname.clone(), resolve_type(&substituted_ty, aliases, assoc_types, single_variant_params))
+                        (fname.clone(), resolve_type(&substituted_ty, aliases, assoc_types, single_variant_params, multi_variant_params))
                     })
                     .collect();
                 return ResolvedType::Record(substituted);
@@ -1208,6 +1244,34 @@ fn resolve_type(
                     resolved @ (ResolvedType::Adt(_) | ResolvedType::Record(_)),
                 ) = aliases.get(name)
                 {
+                    // For multi-variant parameterized ADTs, substitute type
+                    // arguments into constructor field types (mirrors the
+                    // single-variant path above) so schema-dependent logic
+                    // sees the actual type arguments, not `Named("unknown")`.
+                    if let ResolvedType::Adt(_) = resolved {
+                        if let Some((params, raw_ctors)) = multi_variant_params.get(name)
+                            && params.len() == spine_args.len()
+                        {
+                            let subst: HashMap<String, Type> =
+                                params.iter().zip(spine_args.iter())
+                                .map(|(p, arg)| (p.clone(), (*arg).clone()))
+                                .collect();
+                            let substituted: Vec<(String, Vec<(String, ResolvedType)>)> = raw_ctors
+                                .iter()
+                                .map(|(cname, fields)| {
+                                    let sub_fields: Vec<(String, ResolvedType)> = fields
+                                        .iter()
+                                        .map(|(fname, fty)| {
+                                            let sub = apply_type_subst(fty, &subst);
+                                            (fname.clone(), resolve_type(&sub, aliases, assoc_types, single_variant_params, multi_variant_params))
+                                        })
+                                        .collect();
+                                    (cname.clone(), sub_fields)
+                                })
+                                .collect();
+                            return ResolvedType::Adt(substituted);
+                        }
+                    }
                     return resolved.clone();
                 }
             ResolvedType::Named("unknown".into())
@@ -1226,6 +1290,7 @@ fn resolve_type(
                                     f.name.clone(),
                                     resolve_type(
                                         &f.value, aliases, assoc_types, single_variant_params,
+                                        multi_variant_params,
                                     ),
                                 )
                             })
@@ -1236,23 +1301,23 @@ fn resolve_type(
             ResolvedType::Adt(ctors)
         }
         TypeKind::Effectful { ty, .. } => {
-            resolve_type(ty, aliases, assoc_types, single_variant_params)
+            resolve_type(ty, aliases, assoc_types, single_variant_params, multi_variant_params)
         }
         TypeKind::IO { ty, .. } => {
             // IO values aren't persisted — resolve inner type for diagnostics
-            resolve_type(ty, aliases, assoc_types, single_variant_params)
+            resolve_type(ty, aliases, assoc_types, single_variant_params, multi_variant_params)
         }
         TypeKind::UnitAnnotated { base, .. } => {
             // Units are phantom — erase for schema resolution
-            resolve_type(base, aliases, assoc_types, single_variant_params)
+            resolve_type(base, aliases, assoc_types, single_variant_params, multi_variant_params)
         }
         TypeKind::Refined { base, .. } => {
             // Refinements are phantom for schema — base type determines storage
-            resolve_type(base, aliases, assoc_types, single_variant_params)
+            resolve_type(base, aliases, assoc_types, single_variant_params, multi_variant_params)
         }
         TypeKind::Forall { ty, .. } => {
             // Quantifiers are phantom for schema resolution.
-            resolve_type(ty, aliases, assoc_types, single_variant_params)
+            resolve_type(ty, aliases, assoc_types, single_variant_params, multi_variant_params)
         }
     }
 }
@@ -1337,6 +1402,7 @@ fn schema_for_source(
     aliases: &HashMap<String, ResolvedType>,
     assoc_types: &HashMap<String, Vec<AssocTypeDef>>,
     single_variant_params: &HashMap<String, (Vec<String>, Vec<(String, Type)>)>,
+    multi_variant_params: &HashMap<String, (Vec<String>, Vec<(String, Vec<(String, Type)>)>)>,
 ) -> String {
     // Unwrap Effectful/Refined wrappers to find the underlying type
     let unwrapped = match &ty.node {
@@ -1345,14 +1411,14 @@ fn schema_for_source(
     };
     match &unwrapped.node {
         TypeKind::Relation(inner) => {
-            let resolved = resolve_type(inner, aliases, assoc_types, single_variant_params);
+            let resolved = resolve_type(inner, aliases, assoc_types, single_variant_params, multi_variant_params);
             relation_inner_schema(&resolved)
         }
         _ => {
             // The type might be a named alias that resolves to a Relation
             // (e.g. `type People = [{name: Text}]` and `*people : People`).
             // Check the resolved type before falling back to scalar schema.
-            let resolved = resolve_type(unwrapped, aliases, assoc_types, single_variant_params);
+            let resolved = resolve_type(unwrapped, aliases, assoc_types, single_variant_params, multi_variant_params);
             if let ResolvedType::Relation(inner) = &resolved {
                 return relation_inner_schema(inner);
             }

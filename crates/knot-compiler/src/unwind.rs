@@ -78,13 +78,15 @@ impl UnwindContext {
 
         match unwind_info {
             UnwindInfo::SystemV(unwind_info) => {
-                let fde = unwind_info.to_fde(address_for_func(func_id));
-                self.frame_table.add_fde(self.cie_id.unwrap(), fde);
+                if let Some(cie_id) = self.cie_id {
+                    let fde = unwind_info.to_fde(address_for_func(func_id));
+                    self.frame_table.add_fde(cie_id, fde);
+                }
             }
             UnwindInfo::WindowsX64(_) | UnwindInfo::WindowsArm64(_) => {
                 // Windows does not use .eh_frame; unsupported here.
             }
-            unwind_info => unimplemented!("{:?}", unwind_info),
+            _ => {} // unsupported unwind info format
         }
     }
 

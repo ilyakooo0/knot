@@ -329,7 +329,10 @@ fn add_dirty_decl_telemetry(
             | DeclKind::Trait { name, .. }
             | DeclKind::View { name, .. }
             | DeclKind::Derived { name, .. }
-            | DeclKind::Source { name, .. } => name.clone(),
+            | DeclKind::Source { name, .. }
+            | DeclKind::Route { name, .. }
+            | DeclKind::RouteComposite { name, .. }
+            | DeclKind::UnitDecl { name, .. } => name.clone(),
             _ => continue,
         };
         if !doc.dirty_decl_closure.contains(&name) {
@@ -417,6 +420,13 @@ fn add_closing_label_hints(
             }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => collect(body, &doc.source, &mut spans),
+            DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method { default_body: Some(body), .. } = item {
+                        collect(body, &doc.source, &mut spans);
+                    }
+                }
+            }
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {

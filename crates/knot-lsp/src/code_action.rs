@@ -2046,6 +2046,10 @@ fn collect_names_in_pat(pat: &ast::Pat, out: &mut HashSet<String>) {
                 collect_names_in_pat(p, out);
             }
         }
+        ast::PatKind::Cons { head, tail } => {
+            collect_names_in_pat(head, out);
+            collect_names_in_pat(tail, out);
+        }
         _ => {}
     }
 }

@@ -878,6 +878,12 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
             ast::PatKind::Constructor { name, payload } => {
                 format!("{name} {}", pat(payload))
             }
+            ast::PatKind::List(pats) => {
+                format!("[{}]", pats.iter().map(|p| pat(p)).collect::<Vec<_>>().join(", "))
+            }
+            ast::PatKind::Cons { head, tail } => {
+                format!("Cons {} {}", pat(head), pat(tail))
+            }
             _ => "_".to_string(),
         }
     }
@@ -1301,6 +1307,9 @@ pub(crate) fn resolve_var_to_source(
                 }
             }),
             ast::PatKind::List(pats) => pats.iter().any(|p| pat_binds_var(p, name)),
+            ast::PatKind::Cons { head, tail } => {
+                pat_binds_var(head, name) || pat_binds_var(tail, name)
+            }
             _ => false,
         }
     }

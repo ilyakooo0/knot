@@ -3410,32 +3410,46 @@ impl Codegen {
 
             // For overridable constants, check CLI override before evaluating body
             if let Some(type_str) = &override_type {
-                let type_tag: i64 = match type_str.as_str() {
-                    "Int" => 0,
-                    "Float" => 1,
-                    "Text" => 2,
-                    "Bool" => 3,
-                    "Maybe Int" => 4,
-                    "Maybe Float" => 5,
-                    "Maybe Text" => 6,
-                    "Maybe Bool" => 7,
-                    _ => unreachable!(),
+                let type_tag: Option<i64> = match type_str.as_str() {
+                    "Int" => Some(0),
+                    "Float" => Some(1),
+                    "Text" => Some(2),
+                    "Bool" => Some(3),
+                    "Maybe Int" => Some(4),
+                    "Maybe Float" => Some(5),
+                    "Maybe Text" => Some(6),
+                    "Maybe Bool" => Some(7),
+                    // Bytes/Uuid and other types have no CLI-override parser in
+                    // the runtime (knot_override_lookup only handles the scalar
+                    // types above). Skip the override for this constant rather
+                    // than crashing codegen.
+                    _ => {
+                        eprintln!(
+                            "knot: warning: constant '{}' of type '{}' does not support \
+                             command-line overrides; ignoring override for this constant",
+                            name_owned, type_str
+                        );
+                        None
+                    }
                 };
-                let (name_ptr, name_len) = cg.string_ptr(builder, &name_owned);
-                let tag = builder.ins().iconst(types::I32, type_tag);
-                let override_val = cg.call_rt(builder, "knot_override_lookup", &[name_ptr, name_len, tag]);
+                if let Some(type_tag) = type_tag {
+                    let (name_ptr, name_len) = cg.string_ptr(builder, &name_owned);
+                    let tag = builder.ins().iconst(types::I32, type_tag);
+                    let override_val =
+                        cg.call_rt(builder, "knot_override_lookup", &[name_ptr, name_len, tag]);
 
-                let default_block = builder.create_block();
-                let override_block = builder.create_block();
-                let is_null = builder.ins().icmp_imm(IntCC::Equal, override_val, 0);
-                builder.ins().brif(is_null, default_block, &[], override_block, &[]);
+                    let default_block = builder.create_block();
+                    let override_block = builder.create_block();
+                    let is_null = builder.ins().icmp_imm(IntCC::Equal, override_val, 0);
+                    builder.ins().brif(is_null, default_block, &[], override_block, &[]);
 
-                builder.switch_to_block(override_block);
-                builder.seal_block(override_block);
-                builder.ins().return_(&[override_val]);
+                    builder.switch_to_block(override_block);
+                    builder.seal_block(override_block);
+                    builder.ins().return_(&[override_val]);
 
-                builder.switch_to_block(default_block);
-                builder.seal_block(default_block);
+                    builder.switch_to_block(default_block);
+                    builder.seal_block(default_block);
+                }
             }
 
             let result = cg.compile_expr(builder, &body_owned, &mut env, db);
@@ -10094,7 +10108,10 @@ impl Codegen {
                                     }
                                 }
 
-                                if !sql_fragments.is_empty() {
+                                if let (false, Some(schema)) = (
+                                    sql_fragments.is_empty(),
+                                    self.source_schemas.get(source_name).cloned(),
+                                ) {
                                     // Mark consumed and emit knot_source_read_where
                                     let mut all_sql = Vec::new();
                                     let mut all_params = Vec::new();
@@ -10104,7 +10121,6 @@ impl Codegen {
                                         all_params.extend(frag.params.clone());
                                     }
                                     let where_sql = all_sql.join(" AND ");
-                                    let schema = self.source_schemas.get(source_name).cloned().unwrap();
                                     let (name_ptr, name_len) =
                                         self.string_ptr(builder, source_name);
                                     let (schema_ptr, schema_len) =
@@ -10124,6 +10140,9 @@ impl Codegen {
                                     );
                                     Some(val)
                                 } else {
+                                    // No pushable fragments, or the source schema is
+                                    // unexpectedly missing: skip the pushdown
+                                    // optimization and compile the filter normally.
                                     None
                                 }
                             } else {

@@ -966,7 +966,8 @@ pub fn resolve_import_navigation(
                 | DeclKind::Derived { name, .. }
                 | DeclKind::Fun { name, .. }
                 | DeclKind::Route { name, .. }
-                | DeclKind::RouteComposite { name, .. } => {
+                | DeclKind::RouteComposite { name, .. }
+                | DeclKind::UnitDecl { name, .. } => {
                     if !included(name) {
                         continue;
                     }

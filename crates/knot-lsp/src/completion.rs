@@ -1106,6 +1106,13 @@ fn find_enclosing_do_span(module: &Module, offset: usize) -> Option<Span> {
             }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => walk(body, offset, &mut best),
+            DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method { default_body: Some(body), .. } = item {
+                        walk(body, offset, &mut best);
+                    }
+                }
+            }
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {

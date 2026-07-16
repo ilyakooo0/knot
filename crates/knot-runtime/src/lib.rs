@@ -4998,7 +4998,7 @@ pub extern "C-unwind" fn knot_record_set_field(
     key_len: usize,
     value: *mut Value,
 ) {
-    if record.is_null() {
+    if record.is_null() || is_tagged(record) {
         return;
     }
     let name_str = unsafe { str_from_raw(key_ptr, key_len) };
@@ -5935,7 +5935,7 @@ pub extern "C-unwind" fn knot_relation_with_capacity(cap: usize) -> *mut Value {
 /// `[1, 1] == [1]`.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_dedup(rel: *mut Value) -> *mut Value {
-    if rel.is_null() {
+    if rel.is_null() || is_tagged(rel) {
         return rel;
     }
     if let Value::Relation(rows) = unsafe { &mut *rel }
@@ -5985,7 +5985,7 @@ pub extern "C-unwind" fn knot_scalar_source_wrap(val: *mut Value) -> *mut Value 
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
-    if rel.is_null() {
+    if rel.is_null() || is_tagged(rel) {
         return;
     }
     let r = unsafe { &mut *rel };
@@ -6001,6 +6001,9 @@ pub extern "C-unwind" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
 /// inner relation whole.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_extend(rel: *mut Value, src: *mut Value) {
+    if rel.is_null() || is_tagged(rel) {
+        return;
+    }
     let rows: Vec<*mut Value> = match unsafe { as_ref(src) } {
         Value::Relation(rows) => rows.clone(),
         _ => vec![src],
@@ -6040,7 +6043,7 @@ pub extern "C-unwind" fn knot_relation_take(
     rel: *mut Value,
 ) -> *mut Value {
     let n = match unsafe { as_ref(n_val) } {
-        Value::Int(i) => (*i).max(0) as usize,
+        Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
         _ => 0,
     };
     match unsafe { as_ref(rel) } {
@@ -6059,7 +6062,7 @@ pub extern "C-unwind" fn knot_relation_drop(
     rel: *mut Value,
 ) -> *mut Value {
     let n = match unsafe { as_ref(n_val) } {
-        Value::Int(i) => (*i).max(0) as usize,
+        Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
         _ => 0,
     };
     match unsafe { as_ref(rel) } {
@@ -6168,7 +6171,7 @@ pub extern "C-unwind" fn knot_relation_union(
         for &row in rows_b.iter() {
             buf.clear();
             value_to_hash_bytes(row, &mut buf);
-            if seen.insert(std::mem::take(&mut buf)) {
+            if seen.insert(buf.clone()) {
                 result.push(row);
             }
             buf = Vec::with_capacity(128);
@@ -6562,7 +6565,7 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                     }
                     Value::Text(s) => {
                         buf.push(2);
-                        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
                         buf.extend_from_slice(s.as_bytes());
                     }
                     Value::Bool(b) => {
@@ -6571,7 +6574,7 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                     }
                     Value::Bytes(b) => {
                         buf.push(4);
-                        buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&(b.len() as u64).to_le_bytes());
                         buf.extend_from_slice(b);
                     }
                     Value::Unit => {
@@ -6579,7 +6582,7 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                     }
                     Value::Record(fields) => {
                         buf.push(6);
-                        buf.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&(fields.len() as u64).to_le_bytes());
                         // Push field tasks in reverse so they pop in forward
                         // order: for each field, write name bytes, then hash
                         // the value. Push value first (deeper), then the name
@@ -6588,14 +6591,14 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                         for field in fields.iter().rev() {
                             stack.push(HashTask::Value(field.value));
                             let mut nb = Vec::with_capacity(4 + field.name.len());
-                            nb.extend_from_slice(&(field.name.len() as u32).to_le_bytes());
+                            nb.extend_from_slice(&(field.name.len() as u64).to_le_bytes());
                             nb.extend_from_slice(field.name.as_bytes());
                             stack.push(HashTask::Bytes(nb));
                         }
                     }
                     Value::Constructor(tag, payload) => {
                         buf.push(7);
-                        buf.extend_from_slice(&(tag.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&(tag.len() as u64).to_le_bytes());
                         buf.extend_from_slice(tag.as_bytes());
                         // Nullary constructors have three runtime forms:
                         // `Constructor(tag, Unit)`, `Constructor(tag, Record([]))`,
@@ -6645,15 +6648,15 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                             .collect();
                         row_bytes.sort_unstable();
                         row_bytes.dedup();
-                        buf.extend_from_slice(&(row_bytes.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&(row_bytes.len() as u64).to_le_bytes());
                         for rb in &row_bytes {
-                            buf.extend_from_slice(&(rb.len() as u32).to_le_bytes());
+                            buf.extend_from_slice(&(rb.len() as u64).to_le_bytes());
                             buf.extend_from_slice(rb);
                         }
                     }
                     Value::Function(f) => {
                         buf.push(9);
-                        buf.extend_from_slice(&(f.source.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&(f.source.len() as u64).to_le_bytes());
                         buf.extend_from_slice(f.source.as_bytes());
                         buf.extend_from_slice(&(f.fn_ptr as usize).to_le_bytes());
                         stack.push(HashTask::Value(f.env));
@@ -7133,7 +7136,7 @@ pub extern "C-unwind" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut
                 buf.clear();
                 value_to_hash_bytes(row, &mut buf);
                 if !seen.contains(buf.as_slice()) {
-                    seen.insert(std::mem::take(&mut buf));
+                    seen.insert(buf.clone());
                     result.push(row);
                 }
             }
@@ -10129,7 +10132,7 @@ pub extern "C-unwind" fn knot_text_to_lower(v: *mut Value) -> *mut Value {
 pub extern "C-unwind" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut Value {
     // Clamp negative counts to 0, matching `knot_relation_take`.
     let n_idx = match unsafe { as_ref(n) } {
-        Value::Int(i) => (*i).max(0) as usize,
+        Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
         _ => panic!("knot runtime: take expected Int as first arg, got {}", type_name(n)),
     };
     match unsafe { as_ref(text) } {
@@ -10146,7 +10149,7 @@ pub extern "C-unwind" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut
 pub extern "C-unwind" fn knot_text_drop(n: *mut Value, text: *mut Value) -> *mut Value {
     // Clamp negative counts to 0, matching `knot_relation_drop`.
     let n_idx = match unsafe { as_ref(n) } {
-        Value::Int(i) => (*i).max(0) as usize,
+        Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
         _ => panic!("knot runtime: drop expected Int as first arg, got {}", type_name(n)),
     };
     match unsafe { as_ref(text) } {
@@ -10279,11 +10282,11 @@ pub extern "C-unwind" fn knot_bytes_slice(
     // an `Int<u>` can evaluate negative even from well-typed code, and a
     // negative offset/length means "from the start"/"empty" rather than a crash.
     let start = match unsafe { as_ref(start) } {
-        Value::Int(i) => (*i).max(0) as usize,
+        Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
         _ => panic!("knot runtime: bytesSlice expected Int as first arg, got {}", type_name(start)),
     };
     let len = match unsafe { as_ref(len) } {
-        Value::Int(i) => (*i).max(0) as usize,
+        Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
         _ => panic!("knot runtime: bytesSlice expected Int as second arg, got {}", type_name(len)),
     };
     match unsafe { as_ref(bytes) } {

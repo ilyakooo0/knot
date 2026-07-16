@@ -204,6 +204,9 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
             DeclKind::RouteComposite { name, .. } => {
                 resolver.define(name, name_span(name));
             }
+            DeclKind::UnitDecl { name, .. } => {
+                resolver.define(name, name_span(name));
+            }
             _ => {}
         }
     }
@@ -880,6 +883,19 @@ pub fn build_details(module: &Module) -> HashMap<String, String> {
                     .collect::<Vec<_>>()
                     .join(" ");
                 details.insert(name.clone(), format!("trait {name} {params_str}"));
+            }
+            DeclKind::Impl { trait_name, args, .. } => {
+                let args_str = args.iter().map(|a| format_type_kind(&a.node)).collect::<Vec<_>>().join(" ");
+                details.insert(format!("{trait_name}@{args_str}"), format!("impl {trait_name} {args_str}"));
+            }
+            DeclKind::Route { name, .. } => {
+                details.insert(name.clone(), format!("route {name}"));
+            }
+            DeclKind::RouteComposite { name, components, .. } => {
+                details.insert(name.clone(), format!("route {name} = {}", components.join(" | ")));
+            }
+            DeclKind::UnitDecl { name, .. } => {
+                details.insert(name.clone(), format!("unit {name}"));
             }
             _ => {}
         }

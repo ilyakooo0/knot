@@ -1754,7 +1754,7 @@ impl Infer {
     fn widen_refined_vars(&mut self, t1: &Ty, t2: &Ty, depth: usize) {
         // Types are finite (the occurs check rules out cyclic substitutions),
         // but bound the walk anyway — this runs on every unification.
-        if depth > 12 {
+        if depth > 64 {
             return;
         }
         let (v1, a) = self.shallow_resolve(t1);

@@ -540,7 +540,38 @@ fn collect_decl_deps(decl: &ast::Decl) -> HashSet<String> {
                 }
             }
         }
-        _ => {}
+        DeclKind::Route { name, entries, .. } => {
+            deps.insert(name.clone());
+            for entry in entries {
+                if let Some(rate_limit) = &entry.rate_limit {
+                    collect_expr_names(rate_limit, &mut deps);
+                }
+            }
+        }
+        DeclKind::RouteComposite { name, components, .. } => {
+            deps.insert(name.clone());
+            for comp in components {
+                deps.insert(comp.clone());
+            }
+        }
+        DeclKind::Migrate { from_ty, to_ty, using_fn, .. } => {
+            collect_type_names(from_ty, &mut deps);
+            collect_type_names(to_ty, &mut deps);
+            collect_expr_names(using_fn, &mut deps);
+        }
+        DeclKind::SubsetConstraint { sub, sup, .. } => {
+            deps.insert(sub.relation.clone());
+            if let Some(f) = &sub.field {
+                deps.insert(f.clone());
+            }
+            deps.insert(sup.relation.clone());
+            if let Some(f) = &sup.field {
+                deps.insert(f.clone());
+            }
+        }
+        DeclKind::UnitDecl { name, .. } => {
+            deps.insert(name.clone());
+        }
     }
     deps
 }
@@ -591,6 +622,9 @@ fn collect_expr_names(expr: &ast::Expr, out: &mut HashSet<String>) {
         }
         ast::ExprKind::Constructor(name) => {
             out.insert(name.clone());
+        }
+        ast::ExprKind::Serve { api, .. } => {
+            out.insert(api.clone());
         }
         _ => {}
     }

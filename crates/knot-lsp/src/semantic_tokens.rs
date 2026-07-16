@@ -10,8 +10,8 @@ use knot::ast::{self, DeclKind, Span};
 use crate::builtins::EFFECTFUL_BUILTINS;
 use crate::legend::{
     MOD_DECLARATION, MOD_EFFECTFUL, MOD_MUTATION, MOD_READONLY, TOK_ENUM_MEMBER, TOK_FUNCTION,
-    TOK_NAMESPACE, TOK_NUMBER, TOK_PARAMETER, TOK_PROPERTY, TOK_STRING, TOK_STRUCT, TOK_TYPE,
-    TOK_VARIABLE,
+    TOK_KEYWORD, TOK_NAMESPACE, TOK_NUMBER, TOK_PARAMETER, TOK_PROPERTY, TOK_STRING, TOK_STRUCT,
+    TOK_TYPE, TOK_VARIABLE,
 };
 use crate::state::ServerState;
 use crate::utils::{find_word_in_source, position_to_offset};
@@ -534,6 +534,12 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::Lit(ast::Literal::Text(_)) => {
                 self.add(self.strip_parens(expr.span), TOK_STRING, 0);
             }
+            ast::ExprKind::Lit(ast::Literal::Bool(_)) => {
+                self.add(self.strip_parens(expr.span), TOK_KEYWORD, 0);
+            }
+            ast::ExprKind::Lit(ast::Literal::Bytes(_)) => {
+                self.add(self.strip_parens(expr.span), TOK_STRING, 0);
+            }
             ast::ExprKind::Lambda { params, body } => {
                 for p in params {
                     self.visit_pat(p, true);
@@ -727,6 +733,10 @@ impl<'a> TokenCollector<'a> {
                 for p in pats {
                     self.visit_pat(p, false);
                 }
+            }
+            ast::PatKind::Cons { head, tail } => {
+                self.visit_pat(head, false);
+                self.visit_pat(tail, false);
             }
             _ => {}
         }

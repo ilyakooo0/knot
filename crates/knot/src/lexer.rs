@@ -427,7 +427,14 @@ impl<'src> Lexer<'src> {
         // identifier start (`café`, `α`) too — the byte-level gate uses the
         // lead byte, and the full multi-byte character is then consumed by
         // `is_ident_continue`.
-        if ch.is_ascii_alphabetic() || (ch >= 0x80 && char::from(ch).is_alphabetic()) || ch == b'_' {
+        if ch.is_ascii_alphabetic()
+            || (ch >= 0x80
+                && self.source[self.pos..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphabetic()))
+            || ch == b'_'
+        {
             return Some(self.lex_identifier());
         }
 
@@ -502,15 +509,23 @@ impl<'src> Lexer<'src> {
     }
 
     fn is_ident_continue(&self) -> bool {
-        // Any non-ASCII byte (`b >= 0x80`) continues an identifier: this covers
-        // every byte of a multi-byte UTF-8 letter — both the lead byte and its
-        // continuation bytes, which individually are not alphanumeric — so a
-        // Unicode identifier is consumed whole and `slice` stays on a char
-        // boundary. `'` continues identifiers too (`x'`).
-        matches!(
-            self.peek(),
-            Some(b) if b.is_ascii_alphanumeric() || b == b'_' || b == b'\'' || b >= 0x80
-        )
+        // `'` continues identifiers too (`x'`). For non-ASCII bytes we decode
+        // the actual char and require it to be alphanumeric — but only at a
+        // char boundary: mid multi-byte char (`self.pos` on a continuation
+        // byte) we accept unconditionally, since that byte is part of a lead
+        // char already validated at its boundary, and slicing there would
+        // panic. Advancing is byte-by-byte, so the whole char is consumed.
+        match self.peek() {
+            Some(b) if b.is_ascii_alphanumeric() || b == b'_' || b == b'\'' => true,
+            Some(b) if b >= 0x80 => {
+                !self.source.is_char_boundary(self.pos)
+                    || self.source[self.pos..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphanumeric())
+            }
+            _ => false,
+        }
     }
 
     // ── Numbers ─────────────────────────────────────────────────────

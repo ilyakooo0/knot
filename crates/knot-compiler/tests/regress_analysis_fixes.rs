@@ -817,15 +817,28 @@ fn do_blocks_at_identical_offsets_in_different_files_use_their_own_monads() {
     let lib = "f1 : Maybe Int -> Maybe Int\nf1 = \\m -> do\n  x <- m\n  yield (x + 1)\n";
     let lib_do_off = lib.find("do").unwrap();
     let prefix = "import ./lib\n";
+    // f2 has a type annotation so its monad var is not generalized —
+    // without it the pass-8 monad-poly check would flag it.
+    let f2_sig = "f2 : [Int] -> [Int]\n";
     let fn_line = "f2 = \\r -> do";
     // Pad with a comment so that prog's `do` starts at lib_do_off.
     let do_col = fn_line.len() - 2; // offset of "do" within fn_line
+    let before_do = prefix.len() + f2_sig.len() + do_col + 1; // +1 for newline after comment
+    // If lib's do offset is too small to reach, pad lib with extra comment lines.
+    let lib_pad = if lib_do_off < before_do {
+        "-- " .to_string() + &"x".repeat(before_do - lib_do_off + 3) + "\n"
+    } else {
+        String::new()
+    };
+    let lib = format!("{lib_pad}{lib}");
+    let lib_do_off = lib.find("do").unwrap();
     let pad_len = lib_do_off
-        .checked_sub(prefix.len() + do_col + 1) // +1 for the newline after the comment
+        .checked_sub(before_do)
         .expect("lib do offset too small for padding");
     let padding = format!("--{}\n", "p".repeat(pad_len.saturating_sub(3)));
     let mut prog = String::new();
     prog.push_str(prefix);
+    prog.push_str(&f2_sig);
     prog.push_str(&padding);
     prog.push_str(fn_line);
     prog.push_str("\n  x <- r\n  yield (x + 1)\n");
@@ -839,7 +852,7 @@ fn do_blocks_at_identical_offsets_in_different_files_use_their_own_monads() {
   yield {}
 "#,
     );
-    let c = compile_files("monad_span_collision", &prog, &[("lib.knot", lib)]);
+    let c = compile_files("monad_span_collision", &prog, &[("lib.knot", &lib)]);
     let (stdout, stderr, ok) = run(&c);
     assert!(ok, "program failed: {stderr}");
     assert!(

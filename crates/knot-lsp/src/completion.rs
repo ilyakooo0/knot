@@ -434,6 +434,17 @@ pub(crate) fn handle_completion(
                 ..Default::default()
             });
         }
+        // Imported types (Data/Trait/Alias from other modules) are in scope
+        // for type annotations but were missing from type-position completion.
+        for (name, _) in &doc.import_defs {
+            if name.chars().next().is_some_and(|c| c.is_uppercase()) {
+                items.push(CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::STRUCT),
+                    ..Default::default()
+                });
+            }
+        }
         return Some(CompletionResponse::Array(items));
     }
 
@@ -1159,6 +1170,17 @@ fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -
             ast::DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item
+                        && body.span.start <= offset && offset < body.span.end {
+                            return SnippetContext::Expression;
+                        }
+                }
+            }
+            // Trait default bodies are expression positions too — without
+            // this arm, a cursor inside `trait … where f = …` falls through
+            // to TopLevel and offers the wrong snippets.
+            ast::DeclKind::Trait { items, .. } => {
+                for item in items {
+                    if let ast::TraitItem::Method { default_body: Some(body), .. } = item
                         && body.span.start <= offset && offset < body.span.end {
                             return SnippetContext::Expression;
                         }

@@ -4818,7 +4818,17 @@ impl Codegen {
                 if let ast::ExprKind::Var(name) = &func.node
                     && (name == "__yield" || name == "yield") {
                         let val = self.compile_expr(builder, arg, env, db);
-                        if self.in_io_eager {
+                        // In an eager IO context, IO's `pure`/`yield` is the
+                        // identity — *unless* inference resolved this yield to
+                        // a non-IO monad (Relation/Maybe/Result/…), in which
+                        // case the value must still be wrapped or downstream
+                        // relation ops read a bare scalar and panic.
+                        if self.in_io_eager
+                            && !matches!(
+                                self.monad_info.get(&func.span),
+                                Some(MonadKind::Adt(_)) | Some(MonadKind::Relation)
+                            )
+                        {
                             return val;
                         }
                         return self.compile_monadic_yield(builder, val, func.span, db);
@@ -8852,7 +8862,9 @@ impl Codegen {
     ) -> Value {
         if matches!(
             &expr.node,
-            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. }
+            ast::ExprKind::Set { .. }
+                | ast::ExprKind::ReplaceSet { .. }
+                | ast::ExprKind::Atomic(_)
         ) {
             let do_stmts = vec![ast::Spanned::new(
                 ast::StmtKind::Expr(expr.clone()),
@@ -9134,7 +9146,14 @@ impl Codegen {
                         // `knot_io_run` executes it (the thunk body compiles the
                         // atomic eagerly via compile_io_do_eager → compile_expr,
                         // but only when invoked).
-                        ast::ExprKind::Atomic(_) => {
+                        ast::ExprKind::Atomic(_)
+                        | ast::ExprKind::Set { .. }
+                        | ast::ExprKind::ReplaceSet { .. } => {
+                            // An `atomic`, `set`, or `replace` bound in a `let`
+                            // must be deferred into an IO thunk — otherwise the
+                            // write fires once at the `let` and each later use
+                            // is a `knot_io_run` no-op. See the Atomic arm above
+                            // for the detailed rationale.
                             let do_stmts = vec![ast::Spanned::new(
                                 ast::StmtKind::Expr(expr.clone()),
                                 expr.span,
@@ -9375,8 +9394,24 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Value {
-        if let Some(inner) = expr.node.as_yield_arg() {
-            return self.compile_expr(builder, inner, env, db);
+        // A bare `yield e` here is IO's `pure` only when the do-block's monad
+        // is IO — then it is the identity in eager position. In any other monad
+        // (`case … -> yield e` whose arms unify to `[T]`, `Maybe`, …) the value
+        // must still be wrapped, or a downstream relation op reads a raw scalar
+        // and panics. Match the `App` directly (not `as_yield_arg`) so the
+        // `yield` var's span is available for the `monad_info` lookup.
+        if let ast::ExprKind::App { func, arg } = &expr.node
+            && matches!(&func.node, ast::ExprKind::Var(n) if n == "yield" || n == "__yield")
+        {
+            let val = self.compile_expr(builder, arg, env, db);
+            // Wrap only when inference *resolved* this yield to a non-IO monad
+            // (Relation/Maybe/…). A genuine IO trailing yield often carries no
+            // `monad_info` entry, and in eager position IO's `pure` is the
+            // identity — so IO and unresolved both return `val` unwrapped.
+            match self.monad_info.get(&func.span) {
+                Some(MonadKind::IO) | None => return val,
+                _ => return self.compile_monadic_yield(builder, val, func.span, db),
+            }
         }
         if let ast::ExprKind::If {
             cond,

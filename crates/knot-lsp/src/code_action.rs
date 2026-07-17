@@ -718,7 +718,7 @@ pub(crate) fn handle_code_action(
                 .decls
                 .iter()
                 .find(|d| d.span.start <= sel_start && sel_end <= d.span.end)
-                .map(|d| include_export_prefix(&doc.source, d.span.start))
+                .map(|d| if d.exported { include_export_prefix(&doc.source, d.span.start) } else { d.span.start })
                 .unwrap_or(0);
             let fn_insert_pos = offset_to_position(&doc.source, fn_insert_offset);
 
@@ -3553,6 +3553,12 @@ fn find_pipe_conversion_at(
             }
             ast::ExprKind::UnaryOp { operand, .. } => {
                 walk(operand, source, offset, best, false, true);
+            }
+            ast::ExprKind::FieldAccess { expr: recv, .. } => {
+                // A field access binds tighter than `|>`, so converting the
+                // receiver to a pipe must be parenthesized to preserve the
+                // `.field` postfix binding.
+                walk(recv, source, offset, best, false, true);
             }
             _ => {
                 crate::utils::recurse_expr(expr, |e| {

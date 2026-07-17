@@ -1449,10 +1449,30 @@ pub(crate) fn collect_name_uses_in_decl(
         DeclKind::Source { ty, .. } | DeclKind::TypeAlias { ty, .. } => {
             walk_type(ty, name, source, out);
         }
-        DeclKind::Data { constructors, .. } => {
+        DeclKind::Data { constructors, deriving, .. } => {
             for ctor in constructors {
                 for f in &ctor.fields {
                     walk_type(&f.value, name, source, out);
+                }
+            }
+            // `deriving (Trait1, Trait2)` references trait names. Deriving
+            // names are spanless in the AST, so recover each token span by
+            // scanning the decl source with a moving cursor (mirrors the
+            // RouteComposite arm). Anchor the cursor after the `deriving`
+            // keyword so a trait name that also appears as a constructor field
+            // type is not double-counted. Without this, renaming a trait
+            // leaves deriving clauses stale.
+            let mut cursor = source
+                .get(decl.span.start..decl.span.end)
+                .and_then(|s| s.find("deriving").map(|i| decl.span.start + i))
+                .unwrap_or(decl.span.start);
+            for trait_name in deriving {
+                if trait_name == name
+                    && let Some(span) =
+                        find_word_in_source(source, name, cursor, decl.span.end)
+                {
+                    cursor = span.end;
+                    out.push(span);
                 }
             }
         }
@@ -2369,7 +2389,10 @@ fn field_sites_in_type<F: FnMut(&str, Span)>(ty: &ast::Type, source: &str, f: &m
         ast::TypeKind::Effectful { ty: inner, .. }
         | ast::TypeKind::IO { ty: inner, .. } => field_sites_in_type(inner, source, f),
         ast::TypeKind::UnitAnnotated { base, .. } => field_sites_in_type(base, source, f),
-        ast::TypeKind::Refined { base, .. } => field_sites_in_type(base, source, f),
+        ast::TypeKind::Refined { base, predicate, .. } => {
+            field_sites_in_type(base, source, f);
+            field_sites_in_expr(predicate, source, f);
+        }
         ast::TypeKind::Forall { ty: inner, .. } => field_sites_in_type(inner, source, f),
         _ => {}
     }

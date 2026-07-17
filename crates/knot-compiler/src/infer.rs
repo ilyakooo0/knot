@@ -1377,14 +1377,30 @@ impl Infer {
     /// `None` when `arg` doesn't (yet) match any head — e.g. it's still a
     /// variable — so the projection stays unresolved and rigid.
     fn reduce_assoc(&self, name: &str, arg: &Ty) -> Option<Ty> {
+        // Depth guard: reduction substitutes the matched body via `subst_ty`,
+        // whose own `Assoc` arm calls straight back into `reduce_assoc`. A
+        // self-referential family body (`type F X = F X`) would otherwise
+        // recurse forever and overflow the stack — the `apply_impl` path bumps
+        // `assoc_reduce_depth`, but the `subst_ty` path does not, so the bound
+        // has to live here. `assoc_reduce_depth` is a `Cell`, so bump it before
+        // recursing and restore it after.
+        const MAX_ASSOC_REDUCE_DEPTH: u32 = 100;
+        if self.assoc_reduce_depth.get() >= MAX_ASSOC_REDUCE_DEPTH {
+            return None;
+        }
         let defs = self.assoc_impls.get(name)?;
         for (head, body, pattern_vars) in defs {
             let mut binding: HashMap<TyVar, Ty> = HashMap::new();
             if self.match_pattern(head, arg, pattern_vars, &mut binding) {
                 // Apply the matched substitution to the body, then resolve
                 // again in case the body is itself a projection.
+                self.assoc_reduce_depth
+                    .set(self.assoc_reduce_depth.get() + 1);
                 let substituted = self.subst_ty(body, &binding);
-                return Some(self.apply(&substituted));
+                let result = self.apply(&substituted);
+                self.assoc_reduce_depth
+                    .set(self.assoc_reduce_depth.get() - 1);
+                return Some(result);
             }
         }
         None
@@ -3589,6 +3605,25 @@ impl Infer {
         }
     }
 
+    /// Does `var` occur in a *parameter* position — free anywhere on the left
+    /// of a function arrow — within `ty`? Used to tell a monad-polymorphic
+    /// *function* (`f x = do …`, where the monad var flows in through a
+    /// parameter and the Relation default would be wrong) from a monad-*valued*
+    /// binding (`main = do …`, monad var only in the result, Relation default
+    /// correct).
+    fn ty_var_in_param_position(&self, ty: &Ty, var: TyVar) -> bool {
+        match ty {
+            Ty::Fun(param, result) => {
+                self.free_vars(param).contains(&var)
+                    || self.ty_var_in_param_position(result, var)
+            }
+            Ty::Forall(_, inner) | Ty::Alias(_, inner) => {
+                self.ty_var_in_param_position(inner, var)
+            }
+            _ => false,
+        }
+    }
+
     fn generalize(&mut self, ty: &Ty) -> Scheme {
         self.generalize_with_constraints(ty, vec![])
     }
@@ -3604,19 +3639,24 @@ impl Infer {
         let gen_vars: Vec<TyVar> =
             ty_fv.difference(&env_fv).copied().collect();
         let gen_set: HashSet<TyVar> = gen_vars.iter().copied().collect();
-        // B7: Track monad vars that are being let-generalized (quantified
-        // into a local let-binding's scheme). At Phase 5, if such a var is
-        // still unresolved it defaults to Relation dispatch — which is likely
-        // wrong for a monad-polymorphic function. We skip top-level function
-        // generalization (flagged by `in_top_level_generalize`) to avoid
-        // false positives on `main = do …` where the Relation default is
-        // correct.
-        if !self.in_top_level_generalize {
-            for (span, m_var) in &self.monad_vars {
-                if gen_set.contains(m_var) {
-                    self.generalized_monad_spans.insert(*span);
-                }
+        // B7: Track monad vars that are being generalized (quantified into a
+        // scheme). At Phase 5, if such a var is still unresolved it defaults to
+        // Relation dispatch — which is likely wrong for a monad-polymorphic
+        // function. We record top-level decls too (not just let-bindings), but
+        // only when the monad var appears in a *parameter* position of the
+        // generalized type: a monad-*valued* binding like `main = do …` carries
+        // its monad var only in the result, where the Relation default is
+        // correct, so recording it would be a false positive.
+        let mut monad_spans_to_record: Vec<Span> = Vec::new();
+        for (span, m_var) in &self.monad_vars {
+            if gen_set.contains(m_var)
+                && self.ty_var_in_param_position(&applied, *m_var)
+            {
+                monad_spans_to_record.push(*span);
             }
+        }
+        for span in monad_spans_to_record {
+            self.generalized_monad_spans.insert(span);
         }
         // Deferred trait constraints (pushed by `require_trait` when the
         // body used e.g. `<` or a trait method on a still-polymorphic type)
@@ -4190,7 +4230,21 @@ impl Infer {
                         Ty::App(Box::new(func_ty), Box::new(arg_ty))
                     }
                     Ty::Error => Ty::Error,
-                    _ => Ty::Error,
+                    _ => {
+                        // Applying a type argument to a concrete
+                        // non-constructor head (`Int a`, `Text a`, …) is
+                        // ill-kinded. Report it — returning a silent
+                        // `Ty::Error` would unify with everything and disable
+                        // type checking for the whole declaration.
+                        self.error(
+                            format!(
+                                "cannot apply type argument to non-constructor type {}",
+                                self.display_ty(&func_ty)
+                            ),
+                            ty.span,
+                        );
+                        Ty::Error
+                    }
                 }
             }
             ast::TypeKind::Hole => self.fresh(),
@@ -6221,18 +6275,55 @@ impl Infer {
     /// with the placeholder variable the binop returned — or emits the
     /// annotation-demanding error for operands that never resolved.
     fn resolve_deferred_unit_binops(&mut self) {
-        let deferred = std::mem::take(&mut self.deferred_unit_binops);
-        for d in &deferred {
+        let mut deferred = std::mem::take(&mut self.deferred_unit_binops);
+        // Nested unit compositions form a dependency chain: one binop's result
+        // variable is another's operand (`a * b * c` — `(a*b)`'s result var
+        // feeds `… * c`). A single ordered pass can hit the outer binop while
+        // its operand is still a bare `Ty::Var`, mis-resolving it. Iterate to a
+        // fixpoint: each pass resolves only binops whose operands are both
+        // pinned (no bare `Ty::Var` after `apply`), which may pin further result
+        // vars for the next pass. Stop when a pass makes no progress.
+        loop {
+            let mut progress = false;
+            let mut remaining = Vec::with_capacity(deferred.len());
+            for d in deferred {
+                let lhs = self.apply(&d.lhs);
+                let rhs = self.apply(&d.rhs);
+                let ready =
+                    !matches!(lhs, Ty::Var(_)) && !matches!(rhs, Ty::Var(_));
+                if !ready {
+                    remaining.push(d);
+                    continue;
+                }
+                self.resolve_one_unit_binop(&d, &lhs, &rhs);
+                progress = true;
+            }
+            deferred = remaining;
+            if !progress || deferred.is_empty() {
+                break;
+            }
+        }
+        // Final pass: binops that never became ready are resolved with
+        // `allow_defer = false`, which emits the annotation-demanding error (or
+        // falls through to the plain unify + Num path for dimensionless code).
+        let leftover = std::mem::take(&mut deferred);
+        for d in &leftover {
             let lhs = self.apply(&d.lhs);
             let rhs = self.apply(&d.rhs);
-            let result_ty = self.unit_mul_div_ty(d.op, &lhs, &rhs, d.span, false);
-            if !matches!(result_ty, Ty::Error) {
-                // Mirror the direct mul/div sites: a product/quotient of refined
-                // operands is not itself refined (e.g. 9*9=81 isn't `Small`), so
-                // strip the refinement before unifying to prevent laundering.
-                let result_ty = self.degrade_refinement(result_ty, d.span);
-                self.unify(&Ty::Var(d.result), &result_ty, d.span);
-            }
+            self.resolve_one_unit_binop(d, &lhs, &rhs);
+        }
+    }
+
+    /// Resolve a single deferred unit binop with its (already applied)
+    /// operands, unifying the result placeholder with the computed type.
+    fn resolve_one_unit_binop(&mut self, d: &DeferredUnitBinop, lhs: &Ty, rhs: &Ty) {
+        let result_ty = self.unit_mul_div_ty(d.op, lhs, rhs, d.span, false);
+        if !matches!(result_ty, Ty::Error) {
+            // Mirror the direct mul/div sites: a product/quotient of refined
+            // operands is not itself refined (e.g. 9*9=81 isn't `Small`), so
+            // strip the refinement before unifying to prevent laundering.
+            let result_ty = self.degrade_refinement(result_ty, d.span);
+            self.unify(&Ty::Var(d.result), &result_ty, d.span);
         }
     }
 

@@ -101,7 +101,7 @@ pub fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
         }
     }
     // Clamp to a valid char boundary in case offset lands mid-character.
-    let mut safe_offset = offset;
+    let mut safe_offset = offset.max(line_start);
     while safe_offset > line_start && !source.is_char_boundary(safe_offset) {
         safe_offset -= 1;
     }

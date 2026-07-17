@@ -97,14 +97,21 @@ fn main() {
             // `output` can never be overridden via `--output=…` at build time.
             // However `./app --output=x` *does* override the constant at run
             // time, which is surprising — emit a warning so users notice.
-            const RESERVED_FLAGS: &[&str] = &["output"];
+            // Also warn about other reserved runtime flags.
+            //
+            // Note: `output` is intercepted above and never reaches `overrides`,
+            // so the only way to detect the collision is to check the source's
+            // declared overridable constant names. For now we check overrides
+            // (which catches `debug`, `help`, `http-max-body-bytes`) and leave
+            // the `output` case to codegen's warning pass.
+            const RESERVED_FLAGS: &[&str] = &["debug", "help", "http-max-body-bytes"];
             for name in overrides.keys() {
                 if RESERVED_FLAGS.contains(&name.as_str()) {
                     eprintln!(
                         "Warning: compile-time constant '{}' has the same name as a reserved CLI flag; \
-                         it cannot be overridden at build time via --{}=… (the flag is used for the output path). \
-                         At run time the flag will override the constant instead.",
-                        name, name
+                         the flag will be consumed by the runtime instead of overriding the constant. \
+                         Rename the constant to avoid the collision.",
+                        name
                     );
                 }
             }

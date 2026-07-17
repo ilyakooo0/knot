@@ -1613,7 +1613,16 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         return paren_if(parent > Prec::Lowest, s);
     }
     match &e.node {
-        ExprKind::Lit(l) => render_literal(l),
+        ExprKind::Lit(l) => {
+            let s = render_literal(l);
+            // A negative literal in atom position (e.g. a function argument)
+            // would reparse as subtraction (`f -5` → `f - 5`), so parenthesize.
+            if parent > Prec::App && s.starts_with('-') {
+                format!("({})", s)
+            } else {
+                s
+            }
+        }
         // `yield` is refused by the parser's `can_start_atom` in application
         // argument position (it would be ambiguous with do-block yields), so
         // a Var named `yield` must keep its parens there: `f (yield)`.

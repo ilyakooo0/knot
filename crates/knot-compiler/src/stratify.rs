@@ -572,7 +572,7 @@ fn completes_aggregate_over_relation(expr: &ast::Expr) -> bool {
     let expr = strip_head_wrappers(expr);
     match &expr.node {
         ast::ExprKind::Var(name) => {
-            matches!(name.as_str(), "count" | "sum" | "avg" | "minOn" | "maxOn" | "countWhere" | "all")
+            matches!(name.as_str(), "count" | "sum" | "avg" | "minOn" | "maxOn" | "countWhere" | "all" | "fold" | "single")
         }
         ast::ExprKind::App { func, .. } => completes_aggregate_over_relation(func),
         _ => false,

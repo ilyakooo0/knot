@@ -603,9 +603,19 @@ impl<'a> TokenCollector<'a> {
                     if val_start >= f.name.len() + 1 {
                         // Look for `name:` before the value — find the last
                         // occurrence of the field name before the value start.
+                        // Widen the window past `f.name.len() + 1` to allow for
+                        // `: ` plus whitespace between the name and the value,
+                        // and snap the start up to a char boundary + fetch with
+                        // `get` so a non-ASCII field name can't panic on a
+                        // mid-codepoint index.
                         let search_end = val_start;
-                        let search_start = search_end.saturating_sub(f.name.len() + 1);
-                        if let Some(name_start) = self.source[search_start..search_end].rfind(f.name.as_str()) {
+                        let mut search_start = search_end.saturating_sub(f.name.len() + 8);
+                        while search_start < search_end && !self.source.is_char_boundary(search_start) {
+                            search_start += 1;
+                        }
+                        if let Some(slice) = self.source.get(search_start..search_end)
+                            && let Some(name_start) = slice.rfind(f.name.as_str())
+                        {
                             let abs_start = search_start + name_start;
                             let abs_end = abs_start + f.name.len();
                             if self.source.get(abs_start..abs_end) == Some(f.name.as_str()) {
@@ -735,6 +745,10 @@ impl<'a> TokenCollector<'a> {
                 for p in pats {
                     self.visit_pat(p, false);
                 }
+            }
+            ast::PatKind::Cons { head, tail } => {
+                self.visit_pat(head, false);
+                self.visit_pat(tail, false);
             }
             _ => {}
         }

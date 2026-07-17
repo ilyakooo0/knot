@@ -106,6 +106,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // and surface their predicates inline. `None` means we showed details only
     // (no inferred type was available), in which case there's nothing to scan.
     let mut type_for_refinement_scan: Option<String> = None;
+    let is_local_binding = local_type.is_some();
     let detail_opt = if let Some(ty) = local_type {
         type_for_refinement_scan = Some(ty.clone());
         Some(format!("{word} : {ty}"))
@@ -215,7 +216,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // leak the schema of an unrelated lowercase source/view/derived also named
     // `items` — the same wrong-info class the headline suppression guards.
     for decl in &doc.module.decls {
-        if on_field_token {
+        if on_field_token || is_local_binding {
             break;
         }
         match &decl.node {
@@ -305,7 +306,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // Sources whose schema declares refined fields: list the refinements so the
     // user knows which fields will be validated on `set`. Skip on a record-field
     // token (same wrong-info reason as the schema section above).
-    if let Some(refinements) = doc.source_refinements.get(word).filter(|_| !on_field_token)
+    if let Some(refinements) = doc.source_refinements.get(word).filter(|_| !on_field_token && !is_local_binding)
         && !refinements.is_empty() {
             value.push_str("\n\n**Refinements (validated on write):**");
             for (field, type_name, predicate) in refinements {
@@ -386,6 +387,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // unrelated trait method `map`'s dispatch info (field names are lowercase
     // and collide with method names).
     if !on_field_token
+        && !is_local_binding
         && let Some(method_section) = trait_method_dispatch_section(state, word) {
             value.push_str("\n\n");
             value.push_str(&method_section);
@@ -421,6 +423,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // record-field names — so a field token like `rec.total` must not pick up
     // an unrelated top-level `total`'s doc comment.
     if !on_field_token
+        && !is_local_binding
         && let Some(doc_comment) = doc.doc_comments.get(word) {
             value.push_str("\n\n---\n\n");
             value.push_str(doc_comment);

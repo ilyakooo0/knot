@@ -111,6 +111,10 @@ pub(crate) fn handle_call_hierarchy_incoming(
             DeclKind::Fun { name, .. } => name.clone(),
             DeclKind::View { name, .. } => name.clone(),
             DeclKind::Derived { name, .. } => name.clone(),
+            DeclKind::Impl { trait_name, .. } => trait_name.clone(),
+            DeclKind::Trait { name, .. } => name.clone(),
+            DeclKind::Route { name, .. } => name.clone(),
+            DeclKind::Migrate { relation, .. } => relation.clone(),
             _ => continue,
         };
         // Collect call sites within this declaration that point to target_def.
@@ -206,6 +210,10 @@ pub(crate) fn handle_call_hierarchy_incoming(
                     DeclKind::Fun { name, .. }
                     | DeclKind::View { name, .. }
                     | DeclKind::Derived { name, .. } => name.clone(),
+                    DeclKind::Impl { trait_name, .. } => trait_name.clone(),
+                    DeclKind::Trait { name, .. } => name.clone(),
+                    DeclKind::Route { name, .. } => name.clone(),
+                    DeclKind::Migrate { relation, .. } => relation.clone(),
                     _ => continue,
                 };
                 let mut sites: Vec<Span> = Vec::new();
@@ -229,6 +237,7 @@ pub(crate) fn handle_call_hierarchy_incoming(
                     DeclKind::Fun { .. } | DeclKind::View { .. } | DeclKind::Derived { .. } => {
                         SymbolKind::FUNCTION
                     }
+                    DeclKind::Impl { .. } | DeclKind::Trait { .. } => SymbolKind::INTERFACE,
                     _ => SymbolKind::VARIABLE,
                 };
 

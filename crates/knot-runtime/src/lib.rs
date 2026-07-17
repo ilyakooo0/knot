@@ -3399,6 +3399,14 @@ pub extern "C-unwind" fn knot_override_lookup(
         None => return std::ptr::null_mut(),
     };
 
+    // A Maybe-typed override may be the literal `Nothing`, which must produce
+    // the same `Constructor("Nothing", Unit)` value that codegen's
+    // emit_override_literal emits — NOT `Just "Nothing"` from parsing the
+    // string as the inner type and wrapping it.
+    if wrap_maybe && val_str == "Nothing" {
+        return alloc(Value::Constructor(intern_str("Nothing"), alloc(Value::Unit)));
+    }
+
     let type_name = match base_tag {
         0 => "Int",
         1 => "Float",
@@ -3424,7 +3432,11 @@ pub extern "C-unwind" fn knot_override_lookup(
         1 => {
             // Float
             match val_str.parse::<f64>() {
-                Ok(n) => alloc_float(n),
+                // Non-finite floats (nan/inf/-inf/infinity) parse successfully
+                // but other runtime paths panic on them — treat as no override
+                // found (return null) so the in-source default stands.
+                Ok(n) if n.is_finite() => alloc_float(n),
+                Ok(_) => return std::ptr::null_mut(),
                 Err(_) => {
                     eprintln!(
                         "Error: invalid value '{}' for --{} (expected {})",
@@ -13965,6 +13977,14 @@ pub extern "C-unwind" fn knot_source_diff_write(
             })).collect()
         };
 
+        // Diff is DELETE-missing + INSERT-new: suspend the per-row referential
+        // BEFORE DELETE triggers so they don't abort on the transient
+        // missing-key state when a non-key column changes, then restore them
+        // (which runs a whole-relation orphan scan) — mirrors the nested/
+        // zero-column fallbacks and knot_source_write (bug B24).
+        let table_name = format!("_knot_{}", name);
+        let suspended = suspend_del_triggers(&db_ref.conn, &table_name);
+
         if !rows.is_empty() && rows.len().saturating_mul(n_cols) <= MAX_VALUES_PARAMS {
             // VALUES CTE path
             let mut all_params = Vec::with_capacity(rows.len().saturating_mul(n_cols));
@@ -14057,6 +14077,8 @@ pub extern "C-unwind" fn knot_source_diff_write(
             db_ref.conn.execute_batch(&drop_sql)
                 .expect("knot runtime: failed to drop temp table");
         }
+
+        restore_del_triggers(&db_ref.conn, &table_name, &suspended);
     } else {
         let rec_schema = parse_record_schema(schema);
 
@@ -14116,6 +14138,14 @@ pub extern "C-unwind" fn knot_source_diff_write(
                 _ => panic!("knot runtime: relation rows must be Records, got {}", type_name(row_ptr)),
             }
         };
+
+        // Diff is DELETE-missing + INSERT-new: suspend the per-row referential
+        // BEFORE DELETE triggers so they don't abort on the transient
+        // missing-key state when a non-key column changes, then restore them
+        // (which runs a whole-relation orphan scan) — mirrors the nested/
+        // zero-column fallbacks and knot_source_write (bug B24).
+        let table_name = format!("_knot_{}", name);
+        let suspended = suspend_del_triggers(&db_ref.conn, &table_name);
 
         if !rows.is_empty() && rows.len().saturating_mul(n_cols) <= MAX_VALUES_PARAMS {
             // VALUES CTE path
@@ -14212,6 +14242,8 @@ pub extern "C-unwind" fn knot_source_diff_write(
             db_ref.conn.execute_batch(&drop_sql)
                 .expect("knot runtime: failed to drop temp table");
         }
+
+        restore_del_triggers(&db_ref.conn, &table_name, &suspended);
     }
 
     });
@@ -14533,20 +14565,10 @@ pub extern "C-unwind" fn knot_source_update_where(
     let table = format!("_knot_{}", name);
     db_ref.ensure_indexes_for_where(&table, where_clause);
 
-    // Run the UPDATE + pre/post-image SELECTs in a single savepoint (like
-    // every sibling write path) so a subset-constraint trigger ABORT or
-    // other failure doesn't leave the connection in an inconsistent state.
-    db_ref
-        .conn
-        .execute_batch("SAVEPOINT knot_update_where;")
-        .expect("knot runtime: failed to begin transaction");
-
-    fn rollback_update_where(db_ref: &KnotDb) {
-        let _ = db_ref.conn.execute_batch(
-            "ROLLBACK TO SAVEPOINT knot_update_where; RELEASE SAVEPOINT knot_update_where;",
-        );
-    }
-
+    // Build SQL params and validate the placeholder count BEFORE opening the
+    // savepoint: value_to_sql_param panics on a non-finite Float, and the
+    // placeholder-count check panics on a malformed SET clause — neither must
+    // leave an open savepoint behind (matching knot_source_delete_where).
     let param_values = match unsafe { as_ref(params) } {
         Value::Relation(rows) => rows,
         _ => panic!(
@@ -14567,6 +14589,28 @@ pub extern "C-unwind" fn knot_source_update_where(
     debug_sql_params(&sql, &sql_params);
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let set_param_count = count_sql_placeholders(set_clause);
+    if set_param_count > param_refs.len() {
+        panic!(
+            "knot runtime: update_where: SET clause placeholder count {} exceeds total params {}",
+            set_param_count,
+            param_refs.len()
+        );
+    }
+
+    // Run the UPDATE + pre/post-image SELECTs in a single savepoint (like
+    // every sibling write path) so a subset-constraint trigger ABORT or
+    // other failure doesn't leave the connection in an inconsistent state.
+    db_ref
+        .conn
+        .execute_batch("SAVEPOINT knot_update_where;")
+        .expect("knot runtime: failed to begin transaction");
+
+    fn rollback_update_where(db_ref: &KnotDb) {
+        let _ = db_ref.conn.execute_batch(
+            "ROLLBACK TO SAVEPOINT knot_update_where; RELEASE SAVEPOINT knot_update_where;",
+        );
+    }
 
     // Pre-image: snapshot affected rows before the UPDATE so STM watchers
     // filtering on column values can decide whether to wake. The combined
@@ -14580,14 +14624,6 @@ pub extern "C-unwind" fn knot_source_update_where(
     } else {
         None
     };
-    let set_param_count = count_sql_placeholders(set_clause);
-    if set_param_count > param_refs.len() {
-        panic!(
-            "knot runtime: update_where: SET clause placeholder count {} exceeds total params {}",
-            set_param_count,
-            param_refs.len()
-        );
-    }
     let where_params: &[&dyn rusqlite::types::ToSql] = if set_param_count <= param_refs.len() {
         &param_refs[set_param_count..]
     } else {
@@ -17894,7 +17930,7 @@ fn http_serve_loop(
                                 let status_v = knot_record_field(err, b"status".as_ptr(), 6);
                                 let message_v = knot_record_field(err, b"message".as_ptr(), 7);
                                 let status = match unsafe { as_ref(status_v) } {
-                                    Value::Int(n) => (*n).clamp(400, 599) as u16,
+                                    Value::Int(n) => (*n).clamp(100, 599) as u16,
                                     _ => 500,
                                 };
                                 let message = match unsafe { as_ref(message_v) } {

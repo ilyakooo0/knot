@@ -4927,17 +4927,18 @@ impl Codegen {
                             "knot_source_append",
                             &[db, name_ptr, name_len, schema_ptr, schema_len, new_rows],
                         );
-                    } else if !Self::references_source(match_value, name) {
-                        // 2. Full replace: value doesn't read the source
-                        let val = self.compile_set_value_expr(builder, value, env, db);
-                        self.emit_refinement_checks(builder, name, val, env, db);
-                        let (name_ptr, name_len) = self.string_ptr(builder, name);
-                        let (schema_ptr, schema_len) =
-                            self.string_ptr(builder, &schema);
-                        self.call_rt_void(
+                    } else if !Self::references_source(match_value, name, &self.source_var_binds) {
+                        // 2. Full replace: value doesn't read the source.
+                        // This is semantically a `replace` — the user is
+                        // substituting the entire table with a new value that
+                        // doesn't depend on the current contents. Require
+                        // an explicit `replace` keyword to prevent
+                        // accidental full-table rewrites.
+                        self.push_codegen_error(
                             builder,
-                            "knot_source_write",
-                            &[db, name_ptr, name_len, schema_ptr, schema_len, val],
+                            expr.span,
+                            "set on a relation whose value does not reference the source \
+                             requires an explicit `replace` keyword — use `replace *rel = expr`",
                         );
                     } else if !schema.contains('[')
                         && !self.source_refinements.contains_key(name)
@@ -5003,7 +5004,9 @@ impl Codegen {
                                 ],
                             );
                         } else {
-                            // SQL compilation failed → map with no filter → full write
+                            // SQL compilation failed → map with no filter
+                            // → fall back to diff-based write instead of
+                            // a full table rewrite.
                             let val = self.compile_set_value_expr(builder, value, env, db);
                             self.emit_refinement_checks(builder, name, val, env, db);
                             let (name_ptr, name_len) = self.string_ptr(builder, name);
@@ -5011,7 +5014,7 @@ impl Codegen {
                                 self.string_ptr(builder, &schema);
                             self.call_rt_void(
                                 builder,
-                                "knot_source_write",
+                                "knot_source_diff_write",
                                 &[db, name_ptr, name_len, schema_ptr, schema_len, val],
                             );
                         }
@@ -5078,7 +5081,7 @@ impl Codegen {
                         }
                     } else if Self::match_map_no_filter(name, match_value) {
                         // 5. Map without filter: every row transformed, no filtering
-                        //    Full write is safe and avoids diff overhead.
+                        //    Use diff-based write to avoid rewriting the entire table.
                         let val = self.compile_set_value_expr(builder, value, env, db);
                         self.emit_refinement_checks(builder, name, val, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
@@ -5086,7 +5089,7 @@ impl Codegen {
                             self.string_ptr(builder, &schema);
                         self.call_rt_void(
                             builder,
-                            "knot_source_write",
+                            "knot_source_diff_write",
                             &[db, name_ptr, name_len, schema_ptr, schema_len, val],
                         );
                     } else {
@@ -11311,64 +11314,64 @@ impl Codegen {
     // ── Set-expression analysis ──────────────────────────────────
 
     /// Check whether an expression references `*<source_name>` anywhere.
-    fn references_source(expr: &ast::Expr, source_name: &str) -> bool {
+    fn references_source(expr: &ast::Expr, source_name: &str, var_binds: &HashMap<String, String>) -> bool {
         match &expr.node {
             ast::ExprKind::SourceRef(name) => name == source_name,
+            ast::ExprKind::Var(name) => var_binds.get(name).is_some_and(|s| s == source_name),
             ast::ExprKind::Lit(_)
-            | ast::ExprKind::Var(_)
             | ast::ExprKind::Constructor(_)
             | ast::ExprKind::DerivedRef(_) => false,
             ast::ExprKind::Record(fields) => {
-                fields.iter().any(|f| Self::references_source(&f.value, source_name))
+                fields.iter().any(|f| Self::references_source(&f.value, source_name, var_binds))
             }
             ast::ExprKind::RecordUpdate { base, fields } => {
-                Self::references_source(base, source_name)
-                    || fields.iter().any(|f| Self::references_source(&f.value, source_name))
+                Self::references_source(base, source_name, var_binds)
+                    || fields.iter().any(|f| Self::references_source(&f.value, source_name, var_binds))
             }
-            ast::ExprKind::FieldAccess { expr, .. } => Self::references_source(expr, source_name),
+            ast::ExprKind::FieldAccess { expr, .. } => Self::references_source(expr, source_name, var_binds),
             ast::ExprKind::List(elems) => {
-                elems.iter().any(|e| Self::references_source(e, source_name))
+                elems.iter().any(|e| Self::references_source(e, source_name, var_binds))
             }
-            ast::ExprKind::Lambda { body, .. } => Self::references_source(body, source_name),
+            ast::ExprKind::Lambda { body, .. } => Self::references_source(body, source_name, var_binds),
             ast::ExprKind::App { func, arg } => {
-                Self::references_source(func, source_name)
-                    || Self::references_source(arg, source_name)
+                Self::references_source(func, source_name, var_binds)
+                    || Self::references_source(arg, source_name, var_binds)
             }
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
-                Self::references_source(lhs, source_name)
-                    || Self::references_source(rhs, source_name)
+                Self::references_source(lhs, source_name, var_binds)
+                    || Self::references_source(rhs, source_name, var_binds)
             }
             ast::ExprKind::UnaryOp { operand, .. } => {
-                Self::references_source(operand, source_name)
+                Self::references_source(operand, source_name, var_binds)
             }
             ast::ExprKind::If { cond, then_branch, else_branch } => {
-                Self::references_source(cond, source_name)
-                    || Self::references_source(then_branch, source_name)
-                    || Self::references_source(else_branch, source_name)
+                Self::references_source(cond, source_name, var_binds)
+                    || Self::references_source(then_branch, source_name, var_binds)
+                    || Self::references_source(else_branch, source_name, var_binds)
             }
             ast::ExprKind::Case { scrutinee, arms } => {
-                Self::references_source(scrutinee, source_name)
-                    || arms.iter().any(|a| Self::references_source(&a.body, source_name))
+                Self::references_source(scrutinee, source_name, var_binds)
+                    || arms.iter().any(|a| Self::references_source(&a.body, source_name, var_binds))
             }
             ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
-                ast::StmtKind::Bind { expr, .. } => Self::references_source(expr, source_name),
-                ast::StmtKind::Let { expr, .. } => Self::references_source(expr, source_name),
-                ast::StmtKind::Where { cond } => Self::references_source(cond, source_name),
-                ast::StmtKind::GroupBy { key } => Self::references_source(key, source_name),
-                ast::StmtKind::Expr(e) => Self::references_source(e, source_name),
+                ast::StmtKind::Bind { expr, .. } => Self::references_source(expr, source_name, var_binds),
+                ast::StmtKind::Let { expr, .. } => Self::references_source(expr, source_name, var_binds),
+                ast::StmtKind::Where { cond } => Self::references_source(cond, source_name, var_binds),
+                ast::StmtKind::GroupBy { key } => Self::references_source(key, source_name, var_binds),
+                ast::StmtKind::Expr(e) => Self::references_source(e, source_name, var_binds),
             }),
             ast::ExprKind::Set { target, value }
             | ast::ExprKind::ReplaceSet { target, value } => {
-                Self::references_source(target, source_name)
-                    || Self::references_source(value, source_name)
+                Self::references_source(target, source_name, var_binds)
+                    || Self::references_source(value, source_name, var_binds)
             }
-            ast::ExprKind::Atomic(inner) => Self::references_source(inner, source_name),
-            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => Self::references_source(value, source_name),
-            ast::ExprKind::Annot { expr, .. } => Self::references_source(expr, source_name),
-            ast::ExprKind::Refine(inner) => Self::references_source(inner, source_name),
+            ast::ExprKind::Atomic(inner) => Self::references_source(inner, source_name, var_binds),
+            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => Self::references_source(value, source_name, var_binds),
+            ast::ExprKind::Annot { expr, .. } => Self::references_source(expr, source_name, var_binds),
+            ast::ExprKind::Refine(inner) => Self::references_source(inner, source_name, var_binds),
             ast::ExprKind::Serve { handlers, .. } => handlers
                 .iter()
-                .any(|h| Self::references_source(&h.body, source_name)),
+                .any(|h| Self::references_source(&h.body, source_name, var_binds)),
         }
     }
 

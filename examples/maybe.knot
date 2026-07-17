@@ -1,40 +1,10 @@
--- Generic monadic do-blocks with Maybe
+-- Maybe monadic do-blocks
 --
--- Uses the prelude's trait hierarchy (Functor, Applicative, Monad, Alternative).
+-- Maybe is built-in: Nothing, Just, and all trait impls
+-- (Functor, Applicative, Monad, Alternative) are in the prelude.
 -- Do blocks desugar to trait method calls: bind, yield, and empty.
 -- The monad type is inferred from the context (Just/Nothing → Maybe).
 
-data Maybe a
-  = Nothing {}
-  | Just {value: a}
-
--- Implementations for Maybe
-
-impl Functor Maybe where
-  map f m = case m of
-    Nothing {} -> Nothing {}
-    Just {value} -> Just {value: f value}
-
-impl Applicative Maybe where
-  yield x = Just {value: x}
-  ap fs xs = case fs of
-    Nothing {} -> Nothing {}
-    Just {value: f} -> case xs of
-      Nothing {} -> Nothing {}
-      Just {value: x} -> Just {value: f x}
-
-impl Monad Maybe where
-  bind f m = case m of
-    Nothing {} -> Nothing {}
-    Just {value} -> f value
-
-impl Alternative Maybe where
-  empty = Nothing {}
-  alt a b = case a of
-    Nothing {} -> b
-    Just {} -> a
-
--- Test: a simple do-block that uses Maybe as the monad
 safeDivide = \x y -> if y == 0 then Nothing {} else Just {value: x / y}
 
 result1 = do
@@ -49,7 +19,7 @@ result2 = do
   c <- safeDivide a b
   yield c
 
--- Test where clause (uses empty from Alternative for filtering)
+-- where clause uses Alternative.empty (Nothing) to filter
 result3 = do
   a <- Just {value: 10}
   b <- Just {value: 3}

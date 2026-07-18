@@ -1074,24 +1074,18 @@ Walk a structure left-to-right and sequence through any `Applicative` `f`. Built
 
 ### Units of Measure
 
-Optional compile-time units on `Int 1` and `Float 1`. Fully erased at runtime — no performance cost, no runtime representation. Plain `Float 1` is unit-agnostic and unifies with any `Float u`.
+Compile-time units on `Int` and `Float`. Fully erased at runtime — no performance cost, no runtime representation. Every numeric type carries a unit; write `Int 1` / `Float 1` for the dimensionless case.
 
-#### Declaration
+#### No Declaration Needed
 
-```knot
-unit M
-unit S
-unit Kg
-unit N = Kg * M / S^2    -- derived unit alias
-unit Hz = 1 / S
-```
+Units are not declared. Any name used in a unit position is a unit — there is nothing to declare since a unit has no body, only a name. Compound units are written inline as expressions.
 
 #### Literals and Type Annotations
 
 ```knot
-distance = 42.0 M            -- Float M
+distance = (42.0 : Float M)   -- Float M
 speed : Float (M / S)
-force : Float N
+force : Float (Kg * M / S^2)
 cents : Int Usd
 ```
 
@@ -1103,17 +1097,17 @@ cents : Int Usd
 - Scalar (dimensionless) multiplication preserves the other operand's unit
 
 ```knot
-10.0 M + 5.0 M              -- Float M
-10.0 M + 5.0 S              -- type error
-10.0 M * 5.0 M              -- Float (M^2)
-100.0 M / 10.0 S            -- Float (M/S)
-2.0 * 5.0 M                  -- Float M
--(5.0 M)                     -- Float M
+(10.0 : Float M) + (5.0 : Float M)   -- Float M
+(10.0 : Float M) + (5.0 : Float S)   -- type error
+(10.0 : Float M) * (5.0 : Float M)   -- Float (M^2)
+(100.0 : Float M) / (10.0 : Float S) -- Float (M/S)
+2.0 * (5.0 : Float M)                -- Float M
+-((5.0 : Float M))                   -- Float M
 ```
 
 #### Unit Polymorphism
 
-Concrete units are uppercase; lowercase names inside `<...>` are unit variables:
+Concrete units are uppercase; lowercase names are unit variables:
 
 ```knot
 double : Float u -> Float u

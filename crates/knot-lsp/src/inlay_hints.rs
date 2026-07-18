@@ -331,8 +331,7 @@ fn add_dirty_decl_telemetry(
             | DeclKind::Derived { name, .. }
             | DeclKind::Source { name, .. }
             | DeclKind::Route { name, .. }
-            | DeclKind::RouteComposite { name, .. }
-            | DeclKind::UnitDecl { name, .. } => name.clone(),
+            | DeclKind::RouteComposite { name, .. } => name.clone(),
             _ => continue,
         };
         if !doc.dirty_decl_closure.contains(&name) {
@@ -1720,7 +1719,7 @@ checkGlobalRate = \t -> atomic do
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "unit M\nf = \\q -> do\n  let y = (42.0 : Float M)\n  yield y\n",
+            "f = \\q -> do\n  let y = (42.0 : Float M)\n  yield y\n",
         );
         let range = ws.whole_file_range(&uri);
         let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
@@ -1738,7 +1737,7 @@ checkGlobalRate = \t -> atomic do
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "unit M\nbase : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> do\n  let y = base * 2.0\n  yield y\n",
+            "base : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> do\n  let y = base * 2.0\n  yield y\n",
         );
         let doc = ws.doc(&uri);
         // Sanity: the binding really inferred a unit — otherwise this test
@@ -1782,7 +1781,7 @@ checkGlobalRate = \t -> atomic do
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "unit M\nbase : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> do\n  let y = 2.0\n  yield (base + y)\n",
+            "base : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> do\n  let y = 2.0\n  yield (base + y)\n",
         );
         let doc = ws.doc(&uri);
         if !doc.local_type_info.values().any(|t| t.contains("<M>")) {

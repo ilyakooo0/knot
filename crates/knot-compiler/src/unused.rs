@@ -9,7 +9,7 @@
 //! - The `main` function (program entry point).
 //! - Names beginning with `_` (intentionally-unused convention).
 //! - Signature-only `Fun` decls (no body — interface stubs).
-//! - Trait, Impl, Route, RouteComposite, Migrate, SubsetConstraint, UnitDecl
+//! - Trait, Impl, Route, RouteComposite, Migrate, SubsetConstraint
 //!   (skipped because their "use" is implicit in the runtime, not a name reference).
 //!
 //! Operate on the user's parsed `&[Decl]` slice — call this *before* prelude
@@ -109,8 +109,7 @@ pub fn check(decls: &[Decl]) -> Vec<Diagnostic> {
                 }
             }
             // Skip everything else: traits/impls (implicitly used at dispatch),
-            // routes (top-level API surface), migrations, subset constraints,
-            // and unit declarations.
+            // routes (top-level API surface), migrations, and subset constraints.
             _ => {}
         }
     }
@@ -212,7 +211,6 @@ fn walk_decl(decl: &DeclKind, r: &mut Refs) {
             r.sources.insert(sub.relation.clone());
             r.sources.insert(sup.relation.clone());
         }
-        DeclKind::UnitDecl { .. } => {}
     }
 }
 

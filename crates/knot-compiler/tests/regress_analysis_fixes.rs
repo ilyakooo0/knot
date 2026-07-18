@@ -168,9 +168,7 @@ fn unit_var_behind_substituted_lambda_param_is_not_generalized() {
     // α := Float u1. The let-generalization of `g` must NOT quantify u1
     // (it is env-bound through p), so using g at both <M> and <S> is a
     // unit mismatch — previously this compiled.
-    let src = r#"unit M
-unit S
-bad = \p -> do
+    let src = r#"bad = \p -> do
   let stripped = stripFloatUnit p
   let g = \y -> y + p
   println (show (g (1.0 : Float M)))
@@ -191,8 +189,7 @@ main = bad (2.0 : Float M)
 #[test]
 fn var_times_var_composes_units_instead_of_unifying() {
     // area : composing M * M = M^2; adding M must be rejected.
-    let src = r#"unit M
-area = \w h -> w * h
+    let src = r#"area = \w h -> w * h
 v = (area (3.0 : Float M) (4.0 : Float M)) + (5.0 : Float M)
 main = println (show v)
 "#;
@@ -214,8 +211,7 @@ fn constrained_annotation_defers_unit_composition() {
     // resolution degraded to a vacuous unify — the M^2 product was wrongly
     // accepted as Float M. Re-mapping the skolems onto the fresh vars ties
     // the product back to `a`, so `M * M` used at `M` is a unit mismatch.
-    let src = r#"unit M
-scale : Num a => a -> a -> a
+    let src = r#"scale : Num a => a -> a -> a
 scale = \x y -> x * y
 v = (scale (3.0 : Float M) (4.0 : Float M)) + (1.0 : Float M)
 main = println (show v)
@@ -254,9 +250,7 @@ main = do
 fn var_times_var_accepts_mixed_units() {
     // Float M * Float S through an unannotated lambda must be ACCEPTED
     // (the old code unified both operands and falsely rejected).
-    let src = r#"unit M
-unit S
-f = \x y -> x * y
+    let src = r#"f = \x y -> x * y
 v = f (3.0 : Float M) (4.0 : Float S)
 main = println (show v)
 "#;

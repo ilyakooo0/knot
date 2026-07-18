@@ -1650,7 +1650,6 @@ pub(crate) fn collect_name_uses_in_decl(
                 }
             }
         }
-        _ => {}
     }
 }
 

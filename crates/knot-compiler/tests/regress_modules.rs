@@ -141,29 +141,29 @@ fn a_type_and_a_function_may_share_a_name_across_modules() {
     );
 }
 
-// ── 2. `unit` declarations cross the export filter ───────────────────────
+// ── 2. Units match across a module boundary ──────────────────────────────
 
 #[test]
-fn unit_declarations_survive_a_modules_export_filter() {
+fn units_match_across_a_module_boundary() {
     let s = Scratch::new("export_units");
-    // `phys` exports a signature written in `N`, a unit derived from the base
-    // units it declares. Dropping the `unit` decls at the import boundary left
-    // `N` unexpanded, so `Float N` no longer matched `Float (Kg*M/S^2)`.
+    // Units need no declaration: the same unit expression written in an
+    // exported signature and at the call site denote the same unit, so an
+    // imported function's unit-typed argument unifies with the caller's value.
     s.write(
         "phys.knot",
-        "unit M\nunit S\nunit Kg\nunit N = Kg * M / S^2\n\n\
+        "\n\
          export baseForce : Float (Kg*M/S^2)\nbaseForce = (5.0 : Float (Kg*M/S^2))\n\n\
-         export addForce : Float N -> Float N -> Float N\naddForce = \\a b -> a + b\n",
+         export addForce : Float (Kg*M/S^2) -> Float (Kg*M/S^2) -> Float (Kg*M/S^2)\naddForce = \\a b -> a + b\n",
     );
     s.write(
         "main.knot",
-        "import ./phys\n\nmain = do\n  let total = addForce baseForce (3.0 : Float N)\n  \
+        "import ./phys\n\nmain = do\n  let total = addForce baseForce (3.0 : Float (Kg*M/S^2))\n  \
          println (show (stripFloatUnit total))\n  yield {}\n",
     );
 
     assert!(
         s.build_and_run("main.knot", "main").contains("8.0"),
-        "the imported unit declarations must still define `N`"
+        "the same unit expression must unify across the import boundary"
     );
 }
 

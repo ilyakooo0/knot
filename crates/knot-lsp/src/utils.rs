@@ -390,8 +390,7 @@ pub fn extract_doc_comments(source: &str, module: &Module) -> HashMap<String, St
             | DeclKind::Derived { name, .. }
             | DeclKind::Trait { name, .. }
             | DeclKind::Route { name, .. }
-            | DeclKind::RouteComposite { name, .. }
-            | DeclKind::UnitDecl { name, .. } => name.clone(),
+            | DeclKind::RouteComposite { name, .. } => name.clone(),
             _ => continue,
         };
 
@@ -453,7 +452,6 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
             | TokenKind::Deriving
             | TokenKind::With
             | TokenKind::Export
-            | TokenKind::Unit
             | TokenKind::Refine
             | TokenKind::Serve
             | TokenKind::Forall => Some(TOK_KEYWORD),

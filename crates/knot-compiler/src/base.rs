@@ -306,7 +306,7 @@ fn shift_decl_spans(decl: &mut ast::Decl, offset: usize) {
         Migrate { using_fn, .. } => shift_expr_spans(using_fn, offset),
         // No embedded expressions to shift.
         Data { .. } | TypeAlias { .. } | Source { .. } | RouteComposite { .. }
-        | SubsetConstraint { .. } | UnitDecl { .. } => {}
+        | SubsetConstraint { .. } => {}
     }
 }
 

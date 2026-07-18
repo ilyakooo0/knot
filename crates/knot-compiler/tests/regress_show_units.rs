@@ -86,10 +86,7 @@ fn show_appends_concrete_unit_suffix() {
     // Units live on types, so literals are annotated via `(x : Float M)`.
     let stdout = compile_and_run(
         "concrete",
-        r#"unit M
-unit S
-unit Usd
-
+        r#"
 main = do
   println (show (42.0 : Float M))
   println (show (9.8 : Float (M / S^2)))
@@ -106,14 +103,11 @@ main = do
 #[test]
 fn show_appends_unit_computed_by_unit_algebra() {
     // The unit is not written at the `show` call site — it falls out of the
-    // unit algebra on `/` and of a derived-unit alias. Both must resolve to a
-    // concrete unit by the time the post-inference pass reads the call site.
+    // unit algebra on `/`. It must resolve to a concrete unit by the time the
+    // post-inference pass reads the call site.
     let stdout = compile_and_run(
         "algebra",
-        r#"unit M
-unit S
-unit Speed = M / S
-
+        r#"
 main = do
   let distance = (100.0 : Float M)
   let time = (4.0 : Float S)
@@ -122,8 +116,8 @@ main = do
 "#,
     );
     assert_printed(&stdout, "25.0 M/S");
-    // The derived alias expands to its base units, so it shows as "M/S" too.
-    assert_printed(&stdout, "2.5 M/S");
+    // Units need no declaration: `Speed` is an opaque named unit and shows as-is.
+    assert_printed(&stdout, "2.5 Speed");
 }
 
 #[test]
@@ -133,8 +127,7 @@ fn show_omits_polymorphic_and_absent_units() {
     // would be meaningless. A plain `Float`/`Int` likewise has nothing to add.
     let stdout = compile_and_run(
         "polymorphic",
-        r#"unit M
-
+        r#"
 describe : Float u -> Text
 describe = \x -> show x
 

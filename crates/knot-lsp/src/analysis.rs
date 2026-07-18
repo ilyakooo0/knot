@@ -966,8 +966,7 @@ pub fn resolve_import_navigation(
                 | DeclKind::Derived { name, .. }
                 | DeclKind::Fun { name, .. }
                 | DeclKind::Route { name, .. }
-                | DeclKind::RouteComposite { name, .. }
-                | DeclKind::UnitDecl { name, .. } => {
+                | DeclKind::RouteComposite { name, .. } => {
                     if !included(name) {
                         continue;
                     }
@@ -1465,7 +1464,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("u.knot");
-        let src = "unit M\nf : Float M -> Float M\nf = \\x -> x\n";
+        let src = "f : Float M -> Float M\nf = \\x -> x\n";
         std::fs::write(&path, src).unwrap();
         let canonical = path.canonicalize().unwrap();
         let uri = fake_uri(&format!("file://{}", canonical.display()));

@@ -423,15 +423,11 @@ fn export_filter(decls: Vec<ast::Decl>) -> Vec<ast::Decl> {
         .filter(|d| {
             d.exported
                 || match &d.node {
-                    // Migrations, constraints, and unit declarations carry no
+                    // Migrations and constraints carry no
                     // name to export: they are properties of the program, not
-                    // of a module's interface, and are always visible. Dropping
-                    // the unit declarations left the units their exported types
-                    // are written in (`Float (M/S^2)`) undefined at the import
-                    // site, which surfaced as bogus unit mismatches.
+                    // of a module's interface, and are always visible.
                     ast::DeclKind::Migrate { .. }
-                    | ast::DeclKind::SubsetConstraint { .. }
-                    | ast::DeclKind::UnitDecl { .. } => true,
+                    | ast::DeclKind::SubsetConstraint { .. } => true,
                     // An impl is visible with the trait it implements. A trait
                     // this module declares must be exported to carry its impls
                     // out; a trait from anywhere else (another module, the
@@ -513,8 +509,7 @@ fn duplicate_key(decl: &ast::DeclKind) -> Option<(Namespace, String)> {
         ast::DeclKind::Trait { name, .. } => Some((Namespace::Trait, name.clone())),
         ast::DeclKind::Impl { .. }
         | ast::DeclKind::Migrate { .. }
-        | ast::DeclKind::SubsetConstraint { .. }
-        | ast::DeclKind::UnitDecl { .. } => None,
+        | ast::DeclKind::SubsetConstraint { .. } => None,
     }
 }
 
@@ -532,8 +527,7 @@ fn decl_name(decl: &ast::DeclKind) -> Option<String> {
         | ast::DeclKind::RouteComposite { name, .. } => Some(name.clone()),
         ast::DeclKind::Impl { .. }
         | ast::DeclKind::Migrate { .. }
-        | ast::DeclKind::SubsetConstraint { .. }
-        | ast::DeclKind::UnitDecl { .. } => None,
+        | ast::DeclKind::SubsetConstraint { .. } => None,
     }
 }
 
@@ -580,9 +574,8 @@ fn should_include_decl(decl: &ast::Decl, names: &HashSet<String>) -> bool {
         // Routes
         ast::DeclKind::Route { name, .. } => names.contains(name.as_str()),
         ast::DeclKind::RouteComposite { name, .. } => names.contains(name.as_str()),
-        // Migrations, constraints, and unit declarations are always included
+        // Migrations and constraints are always included
         ast::DeclKind::Migrate { .. } => true,
         ast::DeclKind::SubsetConstraint { .. } => true,
-        ast::DeclKind::UnitDecl { .. } => true,
     }
 }

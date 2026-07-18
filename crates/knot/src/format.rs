@@ -751,14 +751,6 @@ fn render_decl(p: &mut Printer, d: &Decl) {
             p.write(" <= ");
             render_relpath(p, sup);
         }
-        DeclKind::UnitDecl { name, definition } => {
-            p.write("unit ");
-            p.write(name);
-            if let Some(def) = definition {
-                p.write(" = ");
-                p.write(&render_unit_expr(def));
-            }
-        }
     }
 }
 

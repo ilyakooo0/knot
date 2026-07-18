@@ -867,8 +867,6 @@ struct Infer {
     /// would be unsound — e.g. a body mixing `<S>` and `<M>` would otherwise
     /// type-check). Removed once the body check completes.
     unit_skolems: HashSet<UnitVar>,
-    /// Declared units: name → definition (None for base units).
-    declared_units: HashMap<String, Option<UnitTy>>,
     /// Unit variable names from type annotations: name → UnitVar.
     annotation_unit_vars: HashMap<String, UnitVar>,
     /// Whether we are currently processing a type annotation (so undeclared
@@ -976,7 +974,6 @@ impl Infer {
             next_unit_var: 0,
             unit_subst: HashMap::new(),
             unit_skolems: HashSet::new(),
-            declared_units: HashMap::new(),
             annotation_unit_vars: HashMap::new(),
             in_type_annotation: false,
             enforce_units: false,
@@ -1293,21 +1290,20 @@ impl Infer {
         );
     }
 
-    /// Convert an AST UnitExpr to our internal UnitTy, expanding aliases.
-    /// When `in_type_annotation` is true, undeclared unit names are treated
+    /// Convert an AST UnitExpr to our internal UnitTy.
+    /// When `in_type_annotation` is true, lowercase unit names are treated
     /// as polymorphic unit variables (analogous to type variables).
     fn ast_unit_to_unit_ty(&mut self, u: &ast::UnitExpr) -> UnitTy {
         match u {
             ast::UnitExpr::Dimensionless => UnitTy::dimensionless(),
             ast::UnitExpr::Named(name) => {
-                // Check if it's a derived unit alias
-                if let Some(Some(def)) = self.declared_units.get(name) {
-                    def.clone()
-                } else if self.in_type_annotation && name.starts_with(|c: char| c.is_lowercase()) {
+                if self.in_type_annotation && name.starts_with(|c: char| c.is_lowercase()) {
                     // In annotation context, lowercase unit names are variables
                     let var = self.annotation_unit_var(name);
                     UnitTy::var(var)
                 } else {
+                    // Uppercase (or non-annotation) names are concrete units.
+                    // Units need no declaration: any name is a valid unit.
                     UnitTy::named(name)
                 }
             }
@@ -4976,26 +4972,13 @@ impl Infer {
                         Ty::Fun(Box::new(record_ty), Box::new(data_ty))
                     }
                 } else {
-                    // A capitalized name that isn't a constructor but IS a
-                    // declared unit is almost certainly the removed
-                    // value-literal syntax (`sleep 1000 Ms`, removed in
-                    // 12deb2e) — the parser reads the trailing `Ms` as a
-                    // constructor application. Point at the annotation form
-                    // instead of the bare "unknown constructor" dead end.
-                    if self.declared_units.contains_key(name) {
-                        self.error(
-                            format!(
-                                "'{}' is a unit, not a value — write an annotation like `(1000 : Int 1 {})` instead of `1000 {}`",
-                                name, name, name
-                            ),
-                            expr.span,
-                        );
-                    } else {
-                        self.error(
-                            format!("unknown constructor '{}'", name),
-                            expr.span,
-                        );
-                    }
+                    // A capitalized name that isn't a constructor. Units are
+                    // no longer declared, so there's no table to consult for
+                    // the old value-literal hint — just report it plainly.
+                    self.error(
+                        format!("unknown constructor '{}'", name),
+                        expr.span,
+                    );
                     Ty::Error
                 }
             }
@@ -7564,44 +7547,6 @@ impl Infer {
                 self.aliases.insert(name.clone(), Ty::Error);
             }
         }
-        // Collect unit declarations *before* the alias fixpoint and refined-type
-        // population below: both call `ast_type_to_ty` → `ast_unit_to_unit_ty`,
-        // which expands derived unit aliases by consulting `declared_units`. If
-        // this ran afterwards (as it once did), a derived unit used in a refined
-        // base or alias body would freeze unexpanded (`{Speed:1}` instead of
-        // `{M:1,S:-1}`), producing spurious unit-mismatch errors against the
-        // expanded form every other site computes.
-        let mut unit_decl_count = 0;
-        for decl in &module.decls {
-            if let ast::DeclKind::UnitDecl { name, definition } = &decl.node {
-                unit_decl_count += 1;
-                let def = definition.as_ref().map(|u| self.ast_unit_to_unit_ty(u));
-                self.declared_units.insert(name.clone(), def);
-            }
-        }
-        // Re-expand derived units to a fixpoint: a single source-order pass
-        // freezes any unit that forward-references a later-declared derived
-        // unit (e.g. `unit Force = M * Accel` before `unit Accel = M / S`
-        // stores `{M:1, Accel:1}` instead of `{M:2, S:-1}`). Re-running
-        // `ast_unit_to_unit_ty` now that all names are registered expands
-        // those references; iterate until stable, bounded like the alias loop.
-        let mut unit_passes = 0;
-        loop {
-            let mut changed = false;
-            for decl in &module.decls {
-                if let ast::DeclKind::UnitDecl { name, definition: Some(u) } = &decl.node {
-                    let def = Some(self.ast_unit_to_unit_ty(u));
-                    if self.declared_units.get(name) != Some(&def) {
-                        self.declared_units.insert(name.clone(), def);
-                        changed = true;
-                    }
-                }
-            }
-            unit_passes += 1;
-            if !changed || unit_passes > unit_decl_count + 1 {
-                break;
-            }
-        }
 
         // Iterate until alias resolutions stabilize (fixpoint).
         // Clear annotation_vars once before the loop so that type variable
@@ -8153,9 +8098,6 @@ impl Infer {
     }
 
     fn register_builtins(&mut self) {
-        // Built-in unit: Ms (milliseconds) — used by now/sleep
-        self.declared_units.insert("Ms".into(), None);
-
         // Built-in ADT: data Maybe a = Nothing {} | Just {value: a}
         let dummy_span = Span::new(0, 0);
         self.constructors.insert(
@@ -11432,7 +11374,7 @@ fn rewrite_decl_results(decl: &mut ast::Decl, pure_spans: &HashSet<Span>) {
         }
         Migrate { using_fn, .. } => rewrite_result_markers(using_fn, pure_spans),
         Data { .. } | TypeAlias { .. } | Source { .. } | RouteComposite { .. }
-        | SubsetConstraint { .. } | UnitDecl { .. } => {}
+        | SubsetConstraint { .. } => {}
     }
 }
 
@@ -12590,70 +12532,70 @@ main = applyPred (\\r -> r.x == r.y)\
 
     #[test]
     fn unit_literal_typechecks() {
-        assert!(check_src("unit M\nmain = (42.0 : Float M)").is_empty());
+        assert!(check_src("main = (42.0 : Float M)").is_empty());
     }
 
     #[test]
     fn unit_addition_same_unit() {
-        assert!(check_src("unit M\nmain = (10.0 : Float M) + (5.0 : Float M)").is_empty());
+        assert!(check_src("main = (10.0 : Float M) + (5.0 : Float M)").is_empty());
     }
 
     #[test]
     fn unit_addition_mismatch() {
-        let diags = check_src("unit M\nunit S\nmain = (10.0 : Float M) + (5.0 : Float S)");
+        let diags = check_src("main = (10.0 : Float M) + (5.0 : Float S)");
         assert!(has_error(&diags, "unit mismatch"));
     }
 
     #[test]
     fn unit_multiplication_composes() {
         // M * M should not error (produces M^2)
-        assert!(check_src("unit M\nmain = (10.0 : Float M) * (5.0 : Float M)").is_empty());
+        assert!(check_src("main = (10.0 : Float M) * (5.0 : Float M)").is_empty());
     }
 
     #[test]
     fn unit_division_composes() {
         // M / S should not error (produces M/S)
-        assert!(check_src("unit M\nunit S\nmain = (100.0 : Float M) / (10.0 : Float S)").is_empty());
+        assert!(check_src("main = (100.0 : Float M) / (10.0 : Float S)").is_empty());
     }
 
     #[test]
     fn unit_dimensionless_scalar_mul() {
         // Float * Float M should produce Float M
-        assert!(check_src("unit M\nmain = 2.0 * (5.0 : Float M)").is_empty());
+        assert!(check_src("main = 2.0 * (5.0 : Float M)").is_empty());
     }
 
     #[test]
     fn unit_in_type_annotation() {
-        assert!(check_src("unit M\nf : Float M -> Float M\nf = \\x -> x").is_empty());
+        assert!(check_src("f : Float M -> Float M\nf = \\x -> x").is_empty());
     }
 
     #[test]
     fn unit_derived_alias() {
-        assert!(check_src("unit M\nunit S\nunit Mps = M / S\nmain = (10.0 : Float Mps)").is_empty());
+        assert!(check_src("main = (10.0 : Float Mps)").is_empty());
     }
 
     #[test]
     fn unit_int_literal() {
-        assert!(check_src("unit Usd\nmain = (999 : Int Usd)").is_empty());
+        assert!(check_src("main = (999 : Int Usd)").is_empty());
     }
 
     #[test]
     fn unit_int_addition_mismatch() {
-        let diags = check_src("unit Usd\nunit Eur\nmain = (100 : Int Usd) + (50 : Int Eur)");
+        let diags = check_src("main = (100 : Int Usd) + (50 : Int Eur)");
         assert!(has_error(&diags, "unit mismatch"));
     }
 
     #[test]
     fn unit_in_record() {
         assert!(check_src(
-            "unit M\nunit S\nmain = {distance: (100.0 : Float M), time: (10.0 : Float S)}"
+            "main = {distance: (100.0 : Float M), time: (10.0 : Float S)}"
         ).is_empty());
     }
 
     #[test]
     fn unit_expr_annotation() {
         // (expr : Type) syntax
-        let diags = check_src("unit M\nmain = (42.0 : Float M)");
+        let diags = check_src("main = (42.0 : Float M)");
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 
@@ -12661,7 +12603,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_avg_preserves_unit() {
         // avg should preserve the unit from the projection function
         let diags = check_src(
-            "unit M\n\
+            "\
              main = avg (\\p -> p.x) [{x: (1.0 : Float M)}, {x: (2.0 : Float M)}] + (1.0 : Float M)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
@@ -12671,7 +12613,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_avg_mismatch() {
         // avg result has unit from projection — adding mismatched unit should fail
         let diags = check_src(
-            "unit M\nunit S\n\
+            "\
              main = avg (\\p -> p.x) [{x: (1.0 : Float M)}] + (1.0 : Float S)"
         );
         assert!(!diags.is_empty(), "should reject adding Float M avg result to Float S");
@@ -12681,7 +12623,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_negation_preserves() {
         // Unary negation should preserve units
         let diags = check_src(
-            "unit M\nmain = -((5.0 : Float M)) + (3.0 : Float M)"
+            "main = -((5.0 : Float M)) + (3.0 : Float M)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12690,7 +12632,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_annotation_on_function_concrete() {
         // Function with concrete unit annotation (identity-style)
         let diags = check_src(
-            "unit M\n\
+            "\
              wrap : Float M -> Float M\n\
              wrap = \\x -> x\n\
              main = wrap (5.0 : Float M)"
@@ -12702,7 +12644,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_annotation_concrete_rejects_wrong_unit() {
         // Calling a concrete-annotated function with wrong unit should fail
         let diags = check_src(
-            "unit M\nunit S\n\
+            "\
              wrap : Float M -> Float M\n\
              wrap = \\x -> x\n\
              main = wrap (5.0 : Float S)"
@@ -12714,7 +12656,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_annotation_on_function_polymorphic() {
         // Function with polymorphic unit variable should type-check
         let diags = check_src(
-            "unit M\n\
+            "\
              double : Float u -> Float u\n\
              double = \\x -> x + x\n\
              main = double (5.0 : Float M)"
@@ -12726,7 +12668,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_annotation_polymorphic_mismatch() {
         // Polymorphic unit annotation should reject unit mismatches
         let diags = check_src(
-            "unit M\nunit S\n\
+            "\
              double : Float u -> Float u\n\
              double = \\x -> x + x\n\
              main = double (5.0 : Float M) + (1.0 : Float S)"
@@ -12738,7 +12680,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_annotation_polymorphic_reuse() {
         // Polymorphic unit function can be called with different units at different sites
         let diags = check_src(
-            "unit M\nunit S\n\
+            "\
              double : Float u -> Float u\n\
              double = \\x -> x + x\n\
              main = do\n  \
@@ -12852,7 +12794,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn refined_type_with_units() {
         // Refinement and units are orthogonal
         let diags = check_src(
-            "unit M\ntype PosFloat = Float 1 where \\x -> x > 0.0\nmain = 1"
+            "type PosFloat = Float 1 where \\x -> x > 0.0\nmain = 1"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12911,7 +12853,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_randomint_preserves_unit() {
         // randomInt should preserve the unit from the bound argument
         let diags = check_src(
-            "unit Usd\n\
+            "\
              f : IO {random} Int Usd\n\
              f = randomInt (100 : Int Usd)\n\
              main = 1"
@@ -12923,7 +12865,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_randomint_mismatch() {
         // randomInt result has unit from bound — annotating with wrong unit should fail
         let diags = check_src(
-            "unit Usd\nunit Eur\n\
+            "\
              f : IO {random} Int Eur\n\
              f = randomInt (100 : Int Usd)\n\
              main = 1"
@@ -12935,7 +12877,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_count_accepts_unit_context() {
         // count result can unify with a unit context
         let diags = check_src(
-            "unit N\n\
+            "\
              main = count [1, 2, 3] + (0 : Int N)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
@@ -12945,7 +12887,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_length_accepts_unit_context() {
         // length result can unify with a unit context
         let diags = check_src(
-            "unit N\n\
+            "\
              main = length \"hello\" + (0 : Int N)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
@@ -12964,7 +12906,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_sleep_rejects_wrong_unit() {
         // sleep requires Ms — passing a different unit should fail
         let diags = check_src(
-            "unit Kg\n\
+            "\
              main = sleep (1000 : Int Kg)"
         );
         assert!(has_error(&diags, "unit mismatch"));
@@ -12985,7 +12927,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_now_rejects_wrong_unit() {
         // now returns Int Ms — annotating with wrong unit should fail
         let diags = check_src(
-            "unit Kg\n\
+            "\
              f : IO {clock} Int Kg\n\
              f = now\n\
              main = 1"
@@ -12996,7 +12938,7 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn strip_with_unit_int_round_trip() {
         let diags = check_src(
-            "unit Ms\nunit S\n\
+            "\
              toS : Int Ms -> Int S\n\
              toS = \\ms -> withUnit (stripUnit ms / 1000)\n\
              main = 1"
@@ -13007,7 +12949,7 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn strip_unit_float() {
         let diags = check_src(
-            "unit M\n\
+            "\
              f : Float M -> Float 1\n\
              f = \\x -> stripFloatUnit x\n\
              main = 1"
@@ -13018,7 +12960,7 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn with_unit_float() {
         let diags = check_src(
-            "unit M\n\
+            "\
              f : Float 1 -> Float M\n\
              f = \\x -> withFloatUnit x\n\
              main = 1"
@@ -13030,7 +12972,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn strip_unit_rejects_float_arg() {
         // stripUnit is Int-only — passing a Float should fail
         let diags = check_src(
-            "unit M\n\
+            "\
              f = stripUnit (1.0 : Float M)\n\
              main = 1"
         );

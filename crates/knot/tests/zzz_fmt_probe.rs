@@ -115,8 +115,6 @@ fn probe_all() {
         ("route-composite", "route All = A | B"),
         ("migrate", "migrate *r from Int to Text using f"),
         ("subset", "*orders.customer <= *people.name"),
-        ("unit-decl", "unit m"),
-        ("unit-def", "unit N = kg * m / s^2"),
         ("cons-pat", "f = \\xs -> case xs of\n  Cons h t -> h\n  [] -> 0"),
         ("cons-ctor-empty", "f = \\x -> case x of\n  Cons -> 1\n  _ -> 0"),
         ("list-pat", "f = \\x -> case x of\n  [a, b] -> a\n  _ -> 0"),

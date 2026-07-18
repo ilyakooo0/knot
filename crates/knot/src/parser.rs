@@ -559,7 +559,6 @@ impl Parser {
                     | TokenKind::Impl
                     | TokenKind::Route
                     | TokenKind::Migrate
-                    | TokenKind::Unit
                     | TokenKind::Star
                     | TokenKind::Ampersand
                     | TokenKind::Lower(_)
@@ -601,7 +600,6 @@ impl Parser {
             | TokenKind::Route
             | TokenKind::Serve
             | TokenKind::Migrate
-            | TokenKind::Unit
             | TokenKind::Refine
             | TokenKind::Forall
             | TokenKind::Export => {
@@ -950,34 +948,11 @@ impl Parser {
             TokenKind::Impl => self.parse_impl_decl(),
             TokenKind::Route => self.parse_route_decl(),
             TokenKind::Migrate => self.parse_migrate(),
-            TokenKind::Unit => self.parse_unit_decl(),
             _ => {
                 self.error_at(start, "expected declaration");
                 None
             }
         }
-    }
-
-    // ── unit ─────────────────────────────────────────────────────────
-
-    fn parse_unit_decl(&mut self) -> Option<Decl> {
-        let start = self.span();
-        self.advance(); // consume `unit`
-
-        let (name, _) = self.expect_upper("expected unit name after 'unit' (units must start with uppercase)").ok()?;
-
-        let definition = if self.eat(&TokenKind::Eq) {
-            Some(self.parse_unit_expr()?)
-        } else {
-            None
-        };
-
-        let span = Span::new(start.start, self.prev_span().end);
-        Some(Decl {
-            node: DeclKind::UnitDecl { name, definition },
-            span,
-            exported: false,
-        })
     }
 
     /// Parse a unit expression: products, quotients, powers of named units.

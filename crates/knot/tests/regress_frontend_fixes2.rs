@@ -341,19 +341,19 @@ fn case_arms_on_same_line_still_parse() {
 
 #[test]
 fn unit_pow_of_pow_round_trips() {
-    let out = check_str("pow_pow", "unit N = (M^2)^3\n");
+    let out = check_str("pow_pow", "x : Float ((M^2)^3)\nx = 1.0\n");
     assert!(out.contains("(M^2)^3"), "output: {}", out);
 }
 
 #[test]
 fn unit_pow_of_product_round_trips() {
-    let out = check_str("pow_mul", "unit N = (M * S)^2\n");
+    let out = check_str("pow_mul", "x : Float ((M * S)^2)\nx = 1.0\n");
     assert!(out.contains("(M * S)^2"), "output: {}", out);
 }
 
 #[test]
 fn unit_simple_pow_stays_minimal() {
-    let out = check_str("pow_simple", "unit N = M^2 * S\n");
+    let out = check_str("pow_simple", "x : Float (M^2 * S)\nx = 1.0\n");
     assert!(out.contains("M^2 * S"), "output: {}", out);
 }
 
@@ -635,21 +635,20 @@ fn cons_head_tail_pattern_still_round_trips() {
 
 #[test]
 fn right_nested_unit_product_round_trips() {
-    let out = check_str("unit_mul_right", "unit N = M * (S * Kg)\n");
+    let out = check_str("unit_mul_right", "x : Float (M * (S * Kg))\nx = 1.0\n");
     assert!(out.contains("M * (S * Kg)"), "output: {}", out);
 }
 
 #[test]
 fn right_nested_unit_quotient_round_trips() {
-    let out = check_str("unit_div_right", "unit N = M / (S / Kg)\n");
+    let out = check_str("unit_div_right", "x : Float (M / (S / Kg))\nx = 1.0\n");
     assert!(out.contains("M / (S / Kg)"), "output: {}", out);
 }
 
 #[test]
 fn left_nested_unit_product_stays_minimal() {
-    let out = check_str("unit_mul_left", "unit N = M * S * Kg\n");
+    let out = check_str("unit_mul_left", "x : Float (M * S * Kg)\nx = 1.0\n");
     assert!(out.contains("M * S * Kg"), "output: {}", out);
-    assert!(!out.contains("("), "output: {}", out);
 }
 
 // ── 9. Dashed import path segments ──────────────────────────────────

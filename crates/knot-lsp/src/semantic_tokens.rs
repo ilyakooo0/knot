@@ -449,11 +449,6 @@ impl<'a> TokenCollector<'a> {
             DeclKind::Migrate { using_fn, .. } => {
                 self.visit_expr(using_fn);
             }
-            DeclKind::UnitDecl { name, .. } => {
-                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
-                    self.add(s, TOK_TYPE, MOD_DECLARATION);
-                }
-            }
             _ => {}
         }
     }
@@ -651,7 +646,6 @@ impl<'a> TokenCollector<'a> {
                     self.visit_expr(&h.body);
                 }
             }
-            _ => {}
         }
     }
 

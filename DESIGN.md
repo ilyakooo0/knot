@@ -1360,40 +1360,39 @@ countOpen = \rel ->
 
 ### Units of Measure
 
-Compile-time units on `Int 1` and `Float 1`. Units are fully erased at runtime — no performance cost, no runtime representation. **Every `Int 1` and `Float 1` type must carry a unit** — there is no bare `Int 1`/`Float 1`. A dimensionless numeric is written explicitly as `Int 1` / `Float 1`.
+Compile-time units on `Int` and `Float`. Units are fully erased at runtime — no performance cost, no runtime representation. **Every `Int` and `Float` type must carry a unit** — there is no bare `Int`/`Float`. A dimensionless numeric is written explicitly as `Int 1` / `Float 1`.
 
-#### Declaration
+#### No Declaration Needed
+
+Units are not declared. Any name used in a unit position is a unit — the compiler figures out that something is a unit from how it's used, and since a unit has no body (only a name), there is nothing to declare. Compound units are written inline as expressions:
 
 ```knot
-unit M
-unit S
-unit Kg
-unit Usd
-
--- Derived unit aliases (expand at use site)
-unit N = Kg * M / S^2
-unit Hz = 1 / S
+height : Float M
+force : Float (Kg * M / S^2)
+frequency : Float (1 / S)
 ```
 
 #### Type Syntax
 
-Angle brackets on numeric types only. Concrete units are uppercase; lowercase names are unit variables (see [Unit Polymorphism](#unit-polymorphism)).
+Postfix unit argument on numeric types only. Concrete units are uppercase; lowercase names are unit variables (see [Unit Polymorphism](#unit-polymorphism)).
 
 ```knot
 height : Float M
 mass : Float Kg
 speed : Float (M / S)
-force : Float N
+force : Float (Kg * M / S^2)
 acceleration : Float (M / S^2)
 cents : Int Usd
 ```
 
 #### Literal Syntax
 
+Literals are unit-polymorphic and pick up their unit from an annotation:
+
 ```knot
-distance = 42.0 M
-duration = 3.5 S
-price = 999 Usd
+distance = (42.0 : Float M)
+duration = (3.5 : Float S)
+price = (999 : Int Usd)
 pi = 3.14159              -- dimensionless (Float 1)
 ```
 
@@ -1403,20 +1402,20 @@ pi = 3.14159              -- dimensionless (Float 1)
 
 ```knot
 -- Same-unit addition/subtraction
-10.0 M + 5.0 M                -- Float M
-10.0 M + 5.0 S                -- type error
+(10.0 : Float M) + (5.0 : Float M)      -- Float M
+(10.0 : Float M) + (5.0 : Float S)      -- type error
 
 -- Unit composition
-10.0 M * 5.0 M                -- Float (M^2)
-100.0 M / 10.0 S              -- Float (M/S)
-2.0 Kg * 9.8 (M / S^2)          -- Float (Kg * M / S^2) = Float N
+(10.0 : Float M) * (5.0 : Float M)      -- Float (M^2)
+(100.0 : Float M) / (10.0 : Float S)    -- Float (M/S)
+(2.0 : Float Kg) * (9.8 : Float (M / S^2))  -- Float (Kg * M / S^2)
 
 -- Dimensionless scalars
-2.0 * 5.0 M                    -- Float M
-5.0 M / 2.0                    -- Float M
+2.0 * (5.0 : Float M)                    -- Float M
+(5.0 : Float M) / 2.0                    -- Float M
 
 -- Negation preserves units
--(5.0 M)                        -- Float M
+-((5.0 : Float M))                       -- Float M
 ```
 
 Arbitrary integer powers arise naturally from multiplication: `M * M` = `M^2`, `S * S * S` = `S^3`. Powers can also be written directly in type annotations: `Float (M^2)`, `Float (S^-1)`.
@@ -1457,7 +1456,7 @@ toMiles : Float Km -> Float Mi
 toMiles = \d -> withFloatUnit (stripFloatUnit d * 0.621371)
 ```
 
-Every numeric type carries a unit — a bare `Int 1` or `Float 1` is a **compile error**; you must write a unit. Use `Int 1` / `Float 1` for the dimensionless case (e.g. counts, indices). A value of a concrete unit does **not** implicitly convert to the dimensionless form — `x : Float 1; x = (1.5 : Float M)` is a type error (`expected Float 1, found Float M`). Numeric **literals** are unit-polymorphic: `1.5` has type `Float 1 <u>` for a fresh unit variable, so it flows into whatever unit the context demands (`(1.5 : Float M)`, `sum` over `[Float M]`, or a `Float 1` field) and defaults to dimensionless when unconstrained. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
+Every numeric type carries a unit — a bare `Int` or `Float` is a **compile error**; you must write a unit. Use `Int 1` / `Float 1` for the dimensionless case (e.g. counts, indices). A value of a concrete unit does **not** implicitly convert to the dimensionless form — `x : Float 1; x = (1.5 : Float M)` is a type error (`expected Float 1, found Float M`). Numeric **literals** are unit-polymorphic: `1.5` has type `Float u` for a fresh unit variable, so it flows into whatever unit the context demands (`(1.5 : Float M)`, `sum` over `[Float M]`, or a `Float 1` field) and defaults to dimensionless when unconstrained. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
 
 For explicit unit ascription you can put a type annotation on any expression, either inside parens or as a bare postfix:
 
@@ -1492,9 +1491,9 @@ rows |> map (\r -> r.price) |> sum
 `show` on a value with a concrete unit appends the unit string. The compiler knows the unit statically and emits the string as a constant:
 
 ```knot
-show 9.8 (M / S^2)       -- "9.8 M/S^2"
-show 42.0 M             -- "42.0 M"
-show 3.14                -- "3.14"
+show (9.8 : Float (M / S^2))  -- "9.8 M/S^2"
+show (42.0 : Float M)         -- "42.0 M"
+show 3.14                     -- "3.14"
 ```
 
 `Int 1` units are appended the same way, including the built-in `Ms` that clock operations carry — `now : IO {clock} Int Ms`, so `show` on a timestamp reads `"1783814121719 Ms"`. Use `stripUnit` to print the bare number.

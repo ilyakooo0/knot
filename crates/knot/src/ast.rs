@@ -178,12 +178,6 @@ pub enum DeclKind {
         sub: RelationPath,
         sup: RelationPath,
     },
-
-    /// `unit m` or `unit N = kg * m / s^2`
-    UnitDecl {
-        name: Name,
-        definition: Option<UnitExpr>,
-    },
 }
 
 // ── Expressions ────────────────────────────────────────────────────

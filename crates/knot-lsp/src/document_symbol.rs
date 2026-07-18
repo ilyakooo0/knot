@@ -401,22 +401,6 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                 });
             }
             DeclKind::SubsetConstraint { .. } => {}
-            DeclKind::UnitDecl { name, .. } => {
-                let range = span_to_range(decl.span, source);
-                let selection_range = find_word_in_source(source, name, decl.span.start, decl.span.end)
-                    .map(|s| span_to_range(s, source))
-                    .unwrap_or(range.clone());
-                symbols.push(DocumentSymbol {
-                    name: format!("unit {name}"),
-                    detail: None,
-                    kind: SymbolKind::CONSTANT,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: None,
-                });
-            }
         }
     }
 

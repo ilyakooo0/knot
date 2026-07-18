@@ -123,7 +123,7 @@ fn refinement_forgetting_direction_still_allowed() {
 fn unit_exponent_overflow_does_not_panic() {
     // A type-correct program with absurd unit exponents must not crash the
     // compiler (regression: unchecked i32 exponent arithmetic panicked).
-    let src = "unit M\n\
+    let src = "\
                area : Float (M^2000000000)\n\
                area = (1.0 : Float (M^2000000000))\n\
                sq : Float (M^2000000000) -> Float 1\n\

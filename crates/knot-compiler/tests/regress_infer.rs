@@ -219,8 +219,7 @@ fn mul_with_unresolved_operand_and_unit_is_rejected() {
     // genuine dimension error and must be rejected — now with the precise
     // "unit mismatch" rather than the old "cannot infer" that the previous
     // (under-generalized) inference produced spuriously.
-    let src = r#"unit M
-f = \x -> x * (2.0 : Float M)
+    let src = r#"f = \x -> x * (2.0 : Float M)
 bad = (f (3.0 : Float M)) + (4.0 : Float M)
 main = bad
 "#;
@@ -235,8 +234,7 @@ main = bad
 #[test]
 fn mul_with_annotated_operand_composes_units() {
     // With an explicit annotation the product is M^2 and adding M fails.
-    let src = r#"unit M
-f = \x -> (x : Float M) * (2.0 : Float M)
+    let src = r#"f = \x -> (x : Float M) * (2.0 : Float M)
 bad = (f (3.0 : Float M)) + (4.0 : Float M)
 main = bad
 "#;
@@ -250,8 +248,7 @@ main = bad
 
 #[test]
 fn mul_with_dimensionless_annotation_is_accepted() {
-    let src = r#"unit M
-g = \x -> (x : Float 1) * (2.0 : Float M)
+    let src = r#"g = \x -> (x : Float 1) * (2.0 : Float M)
 ok = (g 3.0) + (4.0 : Float M)
 main = ok
 "#;
@@ -269,9 +266,7 @@ fn plain_numeric_mul_lambda_still_works() {
 
 #[test]
 fn add_keeps_unit_from_rhs() {
-    let src = r#"unit M
-unit S
-x = 1 + (2 : Int M)
+    let src = r#"x = 1 + (2 : Int M)
 bad = x + (3 : Int S)
 main = bad
 "#;
@@ -285,9 +280,7 @@ main = bad
 
 #[test]
 fn add_keeps_unit_from_lhs() {
-    let src = r#"unit M
-unit S
-x = (2 : Int M) + 1
+    let src = r#"x = (2 : Int M) + 1
 bad = x + (3 : Int S)
 main = bad
 "#;
@@ -297,8 +290,7 @@ main = bad
 
 #[test]
 fn add_matching_units_still_fine() {
-    let src = r#"unit M
-x = 1 + (2 : Int M)
+    let src = r#"x = 1 + (2 : Int M)
 ok = x + (3 : Int M)
 main = ok
 "#;
@@ -557,8 +549,7 @@ fn scalar_mul_with_late_resolved_field_operand_compiles() {
     // (here by `any`'s second argument). The composition check defers
     // instead of demanding an annotation; `f.failures` resolves to `Int`
     // and `base * f.failures` is `Int Ms`.
-    let src = r#"unit Ms
-base : Int Ms
+    let src = r#"base : Int Ms
 base = 30000
 cap : Int Ms
 cap = 480000
@@ -576,8 +567,7 @@ fn deferred_operand_resolving_to_unit_composes_soundly() {
     // When the late-resolved operand turns out to be unit-bearing, the
     // deferred check must compose units (Ms * Ms = Ms^2), not preserve one
     // side's unit — comparing the product against Int Ms is a mismatch.
-    let src = r#"unit Ms
-base : Int Ms
+    let src = r#"base : Int Ms
 base = 30000
 cap : Int Ms
 cap = 480000
@@ -601,8 +591,7 @@ fn concrete_unit_times_unknown_operand_is_unit_polymorphic() {
     // unit" only because the deferred composition wasn't freshened per
     // instantiation, leaving the operand var unpinned; that under-
     // generalization bug is now fixed, so the application type-checks.)
-    let src = r#"unit M
-f = \y -> (2.0 : Float M) * y
+    let src = r#"f = \y -> (2.0 : Float M) * y
 main = println (show (stripFloatUnit (f 3.0)))
 "#;
     let diags = check_src(src);
@@ -627,9 +616,7 @@ fn self_multiply_lambda_is_unit_polymorphic() {
     // `\x -> x * x` must generalize to `∀u. Float u -> Float (u^2)` so it can
     // be applied at two different units. The deferred unit-composition is
     // captured on the scheme and freshened per use site.
-    let src = r#"unit M
-unit S
-square = \x -> x * x
+    let src = r#"square = \x -> x * x
 main = do
   let a = square (3.0 : Float M)
   let b = square (4.0 : Float S)
@@ -643,9 +630,7 @@ main = do
 #[test]
 fn multi_param_product_is_unit_polymorphic() {
     // Same generalization for a two-argument product used at distinct units.
-    let src = r#"unit M
-unit S
-area = \w h -> w * h
+    let src = r#"area = \w h -> w * h
 main = do
   let a = area (6.0 : Float M) (2.0 : Float M)
   let b = area (6.0 : Float S) (2.0 : Float S)

@@ -205,7 +205,6 @@ fn decl_key(decl: &ast::Decl, index: usize) -> String {
         }
         DeclKind::Migrate { .. } => format!("__migrate#{index}"),
         DeclKind::SubsetConstraint { .. } => format!("__subset#{index}"),
-        DeclKind::UnitDecl { name, .. } => format!("__unit:{name}"),
         DeclKind::RouteComposite { name, .. } => format!("__route_comp:{name}"),
     }
 }
@@ -589,30 +588,8 @@ fn collect_decl_deps(decl: &ast::Decl) -> HashSet<String> {
                 deps.insert(f.clone());
             }
         }
-        DeclKind::UnitDecl { name, definition, .. } => {
-            deps.insert(name.clone());
-            if let Some(def) = definition {
-                collect_unit_expr_names(def, &mut deps);
-            }
-        }
-        _ => {}
     }
     deps
-}
-
-/// Collect named unit references from a UnitExpr.
-fn collect_unit_expr_names(expr: &ast::UnitExpr, out: &mut HashSet<String>) {
-    match expr {
-        ast::UnitExpr::Named(name) => {
-            out.insert(name.clone());
-        }
-        ast::UnitExpr::Mul(a, b) | ast::UnitExpr::Div(a, b) => {
-            collect_unit_expr_names(a, out);
-            collect_unit_expr_names(b, out);
-        }
-        ast::UnitExpr::Pow(inner, _) => collect_unit_expr_names(inner, out),
-        ast::UnitExpr::Dimensionless | ast::UnitExpr::Hole => {}
-    }
 }
 
 /// Collect named type references from a type AST node (or a slice of them).

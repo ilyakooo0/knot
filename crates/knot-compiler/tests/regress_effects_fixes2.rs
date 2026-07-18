@@ -72,7 +72,7 @@ fn impl_method_console_io_inside_atomic_rejected() {
     // `tick`'s impl calls println; the trait-method call inside the
     // atomic block must surface that console effect.
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 trait Ticker a where
   tick : a -> IO _ {}
@@ -94,7 +94,7 @@ main = do
 #[test]
 fn trait_default_body_io_inside_atomic_rejected() {
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 trait Ticker a where
   tick : a -> IO _ {}
@@ -120,10 +120,10 @@ fn atomic_relation_access_via_trait_method_accepted() {
     // method whose impl reads *items — pre-fix this was a false
     // "atomic block must interact with relations" error.
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 trait Reader a where
-  readAll : a -> IO _ [{n: Int}]
+  readAll : a -> IO _ [{n: Int 1}]
 
 impl Reader Int where
   readAll = \x -> *items
@@ -145,7 +145,7 @@ fn trait_method_union_includes_all_impls() {
     // (here, the console effect of the Text impl) even when only the Int
     // impl could be the dynamic target — conservative and sound.
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 trait Ticker a where
   tick : a -> IO _ {}
@@ -175,7 +175,7 @@ fn impl_method_param_shadows_io_builtin() {
     // poisoned `pretty` with a spurious `{clock}` effect; calling it inside
     // `atomic` then tripped the IO-in-atomic gate.
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 trait Pretty a where
   pretty : a -> Text
@@ -202,7 +202,7 @@ fn trait_default_param_shadows_io_builtin() {
     // union and must not contribute a spurious `{clock}` effect. The impl
     // uses a benign param so only the default exercises the shadowing path.
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 trait Pretty a where
   pretty : a -> Text
@@ -228,9 +228,9 @@ main = do
 #[test]
 fn let_bound_lambda_passed_by_name_carries_console_effect() {
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
-runIt : (Int -> IO {| e} {}) -> IO {| e} {}
+runIt : (Int 1 -> IO {| e} {}) -> IO {| e} {}
 runIt = \f -> f 1
 
 main = do
@@ -250,7 +250,7 @@ main = do
 #[test]
 fn unannotated_hof_propagates_lambda_io_into_atomic_check() {
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 apply = \f x -> f x
 
@@ -271,9 +271,9 @@ fn closed_row_annotation_still_absorbs_callback_effects() {
     // documented annotation semantics it absorbs its callback's effects,
     // so the caller must NOT be charged with console.
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
-quiet : (Int -> IO {console} {}) -> IO {r *items} {}
+quiet : (Int 1 -> IO {console} {}) -> IO {r *items} {}
 quiet = \f -> *items
 
 caller : IO {r *items} {}
@@ -291,7 +291,7 @@ main = do
 fn pure_lambda_args_add_no_effects() {
     // Conservative propagation must not invent effects for pure lambdas.
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 apply = \f x -> f x
 
@@ -312,7 +312,7 @@ fn atomic_calling_parameter_typed_callable_not_flagged() {
     // `action` is a lambda parameter — the body is not provably
     // relation-free, so the hard error must stay quiet.
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 helper = \action -> atomic (do
   r <- action {}
@@ -333,7 +333,7 @@ fn inner_binder_shadowing_let_effectful_name_is_not_laundered() {
     // must NOT resolve to the outer binding's `{console}` effect (which would
     // spuriously trip the IO-in-atomic gate). The atomic body only writes.
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 apply = \g x -> g x
 
@@ -372,7 +372,7 @@ fn provably_relation_free_atomic_still_rejected() {
 #[test]
 fn pipe_lhs_lambda_io_propagates_into_atomic_check() {
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 apply = \f -> f 1
 
@@ -431,7 +431,7 @@ fn io_laundered_into_atomic_via_record_field_rejected() {
     // level down the call chain and the lambda is bound in the enclosing
     // declaration — the atomic gate must still reject it.
     let diags = effect_diags(
-        r#"*items : [{id: Int}]
+        r#"*items : [{id: Int 1}]
 
 makeRec = \cb -> {fn: cb}
 
@@ -459,7 +459,7 @@ fn clean_atomic_in_impl_method_not_poisoned_by_unrelated_io_lambda() {
     // the laundered-IO search there wrongly attributed that lambda to the
     // method's atomic block — a false positive that rejected a valid program.
     let diags = effect_diags(
-        r#"*items : [{id: Int}]
+        r#"*items : [{id: Int 1}]
 
 writeItems = \u -> replace *items = [{id: 7}]
 
@@ -502,7 +502,7 @@ fn pure_hof_builtin_in_atomic_not_flagged_opaque() {
     // atomic block, the gate wrongly rooted its laundered-IO search at the
     // whole declaration and rejected the (DB-only) atomic body.
     let diags = effect_diags(
-        r#"*items : [{n: Int, expiresAt: Int}]
+        r#"*items : [{n: Int 1, expiresAt: Int 1}]
 
 handle = do
   t <- now
@@ -524,7 +524,7 @@ fn prelude_hof_callback_param_in_atomic_not_flagged_opaque() {
     // false "IO not allowed in atomic" when the enclosing decl did IO (`now`)
     // outside the atomic. A callee's own params are now treated as known.
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 
 lookup = \rows -> findFirst rows (\r -> r.n > 0)
 

@@ -85,7 +85,7 @@ fn set_delete_where_with_top_level_constant_param() {
     // used to panic with `codegen: undefined variable 'maxAge'`.
     let (stdout, stderr, ok) = compile_and_run(
         "set_where_global",
-        r#"*items : [{age: Int}]
+        r#"*items : [{age: Int 1}]
 
 maxAge = 5
 
@@ -115,7 +115,7 @@ fn single_plan_with_do_local_let_param() {
     // the precision upgrade (keeps the broad read filter) for such names.
     let (stdout, stderr, ok) = compile_and_run(
         "single_let_param",
-        r#"*items : [{a: Int}]
+        r#"*items : [{a: Int 1}]
 
 main = do
   replace *items = [{a: 1}, {a: 2}]
@@ -140,7 +140,7 @@ fn pipe_take_with_top_level_constant_param() {
     // top-level constant — this used to panic in Env::get.
     let (stdout, stderr, ok) = compile_and_run(
         "pipe_take_global",
-        r#"*items : [{a: Int}]
+        r#"*items : [{a: Int 1}]
 
 limitN = 2
 
@@ -163,7 +163,7 @@ fn count_filter_with_top_level_constant_param() {
     // count (filter ...) pushdown with a global threshold in the lambda.
     let (stdout, stderr, ok) = compile_and_run(
         "count_filter_global",
-        r#"*items : [{age: Int}]
+        r#"*items : [{age: Int 1}]
 
 cutoff = 3
 
@@ -213,7 +213,7 @@ fn impl_method_partial_explicit_params_plus_lambda() {
     // explicit params together with every leading lambda.
     let (stdout, stderr, ok) = compile_and_run(
         "impl_partial_params",
-        r#"data Pt = Pt {x: Int, y: Int}
+        r#"data Pt = Pt {x: Int 1, y: Int 1}
 
 impl Eq Pt where
   eq a = \b -> a.x == b.x
@@ -236,7 +236,7 @@ fn trait_default_method_lambda_body_param_count() {
     let (stdout, stderr, ok) = compile_and_run(
         "trait_default_lambda_params",
         r#"data Box
-  = Box {n: Int}
+  = Box {n: Int 1}
   deriving (Tag)
 
 trait Tag a where
@@ -361,7 +361,7 @@ fn let_bound_relation_comprehension_materializes() {
     // `count xs` aborted with "expected Relation in len, got IO".
     let (stdout, stderr, ok) = compile_and_run(
         "let_comprehension",
-        r#"*items : [{age: Int}]
+        r#"*items : [{age: Int 1}]
 
 main = do
   replace *items = [{age: 1}, {age: 9}]
@@ -482,7 +482,7 @@ impl Ord Level where
     High x -> (case b of
       High y -> EQ {}
       _ -> GT {})
-type T = {lvl: Level, n: Int}
+type T = {lvl: Level, n: Int 1}
 *t : [T]
 main = do
   replace *t = [{lvl: Low {}, n: 1}, {lvl: High {}, n: 2}]
@@ -508,7 +508,7 @@ fn atomic_loop_where_guard_skip_keeps_prior_writes() {
     // top-level guard aborts the atomic; a per-row guard just skips the row).
     let (stdout, stderr, ok) = compile_and_run(
         "atomic_loop_where_skip",
-        r#"*log : [{id: Int}]
+        r#"*log : [{id: Int 1}]
 
 process = atomic do
   let items = [{id: 10, keep: true}, {id: 20, keep: false}]
@@ -537,8 +537,8 @@ fn atomic_loop_ctor_mismatch_skip_keeps_prior_writes() {
     // transaction instead of just skipping the row.
     let (stdout, stderr, ok) = compile_and_run(
         "atomic_loop_ctor_skip",
-        r#"data Shape = Circle {r: Int} | Square {s: Int}
-*log : [{r: Int}]
+        r#"data Shape = Circle {r: Int 1} | Square {s: Int 1}
+*log : [{r: Int 1}]
 
 process = atomic do
   let shapes = [Circle {r: 7}, Square {s: 3}]
@@ -570,7 +570,7 @@ fn view_where_filter_restricts_reads_and_fills_writes() {
     // WHERE and the write auto-fill.
     let (stdout, stderr, ok) = compile_and_run(
         "view_where_filter",
-        r#"*accounts : [{owner: Text, balance: Int}]
+        r#"*accounts : [{owner: Text, balance: Int 1}]
 
 *aliceAccounts = do
   a <- *accounts
@@ -694,7 +694,7 @@ fn when_false_does_not_run_relation_write() {
     // literal or a runtime value.
     let (stdout, stderr, ok) = compile_and_run(
         "when_guard_gates_write",
-        r#"*items : [{a: Int}]
+        r#"*items : [{a: Int 1}]
 
 flag = false
 
@@ -723,7 +723,7 @@ fn when_true_still_runs_relation_write_exactly_once() {
     // thunk twice would add two rows instead of one.
     let (stdout, stderr, ok) = compile_and_run(
         "when_guard_runs_write_once",
-        r#"*items : [{a: Int}]
+        r#"*items : [{a: Int 1}]
 
 flag = true
 
@@ -757,7 +757,7 @@ fn bind_bound_source_comprehension_yields_all_rows() {
     // disagreed on identical source. They must now agree.
     let (stdout, stderr, ok) = compile_and_run(
         "bind_source_comprehension",
-        r#"*items : [{k: Text, v: Int}]
+        r#"*items : [{k: Text, v: Int 1}]
 
 main = do
   replace *items = [{k: "a", v: 1}, {k: "b", v: 5}, {k: "c", v: 9}]
@@ -817,7 +817,7 @@ fn comprehension_tail_after_io_statement_yields_all_rows() {
     // the comprehension must accumulate all matching rows in this form too.
     let (stdout, stderr, ok) = compile_and_run(
         "comprehension_tail_after_io",
-        r#"type Person = {name: Text, age: Int}
+        r#"type Person = {name: Text, age: Int 1}
 
 *people : [Person]
 

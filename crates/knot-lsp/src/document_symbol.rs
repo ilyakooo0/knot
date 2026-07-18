@@ -132,7 +132,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                 });
             }
             DeclKind::TypeAlias { name, ty, .. } => {
-                // Refined type aliases (`type Nat = Int where \x -> ...`) carry
+                // Refined type aliases (`type Nat = Int 1 where \x -> ...`) carry
                 // their predicate in the AST. Surface it in the outline so the
                 // user can scan for refined types without opening each one.
                 let detail = match &ty.node {
@@ -445,7 +445,7 @@ mod tests {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            r#"type Person = {name: Text, age: Int}
+            r#"type Person = {name: Text, age: Int 1}
 *people : [Person]
 greet = \name -> "hi " ++ name
 main = println "hello"
@@ -469,7 +469,7 @@ main = println "hello"
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            r#"add : Int -> Int -> Int
+            r#"add : Int 1 -> Int 1 -> Int 1
 add = \x y -> x + y
 "#,
         );

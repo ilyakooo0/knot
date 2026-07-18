@@ -95,7 +95,7 @@ fn adt_relation_with_record_field_round_trips() {
     // runtime used to panic at init with "unknown ADT field type 'json'".
     let c = compile(
         "adt_record_field",
-        r#"data Shape = Circle {center: {x: Float, y: Float}, radius: Float} | Dot {}
+        r#"data Shape = Circle {center: {x: Float 1, y: Float 1}, radius: Float 1} | Dot {}
 
 *shapes : [Shape]
 
@@ -131,7 +131,7 @@ fn adt_relation_with_payload_adt_field_round_trips() {
     // column (`inner=json`) in the wide table.
     let c = compile(
         "adt_payload_adt_field",
-        r#"data Inner = A {n: Int} | B {}
+        r#"data Inner = A {n: Int 1} | B {}
 data Outer = W {label: Text, inner: Inner} | E {}
 
 *outers : [Outer]
@@ -162,7 +162,7 @@ main = do
 fn nested_relation_of_adt_elements_round_trips() {
     let c = compile(
         "nested_adt_relation",
-        r#"data Shape = Circle {radius: Float} | Dot {}
+        r#"data Shape = Circle {radius: Float 1} | Dot {}
 
 *drawings : [{name: Text, shapes: [Shape]}]
 
@@ -200,7 +200,7 @@ fn nested_adt_relation_dedups_on_write() {
     // deduped when the relation is serialized into the json column.
     let c = compile(
         "nested_adt_dedup",
-        r#"data Shape = Circle {radius: Float} | Dot {}
+        r#"data Shape = Circle {radius: Float 1} | Dot {}
 
 *drawings : [{name: Text, shapes: [Shape]}]
 
@@ -276,7 +276,7 @@ fn comprehension_binds_over_json_nested_fields() {
     // constructor-pattern binds that filter by tag.
     let c = compile(
         "comprehension_json_fields",
-        r#"data Shape = Circle {radius: Float} | Dot {}
+        r#"data Shape = Circle {radius: Float 1} | Dot {}
 
 *drawings : [{name: Text, shapes: [Shape]}]
 *posts : [{title: Text, tags: [Text]}]

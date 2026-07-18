@@ -65,7 +65,7 @@ fn literal_payload_does_not_cover_constructor() {
     // `Circle {radius: 1.0}` matches only one radius — Circle is NOT
     // covered, so the match must be rejected as non-exhaustive.
     let diags = check_src(
-        r#"data Shape = Circle {radius: Float} | Rect {width: Float, height: Float}
+        r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 
 describe = \s -> case s of
   Circle {radius: 1.0} -> "unit circle"
@@ -89,7 +89,7 @@ main = println (describe (Circle {radius: 2.0}))
 #[test]
 fn wildcard_fixes_literal_payload_match() {
     let diags = check_src(
-        r#"data Shape = Circle {radius: Float} | Rect {width: Float, height: Float}
+        r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 
 describe = \s -> case s of
   Circle {radius: 1.0} -> "unit circle"
@@ -105,7 +105,7 @@ main = println (describe (Circle {radius: 2.0}))
 #[test]
 fn irrefutable_payloads_still_exhaustive() {
     let diags = check_src(
-        r#"data Shape = Circle {radius: Float} | Rect {width: Float, height: Float}
+        r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 
 describe = \s -> case s of
   Circle c -> "circle"
@@ -122,7 +122,7 @@ fn nested_constructor_payload_does_not_cover() {
     // `Wrap {s: Circle c}` only matches Wrap values holding a Circle —
     // a Rect payload would panic at runtime, so a wildcard is required.
     let diags = check_src(
-        r#"data Shape = Circle {radius: Float} | Rect {width: Float}
+        r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1}
 data Wrapper = Wrap {s: Shape}
 
 unwrap = \w -> case w of
@@ -175,7 +175,7 @@ fn groupby_comprehension_types_as_io_relation() {
     // `workload` accumulates one row per group, so its type must be
     // `IO [{owner, n}]` — `count workload` only typechecks as a list.
     let diags = check_src(
-        r#"*todos : [{title: Text, owner: Text, done: Int}]
+        r#"*todos : [{title: Text, owner: Text, done: Int 1}]
 
 main = do
   replace *todos = [{title: "a", owner: "Alice", done: 0}]
@@ -277,7 +277,7 @@ fn rank2_skolem_escape_through_wrapper_rejected() {
     // argument; generalizing it would let `g (\x -> x + 1)` pass a
     // monomorphic function where a polymorphic one is required.
     let diags = check_src(
-        r#"takesPoly : (forall a. a -> a) -> Int
+        r#"takesPoly : (forall a. a -> a) -> Int 1
 takesPoly = \f -> f 1
 
 g = \h -> takesPoly h
@@ -297,7 +297,7 @@ main = do
 #[test]
 fn direct_polymorphic_argument_ok() {
     let diags = check_src(
-        r#"takesPoly : (forall a. a -> a) -> Int
+        r#"takesPoly : (forall a. a -> a) -> Int 1
 takesPoly = \f -> f 1
 
 main = println (show (takesPoly (\x -> x)))
@@ -318,9 +318,9 @@ fn constraint_on_refine_concretized_var_is_checked() {
     // `Foo Int` impl was silently not reported.
     let diags = check_src(
         r#"trait Foo a where
-  foo : a -> Int
+  foo : a -> Int 1
 
-type Nat = Int where \x -> x >= 0
+type Nat = Int 1 where \x -> x >= 0
 
 main = do
   x <- []
@@ -404,7 +404,7 @@ fn applied_lambda_io_do_block_not_desugared_as_pure() {
 fn fetchwith_bad_options_rejected() {
     let diags = check_src(
         r#"route Api where
-  GET /users/{id: Int} -> {name: Text} = GetUser
+  GET /users/{id: Int 1} -> {name: Text} = GetUser
 
 main = do
   r <- fetchWith "http://localhost:1" 42 (GetUser {id: 1})
@@ -422,7 +422,7 @@ main = do
 fn fetchwith_headers_options_accepted() {
     let diags = check_src(
         r#"route Api where
-  GET /users/{id: Int} -> {name: Text} = GetUser
+  GET /users/{id: Int 1} -> {name: Text} = GetUser
 
 main = do
   r <- fetchWith "http://localhost:1" {headers: [{name: "X-A", value: "b"}]} (GetUser {id: 1})
@@ -437,7 +437,7 @@ fn fetch_on_non_route_constructor_rejected() {
     // Pre-fix this passed inference and PANICKED the compiler in codegen
     // ("fetch: no route entry found for constructor 'Mk'").
     let diags = check_src(
-        r#"data Foo = Mk {x: Int}
+        r#"data Foo = Mk {x: Int 1}
 
 main = do
   r <- fetch "http://localhost:1" (Mk {x: 1})
@@ -462,7 +462,7 @@ fn fetch_bare_nullary_route_constructor_accepted() {
     let diags = check_src(
         r#"route Api where
   GET /health -> {status: Text} = Health
-  GET /users/{id: Int} -> {name: Text} = GetUser
+  GET /users/{id: Int 1} -> {name: Text} = GetUser
 
 main = do
   r <- fetch "http://localhost:1" Health
@@ -479,7 +479,7 @@ fn fetchwith_bare_nullary_route_constructor_accepted() {
     let diags = check_src(
         r#"route Api where
   GET /health -> {status: Text} = Health
-  GET /users/{id: Int} -> {name: Text} = GetUser
+  GET /users/{id: Int 1} -> {name: Text} = GetUser
 
 main = do
   r <- fetchWith "http://localhost:1" {headers: [{name: "X-A", value: "b"}]} Health

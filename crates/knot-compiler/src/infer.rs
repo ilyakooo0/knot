@@ -874,6 +874,10 @@ struct Infer {
     /// Whether we are currently processing a type annotation (so undeclared
     /// unit names are treated as polymorphic unit variables).
     in_type_annotation: bool,
+    /// Whether bare `Int`/`Float` are rejected (require an explicit unit).
+    /// Set for value annotations AND for type-alias / data-decl bodies, which
+    /// are converted outside `in_type_annotation` but must still be checked.
+    enforce_units: bool,
 
     // ── Refined types ─────────────────────────────────────────────
     /// Refined type metadata: type_name → (base Ty, predicate Expr).
@@ -975,6 +979,7 @@ impl Infer {
             declared_units: HashMap::new(),
             annotation_unit_vars: HashMap::new(),
             in_type_annotation: false,
+            enforce_units: false,
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
             field_accesses: Vec::new(),
@@ -1093,7 +1098,7 @@ impl Infer {
     ///
     /// Covers the primitive bases (Int/Float/Text/Bool, with or without
     /// units) as well as the composite bases a refined alias can wrap —
-    /// records (`type Valid = {x: Int} where …`) and relations. Without the
+    /// records (`type Valid = {x: Int 1} where …`) and relations. Without the
     /// composite forms, a concrete record/relation value flowing into a
     /// refined type with a matching base would skip the guard and be
     /// laundered into the refined type with no predicate check.
@@ -1339,6 +1344,12 @@ impl Infer {
     }
 
     fn error(&mut self, msg: String, span: Span) {
+        // Dedup identical diagnostics: the alias fixpoint and multi-pass
+        // collection can re-derive the same error at the same span several
+        // times (e.g. a bare `Int` inside a type alias). Report it once.
+        if self.errors.iter().any(|(m, s)| *m == msg && *s == span) {
+            return;
+        }
         self.errors.push((msg, span));
     }
 
@@ -1944,7 +1955,7 @@ impl Infer {
     /// `ServerName` would let `\t -> filter (\_ -> True) [t] : [ServerName]`
     /// launder an arbitrary `Text` into a refined list, so that never happens.
     /// It is also why this walks *variables* and not concrete types:
-    /// `asNat : Int -> Nat; asNat = \x -> x` offers no variable to widen and
+    /// `asNat : Int 1 -> Nat; asNat = \x -> x` offers no variable to widen and
     /// stays rejected.
     fn widen_refined_vars(&mut self, t1: &Ty, t2: &Ty, depth: usize) {
         // Types are finite (the occurs check rules out cyclic substitutions),
@@ -2435,7 +2446,7 @@ impl Infer {
             // relation `[T]` stands for the *whole* result of the IO side,
             // so it unifies with the IO's inner type — not the relation's
             // element type with the inner (which produced nonsense
-            // "expected {x: Int}, found [{x: Int}]" mismatches).
+            // "expected {x: Int 1}, found [{x: Int 1}]" mismatches).
             (Ty::Relation(_), Ty::IO(_, _, b)) if self.in_io_do => {
                 let b = (**b).clone();
                 self.unify_dir(&t1, &b, span, t1_provided);
@@ -2518,7 +2529,7 @@ impl Infer {
             // This keeps literals and unit-polymorphic-but-actually-plain
             // computations flowing into `Float` fields, while a concrete unit
             // (`M`) does NOT unify — closing the laundering hole where
-            // `x : Float; x = (1.5 : Float M)` silently dropped the unit.
+            // `x : Float 1; x = (1.5 : Float M)` silently dropped the unit.
             (Ty::Int, Ty::Con(name, args))
                 if name == "Int" && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
             {
@@ -2580,7 +2591,7 @@ impl Infer {
             // value flowing where an `Int` is required) is always sound. But
             // *introducing* one — a plain `Int` value flowing where a refined
             // `Nat` is required — must NOT happen implicitly at an unchecked
-            // boundary: the predicate would never run, so e.g. `asNat : Int ->
+            // boundary: the predicate would never run, so e.g. `asNat : Int 1 ->
             // Nat; asNat = \x -> x` would launder a negative into a `Nat`. The
             // sound introduction form is `refine`, which performs the runtime
             // check and yields `Result RefinementError Nat`. We therefore
@@ -4296,8 +4307,26 @@ impl Infer {
     fn ast_type_to_ty(&mut self, ty: &ast::Type) -> Ty {
         match &ty.node {
             ast::TypeKind::Named(name) => match name.as_str() {
-                "Int" => Ty::Int,
-                "Float" => Ty::Float,
+                "Int" => {
+                    if self.in_type_annotation || self.enforce_units {
+                        self.error(
+                            "bare `Int` requires a unit — write `Int 1` (dimensionless), `Int M`, or `Int u`".into(),
+                            ty.span,
+                        );
+                        return Ty::Error;
+                    }
+                    Ty::Int
+                }
+                "Float" => {
+                    if self.in_type_annotation || self.enforce_units {
+                        self.error(
+                            "bare `Float` requires a unit — write `Float 1` (dimensionless), `Float M`, or `Float u`".into(),
+                            ty.span,
+                        );
+                        return Ty::Error;
+                    }
+                    Ty::Float
+                }
                 "Text" => Ty::Text,
                 "Bool" => Ty::Bool,
                 "Bytes" => Ty::Bytes,
@@ -4326,7 +4355,7 @@ impl Infer {
                             // Without registering them in `annotation_vars`,
                             // the pre-registered scheme leaves them unquantified
                             // and shares them across every call site — the first
-                            // use pins the alias (e.g. `Box` to `{val: Int}`) and
+                            // use pins the alias (e.g. `Box` to `{val: Int 1}`) and
                             // later uses at other types are falsely rejected. The
                             // bug surfaced only when the annotated decl was
                             // declared after its first caller, so re-generalization
@@ -4484,7 +4513,15 @@ impl Infer {
                 )
             }
             ast::TypeKind::UnitAnnotated { base, unit } => {
+                // Convert the base (`Int`/`Float`) without the bare-numeric
+                // check — the unit is supplied right here.
+                let saved_flag = self.in_type_annotation;
+                let saved_enforce = self.enforce_units;
+                self.in_type_annotation = false;
+                self.enforce_units = false;
                 let base_ty = self.ast_type_to_ty(base);
+                self.in_type_annotation = saved_flag;
+                self.enforce_units = saved_enforce;
                 let unit_ty = self.ast_unit_to_unit_ty(unit);
                 match base_ty {
                     Ty::Int => Ty::int_with_unit(unit_ty),
@@ -4948,7 +4985,7 @@ impl Infer {
                     if self.declared_units.contains_key(name) {
                         self.error(
                             format!(
-                                "'{}' is a unit, not a value — write an annotation like `(1000 : Int {})` instead of `1000 {}`",
+                                "'{}' is a unit, not a value — write an annotation like `(1000 : Int 1 {})` instead of `1000 {}`",
                                 name, name, name
                             ),
                             expr.span,
@@ -6456,7 +6493,7 @@ impl Infer {
                     let op_name = if op == ast::BinOp::Mul { "*" } else { "/" };
                     self.error(
                         format!(
-                            "cannot infer the unit of an operand of `{}`: one side has unit {} but the other side's type is not yet known — units compose under `{}`, so the unresolved operand needs an explicit annotation (e.g. `(x : Float ({}))`, or `(x : Float)` for a dimensionless value)",
+                            "cannot infer the unit of an operand of `{}`: one side has unit {} but the other side's type is not yet known — units compose under `{}`, so the unresolved operand needs an explicit annotation (e.g. `(x : Float ({}))`, or `(x : Float 1)` for a dimensionless value)",
                             op_name, unit, op_name, unit
                         ),
                         span,
@@ -7576,6 +7613,8 @@ impl Infer {
         // alias; anything beyond that indicates an undetected divergence.
         let max_passes = alias_decls.len() + 1;
         let mut passes = 0;
+        let saved_enforce = self.enforce_units;
+        self.enforce_units = true;
         loop {
             let mut changed = false;
             for (name, ty, _) in &alias_decls {
@@ -7600,6 +7639,7 @@ impl Infer {
             self.refined_types
                 .insert(name.clone(), (base_ty, predicate.clone()));
         }
+        self.enforce_units = saved_enforce;
 
         // Second pass: data types and constructors
         for decl in &module.decls {
@@ -7657,6 +7697,27 @@ impl Infer {
                             fields: fields.clone(),
                         });
                     ctor_list.push((ctor.name.clone(), fields));
+                }
+
+                // Enforce unit annotations on every constructor field at
+                // declaration time. Multi-variant fields are otherwise only
+                // converted lazily at use sites (instantiate_ctor), so an
+                // unused constructor with a bare `Int`/`Float` field would
+                // slip through. Convert each field once here to surface the
+                // error; the result is discarded (lazy conversion still runs).
+                {
+                    let saved_annotation_vars = self.annotation_vars.clone();
+                    self.annotation_vars.clear();
+                    for p in params {
+                        let v = self.fresh_var();
+                        self.annotation_vars.insert(p.clone(), v);
+                    }
+                    for ctor in ctors {
+                        for f in &ctor.fields {
+                            let _ = self.ast_type_to_ty(&f.value);
+                        }
+                    }
+                    self.annotation_vars = saved_annotation_vars;
                 }
 
                 // Clear annotation_vars for data type field resolution
@@ -8208,7 +8269,7 @@ impl Infer {
             ),
         );
 
-        // Built-in type: HttpError = {status: Int, message: Text}
+        // Built-in type: HttpError = {status: Int 1, message: Text}
         // Used as the error type for serve handler return values: every
         // handler returns `Result HttpError T`, where Err carries a custom
         // HTTP status code and message.
@@ -8573,7 +8634,7 @@ impl Infer {
             );
         }
 
-        // fetch : ∀a b. Text -> a -> IO {network} (Result {status: Int, message: Text} b)
+        // fetch : ∀a b. Text -> a -> IO {network} (Result {status: Int 1, message: Text} b)
         // (also accepts 3-arg form with options record in the middle)
         // The response type `b` is resolved via special inference when the
         // second/third arg is a route constructor with a known response type.
@@ -8698,7 +8759,7 @@ impl Infer {
         // ("cannot add Int + Text"). Units/refined aliases resolve to their
         // base primitive via `type_name_of`, so `Num Int`/`Num Float` discharge
         // unit- and refinement-typed elements unchanged: `sum ([1,2,3] : [Int])
-        // : Int` and `sum ([1.0 : Float M, ...]) : Float M`. To sum a
+        // : Int 1` and `sum ([1.0 : Float M, ...]) : Float M`. To sum a
         // projection, map first: `sum (map (\r -> r.amount) rows)`.
         let a = self.fresh_var();
         self.bind_top(
@@ -9699,7 +9760,7 @@ impl Infer {
     }
 
     /// Type-check a route's `rateLimit <expr>` clause. The expression must
-    /// have type `{key: input -> RequestCtx -> Maybe a, limit: {requests: Int, window: Int Ms}}`
+    /// have type `{key: input -> RequestCtx -> Maybe a, limit: {requests: Int 1, window: Int Ms}}`
     /// for some `a`, where `input` is the same record the handler receives
     /// (path/query/body/headers fields). The runtime serializes the key via
     /// `show`, so no trait constraint is needed on `a`.
@@ -9746,7 +9807,12 @@ impl Infer {
         // Build mapping from trait type params to the impl's concrete types.
         // e.g. `trait Display a` + `impl Display Int` → { a_var => Int }
         self.annotation_vars.clear();
+        // Impl targets name the type *constructor* (`impl Display Int`), not a
+        // dimensionless value annotation — bare `Int`/`Float` is correct here.
+        let saved_enforce = self.enforce_units;
+        self.enforce_units = false;
         let impl_types: Vec<Ty> = impl_args.iter().map(|a| self.ast_type_to_ty(a)).collect();
+        self.enforce_units = saved_enforce;
 
         for item in items {
             if let ast::ImplItem::Method {
@@ -10798,6 +10864,15 @@ pub fn check(module: &mut ast::Module) -> CheckOutput {
 fn check_inner(module: &mut ast::Module) -> CheckOutput {
     let mut infer = Infer::new();
 
+    // Every user-written numeric type must carry an explicit unit (bare
+    // `Int`/`Float` is rejected). Value annotations already enforce this via
+    // `in_type_annotation`; enable it globally so declaration-level types —
+    // aliases, data fields, sources/views/derived, routes, trait methods,
+    // impls — are checked too. Builtins are registered from Rust `Ty` (not
+    // `ast_type_to_ty`) and the prelude is fully unit-annotated, so neither
+    // is affected.
+    infer.enforce_units = true;
+
     // Phase 1: Collect type aliases, data types, constructors
     infer.collect_types(module);
 
@@ -11724,7 +11799,7 @@ mod tests {
         // pattern. The skolemised row variable must stay rigid even when
         // field-access constraints introduce extra fresh row variables.
         let src = "\
-applyPred : (forall a. {x: Int, y: Int | a} -> Bool) -> Int\n\
+applyPred : (forall a. {x: Int 1, y: Int 1 | a} -> Bool) -> Int 1\n\
 applyPred = \\pred -> if pred {x: 1, y: 2} then 1 else 0\n\
 main = applyPred (\\r -> r.x == r.y)\
 ";
@@ -11735,14 +11810,14 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn data_type_constructor() {
         assert!(check_src(
-            "data Shape = Circle {radius: Int} | Rect {w: Int, h: Int}\nmain = Circle {radius: 5}"
+            "data Shape = Circle {radius: Int 1} | Rect {w: Int 1, h: Int 1}\nmain = Circle {radius: 5}"
         ).is_empty());
     }
 
     #[test]
     fn case_expression() {
         assert!(check_src(
-            "data Shape = Circle {r: Int} | Rect {w: Int, h: Int}\nf = \\s -> case s of\n  Circle {r} -> r\n  Rect {w, h} -> w * h\nmain = f (Circle {r: 5})"
+            "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\nf = \\s -> case s of\n  Circle {r} -> r\n  Rect {w, h} -> w * h\nmain = f (Circle {r: 5})"
         ).is_empty());
     }
 
@@ -11757,7 +11832,7 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn do_block_bind() {
         assert!(check_src(
-            "*people : [{name: Text, age: Int}]\nmain = do\n  p <- *people\n  yield p.name"
+            "*people : [{name: Text, age: Int 1}]\nmain = do\n  p <- *people\n  yield p.name"
         ).is_empty());
     }
 
@@ -11785,7 +11860,7 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn set_type_matches_source() {
         assert!(check_src(
-            "*nums : [Int]\nmain = replace *nums = [1, 2, 3]"
+            "*nums : [Int 1]\nmain = replace *nums = [1, 2, 3]"
         ).is_empty());
     }
 
@@ -11794,7 +11869,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // `*nums = [1, 2, 3]` doesn't reference *nums, so it's a full
         // replacement and must use `replace` syntax.
         let diags = check_src(
-            "*nums : [Int]\nmain = *nums = [1, 2, 3]"
+            "*nums : [Int 1]\nmain = *nums = [1, 2, 3]"
         );
         assert!(has_error(&diags, "replace *nums"));
     }
@@ -11804,7 +11879,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // `xs <- *people` makes `xs` an alias for *people, so writing
         // `union xs [...]` counts as referencing the source.
         let diags = check_src(
-            "type P = {name: Text, age: Int}\n\
+            "type P = {name: Text, age: Int 1}\n\
              *people : [P]\n\
              insert = \\name age -> do\n  \
                ps <- *people\n  \
@@ -11818,7 +11893,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // Even with a local source bind, replacing with an unrelated value
         // is a full replacement and must use `replace`.
         let diags = check_src(
-            "type P = {name: Text, age: Int}\n\
+            "type P = {name: Text, age: Int 1}\n\
              *people : [P]\n\
              *other : [P]\n\
              copy = do\n  \
@@ -11833,7 +11908,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // `replace *rel = expr` where the value references *rel is
         // unnecessary — `set` would produce the same final state.
         let diags = check_src(
-            "type P = {name: Text, age: Int}\n\
+            "type P = {name: Text, age: Int 1}\n\
              *people : [P]\n\
              birthday = do\n  \
                replace *people = do\n    \
@@ -11849,7 +11924,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // Aliases (`xs <- *rel`) count as referencing the source, so
         // `replace *rel = union xs new` is also unnecessary.
         let diags = check_src(
-            "type P = {name: Text, age: Int}\n\
+            "type P = {name: Text, age: Int 1}\n\
              *people : [P]\n\
              insert = \\name age -> do\n  \
                ps <- *people\n  \
@@ -11864,7 +11939,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // The canonical `replace` use case: replacing with a literal that
         // doesn't reference the source.
         let diags = check_src(
-            "type P = {name: Text, age: Int}\n\
+            "type P = {name: Text, age: Int 1}\n\
              *people : [P]\n\
              main = do\n  \
                replace *people = [{name: \"Alice\", age: 30}]\n  \
@@ -11876,7 +11951,7 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn set_type_mismatch() {
         let diags = check_src(
-            "*nums : [Int]\nmain = replace *nums = [\"a\", \"b\"]"
+            "*nums : [Int 1]\nmain = replace *nums = [\"a\", \"b\"]"
         );
         assert!(has_error(&diags, "type mismatch"));
     }
@@ -11897,7 +11972,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn min_builtin_int() {
         // minOn : (a -> b) -> [a] -> b ; numeric projection
         assert!(check_src(
-            "type T = {x: Int}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (minOn (\\t -> t.x) ts)"
+            "type T = {x: Int 1}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (minOn (\\t -> t.x) ts)"
         ).is_empty());
     }
 
@@ -11912,7 +11987,7 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn count_where_builtin() {
         assert!(check_src(
-            "type T = {x: Int}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (countWhere (\\t -> t.x > 5) ts)"
+            "type T = {x: Int 1}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (countWhere (\\t -> t.x > 5) ts)"
         ).is_empty());
     }
 
@@ -11920,7 +11995,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn count_where_rejects_non_bool() {
         // countWhere predicate must return Bool
         let diags = check_src(
-            "type T = {x: Int}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (countWhere (\\t -> t.x) ts)"
+            "type T = {x: Int 1}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (countWhere (\\t -> t.x) ts)"
         );
         assert!(has_error(&diags, "type mismatch"));
     }
@@ -11960,7 +12035,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn exhaustive_case_all_constructors() {
         // Covering all constructors is fine.
         assert!(check_src(
-            "data Shape = Circle {r: Int} | Rect {w: Int, h: Int}\n\
+            "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
              f = \\s -> case s of\n  Circle {r} -> r\n  Rect {w, h} -> w * h\n\
              main = f (Circle {r: 5})"
         ).is_empty());
@@ -11970,7 +12045,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn exhaustive_case_wildcard() {
         // A wildcard catch-all makes any match exhaustive.
         assert!(check_src(
-            "data Shape = Circle {r: Int} | Rect {w: Int, h: Int}\n\
+            "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
              f = \\s -> case s of\n  Circle {r} -> r\n  _ -> 0\n\
              main = f (Circle {r: 5})"
         ).is_empty());
@@ -11980,7 +12055,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn exhaustive_case_var_catchall() {
         // A variable catch-all also makes it exhaustive.
         assert!(check_src(
-            "data Shape = Circle {r: Int} | Rect {w: Int, h: Int}\n\
+            "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
              f = \\s -> case s of\n  Circle {r} -> r\n  other -> 0\n\
              main = f (Circle {r: 5})"
         ).is_empty());
@@ -11990,7 +12065,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn non_exhaustive_case_missing_constructor() {
         // Missing Rect — should produce an error.
         let diags = check_src(
-            "data Shape = Circle {r: Int} | Rect {w: Int, h: Int}\n\
+            "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
              f = \\s -> case s of\n  Circle {r} -> r\n\
              main = f (Circle {r: 5})"
         );
@@ -12015,7 +12090,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn exhaustive_case_single_constructor() {
         // Data type with one constructor — a single arm is exhaustive.
         assert!(check_src(
-            "data Wrapper = Wrap {val: Int}\n\
+            "data Wrapper = Wrap {val: Int 1}\n\
              f = \\w -> case w of\n  Wrap {val} -> val\n\
              main = f (Wrap {val: 42})"
         ).is_empty());
@@ -12368,8 +12443,8 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn closed_variant_unifies_with_matching_adt() {
         let diags = check_src(
-            "data Shape = Circle {radius: Float} | Rect {w: Float, h: Float}\n\
-             f : <Circle {radius: Float} | Rect {w: Float, h: Float}> -> Float\n\
+            "data Shape = Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}\n\
+             f : <Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}> -> Float 1\n\
              f = \\s -> 1.0\n\
              main = f (Circle {radius: 3.0})",
         );
@@ -12379,8 +12454,8 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn open_variant_accepts_adt_with_extra_constructors() {
         let diags = check_src(
-            "data Shape = Circle {radius: Float} | Rect {w: Float, h: Float}\n\
-             f : <Circle {radius: Float} | r> -> Float\n\
+            "data Shape = Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}\n\
+             f : <Circle {radius: Float 1} | r> -> Float 1\n\
              f = \\s -> 1.0\n\
              main = f (Circle {radius: 3.0})",
         );
@@ -12391,7 +12466,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn variant_missing_constructor_error() {
         let diags = check_src(
             "data Color = Red {} | Blue {}\n\
-             f : <Red {} | Blue {} | Green {}> -> Int\n\
+             f : <Red {} | Blue {} | Green {}> -> Int 1\n\
              f = \\c -> 1\n\
              main = f (Red {})",
         );
@@ -12402,7 +12477,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn open_variant_polymorphic_function() {
         let diags = check_src(
             "data Status = Open {} | Closed {} | InProgress {assignee: Text}\n\
-             isOpen : <Open {} | r> -> Int\n\
+             isOpen : <Open {} | r> -> Int 1\n\
              isOpen = \\s -> 1\n\
              main = isOpen (Open {})",
         );
@@ -12429,7 +12504,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // Matching all constructors without wildcard should close the
         // variant and the exhaustiveness check should pass.
         let diags = check_src(
-            "data Shape = Circle {r: Float} | Rect {w: Float, h: Float}\n\
+            "data Shape = Circle {r: Float 1} | Rect {w: Float 1, h: Float 1}\n\
              area = \\s -> case s of\n\
              \x20 Circle {r} -> r\n\
              \x20 Rect {w, h} -> w * h\n\
@@ -12693,7 +12768,7 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn refined_type_alias_definition() {
         // Defining a refined type should not produce errors
-        let diags = check_src("type Nat = Int where \\x -> x >= 0\nmain = 42");
+        let diags = check_src("type Nat = Int 1 where \\x -> x >= 0\nmain = 42");
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 
@@ -12703,7 +12778,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // `Int` is required (the `\x -> x` body returns its `Nat` param as the
         // declared `Int` result). The `Nat` is obtained soundly via `refine`.
         let diags = check_src(
-            "type Nat = Int where \\x -> x >= 0\nf : Nat -> Int\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value: n} -> f n\n  Err {error: _} -> 0"
+            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value: n} -> f n\n  Err {error: _} -> 0"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12715,7 +12790,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // runtime check runs there, so a negative could masquerade as a `Nat`.
         // `refine` is the only sound introduction form at such a boundary.
         let diags = check_src(
-            "type Nat = Int where \\x -> x >= 0\nf : Nat -> Int\nf = \\x -> x\nmain = f 42"
+            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = f 42"
         );
         assert!(
             has_error(&diags, "use `refine`"),
@@ -12730,7 +12805,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // allowed at type-check time — the write is validated at runtime — so
         // it must NOT trip the refined-introduction check.
         let diags = check_src(
-            "type Nat = Int where \\x -> x >= 0\n*ages : [{age: Nat}]\nmain = replace *ages = [{age: 30}]"
+            "type Nat = Int 1 where \\x -> x >= 0\n*ages : [{age: Nat}]\nmain = replace *ages = [{age: 30}]"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12739,7 +12814,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn refined_type_in_record() {
         // Inline refined type in a record should parse and type-check
         let diags = check_src(
-            "type Person = {name: Text, age: Int where \\x -> x >= 0}\nmain = 1"
+            "type Person = {name: Text, age: Int 1 where \\x -> x >= 0}\nmain = 1"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12748,7 +12823,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn refine_expr_with_case() {
         // refine should return Result RefinementError T, usable with case
         let diags = check_src(
-            "type Nat = Int where \\x -> x >= 0\nf : Nat -> Int\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value: n} -> f n\n  Err {error: _} -> 0"
+            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value: n} -> f n\n  Err {error: _} -> 0"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12757,7 +12832,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn refine_expr_in_result_do_block() {
         // refine in a do-block should use Result monad (bind short-circuits on Err)
         let diags = check_src(
-            "type Nat = Int where \\x -> x >= 0\nf : Nat -> Int\nf = \\x -> x\nmain = do\n  n <- refine 42\n  yield (f n)"
+            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = do\n  n <- refine 42\n  yield (f n)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12768,7 +12843,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // Forgetting still walks the whole chain to the base, so an `Age`
         // value (obtained soundly via `refine`) flows where `Int` is required.
         let diags = check_src(
-            "type Nat = Int where \\x -> x >= 0\ntype Age = Nat where \\x -> x <= 150\nf : Age -> Int\nf = \\x -> x\nmain = case refine 25 of\n  Ok {value: a} -> f a\n  Err {error: _} -> 0"
+            "type Nat = Int 1 where \\x -> x >= 0\ntype Age = Nat where \\x -> x <= 150\nf : Age -> Int 1\nf = \\x -> x\nmain = case refine 25 of\n  Ok {value: a} -> f a\n  Err {error: _} -> 0"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12777,7 +12852,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn refined_type_with_units() {
         // Refinement and units are orthogonal
         let diags = check_src(
-            "unit M\ntype PosFloat = Float where \\x -> x > 0.0\nmain = 1"
+            "unit M\ntype PosFloat = Float 1 where \\x -> x > 0.0\nmain = 1"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12795,7 +12870,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn refined_cross_field() {
         // Cross-field refinement on a record type
         let diags = check_src(
-            "type Range = {lo: Int, hi: Int} where \\r -> r.lo <= r.hi\nmain = 1"
+            "type Range = {lo: Int 1, hi: Int 1} where \\r -> r.lo <= r.hi\nmain = 1"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12805,7 +12880,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // A trait impl on the base type should satisfy a constraint on the
         // refined type, since refined types are erased at runtime.
         let diags = check_src(
-            "type Nat = Int where \\x -> x >= 0\n\
+            "type Nat = Int 1 where \\x -> x >= 0\n\
              trait Show_ a where\n  show_ : a -> Text\n\
              impl Show_ Int where\n  show_ n = \"int\"\n\
              f : Nat -> Text\n\
@@ -12819,7 +12894,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn refined_type_chain_uses_base_trait_impl() {
         // Stacked refinements should also resolve to the ultimate base type's impl.
         let diags = check_src(
-            "type Nat = Int where \\x -> x >= 0\n\
+            "type Nat = Int 1 where \\x -> x >= 0\n\
              type Age = Nat where \\x -> x <= 150\n\
              trait Show_ a where\n  show_ : a -> Text\n\
              impl Show_ Int where\n  show_ n = \"int\"\n\
@@ -12933,7 +13008,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn strip_unit_float() {
         let diags = check_src(
             "unit M\n\
-             f : Float M -> Float\n\
+             f : Float M -> Float 1\n\
              f = \\x -> stripFloatUnit x\n\
              main = 1"
         );
@@ -12944,7 +13019,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn with_unit_float() {
         let diags = check_src(
             "unit M\n\
-             f : Float -> Float M\n\
+             f : Float 1 -> Float M\n\
              f = \\x -> withFloatUnit x\n\
              main = 1"
         );
@@ -12967,7 +13042,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // type Person = {...} should appear as "Person" in the inferred
         // type of any function that mentions it, not as the expanded form.
         let info = type_info_for(
-            "type Person = {name: Text, age: Int}\n\
+            "type Person = {name: Text, age: Int 1}\n\
              greet : Person -> Text\n\
              greet = \\p -> p.name\n\
              main = 1"
@@ -13001,7 +13076,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // Field access through an alias must still type-check — the
         // structural inspection has to peel the alias to find the field.
         let diags = check_src(
-            "type Person = {name: Text, age: Int}\n\
+            "type Person = {name: Text, age: Int 1}\n\
              greet : Person -> Text\n\
              greet = \\p -> p.name\n\
              main = greet {name: \"Alice\", age: 30}"
@@ -13013,7 +13088,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn alias_relation_bind_typechecks() {
         // *people : [Person]; reading from it must still typecheck.
         let diags = check_src(
-            "type Person = {name: Text, age: Int}\n\
+            "type Person = {name: Text, age: Int 1}\n\
              *people : [Person]\n\
              main = do\n  \
                replace *people = [{name: \"A\", age: 1}]\n  \
@@ -13027,8 +13102,8 @@ main = applyPred (\\r -> r.x == r.y)\
     fn alias_for_function_type() {
         // type Handler = Int -> Text; calling a Handler must work.
         let diags = check_src(
-            "type Handler = Int -> Text\n\
-             apply : Handler -> Int -> Text\n\
+            "type Handler = Int 1 -> Text\n\
+             apply : Handler -> Int 1 -> Text\n\
              apply = \\h x -> h x\n\
              main = apply (\\n -> show n) 42"
         );
@@ -13052,7 +13127,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // Negation on an aliased numeric type must work — the unary op
         // path inspects the resolved type structurally.
         let diags = check_src(
-            "type Cents = Int\n\
+            "type Cents = Int 1\n\
              flip : Cents -> Cents\n\
              flip = \\x -> -x\n\
              main = flip 100"
@@ -13173,8 +13248,8 @@ main = applyPred (\\r -> r.x == r.y)\
         // A handler that writes to a relation surfaces `w *foo` through
         // listen's effect row.
         let info = type_info_for(
-            "*counter : [{value: Int}]\n\
-             route Api where\n  POST / -> {value: Int} = Bump\n\
+            "*counter : [{value: Int 1}]\n\
+             route Api where\n  POST / -> {value: Int 1} = Bump\n\
              api = serve Api where\n  Bump = \\{} -> do\n    *counter = [{value: 1}]\n    yield Ok {value: {value: 1}}\n\
              main = listen 8080 api"
         );

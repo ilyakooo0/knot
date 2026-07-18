@@ -923,7 +923,7 @@ mod tests {
         // header (here the type parameter `a`) must resolve to its own
         // signature line, not the header occurrence — otherwise goto/rename
         // on calls of the method jump to / edit the type parameter.
-        let source = "trait T a where\n  a : a -> Int\n";
+        let source = "trait T a where\n  a : a -> Int 1\n";
         let module = parse(source);
         let (defs, _, _) = resolve_definitions(&module, source);
         let span = defs.get("a").expect("method `a` is defined");
@@ -975,7 +975,7 @@ mod tests {
 
     #[test]
     fn migrate_relation_is_recorded_as_reference() {
-        let source = "*users : [{v: Int}]\nf = \\x -> x\nmigrate *users from Int to Int using f\n";
+        let source = "*users : [{v: Int 1}]\nf = \\x -> x\nmigrate *users from Int to Int using f\n";
         let module = parse(source);
         let defs = resolve_definitions(&module, source);
         assert!(
@@ -990,7 +990,7 @@ mod tests {
         // the method search on the first *substring* `where` would land inside
         // the name, before the real keyword, and resolve method `a` to the
         // header type parameter `a`. A whole-word keyword search must skip it.
-        let source = "trait Nowhere a where\n  a : a -> Int\n";
+        let source = "trait Nowhere a where\n  a : a -> Int 1\n";
         let module = parse(source);
         let (defs, _, _) = resolve_definitions(&module, source);
         let span = defs.get("a").expect("method `a` is defined");

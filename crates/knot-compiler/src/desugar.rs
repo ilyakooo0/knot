@@ -1580,7 +1580,7 @@ mod tests {
     #[test]
     fn mixed_do_block_not_desugared() {
         let src = r#"
-            *people : [{name: Text, age: Int}]
+            *people : [{name: Text, age: Int 1}]
             main = do
               *people = [{name: "Alice", age: 30}]
               p <- *people
@@ -1601,7 +1601,7 @@ mod tests {
     #[test]
     fn set_value_do_not_desugared() {
         let src = r#"
-            *todos : [{title: Text, done: Int}]
+            *todos : [{title: Text, done: Int 1}]
             complete = \title ->
               *todos = do
                 t <- *todos
@@ -1648,7 +1648,7 @@ mod tests {
         // SQL-compilable do-blocks (Bind→SourceRef + Where + Yield(Var))
         // are preserved as Do nodes for codegen to compile to SQL.
         let src = r#"
-            *items : [{x: Int}]
+            *items : [{x: Int 1}]
             filtered = do
               i <- *items
               where i.x > 0
@@ -1690,7 +1690,7 @@ mod tests {
     #[test]
     fn groupby_do_not_desugared() {
         let src = r#"
-            *items : [{x: Int, cat: Text}]
+            *items : [{x: Int 1, cat: Text}]
             grouped = do
               i <- *items
               groupBy {i.cat}
@@ -1714,7 +1714,7 @@ mod tests {
     fn multi_table_sql_compilable_preserved() {
         let src = r#"
             *employees : [{name: Text, dept: Text}]
-            *departments : [{name: Text, budget: Int}]
+            *departments : [{name: Text, budget: Int 1}]
             joined = do
               e <- *employees
               d <- *departments
@@ -1765,7 +1765,7 @@ mod tests {
         // and compiles the inner do to a single SQL query, so it must be
         // preserved as a raw Do node.
         let src = r#"
-            *people : [{name: Text, age: Int}]
+            *people : [{name: Text, age: Int 1}]
             main = do
               rows <- *people
               let adults = do
@@ -1803,7 +1803,7 @@ mod tests {
         // A lambda param shadows a source-bound variable of the same name:
         // inside the lambda, `u <- rows` is no longer a source read.
         let src = r#"
-            *people : [{name: Text, age: Int}]
+            *people : [{name: Text, age: Int 1}]
             main = do
               rows <- *people
               let f = \rows -> do

@@ -84,14 +84,14 @@ fn associated_type_reduces_on_single_variant_data() {
   type Elem c
   toList : c -> [Elem c]
 
-data IntBox = IntBox {v: Int}
+data IntBox = IntBox {v: Int 1}
 
 impl Container IntBox where
-  type Elem IntBox = Int
+  type Elem IntBox = Int 1
   toList b = case b of
     IntBox {v} -> [v]
 
-useit : IntBox -> [Int]
+useit : IntBox -> [Int 1]
 useit = \b -> toList b
 
 main = do
@@ -117,10 +117,10 @@ fn associated_type_reduces_with_multi_variant_control() {
   type Elem c
   toList : c -> [Elem c]
 
-data Two = A {v: Int} | B {v: Int}
+data Two = A {v: Int 1} | B {v: Int 1}
 
 impl Container Two where
-  type Elem Two = Int
+  type Elem Two = Int 1
   toList t = case t of
     A {v} -> [v]
     B {v} -> [v]
@@ -163,11 +163,11 @@ main = do
 fn single_yield_do_block_respects_maybe_and_relation() {
     let (stdout, stderr, ok) = compile_and_run(
         "single_yield_monads",
-        r#"nums : [Int]
+        r#"nums : [Int 1]
 nums = do
   yield 5
 
-mb : Maybe Int
+mb : Maybe Int 1
 mb = do
   yield 7
 
@@ -191,7 +191,7 @@ main = do
 fn sortby_float_do_block_orders_numerically() {
     let (stdout, stderr, ok) = compile_and_run(
         "sortby_float",
-        r#"*items : [{name: Text, qty: Int, price: Float}]
+        r#"*items : [{name: Text, qty: Int 1, price: Float 1}]
 
 byqty = do
   it <- *items
@@ -234,9 +234,9 @@ fn user_cons_constructor_is_matchable() {
     // not the built-in two-atom `Cons head tail` list form.
     let (stdout, stderr, ok) = compile_and_run(
         "user_cons",
-        r#"data L = Nil {} | Cons {head: Int, tail: L}
+        r#"data L = Nil {} | Cons {head: Int 1, tail: L}
 
-sumL : L -> Int
+sumL : L -> Int 1
 sumL = \l -> case l of
   Nil {} -> 0
   Cons {head: h, tail: t} -> h + sumL t
@@ -255,7 +255,7 @@ fn builtin_list_cons_still_matches() {
     // The two-atom form `Cons a rest` must still destructure a non-empty list.
     let (stdout, stderr, ok) = compile_and_run(
         "builtin_cons",
-        r#"firstOf : [Int] -> Int
+        r#"firstOf : [Int 1] -> Int 1
 firstOf = \xs -> case xs of
   Cons a rest -> a
   _ -> 0
@@ -275,7 +275,7 @@ main = do
 fn elem_arithmetic_needle_matches() {
     let (stdout, stderr, ok) = compile_and_run(
         "elem_arith",
-        r#"*rows : [{a: Int, b: Int}]
+        r#"*rows : [{a: Int 1, b: Int 1}]
 
 query = do
   rs <- *rows

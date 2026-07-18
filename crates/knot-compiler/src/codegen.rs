@@ -237,7 +237,7 @@ pub struct Codegen {
     /// are conservatively treated as possibly-writing).
     top_fn_names: HashSet<String>,
 
-    // Scalar sources: source names whose type is a bare primitive (e.g. `*counter : Int`)
+    // Scalar sources: source names whose type is a bare primitive (e.g. `*counter : Int 1`)
     // rather than a relation of records. These get automatic wrap/unwrap of `_value` field.
     scalar_sources: HashSet<String>,
 
@@ -342,7 +342,7 @@ pub struct Codegen {
 }
 
 /// A top-level constant declared as a signature with no body
-/// (e.g. `port : Int` or `host : Text`). The value must be supplied
+/// (e.g. `port : Int 1` or `host : Text`). The value must be supplied
 /// at run time via a `--<name>=<value>` CLI argument.
 #[derive(Clone)]
 struct RequiredConstant {
@@ -562,7 +562,7 @@ fn classify_required_constant_type(
 ) -> Option<(String, Option<RequiredRefinement>)> {
     match &ty.node {
         ast::TypeKind::Refined { base, predicate } => {
-            // Inline refinement: `name : Int where \x -> x > 0`. The refined type
+            // Inline refinement: `name : Int 1 where \x -> x > 0`. The refined type
             // has no name of its own, so we use the constant's name as the label.
             let (base_type, _) = classify_required_constant_type(
                 base,
@@ -17585,7 +17585,7 @@ fn ast_type_to_descriptor_type(
             format!("[{}]", ast_type_to_descriptor_type(inner, aliases))
         }
         ast::TypeKind::UnitAnnotated { base, .. } => ast_type_to_descriptor_type(base, aliases),
-        // A refined field (`amount: Int where \x -> x > 0`) is transparent for
+        // A refined field (`amount: Int 1 where \x -> x > 0`) is transparent for
         // the wire: it must carry the base type's descriptor, not the `text`
         // fallback — otherwise valid JSON numbers/objects are (de)serialized as
         // Text, inconsistent with the refinement validators codegen already

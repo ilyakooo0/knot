@@ -189,11 +189,11 @@ fn build_explicit_output_path_still_works() {
 const ROUTES_A: &str = r#"
 route AApi where
   /a
-    GET /one -> Int = GetOne
+    GET /one -> Int 1 = GetOne
 
 route BApi where
   /b
-    GET /two -> Int = GetTwo
+    GET /two -> Int 1 = GetTwo
 "#;
 
 fn ctors_for(src: &str, route: &str) -> Vec<String> {
@@ -263,7 +263,7 @@ fn lockfile_resolves_types_imported_from_other_modules() {
     let dir = scratch_dir("lockfile_imports");
     std::fs::write(
         dir.join("types.knot"),
-        "type Person = {name: Text, age: Int}\n",
+        "type Person = {name: Text, age: Int 1}\n",
     )
     .unwrap();
     std::fs::write(

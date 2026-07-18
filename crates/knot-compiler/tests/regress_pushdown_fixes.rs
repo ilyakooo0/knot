@@ -189,7 +189,7 @@ fn nested_constructor_in_record_pattern_is_tested() {
 fn filter_param_shadowing_local_let_is_not_expanded() {
     let (stdout, stderr, ok) = compile_and_run(
         "beta_shadow",
-        r#"type E = {value: Int}
+        r#"type E = {value: Int 1}
 *es : [E]
 
 main = do
@@ -258,7 +258,7 @@ fn io_loop_pattern_mismatch_skips_row_without_unit() {
 fn group_by_post_group_reference_to_other_bind_is_compile_error() {
     let stderr = compile_expect_error(
         "groupby_other_bind",
-        r#"type X = {k: Text, v: Int}
+        r#"type X = {k: Text, v: Int 1}
 type Y = {k: Text}
 *xs : [X]
 *ys : [Y]
@@ -332,7 +332,7 @@ main = do
 fn user_eq_impl_on_int_disables_where_pushdown() {
     let (stdout, stderr, ok) = compile_and_run(
         "user_eq_no_pushdown",
-        r#"type T = {n: Int}
+        r#"type T = {n: Int 1}
 *items : [T]
 
 impl Eq Int where
@@ -354,13 +354,13 @@ main = do
     assert!(stdout.contains("f: 0"), "filter must use the user eq impl, got: {stdout}");
 }
 
-// ── Bug 6: Int/Int division pushed to SQL stays Int-typed ──────────
+// ── Bug 6: Int 1/Int division pushed to SQL stays Int-typed ──────────
 
 #[test]
 fn int_division_in_yield_projection_stays_int() {
     let (stdout, stderr, ok) = compile_and_run(
         "int_div_projection",
-        r#"type T = {x: Int}
+        r#"type T = {x: Int 1}
 *t : [T]
 
 main = do
@@ -376,7 +376,7 @@ main = do
     // result schema previously said float and printed 2.0.
     assert!(
         stdout.contains("{h: 2}") && !stdout.contains("2.0"),
-        "Int division must stay Int, got: {stdout}"
+        "Int division must stay Int 1, got: {stdout}"
     );
 }
 
@@ -410,7 +410,7 @@ fn trim_in_where_is_unicode_aware() {
 fn min_on_if_else_over_int_column_matches_in_memory() {
     let (stdout, stderr, ok) = compile_and_run(
         "minon_int_case",
-        r#"type T = {a: Int}
+        r#"type T = {a: Int 1}
 *t : [T]
 
 main = do
@@ -429,7 +429,7 @@ main = do
 fn sort_by_if_else_over_int_column_matches_in_memory() {
     let (stdout, stderr, ok) = compile_and_run(
         "sortby_int_case",
-        r#"type T = {a: Int}
+        r#"type T = {a: Int 1}
 *t : [T]
 
 main = do
@@ -444,7 +444,7 @@ main = do
     assert!(stdout.contains("s: [{a: 9}, {a: 10}]"), "got: {stdout}");
 }
 
-// ── Bug 10: Int-arithmetic overflow must not satisfy filters ───────
+// ── Bug 10: Int 1-arithmetic overflow must not satisfy filters ───────
 
 #[test]
 fn int_arithmetic_overflow_in_where_compares_numerically() {
@@ -456,7 +456,7 @@ fn int_arithmetic_overflow_in_where_compares_numerically() {
     // numeric comparison is the documented pushdown behavior.)
     let (stdout, stderr, ok) = compile_and_run(
         "int_arith_overflow",
-        r#"type T = {a: Int, b: Int}
+        r#"type T = {a: Int 1, b: Int 1}
 *t : [T]
 
 main = do
@@ -479,7 +479,7 @@ fn int_arithmetic_where_still_pushes_correct_results() {
     // over-fallback regression and the NUMERIC casts compare correctly).
     let (stdout, stderr, ok) = compile_and_run(
         "int_arith_inrange",
-        r#"type T = {a: Int, b: Int}
+        r#"type T = {a: Int 1, b: Int 1}
 *t : [T]
 
 main = do
@@ -504,7 +504,7 @@ main = do
 fn float_neg_zero_equality_is_consistent() {
     let (stdout, stderr, ok) = compile_and_run(
         "float_total_cmp",
-        r#"type T = {x: Float}
+        r#"type T = {x: Float 1}
 *t : [T]
 
 main = do
@@ -545,7 +545,7 @@ impl Ord Level where
       High y -> EQ {}
       _ -> GT {})
 
-type T = {lvl: Level, n: Int}
+type T = {lvl: Level, n: Int 1}
 *t : [T]
 
 main = do
@@ -572,7 +572,7 @@ fn equality_on_tag_column_still_works() {
 impl Eq Level where
   eq = \a b -> show a == show b
 
-type T = {lvl: Level, n: Int}
+type T = {lvl: Level, n: Int 1}
 *t : [T]
 
 main = do
@@ -596,7 +596,7 @@ main = do
 fn minmax_over_text_column_returns_text_not_reparsed_int() {
     let (stdout, stderr, ok) = compile_and_run(
         "minmax_text_col",
-        r#"type Z = {code: Text, n: Int}
+        r#"type Z = {code: Text, n: Int 1}
 *z : [Z]
 
 main = do
@@ -639,7 +639,7 @@ impl Ord Level where
       High y -> EQ {}
       _ -> GT {})
 
-type T = {lvl: Level, n: Int}
+type T = {lvl: Level, n: Int 1}
 *t : [T]
 
 main = do

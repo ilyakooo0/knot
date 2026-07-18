@@ -16,17 +16,17 @@ main = do
   -- input is recoverable rather than fatal — match on the result.
   let json = toJson {x: 10, y: 20}
   println json
-  case parseJson json : Maybe {x: Int, y: Int} of
+  case parseJson json : Maybe {x: Int 1, y: Int 1} of
     Just {value} -> println (show value)
     Nothing {} -> println "parse failed"
 
   -- Parse a JSON array
-  case parseJson "[1, 2, 3]" : Maybe [Int] of
+  case parseJson "[1, 2, 3]" : Maybe [Int 1] of
     Just {value} -> println (show value)
     Nothing {} -> println "parse failed"
 
   -- Malformed input decodes to Nothing instead of crashing the program
-  case parseJson "not valid json" : Maybe [Int] of
+  case parseJson "not valid json" : Maybe [Int 1] of
     Just {value} -> println (show value)
     Nothing {} -> println "parse failed (as expected)"
 

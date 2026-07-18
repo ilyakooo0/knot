@@ -48,7 +48,7 @@ fn arithmetic_does_not_launder_refinement() {
     // `a - b` for `a, b : Nat` can be negative, so it must NOT be typed `Nat`.
     // With the result degraded to the base `Int`, the declared `Nat` return
     // forces the introducing-subsumption error demanding `refine`.
-    let src = "type Nat = Int where \\x -> x >= 0\n\
+    let src = "type Nat = Int 1 where \\x -> x >= 0\n\
                sub : Nat -> Nat -> Nat\n\
                sub = \\a b -> a - b\n";
     let diags = check_src(src);
@@ -62,7 +62,7 @@ fn arithmetic_does_not_launder_refinement() {
 
 #[test]
 fn negation_does_not_launder_refinement() {
-    let src = "type Nat = Int where \\x -> x >= 0\n\
+    let src = "type Nat = Int 1 where \\x -> x >= 0\n\
                neg : Nat -> Nat\n\
                neg = \\a -> -a\n";
     let diags = check_src(src);
@@ -77,8 +77,8 @@ fn negation_does_not_launder_refinement() {
 fn refined_arithmetic_result_is_usable_as_base() {
     // The degraded result is the base type, so returning `Int` is fine — this
     // must still type-check (no over-rejection of legitimate code).
-    let src = "type Nat = Int where \\x -> x >= 0\n\
-               diff : Nat -> Nat -> Int\n\
+    let src = "type Nat = Int 1 where \\x -> x >= 0\n\
+               diff : Nat -> Nat -> Int 1\n\
                diff = \\a b -> a - b\n";
     let diags = check_src(src);
     assert!(
@@ -108,8 +108,8 @@ fn refinement_over_adt_base_requires_refine() {
 fn refinement_forgetting_direction_still_allowed() {
     // Using a refined value where its base is required (forgetting the
     // refinement) is always sound and must keep compiling.
-    let src = "type Nat = Int where \\x -> x >= 0\n\
-               use : Nat -> Int\n\
+    let src = "type Nat = Int 1 where \\x -> x >= 0\n\
+               use : Nat -> Int 1\n\
                use = \\n -> n\n";
     let diags = check_src(src);
     assert!(
@@ -126,7 +126,7 @@ fn unit_exponent_overflow_does_not_panic() {
     let src = "unit M\n\
                area : Float (M^2000000000)\n\
                area = (1.0 : Float (M^2000000000))\n\
-               sq : Float (M^2000000000) -> Float\n\
+               sq : Float (M^2000000000) -> Float 1\n\
                sq = \\x -> stripFloatUnit (x * x)\n";
     // The only assertion that matters is that `check_src` returns without
     // panicking; the exponent saturates instead of overflowing.

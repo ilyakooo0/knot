@@ -338,7 +338,7 @@ impl<'a> TokenCollector<'a> {
                 }
             }
             DeclKind::TypeAlias { ty, .. } => {
-                // Refined-type aliases (`type Nat = Int where \x -> x >= 0`)
+                // Refined-type aliases (`type Nat = Int 1 where \x -> x >= 0`)
                 // contain expression-bodied predicates; walk the type so the
                 // predicate's tokens get highlighted alongside the rest of
                 // the file.
@@ -860,7 +860,7 @@ mod tests {
         // `B` appears first as a field type inside `A`'s payload and then as a
         // real constructor. The ENUM_MEMBER token for the constructor must be
         // anchored on the real `B` (after the `|`), not on the field-type `B`.
-        let src = "data T = A {x: B} | B {y: Int}\n";
+        let src = "data T = A {x: B} | B {y: Int 1}\n";
         let mut ws = TestWorkspace::new();
         let uri = ws.open("main", src);
         let doc = ws.state.documents.get(&uri).expect("doc");

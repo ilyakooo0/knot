@@ -225,7 +225,7 @@ fn call_hierarchy_incoming_excludes_self_declaration_token() {
     let mut ws = TestWorkspace::new();
     let uri = ws.open(
         "main",
-        "inc : Int -> Int\ninc = \\x -> x + 1\nmain = println (show (inc 41))\n",
+        "inc : Int 1 -> Int 1\ninc = \\x -> x + 1\nmain = println (show (inc 41))\n",
     );
     let doc = ws.doc(&uri);
     let inc_def = *doc.definitions.get("inc").expect("inc defined");
@@ -323,8 +323,8 @@ fn type_hierarchy_supertypes_require_whole_token_match() {
     let mut ws = TestWorkspace::new();
     let uri = ws.open(
         "main",
-        r#"data Id = MkId {v: Int}
-data UserId = MkUserId {v: Int}
+        r#"data Id = MkId {v: Int 1}
+data UserId = MkUserId {v: Int 1}
 trait Display a where
   display : a -> Text
 impl Display UserId where
@@ -364,8 +364,8 @@ fn goto_type_definition_selects_innermost_containing_span() {
     let mut ws = TestWorkspace::new();
     let uri = ws.open(
         "main",
-        r#"type Inner = {x: Int}
-type Outer = {y: Int}
+        r#"type Inner = {x: Int 1}
+type Outer = {y: Int 1}
 check = \v -> v
 "#,
     );
@@ -422,7 +422,7 @@ impl Display Int where
   display x = "int"
 route Api where
   /things
-    GET /count -> Int = GetCount
+    GET /count -> Int 1 = GetCount
 "#,
     );
     let params = DocumentSymbolParams {

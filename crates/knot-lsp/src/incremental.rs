@@ -791,8 +791,8 @@ b = \y -> y
     fn signature_changed_decls_ignores_body_change_in_typed_fun() {
         // Typed function: signature stays the same, body shifts. Dependents
         // shouldn't need re-checking.
-        let a = parse_module("double : Int -> Int\ndouble = \\x -> x * 2\n");
-        let b = parse_module("double : Int -> Int\ndouble = \\x -> x * 3\n");
+        let a = parse_module("double : Int 1 -> Int 1\ndouble = \\x -> x * 2\n");
+        let b = parse_module("double : Int 1 -> Int 1\ndouble = \\x -> x * 3\n");
         let fa = ModuleFingerprint::from_module(&a);
         let fb = ModuleFingerprint::from_module(&b);
 
@@ -831,8 +831,8 @@ b = \y -> y
     #[test]
     fn signature_changed_decls_detects_signature_edit() {
         // Signature changed (return type Int → Float) — must propagate.
-        let a = parse_module("double : Int -> Int\ndouble = \\x -> x\n");
-        let b = parse_module("double : Int -> Float\ndouble = \\x -> x\n");
+        let a = parse_module("double : Int 1 -> Int 1\ndouble = \\x -> x\n");
+        let b = parse_module("double : Int 1 -> Float 1\ndouble = \\x -> x\n");
         let fa = ModuleFingerprint::from_module(&a);
         let fb = ModuleFingerprint::from_module(&b);
 

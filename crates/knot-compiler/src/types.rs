@@ -1425,7 +1425,7 @@ fn schema_for_source(
             if let ResolvedType::Relation(inner) = &resolved {
                 return relation_inner_schema(inner);
             }
-            // Non-relation source type (e.g. `*counter : Int`):
+            // Non-relation source type (e.g. `*counter : Int 1`):
             // wrap as a single-column `_value` schema.
             format!("_value:{}", col_type_str(&resolved))
         }

@@ -104,7 +104,7 @@ fn text_take_drop_negative_counts_clamp() {
 fn min_max_on_int_column_supports_arithmetic() {
     let (stdout, stderr, ok) = compile_and_run(
         "minon_int_arith",
-        r#"type Employee = {name: Text, salary: Int}
+        r#"type Employee = {name: Text, salary: Int 1}
 *employees : [Employee]
 
 main = do
@@ -138,7 +138,7 @@ main = do
 fn pipe_filter_min_on_int_column_supports_arithmetic() {
     let (stdout, stderr, ok) = compile_and_run(
         "pipe_minon_int_arith",
-        r#"type Employee = {name: Text, dept: Text, salary: Int}
+        r#"type Employee = {name: Text, dept: Text, salary: Int 1}
 *employees : [Employee]
 
 main = do
@@ -170,9 +170,9 @@ main = do
 fn renaming_referenced_superset_key_is_rejected() {
     let (stdout, stderr, ok) = compile_and_run(
         "fk_superset_key_rename",
-        r#"type Person = {name: Text, age: Int}
+        r#"type Person = {name: Text, age: Int 1}
 *people : [Person]
-*orders : [{customer: Text, amount: Int}]
+*orders : [{customer: Text, amount: Int 1}]
 
 *orders.customer <= *people.name
 

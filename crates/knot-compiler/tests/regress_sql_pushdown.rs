@@ -71,7 +71,7 @@ fn compile_and_run(test_name: &str, source: &str) -> (String, String, bool) {
 fn pipe_take_then_drop_respects_order() {
     let (stdout, stderr, ok) = compile_and_run(
         "pipe_order",
-        r#"type Item = {n: Int}
+        r#"type Item = {n: Int 1}
 *items : [Item]
 
 main = do
@@ -104,7 +104,7 @@ main = do
 fn pipe_count_after_take_respects_limit() {
     let (stdout, stderr, ok) = compile_and_run(
         "pipe_count_take",
-        r#"type Item = {n: Int}
+        r#"type Item = {n: Int 1}
 *items : [Item]
 
 main = do
@@ -125,7 +125,7 @@ main = do
 fn aggregates_resolve_through_yield_projection() {
     let (stdout, stderr, ok) = compile_and_run(
         "projection",
-        r#"type Item = {amt: Int, qty: Int}
+        r#"type Item = {amt: Int 1, qty: Int 1}
 *items : [Item]
 
 main = do
@@ -159,7 +159,7 @@ main = do
 fn atomic_rolls_back_writes_made_through_function_parameter() {
     let (stdout, stderr, ok) = compile_and_run(
         "atomic_param",
-        r#"type Entry = {id: Int}
+        r#"type Entry = {id: Int 1}
 *log : [Entry]
 
 runAtomic = \act -> atomic (do
@@ -188,7 +188,7 @@ main = do
 fn union_append_validates_refinements() {
     let (_stdout, stderr, ok) = compile_and_run(
         "refine_append",
-        r#"type Pos = Int where \x -> x > 0
+        r#"type Pos = Int 1 where \x -> x > 0
 type Row = {v: Pos}
 *rows : [Row]
 
@@ -214,7 +214,7 @@ fn stm_retry_wakes_on_pushed_down_count() {
     use std::time::Instant;
     let c = compile(
         "stm_wake",
-        r#"type Flag = {id: Int, v: Int}
+        r#"type Flag = {id: Int 1, v: Int 1}
 *flags : [Flag]
 
 writer = do
@@ -261,7 +261,7 @@ main = do
 fn lambda_captures_local_shadowing_top_level() {
     let (stdout, stderr, ok) = compile_and_run(
         "shadow_capture",
-        r#"type Row = {n: Int}
+        r#"type Row = {n: Int 1}
 *xs : [Row]
 
 offset = 100
@@ -286,7 +286,7 @@ main = do
 fn float_arithmetic_and_unicode_in_where_match_in_memory() {
     let (stdout, stderr, ok) = compile_and_run(
         "float_where",
-        r#"type M = {v: Float}
+        r#"type M = {v: Float 1}
 *m : [M]
 
 type P = {name: Text}
@@ -323,7 +323,7 @@ main = do
 fn float_division_by_zero_in_where_keeps_ieee_semantics() {
     let (stdout, stderr, ok) = compile_and_run(
         "div_zero",
-        r#"type M = {v: Float}
+        r#"type M = {v: Float 1}
 *m : [M]
 
 main = do
@@ -348,7 +348,7 @@ main = do
 fn int_division_by_zero_in_where_panics_like_in_memory() {
     let (_stdout, stderr, ok) = compile_and_run(
         "div_zero_int",
-        r#"type M = {v: Int}
+        r#"type M = {v: Int 1}
 *m : [M]
 
 main = do
@@ -372,7 +372,7 @@ main = do
 fn division_by_literal_still_pushes_down_correctly() {
     let (stdout, stderr, ok) = compile_and_run(
         "div_literal",
-        r#"type M = {v: Float}
+        r#"type M = {v: Float 1}
 *m : [M]
 
 main = do
@@ -394,7 +394,7 @@ main = do
 fn case_referencing_bind_var_compiles_and_evaluates() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_value_side",
-        r#"type R = {x: Int, big: Bool}
+        r#"type R = {x: Int 1, big: Bool}
 *rs : [R]
 
 main = do
@@ -419,7 +419,7 @@ main = do
 fn int_arithmetic_where_still_correct() {
     let (stdout, stderr, ok) = compile_and_run(
         "int_arith",
-        r#"type M = {a: Int, b: Int}
+        r#"type M = {a: Int 1, b: Int 1}
 *m : [M]
 
 main = do
@@ -448,7 +448,7 @@ main = do
 fn count_of_bound_var_ignores_later_write() {
     let (stdout, stderr, ok) = compile_and_run(
         "stale_bind_write",
-        r#"type Item = {n: Int}
+        r#"type Item = {n: Int 1}
 *items : [Item]
 
 main = do
@@ -469,7 +469,7 @@ main = do
 fn count_of_rebound_var_uses_rebound_value() {
     let (stdout, stderr, ok) = compile_and_run(
         "stale_bind_rebind",
-        r#"type Item = {n: Int}
+        r#"type Item = {n: Int 1}
 *items : [Item]
 
 main = do
@@ -490,7 +490,7 @@ main = do
 fn write_inside_atomic_invalidates_outer_binding() {
     let (stdout, stderr, ok) = compile_and_run(
         "stale_bind_atomic",
-        r#"type Item = {n: Int}
+        r#"type Item = {n: Int 1}
 *items : [Item]
 
 main = do
@@ -513,7 +513,7 @@ main = do
 fn write_via_user_function_invalidates_binding() {
     let (stdout, stderr, ok) = compile_and_run(
         "stale_bind_write_fn",
-        r#"type Item = {n: Int}
+        r#"type Item = {n: Int 1}
 *items : [Item]
 
 addItem = \x -> replace *items = [{n: x}]
@@ -538,7 +538,7 @@ main = do
 fn lambda_param_inside_case_under_set_matcher() {
     let (stdout, stderr, ok) = compile_and_run(
         "subst_case_param",
-        r#"type Item = {n: Int}
+        r#"type Item = {n: Int 1}
 *items : [Item]
 
 main = do
@@ -645,7 +645,7 @@ fn retry_inside_relational_sub_do_completes() {
     // writer's update and terminate with the new row.
     let (stdout, stderr, ok) = compile_and_run(
         "retry_sub_do",
-        r#"type Item = {n: Int}
+        r#"type Item = {n: Int 1}
 *items : [Item]
 
 writer = do

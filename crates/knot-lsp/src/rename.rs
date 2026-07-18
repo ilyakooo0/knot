@@ -2477,7 +2477,7 @@ mod tests {
         // `defs.rs` didn't record component references. Renaming `AApi` must
         // update the composite component token too.
         let mut ws = TestWorkspace::new();
-        let src = "route AApi where\n  /a\n    GET /one -> Int = GetOne\nroute BApi where\n  /b\n    GET /two -> Int = GetTwo\nroute Api = AApi | BApi\n";
+        let src = "route AApi where\n  /a\n    GET /one -> Int 1 = GetOne\nroute BApi where\n  /b\n    GET /two -> Int 1 = GetTwo\nroute Api = AApi | BApi\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
         let off = doc.source.find("route AApi").expect("route def") + "route ".len();
@@ -2774,7 +2774,7 @@ mod tests {
         // the Migrate arm dropped `relation`. Renaming the source left the
         // migrate dangling. Renaming `users` must also update `migrate *users`.
         let mut ws = TestWorkspace::new();
-        let src = "*users : [{v: Int}]\nf = \\x -> x\nmigrate *users from Int to Int using f\n";
+        let src = "*users : [{v: Int 1}]\nf = \\x -> x\nmigrate *users from Int to Int using f\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
         let off = doc.source.find("users").expect("source def");
@@ -3100,7 +3100,7 @@ mod tests {
         // pattern (`Circle c`), so renaming the constructor deleted the
         // payload binder.
         let mut ws = TestWorkspace::new();
-        let src = "data Shape = Circle {radius: Int} | Square {side: Int}\n\
+        let src = "data Shape = Circle {radius: Int 1} | Square {side: Int 1}\n\
                    area = \\s -> case s of\n  Circle c -> c.radius\n  Square q -> q.side\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
@@ -3116,7 +3116,7 @@ mod tests {
             "payload binder must survive constructor rename; got:\n{out}"
         );
         assert!(
-            out.contains("data Shape = Round {radius: Int}"),
+            out.contains("data Shape = Round {radius: Int 1}"),
             "data declaration should be renamed; got:\n{out}"
         );
     }
@@ -3127,7 +3127,7 @@ mod tests {
         // cursor resolve to the constructor's definition, corrupting the
         // `data` declaration.
         let mut ws = TestWorkspace::new();
-        let src = "data Shape = Circle {radius: Int} | Square {side: Int}\n\
+        let src = "data Shape = Circle {radius: Int 1} | Square {side: Int 1}\n\
                    area = \\s -> case s of\n  Circle c -> c.radius\n  Square q -> q.side\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
@@ -3138,7 +3138,7 @@ mod tests {
             let edits = changes.get(&uri).expect("owner file edited");
             let out = apply_edits(&doc.source, edits);
             assert!(
-                out.contains("data Shape = Circle {radius: Int}"),
+                out.contains("data Shape = Circle {radius: Int 1}"),
                 "data declaration must not be touched by payload-var rename; got:\n{out}"
             );
             assert!(
@@ -3602,7 +3602,7 @@ mod regress_rename_fixes_tests {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "data Pair a = Pair {a: Int, b: a}\nmk = Pair {a: 1, b: 2}\n",
+            "data Pair a = Pair {a: Int 1, b: a}\nmk = Pair {a: 1, b: 2}\n",
         );
         let doc = ws.doc(&uri);
         // Cursor on the FIELD `a` inside the constructor record.
@@ -3615,7 +3615,7 @@ mod regress_rename_fixes_tests {
         let out = apply_edits(&doc.source, edits);
         assert_eq!(
             out,
-            "data Pair a = Pair {first: Int, b: a}\nmk = Pair {first: 1, b: 2}\n",
+            "data Pair a = Pair {first: Int 1, b: a}\nmk = Pair {first: 1, b: 2}\n",
             "the type parameter `a` (header and field type) must be untouched; edits: {edits:?}"
         );
     }
@@ -3625,7 +3625,7 @@ mod regress_rename_fixes_tests {
     #[test]
     fn rename_rejects_constructor_to_lowercase() {
         let mut ws = TestWorkspace::new();
-        let src = "data Shape = Circle {radius: Int}\n\
+        let src = "data Shape = Circle {radius: Int 1}\n\
                    area = \\s -> case s of\n  Circle c -> c.radius\n  _ -> 0\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
@@ -3839,10 +3839,10 @@ mod regress_rename_fixes_tests {
     fn rename_type_updates_importer_annotations() {
         use crate::test_support::TempWorkspace;
         let mut tw = TempWorkspace::new();
-        let owner_uri = tw.write_and_open("owner.knot", "type Shape = {radius: Int}\n");
+        let owner_uri = tw.write_and_open("owner.knot", "type Shape = {radius: Int 1}\n");
         let consumer_uri = tw.write_and_open(
             "consumer.knot",
-            "import ./owner\n\nf : Shape -> Int\nf = \\s -> 1\n",
+            "import ./owner\n\nf : Shape -> Int 1\nf = \\s -> 1\n",
         );
         let owner_doc = tw.workspace.doc(&owner_uri);
         let off = owner_doc.source.find("Shape").expect("type def");
@@ -3859,7 +3859,7 @@ mod regress_rename_fixes_tests {
             .expect("consumer annotation must be edited");
         let out = apply_edits(&consumer_doc.source, consumer_edits);
         assert_eq!(
-            out, "import ./owner\n\nf : Form -> Int\nf = \\s -> 1\n",
+            out, "import ./owner\n\nf : Form -> Int 1\nf = \\s -> 1\n",
             "the importer's type annotation must be rewritten; edits: {consumer_edits:?}"
         );
     }
@@ -3875,7 +3875,7 @@ mod regress_rename_fixes_tests {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "double : Int -> Int\ndouble = \\x -> x * 2\nmain = double 2\n",
+            "double : Int 1 -> Int 1\ndouble = \\x -> x * 2\nmain = double 2\n",
         );
         let doc = ws.doc(&uri);
         let off = doc.source.find("double").expect("sig line");
@@ -3887,7 +3887,7 @@ mod regress_rename_fixes_tests {
         let out = apply_edits(&doc.source, edits);
         assert_eq!(
             out,
-            "triple : Int -> Int\ntriple = \\x -> x * 2\nmain = triple 2\n",
+            "triple : Int 1 -> Int 1\ntriple = \\x -> x * 2\nmain = triple 2\n",
             "the body-line definition token must be renamed too; edits: {edits:?}"
         );
     }
@@ -3897,7 +3897,7 @@ mod regress_rename_fixes_tests {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "double : Int -> Int\ndouble = \\x -> x * 2\nmain = double 2\n",
+            "double : Int 1 -> Int 1\ndouble = \\x -> x * 2\nmain = double 2\n",
         );
         let doc = ws.doc(&uri);
         // Cursor on the BODY-line `double` (second occurrence).
@@ -3911,7 +3911,7 @@ mod regress_rename_fixes_tests {
         let out = apply_edits(&doc.source, &edits);
         assert_eq!(
             out,
-            "triple : Int -> Int\ntriple = \\x -> x * 2\nmain = triple 2\n"
+            "triple : Int 1 -> Int 1\ntriple = \\x -> x * 2\nmain = triple 2\n"
         );
     }
 
@@ -3921,7 +3921,7 @@ mod regress_rename_fixes_tests {
         let mut tw = TempWorkspace::new();
         // Owner exists ONLY on disk — never opened — and has a separate
         // type signature, exercising `apply_owner_disk_edits`.
-        let owner_src = "parse : Int -> Int\nparse = \\x -> x\n";
+        let owner_src = "parse : Int 1 -> Int 1\nparse = \\x -> x\n";
         std::fs::write(tw.root.join("owner.knot"), owner_src).expect("write owner");
         let consumer_uri = tw.write_and_open(
             "consumer.knot",
@@ -3942,7 +3942,7 @@ mod regress_rename_fixes_tests {
             .expect("owner file must be edited");
         let out = apply_edits(owner_src, owner_uri_entry.1);
         assert_eq!(
-            out, "parsed : Int -> Int\nparsed = \\x -> x\n",
+            out, "parsed : Int 1 -> Int 1\nparsed = \\x -> x\n",
             "disk-path rename must edit BOTH definition lines; edits: {:?}",
             owner_uri_entry.1
         );

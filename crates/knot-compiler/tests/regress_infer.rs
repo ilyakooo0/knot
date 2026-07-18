@@ -42,9 +42,9 @@ fn rank2_forall_in_required_position_is_rejected() {
     // `alias` claims to accept any `Int -> Int`, but its body forwards to a
     // function requiring a polymorphic `forall a. a -> a`. Accepting this
     // lets a monomorphic increment be applied to a Bool at runtime.
-    let src = r#"takesPoly : (forall a. a -> a) -> Int
+    let src = r#"takesPoly : (forall a. a -> a) -> Int 1
 takesPoly = \f -> if f true then f 1 else 0
-alias : (Int -> Int) -> Int
+alias : (Int 1 -> Int 1) -> Int 1
 alias = takesPoly
 main = println (alias (\x -> x + 1))
 "#;
@@ -59,9 +59,9 @@ main = println (alias (\x -> x + 1))
 #[test]
 fn rank2_alias_at_same_polytype_is_accepted() {
     // Re-exporting a rank-2 function at the SAME rank-2 type is fine.
-    let src = r#"takesPoly : (forall a. a -> a) -> Int
+    let src = r#"takesPoly : (forall a. a -> a) -> Int 1
 takesPoly = \f -> if f true then f 1 else 0
-alias : (forall a. a -> a) -> Int
+alias : (forall a. a -> a) -> Int 1
 alias = takesPoly
 main = alias (\x -> x)
 "#;
@@ -73,7 +73,7 @@ main = alias (\x -> x)
 fn rank2_application_still_works() {
     // Applying a rank-2 function to a polymorphic lambda must keep working
     // (the provided-position instantiation path).
-    let src = r#"takesPoly : (forall a. a -> a) -> Int
+    let src = r#"takesPoly : (forall a. a -> a) -> Int 1
 takesPoly = \f -> if f true then f 1 else 0
 main = takesPoly (\x -> x)
 "#;
@@ -86,9 +86,9 @@ main = takesPoly (\x -> x)
 #[test]
 fn refine_target_honors_annotation_with_shared_base() {
     // Nat and Pos share the base type Int; the annotation must decide.
-    let src = r#"type Nat = Int where \x -> x >= 0
-type Pos = Int where \x -> x > 0
-toNat : Int -> Result RefinementError Nat
+    let src = r#"type Nat = Int 1 where \x -> x >= 0
+type Pos = Int 1 where \x -> x > 0
+toNat : Int 1 -> Result RefinementError Nat
 toNat = \x -> refine x
 main = case toNat 0 of
   Ok {value} -> println "ok"
@@ -103,9 +103,9 @@ main = case toNat 0 of
 
 #[test]
 fn refine_target_resolution_is_deterministic() {
-    let src = r#"type Nat = Int where \x -> x >= 0
-type Pos = Int where \x -> x > 0
-toPos : Int -> Result RefinementError Pos
+    let src = r#"type Nat = Int 1 where \x -> x >= 0
+type Pos = Int 1 where \x -> x > 0
+toPos : Int 1 -> Result RefinementError Pos
 toPos = \x -> refine x
 main = toPos 1
 "#;
@@ -119,8 +119,8 @@ main = toPos 1
 
 #[test]
 fn refine_without_context_and_shared_base_is_ambiguous() {
-    let src = r#"type Nat = Int where \x -> x >= 0
-type Pos = Int where \x -> x > 0
+    let src = r#"type Nat = Int 1 where \x -> x >= 0
+type Pos = Int 1 where \x -> x > 0
 f = \x -> case refine (x + 0) of
   Ok {value} -> 1
   Err {error} -> 0
@@ -141,7 +141,7 @@ main = f 5
 
 #[test]
 fn refine_with_unique_base_still_infers() {
-    let src = r#"type Nat = Int where \x -> x >= 0
+    let src = r#"type Nat = Int 1 where \x -> x >= 0
 f = \x -> case refine (x + 0) of
   Ok {value} -> 1
   Err {error} -> 0
@@ -189,7 +189,7 @@ fn alias_chain_referencing_cycle_does_not_diverge() {
 #[test]
 fn acyclic_forward_alias_chain_still_resolves() {
     let diags = check_src(
-        "type A = B\ntype B = C\ntype C = Int\nf : A -> Int\nf = \\x -> x + 1\nmain = f 1",
+        "type A = B\ntype B = C\ntype C = Int 1\nf : A -> Int 1\nf = \\x -> x + 1\nmain = f 1",
     );
     assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
 }
@@ -251,7 +251,7 @@ main = bad
 #[test]
 fn mul_with_dimensionless_annotation_is_accepted() {
     let src = r#"unit M
-g = \x -> (x : Float) * (2.0 : Float M)
+g = \x -> (x : Float 1) * (2.0 : Float M)
 ok = (g 3.0) + (4.0 : Float M)
 main = ok
 "#;
@@ -474,8 +474,8 @@ fn do_let_generalized_structural_comparison() {
 fn if_branches_with_different_io_effects_merge() {
     // `*a` and `*b` produce concrete `Ty::IO` values with different
     // read-effect sets; `if` must widen to the union like `case` does.
-    let src = r#"*a : [{x: Int}]
-*b : [{x: Int}]
+    let src = r#"*a : [{x: Int 1}]
+*b : [{x: Int 1}]
 main = do
   rows <- if true then *a else *b
   println (show (count rows))
@@ -562,7 +562,7 @@ base : Int Ms
 base = 30000
 cap : Int Ms
 cap = 480000
-shouldRetry : Text -> Int Ms -> [{server: Text, failedAt: Int Ms, failures: Int}] -> Bool
+shouldRetry : Text -> Int Ms -> [{server: Text, failedAt: Int Ms, failures: Int 1}] -> Bool
 shouldRetry = \server t failures ->
   not (any (\f -> f.server == server && t - f.failedAt < base * f.failures) failures)
 main = println (show (shouldRetry "x" 1000 []))
@@ -793,8 +793,8 @@ fn io_relation_and_plain_relation_branches_unify() {
     // `*items` is `IO {} [T]`; the else branch is a plain `[T]` literal.
     // The relation must unify with the IO's *inner* type, not the
     // relation's element with the inner (which produced nonsense
-    // "expected {x: Int}, found [{x: Int}]" mismatches).
-    let src = r#"*items : [{x: Int}]
+    // "expected {x: Int 1}, found [{x: Int 1}]" mismatches).
+    let src = r#"*items : [{x: Int 1}]
 main = do
   rows <- if true then *items else [{x: 1}]
   println (show (count rows))
@@ -820,7 +820,7 @@ fn refinements_for(src: &str, source: &str) -> Vec<(Option<String>, String)> {
 
 #[test]
 fn refinement_direct_field_alias_collected() {
-    let src = r#"type Nat = Int where \x -> x >= 0
+    let src = r#"type Nat = Int 1 where \x -> x >= 0
 *people : [{age: Nat}]
 main = 1
 "#;
@@ -832,7 +832,7 @@ main = 1
 fn refinement_field_alias_to_refined_collected() {
     // `Age` is a plain alias to the refined `Nat` — the predicate must
     // still be registered for the field (previously bypassed).
-    let src = r#"type Nat = Int where \x -> x >= 0
+    let src = r#"type Nat = Int 1 where \x -> x >= 0
 type Age = Nat
 *people : [{age: Age}]
 main = 1
@@ -843,7 +843,7 @@ main = 1
 
 #[test]
 fn refinement_multi_step_alias_chain_collected() {
-    let src = r#"type Nat = Int where \x -> x >= 0
+    let src = r#"type Nat = Int 1 where \x -> x >= 0
 type B = Nat
 type A = B
 *people : [{age: A}]
@@ -855,7 +855,7 @@ main = 1
 
 #[test]
 fn refinement_whole_element_alias_collected() {
-    let src = r#"type Nat = Int where \x -> x >= 0
+    let src = r#"type Nat = Int 1 where \x -> x >= 0
 type Age = Nat
 *scores : [Age]
 main = 1
@@ -868,7 +868,7 @@ main = 1
 fn refinement_aliased_record_with_aliased_field_collected() {
     // Record alias containing a field whose type is an alias chain to a
     // refined type.
-    let src = r#"type Nat = Int where \x -> x >= 0
+    let src = r#"type Nat = Int 1 where \x -> x >= 0
 type Age = Nat
 type Person = {age: Age}
 *people : [Person]

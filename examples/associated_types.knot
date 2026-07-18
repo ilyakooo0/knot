@@ -3,7 +3,7 @@
 
 trait Container c where
   type Elem c
-  size : c -> Int
+  size : c -> Int 1
   toList : c -> [Elem c]
 
 impl Container [a] where
@@ -11,7 +11,7 @@ impl Container [a] where
   size xs = count xs
   toList xs = xs
 
-nums : [Int]
+nums : [Int 1]
 nums = [1, 2, 3]
 
 words : [Text]

@@ -1,7 +1,7 @@
 -- Query optimization examples
 
-type Employee = {name: Text, dept: Text, salary: Int}
-type Department = {name: Text, budget: Int}
+type Employee = {name: Text, dept: Text, salary: Int 1}
+type Department = {name: Text, budget: Int 1}
 
 *employees : [Employee]
 *departments : [Department]

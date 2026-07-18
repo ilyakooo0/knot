@@ -31,7 +31,7 @@ There are five kinds of top-level declarations:
 ```knot
 -- Source: stored in DB, mutable via `*people = ...`
 *people : [Person]
-*orders : [{customer: Text, amount: Int}]
+*orders : [{customer: Text, amount: Int 1}]
 
 -- View: defined by a query over source relations, settable (writes propagate back)
 *openTodos = do
@@ -49,7 +49,7 @@ httpCodes = [{code: 200, name: "OK"}, {code: 404, name: "Not Found"}]
   yield (filter (\p -> p.age > 65) people)
 
 -- Type alias: just a name for a type
-type Person = {name: Text, age: Int}
+type Person = {name: Text, age: Int 1}
 ```
 
 The prefix determines mutability, the presence of a body determines whether it's stored or computed:
@@ -68,8 +68,8 @@ Every ADT defines a relation schema. Each constructor is a record variant. A `[T
 
 ```knot
 data Shape
-  = Circle {radius: Float}
-  | Rect {width: Float, height: Float}
+  = Circle {radius: Float 1}
+  | Rect {width: Float 1, height: Float 1}
 
 *shapes : [Shape]  -- source (no body)
 ```
@@ -78,7 +78,7 @@ Single-variant types are equivalent to bare records:
 
 ```knot
 -- These are the same:
-*people : [{name: Text, age: Int}]
+*people : [{name: Text, age: Int 1}]
 *people : [Person]
 ```
 
@@ -114,7 +114,7 @@ data Status
 A field can hold a `[]` — a set nested inside a row. This departs from SQL's first normal form restriction.
 
 ```knot
-type Person = {name: Text, age: Int}
+type Person = {name: Text, age: Int 1}
 
 *teams : [{name: Text, members: [Person]}]
 ```
@@ -176,7 +176,7 @@ Convert between flat and nested representations:
 
 ```knot
 -- Flat relation
-type FlatMembership = {team: Text, member: Text, age: Int}
+type FlatMembership = {team: Text, member: Text, age: Int 1}
 *memberships : [FlatMembership]
 
 -- Nest: group a flat relation into nested structure
@@ -205,7 +205,7 @@ type FlatMembership = {team: Text, member: Text, age: Int}
 Nesting is arbitrarily deep:
 
 ```knot
-type Course = {name: Text, students: [{name: Text, grades: [{subject: Text, score: Int}]}]}
+type Course = {name: Text, students: [{name: Text, grades: [{subject: Text, score: Int 1}]}]}
 
 *departments : [{name: Text, courses: [Course]}]
 
@@ -250,8 +250,8 @@ trait Foldable t => Traversable (t : Type -> Type) where
   traverse : (a -> f b) -> t a -> f (t b)
 
 trait Sequence s where
-  take : Int -> s -> s
-  drop : Int -> s -> s
+  take : Int 1 -> s -> s
+  drop : Int 1 -> s -> s
 ```
 
 `Sequence` has built-in impls for both `Text` (character take/drop) and relations (row take/drop), so the same `take 5 x` works on a string or a relation.
@@ -456,11 +456,11 @@ Derived combinators like `filter` compose with `|>`:
 `match` filters to one variant and exposes its fields:
 
 ```knot
-&circles = do                              -- : IO {} [{radius: Float}]
+&circles = do                              -- : IO {} [{radius: Float 1}]
   shapes <- *shapes
   yield (shapes |> match Circle)
 
-&rects = do                                -- : IO {} [{width: Float, height: Float}]
+&rects = do                                -- : IO {} [{width: Float 1, height: Float 1}]
   shapes <- *shapes
   yield (shapes |> match Rect)
 
@@ -555,7 +555,7 @@ Grouping is executed via SQLite — key columns are inserted into a temp table a
 All state operations in Knot return IO values. The IO type carries an effect set that distinguishes DB operations from external effects:
 
 - **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), and relation writes (`*rel = expr`, `replace *rel = expr`) all return `IO {} value`.
-- **External effects** carry specific tags: `IO {console} {}`, `IO {fs} Text`, `IO {network} Result`, `IO {clock} Int Ms`, `IO {random} Float`.
+- **External effects** carry specific tags: `IO {console} {}`, `IO {fs} Text`, `IO {network} Result`, `IO {clock} Int Ms`, `IO {random} Float 1`.
 
 This unified model means all stateful code lives in IO do-blocks, while pure comprehensions over plain values remain non-IO.
 
@@ -753,7 +753,7 @@ fork : IO {| r} a -> IO {| r} {}
 The spawned action's effect row `r` propagates through `fork` to the caller — a program that forks an IO that calls `println` is visibly typed with `{console}` in its IO row, so the effect system still reflects what the program can do. Do blocks can be passed as arguments without parentheses: `fork do ...`.
 
 ```knot
-*counter : [{n: Int}]
+*counter : [{n: Int 1}]
 
 increment = do
   c <- *counter
@@ -775,7 +775,7 @@ main = do
 The combination of `fork`, `atomic`, and `retry` enables STM-style concurrent coordination:
 
 ```knot
-*tasks : [{id: Int, status: Text}]
+*tasks : [{id: Int 1, status: Text}]
 
 waitForCompletion = \id -> atomic do
   tasks <- *tasks
@@ -855,7 +855,7 @@ Constructors are bare names — their fields are automatically the union of path
 
 ```knot
 route Api where
-  GET                                          /todos/{user: Text}?{page: Int, limit: Int}  = GetTodos
+  GET                                          /todos/{user: Text}?{page: Int 1, limit: Int 1}  = GetTodos
   POST {title: Text, owner: Text, priority: Priority}  /todos                               = AddTodo
   PUT  {owner: Text, person: Text}             /todos/{title: Text}/assign                   = AssignTodo
   GET                                          /workload                                     = GetWorkload
@@ -881,7 +881,7 @@ api = serve Api where
 main = listen 8080 api
 ```
 
-`serve API where` produces a value of type `Server API _` (a polymorphic row variable when handlers have no concrete effects) or `Server API {effects}` when handlers carry concrete effects — e.g. `Server API {console}` if a handler calls `println`. Each handler receives the request record (path/query/body/header fields) and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int, message: Text}`. Handler effects propagate through `listen` into the program's IO type. No string routes, no untyped params, no missing handlers.
+`serve API where` produces a value of type `Server API _` (a polymorphic row variable when handlers have no concrete effects) or `Server API {effects}` when handlers carry concrete effects — e.g. `Server API {console}` if a handler calls `println`. Each handler receives the request record (path/query/body/header fields) and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. Handler effects propagate through `listen` into the program's IO type. No string routes, no untyped params, no missing handlers.
 
 #### HTTP Status Codes
 
@@ -914,7 +914,7 @@ Return types can be declared per-endpoint:
 route Api where
   GET                              /todos/{user: Text} -> [{title: Text, priority: Priority}]  = GetTodos
   POST {title: Text, owner: Text}  /todos              -> {ok: Bool}                              = AddTodo
-  GET                              /workload           -> [{owner: Text, count: Int}]           = GetWorkload
+  GET                              /workload           -> [{owner: Text, count: Int 1}]           = GetWorkload
 ```
 
 The compiler checks that each handler returns the declared type.
@@ -925,8 +925,8 @@ Request and response headers are declared with the `headers` keyword:
 
 ```knot
 route Api where
-  GET /todos headers {authorization: Text} -> [Todo] headers {xTotalCount: Int, xPage: Int} = GetTodos
-  POST {title: Text} /todos headers {authorization: Text, xIdempotencyKey: Text} -> {id: Int} = CreateTodo
+  GET /todos headers {authorization: Text} -> [Todo] headers {xTotalCount: Int 1, xPage: Int 1} = GetTodos
+  POST {title: Text} /todos headers {authorization: Text, xIdempotencyKey: Text} -> {id: Int 1} = CreateTodo
   GET /health -> {status: Text} = HealthCheck
 ```
 
@@ -958,7 +958,7 @@ On the fetch side, request headers are sent automatically from constructor field
 
 ```knot
 result <- fetch "https://api.example.com" (GetTodos {authorization: "Bearer tok"})
--- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int, xPage: Int}})
+-- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int 1, xPage: Int 1}})
 ```
 
 #### Rate Limiting
@@ -974,7 +974,7 @@ type RequestCtx = {
 
 type RateLimit input a = {
   key: input -> RequestCtx -> Maybe a,    -- Ord a; Nothing exempts this request
-  limit: {requests: Int, window: Int Ms}
+  limit: {requests: Int 1, window: Int Ms}
 }
 ```
 
@@ -1055,11 +1055,11 @@ route Api where
   /api/v1
     /users
       GET  /                       = ListUsers
-      GET  /{id: Int}              = GetUser
+      GET  /{id: Int 1}              = GetUser
       POST {name: Text, email: Text}  /  = CreateUser
     /teams
       GET  /                       = ListTeams
-      GET  /{id: Int}/members      = GetMembers
+      GET  /{id: Int 1}/members      = GetMembers
 ```
 
 #### Route Composition
@@ -1260,13 +1260,13 @@ data Status
   | InProgress {assignee: Text}
   | Resolved {resolution: Text}
 
-*people : [{name: Text, age: Int, email: Text}]
+*people : [{name: Text, age: Int 1, email: Text}]
 
 *todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
 
 migrate *people
-  from {name: Text, age: Int}
-  to   {name: Text, age: Int, email: Text}
+  from {name: Text, age: Int 1}
+  to   {name: Text, age: Int 1, email: Text}
   using (\old -> {old | email: old.name ++ "@unknown.com"})
 ```
 
@@ -1294,8 +1294,8 @@ Breaking changes require a `migrate` block:
 
 ```knot
 migrate *people
-  from {name: Text, age: Int}
-  to   {name: Text, age: Int, email: Text}
+  from {name: Text, age: Int 1}
+  to   {name: Text, age: Int 1, email: Text}
   using (\old -> {old | email: old.name ++ "@unknown.com"})
 ```
 
@@ -1324,8 +1324,8 @@ The runtime stores the compiled schema version in the database. On startup it co
 
 | Type | Description |
 |------|-------------|
-| `Int` | 64-bit signed integer (`i64`); arithmetic is checked and panics on overflow |
-| `Float` | 64-bit float |
+| `Int 1` | 64-bit signed integer (`i64`); arithmetic is checked and panics on overflow |
+| `Float 1` | 64-bit float |
 | `Int u` | Integer tagged with a compile-time unit (`Int Usd`) |
 | `Float u` | Float tagged with a compile-time unit (`Float M`, `Float (M/S^2)`) |
 | `Text` | Unicode string |
@@ -1354,13 +1354,13 @@ Functions can be generic over any ADT that has a particular variant:
 countOpen = \rel ->
   rel |> filter (\r -> case r.status of Open {} -> True {}; _ -> False {}) |> count
 
--- Inferred: [{status: <Open {} | r> | s}] -> Int
+-- Inferred: [{status: <Open {} | r> | s}] -> Int 1
 -- Works on tickets, issues, orders — anything with an Open status variant
 ```
 
 ### Units of Measure
 
-Optional compile-time units on `Int` and `Float`. Units are fully erased at runtime — no performance cost, no runtime representation. Plain `Float` is dimensionless (`Float 1`).
+Compile-time units on `Int 1` and `Float 1`. Units are fully erased at runtime — no performance cost, no runtime representation. **Every `Int 1` and `Float 1` type must carry a unit** — there is no bare `Int 1`/`Float 1`. A dimensionless numeric is written explicitly as `Int 1` / `Float 1`.
 
 #### Declaration
 
@@ -1442,13 +1442,13 @@ double = \x -> x + x
 
 #### Conversion
 
-`stripUnit` / `withUnit` (Int) and `stripFloatUnit` / `withFloatUnit` (Float) are identity functions that exist only for the type checker. Use them to drop a unit tag and re-attach a different one. The result of `withUnit`/`withFloatUnit` carries a free unit variable, so the caller pins the target unit via the surrounding type context (e.g. the function's return signature) or an explicit annotation:
+`stripUnit` / `withUnit` (Int 1) and `stripFloatUnit` / `withFloatUnit` (Float 1) are identity functions that exist only for the type checker. Use them to drop a unit tag and re-attach a different one. The result of `withUnit`/`withFloatUnit` carries a free unit variable, so the caller pins the target unit via the surrounding type context (e.g. the function's return signature) or an explicit annotation:
 
 ```knot
-stripUnit       : Int u -> Int           -- drop unit from Int
-withUnit        : Int -> Int u           -- attach unit to Int
-stripFloatUnit  : Float u -> Float
-withFloatUnit   : Float -> Float u
+stripUnit       : Int u -> Int 1           -- drop unit from Int 1
+withUnit        : Int 1 -> Int u           -- attach unit to Int 1
+stripFloatUnit  : Float u -> Float 1
+withFloatUnit   : Float 1 -> Float u
 
 toS : Int Ms -> Int S
 toS = \ms -> withUnit (stripUnit ms / 1000)
@@ -1457,7 +1457,7 @@ toMiles : Float Km -> Float Mi
 toMiles = \d -> withFloatUnit (stripFloatUnit d * 0.621371)
 ```
 
-Every numeric type carries a unit. `Int` and `Float` written without a unit are **dimensionless** (`Int 1` / `Float 1`). A value of a concrete unit does **not** implicitly convert to the dimensionless form — `x : Float; x = (1.5 : Float M)` is a type error (`expected Float, found Float M`). Numeric **literals** are unit-polymorphic: `1.5` has type `Float <u>` for a fresh unit variable, so it flows into whatever unit the context demands (`(1.5 : Float M)`, `sum` over `[Float M]`, or a `Float` field) and defaults to dimensionless when unconstrained. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
+Every numeric type carries a unit — a bare `Int 1` or `Float 1` is a **compile error**; you must write a unit. Use `Int 1` / `Float 1` for the dimensionless case (e.g. counts, indices). A value of a concrete unit does **not** implicitly convert to the dimensionless form — `x : Float 1; x = (1.5 : Float M)` is a type error (`expected Float 1, found Float M`). Numeric **literals** are unit-polymorphic: `1.5` has type `Float 1 <u>` for a fresh unit variable, so it flows into whatever unit the context demands (`(1.5 : Float M)`, `sum` over `[Float M]`, or a `Float 1` field) and defaults to dimensionless when unconstrained. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
 
 For explicit unit ascription you can put a type annotation on any expression, either inside parens or as a bare postfix:
 
@@ -1497,7 +1497,7 @@ show 42.0 M             -- "42.0 M"
 show 3.14                -- "3.14"
 ```
 
-`Int` units are appended the same way, including the built-in `Ms` that clock operations carry — `now : IO {clock} Int Ms`, so `show` on a timestamp reads `"1783814121719 Ms"`. Use `stripUnit` to print the bare number.
+`Int 1` units are appended the same way, including the built-in `Ms` that clock operations carry — `now : IO {clock} Int Ms`, so `show` on a timestamp reads `"1783814121719 Ms"`. Use `stripUnit` to print the bare number.
 
 When the unit is polymorphic (inside a unit-generic function), `show` prints just the number: the function body is compiled once, for every unit its caller may instantiate.
 
@@ -1561,8 +1561,8 @@ A `where` after the closing `}` constrains the whole record. Multiple `where` cl
 
 ```knot
 type DateRange = {
-  start: Int,
-  end: Int
+  start: Int 1,
+  end: Int 1
 } where \r -> r.start <= r.end
 
 type Discount = {
@@ -1620,15 +1620,15 @@ error or a constraint-violation message.
 `Refined(T, p) <: T`. A refined type is a subtype of its base.
 
 ```
-Nat <: Int
-Age <: Nat <: Int
+Nat <: Int 1
+Age <: Nat <: Int 1
 ```
 
 Upcasting (refined → base) is implicit, no check:
 
 ```knot
-f : Int -> Int
-f (x : Nat)         -- fine: Nat <: Int
+f : Int 1 -> Int 1
+f (x : Nat)         -- fine: Nat <: Int 1
 ```
 
 Downcasting (base → refined) requires `refine`. `refine expr` has type `Result RefinementError T` where `T` is the target refined type, inferred from context. If context doesn't determine `T`, it's a type error.
@@ -1655,7 +1655,7 @@ Arithmetic on refined types returns the base type:
 ```knot
 x : Nat = ...
 y : Nat = ...
-x + y    -- Int, not Nat (no attempt to prove result satisfies predicate)
+x + y    -- Int 1, not Nat (no attempt to prove result satisfies predicate)
 ```
 
 #### The `refine` Expression
@@ -1688,7 +1688,7 @@ type RefinementError = {
 In do-blocks over `Result`, `<-` unwraps on `Ok` and short-circuits on `Err`:
 
 ```knot
-validateOrder : {customer: Text, amount: Int} -> Result RefinementError {customer: NonEmptyText, amount: Nat}
+validateOrder : {customer: Text, amount: Int 1} -> Result RefinementError {customer: NonEmptyText, amount: Nat}
 validateOrder = \raw -> do
   customer <- refine raw.customer    -- NonEmptyText inferred from return type
   amount   <- refine raw.amount      -- Nat inferred from return type
@@ -1758,7 +1758,7 @@ type Person = {
 *orders.customer <= *people.email
 
 route Api where
-  POST {name: Text, age: Int, email: Text}  /users -> {ok: Bool, error: Maybe Text}  = CreateUser
+  POST {name: Text, age: Int 1, email: Text}  /users -> {ok: Bool, error: Maybe Text}  = CreateUser
 
 api = serve Api where
   CreateUser = \{name, age, email} ->
@@ -1817,7 +1817,7 @@ Traits can have associated types:
 ```knot
 trait Container c where
   type Elem c
-  size : c -> Int
+  size : c -> Int 1
   toList : c -> [Elem c]
 
 impl Container [a] where
@@ -1913,7 +1913,7 @@ route Api where
                                      /todos                        -> {ok: Bool}                             = AddTodo
   PUT  {owner: Text, person: Text}   /todos/{title: Text}/assign   -> {ok: Bool}                             = AssignTodo
   PUT  {owner: Text, msg: Text}      /todos/{title: Text}/resolve  -> {ok: Bool}                             = ResolveTodo
-  GET                                /workload                     -> [{owner: Text, count: Int}]          = GetWorkload
+  GET                                /workload                     -> [{owner: Text, count: Int 1}]          = GetWorkload
 
 formatTitle = \title -> toUpper (take 1 title) ++ drop 1 title
 

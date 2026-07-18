@@ -5,7 +5,7 @@ Knot is a functional relational programming language. Relations (typed sets) are
 ## Quick Start
 
 ```knot
-type Person = {name: Text, age: Int}
+type Person = {name: Text, age: Int 1}
 
 *people : [Person]
 
@@ -35,8 +35,8 @@ cargo run -p knot-compiler -- build file.knot
 
 | Type | Description | Literals |
 |------|-------------|----------|
-| `Int` | 64-bit signed integer (overflow panics) | `42`, `-7`, `1_000_000` |
-| `Float` | 64-bit float | `3.14`, `-0.5` |
+| `Int 1` | 64-bit signed integer (overflow panics) | `42`, `-7`, `1_000_000` |
+| `Float 1` | 64-bit float | `3.14`, `-0.5` |
 | `Text` | Unicode string | `"hello"`, `"line\n"` |
 | `Bool` | Boolean | `True {}`, `False {}` |
 | `Bytes` | Byte string | `b"hello"` |
@@ -45,7 +45,7 @@ cargo run -p knot-compiler -- build file.knot
 
 ### Units of Measure
 
-Optional compile-time units on `Int` and `Float`. Units are fully erased at runtime — no performance cost.
+Optional compile-time units on `Int 1` and `Float 1`. Units are fully erased at runtime — no performance cost.
 
 ```knot
 unit M
@@ -85,7 +85,7 @@ Unit-preserving stdlib: `sum` (over a numeric relation) and `avg` (via its proje
 {name: "Alice", age: 30}
 
 -- Type alias
-type Person = {name: Text, age: Int}
+type Person = {name: Text, age: Int 1}
 ```
 
 Field access: `person.name`
@@ -101,7 +101,7 @@ A relation `[T]` is a typed **set** of `T` values. No duplicates. No ordering gu
 ```knot
 names = ["Alice", "Bob", "Carol"]     -- [Text]
 empty = []                             -- [a]
-people = [{name: "Alice", age: 30}]   -- [{name: Text, age: Int}]
+people = [{name: "Alice", age: 30}]   -- [{name: Text, age: Int 1}]
 ```
 
 ### ADTs (Algebraic Data Types)
@@ -124,7 +124,7 @@ Constructing values: `Circle {radius: 5.0}`, `Nothing {}`, `Just {value: 42}`
 ### Type Aliases
 
 ```knot
-type Person = {name: Text, age: Int}
+type Person = {name: Text, age: Int 1}
 type TodoList = [{title: Text, done: Bool}]
 ```
 
@@ -144,7 +144,7 @@ There are five kinds of top-level declarations:
 
 ```knot
 -- Source: stored in DB
-*people : [{name: Text, age: Int}]
+*people : [{name: Text, age: Int 1}]
 
 -- View: settable query over a source
 *openTodos = do
@@ -223,7 +223,7 @@ whatever the surrounding code requires and is generalized like a type variable:
 ```knot
 id : _ -> _
 id = \x -> x
-id 42          -- 42 : Int
+id 42          -- 42 : Int 1
 id "hello"     -- "hello" : Text
 
 first : [_] -> _          -- element type inferred
@@ -427,7 +427,7 @@ After `groupBy {t.owner}`:
 Fields can hold `[T]` — sets nested inside rows:
 
 ```knot
-*teams : [{name: Text, members: [{name: Text, age: Int}]}]
+*teams : [{name: Text, members: [{name: Text, age: Int 1}]}]
 
 -- Query into nested relations
 &allMembers = do
@@ -783,8 +783,8 @@ and the loser unwinds at its next safe point.
 | `diff` | `[a] -> [a] -> [a]` | Set difference |
 | `inter` | `[a] -> [a] -> [a]` | Set intersection |
 | `sortBy` | `(a -> b) -> [a] -> [a]` | Reorder rows by projected key (`Ord b`) |
-| `take` | `Int -> [a] -> [a]` | First *n* rows (`Sequence.take`) |
-| `drop` | `Int -> [a] -> [a]` | Drop first *n* rows (`Sequence.drop`) |
+| `take` | `Int 1 -> [a] -> [a]` | First *n* rows (`Sequence.take`) |
+| `drop` | `Int 1 -> [a] -> [a]` | Drop first *n* rows (`Sequence.drop`) |
 
 ### Text
 
@@ -796,8 +796,8 @@ and the loser unwinds at its next safe point.
 | `trim` | `Text -> Text` | Strip whitespace |
 | `reverse` | `Text -> Text` | Reverse |
 | `chars` | `Text -> [Text]` | Split to characters |
-| `take` | `Int -> Text -> Text` | First *n* characters (`Sequence.take`) |
-| `drop` | `Int -> Text -> Text` | Drop first *n* characters (`Sequence.drop`) |
+| `take` | `Int 1 -> Text -> Text` | First *n* characters (`Sequence.take`) |
+| `drop` | `Int 1 -> Text -> Text` | Drop first *n* characters (`Sequence.drop`) |
 | `contains` | `Text -> Text -> Bool` | Substring check |
 
 `take` and `drop` are `Sequence` trait methods with built-in impls for both
@@ -811,10 +811,10 @@ and the loser unwinds at its next safe point.
 | `toJson` | `a -> Text` | Encode as JSON (`ToJSON.toJson`) |
 | `parseJson` | `Text -> Maybe a` | Decode JSON (`FromJSON.parseJson`) |
 | `display` | `Display a => a -> Text` | Render a value via `Display` |
-| `stripUnit` | `Int u -> Int` | Drop unit tag from `Int` |
-| `withUnit` | `Int -> Int u` | Attach unit tag to `Int` |
-| `stripFloatUnit` | `Float u -> Float` | Drop unit tag from `Float` |
-| `withFloatUnit` | `Float -> Float u` | Attach unit tag to `Float` |
+| `stripUnit` | `Int u -> Int 1` | Drop unit tag from `Int 1` |
+| `withUnit` | `Int 1 -> Int u` | Attach unit tag to `Int 1` |
+| `stripFloatUnit` | `Float u -> Float 1` | Drop unit tag from `Float 1` |
+| `withFloatUnit` | `Float 1 -> Float u` | Attach unit tag to `Float 1` |
 
 ### IO
 
@@ -907,7 +907,7 @@ route TodoApi where
 
 route AdminApi where
   /admin
-    GET /count -> Int = GetCount
+    GET /count -> Int 1 = GetCount
 
 -- Compose routes
 route Api = TodoApi | AdminApi
@@ -927,7 +927,7 @@ api = serve Api where
 main = listen 8080 api
 ```
 
-`serve API where` produces a value of type `Server API r`, where `r` is the effect row of the handlers (rendered `_` when handlers are pure, or e.g. `{console}` when a handler logs). Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int, message: Text}`. The row `r` flows into `listen`'s IO type: `listen : Int u -> Server a r -> IO {network | r} {}`.
+`serve API where` produces a value of type `Server API r`, where `r` is the effect row of the handlers (rendered `_` when handlers are pure, or e.g. `{console}` when a handler logs). Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. The row `r` flows into `listen`'s IO type: `listen : Int u -> Server a r -> IO {network | r} {}`.
 
 ### HTTP Status Codes
 
@@ -951,10 +951,10 @@ Request and response headers use the `headers` keyword:
 ```knot
 route Api where
   GET /todos headers {authorization: Text}
-    -> [Todo] headers {xTotalCount: Int}
+    -> [Todo] headers {xTotalCount: Int 1}
     = GetTodos
   POST {title: Text} /todos headers {authorization: Text}
-    -> {id: Int}
+    -> {id: Int 1}
     = CreateTodo
 ```
 
@@ -984,7 +984,7 @@ On the `fetch` side, header fields are sent automatically. When response headers
 
 ```knot
 result <- fetch "https://api.example.com" (GetTodos {authorization: "Bearer tok"})
--- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int}})
+-- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int 1}})
 ```
 
 ### Rate Limiting
@@ -1000,7 +1000,7 @@ type RequestCtx = {
 
 type RateLimit input a = {
   key: input -> RequestCtx -> Maybe a,    -- Ord a; Nothing exempts the request
-  limit: {requests: Int, window: Int Ms}
+  limit: {requests: Int 1, window: Int Ms}
 }
 ```
 
@@ -1052,8 +1052,8 @@ The compiler maintains a lockfile (`<name>.schema.lock`) tracking persisted sche
 
 ```knot
 migrate *people
-  from {name: Text, age: Int}
-  to   {name: Text, age: Int, email: Text}
+  from {name: Text, age: Int 1}
+  to   {name: Text, age: Int 1, email: Text}
   using (\old -> {old | email: old.name ++ "@unknown.com"})
 ```
 
@@ -1085,7 +1085,7 @@ type Nat = Int where \x -> x >= 0
 type ValidPerson = {name: Text, age: Int where \x -> x >= 0 && x <= 150}
 
 -- Cross-field refinements
-type Range = {lo: Int, hi: Int} where \r -> r.lo <= r.hi
+type Range = {lo: Int 1, hi: Int 1} where \r -> r.lo <= r.hi
 
 -- ADT constructor refinements
 data Shape
@@ -1108,7 +1108,7 @@ validated = do
   n <- refine someInt        -- binds n : Nat on success, short-circuits on failure
   m <- refine otherInt
   yield (n + m)
--- validated : Result RefinementError Int
+-- validated : Result RefinementError Int 1
 ```
 
 `RefinementError = {typeName: Text, violations: [{field: Maybe Text, message: Text}]}`
@@ -1135,7 +1135,7 @@ route Api where
 
 ### Subtyping
 
-Refined types are subtypes of their base type. `Nat` is compatible with `Int` in both directions — passing a `Nat` where `Int` is expected works, and vice versa (but the latter is unchecked unless you use `refine`).
+Refined types are subtypes of their base type. `Nat` is compatible with `Int 1` in both directions — passing a `Nat` where `Int 1` is expected works, and vice versa (but the latter is unchecked unless you use `refine`).
 
 ---
 

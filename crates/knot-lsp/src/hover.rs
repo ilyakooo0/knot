@@ -818,7 +818,7 @@ mod tests {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            r#"type Nat = Int where \x -> x >= 0
+            r#"type Nat = Int 1 where \x -> x >= 0
 double : Nat -> Nat
 double = \n -> n + n
 "#,
@@ -847,7 +847,7 @@ double = \n -> n + n
         // section. The new inline scan should not fire on the same name
         // and produce a duplicate "Refinements in this type" block.
         let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "type Nat = Int where \\x -> x >= 0\n");
+        let uri = ws.open("main", "type Nat = Int 1 where \\x -> x >= 0\n");
         let doc = ws.doc(&uri);
         let off = doc.source.find("Nat").expect("alias");
         let pos = offset_to_position(&doc.source, off);
@@ -864,7 +864,7 @@ double = \n -> n + n
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            r#"*scores : [{name: Text, score: Int where \x -> x >= 0}]
+            r#"*scores : [{name: Text, score: Int 1 where \x -> x >= 0}]
 
 main = do
   s <- *scores
@@ -897,8 +897,8 @@ main = do
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            r#"*alpha : [{amount: Int where \x -> x >= 100}]
-*beta : [{amount: Int where \x -> x >= 200}]
+            r#"*alpha : [{amount: Int 1 where \x -> x >= 100}]
+*beta : [{amount: Int 1 where \x -> x >= 200}]
 
 fromAlpha = do
   p <- *alpha
@@ -978,7 +978,7 @@ show2 = \x -> display x
         // lowercase names, which collide with field names). The doc-comment
         // section must be gated out on field tokens.
         let mut ws = TestWorkspace::new();
-        let src = "-- The grand total value.\ntotal = 42\ntype Rec = {total: Int}\nuseRec = \\r -> r.total\nmain = println (show total)\n";
+        let src = "-- The grand total value.\ntotal = 42\ntype Rec = {total: Int 1}\nuseRec = \\r -> r.total\nmain = println (show total)\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
         let off = doc.source.find("r.total").expect("field access") + "r.".len();
@@ -998,7 +998,7 @@ show2 = \x -> display x
         // info of an unrelated trait method `combine`. Gated out on field
         // tokens.
         let mut ws = TestWorkspace::new();
-        let src = "trait Combiner a where\n  combine : a -> a -> a\ndata Foo = Foo {}\nimpl Combiner Foo where\n  combine = \\x y -> x\ntype Rec = {combine: Int}\nuseRec = \\r -> r.combine\nmain = println \"hi\"\n";
+        let src = "trait Combiner a where\n  combine : a -> a -> a\ndata Foo = Foo {}\nimpl Combiner Foo where\n  combine = \\x y -> x\ntype Rec = {combine: Int 1}\nuseRec = \\r -> r.combine\nmain = println \"hi\"\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
         let off = doc.source.find("r.combine").expect("field access") + "r.".len();
@@ -1110,7 +1110,7 @@ mod regress_fixes_tests {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "data P = P {a: Int, b: Text}\nf = \\p -> case p of\n  P {a, b} -> b\n",
+            "data P = P {a: Int 1, b: Text}\nf = \\p -> case p of\n  P {a, b} -> b\n",
         );
         let doc = ws.doc(&uri);
         let off = doc.source.find("a, b}").expect("binder a");
@@ -1166,7 +1166,7 @@ mod regress_fixes_tests {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "count : Int -> Int\ncount = \\x -> x\nf = \\p -> p.count\n",
+            "count : Int 1 -> Int 1\ncount = \\x -> x\nf = \\p -> p.count\n",
         );
         let doc = ws.doc(&uri);
         let off = doc.source.find("p.count").expect("access") + 2;
@@ -1180,7 +1180,7 @@ mod regress_fixes_tests {
             );
         }
         // Hovering the actual global usage still shows its signature.
-        let uri2 = ws.open("main2", "count : Int -> Int\ncount = \\x -> x\nmain = count 1\n");
+        let uri2 = ws.open("main2", "count : Int 1 -> Int 1\ncount = \\x -> x\nmain = count 1\n");
         let doc2 = ws.doc(&uri2);
         let off2 = doc2.source.find("count 1").expect("usage");
         let pos2 = offset_to_position(&doc2.source, off2);

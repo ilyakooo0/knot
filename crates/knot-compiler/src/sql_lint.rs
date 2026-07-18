@@ -1524,7 +1524,7 @@ mod tests {
     fn no_lint_on_simple_where() {
         // Simple field comparison — compiles to SQL fine.
         let diags = lint(
-            "type T = {name: Text, age: Int}\n\
+            "type T = {name: Text, age: Int 1}\n\
              *people : [T]\n\
              main = do\n  \
                p <- *people\n  \
@@ -1541,7 +1541,7 @@ mod tests {
         // knot_text_length counts all chars. The where clause falls back
         // to runtime evaluation.
         let diags = lint(
-            "type T = {name: Text, age: Int}\n\
+            "type T = {name: Text, age: Int 1}\n\
              *people : [T]\n\
              main = do\n  \
                p <- *people\n  \
@@ -1555,7 +1555,7 @@ mod tests {
     fn no_lint_on_contains_in_update() {
         // contains now compiles to SQL INSTR().
         let diags = lint(
-            "type T = {name: Text, active: Int}\n\
+            "type T = {name: Text, active: Int 1}\n\
              *items : [T]\n\
              process = \\target -> do\n  \
                *items = do\n    \
@@ -1571,7 +1571,7 @@ mod tests {
     fn lint_on_unknown_function_in_where() {
         // Custom function calls still can't be SQL-compiled.
         let diags = lint(
-            "type T = {name: Text, age: Int}\n\
+            "type T = {name: Text, age: Int 1}\n\
              *people : [T]\n\
              isLong = \\t -> length t > 10\n\
              main = do\n  \
@@ -1588,7 +1588,7 @@ mod tests {
     fn no_lint_on_set_conditional_update_simple() {
         // Simple field comparison — SQL UPDATE WHERE works.
         let diags = lint(
-            "type T = {name: Text, active: Int}\n\
+            "type T = {name: Text, active: Int 1}\n\
              *items : [T]\n\
              process = \\target -> do\n  \
                *items = do\n    \
@@ -1604,7 +1604,7 @@ mod tests {
     fn lint_on_set_filter_complex_cond() {
         // Filter with function call — can't be SQL DELETE WHERE.
         let diags = lint(
-            "type T = {name: Text, score: Int}\n\
+            "type T = {name: Text, score: Int 1}\n\
              isGood = \\x -> x > 50\n\
              *items : [T]\n\
              cleanup = do\n  \
@@ -1622,7 +1622,7 @@ mod tests {
     fn no_lint_on_set_filter_simple() {
         // Simple comparison — SQL DELETE WHERE works.
         let diags = lint(
-            "type T = {name: Text, score: Int}\n\
+            "type T = {name: Text, score: Int 1}\n\
              *items : [T]\n\
              cleanup = do\n  \
                *items = do\n    \
@@ -1641,7 +1641,7 @@ mod tests {
         // never pushes down (SQLite UPPER is ASCII-only), so this stays a
         // genuine runtime-fallback case even after beta-reduction.
         let diags = lint(
-            "type T = {name: Text, score: Int}\n\
+            "type T = {name: Text, score: Int 1}\n\
              *a : [T]\n\
              *b : [T]\n\
              sync = do\n  \
@@ -1659,7 +1659,7 @@ mod tests {
         // A set value do-block binding from a DIFFERENT source gets the
         // where-pushdown lint exactly once (no lint_set_expr overlap).
         let diags = lint(
-            "type T = {name: Text, score: Int}\n\
+            "type T = {name: Text, score: Int 1}\n\
              isGood = \\x -> x > 50\n\
              *a : [T]\n\
              *b : [T]\n\
@@ -1685,7 +1685,7 @@ mod tests {
         // The lint mirrors that inlining, so it must NOT warn about runtime
         // fallback (regression for B55).
         let diags = lint(
-            "type T = {name: Text, score: Int}\n\
+            "type T = {name: Text, score: Int 1}\n\
              isGood = \\x -> x.score > 50\n\
              *items : [T]\n\
              main = do\n  \
@@ -1702,7 +1702,7 @@ mod tests {
     fn no_lint_on_pipe_filter_simple() {
         // Simple field comparison — SQL WHERE works.
         let diags = lint(
-            "type T = {name: Text, score: Int}\n\
+            "type T = {name: Text, score: Int 1}\n\
              *items : [T]\n\
              main = do\n  \
                yield (*items |> filter (\\i -> i.score > 50))\n",
@@ -1714,7 +1714,7 @@ mod tests {
     fn no_lint_on_contains_in_where() {
         // contains compiles to SQL INSTR().
         let diags = lint(
-            "type T = {name: Text, age: Int}\n\
+            "type T = {name: Text, age: Int 1}\n\
              *people : [T]\n\
              main = do\n  \
                p <- *people\n  \
@@ -1782,7 +1782,7 @@ mod tests {
         // ASCII-only while the runtime does Unicode case mapping, so the
         // where clause is evaluated at runtime (and the lint reports it).
         let diags = lint(
-            "type T = {name: Text, age: Int}\n\
+            "type T = {name: Text, age: Int 1}\n\
              *people : [T]\n\
              main = do\n  \
                p <- *people\n  \
@@ -1797,7 +1797,7 @@ mod tests {
     fn no_lint_on_not_function_in_where() {
         // `not` function compiles to SQL NOT.
         let diags = lint(
-            "type T = {name: Text, active: Int}\n\
+            "type T = {name: Text, active: Int 1}\n\
              *items : [T]\n\
              main = do\n  \
                i <- *items\n  \
@@ -1811,7 +1811,7 @@ mod tests {
     fn no_lint_on_arithmetic_sum() {
         // sum over an arithmetic map projection compiles to SQL SUM(col * col).
         let diags = lint(
-            "type T = {price: Int, qty: Int}\n\
+            "type T = {price: Int 1, qty: Int 1}\n\
              *items : [T]\n\
              main = do\n  \
                items <- *items\n  \
@@ -1824,7 +1824,7 @@ mod tests {
     fn no_lint_on_arithmetic_min_max() {
         // minOn/maxOn with field access compile to SQL MIN/MAX.
         let diags = lint(
-            "type T = {salary: Int}\n\
+            "type T = {salary: Int 1}\n\
              *items : [T]\n\
              main = do\n  \
                items <- *items\n  \
@@ -1841,7 +1841,7 @@ mod tests {
         // that inlining, so it must NOT warn about runtime fallback
         // (regression for B55).
         let diags = lint(
-            "type T = {salary: Int}\n\
+            "type T = {salary: Int 1}\n\
              classify = \\x -> x + 100\n\
              *items : [T]\n\
              main = do\n  \
@@ -1858,7 +1858,7 @@ mod tests {
     fn no_lint_on_count_where_simple() {
         // countWhere with simple predicate compiles to SQL COUNT(*) WHERE.
         let diags = lint(
-            "type T = {salary: Int, dept: Text}\n\
+            "type T = {salary: Int 1, dept: Text}\n\
              *items : [T]\n\
              main = do\n  \
                items <- *items\n  \
@@ -1873,7 +1873,7 @@ mod tests {
         // is not pushed down (SQLite UPPER is ASCII-only), so even after
         // beta-reduction the predicate falls back to runtime.
         let diags = lint(
-            "type T = {salary: Int, name: Text}\n\
+            "type T = {salary: Int 1, name: Text}\n\
              *items : [T]\n\
              main = do\n  \
                yield (*items |> countWhere (\\i -> toUpper i.name == \"BOB\"))\n",
@@ -1886,7 +1886,7 @@ mod tests {
     fn no_lint_on_pipe_min_max() {
         // Pipe forms `*items |> maxOn ...` compile to SQL MIN/MAX.
         let diags = lint(
-            "type T = {salary: Int}\n\
+            "type T = {salary: Int 1}\n\
              *items : [T]\n\
              main = do\n  \
                yield (*items |> maxOn (\\i -> i.salary))\n",
@@ -1898,7 +1898,7 @@ mod tests {
     fn no_lint_on_pipe_count_where() {
         // Pipe form `*items |> countWhere pred` compiles to SQL COUNT(*) WHERE.
         let diags = lint(
-            "type T = {salary: Int}\n\
+            "type T = {salary: Int 1}\n\
              *items : [T]\n\
              main = do\n  \
                yield (*items |> countWhere (\\i -> i.salary > 75))\n",

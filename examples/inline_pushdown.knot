@@ -1,6 +1,6 @@
 -- Cases that should push down to SQL after full inlining.
 
-type Employee = {name: Text, dept: Text, salary: Int}
+type Employee = {name: Text, dept: Text, salary: Int 1}
 
 *employees : [Employee]
 

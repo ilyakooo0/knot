@@ -1,8 +1,8 @@
 -- Traits: runtime dispatch, default methods, and deriving
 
 data Shape
-  = Circle {radius: Int}
-  | Rect {width: Int, height: Int}
+  = Circle {radius: Int 1}
+  | Rect {width: Int 1, height: Int 1}
 
 data Color
   = Red {}
@@ -14,7 +14,7 @@ trait Describe a where
   describe : a -> Text
 
 trait Area a where
-  area : a -> Int
+  area : a -> Int 1
 
 impl Describe Int where
   describe n = "a number"

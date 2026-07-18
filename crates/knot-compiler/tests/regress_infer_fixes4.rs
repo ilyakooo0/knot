@@ -53,7 +53,7 @@ impl Monad Box where
 #[test]
 fn where_guard_in_monad_without_alternative_reports_clean_diagnostic() {
     let src = format!(
-        "{}\nuseit : Box Int\nuseit = do\n  where True\n  yield 5\n",
+        "{}\nuseit : Box Int 1\nuseit = do\n  where True\n  yield 5\n",
         USER_MONAD
     );
     let diags = check_src(&src);
@@ -70,7 +70,7 @@ fn where_guard_in_monad_without_alternative_reports_clean_diagnostic() {
 fn where_guard_over_maybe_is_accepted() {
     // Maybe has a built-in Alternative impl, so a `where` guard must not be
     // flagged.
-    let src = "safeDiv : Int -> Int -> Maybe Int\nsafeDiv = \\a b -> do\n  where b != 0\n  yield (a / b)\n";
+    let src = "safeDiv : Int 1 -> Int 1 -> Maybe Int 1\nsafeDiv = \\a b -> do\n  where b != 0\n  yield (a / b)\n";
     let diags = check_src(src);
     assert!(
         !diags.iter().any(|d| d.message.contains("Alternative")),

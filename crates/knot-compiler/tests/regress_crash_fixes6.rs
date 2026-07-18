@@ -77,7 +77,7 @@ fn build_graceful_error(name: &str, source: &str) -> String {
 fn deeply_nested_forall_reports_diagnostic_not_stack_overflow() {
     // Thousands of nested `forall`s used to blow the parser's stack.
     let ty = "forall a. ".repeat(6000);
-    let src = format!("x : {ty}Int\nmain = 0\n");
+    let src = format!("x : {ty}Int 1\nmain = 0\n");
     let stderr = build_graceful_error("forall_depth", &src);
     assert!(
         stderr.contains("nesting depth limit"),
@@ -108,9 +108,9 @@ fn join_applies_all_predicates() {
     // `z.ka == x.k` AND `z.kb == y.k` (v = "GOOD") should survive. The row with
     // `ka = 99` (no matching `x.k`) must be filtered out.
     let src = r#"
-*a : [{k: Int}]
-*b : [{k: Int}]
-*c : [{ka: Int, kb: Int, v: Text}]
+*a : [{k: Int 1}]
+*b : [{k: Int 1}]
+*c : [{ka: Int 1, kb: Int 1, v: Text}]
 
 main = do
   replace *a = [{k: 1}, {k: 2}]

@@ -6,7 +6,7 @@
 -- tests (`_stm_filter_tests` in knot-runtime). This program exists primarily
 -- as an end-to-end compile/run check on the codegen specialization path.
 
-type Account = {id: Int, balance: Int}
+type Account = {id: Int 1, balance: Int 1}
 *accounts : [Account]
 
 -- The `single (filter (\a -> a.id == ?) rows)` pattern is what the codegen

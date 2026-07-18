@@ -278,7 +278,7 @@ main = println (show (f 2.0 3.0))
 #[test]
 fn race_through_helper_rejected_inside_atomic() {
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 raceIt = \a b -> race a b
 main = do
   c <- atomic (do
@@ -299,7 +299,7 @@ main = do
 fn shadowed_race_in_helper_not_flagged() {
     // A helper whose *parameter* is named `race` is not the builtin.
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 pickIt = \race -> count race
 main = do
   c <- atomic (do
@@ -320,7 +320,7 @@ main = do
 #[test]
 fn record_field_io_lambda_rejected_inside_atomic() {
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 r = {fn: \u -> println "hidden"}
 main = do
   c <- atomic (do
@@ -340,7 +340,7 @@ main = do
 #[test]
 fn pure_record_field_lambda_still_allowed_inside_atomic() {
     let diags = effect_diags(
-        r#"*items : [{n: Int}]
+        r#"*items : [{n: Int 1}]
 r = {fn: \u -> u}
 main = do
   c <- atomic (do
@@ -389,7 +389,7 @@ main = runIt (\u -> yield {})
 
 #[test]
 fn view_write_attributes_effects_to_backing_source() {
-    let src = r#"*people : [{name: Text, age: Int}]
+    let src = r#"*people : [{name: Text, age: Int 1}]
 *adults = do
   p <- *people
   where p.age >= 18
@@ -440,7 +440,7 @@ fn parameterized_single_variant_data_type_substitutes_args() {
     // Before the fix, the resolved alias collapsed the type parameter to
     // `Named("unknown")`, producing the meaningless "value:text".
     let src = r#"data Box a = Box {value: a}
-*boxes : [Box Int]
+*boxes : [Box Int 1]
 main = println "ok"
 "#;
     let module = parse(src);
@@ -461,7 +461,7 @@ fn alias_applying_later_declared_parameterized_data_type_resolves() {
     // meaningless `_value:text` schema. The re-resolve pass must recover the
     // application from the alias's original AST once `Box` is known, yielding
     // `value:int`.
-    let src = r#"type Wrapped = [Box Int]
+    let src = r#"type Wrapped = [Box Int 1]
 data Box a = Box {value: a}
 *w : Wrapped
 main = println "ok"
@@ -545,8 +545,8 @@ main = do
 fn refined_field_inside_nested_relation_is_enforced() {
     let (_stdout, stderr, ok) = compile_and_run(
         "refine_nested_relation",
-        r#"type Pos = Int where \x -> x > 0
-type Order = {id: Int, items: [{qty: Pos}]}
+        r#"type Pos = Int 1 where \x -> x > 0
+type Order = {id: Int 1, items: [{qty: Pos}]}
 *orders : [Order]
 main = do
   replace *orders = [{id: 1, items: [{qty: 0 - 5}]}]
@@ -565,7 +565,7 @@ main = do
 fn refined_field_inside_nested_record_alias_is_enforced() {
     let (_stdout, stderr, ok) = compile_and_run(
         "refine_nested_record_alias",
-        r#"type Zip = Int where \x -> x > 0
+        r#"type Zip = Int 1 where \x -> x > 0
 type Addr = {zip: Zip}
 type Person = {name: Text, addr: Addr}
 *people : [Person]
@@ -586,7 +586,7 @@ main = do
 fn adt_constructor_field_refinement_is_enforced() {
     let (_stdout, stderr, ok) = compile_and_run(
         "refine_adt_ctor_field",
-        r#"data Shape = Circle {radius: Float where \r -> r > 0.0} | Rect {w: Float}
+        r#"data Shape = Circle {radius: Float 1 where \r -> r > 0.0} | Rect {w: Float 1}
 *shapes : [Shape]
 main = do
   replace *shapes = [Circle {radius: 0.0 - 1.0}]
@@ -607,7 +607,7 @@ fn stacked_inline_over_refined_alias_enforces_both() {
     // still apply; previously only the inline predicate was kept.
     let (_stdout, stderr, ok) = compile_and_run(
         "refine_stacked",
-        r#"type Nat = Int where \x -> x >= 0
+        r#"type Nat = Int 1 where \x -> x >= 0
 type Person = {age: Nat where \x -> x < 150}
 *people : [Person]
 main = do
@@ -627,11 +627,11 @@ main = do
 fn valid_nested_refined_data_still_inserts() {
     let (stdout, stderr, ok) = compile_and_run(
         "refine_nested_valid",
-        r#"type Pos = Int where \x -> x > 0
-type Zip = Int where \x -> x > 0
+        r#"type Pos = Int 1 where \x -> x > 0
+type Zip = Int 1 where \x -> x > 0
 type Addr = {zip: Zip}
-data Shape = Circle {radius: Float where \r -> r > 0.0} | Rect {w: Float}
-type Order = {id: Int, items: [{qty: Pos}], addr: Addr}
+data Shape = Circle {radius: Float 1 where \r -> r > 0.0} | Rect {w: Float 1}
+type Order = {id: Int 1, items: [{qty: Pos}], addr: Addr}
 *orders : [Order]
 *shapes : [Shape]
 main = do
@@ -649,9 +649,9 @@ main = do
 
 #[test]
 fn migrate_bracketed_relation_types_produce_record_schemas() {
-    let src = r#"type Order = {customer: Text, qty: Int}
+    let src = r#"type Order = {customer: Text, qty: Int 1}
 *orders : [Order]
-migrate *orders from [{customer: Text}] to [{customer: Text, qty: Int}] using \r -> {customer: r.customer, qty: 0}
+migrate *orders from [{customer: Text}] to [{customer: Text, qty: Int 1}] using \r -> {customer: r.customer, qty: 0}
 main = println "ok"
 "#;
     let module = parse(src);
@@ -674,8 +674,8 @@ fn sql_lint_suppressed_when_user_primitive_impl_disables_pushdown() {
     // impl on a primitive type, codegen disables SQL pushdown wholesale and
     // evaluates everything in memory — so the lint must stay silent rather
     // than imply (by reporting only this construct) that others push down.
-    let base = r#"*items : [{name: Text, qty: Int}]
-firstFew : IO {} [{name: Text, qty: Int}]
+    let base = r#"*items : [{name: Text, qty: Int 1}]
+firstFew : IO {} [{name: Text, qty: Int 1}]
 firstFew = *items |> take 3 |> filter (\m -> m.qty > 0)
 main = println "ok"
 "#;
@@ -731,16 +731,16 @@ fn migrate_scalar_source_runs_end_to_end() {
         )
     };
 
-    let (_, ok1) = build_run("*counter : Int\nmain = do\n  *counter = 5\n  yield {}\n");
+    let (_, ok1) = build_run("*counter : Int 1\nmain = do\n  *counter = 5\n  yield {}\n");
     assert!(ok1, "phase 1 (Int source) should build and run");
 
     let (stdout, ok2) = build_run(
-        "*counter : Float\n\
+        "*counter : Float 1\n\
          migrate *counter from Int to Float using \\old -> 0.0\n\
          main = do\n  c <- *counter\n  println (show c)\n  yield {}\n",
     );
     let _ = fs::remove_dir_all(&dir);
-    assert!(ok2, "phase 2 (migrate Int→Float) should build and run: {stdout}");
+    assert!(ok2, "phase 2 (migrate Int 1→Float 1) should build and run: {stdout}");
     assert!(
         stdout.contains("0.0"),
         "migrated scalar value should be 0.0, got: {stdout}"
@@ -753,7 +753,7 @@ fn migrate_scalar_source_schema_matches_source_schema() {
     // path must wrap its from/to schemas the same way; otherwise the lockfile
     // (`_value:int`) and the migrate descriptor (`int`) never match and scalar
     // source migrations are impossible.
-    let src = r#"*counter : Float
+    let src = r#"*counter : Float 1
 migrate *counter from Int to Float using \old -> 0.0
 main = println "ok"
 "#;
@@ -774,8 +774,8 @@ main = println "ok"
 #[test]
 fn migrate_relation_of_scalar_schema_matches_source_schema() {
     // Same contract for a relation-of-scalar source (`[Text]` → `_value:text`).
-    let src = r#"*tags : [Int]
-migrate *tags from [Text] to [Int] using \r -> r
+    let src = r#"*tags : [Int 1]
+migrate *tags from [Text] to [Int 1] using \r -> r
 main = println "ok"
 "#;
     let module = parse(src);
@@ -792,9 +792,9 @@ main = println "ok"
 fn migrate_bracketed_relation_types_run_end_to_end() {
     let (stdout, stderr, ok) = compile_and_run(
         "migrate_bracketed",
-        r#"type Order = {customer: Text, qty: Int}
+        r#"type Order = {customer: Text, qty: Int 1}
 *orders : [Order]
-migrate *orders from [{customer: Text}] to [{customer: Text, qty: Int}] using \r -> {customer: r.customer, qty: 0}
+migrate *orders from [{customer: Text}] to [{customer: Text, qty: Int 1}] using \r -> {customer: r.customer, qty: 0}
 main = do
   rows <- *orders
   println ("rows: " ++ show (count rows))
@@ -814,7 +814,7 @@ fn do_blocks_at_identical_offsets_in_different_files_use_their_own_monads() {
     // same byte offset as lib's `do`, which used to collide in monad_info
     // (spans are not shifted when imported modules are merged) and compile
     // the Maybe do-block with Relation binds — a runtime panic.
-    let lib = "f1 : Maybe Int -> Maybe Int\nf1 = \\m -> do\n  x <- m\n  yield (x + 1)\n";
+    let lib = "f1 : Maybe Int 1 -> Maybe Int 1\nf1 = \\m -> do\n  x <- m\n  yield (x + 1)\n";
     let lib_do_off = lib.find("do").unwrap();
     let prefix = "import ./lib\n";
     let fn_line = "f2 = \\r -> do";
@@ -848,7 +848,7 @@ fn do_blocks_at_identical_offsets_in_different_files_use_their_own_monads() {
     );
     assert!(
         stdout.contains("list: 3"),
-        "[Int] do-block must use the Relation monad, got: {stdout}"
+        "[Int 1] do-block must use the Relation monad, got: {stdout}"
     );
 }
 
@@ -900,7 +900,7 @@ fn traverse_empty_in_io_context_yields_empty_relation() {
     let (stdout, stderr, ok) = compile_and_run(
         "traverse_empty_io",
         r#"sendIt = \x -> println (show x.n)
-noRows : [{n: Int}]
+noRows : [{n: Int 1}]
 noRows = []
 main = do
   results <- traverse sendIt noRows
@@ -920,7 +920,7 @@ fn traverse_empty_in_maybe_context_yields_just_empty() {
     let (stdout, stderr, ok) = compile_and_run(
         "traverse_empty_maybe",
         r#"half = \x -> if x.n > 0 then Just {value: x.n} else Nothing {}
-noRows : [{n: Int}]
+noRows : [{n: Int 1}]
 noRows = []
 main = do
   let res = traverse half noRows

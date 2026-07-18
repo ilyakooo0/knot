@@ -144,7 +144,7 @@ fn parse_json_maybe_in_relation_rows() {
   Just {value} -> println ("row: " ++ show value)
 
 main = do
-  case parseJson "[{\"a\":null},{\"a\":7}]" : Maybe [{a: Maybe Int}] of
+  case parseJson "[{\"a\":null},{\"a\":7}]" : Maybe [{a: Maybe Int 1}] of
     Nothing {} -> println "parse failed"
     Just {value} -> forEach value showRow
 "#,
@@ -186,7 +186,7 @@ main = do
 fn maybe_db_storage_keeps_marker_format() {
     let c = compile(
         "maybe_db_marker",
-        r#"*items : [{n: Int, status: Maybe Text}]
+        r#"*items : [{n: Int 1, status: Maybe Text}]
 
 showRow = \r -> case r.status of
   Nothing {} -> println (show r.n ++ ": none")

@@ -23,7 +23,7 @@ fn probe_infer_mode_annot_forall_escape() {
     // *inline* annotation in infer position. If accepted (no error), that is
     // a soundness hole: g addOne : forall a. a -> a, usable at any type.
     let src = r#"g = \h -> (h : forall a. a -> a)
-addOne : Int -> Int
+addOne : Int 1 -> Int 1
 addOne = \x -> x + 1
 bad : Text
 bad = (g addOne) "hello"
@@ -41,7 +41,7 @@ main = println bad
 #[test]
 fn probe_check_mode_annot_forall_escape() {
     // Same but where the annotation is in a checked position (return type).
-    let src = r#"g : (Int -> Int) -> (forall a. a -> a)
+    let src = r#"g : (Int 1 -> Int 1) -> (forall a. a -> a)
 g = \h -> h
 main = println "x"
 "#;

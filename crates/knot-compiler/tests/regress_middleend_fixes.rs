@@ -75,11 +75,11 @@ fn compile_and_run(test_name: &str, source: &str) -> (String, String, bool) {
 fn maybe_comprehension_with_yield_var_compiles_and_runs() {
     // Previously: `is_sql_compilable` accepted the `u <- m` Var bind and
     // preserved the block as a raw Do node, which infer_do then rejected
-    // ("type mismatch: expected Maybe {age: Int}, found [t..]").
+    // ("type mismatch: expected Maybe {age: Int 1}, found [t..]").
     let (stdout, stderr, ok) = compile_and_run(
         "maybe_yield_var",
         r#"
-firstAdult : Maybe {age: Int} -> Maybe {age: Int}
+firstAdult : Maybe {age: Int 1} -> Maybe {age: Int 1}
 firstAdult = \m -> do
   u <- m
   where u.age >= 18
@@ -110,7 +110,7 @@ fn maybe_comprehension_with_yield_field_control() {
     let (stdout, stderr, ok) = compile_and_run(
         "maybe_yield_field",
         r#"
-firstAge : Maybe {age: Int} -> Maybe Int
+firstAge : Maybe {age: Int 1} -> Maybe Int 1
 firstAge = \m -> do
   u <- m
   where u.age >= 18
@@ -134,7 +134,7 @@ fn source_bound_var_inner_do_still_pushes_down() {
     let (stdout, stderr, ok) = compile_and_run(
         "source_bound_var_inner_do",
         r#"
-*people : [{name: Text, age: Int}]
+*people : [{name: Text, age: Int 1}]
 
 main = do
   replace *people = [{name: "Alice", age: 30}, {name: "Bob", age: 10}, {name: "Cara", age: 44}]
@@ -205,7 +205,7 @@ main = do
     let (fun_out, stderr, ok) = compile_and_run(
         "io_fun_seq_control",
         r#"
-tick : Int -> IO {console} {}
+tick : Int 1 -> IO {console} {}
 tick = \v -> println (show v)
 
 main = do
@@ -243,7 +243,7 @@ fn effect_diags(source: &str) -> Vec<knot::diagnostic::Diagnostic> {
 fn shadowed_race_name_allowed_inside_atomic() {
     let diags = effect_diags(
         r#"
-*items : [{n: Int}]
+*items : [{n: Int 1}]
 main = do
   c <- atomic (do
     rows <- *items
@@ -265,7 +265,7 @@ main = do
 fn do_bound_race_name_allowed_inside_atomic() {
     let diags = effect_diags(
         r#"
-*items : [{n: Int}]
+*items : [{n: Int 1}]
 main = do
   c <- atomic (do
     race <- *items
@@ -286,7 +286,7 @@ main = do
 fn real_race_still_rejected_inside_atomic() {
     let diags = effect_diags(
         r#"
-*items : [{n: Int}]
+*items : [{n: Int 1}]
 main = do
   c <- atomic (do
     rows <- *items

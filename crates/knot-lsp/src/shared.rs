@@ -1555,7 +1555,7 @@ mod tests {
 
     #[test]
     fn predicate_to_source_slices_matching_source() {
-        let source = "type Nat = Int where \\x -> x >= 0\n";
+        let source = "type Nat = Int 1 where \\x -> x >= 0\n";
         let pred = parse_refined_predicate(source);
         let rendered = predicate_to_source(&pred, source);
         assert_eq!(rendered, "\\x -> x >= 0");
@@ -1567,7 +1567,7 @@ mod tests {
     /// mismatch and pretty-print the AST instead.
     #[test]
     fn predicate_to_source_does_not_slice_foreign_source() {
-        let owner_source = "type Nat = Int where \\x -> x >= 0\n";
+        let owner_source = "type Nat = Int 1 where \\x -> x >= 0\n";
         let pred = parse_refined_predicate(owner_source);
         // A "current document" whose bytes have nothing to do with the
         // predicate's spans, but is long enough that the slice is in range.
@@ -1584,7 +1584,7 @@ mod tests {
     /// the predicate (or a placeholder) — never panics, never garbage.
     #[test]
     fn predicate_to_source_handles_out_of_range_span() {
-        let owner_source = "type Nat = Int where \\x -> x >= 0\n";
+        let owner_source = "type Nat = Int 1 where \\x -> x >= 0\n";
         let pred = parse_refined_predicate(owner_source);
         let rendered = predicate_to_source(&pred, "");
         assert_eq!(rendered, "\\x -> x >= 0");
@@ -1594,7 +1594,7 @@ mod tests {
     /// rejected when the parameter doesn't match the predicate's.
     #[test]
     fn predicate_to_source_rejects_lookalike_lambda_slice() {
-        let owner_source = "type Nat = Int where \\x -> x >= 0\n";
+        let owner_source = "type Nat = Int 1 where \\x -> x >= 0\n";
         let pred = parse_refined_predicate(owner_source);
         // Bytes at the predicate's span hold a *different* lambda.
         let mut foreign = String::new();

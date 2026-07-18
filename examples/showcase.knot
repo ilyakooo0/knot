@@ -21,19 +21,19 @@ data Department
 
 data Active = Yes {} | No {}
 
-type Employee = {name: Text, age: Int, salary: Float, dept: Department, active: Active}
+type Employee = {name: Text, age: Int 1, salary: Float 1, dept: Department, active: Active}
 
-type Project = {name: Text, lead: Text, budget: Float, priority: Priority}
+type Project = {name: Text, lead: Text, budget: Float 1, priority: Priority}
 
-type Ticket = {title: Text, project: Text, status: Status, priority: Priority, points: Int}
+type Ticket = {title: Text, project: Text, status: Status, priority: Priority, points: Int 1}
 
 type Customer = {name: Text, email: Text, tier: Tier}
 
 data Tier = Free {} | Pro {} | Enterprise {}
 
-type Order = {customer: Text, product: Text, quantity: Int, total: Float}
+type Order = {customer: Text, product: Text, quantity: Int 1, total: Float 1}
 
-type Product = {name: Text, price: Float, category: Category, inStock: Active}
+type Product = {name: Text, price: Float 1, category: Category, inStock: Active}
 
 data Category
   = Electronics {}
@@ -44,11 +44,11 @@ data Category
 
 type Team = {name: Text, members: [{name: Text, role: Text}]}
 
-type LogEntry = {timestamp: Int, level: Level, message: Text, source: Text}
+type LogEntry = {timestamp: Int 1, level: Level, message: Text, source: Text}
 
 data Level = Debug {} | Info {} | Warn {} | Error {}
 
-type Metric = {name: Text, value: Float, tags: Text}
+type Metric = {name: Text, value: Float 1, tags: Text}
 
 -- ── Sources ──────────────────────────────────────────────────────
 

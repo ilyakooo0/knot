@@ -478,7 +478,7 @@ main = println (greet "world")
         // A self-named constructor (`data Pair = Pair {...}`) must resolve to
         // the constructor token after `=`, not the type-name token before it.
         let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "data Pair = Pair {x: Int}\n");
+        let uri = ws.open("main", "data Pair = Pair {x: Int 1}\n");
         let doc = ws.doc(&uri);
         let span = doc
             .definitions
@@ -530,7 +530,7 @@ main = println (greet "world")
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "data Box = Box {size: Int}\nsize = 100\nget = \\b -> b.size\n",
+            "data Box = Box {size: Int 1}\nsize = 100\nget = \\b -> b.size\n",
         );
         let doc = ws.doc(&uri);
         // Cursor on `size` in `b.size` (the last occurrence).

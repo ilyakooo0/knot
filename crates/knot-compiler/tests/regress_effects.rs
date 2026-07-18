@@ -62,7 +62,7 @@ fn assert_has_error(diags: &[Diagnostic], message_contains: &str, note_contains:
 fn derived_relation_inherits_function_effects_missing_annotation_flagged() {
     let diags = effect_diags(
         r#"
-type B = {x: Int}
+type B = {x: Int 1}
 *b : [B]
 
 readsB = \u -> *b
@@ -85,7 +85,7 @@ main = do
 fn derived_relation_correct_annotation_accepted_without_warning() {
     let diags = effect_diags(
         r#"
-type B = {x: Int}
+type B = {x: Int 1}
 *b : [B]
 
 readsB = \u -> *b
@@ -111,7 +111,7 @@ main = do
 fn lambda_effects_propagate_from_non_final_argument() {
     let diags = effect_diags(
         r#"
-withCb2 : (Int -> IO {| e} {}) -> Int -> IO {| e} {}
+withCb2 : (Int 1 -> IO {| e} {}) -> Int 1 -> IO {| e} {}
 withCb2 = \cb x -> cb x
 
 main : IO {} {}
@@ -126,7 +126,7 @@ main = withCb2 (\u -> println "hi") 1
 fn lambda_effects_in_non_final_argument_accepted_when_declared() {
     let diags = effect_diags(
         r#"
-withCb2 : (Int -> IO {| e} {}) -> Int -> IO {| e} {}
+withCb2 : (Int 1 -> IO {| e} {}) -> Int 1 -> IO {| e} {}
 withCb2 = \cb x -> cb x
 
 main : IO {console} {}
@@ -141,7 +141,7 @@ main = withCb2 (\u -> println "hi") 1
 fn lambda_effects_propagate_from_final_argument() {
     let diags = effect_diags(
         r#"
-withCb : Int -> (Int -> IO {| e} {}) -> IO {| e} {}
+withCb : Int 1 -> (Int 1 -> IO {| e} {}) -> IO {| e} {}
 withCb = \x cb -> cb x
 
 main : IO {} {}
@@ -160,7 +160,7 @@ main = withCb 1 (\u -> println "hi")
 fn param_side_effect_annotation_does_not_license_body_effects() {
     let diags = effect_diags(
         r#"
-f : (Int -> IO {console} {}) -> IO {} {}
+f : (Int 1 -> IO {console} {}) -> IO {} {}
 f = \cb -> println "leaky"
 "#,
     );
@@ -172,7 +172,7 @@ f = \cb -> println "leaky"
 fn result_side_effect_annotation_accepted() {
     let diags = effect_diags(
         r#"
-f : (Int -> IO {console} {}) -> IO {console} {}
+f : (Int 1 -> IO {console} {}) -> IO {console} {}
 f = \cb -> println "ok"
 "#,
     );
@@ -188,7 +188,7 @@ f = \cb -> println "ok"
 fn atomic_relation_read_through_local_binding_accepted() {
     let diags = effect_diags(
         r#"
-type Item = {id: Int}
+type Item = {id: Int 1}
 *items : [Item]
 
 main = do
@@ -209,7 +209,7 @@ main = do
 fn local_lambda_relation_read_counts_toward_declared_effects() {
     let diags = effect_diags(
         r#"
-type Item = {id: Int}
+type Item = {id: Int 1}
 *items : [Item]
 
 main : IO {console} {}
@@ -248,7 +248,7 @@ main = do
 fn atomic_io_through_local_binding_rejected() {
     let diags = effect_diags(
         r#"
-type Item = {id: Int}
+type Item = {id: Int 1}
 *items : [Item]
 
 main = do
@@ -270,7 +270,7 @@ main = do
 fn race_inside_atomic_rejected() {
     let diags = effect_diags(
         r#"
-type Counter = {n: Int}
+type Counter = {n: Int 1}
 *counter : [Counter]
 
 main = do
@@ -288,7 +288,7 @@ main = do
 fn race_inside_atomic_via_local_lambda_rejected() {
     let diags = effect_diags(
         r#"
-type Counter = {n: Int}
+type Counter = {n: Int 1}
 *counter : [Counter]
 
 main = do

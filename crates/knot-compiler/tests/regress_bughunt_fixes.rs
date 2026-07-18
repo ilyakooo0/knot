@@ -91,7 +91,7 @@ fn or_in_do_block_where_does_not_escape_and_scope() {
     // (= `a==1 OR (a==2 AND b==3)`) also matched {a:1,b:999}, yielding 2.
     let (stdout, stderr, ok) = compile_and_run(
         "or_do_where",
-        r#"type Item = {a: Int, b: Int}
+        r#"type Item = {a: Int 1, b: Int 1}
 *items : [Item]
 
 main = do
@@ -117,7 +117,7 @@ fn or_in_pipe_filters_does_not_escape_and_scope() {
     // Same invariant through the pipe/aggregate pushdown path.
     let (stdout, stderr, ok) = compile_and_run(
         "or_pipe_filter",
-        r#"type Item = {a: Int, b: Int}
+        r#"type Item = {a: Int 1, b: Int 1}
 *items : [Item]
 
 main = do
@@ -145,7 +145,7 @@ fn partial_application_arg_var_is_not_captured_by_later_param() {
     // outer value is 25, so the correct predicate is `age > 25`, matching 2.
     let (stdout, stderr, ok) = compile_and_run(
         "beta_capture",
-        r#"type Rec = {age: Int, threshold: Int}
+        r#"type Rec = {age: Int 1, threshold: Int 1}
 *people : [Rec]
 
 cmp = \threshold p -> p.age > threshold
@@ -199,7 +199,7 @@ fn assert_has_error(diags: &[Diagnostic], needle: &str) {
 #[test]
 fn top_level_io_builtin_alias_is_caught_inside_atomic() {
     let diags = effect_diags(
-        r#"*counter : [{n: Int}]
+        r#"*counter : [{n: Int 1}]
 
 readIt = readFile
 
@@ -215,7 +215,7 @@ proc = atomic do
 #[test]
 fn local_let_io_builtin_alias_is_caught_inside_atomic() {
     let diags = effect_diags(
-        r#"*counter : [{n: Int}]
+        r#"*counter : [{n: Int 1}]
 
 proc = atomic do
   c <- *counter

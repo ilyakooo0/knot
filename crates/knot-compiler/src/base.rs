@@ -58,8 +58,8 @@ trait Semigroup a where
   append : a -> a -> a
 
 trait Sequence s where
-  take : Int -> s -> s
-  drop : Int -> s -> s
+  take : Int 1 -> s -> s
+  drop : Int 1 -> s -> s
 
 trait Display a where
   display : a -> Text

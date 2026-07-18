@@ -32,7 +32,7 @@ fn verification_pass4_annot_descends_into_inner_expr() {
     // inside the annotated expression should produce a chain that includes
     // the inner expression's span. Before the fix, the Annot arm was in the
     // `_ => {}` catch-all, so the inner expression span was missing.
-    let src = "main = (1 + 2 : Int)\n";
+    let src = "main = (1 + 2 : Int 1)\n";
     let uri = ws.open("main", src);
     let off = src.find("1 + 2").unwrap() + 1; // inside `1`
     let pos = offset_to_position(src, off);

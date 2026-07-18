@@ -4837,7 +4837,7 @@ mod regress_fixes_tests {
     /// textual `IO {` (which can be a callback parameter's row).
     #[test]
     fn widen_effects_targets_result_row_not_callback_param() {
-        let src = "runCb : (Int -> IO {} {}) -> IO {} {}\nrunCb = \\cb -> cb 1\n";
+        let src = "runCb : (Int 1 -> IO {} {}) -> IO {} {}\nrunCb = \\cb -> cb 1\n";
         let lexer = knot::lexer::Lexer::new(src);
         let (tokens, _) = lexer.tokenize();
         let parser = knot::parser::Parser::new(src.to_string(), tokens);
@@ -4862,7 +4862,7 @@ mod regress_fixes_tests {
         out.replace_range(start..end, &edit.new_text);
         assert_eq!(
             out,
-            "runCb : (Int -> IO {} {}) -> IO {console} {}\nrunCb = \\cb -> cb 1\n"
+            "runCb : (Int 1 -> IO {} {}) -> IO {console} {}\nrunCb = \\cb -> cb 1\n"
         );
     }
 
@@ -4985,7 +4985,7 @@ mod regress_fixes_tests {
     #[test]
     fn add_missing_methods_matches_impl_indentation() {
         let mut tw = TestWorkspace::new();
-        let src = "trait Shape a where\n  area : a -> Int\n  name : a -> Text\n\ndata Sq = Sq {s: Int}\n\nimpl Shape Sq where\n    area x = 1\n\nnext = 1\n";
+        let src = "trait Shape a where\n  area : a -> Int 1\n  name : a -> Text\n\ndata Sq = Sq {s: Int 1}\n\nimpl Shape Sq where\n    area x = 1\n\nnext = 1\n";
         let uri = tw.open("main", src);
         let pos = tw.position_of(&uri, "impl Shape");
         let actions = handle_code_action(
@@ -5036,7 +5036,7 @@ mod regress_case_arm_tests {
     #[test]
     fn fill_case_arms_not_offered_when_wildcard_arm_exists() {
         let mut tw = TestWorkspace::new();
-        let src = "data Color = Red {} | Blue {} | Green {}\n\npick : Color -> Int\npick = \\v -> case v of\n  Red {} -> 1\n  _ -> 0\n";
+        let src = "data Color = Red {} | Blue {} | Green {}\n\npick : Color -> Int 1\npick = \\v -> case v of\n  Red {} -> 1\n  _ -> 0\n";
         let uri = tw.open("main", src);
         let pos = tw.position_of(&uri, "case v of");
         let actions = handle_code_action(&tw.state, &params_at(&uri, pos)).unwrap_or_default();
@@ -5054,7 +5054,7 @@ mod regress_case_arm_tests {
     #[test]
     fn fill_case_arms_not_offered_when_var_catch_all_exists() {
         let mut tw = TestWorkspace::new();
-        let src = "data Color = Red {} | Blue {} | Green {}\n\npick : Color -> Int\npick = \\v -> case v of\n  Red {} -> 1\n  other -> 0\n";
+        let src = "data Color = Red {} | Blue {} | Green {}\n\npick : Color -> Int 1\npick = \\v -> case v of\n  Red {} -> 1\n  other -> 0\n";
         let uri = tw.open("main", src);
         let pos = tw.position_of(&uri, "case v of");
         let actions = handle_code_action(&tw.state, &params_at(&uri, pos)).unwrap_or_default();
@@ -5075,7 +5075,7 @@ mod regress_case_arm_tests {
     #[test]
     fn fill_case_arms_resolves_scrutinee_by_span() {
         let mut tw = TestWorkspace::new();
-        let src = "data Color = Red {} | Blue {} | Green {}\n\ndata Shape = Circle {} | Square {}\n\nuseShape : Shape -> Int\nuseShape = \\v -> 0\n\nother = \\v -> useShape v\n\npick : Color -> Int\npick = \\v -> case v of\n  Red {} -> 1\n";
+        let src = "data Color = Red {} | Blue {} | Green {}\n\ndata Shape = Circle {} | Square {}\n\nuseShape : Shape -> Int 1\nuseShape = \\v -> 0\n\nother = \\v -> useShape v\n\npick : Color -> Int 1\npick = \\v -> case v of\n  Red {} -> 1\n";
         let uri = tw.open("main", src);
         let pos = tw.position_of(&uri, "case v of");
         let actions = handle_code_action(&tw.state, &params_at(&uri, pos)).unwrap_or_default();

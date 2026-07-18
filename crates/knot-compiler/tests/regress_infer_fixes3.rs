@@ -4,7 +4,7 @@
 //!    nominally (constructor application yields `Con(name)`) and as a record
 //!    alias (a `: name` annotation/field type resolves to the record). The two
 //!    must unify, so `Box {val: 5} : Box` type-checks instead of reporting a
-//!    spurious "expected {val: Int}, found Box" mismatch.
+//!    spurious "expected {val: Int 1}, found Box" mismatch.
 
 use knot::diagnostic::Diagnostic;
 
@@ -50,9 +50,9 @@ fn assert_clean(diags: &[Diagnostic]) {
 #[test]
 fn open_effect_row_annotation_accepts_fewer_effects() {
     let diags = check_src(
-        r#"*items : [{id: Int}]
+        r#"*items : [{id: Int 1}]
 
-getItems : IO {console | _} [{id: Int}]
+getItems : IO {console | _} [{id: Int 1}]
 getItems = *items
 "#,
     );
@@ -64,7 +64,7 @@ getItems = *items
 #[test]
 fn single_variant_record_ctor_matches_annotation() {
     let diags = check_src(
-        r#"data Box = Box {val: Int}
+        r#"data Box = Box {val: Int 1}
 
 ann : Box
 ann = Box {val: 5}
@@ -94,9 +94,9 @@ fn single_variant_record_ctor_as_function_arg() {
     // The unification also fires when the value flows into a parameter typed
     // by the data-type name, not just a top-level annotation.
     let diags = check_src(
-        r#"data Box = Box {val: Int}
+        r#"data Box = Box {val: Int 1}
 
-unwrap : Box -> Int
+unwrap : Box -> Int 1
 unwrap = \b -> b.val
 
 main = println (show (unwrap (Box {val: 7})))
@@ -109,7 +109,7 @@ main = println (show (unwrap (Box {val: 7})))
 fn multi_variant_record_ctor_still_checks() {
     // Sanity: multi-variant types were always fine and must stay fine.
     let diags = check_src(
-        r#"data Shape = Circle {r: Int} | Square {s: Int}
+        r#"data Shape = Circle {r: Int 1} | Square {s: Int 1}
 
 ann : Shape
 ann = Circle {r: 5}
@@ -124,7 +124,7 @@ main = println (show ann)
 fn single_variant_record_ctor_rejects_wrong_field_type() {
     // The subsumption must not paper over a genuine field-type mismatch.
     let diags = check_src(
-        r#"data Box = Box {val: Int}
+        r#"data Box = Box {val: Int 1}
 
 ann : Box
 ann = Box {val: "nope"}

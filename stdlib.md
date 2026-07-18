@@ -60,8 +60,8 @@ match : Constructor -> [Constructor] -> [Payload]
 Filter a relation to rows matching a constructor tag, extracting the payload.
 
 ```knot
-&circles = *shapes |> match Circle    -- : [{radius: Float}]
-&rects   = *shapes |> match Rect      -- : [{width: Float, height: Float}]
+&circles = *shapes |> match Circle    -- : [{radius: Float 1}]
+&rects   = *shapes |> match Rect      -- : [{width: Float 1, height: Float 1}]
 ```
 
 ### `fold`
@@ -124,7 +124,7 @@ engHeadcount = do
 sum : Num a => [a] -> a
 ```
 
-Sum of a numeric relation. Takes the relation directly — there is no projection argument. To sum a field of a record relation, project first with `map`. Works with `Int`, `Float`, and unit-annotated types — units are preserved.
+Sum of a numeric relation. Takes the relation directly — there is no projection argument. To sum a field of a record relation, project first with `map`. Works with `Int 1`, `Float 1`, and unit-annotated types — units are preserved.
 
 ```knot
 total = sum [10, 20, 30]                          -- 60
@@ -142,7 +142,7 @@ totalDistance = sum (map (\t -> t.distance) *trips)   -- Float M if distance : F
 avg : (a -> Float u) -> [a] -> Float u
 ```
 
-Average of a projected numeric field over a relation. Returns `Float`. Preserves units from the projection function — if the projection returns `Float M`, the average is `Float M`.
+Average of a projected numeric field over a relation. Returns `Float 1`. Preserves units from the projection function — if the projection returns `Float M`, the average is `Float M`.
 
 ### `minOn`
 
@@ -150,7 +150,7 @@ Average of a projected numeric field over a relation. Returns `Float`. Preserves
 minOn : (a -> b) -> [a] -> b
 ```
 
-Minimum of a projected field over a relation. The projection can return any orderable type — `Int`, `Float`, or `Text` (lexicographic ordering). Panics if the relation is empty.
+Minimum of a projected field over a relation. The projection can return any orderable type — `Int 1`, `Float 1`, or `Text` (lexicographic ordering). Panics if the relation is empty.
 
 ```knot
 lowestSalary = do
@@ -282,8 +282,8 @@ Pushes down to SQL `ORDER BY` when applied to a source relation. Combined with `
 ### `take` / `drop`
 
 ```
-take : Int -> [a] -> [a]      -- Sequence.take
-drop : Int -> [a] -> [a]      -- Sequence.drop
+take : Int 1 -> [a] -> [a]      -- Sequence.take
+drop : Int 1 -> [a] -> [a]      -- Sequence.drop
 ```
 
 First / drop *n* rows. Both come from the `Sequence` trait, which also has a `Text` impl that operates on characters.
@@ -439,7 +439,7 @@ Convert text to lowercase.
 ### `length`
 
 ```
-length : Text -> Int
+length : Text -> Int 1
 ```
 
 Return the number of characters (Unicode-aware).
@@ -474,10 +474,10 @@ Split text into a relation of single characters.
 `Text` (characters) and relations (rows):
 
 ```
-take : Int -> Text -> Text         -- characters
-take : Int -> [a]  -> [a]          -- rows
-drop : Int -> Text -> Text
-drop : Int -> [a]  -> [a]
+take : Int 1 -> Text -> Text         -- characters
+take : Int 1 -> [a]  -> [a]          -- rows
+drop : Int 1 -> Text -> Text
+drop : Int 1 -> [a]  -> [a]
 ```
 
 ```knot
@@ -660,7 +660,7 @@ main = do
 now : IO {clock} Int Ms
 ```
 
-Return the current Unix timestamp in milliseconds. The result is tagged with the built-in `Ms` unit; use `stripUnit` if you need a plain `Int`.
+Return the current Unix timestamp in milliseconds. The result is tagged with the built-in `Ms` unit; use `stripUnit` if you need a plain `Int 1`.
 
 ### `sleep`
 
@@ -725,7 +725,7 @@ Encode any value as a JSON string.
 parseJson : Text -> Maybe a
 ```
 
-Parse a JSON string into a value, returning `Just value` on success and `Nothing` on a parse failure. Objects become records, arrays become relations, strings become `Text`, numbers become `Int` or `Float`, booleans become `Bool`, and null becomes `Nothing {}` (the `Maybe` wire convention). Decoding is type-directed where a target type can be inferred.
+Parse a JSON string into a value, returning `Just value` on success and `Nothing` on a parse failure. Objects become records, arrays become relations, strings become `Text`, numbers become `Int 1` or `Float 1`, booleans become `Bool`, and null becomes `Nothing {}` (the `Maybe` wire convention). Decoding is type-directed where a target type can be inferred.
 
 ---
 
@@ -911,10 +911,10 @@ Boolean negation.
 ### `stripUnit` / `withUnit` / `stripFloatUnit` / `withFloatUnit`
 
 ```
-stripUnit      : Int u -> Int
-withUnit       : Int -> Int u
-stripFloatUnit : Float u -> Float
-withFloatUnit  : Float -> Float u
+stripUnit      : Int u -> Int 1
+withUnit       : Int 1 -> Int u
+stripFloatUnit : Float u -> Float 1
+withFloatUnit  : Float 1 -> Float u
 ```
 
 Drop or attach a unit tag. Identity at runtime — they only adjust the
@@ -932,7 +932,7 @@ trait Eq a where
   eq : a -> a -> Bool
 ```
 
-Equality comparison. Built-in implementations for `Int`, `Float`, `Text`, `Bool`. Used by the `==` and `!=` operators.
+Equality comparison. Built-in implementations for `Int 1`, `Float 1`, `Text`, `Bool`. Used by the `==` and `!=` operators.
 
 ### `Ord`
 
@@ -941,7 +941,7 @@ trait Eq a => Ord a where
   compare : a -> a -> Ordering
 ```
 
-Ordering comparison. Returns `LT {}`, `EQ {}`, or `GT {}`. Built-in implementations for `Int`, `Float`, `Text`. Used by `<`, `>`, `<=`, `>=` operators.
+Ordering comparison. Returns `LT {}`, `EQ {}`, or `GT {}`. Built-in implementations for `Int 1`, `Float 1`, `Text`. Used by `<`, `>`, `<=`, `>=` operators.
 
 ### `Num`
 
@@ -954,7 +954,7 @@ trait Eq a => Num a where
   negate : a -> a
 ```
 
-Numeric operations. Built-in implementations for `Int`, `Float`. Used by `+`, `-`, `*`, `/` operators and unary negation. The `%` (modulo) operator is **not** a `Num` trait method — it is handled by intrinsic codegen for `Int`/`Float` (a user `impl Num` cannot supply it). Modulo on `Int` is the remainder (sign follows the dividend); on `Float` it is `fmod`. Modulo by zero panics. The `%` operator pushes down into SQLite as `%` when used inside a SQL-compilable comprehension.
+Numeric operations. Built-in implementations for `Int 1`, `Float 1`. Used by `+`, `-`, `*`, `/` operators and unary negation. The `%` (modulo) operator is **not** a `Num` trait method — it is handled by intrinsic codegen for `Int 1`/`Float 1` (a user `impl Num` cannot supply it). Modulo on `Int 1` is the remainder (sign follows the dividend); on `Float 1` it is `fmod`. Modulo by zero panics. The `%` operator pushes down into SQLite as `%` when used inside a SQL-compilable comprehension.
 
 ### `Semigroup`
 
@@ -972,14 +972,14 @@ trait Display a where
   display : a -> Text
 ```
 
-Convert a value to a human-readable text representation. Built-in implementations for `Int`, `Float`, `Text`, `Bool`.
+Convert a value to a human-readable text representation. Built-in implementations for `Int 1`, `Float 1`, `Text`, `Bool`.
 
 ### `Sequence`
 
 ```knot
 trait Sequence s where
-  take : Int -> s -> s
-  drop : Int -> s -> s
+  take : Int 1 -> s -> s
+  drop : Int 1 -> s -> s
 ```
 
 `take`/`drop` work on any sequenceable type. Built-in implementations for `Text` (characters) and `[]` (rows).
@@ -1058,8 +1058,8 @@ Walk a structure left-to-right and sequence through any `Applicative` `f`. Built
 
 | Type | Description |
 |------|-------------|
-| `Int` | 64-bit signed integer (`i64`); arithmetic is checked and panics on overflow |
-| `Float` | 64-bit floating point |
+| `Int 1` | 64-bit signed integer (`i64`); arithmetic is checked and panics on overflow |
+| `Float 1` | 64-bit floating point |
 | `Int u` | Integer with compile-time unit (e.g. `Int Usd`) |
 | `Float u` | Float with compile-time unit (e.g. `Float M`, `Float (M/S^2)`) |
 | `Text` | Unicode string |
@@ -1074,7 +1074,7 @@ Walk a structure left-to-right and sequence through any `Applicative` `f`. Built
 
 ### Units of Measure
 
-Optional compile-time units on `Int` and `Float`. Fully erased at runtime — no performance cost, no runtime representation. Plain `Float` is unit-agnostic and unifies with any `Float u`.
+Optional compile-time units on `Int 1` and `Float 1`. Fully erased at runtime — no performance cost, no runtime representation. Plain `Float 1` is unit-agnostic and unifies with any `Float u`.
 
 #### Declaration
 

@@ -122,7 +122,7 @@ fn do_bind_shadowing_outer_var_compiles_and_runs() {
     // non-dominating block and the Cranelift verifier panicked.
     let (stdout, stderr, ok) = compile_and_run(
         "do_bind_shadow",
-        r#"*todos : [{title: Text, owner: Text, done: Int}]
+        r#"*todos : [{title: Text, owner: Text, done: Int 1}]
 
 main = do
   replace *todos = [{title: "a", owner: "Alice", done: 0}]
@@ -156,7 +156,7 @@ fn chained_do_local_lets_in_pushed_where() {
     // enclosing env where `a` is unbound — "codegen: undefined variable 'a'".
     let (stdout, stderr, ok) = compile_and_run(
         "chained_lets_where",
-        r#"*items : [{x: Int}]
+        r#"*items : [{x: Int 1}]
 
 main = do
   replace *items = [{x: 5}, {x: 6}]
@@ -178,7 +178,7 @@ main = do
 
 // ── Finding 3: view writes bypassing refined-type validation ───────
 
-const REFINED_VIEW_PROG_HEADER: &str = r#"type Nat = Int where \x -> x >= 0
+const REFINED_VIEW_PROG_HEADER: &str = r#"type Nat = Int 1 where \x -> x >= 0
 
 *accounts : [{owner: Text, balance: Nat}]
 
@@ -251,7 +251,7 @@ fn io_bind_from_let_bound_groupby_iterates_all_rows() {
     // group ("Bob") never printed.
     let (stdout, stderr, ok) = compile_and_run(
         "io_bind_relation_var",
-        r#"*todos : [{title: Text, owner: Text, done: Int}]
+        r#"*todos : [{title: Text, owner: Text, done: Int 1}]
 
 main = do
   replace *todos = [
@@ -282,7 +282,7 @@ fn io_bind_from_let_bound_filter_comprehension_iterates() {
     // Same shape without groupBy: a plain let-bound comprehension.
     let (stdout, stderr, ok) = compile_and_run(
         "io_bind_relation_var_plain",
-        r#"*nums : [{n: Int}]
+        r#"*nums : [{n: Int 1}]
 
 main = do
   replace *nums = [{n: 1}, {n: 2}, {n: 3}]
@@ -395,7 +395,7 @@ fn nullary_adt_tag_column_equality_still_works() {
 impl Eq Color where
   eq = \a b -> show a == show b
 
-*marbles : [{n: Int, c: Color}]
+*marbles : [{n: Int 1, c: Color}]
 
 main = do
   replace *marbles = [{n: 1, c: Red {}}, {n: 2, c: Blue {}}, {n: 3, c: Red {}}]
@@ -460,7 +460,7 @@ fn maxon_over_int_column_still_pushes_and_is_numeric() {
     // Int columns keep numeric MIN/MAX semantics (9 > 10 byte-wise!).
     let (stdout, stderr, ok) = compile_and_run(
         "maxon_int",
-        r#"*scores : [{s: Int}]
+        r#"*scores : [{s: Int 1}]
 
 main = do
   replace *scores = [{s: 9}, {s: 10}]
@@ -523,7 +523,7 @@ main = do
 // ── Finding 9: refined record alias as source element type ─────────
 
 const REFINED_ALIAS_HEADER: &str =
-    r#"type P = {age: Int where \x -> x >= 0} where \p -> p.age <= 200
+    r#"type P = {age: Int 1 where \x -> x >= 0} where \p -> p.age <= 200
 
 *people : [P]
 "#;
@@ -600,8 +600,8 @@ fn groupby_non_equi_join_multibind_survives_arena_reset() {
     // a crash. Promoting the row before the push pins it past the reset.
     let (stdout, stderr, ok) = compile_and_run(
         "groupby_non_equi_multibind",
-        r#"*parents : [{pid: Int}]
-*children : [{owner: Text, bound: Int}]
+        r#"*parents : [{pid: Int 1}]
+*children : [{owner: Text, bound: Int 1}]
 
 main = do
   replace *parents = [{pid: 100}]

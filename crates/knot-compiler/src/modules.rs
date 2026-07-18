@@ -497,7 +497,7 @@ enum Namespace {
 /// `None` for declarations that define no name of their own.
 fn duplicate_key(decl: &ast::DeclKind) -> Option<(Namespace, String)> {
     match decl {
-        // A bare signature (`f : Int -> Int` with the definition elsewhere or
+        // A bare signature (`f : Int 1 -> Int` with the definition elsewhere or
         // missing) defines nothing on its own.
         ast::DeclKind::Fun { body: None, .. } => None,
         ast::DeclKind::Fun { name, .. } | ast::DeclKind::Derived { name, .. } => {

@@ -1458,7 +1458,7 @@ mod tests {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            r#"data Person = Person {name: Text, age: Int}
+            r#"data Person = Person {name: Text, age: Int 1}
 
 show1 = \p -> case p of
   Person {name, age} -> name
@@ -1497,14 +1497,14 @@ show1 = \p -> case p of
             "main",
             r#"type Timestamp = Int Ms
 
-*globalRateCount : Int
+*globalRateCount : Int 1
 *globalRateWindowStart : Timestamp
-*drainPhase : Int
+*drainPhase : Int 1
 
 globalRateWindowMs : Int Ms
 globalRateWindowMs = 1000
 
-maxGlobalRequestRate : Int
+maxGlobalRequestRate : Int 1
 maxGlobalRequestRate = 1000
 
 gateAuth : Timestamp -> (Text -> a) -> IO {r *drainPhase, r *globalRateCount, r *globalRateWindowStart, w *globalRateCount, w *globalRateWindowStart} a
@@ -1631,7 +1631,7 @@ checkGlobalRate = \t -> atomic do
     #[test]
     fn record_field_hints_anchor_on_field_name_not_binder() {
         let mut ws = TestWorkspace::new();
-        let src = "data P = P {a: Int, b: Text}\n\nf = \\p -> case p of\n  P {a: b, b: c} -> c\n";
+        let src = "data P = P {a: Int 1, b: Text}\n\nf = \\p -> case p of\n  P {a: b, b: c} -> c\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
         let range = ws.whole_file_range(&uri);
@@ -1668,7 +1668,7 @@ checkGlobalRate = \t -> atomic do
     #[test]
     fn record_field_hints_do_not_accumulate_across_same_named_ctors() {
         let mut ws = TestWorkspace::new();
-        let src = "data A = Mk {x: Int}\ndata B = Mk {y: Text}\n\nf = \\v -> case v of\n  Mk {x} -> x\n";
+        let src = "data A = Mk {x: Int 1}\ndata B = Mk {y: Text}\n\nf = \\v -> case v of\n  Mk {x} -> x\n";
         let uri = ws.open("main", src);
         let range = ws.whole_file_range(&uri);
         let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
@@ -1842,14 +1842,14 @@ checkGlobalRate = \t -> atomic do
     #[test]
     fn effects_hint_anchors_at_end_of_signature_line() {
         let mut ws = TestWorkspace::new();
-        let src = "*t : [{a: Int}]\n\nf : Int -> IO {} [{a: Int}]\nf = \\x -> *t\n";
+        let src = "*t : [{a: Int 1}]\n\nf : Int 1 -> IO {} [{a: Int 1}]\nf = \\x -> *t\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
         let range = ws.whole_file_range(&uri);
         let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let sig_line_start = doc.source.find("f : Int").expect("sig");
+        let sig_line_start = doc.source.find("f : Int 1").expect("sig");
         let sig_line = offset_to_position(&doc.source, sig_line_start).line;
-        let sig_text_len = "f : Int -> IO {} [{a: Int}]".len() as u32;
+        let sig_text_len = "f : Int 1 -> IO {} [{a: Int 1}]".len() as u32;
         for h in &hints {
             if let InlayHintLabel::String(s) = &h.label
                 && s.starts_with("-- effects:") {

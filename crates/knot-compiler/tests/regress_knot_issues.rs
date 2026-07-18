@@ -216,9 +216,9 @@ fn io_do_block_ending_in_yield_unit_compiles_and_runs() {
 /// every monad, not just IO: this is `m >>= f`, and `f a : Maybe Int` here.
 #[test]
 fn do_block_final_monadic_action_is_not_double_wrapped() {
-    let src = "safeDiv : Int -> Int -> Maybe Int\n\
+    let src = "safeDiv : Int 1 -> Int 1 -> Maybe Int 1\n\
                safeDiv = \\a b -> if b == 0 then Nothing {} else Just {value: a / b}\n\
-               chain : Int -> Maybe Int\n\
+               chain : Int 1 -> Maybe Int 1\n\
                chain = \\x -> do\n\
                \x20 a <- safeDiv 100 x\n\
                \x20 safeDiv a 2\n\
@@ -236,7 +236,7 @@ fn do_block_final_monadic_action_is_not_double_wrapped() {
 /// that is a plain *value* still becomes the monadic result via `pure`.
 #[test]
 fn do_block_final_plain_value_is_still_pure_wrapped() {
-    let src = "describe : Int -> IO {random} Text\n\
+    let src = "describe : Int 1 -> IO {random} Text\n\
                describe = \\n -> do\n\
                \x20 x <- randomInt n\n\
                \x20 show x\n\
@@ -251,7 +251,7 @@ fn do_block_final_plain_value_is_still_pure_wrapped() {
 /// it must not be `pure`-wrapped.
 #[test]
 fn io_action_from_a_callback_param_is_the_block_result() {
-    let src = "runTwice : (Int -> IO {console} {}) -> IO {console} {}\n\
+    let src = "runTwice : (Int 1 -> IO {console} {}) -> IO {console} {}\n\
                runTwice = \\cb -> do\n\
                \x20 cb 1\n\
                \x20 cb 2\n\
@@ -291,7 +291,7 @@ fn pure_let_do_block_has_the_final_expressions_type() {
 /// monadic reading — the block is a one-element comprehension, not a `let`.
 #[test]
 fn let_block_with_explicit_yield_stays_monadic() {
-    let src = "ones : [Int]\n\
+    let src = "ones : [Int 1]\n\
                ones = do\n\
                \x20 let n = 1\n\
                \x20 yield n\n\
@@ -422,8 +422,8 @@ fn a_refined_list_flows_into_base_list_positions() {
 #[test]
 fn identity_cannot_launder_a_base_value_into_a_refinement() {
     assert_rejects(
-        "type Nat = Int where \\x -> x >= 0\n\
-         asNat : Int -> Nat\n\
+        "type Nat = Int 1 where \\x -> x >= 0\n\
+         asNat : Int 1 -> Nat\n\
          asNat = \\x -> x\n\
          main = println (show (asNat (0 - 5)))\n",
         "cannot implicitly use",
@@ -467,7 +467,7 @@ fn a_base_element_read_back_out_of_a_base_list_stays_base() {
 /// any other reference. Locked in so it stays that way.
 #[test]
 fn a_refinement_predicate_reads_the_runtime_override_of_a_constant() {
-    let src = "maxLen : Int\n\
+    let src = "maxLen : Int 1\n\
                maxLen = 10\n\
                isValidName : Text -> Bool\n\
                isValidName = \\s -> length s > 0 && length s <= maxLen\n\
@@ -513,7 +513,7 @@ fn a_refinement_predicate_reads_the_runtime_override_of_a_constant() {
 #[test]
 fn a_constant_typed_by_an_alias_of_a_scalar_is_overridable() {
     let src = "type Host = Text\n\
-               type Port = Int\n\
+               type Port = Int 1\n\
                host : Host\n\
                host = \"localhost\"\n\
                port : Port\n\
@@ -559,7 +559,7 @@ fn a_constant_typed_by_an_alias_of_a_scalar_is_overridable() {
 /// (`base` is body-less, so it takes the refined path, which does validate.)
 #[test]
 fn a_constant_typed_by_a_refined_alias_is_not_overridable() {
-    let src = "type Nat = Int where \\x -> x >= 0\n\
+    let src = "type Nat = Int 1 where \\x -> x >= 0\n\
                base : Nat\n\
                limit : Nat\n\
                limit = base\n\
@@ -691,7 +691,7 @@ main = do
 /// a whole-relation use, so the block took the guard reading: `where u.age >=
 /// 25` asked the FIRST row's age, waved every row through, and `yield u` handed
 /// back the entire relation with the filter silently dropped.
-const ADULTS: &str = "type User = {name: Text, age: Int}\n\
+const ADULTS: &str = "type User = {name: Text, age: Int 1}\n\
                       *users : [User]\n\
                       &adults = do\n\
                       \x20 u <- *users\n\
@@ -724,7 +724,7 @@ fn a_where_filters_the_rows_of_a_source_relation() {
 /// Filtering every row out must give an empty relation, not a non-relation.
 #[test]
 fn a_where_that_no_row_satisfies_yields_an_empty_relation() {
-    let src = "type User = {name: Text, age: Int}\n\
+    let src = "type User = {name: Text, age: Int 1}\n\
                *users : [User]\n\
                &adults = do\n\
                \x20 u <- *users\n\
@@ -745,7 +745,7 @@ fn a_where_that_no_row_satisfies_yields_an_empty_relation() {
 /// the name *as a value* is a genuine guard on the relation, not a row filter.
 #[test]
 fn a_where_over_the_relation_as_a_value_stays_a_guard() {
-    let src = "type Person = {name: Text, age: Int}\n\
+    let src = "type Person = {name: Text, age: Int 1}\n\
                *people : [Person]\n\
                &seniorsIfCrowd = do\n\
                \x20 people <- *people\n\

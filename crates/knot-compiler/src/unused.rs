@@ -575,7 +575,7 @@ main = println "hi"
     fn unused_data_warns() {
         let warnings = warns(
             r#"
-data Shape = Circle {radius: Float} | Rect {w: Float, h: Float}
+data Shape = Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}
 
 main = println "hi"
 "#,
@@ -588,7 +588,7 @@ main = println "hi"
     fn data_used_via_constructor_does_not_warn() {
         let warnings = warns(
             r#"
-data Shape = Circle {radius: Float} | Rect {w: Float, h: Float}
+data Shape = Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}
 
 mkShape = Circle {radius: 1.0}
 
@@ -602,7 +602,7 @@ main = println (show mkShape)
     fn data_used_via_type_alias_does_not_warn() {
         let warnings = warns(
             r#"
-data Shape = Circle {radius: Float} | Rect {w: Float, h: Float}
+data Shape = Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}
 
 type Shapes = [Shape]
 
@@ -619,7 +619,7 @@ main = println "hi"
     fn unused_type_alias_warns() {
         let warnings = warns(
             r#"
-type Pair = {a: Int, b: Int}
+type Pair = {a: Int 1, b: Int 1}
 
 main = println "hi"
 "#,
@@ -632,7 +632,7 @@ main = println "hi"
     fn unused_source_warns() {
         let warnings = warns(
             r#"
-*people : [{name: Text, age: Int}]
+*people : [{name: Text, age: Int 1}]
 
 main = println "hi"
 "#,
@@ -645,7 +645,7 @@ main = println "hi"
     fn used_source_does_not_warn() {
         let warnings = warns(
             r#"
-*people : [{name: Text, age: Int}]
+*people : [{name: Text, age: Int 1}]
 
 main = do
   p <- *people
@@ -659,7 +659,7 @@ main = do
     fn signature_only_fun_does_not_warn() {
         let warnings = warns(
             r#"
-helper : Int -> Int
+helper : Int 1 -> Int 1
 
 main = println "hi"
 "#,

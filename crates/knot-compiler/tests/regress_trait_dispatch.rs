@@ -4,8 +4,8 @@
 //! matching the value's runtime constructor tag against each impl's set of
 //! constructor names. A tag does not identify a type: given
 //!
-//!     data Shape = Circle {r: Float} | Square {s: Float}
-//!     data Blob  = Circle {r: Float} | Blob2 {x: Int}
+//!     data Shape = Circle {r: Float 1} | Square {s: Float 1}
+//!     data Blob  = Circle {r: Float 1} | Blob2 {x: Int 1}
 //!
 //! a `Circle` value matches the `Shape` arm and the `Blob` arm alike, so the
 //! chain ran whichever impl was registered first — `area (… : Blob)` silently
@@ -86,12 +86,12 @@ fn compile_and_run(test_name: &str, source: &str) -> String {
 
 /// Two ADTs sharing the `Circle` constructor. `Area Shape` is declared first,
 /// so a tag-keyed dispatcher answers 1.0 for *both* types.
-const SHARED_CTOR_PRELUDE: &str = r#"data Shape = Circle {r: Float} | Square {s: Float}
-data Blob = Circle {r: Float} | Blob2 {x: Int}
+const SHARED_CTOR_PRELUDE: &str = r#"data Shape = Circle {r: Float 1} | Square {s: Float 1}
+data Blob = Circle {r: Float 1} | Blob2 {x: Int 1}
 
 trait Area a where
-  area : a -> Float
-  scaled : a -> Float -> Float
+  area : a -> Float 1
+  scaled : a -> Float 1 -> Float 1
 
 impl Area Shape where
   area sh = 1.0
@@ -174,7 +174,7 @@ fn ambiguous_polymorphic_dispatch_is_rejected() {
     // program — previously it compiled and silently ran the first impl.
     let src = format!(
         "{SHARED_CTOR_PRELUDE}
-describe : Area a => a -> Float
+describe : Area a => a -> Float 1
 describe = \\x -> area x
 
 main = do
@@ -198,11 +198,11 @@ main = do
 fn polymorphic_dispatch_still_works_without_a_tag_clash() {
     // The ambiguity guard must not overfire: with distinct constructor names
     // the runtime dispatcher is still sound and polymorphic calls must work.
-    let src = r#"data Shape = Circle {r: Float} | Square {s: Float}
-data Blob = Blob1 {r: Float} | Blob2 {x: Int}
+    let src = r#"data Shape = Circle {r: Float 1} | Square {s: Float 1}
+data Blob = Blob1 {r: Float 1} | Blob2 {x: Int 1}
 
 trait Area a where
-  area : a -> Float
+  area : a -> Float 1
 
 impl Area Shape where
   area sh = 1.0
@@ -210,7 +210,7 @@ impl Area Shape where
 impl Area Blob where
   area b = 2.0
 
-describe : Area a => a -> Float
+describe : Area a => a -> Float 1
 describe = \x -> area x
 
 main = do

@@ -78,7 +78,7 @@ fn shadowed_race_in_atomic_compiles() {
     // shadows the `race` primitive.
     let (stdout, stderr, ok) = compile_and_run(
         "shadowed_race_atomic",
-        r#"*items : [{v: Int}]
+        r#"*items : [{v: Int 1}]
 
 store = \race ->
   atomic do
@@ -108,7 +108,7 @@ fn genuine_race_in_atomic_still_rejected() {
     // so the shadowing fix didn't disable the guard entirely.
     let err = compile(
         "genuine_race_atomic",
-        r#"*items : [{v: Int}]
+        r#"*items : [{v: Int 1}]
 
 bad = atomic do
   cur <- *items
@@ -136,7 +136,7 @@ fn literal_int_elem_pushdown_matches() {
     // TEXT-stored Int column. Splitting the pushdown gate must not regress it.
     let (stdout, stderr, ok) = compile_and_run(
         "literal_int_elem",
-        r#"*rows : [{status: Int}]
+        r#"*rows : [{status: Int 1}]
 
 query = do
   rs <- *rows

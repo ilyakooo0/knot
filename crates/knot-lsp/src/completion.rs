@@ -1607,7 +1607,7 @@ fn find_type_for_name(doc: &DocumentState, name: &str, offset: usize) -> Option<
     doc.type_info.get(name).cloned()
 }
 
-/// Extract field names from a type string like `{name: Text, age: Int}` or a named type.
+/// Extract field names from a type string like `{name: Text, age: Int 1}` or a named type.
 fn extract_fields_from_type_str(type_str: &str, module: &Module) -> Vec<String> {
     let mut visited = HashSet::new();
     extract_fields_from_type_str_inner(type_str, module, &mut visited)
@@ -1623,7 +1623,7 @@ fn extract_fields_from_type_str_inner(
 ) -> Vec<String> {
     let type_str = type_str.trim();
 
-    // Direct record type: `{name: Text, age: Int}`
+    // Direct record type: `{name: Text, age: Int 1}`
     if type_str.starts_with('{') && type_str.ends_with('}') {
         return extract_record_fields(type_str);
     }
@@ -2199,7 +2199,7 @@ mod tests {
     fn completion_uses_client_trigger_and_pending_text() {
         use crate::state::PendingSource;
         let mut ws = TestWorkspace::new();
-        let analyzed = "*users : [{name: Text, age: Int}]\nmain = do\n  u <- *users\n  yield u";
+        let analyzed = "*users : [{name: Text, age: Int 1}]\nmain = do\n  u <- *users\n  yield u";
         let uri = ws.open("main", analyzed);
         // The editor buffer is ahead: the user just typed `.` after the final
         // `u`. The analyzed text doesn't contain the dot yet.
@@ -2361,7 +2361,7 @@ check = \flag -> flag &&
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            r#"*people : [{n: Int}]
+            r#"*people : [{n: Int 1}]
 calc = \n -> n*
 "#,
         );
@@ -2416,7 +2416,7 @@ route Hello where
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            r#"*scores : [{name: Text, score: Int where \x -> x >= 0}]
+            r#"*scores : [{name: Text, score: Int 1 where \x -> x >= 0}]
 
 main = do
   s <- *scores
@@ -2512,26 +2512,26 @@ mod regress_fixes_tests {
         use crate::test_support::TestWorkspace;
         use crate::utils::offset_to_position;
         let sources = [
-            "*usérs : [{náme: Text, age: Int}]\nmain = do\n  u <- *usérs\n  yield u",
+            "*usérs : [{náme: Text, age: Int 1}]\nmain = do\n  u <- *usérs\n  yield u",
             "type P = {café: Text}\nx = 3.5\nmain = x.",
             "-- see notés.\nmain = 1",
-            "main = println \"a*b—é\"\nfoo : Int",
+            "main = println \"a*b—é\"\nfoo : Int 1",
             "type X = {n: Text}\nf = \\x -> atomic do\n  yield {}\n",
             "route Hello where\n  GET /hí -> Text\n",
             "import ./café\nmain = 1\n",
             "x = \"\\\"é\nfoo :",
             "🎉 = 1\nmain = 🎉.\n",
             "f : {name: \ng = {a: 1}.",
-            "*t : [{x: Int}]\nmain = *té\n",
+            "*t : [{x: Int 1}]\nmain = *té\n",
             "&d = do yield {}\nmain = &dé\n",
             "s = \"café\nmain = s.",
             "Ünïcöde = 1\nmain = Ünïcöde",
             "a = 1\r\nb = 2\r\nmain = a.\r\n",
         ];
         let valid = [
-            "*people : [{name: Text, age: Int}]\nmain = do\n  p <- *people\n  yield p.name\n",
-            "type Person = {name: Text, age: Int}\ngreet = \\p -> p.name\n",
-            "*t : [{x: Int}]\nf = \\r -> r.x\nmain = f\n",
+            "*people : [{name: Text, age: Int 1}]\nmain = do\n  p <- *people\n  yield p.name\n",
+            "type Person = {name: Text, age: Int 1}\ngreet = \\p -> p.name\n",
+            "*t : [{x: Int 1}]\nf = \\r -> r.x\nmain = f\n",
             "u = {a: 1, b: 2}\nmain = u.a\n",
         ];
         let triggers = [None, Some("."), Some("*"), Some("&"), Some("/"), Some(":")];
@@ -2605,7 +2605,7 @@ mod regress_fixes_tests {
     fn type_context_rules() {
         // Type positions.
         assert!(cursor_in_type_context("f : "));
-        assert!(cursor_in_type_context("f : Int -> "));
+        assert!(cursor_in_type_context("f : Int 1 -> "));
         assert!(cursor_in_type_context("f : ["));
         assert!(cursor_in_type_context("f : {name: "));
         assert!(cursor_in_type_context("type X = "));
@@ -2618,7 +2618,7 @@ mod regress_fixes_tests {
         assert!(!cursor_in_type_context("f = case x of\n  Red {} -> "));
         assert!(!cursor_in_type_context("p = {name: "));
         assert!(!cursor_in_type_context("xs = ["));
-        assert!(!cursor_in_type_context("f : Int -> Int = \\x -> "));
+        assert!(!cursor_in_type_context("f : Int 1 -> Int 1 = \\x -> "));
         // A signature arrow followed by a lambda body arrow: the lambda wins.
         assert!(!cursor_in_type_context("nums = do\n  n <- *numbers\n  let y = "));
     }

@@ -2,7 +2,7 @@
 -- Each pattern below stores its rewrite in a local `let` first; the
 -- compiler inlines the let body when matching the set/replace shape.
 
-type Item = {name: Text, price: Int}
+type Item = {name: Text, price: Int 1}
 
 *items : [Item]
 

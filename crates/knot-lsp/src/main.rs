@@ -2039,7 +2039,7 @@ mod tests {
         apply_analysis_result(state, conn, result);
     }
 
-    const BAD_SOURCE: &str = r#"type Msg = {id: Int, text: Text}
+    const BAD_SOURCE: &str = r#"type Msg = {id: Int 1, text: Text}
 
 *messages : [Msg]
 
@@ -2054,7 +2054,7 @@ main = do
   yield {}
 "#;
 
-    const GOOD_SOURCE: &str = r#"type Msg = {id: Int, text: Text}
+    const GOOD_SOURCE: &str = r#"type Msg = {id: Int 1, text: Text}
 
 *messages : [Msg]
 

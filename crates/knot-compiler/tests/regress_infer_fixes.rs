@@ -81,9 +81,9 @@ main = do
 #[test]
 fn view_comprehension_element_type_mismatch_still_rejected() {
     // The comprehension typing must still catch element-type errors:
-    // the view is annotated `[{title: Int}]` but yields Text titles.
+    // the view is annotated `[{title: Int 1}]` but yields Text titles.
     let src = r#"*todos : [{title: Text}]
-*bad : [{title: Int}] = do
+*bad : [{title: Int 1}] = do
   t <- *todos
   yield {title: t.title}
 
@@ -101,8 +101,8 @@ main = println "x"
 
 #[test]
 fn annotated_derived_with_io_body_typechecks() {
-    let src = r#"*nums : [{n: Int}]
-&doubled : [{n: Int}] = do
+    let src = r#"*nums : [{n: Int 1}]
+&doubled : [{n: Int 1}] = do
   nums <- *nums
   yield (do x <- nums
             yield {n: x.n + x.n})
@@ -124,7 +124,7 @@ fn unannotated_derived_binds_relation_type_not_io() {
     // relation type, not `IO {} [T]` — otherwise `&name` references
     // produce a nested `IO (IO [T])` and element access only works
     // through unification leniency.
-    let src = r#"*nums : [{n: Int}]
+    let src = r#"*nums : [{n: Int 1}]
 &tripled = do
   nums <- *nums
   yield (do x <- nums
@@ -152,7 +152,7 @@ fn synthesis_mode_mismatch_orients_expected_on_required_side() {
     let diags = check_src(src);
     assert!(
         has_error(&diags, "expected Bool, found Int"),
-        "expected `expected Bool, found Int`, got: {:?}",
+        "expected `expected Bool, found Int 1`, got: {:?}",
         diags
     );
     assert!(
@@ -166,14 +166,14 @@ fn synthesis_mode_mismatch_orients_expected_on_required_side() {
 fn check_mode_mismatch_orientation_unchanged() {
     // The check-mode path (`check_expr` pushes the expected type with
     // t1_provided = false) must STILL read "expected Int, found Text".
-    let src = r#"x : {n: Int}
+    let src = r#"x : {n: Int 1}
 x = {n: "text"}
 main = println (show x.n)
 "#;
     let diags = check_src(src);
     assert!(
         has_error(&diags, "expected Int, found Text"),
-        "expected `expected Int, found Text`, got: {:?}",
+        "expected `expected Int 1, found Text`, got: {:?}",
         diags
     );
     assert!(
@@ -190,7 +190,7 @@ fn ctor_pattern_bind_on_source_in_let_comprehension() {
     // `Circle c <- *shapes` directly (no intermediate `rows <- *shapes`)
     // must typecheck: the pattern matches relation ELEMENTS (filter
     // semantics), not the whole `[Shape]`.
-    let src = r#"data Shape = Circle {radius: Float} | Rect {width: Float, height: Float}
+    let src = r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 *shapes : [Shape]
 
 main = do
@@ -207,7 +207,7 @@ main = do
 #[test]
 fn ctor_pattern_bind_via_intermediate_still_typechecks() {
     // The previously-working two-step form must keep working.
-    let src = r#"data Shape = Circle {radius: Float} | Rect {width: Float, height: Float}
+    let src = r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 *shapes : [Shape]
 
 main = do

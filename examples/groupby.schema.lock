@@ -1,6 +1,6 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 
-type Todo = {title: Text, owner: Text, done: Int}
+type Todo = {title: Text, owner: Text, done: Int 1}
 
 *todos : [Todo]

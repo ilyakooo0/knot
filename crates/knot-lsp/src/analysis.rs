@@ -1562,8 +1562,8 @@ mod tests {
         let mut import_cache: ImportCache = HashMap::new();
         let mut inference_cache: InferenceCache = HashMap::new();
 
-        let v1 = "foo : Int -> Int\nfoo = \\x -> x\n";
-        let v2 = "foo : Int -> Text\nfoo = \\x -> show x\n";
+        let v1 = "foo : Int 1 -> Int 1\nfoo = \\x -> x\n";
+        let v2 = "foo : Int 1 -> Text\nfoo = \\x -> show x\n";
 
         std::fs::write(&path, v1).unwrap();
         let _ = analyze_document(&uri, v1, &mut import_cache, &mut inference_cache);
@@ -1650,7 +1650,7 @@ mod tests {
         let (tx, rx, handle) = spawn_worker();
         let uri = fake_uri("file:///tmp/repro_worker.knot");
 
-        let bad = r#"type Msg = {id: Int, text: Text}
+        let bad = r#"type Msg = {id: Int 1, text: Text}
 
 *messages : [Msg]
 
@@ -1664,7 +1664,7 @@ main = do
   replace *messages = removeWhere mssgs (\m -> m.text == "spam")
   yield {}
 "#;
-        let good = r#"type Msg = {id: Int, text: Text}
+        let good = r#"type Msg = {id: Int 1, text: Text}
 
 *messages : [Msg]
 
@@ -1730,7 +1730,7 @@ main = do
         let mut import_cache = HashMap::new();
         let mut inference_cache = HashMap::new();
 
-        let bad = r#"type Msg = {id: Int, text: Text}
+        let bad = r#"type Msg = {id: Int 1, text: Text}
 
 *messages : [Msg]
 
@@ -1745,7 +1745,7 @@ main = do
   yield {}
 "#;
 
-        let good = r#"type Msg = {id: Int, text: Text}
+        let good = r#"type Msg = {id: Int 1, text: Text}
 
 *messages : [Msg]
 

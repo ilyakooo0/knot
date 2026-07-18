@@ -54,7 +54,7 @@ fn id_field_on_parent_with_nested_children_rejected() {
     // "duplicate column name: _id" at init.
     assert_rejects(
         r#"type Tag = {label: Text}
-type Post = {_id: Int, title: Text, tags: [Tag]}
+type Post = {_id: Int 1, title: Text, tags: [Tag]}
 *posts : [Post]
 main = 1
 "#,
@@ -67,7 +67,7 @@ main = 1
 fn tag_field_on_adt_relation_rejected() {
     // A direct ADT relation is stored in a wide table keyed by `_tag`.
     assert_rejects(
-        r#"data Shape = Circle {_tag: Text, radius: Float} | Rect {width: Float, height: Float}
+        r#"data Shape = Circle {_tag: Text, radius: Float 1} | Rect {width: Float 1, height: Float 1}
 *shapes : [Shape]
 main = 1
 "#,
@@ -80,7 +80,7 @@ main = 1
 fn parent_id_field_in_child_table_rejected() {
     // `items` lives in a child table, whose FK column is `_parent_id`.
     assert_rejects(
-        r#"type Item = {_parent_id: Int, label: Text}
+        r#"type Item = {_parent_id: Int 1, label: Text}
 type Box = {name: Text, items: [Item]}
 *boxes : [Box]
 main = 1
@@ -105,11 +105,11 @@ main = 1
 
 #[test]
 fn value_field_rejected() {
-    // `_value` is the column synthesized for scalar sources (`*n : Int`), so a
-    // one-field `{_value: Int}` record is indistinguishable from one: it does
+    // `_value` is the column synthesized for scalar sources (`*n : Int 1`), so a
+    // one-field `{_value: Int 1}` record is indistinguishable from one: it does
     // not collide in SQL, it makes codegen take the scalar-source path.
     assert_rejects(
-        r#"*counters : [{_value: Int}]
+        r#"*counters : [{_value: Int 1}]
 main = 1
 "#,
         "_value",
@@ -123,7 +123,7 @@ main = 1
 fn reserved_field_behind_alias_chain_rejected() {
     // The field sits two aliases away from the source that persists it.
     assert_rejects(
-        r#"type Inner = {_id: Int, name: Text}
+        r#"type Inner = {_id: Int 1, name: Text}
 type Outer = Inner
 *people : [Outer]
 main = 1
@@ -152,7 +152,7 @@ fn reserved_field_in_migrate_type_rejected() {
     // Both sides of a `migrate` produce a schema, so both are checked. Only
     // the old type carries the bad field here.
     let diags = check(
-        r#"type Old = {_id: Int, name: Text}
+        r#"type Old = {_id: Int 1, name: Text}
 type New = {name: Text}
 *people : [New]
 migrate *people from [Old] to [New] using \p -> {name: p.name}
@@ -180,7 +180,7 @@ main = 1
 fn shared_alias_reported_once_per_field() {
     // One bad alias behind two sources is one mistake, not two.
     let diags = check(
-        r#"type Row = {_id: Int, name: Text}
+        r#"type Row = {_id: Int 1, name: Text}
 *a : [Row]
 *b : [Row]
 main = 1
@@ -195,7 +195,7 @@ main = 1
 fn ordinary_field_names_accepted() {
     assert_accepts(
         r#"type Tag = {label: Text}
-type Post = {id: Int, title: Text, tags: [Tag]}
+type Post = {id: Int 1, title: Text, tags: [Tag]}
 *posts : [Post]
 main = 1
 "#,
@@ -206,7 +206,7 @@ main = 1
 fn reserved_name_in_unpersisted_record_accepted() {
     // `Local` never reaches a table, so its field names are its own business.
     assert_accepts(
-        r#"type Local = {_id: Int}
+        r#"type Local = {_id: Int 1}
 type Post = {title: Text}
 *posts : [Post]
 idOf = \l -> l._id
@@ -217,10 +217,10 @@ main = 1
 
 #[test]
 fn scalar_source_accepted() {
-    // The compiler synthesizes the `_value` column for `*counter : Int`; that
+    // The compiler synthesizes the `_value` column for `*counter : Int 1`; that
     // is not a user field and must not trip the check.
     assert_accepts(
-        r#"*counter : Int
+        r#"*counter : Int 1
 *tags : [Text]
 main = 1
 "#,
@@ -241,7 +241,7 @@ fn build_fails_with_clear_error() {
     fs::write(
         &src,
         r#"type Tag = {label: Text}
-type Post = {_id: Int, title: Text, tags: [Tag]}
+type Post = {_id: Int 1, title: Text, tags: [Tag]}
 
 *posts : [Post]
 

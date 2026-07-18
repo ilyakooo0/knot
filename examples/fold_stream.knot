@@ -1,4 +1,4 @@
-type Sale = {item: Text, qty: Int, price: Int}
+type Sale = {item: Text, qty: Int 1, price: Int 1}
 
 *sales : [Sale]
 

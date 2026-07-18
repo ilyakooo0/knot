@@ -132,7 +132,7 @@ fn scalar_set_is_write_only() {
     // type-check with an honest `{w *counter}` signature (no spurious read).
     s.write(
         "prog.knot",
-        r#"*counter : Int
+        r#"*counter : Int 1
 
 bump : IO {w *counter} {}
 bump = do
@@ -161,7 +161,7 @@ fn scalar_read_modify_write_still_needs_read() {
     let s = Scratch::new("scalar_rmw");
     s.write(
         "prog.knot",
-        r#"*counter : Int
+        r#"*counter : Int 1
 
 bump : IO {w *counter} {}
 bump = do
@@ -186,7 +186,7 @@ main = do
 
 fn diff_body(diff_expr: &str) -> String {
     format!(
-        "type Item = {{v: Int}}\n*items : [Item]\n\n&bad = do\n  self <- &bad\n  all <- *items\n{diff_expr}\n  yield result\n\nmain = do\n  rows <- &bad\n  println (show (count rows))\n  yield {{}}\n"
+        "type Item = {{v: Int 1}}\n*items : [Item]\n\n&bad = do\n  self <- &bad\n  all <- *items\n{diff_expr}\n  yield result\n\nmain = do\n  rows <- &bad\n  println (show (count rows))\n  yield {{}}\n"
     )
 }
 

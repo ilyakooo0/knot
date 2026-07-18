@@ -11,7 +11,7 @@ route TodoApi where
 
 route AdminApi where
   /admin
-    GET /count -> Int = GetCount
+    GET /count -> Int 1 = GetCount
 
 route Api = TodoApi | AdminApi
 

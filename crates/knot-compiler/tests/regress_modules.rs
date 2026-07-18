@@ -128,7 +128,7 @@ fn a_type_and_a_function_may_share_a_name_across_modules() {
     let s = Scratch::new("dup_namespaces");
     s.write(
         "lib.knot",
-        "export type Items = [{v: Int}]\n\nexport items = 42\n",
+        "export type Items = [{v: Int 1}]\n\nexport items = 42\n",
     );
     s.write(
         "main.knot",
@@ -175,10 +175,10 @@ fn impl_of_a_trait_declared_elsewhere_survives_the_export_filter() {
     // `circle` exports its data type but declares no trait of its own — the
     // trait it implements comes from `shapes`. Its `impl` used to be dropped
     // because only impls of traits the module itself exported were kept.
-    s.write("shapes.knot", "export trait Area a where\n  area : a -> Float\n");
+    s.write("shapes.knot", "export trait Area a where\n  area : a -> Float 1\n");
     s.write(
         "circle.knot",
-        "import ./shapes\n\nexport data Circle = Circle {radius: Float}\n\n\
+        "import ./shapes\n\nexport data Circle = Circle {radius: Float 1}\n\n\
          impl Area Circle where\n  area = \\c -> case c of\n    Circle x -> 3.14 * x.radius * x.radius\n",
     );
     s.write(

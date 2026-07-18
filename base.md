@@ -182,7 +182,7 @@ inter *users *admins
 ```knot
 sum : Num a => [a] -> a
 ```
-Sum a numeric relation. Takes the relation directly — there is no projection argument. To sum a field of a record relation, project first with `map`. Works with `Int`, `Float`, and unit-annotated types — units are preserved.
+Sum a numeric relation. Takes the relation directly — there is no projection argument. To sum a field of a record relation, project first with `map`. Works with `Int 1`, `Float 1`, and unit-annotated types — units are preserved.
 
 ```knot
 sum [10, 20, 30]                                -- 60
@@ -194,7 +194,7 @@ sum (map (\t -> t.distance) *trips)             -- Float M if distance : Float M
 ```knot
 avg : (a -> Float u) -> [a] -> Float u
 ```
-Average a numeric projection over a relation. Returns `Float`. Returns `0.0` for an empty relation. Preserves units — if the projection returns `Float M`, the average is `Float M`.
+Average a numeric projection over a relation. Returns `Float 1`. Returns `0.0` for an empty relation. Preserves units — if the projection returns `Float M`, the average is `Float M`.
 
 ```knot
 avg (\x -> x) [10.0, 20.0, 30.0]        -- 20.0
@@ -206,7 +206,7 @@ avg (\t -> t.distance) *trips            -- Float M if distance : Float M
 minOn : (a -> b) -> [a] -> b
 maxOn : (a -> b) -> [a] -> b
 ```
-Minimum and maximum of a projected field over a relation. Works with any orderable projection (`Int`, `Float`, `Text`, units). Panics on empty relations. Push down to `SELECT MIN(col)` / `SELECT MAX(col)` when applied to a source relation.
+Minimum and maximum of a projected field over a relation. Works with any orderable projection (`Int 1`, `Float 1`, `Text`, units). Panics on empty relations. Push down to `SELECT MIN(col)` / `SELECT MAX(col)` when applied to a source relation.
 
 ```knot
 minOn (\e -> e.salary) *employees        -- lowest salary
@@ -246,7 +246,7 @@ toLower : Text -> Text
 Convert text to lowercase.
 
 ```knot
-take : Int -> s -> s          -- Sequence trait method
+take : Int 1 -> s -> s          -- Sequence trait method
 ```
 First *n* elements. `Sequence` has built-in impls for `Text` (characters) and `[]` (rows).
 
@@ -256,7 +256,7 @@ take 2 [10, 20, 30, 40]       -- [10, 20]
 ```
 
 ```knot
-drop : Int -> s -> s          -- Sequence trait method
+drop : Int 1 -> s -> s          -- Sequence trait method
 ```
 Skip the first *n* elements.
 
@@ -367,13 +367,13 @@ not : Bool -> Bool
 Boolean negation. Function form of the `!` operator.
 
 ```knot
-stripUnit       : Int u -> Int
-withUnit        : Int -> Int u
-stripFloatUnit  : Float u -> Float
-withFloatUnit   : Float -> Float u
+stripUnit       : Int u -> Int 1
+withUnit        : Int 1 -> Int u
+stripFloatUnit  : Float u -> Float 1
+withFloatUnit   : Float 1 -> Float u
 ```
 
-Drop or attach a unit tag on `Int`/`Float`. All four are identity at
+Drop or attach a unit tag on `Int 1`/`Float 1`. All four are identity at
 runtime — they exist only for the type checker. Use them to rebrand a value
 when you need a different concrete unit (e.g. `Ms` → `S`).
 
@@ -421,7 +421,7 @@ main = do
 ```knot
 toJson : a -> Text
 ```
-Convert any value to its JSON text representation. Records become JSON objects, relations become JSON arrays, `Int`/`Float` become numbers, `Text` becomes a JSON string, `Bool` becomes `true`/`false`, the empty record/unit `{}` becomes `null`, and `Maybe` follows the wire convention (`Nothing` → `null`, `Just x` → `x`'s JSON).
+Convert any value to its JSON text representation. Records become JSON objects, relations become JSON arrays, `Int 1`/`Float 1` become numbers, `Text` becomes a JSON string, `Bool` becomes `true`/`false`, the empty record/unit `{}` becomes `null`, and `Maybe` follows the wire convention (`Nothing` → `null`, `Just x` → `x`'s JSON).
 
 ```knot
 toJson {name: "Alice", age: 30}    -- "{\"name\":\"Alice\",\"age\":30}"
@@ -431,7 +431,7 @@ toJson [1, 2, 3]                   -- "[1,2,3]"
 ```knot
 parseJson : Text -> Maybe a
 ```
-Parse a JSON string into a Knot value, returning `Just value` on success and `Nothing` on a parse failure. JSON objects become records, arrays become relations, strings become `Text`, integers become `Int`, decimals become `Float`, booleans become `Bool`, and `null` becomes `Nothing {}` (the `Maybe` wire convention). Handles standard JSON escape sequences. Decoding is type-directed where a target type is known.
+Parse a JSON string into a Knot value, returning `Just value` on success and `Nothing` on a parse failure. JSON objects become records, arrays become relations, strings become `Text`, integers become `Int 1`, decimals become `Float 1`, booleans become `Bool`, and `null` becomes `Nothing {}` (the `Maybe` wire convention). Handles standard JSON escape sequences. Decoding is type-directed where a target type is known.
 
 ```knot
 parseJson "{\"x\": 10}"           -- Just {x: 10}
@@ -574,7 +574,7 @@ listenOn : Text  -> Int u -> Server a r -> IO {network | r} {}
 ```
 Start an HTTP server. `listen` binds to all interfaces; `listenOn` takes an explicit bind address. The `Server a r` value is built with the `serve API where ...` expression, and its row variable `r` unifies with `listen`'s IO row — so handler effects (e.g. `console` from a handler that calls `println`) propagate into the program's IO type.
 
-Handlers return `Result HttpError T` where `HttpError = {status: Int, message: Text}` and `T` is the response type declared on the route. `Ok {value: T}` responds with HTTP 200; `Err {error: {status, message}}` responds with the given status code (clamped to 100..=599) and a JSON `{"error": message}` body — use this for application-level errors like 404 not found or 401 unauthorized.
+Handlers return `Result HttpError T` where `HttpError = {status: Int 1, message: Text}` and `T` is the response type declared on the route. `Ok {value: T}` responds with HTTP 200; `Err {error: {status, message}}` responds with the given status code (clamped to 100..=599) and a JSON `{"error": message}` body — use this for application-level errors like 404 not found or 401 unauthorized.
 
 ```knot
 fetch     : Text -> Endpoint -> IO {network} (Result HttpError T)
@@ -584,7 +584,7 @@ Type-safe HTTP client. `Endpoint` is a route constructor (e.g. `GetTodos {owner:
 
 ### Rate limiting
 
-Endpoints can declare a per-route token-bucket rate limit with the `rateLimit <expr>` clause (placed after the response type/headers, before `=`). The expression has type `RateLimit input a = {key: input -> RequestCtx -> Maybe a, limit: {requests: Int, window: Int Ms}}` with `Ord a`. `input` is the same record the handler receives (path/query/body/header fields). `RequestCtx = {clientIp: Text, receivedAt: Int Ms, header: Text -> Maybe Text}` is supplied by the runtime; `header` does case-insensitive lookup.
+Endpoints can declare a per-route token-bucket rate limit with the `rateLimit <expr>` clause (placed after the response type/headers, before `=`). The expression has type `RateLimit input a = {key: input -> RequestCtx -> Maybe a, limit: {requests: Int 1, window: Int Ms}}` with `Ord a`. `input` is the same record the handler receives (path/query/body/header fields). `RequestCtx = {clientIp: Text, receivedAt: Int Ms, header: Text -> Maybe Text}` is supplied by the runtime; `header` does case-insensitive lookup.
 
 The `key` function returns `Just k` to put the request in bucket `k` (any `Ord` value — serialized via `show` for the SQLite key) or `Nothing` to exempt the request from rate limiting. On rejection the runtime responds `429 Too Many Requests` with `{"error":"Rate limit exceeded"}` and a `Retry-After: <seconds>` header; the handler is not invoked.
 
@@ -680,7 +680,7 @@ IO types can be annotated in type signatures:
 ```knot
 IO {console} {}              -- IO action with console effect, returns unit
 IO {fs} Text                 -- IO action with fs effect, returns Text
-IO {clock, random} Int       -- IO action with multiple effects
+IO {clock, random} Int 1       -- IO action with multiple effects
 IO {network | r} {}          -- open effect row (used by listen)
 ```
 
@@ -696,7 +696,7 @@ The following traits are defined in the prelude. All types that implement a trai
 trait Eq a where
   eq : a -> a -> Bool
 ```
-Structural equality as a trait method. Built-in impls for `Int`, `Float`, `Text`, `Bool`.
+Structural equality as a trait method. Built-in impls for `Int 1`, `Float 1`, `Text`, `Bool`.
 
 ### Ord
 
@@ -706,7 +706,7 @@ data Ordering = LT {} | EQ {} | GT {}
 trait Eq a => Ord a where
   compare : a -> a -> Ordering
 ```
-Ordering comparison. Returns `LT {}`, `EQ {}`, or `GT {}`. Requires `Eq`. Built-in impls for `Int`, `Float`, `Text`.
+Ordering comparison. Returns `LT {}`, `EQ {}`, or `GT {}`. Requires `Eq`. Built-in impls for `Int 1`, `Float 1`, `Text`.
 
 ### Num
 
@@ -718,7 +718,7 @@ trait Eq a => Num a where
   div : a -> a -> a
   negate : a -> a
 ```
-Numeric operations as trait methods. Requires `Eq`. Built-in impls for `Int` and `Float`. The `%` operator is handled by intrinsic codegen for `Int`/`Float` rather than a `Num` method, so a user `impl Num` cannot supply it. Use as a trait bound for generic numeric code:
+Numeric operations as trait methods. Requires `Eq`. Built-in impls for `Int 1` and `Float 1`. The `%` operator is handled by intrinsic codegen for `Int 1`/`Float 1` rather than a `Num` method, so a user `impl Num` cannot supply it. Use as a trait bound for generic numeric code:
 
 ```knot
 double : Num a => a -> a
@@ -740,7 +740,7 @@ fold add 0 [1, 2, 3]    -- 6
 trait Display a where
   display : a -> Text
 ```
-Convert a value to its text representation. Built-in impls for `Int`, `Float`, `Text`, `Bool`. The `Text` impl returns the value as-is; the others delegate to `show`.
+Convert a value to its text representation. Built-in impls for `Int 1`, `Float 1`, `Text`, `Bool`. The `Text` impl returns the value as-is; the others delegate to `show`.
 
 Use as a trait bound for generic formatting:
 
@@ -799,8 +799,8 @@ Built-in impls: `[]` (`empty = []`, `alt = union`) and `Maybe` (`empty = Nothing
 
 ```knot
 trait Sequence s where
-  take : Int -> s -> s
-  drop : Int -> s -> s
+  take : Int 1 -> s -> s
+  drop : Int 1 -> s -> s
 ```
 Built-in impls for `Text` (operates on characters) and `[]` (operates on rows). When the receiver is a source relation, the compiler pushes `take` down to SQL `LIMIT`; combined with `sortBy` it becomes `ORDER BY ... LIMIT`.
 
@@ -836,11 +836,11 @@ These are not functions but are available as infix operators:
 
 | Operator | Type | Description |
 |----------|------|-------------|
-| `+` | `Int -> Int -> Int` | Addition (also `Float`) |
-| `-` | `Int -> Int -> Int` | Subtraction |
-| `*` | `Int -> Int -> Int` | Multiplication |
-| `/` | `Int -> Int -> Int` | Division |
-| `%` | `Int -> Int -> Int` | Modulo / remainder (also `Float`) |
+| `+` | `Int 1 -> Int 1 -> Int 1` | Addition (also `Float 1`) |
+| `-` | `Int 1 -> Int 1 -> Int 1` | Subtraction |
+| `*` | `Int 1 -> Int 1 -> Int 1` | Multiplication |
+| `/` | `Int 1 -> Int 1 -> Int 1` | Division |
+| `%` | `Int 1 -> Int 1 -> Int 1` | Modulo / remainder (also `Float 1`) |
 | `==` | `a -> a -> Bool` | Structural equality |
 | `!=` | `a -> a -> Bool` | Structural inequality |
 | `<` | `a -> a -> Bool` | Less than |
@@ -851,7 +851,7 @@ These are not functions but are available as infix operators:
 | `\|\|` | `Bool -> Bool -> Bool` | Logical or |
 | `++` | `Text -> Text -> Text` | Text concatenation |
 | `\|>` | `a -> (a -> b) -> b` | Pipe forward |
-| `-` (unary) | `Int -> Int` | Negation |
+| `-` (unary) | `Int 1 -> Int 1` | Negation |
 | `!` (unary) | `Bool -> Bool` | Logical not |
 
 ## Currying

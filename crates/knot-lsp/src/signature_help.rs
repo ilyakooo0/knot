@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn point_free_params_get_distinct_highlight_spans() {
         // `addBoth` has arity 2 in its type but only one lambda binder (`x`).
-        let src = "addBoth : Int -> Int -> Int\naddBoth = \\x -> plus x\nmain = addBoth 1 2\n";
+        let src = "addBoth : Int 1 -> Int 1 -> Int 1\naddBoth = \\x -> plus x\nmain = addBoth 1 2\n";
         // Cursor on the SECOND argument (the `2`), active parameter index 1.
         let h = probe(src, "addBoth 1 2", 10).expect("sig help");
         let sig = &h.signatures[0];
@@ -374,7 +374,7 @@ mod tests {
         let slice = &sig.label[start as usize..end as usize];
         assert!(
             slice.ends_with("Int") && slice.contains(':'),
-            "active param label slice should be a `name: Int`, got {slice:?} in {:?}",
+            "active param label slice should be a `name: Int 1`, got {slice:?} in {:?}",
             sig.label
         );
     }

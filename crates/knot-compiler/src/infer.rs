@@ -4800,10 +4800,26 @@ impl Infer {
                         Ty::Fun(Box::new(record_ty), Box::new(data_ty))
                     }
                 } else {
-                    self.error(
-                        format!("unknown constructor '{}'", name),
-                        expr.span,
-                    );
+                    // A capitalized name that isn't a constructor but IS a
+                    // declared unit is almost certainly the removed
+                    // value-literal syntax (`sleep 1000 Ms`, removed in
+                    // 12deb2e) — the parser reads the trailing `Ms` as a
+                    // constructor application. Point at the annotation form
+                    // instead of the bare "unknown constructor" dead end.
+                    if self.declared_units.contains_key(name) {
+                        self.error(
+                            format!(
+                                "'{}' is a unit, not a value — write an annotation like `(1000 : Int {})` instead of `1000 {}`",
+                                name, name, name
+                            ),
+                            expr.span,
+                        );
+                    } else {
+                        self.error(
+                            format!("unknown constructor '{}'", name),
+                            expr.span,
+                        );
+                    }
                     Ty::Error
                 }
             }
@@ -10971,6 +10987,25 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
         // Peel aliases so a refined/aliased numeric (`type Metres = Float M`)
         // still shows its unit.
         let resolved = infer.apply(&ty);
+        // A *refined* alias (`type Pos = Metres where …`) is a nullary
+        // `Con(name, [])`, not an `Alias`, so `peel_alias`/`unit_of` can't
+        // see through it to the unit-bearing base. Resolve it to its refined
+        // base (following stacked refined chains) before extracting the unit.
+        let resolved_owned;
+        let resolved = match resolved.peel_alias() {
+            Ty::Con(name, args)
+                if args.is_empty() && infer.refined_types.contains_key(name) =>
+            {
+                match infer.resolve_refined_base(name, span) {
+                    Some(base) => {
+                        resolved_owned = base;
+                        &resolved_owned
+                    }
+                    None => continue,
+                }
+            }
+            other => other,
+        };
         let unit = match resolved.peel_alias().unit_of() {
             Some(u) => infer.apply_unit(u),
             None => continue,
@@ -11018,7 +11053,17 @@ fn action_monad_of(ty: &Ty) -> Option<MonadKind> {
         Ty::Relation(_) => Some(MonadKind::Relation),
         // Saturated (`Maybe Int`) or partially applied (`Result e`) ADTs. A
         // nullary `Con(name, [])` is a plain data type, not an action.
-        Ty::Con(name, args) if !args.is_empty() => Some(MonadKind::Adt(name.clone())),
+        // Unit-bearing `Int`/`Float` (`Con("Int", [Unit(_)]`) are also plain
+        // values, not actions — their single argument is a unit annotation,
+        // not a payload. Without this guard, a `do` block whose final
+        // expression is a unit-bearing number (e.g. `do { …; (5.0 : Float M)
+        // }`) would misclassify the number as an `Adt("Int")` action and
+        // try to treat it as the block's monad instead of wrapping in `pure`.
+        Ty::Con(name, args)
+            if !args.is_empty() && !(name == "Int" || name == "Float") =>
+        {
+            Some(MonadKind::Adt(name.clone()))
+        }
         Ty::App(f, _) => action_monad_of(f).or_else(|| match f.peel_alias() {
             Ty::TyCon(name) if name == "[]" => Some(MonadKind::Relation),
             Ty::TyCon(name) if name == "IO" => Some(MonadKind::IO),

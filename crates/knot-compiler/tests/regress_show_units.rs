@@ -1,7 +1,7 @@
 //! End-to-end regression tests for `show` on values carrying a unit of measure.
 //!
 //! DESIGN ("`show` and Units") specifies that `show` on a value with a concrete
-//! unit appends the canonical unit string — `show 42.0 M` is `"42.0 M"` — and
+//! unit appends the canonical unit string — `show (42.0 : Float M)` is `"42.0 M"` — and
 //! prints just the number when the unit is polymorphic or absent. Units are
 //! erased before runtime, so the unit reaches the emitted code only if type
 //! inference resolves it per `show` call site and codegen emits it as a
@@ -83,6 +83,7 @@ fn assert_printed(stdout: &str, expected: &str) {
 #[test]
 fn show_appends_concrete_unit_suffix() {
     // The three examples DESIGN gives verbatim, plus an Int-carried unit.
+    // Units live on types, so literals are annotated via `(x : Float M)`.
     let stdout = compile_and_run(
         "concrete",
         r#"unit M
@@ -90,10 +91,10 @@ unit S
 unit Usd
 
 main = do
-  println (show 42.0 M)
-  println (show 9.8 (M / S^2))
+  println (show (42.0 : Float M))
+  println (show (9.8 : Float (M / S^2)))
   println (show 3.14)
-  println (show 1500 Usd)
+  println (show (1500 : Int Usd))
 "#,
     );
     assert_printed(&stdout, "42.0 M");
@@ -114,10 +115,10 @@ unit S
 unit Speed = M / S
 
 main = do
-  let distance = 100.0 M
-  let time = 4.0 S
+  let distance = (100.0 : Float M)
+  let time = (4.0 : Float S)
   println (show (distance / time))
-  println (show (2.5 Speed))
+  println (show (2.5 : Float Speed))
 "#,
     );
     assert_printed(&stdout, "25.0 M/S");
@@ -138,7 +139,7 @@ describe : Float u -> Text
 describe = \x -> show x
 
 main = do
-  println (describe 7.5 M)
+  println (describe (7.5 : Float M))
   println (show 7.5)
   println (show 42)
 "#,

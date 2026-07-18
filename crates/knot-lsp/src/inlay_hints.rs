@@ -773,8 +773,6 @@ fn extract_unit_from_type_str(ty: &str) -> Option<String> {
 /// unit doesn't necessarily belong to each literal inside it:
 /// - `base * 2.0` — the `2.0` is dimensionless (unit algebra composes via
 ///   `*`), so stamping the binding's `<M>` on it is wrong;
-/// - `42.0 M` — an explicit `UnitLit` already spells the unit; recursing
-///   into its inner literal used to render `42.0 M<M>`;
 /// - `5 seconds` — the time-word sugar desugars to `5 * 1000` where the
 ///   synthesized `1000` literal's span covers the word `seconds`, so the
 ///   old walk hinted `<Ms>` after the word.
@@ -1715,14 +1713,14 @@ checkGlobalRate = \t -> atomic do
         );
     }
 
-    /// Bug 18: an explicitly-annotated literal (`42.0 M`) must not get an
-    /// additional `<M>` hint (used to render `42.0 M<M>`).
+    /// Bug 18: an explicitly-annotated literal (`(42.0 : Float M)`) must not get
+    /// an additional `<M>` hint (used to render `42.0<M> <M>`).
     #[test]
     fn unit_hint_not_duplicated_on_annotated_literal() {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "unit M\nf = \\q -> do\n  let y = 42.0 M\n  yield y\n",
+            "unit M\nf = \\q -> do\n  let y = (42.0 : Float M)\n  yield y\n",
         );
         let range = ws.whole_file_range(&uri);
         let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
@@ -1740,7 +1738,7 @@ checkGlobalRate = \t -> atomic do
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "unit M\nbase : Float M\nbase = 1.0 M\n\nf = \\q -> do\n  let y = base * 2.0\n  yield y\n",
+            "unit M\nbase : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> do\n  let y = base * 2.0\n  yield y\n",
         );
         let doc = ws.doc(&uri);
         // Sanity: the binding really inferred a unit — otherwise this test
@@ -1784,7 +1782,7 @@ checkGlobalRate = \t -> atomic do
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "unit M\nbase : Float M\nbase = 1.0 M\n\nf = \\q -> do\n  let y = 2.0\n  yield (base + y)\n",
+            "unit M\nbase : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> do\n  let y = 2.0\n  yield (base + y)\n",
         );
         let doc = ws.doc(&uri);
         if !doc.local_type_info.values().any(|t| t.contains("<M>")) {

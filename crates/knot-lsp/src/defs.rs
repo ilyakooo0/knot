@@ -763,7 +763,7 @@ impl<'a> DefResolver<'a> {
                 };
                 self.literals.push((expr.span, ty.to_string()));
             }
-            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.resolve_expr(value),
+            ast::ExprKind::TimeUnitLit { value, .. } => self.resolve_expr(value),
             ast::ExprKind::Annot { expr: inner, ty } => {
                 self.resolve_type(ty, self.source);
                 self.resolve_expr(inner);

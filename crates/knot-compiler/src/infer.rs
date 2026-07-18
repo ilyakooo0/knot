@@ -5424,22 +5424,6 @@ impl Infer {
                 }
             }
 
-            ast::ExprKind::UnitLit { value, unit } => {
-                let val_ty = self.infer_expr(value);
-                let unit_ty = self.ast_unit_to_unit_ty(unit);
-                match &val_ty {
-                    t if t.is_int_like() => Ty::int_with_unit(unit_ty),
-                    t if t.is_float_like() => Ty::float_with_unit(unit_ty),
-                    _ => {
-                        self.error(
-                            "unit annotations are only allowed on numeric literals".into(),
-                            expr.span,
-                        );
-                        val_ty
-                    }
-                }
-            }
-
             // `2 seconds` is inference-identical to its desugared `2 * 1000`;
             // infer the wrapped multiplication directly.
             ast::ExprKind::TimeUnitLit { value, .. } => self.infer_expr(value),
@@ -6886,7 +6870,7 @@ impl Infer {
                 })
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io_prescan(body),
-            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => self.expr_is_io_prescan(value),
+            ast::ExprKind::TimeUnitLit { value, .. } => self.expr_is_io_prescan(value),
             ast::ExprKind::Annot { expr, .. } => self.expr_is_io_prescan(expr),
             ast::ExprKind::Refine(inner) => self.expr_is_io_prescan(inner),
             _ => false,
@@ -10573,7 +10557,7 @@ fn value_references_source_inner(
                 inner, source_name, aliases, let_bindings, visited,
             )
         }
-        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => value_references_source_inner(
+        ast::ExprKind::TimeUnitLit { value, .. } => value_references_source_inner(
             value, source_name, aliases, let_bindings, visited,
         ),
         ast::ExprKind::Annot { expr, .. } => value_references_source_inner(
@@ -11218,7 +11202,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
             f(value);
         }
         Atomic(inner) | Refine(inner) => f(inner),
-        UnitLit { value, .. } | TimeUnitLit { value, .. } => f(value),
+        TimeUnitLit { value, .. } => f(value),
         Annot { expr, .. } => f(expr),
         Serve { handlers, .. } => {
             for h in handlers {
@@ -12308,39 +12292,41 @@ main = applyPred (\\r -> r.x == r.y)\
     }
 
     // ── Units of measure ─────────────────────────────────────────
+    // Units live on types, not values. Literals are annotated via
+    // `(expr : Float M)` type ascriptions, not `42.0 M` suffixes.
 
     #[test]
     fn unit_literal_typechecks() {
-        assert!(check_src("unit M\nmain = 42.0 M").is_empty());
+        assert!(check_src("unit M\nmain = (42.0 : Float M)").is_empty());
     }
 
     #[test]
     fn unit_addition_same_unit() {
-        assert!(check_src("unit M\nmain = 10.0 M + 5.0 M").is_empty());
+        assert!(check_src("unit M\nmain = (10.0 : Float M) + (5.0 : Float M)").is_empty());
     }
 
     #[test]
     fn unit_addition_mismatch() {
-        let diags = check_src("unit M\nunit S\nmain = 10.0 M + 5.0 S");
+        let diags = check_src("unit M\nunit S\nmain = (10.0 : Float M) + (5.0 : Float S)");
         assert!(has_error(&diags, "unit mismatch"));
     }
 
     #[test]
     fn unit_multiplication_composes() {
         // M * M should not error (produces M^2)
-        assert!(check_src("unit M\nmain = 10.0 M * 5.0 M").is_empty());
+        assert!(check_src("unit M\nmain = (10.0 : Float M) * (5.0 : Float M)").is_empty());
     }
 
     #[test]
     fn unit_division_composes() {
         // M / S should not error (produces M/S)
-        assert!(check_src("unit M\nunit S\nmain = 100.0 M / 10.0 S").is_empty());
+        assert!(check_src("unit M\nunit S\nmain = (100.0 : Float M) / (10.0 : Float S)").is_empty());
     }
 
     #[test]
     fn unit_dimensionless_scalar_mul() {
         // Float * Float M should produce Float M
-        assert!(check_src("unit M\nmain = 2.0 * 5.0 M").is_empty());
+        assert!(check_src("unit M\nmain = 2.0 * (5.0 : Float M)").is_empty());
     }
 
     #[test]
@@ -12350,24 +12336,24 @@ main = applyPred (\\r -> r.x == r.y)\
 
     #[test]
     fn unit_derived_alias() {
-        assert!(check_src("unit M\nunit S\nunit Mps = M / S\nmain = 10.0 Mps").is_empty());
+        assert!(check_src("unit M\nunit S\nunit Mps = M / S\nmain = (10.0 : Float Mps)").is_empty());
     }
 
     #[test]
     fn unit_int_literal() {
-        assert!(check_src("unit Usd\nmain = 999 Usd").is_empty());
+        assert!(check_src("unit Usd\nmain = (999 : Int Usd)").is_empty());
     }
 
     #[test]
     fn unit_int_addition_mismatch() {
-        let diags = check_src("unit Usd\nunit Eur\nmain = 100 Usd + 50 Eur");
+        let diags = check_src("unit Usd\nunit Eur\nmain = (100 : Int Usd) + (50 : Int Eur)");
         assert!(has_error(&diags, "unit mismatch"));
     }
 
     #[test]
     fn unit_in_record() {
         assert!(check_src(
-            "unit M\nunit S\nmain = {distance: 100.0 M, time: 10.0 S}"
+            "unit M\nunit S\nmain = {distance: (100.0 : Float M), time: (10.0 : Float S)}"
         ).is_empty());
     }
 
@@ -12383,7 +12369,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // avg should preserve the unit from the projection function
         let diags = check_src(
             "unit M\n\
-             main = avg (\\p -> p.x) [{x: 1.0 M}, {x: 2.0 M}] + 1.0 M"
+             main = avg (\\p -> p.x) [{x: (1.0 : Float M)}, {x: (2.0 : Float M)}] + (1.0 : Float M)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12393,7 +12379,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // avg result has unit from projection — adding mismatched unit should fail
         let diags = check_src(
             "unit M\nunit S\n\
-             main = avg (\\p -> p.x) [{x: 1.0 M}] + 1.0 S"
+             main = avg (\\p -> p.x) [{x: (1.0 : Float M)}] + (1.0 : Float S)"
         );
         assert!(!diags.is_empty(), "should reject adding Float M avg result to Float S");
     }
@@ -12402,7 +12388,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_negation_preserves() {
         // Unary negation should preserve units
         let diags = check_src(
-            "unit M\nmain = -(5.0 M) + 3.0 M"
+            "unit M\nmain = -((5.0 : Float M)) + (3.0 : Float M)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12414,7 +12400,7 @@ main = applyPred (\\r -> r.x == r.y)\
             "unit M\n\
              wrap : Float M -> Float M\n\
              wrap = \\x -> x\n\
-             main = wrap 5.0 M"
+             main = wrap (5.0 : Float M)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12426,7 +12412,7 @@ main = applyPred (\\r -> r.x == r.y)\
             "unit M\nunit S\n\
              wrap : Float M -> Float M\n\
              wrap = \\x -> x\n\
-             main = wrap 5.0 S"
+             main = wrap (5.0 : Float S)"
         );
         assert!(!diags.is_empty(), "should reject Float S for Float M param");
     }
@@ -12438,7 +12424,7 @@ main = applyPred (\\r -> r.x == r.y)\
             "unit M\n\
              double : Float u -> Float u\n\
              double = \\x -> x + x\n\
-             main = double 5.0 M"
+             main = double (5.0 : Float M)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12450,7 +12436,7 @@ main = applyPred (\\r -> r.x == r.y)\
             "unit M\nunit S\n\
              double : Float u -> Float u\n\
              double = \\x -> x + x\n\
-             main = double 5.0 M + 1.0 S"
+             main = double (5.0 : Float M) + (1.0 : Float S)"
         );
         assert!(!diags.is_empty(), "should reject Float M + Float S");
     }
@@ -12463,8 +12449,8 @@ main = applyPred (\\r -> r.x == r.y)\
              double : Float u -> Float u\n\
              double = \\x -> x + x\n\
              main = do\n  \
-               let a = double 5.0 M\n  \
-               let b = double 3.0 S\n  \
+               let a = double (5.0 : Float M)\n  \
+               let b = double (3.0 : Float S)\n  \
                yield {}"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
@@ -12634,7 +12620,7 @@ main = applyPred (\\r -> r.x == r.y)\
         let diags = check_src(
             "unit Usd\n\
              f : IO {random} Int Usd\n\
-             f = randomInt 100 Usd\n\
+             f = randomInt (100 : Int Usd)\n\
              main = 1"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
@@ -12646,7 +12632,7 @@ main = applyPred (\\r -> r.x == r.y)\
         let diags = check_src(
             "unit Usd\nunit Eur\n\
              f : IO {random} Int Eur\n\
-             f = randomInt 100 Usd\n\
+             f = randomInt (100 : Int Usd)\n\
              main = 1"
         );
         assert!(has_error(&diags, "unit mismatch"));
@@ -12657,7 +12643,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // count result can unify with a unit context
         let diags = check_src(
             "unit N\n\
-             main = count [1, 2, 3] + 0 N"
+             main = count [1, 2, 3] + (0 : Int N)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12667,7 +12653,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // length result can unify with a unit context
         let diags = check_src(
             "unit N\n\
-             main = length \"hello\" + 0 N"
+             main = length \"hello\" + (0 : Int N)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12676,7 +12662,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn unit_sleep_accepts_ms() {
         // sleep accepts Int Ms (built-in unit)
         let diags = check_src(
-            "main = sleep 1000 Ms"
+            "main = sleep (1000 : Int Ms)"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12686,7 +12672,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // sleep requires Ms — passing a different unit should fail
         let diags = check_src(
             "unit Kg\n\
-             main = sleep 1000 Kg"
+             main = sleep (1000 : Int Kg)"
         );
         assert!(has_error(&diags, "unit mismatch"));
     }
@@ -12752,7 +12738,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // stripUnit is Int-only — passing a Float should fail
         let diags = check_src(
             "unit M\n\
-             f = stripUnit 1.0 M\n\
+             f = stripUnit (1.0 : Float M)\n\
              main = 1"
         );
         assert!(!diags.is_empty());

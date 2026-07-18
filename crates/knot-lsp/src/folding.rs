@@ -220,7 +220,7 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
         ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => {
             collect_folding_ranges_expr(inner, source, ranges);
         }
-        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => {
+        ast::ExprKind::TimeUnitLit { value, .. } => {
             collect_folding_ranges_expr(value, source, ranges);
         }
         ast::ExprKind::Annot { expr, .. } => {

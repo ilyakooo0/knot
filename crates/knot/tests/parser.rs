@@ -2312,43 +2312,6 @@ fn bare_lower_unit_at_expr_end_is_application() {
     }
 }
 
-#[test]
-fn concrete_unit_literal_applied_to_atom_stays_application() {
-    // Uppercase units are never ambiguous with a value variable, so
-    // `f 5 M 0` remains application of the unit-annotated literal.
-    match fun_body("x = f 5 M 0") {
-        ExprKind::App { func, arg } => {
-            assert!(
-                matches!(&arg.node, ExprKind::Lit(Literal::Int(n)) if n == "0"),
-                "outer arg should be 0, got {:?}",
-                arg.node
-            );
-            match &func.node {
-                ExprKind::App { arg: inner_arg, .. } => assert!(
-                    matches!(&inner_arg.node, ExprKind::UnitLit { unit: UnitExpr::Named(u), .. } if u == "M"),
-                    "inner arg should be unit literal 5 M, got {:?}",
-                    inner_arg.node
-                ),
-                other => panic!("expected nested App, got {other:?}"),
-            }
-        }
-        other => panic!("expected App, got {other:?}"),
-    }
-}
-
-#[test]
-fn unit_arithmetic_after_uppercase_unit_not_broken() {
-    // `5 M * 3` is unit-bearing multiplication — `M` is consumed as the unit
-    // annotation, then `*` is the binary operator.
-    match fun_body("x = 5 M * 3") {
-        ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
-            assert!(matches!(&lhs.node, ExprKind::UnitLit { unit: UnitExpr::Named(u), .. } if u == "M"));
-            assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "3"));
-        }
-        other => panic!("expected Mul with unit-literal LHS, got {other:?}"),
-    }
-}
-
 // ── Effectful Types ─────────────────────────────────────────────────
 
 #[test]

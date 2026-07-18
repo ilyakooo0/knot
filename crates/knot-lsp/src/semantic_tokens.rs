@@ -627,7 +627,7 @@ impl<'a> TokenCollector<'a> {
                     self.visit_expr(e);
                 }
             }
-            ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => {
+            ast::ExprKind::TimeUnitLit { value, .. } => {
                 self.visit_expr(value);
             }
             ast::ExprKind::Annot { expr: inner, ty } => {

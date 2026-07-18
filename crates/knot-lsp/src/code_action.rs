@@ -2012,7 +2012,7 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
             }
         }
         ast::ExprKind::FieldAccess { expr, .. } => collect_names_in_expr(expr, out),
-        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => collect_names_in_expr(value, out),
+        ast::ExprKind::TimeUnitLit { value, .. } => collect_names_in_expr(value, out),
         ast::ExprKind::Annot { expr, ty } => {
             collect_names_in_expr(expr, out);
             collect_names_in_type(ty, out);

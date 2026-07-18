@@ -188,7 +188,7 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
         ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
         ExprKind::Set { .. } | ExprKind::ReplaceSet { .. } => true,
         ExprKind::Atomic(_) => true,
-        ExprKind::UnitLit { value, .. } | ExprKind::TimeUnitLit { value, .. } => expr_contains_io(value, builtins, io_fns),
+        ExprKind::TimeUnitLit { value, .. } => expr_contains_io(value, builtins, io_fns),
         ExprKind::Annot { expr, .. } => expr_contains_io(expr, builtins, io_fns),
         ExprKind::Refine(inner) => expr_contains_io(inner, builtins, io_fns),
         ExprKind::App { func, arg } => {
@@ -452,7 +452,7 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
             desugar_expr(target, io_fns, source_vars);
             // Don't desugar the top-level do block of a set value,
             // but DO recurse into its sub-expressions.
-            // Unwrap Annot/UnitLit/Refine wrappers to find the Do block
+            // Unwrap Annot/Refine wrappers to find the Do block
             // (e.g. `set *rel = (do { ... } : [T])`).
             let inner = unwrap_wrappers_mut(value);
             if let ExprKind::Do(stmts) = &mut inner.node {
@@ -657,7 +657,7 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
             desugar_expr(value, io_fns, source_vars);
         }
         ExprKind::Atomic(inner) => desugar_expr(inner, io_fns, source_vars),
-        ExprKind::UnitLit { value, .. } | ExprKind::TimeUnitLit { value, .. } => desugar_expr(value, io_fns, source_vars),
+        ExprKind::TimeUnitLit { value, .. } => desugar_expr(value, io_fns, source_vars),
         ExprKind::Annot { expr, .. } => desugar_expr(expr, io_fns, source_vars),
         ExprKind::Refine(inner) => desugar_expr(inner, io_fns, source_vars),
         ExprKind::Serve { handlers, .. } => {
@@ -668,20 +668,18 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
     }
 }
 
-/// Unwrap Annot/UnitLit/Refine wrappers to find the innermost expression.
+/// Unwrap Annot/Refine wrappers to find the innermost expression.
 /// Used to protect Do blocks inside Set values and View bodies from
 /// desugaring when they're wrapped in type annotations.
 fn unwrap_wrappers_mut(expr: &mut Expr) -> &mut Expr {
     if matches!(
         &expr.node,
         ExprKind::Annot { .. }
-            | ExprKind::UnitLit { .. }
             | ExprKind::TimeUnitLit { .. }
             | ExprKind::Refine(_)
     ) {
         let inner = match &mut expr.node {
             ExprKind::Annot { expr: inner, .. }
-            | ExprKind::UnitLit { value: inner, .. }
             | ExprKind::TimeUnitLit { value: inner, .. } => inner.as_mut(),
             ExprKind::Refine(inner) => inner.as_mut(),
             _ => unreachable!(),
@@ -1101,7 +1099,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
             expr_is_io(lhs, io_fns) || expr_is_io(rhs, io_fns)
         }
         ExprKind::UnaryOp { operand, .. } => expr_is_io(operand, io_fns),
-        ExprKind::UnitLit { value, .. } | ExprKind::TimeUnitLit { value, .. } => expr_is_io(value, io_fns),
+        ExprKind::TimeUnitLit { value, .. } => expr_is_io(value, io_fns),
         ExprKind::Annot { expr, .. } => expr_is_io(expr, io_fns),
         ExprKind::Refine(inner) => expr_is_io(inner, io_fns),
         ExprKind::If { cond, then_branch, else_branch, .. } => {
@@ -1150,8 +1148,7 @@ fn lambda_chain_body_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
             ExprKind::Lambda { .. } => lambda_chain_body_is_io(body, io_fns),
             _ => expr_is_io(body, io_fns),
         },
-        ExprKind::UnitLit { value, .. }
-        | ExprKind::TimeUnitLit { value, .. }
+        ExprKind::TimeUnitLit { value, .. }
         | ExprKind::Annot { expr: value, .. }
         | ExprKind::Refine(value) => lambda_chain_body_is_io(value, io_fns),
         _ => false,
@@ -1169,8 +1166,7 @@ fn applied_lambda_body_is_io(func: &Expr, io_fns: &HashSet<String>) -> bool {
         ExprKind::Lambda { body, .. } => expr_is_io(body, io_fns),
         // Curried application: `(\a b -> body) x y` — keep peeling.
         ExprKind::App { func, .. } => applied_lambda_body_is_io(func, io_fns),
-        ExprKind::UnitLit { value, .. }
-        | ExprKind::TimeUnitLit { value, .. }
+        ExprKind::TimeUnitLit { value, .. }
         | ExprKind::Annot { expr: value, .. }
         | ExprKind::Refine(value) => applied_lambda_body_is_io(value, io_fns),
         _ => false,

@@ -550,7 +550,7 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
         }
         ast::ExprKind::FieldAccess { expr, .. } => f(expr),
         ast::ExprKind::Annot { expr, .. } => f(expr),
-        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => f(value),
+        ast::ExprKind::TimeUnitLit { value, .. } => f(value),
         ast::ExprKind::Serve { handlers, .. } => {
             // `api` is a Name (no sub-expression); handler bodies are the
             // only expression children.

@@ -261,12 +261,6 @@ pub enum ExprKind {
     /// `atomic expr` — transactional boundary.
     Atomic(Box<Expr>),
 
-    /// `42.0 m`, `999 usd` — numeric literal with unit annotation.
-    UnitLit {
-        value: Box<Expr>,
-        unit: UnitExpr,
-    },
-
     /// `2 seconds`, `5 ms` — time-unit sugar. `value` holds the desugared
     /// form (a `BinOp::Mul` of the literal and its millisecond factor, so
     /// inference/codegen treat it identically to that multiplication);

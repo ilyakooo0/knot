@@ -173,10 +173,10 @@ unit S
 bad = \p -> do
   let stripped = stripFloatUnit p
   let g = \y -> y + p
-  println (show (g 1.0 M))
-  println (show (g 1.0 S))
+  println (show (g (1.0 : Float M)))
+  println (show (g (1.0 : Float S)))
   yield {}
-main = bad 2.0 M
+main = bad (2.0 : Float M)
 "#;
     let diags = check_src(src);
     assert!(
@@ -193,7 +193,7 @@ fn var_times_var_composes_units_instead_of_unifying() {
     // area : composing M * M = M^2; adding M must be rejected.
     let src = r#"unit M
 area = \w h -> w * h
-v = (area 3.0 M 4.0 M) + 5.0 M
+v = (area (3.0 : Float M) (4.0 : Float M)) + (5.0 : Float M)
 main = println (show v)
 "#;
     let diags = check_src(src);
@@ -217,7 +217,7 @@ fn constrained_annotation_defers_unit_composition() {
     let src = r#"unit M
 scale : Num a => a -> a -> a
 scale = \x y -> x * y
-v = (scale 3.0 M 4.0 M) + 1.0 M
+v = (scale (3.0 : Float M) (4.0 : Float M)) + (1.0 : Float M)
 main = println (show v)
 "#;
     let diags = check_src(src);
@@ -257,7 +257,7 @@ fn var_times_var_accepts_mixed_units() {
     let src = r#"unit M
 unit S
 f = \x y -> x * y
-v = f 3.0 M 4.0 S
+v = f (3.0 : Float M) (4.0 : Float S)
 main = println (show v)
 "#;
     let diags = check_src(src);

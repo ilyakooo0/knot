@@ -438,7 +438,7 @@ fn collect_edges(
             collect_edges(target, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             collect_edges(value, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
-        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => {
+        ast::ExprKind::TimeUnitLit { value, .. } => {
             collect_edges(value, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
         ast::ExprKind::Annot { expr: inner, .. } => {
@@ -526,7 +526,7 @@ const DIFF_ALIAS: &str = "\0diff";
 fn strip_head_wrappers(expr: &ast::Expr) -> &ast::Expr {
     match &expr.node {
         ast::ExprKind::Annot { expr: inner, .. } => strip_head_wrappers(inner),
-        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => strip_head_wrappers(value),
+        ast::ExprKind::TimeUnitLit { value, .. } => strip_head_wrappers(value),
         ast::ExprKind::Refine(inner) => strip_head_wrappers(inner),
         _ => expr,
     }

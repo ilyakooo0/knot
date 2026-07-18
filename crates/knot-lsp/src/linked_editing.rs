@@ -249,7 +249,7 @@ fn collect_field_name_spans(
         _ => {}
     }
     // Recurse into all sub-expressions via the shared walker — the manual
-    // recursion this replaces missed UnaryOp/Annot/UnitLit/Serve, leaving
+    // recursion this replaces missed UnaryOp/Annot/Serve, leaving
     // field occurrences inside them unlinked.
     recurse_expr(expr, |e| {
         collect_field_name_spans(e, field_name, source, ranges, pun_seen)

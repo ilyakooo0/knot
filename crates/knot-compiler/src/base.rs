@@ -370,7 +370,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
             shift_expr_spans(value, offset);
         }
         Atomic(inner) | Refine(inner) => shift_expr_spans(inner, offset),
-        UnitLit { value, .. } | TimeUnitLit { value, .. } => shift_expr_spans(value, offset),
+        TimeUnitLit { value, .. } => shift_expr_spans(value, offset),
         Annot { expr, .. } => shift_expr_spans(expr, offset),
         Serve { api_span, handlers, .. } => {
             api_span.start += offset;
@@ -641,7 +641,7 @@ mod tests {
             }
             List(items) => items.iter().for_each(f),
             FieldAccess { expr, .. } | Annot { expr, .. } => f(expr),
-            UnitLit { value, .. } | TimeUnitLit { value, .. } => f(value),
+            TimeUnitLit { value, .. } => f(value),
             Serve { handlers, .. } => handlers.iter().for_each(|h| f(&h.body)),
             Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
         }

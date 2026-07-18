@@ -148,7 +148,7 @@ fn expr_mentions_var(e: &knot::ast::Expr, name: &str) -> bool {
             expr_mentions_var(target, name) || expr_mentions_var(value, name)
         }
         ExprKind::Atomic(inner) | ExprKind::Refine(inner) => expr_mentions_var(inner, name),
-        ExprKind::UnitLit { value, .. } | ExprKind::TimeUnitLit { value, .. } => expr_mentions_var(value, name),
+        ExprKind::TimeUnitLit { value, .. } => expr_mentions_var(value, name),
         ExprKind::Annot { expr, .. } => expr_mentions_var(expr, name),
         ExprKind::Serve { handlers, .. } => {
             handlers.iter().any(|h| expr_mentions_var(&h.body, name))

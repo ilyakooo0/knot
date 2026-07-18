@@ -1,4 +1,4 @@
-//! Ad-hoc verification for selection_range.rs fix: Annot/Serve/UnitLit/TimeUnitLit
+//! Ad-hoc verification for selection_range.rs fix: Annot/Serve/TimeUnitLit
 //! now recurse into inner expressions in collect_containing_spans.
 //! Run: cargo test -p knot-lsp verification_pass4 --nocapture
 

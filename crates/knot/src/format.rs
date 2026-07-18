@@ -1766,19 +1766,6 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             let s = format!("atomic {}", render_expr_inline(inner, Prec::App));
             paren_if(parent > Prec::Lowest, s)
         }
-        ExprKind::UnitLit { value, unit } => {
-            let s = format!(
-                "{} {}",
-                render_expr_inline(value, Prec::Atom),
-                render_unit_type_arg(unit)
-            );
-            // A unit literal with a bare-name unit in argument position
-            // (`f 42.0 M 6`) is unambiguous (uppercase `M` can't be a value
-            // var, and applying a literal to anything is ill-typed), so no
-            // special parenthesization is needed — unlike the old `<…>`
-            // syntax which was ambiguous with chained comparison.
-            s
-        }
         ExprKind::TimeUnitLit { value, unit_name } => {
             // Recover the original numeric literal from the desugared
             // `n * factor` and re-render the surface `n unit` form (e.g.

@@ -200,7 +200,7 @@ fn collect_containing_spans(expr: &ast::Expr, offset: usize, spans: &mut Vec<Spa
         ast::ExprKind::Annot { expr, .. } => {
             collect_containing_spans(expr, offset, spans);
         }
-        ast::ExprKind::UnitLit { value, .. } | ast::ExprKind::TimeUnitLit { value, .. } => {
+        ast::ExprKind::TimeUnitLit { value, .. } => {
             collect_containing_spans(value, offset, spans);
         }
         ast::ExprKind::Serve { handlers, .. } => {

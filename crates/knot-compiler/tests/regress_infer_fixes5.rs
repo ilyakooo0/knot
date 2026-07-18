@@ -125,7 +125,7 @@ fn unit_exponent_overflow_does_not_panic() {
     // compiler (regression: unchecked i32 exponent arithmetic panicked).
     let src = "unit M\n\
                area : Float (M^2000000000)\n\
-               area = 1.0 (M^2000000000)\n\
+               area = (1.0 : Float (M^2000000000))\n\
                sq : Float (M^2000000000) -> Float\n\
                sq = \\x -> stripFloatUnit (x * x)\n";
     // The only assertion that matters is that `check_src` returns without

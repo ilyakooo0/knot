@@ -220,8 +220,8 @@ fn mul_with_unresolved_operand_and_unit_is_rejected() {
     // "unit mismatch" rather than the old "cannot infer" that the previous
     // (under-generalized) inference produced spuriously.
     let src = r#"unit M
-f = \x -> x * 2.0 M
-bad = (f 3.0 M) + 4.0 M
+f = \x -> x * (2.0 : Float M)
+bad = (f (3.0 : Float M)) + (4.0 : Float M)
 main = bad
 "#;
     let diags = check_src(src);
@@ -236,8 +236,8 @@ main = bad
 fn mul_with_annotated_operand_composes_units() {
     // With an explicit annotation the product is M^2 and adding M fails.
     let src = r#"unit M
-f = \x -> (x : Float M) * 2.0 M
-bad = (f 3.0 M) + 4.0 M
+f = \x -> (x : Float M) * (2.0 : Float M)
+bad = (f (3.0 : Float M)) + (4.0 : Float M)
 main = bad
 "#;
     let diags = check_src(src);
@@ -251,8 +251,8 @@ main = bad
 #[test]
 fn mul_with_dimensionless_annotation_is_accepted() {
     let src = r#"unit M
-g = \x -> (x : Float) * 2.0 M
-ok = (g 3.0) + 4.0 M
+g = \x -> (x : Float) * (2.0 : Float M)
+ok = (g 3.0) + (4.0 : Float M)
 main = ok
 "#;
     let diags = check_src(src);
@@ -602,7 +602,7 @@ fn concrete_unit_times_unknown_operand_is_unit_polymorphic() {
     // instantiation, leaving the operand var unpinned; that under-
     // generalization bug is now fixed, so the application type-checks.)
     let src = r#"unit M
-f = \y -> 2.0 M * y
+f = \y -> (2.0 : Float M) * y
 main = println (show (stripFloatUnit (f 3.0)))
 "#;
     let diags = check_src(src);
@@ -631,8 +631,8 @@ fn self_multiply_lambda_is_unit_polymorphic() {
 unit S
 square = \x -> x * x
 main = do
-  let a = square 3.0 M
-  let b = square 4.0 S
+  let a = square (3.0 : Float M)
+  let b = square (4.0 : Float S)
   println (show (stripFloatUnit a))
   println (show (stripFloatUnit b))
 "#;
@@ -647,8 +647,8 @@ fn multi_param_product_is_unit_polymorphic() {
 unit S
 area = \w h -> w * h
 main = do
-  let a = area 6.0 M 2.0 M
-  let b = area 6.0 S 2.0 S
+  let a = area (6.0 : Float M) (2.0 : Float M)
+  let b = area (6.0 : Float S) (2.0 : Float S)
   println (show (stripFloatUnit a))
   println (show (stripFloatUnit b))
 "#;

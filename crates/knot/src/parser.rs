@@ -1094,41 +1094,6 @@ impl Parser {
         }
     }
 
-    /// Try to parse a postfix unit annotation on a numeric literal:
-    /// `42.0 M`, `999 Usd`, `9.8 (M / S^2)`. A bare identifier must be
-    /// UPPERCASE (a concrete unit) — lowercase identifiers are value
-    /// variables, and `42.0 u` would be application of a literal to a
-    /// variable (ill-typed but syntactically valid), not a unit annotation.
-    /// Lowercase unit variables (`u`) appear only in type annotations
-    /// (`Float u`), never as literal suffixes. A parenthesized form
-    /// (`(M / S^2)`) allows the full unit algebra.
-    fn try_parse_unit_annotation(&mut self) -> Option<UnitExpr> {
-        match self.peek() {
-            TokenKind::Upper(_) => {
-                // Bare uppercase unit — unambiguous.
-                self.parse_unit_type_arg()
-            }
-            TokenKind::Int(n) if n == "1" => {
-                // Dimensionless `1` unit.
-                self.parse_unit_type_arg()
-            }
-            TokenKind::LParen => {
-                // Parenthesized unit `(M / S^2)`. Could also be a parenthesized
-                // expression (`(\\s -> ...)`) — save/restore so a failed unit
-                // parse doesn't consume the `(`.
-                let saved = self.save();
-                let diag_count = self.diagnostics.len();
-                let result = self.parse_unit_type_arg();
-                if result.is_none() {
-                    self.diagnostics.truncate(diag_count);
-                    self.restore(saved);
-                }
-                result
-            }
-            _ => None,
-        }
-    }
-
     // ── data ─────────────────────────────────────────────────────────
 
     fn parse_data(&mut self) -> Option<Decl> {
@@ -2928,21 +2893,7 @@ impl Parser {
                     span,
                 ))
             }
-            None => {
-                // Try unit annotation: `42.0 m`, `999 usd`
-                if let Some(unit) = self.try_parse_unit_annotation() {
-                    let span = Span::new(lit.span.start, self.prev_span().end);
-                    Some(Spanned::new(
-                        ExprKind::UnitLit {
-                            value: Box::new(lit),
-                            unit,
-                        },
-                        span,
-                    ))
-                } else {
-                    Some(lit)
-                }
-            }
+            None => Some(lit),
         }
     }
 

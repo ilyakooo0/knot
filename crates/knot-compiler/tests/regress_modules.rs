@@ -152,12 +152,12 @@ fn unit_declarations_survive_a_modules_export_filter() {
     s.write(
         "phys.knot",
         "unit M\nunit S\nunit Kg\nunit N = Kg * M / S^2\n\n\
-         export baseForce : Float (Kg*M/S^2)\nbaseForce = 5.0 (Kg*M/S^2)\n\n\
+         export baseForce : Float (Kg*M/S^2)\nbaseForce = (5.0 : Float (Kg*M/S^2))\n\n\
          export addForce : Float N -> Float N -> Float N\naddForce = \\a b -> a + b\n",
     );
     s.write(
         "main.knot",
-        "import ./phys\n\nmain = do\n  let total = addForce baseForce 3.0 N\n  \
+        "import ./phys\n\nmain = do\n  let total = addForce baseForce (3.0 : Float N)\n  \
          println (show (stripFloatUnit total))\n  yield {}\n",
     );
 

@@ -180,15 +180,15 @@ inter *users *admins
 ```
 
 ```knot
-sum : (a -> b) -> [a] -> b
+sum : Num a => [a] -> a
 ```
-Sum a numeric projection over a relation. The projection function extracts the value to sum from each row. Works with `Int`, `Float`, and unit-annotated types — units are preserved.
+Sum a numeric relation. Takes the relation directly — there is no projection argument. To sum a field of a record relation, project first with `map`. Works with `Int`, `Float`, and unit-annotated types — units are preserved.
 
 ```knot
-sum (\x -> x) [10, 20, 30]              -- 60
-sum (\o -> o.amount) *orders             -- total of all order amounts
-*orders |> sum (\o -> o.amount)          -- same with pipe
-sum (\t -> t.distance) *trips            -- Float M if distance : Float M
+sum [10, 20, 30]                                -- 60
+sum (map (\o -> o.amount) *orders)              -- total of all order amounts
+*orders |> map (\o -> o.amount) |> sum          -- same with pipe
+sum (map (\t -> t.distance) *trips)             -- Float M if distance : Float M
 ```
 
 ```knot

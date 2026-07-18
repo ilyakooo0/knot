@@ -1471,12 +1471,20 @@ total = (acc + delta) : Float M  -- parenthesized form
 `sum`, `avg`, `minOn`, `maxOn`, and binary `min`/`max` preserve units:
 
 ```knot
-sum   : (a -> Float u) -> [a] -> Float u
+sum   : Num a => [a] -> a                  -- direct; use `map` to project first
 avg   : (a -> Float u) -> [a] -> Float u
 minOn : (a -> b) -> [a] -> b           -- units flow through via b
 maxOn : (a -> b) -> [a] -> b
 min   : Ord a => a -> a -> a            -- binary
 max   : Ord a => a -> a -> a            -- binary
+```
+
+`sum` takes the relation directly — there is no projection argument. To sum a
+field of a record relation, project first with `map`:
+
+```knot
+sum (map (\r -> r.price) rows)
+rows |> map (\r -> r.price) |> sum
 ```
 
 #### `show` and Units

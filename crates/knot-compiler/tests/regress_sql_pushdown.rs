@@ -131,9 +131,9 @@ fn aggregates_resolve_through_yield_projection() {
 main = do
   replace *items = [{amt: 100, qty: 1}, {amt: 200, qty: 2}]
   items <- *items
-  let s = sum (\x -> x.amt) (do
+  let s = sum (map (\x -> x.amt) (do
     i <- items
-    yield {amt: i.qty})
+    yield {amt: i.qty}))
   println ("sum: " ++ show s)
   let f = count (filter (\x -> x.amt > 1) (do
     i <- items

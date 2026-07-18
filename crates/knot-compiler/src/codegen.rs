@@ -1246,6 +1246,7 @@ impl Codegen {
         self.declare_rt("knot_relation_inter", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_sum", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_sum_typed", &[p, p, p, types::I64], &[p]);
+        self.declare_rt("knot_relation_sum_direct", &[p, p, types::I64], &[p]);
         self.declare_rt("knot_relation_avg", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_min", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_max", &[p, p, p], &[p]);
@@ -1458,6 +1459,32 @@ impl Codegen {
         self.build_function(func_id, sig, |cg, builder, entry| {
             let arg = builder.block_params(entry)[1];
             let result = cg.call_rt(builder, &rt_name, &[arg]);
+            builder.ins().return_(&[result]);
+        });
+    }
+
+    /// Define `sum : [a] -> a` (direct aggregation, no projection). The bare
+    /// `sum` value is a 1-param closure over `knot_relation_sum_direct` with
+    /// `is_float = 0`; the common `sum rel` application is intercepted at the
+    /// call site so the statically inferred element type supplies the
+    /// EMPTY-relation zero (Int vs Float). A bare `sum` value passed around
+    /// (e.g. `map sum rels`) only hits empty relations as Int, which is the
+    /// right zero for the overwhelmingly common `[Int]`/non-empty case.
+    fn define_stdlib_sum(&mut self) {
+        if self.user_shadowed_stdlib.contains("sum") {
+            return;
+        }
+        let (func_id, _) = self.user_fns["sum"];
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.params.push(AbiParam::new(self.ptr_type)); // rel
+        sig.returns.push(AbiParam::new(self.ptr_type));
+
+        self.build_function(func_id, sig, |cg, builder, entry| {
+            let db = builder.block_params(entry)[0];
+            let rel = builder.block_params(entry)[1];
+            let is_float = builder.ins().iconst(types::I64, 0);
+            let result = cg.call_rt(builder, "knot_relation_sum_direct", &[db, rel, is_float]);
             builder.ins().return_(&[result]);
         });
     }
@@ -2784,7 +2811,7 @@ impl Codegen {
         self.define_stdlib_fn_2("elem", "knot_list_elem", false);
         self.define_stdlib_fn_2("diff", "knot_relation_diff", true);
         self.define_stdlib_fn_2("inter", "knot_relation_inter", true);
-        self.define_stdlib_fn_2("sum", "knot_relation_sum", true);
+        self.define_stdlib_sum();
         self.define_stdlib_fn_2("avg", "knot_relation_avg", true);
         self.define_stdlib_fn_2("minOn", "knot_relation_min", true);
         self.define_stdlib_fn_2("maxOn", "knot_relation_max", true);
@@ -6703,8 +6730,8 @@ impl Codegen {
                     );
                 }
 
-        // Special case: `sum f rel` that did not push down to SQL above — pass
-        // the statically inferred numeric type so an EMPTY relation sums to the
+        // Special case: `sum rel` that did not push down to SQL above — pass
+        // the statically inferred element type so an EMPTY relation sums to the
         // right zero. The runtime otherwise takes the type from the summands,
         // of which there are none, and returns `Int 0` even for a `[Float]`
         // (the SQL pushdown paths pass the same `is_float` flag, derived from
@@ -6712,18 +6739,17 @@ impl Codegen {
         // a Float; a user-defined `sum` skips this and dispatches normally.
         if let ast::ExprKind::Var(name) = &func_expr.node
             && name == "sum"
-                && args.len() == 2
+                && args.len() == 1
                 && !user_shadows_special {
-                    let f_val = self.compile_expr(builder, args[0], env, db);
-                    let rel_val = self.compile_expr(builder, args[1], env, db);
+                    let rel_val = self.compile_expr(builder, args[0], env, db);
                     let is_float = builder.ins().iconst(
                         types::I64,
                         self.sum_float_spans.contains(&expr.span) as i64,
                     );
                     return self.call_rt(
                         builder,
-                        "knot_relation_sum_typed",
-                        &[db, f_val, rel_val, is_float],
+                        "knot_relation_sum_direct",
+                        &[db, rel_val, is_float],
                     );
                 }
 
@@ -11624,6 +11650,27 @@ impl Codegen {
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
                     aggregate = Some(("SUM", col_sql, sum_result_is_float(bind_var, body, &schema)));
                 }
+                PipeOp::SumDirect => {
+                    // Direct `rel |> sum`. For `rel |> map f |> sum` the prior
+                    // Map already produced the summable column(s); aggregate
+                    // that. Without a map, `sum` over a raw source relation of
+                    // records isn't a single column — stay in memory (the
+                    // in-memory path handles a relation of numerics, which a
+                    // bare source never is).
+                    if is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    let cols = select_override.as_ref()?;
+                    if cols.len() != 1 {
+                        return None;
+                    }
+                    let col = &cols[0];
+                    let col_sql = col.sql_expr.clone().unwrap_or_else(|| {
+                        format!("{}.{}", col.alias, quote_sql_ident(&col.source_col))
+                    });
+                    let is_float = col.type_str == "float";
+                    aggregate = Some(("SUM", col_sql, is_float));
+                }
                 PipeOp::Avg { bind_var, body } => {
                     if is_count || aggregate.is_some() || select_override.is_some() {
                         return None;
@@ -14729,6 +14776,7 @@ fn pipe_ops_order_pushable(ops: &[PipeOp]) -> bool {
             PipeOp::Count
             | PipeOp::CountWhere { .. }
             | PipeOp::Sum { .. }
+            | PipeOp::SumDirect
             | PipeOp::Avg { .. }
             | PipeOp::Min { .. }
             | PipeOp::Max { .. } => 6,
@@ -14765,6 +14813,10 @@ enum PipeOp {
     Take { n: ast::Expr },
     Drop { n: ast::Expr },
     Sum { bind_var: String, body: ast::Expr },
+    /// Direct `sum rel` (no projection): the relation's own elements are the
+    /// summands. Distinguished from `Sum` so the SQL lowering aggregates the
+    /// (already-mapped) column directly.
+    SumDirect,
     Avg { bind_var: String, body: ast::Expr },
     Min { bind_var: String, body: ast::Expr },
     Max { bind_var: String, body: ast::Expr },
@@ -14805,6 +14857,10 @@ fn analyze_pipe_op(
 ) -> Option<PipeOp> {
     match &expr.node {
         ast::ExprKind::Var(name) if name == "count" => Some(PipeOp::Count),
+        // `rel |> sum` — direct aggregation over a numeric relation, no
+        // projection. The PipeOp::Sum fields are unused for this form (the
+        // relation's own element is the summand); reuse the identity shape.
+        ast::ExprKind::Var(name) if name == "sum" => Some(PipeOp::SumDirect),
         ast::ExprKind::App { func, arg } => {
             if let ast::ExprKind::Var(name) = &func.node {
                 match name.as_str() {
@@ -14819,9 +14875,6 @@ fn analyze_pipe_op(
                     "drop" => Some(PipeOp::Drop { n: (**arg).clone() }),
                     "sortBy" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::SortBy { bind_var, body }
-                    }),
-                    "sum" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
-                        PipeOp::Sum { bind_var, body }
                     }),
                     "avg" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::Avg { bind_var, body }

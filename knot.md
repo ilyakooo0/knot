@@ -76,7 +76,7 @@ double : Float u -> Float u
 double = \x -> x + x
 ```
 
-Unit-preserving stdlib: `sum`, `avg` propagate units from their projection function.
+Unit-preserving stdlib: `sum` (over a numeric relation) and `avg` (via its projection) propagate units.
 
 ### Records
 
@@ -387,7 +387,7 @@ Multiple keys: `groupBy {o.region, o.status}`
 After `groupBy {t.owner}`:
 - `t.owner` returns the shared key value
 - `count t` counts rows in the group
-- `sum (\x -> x.points) t` aggregates over the group
+- `sum (map (\x -> x.points) t)` aggregates over the group
 
 ---
 

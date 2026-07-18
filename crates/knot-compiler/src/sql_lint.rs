@@ -522,6 +522,9 @@ fn lint_pipe_chain(
                     );
                 }
             }
+            // Direct `sum` has no projection lambda to reject; it pushes down
+            // whenever the preceding `map` did.
+            LintPipeOp::SumDirect { .. } => {}
             LintPipeOp::Avg { bind_var, body, span } => {
                 let reduced = beta_reduce(body, fun_bodies, &no_lets);
                 if try_sql_column_expr(bind_var, &reduced, schema).is_none() {
@@ -1175,6 +1178,13 @@ enum LintPipeOp<'a> {
         body: &'a Expr,
         span: Span,
     },
+    /// Direct `rel |> sum` (no projection). The summand is the relation's own
+    /// (already-mapped) element, so there's no lambda to inspect — it always
+    /// pushes down when the preceding map did.
+    SumDirect {
+        #[allow(dead_code)]
+        span: Span,
+    },
     Avg {
         bind_var: String,
         body: &'a Expr,
@@ -1217,6 +1227,7 @@ fn flatten_pipe_chain(expr: &Expr) -> Option<(&Expr, Vec<LintPipeOp<'_>>)> {
 fn analyze_pipe_op(expr: &Expr) -> Option<LintPipeOp<'_>> {
     match &expr.node {
         ExprKind::Var(name) if name == "count" => Some(LintPipeOp::Count { span: expr.span }),
+        ExprKind::Var(name) if name == "sum" => Some(LintPipeOp::SumDirect { span: expr.span }),
         ExprKind::App { func, arg } => {
             if let ExprKind::Var(name) = &func.node {
                 match name.as_str() {
@@ -1232,13 +1243,6 @@ fn analyze_pipe_op(expr: &Expr) -> Option<LintPipeOp<'_>> {
                     "drop" => Some(LintPipeOp::Drop { span: arg.span }),
                     "sortBy" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
                         LintPipeOp::SortBy {
-                            bind_var,
-                            body,
-                            span: arg.span,
-                        }
-                    }),
-                    "sum" => extract_single_param_lambda(arg).map(|(bind_var, body)| {
-                        LintPipeOp::Sum {
                             bind_var,
                             body,
                             span: arg.span,
@@ -1394,6 +1398,7 @@ fn lint_pipe_order_pushable(ops: &[LintPipeOp]) -> bool {
             LintPipeOp::Count { .. }
             | LintPipeOp::CountWhere { .. }
             | LintPipeOp::Sum { .. }
+            | LintPipeOp::SumDirect { .. }
             | LintPipeOp::Avg { .. }
             | LintPipeOp::Min { .. }
             | LintPipeOp::Max { .. } => 6,
@@ -1804,13 +1809,13 @@ mod tests {
 
     #[test]
     fn no_lint_on_arithmetic_sum() {
-        // sum with arithmetic lambda compiles to SQL SUM(col * col).
+        // sum over an arithmetic map projection compiles to SQL SUM(col * col).
         let diags = lint(
             "type T = {price: Int, qty: Int}\n\
              *items : [T]\n\
              main = do\n  \
                items <- *items\n  \
-               yield (sum (\\i -> i.price * i.qty) items)\n",
+               yield (items |> map (\\i -> i.price * i.qty) |> sum)\n",
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
     }

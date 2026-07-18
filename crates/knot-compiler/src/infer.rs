@@ -5289,12 +5289,12 @@ impl Infer {
                             self.traverse_calls.push((expr.span, *res_v, cont_v));
                         }
 
-                // Track full `sum f rel` applications: the resolved result type
+                // Track full `sum rel` applications: the resolved result type
                 // says whether this is a Float sum, which codegen hands to the
                 // runtime to pick the zero for an EMPTY relation (no summand
                 // there to infer the numeric type from).
-                if let ast::ExprKind::App { func: inner_f, .. } = &func.node
-                    && matches!(&inner_f.node, ast::ExprKind::Var(n) if n == "sum")
+                if let ast::ExprKind::Var(n) = &func.node
+                    && n == "sum"
                         && let Ty::Var(res_v) = &result_ty {
                             self.sum_calls.push((expr.span, *res_v));
                         }
@@ -6284,10 +6284,10 @@ impl Infer {
                     Box::new(result_ty.clone()),
                 );
                 self.unify(&rhs_ty, &fun_ty, span);
-                // `rel |> sum f` reaches codegen as an application carrying
-                // this pipe's span, so record it like the `sum f rel` form.
-                if let ast::ExprKind::App { func: inner_f, .. } = &rhs.node
-                    && matches!(&inner_f.node, ast::ExprKind::Var(n) if n == "sum")
+                // `rel |> sum` reaches codegen as an application carrying
+                // this pipe's span, so record it like the `sum rel` form.
+                if let ast::ExprKind::Var(n) = &rhs.node
+                    && n == "sum"
                         && let Ty::Var(res_v) = &result_ty {
                             self.sum_calls.push((span, *res_v));
                         }
@@ -8686,32 +8686,31 @@ impl Infer {
             ),
         );
 
-        // sum : ∀a b. Num b => (a -> b) -> [a] -> b
-        // The `Num b` bound rejects nonsensical aggregations such as summing a
-        // `Text` projection, which would otherwise type-check and then panic at
-        // runtime ("cannot add Int + Text"). Units/refined aliases resolve to
-        // their base primitive via `type_name_of`, so `Num Int`/`Num Float`
-        // discharge unit- and refinement-typed projections unchanged.
+        // sum : ∀a. Num a => [a] -> a
+        // Direct aggregation over a relation of numerics — no projection. The
+        // `Num a` bound rejects nonsensical aggregations such as summing a
+        // `[Text]`, which would otherwise type-check and then panic at runtime
+        // ("cannot add Int + Text"). Units/refined aliases resolve to their
+        // base primitive via `type_name_of`, so `Num Int`/`Num Float` discharge
+        // unit- and refinement-typed elements unchanged: `sum ([1,2,3] : [Int])
+        // : Int` and `sum ([1.0 : Float M, ...]) : Float M`. To sum a
+        // projection, map first: `sum (map (\r -> r.amount) rows)`.
         let a = self.fresh_var();
-        let b = self.fresh_var();
         self.bind_top(
             "sum",
             Scheme {
-                vars: vec![a, b],
+                vars: vec![a],
                 unit_vars: vec![],
                 constraints: vec![TyConstraint {
                     trait_name: "Num".to_string(),
-                    type_var: b,
+                    type_var: a,
                     span: Span::new(0, 0),
                 }],
                 effect_unions: vec![],
                 unit_binops: vec![],
                 ty: Ty::Fun(
-                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
-                    Box::new(Ty::Fun(
-                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::Var(b)),
-                    )),
+                    Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                    Box::new(Ty::Var(a)),
                 ),
             },
         );

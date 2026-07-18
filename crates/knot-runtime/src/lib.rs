@@ -9988,6 +9988,32 @@ fn relation_sum(
     acc
 }
 
+/// `sum rel` — direct aggregation over a relation of numerics, with no
+/// projection. `is_float` picks the EMPTY-input zero for the same reason as
+/// `knot_relation_sum_typed`: with no summands the runtime cannot tell a
+/// `[Float]` from an `[Int]`, so it must come from the statically inferred
+/// element type. Non-empty input promotes `Int 0 + Float x` to Float anyway.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_relation_sum_direct(
+    db: *mut c_void,
+    rel: *mut Value,
+    is_float: i64,
+) -> *mut Value {
+    let _ = db;
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: sum expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    let mut acc = if is_float != 0 { alloc_float(0.0) } else { alloc_int(0) };
+    for &row in rows {
+        acc = knot_value_add(acc, row);
+    }
+    acc
+}
+
 /// avg(f, rel) — average of f(x) for each x in rel (returns Float)
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_avg(

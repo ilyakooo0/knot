@@ -204,9 +204,10 @@ main = do
 
 // In-memory `sum` takes the result's numeric type from its summands, so an
 // empty relation used to fall back to `Int 0` — a `[Float]` sum then showed as
-// "0" and serialized as an integer. A fully-applied `sum f rel` now carries the
-// inferred type down to the runtime, the way the SQL-pushdown path always has.
-// (These relations are in-memory literals, so no pushdown is involved.)
+// "0" and serialized as an integer. A fully-applied `sum rel` now carries the
+// inferred element type down to the runtime, the way the SQL-pushdown path
+// always has. (These relations are in-memory literals, so no pushdown is
+// involved.)
 #[test]
 fn sum_over_empty_float_relation_is_float_zero() {
     let (stdout, stderr, ok) = compile_and_run(
@@ -217,11 +218,11 @@ counts = [{qty: 2}, {qty: 3}]
 main = do
   let noPrices = filter (\p -> p.amount > 100.0) prices
   let noCounts = filter (\c -> c.qty > 100) counts
-  println ("empty_float: " ++ show (sum (\p -> p.amount) noPrices))
-  println ("empty_int: " ++ show (sum (\c -> c.qty) noCounts))
-  println ("float: " ++ show (sum (\p -> p.amount) prices))
-  println ("int: " ++ show (sum (\c -> c.qty) counts))
-  println ("piped_empty_float: " ++ show (noPrices |> sum (\p -> p.amount)))
+  println ("empty_float: " ++ show (sum (map (\p -> p.amount) noPrices)))
+  println ("empty_int: " ++ show (sum (map (\c -> c.qty) noCounts)))
+  println ("float: " ++ show (sum (map (\p -> p.amount) prices)))
+  println ("int: " ++ show (sum (map (\c -> c.qty) counts)))
+  println ("piped_empty_float: " ++ show (noPrices |> map (\p -> p.amount) |> sum))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -231,7 +232,7 @@ main = do
     );
     assert!(
         stdout.contains("piped_empty_float: 0.0"),
-        "the `|> sum f` pipe form must agree with `sum f rel`:\n{stdout}"
+        "the `|> map f |> sum` pipe form must agree with `sum (map f rel)`:\n{stdout}"
     );
     assert!(
         stdout.contains("empty_int: 0"),

@@ -121,16 +121,19 @@ engHeadcount = do
 ### `sum`
 
 ```
-sum : (a -> b) -> [a] -> b
+sum : Num a => [a] -> a
 ```
 
-Sum of a projected numeric field over a relation. Works with `Int`, `Float`, and unit-annotated types — units are preserved through the projection.
+Sum of a numeric relation. Takes the relation directly — there is no projection argument. To sum a field of a record relation, project first with `map`. Works with `Int`, `Float`, and unit-annotated types — units are preserved.
 
 ```knot
-totalAge = sum (\p -> p.age) *people
+total = sum [10, 20, 30]                          -- 60
+
+-- Sum a record field by projecting first:
+totalAge = sum (map (\p -> p.age) *people)
 
 -- Unit-preserving:
-totalDistance = sum (\t -> t.distance) *trips   -- Float M if distance : Float M
+totalDistance = sum (map (\t -> t.distance) *trips)   -- Float M if distance : Float M
 ```
 
 ### `avg`
@@ -1119,11 +1122,11 @@ double = \x -> x + x
 
 #### Unit-Preserving Functions
 
-`sum`, `avg`, `minOn`, and `maxOn` preserve units from their projection function:
+`avg`, `minOn`, and `maxOn` preserve units from their projection function; `sum` preserves the units of the numeric relation it sums:
 
 ```knot
 avg   (\t -> t.distance) *trips   -- Float M if distance : Float M
-sum   (\t -> t.distance) *trips   -- Float M if distance : Float M
+sum   (map (\t -> t.distance) *trips)   -- Float M if distance : Float M
 minOn (\t -> t.distance) *trips   -- Float M if distance : Float M
 maxOn (\t -> t.distance) *trips   -- Float M if distance : Float M
 ```

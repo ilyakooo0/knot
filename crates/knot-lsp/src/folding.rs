@@ -55,6 +55,9 @@ pub(crate) fn handle_folding_range(
                     }
                 }
             }
+            DeclKind::Migrate { using_fn, .. } => {
+                collect_folding_ranges_expr(using_fn, &doc.source, &mut ranges);
+            }
             _ => {}
         }
     }

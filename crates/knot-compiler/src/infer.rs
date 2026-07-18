@@ -1759,6 +1759,16 @@ impl Infer {
             cur = *next;
             steps += 1;
         }
+        // If the chain exceeds 100K steps, something is fundamentally wrong
+        // (the occurs check should prevent cycles). Report via eprintln
+        // rather than self.error, which would need &mut self — var_chain_end
+        // is called from contexts that only have &self.
+        if steps > 100_000 {
+            eprintln!(
+                "knot infer: warning: substitution chain exceeds 100K steps for var {:?} — possible occurs-check bug",
+                cur
+            );
+        }
         cur
     }
 

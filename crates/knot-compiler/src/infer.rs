@@ -6130,7 +6130,7 @@ impl Infer {
             ast::BinOp::Pipe => {
                 let result_ty = self.fresh();
                 let fun_ty = Ty::Fun(
-                    Box::new(lhs_ty),
+                    Box::new(lhs_ty.clone()),
                     Box::new(result_ty.clone()),
                 );
                 self.unify(&rhs_ty, &fun_ty, span);
@@ -6141,6 +6141,15 @@ impl Infer {
                         && let Ty::Var(res_v) = &result_ty {
                             self.sum_calls.push((span, *res_v));
                         }
+                // `x |> show` desugars to `show x` carrying this pipe's span
+                // (codegen.rs:4707-4713), so record the argument's unit like
+                // the direct `show x` form — otherwise the pipe form drops the
+                // unit suffix (`show (3.0 : Float M)` → "3.0 M" but
+                // `(3.0 : Float M) |> show` → "3.0").
+                if let ast::ExprKind::Var(name) = &rhs.node
+                    && name == "show" {
+                        self.show_calls.push((span, lhs_ty.clone()));
+                    }
                 result_ty
             }
         }

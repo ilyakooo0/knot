@@ -344,11 +344,11 @@ The winner is reported via the built-in `Result a b` ADT — `Err {error: a}` wh
 
 ```knot
 slow = do
-  sleep 1000 Ms
+  sleep (1000 : Int Ms)
   yield "slow"
 
 fast = do
-  sleep 50 Ms
+  sleep (50 : Int Ms)
   yield "fast"
 
 main = do

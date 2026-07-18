@@ -3422,9 +3422,19 @@ pub extern "C-unwind" fn knot_override_lookup(
             }
         }
         1 => {
-            // Float
+            // Float — reject non-finite values. NaN/Inf cannot round-trip
+            // through SQLite REAL storage (`float_to_sqlite_real` panics), and
+            // the compile-time override path already rejects them, so the argv
+            // path must too.
             match val_str.parse::<f64>() {
-                Ok(n) => alloc_float(n),
+                Ok(n) if n.is_finite() => alloc_float(n),
+                Ok(_) => {
+                    eprintln!(
+                        "Error: invalid value '{}' for --{} (expected a finite {})",
+                        val_str, name, type_name
+                    );
+                    std::process::exit(1);
+                }
                 Err(_) => {
                     eprintln!(
                         "Error: invalid value '{}' for --{} (expected {})",

@@ -143,9 +143,24 @@ fn classify_field_set(old: &[(String, String)], new: &[(String, String)]) -> Sch
         }
     }
 
-    // Any unmatched new fields are nullable-column additions — safe.
-    if used.iter().any(|u| !u) {
-        any_safe = true;
+    // Any unmatched new fields are nullable-column additions — safe, *unless*
+    // the added column is an enum tag. Every other column type has an empty
+    // default (`sql_null_default_literal`) so the runtime backfills existing
+    // rows; a `tag` column has no default, is left NULL, and `read_sql_column`
+    // panics at runtime. Classify added tag fields as Breaking so the user is
+    // sent to an explicit `migrate` block instead of hitting a runtime panic.
+    let mut added_tag = false;
+    for (i, nf) in new.iter().enumerate() {
+        if !used[i] {
+            if nf.1 == "tag" {
+                added_tag = true;
+            } else {
+                any_safe = true;
+            }
+        }
+    }
+    if added_tag {
+        return SchemaChange::Breaking;
     }
 
     if any_safe {

@@ -921,6 +921,31 @@ Drop or attach a unit tag. Identity at runtime — they only adjust the
 compile-time type. Use them when you need to rebrand a value with a different
 concrete unit (e.g. `Ms` → `S`).
 
+### `strip` / `dress`
+
+```
+strip : a u -> a 1
+dress : a 1 -> a u
+```
+
+Generalized unit rebranding that works across both `Int` and `Float` with a
+single call. `strip` drops a value's unit; `dress` attaches one to a
+dimensionless value, the target pinned by context or annotation. The `u` is a
+unit variable (kind `Unit`), so only unit-carrying numerics qualify. Identity
+at runtime:
+
+```knot
+toS : Int Ms -> Int S
+toS = \ms -> dress (strip ms / 1000)
+
+toMiles : Float M -> Float Mi
+toMiles = \d -> dress (strip d * 0.000621371)
+```
+
+A dimensionless `Int 1`/`Float 1` does **not** unify with a concrete unit, so
+`dress` is the explicit escape hatch for re-attaching one — an annotation alone
+cannot rebrand a value already pinned to `1`.
+
 ---
 
 ## Built-in Traits

@@ -810,6 +810,8 @@ and the loser unwinds at its next safe point.
 | `withUnit` | `Int 1 -> Int u` | Attach unit tag to `Int 1` |
 | `stripFloatUnit` | `Float u -> Float 1` | Drop unit tag from `Float 1` |
 | `withFloatUnit` | `Float 1 -> Float u` | Attach unit tag to `Float 1` |
+| `strip` | `a u -> a 1` | Drop unit tag (any unit-carrying numeric) |
+| `dress` | `a 1 -> a u` | Attach unit tag (any unit-carrying numeric) |
 
 ### IO
 

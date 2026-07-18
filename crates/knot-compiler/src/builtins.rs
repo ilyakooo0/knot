@@ -48,6 +48,7 @@ pub const PURE_BUILTINS: &[&str] = &[
     "upsertBy",
     "countWhere", "minOn", "maxOn", "sortBy",
     "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
+    "strip", "dress",
 ];
 
 /// Set of builtin function names that perform some IO effect. Used by the LSP

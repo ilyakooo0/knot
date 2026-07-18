@@ -377,6 +377,15 @@ Drop or attach a unit tag on `Int 1`/`Float 1`. All four are identity at
 runtime — they exist only for the type checker. Use them to rebrand a value
 when you need a different concrete unit (e.g. `Ms` → `S`).
 
+The generalized pair `strip : a u -> a 1` and `dress : a 1 -> a u` does the
+same across both numeric types in one call (`u` has kind `Unit`, so only
+unit-carrying numerics qualify):
+
+```knot
+toS : Int Ms -> Int S
+toS = \ms -> dress (strip ms / 1000)
+```
+
 ```knot
 now : IO {clock} Int Ms
 ```

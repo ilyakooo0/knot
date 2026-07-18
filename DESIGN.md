@@ -1456,6 +1456,13 @@ toMiles : Float Km -> Float Mi
 toMiles = \d -> withFloatUnit (stripFloatUnit d * 0.621371)
 ```
 
+The generalized top-level pair `strip : a u -> a 1` and `dress : a 1 -> a u` performs the same rebranding across both numeric types with one call. The `u` is a unit variable of kind `Unit`, so in practice `a` is a unit-carrying numeric (`Int` or `Float`); these are registered directly in the compiler because the surface syntax cannot write `a 1` (`1` is not a type). Both are identity at runtime:
+
+```knot
+toS : Int Ms -> Int S
+toS = \ms -> dress (strip ms / 1000)
+```
+
 Every numeric type carries a unit — a bare `Int` or `Float` is a **compile error**; you must write a unit. Use `Int 1` / `Float 1` for the dimensionless case (e.g. counts, indices). A value of a concrete unit does **not** implicitly convert to the dimensionless form — `x : Float 1; x = (1.5 : Float M)` is a type error (`expected Float 1, found Float M`). Numeric **literals** are unit-polymorphic: `1.5` has type `Float u` for a fresh unit variable, so it flows into whatever unit the context demands (`(1.5 : Float M)`, `sum` over `[Float M]`, or a `Float 1` field) and defaults to dimensionless when unconstrained. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
 
 For explicit unit ascription you can put a type annotation on any expression, either inside parens or as a bare postfix:

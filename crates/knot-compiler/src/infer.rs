@@ -2242,6 +2242,35 @@ impl Infer {
                 self.unify_dir(f, &Ty::TyCon("[]".into()), span, !t1_provided);
                 self.unify_dir(a, b, span, !t1_provided);
             }
+            // App(f, Unit(u)) vs dimensionless Int/Float: a unit-carrying
+            // application against the collapsed dimensionless numeric. Only
+            // matches when `u` is dimensionless (`1`); then `f` is the numeric
+            // constructor. Needed because `dress (3.0 : Float 1)` collapses to
+            // bare `Ty::Float` while `dress`'s parameter is `f 1`.
+            (Ty::App(f, a), Ty::Int) => {
+                self.unify_dir(f, &Ty::TyCon("Int".into()), span, t1_provided);
+                if let Ty::Unit(u) = self.apply(a) {
+                    self.unify_units(&u, &UnitTy::dimensionless(), span);
+                }
+            }
+            (Ty::Int, Ty::App(f, a)) => {
+                self.unify_dir(f, &Ty::TyCon("Int".into()), span, !t1_provided);
+                if let Ty::Unit(u) = self.apply(a) {
+                    self.unify_units(&u, &UnitTy::dimensionless(), span);
+                }
+            }
+            (Ty::App(f, a), Ty::Float) => {
+                self.unify_dir(f, &Ty::TyCon("Float".into()), span, t1_provided);
+                if let Ty::Unit(u) = self.apply(a) {
+                    self.unify_units(&u, &UnitTy::dimensionless(), span);
+                }
+            }
+            (Ty::Float, Ty::App(f, a)) => {
+                self.unify_dir(f, &Ty::TyCon("Float".into()), span, !t1_provided);
+                if let Ty::Unit(u) = self.apply(a) {
+                    self.unify_units(&u, &UnitTy::dimensionless(), span);
+                }
+            }
             // App(f, a) vs IO(effects, row, b) → f = App(IO, EffectRow(effects, row)), a = b
             // Binding f to a partially-applied IO (carrying the effect row)
             // instead of just TyCon("IO") preserves effect/row info through
@@ -8246,6 +8275,46 @@ impl Infer {
             ),
         );
 
+        // ── strip / dress: top-level unit rebranding ────────────────────
+        // `strip` removes a value's unit; `dress` attaches one. Both are
+        // unconstrained top-level functions (no trait), identity at runtime.
+        //   strip : ∀a u. a u -> a 1
+        //   dress : ∀a u. a 1 -> a u
+        // `a u` is `App(Var a, Unit u)`, which unifies with a concrete
+        // unit-bearing `Con("Int"/"Float", [Unit M])` by decomposition
+        // (a := TyCon "Int", u := M). The prelude cannot express `a 1`
+        // (`1` is not a type), so these are registered here directly.
+        for (method, from_dimless) in [("strip", false), ("dress", true)] {
+            let a = self.fresh_var();
+            let u = self.fresh_unit_var();
+            let arg_unit = if from_dimless {
+                UnitTy::dimensionless()
+            } else {
+                UnitTy::var(u)
+            };
+            let res_unit = if from_dimless {
+                UnitTy::var(u)
+            } else {
+                UnitTy::dimensionless()
+            };
+            let a_ty = Ty::Var(a);
+            let method_ty = Ty::Fun(
+                Box::new(Ty::App(Box::new(a_ty.clone()), Box::new(Ty::Unit(arg_unit)))),
+                Box::new(Ty::App(Box::new(a_ty), Box::new(Ty::Unit(res_unit)))),
+            );
+            self.bind_top(
+                method,
+                Scheme {
+                    vars: vec![a],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    effect_unions: vec![],
+                    unit_binops: vec![],
+                    ty: method_ty,
+                },
+            );
+        }
+
         // println : ∀a. a -> IO {console} {}
         let a = self.fresh_var();
         self.bind_top(
@@ -12974,6 +13043,108 @@ main = applyPred (\\r -> r.x == r.y)\
         let diags = check_src(
             "\
              f = stripUnit (1.0 : Float M)\n\
+             main = 1"
+        );
+        assert!(!diags.is_empty());
+    }
+
+    // ── Units trait: strip / dress ───────────────────────────────────────
+
+    #[test]
+    fn units_strip_int() {
+        let diags = check_src(
+            "\
+             f : Int M -> Int 1\n\
+             f = \\x -> strip x\n\
+             main = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn units_dress_int() {
+        let diags = check_src(
+            "\
+             f : Int 1 -> Int M\n\
+             f = \\x -> dress x\n\
+             main = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn units_strip_float() {
+        let diags = check_src(
+            "\
+             f : Float (M / S) -> Float 1\n\
+             f = \\x -> strip x\n\
+             main = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn units_dress_float_compound() {
+        let diags = check_src(
+            "\
+             f : Float 1 -> Float (M / S^2)\n\
+             f = \\x -> dress x\n\
+             main = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn units_strip_dress_conversion_round_trip() {
+        // The motivating conversion: Ms -> S via strip / arithmetic / dress.
+        let diags = check_src(
+            "\
+             toS : Int Ms -> Int S\n\
+             toS = \\ms -> dress (strip ms / 1000)\n\
+             main = 1"
+        );
+        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn units_dress_rejects_non_dimensionless_arg() {
+        // dress expects a dimensionless value; an M-tagged one is `1 vs M`.
+        let diags = check_src(
+            "\
+             f = dress (5 : Int M)\n\
+             main = 1"
+        );
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn units_strip_rejects_text() {
+        // Only Int and Float implement Units.
+        let diags = check_src(
+            "\
+             f = strip \"hi\"\n\
+             main = 1"
+        );
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn units_strip_rejects_bool() {
+        let diags = check_src(
+            "\
+             f = strip True\n\
+             main = 1"
+        );
+        assert!(!diags.is_empty());
+    }
+
+    #[test]
+    fn units_strip_rejects_list() {
+        // `u` in `strip : a u -> a 1` has kind `Unit` — a list's element type
+        // is not a unit, so the application must not typecheck.
+        let diags = check_src(
+            "\
+             f = strip [1, 2]\n\
              main = 1"
         );
         assert!(!diags.is_empty());

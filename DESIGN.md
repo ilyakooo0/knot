@@ -1457,7 +1457,7 @@ toMiles : Float Km -> Float Mi
 toMiles = \d -> withFloatUnit (stripFloatUnit d * 0.621371)
 ```
 
-Plain `Int`/`Float` are unit-agnostic and unify with any `Int u`/`Float u`, so passing a unit-tagged value where plain numeric is expected (or vice versa) needs no conversion. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
+Every numeric type carries a unit. `Int` and `Float` written without a unit are **dimensionless** (`Int 1` / `Float 1`). A value of a concrete unit does **not** implicitly convert to the dimensionless form — `x : Float; x = (1.5 : Float M)` is a type error (`expected Float, found Float M`). Numeric **literals** are unit-polymorphic: `1.5` has type `Float <u>` for a fresh unit variable, so it flows into whatever unit the context demands (`(1.5 : Float M)`, `sum` over `[Float M]`, or a `Float` field) and defaults to dimensionless when unconstrained. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
 
 For explicit unit ascription you can put a type annotation on any expression, either inside parens or as a bare postfix:
 

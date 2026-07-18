@@ -213,6 +213,14 @@ impl UnitTy {
         self.bases.is_empty() && self.vars.is_empty()
     }
 
+    /// True when this unit can still be dimensionless: it has no concrete
+    /// base units (so every component is an unsolved variable that can bind
+    /// to exponent 0). A concrete unit (`bases` non-empty) is NOT compatible
+    /// with the bare dimensionless `Int`/`Float`.
+    fn is_compatible_with_dimensionless(&self) -> bool {
+        self.bases.is_empty()
+    }
+
     fn normalize(&mut self) {
         self.bases.retain(|_, exp| *exp != 0);
         self.vars.retain(|_, exp| *exp != 0);
@@ -450,6 +458,75 @@ impl Ty {
     /// Build `Con("Float", [Unit(u)])` — the canonical unit-bearing Float type.
     fn float_with_unit(u: UnitTy) -> Ty {
         Ty::Con("Float".to_string(), vec![Ty::Unit(u)])
+    }
+}
+
+/// Can `value`'s numeric unit serve as `base`'s numeric unit? `base` is a
+/// numeric type (`Int`, `Float`, `Int u`, or `Float u`) and `value` is a
+/// numeric of the same kind. A dimensionless `base` (bare `Int`/`Float`)
+/// accepts a value whose unit is dimensionless or still an unsolved var (a
+/// literal). A concrete-unit base requires the value to carry a unit that can
+/// match it.
+fn numeric_unit_compatible(base: &Ty, value: &Ty) -> bool {
+    let base_unit = base.unit_of();
+    let value_unit = value.unit_of();
+    match (base_unit, value_unit) {
+        // Bare `Int`/`Float` base (dimensionless). The value qualifies unless
+        // it carries a concrete non-trivial unit.
+        (None, None) => true,
+        (None, Some(vu)) => vu.is_compatible_with_dimensionless(),
+        // Unit-bearing base: the value must carry a compatible unit. An
+        // unsolved-var value unit can still bind to the base's unit.
+        (Some(bu), None) => bu.is_compatible_with_dimensionless(),
+        (Some(bu), Some(vu)) => {
+            (bu.is_compatible_with_dimensionless() && vu.is_compatible_with_dimensionless())
+                || bu == vu
+        }
+    }
+}
+
+/// Replace every free unit variable in a type with dimensionless (`1`),
+/// leaving concrete units untouched. Used only for display/extraction of
+/// monomorphic types, where an unsolved unit var means inference never pinned
+/// the unit — mirroring the dimensionless defaulting codegen applies at
+/// runtime. Never call this on a type that still participates in unification.
+fn default_free_unit_vars(ty: &Ty) -> Ty {
+    match ty {
+        Ty::Unit(u) => {
+            let mut u = u.clone();
+            u.vars.clear();
+            u.normalize();
+            Ty::Unit(u)
+        }
+        Ty::Fun(p, r) => Ty::Fun(
+            Box::new(default_free_unit_vars(p)),
+            Box::new(default_free_unit_vars(r)),
+        ),
+        Ty::Record(fields, row) => Ty::Record(
+            fields.iter().map(|(n, t)| (n.clone(), default_free_unit_vars(t))).collect(),
+            *row,
+        ),
+        Ty::Relation(inner) => Ty::Relation(Box::new(default_free_unit_vars(inner))),
+        Ty::Con(name, args) => Ty::Con(
+            name.clone(),
+            args.iter().map(default_free_unit_vars).collect(),
+        ),
+        Ty::Variant(ctors, row) => Ty::Variant(
+            ctors.iter().map(|(n, t)| (n.clone(), default_free_unit_vars(t))).collect(),
+            *row,
+        ),
+        Ty::App(f, a) => Ty::App(
+            Box::new(default_free_unit_vars(f)),
+            Box::new(default_free_unit_vars(a)),
+        ),
+        Ty::IO(eff, row, inner) => Ty::IO(
+            eff.clone(),
+            *row,
+            Box::new(default_free_unit_vars(inner)),
+        ),
+        Ty::Assoc(name, inner) => Ty::Assoc(name.clone(), Box::new(default_free_unit_vars(inner))),
+        Ty::Alias(name, inner) => Ty::Alias(name.clone(), Box::new(default_free_unit_vars(inner))),
+        _ => ty.clone(),
     }
 }
 
@@ -1020,6 +1097,35 @@ impl Infer {
     /// composite forms, a concrete record/relation value flowing into a
     /// refined type with a matching base would skip the guard and be
     /// laundered into the refined type with no predicate check.
+    /// Whether a refined type's declared base is compatible with the type of
+    /// the value being refined. Exact structural equality misses the case
+    /// where the value is a unit-polymorphic numeric (`Int <var>`, from a
+    /// literal) while the declared base is dimensionless (`Int`) — both are
+    /// the same numeric kind and an unsolved-unit value can always be
+    /// dimensionless, so they match. A concrete-unit base (`Metres =
+    /// Float M`) still requires the value to carry that exact unit.
+    fn refined_base_compatible(&self, base: &Ty, value: &Ty) -> bool {
+        let base = self.apply(base);
+        let value = self.apply(value);
+        match (base.peel_alias(), value.peel_alias()) {
+            // Same numeric kind. The value's unit must be able to be the
+            // base's unit: when the base is dimensionless (`Int`/`Float`),
+            // any value whose unit is dimensionless or still an unsolved var
+            // qualifies (a literal-derived `Int <var>`).
+            (Ty::Int, v) if v.is_int_like() => numeric_unit_compatible(&base, v),
+            (Ty::Float, v) if v.is_float_like() => numeric_unit_compatible(&base, v),
+            (Ty::Con(bn, ba), Ty::Con(vn, va))
+                if bn == vn
+                    && (bn == "Int" || bn == "Float")
+                    && matches!(ba.first(), Some(Ty::Unit(_)))
+                    && matches!(va.first(), Some(Ty::Unit(_))) =>
+            {
+                numeric_unit_compatible(&base, &value)
+            }
+            _ => false,
+        }
+    }
+
     fn is_concrete_refinement_base(&self, ty: &Ty) -> bool {
         matches!(
             self.apply(ty),
@@ -2399,19 +2505,47 @@ impl Infer {
             (Ty::Unit(u1), Ty::Unit(u2)) => {
                 self.unify_units(u1, u2, span);
             }
-            // Plain Int/Float unifies with any unit-bearing Int/Float — plain
-            // numeric types are unit-agnostic (not "dimensionless"). To express
-            // dimensionless explicitly, use Int 1/Float 1. These guards must
-            // precede the general `Con vs Con` arm so a plain `Ty::Int`/`Float`
-            // doesn't fall through to the Con-vs-non-Con mismatch path.
-            (Ty::Int, Ty::Con(name, _))
-                if name == "Int" => {}
-            (Ty::Con(name, _), Ty::Int)
-                if name == "Int" => {}
-            (Ty::Float, Ty::Con(name, _))
-                if name == "Float" => {}
-            (Ty::Con(name, _), Ty::Float)
-                if name == "Float" => {}
+            // A bare `Ty::Int`/`Ty::Float` is dimensionless (the `Int`/`Float`
+            // annotation lowers to unit `1`). It unifies with a unit-bearing
+            // `Con("Int"/"Float", [Unit(u)])` when that unit can still be
+            // dimensionless — i.e. it carries no concrete base units, only
+            // unsolved unit variables, which we then solve to dimensionless.
+            // This keeps literals and unit-polymorphic-but-actually-plain
+            // computations flowing into `Float` fields, while a concrete unit
+            // (`M`) does NOT unify — closing the laundering hole where
+            // `x : Float; x = (1.5 : Float M)` silently dropped the unit.
+            (Ty::Int, Ty::Con(name, args))
+                if name == "Int" && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
+            {
+                if let Some(Ty::Unit(u)) = args.first() {
+                    let u = u.clone();
+                    self.unify_units(&u, &UnitTy::dimensionless(), span);
+                }
+            }
+            (Ty::Con(name, args), Ty::Int)
+                if name == "Int" && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
+            {
+                if let Some(Ty::Unit(u)) = args.first() {
+                    let u = u.clone();
+                    self.unify_units(&u, &UnitTy::dimensionless(), span);
+                }
+            }
+            (Ty::Float, Ty::Con(name, args))
+                if name == "Float" && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
+            {
+                if let Some(Ty::Unit(u)) = args.first() {
+                    let u = u.clone();
+                    self.unify_units(&u, &UnitTy::dimensionless(), span);
+                }
+            }
+            (Ty::Con(name, args), Ty::Float)
+                if name == "Float" && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
+            {
+                if let Some(Ty::Unit(u)) = args.first() {
+                    let u = u.clone();
+                    self.unify_units(&u, &UnitTy::dimensionless(), span);
+                }
+            }
             // Bool is Ty::Bool (not Ty::Con), so handle Bool/Variant
             // unification explicitly to support True {}/False {} patterns.
             (Ty::Bool, Ty::Variant(c2, r2)) => {
@@ -6353,10 +6487,17 @@ impl Infer {
         }
     }
 
-    fn literal_type(&self, lit: &ast::Literal) -> Ty {
+    fn literal_type(&mut self, lit: &ast::Literal) -> Ty {
         match lit {
-            ast::Literal::Int(_) => Ty::Int,
-            ast::Literal::Float(_) => Ty::Float,
+            // Numeric literals are unit-polymorphic: `1.5` has type
+            // `Float <u>` for a fresh unit variable `u`, so it unifies with
+            // whatever unit its context demands (`(1.5 : Float M)`, `sum
+            // [Float M]`, a `Float` param) while remaining sound — the var
+            // binds to that unit rather than laundering it away. When the
+            // context leaves `u` unconstrained, codegen defaults it to
+            // dimensionless.
+            ast::Literal::Int(_) => Ty::int_with_unit(UnitTy::var(self.fresh_unit_var())),
+            ast::Literal::Float(_) => Ty::float_with_unit(UnitTy::var(self.fresh_unit_var())),
             ast::Literal::Text(_) => Ty::Text,
             ast::Literal::Bytes(_) => Ty::Bytes,
             ast::Literal::Bool(_) => Ty::Bool,
@@ -9894,6 +10035,13 @@ impl Infer {
         let mut info = LocalTypeInfo::new();
         for (span, ty) in &self.binding_types {
             let applied = self.apply(ty);
+            // Local binding types are monomorphic (no `forall`-quantified unit
+            // vars), so an unsolved unit var is one inference never pinned —
+            // e.g. the literal `2.0` in `base * 2.0`, whose fresh var `Mul`
+            // can't fold into the other operand's `M`. Runtime codegen already
+            // defaults such vars to dimensionless; mirror that here so the
+            // hint shows `Float M`, not a dangling `Float M*u`.
+            let applied = default_free_unit_vars(&applied);
             let var_map = var_map_for(&applied);
             let unit_var_map = unit_var_map_for(&applied);
             info.insert(*span, display_ty_clean(&applied, &var_map, &unit_var_map));
@@ -10756,7 +10904,9 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
         let mut candidates: Vec<String> = infer
             .refined_types
             .iter()
-            .filter(|(_, (base_ty, _))| *base_ty == key_ty)
+            .filter(|(_, (base_ty, _))| {
+                *base_ty == key_ty || infer.refined_base_compatible(base_ty, &key_ty)
+            })
             .map(|(name, _)| name.clone())
             .collect();
         candidates.sort();

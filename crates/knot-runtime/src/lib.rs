@@ -7892,10 +7892,10 @@ pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
 /// it here as a constant: `show 42.0<M>` renders `"42.0 M"`.
 ///
 /// Codegen only routes a `show` through this entry point when the argument's
-/// type resolves to a concrete `IntUnit`/`FloatUnit`; a dimensionless or
-/// unit-polymorphic argument goes to plain `knot_value_show` and prints just
-/// the number. The empty-unit guard below is a belt-and-braces fallback for
-/// that same case.
+/// type resolves to a concrete unit-bearing `Int`/`Float`
+/// (`Con("Int"/"Float", [Unit(u)])`); a dimensionless or unit-polymorphic
+/// argument goes to plain `knot_value_show` and prints just the number. The
+/// empty-unit guard below is a belt-and-braces fallback for that same case.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_show_unit(
     v: *mut Value,

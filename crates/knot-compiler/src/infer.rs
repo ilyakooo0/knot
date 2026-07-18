@@ -360,10 +360,12 @@ enum Ty {
     /// `tail`". Only legal as the right-hand side of a substitution for a
     /// row variable that appeared in `Ty::IO`'s tail position.
     EffectRow(BTreeSet<IoEffect>, Option<TyVar>),
-    /// Int with unit of measure (compile-time only).
-    IntUnit(UnitTy),
-    /// Float with unit of measure (compile-time only).
-    FloatUnit(UnitTy),
+    /// Unit of measure carrier, used as a type argument to `Con("Int"/"Float", [Unit(u)])`.
+    /// A standalone `Ty::Unit(u)` only appears as the sole argument of
+    /// `Con("Int", _)` / `Con("Float", _)`; it is the kind-`Unit` type that
+    /// describes the unit dimension of a numeric type. It is erased at
+    /// runtime and has no value inhabitants.
+    Unit(UnitTy),
     /// Higher-rank universal quantifier (predicative). The bound vars are
     /// rigid skolems for the body of `ty`; users introduce them via
     /// explicit `forall a. T` syntax. Only legal in function arg/result
@@ -401,6 +403,53 @@ impl Ty {
             t = inner;
         }
         t
+    }
+
+    /// True for `Ty::Int` and `Con("Int", [Unit(_)])` (unit-bearing Int).
+    /// Use this instead of matching `Ty::Int` directly at sites that must
+    /// also accept a unit-bearing Int.
+    fn is_int_like(&self) -> bool {
+        match self.peel_alias() {
+            Ty::Int => true,
+            Ty::Con(name, args) => name == "Int" && args.len() == 1 && matches!(args[0].peel_alias(), Ty::Unit(_)),
+            _ => false,
+        }
+    }
+
+    /// True for `Ty::Float` and `Con("Float", [Unit(_)])` (unit-bearing Float).
+    fn is_float_like(&self) -> bool {
+        match self.peel_alias() {
+            Ty::Float => true,
+            Ty::Con(name, args) => name == "Float" && args.len() == 1 && matches!(args[0].peel_alias(), Ty::Unit(_)),
+            _ => false,
+        }
+    }
+
+    /// Extract the `UnitTy` from `Con("Int"/"Float", [Unit(u)])`, peeling
+    /// aliases. Returns `None` for plain `Int`/`Float` or anything else.
+    fn unit_of(&self) -> Option<&UnitTy> {
+        match self.peel_alias() {
+            Ty::Con(name, args)
+                if (name == "Int" || name == "Float")
+                    && args.len() == 1 =>
+            {
+                match args[0].peel_alias() {
+                    Ty::Unit(u) => Some(u),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Build `Con("Int", [Unit(u)])` — the canonical unit-bearing Int type.
+    fn int_with_unit(u: UnitTy) -> Ty {
+        Ty::Con("Int".to_string(), vec![Ty::Unit(u)])
+    }
+
+    /// Build `Con("Float", [Unit(u)])` — the canonical unit-bearing Float type.
+    fn float_with_unit(u: UnitTy) -> Ty {
+        Ty::Con("Float".to_string(), vec![Ty::Unit(u)])
     }
 }
 
@@ -879,10 +928,18 @@ impl Infer {
             // Float is deliberately excluded: `IN` / `=` in SQL is IEEE equality
             // (-0.0 = +0.0, NaN stored as NULL), while Knot compares floats with
             // `total_cmp` (-0.0 ≠ +0.0, NaN orderable). Pushing a float `elem`
-            // down — whether the needle is a bare column, a computed value, or a
-            // literal — would silently disagree with in-memory semantics, so
+            // down — whether the needle is a bare column, a computed value, or
+            // a literal — would silently disagree with in-memory semantics, so
             // keep every float `elem` in memory (see the codegen `elem` gates).
-            Ty::Int | Ty::Text | Ty::Bool | Ty::Uuid | Ty::IntUnit(_) => true,
+            Ty::Int | Ty::Text | Ty::Bool | Ty::Uuid => true,
+            // Unit-bearing Int is `Con("Int", [Unit(_)])` — the unit is erased
+            // at runtime, so it is SQL-pushable just like plain Int. (Unit-
+            // bearing Float is excluded for the same total_cmp reason.)
+            Ty::Con(name, args)
+                if name == "Int" && args.len() == 1 && matches!(args[0].peel_alias(), Ty::Unit(_)) =>
+            {
+                true
+            }
             // Refined nominal alias `type Nat = Int where ...` shows up as
             // `Con(name, [])`; recurse to its base type.
             Ty::Con(name, args) if args.is_empty() => {
@@ -972,8 +1029,6 @@ impl Infer {
                 | Ty::Bool
                 | Ty::Bytes
                 | Ty::Uuid
-                | Ty::IntUnit(_)
-                | Ty::FloatUnit(_)
                 | Ty::Record(..)
                 | Ty::Relation(_)
                 // A nominal ADT / data base (`type Warm = Color where …`).
@@ -1159,19 +1214,17 @@ impl Infer {
         }
     }
 
-    /// Get the unit from a type, if it has one. Returns None for dimensionless.
+    /// Get the unit from a type, if it has one. Returns None for dimensionless
+    /// or non-numeric types.
     #[allow(dead_code)]
     fn type_unit(&self, ty: &Ty) -> Option<UnitTy> {
-        match ty {
-            Ty::IntUnit(u) | Ty::FloatUnit(u) => Some(self.apply_unit(u)),
-            _ => None,
-        }
+        ty.unit_of().map(|u| self.apply_unit(u))
     }
 
-    /// Check if a type is numeric (Int, Float, IntUnit, FloatUnit).
+    /// Check if a type is numeric (Int, Float, or unit-bearing Int/Float).
     #[allow(dead_code)]
     fn is_numeric(&self, ty: &Ty) -> bool {
-        matches!(ty, Ty::Int | Ty::Float | Ty::IntUnit(_) | Ty::FloatUnit(_))
+        ty.is_int_like() || ty.is_float_like()
     }
 
     fn error(&mut self, msg: String, span: Span) {
@@ -1309,10 +1362,31 @@ impl Infer {
             Ty::Relation(inner) => {
                 Ty::Relation(Box::new(self.apply_impl(inner, excluded)))
             }
-            Ty::Con(name, args) => Ty::Con(
-                name.clone(),
-                args.iter().map(|a| self.apply_impl(a, excluded)).collect(),
-            ),
+            Ty::Con(name, args) => {
+                let applied_args: Vec<Ty> =
+                    args.iter().map(|a| self.apply_impl(a, excluded)).collect();
+                // Unit folding: `Con("Int"/"Float", [Unit(u)])` resolves the
+                // unit and collapses a dimensionless result back to plain
+                // `Ty::Int`/`Ty::Float`. Anything else is a normal type
+                // application. The `Unit` arm below handles unit substitution
+                // for the inner `Ty::Unit(u)`, so by the time we get here the
+                // arg may already be a substituted `Unit(u)` — but if the arg
+                // was something exotic we must not pretend it's a unit.
+                if (name == "Int" || name == "Float") && applied_args.len() == 1 {
+                    if let Ty::Unit(u) = &applied_args[0] {
+                        let u = self.apply_unit(u);
+                        if u.is_dimensionless() {
+                            return if name == "Int" { Ty::Int } else { Ty::Float };
+                        }
+                        return if name == "Int" {
+                            Ty::int_with_unit(u)
+                        } else {
+                            Ty::float_with_unit(u)
+                        };
+                    }
+                }
+                Ty::Con(name.clone(), applied_args)
+            }
             Ty::TyCon(_) => ty.clone(),
             Ty::App(f, a) => {
                 let f = self.apply_impl(f, excluded);
@@ -1330,13 +1404,13 @@ impl Infer {
                     self.resolve_effect_row(effects.clone(), *row);
                 Ty::EffectRow(effects, row)
             }
-            Ty::IntUnit(u) => {
+            Ty::Unit(u) => {
                 let u = self.apply_unit(u);
-                if u.is_dimensionless() { Ty::Int } else { Ty::IntUnit(u) }
-            }
-            Ty::FloatUnit(u) => {
-                let u = self.apply_unit(u);
-                if u.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(u) }
+                // A standalone `Ty::Unit` is only meaningful inside
+                // `Con("Int"/"Float", [Unit(u)])`, whose `Con` arm does the
+                // dimensionless fold. Keep the substituted unit here; the
+                // surrounding `Con` arm re-folds if needed.
+                Ty::Unit(u)
             }
             Ty::Forall(vars, inner) => {
                 let mut new_excluded = excluded.to_vec();
@@ -2308,19 +2382,26 @@ impl Infer {
                 }
             }
             // ── Units of measure ──────────────────────────────
-            (Ty::IntUnit(u1), Ty::IntUnit(u2)) => {
+            // Unit-bearing Int/Float are now `Con("Int"/"Float", [Unit(u)])`.
+            // Same-name same-arity `Con` unifies the args, so
+            // `Con("Int",[Unit(u1)])` vs `Con("Int",[Unit(u2)])` recurses into
+            // the `Unit vs Unit` arm below.
+            (Ty::Unit(u1), Ty::Unit(u2)) => {
                 self.unify_units(u1, u2, span);
             }
-            (Ty::FloatUnit(u1), Ty::FloatUnit(u2)) => {
-                self.unify_units(u1, u2, span);
-            }
-            // Plain Int/Float unifies with any IntUnit/FloatUnit — plain
-            // numeric types are unit-agnostic (not "dimensionless").
-            // To express dimensionless explicitly, use Int<1>/Float<1>.
-            (Ty::Int, Ty::IntUnit(_))
-            | (Ty::IntUnit(_), Ty::Int)
-            | (Ty::Float, Ty::FloatUnit(_))
-            | (Ty::FloatUnit(_), Ty::Float) => {}
+            // Plain Int/Float unifies with any unit-bearing Int/Float — plain
+            // numeric types are unit-agnostic (not "dimensionless"). To express
+            // dimensionless explicitly, use Int<1>/Float<1>. These guards must
+            // precede the general `Con vs Con` arm so a plain `Ty::Int`/`Float`
+            // doesn't fall through to the Con-vs-non-Con mismatch path.
+            (Ty::Int, Ty::Con(name, _))
+                if name == "Int" => {}
+            (Ty::Con(name, _), Ty::Int)
+                if name == "Int" => {}
+            (Ty::Float, Ty::Con(name, _))
+                if name == "Float" => {}
+            (Ty::Con(name, _), Ty::Float)
+                if name == "Float" => {}
             // Bool is Ty::Bool (not Ty::Con), so handle Bool/Variant
             // unification explicitly to support True {}/False {} patterns.
             (Ty::Bool, Ty::Variant(c2, r2)) => {
@@ -3452,8 +3533,7 @@ impl Infer {
     /// Replace unit variables in a type according to a freshening mapping.
     fn subst_unit_vars_in_ty(&self, ty: &Ty, mapping: &HashMap<UnitVar, UnitVar>) -> Ty {
         match ty {
-            Ty::IntUnit(u) => Ty::IntUnit(Self::subst_unit_var(u, mapping)),
-            Ty::FloatUnit(u) => Ty::FloatUnit(Self::subst_unit_var(u, mapping)),
+            Ty::Unit(u) => Ty::Unit(Self::subst_unit_var(u, mapping)),
             Ty::Fun(p, r) => Ty::Fun(
                 Box::new(self.subst_unit_vars_in_ty(p, mapping)),
                 Box::new(self.subst_unit_vars_in_ty(r, mapping)),
@@ -3531,7 +3611,7 @@ impl Infer {
                     self.collect_free_unit_vars(resolved, out);
                 }
             }
-            Ty::IntUnit(u) | Ty::FloatUnit(u) => {
+            Ty::Unit(u) => {
                 let applied = self.apply_unit(u);
                 for &v in applied.vars.keys() {
                     out.insert(v);
@@ -4258,8 +4338,8 @@ impl Infer {
                 let base_ty = self.ast_type_to_ty(base);
                 let unit_ty = self.ast_unit_to_unit_ty(unit);
                 match base_ty {
-                    Ty::Int => Ty::IntUnit(unit_ty),
-                    Ty::Float => Ty::FloatUnit(unit_ty),
+                    Ty::Int => Ty::int_with_unit(unit_ty),
+                    Ty::Float => Ty::float_with_unit(unit_ty),
                     _ => {
                         self.error(
                             "unit annotations are only allowed on Int and Float types".into(),
@@ -4385,22 +4465,6 @@ impl Infer {
             },
             Ty::Int => "Int".into(),
             Ty::Float => "Float".into(),
-            Ty::IntUnit(u) => {
-                let u = self.apply_unit(u);
-                if u.is_dimensionless() {
-                    "Int".into()
-                } else {
-                    format!("Int<{}>", u.display())
-                }
-            }
-            Ty::FloatUnit(u) => {
-                let u = self.apply_unit(u);
-                if u.is_dimensionless() {
-                    "Float".into()
-                } else {
-                    format!("Float<{}>", u.display())
-                }
-            }
             Ty::Text => "Text".into(),
             Ty::Bool => "Bool".into(),
             Ty::Bytes => "Bytes".into(),
@@ -4455,6 +4519,17 @@ impl Infer {
                 format!("[{}]", self.display_ty(inner))
             }
             Ty::Con(name, args) => {
+                // Unit-bearing Int/Float: `Con("Int", [Unit(u)])` → `Int<u>`,
+                // collapsing to `Int`/`Float` when the unit is dimensionless.
+                if (name == "Int" || name == "Float") && args.len() == 1 {
+                    if let Ty::Unit(u) = args[0].peel_alias() {
+                        let u = self.apply_unit(u);
+                        if u.is_dimensionless() {
+                            return name.clone();
+                        }
+                        return format!("{}<{}>", name, u.display());
+                    }
+                }
                 if args.is_empty() {
                     name.clone()
                 } else {
@@ -4540,6 +4615,10 @@ impl Infer {
                 }
             }
             Ty::Alias(name, _) => name.clone(),
+            // A standalone `Ty::Unit` only appears as the argument of
+            // `Con("Int"/"Float", [Unit(u)])`, whose `Con` arm renders it.
+            // Render it bare here as a defensive fallback.
+            Ty::Unit(u) => format!("Unit<{}>", u.display()),
             Ty::Error => "<error>".into(),
         }
     }
@@ -5338,8 +5417,8 @@ impl Infer {
                 let val_ty = self.infer_expr(value);
                 let unit_ty = self.ast_unit_to_unit_ty(unit);
                 match &val_ty {
-                    Ty::Int | Ty::IntUnit(_) => Ty::IntUnit(unit_ty),
-                    Ty::Float | Ty::FloatUnit(_) => Ty::FloatUnit(unit_ty),
+                    t if t.is_int_like() => Ty::int_with_unit(unit_ty),
+                    t if t.is_float_like() => Ty::float_with_unit(unit_ty),
                     _ => {
                         self.error(
                             "unit annotations are only allowed on numeric literals".into(),
@@ -5990,8 +6069,8 @@ impl Infer {
                 let lhs_final = self.apply(&lhs_applied);
                 let rhs_final = self.apply(&rhs_applied);
                 let result = match (&lhs_final, &rhs_final) {
-                    (Ty::IntUnit(_), _) | (Ty::FloatUnit(_), _) => lhs_final,
-                    (_, Ty::IntUnit(_)) | (_, Ty::FloatUnit(_)) => rhs_final,
+                    (l, _) if l.unit_of().is_some() => lhs_final,
+                    (_, r) if r.unit_of().is_some() => rhs_final,
                     _ => lhs_final,
                 };
                 self.degrade_refinement(result, span)
@@ -6079,79 +6158,88 @@ impl Infer {
         span: Span,
         allow_defer: bool,
     ) -> Ty {
-        match (lhs_applied, rhs_applied) {
-            // Both have units → compose
-            (Ty::IntUnit(u1), Ty::IntUnit(u2)) => {
+        // Unit arithmetic uses helpers so it works for both plain and
+        // unit-bearing numeric types.
+        let same_numeric_class =
+            |a: &Ty, b: &Ty| (a.is_int_like() && b.is_int_like()) || (a.is_float_like() && b.is_float_like());
+        // Both operands have a unit and are the same numeric class → compose.
+        if let (Some(u1), Some(u2)) = (lhs_applied.unit_of(), rhs_applied.unit_of()) {
+            if same_numeric_class(lhs_applied, rhs_applied) {
+                let u1 = self.apply_unit(u1);
+                let u2 = self.apply_unit(u2);
                 let result_unit = if op == ast::BinOp::Mul {
-                    u1.mul(u2)
+                    u1.mul(&u2)
                 } else {
-                    u1.div(u2)
+                    u1.div(&u2)
                 };
-                if result_unit.is_dimensionless() { Ty::Int } else { Ty::IntUnit(result_unit) }
-            }
-            (Ty::FloatUnit(u1), Ty::FloatUnit(u2)) => {
-                let result_unit = if op == ast::BinOp::Mul {
-                    u1.mul(u2)
+                if result_unit.is_dimensionless() {
+                    if lhs_applied.is_int_like() { return Ty::Int; } else { return Ty::Float; }
+                }
+                return if lhs_applied.is_int_like() {
+                    Ty::int_with_unit(result_unit)
                 } else {
-                    u1.div(u2)
+                    Ty::float_with_unit(result_unit)
                 };
-                if result_unit.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(result_unit) }
             }
-            // One unit, one dimensionless → preserve unit
-            (Ty::IntUnit(u), Ty::Int) | (Ty::Int, Ty::IntUnit(u)) => {
-                if op == ast::BinOp::Div && matches!(rhs_applied, Ty::IntUnit(_)) {
-                    // x / y<u> → x<1/u>
-                    let inv = u.pow(-1);
-                    if inv.is_dimensionless() { Ty::Int } else { Ty::IntUnit(inv) }
-                } else if op == ast::BinOp::Div && matches!(lhs_applied, Ty::IntUnit(_)) {
-                    // x<u> / y → x<u>
-                    Ty::IntUnit(u.clone())
-                } else {
-                    Ty::IntUnit(u.clone())
+        }
+        // One side carries a unit, the other is the plain form of the same
+        // numeric class → preserve (and on `/`, invert the unit when the
+        // *denominator* is the unit side).
+        let one_unit: Option<(&UnitTy, bool, bool)> =
+            match (lhs_applied, rhs_applied) {
+                (a, b) if a.unit_of().is_some() && b.is_int_like() && a.is_int_like() && matches!(b, Ty::Int) => Some((a.unit_of().unwrap(), true,  false)),
+                (a, b) if a.unit_of().is_some() && b.is_float_like() && a.is_float_like() && matches!(b, Ty::Float) => Some((a.unit_of().unwrap(), false, false)),
+                (a, b) if b.unit_of().is_some() && a.is_int_like() && b.is_int_like() && matches!(a, Ty::Int) => Some((b.unit_of().unwrap(), true,  true)),
+                (a, b) if b.unit_of().is_some() && a.is_float_like() && b.is_float_like() && matches!(a, Ty::Float) => Some((b.unit_of().unwrap(), false, true)),
+                _ => None,
+            };
+        if let Some((u, is_int, rhs_has_unit)) = one_unit {
+            let u = self.apply_unit(u);
+            if op == ast::BinOp::Div && rhs_has_unit {
+                // x / y<u> → x<1/u>
+                let inv = u.pow(-1);
+                if inv.is_dimensionless() {
+                    return if is_int { Ty::Int } else { Ty::Float };
                 }
+                return if is_int { Ty::int_with_unit(inv) } else { Ty::float_with_unit(inv) };
             }
-            (Ty::FloatUnit(u), Ty::Float) | (Ty::Float, Ty::FloatUnit(u)) => {
-                if op == ast::BinOp::Div && matches!(rhs_applied, Ty::FloatUnit(_)) {
-                    let inv = u.pow(-1);
-                    if inv.is_dimensionless() { Ty::Float } else { Ty::FloatUnit(inv) }
-                } else if op == ast::BinOp::Div && matches!(lhs_applied, Ty::FloatUnit(_)) {
-                    // x<u> / y → x<u>
-                    Ty::FloatUnit(u.clone())
-                } else {
-                    Ty::FloatUnit(u.clone())
-                }
+            // x<u> / y → x<u>; x<u> * y → x<u>; y * x<u> → x<u>
+            if u.is_dimensionless() {
+                return if is_int { Ty::Int } else { Ty::Float };
             }
-            // No units involved → default behavior
-            _ => {
-                // Unit soundness: `*`/`/` *compose* units, but
-                // composition is only computable when both operands'
-                // units are known. If one side carries a concrete
-                // unit while the other is still an unresolved type
-                // variable (e.g. an unannotated lambda parameter),
-                // unifying them would force both to the *same* unit
-                // and type the product with that unit instead of its
-                // square. Defer the check (the operand's type may be
-                // pinned by a later unification), and at end of
-                // inference reject conservatively rather than silently
-                // inferring an unsound unit.
-                // A unit is "known to be unit-bearing" when, after
-                // resolving unit variables, it still has concrete
-                // bases OR an unresolved unit variable. A bare unit
-                // variable (e.g. the `u` in `Float<u> -> Float<u>`)
-                // is just as unit-bearing as a concrete unit: typing
-                // `x<u> * y` with `y` unresolved would unify `y`
-                // with `x` and produce `u` where `u^2` is correct.
-                let concrete_unit = |slf: &Self, t: &Ty| match t {
-                    Ty::IntUnit(u) | Ty::FloatUnit(u) => {
-                        let applied = slf.apply_unit(u);
-                        if applied.is_dimensionless() {
-                            None
-                        } else {
-                            Some(applied.display())
-                        }
+            return if is_int { Ty::int_with_unit(u) } else { Ty::float_with_unit(u) };
+        }
+        // No units involved → default behavior
+        {
+            // Unit soundness: `*`/`/` *compose* units, but
+            // composition is only computable when both operands'
+            // units are known. If one side carries a concrete
+            // unit while the other is still an unresolved type
+            // variable (e.g. an unannotated lambda parameter),
+            // unifying them would force both to the *same* unit
+            // and type the product with that unit instead of its
+            // square. Defer the check (the operand's type may be
+            // pinned by a later unification), and at end of
+            // inference reject conservatively rather than silently
+            // inferring an unsound unit.
+            // A unit is "known to be unit-bearing" when, after
+            // resolving unit variables, it still has concrete
+            // bases OR an unresolved unit variable. A bare unit
+            // variable (e.g. the `u` in `Float<u> -> Float<u>`)
+            // is just as unit-bearing as a concrete unit: typing
+            // `x<u> * y` with `y` unresolved would unify `y`
+            // with `x` and produce `u` where `u^2` is correct.
+            let concrete_unit = |slf: &Self, t: &Ty| match t.unit_of() {
+                Some(u) => {
+                    let applied = slf.apply_unit(u);
+                    if applied.is_dimensionless() {
+                        None
+                    } else {
+                        Some(applied.display())
                     }
-                    _ => None,
-                };
+                }
+                _ => None,
+            };
                 let lhs_is_var = matches!(lhs_applied, Ty::Var(_));
                 let rhs_is_var = matches!(rhs_applied, Ty::Var(_));
                 // BOTH operands unresolved: the composition can't be
@@ -6209,7 +6297,6 @@ impl Infer {
                 self.unify(lhs_applied, rhs_applied, span);
                 self.require_trait("Num", lhs_applied, span);
                 lhs_applied.clone()
-            }
         }
     }
 
@@ -7551,9 +7638,10 @@ impl Infer {
             Ty::Variant(_, _) => Some("Variant".into()),
             Ty::App(_, _) => Some("App".into()),
             // Units are erased at runtime, so trait dispatch on a unit-typed
-            // value resolves to the underlying primitive's impl.
-            Ty::IntUnit(_) => Some("Int".into()),
-            Ty::FloatUnit(_) => Some("Float".into()),
+            // value resolves to the underlying primitive's impl. A unit-bearing
+            // Int/Float is `Con("Int"/"Float", [Unit(_)])`; the general
+            // `Ty::Con(name, _)` arm below already returns the name, so no
+            // special arm is needed — the name IS "Int"/"Float".
             // An unresolved associated-type projection (`Elem c`, etc.) cannot
             // be reduced to a concrete type with trait impls. Returning None
             // here would silently drop trait constraints on such types
@@ -7966,7 +8054,7 @@ impl Infer {
             Ty::Record(
                 BTreeMap::from([
                     ("clientIp".into(), Ty::Text),
-                    ("receivedAt".into(), Ty::IntUnit(UnitTy::named("Ms"))),
+                    ("receivedAt".into(), Ty::int_with_unit(UnitTy::named("Ms"))),
                     (
                         "header".into(),
                         Ty::Fun(
@@ -8043,7 +8131,7 @@ impl Infer {
         {
             let a = self.fresh_var();
             let u = self.fresh_unit_var();
-            let int_u = Ty::IntUnit(UnitTy::var(u));
+            let int_u = Ty::int_with_unit(UnitTy::var(u));
             self.bind_top(
                 "count",
                 Scheme {
@@ -8064,7 +8152,7 @@ impl Infer {
         {
             let a = self.fresh_var();
             let u = self.fresh_unit_var();
-            let int_u = Ty::IntUnit(UnitTy::var(u));
+            let int_u = Ty::int_with_unit(UnitTy::var(u));
             self.bind_top(
                 "countWhere",
                 Scheme {
@@ -8096,7 +8184,7 @@ impl Infer {
 
         // now : IO {clock} Int<Ms>
         {
-            let int_ms = Ty::IntUnit(UnitTy::named("Ms"));
+            let int_ms = Ty::int_with_unit(UnitTy::named("Ms"));
             self.bind_top("now", Scheme::mono(
                 Ty::IO(BTreeSet::from([IoEffect::Clock]), None, Box::new(int_ms)),
             ));
@@ -8104,7 +8192,7 @@ impl Infer {
 
         // sleep : Int<Ms> -> IO {clock} {}
         {
-            let int_ms = Ty::IntUnit(UnitTy::named("Ms"));
+            let int_ms = Ty::int_with_unit(UnitTy::named("Ms"));
             self.bind_top(
                 "sleep",
                 Scheme::mono(Ty::Fun(
@@ -8117,7 +8205,7 @@ impl Infer {
         // randomInt : ∀u. Int<u> -> IO {random} Int<u>
         {
             let u = self.fresh_unit_var();
-            let int_u = Ty::IntUnit(UnitTy::var(u));
+            let int_u = Ty::int_with_unit(UnitTy::var(u));
             self.bind_top(
                 "randomInt",
                 Scheme {
@@ -8137,7 +8225,7 @@ impl Infer {
         // randomFloat : ∀u. IO {random} Float<u>
         {
             let u = self.fresh_unit_var();
-            let float_u = Ty::FloatUnit(UnitTy::var(u));
+            let float_u = Ty::float_with_unit(UnitTy::var(u));
             self.bind_top("randomFloat", Scheme {
                 vars: vec![],
                 unit_vars: vec![u],
@@ -8239,7 +8327,7 @@ impl Infer {
             let a = self.fresh_var();
             let r = self.fresh_var();
             let u = self.fresh_unit_var();
-            let int_u = Ty::IntUnit(UnitTy::var(u));
+            let int_u = Ty::int_with_unit(UnitTy::var(u));
             let server = Ty::Con(
                 "Server".into(),
                 vec![
@@ -8275,7 +8363,7 @@ impl Infer {
             let a = self.fresh_var();
             let r = self.fresh_var();
             let u = self.fresh_unit_var();
-            let int_u = Ty::IntUnit(UnitTy::var(u));
+            let int_u = Ty::int_with_unit(UnitTy::var(u));
             let server = Ty::Con(
                 "Server".into(),
                 vec![
@@ -8461,7 +8549,7 @@ impl Infer {
         {
             let a = self.fresh_var();
             let u = self.fresh_unit_var();
-            let float_u = Ty::FloatUnit(UnitTy::var(u));
+            let float_u = Ty::float_with_unit(UnitTy::var(u));
             self.bind_top(
                 "avg",
                 Scheme {
@@ -8638,7 +8726,7 @@ impl Infer {
         // length : ∀u. Text -> Int<u>
         {
             let u = self.fresh_unit_var();
-            let int_u = Ty::IntUnit(UnitTy::var(u));
+            let int_u = Ty::int_with_unit(UnitTy::var(u));
             self.bind_top(
                 "length",
                 Scheme {
@@ -8717,7 +8805,7 @@ impl Infer {
                     effect_unions: vec![],
                     unit_binops: vec![],
                     ty: Ty::Fun(
-                        Box::new(Ty::IntUnit(UnitTy::var(u))),
+                        Box::new(Ty::int_with_unit(UnitTy::var(u))),
                         Box::new(Ty::Int),
                     ),
                 },
@@ -8737,7 +8825,7 @@ impl Infer {
                     unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Int),
-                        Box::new(Ty::IntUnit(UnitTy::var(u))),
+                        Box::new(Ty::int_with_unit(UnitTy::var(u))),
                     ),
                 },
             );
@@ -8755,7 +8843,7 @@ impl Infer {
                     effect_unions: vec![],
                     unit_binops: vec![],
                     ty: Ty::Fun(
-                        Box::new(Ty::FloatUnit(UnitTy::var(u))),
+                        Box::new(Ty::float_with_unit(UnitTy::var(u))),
                         Box::new(Ty::Float),
                     ),
                 },
@@ -8775,7 +8863,7 @@ impl Infer {
                     unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Float),
-                        Box::new(Ty::FloatUnit(UnitTy::var(u))),
+                        Box::new(Ty::float_with_unit(UnitTy::var(u))),
                     ),
                 },
             );
@@ -8858,7 +8946,7 @@ impl Infer {
         // bytesLength : ∀u. Bytes -> Int<u>
         {
             let u = self.fresh_unit_var();
-            let int_u = Ty::IntUnit(UnitTy::var(u));
+            let int_u = Ty::int_with_unit(UnitTy::var(u));
             self.bind_top(
                 "bytesLength",
                 Scheme {
@@ -8876,8 +8964,8 @@ impl Infer {
         {
             let u1 = self.fresh_unit_var();
             let u2 = self.fresh_unit_var();
-            let int_u1 = Ty::IntUnit(UnitTy::var(u1));
-            let int_u2 = Ty::IntUnit(UnitTy::var(u2));
+            let int_u1 = Ty::int_with_unit(UnitTy::var(u1));
+            let int_u2 = Ty::int_with_unit(UnitTy::var(u2));
             self.bind_top(
                 "bytesSlice",
                 Scheme {
@@ -8960,8 +9048,8 @@ impl Infer {
         {
             let u1 = self.fresh_unit_var();
             let u2 = self.fresh_unit_var();
-            let int_u1 = Ty::IntUnit(UnitTy::var(u1));
-            let int_u2 = Ty::IntUnit(UnitTy::var(u2));
+            let int_u1 = Ty::int_with_unit(UnitTy::var(u1));
+            let int_u2 = Ty::int_with_unit(UnitTy::var(u2));
             self.bind_top(
                 "bytesGet",
                 Scheme {
@@ -9458,7 +9546,7 @@ impl Infer {
         let limit_ty = Ty::Record(
             BTreeMap::from([
                 ("requests".into(), Ty::Int),
-                ("window".into(), Ty::IntUnit(UnitTy::named("Ms"))),
+                ("window".into(), Ty::int_with_unit(UnitTy::named("Ms"))),
             ]),
             None,
         );
@@ -9849,7 +9937,7 @@ fn unit_var_map_for(ty: &Ty) -> HashMap<UnitVar, usize> {
 
 fn collect_unit_vars_ordered(ty: &Ty, out: &mut Vec<UnitVar>) {
     match ty {
-        Ty::IntUnit(u) | Ty::FloatUnit(u) => {
+        Ty::Unit(u) => {
             for &v in u.vars.keys() {
                 if !out.contains(&v) {
                     out.push(v);
@@ -9947,8 +10035,7 @@ fn correspond_vars(
             }
             correspond_vars(i1, i2, ty_map, unit_map);
         }
-        (Ty::IntUnit(u1), Ty::IntUnit(u2))
-        | (Ty::FloatUnit(u1), Ty::FloatUnit(u2)) => {
+        (Ty::Unit(u1), Ty::Unit(u2)) => {
             correspond_unit_vars(u1, u2, unit_map);
         }
         (Ty::Forall(_, i1), Ty::Forall(_, i2)) => {
@@ -10235,20 +10322,6 @@ fn display_ty_clean_inner(
         Ty::Var(v) => var_letter(names.get(v).copied().unwrap_or(*v as usize)),
         Ty::Int => "Int".into(),
         Ty::Float => "Float".into(),
-        Ty::IntUnit(u) => {
-            if u.is_dimensionless() {
-                "Int".into()
-            } else {
-                format!("Int<{}>", display_unit_clean(u, unit_names))
-            }
-        }
-        Ty::FloatUnit(u) => {
-            if u.is_dimensionless() {
-                "Float".into()
-            } else {
-                format!("Float<{}>", display_unit_clean(u, unit_names))
-            }
-        }
         Ty::Text => "Text".into(),
         Ty::Bool => "Bool".into(),
         Ty::Bytes => "Bytes".into(),
@@ -10283,6 +10356,16 @@ fn display_ty_clean_inner(
         }
         Ty::Relation(inner) => format!("[{}]", display_ty_clean(inner, names, unit_names)),
         Ty::Con(name, args) => {
+            // Unit-bearing Int/Float → `Int<u>`/`Float<u>`, collapsing to
+            // `Int`/`Float` when dimensionless.
+            if (name == "Int" || name == "Float") && args.len() == 1 {
+                if let Ty::Unit(u) = args[0].peel_alias() {
+                    if u.is_dimensionless() {
+                        return name.clone();
+                    }
+                    return format!("{}<{}>", name, display_unit_clean(u, unit_names));
+                }
+            }
             if args.is_empty() {
                 name.clone()
             } else {
@@ -10336,6 +10419,9 @@ fn display_ty_clean_inner(
             }
         }
         Ty::Alias(name, _) => name.clone(),
+        // Standalone `Ty::Unit` only appears as the arg of a unit-bearing
+        // Int/Float `Con`; the `Con` arm renders it. Defensive fallback:
+        Ty::Unit(u) => format!("Unit<{}>", display_unit_clean(u, unit_names)),
         Ty::Error => "<error>".into(),
     }
 }
@@ -10811,10 +10897,7 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
     // (`Float 0.0`, not `Int 0`).
     let mut sum_float_spans = SumFloatSpans::new();
     for (span, res_v) in &infer.sum_calls {
-        if matches!(
-            infer.apply(&Ty::Var(*res_v)).peel_alias(),
-            Ty::Float | Ty::FloatUnit(_)
-        ) {
+        if infer.apply(&Ty::Var(*res_v)).peel_alias().is_float_like() {
             sum_float_spans.insert(*span);
         }
     }
@@ -10874,15 +10957,15 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
         // Peel aliases so a refined/aliased numeric (`type Metres = Float<M>`)
         // still shows its unit.
         let resolved = infer.apply(&ty);
-        let unit = match resolved.peel_alias() {
-            Ty::IntUnit(u) | Ty::FloatUnit(u) => infer.apply_unit(u),
-            _ => continue,
+        let unit = match resolved.peel_alias().unit_of() {
+            Some(u) => infer.apply_unit(u),
+            None => continue,
         };
         // A unit still carrying variables is polymorphic — inside a unit-generic
         // function the concrete unit is not known at this call site, and DESIGN
         // specifies `show` prints just the number there. `apply` already folds a
         // dimensionless unit back to plain `Int`/`Float`, so the emptiness check
-        // is only a guard against a hand-built `IntUnit(dimensionless)`.
+        // is only a guard against a hand-built dimensionless `Unit`.
         if !unit.vars.is_empty() || unit.is_dimensionless() {
             continue;
         }
@@ -11221,8 +11304,8 @@ fn collect_alias_refs(
 /// anything the decoder shouldn't touch.
 fn ty_to_wire_descriptor(ty: &Ty) -> String {
     match ty.peel_alias() {
-        Ty::Int | Ty::IntUnit(_) => "int".to_string(),
-        Ty::Float | Ty::FloatUnit(_) => "float".to_string(),
+        t if t.is_int_like() => "int".to_string(),
+        t if t.is_float_like() => "float".to_string(),
         Ty::Text => "text".to_string(),
         Ty::Bool => "bool".to_string(),
         Ty::Con(name, args) if name == "Maybe" && args.len() == 1 => {
@@ -11255,8 +11338,8 @@ fn ty_to_wire_descriptor(ty: &Ty) -> String {
 /// Extract a simple type name from a resolved type for trait dispatch purposes.
 fn ty_to_type_name(ty: &Ty) -> Option<String> {
     match ty {
-        Ty::Int | Ty::IntUnit(_) => Some("Int".to_string()),
-        Ty::Float | Ty::FloatUnit(_) => Some("Float".to_string()),
+        t if t.is_int_like() => Some("Int".to_string()),
+        t if t.is_float_like() => Some("Float".to_string()),
         Ty::Text => Some("Text".to_string()),
         Ty::Bool => Some("Bool".to_string()),
         Ty::Bytes => Some("Bytes".to_string()),

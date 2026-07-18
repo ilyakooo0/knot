@@ -1435,6 +1435,7 @@ fn render_unit_expr_prec(u: &UnitExpr, ctx: u8) -> String {
             let s = format!("{}^{}", render_unit_expr_prec(a, 3), n);
             if ctx > 2 { format!("({})", s) } else { s }
         }
+        UnitExpr::Hole => "_".into(),
     }
 }
 
@@ -1444,6 +1445,7 @@ fn render_unit_type_arg(u: &UnitExpr) -> String {
     match u {
         UnitExpr::Named(n) => n.clone(),
         UnitExpr::Dimensionless => "1".into(),
+        UnitExpr::Hole => "_".into(),
         _ => format!("({})", render_unit_expr(u)),
     }
 }

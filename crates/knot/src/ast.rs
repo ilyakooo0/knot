@@ -85,6 +85,9 @@ pub enum UnitExpr {
     Div(Box<UnitExpr>, Box<UnitExpr>),
     /// Power: `u ^ n` (integer exponent)
     Pow(Box<UnitExpr>, i32),
+    /// `_` — unit hole: a fresh unit variable, bound by unification (like a
+    /// lowercase unit variable, but each occurrence is independent).
+    Hole,
 }
 
 // ── Declarations ───────────────────────────────────────────────────

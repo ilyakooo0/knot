@@ -611,7 +611,7 @@ fn collect_unit_expr_names(expr: &ast::UnitExpr, out: &mut HashSet<String>) {
             collect_unit_expr_names(b, out);
         }
         ast::UnitExpr::Pow(inner, _) => collect_unit_expr_names(inner, out),
-        ast::UnitExpr::Dimensionless => {}
+        ast::UnitExpr::Dimensionless | ast::UnitExpr::Hole => {}
     }
 }
 

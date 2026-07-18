@@ -300,6 +300,7 @@ fn format_unit_expr_d(u: &ast::UnitExpr, depth: usize) -> String {
             format!("{}/{}", format_unit_expr_d(a, d), format_unit_expr_d(b, d))
         }
         ast::UnitExpr::Pow(base, exp) => format!("{}^{}", format_unit_expr_d(base, d), exp),
+        ast::UnitExpr::Hole => "_".into(),
     }
 }
 

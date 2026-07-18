@@ -214,6 +214,37 @@ distance = 42.0 : Float (M / S)  -- units on a literal
 Annotations are common with units of measure where the literal alone is
 unit-agnostic.
 
+### Type Holes
+
+In any type position you can write `_` instead of a concrete type, and the
+compiler infers it. Each `_` is an independent placeholder — it unifies with
+whatever the surrounding code requires and is generalized like a type variable:
+
+```knot
+id : _ -> _
+id = \x -> x
+id 42          -- 42 : Int
+id "hello"     -- "hello" : Text
+
+first : [_] -> _          -- element type inferred
+const : _ -> _ -> _       -- three independent holes
+```
+
+Holes work anywhere a type can appear: function arrows, records, relation
+element types, `Maybe _`, and inline annotations. In a unit-annotated numeric
+type, `_` is a unit hole — it binds the unit by unification, like a lowercase
+unit variable:
+
+```knot
+double : Float _ -> Float _
+double = \x -> x + x
+double (5.0 : Float M)     -- 10.0 M — the unit flows through the hole
+```
+
+Each occurrence is fresh: `f : _ -> _` does not force the result to equal the
+argument. To share a type between positions, use an explicit type variable
+(`a`, `u`) instead of `_`.
+
 ---
 
 ## Do Blocks

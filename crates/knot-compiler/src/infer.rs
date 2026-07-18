@@ -1317,6 +1317,11 @@ impl Infer {
                 a_ty.div(&b_ty)
             }
             ast::UnitExpr::Pow(base, exp) => self.ast_unit_to_unit_ty(base).pow(*exp),
+            ast::UnitExpr::Hole => {
+                // Unit hole `_`: a fresh unit variable bound by unification.
+                // Each occurrence is independent (matching value-type `_`).
+                UnitTy::var(self.fresh_unit_var())
+            }
         }
     }
 

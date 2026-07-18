@@ -1046,6 +1046,10 @@ impl Parser {
                 self.advance();
                 Some(UnitExpr::Dimensionless)
             }
+            TokenKind::Underscore => {
+                self.advance();
+                Some(UnitExpr::Hole)
+            }
             TokenKind::LParen => {
                 self.advance();
                 let inner = self.parse_unit_expr()?;
@@ -1074,6 +1078,7 @@ impl Parser {
         }
         match self.peek() {
             TokenKind::Upper(_) | TokenKind::Lower(_) | TokenKind::LParen => true,
+            TokenKind::Underscore => true,
             TokenKind::Int(n) => n == "1",
             _ => false,
         }

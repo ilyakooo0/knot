@@ -165,7 +165,7 @@ fn lex_diags(src: &str) -> Vec<Diagnostic> {
 #[test]
 fn unit_var_behind_substituted_lambda_param_is_not_generalized() {
     // `p` is bound as Scheme::mono(Var α); `stripFloatUnit p` substitutes
-    // α := Float<u1>. The let-generalization of `g` must NOT quantify u1
+    // α := Float u1. The let-generalization of `g` must NOT quantify u1
     // (it is env-bound through p), so using g at both <M> and <S> is a
     // unit mismatch — previously this compiled.
     let src = r#"unit M
@@ -173,10 +173,10 @@ unit S
 bad = \p -> do
   let stripped = stripFloatUnit p
   let g = \y -> y + p
-  println (show (g 1.0<M>))
-  println (show (g 1.0<S>))
+  println (show (g 1.0 M))
+  println (show (g 1.0 S))
   yield {}
-main = bad 2.0<M>
+main = bad 2.0 M
 "#;
     let diags = check_src(src);
     assert!(
@@ -193,7 +193,7 @@ fn var_times_var_composes_units_instead_of_unifying() {
     // area : composing M * M = M^2; adding M must be rejected.
     let src = r#"unit M
 area = \w h -> w * h
-v = (area 3.0<M> 4.0<M>) + 5.0<M>
+v = (area 3.0 M 4.0 M) + 5.0 M
 main = println (show v)
 "#;
     let diags = check_src(src);
@@ -212,12 +212,12 @@ fn constrained_annotation_defers_unit_composition() {
     // the body-check skolems, which vanish from the rebuilt type, so at each
     // call site the binop's result floated free of the return type and
     // resolution degraded to a vacuous unify — the M^2 product was wrongly
-    // accepted as Float<M>. Re-mapping the skolems onto the fresh vars ties
+    // accepted as Float M. Re-mapping the skolems onto the fresh vars ties
     // the product back to `a`, so `M * M` used at `M` is a unit mismatch.
     let src = r#"unit M
 scale : Num a => a -> a -> a
 scale = \x y -> x * y
-v = (scale 3.0<M> 4.0<M>) + 1.0<M>
+v = (scale 3.0 M 4.0 M) + 1.0 M
 main = println (show v)
 "#;
     let diags = check_src(src);
@@ -252,12 +252,12 @@ main = do
 
 #[test]
 fn var_times_var_accepts_mixed_units() {
-    // Float<M> * Float<S> through an unannotated lambda must be ACCEPTED
+    // Float M * Float S through an unannotated lambda must be ACCEPTED
     // (the old code unified both operands and falsely rejected).
     let src = r#"unit M
 unit S
 f = \x y -> x * y
-v = f 3.0<M> 4.0<S>
+v = f 3.0 M 4.0 S
 main = println (show v)
 "#;
     let diags = check_src(src);

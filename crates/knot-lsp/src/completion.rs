@@ -2596,7 +2596,7 @@ mod regress_fixes_tests {
         // Constraint arrows don't corrupt the count either.
         assert_eq!(arrow_arity("Ord a => a -> a -> a"), 2);
         // Units and effect rows unaffected.
-        assert_eq!(arrow_arity("Int<Ms> -> IO {clock} {}"), 1);
+        assert_eq!(arrow_arity("Int Ms -> IO {clock} {}"), 1);
     }
 
     /// Item 9: type-context detection must not fire after lambda arrows,

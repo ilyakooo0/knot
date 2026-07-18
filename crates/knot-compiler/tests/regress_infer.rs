@@ -214,14 +214,14 @@ main = do
 
 #[test]
 fn mul_with_unresolved_operand_and_unit_is_rejected() {
-    // `\x -> x * 2.0<M>` is unit-polymorphic (`∀u. Float<u> -> Float<u*M>`),
-    // so `f 3.0<M>` has unit `M^2`. Adding `4.0<M>` to an `M^2` value is a
+    // `\x -> x * 2.0 M` is unit-polymorphic (`∀u. Float u -> Float (u*M)`),
+    // so `f 3.0 M` has unit `M^2`. Adding `4.0 M` to an `M^2` value is a
     // genuine dimension error and must be rejected — now with the precise
     // "unit mismatch" rather than the old "cannot infer" that the previous
     // (under-generalized) inference produced spuriously.
     let src = r#"unit M
-f = \x -> x * 2.0<M>
-bad = (f 3.0<M>) + 4.0<M>
+f = \x -> x * 2.0 M
+bad = (f 3.0 M) + 4.0 M
 main = bad
 "#;
     let diags = check_src(src);
@@ -236,8 +236,8 @@ main = bad
 fn mul_with_annotated_operand_composes_units() {
     // With an explicit annotation the product is M^2 and adding M fails.
     let src = r#"unit M
-f = \x -> (x : Float<M>) * 2.0<M>
-bad = (f 3.0<M>) + 4.0<M>
+f = \x -> (x : Float M) * 2.0 M
+bad = (f 3.0 M) + 4.0 M
 main = bad
 "#;
     let diags = check_src(src);
@@ -251,8 +251,8 @@ main = bad
 #[test]
 fn mul_with_dimensionless_annotation_is_accepted() {
     let src = r#"unit M
-g = \x -> (x : Float) * 2.0<M>
-ok = (g 3.0) + 4.0<M>
+g = \x -> (x : Float) * 2.0 M
+ok = (g 3.0) + 4.0 M
 main = ok
 "#;
     let diags = check_src(src);
@@ -271,8 +271,8 @@ fn plain_numeric_mul_lambda_still_works() {
 fn add_keeps_unit_from_rhs() {
     let src = r#"unit M
 unit S
-x = 1 + (2 : Int<M>)
-bad = x + (3 : Int<S>)
+x = 1 + (2 : Int M)
+bad = x + (3 : Int S)
 main = bad
 "#;
     let diags = check_src(src);
@@ -287,8 +287,8 @@ main = bad
 fn add_keeps_unit_from_lhs() {
     let src = r#"unit M
 unit S
-x = (2 : Int<M>) + 1
-bad = x + (3 : Int<S>)
+x = (2 : Int M) + 1
+bad = x + (3 : Int S)
 main = bad
 "#;
     let diags = check_src(src);
@@ -298,8 +298,8 @@ main = bad
 #[test]
 fn add_matching_units_still_fine() {
     let src = r#"unit M
-x = 1 + (2 : Int<M>)
-ok = x + (3 : Int<M>)
+x = 1 + (2 : Int M)
+ok = x + (3 : Int M)
 main = ok
 "#;
     let diags = check_src(src);
@@ -531,13 +531,13 @@ runIt = \act -> do
 
 #[test]
 fn unit_var_times_unknown_operand_is_rejected() {
-    // `x : Float<u>` (a unit VARIABLE) multiplied by a lambda param that is
+    // `x : Float u` (a unit VARIABLE) multiplied by a lambda param that is
     // unresolved at the `*` node must still be rejected — typing `x * y` as
     // `u` instead of `u^2` would be unsound. The composition check is
     // deferred until the operand resolves (here `y` unifies with `x` via
     // the application), so the rejection surfaces as a precise mismatch
     // between the annotated result `u` and the composed product `u^2`.
-    let src = r#"sq : Float<u> -> Float<u>
+    let src = r#"sq : Float u -> Float u
 sq = \x -> (\y -> x * y) x
 main = println (show (sq 2.0))
 "#;
@@ -556,13 +556,13 @@ fn scalar_mul_with_late_resolved_field_operand_compiles() {
     // lambda parameter whose record type is only pinned AFTER the `*` node
     // (here by `any`'s second argument). The composition check defers
     // instead of demanding an annotation; `f.failures` resolves to `Int`
-    // and `base * f.failures` is `Int<Ms>`.
+    // and `base * f.failures` is `Int Ms`.
     let src = r#"unit Ms
-base : Int<Ms>
+base : Int Ms
 base = 30000
-cap : Int<Ms>
+cap : Int Ms
 cap = 480000
-shouldRetry : Text -> Int<Ms> -> [{server: Text, failedAt: Int<Ms>, failures: Int}] -> Bool
+shouldRetry : Text -> Int Ms -> [{server: Text, failedAt: Int Ms, failures: Int}] -> Bool
 shouldRetry = \server t failures ->
   not (any (\f -> f.server == server && t - f.failedAt < base * f.failures) failures)
 main = println (show (shouldRetry "x" 1000 []))
@@ -575,13 +575,13 @@ main = println (show (shouldRetry "x" 1000 []))
 fn deferred_operand_resolving_to_unit_composes_soundly() {
     // When the late-resolved operand turns out to be unit-bearing, the
     // deferred check must compose units (Ms * Ms = Ms^2), not preserve one
-    // side's unit — comparing the product against Int<Ms> is a mismatch.
+    // side's unit — comparing the product against Int Ms is a mismatch.
     let src = r#"unit Ms
-base : Int<Ms>
+base : Int Ms
 base = 30000
-cap : Int<Ms>
+cap : Int Ms
 cap = 480000
-check : [{dur: Int<Ms>}] -> Bool
+check : [{dur: Int Ms}] -> Bool
 check = \rows -> any (\f -> cap < base * f.dur) rows
 main = println (show (check []))
 "#;
@@ -595,14 +595,14 @@ main = println (show (check []))
 
 #[test]
 fn concrete_unit_times_unknown_operand_is_unit_polymorphic() {
-    // `\y -> 2.0<M> * y` is `∀u. Float<u> -> Float<M*u>`. Applying it to a
-    // dimensionless `3.0` resolves `u` to the empty unit, giving `Float<M>`
+    // `\y -> 2.0 M * y` is `∀u. Float u -> Float (M*u)`. Applying it to a
+    // dimensionless `3.0` resolves `u` to the empty unit, giving `Float M`
     // — a well-typed program. (Previously rejected with "cannot infer the
     // unit" only because the deferred composition wasn't freshened per
     // instantiation, leaving the operand var unpinned; that under-
     // generalization bug is now fixed, so the application type-checks.)
     let src = r#"unit M
-f = \y -> 2.0<M> * y
+f = \y -> 2.0 M * y
 main = println (show (stripFloatUnit (f 3.0)))
 "#;
     let diags = check_src(src);
@@ -624,15 +624,15 @@ main = println (show (f 2.0 3.0))
 
 #[test]
 fn self_multiply_lambda_is_unit_polymorphic() {
-    // `\x -> x * x` must generalize to `∀u. Float<u> -> Float<u^2>` so it can
+    // `\x -> x * x` must generalize to `∀u. Float u -> Float (u^2)` so it can
     // be applied at two different units. The deferred unit-composition is
     // captured on the scheme and freshened per use site.
     let src = r#"unit M
 unit S
 square = \x -> x * x
 main = do
-  let a = square 3.0<M>
-  let b = square 4.0<S>
+  let a = square 3.0 M
+  let b = square 4.0 S
   println (show (stripFloatUnit a))
   println (show (stripFloatUnit b))
 "#;
@@ -647,8 +647,8 @@ fn multi_param_product_is_unit_polymorphic() {
 unit S
 area = \w h -> w * h
 main = do
-  let a = area 6.0<M> 2.0<M>
-  let b = area 6.0<S> 2.0<S>
+  let a = area 6.0 M 2.0 M
+  let b = area 6.0 S 2.0 S
   println (show (stripFloatUnit a))
   println (show (stripFloatUnit b))
 "#;

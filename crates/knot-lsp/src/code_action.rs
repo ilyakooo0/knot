@@ -411,7 +411,7 @@ pub(crate) fn handle_code_action(
 
         // Unit-mismatch quick fixes: when the inferred unit on a numeric
         // expression doesn't match what the surrounding context expects
-        // (e.g. `Float<M>` flowing into a `Float<Ft>` slot), offer to wrap the
+        // (e.g. `Float M` flowing into a `Float Ft` slot), offer to wrap the
         // expression in the strip/with conversion idiom. The user supplies the
         // numeric factor; the wrapper just gets the types to line up so they
         // see the call site rather than a type error.
@@ -443,7 +443,7 @@ pub(crate) fn handle_code_action(
                         ..Default::default()
                     }));
 
-                    // Int variant — for `Int<u1>` ↔ `Int<u2>` mismatches.
+                    // Int variant — for `Int u1` ↔ `Int u2` mismatches.
                     let mut changes_i = HashMap::new();
                     changes_i.insert(
                         uri.clone(),
@@ -2082,6 +2082,7 @@ fn collect_names_in_type(ty: &ast::Type, out: &mut HashSet<String>) {
         }
         TypeKind::Effectful { ty, .. } => collect_names_in_type(ty, out),
         TypeKind::IO { ty, .. } => collect_names_in_type(ty, out),
+        TypeKind::Unit(_) => {},
         TypeKind::UnitAnnotated { base, .. } => collect_names_in_type(base, out),
         TypeKind::Refined { base, .. } => collect_names_in_type(base, out),
         TypeKind::Forall { ty, .. } => collect_names_in_type(ty, out),
@@ -2781,7 +2782,7 @@ fn is_atomic_expr_text(s: &str) -> bool {
         return true;
     }
     // Numeric literal: digits with optional `.`, `_` separators, and a
-    // trailing `<Unit>` annotation (`42.0<M>`).
+    // trailing `<Unit>` annotation (`42.0 M`).
     if bytes[0].is_ascii_digit() {
         let (num, unit) = match t.find('<') {
             Some(p) if t.ends_with('>') => (&t[..p], Some(&t[p + 1..t.len() - 1])),

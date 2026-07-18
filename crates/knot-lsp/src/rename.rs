@@ -1295,6 +1295,7 @@ pub(crate) fn collect_name_uses_in_decl(
             }
             ast::TypeKind::Effectful { ty: inner, .. }
             | ast::TypeKind::IO { ty: inner, .. } => walk_type(inner, name, source, out),
+            ast::TypeKind::Unit(_) => {},
             ast::TypeKind::UnitAnnotated { base, .. } => walk_type(base, name, source, out),
             ast::TypeKind::Refined { base, predicate } => {
                 walk_type(base, name, source, out);

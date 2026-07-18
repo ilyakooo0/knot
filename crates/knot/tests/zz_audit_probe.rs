@@ -61,6 +61,6 @@ fn audit4() {
     probe_revert("messy_effectful_type", "f:{console} Int->{console} Int\nf=\\x->x\n");
     probe_revert("messy_io_type", "f:Int->IO {console} {}\nf=\\x->println x\n");
     probe_revert("messy_refined", "type Nat=Int where \\x->x>=0\n");
-    probe_revert("messy_units", "speed:Float<M / S>\nspeed=1.0<M / S>\n");
+    probe_revert("messy_units", "speed:Float (M / S)\nspeed=1.0 (M / S)\n");
     probe_revert("messy_large_signature", "process:Aaaaaaaaaa->Bbbbbbbbbb->Cccccccccc->Dddddddddd->Eeeeeeeeee->Ffffffffff->Gggggggggg\nprocess=undefined\n");
 }

@@ -124,9 +124,9 @@ fn unit_exponent_overflow_does_not_panic() {
     // A type-correct program with absurd unit exponents must not crash the
     // compiler (regression: unchecked i32 exponent arithmetic panicked).
     let src = "unit M\n\
-               area : Float<M^2000000000>\n\
-               area = 1.0<M^2000000000>\n\
-               sq : Float<M^2000000000> -> Float\n\
+               area : Float (M^2000000000)\n\
+               area = 1.0 (M^2000000000)\n\
+               sq : Float (M^2000000000) -> Float\n\
                sq = \\x -> stripFloatUnit (x * x)\n";
     // The only assertion that matters is that `check_src` returns without
     // panicking; the exponent saturates instead of overflowing.

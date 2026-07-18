@@ -555,7 +555,7 @@ Grouping is executed via SQLite — key columns are inserted into a temp table a
 All state operations in Knot return IO values. The IO type carries an effect set that distinguishes DB operations from external effects:
 
 - **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), and relation writes (`*rel = expr`, `replace *rel = expr`) all return `IO {} value`.
-- **External effects** carry specific tags: `IO {console} {}`, `IO {fs} Text`, `IO {network} Result`, `IO {clock} Int<Ms>`, `IO {random} Float`.
+- **External effects** carry specific tags: `IO {console} {}`, `IO {fs} Text`, `IO {network} Result`, `IO {clock} Int Ms`, `IO {random} Float`.
 
 This unified model means all stateful code lives in IO do-blocks, while pure comprehensions over plain values remain non-IO.
 
@@ -575,7 +575,7 @@ println : a -> IO {console} {}
 readFile : Text -> IO {fs} Text
 
 -- now returns an IO action with clock effect, tagged with the built-in Ms unit
-now : IO {clock} Int<Ms>
+now : IO {clock} Int Ms
 ```
 
 ### IO Do-Blocks
@@ -587,7 +587,7 @@ main = do
   people <- *people                  -- IO {} [Person] → binds [Person]
   content <- readFile "input.txt"    -- IO {fs} Text → binds Text
   println content                     -- IO {console} {}
-  t <- now                            -- IO {clock} Int<Ms> → binds Int<Ms>
+  t <- now                            -- IO {clock} Int Ms → binds Int Ms
   println ("time: " ++ show t)
   yield {}
 -- overall type: IO {fs, console, clock} {}
@@ -815,11 +815,11 @@ race : IO {| r1} a -> IO {| r2} b -> IO {| r1 \/ r2} (Result a b)
 
 ```knot
 slow = do
-  sleep 1000<Ms>
+  sleep 1000 Ms
   yield "slow"
 
 fast = do
-  sleep 50<Ms>
+  sleep 50 Ms
   yield "fast"
 
 main = do
@@ -968,13 +968,13 @@ Endpoints may declare a per-route token-bucket rate limit with the `rateLimit` c
 ```knot
 type RequestCtx = {
   clientIp: Text,
-  receivedAt: Int<Ms>,
+  receivedAt: Int Ms,
   header: Text -> Maybe Text       -- case-insensitive lookup
 }
 
 type RateLimit input a = {
   key: input -> RequestCtx -> Maybe a,    -- Ord a; Nothing exempts this request
-  limit: {requests: Int, window: Int<Ms>}
+  limit: {requests: Int, window: Int Ms}
 }
 ```
 
@@ -991,15 +991,15 @@ byApiKey = \input ctx -> case ctx.header "Authorization" of
 
 route Api where
   GET /hello -> {message: Text}
-    rateLimit {key: byClientIp, limit: {requests: 100, window: 60000<Ms>}}
+    rateLimit {key: byClientIp, limit: {requests: 100, window: 60000 Ms}}
     = Hello
 
   GET /user/{owner: Text} -> {message: Text}
-    rateLimit {key: byOwner, limit: {requests: 10, window: 60000<Ms>}}
+    rateLimit {key: byOwner, limit: {requests: 10, window: 60000 Ms}}
     = User
 
   POST {body: Text} /upload -> {ok: Bool}
-    rateLimit {key: byApiKey, limit: {requests: 10, window: 60000<Ms>}}
+    rateLimit {key: byApiKey, limit: {requests: 10, window: 60000 Ms}}
     = Upload
 
   GET /open -> {message: Text} = Open       -- no clause = unlimited
@@ -1009,7 +1009,7 @@ The clause accepts any expression of type `RateLimit input a`, so common keying 
 
 ```knot
 serverLimit = {key: \input ctx -> Just {value: ctx.clientIp},
-               limit: {requests: 1000, window: 60000<Ms>}}
+               limit: {requests: 1000, window: 60000 Ms}}
 
 route Api where
   POST {events: [Event]} /federation/gossip -> {} rateLimit serverLimit = RecvGossip
@@ -1326,8 +1326,8 @@ The runtime stores the compiled schema version in the database. On startup it co
 |------|-------------|
 | `Int` | 64-bit signed integer (`i64`); arithmetic is checked and panics on overflow |
 | `Float` | 64-bit float |
-| `Int<u>` | Integer tagged with a compile-time unit (`Int<Usd>`) |
-| `Float<u>` | Float tagged with a compile-time unit (`Float<M>`, `Float<M/S^2>`) |
+| `Int u` | Integer tagged with a compile-time unit (`Int Usd`) |
+| `Float u` | Float tagged with a compile-time unit (`Float M`, `Float (M/S^2)`) |
 | `Text` | Unicode string |
 | `Bool` | `True {}` / `False {}` (interchangeable with `true`/`false` literals) |
 | `Bytes` | Opaque byte string |
@@ -1360,7 +1360,7 @@ countOpen = \rel ->
 
 ### Units of Measure
 
-Optional compile-time units on `Int` and `Float`. Units are fully erased at runtime — no performance cost, no runtime representation. Plain `Float` is dimensionless (`Float<1>`).
+Optional compile-time units on `Int` and `Float`. Units are fully erased at runtime — no performance cost, no runtime representation. Plain `Float` is dimensionless (`Float 1`).
 
 #### Declaration
 
@@ -1380,21 +1380,21 @@ unit Hz = 1 / S
 Angle brackets on numeric types only. Concrete units are uppercase; lowercase names are unit variables (see [Unit Polymorphism](#unit-polymorphism)).
 
 ```knot
-height : Float<M>
-mass : Float<Kg>
-speed : Float<M / S>
-force : Float<N>
-acceleration : Float<M / S^2>
-cents : Int<Usd>
+height : Float M
+mass : Float Kg
+speed : Float (M / S)
+force : Float N
+acceleration : Float (M / S^2)
+cents : Int Usd
 ```
 
 #### Literal Syntax
 
 ```knot
-distance = 42.0<M>
-duration = 3.5<S>
-price = 999<Usd>
-pi = 3.14159              -- dimensionless (Float<1>)
+distance = 42.0 M
+duration = 3.5 S
+price = 999 Usd
+pi = 3.14159              -- dimensionless (Float 1)
 ```
 
 #### Arithmetic
@@ -1403,33 +1403,33 @@ pi = 3.14159              -- dimensionless (Float<1>)
 
 ```knot
 -- Same-unit addition/subtraction
-10.0<M> + 5.0<M>                -- Float<M>
-10.0<M> + 5.0<S>                -- type error
+10.0 M + 5.0 M                -- Float M
+10.0 M + 5.0 S                -- type error
 
 -- Unit composition
-10.0<M> * 5.0<M>                -- Float<M^2>
-100.0<M> / 10.0<S>              -- Float<M/S>
-2.0<Kg> * 9.8<M / S^2>          -- Float<Kg * M / S^2> = Float<N>
+10.0 M * 5.0 M                -- Float (M^2)
+100.0 M / 10.0 S              -- Float (M/S)
+2.0 Kg * 9.8 (M / S^2)          -- Float (Kg * M / S^2) = Float N
 
 -- Dimensionless scalars
-2.0 * 5.0<M>                    -- Float<M>
-5.0<M> / 2.0                    -- Float<M>
+2.0 * 5.0 M                    -- Float M
+5.0 M / 2.0                    -- Float M
 
 -- Negation preserves units
--(5.0<M>)                        -- Float<M>
+-(5.0 M)                        -- Float M
 ```
 
-Arbitrary integer powers arise naturally from multiplication: `M * M` = `M^2`, `S * S * S` = `S^3`. Powers can also be written directly in type annotations: `Float<M^2>`, `Float<S^-1>`.
+Arbitrary integer powers arise naturally from multiplication: `M * M` = `M^2`, `S * S * S` = `S^3`. Powers can also be written directly in type annotations: `Float (M^2)`, `Float (S^-1)`.
 
 #### Unit Polymorphism
 
 Concrete units are uppercase; lowercase names inside `<...>` are unit variables — no extra syntax needed:
 
 ```knot
-double : Float<u> -> Float<u>
+double : Float u -> Float u
 double = \x -> x + x
 
-computeSpeed : Float<d> -> Float<t> -> Float<d / t>
+computeSpeed : Float d -> Float t -> Float (d / t)
 computeSpeed = \distance time -> distance / time
 ```
 
@@ -1437,7 +1437,7 @@ Unit variables are inferred like type variables:
 
 ```knot
 double = \x -> x + x
--- inferred: Float<u> -> Float<u>  (or Int<u> -> Int<u> via Num)
+-- inferred: Float u -> Float u  (or Int u -> Int u via Num)
 ```
 
 #### Conversion
@@ -1445,25 +1445,25 @@ double = \x -> x + x
 `stripUnit` / `withUnit` (Int) and `stripFloatUnit` / `withFloatUnit` (Float) are identity functions that exist only for the type checker. Use them to drop a unit tag and re-attach a different one. The result of `withUnit`/`withFloatUnit` carries a free unit variable, so the caller pins the target unit via the surrounding type context (e.g. the function's return signature) or an explicit annotation:
 
 ```knot
-stripUnit       : Int<u> -> Int           -- drop unit from Int
-withUnit        : Int -> Int<u>           -- attach unit to Int
-stripFloatUnit  : Float<u> -> Float
-withFloatUnit   : Float -> Float<u>
+stripUnit       : Int u -> Int           -- drop unit from Int
+withUnit        : Int -> Int u           -- attach unit to Int
+stripFloatUnit  : Float u -> Float
+withFloatUnit   : Float -> Float u
 
-toS : Int<Ms> -> Int<S>
+toS : Int Ms -> Int S
 toS = \ms -> withUnit (stripUnit ms / 1000)
 
-toMiles : Float<Km> -> Float<Mi>
+toMiles : Float Km -> Float Mi
 toMiles = \d -> withFloatUnit (stripFloatUnit d * 0.621371)
 ```
 
-Plain `Int`/`Float` are unit-agnostic and unify with any `Int<u>`/`Float<u>`, so passing a unit-tagged value where plain numeric is expected (or vice versa) needs no conversion. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
+Plain `Int`/`Float` are unit-agnostic and unify with any `Int u`/`Float u`, so passing a unit-tagged value where plain numeric is expected (or vice versa) needs no conversion. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
 
 For explicit unit ascription you can put a type annotation on any expression, either inside parens or as a bare postfix:
 
 ```knot
-count = 0 : Int<Usd>            -- bare postfix annotation
-total = (acc + delta) : Float<M>  -- parenthesized form
+count = 0 : Int Usd            -- bare postfix annotation
+total = (acc + delta) : Float M  -- parenthesized form
 ```
 
 #### Unit-Preserving Stdlib
@@ -1471,8 +1471,8 @@ total = (acc + delta) : Float<M>  -- parenthesized form
 `sum`, `avg`, `minOn`, `maxOn`, and binary `min`/`max` preserve units:
 
 ```knot
-sum   : (a -> Float<u>) -> [a] -> Float<u>
-avg   : (a -> Float<u>) -> [a] -> Float<u>
+sum   : (a -> Float u) -> [a] -> Float u
+avg   : (a -> Float u) -> [a] -> Float u
 minOn : (a -> b) -> [a] -> b           -- units flow through via b
 maxOn : (a -> b) -> [a] -> b
 min   : Ord a => a -> a -> a            -- binary
@@ -1484,12 +1484,12 @@ max   : Ord a => a -> a -> a            -- binary
 `show` on a value with a concrete unit appends the unit string. The compiler knows the unit statically and emits the string as a constant:
 
 ```knot
-show 9.8<M / S^2>       -- "9.8 M/S^2"
-show 42.0<M>             -- "42.0 M"
+show 9.8 (M / S^2)       -- "9.8 M/S^2"
+show 42.0 M             -- "42.0 M"
 show 3.14                -- "3.14"
 ```
 
-`Int` units are appended the same way, including the built-in `Ms` that clock operations carry — `now : IO {clock} Int<Ms>`, so `show` on a timestamp reads `"1783814121719 Ms"`. Use `stripUnit` to print the bare number.
+`Int` units are appended the same way, including the built-in `Ms` that clock operations carry — `now : IO {clock} Int Ms`, so `show` on a timestamp reads `"1783814121719 Ms"`. Use `stripUnit` to print the bare number.
 
 When the unit is polymorphic (inside a unit-generic function), `show` prints just the number: the function body is compiled once, for every unit its caller may instantiate.
 
@@ -1500,7 +1500,7 @@ The compiler uses a canonical form for unit strings: alphabetical numerator, alp
 Units are phantom — SQLite stores raw numbers. Schema descriptors ignore units.
 
 ```knot
-type Measurement = {distance: Float<M>, time: Float<S>}
+type Measurement = {distance: Float M, time: Float S}
 
 *measurements : [Measurement]
 
@@ -1509,13 +1509,13 @@ type Measurement = {distance: Float<M>, time: Float<S>}
   measurements <- *measurements
   let result = do
     m <- measurements
-    yield {speed: m.distance / m.time}   -- Float<M/S>
+    yield {speed: m.distance / m.time}   -- Float (M/S)
   yield result
 ```
 
 #### Interaction with Traits
 
-Units live outside the trait system as a compile-time overlay. The `Num` trait handles runtime dispatch for arithmetic; the compiler applies unit algebra rules as an additional layer. No changes to trait definitions are needed — `+` on `Float<M>` dispatches through `Num.add` at runtime while the compiler separately verifies that both operands share the unit `M` and propagates `M` to the result.
+Units live outside the trait system as a compile-time overlay. The `Num` trait handles runtime dispatch for arithmetic; the compiler applies unit algebra rules as an additional layer. No changes to trait definitions are needed — `+` on `Float M` dispatches through `Num.add` at runtime while the compiler separately verifies that both operands share the unit `M` and propagates `M` to the result.
 
 ### Refined Types
 
@@ -1709,8 +1709,8 @@ Predicates in relation `where` clauses follow the same rule — they are pure fu
 Units and refinements are orthogonal — units are compile-time phantom, refinements are runtime-checked:
 
 ```knot
-type PositiveDistance = Float<M> where \x -> x > 0.0
-type Speed = Float<M/S> where \x -> x >= 0.0
+type PositiveDistance = Float M where \x -> x > 0.0
+type Speed = Float (M/S) where \x -> x >= 0.0
 ```
 
 #### Schema Evolution

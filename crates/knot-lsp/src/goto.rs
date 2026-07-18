@@ -210,7 +210,7 @@ pub(crate) fn handle_goto_type_definition(
 
 /// The head type constructor name of a type, peeling type application, unit
 /// annotations, and refinements — `Foo` → `Foo`, `Maybe a` → `Maybe`,
-/// `Int<Usd>` → `Int`. `None` for types with no named head (vars, records,
+/// `Int Usd` → `Int`. `None` for types with no named head (vars, records,
 /// functions, `[]`, …). Used to match `impl Trait <Type>` args to a type name.
 fn type_head_name(ty: &ast::Type) -> Option<&str> {
     match &ty.node {

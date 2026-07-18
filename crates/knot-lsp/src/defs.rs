@@ -594,6 +594,7 @@ impl<'a> DefResolver<'a> {
             }
             TypeKind::Effectful { ty, .. } => self.resolve_type(ty, source),
             TypeKind::IO { ty, .. } => self.resolve_type(ty, source),
+            TypeKind::Unit(_) => {},
             TypeKind::UnitAnnotated { base, .. } => self.resolve_type(base, source),
             TypeKind::Refined { base, predicate } => {
                 self.resolve_type(base, source);

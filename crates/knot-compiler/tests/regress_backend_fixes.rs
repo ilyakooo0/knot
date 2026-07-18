@@ -138,7 +138,7 @@ main = do
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
     // The outer `t` is a clock timestamp (a large integer), not a row. `now`
-    // is typed `IO {clock} Int<Ms>`, so `show` appends its unit: "<digits> Ms".
+    // is typed `IO {clock} Int Ms`, so `show` appends its unit: "<digits> Ms".
     let first = stdout.lines().next().unwrap_or("");
     let digits = first.trim_matches('"').trim_end_matches(" Ms");
     assert!(

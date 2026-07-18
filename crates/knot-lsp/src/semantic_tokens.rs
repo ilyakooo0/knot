@@ -690,6 +690,7 @@ impl<'a> TokenCollector<'a> {
             ast::TypeKind::IO { ty: inner, .. } | ast::TypeKind::Effectful { ty: inner, .. } => {
                 self.visit_type(inner);
             }
+            ast::TypeKind::Unit(_) => {},
             ast::TypeKind::UnitAnnotated { base, .. } => {
                 self.visit_type(base);
             }

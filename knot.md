@@ -53,26 +53,26 @@ unit S
 unit Kg
 unit N = Kg * M / S^2    -- derived unit alias
 
-distance = 42.0<M>        -- Float<M>
-speed : Float<M / S>
-force : Float<N>
-cents : Int<Usd>
+distance = 42.0 M        -- Float M
+speed : Float (M / S)
+force : Float N
+cents : Int Usd
 ```
 
 Arithmetic rules: `+`/`-` require matching units, `*`/`/` compose units, negation preserves units.
 
 ```knot
-10.0<M> + 5.0<M>              -- Float<M>
-10.0<M> * 5.0<M>              -- Float<M^2>
-100.0<M> / 10.0<S>            -- Float<M/S>
-2.0 * 5.0<M>                  -- Float<M> (scalar mul)
--(5.0<M>)                     -- Float<M>
+10.0 M + 5.0 M              -- Float M
+10.0 M * 5.0 M              -- Float (M^2)
+100.0 M / 10.0 S            -- Float (M/S)
+2.0 * 5.0 M                  -- Float M (scalar mul)
+-(5.0 M)                     -- Float M
 ```
 
 Unit polymorphism — concrete units are uppercase, lowercase names in `<...>` are unit variables:
 
 ```knot
-double : Float<u> -> Float<u>
+double : Float u -> Float u
 double = \x -> x + x
 ```
 
@@ -206,9 +206,9 @@ Any expression can carry a postfix type annotation, both with and without
 surrounding parens:
 
 ```knot
-n = 0 : Int<Usd>                -- bare postfix annotation
-m = (x + y) : Float<M>          -- parenthesized
-distance = 42.0 : Float<M / S>  -- units on a literal
+n = 0 : Int Usd                -- bare postfix annotation
+m = (x + y) : Float M          -- parenthesized
+distance = 42.0 : Float (M / S)  -- units on a literal
 ```
 
 Annotations are common with units of measure where the literal alone is
@@ -568,7 +568,7 @@ Effectful functions return `IO {effects} a` — descriptions of effects, not imm
 -- External effects
 println : a -> IO {console} {}
 readFile : Text -> IO {fs} Text
-now : IO {clock} Int<Ms>
+now : IO {clock} Int Ms
 
 -- DB operations (empty effect set)
 -- *rel : IO {} [T]
@@ -684,11 +684,11 @@ when the left action wins, `Ok {value: b}` when the right action wins.
 
 ```knot
 slow = do
-  sleep 1000<Ms>
+  sleep 1000 Ms
   yield "slow"
 
 fast = do
-  sleep 50<Ms>
+  sleep 50 Ms
   yield "fast"
 
 main = do
@@ -734,10 +734,10 @@ and the loser unwinds at its next safe point.
 | `map` | `(a -> b) -> [a] -> [b]` | Transform each row (`Functor.map`) |
 | `match` | `Constructor -> [ADT] -> [Payload]` | Filter by variant |
 | `fold` | `(b -> a -> b) -> b -> [a] -> b` | Left fold (`Foldable.fold`) |
-| `count` | `[a] -> Int<u>` | Number of rows |
-| `countWhere` | `(a -> Bool) -> [a] -> Int<u>` | Filtered count (SQL-pushed when possible) |
+| `count` | `[a] -> Int u` | Number of rows |
+| `countWhere` | `(a -> Bool) -> [a] -> Int u` | Filtered count (SQL-pushed when possible) |
 | `sum` | `(a -> b) -> [a] -> b` | Sum projected field (preserves units) |
-| `avg` | `(a -> Float<u>) -> [a] -> Float<u>` | Average projected field (preserves units) |
+| `avg` | `(a -> Float u) -> [a] -> Float u` | Average projected field (preserves units) |
 | `minOn` | `(a -> b) -> [a] -> b` | Min of projected field (panics on empty) |
 | `maxOn` | `(a -> b) -> [a] -> b` | Max of projected field (panics on empty) |
 | `min` | `Ord a => a -> a -> a` | Binary min of two values |
@@ -761,7 +761,7 @@ and the loser unwinds at its next safe point.
 |----------|------|-------------|
 | `toUpper` | `Text -> Text` | Uppercase |
 | `toLower` | `Text -> Text` | Lowercase |
-| `length` | `Text -> Int<u>` | Character count |
+| `length` | `Text -> Int u` | Character count |
 | `trim` | `Text -> Text` | Strip whitespace |
 | `reverse` | `Text -> Text` | Reverse |
 | `chars` | `Text -> [Text]` | Split to characters |
@@ -780,10 +780,10 @@ and the loser unwinds at its next safe point.
 | `toJson` | `a -> Text` | Encode as JSON (`ToJSON.toJson`) |
 | `parseJson` | `Text -> Maybe a` | Decode JSON (`FromJSON.parseJson`) |
 | `display` | `Display a => a -> Text` | Render a value via `Display` |
-| `stripUnit` | `Int<u> -> Int` | Drop unit tag from `Int` |
-| `withUnit` | `Int -> Int<u>` | Attach unit tag to `Int` |
-| `stripFloatUnit` | `Float<u> -> Float` | Drop unit tag from `Float` |
-| `withFloatUnit` | `Float -> Float<u>` | Attach unit tag to `Float` |
+| `stripUnit` | `Int u -> Int` | Drop unit tag from `Int` |
+| `withUnit` | `Int -> Int u` | Attach unit tag to `Int` |
+| `stripFloatUnit` | `Float u -> Float` | Drop unit tag from `Float` |
+| `withFloatUnit` | `Float -> Float u` | Attach unit tag to `Float` |
 
 ### IO
 
@@ -802,10 +802,10 @@ and the loser unwinds at its next safe point.
 | `fileExists` | `Text -> IO {fs} Bool` | Check file exists |
 | `removeFile` | `Text -> IO {fs} {}` | Delete file |
 | `listDir` | `Text -> IO {fs} [Text]` | List directory |
-| `now` | `IO {clock} Int<Ms>` | Unix timestamp (milliseconds) |
-| `sleep` | `Int<Ms> -> IO {clock} {}` | Pause the current thread |
-| `randomInt` | `Int<u> -> IO {random} Int<u>` | Random int `[0, bound)`, preserves unit |
-| `randomFloat` | `IO {random} Float<u>` | Random float `[0.0, 1.0)`, unit-polymorphic |
+| `now` | `IO {clock} Int Ms` | Unix timestamp (milliseconds) |
+| `sleep` | `Int Ms -> IO {clock} {}` | Pause the current thread |
+| `randomInt` | `Int u -> IO {random} Int u` | Random int `[0, bound)`, preserves unit |
+| `randomFloat` | `IO {random} Float u` | Random float `[0.0, 1.0)`, unit-polymorphic |
 | `randomUuid` | `IO {random} Uuid` | Generate a RFC 9562 UUIDv7 |
 | `atomic` | `IO {} a -> IO {} a` | Run DB operations in a transaction |
 | `fork` | `IO {\| r} a -> IO {\| r} {}` | Fire-and-forget on new OS thread; effects propagate |
@@ -814,7 +814,7 @@ and the loser unwinds at its next safe point.
 | `when` | `Bool -> IO r {} -> IO r {}` | Run action when condition is true |
 | `unless` | `Bool -> IO r {} -> IO r {}` | Run action when condition is false |
 | `forEach` | `[a] -> (a -> IO r {}) -> IO r {}` | Sequence an action over each row |
-| `listen` | `Int<u> -> Server a r -> IO {network \| r} {}` | Start an HTTP server |
+| `listen` | `Int u -> Server a r -> IO {network \| r} {}` | Start an HTTP server |
 | `fetch` | `Text -> Endpoint -> IO {network} (Result HttpError T)` | Type-safe HTTP client |
 | `fetchWith` | `Text -> {headers: [..]} -> Endpoint -> IO {network} (Result HttpError T)` | `fetch` with ad-hoc headers |
 
@@ -828,10 +828,10 @@ program.
 |----------|------|-------------|
 | `textToBytes` | `Text -> Bytes` | UTF-8 encode |
 | `bytesToText` | `Bytes -> Maybe Text` | UTF-8 decode (`Nothing` on invalid UTF-8) |
-| `bytesLength` | `Bytes -> Int<u>` | Byte length |
-| `bytesSlice` | `Int<u1> -> Int<u2> -> Bytes -> Bytes` | Sub-range (start, length, bytes) |
+| `bytesLength` | `Bytes -> Int u` | Byte length |
+| `bytesSlice` | `Int u1 -> Int u2 -> Bytes -> Bytes` | Sub-range (start, length, bytes) |
 | `bytesConcat` | `Bytes -> Bytes -> Bytes` | Concatenate |
-| `bytesGet` | `Int<u1> -> Bytes -> Int<u2>` | Byte value (0–255) at index |
+| `bytesGet` | `Int u1 -> Bytes -> Int u2` | Byte value (0–255) at index |
 | `bytesToHex` | `Bytes -> Text` | Hex encode |
 | `bytesFromHex` | `Text -> Maybe Bytes` | Hex decode (`Nothing` on bad input) |
 | `hash` | `a -> Bytes` | BLAKE3 hash (32 bytes) of any value |
@@ -896,7 +896,7 @@ api = serve Api where
 main = listen 8080 api
 ```
 
-`serve API where` produces a value of type `Server API r`, where `r` is the effect row of the handlers (rendered `_` when handlers are pure, or e.g. `{console}` when a handler logs). Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int, message: Text}`. The row `r` flows into `listen`'s IO type: `listen : Int<u> -> Server a r -> IO {network | r} {}`.
+`serve API where` produces a value of type `Server API r`, where `r` is the effect row of the handlers (rendered `_` when handlers are pure, or e.g. `{console}` when a handler logs). Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int, message: Text}`. The row `r` flows into `listen`'s IO type: `listen : Int u -> Server a r -> IO {network | r} {}`.
 
 ### HTTP Status Codes
 
@@ -963,13 +963,13 @@ Add a per-endpoint token-bucket rate limit with `rateLimit <expr>` (placed after
 ```knot
 type RequestCtx = {
   clientIp: Text,
-  receivedAt: Int<Ms>,
+  receivedAt: Int Ms,
   header: Text -> Maybe Text       -- case-insensitive lookup
 }
 
 type RateLimit input a = {
   key: input -> RequestCtx -> Maybe a,    -- Ord a; Nothing exempts the request
-  limit: {requests: Int, window: Int<Ms>}
+  limit: {requests: Int, window: Int Ms}
 }
 ```
 
@@ -982,11 +982,11 @@ byOwner = \{owner} ctx -> Just {value: owner}             -- key on a path/body 
 
 route Api where
   GET /hello -> {message: Text}
-    rateLimit {key: byClientIp, limit: {requests: 100, window: 60000<Ms>}}
+    rateLimit {key: byClientIp, limit: {requests: 100, window: 60000 Ms}}
     = Hello
 
   GET /user/{owner: Text} -> {message: Text}
-    rateLimit {key: byOwner, limit: {requests: 10, window: 60000<Ms>}}
+    rateLimit {key: byOwner, limit: {requests: 10, window: 60000 Ms}}
     = User
 
   GET /open -> {message: Text} = Open                  -- no clause = unlimited
@@ -1000,7 +1000,7 @@ Common keying strategies are regular expressions, so extract them once and reuse
 
 ```knot
 serverLimit = {key: \input ctx -> Just {value: ctx.clientIp},
-               limit: {requests: 1000, window: 60000<Ms>}}
+               limit: {requests: 1000, window: 60000 Ms}}
 
 route Api where
   POST {events: [Event]} /federation/gossip -> {} rateLimit serverLimit = RecvGossip

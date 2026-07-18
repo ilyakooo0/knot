@@ -466,6 +466,7 @@ fn walk_type(t: &Type, r: &mut Refs) {
             walk_type(ty, r);
         }
         TypeKind::UnitAnnotated { base, .. } => walk_type(base, r),
+        TypeKind::Unit(_) => {}
         TypeKind::Refined { base, predicate } => {
             walk_type(base, r);
             walk_expr(predicate, r);

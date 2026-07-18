@@ -427,7 +427,7 @@ fn export_filter(decls: Vec<ast::Decl>) -> Vec<ast::Decl> {
                     // name to export: they are properties of the program, not
                     // of a module's interface, and are always visible. Dropping
                     // the unit declarations left the units their exported types
-                    // are written in (`Float<M/S^2>`) undefined at the import
+                    // are written in (`Float (M/S^2)`) undefined at the import
                     // site, which surfaced as bogus unit mismatches.
                     ast::DeclKind::Migrate { .. }
                     | ast::DeclKind::SubsetConstraint { .. }
@@ -558,6 +558,7 @@ fn type_references_name(ty: &ast::Type, name: &str) -> bool {
             type_references_name(ty, name)
         }
         ast::TypeKind::UnitAnnotated { base, .. } => type_references_name(base, name),
+        ast::TypeKind::Unit(_) => false,
         ast::TypeKind::Refined { base, .. } => type_references_name(base, name),
         ast::TypeKind::Forall { ty, .. } => type_references_name(ty, name),
         ast::TypeKind::Var(_) | ast::TypeKind::Hole => false,

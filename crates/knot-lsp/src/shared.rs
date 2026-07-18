@@ -1522,6 +1522,7 @@ fn type_mentions_var(ty: &ast::Type, var: &str) -> bool {
         | ast::TypeKind::IO { ty, .. }
         | ast::TypeKind::UnitAnnotated { base: ty, .. }
         | ast::TypeKind::Refined { base: ty, .. } => type_mentions_var(ty, var),
+        ast::TypeKind::Unit(_) => false,
         ast::TypeKind::Forall { vars, ty } => {
             !vars.iter().any(|n| n == var) && type_mentions_var(ty, var)
         }

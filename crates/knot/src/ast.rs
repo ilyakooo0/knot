@@ -261,7 +261,7 @@ pub enum ExprKind {
     /// `atomic expr` — transactional boundary.
     Atomic(Box<Expr>),
 
-    /// `42.0<m>`, `999<usd>` — numeric literal with unit annotation.
+    /// `42.0 m`, `999 usd` — numeric literal with unit annotation.
     UnitLit {
         value: Box<Expr>,
         unit: UnitExpr,
@@ -477,7 +477,17 @@ pub enum TypeKind {
     /// `_` — type hole, inferred by the type checker.
     Hole,
 
-    /// `Float<m>`, `Int<usd>`, `Float<m / s^2>` — numeric type with unit.
+    /// `Float M`, `Float (M / S^2)`, `Float u` — a type-level unit
+    /// expression, appearing as the argument of a type application to
+    /// `Int`/`Float`. Carries the compile-time unit algebra (`*`, `/`, `^`).
+    /// A bare `Named(n)` unit is a concrete unit (`M`) when `n` is uppercase
+    /// or a unit variable (`u`) when lowercase.
+    Unit(UnitExpr),
+
+    /// `Float M` / `Int Usd` / `Float (M / S^2)` — numeric type with unit.
+    /// Kept as a dedicated node (rather than desugared to `App(Named "Float",
+    /// Unit u)`) so inference can recognise the shape without peeling
+    /// application spines. The `base` is `Named "Int"`/`Named "Float"`.
     UnitAnnotated {
         base: Box<Type>,
         unit: UnitExpr,

@@ -100,7 +100,7 @@ impl ParsedType {
         }
     }
 
-    /// If this is `Float<unit>` or `Int<unit>`, return the unit text.
+    /// If this is `Float unit` or `Int unit`, return the unit text.
     /// Skips trivial dimensionless `<1>`.
     pub fn unit(&self) -> Option<&str> {
         match self {
@@ -170,7 +170,7 @@ impl ParsedType {
                 format!("IO {{{row}}} {}", ty.render_atomic())
             }
             ParsedType::UnitAnnotated { base, unit } => {
-                format!("{}<{unit}>", base.render_atomic())
+                format!("{} {}", base.render_atomic(), unit)
             }
             ParsedType::Refined { base, predicate } => {
                 format!("{} where {predicate}", base.render())
@@ -403,11 +403,12 @@ impl<'a> Parser<'a> {
                 } else {
                     ParsedType::Var(name)
                 };
-                // `<unit>` only applies to numeric primitives.
+                // Postfix unit argument: `Float M`, `Float (M / S^2)`.
+                // Only applies to numeric primitives (Int/Float).
                 self.skip_ws();
-                if self.peek() == Some('<') && type_takes_unit(&node) {
+                if type_takes_unit(&node) && self.peek().map_or(false, |c| c.is_alphabetic() || c == '(') {
                     let saved = self.pos;
-                    if let Some(unit) = self.parse_unit_braces() {
+                    if let Some(unit) = self.parse_unit_arg() {
                         node = ParsedType::UnitAnnotated {
                             base: Box::new(node),
                             unit,
@@ -583,28 +584,48 @@ impl<'a> Parser<'a> {
         Some((effects, rest))
     }
 
-    fn parse_unit_braces(&mut self) -> Option<String> {
-        self.eat_char('<');
-        let start = self.pos;
-        let mut depth = 1i32;
-        while let Some(c) = self.peek() {
-            match c {
-                '<' => depth += 1,
-                '>' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
+    /// Parse a unit argument in type position: a bare name (`M`, `u`) or
+    /// a parenthesized unit expression (`(M / S^2)`). Returns the raw unit
+    /// string (without surrounding parens for the parenthesized form).
+    fn parse_unit_arg(&mut self) -> Option<String> {
+        if self.peek() == Some('(') {
+            self.eat_char('(');
+            let start = self.pos;
+            let mut depth = 1i32;
+            while let Some(c) = self.peek() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+                self.advance();
             }
-            self.advance();
-        }
-        let unit = self.src[start..self.pos].trim().to_string();
-        if self.eat_char('>') {
-            Some(unit)
+            let unit = self.src[start..self.pos].trim().to_string();
+            if self.eat_char(')') {
+                Some(unit)
+            } else {
+                None
+            }
         } else {
-            None
+            // Bare name — read an identifier.
+            let start = self.pos;
+            while let Some(c) = self.peek() {
+                if c.is_alphanumeric() || c == '_' {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            if self.pos > start {
+                Some(self.src[start..self.pos].to_string())
+            } else {
+                None
+            }
         }
     }
 
@@ -783,13 +804,13 @@ mod tests {
 
     #[test]
     fn parse_unit_annotated() {
-        let t = p("Float<M>");
+        let t = p("Float M");
         assert_eq!(t.unit(), Some("M"));
     }
 
     #[test]
     fn parse_dimensionless_unit_skipped() {
-        let t = p("Int<1>");
+        let t = p("Int 1");
         assert_eq!(t.unit(), None);
     }
 

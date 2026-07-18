@@ -93,7 +93,7 @@ single [1, 2]               -- Nothing {}
 ### `count`
 
 ```
-count : [a] -> Int<u>
+count : [a] -> Int u
 ```
 
 Return the number of rows in a relation.
@@ -107,7 +107,7 @@ When the argument is a source relation (or its bound alias), the compiler emits 
 ### `countWhere`
 
 ```
-countWhere : (a -> Bool) -> [a] -> Int<u>
+countWhere : (a -> Bool) -> [a] -> Int u
 ```
 
 Count rows that satisfy a predicate. Equivalent to `count . filter`, but pushes down to a single `SELECT COUNT(*) FROM ... WHERE pred` when the predicate is SQL-compilable.
@@ -130,16 +130,16 @@ Sum of a projected numeric field over a relation. Works with `Int`, `Float`, and
 totalAge = sum (\p -> p.age) *people
 
 -- Unit-preserving:
-totalDistance = sum (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
+totalDistance = sum (\t -> t.distance) *trips   -- Float M if distance : Float M
 ```
 
 ### `avg`
 
 ```
-avg : (a -> Float<u>) -> [a] -> Float<u>
+avg : (a -> Float u) -> [a] -> Float u
 ```
 
-Average of a projected numeric field over a relation. Returns `Float`. Preserves units from the projection function — if the projection returns `Float<M>`, the average is `Float<M>`.
+Average of a projected numeric field over a relation. Returns `Float`. Preserves units from the projection function — if the projection returns `Float M`, the average is `Float M`.
 
 ### `minOn`
 
@@ -344,11 +344,11 @@ The winner is reported via the built-in `Result a b` ADT — `Err {error: a}` wh
 
 ```knot
 slow = do
-  sleep 1000<Ms>
+  sleep 1000 Ms
   yield "slow"
 
 fast = do
-  sleep 50<Ms>
+  sleep 50 Ms
   yield "fast"
 
 main = do
@@ -654,7 +654,7 @@ main = do
 ### `now`
 
 ```
-now : IO {clock} Int<Ms>
+now : IO {clock} Int Ms
 ```
 
 Return the current Unix timestamp in milliseconds. The result is tagged with the built-in `Ms` unit; use `stripUnit` if you need a plain `Int`.
@@ -662,7 +662,7 @@ Return the current Unix timestamp in milliseconds. The result is tagged with the
 ### `sleep`
 
 ```
-sleep : Int<Ms> -> IO {clock} {}
+sleep : Int Ms -> IO {clock} {}
 ```
 
 Pause the current thread for the given number of milliseconds. Inside a `race` worker, `sleep` parks on the worker's cancel condvar and wakes immediately if the peer wins.
@@ -674,15 +674,15 @@ Pause the current thread for the given number of milliseconds. Inside a `race` w
 ### `randomInt`
 
 ```
-randomInt : Int<u> -> IO {random} Int<u>
+randomInt : Int u -> IO {random} Int u
 ```
 
-Generate a random integer in the range `[0, bound)`. Unit-polymorphic — the bound's unit is preserved in the result, so `randomInt 100<Usd>` returns `Int<Usd>`.
+Generate a random integer in the range `[0, bound)`. Unit-polymorphic — the bound's unit is preserved in the result, so `randomInt 100 Usd` returns `Int Usd`.
 
 ### `randomFloat`
 
 ```
-randomFloat : IO {random} Float<u>
+randomFloat : IO {random} Float u
 ```
 
 Generate a random float in the range `[0.0, 1.0)`. Unit-polymorphic — the unit is inferred from context.
@@ -747,7 +747,7 @@ UTF-8 decode bytes to text. Returns `Nothing {}` on invalid UTF-8.
 ### `bytesLength`
 
 ```
-bytesLength : Bytes -> Int<u>
+bytesLength : Bytes -> Int u
 ```
 
 Return the byte length.
@@ -779,7 +779,7 @@ Concatenate two byte strings.
 ### `bytesGet`
 
 ```
-bytesGet : Int<u1> -> Bytes -> Int<u2>
+bytesGet : Int u1 -> Bytes -> Int u2
 ```
 
 Get the byte value (0–255) at the given index.
@@ -787,7 +787,7 @@ Get the byte value (0–255) at the given index.
 ### `bytesSlice`
 
 ```
-bytesSlice : Int<u1> -> Int<u2> -> Bytes -> Bytes
+bytesSlice : Int u1 -> Int u2 -> Bytes -> Bytes
 ```
 
 Extract a sub-range. Arguments: start index, length, bytes.
@@ -815,8 +815,8 @@ The HTTP types and primitives are defined in the language spec (`DESIGN.md`). Th
 ### `listen` / `listenOn`
 
 ```
-listen   : Int<u> -> Server a r -> IO {network | r} {}
-listenOn : Text   -> Int<u> -> Server a r -> IO {network | r} {}
+listen   : Int u -> Server a r -> IO {network | r} {}
+listenOn : Text   -> Int u -> Server a r -> IO {network | r} {}
 ```
 
 Start an HTTP server built with `serve API where ...`. `listen` binds to all interfaces; `listenOn` takes an explicit bind address. The `r` row variable unifies with the server's effect row, so handler effects (e.g. `console` from a handler that calls `println`) flow into the program's IO type.
@@ -908,10 +908,10 @@ Boolean negation.
 ### `stripUnit` / `withUnit` / `stripFloatUnit` / `withFloatUnit`
 
 ```
-stripUnit      : Int<u> -> Int
-withUnit       : Int -> Int<u>
-stripFloatUnit : Float<u> -> Float
-withFloatUnit  : Float -> Float<u>
+stripUnit      : Int u -> Int
+withUnit       : Int -> Int u
+stripFloatUnit : Float u -> Float
+withFloatUnit  : Float -> Float u
 ```
 
 Drop or attach a unit tag. Identity at runtime — they only adjust the
@@ -1057,8 +1057,8 @@ Walk a structure left-to-right and sequence through any `Applicative` `f`. Built
 |------|-------------|
 | `Int` | 64-bit signed integer (`i64`); arithmetic is checked and panics on overflow |
 | `Float` | 64-bit floating point |
-| `Int<u>` | Integer with compile-time unit (e.g. `Int<Usd>`) |
-| `Float<u>` | Float with compile-time unit (e.g. `Float<M>`, `Float<M/S^2>`) |
+| `Int u` | Integer with compile-time unit (e.g. `Int Usd`) |
+| `Float u` | Float with compile-time unit (e.g. `Float M`, `Float (M/S^2)`) |
 | `Text` | Unicode string |
 | `Bool` | `True {}` or `False {}` |
 | `Bytes` | Byte string |
@@ -1071,7 +1071,7 @@ Walk a structure left-to-right and sequence through any `Applicative` `f`. Built
 
 ### Units of Measure
 
-Optional compile-time units on `Int` and `Float`. Fully erased at runtime — no performance cost, no runtime representation. Plain `Float` is unit-agnostic and unifies with any `Float<u>`.
+Optional compile-time units on `Int` and `Float`. Fully erased at runtime — no performance cost, no runtime representation. Plain `Float` is unit-agnostic and unifies with any `Float u`.
 
 #### Declaration
 
@@ -1086,10 +1086,10 @@ unit Hz = 1 / S
 #### Literals and Type Annotations
 
 ```knot
-distance = 42.0<M>            -- Float<M>
-speed : Float<M / S>
-force : Float<N>
-cents : Int<Usd>
+distance = 42.0 M            -- Float M
+speed : Float (M / S)
+force : Float N
+cents : Int Usd
 ```
 
 #### Arithmetic Rules
@@ -1100,12 +1100,12 @@ cents : Int<Usd>
 - Scalar (dimensionless) multiplication preserves the other operand's unit
 
 ```knot
-10.0<M> + 5.0<M>              -- Float<M>
-10.0<M> + 5.0<S>              -- type error
-10.0<M> * 5.0<M>              -- Float<M^2>
-100.0<M> / 10.0<S>            -- Float<M/S>
-2.0 * 5.0<M>                  -- Float<M>
--(5.0<M>)                     -- Float<M>
+10.0 M + 5.0 M              -- Float M
+10.0 M + 5.0 S              -- type error
+10.0 M * 5.0 M              -- Float (M^2)
+100.0 M / 10.0 S            -- Float (M/S)
+2.0 * 5.0 M                  -- Float M
+-(5.0 M)                     -- Float M
 ```
 
 #### Unit Polymorphism
@@ -1113,7 +1113,7 @@ cents : Int<Usd>
 Concrete units are uppercase; lowercase names inside `<...>` are unit variables:
 
 ```knot
-double : Float<u> -> Float<u>
+double : Float u -> Float u
 double = \x -> x + x
 ```
 
@@ -1122,10 +1122,10 @@ double = \x -> x + x
 `sum`, `avg`, `minOn`, and `maxOn` preserve units from their projection function:
 
 ```knot
-avg   (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
-sum   (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
-minOn (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
-maxOn (\t -> t.distance) *trips   -- Float<M> if distance : Float<M>
+avg   (\t -> t.distance) *trips   -- Float M if distance : Float M
+sum   (\t -> t.distance) *trips   -- Float M if distance : Float M
+minOn (\t -> t.distance) *trips   -- Float M if distance : Float M
+maxOn (\t -> t.distance) *trips   -- Float M if distance : Float M
 ```
 
 ---

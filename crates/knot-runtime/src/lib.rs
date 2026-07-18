@@ -7886,10 +7886,10 @@ pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
 }
 
 /// `show` on a value whose static type carries a concrete unit of measure
-/// (`Float<M>`, `Int<Usd>`). Units are erased at runtime — a `Float<M>` is an
+/// (`Float M`, `Int Usd`). Units are erased at runtime — a `Float M` is an
 /// ordinary `Value::Float` — so the unit only exists in the type checker. It
 /// hands the canonical unit string (`"M"`, `"M/S^2"`) to codegen, which passes
-/// it here as a constant: `show 42.0<M>` renders `"42.0 M"`.
+/// it here as a constant: `show 42.0 M` renders `"42.0 M"`.
 ///
 /// Codegen only routes a `show` through this entry point when the argument's
 /// type resolves to a concrete unit-bearing `Int`/`Float`
@@ -10279,7 +10279,7 @@ pub extern "C-unwind" fn knot_bytes_slice(
     bytes: *mut Value,
 ) -> *mut Value {
     // Clamp negative offsets/lengths to 0, matching `knot_text_take`/`drop`:
-    // an `Int<u>` can evaluate negative even from well-typed code, and a
+    // an `Int u` can evaluate negative even from well-typed code, and a
     // negative offset/length means "from the start"/"empty" rather than a crash.
     let start = match unsafe { as_ref(start) } {
         Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
@@ -10739,7 +10739,7 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
     // field swallow a JSON number (`42` -> Value::Int) or a `bool` field swallow
     // `1`, since `coerce_json_field` only rewrites tag/int/float and would pass
     // the mistyped value through to the handler as HTTP 200 instead of 400.
-    // Numbers stay interchangeable (Int<->Float) for a `float` position. For an
+    // Numbers stay interchangeable (Int (-)Float) for a `float` position. For an
     // `int` position a Float is only accepted when it demotes losslessly to a
     // representable i64 (integral, finite, in range) — exactly what
     // `coerce_json_field` can convert. A fractional or out-of-range float for an
@@ -15144,7 +15144,7 @@ fn refinement_holds_at(
 /// Register a rate-limit configuration for a route endpoint.
 /// Called once during program initialization, after the route table is built.
 /// `rate_limit_val` is the compiled Knot value of the `rateLimit` clause:
-/// `{key: RequestCtx -> Maybe a, limit: {requests: Int, window: Int<Ms>}}`.
+/// `{key: RequestCtx -> Maybe a, limit: {requests: Int, window: Int Ms}}`.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_route_set_rate_limit(
     table: *mut c_void,
@@ -17301,7 +17301,7 @@ pub extern "C-unwind" fn knot_http_listen(
     http_serve_loop(format!("0.0.0.0:{}", port), route_table, handler)
 }
 
-/// IO-thunk builder for `listen`. `listen : Int<u> -> Server a r -> IO ... {}`
+/// IO-thunk builder for `listen`. `listen : Int u -> Server a r -> IO ... {}`
 /// is an IO *value* — building it must not start the server, or
 /// `fork (listen port api)` would run the accept loop on the calling thread
 /// and never reach `fork`. The route-table pointer rides in the env as an
@@ -20497,7 +20497,7 @@ mod _maybe_json_tests {
         assert!(apply_wire_type_checked(alloc_bool(true), "int").is_none());
         assert!(apply_wire_type_checked(alloc_bool(true), "text").is_none());
         // Compatible positions still succeed: numbers are interchangeable
-        // (Int<->Float coercion is intentional), and matching tags pass.
+        // (Int (-)Float coercion is intentional), and matching tags pass.
         assert!(apply_wire_type_checked(alloc_int(7), "int").is_some());
         assert!(apply_wire_type_checked(alloc_int(7), "float").is_some());
         assert!(apply_wire_type_checked(alloc_float(1.5), "float").is_some());
@@ -23544,12 +23544,12 @@ mod _deep_nesting_iterative_tests {
 
     #[test]
     fn value_show_unit_appends_the_unit_suffix() {
-        // DESIGN: `show 42.0<M>` is "42.0 M" and `show 9.8<M / S^2>` is
+        // DESIGN: `show 42.0 M` is "42.0 M" and `show 9.8 (M / S^2)` is
         // "9.8 M/S^2" — the number formats exactly as plain `show` would, with
         // the canonical unit string appended after a single space.
         assert_eq!(show_unit_text(alloc(Value::Float(42.0)), "M"), "42.0 M");
         assert_eq!(show_unit_text(alloc(Value::Float(9.8)), "M/S^2"), "9.8 M/S^2");
-        // Ints carry units too (`Int<Usd>`).
+        // Ints carry units too (`Int Usd`).
         assert_eq!(show_unit_text(alloc(Value::Int(1500)), "Usd"), "1500 Usd");
     }
 

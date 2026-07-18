@@ -52,6 +52,7 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
                     | TypeKind::Effectful { .. }
                     | TypeKind::Refined { .. }
                     | TypeKind::Forall { .. }
+                    | TypeKind::Unit(_)
             ) {
                 format!("({a})")
             } else {
@@ -119,8 +120,15 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
         }
         TypeKind::Hole => "_".into(),
         TypeKind::UnitAnnotated { base, unit } => {
-            format!("{}<{}>", format_type_kind_d(&base.node, d), format_unit_expr_d(unit, d))
+            // `Float M`, `Float (M / S^2)` — space-separated, parens for compound.
+            let u = format_unit_expr_d(unit, d);
+            if u.contains(' ') || u.contains('^') {
+                format!("{} ({})", format_type_kind_d(&base.node, d), u)
+            } else {
+                format!("{} {}", format_type_kind_d(&base.node, d), u)
+            }
         }
+        TypeKind::Unit(u) => format_unit_expr_d(u, d),
         TypeKind::Refined { base, predicate } => {
             format!(
                 "{} where {}",

@@ -1324,8 +1324,13 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
         }
         TypeKind::Hole => "_".into(),
         TypeKind::UnitAnnotated { base, unit } => {
-            format!("{}<{}>", render_type_atom(base), render_unit_expr(unit))
+            // `Float M`, `Float (M / S^2)`, `Float u` — space-separated
+            // application. Parenthesize compound units (those with operators)
+            // so the algebraic precedence is explicit.
+            let unit_str = render_unit_type_arg(unit);
+            format!("{} {}", render_type_atom(base), unit_str)
         }
+        TypeKind::Unit(u) => render_unit_type_arg(u),
         TypeKind::Refined { base, predicate } => {
             // `T where \x -> ...` — predicate is always a lambda.
             let s = format!("{} where {}", render_type_prec(base, TyPrec::App), render_expr_inline(predicate, Prec::Lowest));
@@ -1409,18 +1414,6 @@ fn render_unit_expr(u: &UnitExpr) -> String {
     render_unit_expr_prec(u, 0)
 }
 
-/// Returns true if the unit expression is a single bare lowercase identifier
-/// (e.g. `usd`, `m`), which in argument position creates a syntactic ambiguity
-/// with chained comparison (`f 999<usd> 6` reparses as `(f 999 < usd) > 6`).
-/// Uppercase (`M`), compound (`m/s`), and power (`m^2`) units have no
-/// comparison reading, so only the bare-lowercase-ident case needs protecting.
-fn unit_is_bare_lower_ident(u: &UnitExpr) -> bool {
-    match u {
-        UnitExpr::Named(n) => n.chars().all(|c| c.is_ascii_lowercase()) && !n.is_empty(),
-        _ => false,
-    }
-}
-
 /// Contexts (`ctx`): 0 = top level, 1 = left operand of `*`/`/` (left-assoc,
 /// so same-precedence children need no parens), 2 = right operand of `*`/`/`
 /// (a nested `*`/`/` must keep its parens to preserve associativity), 3 =
@@ -1442,6 +1435,16 @@ fn render_unit_expr_prec(u: &UnitExpr, ctx: u8) -> String {
             let s = format!("{}^{}", render_unit_expr_prec(a, 3), n);
             if ctx > 2 { format!("({})", s) } else { s }
         }
+    }
+}
+
+/// Render a unit as a type argument: bare for a simple name or `1`,
+/// parenthesized for compound expressions (`M / S^2`, `M^2`).
+fn render_unit_type_arg(u: &UnitExpr) -> String {
+    match u {
+        UnitExpr::Named(n) => n.clone(),
+        UnitExpr::Dimensionless => "1".into(),
+        _ => format!("({})", render_unit_expr(u)),
     }
 }
 
@@ -1765,25 +1768,16 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         }
         ExprKind::UnitLit { value, unit } => {
             let s = format!(
-                "{}<{}>",
+                "{} {}",
                 render_expr_inline(value, Prec::Atom),
-                render_unit_expr(unit)
+                render_unit_type_arg(unit)
             );
-            // A unit literal whose unit is a single bare lowercase identifier
-            // (`999<usd>`) is syntactically ambiguous with a chained
-            // comparison: in argument position `f 999<usd> 6` reparses as
-            // `(f 999 < usd) > 6`. The parser resolves this toward comparison
-            // whenever another atom follows the `>`, even across whitespace.
-            // Uppercase (`<M>`), compound (`<m/s>`), and power (`<m^2>`) units
-            // have no comparison reading once space-separated, so only the
-            // bare-lowercase case needs protecting. Parenthesize it in tight
-            // (atom) positions — i.e. as a function argument — so the `<…>`
-            // can never be mistaken for comparison operators.
-            if parent == Prec::Atom && unit_is_bare_lower_ident(unit) {
-                format!("({})", s)
-            } else {
-                s
-            }
+            // A unit literal with a bare-name unit in argument position
+            // (`f 42.0 M 6`) is unambiguous (uppercase `M` can't be a value
+            // var, and applying a literal to anything is ill-typed), so no
+            // special parenthesization is needed — unlike the old `<…>`
+            // syntax which was ambiguous with chained comparison.
+            s
         }
         ExprKind::TimeUnitLit { value, unit_name } => {
             // Recover the original numeric literal from the desugared

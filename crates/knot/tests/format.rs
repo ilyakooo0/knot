@@ -119,7 +119,7 @@ fn check_str(label: &str, source: &str) {
 #[test]
 fn round_trip_route_rate_limit() {
     let src = r#"route API where
-  GET {} /ping -> Text rateLimit {key: \i ctx -> Just ctx.clientIp, limit: {requests: 10, window: 1000<Ms>}} = Ping
+  GET {} /ping -> Text rateLimit {key: \i ctx -> Just ctx.clientIp, limit: {requests: 10, window: 1000 Ms}} = Ping
 "#;
     check_str("rate_limit_route", src);
 }

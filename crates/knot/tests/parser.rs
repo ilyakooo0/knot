@@ -2289,60 +2289,34 @@ fn non_time_unit_identifier_not_consumed() {
     }
 }
 
-// ── Unit annotation vs chained comparison ───────────────────────────
+// ── Unit annotation syntax ─────────────────────────────────────────
 
-// `5<n>0` and `5<n> 0` must parse identically: a bare lowercase unit body is
-// ambiguous with a value variable, so a following atom (with or without a
-// space) means the chained comparison `(5 < n) > 0`, never a unit literal
-// applied to `0`. A single space must not flip the parse.
-fn assert_chained_lt_gt(body: ExprKind, ctx: &str) {
-    match body {
-        ExprKind::BinOp { op: BinOp::Gt, lhs, rhs } => {
-            assert!(
-                matches!(&lhs.node, ExprKind::BinOp { op: BinOp::Lt, .. }),
-                "{ctx}: expected `(5 < n)` as the `>` LHS, got {:?}",
-                lhs.node
-            );
-            assert!(
-                matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "0"),
-                "{ctx}: expected `0` as the `>` RHS, got {:?}",
-                rhs.node
-            );
+// The new space-separated syntax (`5 M`, `Float M`) replaces the old angle-
+// bracket form (`5<M>`, `Float<M>`). Lowercase unit variables (`u`) appear
+// only in type annotations (`Float u`), never as literal suffixes — a bare
+// lowercase identifier after a numeric literal is application, not a unit.
+
+#[test]
+fn bare_lower_unit_at_expr_end_is_application() {
+    // In the new space-separated syntax, `5 n` is application of the literal
+    // `5` to the variable `n` (ill-typed but syntactically valid). Lowercase
+    // unit variables on literals are not supported — they appear only in
+    // type annotations (`Float u`). Use uppercase or `(compound)` for
+    // literal unit annotations.
+    match fun_body("x = 5 n") {
+        ExprKind::App { func, arg } => {
+            assert!(matches!(&func.node, ExprKind::Lit(Literal::Int(n)) if n == "5"));
+            assert!(matches!(&arg.node, ExprKind::Var(n) if n == "n"));
         }
-        other => panic!("{ctx}: expected chained `(5 < n) > 0`, got {other:?}"),
-    }
-}
-
-#[test]
-fn bare_lower_unit_followed_by_atom_is_comparison_spaceless() {
-    assert_chained_lt_gt(fun_body("x = 5<n>0"), "5<n>0");
-}
-
-#[test]
-fn bare_lower_unit_followed_by_atom_is_comparison_spaced() {
-    // The bug: a space before the operand previously flipped this into
-    // `App(UnitLit(5, n), 0)`. It must match the spaceless form.
-    assert_chained_lt_gt(fun_body("x = 5<n> 0"), "5<n> 0");
-}
-
-#[test]
-fn bare_lower_unit_at_expr_end_is_unit_literal() {
-    // No following atom → genuine unit annotation, not a comparison.
-    match fun_body("x = 5<n>") {
-        ExprKind::UnitLit { value, unit } => {
-            assert!(matches!(&value.node, ExprKind::Lit(Literal::Int(n)) if n == "5"));
-            assert!(matches!(&unit, UnitExpr::Named(n) if n == "n"));
-        }
-        other => panic!("expected UnitLit, got {other:?}"),
+        other => panic!("expected App, got {other:?}"),
     }
 }
 
 #[test]
 fn concrete_unit_literal_applied_to_atom_stays_application() {
     // Uppercase units are never ambiguous with a value variable, so
-    // `f 5<M> 0` remains application of the unit-annotated literal — the
-    // adjacency-only rule still governs concrete units.
-    match fun_body("x = f 5<M> 0") {
+    // `f 5 M 0` remains application of the unit-annotated literal.
+    match fun_body("x = f 5 M 0") {
         ExprKind::App { func, arg } => {
             assert!(
                 matches!(&arg.node, ExprKind::Lit(Literal::Int(n)) if n == "0"),
@@ -2352,7 +2326,7 @@ fn concrete_unit_literal_applied_to_atom_stays_application() {
             match &func.node {
                 ExprKind::App { arg: inner_arg, .. } => assert!(
                     matches!(&inner_arg.node, ExprKind::UnitLit { unit: UnitExpr::Named(u), .. } if u == "M"),
-                    "inner arg should be unit literal 5<M>, got {:?}",
+                    "inner arg should be unit literal 5 M, got {:?}",
                     inner_arg.node
                 ),
                 other => panic!("expected nested App, got {other:?}"),
@@ -2363,12 +2337,12 @@ fn concrete_unit_literal_applied_to_atom_stays_application() {
 }
 
 #[test]
-fn unit_arithmetic_after_bare_lower_unit_not_broken() {
-    // `5<m> * 3` is unit-bearing multiplication, not a comparison — the `*`
-    // is a binary operator, not an atom starter, so the unit literal stands.
-    match fun_body("x = 5<m> * 3") {
+fn unit_arithmetic_after_uppercase_unit_not_broken() {
+    // `5 M * 3` is unit-bearing multiplication — `M` is consumed as the unit
+    // annotation, then `*` is the binary operator.
+    match fun_body("x = 5 M * 3") {
         ExprKind::BinOp { op: BinOp::Mul, lhs, rhs } => {
-            assert!(matches!(&lhs.node, ExprKind::UnitLit { unit: UnitExpr::Named(u), .. } if u == "m"));
+            assert!(matches!(&lhs.node, ExprKind::UnitLit { unit: UnitExpr::Named(u), .. } if u == "M"));
             assert!(matches!(&rhs.node, ExprKind::Lit(Literal::Int(n)) if n == "3"));
         }
         other => panic!("expected Mul with unit-literal LHS, got {other:?}"),

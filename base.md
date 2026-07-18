@@ -70,7 +70,7 @@ union : [a] -> [a] -> [a]
 Set union of two relations. Duplicates (by structural equality) are removed.
 
 ```knot
-count : [a] -> Int<u>
+count : [a] -> Int u
 ```
 Number of rows in a relation.
 
@@ -188,18 +188,18 @@ Sum a numeric projection over a relation. The projection function extracts the v
 sum (\x -> x) [10, 20, 30]              -- 60
 sum (\o -> o.amount) *orders             -- total of all order amounts
 *orders |> sum (\o -> o.amount)          -- same with pipe
-sum (\t -> t.distance) *trips            -- Float<M> if distance : Float<M>
+sum (\t -> t.distance) *trips            -- Float M if distance : Float M
 ```
 
 ```knot
-avg : (a -> Float<u>) -> [a] -> Float<u>
+avg : (a -> Float u) -> [a] -> Float u
 ```
-Average a numeric projection over a relation. Returns `Float`. Returns `0.0` for an empty relation. Preserves units — if the projection returns `Float<M>`, the average is `Float<M>`.
+Average a numeric projection over a relation. Returns `Float`. Returns `0.0` for an empty relation. Preserves units — if the projection returns `Float M`, the average is `Float M`.
 
 ```knot
 avg (\x -> x) [10.0, 20.0, 30.0]        -- 20.0
 avg (\e -> e.salary) *employees          -- mean salary
-avg (\t -> t.distance) *trips            -- Float<M> if distance : Float<M>
+avg (\t -> t.distance) *trips            -- Float M if distance : Float M
 ```
 
 ```knot
@@ -210,7 +210,7 @@ Minimum and maximum of a projected field over a relation. Works with any orderab
 
 ```knot
 minOn (\e -> e.salary) *employees        -- lowest salary
-maxOn (\t -> t.distance) *trips          -- Float<M> if distance : Float<M>
+maxOn (\t -> t.distance) *trips          -- Float M if distance : Float M
 ```
 
 ```knot
@@ -225,7 +225,7 @@ max "a" "b"    -- "b"
 ```
 
 ```knot
-countWhere : (a -> Bool) -> [a] -> Int<u>
+countWhere : (a -> Bool) -> [a] -> Int u
 ```
 Number of rows satisfying a predicate. Equivalent to `count (filter p rel)` but pushes down to `SELECT COUNT(*) ... WHERE ...` when the predicate is SQL-compilable.
 
@@ -266,7 +266,7 @@ drop 1 [10, 20, 30]           -- [20, 30]
 ```
 
 ```knot
-length : Text -> Int<u>
+length : Text -> Int u
 ```
 Number of characters in a text value.
 
@@ -367,10 +367,10 @@ not : Bool -> Bool
 Boolean negation. Function form of the `!` operator.
 
 ```knot
-stripUnit       : Int<u> -> Int
-withUnit        : Int -> Int<u>
-stripFloatUnit  : Float<u> -> Float
-withFloatUnit   : Float -> Float<u>
+stripUnit       : Int u -> Int
+withUnit        : Int -> Int u
+stripFloatUnit  : Float u -> Float
+withFloatUnit   : Float -> Float u
 ```
 
 Drop or attach a unit tag on `Int`/`Float`. All four are identity at
@@ -378,7 +378,7 @@ runtime — they exist only for the type checker. Use them to rebrand a value
 when you need a different concrete unit (e.g. `Ms` → `S`).
 
 ```knot
-now : IO {clock} Int<Ms>
+now : IO {clock} Int Ms
 ```
 Current time in milliseconds since the Unix epoch, tagged with the built-in `Ms` unit. Use `<-` in a do-block to get the value:
 
@@ -390,17 +390,17 @@ main = do
 ```
 
 ```knot
-sleep : Int<Ms> -> IO {clock} {}
+sleep : Int Ms -> IO {clock} {}
 ```
 Pause the current thread for the given number of milliseconds. Inside a `race` worker, `sleep` parks on the worker's cancel condvar and returns immediately if the peer wins the race.
 
 ```knot
-randomInt : Int<u> -> IO {random} Int<u>
+randomInt : Int u -> IO {random} Int u
 ```
-Random integer in `[0, bound)`. Unit-polymorphic — the bound's unit is preserved in the result, so `randomInt 100<Usd>` produces `Int<Usd>`.
+Random integer in `[0, bound)`. Unit-polymorphic — the bound's unit is preserved in the result, so `randomInt 100 Usd` produces `Int Usd`.
 
 ```knot
-randomFloat : IO {random} Float<u>
+randomFloat : IO {random} Float u
 ```
 Random float in `[0.0, 1.0)`. Unit-polymorphic — the unit is inferred from context.
 
@@ -445,12 +445,12 @@ parseJson json                     -- Just {name: "Bob"}
 ## Bytes
 
 ```knot
-bytesLength : Bytes -> Int<u>
+bytesLength : Bytes -> Int u
 ```
 Number of bytes in a byte string.
 
 ```knot
-bytesSlice : Int<u1> -> Int<u2> -> Bytes -> Bytes
+bytesSlice : Int u1 -> Int u2 -> Bytes -> Bytes
 ```
 Extract a sub-range. `bytesSlice start len bytes` returns `len` bytes starting at offset `start`.
 
@@ -460,7 +460,7 @@ bytesConcat : Bytes -> Bytes -> Bytes
 Concatenate two byte strings.
 
 ```knot
-bytesGet : Int<u1> -> Bytes -> Int<u2>
+bytesGet : Int u1 -> Bytes -> Int u2
 ```
 Get the byte value (0–255) at the given index.
 
@@ -569,8 +569,8 @@ main = do
 ## Server
 
 ```knot
-listen   : Int<u> -> Server a r -> IO {network | r} {}
-listenOn : Text  -> Int<u> -> Server a r -> IO {network | r} {}
+listen   : Int u -> Server a r -> IO {network | r} {}
+listenOn : Text  -> Int u -> Server a r -> IO {network | r} {}
 ```
 Start an HTTP server. `listen` binds to all interfaces; `listenOn` takes an explicit bind address. The `Server a r` value is built with the `serve API where ...` expression, and its row variable `r` unifies with `listen`'s IO row — so handler effects (e.g. `console` from a handler that calls `println`) propagate into the program's IO type.
 
@@ -584,7 +584,7 @@ Type-safe HTTP client. `Endpoint` is a route constructor (e.g. `GetTodos {owner:
 
 ### Rate limiting
 
-Endpoints can declare a per-route token-bucket rate limit with the `rateLimit <expr>` clause (placed after the response type/headers, before `=`). The expression has type `RateLimit input a = {key: input -> RequestCtx -> Maybe a, limit: {requests: Int, window: Int<Ms>}}` with `Ord a`. `input` is the same record the handler receives (path/query/body/header fields). `RequestCtx = {clientIp: Text, receivedAt: Int<Ms>, header: Text -> Maybe Text}` is supplied by the runtime; `header` does case-insensitive lookup.
+Endpoints can declare a per-route token-bucket rate limit with the `rateLimit <expr>` clause (placed after the response type/headers, before `=`). The expression has type `RateLimit input a = {key: input -> RequestCtx -> Maybe a, limit: {requests: Int, window: Int Ms}}` with `Ord a`. `input` is the same record the handler receives (path/query/body/header fields). `RequestCtx = {clientIp: Text, receivedAt: Int Ms, header: Text -> Maybe Text}` is supplied by the runtime; `header` does case-insensitive lookup.
 
 The `key` function returns `Just k` to put the request in bucket `k` (any `Ord` value — serialized via `show` for the SQLite key) or `Nothing` to exempt the request from rate limiting. On rejection the runtime responds `429 Too Many Requests` with `{"error":"Rate limit exceeded"}` and a `Retry-After: <seconds>` header; the handler is not invoked.
 
@@ -597,11 +597,11 @@ byOwner = \{owner} ctx -> Just {value: owner}    -- key on a path/body field
 
 route Api where
   GET /hello -> {message: Text}
-    rateLimit {key: byIp, limit: {requests: 100, window: 60000<Ms>}}
+    rateLimit {key: byIp, limit: {requests: 100, window: 60000 Ms}}
     = Hello
 
   GET /user/{owner: Text} -> {message: Text}
-    rateLimit {key: byOwner, limit: {requests: 10, window: 60000<Ms>}}
+    rateLimit {key: byOwner, limit: {requests: 10, window: 60000 Ms}}
     = User
 ```
 
@@ -629,11 +629,11 @@ Cancellation is cooperative: the loser's IO chain checks its cancel token betwee
 
 ```knot
 slow = do
-  sleep 1000<Ms>
+  sleep 1000 Ms
   yield "slow"
 
 fast = do
-  sleep 50<Ms>
+  sleep 50 Ms
   yield "fast"
 
 main = do

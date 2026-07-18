@@ -606,6 +606,7 @@ fn collect_type_names(ty: &ast::Type, out: &mut HashSet<String>) {
         }
         ast::TypeKind::Effectful { ty, .. } => collect_type_names(ty, out),
         ast::TypeKind::IO { ty, .. } => collect_type_names(ty, out),
+        ast::TypeKind::Unit(_) => {},
         ast::TypeKind::UnitAnnotated { base, .. } => collect_type_names(base, out),
         ast::TypeKind::Refined { base, .. } => collect_type_names(base, out),
         ast::TypeKind::Forall { ty, .. } => collect_type_names(ty, out),

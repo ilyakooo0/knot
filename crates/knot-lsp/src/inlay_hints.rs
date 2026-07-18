@@ -241,7 +241,7 @@ pub(crate) fn handle_inlay_hint(
         // Show inferred unit hints on numeric literals whose enclosing binding has
         // a unit-annotated type. The literals themselves don't carry explicit unit
         // syntax, so the user otherwise has to mentally trace the type — the hint
-        // shows e.g. `<M>` after `42` in `let distance : Float<M> = 42.0`.
+        // shows e.g. `<M>` after `42` in `let distance : Float M = 42.0`.
         add_unit_literal_hints(doc, range_start, range_end, &mut hints);
     }
 
@@ -769,12 +769,12 @@ fn extract_unit_from_type_str(ty: &str) -> Option<String> {
 ///
 /// Attribution is deliberately conservative: the hint fires ONLY when the
 /// binding's RHS is exactly one bare numeric literal (`let d = 42.0` with an
-/// inferred `Float<M>`). Anything compound is skipped, because the binding's
+/// inferred `Float M`). Anything compound is skipped, because the binding's
 /// unit doesn't necessarily belong to each literal inside it:
 /// - `base * 2.0` — the `2.0` is dimensionless (unit algebra composes via
 ///   `*`), so stamping the binding's `<M>` on it is wrong;
-/// - `42.0<M>` — an explicit `UnitLit` already spells the unit; recursing
-///   into its inner literal used to render `42.0<M><M>`;
+/// - `42.0 M` — an explicit `UnitLit` already spells the unit; recursing
+///   into its inner literal used to render `42.0 M<M>`;
 /// - `5 seconds` — the time-word sugar desugars to `5 * 1000` where the
 ///   synthesized `1000` literal's span covers the word `seconds`, so the
 ///   old walk hinted `<Ms>` after the word.
@@ -1497,13 +1497,13 @@ show1 = \p -> case p of
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            r#"type Timestamp = Int<Ms>
+            r#"type Timestamp = Int Ms
 
 *globalRateCount : Int
 *globalRateWindowStart : Timestamp
 *drainPhase : Int
 
-globalRateWindowMs : Int<Ms>
+globalRateWindowMs : Int Ms
 globalRateWindowMs = 1000
 
 maxGlobalRequestRate : Int
@@ -1715,14 +1715,14 @@ checkGlobalRate = \t -> atomic do
         );
     }
 
-    /// Bug 18: an explicitly-annotated literal (`42.0<M>`) must not get an
-    /// additional `<M>` hint (used to render `42.0<M><M>`).
+    /// Bug 18: an explicitly-annotated literal (`42.0 M`) must not get an
+    /// additional `<M>` hint (used to render `42.0 M<M>`).
     #[test]
     fn unit_hint_not_duplicated_on_annotated_literal() {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "unit M\nf = \\q -> do\n  let y = 42.0<M>\n  yield y\n",
+            "unit M\nf = \\q -> do\n  let y = 42.0 M\n  yield y\n",
         );
         let range = ws.whole_file_range(&uri);
         let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
@@ -1740,14 +1740,14 @@ checkGlobalRate = \t -> atomic do
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "unit M\nbase : Float<M>\nbase = 1.0<M>\n\nf = \\q -> do\n  let y = base * 2.0\n  yield y\n",
+            "unit M\nbase : Float M\nbase = 1.0 M\n\nf = \\q -> do\n  let y = base * 2.0\n  yield y\n",
         );
         let doc = ws.doc(&uri);
         // Sanity: the binding really inferred a unit — otherwise this test
         // passes vacuously on the old code too.
         assert!(
             doc.local_type_info.values().any(|t| t.contains("<M>")),
-            "setup: y should infer Float<M>; got {:?}",
+            "setup: y should infer Float M; got {:?}",
             doc.local_type_info
         );
         let range = ws.whole_file_range(&uri);
@@ -1784,7 +1784,7 @@ checkGlobalRate = \t -> atomic do
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "unit M\nbase : Float<M>\nbase = 1.0<M>\n\nf = \\q -> do\n  let y = 2.0\n  yield (base + y)\n",
+            "unit M\nbase : Float M\nbase = 1.0 M\n\nf = \\q -> do\n  let y = 2.0\n  yield (base + y)\n",
         );
         let doc = ws.doc(&uri);
         if !doc.local_type_info.values().any(|t| t.contains("<M>")) {

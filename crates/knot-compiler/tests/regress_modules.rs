@@ -4,7 +4,7 @@
 //!    definitions of one symbol and aborted the compiler with an unhandled
 //!    Cranelift `DuplicateDefinition` panic. It must be a diagnostic.
 //! 2. `unit` declarations were dropped by a module's export filter, leaving the
-//!    units its exported signatures are written in (`Float<N>`) undefined at the
+//!    units its exported signatures are written in (`Float N`) undefined at the
 //!    import site — reported as bogus unit mismatches.
 //! 3. An `impl` of a trait declared in *another* module was dropped by the
 //!    export filter, which only kept impls of traits the module exported itself.
@@ -148,16 +148,16 @@ fn unit_declarations_survive_a_modules_export_filter() {
     let s = Scratch::new("export_units");
     // `phys` exports a signature written in `N`, a unit derived from the base
     // units it declares. Dropping the `unit` decls at the import boundary left
-    // `N` unexpanded, so `Float<N>` no longer matched `Float<Kg*M/S^2>`.
+    // `N` unexpanded, so `Float N` no longer matched `Float (Kg*M/S^2)`.
     s.write(
         "phys.knot",
         "unit M\nunit S\nunit Kg\nunit N = Kg * M / S^2\n\n\
-         export baseForce : Float<Kg*M/S^2>\nbaseForce = 5.0<Kg*M/S^2>\n\n\
-         export addForce : Float<N> -> Float<N> -> Float<N>\naddForce = \\a b -> a + b\n",
+         export baseForce : Float (Kg*M/S^2)\nbaseForce = 5.0 (Kg*M/S^2)\n\n\
+         export addForce : Float N -> Float N -> Float N\naddForce = \\a b -> a + b\n",
     );
     s.write(
         "main.knot",
-        "import ./phys\n\nmain = do\n  let total = addForce baseForce 3.0<N>\n  \
+        "import ./phys\n\nmain = do\n  let total = addForce baseForce 3.0 N\n  \
          println (show (stripFloatUnit total))\n  yield {}\n",
     );
 

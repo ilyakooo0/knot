@@ -6881,7 +6881,7 @@ impl Codegen {
             ast::ExprKind::Var(name) if name == "show" => {
                 if compiled_args.len() == 1 {
                     // A `show` whose argument's type carried a concrete unit
-                    // gets the unit appended: `show 42.0<M>` → "42.0 M". The
+                    // gets the unit appended: `show 42.0 M` → "42.0 M". The
                     // unit is erased from the value, so inference resolved it
                     // per call site and it is emitted as a string constant.
                     match self.show_unit_strings.get(&expr.span).cloned() {

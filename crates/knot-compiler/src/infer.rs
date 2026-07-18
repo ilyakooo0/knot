@@ -167,7 +167,7 @@ pub type SumFloatSpans = HashSet<Span>;
 ///   element binds as its stored representation, so `Int` (stored as TEXT) works.
 /// - `dynamic` — the `IN (SELECT value FROM json_each(?))` form for a computed
 ///   haystack. `json_each` yields JSON storage classes (numbers as INTEGER), so
-///   `Int`/`Int<u>` (TEXT-stored) never match and are EXCLUDED here even though
+///   `Int`/`Int u` (TEXT-stored) never match and are EXCLUDED here even though
 ///   they are in `literal`. Only `Text`/`Bool`/`Uuid` are dynamic-safe.
 ///   `dynamic` is always a subset of `literal`.
 #[derive(Clone, Default, Debug)]
@@ -474,8 +474,8 @@ struct Scheme {
     /// Deferred `*`/`/` unit-composition checks captured during generalization
     /// (e.g. `\x -> x * x`). Like `effect_unions`, each one references `vars`
     /// and is freshened per instantiation so the same unit-polymorphic
-    /// function can be applied at different units (`square 3.0<M>` and
-    /// `square 4.0<S>` each get their own composition `M^2` / `S^2`).
+    /// function can be applied at different units (`square 3.0 M` and
+    /// `square 4.0 S` each get their own composition `M^2` / `S^2`).
     unit_binops: Vec<DeferredUnitBinop>,
     ty: Ty,
 }
@@ -955,7 +955,7 @@ impl Infer {
     /// Whether a resolved haystack type is safe for the *dynamic* `elem` path
     /// (`IN (SELECT value FROM json_each(?))`). Stricter than
     /// `is_elem_haystack_pushable`: `json_each` yields JSON storage classes, so
-    /// `Int`/`Int<u>` (stored as TEXT) never match and must fall back to memory.
+    /// `Int`/`Int u` (stored as TEXT) never match and must fall back to memory.
     fn is_elem_haystack_dynamic_pushable(&self, ty: &Ty) -> bool {
         let peeled = ty.peel_alias();
         let inner = match peeled {
@@ -1144,9 +1144,9 @@ impl Infer {
         // though a flexible var may still be solved *to* a skolem. Prefer a
         // variable with |e| == 1 (always cleanly solvable); otherwise try any
         // whose exponent evenly divides the rest. Considering *every* candidate
-        // rather than the first is what lets `Float<u*u*v>` unify with
-        // `Float<M>` (solve the exp-1 `v`, leaving `u` free) and `Float<u>`
-        // unify with `Float<u^2>` (solve the shared `u` to dimensionless) — a
+        // rather than the first is what lets `Float (u*u*v)` unify with
+        // `Float M` (solve the exp-1 `v`, leaving `u` free) and `Float u`
+        // unify with `Float (u^2)` (solve the shared `u` to dimensionless) — a
         // first-only greedy pick would wrongly reject both.
         let mut candidates: Vec<UnitVar> = diff.vars.keys()
             .filter(|v| !self.unit_skolems.contains(v))
@@ -2391,7 +2391,7 @@ impl Infer {
             }
             // Plain Int/Float unifies with any unit-bearing Int/Float — plain
             // numeric types are unit-agnostic (not "dimensionless"). To express
-            // dimensionless explicitly, use Int<1>/Float<1>. These guards must
+            // dimensionless explicitly, use Int 1/Float 1. These guards must
             // precede the general `Con vs Con` arm so a plain `Ty::Int`/`Float`
             // doesn't fall through to the Con-vs-non-Con mismatch path.
             (Ty::Int, Ty::Con(name, _))
@@ -3230,8 +3230,8 @@ impl Infer {
             .collect();
         // Freshen captured `*`/`/` unit-composition checks alongside the type
         // and unit variables, then re-arm them for end-of-inference resolution
-        // — each instantiation resolves its own composition (so `square 3.0<M>`
-        // yields `M^2` independently of `square 4.0<S>` → `S^2`).
+        // — each instantiation resolves its own composition (so `square 3.0 M`
+        // yields `M^2` independently of `square 4.0 S` → `S^2`).
         for b in &scheme.unit_binops {
             let result = match mapping.get(&b.result) {
                 Some(Ty::Var(nv)) => *nv,
@@ -3343,7 +3343,7 @@ impl Infer {
             .collect();
         // Re-arm captured `*`/`/` unit-composition checks alongside the
         // skolems and fresh units, mirroring `instantiate_at`. Without this,
-        // a unit-polymorphic annotation like `square : Float<u> -> Float<u2>`
+        // a unit-polymorphic annotation like `square : Float u -> Float u2`
         // (carrying a deferred `u2 = u * u` obligation) would have that
         // obligation silently dropped while checking the body, so the body
         // could violate the declared unit relationship undetected.
@@ -3800,7 +3800,7 @@ impl Infer {
         // generalized here, capturing them on the scheme (freshened per
         // instantiation) just like effect-unions above. This is what lets a
         // function like `\x -> x * x` be unit-polymorphic: each call site gets
-        // its own composition (`square 3.0<M>` → `M^2`, `square 4.0<S>` →
+        // its own composition (`square 3.0 M` → `M^2`, `square 4.0 S` →
         // `S^2`) instead of all uses being pinned to one monomorphic unit.
         // Binops not generalized here stay pending for the end-of-inference
         // global resolution.
@@ -4349,7 +4349,18 @@ impl Infer {
                     }
                 }
             }
-
+            ast::TypeKind::Unit(_unit) => {
+                // A standalone type-level unit expression. Only meaningful as
+                // the argument of `Con("Int"/"Float", [Unit(u)])`, which is
+                // built via `UnitAnnotated`. Reaching here means the unit
+                // appeared bare in a type position — treat it as an error
+                // since a unit is not a value-inhabited type.
+                self.error(
+                    "a unit expression cannot appear as a standalone type — it must be the argument of Int or Float".into(),
+                    ty.span,
+                );
+                Ty::Error
+            }
             ast::TypeKind::Refined { base, .. } => {
                 // Inline refined types resolve to their base type.
                 // Named refined type aliases are kept nominal (handled in Named arm).
@@ -4519,7 +4530,7 @@ impl Infer {
                 format!("[{}]", self.display_ty(inner))
             }
             Ty::Con(name, args) => {
-                // Unit-bearing Int/Float: `Con("Int", [Unit(u)])` → `Int<u>`,
+                // Unit-bearing Int/Float: `Con("Int", [Unit(u)])` → `Int u`,
                 // collapsing to `Int`/`Float` when the unit is dimensionless.
                 if (name == "Int" || name == "Float") && args.len() == 1 {
                     if let Ty::Unit(u) = args[0].peel_alias() {
@@ -4527,7 +4538,7 @@ impl Infer {
                         if u.is_dimensionless() {
                             return name.clone();
                         }
-                        return format!("{}<{}>", name, u.display());
+                        return format!("{} {}", name, u.display());
                     }
                 }
                 if args.is_empty() {
@@ -5437,7 +5448,7 @@ impl Infer {
                 let inner_ty = self.infer_expr(inner);
                 // Treat lowercase unit names in an inline ascription as
                 // polymorphic unit variables (as in a signature), not as
-                // concrete units — otherwise `(x : Float<u>)` would pin `u`
+                // concrete units — otherwise `(x : Float u)` would pin `u`
                 // to a unit literally named `u` and reject valid code. Isolate
                 // the unit-var map so these fresh vars don't collide with any
                 // signature's unit vars.
@@ -6225,7 +6236,7 @@ impl Infer {
             // A unit is "known to be unit-bearing" when, after
             // resolving unit variables, it still has concrete
             // bases OR an unresolved unit variable. A bare unit
-            // variable (e.g. the `u` in `Float<u> -> Float<u>`)
+            // variable (e.g. the `u` in `Float u -> Float u`)
             // is just as unit-bearing as a concrete unit: typing
             // `x<u> * y` with `y` unresolved would unify `y`
             // with `x` and produce `u` where `u^2` is correct.
@@ -6245,7 +6256,7 @@ impl Infer {
                 // BOTH operands unresolved: the composition can't be
                 // computed yet AND unifying them would be unsound (it
                 // types `w * h` as `w`'s unit instead of its square once
-                // units appear, and falsely rejects `Float<M> * Float<S>`).
+                // units appear, and falsely rejects `Float M * Float S`).
                 // Defer the whole check and return a fresh result variable.
                 // If the surrounding binding is generalized, `generalize`
                 // captures this binop on the scheme so each instantiation
@@ -6287,7 +6298,7 @@ impl Infer {
                     let op_name = if op == ast::BinOp::Mul { "*" } else { "/" };
                     self.error(
                         format!(
-                            "cannot infer the unit of an operand of `{}`: one side has unit <{}> but the other side's type is not yet known — units compose under `{}`, so the unresolved operand needs an explicit annotation (e.g. `(x : Float<{}>)`, or `(x : Float)` for a dimensionless value)",
+                            "cannot infer the unit of an operand of `{}`: one side has unit {} but the other side's type is not yet known — units compose under `{}`, so the unresolved operand needs an explicit annotation (e.g. `(x : Float ({}))`, or `(x : Float)` for a dimensionless value)",
                             op_name, unit, op_name, unit
                         ),
                         span,
@@ -8127,7 +8138,7 @@ impl Infer {
             ),
         );
 
-        // count : ∀a u. [a] -> Int<u>
+        // count : ∀a u. [a] -> Int u
         {
             let a = self.fresh_var();
             let u = self.fresh_unit_var();
@@ -8148,7 +8159,7 @@ impl Infer {
             );
         }
 
-        // countWhere : ∀a u. (a -> Bool) -> [a] -> Int<u>
+        // countWhere : ∀a u. (a -> Bool) -> [a] -> Int u
         {
             let a = self.fresh_var();
             let u = self.fresh_unit_var();
@@ -8182,7 +8193,7 @@ impl Infer {
             )),
         );
 
-        // now : IO {clock} Int<Ms>
+        // now : IO {clock} Int Ms
         {
             let int_ms = Ty::int_with_unit(UnitTy::named("Ms"));
             self.bind_top("now", Scheme::mono(
@@ -8190,7 +8201,7 @@ impl Infer {
             ));
         }
 
-        // sleep : Int<Ms> -> IO {clock} {}
+        // sleep : Int Ms -> IO {clock} {}
         {
             let int_ms = Ty::int_with_unit(UnitTy::named("Ms"));
             self.bind_top(
@@ -8202,7 +8213,7 @@ impl Infer {
             );
         }
 
-        // randomInt : ∀u. Int<u> -> IO {random} Int<u>
+        // randomInt : ∀u. Int u -> IO {random} Int u
         {
             let u = self.fresh_unit_var();
             let int_u = Ty::int_with_unit(UnitTy::var(u));
@@ -8222,7 +8233,7 @@ impl Infer {
             );
         }
 
-        // randomFloat : ∀u. IO {random} Float<u>
+        // randomFloat : ∀u. IO {random} Float u
         {
             let u = self.fresh_unit_var();
             let float_u = Ty::float_with_unit(UnitTy::var(u));
@@ -8314,7 +8325,7 @@ impl Infer {
         // with polymorphic HKT types: ∀m a b. (a -> m b) -> m a -> m b, etc.
         // This allows do-block desugaring to work with any monad, not just [].
 
-        // listen : ∀a u r. Int<u> -> Server a r -> IO {network | r} {}
+        // listen : ∀a u r. Int u -> Server a r -> IO {network | r} {}
         // The handler value must be a `Server a`, produced by the
         // `serve a where ...` expression. Each endpoint handler returns
         // its own response type; the runtime serializes the result based
@@ -8358,7 +8369,7 @@ impl Infer {
             );
         }
 
-        // listenOn : ∀a u r. Text -> Int<u> -> Server a r -> IO {network | r} {}
+        // listenOn : ∀a u r. Text -> Int u -> Server a r -> IO {network | r} {}
         {
             let a = self.fresh_var();
             let r = self.fresh_var();
@@ -8545,7 +8556,7 @@ impl Infer {
             },
         );
 
-        // avg : ∀a u. (a -> Float<u>) -> [a] -> Float<u>
+        // avg : ∀a u. (a -> Float u) -> [a] -> Float u
         {
             let a = self.fresh_var();
             let u = self.fresh_unit_var();
@@ -8723,7 +8734,7 @@ impl Infer {
             Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
         );
 
-        // length : ∀u. Text -> Int<u>
+        // length : ∀u. Text -> Int u
         {
             let u = self.fresh_unit_var();
             let int_u = Ty::int_with_unit(UnitTy::var(u));
@@ -8793,7 +8804,7 @@ impl Infer {
             Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(a)))),
         );
 
-        // stripUnit : ∀u. Int<u> -> Int — drop the unit tag from an Int
+        // stripUnit : ∀u. Int u -> Int — drop the unit tag from an Int
         {
             let u = self.fresh_unit_var();
             self.bind_top(
@@ -8812,7 +8823,7 @@ impl Infer {
             );
         }
 
-        // withUnit : ∀u. Int -> Int<u> — attach a unit (caller must annotate result)
+        // withUnit : ∀u. Int -> Int u — attach a unit (caller must annotate result)
         {
             let u = self.fresh_unit_var();
             self.bind_top(
@@ -8831,7 +8842,7 @@ impl Infer {
             );
         }
 
-        // stripFloatUnit : ∀u. Float<u> -> Float
+        // stripFloatUnit : ∀u. Float u -> Float
         {
             let u = self.fresh_unit_var();
             self.bind_top(
@@ -8850,7 +8861,7 @@ impl Infer {
             );
         }
 
-        // withFloatUnit : ∀u. Float -> Float<u>
+        // withFloatUnit : ∀u. Float -> Float u
         {
             let u = self.fresh_unit_var();
             self.bind_top(
@@ -8943,7 +8954,7 @@ impl Infer {
 
         // ── Bytes standard library ────────────────────────────────
 
-        // bytesLength : ∀u. Bytes -> Int<u>
+        // bytesLength : ∀u. Bytes -> Int u
         {
             let u = self.fresh_unit_var();
             let int_u = Ty::int_with_unit(UnitTy::var(u));
@@ -8960,7 +8971,7 @@ impl Infer {
             );
         }
 
-        // bytesSlice : ∀u1 u2. Int<u1> -> Int<u2> -> Bytes -> Bytes
+        // bytesSlice : ∀u1 u2. Int u1 -> Int u2 -> Bytes -> Bytes
         {
             let u1 = self.fresh_unit_var();
             let u2 = self.fresh_unit_var();
@@ -9042,7 +9053,7 @@ impl Infer {
             )),
         );
 
-        // bytesGet : ∀u1 u2. Int<u1> -> Bytes -> Maybe Int<u2>
+        // bytesGet : ∀u1 u2. Int u1 -> Bytes -> Maybe Int u2
         // `Maybe`, not a bare `Int`: the index is often attacker-supplied, so an
         // out-of-bounds read yields `Nothing {}` instead of aborting the process.
         {
@@ -9347,8 +9358,8 @@ impl Infer {
                             // the binop's result floats free of the return type
                             // at instantiation and end-of-inference resolution
                             // degrades to a vacuous `unify`, silently
-                            // mis-typing e.g. `scale 3.0<M> 4.0<M>` as
-                            // `Float<M>` instead of the `Float<M^2>` that
+                            // mis-typing e.g. `scale 3.0 M 4.0 M` as
+                            // `Float M` instead of the `Float (M^2)` that
                             // contradicts the `a -> a -> a` signature. (B12)
                             let skolem_set: HashSet<TyVar> = fresh_skolems.iter().copied().collect();
                             let unit_skolem_set: HashSet<UnitVar> = fresh_unit_skolems.iter().copied().collect();
@@ -9524,7 +9535,7 @@ impl Infer {
     }
 
     /// Type-check a route's `rateLimit <expr>` clause. The expression must
-    /// have type `{key: input -> RequestCtx -> Maybe a, limit: {requests: Int, window: Int<Ms>}}`
+    /// have type `{key: input -> RequestCtx -> Maybe a, limit: {requests: Int, window: Int Ms}}`
     /// for some `a`, where `input` is the same record the handler receives
     /// (path/query/body/headers fields). The runtime serializes the key via
     /// `show`, so no trait constraint is needed on `a`.
@@ -10060,7 +10071,7 @@ fn correspond_vars(
 
 /// Pair the unit variables of two structurally-parallel units by exponent
 /// (see `correspond_vars`). The common shape is a single variable per unit
-/// (`Float<u>`), which pairs unambiguously; ties within one exponent pair in
+/// (`Float u`), which pairs unambiguously; ties within one exponent pair in
 /// `BTreeMap` iteration order.
 fn correspond_unit_vars(
     from: &UnitTy,
@@ -10356,14 +10367,14 @@ fn display_ty_clean_inner(
         }
         Ty::Relation(inner) => format!("[{}]", display_ty_clean(inner, names, unit_names)),
         Ty::Con(name, args) => {
-            // Unit-bearing Int/Float → `Int<u>`/`Float<u>`, collapsing to
+            // Unit-bearing Int/Float → `Int u`/`Float u`, collapsing to
             // `Int`/`Float` when dimensionless.
             if (name == "Int" || name == "Float") && args.len() == 1 {
                 if let Ty::Unit(u) = args[0].peel_alias() {
                     if u.is_dimensionless() {
                         return name.clone();
                     }
-                    return format!("{}<{}>", name, display_unit_clean(u, unit_names));
+                    return format!("{} {}", name, display_unit_clean(u, unit_names));
                 }
             }
             if args.is_empty() {
@@ -10954,7 +10965,7 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
     // only be printed if it is captured here and emitted as a constant.
     let mut show_unit_strings = ShowUnitStrings::new();
     for (span, ty) in std::mem::take(&mut infer.show_calls) {
-        // Peel aliases so a refined/aliased numeric (`type Metres = Float<M>`)
+        // Peel aliases so a refined/aliased numeric (`type Metres = Float M`)
         // still shows its unit.
         let resolved = infer.apply(&ty);
         let unit = match resolved.peel_alias().unit_of() {
@@ -11288,6 +11299,7 @@ fn collect_alias_refs(
         ast::TypeKind::UnitAnnotated { base, .. } => {
             collect_alias_refs(base, alias_names, out);
         }
+        ast::TypeKind::Unit(_) => {}
         ast::TypeKind::Refined { base, .. } => {
             collect_alias_refs(base, alias_names, out);
         }
@@ -12299,70 +12311,70 @@ main = applyPred (\\r -> r.x == r.y)\
 
     #[test]
     fn unit_literal_typechecks() {
-        assert!(check_src("unit M\nmain = 42.0<M>").is_empty());
+        assert!(check_src("unit M\nmain = 42.0 M").is_empty());
     }
 
     #[test]
     fn unit_addition_same_unit() {
-        assert!(check_src("unit M\nmain = 10.0<M> + 5.0<M>").is_empty());
+        assert!(check_src("unit M\nmain = 10.0 M + 5.0 M").is_empty());
     }
 
     #[test]
     fn unit_addition_mismatch() {
-        let diags = check_src("unit M\nunit S\nmain = 10.0<M> + 5.0<S>");
+        let diags = check_src("unit M\nunit S\nmain = 10.0 M + 5.0 S");
         assert!(has_error(&diags, "unit mismatch"));
     }
 
     #[test]
     fn unit_multiplication_composes() {
         // M * M should not error (produces M^2)
-        assert!(check_src("unit M\nmain = 10.0<M> * 5.0<M>").is_empty());
+        assert!(check_src("unit M\nmain = 10.0 M * 5.0 M").is_empty());
     }
 
     #[test]
     fn unit_division_composes() {
         // M / S should not error (produces M/S)
-        assert!(check_src("unit M\nunit S\nmain = 100.0<M> / 10.0<S>").is_empty());
+        assert!(check_src("unit M\nunit S\nmain = 100.0 M / 10.0 S").is_empty());
     }
 
     #[test]
     fn unit_dimensionless_scalar_mul() {
-        // Float * Float<M> should produce Float<M>
-        assert!(check_src("unit M\nmain = 2.0 * 5.0<M>").is_empty());
+        // Float * Float M should produce Float M
+        assert!(check_src("unit M\nmain = 2.0 * 5.0 M").is_empty());
     }
 
     #[test]
     fn unit_in_type_annotation() {
-        assert!(check_src("unit M\nf : Float<M> -> Float<M>\nf = \\x -> x").is_empty());
+        assert!(check_src("unit M\nf : Float M -> Float M\nf = \\x -> x").is_empty());
     }
 
     #[test]
     fn unit_derived_alias() {
-        assert!(check_src("unit M\nunit S\nunit Mps = M / S\nmain = 10.0<Mps>").is_empty());
+        assert!(check_src("unit M\nunit S\nunit Mps = M / S\nmain = 10.0 Mps").is_empty());
     }
 
     #[test]
     fn unit_int_literal() {
-        assert!(check_src("unit Usd\nmain = 999<Usd>").is_empty());
+        assert!(check_src("unit Usd\nmain = 999 Usd").is_empty());
     }
 
     #[test]
     fn unit_int_addition_mismatch() {
-        let diags = check_src("unit Usd\nunit Eur\nmain = 100<Usd> + 50<Eur>");
+        let diags = check_src("unit Usd\nunit Eur\nmain = 100 Usd + 50 Eur");
         assert!(has_error(&diags, "unit mismatch"));
     }
 
     #[test]
     fn unit_in_record() {
         assert!(check_src(
-            "unit M\nunit S\nmain = {distance: 100.0<M>, time: 10.0<S>}"
+            "unit M\nunit S\nmain = {distance: 100.0 M, time: 10.0 S}"
         ).is_empty());
     }
 
     #[test]
     fn unit_expr_annotation() {
         // (expr : Type) syntax
-        let diags = check_src("unit M\nmain = (42.0 : Float<M>)");
+        let diags = check_src("unit M\nmain = (42.0 : Float M)");
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 
@@ -12371,7 +12383,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // avg should preserve the unit from the projection function
         let diags = check_src(
             "unit M\n\
-             main = avg (\\p -> p.x) [{x: 1.0<M>}, {x: 2.0<M>}] + 1.0<M>"
+             main = avg (\\p -> p.x) [{x: 1.0 M}, {x: 2.0 M}] + 1.0 M"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12381,16 +12393,16 @@ main = applyPred (\\r -> r.x == r.y)\
         // avg result has unit from projection — adding mismatched unit should fail
         let diags = check_src(
             "unit M\nunit S\n\
-             main = avg (\\p -> p.x) [{x: 1.0<M>}] + 1.0<S>"
+             main = avg (\\p -> p.x) [{x: 1.0 M}] + 1.0 S"
         );
-        assert!(!diags.is_empty(), "should reject adding Float<M> avg result to Float<S>");
+        assert!(!diags.is_empty(), "should reject adding Float M avg result to Float S");
     }
 
     #[test]
     fn unit_negation_preserves() {
         // Unary negation should preserve units
         let diags = check_src(
-            "unit M\nmain = -(5.0<M>) + 3.0<M>"
+            "unit M\nmain = -(5.0 M) + 3.0 M"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12400,9 +12412,9 @@ main = applyPred (\\r -> r.x == r.y)\
         // Function with concrete unit annotation (identity-style)
         let diags = check_src(
             "unit M\n\
-             wrap : Float<M> -> Float<M>\n\
+             wrap : Float M -> Float M\n\
              wrap = \\x -> x\n\
-             main = wrap 5.0<M>"
+             main = wrap 5.0 M"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12412,11 +12424,11 @@ main = applyPred (\\r -> r.x == r.y)\
         // Calling a concrete-annotated function with wrong unit should fail
         let diags = check_src(
             "unit M\nunit S\n\
-             wrap : Float<M> -> Float<M>\n\
+             wrap : Float M -> Float M\n\
              wrap = \\x -> x\n\
-             main = wrap 5.0<S>"
+             main = wrap 5.0 S"
         );
-        assert!(!diags.is_empty(), "should reject Float<S> for Float<M> param");
+        assert!(!diags.is_empty(), "should reject Float S for Float M param");
     }
 
     #[test]
@@ -12424,9 +12436,9 @@ main = applyPred (\\r -> r.x == r.y)\
         // Function with polymorphic unit variable should type-check
         let diags = check_src(
             "unit M\n\
-             double : Float<u> -> Float<u>\n\
+             double : Float u -> Float u\n\
              double = \\x -> x + x\n\
-             main = double 5.0<M>"
+             main = double 5.0 M"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12436,11 +12448,11 @@ main = applyPred (\\r -> r.x == r.y)\
         // Polymorphic unit annotation should reject unit mismatches
         let diags = check_src(
             "unit M\nunit S\n\
-             double : Float<u> -> Float<u>\n\
+             double : Float u -> Float u\n\
              double = \\x -> x + x\n\
-             main = double 5.0<M> + 1.0<S>"
+             main = double 5.0 M + 1.0 S"
         );
-        assert!(!diags.is_empty(), "should reject Float<M> + Float<S>");
+        assert!(!diags.is_empty(), "should reject Float M + Float S");
     }
 
     #[test]
@@ -12448,11 +12460,11 @@ main = applyPred (\\r -> r.x == r.y)\
         // Polymorphic unit function can be called with different units at different sites
         let diags = check_src(
             "unit M\nunit S\n\
-             double : Float<u> -> Float<u>\n\
+             double : Float u -> Float u\n\
              double = \\x -> x + x\n\
              main = do\n  \
-               let a = double 5.0<M>\n  \
-               let b = double 3.0<S>\n  \
+               let a = double 5.0 M\n  \
+               let b = double 3.0 S\n  \
                yield {}"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
@@ -12469,7 +12481,7 @@ main = applyPred (\\r -> r.x == r.y)\
             "type info should not leak raw unit vars: got {:?}",
             s
         );
-        assert_eq!(s, "Text -> Int<u>", "got {:?}", s);
+        assert_eq!(s, "Text -> Int u", "got {:?}", s);
     }
 
     // ── Refined types ─────────────────────────────────────────────
@@ -12621,8 +12633,8 @@ main = applyPred (\\r -> r.x == r.y)\
         // randomInt should preserve the unit from the bound argument
         let diags = check_src(
             "unit Usd\n\
-             f : IO {random} Int<Usd>\n\
-             f = randomInt 100<Usd>\n\
+             f : IO {random} Int Usd\n\
+             f = randomInt 100 Usd\n\
              main = 1"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
@@ -12633,8 +12645,8 @@ main = applyPred (\\r -> r.x == r.y)\
         // randomInt result has unit from bound — annotating with wrong unit should fail
         let diags = check_src(
             "unit Usd\nunit Eur\n\
-             f : IO {random} Int<Eur>\n\
-             f = randomInt 100<Usd>\n\
+             f : IO {random} Int Eur\n\
+             f = randomInt 100 Usd\n\
              main = 1"
         );
         assert!(has_error(&diags, "unit mismatch"));
@@ -12645,7 +12657,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // count result can unify with a unit context
         let diags = check_src(
             "unit N\n\
-             main = count [1, 2, 3] + 0<N>"
+             main = count [1, 2, 3] + 0 N"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12655,16 +12667,16 @@ main = applyPred (\\r -> r.x == r.y)\
         // length result can unify with a unit context
         let diags = check_src(
             "unit N\n\
-             main = length \"hello\" + 0<N>"
+             main = length \"hello\" + 0 N"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 
     #[test]
     fn unit_sleep_accepts_ms() {
-        // sleep accepts Int<Ms> (built-in unit)
+        // sleep accepts Int Ms (built-in unit)
         let diags = check_src(
-            "main = sleep 1000<Ms>"
+            "main = sleep 1000 Ms"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12674,16 +12686,16 @@ main = applyPred (\\r -> r.x == r.y)\
         // sleep requires Ms — passing a different unit should fail
         let diags = check_src(
             "unit Kg\n\
-             main = sleep 1000<Kg>"
+             main = sleep 1000 Kg"
         );
         assert!(has_error(&diags, "unit mismatch"));
     }
 
     #[test]
     fn unit_now_returns_ms() {
-        // now returns IO {clock} Int<Ms>
+        // now returns IO {clock} Int Ms
         let diags = check_src(
-            "f : IO {clock} Int<Ms>\n\
+            "f : IO {clock} Int Ms\n\
              f = now\n\
              main = 1"
         );
@@ -12692,10 +12704,10 @@ main = applyPred (\\r -> r.x == r.y)\
 
     #[test]
     fn unit_now_rejects_wrong_unit() {
-        // now returns Int<Ms> — annotating with wrong unit should fail
+        // now returns Int Ms — annotating with wrong unit should fail
         let diags = check_src(
             "unit Kg\n\
-             f : IO {clock} Int<Kg>\n\
+             f : IO {clock} Int Kg\n\
              f = now\n\
              main = 1"
         );
@@ -12706,7 +12718,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn strip_with_unit_int_round_trip() {
         let diags = check_src(
             "unit Ms\nunit S\n\
-             toS : Int<Ms> -> Int<S>\n\
+             toS : Int Ms -> Int S\n\
              toS = \\ms -> withUnit (stripUnit ms / 1000)\n\
              main = 1"
         );
@@ -12717,7 +12729,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn strip_unit_float() {
         let diags = check_src(
             "unit M\n\
-             f : Float<M> -> Float\n\
+             f : Float M -> Float\n\
              f = \\x -> stripFloatUnit x\n\
              main = 1"
         );
@@ -12728,7 +12740,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn with_unit_float() {
         let diags = check_src(
             "unit M\n\
-             f : Float -> Float<M>\n\
+             f : Float -> Float M\n\
              f = \\x -> withFloatUnit x\n\
              main = 1"
         );
@@ -12740,7 +12752,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // stripUnit is Int-only — passing a Float should fail
         let diags = check_src(
             "unit M\n\
-             f = stripUnit 1.0<M>\n\
+             f = stripUnit 1.0 M\n\
              main = 1"
         );
         assert!(!diags.is_empty());
@@ -12879,7 +12891,7 @@ main = applyPred (\\r -> r.x == r.y)\
     //
     // `serve` returns `Server Api _` (effect-row tail rendered as `_` when
     // polymorphic, `{effects}` when concrete). Internally Server carries an
-    // effect-row arg shared across every handler. `listen : Int<u> -> Server a
+    // effect-row arg shared across every handler. `listen : Int u -> Server a
     // r -> IO {network | r} {}` then unifies its row variable with the
     // server's row, so every handler effect surfaces in the type of the
     // program that calls `listen`.

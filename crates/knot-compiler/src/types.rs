@@ -438,6 +438,7 @@ fn collect_named_alias_refs(
         TypeKind::UnitAnnotated { base, .. } | TypeKind::Refined { base, .. } => {
             collect_named_alias_refs(base, alias_names, out);
         }
+        TypeKind::Unit(_) => {}
         TypeKind::Forall { ty, .. } => {
             collect_named_alias_refs(ty, alias_names, out);
         }
@@ -544,6 +545,7 @@ impl<'a> ReservedFieldWalker<'a> {
             TypeKind::UnitAnnotated { base, .. } | TypeKind::Refined { base, .. } => {
                 self.walk(base, seen)
             }
+            TypeKind::Unit(_) => {}
             TypeKind::Effectful { ty, .. } | TypeKind::IO { ty, .. } | TypeKind::Forall { ty, .. } => {
                 self.walk(ty, seen)
             }
@@ -1246,6 +1248,7 @@ fn resolve_type(
             // Units are phantom — erase for schema resolution
             resolve_type(base, aliases, assoc_types, single_variant_params)
         }
+        TypeKind::Unit(_) => ResolvedType::Named("unknown".into()),
         TypeKind::Refined { base, .. } => {
             // Refinements are phantom for schema — base type determines storage
             resolve_type(base, aliases, assoc_types, single_variant_params)
@@ -1641,6 +1644,7 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             base: Box::new(apply_type_subst(base, subst)),
             unit: unit.clone(),
         },
+        TypeKind::Unit(u) => TypeKind::Unit(u.clone()),
         TypeKind::Refined { base, predicate } => TypeKind::Refined {
             base: Box::new(apply_type_subst(base, subst)),
             predicate: predicate.clone(),

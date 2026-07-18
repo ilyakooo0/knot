@@ -111,10 +111,10 @@ HTTP body decoding, and explicit `refine expr`. Route handlers auto-return
 HTTP 400 on validation failure. See `examples/required_args.knot`.
 
 **Units of measure.** `unit Ms`, `unit Usd`, `unit N = Kg * M / S^2`.
-Numeric literals carry units via `42.0<M>` and `(expr : Int<Ms>)`. The
+Numeric literals carry units via `42.0 M` and `(expr : Int Ms)`. The
 compiler checks unit consistency through arithmetic. Most stdlib numeric
-functions are unit-polymorphic — `sleep` takes `Int<Ms>`, `now` returns
-`Int<Ms>`, `randomInt 100<Usd>` returns `Int<Usd>`.
+functions are unit-polymorphic — `sleep` takes `Int Ms`, `now` returns
+`Int Ms`, `randomInt 100 Usd` returns `Int Usd`.
 
 **Schema evolution.** A `<name>.schema.lock` file records the persisted
 schema. Adding nullable fields or ADT variants auto-updates; breaking

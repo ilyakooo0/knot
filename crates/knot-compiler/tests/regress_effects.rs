@@ -309,11 +309,11 @@ fn race_outside_atomic_allowed() {
     let diags = effect_diags(
         r#"
 slow = do
-  sleep 1000<Ms>
+  sleep 1000 Ms
   yield "slow"
 
 fast = do
-  sleep 50<Ms>
+  sleep 50 Ms
   yield "fast"
 
 main = do

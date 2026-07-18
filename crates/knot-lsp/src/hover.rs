@@ -604,7 +604,7 @@ fn unit_aware_section(ty: &str) -> Option<String> {
     // conversion helpers and the user has to pick the right one. `unit()`
     // only returns `Some` for `UnitAnnotated`, so discriminate on its base
     // type — a substring scan of the WHOLE type string would give Float
-    // advice for `g : Float -> Int<Ms>`.
+    // advice for `g : Float -> Int Ms`.
     let is_float = matches!(
         value,
         crate::parsed_type::ParsedType::UnitAnnotated { base, .. }
@@ -615,7 +615,7 @@ fn unit_aware_section(ty: &str) -> Option<String> {
     } else {
         ("stripUnit", "withUnit")
     };
-    let mut out = format!("**Units:** `<{unit_str}>`");
+    let mut out = format!("**Units:** `{unit_str}`");
     out.push_str(&format!(
         "  \n*Drop unit:* `{strip} v` — get the unitless number  \n*Re-tag:* `{with} v` — re-attach the inferred unit"
     ));
@@ -1019,24 +1019,24 @@ show2 = \x -> display x
 mod regress_fixes_tests {
     use super::*;
 
-    /// Item 12: Int<unit> results must get Int conversion advice even when
+    /// Item 12: Int unit results must get Int conversion advice even when
     /// the type string mentions Float elsewhere (e.g. in a parameter).
     #[test]
     fn unit_section_discriminates_on_annotated_component() {
-        let section = unit_aware_section("Float -> Int<Ms>").expect("unit section");
+        let section = unit_aware_section("Float -> Int Ms").expect("unit section");
         assert!(
             section.contains("stripUnit") && section.contains("withUnit"),
-            "expected Int advice for Int<Ms> result, got: {section}"
+            "expected Int advice for Int Ms result, got: {section}"
         );
         assert!(
             !section.contains("stripFloatUnit"),
             "Float advice leaked from a Float parameter: {section}"
         );
 
-        let f = unit_aware_section("Int -> Float<M>").expect("unit section");
+        let f = unit_aware_section("Int -> Float M").expect("unit section");
         assert!(
             f.contains("stripFloatUnit") && f.contains("withFloatUnit"),
-            "expected Float advice for Float<M> result, got: {f}"
+            "expected Float advice for Float M result, got: {f}"
         );
     }
 

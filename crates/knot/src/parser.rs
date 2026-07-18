@@ -1059,60 +1059,74 @@ impl Parser {
         }
     }
 
-    /// Try to parse `<unit_expr>` after a numeric literal or type name.
-    /// Returns `None` if the `<` doesn't start a unit annotation (falls through to comparison).
-    fn try_parse_unit_annotation(&mut self) -> Option<UnitExpr> {
-        if !matches!(self.peek(), TokenKind::Lt) {
-            return None;
+    /// Whether the next token can start a unit type argument: a bare unit
+    /// name (`M`, `u`), `1` (dimensionless), or `(` for a compound unit
+    /// expression (`M / S^2`). Used after `Float`/`Int` to decide whether to
+    /// parse a postfix unit argument.
+    fn can_start_unit_type_arg(&self) -> bool {
+        // Don't consume a unit arg when the next token is a migrate clause
+        // keyword (`to`/`using`) — `migrate *r from Int to Float ...` must
+        // not parse `Int to` as `Int` with unit `to`.
+        if self.stop_type_at_migrate_clauses
+            && matches!(self.peek(), TokenKind::Lower(s) if s == "to" || s == "using")
+        {
+            return false;
         }
-        // Check adjacency: no whitespace between previous token and `<`
-        let lt_span = self.span();
-        let prev_end = self.prev_span().end;
-        if lt_span.start != prev_end {
-            return None;
+        match self.peek() {
+            TokenKind::Upper(_) | TokenKind::Lower(_) | TokenKind::LParen => true,
+            TokenKind::Int(n) => n == "1",
+            _ => false,
         }
+    }
 
-        let saved = self.save();
-        let diag_count = self.diagnostics.len();
-        self.advance(); // consume `<`
-        // A unit body that is a single bare lowercase identifier (`<n>`) is
-        // syntactically also a valid value variable, so `5<n> …` is genuinely
-        // ambiguous with the chained comparison `(5 < n) > …`. Uppercase units
-        // (`<M>`), compound units (`<m/s>`), and powers (`<m^2>`) have no
-        // value-variable reading, so they are never ambiguous.
-        let body_is_bare_lower_ident = matches!(self.peek(), TokenKind::Lower(_))
-            && matches!(
-                self.tokens.get(self.pos + 1).map(|t| &t.kind),
-                Some(TokenKind::Gt)
-            );
-        if let Some(unit) = self.parse_unit_expr()
-            && matches!(self.peek(), TokenKind::Gt) {
-                let gt_end = self.span().end;
-                self.advance(); // consume `>`
-                // Disambiguate a real unit annotation (`5<M>`, `5<M> + x`) from
-                // a chained comparison (`5<n>0`, which is `(5 < n) > 0`).
-                // A unit literal's closing `>` is never followed by an atom:
-                //   - if an atom-starter abuts the `>` (no whitespace), the `>`
-                //     is a comparison operator regardless of the unit body; or
-                //   - for the ambiguous bare-lowercase-ident body, any following
-                //     atom (even whitespace-separated) means comparison — so
-                //     `5<n> 0` parses identically to `5<n>0`, not as a unit
-                //     literal applied to `0`. Concrete/compound units keep the
-                //     adjacency-only rule so `f 5<M> 0` still parses as
-                //     application of the unit-annotated literal.
-                let following_atom = self.can_start_atom();
-                let adjacent = self.span().start == gt_end;
-                if following_atom && (adjacent || body_is_bare_lower_ident) {
+    /// Parse a unit argument in type position: `M`, `u`, `1`, or
+    /// `(M / S^2)`. A bare identifier is a single unit atom; a parenthesized
+    /// form allows the full unit algebra (`* / ^`).
+    fn parse_unit_type_arg(&mut self) -> Option<UnitExpr> {
+        match self.peek() {
+            TokenKind::LParen => {
+                self.advance();
+                let inner = self.parse_unit_expr()?;
+                self.expect(&TokenKind::RParen, "expected ')' in unit argument").ok()?;
+                Some(inner)
+            }
+            _ => self.parse_unit_atom(),
+        }
+    }
+
+    /// Try to parse a postfix unit annotation on a numeric literal:
+    /// `42.0 M`, `999 Usd`, `9.8 (M / S^2)`. A bare identifier must be
+    /// UPPERCASE (a concrete unit) — lowercase identifiers are value
+    /// variables, and `42.0 u` would be application of a literal to a
+    /// variable (ill-typed but syntactically valid), not a unit annotation.
+    /// Lowercase unit variables (`u`) appear only in type annotations
+    /// (`Float u`), never as literal suffixes. A parenthesized form
+    /// (`(M / S^2)`) allows the full unit algebra.
+    fn try_parse_unit_annotation(&mut self) -> Option<UnitExpr> {
+        match self.peek() {
+            TokenKind::Upper(_) => {
+                // Bare uppercase unit — unambiguous.
+                self.parse_unit_type_arg()
+            }
+            TokenKind::Int(n) if n == "1" => {
+                // Dimensionless `1` unit.
+                self.parse_unit_type_arg()
+            }
+            TokenKind::LParen => {
+                // Parenthesized unit `(M / S^2)`. Could also be a parenthesized
+                // expression (`(\\s -> ...)`) — save/restore so a failed unit
+                // parse doesn't consume the `(`.
+                let saved = self.save();
+                let diag_count = self.diagnostics.len();
+                let result = self.parse_unit_type_arg();
+                if result.is_none() {
                     self.diagnostics.truncate(diag_count);
                     self.restore(saved);
-                    return None;
                 }
-                return Some(unit);
+                result
             }
-        // Not a unit annotation — restore
-        self.diagnostics.truncate(diag_count);
-        self.restore(saved);
-        None
+            _ => None,
+        }
     }
 
     // ── data ─────────────────────────────────────────────────────────
@@ -2915,7 +2929,7 @@ impl Parser {
                 ))
             }
             None => {
-                // Try unit annotation: `42.0<m>`, `999<usd>`
+                // Try unit annotation: `42.0 m`, `999 usd`
                 if let Some(unit) = self.try_parse_unit_annotation() {
                     let span = Span::new(lit.span.start, self.prev_span().end);
                     Some(Spanned::new(
@@ -4365,7 +4379,6 @@ impl Parser {
                 | TokenKind::LBrace
                 | TokenKind::LBracket
                 | TokenKind::LParen
-                | TokenKind::Lt
         )
     }
 
@@ -4458,18 +4471,24 @@ impl Parser {
                         },
                         span,
                     ))
-                } else if (name == "Float" || name == "Int") && matches!(self.peek(), TokenKind::Lt) {
-                    // Try Float<unit> or Int<unit> — no adjacency check in type context
+                } else if (name == "Float" || name == "Int")
+                    && self.can_start_unit_type_arg()
+                {
+                    // `Float M`, `Float u`, `Float (M / S^2)` — the unit is a
+                    // regular type-argument position parsed as a unit
+                    // expression. A bare Upper/Lower identifier is a unit
+                    // (`M`, `u`); a parenthesized form carries the algebraic
+                    // operators `* / ^`. A `(` could also start a parenthesized
+                    // type (`Float (Int -> Text)` is application, not a unit),
+                    // so save/restore on failure.
                     let saved = self.save();
                     let diag_count = self.diagnostics.len();
-                    self.advance(); // consume `<`
-                    if let Some(unit) = self.parse_unit_expr()
-                        && matches!(self.peek(), TokenKind::Gt) {
-                            self.advance(); // consume `>`
-                            let span = Span::new(tok.span.start, self.prev_span().end);
-                            let base = Box::new(Spanned::new(TypeKind::Named(name), tok.span));
-                            return Some(Spanned::new(TypeKind::UnitAnnotated { base, unit }, span));
-                        }
+                    let unit = self.parse_unit_type_arg();
+                    if let Some(unit) = unit {
+                        let span = Span::new(tok.span.start, self.prev_span().end);
+                        let base = Box::new(Spanned::new(TypeKind::Named(name), tok.span));
+                        return Some(Spanned::new(TypeKind::UnitAnnotated { base, unit }, span));
+                    }
                     self.diagnostics.truncate(diag_count);
                     self.restore(saved);
                     Some(Spanned::new(TypeKind::Named(name), tok.span))

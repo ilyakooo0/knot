@@ -7,13 +7,13 @@
   manages <- *manages
   yield (do
     m <- manages
-    yield {manager: m.manager, report: m.report})
+    yield { manager m.manager report m.report })
 
 main = do
   replace *manages = [
-    {manager: "Alice", report: "Bob"},
-    {manager: "Alice", report: "Carol"},
-    {manager: "Bob",   report: "Dave"}
+    { manager "Alice" report "Bob" },
+    { manager "Alice" report "Carol" },
+    { manager "Bob" report "Dave" }
   ]
   println "Direct reports:"
   rows <- &directReports

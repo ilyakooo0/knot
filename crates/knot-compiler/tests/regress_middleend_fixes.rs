@@ -78,16 +78,15 @@ fn maybe_comprehension_with_yield_var_compiles_and_runs() {
     // ("type mismatch: expected Maybe {age: Int 1}, found [t..]").
     let (stdout, stderr, ok) = compile_and_run(
         "maybe_yield_var",
-        r#"
-firstAdult : Maybe {age: Int 1} -> Maybe {age: Int 1}
+        r#"firstAdult : Maybe {age: Int 1} -> Maybe {age: Int 1}
 firstAdult = \m -> do
   u <- m
   where u.age >= 18
   yield u
 
 main = do
-  println (show (firstAdult (Just {value: {age: 30}})))
-  println (show (firstAdult (Just {value: {age: 10}})))
+  println (show (firstAdult (Just {value {age 30}})))
+  println (show (firstAdult (Just {value {age 10}})))
   println (show (firstAdult (Nothing {})))
 "#,
     );
@@ -109,14 +108,13 @@ fn maybe_comprehension_with_yield_field_control() {
     // always desugared — must keep working.
     let (stdout, stderr, ok) = compile_and_run(
         "maybe_yield_field",
-        r#"
-firstAge : Maybe {age: Int 1} -> Maybe Int 1
+        r#"firstAge : Maybe {age: Int 1} -> Maybe Int 1
 firstAge = \m -> do
   u <- m
   where u.age >= 18
   yield u.age
 
-main = println (show (firstAge (Just {value: {age: 30}})))
+main = println (show (firstAge (Just {value {age 30}})))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -133,17 +131,12 @@ fn source_bound_var_inner_do_still_pushes_down() {
     // preserved for SQL pushdown (and must produce the right answer).
     let (stdout, stderr, ok) = compile_and_run(
         "source_bound_var_inner_do",
-        r#"
-*people : [{name: Text, age: Int 1}]
+        r#"*people : [{name: Text, age: Int 1}]
 
 main = do
-  replace *people = [{name: "Alice", age: 30}, {name: "Bob", age: 10}, {name: "Cara", age: 44}]
+  replace *people = [{name "Alice" age 30}, {name "Bob" age 10}, {name "Cara" age 44}]
   rows <- *people
-  with {adults: do
-        p <- rows
-        where p.age >= 18
-        yield p} (do
-    println (show (count adults)))
+  with {adults (do p <- rows; where p.age >= 18; yield p)} (do println (show (count adults)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -242,13 +235,9 @@ fn effect_diags(source: &str) -> Vec<knot::diagnostic::Diagnostic> {
 #[test]
 fn shadowed_race_name_allowed_inside_atomic() {
     let diags = effect_diags(
-        r#"
-*items : [{n: Int 1}]
+        r#"*items : [{n: Int 1}]
 main = do
-  c <- atomic (do
-    rows <- *items
-    with {pick: \race -> count race} (do
-      yield (pick rows)))
+  c <- atomic (do rows <- *items; with {pick (\race -> count race)} (do yield (pick rows)))
   println (show c)
 "#,
     );
@@ -264,12 +253,9 @@ main = do
 #[test]
 fn do_bound_race_name_allowed_inside_atomic() {
     let diags = effect_diags(
-        r#"
-*items : [{n: Int 1}]
+        r#"*items : [{n: Int 1}]
 main = do
-  c <- atomic (do
-    race <- *items
-    yield (count race))
+  c <- atomic (do race <- *items; yield (count race))
   println (show c)
 "#,
     );
@@ -285,13 +271,9 @@ main = do
 #[test]
 fn real_race_still_rejected_inside_atomic() {
     let diags = effect_diags(
-        r#"
-*items : [{n: Int 1}]
+        r#"*items : [{n: Int 1}]
 main = do
-  c <- atomic (do
-    rows <- *items
-    r <- race (yield 1) (yield 2)
-    yield (count rows))
+  c <- atomic (do rows <- *items; r <- race (yield 1) (yield 2); yield (count rows))
   println (show c)
 "#,
     );

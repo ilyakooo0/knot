@@ -90,7 +90,7 @@ fn set_delete_where_with_top_level_constant_param() {
 maxAge = 5
 
 main = do
-  replace *items = [{age: 1}, {age: 9}]
+  replace *items = [{age 1}, {age 9}]
   *items = do
     t <- *items
     where t.age > maxAge
@@ -118,12 +118,8 @@ fn single_plan_with_do_local_let_param() {
         r#"*items : [{a: Int 1}]
 
 main = do
-  replace *items = [{a: 1}, {a: 2}]
-  with {r: single (with {lim: 1} (do
-    t <- *items
-    where t.a == lim
-    yield t))} (do
-    println (show r))
+  replace *items = [{a 1}, {a 2}]
+  with {r (single (with {lim 1} (do t <- *items; where t.a == lim; yield t)))} (do println (show r))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -144,10 +140,9 @@ fn pipe_take_with_top_level_constant_param() {
 limitN = 2
 
 main = do
-  replace *items = [{a: 1}, {a: 2}, {a: 3}]
+  replace *items = [{a 1}, {a 2}, {a 3}]
   rows <- *items
-  with {firstTwo: rows |> take limitN} (do
-    println ("took: " ++ show (count firstTwo)))
+  with {firstTwo (rows |> take limitN)} (do println ("took: " ++ show (count firstTwo)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -167,9 +162,8 @@ fn count_filter_with_top_level_constant_param() {
 cutoff = 3
 
 main = do
-  replace *items = [{age: 1}, {age: 4}, {age: 9}]
-  with {n: count (filter (\t -> t.age > cutoff) *items)} (do
-    println ("n: " ++ show n))
+  replace *items = [{age 1}, {age 4}, {age 9}]
+  with {n (count (filter (\t -> t.age > cutoff) *items))} (do println ("n: " ++ show n))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -218,8 +212,8 @@ impl Eq Pt where
   eq a = \b -> a.x == b.x
 
 main = do
-  println (show (Pt {x: 1, y: 2} == Pt {x: 1, y: 9}))
-  println (show (Pt {x: 1, y: 2} == Pt {x: 5, y: 2}))
+  println (show (Pt {x 1 y 2} == Pt {x 1 y 9}))
+  println (show (Pt {x 1 y 2} == Pt {x 5 y 2}))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -234,16 +228,14 @@ fn trait_default_method_lambda_body_param_count() {
     // Same bug class for trait defaults written as lambda-bound constants.
     let (stdout, stderr, ok) = compile_and_run(
         "trait_default_lambda_params",
-        r#"data Box
-  = Box {n: Int 1}
-  deriving (Tag)
+        r#"data Box = Box {n: Int 1} deriving (Tag)
 
 trait Tag a where
   tag : a -> Text
   tag = \x -> "default"
 
 main = do
-  println (tag (Box {n: 1}))
+  println (tag (Box {n 1}))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -293,8 +285,7 @@ fn user_primitive_eq_applies_inside_conditions() {
   eq a b = true
 
 main = do
-  with {msg: if 1 == 2 then "impl" else "fallback"} (do
-    println msg)
+  with {msg (if 1 == 2 then "impl" else "fallback")} (do println msg)
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -363,12 +354,8 @@ fn let_bound_relation_comprehension_materializes() {
         r#"*items : [{age: Int 1}]
 
 main = do
-  replace *items = [{age: 1}, {age: 9}]
-  with {xs: do
-    t <- *items
-    where t.age > 3
-    yield t} (do
-    println (show (count xs)))
+  replace *items = [{age 1}, {age 9}]
+  with {xs (do t <- *items; where t.age > 3; yield t)} (do println (show (count xs)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -385,8 +372,7 @@ fn let_bound_external_io_stays_deferred() {
     let (stdout, stderr, ok) = compile_and_run(
         "let_io_deferred",
         r#"main = do
-  with {action: println "hi"} (do
-    action)
+  with {action (println "hi")} (do action)
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -402,8 +388,7 @@ fn let_bound_unused_external_io_never_runs() {
     let (stdout, stderr, ok) = compile_and_run(
         "let_io_unused",
         r#"main = do
-  with {action: println "never"} (do
-    println "done")
+  with {action (println "never")} (do println "done")
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -424,16 +409,12 @@ fn thirteen_param_function_curries_in_order() {
     // Separators make any arg-order scrambling visible.
     let (stdout, stderr, ok) = compile_and_run(
         "tramp_13_params",
-        r#"f13 = \a b c d e f g h i j k l m ->
-  show a ++ "." ++ show b ++ "." ++ show c ++ "." ++ show d ++ "." ++
-  show e ++ "." ++ show f ++ "." ++ show g ++ "." ++ show h ++ "." ++
-  show i ++ "." ++ show j ++ "." ++ show k ++ "." ++ show l ++ "." ++ show m
+        r#"f13 = \a b c d e f g h i j k l m -> show a ++ "." ++ show b ++ "." ++ show c ++ "." ++ show d ++ "." ++ show e ++ "." ++ show f ++ "." ++ show g ++ "." ++ show h ++ "." ++ show i ++ "." ++ show j ++ "." ++ show k ++ "." ++ show l ++ "." ++ show m
 
 apply = \g x -> g x
 
 main = do
-  with {g: f13} (do
-    println (apply (g 1 2 3 4 5 6 7 8 9 10 11 12) 13))
+  with {g f13} (do println (apply (g 1 2 3 4 5 6 7 8 9 10 11 12) 13))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -475,18 +456,17 @@ impl Eq Level where
   eq = \a b -> show a == show b
 impl Ord Level where
   compare = \a b -> case a of
-    Low x -> (case b of
+    Low x -> case b of
       Low y -> EQ {}
-      _ -> LT {})
-    High x -> (case b of
+      _ -> LT {}
+    High x -> case b of
       High y -> EQ {}
-      _ -> GT {})
+      _ -> GT {}
 type T = {lvl: Level, n: Int 1}
 *t : [T]
 main = do
-  replace *t = [{lvl: Low {}, n: 1}, {lvl: High {}, n: 2}]
-  with {top: maxOn (\r -> r.lvl) *t} (do
-    println ("top: " ++ show top))
+  replace *t = [{lvl (Low {}) n 1}, {lvl (High {}) n 2}]
+  with {top (maxOn (\r -> r.lvl) *t)} (do println ("top: " ++ show top))
 "#,
     );
     assert!(
@@ -509,11 +489,8 @@ fn atomic_loop_where_guard_skip_keeps_prior_writes() {
         "atomic_loop_where_skip",
         r#"*log : [{id: Int 1}]
 
-process = atomic do
-  with {items: [{id: 10, keep: true}, {id: 20, keep: false}]} (do
-    row <- items
-    where row.keep
-    *log = union *log [{id: row.id}])
+process = atomic (do
+  with {items [{id 10 keep true}, {id 20 keep false}]} (do row <- items; where row.keep; *log = union *log [{id row.id}]))
 
 main = do
   replace *log = []
@@ -539,10 +516,8 @@ fn atomic_loop_ctor_mismatch_skip_keeps_prior_writes() {
         r#"data Shape = Circle {r: Int 1} | Square {s: Int 1}
 *log : [{r: Int 1}]
 
-process = atomic do
-  with {shapes: [Circle {r: 7}, Square {s: 3}]} (do
-    Circle c <- shapes
-    *log = union *log [{r: c.r}])
+process = atomic (do
+  with {shapes [Circle {r 7}, Square {s 3}]} (do Circle c <- shapes; *log = union *log [{r c.r}]))
 
 main = do
   replace *log = []
@@ -574,13 +549,13 @@ fn view_where_filter_restricts_reads_and_fills_writes() {
 *aliceAccounts = do
   a <- *accounts
   where a.owner == "alice"
-  yield {balance: a.balance}
+  yield {balance a.balance}
 
 main = do
-  replace *accounts = [{owner: "alice", balance: 1}, {owner: "bob", balance: 2}]
+  replace *accounts = [{owner "alice" balance 1}, {owner "bob" balance 2}]
   filtered <- *aliceAccounts
   println ("read: " ++ show (count filtered))
-  *aliceAccounts = [{balance: 7}]
+  *aliceAccounts = [{balance 7}]
   all <- *accounts
   forEach all (\r -> println ("row: " ++ r.owner ++ ":" ++ show r.balance))
 "#,
@@ -617,8 +592,7 @@ fn local_param_shadowing_user_fn_is_called() {
         r#"helper = \x -> x + 1
 run = \helper -> helper 5
 main = do
-  with {r: run (\y -> y * 100)} (do
-    println (show r))
+  with {r (run (\y -> y * 100))} (do println (show r))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -636,8 +610,7 @@ fn local_param_shadowing_stdlib_fn_is_called() {
     let (stdout, stderr, ok) = compile_and_run(
         "shadow_stdlib_fn",
         r#"apply2 = \count -> count 7
-main = with {r: apply2 (\n -> n * 2)} (do
-  println (show r))
+main = with {r (apply2 (\n -> n * 2))} (do println (show r))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -697,12 +670,12 @@ fn when_false_does_not_run_relation_write() {
 flag = false
 
 main = do
-  replace *items = [{a: 1}, {a: 2}]
-  when false (replace *items = [{a: 99}])
+  replace *items = [{a 1}, {a 2}]
+  when false (replace *items = [{a 99}])
   unless true (replace *items = [])
-  when flag (*items = union *items [{a: 99}])
-  when false do
-    replace *items = [{a: 99}]
+  when flag (*items = union *items [{a 99}])
+  when false (do
+    replace *items = [{a 99}])
   rows <- *items
   println ("count: " ++ show (count rows))
 "#,
@@ -726,10 +699,10 @@ fn when_true_still_runs_relation_write_exactly_once() {
 flag = true
 
 main = do
-  replace *items = [{a: 1}]
-  when true (*items = union *items [{a: 2}])
-  unless false (*items = union *items [{a: 3}])
-  when flag (*items = union *items [{a: 4}])
+  replace *items = [{a 1}]
+  when true (*items = union *items [{a 2}])
+  unless false (*items = union *items [{a 3}])
+  when flag (*items = union *items [{a 4}])
   rows <- *items
   println ("count: " ++ show (count rows))
 "#,
@@ -758,7 +731,7 @@ fn bind_bound_source_comprehension_yields_all_rows() {
         r#"*items : [{k: Text, v: Int 1}]
 
 main = do
-  replace *items = [{k: "a", v: 1}, {k: "b", v: 5}, {k: "c", v: 9}]
+  replace *items = [{k "a" v 1}, {k "b" v 5}, {k "c" v 9}]
 
   -- first row (v = 1) fails the filter: the guard reading used to bail out
   -- of the whole block and yield {}
@@ -766,10 +739,10 @@ main = do
     r <- *items
     where r.v > 3
     yield r.k
-  with {letted: do
+  with {letted (do
     r <- *items
     where r.v > 3
-    yield r.k} (do
+    yield r.k)} (do
 
     -- first row passes: the guard reading yielded just that one row's value
     -- ("a") instead of accumulating every match
@@ -825,7 +798,7 @@ adults = do
   yield p.name
 
 main = do
-  replace *people = [{name: "Alice", age: 30}, {name: "Bob", age: 25}, {name: "Carol", age: 35}]
+  replace *people = [{name "Alice" age 30}, {name "Bob" age 25}, {name "Carol" age 35}]
 
   -- the comprehension tail: `where` is a per-row filter, not a guard on row 1
   names <- adults
@@ -880,7 +853,7 @@ fn set_value_comprehension_inside_if_branch() {
 *items : [{name: Text}]
 
 main = do
-  replace *other = [{name: "a"}, {name: "b"}]
+  replace *other = [{name "a"}, {name "b"}]
   replace *items =
     if True
       then do
@@ -909,7 +882,7 @@ main = do
       then do
         x <- *other
         yield x
-      else [{name: "z"}]
+      else [{name "z"}]
   lit <- *items
   println ("lit: " ++ show lit)
 "#,
@@ -926,7 +899,7 @@ main = do
         "a nested else-branch comprehension must write every row, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("lit: [{name: z}]"),
+        stdout.contains("lit : [{name: z}]\n"),
         "a non-comprehension branch must still write its own value, got:\n{stdout}"
     );
 }
@@ -936,27 +909,25 @@ fn set_value_comprehension_inside_case_arm() {
     // Same defect via `case`: the arm bodies are set values too.
     let (stdout, stderr, ok) = compile_and_run(
         "set_case_arm_comprehension",
-        r#"data Mode = Copy | Clear
+        r#"data Mode = Copy {} | Clear {}
 
 *other : [{name: Text}]
 *items : [{name: Text}]
 
 main = do
-  replace *other = [{name: "a"}, {name: "b"}]
-  replace *items =
-    case Copy of
-      Copy -> do
-        x <- *other
-        yield x
-      Clear -> []
+  replace *other = [{name "a"}, {name "b"}]
+  replace *items = case Copy of
+    Copy {} -> do
+      x <- *other
+      yield x
+    Clear {} -> []
   copied <- *items
   println ("copy: " ++ show (count copied))
-  replace *items =
-    case Clear of
-      Copy -> do
-        x <- *other
-        yield x
-      Clear -> []
+  replace *items = case Clear of
+    Copy {} -> do
+      x <- *other
+      yield x
+    Clear {} -> []
   cleared <- *items
   println ("clear: " ++ show (count cleared))
 "#,

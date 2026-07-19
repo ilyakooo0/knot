@@ -22,7 +22,7 @@ case2 = do
 -- 3. filter then count, with predicate via helper.
 case3 = do
   emps <- *employees
-  with {filtered: emps |> filter (\e -> isHighEarner e)}
+  with { filtered (emps |> filter (\e -> isHighEarner e)) }
     (yield (count filtered))
 
 -- 4. filter using a curried helper.
@@ -37,11 +37,11 @@ case5 = do
 
 main = do
   replace *employees = [
-    {name: "Alice", dept: "Eng", salary: 90},
-    {name: "Bob", dept: "Eng", salary: 80},
-    {name: "Carol", dept: "Sales", salary: 70},
-    {name: "Dave", dept: "Sales", salary: 60},
-    {name: "Eve", dept: "Eng", salary: 100}
+    { name "Alice" dept "Eng" salary 90 },
+    { name "Bob" dept "Eng" salary 80 },
+    { name "Carol" dept "Sales" salary 70 },
+    { name "Dave" dept "Sales" salary 60 },
+    { name "Eve" dept "Eng" salary 100 }
   ]
   c1 <- case1
   println ("case1: " ++ show c1)

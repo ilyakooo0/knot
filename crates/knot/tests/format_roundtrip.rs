@@ -198,7 +198,7 @@ fn inline_case_in_list() {
 
 #[test]
 fn inline_case_in_record() {
-    let src = "f = \\x -> {v: (case x of\n  A {} -> 1\n  B {} -> 2), w: 3}\n";
+    let src = "f = \\x -> {v (case x of\n  A {} -> 1\n  B {} -> 2) w 3}\n";
     check_str("inline_case_record", src);
 }
 
@@ -212,7 +212,7 @@ fn inline_do_in_list() {
 
 #[test]
 fn inline_do_in_record() {
-    check_str("do_record", "f = {a: (do yield 1), b: 2}\n");
+    check_str("do_record", "f = {a (do yield 1) b 2}\n");
 }
 
 #[test]
@@ -388,19 +388,19 @@ fn export_survives_verbatim_comment_fallback() {
 fn set_as_function_argument_keeps_parens() {
     let out = check_str(
         "set_arg",
-        "*counters : [{n: Int}]\nmain = fork (*counters = [{n: 1}])\n",
+        "*counters : [{n: Int}]\nmain = fork (*counters = [{n 1}])\n",
     );
-    assert!(out.contains("fork (*counters = [{n: 1}])"), "output: {}", out);
+    assert!(out.contains("fork (*counters = [{n 1}])"), "output: {}", out);
 }
 
 #[test]
 fn replace_set_as_function_argument_keeps_parens() {
     let out = check_str(
         "replace_set_arg",
-        "*counters : [{n: Int}]\nmain = fork (replace *counters = [{n: 1}])\n",
+        "*counters : [{n: Int}]\nmain = fork (replace *counters = [{n 1}])\n",
     );
     assert!(
-        out.contains("fork (replace *counters = [{n: 1}])"),
+        out.contains("fork (replace *counters = [{n 1}])"),
         "output: {}",
         out
     );
@@ -416,9 +416,9 @@ fn set_with_multiline_value_keeps_parens() {
 
 #[test]
 fn set_at_statement_head_stays_bare() {
-    let src = "*counters : [{n: Int}]\nmain = do\n  *counters = [{n: 1}]\n  yield 1\n";
+    let src = "*counters : [{n: Int}]\nmain = do\n  *counters = [{n 1}]\n  yield 1\n";
     let out = check_str("set_head", src);
-    assert!(out.contains("  *counters = [{n: 1}]"), "output: {}", out);
+    assert!(out.contains("*counters = [{n 1}]\n"), "output: {}", out);
     assert!(!out.contains("(*counters"), "unnecessary parens: {}", out);
 }
 
@@ -462,7 +462,7 @@ fn simple_patterns_stay_minimal() {
 
 #[test]
 fn migrate_round_trips_multiline() {
-    let src = "migrate *orders\n  from [{customer: Text}]\n  to [{customer: Text, amount: Int}]\n  using \\o -> {customer: o.customer, amount: 0}\n";
+    let src = "migrate *orders\n  from [{customer: Text}]\n  to [{customer: Text, amount: Int}]\n  using \\o -> {customer o.customer amount 0}\n";
     let out = check_str("migrate", src);
     assert!(out.contains("migrate *orders\n"), "output: {}", out);
     assert!(out.contains("\n  from "), "output: {}", out);
@@ -475,7 +475,7 @@ fn migrate_single_line_parses_and_reformats() {
     // The parser now stops type application at the `to`/`using` clause
     // keywords, so the single-line form parses; the formatter normalizes
     // it to the multi-line layout.
-    let src = "migrate *orders from [{customer: Text}] to [{customer: Text, amount: Int}] using \\o -> {customer: o.customer, amount: 0}\n";
+    let src = "migrate *orders from [{customer: Text}] to [{customer: Text, amount: Int}] using \\o -> {customer o.customer amount 0}\n";
     let out = check_str("migrate_single_line", src);
     assert!(out.contains("migrate *orders\n  from"), "output: {}", out);
 }

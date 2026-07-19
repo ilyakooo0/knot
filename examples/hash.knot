@@ -11,11 +11,11 @@ main = do
   println (bytesToHex (hash "abc"))
 
   -- Records: equal records hash equal
-  println (bytesToHex (hash {x: 1, y: 2}))
-  println (bytesToHex (hash {x: 1, y: 2}))
+  println (bytesToHex (hash { x 1 y 2 }))
+  println (bytesToHex (hash { x 1 y 2 }))
 
   -- Different records hash differently
-  println (bytesToHex (hash {x: 1, y: 3}))
+  println (bytesToHex (hash { x 1 y 3 }))
 
   -- Numbers, booleans, lists also work
   println (bytesToHex (hash 42))

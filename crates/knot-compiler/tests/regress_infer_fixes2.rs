@@ -68,10 +68,10 @@ fn literal_payload_does_not_cover_constructor() {
         r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 
 describe = \s -> case s of
-  Circle {radius: 1.0} -> "unit circle"
+  Circle {radius 1.0} -> "unit circle"
   Rect r -> "rect"
 
-main = println (describe (Circle {radius: 2.0}))
+main = println (describe (Circle {radius 2.0}))
 "#,
     );
     assert!(
@@ -92,11 +92,11 @@ fn wildcard_fixes_literal_payload_match() {
         r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 
 describe = \s -> case s of
-  Circle {radius: 1.0} -> "unit circle"
+  Circle {radius 1.0} -> "unit circle"
   Rect r -> "rect"
   _ -> "other"
 
-main = println (describe (Circle {radius: 2.0}))
+main = println (describe (Circle {radius 2.0}))
 "#,
     );
     assert_clean(&diags);
@@ -109,9 +109,9 @@ fn irrefutable_payloads_still_exhaustive() {
 
 describe = \s -> case s of
   Circle c -> "circle"
-  Rect {width: w, height: h} -> "rect"
+  Rect {width w height h} -> "rect"
 
-main = println (describe (Circle {radius: 2.0}))
+main = println (describe (Circle {radius 2.0}))
 "#,
     );
     assert_clean(&diags);
@@ -126,9 +126,9 @@ fn nested_constructor_payload_does_not_cover() {
 data Wrapper = Wrap {s: Shape}
 
 unwrap = \w -> case w of
-  Wrap {s: Circle c} -> c.radius
+  Wrap {s (Circle c)} -> c.radius
 
-main = println (show (unwrap (Wrap {s: Circle {radius: 1.0}})))
+main = println (show (unwrap (Wrap {s (Circle {radius 1.0})})))
 "#,
     );
     assert!(
@@ -178,17 +178,8 @@ fn groupby_comprehension_types_as_io_relation() {
         r#"*todos : [{title: Text, owner: Text, done: Int 1}]
 
 main = do
-  replace *todos = [{title: "a", owner: "Alice", done: 0}]
-  with {workload: do
-    t <- *todos
-    where t.done == 0
-    groupBy {t.owner}
-    yield {owner: t.owner, n: count t}}
-    (do
-      c <- println (show (count workload))
-      w <- workload
-      p <- println (w.owner ++ ": " ++ show w.n)
-      yield {})
+  replace *todos = [{title "a" owner "Alice" done 0}]
+  with {workload (do t <- *todos; where t.done == 0; groupBy {owner t.owner}; yield {owner t.owner n (count t)})} (do c <- println (show (count workload)); w <- workload; p <- println (w.owner ++ ": " ++ show w.n); yield {})
 "#,
     );
     assert_clean(&diags);
@@ -283,8 +274,7 @@ takesPoly = \f -> f 1
 
 g = \h -> takesPoly h
 
-main = with {r: g (\x -> x + 1)}
-  (println (show r))
+main = with {r (g (\x -> x + 1))} println (show r)
 "#,
     );
     assert!(
@@ -324,8 +314,7 @@ type Nat = Int 1 where \x -> x >= 0
 
 main = do
   x <- []
-  with {n: foo x, r: ((refine x) : Result RefinementError Nat)}
-    (yield n)
+  with {n (foo x) r ((refine x) : Result RefinementError Nat)} yield n
 "#,
     );
     assert!(
@@ -343,10 +332,10 @@ fn alias_with_free_var_usable_at_two_types() {
         r#"type Box = {val: a}
 
 b1 : Box
-b1 = {val: 1}
+b1 = {val 1}
 
 b2 : Box
-b2 = {val: "s"}
+b2 = {val "s"}
 
 main = println "ok"
 "#,
@@ -406,7 +395,7 @@ fn fetchwith_bad_options_rejected() {
   GET /users/{id: Int 1} -> {name: Text} = GetUser
 
 main = do
-  r <- fetchWith "http://localhost:1" 42 (GetUser {id: 1})
+  r <- fetchWith "http://localhost:1" 42 (GetUser {id 1})
   yield {}
 "#,
     );
@@ -424,7 +413,7 @@ fn fetchwith_headers_options_accepted() {
   GET /users/{id: Int 1} -> {name: Text} = GetUser
 
 main = do
-  r <- fetchWith "http://localhost:1" {headers: [{name: "X-A", value: "b"}]} (GetUser {id: 1})
+  r <- fetchWith "http://localhost:1" {headers [{name "X-A" value "b"}]} (GetUser {id 1})
   yield {}
 "#,
     );
@@ -439,7 +428,7 @@ fn fetch_on_non_route_constructor_rejected() {
         r#"data Foo = Mk {x: Int 1}
 
 main = do
-  r <- fetch "http://localhost:1" (Mk {x: 1})
+  r <- fetch "http://localhost:1" (Mk {x 1})
   yield {}
 "#,
     );
@@ -481,7 +470,7 @@ fn fetchwith_bare_nullary_route_constructor_accepted() {
   GET /users/{id: Int 1} -> {name: Text} = GetUser
 
 main = do
-  r <- fetchWith "http://localhost:1" {headers: [{name: "X-A", value: "b"}]} Health
+  r <- fetchWith "http://localhost:1" {headers [{name "X-A" value "b"}]} Health
   yield {}
 "#,
     );

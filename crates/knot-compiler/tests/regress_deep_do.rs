@@ -53,7 +53,7 @@ fn deep_comprehension(depth: usize) -> String {
         src.push_str(&format!("  x{i} <- nums\n"));
     }
     src.push_str("  where x0 > 0\n");
-    src.push_str("  yield {v: x0}\n\nmain = println (count res)\n");
+    src.push_str("  yield {v x0}\n\nmain = println (count res)\n");
     src
 }
 

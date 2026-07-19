@@ -107,10 +107,7 @@ fn show_appends_unit_computed_by_unit_algebra() {
     // post-inference pass reads the call site.
     let stdout = compile_and_run(
         "algebra",
-        r#"
-main = with {distance: (100.0 : Float M), time: (4.0 : Float S)} (do
-  println (show (distance / time))
-  println (show (2.5 : Float Speed)))
+        r#"main = with {distance (100.0 : Float M) time (4.0 : Float S)} (do println (show (distance / time)); println (show (2.5 : Float Speed)))
 "#,
     );
     assert_printed(&stdout, "25.0 M/S");

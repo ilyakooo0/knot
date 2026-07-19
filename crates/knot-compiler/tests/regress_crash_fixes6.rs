@@ -87,12 +87,11 @@ fn deeply_nested_forall_reports_diagnostic_not_stack_overflow() {
 
 #[test]
 fn view_with_non_equality_where_reports_diagnostic_not_panic() {
-    let src = r#"
-*people = [{name: "a", age: 30}]
+    let src = r#"*people = [{name "a" age 30}]
 *adults = do
   p <- *people
   where p.age > 18
-  yield {name: p.name}
+  yield {name p.name}
 main = 0
 "#;
     let stderr = build_graceful_error("view_non_eq_where", src);
@@ -107,27 +106,18 @@ fn join_applies_all_predicates() {
     // `z` equi-joins to both `x` and `y`; only the row satisfying BOTH
     // `z.ka == x.k` AND `z.kb == y.k` (v = "GOOD") should survive. The row with
     // `ka = 99` (no matching `x.k`) must be filtered out.
-    let src = r#"
-*a : [{k: Int 1}]
+    let src = r#"*a : [{k: Int 1}]
 *b : [{k: Int 1}]
 *c : [{ka: Int 1, kb: Int 1, v: Text}]
 
 main = do
-  replace *a = [{k: 1}, {k: 2}]
-  replace *b = [{k: 10}, {k: 20}]
-  replace *c = [{ka: 1, kb: 10, v: "GOOD"}, {ka: 99, kb: 20, v: "BAD"}]
+  replace *a = [{k 1}, {k 2}]
+  replace *b = [{k 10}, {k 20}]
+  replace *c = [{ka 1 kb 10 v "GOOD"}, {ka 99 kb 20 v "BAD"}]
   as <- *a
   bs <- *b
   cs <- *c
-  with {joined: do
-    x <- as
-    y <- bs
-    z <- cs
-    where z.ka == x.k
-    where z.kb == y.k
-    yield z.v} (do
-    r <- joined
-    println (show r))
+  with {joined (do x <- as; y <- bs; z <- cs; where z.ka == x.k; where z.kb == y.k; yield z.v)} (do r <- joined; println (show r))
 "#;
     let s = scratch("join_predicates");
     let out = run_build(&s.dir, src);

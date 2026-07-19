@@ -155,7 +155,10 @@ fn reserved_field_in_migrate_type_rejected() {
         r#"type Old = {_id: Int 1, name: Text}
 type New = {name: Text}
 *people : [New]
-migrate *people from [Old] to [New] using \p -> {name: p.name}
+migrate *people
+  from [Old]
+  to [New]
+  using \p -> {name p.name}
 main = 1
 "#,
     );
@@ -246,7 +249,7 @@ type Post = {_id: Int 1, title: Text, tags: [Tag]}
 *posts : [Post]
 
 main = do
-  replace *posts = [{_id: 1, title: "hi", tags: [{label: "x"}]}]
+  replace *posts = [{_id 1 title "hi" tags [{label "x"}]}]
   p <- *posts
   yield p.title
 "#,

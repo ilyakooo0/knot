@@ -2045,7 +2045,7 @@ mod tests {
 
 removeWhere = \xs pred -> do
   m <- xs
-  where not (pred m)
+  where not pred m
   yield m
 
 main = do
@@ -2060,7 +2060,7 @@ main = do
 
 removeWhere = \xs pred -> do
   m <- xs
-  where not (pred m)
+  where not pred m
   yield m
 
 main = do

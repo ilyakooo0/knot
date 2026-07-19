@@ -1461,13 +1461,12 @@ mod tests {
 
     #[test]
     fn mixed_do_block_not_desugared() {
-        let src = r#"
-            *people : [{name: Text, age: Int 1}]
-            main = do
-              *people = [{name: "Alice", age: 30}]
-              p <- *people
-              yield p.name
-        "#;
+        let src = r#"*people : [{name: Text, age: Int 1}]
+main = do
+  *people = [{name "Alice" age 30}]
+  p <- *people
+  yield p.name
+"#;
         let mut module = parse(src);
         desugar(&mut module);
         // The main body should still be a Do block (mixed: has set + bind)
@@ -1482,13 +1481,11 @@ mod tests {
 
     #[test]
     fn set_value_do_not_desugared() {
-        let src = r#"
-            *todos : [{title: Text, done: Int 1}]
-            complete = \title ->
-              *todos = do
-                t <- *todos
-                yield (if t.title == title then {t | done: 1} else t)
-        "#;
+        let src = r#"*todos : [{title: Text, done: Int 1}]
+complete = \title -> *todos = do
+  t <- *todos
+  yield (if t.title == title then {t | done 1} else t)
+"#;
         let mut module = parse(src);
         desugar(&mut module);
         // The set value should still be a Do block
@@ -1529,13 +1526,12 @@ mod tests {
     fn sql_compilable_do_preserved() {
         // SQL-compilable do-blocks (Bind→SourceRef + Where + Yield(Var))
         // are preserved as Do nodes for codegen to compile to SQL.
-        let src = r#"
-            *items : [{x: Int 1}]
-            filtered = do
-              i <- *items
-              where i.x > 0
-              yield i
-        "#;
+        let src = r#"*items : [{x: Int 1}]
+filtered = do
+  i <- *items
+  where i.x > 0
+  yield i
+"#;
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
@@ -1571,13 +1567,12 @@ mod tests {
 
     #[test]
     fn groupby_do_not_desugared() {
-        let src = r#"
-            *items : [{x: Int 1, cat: Text}]
-            grouped = do
-              i <- *items
-              groupBy {i.cat}
-              yield {cat: i.cat, n: count i}
-        "#;
+        let src = r#"*items : [{x: Int 1, cat: Text}]
+grouped = do
+  i <- *items
+  groupBy {cat i.cat}
+  yield {cat i.cat n (count i)}
+"#;
         let mut module = parse(src);
         desugar(&mut module);
         // groupBy do blocks must stay as Do nodes (loop-based codegen)
@@ -1594,15 +1589,14 @@ mod tests {
 
     #[test]
     fn multi_table_sql_compilable_preserved() {
-        let src = r#"
-            *employees : [{name: Text, dept: Text}]
-            *departments : [{name: Text, budget: Int 1}]
-            joined = do
-              e <- *employees
-              d <- *departments
-              where e.dept == d.name
-              yield {name: e.name, budget: d.budget}
-        "#;
+        let src = r#"*employees : [{name: Text, dept: Text}]
+*departments : [{name: Text, budget: Int 1}]
+joined = do
+  e <- *employees
+  d <- *departments
+  where e.dept == d.name
+  yield {name e.name budget d.budget}
+"#;
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {
@@ -1698,14 +1692,13 @@ mod tests {
         // Constructor pattern binds may be value pattern matches
         // (not monadic binds) — the desugarer can't distinguish, so
         // these do blocks are left for direct codegen.
-        let src = r#"
-            data Status = Open {} | Closed {}
-            *items : [{name: Text, status: Status}]
-            main = do
-              i <- *items
-              Open {} <- i.status
-              yield {name: i.name}
-        "#;
+        let src = r#"data Status = Open {} | Closed {}
+*items : [{name: Text, status: Status}]
+main = do
+  i <- *items
+  Open {} <- i.status
+  yield {name i.name}
+"#;
         let mut module = parse(src);
         desugar(&mut module);
         for decl in &module.decls {

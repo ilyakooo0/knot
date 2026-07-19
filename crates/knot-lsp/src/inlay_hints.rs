@@ -1456,7 +1456,7 @@ mod tests {
             r#"data Person = Person {name: Text, age: Int 1}
 
 show1 = \p -> case p of
-  Person {name, age} -> name
+  Person {name name age age} -> name
 "#,
         );
         let range = ws.whole_file_range(&uri);
@@ -1556,7 +1556,7 @@ checkGlobalRate = \t -> atomic do
         let uri = ws.open(
             "main",
             r#"safe = \x -> do
-  v <- Just {value: x}
+  v <- Just {value x}
   yield v.value
 "#,
         );
@@ -1847,7 +1847,7 @@ checkGlobalRate = \t -> atomic do
         let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
         let sig_line_start = doc.source.find("f : Int 1").expect("sig");
         let sig_line = offset_to_position(&doc.source, sig_line_start).line;
-        let sig_text_len = "f : Int 1 -> IO {} [{a: Int 1}]".len() as u32;
+        let sig_text_len = "f : Int 1 -> IO {} [{a: Int 1}]\n".len() as u32;
         for h in &hints {
             if let InlayHintLabel::String(s) = &h.label
                 && s.starts_with("-- effects:") {

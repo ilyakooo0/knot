@@ -1403,10 +1403,10 @@ mod tests {
         let mut inference_cache: InferenceCache = HashMap::new();
 
         // v1 has a lambda parameter whose binder span is captured in
-        // local_type_info (the `with {y: x + 1} y` body exercises the
+        // local_type_info (the `with {y (x + 1)} y` body exercises the
         // binding form without a do-block). The target byte offset in v1
         // is known.
-        let v1 = "f = \\x -> with {y: x + 1} y\n";
+        let v1 = "f = \\x -> with {y (x + 1)} y\n";
         std::fs::write(&path, v1).unwrap();
         let doc1 = analyze_document(&uri, v1, &mut import_cache, &mut inference_cache);
         // The lambda binder `x` is the first `x` in the source.
@@ -1660,7 +1660,7 @@ mod tests {
 
 removeWhere = \xs pred -> do
   m <- xs
-  where not (pred m)
+  where not pred m
   yield m
 
 main = do
@@ -1674,7 +1674,7 @@ main = do
 
 removeWhere = \xs pred -> do
   m <- xs
-  where not (pred m)
+  where not pred m
   yield m
 
 main = do
@@ -1740,7 +1740,7 @@ main = do
 
 removeWhere = \xs pred -> do
   m <- xs
-  where not (pred m)
+  where not pred m
   yield m
 
 main = do
@@ -1755,7 +1755,7 @@ main = do
 
 removeWhere = \xs pred -> do
   m <- xs
-  where not (pred m)
+  where not pred m
   yield m
 
 main = do
@@ -1808,7 +1808,7 @@ main = do
             ("unterminated_comment", "x = 1 -- comment with no newline"),
             ("only_operators", "+ - * /"),
             ("only_punctuation", "(((((((((("),
-            ("mismatched_braces", "f = {a: 1, b: 2"),
+            ("mismatched_braces", "f = {a 1 b 2"),
             ("mismatched_brackets", "xs = [1, 2, 3"),
             ("naked_arrow", "->"),
             ("naked_pipe", "|"),

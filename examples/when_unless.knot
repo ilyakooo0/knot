@@ -5,7 +5,7 @@ main = do
   when false (println "when false: skipped")
   unless true (println "unless true: skipped")
   unless false (println "unless false: runs")
-  with {n: 5} (do
+  with { n 5 } (do
     when (n > 0) do
       println "block action: n is positive"
       println (show n)

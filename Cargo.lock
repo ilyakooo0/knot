@@ -1059,6 +1059,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "knot-migrate"
+version = "0.1.0"
+dependencies = [
+ "ariadne",
+]
+
+[[package]]
 name = "knot-runtime"
 version = "0.1.0"
 dependencies = [

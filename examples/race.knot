@@ -18,14 +18,14 @@ main = do
   r1 <- race slow fast
   end1 <- now
   case r1 of
-    Err {error: a} -> println ("left won: " ++ a)
-    Ok {value: b}  -> println ("right won: " ++ b)
+    Err { error a } -> println ("left won: " ++ a)
+    Ok { value b }  -> println ("right won: " ++ b)
   println ("  race 1 took " ++ show (stripUnit (end1 - start1)) ++ "ms")
 
   start2 <- now
   r2 <- race fast slow
   end2 <- now
   case r2 of
-    Err {error: a} -> println ("left won: " ++ a)
-    Ok {value: b}  -> println ("right won: " ++ b)
+    Err { error a } -> println ("left won: " ++ a)
+    Ok { value b }  -> println ("right won: " ++ b)
   println ("  race 2 took " ++ show (stripUnit (end2 - start2)) ++ "ms")

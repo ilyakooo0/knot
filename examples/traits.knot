@@ -24,8 +24,8 @@ impl Describe Text where
 
 impl Describe Shape where
   describe s = case s of
-    Circle {radius} -> "a circle"
-    Rect {width, height} -> "a rectangle"
+    Circle { radius radius } -> "a circle"
+    Rect { width width height height } -> "a rectangle"
 
 impl Describe Color where
   describe c = case c of
@@ -35,16 +35,16 @@ impl Describe Color where
 
 impl Area Shape where
   area s = case s of
-    Circle {radius} -> radius * radius * 3
-    Rect {width, height} -> width * height
+    Circle { radius radius } -> radius * radius * 3
+    Rect { width width height height } -> width * height
 
 main = do
   println (describe 42)
   println (describe "hello")
-  println (describe (Circle {radius: 5}))
-  println (describe (Rect {width: 3, height: 4}))
-  println (area (Circle {radius: 5}))
-  println (area (Rect {width: 3, height: 4}))
+  println (describe (Circle { radius 5 }))
+  println (describe (Rect { width 3 height 4 }))
+  println (area (Circle { radius 5 }))
+  println (area (Rect { width 3 height 4 }))
   println (describe (Red {}))
   println (describe (Green {}))
   println (describe (Blue {}))

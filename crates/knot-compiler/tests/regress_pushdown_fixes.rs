@@ -109,13 +109,7 @@ fn nested_literal_in_constructor_pattern_is_tested() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_nested_lit",
         r#"main = do
-  with {m: Just {value: 5}} (do
-    with {r: case m of
-      Just {value: 1} -> "one"
-      Just {value: n} -> show n
-      Nothing -> "none"}
-    (do
-      println r))
+  with {m (Just {value 5})} (do with {r (case m of Just {value: 1} -> "one"; Just {value: n} -> show n; Nothing {} -> "none")} (do println r))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -131,13 +125,7 @@ fn nested_literal_in_list_pattern_is_tested() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_list_lit",
         r#"main = do
-  with {xs: [5]} (do
-    with {r: case xs of
-      [1] -> "one"
-      [n] -> show n
-      _ -> "many"}
-    (do
-      println r))
+  with {xs [5]} (do with {r (case xs of [1] -> "one"; [n] -> show n; _ -> "many")} (do println r))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -152,12 +140,7 @@ fn nested_literal_in_record_pattern_is_tested() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_record_lit",
         r#"main = do
-  with {p: {tag: 2, name: "b"}} (do
-    with {r: case p of
-      {tag: 1} -> "first"
-      {tag: t} -> "tag " ++ show t}
-    (do
-      println r))
+  with {p {tag 2 name "b"}} (do with {r (case p of {tag: 1} -> "first"; {tag: t} -> "tag " ++ show t)} (do println r))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -172,12 +155,7 @@ fn nested_constructor_in_record_pattern_is_tested() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_nested_ctor",
         r#"main = do
-  with {p: {st: Nothing {}, n: 7}} (do
-    with {r: case p of
-      {st: Just v} -> "just"
-      {st: Nothing} -> "nothing"}
-    (do
-      println r))
+  with {p {st (Nothing {}) n 7}} (do with {r (case p of {st: Just v} -> "just"; {st: Nothing {}} -> "nothing")} (do println r))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -197,12 +175,9 @@ fn filter_param_shadowing_local_let_is_not_expanded() {
 *es : [E]
 
 main = do
-  replace *es = [{value: 10}, {value: 60}]
+  replace *es = [{value 10}, {value 60}]
   rows <- *es
-  with {q: {value: 99}} (do
-    with {kept: rows |> filter (\q -> q.value > 50)} (do
-      println ("kept: " ++ show (count kept))
-      println ("q: " ++ show q.value)))
+  with {q {value 99}} (do with {kept (rows |> filter (\q -> q.value > 50))} (do println ("kept: " ++ show (count kept)); println ("q: " ++ show q.value)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -244,7 +219,7 @@ fn io_loop_pattern_mismatch_skips_row_without_unit() {
         "io_loop_pat_skip",
         r#"main = do
   r <- do
-    x <- [Nothing {}, Just {value: 4}]
+    x <- [Nothing {}, Just {value 4}]
     Just v <- x
     println ("got " ++ show v.value)
     yield v.value
@@ -272,8 +247,8 @@ main = do
     x <- *xs
     y <- *ys
     where x.k == y.k
-    groupBy {g: y.k}
-    yield {g: y.k, n: x.v}
+    groupBy {g y.k}
+    yield {g y.k n x.v}
   println (show r)
 "#,
     );
@@ -291,13 +266,13 @@ fn group_by_key_on_non_primary_variable_is_compile_error() {
         r#"type Todo = {owner: Text, title: Text}
 *todos : [Todo]
 
-cfg = {owner: "a"}
+cfg = {owner "a"}
 
 main = do
   r <- do
     t <- *todos
-    groupBy {g: cfg.owner}
-    yield {g: t.owner, cnt: count t}
+    groupBy {g cfg.owner}
+    yield {g t.owner cnt (count t)}
   println (show r)
 "#,
     );
@@ -317,11 +292,11 @@ fn group_by_on_primary_bind_still_works() {
 *todos : [Todo]
 
 main = do
-  replace *todos = [{owner: "a", title: "x"}, {owner: "a", title: "y"}, {owner: "b", title: "z"}]
+  replace *todos = [{owner "a" title "x"}, {owner "a" title "y"}, {owner "b" title "z"}]
   r <- do
     t <- *todos
-    groupBy {k: t.owner}
-    yield {k: t.owner, cnt: count t}
+    groupBy {k t.owner}
+    yield {k t.owner cnt (count t)}
   println (show r)
 "#,
     );
@@ -343,12 +318,9 @@ impl Eq Int where
   eq = \a b -> false
 
 main = do
-  replace *items = [{n: 1}, {n: 2}]
+  replace *items = [{n 1}, {n 2}]
   rows <- *items
-  with {c: countWhere (\r -> r.n == 1) rows} (do
-    println ("c: " ++ show c)
-    with {f: count (filter (\r -> r.n == 1) rows)} (do
-      println ("f: " ++ show f)))
+  with {c (countWhere (\r -> r.n == 1) rows)} (do println ("c: " ++ show c); with {f (count (filter (\r -> r.n == 1) rows))} (do println ("f: " ++ show f)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -368,10 +340,10 @@ fn int_division_in_yield_projection_stays_int() {
 *t : [T]
 
 main = do
-  replace *t = [{x: 5}]
+  replace *t = [{x 5}]
   r <- do
     m <- *t
-    yield {h: m.x / 2}
+    yield {h (m.x / 2)}
   println (show r)
 "#,
     );
@@ -417,10 +389,9 @@ fn min_on_if_else_over_int_column_matches_in_memory() {
 *t : [T]
 
 main = do
-  replace *t = [{a: 9}, {a: 10}]
+  replace *t = [{a 9}, {a 10}]
   rows <- *t
-  with {m: minOn (\r -> if r.a > 5 then r.a else 99) rows} (do
-    println ("m: " ++ show m))
+  with {m (minOn (\r -> if r.a > 5 then r.a else 99) rows)} (do println ("m: " ++ show m))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -436,10 +407,9 @@ fn sort_by_if_else_over_int_column_matches_in_memory() {
 *t : [T]
 
 main = do
-  replace *t = [{a: 10}, {a: 9}]
+  replace *t = [{a 10}, {a 9}]
   rows <- *t
-  with {s: rows |> sortBy (\r -> if r.a > 5 then r.a else 0)} (do
-    println ("s: " ++ show s))
+  with {s (rows |> sortBy (\r -> if r.a > 5 then r.a else 0))} (do println ("s: " ++ show s))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -463,10 +433,9 @@ fn int_arithmetic_overflow_in_where_compares_numerically() {
 *t : [T]
 
 main = do
-  replace *t = [{a: 0 - 4000000000, b: 4000000000}]
+  replace *t = [{a (0 - 4000000000) b 4000000000}]
   rows <- *t
-  with {c: countWhere (\r -> r.a * r.b > 5) rows} (do
-    println ("c: " ++ show c))
+  with {c (countWhere (\r -> r.a * r.b > 5) rows)} (do println ("c: " ++ show c))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -486,12 +455,9 @@ fn int_arithmetic_where_still_pushes_correct_results() {
 *t : [T]
 
 main = do
-  replace *t = [{a: 5, b: 2}, {a: 1, b: 9}, {a: 0 - 3, b: 4}]
+  replace *t = [{a 5 b 2}, {a 1 b 9}, {a (0 - 3) b 4}]
   rows <- *t
-  with {n: countWhere (\r -> r.a * r.b > 8) rows} (do
-    println ("n: " ++ show n)
-    with {m: countWhere (\r -> r.a + r.b < 2) rows} (do
-      println ("m: " ++ show m)))
+  with {n (countWhere (\r -> r.a * r.b > 8) rows)} (do println ("n: " ++ show n); with {m (countWhere (\r -> r.a + r.b < 2) rows)} (do println ("m: " ++ show m)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -511,13 +477,9 @@ fn float_neg_zero_equality_is_consistent() {
 *t : [T]
 
 main = do
-  replace *t = [{x: 0.0}]
+  replace *t = [{x 0.0}]
   rows <- *t
-  with {neg: 0.0 * (0.0 - 1.0)} (do
-    with {e: countWhere (\r -> r.x == neg) rows} (do
-      println ("eq: " ++ show e)
-      with {g: countWhere (\r -> r.x > neg) rows} (do
-        println ("gt: " ++ show g))))
+  with {neg (0.0 * (0.0 - 1.0))} (do with {e (countWhere (\r -> r.x == neg) rows)} (do println ("eq: " ++ show e); with {g (countWhere (\r -> r.x > neg) rows)} (do println ("gt: " ++ show g))))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -541,23 +503,19 @@ impl Eq Level where
 
 impl Ord Level where
   compare = \a b -> case a of
-    Low x -> (case b of
+    Low x -> case b of
       Low y -> EQ {}
-      _ -> LT {})
-    High x -> (case b of
+      _ -> LT {}
+    High x -> case b of
       High y -> EQ {}
-      _ -> GT {})
+      _ -> GT {}
 
 type T = {lvl: Level, n: Int 1}
 *t : [T]
 
 main = do
-  replace *t = [{lvl: Low {}, n: 1}, {lvl: High {}, n: 2}]
-  with {r: do
-    i <- *t
-    where i.lvl < High {}
-    yield i} (do
-    println ("r: " ++ show (count r)))
+  replace *t = [{lvl (Low {}) n 1}, {lvl (High {}) n 2}]
+  with {r (do i <- *t; where i.lvl < High {}; yield i)} (do println ("r: " ++ show (count r)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -579,12 +537,8 @@ type T = {lvl: Level, n: Int 1}
 *t : [T]
 
 main = do
-  replace *t = [{lvl: Low {}, n: 1}, {lvl: High {}, n: 2}, {lvl: Low {}, n: 3}]
-  with {r: do
-    i <- *t
-    where i.lvl == Low {}
-    yield i} (do
-    println ("r: " ++ show (count r)))
+  replace *t = [{lvl (Low {}) n 1}, {lvl (High {}) n 2}, {lvl (Low {}) n 3}]
+  with {r (do i <- *t; where i.lvl == Low {}; yield i)} (do println ("r: " ++ show (count r)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -635,12 +589,12 @@ impl Eq Level where
 
 impl Ord Level where
   compare = \a b -> case a of
-    Low x -> (case b of
+    Low x -> case b of
       Low y -> EQ {}
-      _ -> LT {})
-    High x -> (case b of
+      _ -> LT {}
+    High x -> case b of
       High y -> EQ {}
-      _ -> GT {})
+      _ -> GT {}
 
 type T = {lvl: Level, n: Int 1}
 *t : [T]

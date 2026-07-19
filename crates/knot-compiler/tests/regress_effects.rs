@@ -61,8 +61,7 @@ fn assert_has_error(diags: &[Diagnostic], message_contains: &str, note_contains:
 #[test]
 fn derived_relation_inherits_function_effects_missing_annotation_flagged() {
     let diags = effect_diags(
-        r#"
-type B = {x: Int 1}
+        r#"type B = {x: Int 1}
 *b : [B]
 
 readsB = \u -> *b
@@ -84,8 +83,7 @@ main = do
 #[test]
 fn derived_relation_correct_annotation_accepted_without_warning() {
     let diags = effect_diags(
-        r#"
-type B = {x: Int 1}
+        r#"type B = {x: Int 1}
 *b : [B]
 
 readsB = \u -> *b
@@ -187,14 +185,11 @@ f = \cb -> println "ok"
 #[test]
 fn atomic_relation_read_through_local_binding_accepted() {
     let diags = effect_diags(
-        r#"
-type Item = {id: Int 1}
+        r#"type Item = {id: Int 1}
 *items : [Item]
 
 main = do
-  n <- atomic (with {f: \u -> *items} (do
-    rows <- f {}
-    yield (count rows)))
+  n <- atomic (with {f (\u -> *items)} (do rows <- f {}; yield (count rows)))
   println (show n)
   yield {}
 "#,
@@ -207,15 +202,12 @@ main = do
 #[test]
 fn local_lambda_relation_read_counts_toward_declared_effects() {
     let diags = effect_diags(
-        r#"
-type Item = {id: Int 1}
+        r#"type Item = {id: Int 1}
 *items : [Item]
 
 main : IO {console} {}
 main = do
-  n <- atomic (with {f: \u -> *items} (do
-    rows <- f {}
-    yield (count rows)))
+  n <- atomic (with {f (\u -> *items)} (do rows <- f {}; yield (count rows)))
   println (show n)
   yield {}
 "#,
@@ -227,11 +219,8 @@ main = do
 #[test]
 fn atomic_with_no_relation_ops_still_rejected() {
     let diags = effect_diags(
-        r#"
-main = do
-  n <- atomic (with {f: \u -> 42} (do
-    x <- f {}
-    yield x))
+        r#"main = do
+  n <- atomic (with {f (\u -> 42)} (do x <- f {}; yield x))
   println (show n)
   yield {}
 "#,
@@ -244,16 +233,13 @@ main = do
 #[test]
 fn atomic_io_through_local_binding_rejected() {
     let diags = effect_diags(
-        r#"
-type Item = {id: Int 1}
+        r#"type Item = {id: Int 1}
 *items : [Item]
 
 main = do
   n <- atomic (do
     rows <- *items
-    with {f: \u -> println "side effect"} (do
-      x <- f {}
-      yield (count rows)))
+    with {f (\u -> println "side effect")} (do x <- f {}; yield (count rows)))
   println (show n)
   yield {}
 "#,
@@ -266,12 +252,11 @@ main = do
 #[test]
 fn race_inside_atomic_rejected() {
     let diags = effect_diags(
-        r#"
-type Counter = {n: Int 1}
+        r#"type Counter = {n: Int 1}
 *counter : [Counter]
 
 main = do
-  r <- atomic (race *counter *counter)
+  r <- atomic race *counter *counter
   println "done"
   yield {}
 "#,
@@ -284,14 +269,11 @@ main = do
 #[test]
 fn race_inside_atomic_via_local_lambda_rejected() {
     let diags = effect_diags(
-        r#"
-type Counter = {n: Int 1}
+        r#"type Counter = {n: Int 1}
 *counter : [Counter]
 
 main = do
-  r <- atomic (with {f: \u -> race *counter *counter} (do
-    x <- f {}
-    yield x))
+  r <- atomic (with {f (\u -> race *counter *counter)} (do x <- f {}; yield x))
   println "done"
   yield {}
 "#,

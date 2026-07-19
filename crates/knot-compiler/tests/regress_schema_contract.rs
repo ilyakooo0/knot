@@ -102,7 +102,7 @@ fn adt_relation_with_record_field_round_trips() {
 main = do
   pre <- *shapes
   println ("pre: " ++ show (count pre))
-  replace *shapes = [Circle {center: {x: 1.5, y: 2.5}, radius: 3.0}, Dot {}]
+  replace *shapes = [Circle {center {x 1.5 y 2.5} radius 3.0}, Dot {}]
   ss <- *shapes
   forEach ss (\s -> case s of
     Circle k -> println ("circle " ++ show k.center.x ++ " " ++ show k.center.y ++ " r=" ++ show k.radius)
@@ -137,7 +137,7 @@ data Outer = W {label: Text, inner: Inner} | E {}
 *outers : [Outer]
 
 main = do
-  replace *outers = [W {label: "w1", inner: A {n: 42}}, W {label: "w2", inner: B {}}, E {}]
+  replace *outers = [W {label "w1" inner (A {n 42})}, W {label "w2" inner (B {})}, E {}]
   os <- *outers
   forEach os (\o -> case o of
     W w -> case w.inner of
@@ -169,7 +169,7 @@ fn nested_relation_of_adt_elements_round_trips() {
 main = do
   pre <- *drawings
   println ("pre: " ++ show (count pre))
-  replace *drawings = [{name: "d1", shapes: [Circle {radius: 2.0}, Dot {}]}]
+  replace *drawings = [{name "d1" shapes [Circle {radius 2.0}, Dot {}]}]
   ds <- *drawings
   forEach ds (\d -> do
     println d.name
@@ -205,7 +205,9 @@ fn nested_adt_relation_dedups_on_write() {
 *drawings : [{name: Text, shapes: [Shape]}]
 
 main = do
-  replace *drawings = [{name: "d", shapes: [Dot {}, Dot {}, Circle {radius: 1.0}, Dot {}, Circle {radius: 1.0}]}]
+  replace *drawings = [
+    {name "d" shapes [Dot {}, Dot {}, Circle {radius 1.0}, Dot {}, Circle {radius 1.0}]}
+  ]
   ds <- *drawings
   forEach ds (\d -> println ("n=" ++ show (count d.shapes)))
 "#,
@@ -227,7 +229,7 @@ fn nested_relation_of_scalar_elements_round_trips() {
 main = do
   pre <- *posts
   println ("pre: " ++ show (count pre))
-  replace *posts = [{title: "a", tags: ["x", "y"]}]
+  replace *posts = [{title "a" tags ["x", "y"]}]
   ps <- *posts
   forEach ps (\p -> do
     println p.title
@@ -253,7 +255,7 @@ fn nested_scalar_relation_dedups_on_write() {
         r#"*posts : [{title: Text, tags: [Text]}]
 
 main = do
-  replace *posts = [{title: "a", tags: ["x", "y", "x", "y", "x"]}]
+  replace *posts = [{title "a" tags ["x", "y", "x", "y", "x"]}]
   ps <- *posts
   forEach ps (\p -> do
     println ("n=" ++ show (count p.tags))
@@ -282,20 +284,10 @@ fn comprehension_binds_over_json_nested_fields() {
 *posts : [{title: Text, tags: [Text]}]
 
 main = do
-  replace *drawings = [{name: "d1", shapes: [Circle {radius: 2.0}, Dot {}]}]
-  replace *posts = [{title: "a", tags: ["x", "y"]}]
-  with {circles: do
-        d <- *drawings
-        Circle k <- d.shapes
-        yield {r: k.radius}}
-    (do
-      forEach circles (\c -> println ("r=" ++ show c.r)))
-  with {allTags: do
-        p <- *posts
-        t <- p.tags
-        yield {tag: t}}
-    (do
-      forEach allTags (\t -> println ("tag=" ++ t.tag)))
+  replace *drawings = [{name "d1" shapes [Circle {radius 2.0}, Dot {}]}]
+  replace *posts = [{title "a" tags ["x", "y"]}]
+  with {circles (do d <- *drawings; Circle k <- d.shapes; yield {r k.radius})} (do forEach circles (\c -> println ("r=" ++ show c.r)))
+  with {allTags (do p <- *posts; t <- p.tags; yield {tag t})} (do forEach allTags (\t -> println ("tag=" ++ t.tag)))
 "#,
     );
 
@@ -320,7 +312,9 @@ fn record_child_table_with_inner_scalar_relation_round_trips() {
         r#"*teams : [{name: Text, members: [{handle: Text, skills: [Text]}]}]
 
 main = do
-  replace *teams = [{name: "t1", members: [{handle: "ana", skills: ["rust", "sql"]}, {handle: "bo", skills: []}]}]
+  replace *teams = [
+    {name "t1" members [{handle "ana" skills ["rust", "sql"]}, {handle "bo" skills []}]}
+  ]
   ts <- *teams
   forEach ts (\t -> do
     println t.name

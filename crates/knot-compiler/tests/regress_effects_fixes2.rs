@@ -81,10 +81,7 @@ impl Ticker Int where
   tick = \x -> println "tick"
 
 main = do
-  r <- atomic (do
-    rows <- *items
-    t <- tick 1
-    yield {})
+  r <- atomic (do rows <- *items; t <- tick 1; yield {})
   yield {}
 "#,
     );
@@ -104,10 +101,7 @@ impl Ticker Int where
   tick = \x -> println "impl tick"
 
 main = do
-  r <- atomic (do
-    rows <- *items
-    t <- tick 1
-    yield {})
+  r <- atomic (do rows <- *items; t <- tick 1; yield {})
   yield {}
 "#,
     );
@@ -129,9 +123,7 @@ impl Reader Int where
   readAll = \x -> *items
 
 main = do
-  r <- atomic (do
-    t <- readAll 1
-    yield {})
+  r <- atomic (do t <- readAll 1; yield {})
   yield {}
 "#,
     );
@@ -157,10 +149,7 @@ impl Ticker Text where
   tick = \x -> println "noisy"
 
 main = do
-  r <- atomic (do
-    rows <- *items
-    t <- tick 1
-    yield {})
+  r <- atomic (do rows <- *items; t <- tick 1; yield {})
   yield {}
 "#,
     );
@@ -184,10 +173,7 @@ impl Pretty Int where
   pretty now = show now
 
 main = do
-  r <- atomic (do
-    rows <- *items
-    with {s: pretty 1} (do
-      yield {}))
+  r <- atomic (do rows <- *items; with {s (pretty 1)} (do yield {}))
   yield {}
 "#,
     );
@@ -212,10 +198,7 @@ impl Pretty Int where
   pretty x = show x
 
 main = do
-  r <- atomic (do
-    rows <- *items
-    with {s: pretty 1} (do
-      yield {}))
+  r <- atomic (do rows <- *items; with {s (pretty 1)} (do yield {}))
   yield {}
 "#,
     );
@@ -230,15 +213,11 @@ fn let_bound_lambda_passed_by_name_carries_console_effect() {
     let diags = effect_diags(
         r#"*items : [{n: Int 1}]
 
-runIt : (Int 1 -> IO {| e} {}) -> IO {| e} {}
+runIt : (Int 1 -> IO e {}) -> IO e {}
 runIt = \f -> f 1
 
 main = do
-  r <- atomic (do
-    rows <- *items
-    with {cb: \u -> println "x"} (do
-      q <- runIt cb
-      yield {}))
+  r <- atomic (do rows <- *items; with {cb (\u -> println "x")} (do q <- runIt cb; yield {}))
   yield {}
 "#,
     );
@@ -255,10 +234,7 @@ fn unannotated_hof_propagates_lambda_io_into_atomic_check() {
 apply = \f x -> f x
 
 main = do
-  r <- atomic (do
-    rows <- *items
-    q <- apply (\u -> println "x") 1
-    yield {})
+  r <- atomic (do rows <- *items; q <- apply (\u -> println "x") 1; yield {})
   yield {}
 "#,
     );
@@ -314,9 +290,7 @@ fn atomic_calling_parameter_typed_callable_not_flagged() {
     let diags = effect_diags(
         r#"*items : [{n: Int 1}]
 
-helper = \action -> atomic (do
-  r <- action {}
-  yield {})
+helper = \action -> atomic (do r <- action {}; yield {})
 
 main = do
   q <- helper (\u -> *items)
@@ -339,9 +313,7 @@ apply = \g x -> g x
 
 main = do
   atomic (do
-    with {log: \u -> println "hi"} (do
-      _ <- apply (\log -> log) (*items)
-      replace *items = []))
+    with {log (\u -> println "hi")} (do _ <- apply (\log -> log) *items; replace *items = []))
   yield {}
 "#,
     );
@@ -352,9 +324,7 @@ main = do
 fn provably_relation_free_atomic_still_rejected() {
     let diags = effect_diags(
         r#"main = do
-  n <- atomic (do
-    with {x: 1 + 2} (do
-      yield x))
+  n <- atomic (do with {x (1 + 2)} (do yield x))
   yield {}
 "#,
     );
@@ -377,10 +347,7 @@ fn pipe_lhs_lambda_io_propagates_into_atomic_check() {
 apply = \f -> f 1
 
 main = do
-  r <- atomic (do
-    rows <- *items
-    q <- (\u -> println "x") |> apply
-    yield {})
+  r <- atomic (do rows <- *items; q <- (\u -> println "x") |> apply; yield {})
   yield {}
 "#,
     );
@@ -433,15 +400,14 @@ fn io_laundered_into_atomic_via_record_field_rejected() {
     let diags = effect_diags(
         r#"*items : [{id: Int 1}]
 
-makeRec = \cb -> {fn: cb}
+makeRec = \cb -> {fn cb}
 
 useRec = \r -> do
   xs <- *items
-  (r.fn) {}
+  r.fn {}
 
 doStuff = do
-  with {r: makeRec (\u -> println "hidden IO inside atomic")} (do
-    atomic (useRec r))
+  with {r (makeRec (\u -> println "hidden IO inside atomic"))} (do atomic useRec r)
 
 main = doStuff
 "#,
@@ -461,27 +427,25 @@ fn clean_atomic_in_impl_method_not_poisoned_by_unrelated_io_lambda() {
     let diags = effect_diags(
         r#"*items : [{id: Int 1}]
 
-writeItems = \u -> replace *items = [{id: 7}]
+writeItems = \u -> replace *items = [{id 7}]
 
 useRec = \r -> do
   xs <- *items
-  (r.fn) {}
+  r.fn {}
 
 trait Doer a where
   doIt : a -> IO {rw *items} {}
 
 impl Doer Int where
   doIt = \x -> do
-    with {r: {fn: writeItems}} (do
-      atomic (useRec r))
+    with {r {fn writeItems}} (do atomic useRec r)
 
 main : IO {rw *items} {}
 main = doIt 1
 
 noise : IO {console} {}
 noise = do
-  with {bad: \u -> println "unrelated IO in another decl"} (do
-    println "x")
+  with {bad (\u -> println "unrelated IO in another decl")} (do println "x")
 "#,
     );
     assert!(
@@ -506,9 +470,7 @@ fn pure_hof_builtin_in_atomic_not_flagged_opaque() {
 
 handle = do
   t <- now
-  atomic (do
-    rows <- *items
-    *items = sortBy (\x -> x.expiresAt) rows)
+  atomic (do rows <- *items; *items = sortBy (\x -> x.expiresAt) rows)
 
 main = handle
 "#,
@@ -530,10 +492,7 @@ lookup = \rows -> findFirst rows (\r -> r.n > 0)
 
 handle = do
   t <- now
-  atomic (do
-    rows <- *items
-    with {hit: lookup rows} (do
-      *items = rows))
+  atomic (do rows <- *items; with {hit (lookup rows)} (do *items = rows))
 
 main = handle
 "#,
@@ -556,10 +515,7 @@ fn fork_via_helper_inside_atomic_accepted() {
 
 helper = \u -> fork (println "hi")
 
-main =
-  atomic (do
-    _ <- *people
-    helper {})
+main = atomic (do _ <- *people; helper {})
 "#,
     );
     assert_no_error(&diags, "IO effects are not allowed inside atomic blocks");
@@ -574,10 +530,7 @@ fn non_forked_io_via_helper_inside_atomic_still_rejected() {
 
 helper = \u -> println "hi"
 
-main =
-  atomic (do
-    _ <- *people
-    helper {})
+main = atomic (do _ <- *people; helper {})
 "#,
     );
     assert_has_error(&diags, "IO effects are not allowed inside atomic blocks");
@@ -594,10 +547,7 @@ helper = \u -> do
   _ <- println "direct"
   fork (println "forked")
 
-main =
-  atomic (do
-    _ <- *people
-    helper {})
+main = atomic (do _ <- *people; helper {})
 "#,
     );
     assert_has_error(&diags, "IO effects are not allowed inside atomic blocks");

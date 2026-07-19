@@ -427,12 +427,12 @@ mod tests {
 
     #[test]
     fn explicit_pattern_field_links_with_expression_field() {
-        // `name` appears in an explicit (non-pun) record pattern AND in a record
-        // expression within the same declaration. Both must be linked so editing
-        // one mirrors to the other — previously only the expression side was
-        // collected, leaving the pattern occurrence stale.
+        // `name` appears in a record pattern AND in a record expression within
+        // the same declaration. Both must be linked so editing one mirrors to
+        // the other — previously only the expression side was collected,
+        // leaving the pattern occurrence stale.
         let mut ws = TestWorkspace::new();
-        let src = "extract = \\p ->\n  case p of\n    {name: n, age: a} -> {name: n, age: a}\n";
+        let src = "extract = \\p ->\n  case p of\n    {name n age a} -> {name n age a}\n";
         let uri = ws.open("main", src);
         // Cursor on the expression-side `name` (2nd occurrence).
         let pos = offset_to_position(src, nth_offset(src, "name", 1));
@@ -446,30 +446,32 @@ mod tests {
     }
 
     #[test]
-    fn punned_pattern_field_suppresses_linked_editing() {
-        // `{name}` is a pun: the token both names the field and binds the `name`
-        // variable used in the body. Linking it would rename the field but leave
-        // the variable's uses stale, so linked editing must NOT activate even
-        // though the expression side has two `name` field occurrences.
+    fn same_named_pattern_binder_is_not_a_field_link() {
+        // `{name name}` names field `name` and binds a variable `name`; the
+        // same-named variable in the body is NOT a field occurrence. Linked
+        // editing on a field token must link only the field-name tokens, so
+        // the bound variable is left alone (rename handles it separately).
         let mut ws = TestWorkspace::new();
-        let src = "extract = \\p ->\n  case p of\n    {name} -> {name: name, other: name}\n";
+        let src = "extract = \\p ->\n  case p of\n    {name name} -> {name name other name}\n";
         let uri = ws.open("main", src);
-        // Cursor on the first expression-side `name:` field (2nd occurrence of
-        // `name` overall; 1st is the pun in the pattern).
-        let pos = offset_to_position(src, nth_offset(src, "name", 1));
-        let resp = handle_linked_editing_range(&ws.state, &params(&uri, pos));
-        assert!(
-            resp.is_none(),
-            "a punned pattern field must suppress linked editing (defer to rename)"
+        // Cursor on the expression-side `name` field token (3rd occurrence of
+        // `name`: pattern field, pattern binder, then this one).
+        let pos = offset_to_position(src, nth_offset(src, "name", 2));
+        let resp = handle_linked_editing_range(&ws.state, &params(&uri, pos))
+            .expect("explicit same-named field tokens still link");
+        assert_eq!(
+            resp.ranges.len(),
+            2,
+            "only the two field-name tokens link; binder + usages are excluded"
         );
     }
 
     #[test]
     fn expression_only_fields_still_link() {
         // No patterns involved — two record-expression occurrences of `name`
-        // must still link, and no spurious pun suppression should fire.
+        // must still link.
         let mut ws = TestWorkspace::new();
-        let src = "f = \\n -> {name: n, other: {name: n}}\n";
+        let src = "f = \\n -> {name n other {name n}}\n";
         let uri = ws.open("main", src);
         let pos = offset_to_position(src, nth_offset(src, "name", 0));
         let resp = handle_linked_editing_range(&ws.state, &params(&uri, pos))

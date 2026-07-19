@@ -76,9 +76,9 @@ fn to_json_maybe_encodes_null_and_bare_value() {
     let (stdout, stderr, ok) = compile_and_run(
         "tojson_maybe",
         r#"main = do
-  println (toJson {name: "a", nick: Just {value: "x"}})
-  println (toJson {name: "b", nick: Nothing {}})
-  println (toJson (Just {value: 42}))
+  println (toJson {name "a" nick (Just {value "x"})})
+  println (toJson {name "b" nick (Nothing {})})
+  println (toJson (Just {value 42}))
   println (toJson (Nothing {}))
 "#,
     );
@@ -109,11 +109,11 @@ fn parse_json_maybe_decodes_null_absent_and_wraps_present() {
 
 showPerson = \p -> case p.nick of
   Nothing {} -> println (p.name ++ ": none")
-  Just {value} -> println (p.name ++ ": " ++ value)
+  Just {value value} -> println (p.name ++ ": " ++ value)
 
 showResult = \m -> case m of
   Nothing {} -> println "parse failed"
-  Just {value} -> showPerson value
+  Just {value value} -> showPerson value
 
 main = do
   showResult (parseJson "{\"name\":\"a\",\"nick\":null}" : Maybe Person)
@@ -141,12 +141,12 @@ fn parse_json_maybe_in_relation_rows() {
         "parsejson_maybe_rel",
         r#"showRow = \r -> case r.a of
   Nothing {} -> println "row: none"
-  Just {value} -> println ("row: " ++ show value)
+  Just {value value} -> println ("row: " ++ show value)
 
 main = do
-  case parseJson "[{\"a\":null},{\"a\":7}]" : Maybe [{a: Maybe Int 1}] of
+  case (parseJson "[{\"a\":null},{\"a\":7}]" : Maybe [{a: Maybe Int 1}]) of
     Nothing {} -> println "parse failed"
-    Just {value} -> forEach value showRow
+    Just {value value} -> forEach value showRow
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -171,8 +171,8 @@ showResult = \m -> case m of
   Just {value} -> showPerson value
 
 main = do
-  showResult (parseJson (toJson {name: "a", nick: Just {value: "x"}}) : Maybe Person)
-  showResult (parseJson (toJson {name: "b", nick: Nothing {}}) : Maybe Person)
+  showResult (parseJson (toJson {name "a" nick (Just {value "x"})}) : Maybe Person)
+  showResult (parseJson (toJson {name "b" nick (Nothing {})}) : Maybe Person)
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -193,7 +193,7 @@ showRow = \r -> case r.status of
   Just {value} -> println (show r.n ++ ": " ++ value)
 
 main = do
-  replace *items = [{n: 1, status: Just {value: "active"}}, {n: 2, status: Nothing {}}]
+  replace *items = [{n 1 status (Just {value "active"})}, {n 2 status (Nothing {})}]
   rows <- *items
   forEach rows showRow
 "#,

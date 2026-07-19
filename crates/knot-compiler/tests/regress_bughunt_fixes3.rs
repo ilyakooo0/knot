@@ -195,7 +195,7 @@ fn stratify_detects_aliased_diff_self_negation() {
     let s = Scratch::new("strat_alias");
     s.write(
         "prog.knot",
-        &diff_body("  result <- with {d: diff} (do\n    r <- d all self\n    yield r)"),
+        &diff_body("  result <- with {d diff} (do\n    r <- d all self\n    yield r)"),
     );
     let (ok, _stdout, stderr) = s.build("prog.knot");
     assert!(!ok, "aliased-`diff` self-negation must be rejected");

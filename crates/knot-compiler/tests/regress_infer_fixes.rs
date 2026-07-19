@@ -46,7 +46,7 @@ fn view_alias_of_source_typechecks() {
 *alias = *todos
 
 main = do
-  replace *todos = [{title: "buy milk"}]
+  replace *todos = [{title "buy milk"}]
   xs <- *alias
   x <- xs
   p <- println x.title
@@ -65,10 +65,10 @@ fn view_comprehension_typechecks() {
 *mine = do
   t <- *todos
   where t.done
-  yield {title: t.title}
+  yield {title t.title}
 
 main = do
-  replace *todos = [{title: "a", done: true}, {title: "b", done: false}]
+  replace *todos = [{title "a" done true}, {title "b" done false}]
   xs <- *mine
   m <- xs
   p <- println m.title
@@ -85,7 +85,7 @@ fn view_comprehension_element_type_mismatch_still_rejected() {
     let src = r#"*todos : [{title: Text}]
 *bad : [{title: Int 1}] = do
   t <- *todos
-  yield {title: t.title}
+  yield {title t.title}
 
 main = println "x"
 "#;
@@ -104,11 +104,12 @@ fn annotated_derived_with_io_body_typechecks() {
     let src = r#"*nums : [{n: Int 1}]
 &doubled : [{n: Int 1}] = do
   nums <- *nums
-  yield (do x <- nums
-            yield {n: x.n + x.n})
+  yield (do
+    x <- nums
+    yield {n (x.n + x.n)})
 
 main = do
-  replace *nums = [{n: 3}]
+  replace *nums = [{n 3}]
   ds <- &doubled
   d <- ds
   p <- println (show d.n)
@@ -127,11 +128,12 @@ fn unannotated_derived_binds_relation_type_not_io() {
     let src = r#"*nums : [{n: Int 1}]
 &tripled = do
   nums <- *nums
-  yield (do x <- nums
-            yield {n: x.n * 3})
+  yield (do
+    x <- nums
+    yield {n (x.n * 3)})
 
 main = do
-  replace *nums = [{n: 4}]
+  replace *nums = [{n 4}]
   ds <- &tripled
   d <- ds
   p <- println (show d.n)
@@ -167,7 +169,7 @@ fn check_mode_mismatch_orientation_unchanged() {
     // The check-mode path (`check_expr` pushes the expected type with
     // t1_provided = false) must STILL read "expected Int, found Text".
     let src = r#"x : {n: Int 1}
-x = {n: "text"}
+x = {n "text"}
 main = println (show x.n)
 "#;
     let diags = check_src(src);
@@ -193,11 +195,7 @@ fn ctor_pattern_bind_on_source_in_let_comprehension() {
     let src = r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 *shapes : [Shape]
 
-main = with {circles: do
-      Circle c <- *shapes
-      yield {radius: c.radius}} (do
-  p <- println "ok"
-  yield {})
+main = with {circles (do Circle c <- *shapes; yield {radius c.radius})} (do p <- println "ok"; yield {})
 "#;
     let diags = check_src(src);
     assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
@@ -209,12 +207,7 @@ fn ctor_pattern_bind_via_intermediate_still_typechecks() {
     let src = r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 *shapes : [Shape]
 
-main = with {circles: do
-      rows <- *shapes
-      Circle c <- rows
-      yield {radius: c.radius}} (do
-  p <- println "ok"
-  yield {})
+main = with {circles (do rows <- *shapes; Circle c <- rows; yield {radius c.radius})} (do p <- println "ok"; yield {})
 "#;
     let diags = check_src(src);
     assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);

@@ -132,7 +132,7 @@ fn a_type_and_a_function_may_share_a_name_across_modules() {
     );
     s.write(
         "main.knot",
-        "import ./lib\n\n*items : Items\n\nmain = do\n  replace *items = [{v: 1}]\n  rows <- *items\n  println (show (count rows + items))\n  yield {}\n",
+        "import ./lib\n\n*items : Items\n\nmain = do\n  replace *items = [{v 1}]\n  rows <- *items\n  println (show (count rows + items))\n  yield {}\n",
     );
 
     assert!(
@@ -157,7 +157,7 @@ fn units_match_across_a_module_boundary() {
     );
     s.write(
         "main.knot",
-        "import ./phys\n\nmain = with {total: addForce baseForce (3.0 : Float (Kg*M/S^2))} (do\n  \
+        "import ./phys\n\nmain = with {total (addForce baseForce (3.0 : Float (Kg*M/S^2)))} (do\n  \
          println (show (stripFloatUnit total))\n  yield {})\n",
     );
 
@@ -184,7 +184,7 @@ fn impl_of_a_trait_declared_elsewhere_survives_the_export_filter() {
     s.write(
         "main.knot",
         "import ./circle\nimport ./shapes\n\nmain = do\n  \
-         println (show (area (Circle {radius: 2.0})))\n  yield {}\n",
+         println (show (area (Circle {radius 2.0})))\n  yield {}\n",
     );
 
     assert!(

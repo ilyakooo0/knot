@@ -16,21 +16,21 @@ findById = \aid rows -> single (filter (\a -> a.id == aid) rows)
 
 setBalance = \aid newBalance rows -> do
   r <- rows
-  yield (if r.id == aid then {r | balance: newBalance} else r)
+  yield (if r.id == aid then { r | balance newBalance } else r)
 
 credit = \aid amount -> atomic do
   rows <- *accounts
   -- The `single (filter ...)` lookup is what the runtime SQL pushdown turns
   -- into a `WHERE "id" = ?` query — codegen extracts the predicate and the
   -- runtime calls `knot_stm_track_read_pred` to register a row-level filter.
-  with {lookup: findById aid rows}
+  with { lookup (findById aid rows) }
     (*accounts = setBalance aid amount rows)
 
 main = do
   replace *accounts = [
-    {id: 1, balance: 0},
-    {id: 2, balance: 0},
-    {id: 3, balance: 0}
+    { id 1 balance 0 },
+    { id 2 balance 0 },
+    { id 3 balance 0 }
   ]
   credit 1 100
   credit 2 50

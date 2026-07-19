@@ -61,10 +61,10 @@ fn well_formed_effect_row_still_parses() {
 
 #[test]
 fn with_annotation_span_covers_the_type() {
-    // The `Annot` in `with {x: (5 : Int)}` must span both the type and the
+    // The `Annot` in `with {x (5 : Int)}` must span both the type and the
     // value (never inverted). We locate the binding and assert its span covers
     // the `5 : Int` source range.
-    let src = "main = do\n  with {x: (5 : Int)} (yield x)\n";
+    let src = "main = do\n  with {x (5 : Int)} (yield x)\n";
     let (module, diags) = parse(src);
     assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
 

@@ -67,7 +67,7 @@ fn single_variant_record_ctor_matches_annotation() {
         r#"data Box = Box {val: Int 1}
 
 ann : Box
-ann = Box {val: 5}
+ann = Box {val 5}
 
 main = println (show ann)
 "#,
@@ -99,7 +99,7 @@ fn single_variant_record_ctor_as_function_arg() {
 unwrap : Box -> Int 1
 unwrap = \b -> b.val
 
-main = println (show (unwrap (Box {val: 7})))
+main = println (show (unwrap (Box {val 7})))
 "#,
     );
     assert_clean(&diags);
@@ -112,7 +112,7 @@ fn multi_variant_record_ctor_still_checks() {
         r#"data Shape = Circle {r: Int 1} | Square {s: Int 1}
 
 ann : Shape
-ann = Circle {r: 5}
+ann = Circle {r 5}
 
 main = println (show ann)
 "#,
@@ -127,7 +127,7 @@ fn single_variant_record_ctor_rejects_wrong_field_type() {
         r#"data Box = Box {val: Int 1}
 
 ann : Box
-ann = Box {val: "nope"}
+ann = Box {val "nope"}
 
 main = println (show ann)
 "#,
@@ -152,7 +152,7 @@ data Email = Email {raw: Text}
 greet : Email -> Text
 greet = \e -> "Hello " ++ e.raw
 
-main = println (greet (UserId {raw: "12345"}))
+main = println (greet (UserId {raw "12345"}))
 "#,
     );
     assert!(

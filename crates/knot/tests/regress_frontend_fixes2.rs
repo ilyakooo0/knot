@@ -121,7 +121,7 @@ fn route_entries(m: &knot::ast::Module) -> &[knot::ast::RouteEntry] {
 
 #[test]
 fn refined_response_type_keeps_rate_limit() {
-    let src = "route Api where\n  POST {name: Text} /items -> Int where \\v -> v > 0 rateLimit {key: \\i -> \\c -> Nothing, limit: {requests: 10, window: 1000}} = CreateItem\n";
+    let src = "route Api where\n  POST {name: Text} /items -> Int where \\v -> v > 0 rateLimit {key (\\i -> \\c -> Nothing) limit {requests 10 window 1000}} = CreateItem\n";
     let m = parse(src).expect("parse");
     let entries = route_entries(&m);
     assert_eq!(entries.len(), 1);
@@ -189,7 +189,7 @@ fn refined_response_type_keeps_response_headers() {
 fn refined_response_type_with_rate_limit_round_trips() {
     check_str(
         "refined_rate_limit",
-        "route Api where\n  POST {name: Text} /items -> Int where \\v -> v > 0 rateLimit {key: \\i -> \\c -> Nothing, limit: {requests: 10, window: 1000}} = CreateItem\n",
+        "route Api where\n  POST {name: Text} /items -> Int where \\v -> v > 0 rateLimit {key (\\i -> \\c -> Nothing) limit {requests 10 window 1000}} = CreateItem\n",
     );
 }
 
@@ -224,7 +224,7 @@ fn deep_nested_brackets_expr_is_diagnosed() {
 #[test]
 fn deep_nested_braces_expr_is_diagnosed() {
     let n = 3000;
-    let src = format!("f = {}1{}\n", "{a: ".repeat(n), "}".repeat(n));
+    let src = format!("f = {}1{}\n", "{a ".repeat(n), "}".repeat(n));
     assert_depth_diagnostic("braces_expr", &src);
 }
 
@@ -420,12 +420,12 @@ fn do_bind_named_seconds_is_not_unit_sugar() {
 
 #[test]
 fn with_named_ms_is_not_unit_sugar() {
-    let src = "f = with {ms: 5} g 2 ms\n";
+    let src = "f = with {ms 5} g 2 ms\n";
     let m = parse(src).expect("parse");
     let DeclKind::Fun { body: Some(b), .. } = &m.decls[0].node else {
         panic!("expected Fun");
     };
-    // `with {ms: 5} g 2 ms` — the body must reference `ms` as a variable.
+    // `with {ms 5} g 2 ms` — the body must reference `ms` as a variable.
     let ExprKind::With { body, .. } = &b.node else {
         panic!("expected With, got {:?}", b);
     };
@@ -438,7 +438,7 @@ fn with_named_ms_is_not_unit_sugar() {
 
 #[test]
 fn case_binder_named_ms_is_not_unit_sugar() {
-    let src = "f = \\x -> case x of\n  Just {value: ms} -> g 2 ms\n  Nothing {} -> 0\n";
+    let src = "f = \\x -> case x of\n  Just {value ms} -> g 2 ms\n  Nothing {} -> 0\n";
     let m = parse(src).expect("parse");
     let DeclKind::Fun { body: Some(b), .. } = &m.decls[0].node else {
         panic!("expected Fun");

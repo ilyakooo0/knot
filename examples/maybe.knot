@@ -13,20 +13,20 @@ data Maybe a
 impl Functor Maybe where
   map f m = case m of
     Nothing {} -> Nothing {}
-    Just {value} -> Just {value: f value}
+    Just { value value } -> Just { value (f value) }
 
 impl Applicative Maybe where
-  yield x = Just {value: x}
+  yield x = Just { value x }
   ap fs xs = case fs of
     Nothing {} -> Nothing {}
-    Just {value: f} -> case xs of
+    Just { value f } -> case xs of
       Nothing {} -> Nothing {}
-      Just {value: x} -> Just {value: f x}
+      Just { value x } -> Just { value (f x) }
 
 impl Monad Maybe where
   bind f m = case m of
     Nothing {} -> Nothing {}
-    Just {value} -> f value
+    Just { value value } -> f value
 
 impl Alternative Maybe where
   empty = Nothing {}
@@ -35,30 +35,30 @@ impl Alternative Maybe where
     Just {} -> a
 
 -- Test: a simple do-block that uses Maybe as the monad
-safeDivide = \x y -> if y == 0 then Nothing {} else Just {value: x / y}
+safeDivide = \x y -> if y == 0 then Nothing {} else Just { value (x / y) }
 
 result1 = do
-  a <- Just {value: 10}
-  b <- Just {value: 2}
+  a <- Just { value 10 }
+  b <- Just { value 2 }
   c <- safeDivide a b
   yield c
 
 result2 = do
-  a <- Just {value: 10}
-  b <- Just {value: 0}
+  a <- Just { value 10 }
+  b <- Just { value 0 }
   c <- safeDivide a b
   yield c
 
 -- Test where clause (uses empty from Alternative for filtering)
 result3 = do
-  a <- Just {value: 10}
-  b <- Just {value: 3}
+  a <- Just { value 10 }
+  b <- Just { value 3 }
   where b > 2
   yield (a + b)
 
 result4 = do
-  a <- Just {value: 10}
-  b <- Just {value: 1}
+  a <- Just { value 10 }
+  b <- Just { value 1 }
   where b > 2
   yield (a + b)
 

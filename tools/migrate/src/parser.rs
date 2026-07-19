@@ -515,6 +515,34 @@ impl Parser {
     /// field value without aborting the whole record literal. Stops at the
     /// boundary token *without consuming it* so the surrounding loop can
     /// inspect and react (continue on `,`, exit on `}`).
+    fn skip_to_record_field_boundary(&mut self) {
+        let mut depth: usize = 0;
+        loop {
+            if self.at_eof() {
+                break;
+            }
+            match self.peek() {
+                TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => {
+                    depth += 1;
+                    self.advance();
+                }
+                TokenKind::RBrace if depth == 0 => break,
+                TokenKind::RBrace => {
+                    depth = depth.saturating_sub(1);
+                    self.advance();
+                }
+                TokenKind::RParen | TokenKind::RBracket => {
+                    depth = depth.saturating_sub(1);
+                    self.advance();
+                }
+                TokenKind::Comma if depth == 0 => break,
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
     /// Skip tokens until we reach what looks like a new declaration boundary.
     fn skip_to_decl_boundary(&mut self) {
         loop {
@@ -3036,29 +3064,61 @@ impl Parser {
             ));
         }
 
-        // New record syntax: whitespace-separated `name value` pairs, no `:` or
-        // `,`. A field value is a single atom / postfix chain / parenthesized
-        // (or list / nested-record) compound — i.e. `parse_postfix`, which never
-        // consumes a following bare identifier as an application argument. A bare
-        // `Lower` after a value therefore always opens the next field.
-        //
-        // A record UPDATE `{base | name value, ...}` is detected by speculatively
-        // parsing a leading postfix expression and checking for a top-level `|`.
-        // A leading `Lower` is always a field name, never an update base, so we
-        // only speculate when the first token is NOT a plain identifier.
+        // We need to distinguish:
+        // 1. Record literal: {name: expr, ...}
+        // 2. Record update: {base | name: expr, ...}
+        // 3. Punned fields: {name, age} (shorthand for {name: name, age: age})
+        //    or {expr.field, ...} (shorthand for {field: expr.field})
+
+        // Decide between a record literal/pun and a record update
+        // (`{base | field: val, ...}`). A record update's base expression is
+        // always followed by a top-level `|`; a leading `name:` can therefore
+        // only be a record-literal field, never an update — special-case it so
+        // the common `{name: val, ...}` form skips the speculative base parse.
+        let first_is_named_field = matches!(self.peek(), TokenKind::Lower(_))
+            && matches!(self.peek_ahead(1), TokenKind::Colon);
+
         let mut fields: Vec<Field<Expr>> = Vec::new();
 
-        let first_is_lower = matches!(self.peek(), TokenKind::Lower(_));
-        if !first_is_lower {
-            // Speculative base parse for `{base | …}` (e.g. base is a parenthesized
-            // expr, field-access chain, etc.). A bare-identifier base is handled by
-            // the named-field path below and disambiguated there.
+        if !first_is_named_field {
+            // Speculatively parse the first element to detect a record update.
+            // `|` is not an expression operator (only `|>` is), so `parse_expr`
+            // stops before a top-level `|`, which we then check for.
             let saved = self.save();
             let diag_count = self.diagnostics.len();
-            if let Some(first_expr) = self.parse_postfix() {
+            if let Some(first_expr) = self.parse_expr() {
                 self.skip_newlines();
                 if self.eat(&TokenKind::Pipe) {
-                    let update_fields = self.parse_record_update_fields()?;
+                    // Record update: {base | field: expr, ...}
+                    let mut update_fields = Vec::new();
+                    self.skip_newlines();
+                    if !self.at(&TokenKind::RBrace) {
+                        loop {
+                            self.skip_newlines();
+                            let (fname, _) = self
+                                .expect_lower("expected field name in record update")
+                                .ok()?;
+                            self.expect(
+                                &TokenKind::Colon,
+                                "expected ':' after field name in record update",
+                            )
+                            .ok()?;
+                            let val = self.parse_expr()?;
+                            update_fields.push(Field {
+                                name: fname,
+                                value: val,
+                            });
+                            self.skip_newlines();
+                            if !self.eat(&TokenKind::Comma) {
+                                break;
+                            }
+                            self.skip_newlines();
+                            if self.at(&TokenKind::RBrace) {
+                                break; // trailing comma
+                            }
+                        }
+                    }
+                    self.skip_newlines();
                     let end_tok = self
                         .expect(&TokenKind::RBrace, "expected '}' to close record update")
                         .ok()?;
@@ -3070,49 +3130,126 @@ impl Parser {
                         Span::new(start.start, end_tok.span.end),
                     ));
                 }
-            }
-            self.restore(saved);
-            self.diagnostics.truncate(diag_count);
-        } else {
-            // Leading identifier: could still be an update `{base | …}` where base
-            // is a plain var or field-access chain. Parse the postfix, check `|`.
-            let saved = self.save();
-            let diag_count = self.diagnostics.len();
-            if let Some(head) = self.parse_postfix() {
+
+                // Not an update: reuse the already-parsed first element as the
+                // first punned field instead of restoring and reparsing it.
+                // The old restore+reparse doubled work at every nesting level,
+                // causing exponential-time parsing of nested record literals
+                // like `{{{...}}}`.
+                let field_name =
+                    self.extract_pun_name(&first_expr).unwrap_or_else(|| {
+                        self.error_at(
+                            first_expr.span,
+                            "cannot determine field name for punned record field",
+                        );
+                        "?".into()
+                    });
+                fields.push(Field {
+                    name: field_name,
+                    value: first_expr,
+                });
+
                 self.skip_newlines();
-                if self.eat(&TokenKind::Pipe) {
-                    let update_fields = self.parse_record_update_fields()?;
+                if !self.eat(&TokenKind::Comma) {
+                    self.skip_newlines();
                     let end_tok = self
-                        .expect(&TokenKind::RBrace, "expected '}' to close record update")
+                        .expect(&TokenKind::RBrace, "expected '}' to close record")
                         .ok()?;
                     return Some(Spanned::new(
-                        ExprKind::RecordUpdate {
-                            base: Box::new(head),
-                            fields: update_fields,
-                        },
+                        ExprKind::Record(fields),
                         Span::new(start.start, end_tok.span.end),
                     ));
                 }
+                // Fall through to parse the remaining fields.
+            } else {
+                self.restore(saved);
+                self.diagnostics.truncate(diag_count);
             }
-            self.restore(saved);
-            self.diagnostics.truncate(diag_count);
         }
 
-        // Named fields: `name value name2 value2 …`
+        // Parse (remaining) record literal or punned fields.
+        // If we see `lower:` it's a record literal.
+        // If we see `lower,` or `lower}` it's punned fields.
+        // If we see an expression followed by `,` or `}` it's punned fields.
+        //
+        // Field-level error recovery: when a field's value or punned
+        // expression fails to parse, skip to the next `,` or `}` instead of
+        // bailing on the whole record. This way a single malformed field
+        // surfaces one diagnostic but doesn't suppress the rest of the
+        // record (and any cascading errors from later code that depends on
+        // the record having parsed).
         loop {
             self.skip_newlines();
             if self.at(&TokenKind::RBrace) {
                 break;
             }
-            let (fname, _) = self
-                .expect_lower("expected field name in record")
-                .ok()?;
+
+            let progress_before = self.pos;
+            if matches!(self.peek(), TokenKind::Lower(_)) {
+                // Check if next token after the identifier is `:` (record literal field)
+                if matches!(self.peek_ahead(1), TokenKind::Colon) {
+                    // Record literal field: name: expr
+                    let tok = self.advance(); // consume name
+                    let TokenKind::Lower(fname) = tok.kind else { unreachable!() };
+                    self.advance(); // consume `:`
+                    match self.parse_expr() {
+                        Some(val) => fields.push(Field {
+                            name: fname,
+                            value: val,
+                        }),
+                        None => self.skip_to_record_field_boundary(),
+                    }
+                } else {
+                    // Punned field: {name} means {name: name}
+                    // Or it could be an expression like {expr.field}
+                    match self.parse_expr() {
+                        Some(expr) => {
+                            let field_name = self.extract_pun_name(&expr).unwrap_or_else(|| {
+                                self.error_at(
+                                    expr.span,
+                                    "cannot determine field name for punned record field",
+                                );
+                                "?".into()
+                            });
+                            fields.push(Field {
+                                name: field_name,
+                                value: expr,
+                            });
+                        }
+                        None => self.skip_to_record_field_boundary(),
+                    }
+                }
+            } else {
+                // Expression-based pun: {expr.field}
+                match self.parse_expr() {
+                    Some(expr) => {
+                        let field_name = self.extract_pun_name(&expr).unwrap_or_else(|| {
+                            self.error_at(
+                                expr.span,
+                                "cannot determine field name for punned record field",
+                            );
+                            "?".into()
+                        });
+                        fields.push(Field {
+                            name: field_name,
+                            value: expr,
+                        });
+                    }
+                    None => self.skip_to_record_field_boundary(),
+                }
+            }
+
             self.skip_newlines();
-            let Some(value) = self.parse_postfix() else {
-                self.error("expected field value after field name in record");
-                return None;
-            };
-            fields.push(Field { name: fname, value });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+            // Defensive: if we made no progress on this iteration AND didn't
+            // hit a comma, bail out to avoid an infinite loop on pathological
+            // inputs (every recovery path advances at least one token, so
+            // this should be unreachable in practice).
+            if self.pos == progress_before {
+                break;
+            }
         }
 
         self.skip_newlines();
@@ -3126,33 +3263,14 @@ impl Parser {
         ))
     }
 
-    /// Parse the `name value …` fields after the `|` in a record update
-    /// `{base | name value, …}`. Stops before the closing `}`.
-    fn parse_record_update_fields(&mut self) -> Option<Vec<Field<Expr>>> {
-        let mut update_fields = Vec::new();
-        self.skip_newlines();
-        if !self.at(&TokenKind::RBrace) {
-            loop {
-                self.skip_newlines();
-                if self.at(&TokenKind::RBrace) {
-                    break;
-                }
-                let (fname, _) = self
-                    .expect_lower("expected field name in record update")
-                    .ok()?;
-                self.skip_newlines();
-                let Some(val) = self.parse_postfix() else {
-                    self.error("expected field value after field name in record update");
-                    return None;
-                };
-                update_fields.push(Field {
-                    name: fname,
-                    value: val,
-                });
-            }
+    /// Extract the field name for a punned record field.
+    /// `x` => "x", `t.name` => "name"
+    fn extract_pun_name(&self, expr: &Expr) -> Option<Name> {
+        match &expr.node {
+            ExprKind::Var(name) => Some(name.clone()),
+            ExprKind::FieldAccess { field, .. } => Some(field.clone()),
+            _ => None,
         }
-        self.skip_newlines();
-        Some(update_fields)
     }
 
     fn parse_list_expr(&mut self, start: Span) -> Option<Expr> {
@@ -3877,20 +3995,27 @@ impl Parser {
         if !self.at(&TokenKind::RBrace) {
             loop {
                 self.skip_newlines();
-                if self.at(&TokenKind::RBrace) {
-                    break;
-                }
                 let (fname, fname_span) =
                     self.expect_lower("expected field name in record pattern").ok()?;
-                self.skip_newlines();
-                // Field pattern value: `name pattern` (whitespace-separated, no
-                // `:`). No punning — every field binds an explicit pattern.
-                let pattern = Some(self.parse_pat()?);
+                let pattern = if self.eat(&TokenKind::Colon) {
+                    self.skip_newlines();
+                    Some(self.parse_pat()?)
+                } else {
+                    None // punned: {name} means {name: name}
+                };
                 fields.push(FieldPat {
                     name: fname,
                     name_span: fname_span,
                     pattern,
                 });
+                self.skip_newlines();
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                self.skip_newlines();
+                if self.at(&TokenKind::RBrace) {
+                    break; // trailing comma
+                }
             }
         }
         self.skip_newlines();
@@ -4804,18 +4929,21 @@ mod tests {
 
     #[test]
     fn parse_record_expr() {
-        // r = {name "Alice" age 30}
-        let source = r#"r = {name "Alice" age 30}"#.to_string();
+        // r = {name: "Alice", age: 30}
+        let source = r#"r = {name: "Alice", age: 30}"#.to_string();
         let tokens = toks(vec![
             (TokenKind::Lower("r".into()), 0, 1),
             (TokenKind::Eq, 2, 3),
             (TokenKind::LBrace, 4, 5),
             (TokenKind::Lower("name".into()), 5, 9),
-            (TokenKind::Text("Alice".into()), 10, 17),
-            (TokenKind::Lower("age".into()), 18, 21),
-            (TokenKind::Int("30".into()), 22, 24),
-            (TokenKind::RBrace, 24, 25),
-            (TokenKind::Eof, 25, 25),
+            (TokenKind::Colon, 9, 10),
+            (TokenKind::Text("Alice".into()), 11, 18),
+            (TokenKind::Comma, 18, 19),
+            (TokenKind::Lower("age".into()), 20, 23),
+            (TokenKind::Colon, 23, 24),
+            (TokenKind::Int("30".into()), 25, 27),
+            (TokenKind::RBrace, 27, 28),
+            (TokenKind::Eof, 28, 28),
         ]);
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
@@ -5030,8 +5158,8 @@ mod tests {
 
     #[test]
     fn parse_record_update() {
-        // f = {t | age 30}
-        let source = "f = {t | age 30}".to_string();
+        // f = {t | age: 30}
+        let source = "f = {t | age: 30}".to_string();
         let tokens = toks(vec![
             (TokenKind::Lower("f".into()), 0, 1),
             (TokenKind::Eq, 2, 3),
@@ -5039,9 +5167,10 @@ mod tests {
             (TokenKind::Lower("t".into()), 5, 6),
             (TokenKind::Pipe, 7, 8),
             (TokenKind::Lower("age".into()), 9, 12),
-            (TokenKind::Int("30".into()), 13, 15),
-            (TokenKind::RBrace, 15, 16),
-            (TokenKind::Eof, 16, 16),
+            (TokenKind::Colon, 12, 13),
+            (TokenKind::Int("30".into()), 14, 16),
+            (TokenKind::RBrace, 16, 17),
+            (TokenKind::Eof, 17, 17),
         ]);
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);

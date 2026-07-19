@@ -111,39 +111,39 @@ fn decl_body<'a>(m: &'a knot::ast::Module, name: &str) -> &'a knot::ast::Expr {
     panic!("no Fun decl named {}", name);
 }
 
-// ── 1. Record-update fields are never punned ─────────────────────────
+// ── 1. Punning is gone; records are always explicit `name value` ─────
 
 #[test]
-fn record_update_var_pun_not_applied() {
-    // `{t | age: age}` must NOT format to `{t | age}` (parse error in updates).
-    let out = check_str("update-var-pun", "f = \\t age -> {t | age: age}\n");
-    assert!(out.contains("{t | age: age}"), "output: {}", out);
+fn record_update_var_value_explicit() {
+    // `{t | age age}` — field `age` bound to var `age`; no punning, no colon.
+    let out = check_str("update-var", "f = \\t age -> {t | age age}\n");
+    assert!(out.contains("{t | age age}"), "output: {}", out);
 }
 
 #[test]
-fn record_update_field_access_pun_not_applied() {
-    // `{t | name: u.name}` must NOT format to `{t | u.name}` (unparseable).
-    let out = check_str("update-fieldaccess-pun", "f = \\t u -> {t | name: u.name}\n");
-    assert!(out.contains("{t | name: u.name}"), "output: {}", out);
+fn record_update_field_access_value_explicit() {
+    // `{t | name u.name}` — field-access value stays atomic (no parens needed).
+    let out = check_str("update-fieldaccess", "f = \\t u -> {t | name u.name}\n");
+    assert!(out.contains("{t | name u.name}"), "output: {}", out);
 }
 
 #[test]
-fn record_update_block_path_not_punned() {
+fn record_update_block_path_explicit() {
     // Long enough to force the multi-line record-update renderer.
-    let src = "f = \\someRecordValue veryLongFieldNameOne veryLongFieldNameTwo veryLongFieldNameThree -> {someRecordValue | veryLongFieldNameOne: veryLongFieldNameOne, veryLongFieldNameTwo: veryLongFieldNameTwo, veryLongFieldNameThree: veryLongFieldNameThree}\n";
-    let out = check_str("update-block-pun", src);
+    let src = "f = \\someRecordValue veryLongFieldNameOne veryLongFieldNameTwo veryLongFieldNameThree -> {someRecordValue | veryLongFieldNameOne veryLongFieldNameOne veryLongFieldNameTwo veryLongFieldNameTwo veryLongFieldNameThree veryLongFieldNameThree}\n";
+    let out = check_str("update-block", src);
     assert!(
-        out.contains("veryLongFieldNameOne: veryLongFieldNameOne"),
+        out.contains("veryLongFieldNameOne veryLongFieldNameOne"),
         "output: {}",
         out
     );
 }
 
 #[test]
-fn record_literal_punning_still_works() {
-    // Punning in record LITERALS is valid and should be preserved.
-    let out = check_str("literal-pun", "f = \\name age -> {name, age}\n");
-    assert!(out.contains("{name, age}"), "output: {}", out);
+fn record_literal_explicit_fields() {
+    // Record literals are explicit `name value` pairs; punning does not exist.
+    let out = check_str("literal-explicit", "f = \\name age -> {name name age age}\n");
+    assert!(out.contains("{name name age age}"), "output: {}", out);
 }
 
 // ── 2. Annotations on greedy-tail expressions keep their parens ──────
@@ -270,7 +270,7 @@ fn negative_case_arm_at_block_indent() {
 
 #[test]
 fn do_block_negative_statement_at_block_indent() {
-    let src = "main = do\n  with {x: 5} (do\n    -1)\n";
+    let src = "main = do\n  with {x 5} (do\n    -1)\n";
     let m = parse(src).unwrap_or_else(|e| panic!("do neg stmt: {}", e));
     match &decl_body(&m, "main").node {
         ExprKind::Do(stmts) => {
@@ -342,7 +342,7 @@ fn deeper_indent_binop_continuation_still_works() {
 fn deeper_indent_binop_continuation_in_do_block() {
     // Operator indented PAST the block indent continues the expression —
     // here the `with` record value absorbs the continuation.
-    let src = "main = do\n  with {x: 1\n    + 2} x\n";
+    let src = "main = do\n  with {x (1\n    + 2)} x\n";
     let m = parse(src).unwrap_or_else(|e| panic!("do continuation: {}", e));
     match &decl_body(&m, "main").node {
         ExprKind::Do(stmts) => {

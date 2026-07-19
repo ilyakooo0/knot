@@ -11832,7 +11832,7 @@ mod tests {
 
     #[test]
     fn field_access_nonexistent() {
-        let diags = check_src("main = {name: \"Alice\"}.age");
+        let diags = check_src("main = {name \"Alice\"}.age");
         assert!(has_error(&diags, "unexpected fields"));
     }
 
@@ -11999,7 +11999,7 @@ main = applyPred (\\r -> r.x == r.y)\
              *people : [P]\n\
              insert = \\name age -> do\n  \
                ps <- *people\n  \
-               replace *people = union ps [{name: name, age: age}]\n  \
+               replace *people = union ps [{name name age age}]\n  \
                yield {}"
         );
         assert!(has_error(&diags, "`replace *people = ...` is unnecessary"));
@@ -12107,8 +12107,8 @@ main = applyPred (\\r -> r.x == r.y)\
         // Covering all constructors is fine.
         assert!(check_src(
             "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
-             f = \\s -> case s of\n  Circle {r} -> r\n  Rect {w, h} -> w * h\n\
-             main = f (Circle {r: 5})"
+             f = \\s -> case s of\n  Circle {r r} -> r\n  Rect {w w h h} -> w * h\n\
+             main = f (Circle {r 5})"
         ).is_empty());
     }
 
@@ -12117,8 +12117,8 @@ main = applyPred (\\r -> r.x == r.y)\
         // A wildcard catch-all makes any match exhaustive.
         assert!(check_src(
             "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
-             f = \\s -> case s of\n  Circle {r} -> r\n  _ -> 0\n\
-             main = f (Circle {r: 5})"
+             f = \\s -> case s of\n  Circle {r r} -> r\n  _ -> 0\n\
+             main = f (Circle {r 5})"
         ).is_empty());
     }
 
@@ -12127,7 +12127,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // A variable catch-all also makes it exhaustive.
         assert!(check_src(
             "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
-             f = \\s -> case s of\n  Circle {r} -> r\n  other -> 0\n\
+             f = \\s -> case s of\n  Circle {r r} -> r\n  other -> 0\n\
              main = f (Circle {r: 5})"
         ).is_empty());
     }
@@ -12137,8 +12137,8 @@ main = applyPred (\\r -> r.x == r.y)\
         // Missing Rect — should produce an error.
         let diags = check_src(
             "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
-             f = \\s -> case s of\n  Circle {r} -> r\n\
-             main = f (Circle {r: 5})"
+             f = \\s -> case s of\n  Circle {r r} -> r\n\
+             main = f (Circle {r 5})"
         );
         assert!(has_error(&diags, "non-exhaustive"));
         assert!(has_error(&diags, "Rect"));
@@ -12233,8 +12233,8 @@ main = applyPred (\\r -> r.x == r.y)\
              impl Functor Maybe where\n\
              \x20 fmap f m = case m of\n\
              \x20   Nothing {} -> Nothing {}\n\
-             \x20   Just {value} -> Just {value: f value}\n\
-             main = fmap (\\x -> x + 1) (Just {value: 42})"
+             \x20   Just {value value} -> Just {value (f value)}\n\
+             main = fmap (\\x -> x + 1) (Just {value 42})"
         ).is_empty());
     }
 
@@ -12504,7 +12504,7 @@ main = applyPred (\\r -> r.x == r.y)\
              \x20 fmap f rel = do\n\
              \x20   x <- rel\n\
              \x20   yield (f x)\n\
-             main = fmap (\\x -> x + 1) (MkBox {value: 42})"
+             main = fmap (\\x -> x + 1) (MkBox {value 42})"
         );
         assert!(has_error(&diags, "no implementation of trait 'Functor'"));
     }
@@ -12717,7 +12717,7 @@ main = applyPred (\\r -> r.x == r.y)\
     #[test]
     fn unit_in_record() {
         assert!(check_src(
-            "main = {distance: (100.0 : Float M), time: (10.0 : Float S)}"
+            "main = {distance (100.0 : Float M) time (10.0 : Float S)}\n"
         ).is_empty());
     }
 
@@ -12743,7 +12743,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // avg result has unit from projection — adding mismatched unit should fail
         let diags = check_src(
             "\
-             main = avg (\\p -> p.x) [{x: (1.0 : Float M)}] + (1.0 : Float S)"
+             main = avg (\\p -> p.x) [{x (1.0 : Float M)}] + (1.0 : Float S)"
         );
         assert!(!diags.is_empty(), "should reject adding Float M avg result to Float S");
     }
@@ -12849,7 +12849,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // `Int` is required (the `\x -> x` body returns its `Nat` param as the
         // declared `Int` result). The `Nat` is obtained soundly via `refine`.
         let diags = check_src(
-            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value: n} -> f n\n  Err {error: _} -> 0"
+            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value n} -> f n\n  Err {error _} -> 0"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12894,7 +12894,7 @@ main = applyPred (\\r -> r.x == r.y)\
     fn refine_expr_with_case() {
         // refine should return Result RefinementError T, usable with case
         let diags = check_src(
-            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value: n} -> f n\n  Err {error: _} -> 0"
+            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value n} -> f n\n  Err {error _} -> 0"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -12914,7 +12914,7 @@ main = applyPred (\\r -> r.x == r.y)\
         // Forgetting still walks the whole chain to the base, so an `Age`
         // value (obtained soundly via `refine`) flows where `Int` is required.
         let diags = check_src(
-            "type Nat = Int 1 where \\x -> x >= 0\ntype Age = Nat where \\x -> x <= 150\nf : Age -> Int 1\nf = \\x -> x\nmain = case refine 25 of\n  Ok {value: a} -> f a\n  Err {error: _} -> 0"
+            "type Nat = Int 1 where \\x -> x >= 0\ntype Age = Nat where \\x -> x <= 150\nf : Age -> Int 1\nf = \\x -> x\nmain = case refine 25 of\n  Ok {value a} -> f a\n  Err {error _} -> 0"
         );
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
@@ -13398,9 +13398,9 @@ main = applyPred (\\r -> r.x == r.y)\
              *items : [{name: Text}]\n\
              route Api where\n  GET /a -> Text = HandlerA\n  POST /b -> Text = HandlerB\n  GET /c -> Text = HandlerC\n\
              api = serve Api where\n\
-             \x20 HandlerA = \\{} -> do\n    println \"a\"\n    yield Ok {value: \"a\"}\n\
-             \x20 HandlerB = \\{} -> do\n    replace *log = [{msg: \"b\"}]\n    yield Ok {value: \"b\"}\n\
-             \x20 HandlerC = \\{} -> do\n    items <- *items\n    yield Ok {value: \"c\"}\n\
+             \x20 HandlerA = \\{} -> do\n    println \"a\"\n    yield Ok {value \"a\"}\n\
+             \x20 HandlerB = \\{} -> do\n    replace *log = [{msg \"b\"}]\n    yield Ok {value \"b\"}\n\
+             \x20 HandlerC = \\{} -> do\n    items <- *items\n    yield Ok {value \"c\"}\n\
              main = listen 8080 api";
         let diags = check_src(src);
         assert!(diags.is_empty(), "expected clean check, got: {:?}",
@@ -13423,7 +13423,7 @@ main = applyPred (\\r -> r.x == r.y)\
         let info = type_info_for(
             "*counter : [{value: Int 1}]\n\
              route Api where\n  POST / -> {value: Int 1} = Bump\n\
-             api = serve Api where\n  Bump = \\{} -> do\n    *counter = [{value: 1}]\n    yield Ok {value: {value: 1}}\n\
+             api = serve Api where\n  Bump = \\{} -> do\n    *counter = [{value 1}]\n    yield Ok {value {value 1}}\n\
              main = listen 8080 api"
         );
         let main_ty = info.get("main").expect("missing main type");

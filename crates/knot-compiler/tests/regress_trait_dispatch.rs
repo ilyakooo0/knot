@@ -108,7 +108,7 @@ fn shared_constructor_dispatches_on_static_type() {
     // because both types spell the constructor `Circle`.
     let src = format!(
         "{SHARED_CTOR_PRELUDE}
-main = with {{s: Circle {{r: 2.0}} : Shape, b: Circle {{r: 2.0}} : Blob}} (do
+main = with {{s (Circle {{r 2.0}} : Shape) b (Circle {{r 2.0}} : Blob)}} (do
   println (show (area s))
   println (show (area b)))
 "
@@ -127,7 +127,7 @@ fn shared_constructor_dispatches_multi_arg_method() {
     // Dispatch is on the first param; the extra arg must still be forwarded.
     let src = format!(
         "{SHARED_CTOR_PRELUDE}
-main = with {{s: Circle {{r: 2.0}} : Shape, b: Circle {{r: 2.0}} : Blob}} (do
+main = with {{s (Circle {{r 2.0}} : Shape) b (Circle {{r 2.0}} : Blob)}} (do
   println (show (scaled s 10.0))
   println (show (scaled b 10.0)))
 "
@@ -147,7 +147,7 @@ fn shared_constructor_dispatches_when_method_is_a_bare_value() {
     // box the tag dispatcher; it must box the statically selected impl.
     let src = format!(
         "{SHARED_CTOR_PRELUDE}
-main = with {{shapes: [Circle {{r: 1.0}} : Shape], blobs: [Circle {{r: 1.0}} : Blob]}} (do
+main = with {{shapes [Circle {{r 1.0}} : Shape] blobs [Circle {{r 1.0}} : Blob]}} (do
   println (show (map area shapes))
   println (show (map area blobs)))
 "
@@ -172,7 +172,7 @@ describe : Area a => a -> Float 1
 describe = \\x -> area x
 
 main = do
-  println (show (describe (Circle {{r: 2.0}} : Blob)))
+  println (show (describe (Circle {{r 2.0}} : Blob)))
 "
     );
     let err = try_compile("ambiguous_poly", &src)
@@ -208,8 +208,8 @@ describe : Area a => a -> Float 1
 describe = \x -> area x
 
 main = do
-  println (show (describe (Circle {r: 2.0} : Shape)))
-  println (show (describe (Blob1 {r: 2.0} : Blob)))
+  println (show (describe (Circle {r 2.0} : Shape)))
+  println (show (describe (Blob1 {r 2.0} : Blob)))
 "#;
     let stdout = compile_and_run("poly_no_clash", src);
     let lines: Vec<&str> = stdout.lines().collect();

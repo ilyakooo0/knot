@@ -49,7 +49,7 @@ fn errors(diags: &[Diagnostic]) -> Vec<&Diagnostic> {
 fn b21_alias_free_var_is_order_independent() {
     let src = "type Box = {val: a}\n\
                callBoth : Text\n\
-               callBoth = show (f {val: 1}) ++ show (f {val: \"s\"})\n\
+               callBoth = show (f {val 1}) ++ show (f {val \"s\"})\n\
                f : Box -> Box\n\
                f = \\b -> b\n";
     let diags = check_src(src);
@@ -69,7 +69,7 @@ fn b21_forward_declared_alias_still_compiles() {
                f : Box -> Box\n\
                f = \\b -> b\n\
                callBoth : Text\n\
-               callBoth = show (f {val: 1}) ++ show (f {val: \"s\"})\n";
+               callBoth = show (f {val 1}) ++ show (f {val \"s\"})\n";
     let diags = check_src(src);
     assert!(
         errors(&diags).is_empty(),
@@ -85,7 +85,7 @@ fn b21_forward_declared_alias_still_compiles() {
 fn b21_nested_alias_free_var_is_order_independent() {
     let src = "type Box = {val: a}\n\
                callBoth : Text\n\
-               callBoth = show (wrap [{val: 1}]) ++ show (wrap [{val: \"s\"}])\n\
+               callBoth = show (wrap [{val 1}]) ++ show (wrap [{val \"s\"}])\n\
                wrap : [Box] -> [Box]\n\
                wrap = \\xs -> xs\n";
     let diags = check_src(src);

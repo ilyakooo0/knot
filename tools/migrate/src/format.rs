@@ -156,7 +156,7 @@ fn utf8_char_len(first: u8) -> usize {
     }
 }
 
-fn format_module_inner(source: &str, module: &Module) -> String {
+pub fn format_module_inner(source: &str, module: &Module) -> String {
     let comments = collect_comments(source);
 
     enum Block<'a> {
@@ -2321,12 +2321,20 @@ fn render_pat(p: &Pat) -> String {
             let mut s = String::from("{");
             for (i, f) in fields.iter().enumerate() {
                 if i > 0 {
-                    s.push_str(", ");
+                    s.push(' ');
                 }
                 s.push_str(&f.name);
-                if let Some(sub) = &f.pattern {
-                    s.push_str(": ");
-                    s.push_str(&render_pat(sub));
+                // No punning: a bare field always binds a same-named var, so
+                // always render the explicit sub-pattern (`value value`).
+                match &f.pattern {
+                    Some(sub) => {
+                        s.push(' ');
+                        s.push_str(&render_pat(sub));
+                    }
+                    None => {
+                        s.push(' ');
+                        s.push_str(&f.name);
+                    }
                 }
             }
             s.push('}');
@@ -2517,11 +2525,28 @@ mod tests {
         );
     }
 
+    /// The tool intentionally formats OLD syntax into NEW syntax that the
+    /// vendored OLD parser cannot reparse, so these tests must call
+    /// `format_module_inner` directly — `format_module`'s reparse safety net
+    /// would (correctly) bounce the new-syntax output back to the original.
+    fn fmt_migrate(src: &str) -> String {
+        let lexer = Lexer::new(src);
+        let (tokens, _) = lexer.tokenize();
+        let parser = Parser::new(src.to_string(), tokens);
+        let (module, diags) = parser.parse_module();
+        for d in &diags {
+            if d.severity == crate::diagnostic::Severity::Error {
+                panic!("parse error: {}", d.render(src, "<test>"));
+            }
+        }
+        format_module_inner(src, &module)
+    }
+
     #[test]
     fn record_field_access_value() {
-        // No punning exists; a field-access value renders explicitly and is
-        // parenthesized only if non-atomic (field-access chains are atomic).
-        let formatted = fmt("main = {name e.name value e.salary}");
+        // Tool purpose: OLD colon syntax in, NEW whitespace syntax out. The
+        // vendored parser is the OLD one, so feed it old syntax.
+        let formatted = fmt_migrate("main = {name: e.name, value: e.salary}");
         assert!(
             formatted.contains("{name e.name value e.salary}"),
             "expected name value pairs; got:\n{}",
@@ -2539,18 +2564,18 @@ mod tests {
 
     #[test]
     fn case_block_multiline() {
-        let src = "f = \\x -> case x of\n  Just {value value} -> value\n  Nothing {} -> 0";
-        assert_idempotent(src);
-        let out = fmt(src);
+        let src = "f = \\x -> case x of\n  Just {value} -> value\n  Nothing {} -> 0";
+        let out = fmt_migrate(src);
         assert!(out.contains("case x of"));
         assert!(out.contains("Just {value value} -> value"));
     }
 
     #[test]
     fn impl_method_curried_args() {
-        let src = "impl Functor Maybe where\n  map f m = case m of\n    Just {value value} -> Just {value (f value)}\n    Nothing {} -> Nothing {}";
-        let out = fmt(src);
+        let src = "impl Functor Maybe where\n  map f m = case m of\n    Just {value} -> Just {value: f value}\n    Nothing {} -> Nothing {}";
+        let out = fmt_migrate(src);
         assert!(out.contains("map f m = case m of"));
+        assert!(out.contains("Just {value value} -> Just {value (f value)}"));
     }
 
     #[test]

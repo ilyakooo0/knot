@@ -83,20 +83,20 @@ impl Alternative [] where
 impl Functor Maybe where
   map f m = case m of
     Nothing {} -> Nothing {}
-    Just {value} -> Just {value: f value}
+    Just {value value} -> Just {value (f value)}
 
 impl Applicative Maybe where
-  yield x = Just {value: x}
+  yield x = Just {value x}
   ap fs xs = case fs of
     Nothing {} -> Nothing {}
-    Just {value: f} -> case xs of
+    Just {value f} -> case xs of
       Nothing {} -> Nothing {}
-      Just {value: x} -> Just {value: f x}
+      Just {value x} -> Just {value (f x)}
 
 impl Monad Maybe where
   bind f m = case m of
     Nothing {} -> Nothing {}
-    Just {value} -> f value
+    Just {value value} -> f value
 
 impl Alternative Maybe where
   empty = Nothing {}
@@ -107,7 +107,7 @@ impl Alternative Maybe where
 impl Foldable Maybe where
   fold f z m = case m of
     Nothing {} -> z
-    Just {value} -> f z value
+    Just {value value} -> f z value
 
 trait ToJSON a where
   toJson : a -> Text
@@ -123,12 +123,12 @@ max = \a b -> if a > b then a else b
 
 head : [a] -> Maybe a
 head = \items -> case items of
-  Cons x _ -> Just {value: x}
+  Cons x _ -> Just {value x}
   [] -> Nothing {}
 
 findFirst : [a] -> (a -> Bool) -> Maybe a
 findFirst = \items pred -> case items of
-  Cons x rest -> if pred x then Just {value: x} else findFirst rest pred
+  Cons x rest -> if pred x then Just {value x} else findFirst rest pred
   [] -> Nothing {}
 
 when : Bool -> IO {| e} {} -> IO {| e} {}

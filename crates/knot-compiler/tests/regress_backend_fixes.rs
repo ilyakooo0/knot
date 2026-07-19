@@ -126,15 +126,9 @@ fn do_bind_shadowing_outer_var_compiles_and_runs() {
         r#"*todos : [{title: Text, owner: Text, done: Int 1}]
 
 main = do
-  replace *todos = [{title: "a", owner: "Alice", done: 0}]
+  replace *todos = [{title "a" owner "Alice" done 0}]
   t <- now
-  with {workload: do
-    t <- *todos
-    where t.done == 0
-    groupBy {t.owner}
-    yield {owner: t.owner, count: count t}} (do
-    println (show t)
-    yield {})
+  with {workload (do t <- *todos; where t.done == 0; groupBy {owner t.owner}; yield {owner t.owner count (count t)})} (do println (show t); yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -160,14 +154,8 @@ fn chained_do_local_lets_in_pushed_where() {
         r#"*items : [{x: Int 1}]
 
 main = do
-  replace *items = [{x: 5}, {x: 6}]
-  with {a: 5} (
-    with {b: a + 1} (
-      with {r: do
-        m <- *items
-        where m.x == b
-        yield m} (do
-        println (show (count r)))))
+  replace *items = [{x 5}, {x 6}]
+  with {a 5} with {b (a + 1)} with {r (do m <- *items; where m.x == b; yield m)} (do println (show (count r)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -186,7 +174,7 @@ const REFINED_VIEW_PROG_HEADER: &str = r#"type Nat = Int 1 where \x -> x >= 0
 *aliceAccounts = do
   a <- *accounts
   where a.owner == "alice"
-  yield {balance: a.balance}
+  yield {balance a.balance}
 "#;
 
 #[test]
@@ -194,7 +182,7 @@ fn direct_write_of_refined_source_rejected() {
     let src = format!(
         "{REFINED_VIEW_PROG_HEADER}
 main = do
-  replace *accounts = [{{owner: \"bob\", balance: 0 - 5}}]
+  replace *accounts = [{{owner \"bob\" balance (0 - 5)}}]
   rows <- *accounts
   println (show (count rows))
 "
@@ -213,7 +201,7 @@ fn view_write_of_refined_source_rejected() {
     let src = format!(
         "{REFINED_VIEW_PROG_HEADER}
 main = do
-  *aliceAccounts = [{{balance: 0 - 5}}]
+  *aliceAccounts = [{{balance (0 - 5)}}]
   rows <- *accounts
   println (show (count rows))
 "
@@ -230,7 +218,7 @@ fn view_write_of_valid_rows_accepted() {
     let src = format!(
         "{REFINED_VIEW_PROG_HEADER}
 main = do
-  *aliceAccounts = [{{balance: 7}}]
+  *aliceAccounts = [{{balance 7}}]
   rows <- *accounts
   println (show (count rows))
 "
@@ -256,19 +244,12 @@ fn io_bind_from_let_bound_groupby_iterates_all_rows() {
 
 main = do
   replace *todos = [
-    {title: "a", owner: "Alice", done: 0},
-    {title: "b", owner: "Alice", done: 0},
-    {title: "c", owner: "Bob", done: 0},
-    {title: "d", owner: "Alice", done: 1}
+    {title "a" owner "Alice" done 0},
+    {title "b" owner "Alice" done 0},
+    {title "c" owner "Bob" done 0},
+    {title "d" owner "Alice" done 1}
   ]
-  with {workload: do
-    t <- *todos
-    where t.done == 0
-    groupBy {t.owner}
-    yield {owner: t.owner, count: count t}} (do
-    w <- workload
-    println (w.owner ++ ": " ++ show w.count)
-    yield {})
+  with {workload (do t <- *todos; where t.done == 0; groupBy {owner t.owner}; yield {owner t.owner count (count t)})} (do w <- workload; println (w.owner ++ ": " ++ show w.count); yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -286,14 +267,8 @@ fn io_bind_from_let_bound_filter_comprehension_iterates() {
         r#"*nums : [{n: Int 1}]
 
 main = do
-  replace *nums = [{n: 1}, {n: 2}, {n: 3}]
-  with {bigs: do
-    x <- *nums
-    where x.n > 1
-    yield x} (do
-    b <- bigs
-    println (show b.n)
-    yield {})
+  replace *nums = [{n 1}, {n 2}, {n 3}]
+  with {bigs (do x <- *nums; where x.n > 1; yield x)} (do b <- bigs; println (show b.n); yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -314,12 +289,8 @@ fn text_concat_equality_is_not_numeric() {
         r#"*items : [{a: Text, b: Text}]
 
 main = do
-  replace *items = [{a: "0", b: "7"}]
-  with {r: do
-    i <- *items
-    where i.a ++ i.b == "7"
-    yield i} (do
-    println (show (count r)))
+  replace *items = [{a "0" b "7"}]
+  with {r (do i <- *items; where i.a ++ i.b == "7"; yield i)} (do println (show (count r)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -337,12 +308,8 @@ fn text_concat_ordering_is_bytewise() {
         r#"*items : [{a: Text, b: Text}]
 
 main = do
-  replace *items = [{a: "0", b: "7"}]
-  with {r: do
-    i <- *items
-    where i.a ++ i.b < "1"
-    yield i} (do
-    println (show (count r)))
+  replace *items = [{a "0" b "7"}]
+  with {r (do i <- *items; where i.a ++ i.b < "1"; yield i)} (do println (show (count r)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -368,15 +335,8 @@ impl Eq Status where
 *users : [{name: Text, st: Status}]
 
 main = do
-  replace *users = [
-    {name: "a", st: Active {}},
-    {name: "b", st: Banned {reason: "spam"}}
-  ]
-  with {r: do
-    u <- *users
-    where u.st == Active {}
-    yield u} (do
-    println (show (count r)))
+  replace *users = [{name "a" st (Active {})}, {name "b" st (Banned {reason "spam"})}]
+  with {r (do u <- *users; where u.st == Active {}; yield u)} (do println (show (count r)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -399,12 +359,8 @@ impl Eq Color where
 *marbles : [{n: Int 1, c: Color}]
 
 main = do
-  replace *marbles = [{n: 1, c: Red {}}, {n: 2, c: Blue {}}, {n: 3, c: Red {}}]
-  with {r: do
-    m <- *marbles
-    where m.c == Red {}
-    yield m} (do
-    println (show (count r)))
+  replace *marbles = [{n 1 c (Red {})}, {n 2 c (Blue {})}, {n 3 c (Red {})}]
+  with {r (do m <- *marbles; where m.c == Red {}; yield m)} (do println (show (count r)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -425,9 +381,8 @@ fn maxon_over_text_column_returns_text() {
         r#"*codes : [{c: Text}]
 
 main = do
-  replace *codes = [{c: "007"}, {c: "01"}]
-  with {m: maxOn (\x -> x.c) *codes}
-    (println (show m))
+  replace *codes = [{c "007"}, {c "01"}]
+  with {m (maxOn (\x -> x.c) *codes)} println (show m)
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -444,9 +399,8 @@ fn minon_over_text_column_returns_text() {
         r#"*codes : [{c: Text}]
 
 main = do
-  replace *codes = [{c: "007"}, {c: "01"}]
-  with {m: minOn (\x -> x.c) *codes}
-    (println (show m))
+  replace *codes = [{c "007"}, {c "01"}]
+  with {m (minOn (\x -> x.c) *codes)} println (show m)
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -464,9 +418,8 @@ fn maxon_over_int_column_still_pushes_and_is_numeric() {
         r#"*scores : [{s: Int 1}]
 
 main = do
-  replace *scores = [{s: 9}, {s: 10}]
-  with {m: maxOn (\x -> x.s) *scores}
-    (println (show m))
+  replace *scores = [{s 9}, {s 10}]
+  with {m (maxOn (\x -> x.s) *scores)} println (show m)
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -536,7 +489,7 @@ fn refined_alias_field_refinement_enforced() {
     let src = format!(
         "{REFINED_ALIAS_HEADER}
 main = do
-  replace *people = [{{age: 0 - 5}}]
+  replace *people = [{{age (0 - 5)}}]
   rows <- *people
   println (show (count rows))
 "
@@ -553,7 +506,7 @@ fn refined_alias_whole_element_refinement_still_enforced() {
     let src = format!(
         "{REFINED_ALIAS_HEADER}
 main = do
-  replace *people = [{{age: 300}}]
+  replace *people = [{{age 300}}]
   rows <- *people
   println (show (count rows))
 "
@@ -570,7 +523,7 @@ fn refined_alias_valid_row_accepted() {
     let src = format!(
         "{REFINED_ALIAS_HEADER}
 main = do
-  replace *people = [{{age: 42}}]
+  replace *people = [{{age 42}}]
   rows <- *people
   println (show (count rows))
 "
@@ -605,21 +558,9 @@ fn groupby_non_equi_join_multibind_survives_arena_reset() {
 *children : [{owner: Text, bound: Int 1}]
 
 main = do
-  replace *parents = [{pid: 100}]
-  replace *children = [
-    {owner: "alice", bound: 3},
-    {owner: "alice", bound: 5},
-    {owner: "bob", bound: 7}
-  ]
-  with {grouped: do
-    p <- *parents
-    c <- *children
-    where c.bound < p.pid
-    groupBy {c.owner}
-    yield {owner: c.owner, n: count c}} (do
-    g <- grouped
-    println (g.owner ++ ":" ++ show g.n)
-    yield {})
+  replace *parents = [{pid 100}]
+  replace *children = [{owner "alice" bound 3}, {owner "alice" bound 5}, {owner "bob" bound 7}]
+  with {grouped (do p <- *parents; c <- *children; where c.bound < p.pid; groupBy {owner c.owner}; yield {owner c.owner n (count c)})} (do g <- grouped; println (g.owner ++ ":" ++ show g.n); yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");

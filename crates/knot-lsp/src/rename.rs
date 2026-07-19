@@ -2814,7 +2814,7 @@ mod tests {
         // renames it correctly. The builtin-rejection guard must exempt field
         // positions, otherwise the editor never offers F2 on the field.
         let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "g = {count: 2}\n");
+        let uri = ws.open("main", "g = {count 2}\n");
         let doc = ws.doc(&uri);
         let off = doc.source.find("count").expect("field");
         let pos = offset_to_position(&doc.source, off);
@@ -3146,11 +3146,12 @@ mod tests {
 
     #[test]
     fn rename_punned_pattern_binder_expands_pun() {
-        // Regression: renaming the binder of a punned record pattern `{name}`
-        // used to rewrite the pun token itself, silently changing which field
-        // is matched. The pun must expand to `name: newName`.
+        // Punning is gone: record patterns are explicit (`{name name}` binds
+        // field `name` to binder `name`). Renaming the *binder* (via a body
+        // usage) must rewrite only the binder pattern + usages — the field
+        // name token stays put, so the matched field is preserved.
         let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "getName = \\{name} -> name\n");
+        let uri = ws.open("main", "getName = \\{name name} -> name\n");
         let doc = ws.doc(&uri);
         let off = doc.source.find("> name").expect("body usage") + 2;
         let pos = offset_to_position(&doc.source, off);
@@ -3160,19 +3161,20 @@ mod tests {
         let edits = changes.get(&uri).expect("owner file edited");
         let out = apply_edits(&doc.source, edits);
         assert_eq!(
-            out, "getName = \\{name: fullName} -> fullName\n",
-            "pun must expand so the matched field is preserved"
+            out, "getName = \\{name fullName} -> fullName\n",
+            "binder rename must leave the field name token untouched"
         );
     }
 
     #[test]
     fn rename_through_expression_pun_expands_pun() {
-        // Expression puns have the same hazard: `{name}` builds `{name: name}`,
-        // so renaming the variable must expand the pun to keep the field name.
+        // Same for record expressions: `{name name}` builds a record whose
+        // field `name` reads the variable `name`. Renaming the variable must
+        // not change the built field name.
         let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "mk = \\name -> {name}\n");
+        let uri = ws.open("main", "mk = \\name -> {name name}\n");
         let doc = ws.doc(&uri);
-        let off = doc.source.find("{name}").expect("expr pun") + 1;
+        let off = doc.source.find("name}").expect("expr field value");
         let pos = offset_to_position(&doc.source, off);
         let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
             .expect("rename emits edit");
@@ -3180,21 +3182,21 @@ mod tests {
         let edits = changes.get(&uri).expect("owner file edited");
         let out = apply_edits(&doc.source, edits);
         assert_eq!(
-            out, "mk = \\label -> {name: label}\n",
-            "expression pun must expand so the built record keeps its field"
+            out, "mk = \\label -> {name label}\n",
+            "variable rename must leave the field name token untouched"
         );
     }
 
     #[test]
     fn field_rename_targets_field_token_not_variable() {
-        // `count` appears both as a lambda-bound variable (value position in
-        // `a: count`) and as a field name (`count: 2`). Renaming the *field*
-        // must touch only the field token — the old first-whole-word scan
-        // rewrote the variable and left the field untouched.
+        // `count` appears both as a lambda-bound variable (value position of
+        // field `a`) and as a field name. Renaming the *field* must touch only
+        // the field token — the old first-whole-word scan rewrote the variable
+        // and left the field untouched.
         let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\count -> {a: count, count: 2}\n");
+        let uri = ws.open("main", "f = \\count -> {a count count 2}\n");
         let doc = ws.doc(&uri);
-        let off = doc.source.find("count: 2").expect("field position");
+        let off = doc.source.find("count 2").expect("field position");
         let pos = offset_to_position(&doc.source, off);
         let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "total"))
             .expect("rename emits edit");
@@ -3202,7 +3204,7 @@ mod tests {
         let edits = changes.get(&uri).expect("edits for main");
         assert_eq!(edits.len(), 1, "exactly the field token; got: {edits:?}");
         let new_src = apply_edits(&doc.source, edits);
-        assert_eq!(new_src, "f = \\count -> {a: count, total: 2}\n");
+        assert_eq!(new_src, "f = \\count -> {a count total 2}\n");
     }
 
     #[test]
@@ -3211,9 +3213,9 @@ mod tests {
         // implementation found the same (first) span twice and deduped to a
         // single wrong edit.
         let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "g = [{n: 1}, {n: 2}]\n");
+        let uri = ws.open("main", "g = [{n 1}, {n 2}]\n");
         let doc = ws.doc(&uri);
-        let off = doc.source.find("n: 1").expect("first field");
+        let off = doc.source.find("n 1").expect("first field");
         let pos = offset_to_position(&doc.source, off);
         let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "m"))
             .expect("rename emits edit");
@@ -3221,7 +3223,7 @@ mod tests {
         let edits = changes.get(&uri).expect("edits for main");
         assert_eq!(edits.len(), 2, "one edit per record; got: {edits:?}");
         let new_src = apply_edits(&doc.source, edits);
-        assert_eq!(new_src, "g = [{m: 1}, {m: 2}]\n");
+        assert_eq!(new_src, "g = [{m 1}, {m 2}]\n");
     }
 
     #[test]
@@ -3231,10 +3233,10 @@ mod tests {
         // signature's `{name: Text}` stale — a type mismatch that corrupts the
         // source. The signature occurrence must rename in lockstep.
         let mut ws = TestWorkspace::new();
-        let src = "mkPerson : Text -> {name: Text}\nmkPerson = \\n -> {name: n}\n";
+        let src = "mkPerson : Text -> {name: Text}\nmkPerson = \\n -> {name n}\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
-        let off = doc.source.find("name: n").expect("body field");
+        let off = doc.source.find("name n").expect("body field");
         let pos = offset_to_position(&doc.source, off);
         let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "fullName"))
             .expect("rename emits edit");
@@ -3247,7 +3249,7 @@ mod tests {
         let new_src = apply_edits(&doc.source, &edits);
         assert_eq!(
             new_src,
-            "mkPerson : Text -> {fullName: Text}\nmkPerson = \\n -> {fullName: n}\n"
+            "mkPerson : Text -> {fullName: Text}\nmkPerson = \\n -> {fullName n}\n"
         );
     }
 
@@ -3258,10 +3260,10 @@ mod tests {
         // never its type — so the field in `(r : {name: Text})` was never
         // collected, leaving the annotation stale after a field rename.
         let mut ws = TestWorkspace::new();
-        let src = "f = \\r -> (r : {name: Text})\ng = {name: 1}\n";
+        let src = "f = \\r -> (r : {name: Text})\ng = {name 1}\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
-        let off = doc.source.find("name: 1").expect("record field");
+        let off = doc.source.find("name 1").expect("record field");
         let pos = offset_to_position(&doc.source, off);
         let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
             .expect("rename emits edit");
@@ -3269,7 +3271,7 @@ mod tests {
         let new_src = apply_edits(&doc.source, &edits);
         assert_eq!(
             new_src,
-            "f = \\r -> (r : {label: Text})\ng = {label: 1}\n",
+            "f = \\r -> (r : {label: Text})\ng = {label 1}\n",
             "annotation field must rename too; got edits: {edits:?}"
         );
     }
@@ -3527,27 +3529,30 @@ mod regress_rename_fixes_tests {
 
     #[test]
     fn rename_real_expression_pun_still_expands() {
-        // The AST-driven check must keep the correct pun expansion.
+        // Punning is gone, but the explicit `{name name}` form has the same
+        // hazard: renaming the variable must rewrite only the value token so
+        // the built record keeps its field name.
         let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "mk = \\name -> {name}\n");
+        let uri = ws.open("main", "mk = \\name -> {name name}\n");
         let doc = ws.doc(&uri);
-        let off = doc.source.find("{name}").expect("expr pun") + 1;
+        let off = doc.source.find("name}").expect("expr field value");
         let pos = offset_to_position(&doc.source, off);
         let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
             .expect("rename emits edit");
         let changes = edit.changes.expect("changes present");
         let edits = changes.get(&uri).expect("edits for main");
         let out = apply_edits(&doc.source, edits);
-        assert_eq!(out, "mk = \\label -> {name: label}\n");
+        assert_eq!(out, "mk = \\label -> {name label}\n");
     }
 
     #[test]
     fn rename_explicit_same_named_field_value_is_not_a_pun() {
-        // `{name: name}` written out explicitly: the value var renames in
-        // place; expanding it again would corrupt the record.
+        // `{name name}` written out explicitly: the value var renames in
+        // place; touching the field name token would corrupt the record.
         let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "mk = \\name -> {name: name}\n");
+        let uri = ws.open("main", "mk = \\name -> {name name}\n");
         let doc = ws.doc(&uri);
+        // Cursor on the VALUE var (the second `name`).
         let off = doc.source.find("name}").expect("value var");
         let pos = offset_to_position(&doc.source, off);
         let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
@@ -3555,7 +3560,7 @@ mod regress_rename_fixes_tests {
         let changes = edit.changes.expect("changes present");
         let edits = changes.get(&uri).expect("edits for main");
         let out = apply_edits(&doc.source, edits);
-        assert_eq!(out, "mk = \\label -> {name: label}\n");
+        assert_eq!(out, "mk = \\label -> {name label}\n");
     }
 
     // ── Finding 5: prepare_rename on usages of builtin-shadowing symbols ──
@@ -3598,7 +3603,7 @@ mod regress_rename_fixes_tests {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "data Pair a = Pair {a: Int 1, b: a}\nmk = Pair {a: 1, b: 2}\n",
+            "data Pair a = Pair {a: Int 1, b: a}\nmk = Pair {a 1 b 2}\n",
         );
         let doc = ws.doc(&uri);
         // Cursor on the FIELD `a` inside the constructor record.
@@ -3611,7 +3616,7 @@ mod regress_rename_fixes_tests {
         let out = apply_edits(&doc.source, edits);
         assert_eq!(
             out,
-            "data Pair a = Pair {first: Int 1, b: a}\nmk = Pair {first: 1, b: 2}\n",
+            "data Pair a = Pair {first: Int 1, b: a}\nmk = Pair {first 1 b 2}\n",
             "the type parameter `a` (header and field type) must be untouched; edits: {edits:?}"
         );
     }
@@ -3776,7 +3781,7 @@ mod regress_rename_fixes_tests {
     fn linked_editing_finds_fields_under_unary_op() {
         use crate::linked_editing::handle_linked_editing_range;
         let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "g = \\p -> {amt: -p.amt}\n");
+        let uri = ws.open("main", "g = \\p -> {amt (-p.amt)}\n");
         let doc = ws.doc(&uri);
         let off = doc.source.find("p.amt").expect("access") + 2;
         let pos = offset_to_position(&doc.source, off);
@@ -4071,7 +4076,7 @@ mod regress_rename_fixes_tests {
 route Api where
   GET /users -> Resp = GetUsers
 
-srv = serve Api where GetUsers = \req -> Ok {value: {ok: true}}
+srv = (serve Api where GetUsers = \req -> Ok {value {ok true}})
 "#;
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);

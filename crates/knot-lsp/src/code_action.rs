@@ -1062,7 +1062,7 @@ pub(crate) fn handle_code_action(
             vec![TextEdit {
                 range: span_to_range(refine_span, &doc.source),
                 new_text: format!(
-                    "case {inner_text} of{indent}Ok {{value: x}} -> x{indent}Err {{error: e}} -> e"
+                    "case {inner_text} of{indent}Ok {{value x}} -> x{indent}Err {{error e}} -> e"
                 ),
             }],
         );
@@ -1541,7 +1541,12 @@ fn find_wrap_in_err_at(
             | DeclKind::Derived { body, .. } => {
                 if let Some(span) = walk(body, range_start, range_end) {
                     let text = source.get(span.start..span.end)?;
-                    return Some((span, format!("Err {{error: {text}}}")));
+                    let body = if is_atomic_expr_text(text) {
+                        text.to_string()
+                    } else {
+                        format!("({text})")
+                    };
+                    return Some((span, format!("Err {{error {body}}}")));
                 }
             }
             DeclKind::Impl { items, .. } => {
@@ -1550,7 +1555,12 @@ fn find_wrap_in_err_at(
                         && let Some(span) = walk(body, range_start, range_end)
                     {
                         let text = source.get(span.start..span.end)?;
-                        return Some((span, format!("Err {{error: {text}}}")));
+                        let body = if is_atomic_expr_text(text) {
+                            text.to_string()
+                        } else {
+                            format!("({text})")
+                        };
+                        return Some((span, format!("Err {{error {body}}}")));
                     }
                 }
             }
@@ -2283,7 +2293,7 @@ fn detect_wrap_suggestions(
         && inner.trim() == found.trim() {
             out.push(WrapSuggestion {
                 title: "Wrap in `Just`".to_string(),
-                template: format!("Just {{value: {WRAP_PLACEHOLDER}}}"),
+                template: format!("Just {{value {WRAP_PLACEHOLDER}}}"),
             });
         }
     // `expected Maybe T, found {}` → suggest `Nothing {}`. The `{}` here is
@@ -2316,7 +2326,7 @@ fn detect_wrap_suggestions(
             {
                 out.push(WrapSuggestion {
                     title: "Wrap in `Ok`".to_string(),
-                    template: format!("Ok {{value: {WRAP_PLACEHOLDER}}}"),
+                    template: format!("Ok {{value {WRAP_PLACEHOLDER}}}"),
                 });
             }
         }
@@ -3669,7 +3679,7 @@ mod tests {
     fn if_to_case_inside_do_block_keeps_layout_parseable() {
         // Regression: arms were emitted at a hard-coded 2-space indent, which
         // collided with the do-block statement column and failed to reparse.
-        let src = "main = do\n  x <- *items\n  with {y: if x > 1 then 1 else 2} (do\n    yield y)\n";
+        let src = "main = do\n  x <- *items\n  with {y (if x > 1 then 1 else 2)} (do\n    yield y)\n";
         let module = parse_module(src);
         let off = src.find("if x").expect("if expr");
         let (span, replacement) =
@@ -3884,10 +3894,10 @@ mod tests {
         let suggestions = detect_wrap_suggestions("Maybe Int", "Int", &empty);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(suggestions[0].title, "Wrap in `Just`");
-        assert_eq!(suggestions[0].format_wrapping("5"), "Just {value: 5}");
+        assert_eq!(suggestions[0].format_wrapping("5"), "Just {value 5}");
         assert_eq!(
             suggestions[0].format_wrapping("a + b"),
-            "Just {value: (a + b)}"
+            "Just {value (a + b)}"
         );
     }
 
@@ -3941,7 +3951,7 @@ mod tests {
         let mut tw = TempWorkspace::new();
         let uri = tw.write_and_open(
             "main.knot",
-            "f : Maybe Int -> Int\nf m = case m of\n  Just {value} -> value\n  Nothing {} -> 0\n\nmain : IO {} {}\nmain = println (show (f 5))\n",
+            "f : Maybe Int -> Int\nf m = case m of\n  Just {value value} -> value\n  Nothing {} -> 0\n\nmain : IO {} {}\nmain = println (show (f 5))\n",
         );
         let doc = tw.workspace.doc(&uri);
         // Synthesize a diagnostic at `5` claiming Maybe Int was expected.
@@ -3982,7 +3992,7 @@ mod tests {
             .unwrap()
             .get(&uri)
             .unwrap()[0];
-        assert_eq!(edit.new_text, "Just {value: 5}");
+        assert_eq!(edit.new_text, "Just {value 5}");
     }
 
     #[test]
@@ -4508,7 +4518,7 @@ mod regress_fixes_tests {
             action_titled(&actions, |t| t == "Wrap in `Err`").expect("wrap action offered");
         let edits = edits_for(action, &uri);
         assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].new_text, "Err {error: x + 1}");
+        assert_eq!(edits[0].new_text, "Err {error (x + 1)}");
     }
 
     /// Item 6: adding a wildcard arm to a single-line case must not emit the
@@ -4899,13 +4909,13 @@ mod regress_fixes_tests {
     }
 
     /// "Inline variable" must parenthesize non-atomic values even without
-    /// spaces — `with {y: n-1}` into `2 * y` is `2 * (n-1)`, not `2 * n-1`.
+    /// spaces — `with {y (n-1)}` into `2 * y` is `2 * (n-1)`, not `2 * n-1`.
     #[test]
     fn inline_variable_parenthesizes_operator_value_without_spaces() {
         let mut tw = TestWorkspace::new();
-        let src = "f = \\n -> with {y: n-1} (2 * y)\n";
+        let src = "f = \\n -> with {y (n-1)} (2 * y)\n";
         let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "y:");
+        let pos = tw.position_of(&uri, "y (");
         let actions = handle_code_action(
             &tw.state,
             &params_for(&uri, Range { start: pos, end: pos }),
@@ -4925,9 +4935,9 @@ mod regress_fixes_tests {
     #[test]
     fn inline_variable_leaves_atomic_values_bare() {
         let mut tw = TestWorkspace::new();
-        let src = "f = \\n -> with {y: n} (2 * y)\n";
+        let src = "f = \\n -> with {y n} (2 * y)\n";
         let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "y:");
+        let pos = tw.position_of(&uri, "y n");
         let actions = handle_code_action(
             &tw.state,
             &params_for(&uri, Range { start: pos, end: pos }),

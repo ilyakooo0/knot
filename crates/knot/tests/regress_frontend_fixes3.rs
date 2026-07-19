@@ -271,9 +271,9 @@ fn format_module_never_changes_the_ast() {
 
 #[test]
 fn with_prints_back_as_with() {
-    let out = check_str("with_simple", "f = with {x: 1} x + 2\n");
+    let out = check_str("with_simple", "f = with {x 1} x + 2\n");
     assert!(
-        out.contains("with {x: 1} x + 2"),
+        out.contains("with {x 1} x + 2"),
         "with was rewritten:\n{}",
         out
     );
@@ -281,9 +281,9 @@ fn with_prints_back_as_with() {
 
 #[test]
 fn with_annotated_field_prints_back() {
-    let out = check_str("with_annot", "f = with {x: (5 : Int)} x\n");
+    let out = check_str("with_annot", "f = with {x (5 : Int)} x\n");
     assert!(
-        out.contains("with {x: (5 : Int)} x"),
+        out.contains("with {x (5 : Int)} x"),
         "annotated with was rewritten:\n{}",
         out
     );
@@ -291,9 +291,9 @@ fn with_annotated_field_prints_back() {
 
 #[test]
 fn nested_with_prints_back() {
-    let out = check_str("with_nested", "f = with {x: 1} with {y: 2} x + y\n");
+    let out = check_str("with_nested", "f = with {x 1} with {y 2} x + y\n");
     assert!(
-        out.contains("with {x: 1} with {y: 2} x + y"),
+        out.contains("with {x 1} with {y 2} x + y"),
         "nested with was rewritten:\n{}",
         out
     );
@@ -303,10 +303,10 @@ fn nested_with_prints_back() {
 fn with_multi_field_record_prints_back() {
     let out = check_str(
         "with_multi",
-        "f = \\p -> with {lo: p.lo, hi: p.hi} hi - lo\n",
+        "f = \\p -> with {lo p.lo hi p.hi} hi - lo\n",
     );
     assert!(
-        out.contains("with {lo: p.lo, hi: p.hi} hi - lo"),
+        out.contains("with {lo p.lo hi p.hi} hi - lo"),
         "multi-field with was rewritten:\n{}",
         out
     );
@@ -314,9 +314,9 @@ fn with_multi_field_record_prints_back() {
 
 #[test]
 fn with_as_binop_operand_keeps_parens() {
-    let out = check_str("with_rhs", "f = 1 + (with {x: 2} x)\n");
+    let out = check_str("with_rhs", "f = 1 + (with {x 2} x)\n");
     assert!(
-        out.contains("1 + (with {x: 2} x)"),
+        out.contains("1 + (with {x 2} x)"),
         "with operand lost parens:\n{}",
         out
     );
@@ -326,21 +326,21 @@ fn with_as_binop_operand_keeps_parens() {
 fn with_under_postfix_annotation_keeps_parens() {
     // The with body is parsed with `parse_expr`, which greedily reattaches
     // a trailing `: Type` — the formatter must keep the grouping parens.
-    check_str("with_annot_tail", "f = (with {x: 1} x) : Int\n");
+    check_str("with_annot_tail", "f = (with {x 1} x) : Int\n");
 }
 
 #[test]
 fn with_do_body_round_trips() {
     check_str(
         "with_do_body",
-        "f = with {xs: [1, 2]} do\n  y <- xs\n  yield y\n",
+        "f = with {xs [1, 2]} do\n  y <- xs\n  yield y\n",
     );
 }
 
 #[test]
 fn applied_with_keeps_parens() {
-    // `(with {x: h} x) 2` — a with in application head position.
-    check_str("with_applied", "g = (with {x: h} x) 2\n");
+    // `(with {x h} x) 2` — a with in application head position.
+    check_str("with_applied", "g = (with {x h} x) 2\n");
 }
 
 #[test]

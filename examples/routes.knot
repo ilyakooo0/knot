@@ -17,31 +17,31 @@ route Api = TodoApi | AdminApi
 
 addTodo = \title owner priority -> do
   todos <- *todos
-  *todos = union todos [{title: title, owner: owner, priority: Low {}}]
+  *todos = union todos [{ title title owner owner priority (Low {}) }]
 
 getTodos = \owner -> do
   todos <- *todos
-  with {result: do
+  with { result (do
     t <- todos
     where t.owner == owner
-    yield t}
+    yield t) }
     (yield result)
 
 api = serve Api where
-  GetTodos = \{owner, xForwardedFor} -> do
+  GetTodos = \{ owner owner xForwardedFor xForwardedFor } -> do
     case xForwardedFor of
-      Just {value: ip} -> logInfo ("GetTodos from " ++ ip)
+      Just { value ip } -> logInfo ("GetTodos from " ++ ip)
       Nothing {} -> logInfo "GetTodos (no proxy header)"
     todos <- getTodos owner
     if (count todos) == 0 then
-      yield Err {error: {status: 404, message: "no todos found for owner"}}
+      yield Err { error { status 404 message "no todos found for owner" } }
     else
-      yield Ok {value: todos}
-  CreateTodo = \{title, owner, priority} -> do
+      yield Ok { value todos }
+  CreateTodo = \{ title title owner owner priority priority } -> do
     addTodo title owner priority
-    yield Ok {value: {title: title, owner: owner, priority: Low {}}}
+    yield Ok { value { title title owner owner priority (Low {}) } }
   GetCount = \{} -> do
     todos <- *todos
-    yield Ok {value: count todos}
+    yield Ok { value (count todos) }
 
 main = listen 8080 api

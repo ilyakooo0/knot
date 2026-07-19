@@ -1,56 +1,56 @@
 -- ByteString example
 
-main = with {raw: b"hello"} (do
+main = with { raw (b"hello") } (do
   -- Byte string literals
   println (bytesLength raw)        -- 5
 
   -- Convert text -> bytes (always succeeds)
-  with {encoded: textToBytes "world"} (do
+  with { encoded (textToBytes "world") } (do
     println (bytesLength encoded)    -- 5
 
     -- Convert bytes -> text — Maybe, returns Nothing on invalid UTF-8
     case bytesToText encoded of
-      Just {value: t} -> println t   -- world
+      Just { value t } -> println t   -- world
       Nothing {} -> println "<invalid utf-8>"
 
     -- Hex encoding always succeeds
-    with {hex: bytesToHex raw} (do
+    with { hex (bytesToHex raw) } (do
       println hex                      -- 68656c6c6f
 
       -- Hex decoding is Maybe — returns Nothing on odd-length / non-hex input
       case bytesFromHex hex of
-        Just {value: decoded} -> case bytesToText decoded of
-          Just {value: t} -> println t -- hello
+        Just { value decoded } -> case bytesToText decoded of
+          Just { value t } -> println t -- hello
           Nothing {} -> println "<invalid utf-8>"
         Nothing {} -> println "<invalid hex>"
 
       -- Concatenation
-      with {combined: bytesConcat raw encoded} (do
+      with { combined (bytesConcat raw encoded) } (do
         println (bytesLength combined)   -- 10
 
         -- Slicing
-        with {slice: bytesSlice 0 5 combined} (do
+        with { slice (bytesSlice 0 5 combined) } (do
           case bytesToText slice of
-            Just {value: t} -> println t   -- hello
+            Just { value t } -> println t   -- hello
             Nothing {} -> println "<invalid utf-8>"
 
           -- Byte access is Maybe — Nothing when the index is out of bounds
           case bytesGet 0 raw of
-            Just {value: byte} -> println byte  -- 104 (ascii 'h')
+            Just { value byte } -> println byte  -- 104 (ascii 'h')
             Nothing {} -> println "<out of bounds>"
 
           case bytesGet 10 raw of
-            Just {value: byte} -> println byte
+            Just { value byte } -> println byte
             Nothing {} -> println "<out of bounds>"  -- raw has only 5 bytes
 
           -- Hex escapes in literals
-          with {withHex: b"\x48\x49"} (do
+          with { withHex (b"\x48\x49") } (do
             case bytesToText withHex of
-              Just {value: t} -> println t   -- HI
+              Just { value t } -> println t   -- HI
               Nothing {} -> println "<invalid utf-8>"
 
             -- JSON encoding wraps bytes so they round-trip through parseJson.
             println (toJson raw)             -- {"__knot_bytes":"aGVsbG8="}
-            println (toJson {payload: raw})  -- {"payload":{"__knot_bytes":"aGVsbG8="}}
+            println (toJson { payload raw })  -- {"payload":{"__knot_bytes":"aGVsbG8="}}
 
             yield {}))))))

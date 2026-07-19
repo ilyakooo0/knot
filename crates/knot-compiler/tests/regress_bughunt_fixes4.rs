@@ -80,10 +80,7 @@ fn shadowed_race_in_atomic_compiles() {
         "shadowed_race_atomic",
         r#"*items : [{v: Int 1}]
 
-store = \race ->
-  atomic do
-    cur <- *items
-    replace *items = [{v: race}]
+store = \race -> atomic (do cur <- *items; replace *items = [{v race}])
 
 main = do
   store 7
@@ -110,10 +107,7 @@ fn genuine_race_in_atomic_still_rejected() {
         "genuine_race_atomic",
         r#"*items : [{v: Int 1}]
 
-bad = atomic do
-  cur <- *items
-  r <- race (println "a") (println "b")
-  replace *items = [{v: 1}]
+bad = atomic (do cur <- *items; r <- race (println "a") (println "b"); replace *items = [{v 1}])
 
 main = bad
 "#,
@@ -143,7 +137,7 @@ query = do
   yield (count (rs |> filter (\x -> elem x.status [1, 3, 10])))
 
 main = do
-  replace *rows = [{status: 1}, {status: 5}, {status: 10}]
+  replace *rows = [{status 1}, {status 5}, {status 10}]
   c <- query
   println ("matched: " ++ show c)
   yield {}

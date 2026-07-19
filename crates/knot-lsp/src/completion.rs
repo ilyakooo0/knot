@@ -2454,9 +2454,7 @@ main = do
             "main",
             r#"type P = {n: Text}
 *people : [P]
-main = atomic do
-  *people = [{n: "A"}]
-  yield {}
+main = atomic (do *people = [{n "A"}]; yield {})
 "#,
         );
         let doc = ws.doc(&uri);

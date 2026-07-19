@@ -978,7 +978,7 @@ show2 = \x -> display x
         // lowercase names, which collide with field names). The doc-comment
         // section must be gated out on field tokens.
         let mut ws = TestWorkspace::new();
-        let src = "-- The grand total value.\ntotal = 42\ntype Rec = {total: Int 1}\nuseRec = \\r -> r.total\nmain = println (show total)\n";
+        let src = "-- The grand total value.\\\\ntotal = 42\\\\ntype Rec = {total: Int 1}\\\\nuseRec = \\\\\\\\r -> r.total\\\\nmain = println (show total)\\\\n\\n\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
         let off = doc.source.find("r.total").expect("field access") + "r.".len();
@@ -1110,10 +1110,10 @@ mod regress_fixes_tests {
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "data P = P {a: Int 1, b: Text}\nf = \\p -> case p of\n  P {a, b} -> b\n",
+            "data P = P {a: Int 1, b: Text}\nf = \\p -> case p of\n  P {a a b b} -> b\n",
         );
         let doc = ws.doc(&uri);
-        let off = doc.source.find("a, b}").expect("binder a");
+        let off = doc.source.find("a a b b}").expect("binder a") + 2;
         let pos = offset_to_position(&doc.source, off);
         // Run the lookup many times — with the smallest-span rule the result
         // is stable; the old behavior depended on HashMap iteration order.

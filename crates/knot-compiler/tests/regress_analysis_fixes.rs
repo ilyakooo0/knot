@@ -169,11 +169,7 @@ fn unit_var_behind_substituted_lambda_param_is_not_generalized() {
     // (it is env-bound through p), so using g at both <M> and <S> is a
     // unit mismatch — previously this compiled.
     let src = r#"bad = \p -> do
-  with {stripped: stripFloatUnit p} (do
-    with {g: \y -> y + p} (do
-      println (show (g (1.0 : Float M)))
-      println (show (g (1.0 : Float S)))
-      yield {}))
+  with {stripped (stripFloatUnit p)} (do with {g (\y -> y + p)} (do println (show (g (1.0 : Float M))); println (show (g (1.0 : Float S))); yield {}))
 main = bad (2.0 : Float M)
 "#;
     let diags = check_src(src);
@@ -275,10 +271,7 @@ fn race_through_helper_rejected_inside_atomic() {
         r#"*items : [{n: Int 1}]
 raceIt = \a b -> race a b
 main = do
-  c <- atomic (do
-    rows <- *items
-    r <- raceIt (yield 1) (yield 2)
-    yield (count rows))
+  c <- atomic (do rows <- *items; r <- raceIt (yield 1) (yield 2); yield (count rows))
   println (show c)
 "#,
     );
@@ -296,9 +289,7 @@ fn shadowed_race_in_helper_not_flagged() {
         r#"*items : [{n: Int 1}]
 pickIt = \race -> count race
 main = do
-  c <- atomic (do
-    rows <- *items
-    yield (pickIt rows))
+  c <- atomic (do rows <- *items; yield (pickIt rows))
   println (show c)
 "#,
     );
@@ -315,12 +306,9 @@ main = do
 fn record_field_io_lambda_rejected_inside_atomic() {
     let diags = effect_diags(
         r#"*items : [{n: Int 1}]
-r = {fn: \u -> println "hidden"}
+r = {fn (\u -> println "hidden")}
 main = do
-  c <- atomic (do
-    rows <- *items
-    r.fn {}
-    yield (count rows))
+  c <- atomic (do rows <- *items; r.fn {}; yield (count rows))
   println (show c)
 "#,
     );
@@ -335,12 +323,9 @@ main = do
 fn pure_record_field_lambda_still_allowed_inside_atomic() {
     let diags = effect_diags(
         r#"*items : [{n: Int 1}]
-r = {fn: \u -> u}
+r = {fn (\u -> u)}
 main = do
-  c <- atomic (do
-    rows <- *items
-    r.fn {}
-    yield (count rows))
+  c <- atomic (do rows <- *items; r.fn {}; yield (count rows))
   println (show c)
 "#,
     );
@@ -493,12 +478,12 @@ fn maybe_field_round_trips_just_and_nothing() {
         r#"type User = {name: Text, nick: Maybe Text}
 *users : [User]
 main = do
-  replace *users = [{name: "al", nick: Just {value: "big al"}}, {name: "bo", nick: Nothing {}}]
+  replace *users = [{name "al" nick (Just {value "big al"})}, {name "bo" nick (Nothing {})}]
   rows <- *users
   u <- rows
   where u.name == "al"
   case u.nick of
-    Just {value} -> println ("nick: " ++ value)
+    Just {value value} -> println ("nick: " ++ value)
     _ -> println "none"
   yield {}
 "#,
@@ -517,11 +502,11 @@ fn nothing_field_round_trips() {
         r#"type User = {name: Text, nick: Maybe Text}
 *users : [User]
 main = do
-  replace *users = [{name: "bo", nick: Nothing {}}]
+  replace *users = [{name "bo" nick (Nothing {})}]
   rows <- *users
   u <- rows
   case u.nick of
-    Just {value} -> println ("nick: " ++ value)
+    Just {value value} -> println ("nick: " ++ value)
     _ -> println "none"
   yield {}
 "#,
@@ -543,7 +528,7 @@ fn refined_field_inside_nested_relation_is_enforced() {
 type Order = {id: Int 1, items: [{qty: Pos}]}
 *orders : [Order]
 main = do
-  replace *orders = [{id: 1, items: [{qty: 0 - 5}]}]
+  replace *orders = [{id 1 items [{qty (0 - 5)}]}]
   println "should not be reached"
   yield {}
 "#,
@@ -564,7 +549,7 @@ type Addr = {zip: Zip}
 type Person = {name: Text, addr: Addr}
 *people : [Person]
 main = do
-  replace *people = [{name: "al", addr: {zip: 0 - 1}}]
+  replace *people = [{name "al" addr {zip (0 - 1)}}]
   println "should not be reached"
   yield {}
 "#,
@@ -583,7 +568,7 @@ fn adt_constructor_field_refinement_is_enforced() {
         r#"data Shape = Circle {radius: Float 1 where \r -> r > 0.0} | Rect {w: Float 1}
 *shapes : [Shape]
 main = do
-  replace *shapes = [Circle {radius: 0.0 - 1.0}]
+  replace *shapes = [Circle {radius (0.0 - 1.0)}]
   println "should not be reached"
   yield {}
 "#,
@@ -605,7 +590,7 @@ fn stacked_inline_over_refined_alias_enforces_both() {
 type Person = {age: Nat where \x -> x < 150}
 *people : [Person]
 main = do
-  replace *people = [{age: 0 - 5}]
+  replace *people = [{age (0 - 5)}]
   println "should not be reached"
   yield {}
 "#,
@@ -629,8 +614,8 @@ type Order = {id: Int 1, items: [{qty: Pos}], addr: Addr}
 *orders : [Order]
 *shapes : [Shape]
 main = do
-  replace *orders = [{id: 1, items: [{qty: 3}], addr: {zip: 90210}}]
-  replace *shapes = [Circle {radius: 1.5}, Rect {w: 2.0}]
+  replace *orders = [{id 1 items [{qty 3}] addr {zip 90210}}]
+  replace *shapes = [Circle {radius 1.5}, Rect {w 2.0}]
   println "all good"
   yield {}
 "#,
@@ -645,7 +630,10 @@ main = do
 fn migrate_bracketed_relation_types_produce_record_schemas() {
     let src = r#"type Order = {customer: Text, qty: Int 1}
 *orders : [Order]
-migrate *orders from [{customer: Text}] to [{customer: Text, qty: Int 1}] using \r -> {customer: r.customer, qty: 0}
+migrate *orders
+  from [{customer: Text}]
+  to [{customer: Text, qty: Int 1}]
+  using \r -> {customer r.customer qty 0}
 main = println "ok"
 "#;
     let module = parse(src);
@@ -788,7 +776,10 @@ fn migrate_bracketed_relation_types_run_end_to_end() {
         "migrate_bracketed",
         r#"type Order = {customer: Text, qty: Int 1}
 *orders : [Order]
-migrate *orders from [{customer: Text}] to [{customer: Text, qty: Int 1}] using \r -> {customer: r.customer, qty: 0}
+migrate *orders
+  from [{customer: Text}]
+  to [{customer: Text, qty: Int 1}]
+  using \r -> {customer r.customer qty 0}
 main = do
   rows <- *orders
   println ("rows: " ++ show (count rows))
@@ -825,12 +816,7 @@ fn do_blocks_at_identical_offsets_in_different_files_use_their_own_monads() {
     prog.push_str("\n  x <- r\n  yield (x + 1)\n");
     prog.push_str(
         r#"main = do
-  with {res: f1 (Just {value: 41})} (do
-    case res of
-      Just {value} -> println ("maybe: " ++ show value)
-      _ -> println "none"
-    println ("list: " ++ show (count (f2 [1, 2, 3])))
-    yield {})
+  with {res (f1 (Just {value 41}))} (do (case res of Just {value value} -> println ("maybe: " ++ show value); _ -> println "none"); println ("list: " ++ show (count (f2 [1, 2, 3]))); yield {})
 "#,
     );
     let c = compile_files("monad_span_collision", &prog, &[("lib.knot", lib)]);
@@ -855,10 +841,7 @@ fn let_bound_io_lambda_in_do_compiles_and_runs() {
     let (stdout, stderr, ok) = compile_and_run(
         "let_bound_io_lambda",
         r#"main = do
-  with {f: \y -> println (show y)} (do
-    f 1
-    f 2
-    yield {})
+  with {f (\y -> println (show y))} (do f 1; f 2; yield {})
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -873,7 +856,10 @@ fn let_bound_io_lambda_in_do_compiles_and_runs() {
 #[test]
 fn source_referenced_only_by_migrate_is_not_unused() {
     let src = r#"*orders : [{customer: Text}]
-migrate *orders from [{customer: Text}] to [{customer: Text}] using \r -> r
+migrate *orders
+  from [{customer: Text}]
+  to [{customer: Text}]
+  using \r -> r
 main = println "ok"
 "#;
     let module = parse(src);
@@ -913,15 +899,11 @@ main = do
 fn traverse_empty_in_maybe_context_yields_just_empty() {
     let (stdout, stderr, ok) = compile_and_run(
         "traverse_empty_maybe",
-        r#"half = \x -> if x.n > 0 then Just {value: x.n} else Nothing {}
+        r#"half = \x -> if x.n > 0 then Just {value x.n} else Nothing {}
 noRows : [{n: Int 1}]
 noRows = []
 main = do
-  with {res: traverse half noRows} (do
-    case res of
-      Just {value} -> println ("got: " ++ show (count value))
-      _ -> println "nothing"
-    yield {})
+  with {res (traverse half noRows)} (do (case res of Just {value value} -> println ("got: " ++ show (count value)); _ -> println "nothing"); yield {})
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -935,13 +917,9 @@ main = do
 fn traverse_nonempty_still_dispatches_on_elements() {
     let (stdout, stderr, ok) = compile_and_run(
         "traverse_nonempty",
-        r#"half = \x -> if x.n > 0 then Just {value: x.n} else Nothing {}
+        r#"half = \x -> if x.n > 0 then Just {value x.n} else Nothing {}
 main = do
-  with {res: traverse half [{n: 1}, {n: 2}]} (do
-    case res of
-      Just {value} -> println ("got: " ++ show (count value))
-      _ -> println "nothing"
-    yield {})
+  with {res (traverse half [{n 1}, {n 2}])} (do (case res of Just {value value} -> println ("got: " ++ show (count value)); _ -> println "nothing"); yield {})
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -1133,7 +1111,7 @@ fn relation_literal_deduplicates() {
         r#"main = do
   println (show ([1, 1, 2] == [1, 2]))
   println (show (count [1, 1, 2]))
-  println (show (count [{a: 1}, {a: 1}, {a: 2}]))
+  println (show (count [{a 1}, {a 1}, {a 2}]))
   println (show (count [1, 2, 3]))
   yield {}
 "#,
@@ -1169,7 +1147,7 @@ fn nested_relation_field_bind_iterates_every_element() {
 *teams : [Team]
 
 main = do
-  replace *teams = [{name: "A", members: [{who: "x"}, {who: "y"}, {who: "z"}]}]
+  replace *teams = [{name "A" members [{who "x"}, {who "y"}, {who "z"}]}]
   t <- *teams
   m <- t.members
   yield m.who
@@ -1192,11 +1170,11 @@ fn nested_source_binds_yield_one_flat_relation() {
 *tags : [{t: Text}]
 
 main = do
-  replace *names = [{n: "A"}]
-  replace *tags = [{t: "p"}, {t: "q"}]
+  replace *names = [{n "A"}]
+  replace *tags = [{t "p"}, {t "q"}]
   a <- *names
   b <- *tags
-  yield {n: a.n, t: b.t}
+  yield {n a.n t b.t}
 "#,
     );
     assert!(ok, "program failed: {stderr}");

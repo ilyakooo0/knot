@@ -89,13 +89,13 @@ data IntBox = IntBox {v: Int 1}
 impl Container IntBox where
   type Elem IntBox = Int 1
   toList b = case b of
-    IntBox {v} -> [v]
+    IntBox {v v} -> [v]
 
 useit : IntBox -> [Int 1]
 useit = \b -> toList b
 
 main = do
-  println (show (toList (IntBox {v: 5})))
+  println (show (toList (IntBox {v 5})))
   yield {}
 "#,
     );
@@ -122,11 +122,11 @@ data Two = A {v: Int 1} | B {v: Int 1}
 impl Container Two where
   type Elem Two = Int 1
   toList t = case t of
-    A {v} -> [v]
-    B {v} -> [v]
+    A {v v} -> [v]
+    B {v v} -> [v]
 
 main = do
-  println (show (toList (A {v: 9})))
+  println (show (toList (A {v 9})))
   yield {}
 "#,
     );
@@ -200,18 +200,14 @@ byqty = do
 
 main = do
   replace *items = [
-    {name: "a", qty: 10, price: 2.5},
-    {name: "b", qty: 9, price: 1.5},
-    {name: "c", qty: 2, price: 3.5}
+    {name "a" qty 10 price 2.5},
+    {name "b" qty 9 price 1.5},
+    {name "c" qty 2 price 3.5}
   ]
   si <- byqty
-  with {bi: sortBy (\x -> x.qty) si} (do
-    println ("qty: " ++ show (map (\x -> x.qty) bi))
-    yield {})
+  with {bi (sortBy (\x -> x.qty) si)} (do println ("qty: " ++ show (map (\x -> x.qty) bi)); yield {})
   sf <- byqty
-  with {bf: sortBy (\x -> x.price) sf} (do
-    println ("price: " ++ show (map (\x -> x.price) bf))
-    yield {})
+  with {bf (sortBy (\x -> x.price) sf)} (do println ("price: " ++ show (map (\x -> x.price) bf)); yield {})
   yield {}
 "#,
     );
@@ -241,10 +237,10 @@ fn user_cons_constructor_is_matchable() {
 sumL : L -> Int 1
 sumL = \l -> case l of
   Nil {} -> 0
-  Cons {head: h, tail: t} -> h + sumL t
+  Cons {head h tail t} -> h + sumL t
 
 main = do
-  println (show (sumL (Cons {head: 1, tail: Cons {head: 2, tail: Nil {}}})))
+  println (show (sumL (Cons {head 1 tail (Cons {head 2 tail (Nil {})})})))
   yield {}
 "#,
     );
@@ -284,7 +280,7 @@ query = do
   yield (count (rs |> filter (\x -> elem (x.a + x.b) [8, 99])))
 
 main = do
-  replace *rows = [{a: 5, b: 3}, {a: 6, b: 4}]
+  replace *rows = [{a 5 b 3}, {a 6 b 4}]
   c <- query
   println ("matched: " ++ show c)
   yield {}

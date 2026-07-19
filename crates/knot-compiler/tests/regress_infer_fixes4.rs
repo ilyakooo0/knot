@@ -37,17 +37,17 @@ const USER_MONAD: &str = r#"data Box a = Box {value: a}
 
 impl Functor Box where
   map f b = case b of
-    Box {value} -> Box {value: f value}
+    Box {value value} -> Box {value (f value)}
 
 impl Applicative Box where
-  yield x = Box {value: x}
+  yield x = Box {value x}
   ap fs xs = case fs of
-    Box {value: f} -> case xs of
-      Box {value: x} -> Box {value: f x}
+    Box {value f} -> case xs of
+      Box {value x} -> Box {value (f x)}
 
 impl Monad Box where
   bind f b = case b of
-    Box {value} -> f value
+    Box {value value} -> f value
 "#;
 
 #[test]

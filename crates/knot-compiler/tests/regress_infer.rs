@@ -91,8 +91,8 @@ type Pos = Int 1 where \x -> x > 0
 toNat : Int 1 -> Result RefinementError Nat
 toNat = \x -> refine x
 main = case toNat 0 of
-  Ok {value} -> println "ok"
-  Err {error} -> println "err"
+  Ok {value value} -> println "ok"
+  Err {error error} -> println "err"
 "#;
     let (diags, targets) = check_full(src);
     assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
@@ -122,8 +122,8 @@ fn refine_without_context_and_shared_base_is_ambiguous() {
     let src = r#"type Nat = Int 1 where \x -> x >= 0
 type Pos = Int 1 where \x -> x > 0
 f = \x -> case refine (x + 0) of
-  Ok {value} -> 1
-  Err {error} -> 0
+  Ok {value value} -> 1
+  Err {error error} -> 0
 main = f 5
 "#;
     let diags = check_src(src);
@@ -143,8 +143,8 @@ main = f 5
 fn refine_with_unique_base_still_infers() {
     let src = r#"type Nat = Int 1 where \x -> x >= 0
 f = \x -> case refine (x + 0) of
-  Ok {value} -> 1
-  Err {error} -> 0
+  Ok {value value} -> 1
+  Err {error error} -> 0
 main = f 5
 "#;
     let (diags, targets) = check_full(src);
@@ -357,12 +357,7 @@ route BApi where
 route All = AB | BApi
 route AB = AApi
 
-main = with {server: serve All where
-    GetA = \r -> do
-      yield Ok {value: "a"}
-    GetB = \r -> do
-      yield Ok {value: "b"}}
-  (listen 8080 server)
+main = with {server (serve All where GetA = \r -> (do yield (Ok {value "a"})); GetB = \r -> (do yield (Ok {value "b"})))} listen 8080 server
 "#;
     let diags = check_src(src);
     assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
@@ -447,8 +442,7 @@ main = println (callGreet 1)
 #[test]
 fn do_let_generalized_structural_comparison() {
     // Eq/Ord traits removed from comparison operators — < is structural, no constraint needed.
-    let src = r#"main = with {cmp: \a b -> a < b}
-  (println (show (cmp true false)))
+    let src = r#"main = with {cmp (\a b -> a < b)} println (show (cmp true false))
 "#;
     let diags = check_src(src);
     assert!(
@@ -552,8 +546,7 @@ base = 30000
 cap : Int Ms
 cap = 480000
 shouldRetry : Text -> Int Ms -> [{server: Text, failedAt: Int Ms, failures: Int 1}] -> Bool
-shouldRetry = \server t failures ->
-  not (any (\f -> f.server == server && t - f.failedAt < base * f.failures) failures)
+shouldRetry = \server t failures -> not any (\f -> f.server == server && t - f.failedAt < base * f.failures) failures
 main = println (show (shouldRetry "x" 1000 []))
 "#;
     let diags = check_src(src);
@@ -615,11 +608,7 @@ fn self_multiply_lambda_is_unit_polymorphic() {
     // be applied at two different units. The deferred unit-composition is
     // captured on the scheme and freshened per use site.
     let src = r#"square = \x -> x * x
-main = with {a: square (3.0 : Float M)}
-  (with {b: square (4.0 : Float S)}
-    (do
-      println (show (stripFloatUnit a))
-      println (show (stripFloatUnit b))))
+main = with {a (square (3.0 : Float M))} with {b (square (4.0 : Float S))} (do println (show (stripFloatUnit a)); println (show (stripFloatUnit b)))
 "#;
     let diags = check_src(src);
     assert!(diags.is_empty(), "square should be unit-polymorphic: {:?}", diags);
@@ -629,11 +618,7 @@ main = with {a: square (3.0 : Float M)}
 fn multi_param_product_is_unit_polymorphic() {
     // Same generalization for a two-argument product used at distinct units.
     let src = r#"area = \w h -> w * h
-main = with {a: area (6.0 : Float M) (2.0 : Float M)}
-  (with {b: area (6.0 : Float S) (2.0 : Float S)}
-    (do
-      println (show (stripFloatUnit a))
-      println (show (stripFloatUnit b))))
+main = with {a (area (6.0 : Float M) (2.0 : Float M))} with {b (area (6.0 : Float S) (2.0 : Float S))} (do println (show (stripFloatUnit a)); println (show (stripFloatUnit b)))
 "#;
     let diags = check_src(src);
     assert!(diags.is_empty(), "area should be unit-polymorphic: {:?}", diags);
@@ -659,7 +644,7 @@ fn record_and_list_equality_typecheck() {
     // Structural `Eq` for records and relations: `==` must type-check even
     // though no user impl can be written for these shapes.
     let src = r#"main = do
-  println (show ({a: 1, b: 2} == {a: 1, b: 2}))
+  println (show ({a 1 b 2} == {a 1 b 2}))
   println (show ([1, 2, 3] == [1, 2, 3]))
 "#;
     let diags = check_src(src);
@@ -779,7 +764,7 @@ fn io_relation_and_plain_relation_branches_unify() {
     // "expected {x: Int 1}, found [{x: Int 1}]" mismatches).
     let src = r#"*items : [{x: Int 1}]
 main = do
-  rows <- if true then *items else [{x: 1}]
+  rows <- if true then *items else [{x 1}]
   println (show (count rows))
 "#;
     let diags = check_src(src);

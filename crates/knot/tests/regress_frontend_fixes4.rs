@@ -46,7 +46,7 @@ fn first_body(module: &knot::ast::Module) -> ExprKind {
 
 #[test]
 fn record_literal_named_fields_parse() {
-    let m = parse("v = {a: 1, b: 2}\n");
+    let m = parse("v = {a 1 b 2}\n");
     match first_body(&m) {
         ExprKind::Record(fields) => {
             let names: Vec<_> = fields.iter().map(|f| f.name.clone()).collect();
@@ -58,11 +58,13 @@ fn record_literal_named_fields_parse() {
 
 #[test]
 fn record_punned_fields_parse() {
-    let m = parse("v = {a, b}\n");
+    // Punning no longer exists: `{a a b b}` is the explicit form. A field
+    // whose value is a variable of the same name is what a punned field
+    // used to desugar to.
+    let m = parse("v = {a a b b}\n");
     match first_body(&m) {
         ExprKind::Record(fields) => {
             assert_eq!(fields.len(), 2);
-            // Punned `{a}` desugars to field `a` with value `a`.
             assert_eq!(fields[0].name, "a");
             assert!(matches!(fields[0].value.node, ExprKind::Var(_)));
         }
@@ -72,7 +74,7 @@ fn record_punned_fields_parse() {
 
 #[test]
 fn record_update_parses() {
-    let m = parse("v = {base | a: 1}\n");
+    let m = parse("v = {base | a 1}\n");
     match first_body(&m) {
         ExprKind::RecordUpdate { base, fields } => {
             assert!(matches!(base.node, ExprKind::Var(_)));
@@ -86,7 +88,7 @@ fn record_update_parses() {
 #[test]
 fn record_update_with_field_access_base_parses() {
     // Base is a non-trivial expression — still needs the speculative path.
-    let m = parse("v = {person.address | city: 1}\n");
+    let m = parse("v = {person.address | city 1}\n");
     assert!(matches!(first_body(&m), ExprKind::RecordUpdate { .. }));
 }
 
@@ -99,7 +101,7 @@ fn deeply_nested_records_parse_quickly() {
     let depth = 80;
     let mut src = String::from("v = ");
     for _ in 0..depth {
-        src.push_str("{a: ");
+        src.push_str("{a ");
     }
     src.push('1');
     for _ in 0..depth {

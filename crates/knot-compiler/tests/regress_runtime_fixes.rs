@@ -77,12 +77,7 @@ fn text_take_drop_negative_counts_clamp() {
     let (stdout, stderr, ok) = compile_and_run(
         "text_take_drop_neg",
         r#"main = do
-  with {n: 0 - 2} (do
-    println ("take_neg: [" ++ take n "hello" ++ "]")
-    println ("drop_neg: [" ++ drop n "hello" ++ "]")
-    println ("take_pos: [" ++ take 2 "hello" ++ "]")
-    println ("drop_pos: [" ++ drop 2 "hello" ++ "]")
-    yield {})
+  with {n (0 - 2)} (do println ("take_neg: [" ++ take n "hello" ++ "]"); println ("drop_neg: [" ++ drop n "hello" ++ "]"); println ("take_pos: [" ++ take 2 "hello" ++ "]"); println ("drop_pos: [" ++ drop 2 "hello" ++ "]"); yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -108,17 +103,9 @@ fn min_max_on_int_column_supports_arithmetic() {
 *employees : [Employee]
 
 main = do
-  replace *employees = [
-    {name: "a", salary: 50},
-    {name: "b", salary: 30},
-    {name: "c", salary: 70}
-  ]
+  replace *employees = [{name "a" salary 50}, {name "b" salary 30}, {name "c" salary 70}]
   employees <- *employees
-  with {lo: minOn (\e -> e.salary) employees} (do
-    with {hi: maxOn (\e -> e.salary) employees} (do
-      println ("lo_plus_one: " ++ show (lo + 1))
-      println ("hi_plus_one: " ++ show (hi + 1))
-      yield {}))
+  with {lo (minOn (\e -> e.salary) employees)} (do with {hi (maxOn (\e -> e.salary) employees)} (do println ("lo_plus_one: " ++ show (lo + 1)); println ("hi_plus_one: " ++ show (hi + 1)); yield {}))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -143,14 +130,12 @@ fn pipe_filter_min_on_int_column_supports_arithmetic() {
 
 main = do
   replace *employees = [
-    {name: "a", dept: "Eng", salary: 50},
-    {name: "b", dept: "Eng", salary: 30},
-    {name: "c", dept: "Sales", salary: 10}
+    {name "a" dept "Eng" salary 50},
+    {name "b" dept "Eng" salary 30},
+    {name "c" dept "Sales" salary 10}
   ]
   employees <- *employees
-  with {lo: employees |> filter (\e -> e.dept == "Eng") |> minOn (\e -> e.salary)} (do
-    println ("eng_lo_plus_one: " ++ show (lo + 1))
-    yield {})
+  with {lo (employees |> filter (\e -> e.dept == "Eng") |> minOn (\e -> e.salary))} (do println ("eng_lo_plus_one: " ++ show (lo + 1)); yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -177,15 +162,10 @@ fn renaming_referenced_superset_key_is_rejected() {
 *orders.customer <= *people.name
 
 main = do
-  replace *people = [{name: "Alice", age: 30}]
-  replace *orders = [{customer: "Alice", amount: 100}]
+  replace *people = [{name "Alice" age 30}]
+  replace *orders = [{customer "Alice" amount 100}]
   ppl <- *people
-  with {renamed: do
-    p <- ppl
-    yield (if p.name == "Alice" then {p | name: "Alicia"} else p)} (do
-    *people = renamed
-    println "rename succeeded"
-    yield {})
+  with {renamed (do p <- ppl; yield (if p.name == "Alice" then {p | name "Alicia"} else p))} (do *people = renamed; println "rename succeeded"; yield {})
 "#,
     );
     assert!(
@@ -212,17 +192,11 @@ main = do
 fn sum_over_empty_float_relation_is_float_zero() {
     let (stdout, stderr, ok) = compile_and_run(
         "sum_empty_float",
-        r#"prices = [{amount: 1.5}, {amount: 2.5}]
-counts = [{qty: 2}, {qty: 3}]
+        r#"prices = [{amount 1.5}, {amount 2.5}]
+counts = [{qty 2}, {qty 3}]
 
 main = do
-  with {noPrices: filter (\p -> p.amount > 100.0) prices} (do
-    with {noCounts: filter (\c -> c.qty > 100) counts} (do
-      println ("empty_float: " ++ show (sum (map (\p -> p.amount) noPrices)))
-      println ("empty_int: " ++ show (sum (map (\c -> c.qty) noCounts)))
-      println ("float: " ++ show (sum (map (\p -> p.amount) prices)))
-      println ("int: " ++ show (sum (map (\c -> c.qty) counts)))
-      println ("piped_empty_float: " ++ show (noPrices |> map (\p -> p.amount) |> sum))))
+  with {noPrices (filter (\p -> p.amount > 100.0) prices)} (do with {noCounts (filter (\c -> c.qty > 100) counts)} (do println ("empty_float: " ++ show (sum (map (\p -> p.amount) noPrices))); println ("empty_int: " ++ show (sum (map (\c -> c.qty) noCounts))); println ("float: " ++ show (sum (map (\p -> p.amount) prices))); println ("int: " ++ show (sum (map (\c -> c.qty) counts))); println ("piped_empty_float: " ++ show (noPrices |> map (\p -> p.amount) |> sum))))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -263,9 +237,7 @@ impl Eq Grade where
 impl Ord Grade where
   compare = \x y -> EQ {}
 main = do
-  with {items: [A {}, B {}, C {}]} (do
-    with {sorted: sortBy (\g -> g) items} (do
-      println ("count: " ++ show (count sorted))))
+  with {items [A {}, B {}, C {}]} (do with {sorted (sortBy (\g -> g) items)} (do println ("count: " ++ show (count sorted))))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");

@@ -399,7 +399,7 @@ fn multi_arg_application() {
 #[test]
 fn application_with_constructor() {
     // Just {value: 5}
-    match fun_body("x = Just {value: 5}") {
+    match fun_body("x = Just {value 5}\n") {
         ExprKind::App { func, arg } => {
             assert!(matches!(&func.node, ExprKind::Constructor(n) if n == "Just"));
             assert!(matches!(&arg.node, ExprKind::Record(_)));
@@ -476,7 +476,8 @@ fn empty_record() {
 
 #[test]
 fn record_with_fields() {
-    match fun_body(r#"x = {name: "Alice", age: 30}"#) {
+    match fun_body(r#"x = {name "Alice" age 30}
+"#) {
         ExprKind::Record(fields) => {
             assert_eq!(fields.len(), 2);
             assert_eq!(fields[0].name, "name");
@@ -490,7 +491,7 @@ fn record_with_fields() {
 
 #[test]
 fn record_update() {
-    match fun_body("x = {t | age: 31}") {
+    match fun_body("x = {t | age 31}") {
         ExprKind::RecordUpdate { base, fields } => {
             assert!(matches!(&base.node, ExprKind::Var(n) if n == "t"));
             assert_eq!(fields.len(), 1);
@@ -502,7 +503,7 @@ fn record_update() {
 
 #[test]
 fn record_update_multiple_fields() {
-    match fun_body("x = {t | age: 31, name: y}") {
+    match fun_body("x = {t | age 31 name y}") {
         ExprKind::RecordUpdate { base, fields } => {
             assert!(matches!(&base.node, ExprKind::Var(n) if n == "t"));
             assert_eq!(fields.len(), 2);
@@ -536,7 +537,8 @@ fn list_of_ints() {
 
 #[test]
 fn list_of_records() {
-    match fun_body(r#"x = [{name: "a"}, {name: "b"}]"#) {
+    match fun_body(r#"x = [{name "a"}, {name "b"}]
+"#) {
         ExprKind::List(elems) => {
             assert_eq!(elems.len(), 2);
             assert!(matches!(&elems[0].node, ExprKind::Record(_)));
@@ -652,7 +654,7 @@ fn simple_case() {
 
 #[test]
 fn case_with_constructor_patterns() {
-    let src = "x = case s of\n  Circle {radius} -> radius\n  Rect {width} -> width";
+    let src = "x = case s of\n  Circle {radius radius} -> radius\n  Rect {width width} -> width";
     match fun_body(src) {
         ExprKind::Case { arms, .. } => {
             assert_eq!(arms.len(), 2);
@@ -707,9 +709,9 @@ fn do_with_where() {
 
 #[test]
 fn do_with_with_binding() {
-    // `with {y: 5} body` binds `y` in `body`; inside a do-block the
+    // `with {y 5} body` binds `y` in `body`; inside a do-block the
     // continuation is a nested do.
-    let src = "x = do\n  with {y: 5} (do\n    yield y)";
+    let src = "x = do\n  with {y 5} (do\n    yield y)";
     match fun_body(src) {
         ExprKind::Do(stmts) => {
             assert_eq!(stmts.len(), 1);
@@ -770,7 +772,7 @@ fn do_with_pattern_bind() {
 
 #[test]
 fn do_multiple_binds() {
-    let src = "x = do\n  a <- xs\n  b <- ys\n  yield {a, b}";
+    let src = "x = do\n  a <- xs\n  b <- ys\n  yield {a a b b}";
     match fun_body(src) {
         ExprKind::Do(stmts) => {
             assert_eq!(stmts.len(), 3);
@@ -797,7 +799,8 @@ fn simple_set() {
 
 #[test]
 fn set_with_union() {
-    let src = r#"x = *people = union *people [{name: "Bob"}]"#;
+    let src = r#"x = *people = union *people [{name "Bob"}]
+"#;
     match fun_body(src) {
         ExprKind::Set { target, value } => {
             assert!(matches!(&target.node, ExprKind::SourceRef(n) if n == "people"));
@@ -889,7 +892,7 @@ fn data_multiple_constructors() {
 
 #[test]
 fn data_with_fields() {
-    match first_decl("data Shape = Circle {radius: Float} | Rect {width: Float, height: Float}") {
+    match first_decl("data Shape = Circle {radius: Float} | Rect {width: Float, height: Float}\n") {
         DeclKind::Data {
             constructors, ..
         } => {
@@ -904,7 +907,7 @@ fn data_with_fields() {
 
 #[test]
 fn data_with_type_params() {
-    match first_decl("data Maybe a = Nothing {} | Just {value: a}") {
+    match first_decl("data Maybe a = Nothing {} | Just {value: a}\n") {
         DeclKind::Data {
             name,
             params,
@@ -957,7 +960,7 @@ fn data_with_deriving() {
 
 #[test]
 fn data_nested_relation_field() {
-    match first_decl("data Team = Team {name: Text, members: [Person]}") {
+    match first_decl("data Team = Team {name: Text, members: [Person]}\n") {
         DeclKind::Data {
             constructors, ..
         } => {
@@ -986,7 +989,7 @@ fn simple_type_alias() {
 
 #[test]
 fn record_type_alias() {
-    match first_decl("type Person = {name: Text, age: Int}") {
+    match first_decl("type Person = {name: Text, age: Int}\n") {
         DeclKind::TypeAlias { name, ty, .. } => {
             assert_eq!(name, "Person");
             match &ty.node {
@@ -1005,7 +1008,7 @@ fn record_type_alias() {
 
 #[test]
 fn type_alias_with_params() {
-    match first_decl("type Pair a b = {fst: a, snd: b}") {
+    match first_decl("type Pair a b = {fst: a, snd: b}\n") {
         DeclKind::TypeAlias { name, params, .. } => {
             assert_eq!(name, "Pair");
             assert_eq!(params, vec!["a", "b"]);
@@ -1028,7 +1031,7 @@ fn source_simple() {
 
 #[test]
 fn source_with_record_type() {
-    match first_decl("*orders : [{customer: Text, amount: Int}]") {
+    match first_decl("*orders : [{customer: Text, amount: Int}]\n") {
         DeclKind::Source { name, ty, .. } => {
             assert_eq!(name, "orders");
             match &ty.node {
@@ -1138,7 +1141,8 @@ fn fun_as_lambda() {
 
 #[test]
 fn fun_with_multiline_body() {
-    let src = r"add = \title owner priority -> *todos = union *todos [{title: title}]";
+    let src = r#"add = \title owner priority -> *todos = union *todos [{title title}]
+"#;
     match first_decl(src) {
         DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "add");
@@ -1222,7 +1226,7 @@ fn relation_type() {
 
 #[test]
 fn record_type_with_row_var() {
-    match first_decl("type X = {name: Text | r}") {
+    match first_decl("type X = {name: Text | r}\n") {
         DeclKind::TypeAlias { ty, .. } => {
             match &ty.node {
                 TypeKind::Record { fields, rest } => {
@@ -1239,7 +1243,7 @@ fn record_type_with_row_var() {
 #[test]
 fn nested_relation_record_type() {
     // [{name: Text, grades: [{subject: Text, score: Int}]}]
-    match first_decl("*records : [{name: Text, grades: [{subject: Text, score: Int}]}]") {
+    match first_decl("*records : [{name: Text, grades: [{subject: Text, score: Int}]}]\n") {
         DeclKind::Source { ty, .. } => {
             match &ty.node {
                 TypeKind::Relation(inner) => {
@@ -1320,7 +1324,7 @@ fn wildcard_pattern_in_case() {
 
 #[test]
 fn constructor_with_record_pattern() {
-    let src = "x = case s of\n  Circle {radius} -> radius";
+    let src = "x = case s of\n  Circle {radius radius} -> radius";
     match fun_body(src) {
         ExprKind::Case { arms, .. } => {
             match &arms[0].pat.node {
@@ -1330,7 +1334,12 @@ fn constructor_with_record_pattern() {
                         PatKind::Record(fields) => {
                             assert_eq!(fields.len(), 1);
                             assert_eq!(fields[0].name, "radius");
-                            assert!(fields[0].pattern.is_none()); // punned
+                            // No punning: explicit `{radius radius}` binds the
+                            // field to a variable of the same name.
+                            match &fields[0].pattern {
+                                Some(p) => assert!(matches!(&p.node, PatKind::Var(n) if n == "radius")),
+                                other => panic!("expected explicit Var pattern, got {:?}", other),
+                            }
                         }
                         other => panic!("expected Record pattern, got {:?}", other),
                     }
@@ -1612,7 +1621,7 @@ fn composite_route() {
 
 #[test]
 fn simple_migrate() {
-    let src = "migrate *people\n  from {name: Text}\n  to {name: Text, age: Int}\n  using (\\old -> {old | age: 0})";
+    let src = "migrate *people\n  from {name: Text}\n  to {name: Text, age: Int}\n  using (\\old -> {old | age 0})";
     match first_decl(src) {
         DeclKind::Migrate {
             relation,
@@ -1673,7 +1682,7 @@ pendingFor = \\user -> do
   t <- *todos
   where t.owner == user
   Open {} <- t.status
-  yield {title: t.title, priority: t.priority}";
+  yield {title t.title priority t.priority}";
     match first_decl(src) {
         DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "pendingFor");
@@ -1716,7 +1725,7 @@ pendingFor = \\user -> do
 #[test]
 fn function_with_set_and_union() {
     let src =
-        "add = \\title owner priority -> *todos = union *todos [{title: title, owner, priority, status: Open {}}]";
+        "add = \\title owner priority -> *todos = union *todos [{title title owner owner priority priority status (Open {})}]";
     match first_decl(src) {
         DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "add");
@@ -1735,8 +1744,8 @@ fn function_with_set_and_union() {
 fn function_with_case_expression() {
     let src = "\
 scale = \\factor shapes -> case shapes of
-  Circle {radius} -> Circle {radius: radius * factor}
-  Rect {width, height} -> Rect {width: width * factor, height: height * factor}";
+  Circle {radius radius} -> Circle {radius (radius * factor)}
+  Rect {width width height height} -> Rect {width (width * factor) height (height * factor)}";
     match first_decl(src) {
         DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "scale");
@@ -1787,7 +1796,7 @@ fn pipe_chain() {
 
 #[test]
 fn record_update_with_field_access() {
-    match fun_body("x = {p | age: p.age + 1}") {
+    match fun_body("x = {p | age (p.age + 1)}") {
         ExprKind::RecordUpdate { base, fields } => {
             assert!(matches!(&base.node, ExprKind::Var(n) if n == "p"));
             assert_eq!(fields.len(), 1);
@@ -1806,7 +1815,7 @@ fn if_in_do_block() {
     let src = "\
 f = do
   t <- *todos
-  yield (if t.name == name then {t | age: t.age + 1} else t)";
+  yield (if t.name == name then {t | age (t.age + 1)} else t)";
     match fun_body(src) {
         ExprKind::Do(stmts) => {
             assert_eq!(stmts.len(), 2);
@@ -1839,14 +1848,14 @@ formatTitle = \\title -> toUpper (take 1 title) ++ drop 1 title
 pendingFor = \\user -> do
   t <- *todos
   where t.owner == user
-  yield {title: t.title, priority: t.priority}
+  yield {title t.title priority t.priority}
 
 add = \\title owner priority ->
-  *todos = union *todos [{title: formatTitle title, owner, priority, status: Open {}}]
+  *todos = union *todos [{title (formatTitle title) owner owner priority priority status (Open {})}]
 
 &workload = do
   t <- *todos
-  yield {owner: t.owner, count: count t}";
+  yield {owner t.owner count (count t)}";
 
     let m = parse_ok(src);
     assert_eq!(m.decls.len(), 7);
@@ -1927,8 +1936,12 @@ fn error_unclosed_bracket() {
 
 #[test]
 fn error_unclosed_brace() {
-    let (_, diags) = parse_err("x = {a: 1");
-    let has_brace_error = diags.iter().any(|d| d.message.contains("}") || d.message.contains("close"));
+    let (_, diags) = parse_err("x = {a 1");
+    let has_brace_error = diags.iter().any(|d| {
+        d.message.contains("}")
+            || d.message.contains("close")
+            || d.message.contains("expected field name in record")
+    });
     assert!(
         has_brace_error,
         "error should mention unclosed brace, got: {:?}",
@@ -2017,7 +2030,7 @@ fn constructor_applied_to_empty_record() {
 fn constructor_greedy_binding() {
     // `f Circle {radius: 5}` should parse as `f (Circle {radius: 5})`
     // not `(f Circle) {radius: 5}`.
-    match fun_body("x = f Circle {radius: 5}") {
+    match fun_body("x = f (Circle {radius 5})\n") {
         ExprKind::App { func, arg } => {
             assert!(matches!(&func.node, ExprKind::Var(n) if n == "f"));
             // arg should be App(Constructor("Circle"), Record(...))
@@ -2057,7 +2070,7 @@ fn constructor_greedy_with_field_access() {
     // application arguments: `Circle {radius: 5}.radius` parses as
     // `Circle ({radius: 5}.radius)`, consistent with `f x.y` → `f (x.y)`.
     // (Previously the `.radius` attached to the whole application.)
-    match fun_body("x = Circle {radius: 5}.radius") {
+    match fun_body("x = Circle {radius 5}.radius\n") {
         ExprKind::App { func, arg } => {
             assert!(matches!(&func.node, ExprKind::Constructor(n) if n == "Circle"));
             match &arg.node {
@@ -2117,7 +2130,7 @@ fn nested_lambdas() {
 
 #[test]
 fn arithmetic_in_field_value() {
-    match fun_body("x = {area: pi * r * r}") {
+    match fun_body("x = {area (pi * r * r)}\n") {
         ExprKind::Record(fields) => {
             assert_eq!(fields[0].name, "area");
             assert!(matches!(
@@ -2528,7 +2541,7 @@ fn io_type_row_union_shorthand() {
 
 #[test]
 fn inline_variant_type() {
-    match first_decl("type X = <Ok {} | Err {msg: Text}>") {
+    match first_decl("type X = <Ok {} | Err {msg: Text}>\n") {
         DeclKind::TypeAlias { ty, .. } => match &ty.node {
             TypeKind::Variant {
                 constructors, rest, ..
@@ -3304,12 +3317,12 @@ route Api where
     }
 }
 
-// ── Record Punning ──────────────────────────────────────────────────
+// ── Record Fields (explicit — punning has been removed) ────────────
 
 #[test]
 fn record_punned_fields() {
-    // {name, age} means {name: name, age: age}
-    match fun_body("x = {name, age}") {
+    // Punning no longer exists: `{name name age age}` is the explicit form.
+    match fun_body("x = {name name age age}") {
         ExprKind::Record(fields) => {
             assert_eq!(fields.len(), 2);
             assert_eq!(fields[0].name, "name");
@@ -3317,27 +3330,27 @@ fn record_punned_fields() {
             assert_eq!(fields[1].name, "age");
             assert!(matches!(&fields[1].value.node, ExprKind::Var(n) if n == "age"));
         }
-        other => panic!("expected Record with punning, got {:?}", other),
+        other => panic!("expected Record with explicit fields, got {:?}", other),
     }
 }
 
 #[test]
 fn record_field_access_pun() {
-    // {t.name, t.age} means {name: t.name, age: t.age}
-    match fun_body("x = {t.name, t.age}") {
+    // Field-access values must be written explicitly: `{name t.name age t.age}`.
+    match fun_body("x = {name t.name age t.age}") {
         ExprKind::Record(fields) => {
             assert_eq!(fields.len(), 2);
             assert_eq!(fields[0].name, "name");
             assert!(matches!(&fields[0].value.node, ExprKind::FieldAccess { field, .. } if field == "name"));
             assert_eq!(fields[1].name, "age");
         }
-        other => panic!("expected Record with field access pun, got {:?}", other),
+        other => panic!("expected Record with field access values, got {:?}", other),
     }
 }
 
 #[test]
 fn record_mixed_punned_and_explicit() {
-    match fun_body(r#"x = {name, age: 30, title: "Dr"}"#) {
+    match fun_body(r#"x = {name name age 30 title "Dr"}"#) {
         ExprKind::Record(fields) => {
             assert_eq!(fields.len(), 3);
             assert_eq!(fields[0].name, "name");
@@ -3354,7 +3367,7 @@ fn record_mixed_punned_and_explicit() {
 #[test]
 fn with_expression() {
     // `with {x: 1} x + 1` parses as a With expression whose record binds `x`.
-    match fun_body("f = with {x: 1} x + 1") {
+    match fun_body("f = with {x 1} x + 1\n") {
         ExprKind::With { record, body } => {
             match &record.node {
                 ExprKind::Record(fields) => {
@@ -3419,8 +3432,8 @@ fn literal_string_pattern() {
 
 #[test]
 fn record_pattern_with_explicit_binding() {
-    // {name: n, age: a} binds name to n, age to a
-    let src = "x = case r of\n  {name: n, age: a} -> n";
+    // `{name n age a}` binds field `name` to `n`, field `age` to `a`.
+    let src = "x = case r of\n  {name n age a} -> n";
     match fun_body(src) {
         ExprKind::Case { arms, .. } => {
             match &arms[0].pat.node {
@@ -3756,7 +3769,7 @@ fn division_operator() {
 
 #[test]
 fn lambda_with_record_pattern() {
-    match fun_body("x = \\{name, age} -> name") {
+    match fun_body("x = \\{name name age age} -> name") {
         ExprKind::Lambda { params, .. } => {
             assert_eq!(params.len(), 1);
             assert!(matches!(&params[0].node, PatKind::Record(_)));
@@ -3827,7 +3840,7 @@ fn migrate_with_nested_type() {
 migrate *teams
   from {name: Text}
   to {name: Text, members: [Person]}
-  using (\\old -> {old | members: []})";
+  using (\\old -> {old | members []})";
     match first_decl(src) {
         DeclKind::Migrate {
             relation,
@@ -3893,7 +3906,7 @@ fn case_single_line_semicolons() {
 
 #[test]
 fn data_recursive_type() {
-    match first_decl("data List a = Nil {} | Cons {head: a, tail: List a}") {
+    match first_decl("data List a = Nil {} | Cons {head: a, tail: List a}\n") {
         DeclKind::Data {
             name,
             params,
@@ -3915,7 +3928,7 @@ fn data_recursive_type() {
 
 #[test]
 fn data_multiple_type_params() {
-    match first_decl("data Either a b = Left {value: a} | Right {value: b}") {
+    match first_decl("data Either a b = Left {value: a} | Right {value: b}\n") {
         DeclKind::Data {
             params,
             constructors,
@@ -3987,14 +4000,14 @@ fn subset_constraint_with_source_decls() {
 
 #[test]
 fn do_with_group_by() {
-    let src = "x = do\n  t <- xs\n  groupBy {t.owner}\n  yield {owner: t.owner, count: count t}";
+    let src = "x = do\n  t <- xs\n  groupBy {owner t.owner}\n  yield {owner t.owner count (count t)}";
     match fun_body(src) {
         ExprKind::Do(stmts) => {
             assert_eq!(stmts.len(), 3);
             assert!(matches!(&stmts[0].node, StmtKind::Bind { .. }));
             match &stmts[1].node {
                 StmtKind::GroupBy { key } => {
-                    // Key should be a record {owner: t.owner}
+                    // Key should be a record {owner t.owner}
                     assert!(matches!(&key.node, ExprKind::Record(_)));
                 }
                 other => panic!("expected GroupBy, got {:?}", other),
@@ -4165,18 +4178,18 @@ fn case_inside_parens_single_line() {
 
 #[test]
 fn case_inside_lambda_in_parens() {
-    // Pattern from fold: (\acc x -> case acc of ... ) init items
+    // Pattern from fold: (\\acc x -> case acc of ... ) init items
     let src = "\
 f = fold (\\acc x -> case acc of
-  Nothing {} -> Just {value: x}
-  _ -> acc) Nothing {} items";
+  Nothing {} -> Just {value x}
+  _ -> acc) (Nothing {}) items";
     // Should parse without errors — the ) closes the paren, not a case arm
     parse_ok(src);
 }
 
 #[test]
 fn case_inside_braces() {
-    let src = "f = {x: case v of A {} -> 1; B {} -> 2}";
+    let src = "f = {x (case v of A {} -> 1; B {} -> 2)}\n";
     match fun_body(src) {
         ExprKind::Record(fields) => {
             assert_eq!(fields.len(), 1);

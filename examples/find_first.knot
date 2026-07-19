@@ -1,8 +1,8 @@
 -- Test findFirst builtin.
 
-main = with {r1: findFirst [1, 2, 3, 4, 5] (\x -> x > 3)} (do
-  with {r2: findFirst [1, 2, 3] (\x -> x > 10)} (do
-    with {r3: findFirst [] (\x -> x > 0)} (do
+main = with { r1 (findFirst [1, 2, 3, 4, 5] (\x -> x > 3)) } (do
+  with { r2 (findFirst [1, 2, 3] (\x -> x > 10)) } (do
+    with { r3 (findFirst [] (\x -> x > 0)) } (do
       println (show r1)
       println (show r2)
       println (show r3)

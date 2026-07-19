@@ -2459,7 +2459,7 @@ main = atomic (do *people = [{n "A"}]; yield {})
         );
         let doc = ws.doc(&uri);
         // Cursor inside the atomic body, on the line after `*people = ...`
-        let inside = doc.source.find("[{n:").expect("atomic body");
+        let inside = doc.source.find("[{n ").expect("atomic body");
         let pos = offset_to_position(&doc.source, inside);
         let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
             .expect("completion returns");
@@ -2910,7 +2910,7 @@ mod regress_fixes_tests {
     fn rate_limit_expression_gets_normal_expression_completions() {
         use crate::test_support::TestWorkspace;
         let mut ws = TestWorkspace::new();
-        let src = "route Api where\n  GET /things -> Text rateLimit {key: \\i -> \\c -> Nothing, limit: {requests: 10, window: 1000}} = GetThings\n";
+        let src = "route Api where\n  GET /things -> Text rateLimit {key (\\i -> \\c -> Nothing) limit {requests 10 window 1000}} = GetThings\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
         // Sanity: the parser recorded the rateLimit expression.

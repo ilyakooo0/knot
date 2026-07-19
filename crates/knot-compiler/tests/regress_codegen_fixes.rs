@@ -899,7 +899,7 @@ main = do
         "a nested else-branch comprehension must write every row, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("lit : [{name: z}]\n"),
+        stdout.contains("\"lit: [{name: z}]\"\n"),
         "a non-comprehension branch must still write its own value, got:\n{stdout}"
     );
 }

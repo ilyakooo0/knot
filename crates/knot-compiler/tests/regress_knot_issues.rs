@@ -217,7 +217,7 @@ fn io_do_block_ending_in_yield_unit_compiles_and_runs() {
 #[test]
 fn do_block_final_monadic_action_is_not_double_wrapped() {
     let src = "safeDiv : Int 1 -> Int 1 -> Maybe Int 1\n\
-               safeDiv = \\a b -> if b == 0 then Nothing {} else Just {value: a / b}\n\
+               safeDiv = \\a b -> if b == 0 then Nothing {} else Just {value (a / b)}\n\
                chain : Int 1 -> Maybe Int 1\n\
                chain = \\x -> do\n\
                \x20 a <- safeDiv 100 x\n\
@@ -272,7 +272,7 @@ fn io_action_from_a_callback_param_is_the_block_result() {
 #[test]
 fn pure_with_do_block_has_the_final_expressions_type() {
     let src = "isValidHex : Text -> Bool\n\
-               isValidHex = \\s -> with {n: length s} (do\n\
+               isValidHex = \\s -> with {n (length s)} (do\n\
                \x20 n > 0 && n % 2 == 0)\n\
                main = do\n\
                \x20 println (show (isValidHex \"abc\"))\n\
@@ -291,7 +291,7 @@ fn pure_with_do_block_has_the_final_expressions_type() {
 #[test]
 fn with_block_with_explicit_yield_stays_monadic() {
     let src = "ones : [Int 1]\n\
-               ones = with {n: 1} (do\n\
+               ones = with {n 1} (do\n\
                \x20 yield n)\n\
                main = println (show (count ones))\n";
     assert_clean(src, "a with block with an explicit yield");
@@ -337,7 +337,7 @@ fn bare_unit_and_yield_unit_agree_as_an_io_result() {
         "an IO do-block ending in a bare `{}`",
     );
     assert_clean(
-        "main = do\n  println \"a\"\n  with {done: ({} : {})} done\n",
+        "main = do\n  println \"a\"\n  with {done ({} : {})} done\n",
         "an IO do-block ending in a with-bound unit",
     );
 }
@@ -388,8 +388,8 @@ fn elem_works_across_the_refined_subtype_boundary() {
          seen : ServerName -> Bool\n\
          seen = \\n -> elem n touched\n\
          main = case refine \"a\" of\n\
-         \x20 Ok {{value: n}} -> println (show (seen n))\n\
-         \x20 Err {{error: e}} -> println \"bad\"\n"
+         \x20 Ok {{value n}} -> println (show (seen n))\n\
+         \x20 Err {{error e}} -> println \"bad\"\n"
     );
     let (stdout, stderr, ok) = compile_and_run("elem_subtype", &src, &[]);
     assert!(ok, "program failed: {stderr}");
@@ -449,7 +449,7 @@ fn a_base_element_read_back_out_of_a_base_list_stays_base() {
          takesServer = \\s -> length s > 0\n\
          sneak : [Text] -> Bool\n\
          sneak = \\xs -> case head xs of\n\
-         \x20 Just {value: t} -> takesServer t\n\
+         \x20 Just {value t} -> takesServer t\n\
          \x20 Nothing {} -> False {}\n\
          main = println (show (sneak []))\n",
         "cannot implicitly use",
@@ -474,8 +474,8 @@ fn a_refinement_predicate_reads_the_runtime_override_of_a_constant() {
                describe = \\n -> \"accepted\"\n\
                check : Text -> Text\n\
                check = \\s -> case refine s of\n\
-               \x20 Ok {value: n} -> describe n\n\
-               \x20 Err {error: e} -> \"rejected\"\n\
+               \x20 Ok {value n} -> describe n\n\
+               \x20 Err {error e} -> \"rejected\"\n\
                main = println (check \"abcdefg\")\n";
     let c = compile("override_refinement", src);
 
@@ -592,7 +592,7 @@ fn refinements_nested_in_route_body_fields_are_validated() {
          \x20 /gossip\n\
          \x20   POST {{events: [Ev], top: PubkeyHex}} / -> {{ok: Bool}} = Gossip\n\
          srv = serve API where\n\
-         \x20 Gossip = \\r -> yield (Ok {{value: {{ok: True {{}}}}}})\n\
+         \x20 Gossip = \\r -> yield (Ok {{value {{ok (True {{}})}}}})\n\
          main = listen {port} srv\n"
     );
     let _server = start_server("nested_refinements", &src, port);
@@ -701,7 +701,7 @@ fn a_where_filters_the_rows_of_a_source_relation() {
     let src = format!(
         "{ADULTS}\
          main = do\n\
-         \x20 replace *users = [{{name: \"Alice\", age: 30}}, {{name: \"Bob\", age: 20}}, {{name: \"Carol\", age: 40}}]\n\
+         \x20 replace *users = [{{name \"Alice\" age 30}}, {{name \"Bob\" age 20}}, {{name \"Carol\" age 40}}]\n\
          \x20 a <- &adults\n\
          \x20 forEach a (\\u -> println u.name)\n\
          \x20 yield {{}}\n"
@@ -729,7 +729,7 @@ fn a_where_that_no_row_satisfies_yields_an_empty_relation() {
                \x20 where u.age >= 99\n\
                \x20 yield u\n\
                main = do\n\
-               \x20 replace *users = [{name: \"Alice\", age: 30}]\n\
+               \x20 replace *users = [{name \"Alice\" age 30}]\n\
                \x20 a <- &adults\n\
                \x20 println (\"count: \" ++ show (count a))\n\
                \x20 yield {}\n";
@@ -750,7 +750,7 @@ fn a_where_over_the_relation_as_a_value_stays_a_guard() {
                \x20 where count people > 1\n\
                \x20 yield (filter (\\p -> p.age > 65) people)\n\
                main = do\n\
-               \x20 replace *people = [{name: \"Alice\", age: 70}, {name: \"Bob\", age: 20}]\n\
+               \x20 replace *people = [{name \"Alice\" age 70}, {name \"Bob\" age 20}]\n\
                \x20 s <- &seniorsIfCrowd\n\
                \x20 forEach s (\\p -> println p.name)\n\
                \x20 yield {}\n";

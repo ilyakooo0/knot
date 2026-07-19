@@ -1587,7 +1587,7 @@ checkGlobalRate = \t -> atomic do
     #[test]
     fn monad_context_hint_anchors_at_do_keyword_for_parenthesized_do() {
         let mut ws = TestWorkspace::new();
-        let src = "apply = \\m -> m\nsafe = \\x -> apply (do\n  v <- Just {value: x}\n  yield v.value)\n";
+        let src = "apply = \\m -> m\nsafe = \\x -> apply (do\n  v <- Just {value x}\n  yield v.value)\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
         let range = ws.whole_file_range(&uri);
@@ -1620,25 +1620,25 @@ checkGlobalRate = \t -> atomic do
     }
 
     /// Record-destructure field hints must anchor on the FIELD-NAME token,
-    /// not the first same-named token: in `P {a: b, b: c}`, field `b`'s hint
+    /// not the first same-named token: in `P {a b b c}`, field `b`'s hint
     /// belongs on the second `b` (the field name), not on the binder `b`
     /// of field `a`.
     #[test]
     fn record_field_hints_anchor_on_field_name_not_binder() {
         let mut ws = TestWorkspace::new();
-        let src = "data P = P {a: Int 1, b: Text}\n\nf = \\p -> case p of\n  P {a: b, b: c} -> c\n";
+        let src = "data P = P {a: Int 1, b: Text}\n\nf = \\p -> case p of\n  P {a b b c} -> c\n";
         let uri = ws.open("main", src);
         let doc = ws.doc(&uri);
         let range = ws.whole_file_range(&uri);
         let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
 
         // Expected anchor for field `b`: just after the SECOND `b` in the
-        // pattern (the field-name token of `b: c`).
-        let pat_off = doc.source.find("P {a: b, b: c}").expect("pattern");
-        let field_b_off = doc.source[pat_off..].find(", b:").map(|p| pat_off + p + 2).unwrap();
+        // pattern (the field-name token of `b c`).
+        let pat_off = doc.source.find("P {a b b c}").expect("pattern");
+        let field_b_off = doc.source[pat_off..].find(" b c").map(|p| pat_off + p + 1).unwrap();
         let expected_b_pos = offset_to_position(&doc.source, field_b_off + 1);
         // And the WRONG anchor (the binder b of field a).
-        let binder_b_off = doc.source[pat_off..].find("a: b").map(|p| pat_off + p + 3).unwrap();
+        let binder_b_off = doc.source[pat_off..].find("a b").map(|p| pat_off + p + 2).unwrap();
         let wrong_b_pos = offset_to_position(&doc.source, binder_b_off + 1);
 
         let text_hints: Vec<(&Position, String)> = hints
@@ -1733,7 +1733,7 @@ checkGlobalRate = \t -> atomic do
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "base : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> with {y: base * 2.0} (do\n  yield y)\n",
+            "base : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> with {y (base * 2.0)} (do\n  yield y)\n",
         );
         let doc = ws.doc(&uri);
         // Sanity: the unit really flows into the compound RHS — `f`'s
@@ -1847,7 +1847,9 @@ checkGlobalRate = \t -> atomic do
         let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
         let sig_line_start = doc.source.find("f : Int 1").expect("sig");
         let sig_line = offset_to_position(&doc.source, sig_line_start).line;
-        let sig_text_len = "f : Int 1 -> IO {} [{a: Int 1}]\n".len() as u32;
+        // End-of-line anchor = length of the signature line EXCLUDING the
+        // trailing newline (the hint sits just before the '\n').
+        let sig_text_len = "f : Int 1 -> IO {} [{a: Int 1}]".len() as u32;
         for h in &hints {
             if let InlayHintLabel::String(s) = &h.label
                 && s.starts_with("-- effects:") {

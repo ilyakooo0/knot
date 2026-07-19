@@ -164,11 +164,11 @@ fn maybe_to_json_parse_json_round_trip() {
 
 showPerson = \p -> case p.nick of
   Nothing {} -> println (p.name ++ ": none")
-  Just {value} -> println (p.name ++ ": " ++ value)
+  Just {value value} -> println (p.name ++ ": " ++ value)
 
 showResult = \m -> case m of
   Nothing {} -> println "parse failed"
-  Just {value} -> showPerson value
+  Just {value value} -> showPerson value
 
 main = do
   showResult (parseJson (toJson {name "a" nick (Just {value "x"})}) : Maybe Person)
@@ -190,7 +190,7 @@ fn maybe_db_storage_keeps_marker_format() {
 
 showRow = \r -> case r.status of
   Nothing {} -> println (show r.n ++ ": none")
-  Just {value} -> println (show r.n ++ ": " ++ value)
+  Just {value value} -> println (show r.n ++ ": " ++ value)
 
 main = do
   replace *items = [{n 1 status (Just {value "active"})}, {n 2 status (Nothing {})}]

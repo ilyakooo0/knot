@@ -109,7 +109,7 @@ fn nested_literal_in_constructor_pattern_is_tested() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_nested_lit",
         r#"main = do
-  with {m (Just {value 5})} (do with {r (case m of Just {value: 1} -> "one"; Just {value: n} -> show n; Nothing {} -> "none")} (do println r))
+  with {m (Just {value 5})} (do with {r (case m of Just {value 1} -> "one"; Just {value n} -> show n; Nothing {} -> "none")} (do println r))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -140,7 +140,7 @@ fn nested_literal_in_record_pattern_is_tested() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_record_lit",
         r#"main = do
-  with {p {tag 2 name "b"}} (do with {r (case p of {tag: 1} -> "first"; {tag: t} -> "tag " ++ show t)} (do println r))
+  with {p {tag 2 name "b"}} (do with {r (case p of {tag 1} -> "first"; {tag t} -> "tag " ++ show t)} (do println r))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -155,7 +155,7 @@ fn nested_constructor_in_record_pattern_is_tested() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_nested_ctor",
         r#"main = do
-  with {p {st (Nothing {}) n 7}} (do with {r (case p of {st: Just v} -> "just"; {st: Nothing {}} -> "nothing")} (do println r))
+  with {p {st (Nothing {}) n 7}} (do with {r (case p of {st (Just v)} -> "just"; {st (Nothing {})} -> "nothing")} (do println r))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -368,9 +368,9 @@ fn trim_in_where_is_unicode_aware() {
          *p : [T]\n\
          \n\
          main = do\n  \
-           replace *p = [{name: \"\u{2003}x\u{2003}\"}]\n  \
+           replace *p = [{name \"\u{2003}x\u{2003}\"}]\n  \
            rows <- *p\n  \
-           with {c: countWhere (\\r -> trim r.name == \"x\") rows} (do\n             println (\"c: \" ++ show c))\n",
+           with {c (countWhere (\\r -> trim r.name == \"x\") rows)} (do\n             println (\"c: \" ++ show c))\n",
     );
     assert!(ok, "program failed: {stderr}");
     assert!(
@@ -557,9 +557,9 @@ fn minmax_over_text_column_returns_text_not_reparsed_int() {
 *z : [Z]
 
 main = do
-  replace *z = [{code: "007", n: 1}, {code: "005", n: 2}, {code: "003", n: 3}]
-  with {hi: maxOn (\r -> r.code) *z} (do
-    with {lo: minOn (\r -> r.code) *z} (do
+  replace *z = [{code "007" n 1}, {code "005" n 2}, {code "003" n 3}]
+  with {hi (maxOn (\r -> r.code) *z)} (do
+    with {lo (minOn (\r -> r.code) *z)} (do
       -- `++` requires Text; if the runtime re-parsed "007" to Int 7 this would
       -- both corrupt the value ("7") and break the Text concatenation.
       println ("hi: " ++ hi)
@@ -600,10 +600,10 @@ type T = {lvl: Level, n: Int 1}
 *t : [T]
 
 main = do
-  replace *t = [{lvl: Low {}, n: 1}, {lvl: High {}, n: 2}]
+  replace *t = [{lvl (Low {}) n 1}, {lvl (High {}) n 2}]
   -- Ord says Low < High, so the true max is High. A byte-wise SQL MAX over
   -- the tag strings would wrongly pick 'Low' ('L' > 'H') as bare Text.
-  with {top: maxOn (\r -> r.lvl) *t} (do
+  with {top (maxOn (\r -> r.lvl) *t)} (do
     println ("top: " ++ show top))
 "#,
     );

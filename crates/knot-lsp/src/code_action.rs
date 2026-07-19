@@ -659,8 +659,17 @@ pub(crate) fn handle_code_action(
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
+                // Non-atomic values must be parenthesized in the new
+                // brace-pattern syntax: `{x v}` for atoms, `{x (a + b)}`
+                // otherwise — a bare `{x 1 + 2}` parses `1` as the value
+                // and chokes on `+`.
+                let value_text = if is_atomic_expr_text(trimmed) {
+                    trimmed.to_string()
+                } else {
+                    format!("({trimmed})")
+                };
                 let with_text = format!(
-                    "{prefix}with {{{let_name}: {trimmed}}} (do\n{reindented_body})"
+                    "{prefix}with {{{let_name} {value_text}}} (do\n{reindented_body})"
                 );
 
                 let mut changes = HashMap::new();
@@ -5428,10 +5437,10 @@ mod regress_fixes_batch2_tests {
     #[test]
     fn inline_variable_on_do_line_keeps_do_header() {
         let mut tw = TestWorkspace::new();
-        let src = "main = do with {y: 5} (do yield (y + 1))\n";
+        let src = "main = do with {y 5} (do yield (y + 1))\n";
         assert!(parses_cleanly(src), "fixture must parse");
         let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "y:");
+        let pos = tw.position_of(&uri, "y ");
         let actions = handle_code_action(
             &tw.state,
             &params_for(&uri, Range { start: pos, end: pos }),
@@ -5453,10 +5462,10 @@ mod regress_fixes_batch2_tests {
     #[test]
     fn inline_variable_own_line_removes_whole_line() {
         let mut tw = TestWorkspace::new();
-        let src = "main = do\n  with {y: 5} (do\n    yield (y + 1))\n";
+        let src = "main = do\n  with {y 5} (do\n    yield (y + 1))\n";
         assert!(parses_cleanly(src), "fixture must parse");
         let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "y:");
+        let pos = tw.position_of(&uri, "y ");
         let actions = handle_code_action(
             &tw.state,
             &params_for(&uri, Range { start: pos, end: pos }),
@@ -5492,7 +5501,7 @@ mod regress_fixes_batch2_tests {
             .expect("extract-to-with offered inside do block");
         let out = apply_edits_to(src, edits_for(action, &uri));
         assert!(
-            out.starts_with("main = do with {extracted: 1 + 2} (do"),
+            out.starts_with("main = do with {extracted (1 + 2)} (do"),
             "with-binding must be inserted after `do `, wrapping the statement:\\n{out}"
         );
         assert!(

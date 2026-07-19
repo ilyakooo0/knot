@@ -711,6 +711,12 @@ struct Infer {
     /// Type aliases: name → resolved Ty.
     aliases: HashMap<String, Ty>,
 
+    /// Parameterized type aliases: name → (param names, body AST type). Kept as
+    /// the AST body (not a resolved Ty) so each application can elaborate the
+    /// body with FRESH parameter variables and substitute the actual arguments,
+    /// avoiding the shared-var pinning that resolving once would cause.
+    param_aliases: HashMap<String, (Vec<String>, ast::Type)>,
+
     /// Mapping from annotation type-variable names to TyVars (per-declaration).
     annotation_vars: HashMap<String, TyVar>,
 
@@ -947,6 +953,7 @@ impl Infer {
             assoc_impls: HashMap::new(),
             assoc_reduce_depth: std::cell::Cell::new(0),
             aliases: HashMap::new(),
+            param_aliases: HashMap::new(),
             annotation_vars: HashMap::new(),
             errors: Vec::new(),
             monad_vars: Vec::new(),
@@ -4338,6 +4345,64 @@ impl Infer {
 
     // ── AST type → Ty ────────────────────────────────────────────
 
+    /// If `ty` is a (possibly applied) reference to a parameterized type alias
+    /// (`Pair Int Text`), expand it: peel the `App` spine, elaborate the alias
+    /// body with FRESH parameter variables, and substitute the actual
+    /// arguments. Returns `None` when the head is not a parameterized alias, so
+    /// the caller falls through to the normal `Named`/`App` handling.
+    fn expand_param_alias(&mut self, ty: &ast::Type) -> Option<Ty> {
+        // Peel the application spine into (head, args in application order).
+        let mut args: Vec<&ast::Type> = Vec::new();
+        let mut head = ty;
+        while let ast::TypeKind::App { func, arg } = &head.node {
+            args.push(arg);
+            head = func;
+        }
+        args.reverse();
+        let ast::TypeKind::Named(name) = &head.node else {
+            return None;
+        };
+        let (params, body) = self.param_aliases.get(name)?.clone();
+        if args.len() != params.len() {
+            self.error(
+                format!(
+                    "type alias `{name}` expects {} argument(s), but {} were supplied",
+                    params.len(),
+                    args.len()
+                ),
+                ty.span,
+            );
+            return Some(Ty::Error);
+        }
+        // Bind each parameter name to a FRESH variable so every use of the
+        // alias elaborates independently (no shared pinning across call sites).
+        let saved: Vec<(String, Option<TyVar>)> = params
+            .iter()
+            .map(|p| (p.clone(), self.annotation_vars.get(p).copied()))
+            .collect();
+        let mut mapping: HashMap<TyVar, Ty> = HashMap::new();
+        for (p, arg_ty) in params.iter().zip(args.iter()) {
+            let pv = self.fresh_var();
+            self.annotation_vars.insert(p.clone(), pv);
+            let arg = self.ast_type_to_ty(arg_ty);
+            mapping.insert(pv, arg);
+        }
+        let body_ty = self.ast_type_to_ty(&body);
+        // Restore the caller's annotation-vars bindings for these param names.
+        for (p, old) in saved {
+            match old {
+                Some(v) => {
+                    self.annotation_vars.insert(p, v);
+                }
+                None => {
+                    self.annotation_vars.remove(&p);
+                }
+            }
+        }
+        let expanded = self.subst_ty(&body_ty, &mapping);
+        Some(Ty::Alias(name.clone(), Box::new(expanded)))
+    }
+
     fn ast_type_to_ty(&mut self, ty: &ast::Type) -> Ty {
         match &ty.node {
             ast::TypeKind::Named(name) => match name.as_str() {
@@ -4367,6 +4432,12 @@ impl Infer {
                 "Uuid" => Ty::Uuid,
                 "[]" => Ty::TyCon("[]".into()),
                 _ => {
+                    // Parameterized alias referenced bare (`Pair` with 0 args).
+                    if self.param_aliases.contains_key(name) {
+                        if let Some(t) = self.expand_param_alias(ty) {
+                            return t;
+                        }
+                    }
                     if let Some(aliased) = self.aliases.get(name).cloned() {
                         // Freshen any free type variables in the alias body
                         // (e.g. the `a` in `type Box = {val: a}`): the body
@@ -4459,6 +4530,10 @@ impl Infer {
                 Box::new(self.ast_type_to_ty(result)),
             ),
             ast::TypeKind::App { func, arg } => {
+                // Applied parameterized alias (`Pair Int Text`): expand it.
+                if let Some(t) = self.expand_param_alias(ty) {
+                    return t;
+                }
                 // Associated-type application `AssocName arg` (e.g. `Elem c`).
                 // Preserve it as a projection so it can be reduced once `arg`
                 // resolves to a concrete type matching an impl definition,
@@ -7630,8 +7705,8 @@ impl Infer {
         let mut alias_decls: Vec<(String, ast::Type, Span)> = Vec::new();
         let mut refined_alias_decls: Vec<(String, ast::Type, ast::Expr)> = Vec::new();
         for decl in &module.decls {
-            if let ast::DeclKind::TypeAlias { name, params, ty } = &decl.node
-                && params.is_empty() {
+            if let ast::DeclKind::TypeAlias { name, params, ty } = &decl.node {
+                if params.is_empty() {
                     if let ast::TypeKind::Refined { base, predicate } = &ty.node {
                         refined_alias_decls.push((
                             name.clone(),
@@ -7641,7 +7716,14 @@ impl Infer {
                     } else {
                         alias_decls.push((name.clone(), ty.clone(), decl.span));
                     }
+                } else {
+                    // Parameterized alias: keep the AST body + param names so
+                    // applications (`Pair Int Text`) elaborate fresh each time
+                    // and substitute the actual arguments.
+                    self.param_aliases
+                        .insert(name.clone(), (params.clone(), ty.clone()));
                 }
+            }
         }
         // Detect cyclic alias definitions (e.g. `type A = B; type B = A`)
         // before the fixpoint loop: each iteration would wrap another

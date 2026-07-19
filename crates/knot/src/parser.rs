@@ -22,6 +22,13 @@ pub struct Parser {
     /// `migrate` declaration so a single-line migrate doesn't have its clause
     /// keywords consumed as type-variable applications.
     stop_type_at_migrate_clauses: bool,
+    /// When true, the cross-newline type-application continuation stops at a
+    /// `Lower` token on the following line. Set while parsing the `name : Type`
+    /// signature line of a record VALUE literal, where a lowercase identifier
+    /// on the next line is always the field's value (`name value`), never a
+    /// type-variable argument. (Contrast record TYPES, where the next field is
+    /// `Lower :` and the existing `next_starts_decl` guard already stops.)
+    record_value_sig_type: bool,
     /// Indentation level of the current block (set by `parse_block`).
     /// Used by `parse_application` to allow multi-line function application
     /// when continuation lines are indented past the block indent.
@@ -80,6 +87,7 @@ impl Parser {
             context: Vec::new(),
             stop_type_at_headers: false,
             stop_type_at_migrate_clauses: false,
+            record_value_sig_type: false,
             block_indent: usize::MAX,
             block_delim: 0,
             delimiter_depth: 0,
@@ -3054,8 +3062,6 @@ impl Parser {
         // parsing a leading postfix expression and checking for a top-level `|`.
         // A leading `Lower` is always a field name, never an update base, so we
         // only speculate when the first token is NOT a plain identifier.
-        let mut fields: Vec<Field<Expr>> = Vec::new();
-
         let first_is_lower = matches!(self.peek(), TokenKind::Lower(_));
         if !first_is_lower {
             // Speculative base parse for `{base | …}` (e.g. base is a parenthesized
@@ -3107,10 +3113,40 @@ impl Parser {
         }
 
         // Named fields: `name value name2 value2 …`
+        //
+        // A field may carry a standalone type-signature line, written like a
+        // record-type field, immediately before its value field:
+        //   {name : Text
+        //    name "a"
+        //    age  : Int 1
+        //    age  30}
+        // The sig is attached to its value field and enforced by the checker;
+        // the sig-line layout is preserved through the formatter.
+        let mut fields: Vec<RecordField> = Vec::new();
+        let mut pending_sigs: Vec<(Name, Type)> = Vec::new();
         loop {
             self.skip_newlines();
             if self.at(&TokenKind::RBrace) {
                 break;
+            }
+            // Signature line: `name : Type`. The value for `name` is supplied by
+            // a later `name value` field. Parse the type with
+            // `record_value_sig_type` set so a `Lower` on the next line (the
+            // field's value) is not absorbed as a type argument.
+            if self.at_field_signature() {
+                let (sname, _) = self.expect_lower("expected field name in record").ok()?;
+                self.expect(&TokenKind::Colon, "expected ':' after field name").ok()?;
+                self.skip_newlines();
+                let saved_flag = self.record_value_sig_type;
+                self.record_value_sig_type = true;
+                let sty = self.parse_type();
+                self.record_value_sig_type = saved_flag;
+                let Some(sty) = sty else {
+                    self.error("expected type after ':' in record field signature");
+                    return None;
+                };
+                pending_sigs.push((sname, sty));
+                continue;
             }
             let (fname, _) = self
                 .expect_lower("expected field name in record")
@@ -3120,18 +3156,33 @@ impl Parser {
                 self.error("expected field value after field name in record");
                 return None;
             };
-            fields.push(Field { name: fname, value });
+            // Attach any pending sig for this field name.
+            let sig = pending_sigs
+                .iter()
+                .position(|(n, _)| *n == fname)
+                .map(|i| pending_sigs.remove(i).1);
+            fields.push(RecordField {
+                name: fname,
+                value,
+                sig,
+            });
+        }
+
+        // Any leftover sig has no matching value field.
+        if let Some((sname, _)) = pending_sigs.first() {
+            self.error(&format!(
+                "record field signature '{}' has no matching value field",
+                sname
+            ));
+            return None;
         }
 
         self.skip_newlines();
         let end_tok = self
             .expect(&TokenKind::RBrace, "expected '}' to close record")
             .ok()?;
-
-        Some(Spanned::new(
-            ExprKind::Record(fields),
-            Span::new(start.start, end_tok.span.end),
-        ))
+        let full_span = Span::new(start.start, end_tok.span.end);
+        Some(Spanned::new(ExprKind::Record(fields), full_span))
     }
 
     /// Parse the `name value …` fields after the `|` in a record update
@@ -4074,8 +4125,15 @@ impl Parser {
             // extend the type application and silently swallow the next decl.
             let next_starts_decl = matches!(self.peek(), TokenKind::Lower(_))
                 && matches!(self.peek_ahead(1), TokenKind::Eq | TokenKind::Colon);
+            // While parsing a record VALUE literal's `name : Type` sig line, a
+            // lowercase token on the next line is the field's value
+            // (`name value`), never a type argument — stop regardless of what
+            // follows it.
+            let next_is_value_field = self.record_value_sig_type
+                && matches!(self.peek(), TokenKind::Lower(_));
             if !self.at_eof()
                 && !next_starts_decl
+                && !next_is_value_field
                 && self.cur_column() > self.block_indent
                 && self.can_start_type_atom()
             {

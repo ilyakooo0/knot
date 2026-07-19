@@ -2656,9 +2656,10 @@ mod tests {
             })),
         });
         // Just referencing a lambda (not calling it) — pure at the expression level
-        let wrapper = spanned(ExprKind::Record(vec![Field {
+        let wrapper = spanned(ExprKind::Record(vec![RecordField {
             name: "f".into(),
             value: body,
+            sig: None,
         }]));
         let (diags, effects) = check_module(vec![make_fun("g", wrapper)]);
         assert!(diags.is_empty());

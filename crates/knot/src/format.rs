@@ -1898,11 +1898,19 @@ fn escape_bytes(bs: &[u8]) -> String {
 /// Record fields render as whitespace-separated `name value` pairs (no `:` or
 /// `,`). The value is rendered at `Prec::Atom` so non-atomic values
 /// (applications, operators, lambdas, …) are parenthesized and the field
-/// boundary stays unambiguous on reparse.
-fn render_record_inline(fields: &[Field<Expr>]) -> String {
+/// boundary stays unambiguous on reparse. A field with an explicit type
+/// signature renders as `name : Type name value` — the sig-line form
+/// round-trips through the parser unchanged.
+fn render_record_inline(fields: &[RecordField]) -> String {
     let mut s = String::from("{");
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
+            s.push(' ');
+        }
+        if let Some(sig) = &f.sig {
+            s.push_str(&f.name);
+            s.push_str(" : ");
+            s.push_str(&render_type(sig));
             s.push(' ');
         }
         s.push_str(&f.name);
@@ -1914,7 +1922,7 @@ fn render_record_inline(fields: &[Field<Expr>]) -> String {
 }
 
 /// `with` records use the same `name value` rendering (no punning exists).
-fn render_record_inline_no_pun(fields: &[Field<Expr>]) -> String {
+fn render_record_inline_no_pun(fields: &[RecordField]) -> String {
     render_record_inline(fields)
 }
 
@@ -2201,7 +2209,7 @@ fn render_list_block(p: &mut Printer, items: &[Expr]) {
     p.write("]");
 }
 
-fn render_record_block(p: &mut Printer, fields: &[Field<Expr>]) {
+fn render_record_block(p: &mut Printer, fields: &[RecordField]) {
     if fields.is_empty() {
         p.write("{}");
         return;
@@ -2210,6 +2218,14 @@ fn render_record_block(p: &mut Printer, fields: &[Field<Expr>]) {
     p.newline();
     p.with_indent(|p| {
         for f in fields.iter() {
+            // A field with an explicit type signature keeps its sig-line
+            // layout: `name : Type` on its own line, then `name value`.
+            if let Some(sig) = &f.sig {
+                p.write(&f.name);
+                p.write(" : ");
+                p.write(&render_type(sig));
+                p.newline();
+            }
             p.write(&f.name);
             p.write(" ");
             render_expr(p, &f.value, Prec::Atom);

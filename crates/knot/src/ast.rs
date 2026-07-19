@@ -200,7 +200,7 @@ pub enum ExprKind {
     DerivedRef(Name),
 
     /// `{name: "Alice", age: 30}`
-    Record(Vec<Field<Expr>>),
+    Record(Vec<RecordField>),
 
     /// `{t | age: t.age + 1}`
     RecordUpdate {
@@ -530,6 +530,19 @@ pub enum Effect {
 pub struct Field<T> {
     pub name: Name,
     pub value: T,
+}
+
+/// A field in a record VALUE literal `{name value, ...}` — like `Field<Expr>`
+/// but may carry an optional standalone type signature from a preceding
+/// `name : Type` sig line:
+///   {name : Text
+///    name "a"}
+/// The sig (when present) is enforced against the value's type.
+#[derive(Debug, Clone)]
+pub struct RecordField {
+    pub name: Name,
+    pub value: Expr,
+    pub sig: Option<Type>,
 }
 
 /// A constructor in a `data` declaration: `Circle {radius: Float}`.

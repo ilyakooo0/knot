@@ -5068,7 +5068,25 @@ impl Infer {
                 let field_tys: BTreeMap<String, Ty> = fields
                     .iter()
                     .map(|f| {
-                        (f.name.clone(), self.infer_expr(&f.value))
+                        let val_ty = self.infer_expr(&f.value);
+                        // A field with a standalone sig line (`name : Type`)
+                        // must have a value whose type matches the sig —
+                        // enforced exactly like an inline `(expr : Type)`
+                        // ascription: lowercase unit names are polymorphic unit
+                        // variables, then the value type is unified against the
+                        // sig type at the value's span.
+                        if let Some(sig) = &f.sig {
+                            let saved_flag = self.in_type_annotation;
+                            let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
+                            self.in_type_annotation = true;
+                            let sig_ty = self.ast_type_to_ty(sig);
+                            self.in_type_annotation = saved_flag;
+                            self.annotation_unit_vars = saved_unit_vars;
+                            self.unify(&val_ty, &sig_ty, f.value.span);
+                            (f.name.clone(), sig_ty)
+                        } else {
+                            (f.name.clone(), val_ty)
+                        }
                     })
                     .collect();
                 Ty::Record(field_tys, None)
@@ -5893,7 +5911,19 @@ impl Infer {
                     let expected_fields = expected_fields.clone();
                     let mut field_tys = BTreeMap::new();
                     for f in fields {
-                        if let Some(exp_ty) = expected_fields.get(&f.name) {
+                        // A field with a sig line is checked against its sig
+                        // first; the sig type then stands as the field's type.
+                        if let Some(sig) = &f.sig {
+                            let saved_flag = self.in_type_annotation;
+                            let saved_unit_vars =
+                                std::mem::take(&mut self.annotation_unit_vars);
+                            self.in_type_annotation = true;
+                            let sig_ty = self.ast_type_to_ty(sig);
+                            self.in_type_annotation = saved_flag;
+                            self.annotation_unit_vars = saved_unit_vars;
+                            self.check_expr(&f.value, &sig_ty);
+                            field_tys.insert(f.name.clone(), sig_ty);
+                        } else if let Some(exp_ty) = expected_fields.get(&f.name) {
                             self.check_expr(&f.value, exp_ty);
                             field_tys.insert(f.name.clone(), exp_ty.clone());
                         } else {

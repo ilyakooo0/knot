@@ -479,6 +479,32 @@ fn pun_aware_new_text(
 /// (`{name}` matching field `name` and binding a variable). Explicit
 /// `{name: name}` fields are NOT puns: their field-name token sits before
 /// the value, so the field-name search window is non-empty.
+///
+/// `Field<Expr>` and `RecordField` both expose a field name + value expr;
+/// this trait lets the pun detector work over either.
+trait PunField {
+    fn field_name(&self) -> &str;
+    fn field_value(&self) -> &ast::Expr;
+}
+
+impl PunField for ast::Field<ast::Expr> {
+    fn field_name(&self) -> &str {
+        &self.name
+    }
+    fn field_value(&self) -> &ast::Expr {
+        &self.value
+    }
+}
+
+impl PunField for ast::RecordField {
+    fn field_name(&self) -> &str {
+        &self.name
+    }
+    fn field_value(&self) -> &ast::Expr {
+        &self.value
+    }
+}
+
 fn span_is_record_pun(module: &Module, source: &str, span: Span) -> bool {
     fn pun_in_pat(pat: &ast::Pat, source: &str, span: Span) -> bool {
         match &pat.node {
@@ -519,24 +545,25 @@ fn span_is_record_pun(module: &Module, source: &str, span: Span) -> bool {
             _ => false,
         }
     }
-    fn pun_field_in_fields(
-        fields: &[ast::Field<ast::Expr>],
+    fn pun_field_in_fields<F: PunField>(
+        fields: &[F],
         mut search_start: usize,
         source: &str,
         span: Span,
     ) -> bool {
         for f in fields {
+            let (name, value) = (f.field_name(), f.field_value());
             // A pun field's value span IS the field-name token; an explicit
             // field has its name token (in the window before the value).
-            let named = find_word_in_source(source, &f.name, search_start, f.value.span.start)
+            let named = find_word_in_source(source, name, search_start, value.span.start)
                 .is_some();
             if !named
-                && f.value.span == span
-                && matches!(&f.value.node, ast::ExprKind::Var(n) if *n == f.name)
+                && value.span == span
+                && matches!(&value.node, ast::ExprKind::Var(n) if n == name)
             {
                 return true;
             }
-            search_start = f.value.span.end;
+            search_start = value.span.end;
         }
         false
     }

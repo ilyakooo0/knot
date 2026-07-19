@@ -15273,9 +15273,10 @@ fn beta_reduce_inner(
         Record(fields) => Record(
             fields
                 .iter()
-                .map(|f| ast::Field {
+                .map(|f| ast::RecordField {
                     name: f.name.clone(),
                     value: beta_reduce_inner(&f.value, fun_bodies, let_bindings, visited, fuel),
+                    sig: f.sig.clone(),
                 })
                 .collect(),
         ),
@@ -15380,9 +15381,10 @@ fn substitute_inner(
             fields
                 .iter()
                 .map(|f| {
-                    substitute_inner(&f.value, var, value, value_fv).map(|v| ast::Field {
+                    substitute_inner(&f.value, var, value, value_fv).map(|v| ast::RecordField {
                         name: f.name.clone(),
                         value: v,
+                        sig: f.sig.clone(),
                     })
                 })
                 .collect::<Option<Vec<_>>>()?,

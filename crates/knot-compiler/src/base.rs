@@ -433,6 +433,7 @@ fn shift_pat_spans(p: &mut ast::Pat, offset: usize) {
             shift_pat_spans(head, offset);
             shift_pat_spans(tail, offset);
         }
+        Annot { pat, .. } => shift_pat_spans(pat, offset),
     }
 }
 
@@ -530,6 +531,7 @@ mod tests {
                     pat(head, out);
                     pat(tail, out);
                 }
+                ast::PatKind::Annot { pat: inner, .. } => pat(inner, out),
             }
         }
         fn expr(e: &ast::Expr, out: &mut Vec<(&'static str, Span)>) {

@@ -428,6 +428,7 @@ fn walk_pat(p: &Pat, r: &mut Refs) {
             walk_pat(head, r);
             walk_pat(tail, r);
         }
+        PatKind::Annot { pat, .. } => walk_pat(pat, r),
     }
 }
 

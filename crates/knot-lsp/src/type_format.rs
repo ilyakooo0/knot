@@ -282,6 +282,7 @@ fn format_pat_brief_d(pat: &ast::PatKind, depth: usize) -> String {
                 format_pat_brief_d(&tail.node, d)
             )
         }
+        ast::PatKind::Annot { pat, .. } => format_pat_brief_d(&pat.node, d),
     }
 }
 

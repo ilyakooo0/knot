@@ -397,6 +397,11 @@ pub enum PatKind {
     /// `Cons head tail` — non-empty relation pattern. `head` binds the
     /// first element, `tail` binds the remainder as a relation.
     Cons { head: Box<Pat>, tail: Box<Pat> },
+
+    /// `(x : T)` — a type-annotated pattern. Binds `x` at the annotated type.
+    /// On a lambda param this enables rank-N: `\(f : (forall a. a -> a)) -> …`
+    /// gives `f` a polymorphic type inside the body.
+    Annot { pat: Box<Pat>, ty: Box<Type> },
 }
 
 /// A field in a record pattern.

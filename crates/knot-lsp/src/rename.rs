@@ -1025,6 +1025,7 @@ fn pat_binds_name(pat: &ast::Pat, name: &str) -> bool {
         ast::PatKind::Cons { head, tail } => {
             pat_binds_name(head, name) || pat_binds_name(tail, name)
         }
+        ast::PatKind::Annot { pat, .. } => pat_binds_name(pat, name),
     }
 }
 

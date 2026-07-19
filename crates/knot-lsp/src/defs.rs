@@ -659,6 +659,7 @@ impl<'a> DefResolver<'a> {
                 self.define_pat(head);
                 self.define_pat(tail);
             }
+            ast::PatKind::Annot { pat, .. } => self.define_pat(pat),
             ast::PatKind::Wildcard | ast::PatKind::Lit(_) => {}
         }
     }

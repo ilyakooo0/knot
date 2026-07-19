@@ -34,6 +34,7 @@ fn collect_pat_bound_names(pat: &ast::Pat, out: &mut Vec<String>) {
             collect_pat_bound_names(head, out);
             collect_pat_bound_names(tail, out);
         }
+        PatKind::Annot { pat, .. } => collect_pat_bound_names(pat, out),
     }
 }
 
@@ -4424,7 +4425,8 @@ impl Infer {
         span: Span,
     ) -> Option<Ty> {
         let scheme = self.lookup(name)?.clone();
-        Some(self.instantiate_at(&scheme, span))
+        let inst = self.instantiate_at(&scheme, span);
+        Some(inst)
     }
 
     // ── AST type → Ty ────────────────────────────────────────────
@@ -5657,9 +5659,9 @@ impl Infer {
                     // leading erased `Type` arrow. Runs BEFORE `infer_expr(arg)`
                     // so a bare uppercase type name is reinterpreted via
                     // `ast_type_to_ty` rather than erroring as a constructor.
-                    if let Ty::Forall(vars, body) = &func_applied {
+                    if let Ty::Forall(_vars, body) = &func_applied {
                         let body_applied = self.apply(body);
-                        if let Ty::Fun(witness_slot, rest) = &body_applied
+                        if let Ty::Fun(witness_slot, _rest) = &body_applied
                             && matches!(self.apply(witness_slot), Ty::Con(ref n, _) if n == "Type")
                         {
                             // The parser glues `apply Int 42` into
@@ -6397,6 +6399,23 @@ impl Infer {
             }
             _ => {
                 let inferred = self.infer_expr(expr);
+                // Π-lite: an unannotated binding whose body infers to a
+                // type-witness `Forall` (e.g. `step1 = const2 Int`, the
+                // partial application of a `\(T : Type)` lambda) must keep
+                // that `Forall` so later uses can still supply the remaining
+                // type argument. Unifying against the unsolved fresh `expected`
+                // var would *instantiate* the Forall and strip it, degrading
+                // `step1` to `Type -> …` and breaking `step1 Text 99`. Bind the
+                // var directly to the Forall instead — the standard
+                // generalization of a principal (Forall) type.
+                if let Ty::Forall(..) = &inferred
+                    && let Ty::Var(v) = self.apply(expected)
+                    && !self.subst.contains_key(&v)
+                    && !self.skolems.contains(&v)
+                {
+                    self.subst.insert(v, inferred);
+                    return;
+                }
                 // `expected` is on the required side here (t1), so pass
                 // t1_provided=false for correct Forall polarity.
                 self.unify_dir(expected, &inferred, expr.span, false);
@@ -7238,6 +7257,33 @@ impl Infer {
                 self.check_pattern(head, &elem_ty);
                 self.check_pattern(tail, &rel_ty);
             }
+            ast::PatKind::Annot { pat: inner, ty } => {
+                // `(pat : T)` — bind `pat` at the annotated type `T`, which
+                // must match the expected type. Convert in type-annotation
+                // mode (lowercase unit vars are polymorphic), then unify the
+                // annotation with `expected` and check the inner pattern
+                // against it. When `T` is a `forall`, checking a `Var` inner
+                // pattern against it binds the var to a polymorphic Scheme —
+                // this is rank-N lambda params `\(f : (forall a. a -> a))`.
+                let saved_flag = self.in_type_annotation;
+                let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
+                self.in_type_annotation = true;
+                let annot_ty = self.ast_type_to_ty(ty);
+                self.in_type_annotation = saved_flag;
+                self.annotation_unit_vars = saved_unit_vars;
+                // Make the pattern's own type the annotation itself. For a
+                // `forall` this keeps the quantifier on the lambda's parameter
+                // slot, so at the call site the argument is checked against a
+                // *required* Forall and skolemised (rank-N soundness) — a
+                // monomorphic `Int->Int` is then rejected. (Unifying instead
+                // would solve the skolems away and accept anything.)
+                if let Ty::Var(v) = self.apply(expected) {
+                    if !self.skolems.contains(&v) {
+                        self.bind_var(v, annot_ty.clone(), ty.span);
+                    }
+                }
+                self.check_pattern(inner, &annot_ty);
+            }
         }
     }
 
@@ -7262,6 +7308,7 @@ impl Infer {
             | ast::PatKind::Constructor { .. }
             | ast::PatKind::List(_)
             | ast::PatKind::Cons { .. } => false,
+            ast::PatKind::Annot { pat, .. } => Self::pattern_is_irrefutable(pat),
         }
     }
 

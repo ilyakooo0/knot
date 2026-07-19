@@ -2403,6 +2403,9 @@ fn render_pat(p: &Pat) -> String {
         PatKind::Cons { head, tail } => {
             format!("Cons {} {}", render_pat_atom(head), render_pat_atom(tail))
         }
+        PatKind::Annot { pat, ty } => {
+            format!("({} : {})", render_pat(pat), render_type(ty))
+        }
     }
 }
 

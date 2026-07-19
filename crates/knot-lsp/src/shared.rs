@@ -1151,6 +1151,7 @@ pub(crate) fn pat_to_simple_name(pat: &ast::PatKind) -> String {
         ast::PatKind::Cons { head, tail } => {
             format!("Cons {} {}", pat_to_simple_name(&head.node), pat_to_simple_name(&tail.node))
         }
+        ast::PatKind::Annot { pat, .. } => pat_to_simple_name(&pat.node),
         ast::PatKind::Lit(_) => "_".into(),
     }
 }

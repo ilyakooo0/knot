@@ -690,6 +690,7 @@ fn pat_bound_names(pat: &Pat, out: &mut Vec<String>) {
             pat_bound_names(head, out);
             pat_bound_names(tail, out);
         }
+        PatKind::Annot { pat, .. } => pat_bound_names(pat, out),
     }
 }
 
@@ -966,6 +967,7 @@ fn pat_is_refutable(pat: &PatKind) -> bool {
         PatKind::Record(fields) => fields
             .iter()
             .any(|f| f.pattern.as_ref().is_some_and(|p| pat_is_refutable(&p.node))),
+        PatKind::Annot { pat, .. } => pat_is_refutable(&pat.node),
     }
 }
 

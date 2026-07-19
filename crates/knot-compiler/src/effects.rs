@@ -1940,6 +1940,7 @@ fn collect_pat_binders(pat: &ast::Pat, out: &mut Vec<String>) {
             collect_pat_binders(head, out);
             collect_pat_binders(tail, out);
         }
+        ast::PatKind::Annot { pat, .. } => collect_pat_binders(pat, out),
     }
 }
 

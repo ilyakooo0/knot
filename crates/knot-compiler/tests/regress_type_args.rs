@@ -186,3 +186,64 @@ fn erasure_two_types() {
     assert!(stdout.contains("42"), "expected `42` in:\n{stdout}");
     assert!(stdout.contains("\"yo\""), "expected `\"yo\"` in:\n{stdout}");
 }
+
+// ── multi-type-argument (curried) ─────────────────────────────────
+
+/// A lambda with two type witnesses, fully applied in one call:
+/// `const2 Int Text 99` consumes `Int` for `A` and `Text` for `B`, then the
+/// value `99`. The result is the identity on `99`.
+#[test]
+fn multi_ty_arg_fully_applied() {
+    let diags = check_src(
+        "const2 = \\(A : Type) -> \\(B : Type) -> \\x -> x\nmain = const2 Int Text 99\n",
+    );
+    assert!(
+        !has_error(&diags, "unknown constructor") && !has_error(&diags, "type mismatch"),
+        "const2 Int Text 99 should typecheck: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// Runtime: a multi-witness top-level def is compiled with the arity of its
+/// value lambda (witness layers erased), so `const2 Int Text 99` runs as `99`.
+#[test]
+fn multi_ty_arg_fully_applied_runs() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "tyarg_multi_full",
+        "const2 = \\(A : Type) -> \\(B : Type) -> \\x -> x\nmain = println (const2 Int Text 99)\n",
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.trim_start().starts_with("99"),
+        "expected `99`, got:\n{stdout}"
+    );
+}
+
+/// Partial application across defs: `step1 = const2 Int` keeps the remaining
+/// `Forall` for `B`, so `step1 Text 99` supplies `Text` then `99`.
+#[test]
+fn multi_ty_arg_partial_across_defs() {
+    let diags = check_src(
+        "const2 = \\(A : Type) -> \\(B : Type) -> \\x -> x\nstep1 = const2 Int\nmain = step1 Text 99\n",
+    );
+    assert!(
+        !has_error(&diags, "unknown constructor") && !has_error(&diags, "type mismatch"),
+        "step1 = const2 Int; step1 Text 99 should typecheck: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+/// Runtime for the partial-application case: `step1` is a one-value-arg
+/// function (both witness layers erased), so `step1 Text 99` runs as `99`.
+#[test]
+fn multi_ty_arg_partial_across_defs_runs() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "tyarg_multi_partial",
+        "const2 = \\(A : Type) -> \\(B : Type) -> \\x -> x\nstep1 = const2 Int\nmain = println (step1 Text 99)\n",
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.trim_start().starts_with("99"),
+        "expected `99`, got:\n{stdout}"
+    );
+}

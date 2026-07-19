@@ -305,6 +305,7 @@ impl Parser {
                 self.push_pat_vars(head);
                 self.push_pat_vars(tail);
             }
+            PatKind::Annot { pat, .. } => self.push_pat_vars(pat),
         }
     }
 
@@ -3837,6 +3838,21 @@ impl Parser {
                     ));
                 }
                 let inner = self.parse_pat()?;
+                // Optional type annotation: `(pat : Type)`. Enables rank-N
+                // lambda params like `\(f : (forall a. a -> a)) -> …`.
+                if self.eat(&TokenKind::Colon) {
+                    let ty = self.parse_type()?;
+                    let end_tok = self
+                        .expect(&TokenKind::RParen, "expected ')' after pattern type annotation")
+                        .ok()?;
+                    return Some(Spanned::new(
+                        PatKind::Annot {
+                            pat: Box::new(inner),
+                            ty: Box::new(ty),
+                        },
+                        Span::new(start.start, end_tok.span.end),
+                    ));
+                }
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
                     .ok()?;
@@ -3960,6 +3976,21 @@ impl Parser {
                     ));
                 }
                 let inner = self.parse_pat()?;
+                // Optional type annotation: `(pat : Type)`. Enables rank-N
+                // lambda params like `\(f : (forall a. a -> a)) -> …`.
+                if self.eat(&TokenKind::Colon) {
+                    let ty = self.parse_type()?;
+                    let end_tok = self
+                        .expect(&TokenKind::RParen, "expected ')' after pattern type annotation")
+                        .ok()?;
+                    return Some(Spanned::new(
+                        PatKind::Annot {
+                            pat: Box::new(inner),
+                            ty: Box::new(ty),
+                        },
+                        Span::new(start.start, end_tok.span.end),
+                    ));
+                }
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
                     .ok()?;

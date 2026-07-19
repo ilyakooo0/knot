@@ -1797,10 +1797,9 @@ impl Codegen {
                             continue;
                         }
                         // If the body is a lambda, extract its params for direct-call optimization.
-                        let n_params = match &body.node {
-                            ast::ExprKind::Lambda { params, .. } => params.len(),
-                            _ => 0,
-                        };
+                        // Peel type-witness layers so `\(A : Type) -> \x -> …`
+                        // is registered with the runtime arity of `\x -> …`.
+                        let n_params = value_lambda_chain(body).0.len();
                         let mut sig = self.module.make_signature();
                         sig.params.push(AbiParam::new(self.ptr_type)); // db
                         for _ in 0..n_params {
@@ -2964,14 +2963,11 @@ impl Codegen {
                             continue;
                         }
                         // If body is a lambda, extract its params for direct compilation.
-                        match &body.node {
-                            ast::ExprKind::Lambda { params, body: lambda_body, .. } => {
-                                self.define_user_function(name, params, lambda_body);
-                            }
-                            _ => {
-                                self.define_user_function(name, &[], body);
-                            }
-                        }
+                        // Peel type-witness layers so `\(A : Type) -> \x -> …`
+                        // is defined with the runtime arity of `\x -> …`. For a
+                        // non-lambda body this returns `([], body)` unchanged.
+                        let (vparams, vbody) = value_lambda_chain(body);
+                        self.define_user_function(name, &vparams, vbody);
                     }
                 }
                 ast::DeclKind::Derived { name, body, .. } => {
@@ -8107,6 +8103,11 @@ impl Codegen {
                     // Record patterns always match (no top-level guard)
                     builder.ins().jump(arm_block, &[]);
                 }
+                ast::PatKind::Annot { .. } => {
+                    // Type annotations are erased after inference; an
+                    // annotated pattern never appears in typed case arms.
+                    unreachable!("PatKind::Annot in case arm (should be erased by inference)")
+                }
             }
 
             builder.switch_to_block(arm_block);
@@ -8215,6 +8216,9 @@ impl Codegen {
                 self.bind_case_pattern(builder, head, head_val, env);
                 self.bind_case_pattern(builder, tail, tail_val, env);
             }
+            ast::PatKind::Annot { pat, .. } => {
+                self.bind_case_pattern(builder, pat, val, env);
+            }
         }
     }
 
@@ -8298,6 +8302,9 @@ impl Codegen {
                     self.call_rt(builder, "knot_relation_tail", &[val]);
                 self.test_and_bind_case_subpattern(builder, head, head_val, env, fail_block);
                 self.test_and_bind_case_subpattern(builder, tail, tail_val, env, fail_block);
+            }
+            ast::PatKind::Annot { pat, .. } => {
+                self.bind_case_pattern_checked(builder, pat, val, env, fail_block);
             }
         }
     }
@@ -8405,6 +8412,9 @@ impl Codegen {
                     self.call_rt(builder, "knot_relation_tail", &[val]);
                 self.test_and_bind_case_subpattern(builder, head, head_val, env, fail_block);
                 self.test_and_bind_case_subpattern(builder, tail, tail_val, env, fail_block);
+            }
+            ast::PatKind::Annot { pat, .. } => {
+                self.test_and_bind_case_subpattern(builder, pat, val, env, fail_block);
             }
         }
     }
@@ -9970,6 +9980,9 @@ impl Codegen {
                     self.call_rt(builder, "knot_relation_tail", &[val]);
                 self.bind_io_pattern(builder, head, head_val, env, done_block);
                 self.bind_io_pattern(builder, tail, tail_val, env, done_block);
+            }
+            ast::PatKind::Annot { pat, .. } => {
+                self.bind_io_pattern(builder, pat, val, env, done_block);
             }
         }
     }
@@ -15743,6 +15756,7 @@ fn collect_pat_binds(pat: &ast::Pat, bound: &mut HashSet<String>) {
             collect_pat_binds(tail, bound);
         }
         ast::PatKind::Wildcard | ast::PatKind::Lit(_) => {}
+        ast::PatKind::Annot { pat, .. } => collect_pat_binds(pat, bound),
     }
 }
 
@@ -15757,6 +15771,7 @@ fn pat_binds(pat: &ast::Pat, name: &str) -> bool {
         ast::PatKind::List(items) => items.iter().any(|p| pat_binds(p, name)),
         ast::PatKind::Cons { head, tail } => pat_binds(head, name) || pat_binds(tail, name),
         ast::PatKind::Wildcard | ast::PatKind::Lit(_) => false,
+        ast::PatKind::Annot { pat, .. } => pat_binds(pat, name),
     }
 }
 
@@ -15773,6 +15788,7 @@ fn pat_captures(pat: &ast::Pat, free_vars: &HashSet<String>) -> bool {
             pat_captures(head, free_vars) || pat_captures(tail, free_vars)
         }
         ast::PatKind::Wildcard | ast::PatKind::Lit(_) => false,
+        ast::PatKind::Annot { pat, .. } => pat_captures(pat, free_vars),
     }
 }
 
@@ -16412,6 +16428,7 @@ fn case_pattern_is_irrefutable(pat: &ast::Pat) -> bool {
         | ast::PatKind::Constructor { .. }
         | ast::PatKind::List(_)
         | ast::PatKind::Cons { .. } => false,
+        ast::PatKind::Annot { pat, .. } => case_pattern_is_irrefutable(pat),
     }
 }
 
@@ -16545,6 +16562,9 @@ fn bind_do_pattern(
             bind_do_pattern(builder, cg, head, head_val, env, skips);
             bind_do_pattern(builder, cg, tail, tail_val, env, skips);
         }
+        ast::PatKind::Annot { pat, .. } => {
+            bind_do_pattern(builder, cg, pat, val, env, skips);
+        }
     }
 }
 
@@ -16557,6 +16577,29 @@ fn uncurry_app(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
             (f, args)
         }
         _ => (expr, Vec::new()),
+    }
+}
+
+/// Peel a top-level function body into its runtime value params and body,
+/// skipping Π-lite type-witness lambda layers. A witness layer `\(T : Type)`
+/// has entries in `ty_params` and no value `params`; it is erased at runtime,
+/// so `\(A : Type) -> \(B : Type) -> \x -> x` defines a ONE-argument function
+/// over `x` — not a zero-argument function returning a closure. Witness layers
+/// interleaved *after* a value param (`\x -> \(T : Type) -> …`) are left in
+/// the body (partial application across a witness is unsupported).
+fn value_lambda_chain(expr: &ast::Expr) -> (Vec<ast::Pat>, &ast::Expr) {
+    let mut cur = expr;
+    // Skip leading witness-only layers.
+    while let ast::ExprKind::Lambda { params, ty_params, body, .. } = &cur.node {
+        if params.is_empty() && !ty_params.is_empty() {
+            cur = body;
+        } else {
+            break;
+        }
+    }
+    match &cur.node {
+        ast::ExprKind::Lambda { params, body, .. } => (params.clone(), body),
+        _ => (Vec::new(), cur),
     }
 }
 
@@ -16588,6 +16631,7 @@ fn collect_pat_var_names(pat: &ast::Pat, out: &mut HashSet<String>) {
             collect_pat_var_names(head, out);
             collect_pat_var_names(tail, out);
         }
+        ast::PatKind::Annot { pat, .. } => collect_pat_var_names(pat, out),
     }
 }
 
@@ -16668,6 +16712,7 @@ fn pat_bound_names(pat: &ast::Pat) -> Vec<String> {
             names.extend(pat_bound_names(tail));
             names
         }
+        ast::PatKind::Annot { pat, .. } => pat_bound_names(pat),
         _ => vec![],
     }
 }
@@ -16836,6 +16881,7 @@ fn collect_pat_bindings_set<'a>(pat: &'a ast::Pat, bound: &mut HashSet<&'a str>)
             collect_pat_bindings_set(head, bound);
             collect_pat_bindings_set(tail, bound);
         }
+        ast::PatKind::Annot { pat, .. } => collect_pat_bindings_set(pat, bound),
     }
 }
 
@@ -17428,6 +17474,7 @@ fn pretty_pat(pat: &ast::Pat) -> String {
         ast::PatKind::Cons { head, tail } => {
             format!("Cons {} {}", pretty_pat(head), pretty_pat(tail))
         }
+        ast::PatKind::Annot { pat, .. } => pretty_pat(pat),
     }
 }
 

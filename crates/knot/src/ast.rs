@@ -282,6 +282,20 @@ pub enum ExprKind {
     /// `refine expr` — runtime refinement check, returns Result.
     Refine(Box<Expr>),
 
+    /// A first-class (erased) TYPE CONSTRUCTOR value, produced by a `type`
+    /// alias declaration inside a record value literal:
+    ///   {type Pair a b = {fst: a, snd: b}  Pair  ...}
+    /// The field named `name` has this as its value. Statically its type is
+    /// the alias's kind (`Type`, `Type -> Type`, …, one `Type ->` per param,
+    /// ending in `Type`); the alias `name` is brought into type scope so it can
+    /// be applied in annotations (`x : Pair Int Text`). Fully ERASED at runtime
+    /// (compiles to unit) — there is no reified type value.
+    TypeCtor {
+        name: Name,
+        params: Vec<Name>,
+        ty: Type,
+    },
+
     /// `serve Api where E1 = expr1; E2 = expr2; ...` — typed server value.
     /// Each handler is bound to a route endpoint constructor; the whole
     /// expression has type `Server Api _` (a row variable when no handler

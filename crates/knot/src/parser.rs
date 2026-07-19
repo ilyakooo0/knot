@@ -2774,7 +2774,15 @@ impl Parser {
         loop {
             if self.at(&TokenKind::Dot) {
                 self.advance();
-                let (field, field_span) = match self.expect_lower("expected field name after '.'") {
+                // Field names are normally lowercase; a record may also carry a
+                // first-class type-constructor field named after a `type` alias
+                // (uppercase), accessed the same way (`r.Pair`).
+                let field_result = if matches!(self.peek(), TokenKind::Upper(_)) {
+                    self.expect_upper("expected field name after '.'")
+                } else {
+                    self.expect_lower("expected field name after '.'")
+                };
+                let (field, field_span) = match field_result {
                     Ok(pair) => pair,
                     Err(_) => { self.recursion_depth -= spine_charged; return None; }
                 };
@@ -3128,6 +3136,46 @@ impl Parser {
             self.skip_newlines();
             if self.at(&TokenKind::RBrace) {
                 break;
+            }
+            // `type Name p1 p2 … = <type>` — an embedded type-alias line. It
+            // contributes a field named `Name` whose value is the (erased) type
+            // constructor itself; the alias is also brought into type scope.
+            if self.at(&TokenKind::Type) {
+                self.advance(); // consume `type`
+                let (tname, tspan) = self
+                    .expect_upper("expected type name after 'type'")
+                    .ok()?;
+                let mut params = Vec::new();
+                while matches!(self.peek(), TokenKind::Lower(_)) {
+                    let tok = self.advance();
+                    let TokenKind::Lower(p) = tok.kind else { unreachable!() };
+                    params.push(p);
+                }
+                self.expect(&TokenKind::Eq, "expected '=' in type alias").ok()?;
+                // Parse the alias body with `record_value_sig_type` set so a
+                // `Lower` on the next line (a following record field) is not
+                // absorbed as a type argument of the alias body.
+                let saved_flag = self.record_value_sig_type;
+                self.record_value_sig_type = true;
+                let ty = self.parse_type();
+                self.record_value_sig_type = saved_flag;
+                let Some(ty) = ty else {
+                    self.error("expected type after '=' in record type alias");
+                    return None;
+                };
+                fields.push(RecordField {
+                    name: tname.clone(),
+                    value: Spanned::new(
+                        ExprKind::TypeCtor {
+                            name: tname,
+                            params,
+                            ty,
+                        },
+                        tspan,
+                    ),
+                    sig: None,
+                });
+                continue;
             }
             // Signature line: `name : Type`. The value for `name` is supplied by
             // a later `name value` field. Parse the type with

@@ -499,6 +499,7 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
     match &mut expr.node {
         ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Constructor(_)
         | ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => {}
+        ExprKind::TypeCtor { .. } => {}
 
         ExprKind::Record(fields) => {
             for f in fields {

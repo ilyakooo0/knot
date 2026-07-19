@@ -704,6 +704,8 @@ impl EffectChecker {
         match &expr.node {
             ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => EffectSet::empty(),
 
+            ast::ExprKind::TypeCtor { .. } => EffectSet::empty(),
+
             ast::ExprKind::Var(name) => {
                 // A locally shadowed name is a local value, not the builtin
                 // or top-level declaration of the same name.
@@ -1845,6 +1847,7 @@ fn walk_expr(expr: &ast::Expr, f: &mut impl FnMut(&ast::Expr)) {
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::DerivedRef(_) => {}
+        ast::ExprKind::TypeCtor { .. } => {}
         ast::ExprKind::Record(fields) => {
             for field in fields {
                 walk_expr(&field.value, f);
@@ -1963,6 +1966,7 @@ fn collect_unshadowed_disallowed(
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::DerivedRef(_) => {}
+        ast::ExprKind::TypeCtor { .. } => {}
         ast::ExprKind::Record(fields) => {
             for field in fields {
                 collect_unshadowed_disallowed(&field.value, shadowed, out);

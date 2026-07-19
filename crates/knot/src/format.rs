@@ -1789,6 +1789,17 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             let s = format!("refine {}", render_expr_inline(inner, Prec::App));
             paren_if(parent > Prec::Lowest, s)
         }
+        ExprKind::TypeCtor { name, params, ty } => {
+            // Renders the embedded `type` alias line. When this is a record
+            // field's value, the record renderers emit the field-name line
+            // before it, so here we emit only the `type Name … = <type>` part.
+            let params = if params.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", params.join(" "))
+            };
+            format!("type {}{} = {}", name, params, render_type(ty))
+        }
         ExprKind::Serve { api, handlers, .. } => {
             let mut s = format!("serve {} where", api);
             // The first handler follows `where` directly; `;` only separates
@@ -1906,6 +1917,12 @@ fn render_record_inline(fields: &[RecordField]) -> String {
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
             s.push(' ');
+        }
+        // A type-constructor field renders as the bare embedded `type` alias
+        // line — the field name is the alias name, so no separate `name value`.
+        if let ExprKind::TypeCtor { .. } = &f.value.node {
+            s.push_str(&render_expr_inline(&f.value, Prec::Atom));
+            continue;
         }
         if let Some(sig) = &f.sig {
             s.push_str(&f.name);
@@ -2218,6 +2235,13 @@ fn render_record_block(p: &mut Printer, fields: &[RecordField]) {
     p.newline();
     p.with_indent(|p| {
         for f in fields.iter() {
+            // A type-constructor field renders as the bare embedded `type`
+            // alias line — the field name is the alias name.
+            if let ExprKind::TypeCtor { .. } = &f.value.node {
+                render_expr(p, &f.value, Prec::Atom);
+                p.newline();
+                continue;
+            }
             // A field with an explicit type signature keeps its sig-line
             // layout: `name : Type` on its own line, then `name value`.
             if let Some(sig) = &f.sig {

@@ -779,6 +779,9 @@ impl<'a> DefResolver<'a> {
                     self.resolve_expr(&h.body);
                 }
             }
+            // A type-constructor field references a TYPE, not a value — resolve
+            // its alias body's type so type refs inside it are navigable.
+            ast::ExprKind::TypeCtor { ty, .. } => self.resolve_type(ty, self.source),
         }
     }
 }

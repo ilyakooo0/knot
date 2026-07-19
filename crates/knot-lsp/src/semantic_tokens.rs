@@ -646,6 +646,9 @@ impl<'a> TokenCollector<'a> {
                     self.visit_expr(&h.body);
                 }
             }
+            // Highlight the alias body's type (the alias name token itself is
+            // emitted by the record-field path); no value exprs inside.
+            ast::ExprKind::TypeCtor { ty, .. } => self.visit_type(ty),
         }
     }
 

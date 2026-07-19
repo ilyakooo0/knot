@@ -112,7 +112,8 @@ fn expr_mentions_var(e: &knot::ast::Expr, name: &str) -> bool {
         ExprKind::Lit(_)
         | ExprKind::Constructor(_)
         | ExprKind::SourceRef(_)
-        | ExprKind::DerivedRef(_) => false,
+        | ExprKind::DerivedRef(_)
+        | ExprKind::TypeCtor { .. } => false,
         ExprKind::Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, name)),
         ExprKind::RecordUpdate { base, fields } => {
             expr_mentions_var(base, name)

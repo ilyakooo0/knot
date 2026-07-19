@@ -296,6 +296,7 @@ fn walk_route_entry(e: &RouteEntry, r: &mut Refs) {
 fn walk_expr(e: &Expr, r: &mut Refs) {
     match &e.node {
         ExprKind::Lit(_) => {}
+        ExprKind::TypeCtor { .. } => {}
         ExprKind::Var(name) => {
             r.values.insert(name.clone());
         }

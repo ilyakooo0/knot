@@ -5789,6 +5789,37 @@ impl Infer {
             ast::ExprKind::Serve { api, api_span, handlers } => {
                 self.infer_serve(api, *api_span, handlers, expr.span)
             }
+
+            ast::ExprKind::TypeCtor { name, params, ty } => {
+                // A first-class (erased) type-constructor value from an
+                // embedded `type` alias line. Statically its type is the alias's
+                // KIND: `Type` (0 params), `Type -> Type` (1 param), …, one
+                // `Type ->` per type parameter, ending in `Type`. The "Type"
+                // here is the same opaque named type knot already accepts in
+                // signatures like `f : Type -> Type` (i.e. `Ty::Con("Type", [])`).
+                //
+                // Bring the alias into type scope. Parameterized aliases mirror
+                // the (currently limited) top-level behaviour: a nullary alias
+                // registers its body so `x : Name` resolves; a parameterized
+                // alias registers as an unapplied type constructor so it can be
+                // referenced by name.
+                if params.is_empty() {
+                    let body = self.ast_type_to_ty(ty);
+                    self.aliases
+                        .insert(name.clone(), Ty::Alias(name.clone(), Box::new(body)));
+                } else {
+                    self.aliases
+                        .insert(name.clone(), Ty::TyCon(name.clone()));
+                }
+                let kind_type =
+                    (0..params.len()).fold(Ty::Con("Type".into(), vec![]), |acc, _| {
+                        Ty::Fun(
+                            Box::new(Ty::Con("Type".into(), vec![])),
+                            Box::new(acc),
+                        )
+                    });
+                kind_type
+            }
         }
     }
 
@@ -10812,6 +10843,7 @@ fn value_references_source_inner(
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::DerivedRef(_) => false,
+        ast::ExprKind::TypeCtor { .. } => false,
         ast::ExprKind::Record(fields) => fields.iter().any(|f| {
             value_references_source_inner(
                 &f.value, source_name, aliases, let_bindings, visited,
@@ -11539,6 +11571,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
     use ast::ExprKind::*;
     match &mut expr.node {
         Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
+        TypeCtor { .. } => {}
         Record(fields) => {
             for fl in fields {
                 f(&mut fl.value);

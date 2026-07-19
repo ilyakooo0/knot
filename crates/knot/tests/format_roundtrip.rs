@@ -575,3 +575,23 @@ c = \x -> 1 + (case x of
 "#;
     check_str("combined", src);
 }
+
+// ── Embedded `type` alias lines in record value literals ──
+
+#[test]
+fn record_type_alias_roundtrip() {
+    let out = check_str(
+        "record-type-alias",
+        "main = with {r {type Pair a b = {fst: a, snd: b}\n                answer 7}} (println r.answer)\n",
+    );
+    assert!(out.contains("type Pair a b = {fst: a, snd: b}"), "output: {}", out);
+}
+
+#[test]
+fn record_type_alias_nullary_roundtrip() {
+    let out = check_str(
+        "record-type-alias-nullary",
+        "main = with {r {type Point = {x: Int 1, y: Int 1}\n                answer 42}} (println r.answer)\n",
+    );
+    assert!(out.contains("type Point = {x: Int 1, y: Int 1}"), "output: {}", out);
+}

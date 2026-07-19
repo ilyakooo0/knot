@@ -559,12 +559,13 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
                 f(&h.body);
             }
         }
-        // Leaves: Lit, Var, Constructor, SourceRef, DerivedRef.
+        // Leaves: Lit, Var, Constructor, SourceRef, DerivedRef, TypeCtor.
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Var(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_)
-        | ast::ExprKind::DerivedRef(_) => {}
+        | ast::ExprKind::DerivedRef(_)
+        | ast::ExprKind::TypeCtor { .. } => {}
     }
 }
 

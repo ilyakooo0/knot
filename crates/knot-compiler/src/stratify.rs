@@ -244,6 +244,7 @@ fn collect_edges(
         | ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_) => {}
+        ast::ExprKind::TypeCtor { .. } => {}
 
         // `diff` is a curried 2-arg stdlib function. In the AST after
         // desugaring it appears as `App(App(Var("diff"), a), b)`.

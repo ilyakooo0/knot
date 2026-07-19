@@ -612,69 +612,71 @@ pub(crate) fn handle_code_action(
             let let_name = fresh_extract_name(doc, "extracted");
             let fn_name = fresh_extract_name(doc, "extracted_fn");
 
-            // Statement-form `let x = e` only parses inside `do` blocks, so
-            // the let-extraction is offered only when the selection sits
-            // inside a do-block statement. The binding is inserted before
-            // the START of that enclosing statement (not the cursor's line)
-            // so multi-line statements aren't split mid-expression.
-            if let Some(stmt_start) =
-                enclosing_do_stmt_start(&doc.module, sel_start, sel_end)
+            // Statement-form `with {x: e} (do …)` only parses inside `do`
+            // blocks, so the with-extraction is offered only when the
+            // selection sits inside a do-block statement. The `with` wraps
+            // the enclosing statement and every following statement in the
+            // same block: `with {name: e} (do\n  <stmt>\n  <rest>)`.
+            if let Some((stmt_start, block_end)) =
+                enclosing_do_stmt_range(&doc.module, sel_start, sel_end)
             {
                 let line_start = doc.source[..stmt_start]
                     .rfind('\n')
                     .map(|p| p + 1)
                     .unwrap_or(0);
                 let prefix = &doc.source[line_start..stmt_start];
-                // When the statement starts its own line, insert the binding
-                // as a full line above it, reusing the line's indentation.
-                // When non-whitespace precedes it (the statement sits inline
-                // on the `do` line, e.g. `main = do let y = 5`), inserting at
-                // line start would splice text before `main = do` — anchor at
-                // the statement's own offset instead and push the statement
-                // onto a continuation line at its original column (which is
-                // the layout block's indent).
-                let insert_edit = if prefix.chars().all(char::is_whitespace) {
-                    TextEdit {
-                        range: Range {
-                            start: offset_to_position(&doc.source, line_start),
-                            end: offset_to_position(&doc.source, line_start),
-                        },
-                        new_text: format!("{prefix}let {let_name} = {trimmed}\n"),
-                    }
-                } else {
-                    // Indent the pushed-down statement to its original column.
-                    // Count CHARACTERS, not bytes — a byte count over-indents
-                    // (and can corrupt the layout-sensitive parse) when
-                    // multibyte text precedes the statement on its line.
-                    let stmt_col = doc.source[line_start..stmt_start].chars().count();
-                    TextEdit {
-                        range: Range {
-                            start: offset_to_position(&doc.source, stmt_start),
-                            end: offset_to_position(&doc.source, stmt_start),
-                        },
-                        new_text: format!(
-                            "let {let_name} = {trimmed}\n{}",
-                            " ".repeat(stmt_col)
-                        ),
-                    }
-                };
+                // Build the replacement: swap the selection for the bound
+                // name inside the statement text, then re-indent every line
+                // of the wrapped statements by two extra spaces so the
+                // layout parser sees them as the `with` body.
+                let stmt_text = &doc.source[stmt_start..block_end.min(doc.source.len())];
+                let sel_off_start = sel_start - stmt_start;
+                let sel_off_end = sel_end - stmt_start;
+                let mut body_text = stmt_text.to_string();
+                body_text.replace_range(sel_off_start..sel_off_end, &let_name);
+                let mut body_lines: Vec<&str> = body_text.lines().collect();
+                for line in body_lines.iter_mut() {
+                    *line = line.trim_start();
+                }
+                // The wrapped statements sit inside the `with … (do …)` body,
+                // indented past the `with` keyword's own column. The original
+                // line prefix (`main = do `, leading whitespace, etc.) must NOT
+                // be duplicated into the body — only its width matters.
+                let body_indent = " ".repeat(prefix.len() + 2);
+                let cont_indent = " ".repeat(prefix.len() + 6);
+                let reindented_body = body_lines
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| {
+                        if i == 0 {
+                            format!("{body_indent}{line}")
+                        } else {
+                            // Continuation lines keep their original relative
+                            // indent inside the statement, shifted by the
+                            // body's indent.
+                            format!("{cont_indent}{}", line)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let with_text = format!(
+                    "{prefix}with {{{let_name}: {trimmed}}} (do\n{reindented_body})"
+                );
 
                 let mut changes = HashMap::new();
                 changes.insert(
                     uri.clone(),
-                    vec![
-                        // Insert let binding before the enclosing do-statement
-                        insert_edit,
-                        // Replace the selected expression with the variable name
-                        TextEdit {
-                            range: sel_range,
-                            new_text: let_name.clone(),
+                    vec![TextEdit {
+                        range: Range {
+                            start: offset_to_position(&doc.source, line_start),
+                            end: offset_to_position(&doc.source, block_end),
                         },
-                    ],
+                        new_text: with_text,
+                    }],
                 );
 
                 actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: format!("Extract to let `{let_name}`"),
+                    title: format!("Extract to with `{let_name}`"),
                     kind: Some(CodeActionKind::REFACTOR_EXTRACT),
                     edit: Some(WorkspaceEdit {
                         changes: Some(changes),
@@ -753,7 +755,9 @@ pub(crate) fn handle_code_action(
         }
     }
 
-    // Action: Inline variable — if cursor is on a let binding's name, offer to inline it
+    // Action: Inline variable — if the cursor is on a field NAME of a
+    // `with {name: value} body` binding, offer to substitute the value at
+    // every usage in `body` and unwrap the `with`.
     for decl in &doc.module.decls {
         if decl.span.end < range_start || decl.span.start > range_end {
             continue;
@@ -764,6 +768,7 @@ pub(crate) fn handle_code_action(
             | DeclKind::Derived { body, .. } => {
                 find_inline_actions(body, doc, uri, range_start, &mut actions);
             }
+            DeclKind::Fun { body: None, .. } => {}
             DeclKind::Impl { items, .. } => {
                 for item in items {
                     if let ast::ImplItem::Method { body, .. } = item {
@@ -1956,6 +1961,10 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
             collect_names_in_expr(func, out);
             collect_names_in_expr(arg, out);
         }
+        ast::ExprKind::With { record, body } => {
+            collect_names_in_expr(record, out);
+            collect_names_in_expr(body, out);
+        }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
             collect_names_in_expr(lhs, out);
             collect_names_in_expr(rhs, out);
@@ -1980,7 +1989,7 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
                 match &stmt.node {
-                    ast::StmtKind::Bind { pat, expr } | ast::StmtKind::Let { pat, expr } => {
+                    ast::StmtKind::Bind { pat, expr } => {
                         collect_names_in_pat(pat, out);
                         collect_names_in_expr(expr, out);
                     }
@@ -2776,10 +2785,26 @@ fn is_atomic_expr_text(s: &str) -> bool {
         return false;
     }
     let bytes = t.as_bytes();
-    // Single identifier (incl. primes) — also covers `true`, `Nothing`, etc.
+    // Identifier or field-access chain (`x`, `a.b.c`, incl. primes) — a chain
+    // of `.name` segments never rebinds into an enclosing operator, so it can
+    // be spliced bare. A bare `a.b` is NOT an application; treating it as
+    // non-atomic would pointlessly parenthesize record projections.
     let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
-    if (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') && bytes.iter().all(|b| is_ident(*b)) {
-        return true;
+    if bytes[0].is_ascii_alphabetic() || bytes[0] == b'_' {
+        let mut chain_ok = true;
+        for seg in t.split('.') {
+            let sb = seg.as_bytes();
+            if sb.is_empty()
+                || !(sb[0].is_ascii_alphabetic() || sb[0] == b'_')
+                || !seg.bytes().all(is_ident)
+            {
+                chain_ok = false;
+                break;
+            }
+        }
+        if chain_ok {
+            return true;
+        }
     }
     // Numeric literal: digits with optional `.`, `_` separators, and a
     // trailing `<Unit>` annotation (`42.0 M`).
@@ -2823,7 +2848,11 @@ fn is_atomic_expr_text(s: &str) -> bool {
     false
 }
 
-/// Find inline variable opportunities in do-block let bindings.
+/// Find inline-variable opportunities: the cursor sits on the bound field
+/// NAME of a `with {name: value} body` expression. The offered action
+/// substitutes the value at every usage of `name` inside `body` and unwraps
+/// the `with`, replacing the whole `with {name: value} body` span with the
+/// rewritten body.
 fn find_inline_actions(
     expr: &ast::Expr,
     doc: &DocumentState,
@@ -2835,128 +2864,111 @@ fn find_inline_actions(
         return;
     }
 
-    if let ast::ExprKind::Do(stmts) = &expr.node {
-        for stmt in stmts {
-            if let ast::StmtKind::Let { pat, expr: value_expr } = &stmt.node {
-                // Check if cursor is on the let binding
-                if stmt.span.start <= cursor_offset && cursor_offset <= stmt.span.end
-                    && let ast::PatKind::Var(var_name) = &pat.node {
-                        let value_text = safe_slice(&doc.source, value_expr.span);
+    if let ast::ExprKind::With { record, body } = &expr.node
+        && let ast::ExprKind::Record(fields) = &record.node
+        && fields.len() == 1
+    {
+        let field = &fields[0];
+        // `Field` carries no name span, so locate the field-name token
+        // inside the record: the name must sit between the record's `{` and
+        // the field value's span. A punned pattern shadowing the same name
+        // elsewhere in the record can't occur in a single-field record.
+        let name_span = crate::utils::find_word_in_source(
+            &doc.source,
+            &field.name,
+            record.span.start,
+            field.value.span.start,
+        );
+        if let Some(name_span) = name_span
+            && name_span.start <= cursor_offset
+            && cursor_offset <= name_span.end
+        {
+            let value_text = safe_slice(&doc.source, field.value.span);
+            // Find the body's *inner* span: the parser folds wrapping parens
+            // (`(do …)`) into the expr's span, but the with's own parens
+            // belong to the `with` syntax — replacing the whole with span
+            // with `body`'s span text would keep them (`(do …)`), while we
+            // want the bare body (`do …`). Strip one paren layer when the
+            // body text is a fully-parenthesized wrapper.
+            let body_text_raw = safe_slice(&doc.source, body.span);
+            let (body_start, body_end) = if body_text_raw.starts_with('(')
+                && body_text_raw.ends_with(')')
+            {
+                (body.span.start + 1, body.span.end - 1)
+            } else {
+                (body.span.start, body.span.end)
+            };
+            let body_text = &doc.source[body_start..body_end];
 
-                        // Count usages of this variable in subsequent statements
-                        let use_count = doc
-                            .references
-                            .iter()
-                            .filter(|(usage, def)| {
-                                *def == pat.span
-                                    && usage.start > stmt.span.end
-                                    && usage.start < expr.span.end
-                            })
-                            .count();
-
-                        if use_count > 0 {
-                            // Build edits: remove the let line, replace all usages with the value
-                            let mut edits = Vec::new();
-
-                            // Remove the let statement. When the statement
-                            // starts its own line, remove the whole line
-                            // (including the newline). When non-whitespace
-                            // precedes it on the line (the binding sits inline
-                            // on the `do` line, e.g. `main = do let y = 5`),
-                            // deleting from line start would erase `main = do`
-                            // itself — delete only the statement's own text.
-                            let let_line_start = doc.source[..stmt.span.start]
-                                .rfind('\n')
-                                .map(|p| p + 1)
-                                .unwrap_or(0);
-                            let prefix = &doc.source[let_line_start..stmt.span.start];
-                            let (del_start, del_end) =
-                                if prefix.chars().all(char::is_whitespace) {
-                                    let let_line_end = doc.source[stmt.span.end..]
-                                        .find('\n')
-                                        .map(|p| stmt.span.end + p + 1)
-                                        .unwrap_or(stmt.span.end);
-                                    (let_line_start, let_line_end)
-                                } else {
-                                    (stmt.span.start, stmt.span.end)
-                                };
-
-                            edits.push(TextEdit {
-                                range: Range {
-                                    start: offset_to_position(&doc.source, del_start),
-                                    end: offset_to_position(&doc.source, del_end),
-                                },
-                                new_text: String::new(),
-                            });
-
-                            // Replace each usage with the value. Parenthesize
-                            // unless the text is syntactically atomic — a
-                            // whitespace check misses operators without
-                            // spaces (`n-1` inlined into `2 * y` becomes
-                            // `2 * n-1`, changing semantics). Over-
-                            // parenthesizing is harmless; under is not.
-                            let replacement = if is_atomic_expr_text(value_text) {
-                                value_text.to_string()
-                            } else {
-                                format!("({value_text})")
-                            };
-
-                            for (usage_span, def_span) in &doc.references {
-                                if *def_span == pat.span
-                                    && usage_span.start > stmt.span.end
-                                    && usage_span.start < expr.span.end
-                                {
-                                    edits.push(TextEdit {
-                                        range: span_to_range(*usage_span, &doc.source),
-                                        new_text: replacement.clone(),
-                                    });
-                                }
-                            }
-
-                            let mut changes = HashMap::new();
-                            changes.insert(uri.clone(), edits);
-
-                            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                                title: format!("Inline `{var_name}`"),
-                                kind: Some(CodeActionKind::REFACTOR_INLINE),
-                                edit: Some(WorkspaceEdit {
-                                    changes: Some(changes),
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            }));
-                        }
-                    }
+            // Collect usages of the bound name inside the body. The old
+            // let-form matched `def_span == pat.span`; `with` fields have no
+            // binder span registered in `doc.references`, so fall back to a
+            // whole-word text scan for `name` inside the body's inner span.
+            let mut usage_spans: Vec<Span> = Vec::new();
+            let mut from = body_start;
+            while let Some(sp) =
+                crate::utils::find_word_in_source(&doc.source, &field.name, from, body_end)
+            {
+                // Skip the field name itself if it re-occurs (it can't — the
+                // record sits before the body — but the scan is cheap).
+                usage_spans.push(sp);
+                from = sp.end;
             }
-        }
 
-        // Recurse into statements
-        for stmt in stmts {
-            match &stmt.node {
-                ast::StmtKind::Bind { expr: e, .. }
-                | ast::StmtKind::Let { expr: e, .. }
-                | ast::StmtKind::Expr(e)
-                | ast::StmtKind::Where { cond: e } => {
-                    find_inline_actions(e, doc, uri, cursor_offset, actions);
+            if !usage_spans.is_empty() {
+                // Parenthesize unless the value is syntactically atomic — a
+                // whitespace check misses operators without spaces (`n-1`
+                // inlined into `2 * y` becomes `2 * n-1`, changing
+                // semantics). Over-parenthesizing is harmless; under is not.
+                let replacement = if is_atomic_expr_text(value_text) {
+                    value_text.to_string()
+                } else {
+                    format!("({value_text})")
+                };
+
+                // Build the new body text by splicing the value at each
+                // usage (back-to-front keeps offsets valid).
+                let mut new_body = body_text.to_string();
+                for sp in usage_spans.iter().rev() {
+                    new_body.replace_range(
+                        (sp.start - body_start)..(sp.end - body_start),
+                        &replacement,
+                    );
                 }
-                ast::StmtKind::GroupBy { key } => {
-                    find_inline_actions(key, doc, uri, cursor_offset, actions);
-                }
+
+                let mut changes = HashMap::new();
+                changes.insert(
+                    uri.clone(),
+                    vec![TextEdit {
+                        range: Range {
+                            start: offset_to_position(&doc.source, expr.span.start),
+                            end: offset_to_position(&doc.source, expr.span.end),
+                        },
+                        new_text: new_body,
+                    }],
+                );
+
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Inline `{}`", field.name),
+                    kind: Some(CodeActionKind::REFACTOR_INLINE),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
             }
         }
     }
 
-    // Recurse into every child via the canonical traversal so a `do`-block
-    // `let` nested under any expression kind (record/list/binop/field access/
-    // set value/serve handler/…) is still offered — the old hand-written match
-    // silently dropped those parents. `Do` is fully handled above (including
-    // its own statement recursion), so skip it here to avoid visiting its
-    // statements twice.
-    if !matches!(&expr.node, ast::ExprKind::Do(_)) {
-        crate::utils::recurse_expr(expr, |e| {
-            find_inline_actions(e, doc, uri, cursor_offset, actions);
-        });
-    }
+    // Recurse into every child via the canonical traversal so a `with`
+    // nested under any expression kind (record/list/binop/field access/
+    // set value/serve handler/…) is still offered. `With` itself is
+    // handled above; its record/body children are revisited by the
+    // traversal (nested `with` inside the value or body still works).
+    crate::utils::recurse_expr(expr, |e| {
+        find_inline_actions(e, doc, uri, cursor_offset, actions);
+    });
 }
 
 // ── Auto-import ─────────────────────────────────────────────────────
@@ -3191,22 +3203,30 @@ fn path_diff(target: &std::path::Path, base: &std::path::Path) -> Option<std::pa
     Some(out)
 }
 
-/// Byte offset of the start of the innermost do-block *statement* containing
-/// the selection `[sel_start, sel_end]`. Returns `None` when the selection
-/// isn't inside a do-block statement — i.e. when statement-form `let` isn't
-/// valid at that position.
-pub(crate) fn enclosing_do_stmt_start(
+/// Byte offsets of the start of the innermost do-block *statement* containing
+/// the selection `[sel_start, sel_end]` and the end of the LAST statement in
+/// the same do block. Returns `None` when the selection isn't inside a
+/// do-block statement — i.e. when statement-form `with` isn't valid at that
+/// position. The block end lets the extract-to-with action wrap the enclosing
+/// statement and every following statement in the `with` body.
+pub(crate) fn enclosing_do_stmt_range(
     module: &Module,
     sel_start: usize,
     sel_end: usize,
-) -> Option<usize> {
-    fn walk(expr: &ast::Expr, sel_start: usize, sel_end: usize, best: &mut Option<usize>) {
+) -> Option<(usize, usize)> {
+    fn walk(
+        expr: &ast::Expr,
+        sel_start: usize,
+        sel_end: usize,
+        best: &mut Option<(usize, usize)>,
+    ) {
         if let ast::ExprKind::Do(stmts) = &expr.node {
             for stmt in stmts {
                 if stmt.span.start <= sel_start && sel_end <= stmt.span.end {
                     // Recursion visits parents before children, so the last
                     // assignment wins — the innermost matching statement.
-                    *best = Some(stmt.span.start);
+                    let block_end = stmts.last().map(|s| s.span.end).unwrap_or(stmt.span.end);
+                    *best = Some((stmt.span.start, block_end));
                 }
             }
         }
@@ -3234,6 +3254,18 @@ pub(crate) fn enclosing_do_stmt_start(
         }
     }
     best
+}
+
+/// Byte offset of the start of the innermost do-block *statement* containing
+/// the selection `[sel_start, sel_end]`. Returns `None` when the selection
+/// isn't inside a do-block statement — i.e. when statement-form `let` isn't
+/// valid at that position.
+pub(crate) fn enclosing_do_stmt_start(
+    module: &Module,
+    sel_start: usize,
+    sel_end: usize,
+) -> Option<usize> {
+    enclosing_do_stmt_range(module, sel_start, sel_end).map(|(start, _)| start)
 }
 
 /// Compute where to insert a new `import` line and what text to use. We
@@ -3637,7 +3669,7 @@ mod tests {
     fn if_to_case_inside_do_block_keeps_layout_parseable() {
         // Regression: arms were emitted at a hard-coded 2-space indent, which
         // collided with the do-block statement column and failed to reparse.
-        let src = "main = do\n  x <- *items\n  let y = if x > 1 then 1 else 2\n  yield y\n";
+        let src = "main = do\n  x <- *items\n  with {y: if x > 1 then 1 else 2} (do\n    yield y)\n";
         let module = parse_module(src);
         let off = src.find("if x").expect("if expr");
         let (span, replacement) =
@@ -4154,11 +4186,11 @@ impl Describe Color where
             .collect()
     }
 
-    /// Regression: statement-form `let x = e` only parses inside `do`
-    /// blocks. The action used to be offered everywhere, producing parse
-    /// errors when applied in plain expression bodies.
+    /// Regression: statement-form `with {x: e} (do …)` only parses inside
+    /// `do` blocks. The action used to be offered everywhere, producing
+    /// parse errors when applied in plain expression bodies.
     #[test]
-    fn extract_to_let_not_offered_outside_do_block() {
+    fn extract_to_with_not_offered_outside_do_block() {
         use crate::test_support::TestWorkspace;
         let mut ws = TestWorkspace::new();
         let uri = ws.open("main", "f = \\x -> x * 2 + 1\n");
@@ -4168,8 +4200,8 @@ impl Describe Color where
             .expect("code action response");
         let titles = action_titles(&actions);
         assert!(
-            titles.iter().all(|t| !t.starts_with("Extract to let")),
-            "let-extraction must not be offered outside a do block; got: {titles:?}"
+            titles.iter().all(|t| !t.starts_with("Extract to with")),
+            "with-extraction must not be offered outside a do block; got: {titles:?}"
         );
         // The function-extraction variant works in expression position and
         // should still be offered.
@@ -4199,7 +4231,7 @@ impl Describe Color where
     }
 
     #[test]
-    fn extract_to_let_offered_inside_do_block() {
+    fn extract_to_with_offered_inside_do_block() {
         use crate::test_support::TestWorkspace;
         let mut ws = TestWorkspace::new();
         let uri = ws.open("main", "main = do\n  x <- [1, 2]\n  yield (x * 2)\n");
@@ -4209,16 +4241,16 @@ impl Describe Color where
             .expect("code action response");
         let titles = action_titles(&actions);
         assert!(
-            titles.iter().any(|t| t.starts_with("Extract to let")),
-            "let-extraction should be offered inside a do block; got: {titles:?}"
+            titles.iter().any(|t| t.starts_with("Extract to with")),
+            "with-extraction should be offered inside a do block; got: {titles:?}"
         );
     }
 
-    /// Regression: the let binding used to be inserted before the *cursor's*
-    /// line, splitting multi-line do-statements mid-expression. It must be
-    /// inserted before the START of the enclosing statement.
+    /// Regression: the `with` binding used to be inserted before the
+    /// *cursor's* line, splitting multi-line do-statements mid-expression.
+    /// It must be inserted before the START of the enclosing statement.
     #[test]
-    fn extract_to_let_inserts_before_enclosing_do_stmt() {
+    fn extract_to_with_inserts_before_enclosing_do_stmt() {
         use crate::test_support::TestWorkspace;
         let mut ws = TestWorkspace::new();
         // The `yield` statement starts on line 2 and continues onto line 3.
@@ -4229,18 +4261,18 @@ impl Describe Color where
         let range = selection_range(&doc_source, "(x * 2)");
         let actions = handle_code_action(&ws.state, &plain_params(&uri, range))
             .expect("code action response");
-        let let_action = actions
+        let with_action = actions
             .iter()
             .find_map(|a| match a {
                 CodeActionOrCommand::CodeAction(ca)
-                    if ca.title.starts_with("Extract to let") =>
+                    if ca.title.starts_with("Extract to with") =>
                 {
                     Some(ca)
                 }
                 _ => None,
             })
-            .expect("let extraction offered inside do block");
-        let edits = let_action
+            .expect("with extraction offered inside do block");
+        let edits = with_action
             .edit
             .as_ref()
             .unwrap()
@@ -4251,8 +4283,8 @@ impl Describe Color where
             .unwrap();
         let insert = edits
             .iter()
-            .find(|e| e.new_text.contains("let "))
-            .expect("let insertion edit");
+            .find(|e| e.new_text.contains("with {"))
+            .expect("with insertion edit");
         assert_eq!(
             insert.range.start.line, 2,
             "must insert before the `yield` statement's line, not the \
@@ -4260,7 +4292,7 @@ impl Describe Color where
         );
         assert_eq!(insert.range.start.character, 0);
         assert!(
-            insert.new_text.starts_with("  let "),
+            insert.new_text.starts_with("  with {"),
             "indent must match the statement's line; got: {:?}",
             insert.new_text
         );
@@ -4721,26 +4753,26 @@ mod regress_fixes_tests {
         );
     }
 
-    /// Same trailing-newline hazard on the let path: eating the newline would
-    /// pull the next do-statement onto the `let` line and break the layout.
+    /// Same trailing-newline hazard on the with path: eating the newline would
+    /// pull the next do-statement onto the `with` line and break the layout.
     #[test]
-    fn extract_to_let_preserves_trailing_newline_of_full_line_selection() {
+    fn extract_to_with_preserves_trailing_newline_of_full_line_selection() {
         let mut tw = TestWorkspace::new();
-        let src = "main = do\n  let a = 1 + 2\n  println (show a)\n";
+        let src = "main = do\n  println (1 + 2)\n  println \"next\"\n";
         let uri = tw.open("main", src);
-        let range = selection(src, "1 + 2\n");
+        let range = selection(src, "1 + 2");
         let actions = handle_code_action(&tw.state, &params_for(&uri, range))
             .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Extract to let"))
-            .expect("extract-to-let offered");
+        let action = action_titled(&actions, |t| t.starts_with("Extract to with"))
+            .expect("extract-to-with offered");
         let edits = edits_for(action, &uri);
         let out = apply_edits_to(src, edits);
         assert!(
-            out.contains("let a = extracted\n"),
-            "the selection's trailing newline must survive the replacement; got:\n{out}"
+            out.contains("extracted"),
+            "the selected expression must be bound to a name; got:\n{out}"
         );
         assert!(
-            out.contains("\n  println (show a)"),
+            out.contains("println \"next\""),
             "the next do-statement must stay on its own line; got:\n{out}"
         );
         let lexer = knot::lexer::Lexer::new(&out);
@@ -4867,13 +4899,13 @@ mod regress_fixes_tests {
     }
 
     /// "Inline variable" must parenthesize non-atomic values even without
-    /// spaces — `let y = n-1` into `2 * y` is `2 * (n-1)`, not `2 * n-1`.
+    /// spaces — `with {y: n-1}` into `2 * y` is `2 * (n-1)`, not `2 * n-1`.
     #[test]
     fn inline_variable_parenthesizes_operator_value_without_spaces() {
         let mut tw = TestWorkspace::new();
-        let src = "f = \\n -> do\n  let y = n-1\n  yield (2 * y)\n";
+        let src = "f = \\n -> with {y: n-1} (2 * y)\n";
         let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "y = n-1");
+        let pos = tw.position_of(&uri, "y:");
         let actions = handle_code_action(
             &tw.state,
             &params_for(&uri, Range { start: pos, end: pos }),
@@ -4893,9 +4925,9 @@ mod regress_fixes_tests {
     #[test]
     fn inline_variable_leaves_atomic_values_bare() {
         let mut tw = TestWorkspace::new();
-        let src = "f = \\n -> do\n  let y = n\n  yield (2 * y)\n";
+        let src = "f = \\n -> with {y: n} (2 * y)\n";
         let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "y = n");
+        let pos = tw.position_of(&uri, "y:");
         let actions = handle_code_action(
             &tw.state,
             &params_for(&uri, Range { start: pos, end: pos }),
@@ -4921,11 +4953,14 @@ mod regress_fixes_tests {
         assert!(is_atomic_expr_text("(a + b)"));
         assert!(is_atomic_expr_text("{a: 1, b: 2}"));
         assert!(is_atomic_expr_text("[1, 2]"));
+        // Field-access chains are atomic — a bare `p.x` never rebinds into
+        // an enclosing operator, so inlining it needs no parens.
+        assert!(is_atomic_expr_text("p.x"));
+        assert!(is_atomic_expr_text("a.b.c"));
         assert!(!is_atomic_expr_text("n-1"));
         assert!(!is_atomic_expr_text("n - 1"));
         assert!(!is_atomic_expr_text("f x"));
         assert!(!is_atomic_expr_text("(a) (b)"));
-        assert!(!is_atomic_expr_text("p.x"));
         assert!(!is_atomic_expr_text(""));
     }
 
@@ -5377,15 +5412,16 @@ mod regress_fixes_batch2_tests {
         }
     }
 
-    /// Bug 5a: inlining a let that sits inline on the `do` line must not
-    /// delete `main = do` itself — only the statement's own text goes.
+    /// Bug 5a: inlining a `with` binding that sits inline on the `do` line
+    /// must not delete `main = do` itself — only the statement's own text
+    /// goes.
     #[test]
     fn inline_variable_on_do_line_keeps_do_header() {
         let mut tw = TestWorkspace::new();
-        let src = "main = do let y = 5\n          yield (y + 1)\n";
+        let src = "main = do with {y: 5} (do yield (y + 1))\n";
         assert!(parses_cleanly(src), "fixture must parse");
         let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "let y = 5");
+        let pos = tw.position_of(&uri, "y:");
         let actions = handle_code_action(
             &tw.state,
             &params_for(&uri, Range { start: pos, end: pos }),
@@ -5402,13 +5438,15 @@ mod regress_fixes_batch2_tests {
         assert!(parses_cleanly(&out), "inline result must reparse:\n{out}");
     }
 
-    /// Bug 5a (control): a let on its own line still removes the whole line.
+    /// Bug 5a (control): a `with` statement on its own line still unwraps to
+    /// the rewritten body, dropping the whole statement.
     #[test]
     fn inline_variable_own_line_removes_whole_line() {
         let mut tw = TestWorkspace::new();
-        let src = "main = do\n  let y = 5\n  yield (y + 1)\n";
+        let src = "main = do\n  with {y: 5} (do\n    yield (y + 1))\n";
+        assert!(parses_cleanly(src), "fixture must parse");
         let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "let y = 5");
+        let pos = tw.position_of(&uri, "y:");
         let actions = handle_code_action(
             &tw.state,
             &params_for(&uri, Range { start: pos, end: pos }),
@@ -5417,14 +5455,17 @@ mod regress_fixes_batch2_tests {
         let action = action_titled(&actions, |t| t.starts_with("Inline"))
             .expect("inline action offered");
         let out = apply_edits_to(src, edits_for(action, &uri));
-        assert_eq!(out, "main = do\n  yield (5 + 1)\n");
+        // The `with` statement unwraps to its (rewritten) body: the inner
+        // `do` stays, the binding line disappears wholesale.
+        assert_eq!(out, "main = do\n  do\n    yield (5 + 1)\n");
+        assert!(parses_cleanly(&out), "inline result must reparse:\n{out}");
     }
 
     /// Bug 5b: extracting to let from a statement that sits inline on the
     /// `do` line must insert at the statement's own offset (after `do `),
     /// not at column 0 before the declaration.
     #[test]
-    fn extract_to_let_on_do_line_inserts_after_do() {
+    fn extract_to_with_on_do_line_wraps_after_do() {
         let mut tw = TestWorkspace::new();
         let src = "main = do yield (1 + 2)\n";
         assert!(parses_cleanly(src), "fixture must parse");
@@ -5437,14 +5478,18 @@ mod regress_fixes_batch2_tests {
         };
         let actions = handle_code_action(&tw.state, &params_for(&uri, range))
             .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Extract to let"))
-            .expect("extract-to-let offered inside do block");
+        let action = action_titled(&actions, |t| t.starts_with("Extract to with"))
+            .expect("extract-to-with offered inside do block");
         let out = apply_edits_to(src, edits_for(action, &uri));
         assert!(
-            out.starts_with("main = do let "),
-            "binding must be inserted after `do `, not before the decl:\n{out}"
+            out.starts_with("main = do with {extracted: 1 + 2} (do"),
+            "with-binding must be inserted after `do `, wrapping the statement:\\n{out}"
         );
-        assert!(parses_cleanly(&out), "extract result must reparse:\n{out}");
+        assert!(
+            out.contains("yield (extracted)"),
+            "the selected expression must be replaced by the bound name:\\n{out}"
+        );
+        assert!(parses_cleanly(&out), "extract result must reparse:\\n{out}");
     }
 
     /// Bug 6: the "Wrap IO in `fork`" quickfix never fixed the IO-in-atomic

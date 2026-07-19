@@ -395,14 +395,15 @@ Used inside `atomic` blocks only. Causes the transaction to rollback and wait un
 ```knot
 waitForTask = \id -> atomic do
   tasks <- *tasks
-  let done = do
+  with {done: do
     t <- tasks
     where t.id == id
     where t.status == "done"
-    yield t
-  where (count done) == 0
-  retry
-  yield done
+    yield t}
+  (do
+    where (count done) == 0
+    retry
+    yield done)
 ```
 
 The compiler enforces that `retry` is only used inside `atomic`.

@@ -195,6 +195,10 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
             expr_contains_io(func, builtins, io_fns)
                 || expr_contains_io(arg, builtins, io_fns)
         }
+        ExprKind::With { record, body } => {
+            expr_contains_io(record, builtins, io_fns)
+                || expr_contains_io(body, builtins, io_fns)
+        }
         ExprKind::BinOp { lhs, rhs, .. } => {
             expr_contains_io(lhs, builtins, io_fns)
                 || expr_contains_io(rhs, builtins, io_fns)
@@ -206,7 +210,6 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
             stmts.iter().any(|s| match &s.node {
                 StmtKind::Bind { expr, .. } => expr_contains_io(expr, builtins, io_fns),
                 StmtKind::Expr(expr) => expr_contains_io(expr, builtins, io_fns),
-                StmtKind::Let { expr, .. } => expr_contains_io(expr, builtins, io_fns),
                 StmtKind::Where { cond } => expr_contains_io(cond, builtins, io_fns),
                 StmtKind::GroupBy { key } => expr_contains_io(key, builtins, io_fns),
             })
@@ -467,14 +470,13 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
 
     // Now check if this expression is a desugaring-eligible Do block.
     // Check eligibility with immutable borrows first to avoid borrow conflicts.
-    let (sql_compilable, pure_comp, let_block) = if let ExprKind::Do(stmts) = &expr.node {
+    let (sql_compilable, pure_comp) = if let ExprKind::Do(stmts) = &expr.node {
         (
             is_sql_compilable(stmts, source_vars),
             is_pure_comprehension(stmts, io_fns),
-            is_let_block(stmts),
         )
     } else {
-        (false, false, false)
+        (false, false)
     };
 
     if sql_compilable {
@@ -483,79 +485,12 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
         // recurse_into_children above.
         return;
     }
-    if let_block
-        && let ExprKind::Do(stmts) = &expr.node
-    {
-        let span = expr.span;
-        let desugared = desugar_let_block(stmts, span);
-        *expr = desugared;
-        return;
-    }
     if pure_comp
         && let ExprKind::Do(stmts) = &expr.node {
             let span = expr.span;
             let desugared = desugar_stmts(stmts, span);
             *expr = desugared;
         }
-}
-
-/// A `do` block that binds nothing monadic — only `let`s followed by a bare
-/// final expression, as in
-///
-/// ```knot
-/// isValidHex = \s -> do
-///   let n = length s
-///   n > 0 && n % 2 == 0
-/// ```
-///
-/// There is no `<-`, no `where`, and no `yield`, so no monad is involved: the
-/// block is plain `let … in expr` and its type is the final expression's type.
-/// Treating it as a comprehension instead invents a monad variable for the
-/// result and reports the final `Bool` as `(t384 Bool)`.
-fn is_let_block(stmts: &[Stmt]) -> bool {
-    let Some((last, init)) = stmts.split_last() else {
-        return false;
-    };
-    if init.is_empty() {
-        return false; // a lone expression is not a `let` block
-    }
-    if !init.iter().all(|s| matches!(&s.node, StmtKind::Let { .. })) {
-        return false;
-    }
-    // An explicit `yield` asks for the monadic reading even here
-    // (`do { let x = 1; yield x }` is `pure 1`), so leave it to the
-    // comprehension path.
-    matches!(&last.node, StmtKind::Expr(e) if e.node.as_yield_arg().is_none())
-}
-
-/// Lower a `let` block (see `is_let_block`) to nested immediately-applied
-/// lambdas — the same shape `desugar_stmts` gives a `Let` statement, but with
-/// no `__yield`/`__bind` around the result.
-fn desugar_let_block(stmts: &[Stmt], span: Span) -> Expr {
-    let (last, init) = stmts.split_last().expect("is_let_block checked non-empty");
-    let StmtKind::Expr(body) = &last.node else {
-        unreachable!("is_let_block requires a bare final expression")
-    };
-    let mut out = body.clone();
-    for stmt in init.iter().rev() {
-        let StmtKind::Let { pat, expr } = &stmt.node else {
-            unreachable!("is_let_block requires every preceding statement to be a let")
-        };
-        out = spanned(
-            ExprKind::App {
-                func: Box::new(spanned(
-                    ExprKind::Lambda {
-                        params: vec![pat.clone()],
-                        body: Box::new(out),
-                    },
-                    span,
-                )),
-                arg: Box::new(expr.clone()),
-            },
-            span,
-        );
-    }
-    out
 }
 
 /// Recurse into all child expressions of a node (except Do blocks handled
@@ -598,6 +533,10 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
             } else {
                 desugar_expr(body, io_fns, source_vars);
             }
+        }
+        ExprKind::With { record, body } => {
+            desugar_expr(record, io_fns, source_vars);
+            desugar_expr(body, io_fns, source_vars);
         }
         ExprKind::App { func, arg } => {
             // Preserve do-block arguments to sortBy/takeRelation so codegen
@@ -693,7 +632,6 @@ fn unwrap_wrappers_mut(expr: &mut Expr) -> &mut Expr {
 fn desugar_stmt(stmt: &mut Stmt, io_fns: &IoFns, source_vars: &HashSet<String>) {
     match &mut stmt.node {
         StmtKind::Bind { expr, .. } => desugar_expr(expr, io_fns, source_vars),
-        StmtKind::Let { expr, .. } => desugar_expr(expr, io_fns, source_vars),
         StmtKind::Where { cond } => desugar_expr(cond, io_fns, source_vars),
         StmtKind::GroupBy { key } => desugar_expr(key, io_fns, source_vars),
         StmtKind::Expr(e) => desugar_expr(e, io_fns, source_vars),
@@ -720,13 +658,6 @@ fn desugar_do_stmts(stmts: &mut [Stmt], io_fns: &IoFns, source_vars: &HashSet<St
                     for n in &bound {
                         local.remove(n);
                     }
-                }
-            }
-            StmtKind::Let { pat, .. } => {
-                let mut bound: Vec<String> = Vec::new();
-                pat_bound_names(pat, &mut bound);
-                for n in &bound {
-                    local.remove(n);
                 }
             }
             _ => {}
@@ -812,16 +743,6 @@ fn is_sql_compilable(stmts: &[Stmt], source_vars: &HashSet<String>) -> bool {
             StmtKind::Where { cond } => {
                 if !is_sql_where_expr(cond, &bind_vars) {
                     return false;
-                }
-            }
-            StmtKind::Let { pat, .. } => {
-                // Let statements are handled by codegen's `analyze_sql_plan`
-                // (which substitutes let-bound values as SQL parameters).
-                // Add the let-bound variable name to bind_vars so that
-                // subsequent Where clauses can reference it and stay
-                // SQL-compilable.
-                if let PatKind::Var(name) = &pat.node {
-                    bind_vars.insert(name.as_str());
                 }
             }
             _ => return false,
@@ -946,35 +867,14 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
         return false;
     }
 
-    // Do-local let-bound lambdas whose bodies perform IO make applications
-    // of the bound name IO expressions: `let f = \y -> println (show y)`
-    // followed by `f x` must NOT desugar as a pure comprehension (codegen's
-    // `is_io_do_block` recurses into lambda bodies and classifies the block
-    // as IO, so desugaring it here would diverge and produce a misleading
-    // type error). Extend the IO-name sets with such local bindings before
-    // scanning; processed in order so chains (`let g = \x -> f x`) resolve.
-    let mut io_base = std::borrow::Cow::Borrowed(&io_fns.base);
-    let mut io_all = std::borrow::Cow::Borrowed(&io_fns.all);
-    for s in stmts {
-        if let StmtKind::Let { pat, expr } = &s.node
-            && let PatKind::Var(name) = &pat.node {
-                if lambda_chain_body_is_io(expr, &io_base) {
-                    io_base.to_mut().insert(name.clone());
-                }
-                if lambda_chain_body_is_io(expr, &io_all) {
-                    io_all.to_mut().insert(name.clone());
-                }
-            }
-    }
-    let io_base = io_base.as_ref();
-    let io_all = io_all.as_ref();
-
     // IO do blocks use a dedicated codegen path (compile_io_do) that handles
     // running IO actions and iterating over resulting relations. Desugaring
     // would use IO's monadic bind (sequencing) instead, which is wrong when
     // the intent is to iterate over relation elements.
+    let io_base = &io_fns.base;
+    let io_all = &io_fns.all;
     if stmts.iter().any(|s| match &s.node {
-        StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr, io_base),
+        StmtKind::Bind { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr, io_base),
         StmtKind::Where { cond } => expr_is_io(cond, io_base),
         _ => false,
     }) {
@@ -991,7 +891,7 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     // from a relation/Maybe would force a different monad and make the
     // desugared chain ill-typed).
     let has_trait_only_io = stmts.iter().any(|s| match &s.node {
-        StmtKind::Bind { expr, .. } | StmtKind::Let { expr, .. } | StmtKind::Expr(expr) => {
+        StmtKind::Bind { expr, .. } | StmtKind::Expr(expr) => {
             expr_is_io(expr, io_all)
         }
         StmtKind::Where { cond } => expr_is_io(cond, io_all),
@@ -1044,7 +944,7 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     // becomes the monadic result `m a`.
     for stmt in &stmts[..stmts.len() - 1] {
         match &stmt.node {
-            StmtKind::Bind { .. } | StmtKind::Where { .. } | StmtKind::Let { .. } | StmtKind::Expr(_) => {}
+            StmtKind::Bind { .. } | StmtKind::Where { .. } | StmtKind::Expr(_) => {}
             _ => return false,
         }
     }
@@ -1124,7 +1024,6 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
             stmts.iter().any(|s| match &s.node {
                 StmtKind::Bind { expr, .. } => expr_is_io(expr, io_fns),
                 StmtKind::Expr(expr) => expr_is_io(expr, io_fns),
-                StmtKind::Let { expr, .. } => expr_is_io(expr, io_fns),
                 StmtKind::Where { cond } => expr_is_io(cond, io_fns),
                 StmtKind::GroupBy { key } => expr_is_io(key, io_fns),
             })
@@ -1326,23 +1225,6 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
                     span,
                 ),
                 guard,
-                span,
-            )
-        }
-
-        StmtKind::Let { pat, expr } => {
-            // (\pat -> rest) expr
-            spanned(
-                ExprKind::App {
-                    func: Box::new(spanned(
-                        ExprKind::Lambda {
-                            params: vec![pat.clone()],
-                            body: Box::new(rest),
-                        },
-                        span,
-                    )),
-                    arg: Box::new(expr.clone()),
-                },
                 span,
             )
         }
@@ -1754,86 +1636,6 @@ mod tests {
                 && name == "firstAdult" {
                     assert!(has_bind_var(body), "expected __bind in desugared body");
                     assert!(!has_do_block(body), "expected no Do block after desugaring");
-                }
-        }
-    }
-
-    #[test]
-    fn var_bind_with_source_context_preserved() {
-        // `p <- rows` where `rows <- *people` in the enclosing do-block IS
-        // a source-bound variable — codegen resolves it via source_var_binds
-        // and compiles the inner do to a single SQL query, so it must be
-        // preserved as a raw Do node.
-        let src = r#"
-            *people : [{name: Text, age: Int 1}]
-            main = do
-              rows <- *people
-              let adults = do
-                    p <- rows
-                    where p.age >= 18
-                    yield p
-              println (show (count adults))
-        "#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "main" {
-                    // outer block is mixed/IO → preserved; the let-bound
-                    // inner do must also still be a Do node.
-                    let stmts = match &body.node {
-                        ExprKind::Do(stmts) => stmts,
-                        other => panic!("expected outer Do, got {:?}", other),
-                    };
-                    let inner = stmts.iter().find_map(|s| match &s.node {
-                        StmtKind::Let { expr, .. } => Some(expr),
-                        _ => None,
-                    });
-                    let inner = inner.expect("expected let stmt");
-                    assert!(
-                        matches!(&inner.node, ExprKind::Do(_)),
-                        "inner do over source-bound var should be preserved"
-                    );
-                }
-        }
-    }
-
-    #[test]
-    fn var_bind_shadowed_by_lambda_param_desugars() {
-        // A lambda param shadows a source-bound variable of the same name:
-        // inside the lambda, `u <- rows` is no longer a source read.
-        let src = r#"
-            *people : [{name: Text, age: Int 1}]
-            main = do
-              rows <- *people
-              let f = \rows -> do
-                    u <- rows
-                    where u.age >= 18
-                    yield u
-              println (show (f (Just {value: {age: 1}})))
-        "#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "main" {
-                    let stmts = match &body.node {
-                        ExprKind::Do(stmts) => stmts,
-                        other => panic!("expected outer Do, got {:?}", other),
-                    };
-                    let lambda = stmts.iter().find_map(|s| match &s.node {
-                        StmtKind::Let { expr, .. } => Some(expr),
-                        _ => None,
-                    });
-                    let lambda = lambda.expect("expected let stmt");
-                    assert!(
-                        has_bind_var(lambda),
-                        "shadowed var bind should desugar through __bind"
-                    );
-                    assert!(
-                        !has_do_block(lambda),
-                        "shadowed var bind should not be preserved as Do"
-                    );
                 }
         }
     }

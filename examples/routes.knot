@@ -21,11 +21,11 @@ addTodo = \title owner priority -> do
 
 getTodos = \owner -> do
   todos <- *todos
-  let result = do
+  with {result: do
     t <- todos
     where t.owner == owner
-    yield t
-  yield result
+    yield t}
+    (yield result)
 
 api = serve Api where
   GetTodos = \{owner, xForwardedFor} -> do

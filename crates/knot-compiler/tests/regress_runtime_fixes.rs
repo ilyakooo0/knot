@@ -77,12 +77,12 @@ fn text_take_drop_negative_counts_clamp() {
     let (stdout, stderr, ok) = compile_and_run(
         "text_take_drop_neg",
         r#"main = do
-  let n = 0 - 2
-  println ("take_neg: [" ++ take n "hello" ++ "]")
-  println ("drop_neg: [" ++ drop n "hello" ++ "]")
-  println ("take_pos: [" ++ take 2 "hello" ++ "]")
-  println ("drop_pos: [" ++ drop 2 "hello" ++ "]")
-  yield {}
+  with {n: 0 - 2} (do
+    println ("take_neg: [" ++ take n "hello" ++ "]")
+    println ("drop_neg: [" ++ drop n "hello" ++ "]")
+    println ("take_pos: [" ++ take 2 "hello" ++ "]")
+    println ("drop_pos: [" ++ drop 2 "hello" ++ "]")
+    yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -114,11 +114,11 @@ main = do
     {name: "c", salary: 70}
   ]
   employees <- *employees
-  let lo = minOn (\e -> e.salary) employees
-  let hi = maxOn (\e -> e.salary) employees
-  println ("lo_plus_one: " ++ show (lo + 1))
-  println ("hi_plus_one: " ++ show (hi + 1))
-  yield {}
+  with {lo: minOn (\e -> e.salary) employees} (do
+    with {hi: maxOn (\e -> e.salary) employees} (do
+      println ("lo_plus_one: " ++ show (lo + 1))
+      println ("hi_plus_one: " ++ show (hi + 1))
+      yield {}))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -148,9 +148,9 @@ main = do
     {name: "c", dept: "Sales", salary: 10}
   ]
   employees <- *employees
-  let lo = employees |> filter (\e -> e.dept == "Eng") |> minOn (\e -> e.salary)
-  println ("eng_lo_plus_one: " ++ show (lo + 1))
-  yield {}
+  with {lo: employees |> filter (\e -> e.dept == "Eng") |> minOn (\e -> e.salary)} (do
+    println ("eng_lo_plus_one: " ++ show (lo + 1))
+    yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -180,12 +180,12 @@ main = do
   replace *people = [{name: "Alice", age: 30}]
   replace *orders = [{customer: "Alice", amount: 100}]
   ppl <- *people
-  let renamed = do
+  with {renamed: do
     p <- ppl
-    yield (if p.name == "Alice" then {p | name: "Alicia"} else p)
-  *people = renamed
-  println "rename succeeded"
-  yield {}
+    yield (if p.name == "Alice" then {p | name: "Alicia"} else p)} (do
+    *people = renamed
+    println "rename succeeded"
+    yield {})
 "#,
     );
     assert!(
@@ -216,13 +216,13 @@ fn sum_over_empty_float_relation_is_float_zero() {
 counts = [{qty: 2}, {qty: 3}]
 
 main = do
-  let noPrices = filter (\p -> p.amount > 100.0) prices
-  let noCounts = filter (\c -> c.qty > 100) counts
-  println ("empty_float: " ++ show (sum (map (\p -> p.amount) noPrices)))
-  println ("empty_int: " ++ show (sum (map (\c -> c.qty) noCounts)))
-  println ("float: " ++ show (sum (map (\p -> p.amount) prices)))
-  println ("int: " ++ show (sum (map (\c -> c.qty) counts)))
-  println ("piped_empty_float: " ++ show (noPrices |> map (\p -> p.amount) |> sum))
+  with {noPrices: filter (\p -> p.amount > 100.0) prices} (do
+    with {noCounts: filter (\c -> c.qty > 100) counts} (do
+      println ("empty_float: " ++ show (sum (map (\p -> p.amount) noPrices)))
+      println ("empty_int: " ++ show (sum (map (\c -> c.qty) noCounts)))
+      println ("float: " ++ show (sum (map (\p -> p.amount) prices)))
+      println ("int: " ++ show (sum (map (\c -> c.qty) counts)))
+      println ("piped_empty_float: " ++ show (noPrices |> map (\p -> p.amount) |> sum))))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -263,9 +263,9 @@ impl Eq Grade where
 impl Ord Grade where
   compare = \x y -> EQ {}
 main = do
-  let items = [A {}, B {}, C {}]
-  let sorted = sortBy (\g -> g) items
-  println ("count: " ++ show (count sorted))
+  with {items: [A {}, B {}, C {}]} (do
+    with {sorted: sortBy (\g -> g) items} (do
+      println ("count: " ++ show (count sorted))))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");

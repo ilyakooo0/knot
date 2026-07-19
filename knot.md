@@ -12,12 +12,13 @@ type Person = {name: Text, age: Int 1}
 main = do
   *people = [{name: "Alice", age: 30}, {name: "Bob", age: 25}]
   people <- *people
-  let result = do
+  with {result: do
     p <- people
     where p.age > 27
-    yield p.name
-  println (show result)
-  yield {}
+    yield p.name}
+  (do
+    println (show result)
+    yield {})
 ```
 
 Build and run:
@@ -144,10 +145,11 @@ There are five kinds of top-level declarations:
 -- View: settable query over a source
 *openTodos = do
   todos <- *todos
-  let result = do
+  with {result: do
     t <- todos
-    yield {title: t.title, owner: t.owner, status: Open {}}
-  yield result
+    yield {title: t.title, owner: t.owner, status: Open {}}}
+  (do
+    yield result)
 
 -- Derived: read-only computed relation
 &seniors = do
@@ -252,13 +254,15 @@ argument. To share a type between positions, use an explicit type variable
 &results = do
   employees <- *employees       -- IO bind: get [Employee]
   departments <- *departments   -- IO bind: get [Department]
-  let joined = do               -- pure comprehension
+  with {joined: do              -- pure comprehension
     e <- employees
     d <- departments
     where e.dept == d.name
-    let bonus = e.salary * 0.1
-    yield {e.name, bonus, d.budget}
-  yield joined
+    with {bonus: e.salary * 0.1}
+    (do
+      yield {e.name, bonus, d.budget})}
+  (do
+    yield joined)
 ```
 
 Statements in a `do` block:
@@ -267,7 +271,6 @@ Statements in a `do` block:
 |-----------|---------|
 | `x <- expr` | Bind: iterate over relation / unwrap monad |
 | `where cond` | Filter: skip when condition is false |
-| `let x = expr` | Local binding |
 | `yield expr` | Emit a value into the result |
 | `groupBy {fields}` | Group by key fields (see Grouping) |
 | `expr` | Bare expression (for IO side effects) |
@@ -298,18 +301,20 @@ Filter and destructure in one step:
 ```knot
 &circles = do
   shapes <- *shapes
-  let result = do
+  with {result: do
     Circle c <- shapes
-    yield c
-  yield result
+    yield c}
+  (do
+    yield result)
 
 &inProgress = do
   tickets <- *tickets
-  let result = do
+  with {result: do
     t <- tickets
     InProgress ip <- t.status
-    yield {t.title, ip.assignee}
-  yield result
+    yield {t.title, ip.assignee}}
+  (do
+    yield result)
 ```
 
 ---
@@ -353,6 +358,25 @@ result = if x > 0 then "positive" else "non-positive"
 ```
 
 `if` is an expression — both branches must have the same type.
+
+### `with` Expressions
+
+`with {name: value, ...} body` evaluates `body` with each record field bound as a variable in scope. The whole expression's value is `body`'s value:
+
+```knot
+with {x: 2, y: 3} (x + y)            -- 5
+
+-- The bound value can be any expression, including a do block:
+with {result: do
+  p <- people
+  where p.age > 27
+  yield p.name}
+(do
+  println (show result)
+  yield {})
+```
+
+Use `with` wherever you would otherwise introduce a local name — inside do blocks, in function bodies, or nested in other expressions.
 
 ### Case Expressions
 
@@ -400,12 +424,13 @@ sumList = \xs -> case xs of
 ```knot
 &workload = do
   todos <- *todos
-  let result = do
+  with {result: do
     t <- todos
     where t.done == 0
     groupBy {t.owner}
-    yield {owner: t.owner, count: count t}
-  yield result
+    yield {owner: t.owner, count: count t}}
+  (do
+    yield result)
 ```
 
 Multiple keys: `groupBy {o.region, o.status}`
@@ -427,11 +452,12 @@ Fields can hold `[T]` — sets nested inside rows:
 -- Query into nested relations
 &allMembers = do
   teams <- *teams
-  let result = do
+  with {result: do
     t <- teams
     m <- t.members
-    yield {team: t.name, member: m.name}
-  yield result
+    yield {team: t.name, member: m.name}}
+  (do
+    yield result)
 
 -- Update nested relations
 updateTeams = do
@@ -453,10 +479,11 @@ A `*`-prefixed declaration with a body is a view — reads compute the query, wr
 ```knot
 *openTodos = do
   todos <- *todos
-  let result = do
+  with {result: do
     t <- todos
-    yield {title: t.title, owner: t.owner, priority: t.priority, status: Open {}}
-  yield result
+    yield {title: t.title, owner: t.owner, priority: t.priority, status: Open {}}}
+  (do
+    yield result)
 ```
 
 Constant columns (like `status: Open {}`) are:
@@ -484,11 +511,12 @@ Read-only computed relations, prefixed with `&`:
 
 &stats = do
   todos <- *todos
-  let result = do
+  with {result: do
     t <- todos
     groupBy {t.owner}
-    yield {owner: t.owner, total: count t}
-  yield result
+    yield {owner: t.owner, total: count t}}
+  (do
+    yield result)
 ```
 
 ### Recursive Derived Relations
@@ -500,12 +528,13 @@ Datalog-style fixpoint iteration for transitive closure:
   reportsTo <- &reportsTo     -- self-reference (IO bind)
   manages <- *manages
   base <- &base
-  let step = do
+  with {step: do
     r <- reportsTo
     m <- manages
     where r.descendant == m.manager
-    yield {ancestor: r.ancestor, descendant: m.report}
-  yield (union base step)
+    yield {ancestor: r.ancestor, descendant: m.report}}
+  (do
+    yield (union base step))
 ```
 
 ---
@@ -961,9 +990,10 @@ Request headers become constructor fields. When response headers are declared, t
 
 ```knot
 api = serve Api where
-  GetTodos = \{authorization} -> do
-    let todos = allTodos
-    yield Ok {value: {body: todos, headers: {xTotalCount: length todos}}}
+  GetTodos = \{authorization} ->
+    with {todos: allTodos}
+    (do
+      yield Ok {value: {body: todos, headers: {xTotalCount: length todos}}})
   CreateTodo = \{title, authorization} ->
     yield Ok {value: {body: addTodo title, headers: {}}}
 ```
@@ -1212,21 +1242,23 @@ assign = \title person -> do
 
 pending = \owner -> do
   todos <- *todos
-  let result = do
+  with {result: do
     t <- todos
     where t.owner == owner
     Open {} <- t.status
-    yield {t.title, t.priority}
-  yield result
+    yield {t.title, t.priority}}
+  (do
+    yield result)
 
 &workload = do
   todos <- *todos
-  let result = do
+  with {result: do
     t <- todos
     Open {} <- t.status
     groupBy {t.owner}
-    yield {owner: t.owner, count: count t}
-  yield result
+    yield {owner: t.owner, count: count t}}
+  (do
+    yield result)
 
 main = do
   add "Write parser" "Alice" High {}
@@ -1282,12 +1314,13 @@ updateWhere = \target newValue -> do
 &joined = do
   employees <- *employees
   departments <- *departments
-  let result = do
+  with {result: do
     e <- employees
     d <- departments
     where e.dept == d.name
-    yield {e.name, d.budget}
-  yield result
+    yield {e.name, d.budget}}
+  (do
+    yield result)
 ```
 
 ### Aggregate
@@ -1313,8 +1346,9 @@ getCount = do
 -- Using pattern bind in do
 &circles = do
   shapes <- *shapes
-  let result = do
+  with {result: do
     Circle c <- shapes
-    yield c
-  yield result
+    yield c}
+  (do
+    yield result)
 ```

@@ -493,6 +493,10 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
             f(func);
             f(arg);
         }
+        ast::ExprKind::With { record, body } => {
+            f(record);
+            f(body);
+        }
         ast::ExprKind::Lambda { body, .. } => f(body),
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
             f(lhs);
@@ -518,7 +522,6 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
             for stmt in stmts {
                 match &stmt.node {
                     ast::StmtKind::Bind { expr, .. }
-                    | ast::StmtKind::Let { expr, .. }
                     | ast::StmtKind::Expr(expr)
                     | ast::StmtKind::Where { cond: expr } => f(expr),
                     ast::StmtKind::GroupBy { key } => f(key),

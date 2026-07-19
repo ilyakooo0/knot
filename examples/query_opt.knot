@@ -15,56 +15,56 @@ countDemo = do
 filterDemo = do
   employees <- *employees
   println "High earners (salary > 75):"
-  let filtered = do
+  with {filtered: do
     e <- employees
     where e.salary > 75
-    yield ("  " ++ e.name ++ " ($" ++ show e.salary ++ ")")
-  r <- filtered
-  println r
-  yield {}
+    yield ("  " ++ e.name ++ " ($" ++ show e.salary ++ ")")} (do
+    r <- filtered
+    println r
+    yield {})
 
 -- 3. Hash join: equi-join via hash index
 joinDemo = do
   employees <- *employees
   departments <- *departments
   println "Employee departments:"
-  let joined = do
+  with {joined: do
     e <- employees
     d <- departments
     where e.dept == d.name
-    yield ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget: $" ++ show d.budget ++ ")")
-  r <- joined
-  println r
-  yield {}
+    yield ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget: $" ++ show d.budget ++ ")")} (do
+    r <- joined
+    println r
+    yield {})
 
 -- 4. Full SQL: single-table filter → one SQL SELECT
 filterQuery = do
   employees <- *employees
-  let result = do
+  with {result: do
     e <- employees
     where e.salary > 75
-    yield {name: e.name, salary: e.salary}
-  yield result
+    yield {name: e.name, salary: e.salary}}
+    (yield result)
 
 -- 5. Full SQL: multi-table join + filter → one SQL SELECT
 joinQuery = do
   employees <- *employees
   departments <- *departments
-  let result = do
+  with {result: do
     e <- employees
     d <- departments
     where e.dept == d.name
     where e.salary > 75
-    yield {name: e.name, dept: d.name, budget: d.budget}
-  yield result
+    yield {name: e.name, dept: d.name, budget: d.budget}}
+    (yield result)
 
 -- 6. Full SQL: yield entire row (single-table)
 allEmployees = do
   employees <- *employees
-  let result = do
+  with {result: do
     e <- employees
-    yield e
-  yield result
+    yield e}
+    (yield result)
 
 printQuery = \label results -> do
   println (label ++ ":")
@@ -87,8 +87,8 @@ pipeFilterMap = do
 -- 9. Pipe: filter + count
 pipeFilterCount = do
   employees <- *employees
-  let filtered = employees |> filter (\e -> e.salary > 75)
-  yield (count filtered)
+  with {filtered: employees |> filter (\e -> e.salary > 75)}
+    (yield (count filtered))
 
 -- 10. Pipe: map only → SQL SELECT
 pipeMap = do
@@ -98,15 +98,15 @@ pipeMap = do
 -- 11. minOn/maxOn projection → SQL MIN/MAX
 minMaxDemo = do
   employees <- *employees
-  let lo = minOn (\e -> e.salary) employees
-  let hi = maxOn (\e -> e.salary) employees
-  println ("min salary: " ++ show lo ++ ", max salary: " ++ show hi)
+  with {lo: minOn (\e -> e.salary) employees} (
+    with {hi: maxOn (\e -> e.salary) employees}
+      (println ("min salary: " ++ show lo ++ ", max salary: " ++ show hi)))
 
 -- 12. countWhere predicate → SQL COUNT(*) WHERE
 countWhereDemo = do
   employees <- *employees
-  let n = countWhere (\e -> e.dept == "Eng") employees
-  println ("eng headcount: " ++ show n)
+  with {n: countWhere (\e -> e.dept == "Eng") employees}
+    (println ("eng headcount: " ++ show n))
 
 -- 13. Pipe: filter + minOn/maxOn → SQL aggregate with WHERE
 pipeFilterMin = do

@@ -9,25 +9,25 @@ main = do
   println (toJson {name: "Alice", age: 30})
 
   -- Encode a relation (becomes JSON array)
-  let nums = [{x: 1}, {x: 2}, {x: 3}]
-  println (toJson nums)
+  with {nums: [{x: 1}, {x: 2}, {x: 3}]} (do
+    println (toJson nums)
 
-  -- Round-trip: encode then decode. parseJson returns `Maybe a` so malformed
-  -- input is recoverable rather than fatal — match on the result.
-  let json = toJson {x: 10, y: 20}
-  println json
-  case parseJson json : Maybe {x: Int 1, y: Int 1} of
-    Just {value} -> println (show value)
-    Nothing {} -> println "parse failed"
+    -- Round-trip: encode then decode. parseJson returns `Maybe a` so malformed
+    -- input is recoverable rather than fatal — match on the result.
+    with {json: toJson {x: 10, y: 20}} (do
+      println json
+      case parseJson json : Maybe {x: Int 1, y: Int 1} of
+        Just {value} -> println (show value)
+        Nothing {} -> println "parse failed"
 
-  -- Parse a JSON array
-  case parseJson "[1, 2, 3]" : Maybe [Int 1] of
-    Just {value} -> println (show value)
-    Nothing {} -> println "parse failed"
+      -- Parse a JSON array
+      case parseJson "[1, 2, 3]" : Maybe [Int 1] of
+        Just {value} -> println (show value)
+        Nothing {} -> println "parse failed"
 
-  -- Malformed input decodes to Nothing instead of crashing the program
-  case parseJson "not valid json" : Maybe [Int 1] of
-    Just {value} -> println (show value)
-    Nothing {} -> println "parse failed (as expected)"
+      -- Malformed input decodes to Nothing instead of crashing the program
+      case parseJson "not valid json" : Maybe [Int 1] of
+        Just {value} -> println (show value)
+        Nothing {} -> println "parse failed (as expected)"
 
-  yield {}
+      yield {}))

@@ -343,6 +343,10 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
             shift_expr_spans(func, offset);
             shift_expr_spans(arg, offset);
         }
+        With { record, body } => {
+            shift_expr_spans(record, offset);
+            shift_expr_spans(body, offset);
+        }
         BinOp { lhs, rhs, .. } => {
             shift_expr_spans(lhs, offset);
             shift_expr_spans(rhs, offset);
@@ -389,7 +393,7 @@ fn shift_stmt_spans(s: &mut ast::Stmt, offset: usize) {
     s.span.start += offset;
     s.span.end += offset;
     match &mut s.node {
-        Bind { pat, expr } | Let { pat, expr } => {
+        Bind { pat, expr } => {
             shift_pat_spans(pat, offset);
             shift_expr_spans(expr, offset);
         }
@@ -544,7 +548,7 @@ mod tests {
             if let ast::ExprKind::Do(stmts) = &e.node {
                 for s in stmts {
                     out.push(("stmt", s.span));
-                    if let ast::StmtKind::Bind { pat: p, .. } | ast::StmtKind::Let { pat: p, .. } =
+                    if let ast::StmtKind::Bind { pat: p, .. } =
                         &s.node
                     {
                         pat(p, out);
@@ -603,6 +607,10 @@ mod tests {
                 f(func);
                 f(arg);
             }
+            With { record, body } => {
+                f(record);
+                f(body);
+            }
             Lambda { body, .. } => f(body),
             BinOp { lhs, rhs, .. } => {
                 f(lhs);
@@ -622,7 +630,6 @@ mod tests {
                 for s in stmts {
                     match &s.node {
                         ast::StmtKind::Bind { expr, .. }
-                        | ast::StmtKind::Let { expr, .. }
                         | ast::StmtKind::Expr(expr)
                         | ast::StmtKind::Where { cond: expr } => f(expr),
                         ast::StmtKind::GroupBy { key } => f(key),

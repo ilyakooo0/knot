@@ -109,12 +109,13 @@ fn nested_literal_in_constructor_pattern_is_tested() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_nested_lit",
         r#"main = do
-  let m = Just {value: 5}
-  let r = case m of
-    Just {value: 1} -> "one"
-    Just {value: n} -> show n
-    Nothing -> "none"
-  println r
+  with {m: Just {value: 5}} (do
+    with {r: case m of
+      Just {value: 1} -> "one"
+      Just {value: n} -> show n
+      Nothing -> "none"}
+    (do
+      println r))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -130,12 +131,13 @@ fn nested_literal_in_list_pattern_is_tested() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_list_lit",
         r#"main = do
-  let xs = [5]
-  let r = case xs of
-    [1] -> "one"
-    [n] -> show n
-    _ -> "many"
-  println r
+  with {xs: [5]} (do
+    with {r: case xs of
+      [1] -> "one"
+      [n] -> show n
+      _ -> "many"}
+    (do
+      println r))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -150,11 +152,12 @@ fn nested_literal_in_record_pattern_is_tested() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_record_lit",
         r#"main = do
-  let p = {tag: 2, name: "b"}
-  let r = case p of
-    {tag: 1} -> "first"
-    {tag: t} -> "tag " ++ show t
-  println r
+  with {p: {tag: 2, name: "b"}} (do
+    with {r: case p of
+      {tag: 1} -> "first"
+      {tag: t} -> "tag " ++ show t}
+    (do
+      println r))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -169,11 +172,12 @@ fn nested_constructor_in_record_pattern_is_tested() {
     let (stdout, stderr, ok) = compile_and_run(
         "case_nested_ctor",
         r#"main = do
-  let p = {st: Nothing {}, n: 7}
-  let r = case p of
-    {st: Just v} -> "just"
-    {st: Nothing} -> "nothing"
-  println r
+  with {p: {st: Nothing {}, n: 7}} (do
+    with {r: case p of
+      {st: Just v} -> "just"
+      {st: Nothing} -> "nothing"}
+    (do
+      println r))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -195,10 +199,10 @@ fn filter_param_shadowing_local_let_is_not_expanded() {
 main = do
   replace *es = [{value: 10}, {value: 60}]
   rows <- *es
-  let q = {value: 99}
-  let kept = rows |> filter (\q -> q.value > 50)
-  println ("kept: " ++ show (count kept))
-  println ("q: " ++ show q.value)
+  with {q: {value: 99}} (do
+    with {kept: rows |> filter (\q -> q.value > 50)} (do
+      println ("kept: " ++ show (count kept))
+      println ("q: " ++ show q.value)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -341,10 +345,10 @@ impl Eq Int where
 main = do
   replace *items = [{n: 1}, {n: 2}]
   rows <- *items
-  let c = countWhere (\r -> r.n == 1) rows
-  println ("c: " ++ show c)
-  let f = count (filter (\r -> r.n == 1) rows)
-  println ("f: " ++ show f)
+  with {c: countWhere (\r -> r.n == 1) rows} (do
+    println ("c: " ++ show c)
+    with {f: count (filter (\r -> r.n == 1) rows)} (do
+      println ("f: " ++ show f)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -394,8 +398,7 @@ fn trim_in_where_is_unicode_aware() {
          main = do\n  \
            replace *p = [{name: \"\u{2003}x\u{2003}\"}]\n  \
            rows <- *p\n  \
-           let c = countWhere (\\r -> trim r.name == \"x\") rows\n  \
-           println (\"c: \" ++ show c)\n",
+           with {c: countWhere (\\r -> trim r.name == \"x\") rows} (do\n             println (\"c: \" ++ show c))\n",
     );
     assert!(ok, "program failed: {stderr}");
     assert!(
@@ -416,8 +419,8 @@ fn min_on_if_else_over_int_column_matches_in_memory() {
 main = do
   replace *t = [{a: 9}, {a: 10}]
   rows <- *t
-  let m = minOn (\r -> if r.a > 5 then r.a else 99) rows
-  println ("m: " ++ show m)
+  with {m: minOn (\r -> if r.a > 5 then r.a else 99) rows} (do
+    println ("m: " ++ show m))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -435,8 +438,8 @@ fn sort_by_if_else_over_int_column_matches_in_memory() {
 main = do
   replace *t = [{a: 10}, {a: 9}]
   rows <- *t
-  let s = rows |> sortBy (\r -> if r.a > 5 then r.a else 0)
-  println ("s: " ++ show s)
+  with {s: rows |> sortBy (\r -> if r.a > 5 then r.a else 0)} (do
+    println ("s: " ++ show s))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -462,8 +465,8 @@ fn int_arithmetic_overflow_in_where_compares_numerically() {
 main = do
   replace *t = [{a: 0 - 4000000000, b: 4000000000}]
   rows <- *t
-  let c = countWhere (\r -> r.a * r.b > 5) rows
-  println ("c: " ++ show c)
+  with {c: countWhere (\r -> r.a * r.b > 5) rows} (do
+    println ("c: " ++ show c))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -485,10 +488,10 @@ fn int_arithmetic_where_still_pushes_correct_results() {
 main = do
   replace *t = [{a: 5, b: 2}, {a: 1, b: 9}, {a: 0 - 3, b: 4}]
   rows <- *t
-  let n = countWhere (\r -> r.a * r.b > 8) rows
-  println ("n: " ++ show n)
-  let m = countWhere (\r -> r.a + r.b < 2) rows
-  println ("m: " ++ show m)
+  with {n: countWhere (\r -> r.a * r.b > 8) rows} (do
+    println ("n: " ++ show n)
+    with {m: countWhere (\r -> r.a + r.b < 2) rows} (do
+      println ("m: " ++ show m)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -510,11 +513,11 @@ fn float_neg_zero_equality_is_consistent() {
 main = do
   replace *t = [{x: 0.0}]
   rows <- *t
-  let neg = 0.0 * (0.0 - 1.0)
-  let e = countWhere (\r -> r.x == neg) rows
-  println ("eq: " ++ show e)
-  let g = countWhere (\r -> r.x > neg) rows
-  println ("gt: " ++ show g)
+  with {neg: 0.0 * (0.0 - 1.0)} (do
+    with {e: countWhere (\r -> r.x == neg) rows} (do
+      println ("eq: " ++ show e)
+      with {g: countWhere (\r -> r.x > neg) rows} (do
+        println ("gt: " ++ show g))))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -550,11 +553,11 @@ type T = {lvl: Level, n: Int 1}
 
 main = do
   replace *t = [{lvl: Low {}, n: 1}, {lvl: High {}, n: 2}]
-  let r = do
+  with {r: do
     i <- *t
     where i.lvl < High {}
-    yield i
-  println ("r: " ++ show (count r))
+    yield i} (do
+    println ("r: " ++ show (count r)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -577,11 +580,11 @@ type T = {lvl: Level, n: Int 1}
 
 main = do
   replace *t = [{lvl: Low {}, n: 1}, {lvl: High {}, n: 2}, {lvl: Low {}, n: 3}]
-  let r = do
+  with {r: do
     i <- *t
     where i.lvl == Low {}
-    yield i
-  println ("r: " ++ show (count r))
+    yield i} (do
+    println ("r: " ++ show (count r)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -601,12 +604,12 @@ fn minmax_over_text_column_returns_text_not_reparsed_int() {
 
 main = do
   replace *z = [{code: "007", n: 1}, {code: "005", n: 2}, {code: "003", n: 3}]
-  let hi = maxOn (\r -> r.code) *z
-  let lo = minOn (\r -> r.code) *z
-  -- `++` requires Text; if the runtime re-parsed "007" to Int 7 this would
-  -- both corrupt the value ("7") and break the Text concatenation.
-  println ("hi: " ++ hi)
-  println ("lo: " ++ lo)
+  with {hi: maxOn (\r -> r.code) *z} (do
+    with {lo: minOn (\r -> r.code) *z} (do
+      -- `++` requires Text; if the runtime re-parsed "007" to Int 7 this would
+      -- both corrupt the value ("7") and break the Text concatenation.
+      println ("hi: " ++ hi)
+      println ("lo: " ++ lo)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -646,8 +649,8 @@ main = do
   replace *t = [{lvl: Low {}, n: 1}, {lvl: High {}, n: 2}]
   -- Ord says Low < High, so the true max is High. A byte-wise SQL MAX over
   -- the tag strings would wrongly pick 'Low' ('L' > 'H') as bare Text.
-  let top = maxOn (\r -> r.lvl) *t
-  println ("top: " ++ show top)
+  with {top: maxOn (\r -> r.lvl) *t} (do
+    println ("top: " ++ show top))
 "#,
     );
     // Must never emit the byte-wise SQL MAX 'Low'. (Without pushdown the

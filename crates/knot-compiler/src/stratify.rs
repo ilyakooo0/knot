@@ -253,6 +253,36 @@ fn collect_edges(
         // same call shape `App(App(Var("minus"), a), b)` — detect it via
         // `diff_wrappers` and treat identically to a direct `diff` call
         // (B31: negation laundered through a user wrapper).
+        ast::ExprKind::With { record, body } => {
+            collect_edges(record, polarity, node_names, env, partial_diffs, diff_wrappers, out);
+            // A record-literal `with {name: value, ...} body` binds each field
+            // name to the field's value inside `body` — exactly like the old
+            // do-block `let`. Extend the alias env for the body so a
+            // with-bound `diff` alias (`with {d: diff} (… d all self …)`) is
+            // still recognized as set difference at its application site.
+            let mut body_env_storage;
+            let mut body_partial_storage;
+            let (body_env, body_partial) = if let ast::ExprKind::Record(fields) = &record.node {
+                body_env_storage = env.clone();
+                body_partial_storage = partial_diffs.clone();
+                for f in fields {
+                    bind_derived_alias(
+                        &ast::Pat {
+                            node: ast::PatKind::Var(f.name.clone()),
+                            span: f.value.span,
+                        },
+                        &f.value,
+                        node_names,
+                        &mut body_env_storage,
+                        &mut body_partial_storage,
+                    );
+                }
+                (&body_env_storage, &body_partial_storage)
+            } else {
+                (env, partial_diffs)
+            };
+            collect_edges(body, polarity, node_names, body_env, body_partial, diff_wrappers, out);
+        }
         ast::ExprKind::App { func, arg } => {
             // Fully-applied user diff-wrapper: `minus a b` → diff a b.
             // The wrapper takes exactly 2 args; if the outer App's func is
@@ -412,10 +442,6 @@ fn collect_edges(
             for s in stmts {
                 match &s.node {
                     ast::StmtKind::Bind { pat, expr } => {
-                        collect_edges(expr, polarity, node_names, &local_env, &local_partial, diff_wrappers, out);
-                        bind_derived_alias(pat, expr, node_names, &mut local_env, &mut local_partial);
-                    }
-                    ast::StmtKind::Let { pat, expr } => {
                         collect_edges(expr, polarity, node_names, &local_env, &local_partial, diff_wrappers, out);
                         bind_derived_alias(pat, expr, node_names, &mut local_env, &mut local_partial);
                     }

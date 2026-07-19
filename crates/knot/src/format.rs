@@ -1644,6 +1644,16 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         ExprKind::FieldAccess { expr, field } => {
             format!("{}.{}", render_expr_inline(expr, Prec::Atom), field)
         }
+        ExprKind::With { record, body } => {
+            // Never pun the `with` record: its field NAMES are the bindings,
+            // so `{lo: p.lo}` must stay explicit — `{p.lo}` would bind nothing.
+            let rec_s = match &record.node {
+                ExprKind::Record(fields) => render_record_inline_no_pun(fields),
+                _ => render_expr_inline(record, Prec::Atom),
+            };
+            let s = format!("with {} {}", rec_s, render_expr_inline(body, Prec::Lowest));
+            paren_if(parent > Prec::Lowest, s)
+        }
         ExprKind::List(items) => {
             let mut s = String::from("[");
             for (i, it) in items.iter().enumerate() {
@@ -1806,9 +1816,6 @@ fn render_stmt_inline(s: &Stmt) -> String {
         StmtKind::Bind { pat, expr } => {
             format!("{} <- {}", render_pat(pat), render_expr_inline(expr, Prec::Lowest))
         }
-        StmtKind::Let { pat, expr } => {
-            format!("let {} = {}", render_pat(pat), render_expr_inline(expr, Prec::Lowest))
-        }
         StmtKind::Where { cond } => {
             format!("where {}", render_expr_inline(cond, Prec::Lowest))
         }
@@ -1905,6 +1912,22 @@ fn render_record_inline(fields: &[Field<Expr>]) -> String {
             s.push_str(": ");
             s.push_str(&render_expr_inline(&f.value, Prec::Lowest));
         }
+    }
+    s.push('}');
+    s
+}
+
+/// Record fields always explicit (`name: value`), no punning. Used for `with`
+/// records where the field name is the binding, so punning would lose it.
+fn render_record_inline_no_pun(fields: &[Field<Expr>]) -> String {
+    let mut s = String::from("{");
+    for (i, f) in fields.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&f.name);
+        s.push_str(": ");
+        s.push_str(&render_expr_inline(&f.value, Prec::Lowest));
     }
     s.push('}');
     s
@@ -2126,12 +2149,6 @@ fn render_stmt(p: &mut Printer, s: &Stmt) {
         StmtKind::Bind { pat, expr } => {
             p.write(&render_pat(pat));
             p.write(" <- ");
-            render_expr(p, expr, Prec::Lowest);
-        }
-        StmtKind::Let { pat, expr } => {
-            p.write("let ");
-            p.write(&render_pat(pat));
-            p.write(" = ");
             render_expr(p, expr, Prec::Lowest);
         }
         StmtKind::Where { cond } => {
@@ -2423,24 +2440,24 @@ mod tests {
     // parenthesized. A statement that begins with a prefix operator (`-2`)
     // must stay a separate statement on reparse — the parser's layout column
     // guard has to fire at the block-item boundary even inside parens, or the
-    // `let a = 1` line glues to the `-2` line as `let a = 1 - 2`, the reparse
+    // `a <- pure 1` line glues to the `-2` line as `a <- pure 1 - 2`, the reparse
     // AST diverges, and the whole file silently reverts.
     #[test]
     fn b50_parenthesized_do_block_keeps_statement_boundary() {
         // The formatter parenthesizes the do-block (last app arg) and the
         // output must round-trip — no whole-file revert to the input.
         assert_fmt(
-            "main = forEach xs do\n  let a = 1\n  -2\n",
-            "main = forEach xs (do\n  let a = 1\n  -2)\n",
+            "main = forEach xs do\n  a <- pure 1\n  -2\n",
+            "main = forEach xs (do\n  a <- pure 1\n  -2)\n",
         );
-        assert_idempotent("main = forEach xs do\n  let a = 1\n  -2\n");
+        assert_idempotent("main = forEach xs do\n  a <- pure 1\n  -2\n");
     }
 
     #[test]
     fn b50_parenthesized_do_block_parses_two_statements() {
         // Parse the parenthesized rendering directly: the do-block must hold
-        // two statements (`let a = 1` and `-2`), not one glued `let a = 1 - 2`.
-        let src = "main = forEach xs (do\n  let a = 1\n  -2)\n";
+        // two statements (`a <- pure 1` and `-2`), not one glued `a <- pure 1 - 2`.
+        let src = "main = forEach xs (do\n  a <- pure 1\n  -2)\n";
         let lexer = Lexer::new(src);
         let (tokens, _) = lexer.tokenize();
         let (module, diags) = Parser::new(src.to_string(), tokens).parse_module();
@@ -2461,7 +2478,7 @@ mod tests {
         };
         let stmts = find_do(body).expect("expected a do-block argument");
         assert_eq!(stmts.len(), 2, "statements glued together: {:?}", stmts);
-        assert!(matches!(&stmts[0].node, StmtKind::Let { .. }), "{:?}", stmts[0]);
+        assert!(matches!(&stmts[0].node, StmtKind::Bind { .. }), "{:?}", stmts[0]);
     }
 
     #[test]

@@ -186,8 +186,8 @@ impl Pretty Int where
 main = do
   r <- atomic (do
     rows <- *items
-    let s = pretty 1
-    yield {})
+    with {s: pretty 1} (do
+      yield {}))
   yield {}
 "#,
     );
@@ -214,8 +214,8 @@ impl Pretty Int where
 main = do
   r <- atomic (do
     rows <- *items
-    let s = pretty 1
-    yield {})
+    with {s: pretty 1} (do
+      yield {}))
   yield {}
 "#,
     );
@@ -236,9 +236,9 @@ runIt = \f -> f 1
 main = do
   r <- atomic (do
     rows <- *items
-    let cb = \u -> println "x"
-    q <- runIt cb
-    yield {})
+    with {cb: \u -> println "x"} (do
+      q <- runIt cb
+      yield {}))
   yield {}
 "#,
     );
@@ -339,9 +339,9 @@ apply = \g x -> g x
 
 main = do
   atomic (do
-    let log = \u -> println "hi"
-    _ <- apply (\log -> log) (*items)
-    replace *items = [])
+    with {log: \u -> println "hi"} (do
+      _ <- apply (\log -> log) (*items)
+      replace *items = []))
   yield {}
 "#,
     );
@@ -353,8 +353,8 @@ fn provably_relation_free_atomic_still_rejected() {
     let diags = effect_diags(
         r#"main = do
   n <- atomic (do
-    let x = 1 + 2
-    yield x)
+    with {x: 1 + 2} (do
+      yield x))
   yield {}
 "#,
     );
@@ -440,8 +440,8 @@ useRec = \r -> do
   (r.fn) {}
 
 doStuff = do
-  let r = makeRec (\u -> println "hidden IO inside atomic")
-  atomic (useRec r)
+  with {r: makeRec (\u -> println "hidden IO inside atomic")} (do
+    atomic (useRec r))
 
 main = doStuff
 "#,
@@ -472,16 +472,16 @@ trait Doer a where
 
 impl Doer Int where
   doIt = \x -> do
-    let r = {fn: writeItems}
-    atomic (useRec r)
+    with {r: {fn: writeItems}} (do
+      atomic (useRec r))
 
 main : IO {rw *items} {}
 main = doIt 1
 
 noise : IO {console} {}
 noise = do
-  let bad = \u -> println "unrelated IO in another decl"
-  println "x"
+  with {bad: \u -> println "unrelated IO in another decl"} (do
+    println "x")
 "#,
     );
     assert!(
@@ -532,8 +532,8 @@ handle = do
   t <- now
   atomic (do
     rows <- *items
-    let hit = lookup rows
-    *items = rows)
+    with {hit: lookup rows} (do
+      *items = rows))
 
 main = handle
 "#,

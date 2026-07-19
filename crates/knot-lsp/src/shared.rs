@@ -1337,8 +1337,7 @@ pub(crate) fn resolve_var_to_source(
         }
         if let ast::ExprKind::Do(stmts) = &expr.node {
             for stmt in stmts {
-                if let ast::StmtKind::Bind { pat, expr: rhs }
-                | ast::StmtKind::Let { pat, expr: rhs } = &stmt.node
+                if let ast::StmtKind::Bind { pat, expr: rhs } = &stmt.node
                 {
                     if pat_binds_var(pat, var_name)
                         && let Some(name) = rhs_source_name(rhs) {

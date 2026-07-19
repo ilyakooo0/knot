@@ -567,8 +567,7 @@ fn span_is_record_pun(module: &Module, source: &str, span: Span) -> bool {
                 }
             ast::ExprKind::Do(stmts) => {
                 for stmt in stmts {
-                    if let ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } =
-                        &stmt.node
+                    if let ast::StmtKind::Bind { pat, .. } = &stmt.node
                         && pun_in_pat(pat, source, span) {
                             *found = true;
                             return;
@@ -1111,8 +1110,7 @@ pub(crate) fn collect_shadowed_names(
                 let mut pushed = 0usize;
                 for stmt in stmts {
                     match &stmt.node {
-                        ast::StmtKind::Bind { pat, expr }
-                        | ast::StmtKind::Let { pat, expr } => {
+                        ast::StmtKind::Bind { pat, expr } => {
                             walk(expr, old_name, new_name, stack, out);
                             let binds_old = pat_binds_name(pat, old_name);
                             let binds_new = pat_binds_name(pat, new_name);
@@ -1349,8 +1347,7 @@ pub(crate) fn collect_name_uses_in_decl(
                 let mut sh = shadowed;
                 for stmt in stmts {
                     match &stmt.node {
-                        ast::StmtKind::Bind { pat, expr }
-                        | ast::StmtKind::Let { pat, expr } => {
+                        ast::StmtKind::Bind { pat, expr } => {
                             // The RHS is evaluated before the pattern binds,
                             // so it sees the pre-bind shadow status.
                             walk_expr(expr, name, source, sh, out);
@@ -2252,7 +2249,7 @@ fn field_sites_in_expr<F: FnMut(&str, Span)>(expr: &ast::Expr, source: &str, f: 
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
                 match &stmt.node {
-                    ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } => {
+                    ast::StmtKind::Bind { pat, .. } => {
                         field_sites_in_pat(pat, source, f);
                     }
                     _ => {}

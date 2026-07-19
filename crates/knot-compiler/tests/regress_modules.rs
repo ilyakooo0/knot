@@ -157,8 +157,8 @@ fn units_match_across_a_module_boundary() {
     );
     s.write(
         "main.knot",
-        "import ./phys\n\nmain = do\n  let total = addForce baseForce (3.0 : Float (Kg*M/S^2))\n  \
-         println (show (stripFloatUnit total))\n  yield {}\n",
+        "import ./phys\n\nmain = with {total: addForce baseForce (3.0 : Float (Kg*M/S^2))} (do\n  \
+         println (show (stripFloatUnit total))\n  yield {})\n",
     );
 
     assert!(

@@ -679,15 +679,16 @@ impl<'a> DefResolver<'a> {
                 self.pop_scope();
             }
 
+            ast::ExprKind::With { record, body } => {
+                self.resolve_expr(record);
+                self.resolve_expr(body);
+            }
+
             ast::ExprKind::Do(stmts) => {
                 self.push_scope();
                 for stmt in stmts {
                     match &stmt.node {
                         ast::StmtKind::Bind { pat, expr } => {
-                            self.resolve_expr(expr);
-                            self.define_pat(pat);
-                        }
-                        ast::StmtKind::Let { pat, expr } => {
                             self.resolve_expr(expr);
                             self.define_pat(pat);
                         }

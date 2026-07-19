@@ -192,10 +192,9 @@ type Item = {id: Int 1}
 *items : [Item]
 
 main = do
-  n <- atomic (do
-    let f = \u -> *items
+  n <- atomic (with {f: \u -> *items} (do
     rows <- f {}
-    yield (count rows))
+    yield (count rows)))
   println (show n)
   yield {}
 "#,
@@ -214,10 +213,9 @@ type Item = {id: Int 1}
 
 main : IO {console} {}
 main = do
-  n <- atomic (do
-    let f = \u -> *items
+  n <- atomic (with {f: \u -> *items} (do
     rows <- f {}
-    yield (count rows))
+    yield (count rows)))
   println (show n)
   yield {}
 "#,
@@ -231,10 +229,9 @@ fn atomic_with_no_relation_ops_still_rejected() {
     let diags = effect_diags(
         r#"
 main = do
-  n <- atomic (do
-    let f = \u -> 42
+  n <- atomic (with {f: \u -> 42} (do
     x <- f {}
-    yield x)
+    yield x))
   println (show n)
   yield {}
 "#,
@@ -242,7 +239,7 @@ main = do
     assert_has_error(&diags, "atomic block must interact with relations", "");
 }
 
-/// IO through a let-bound lambda called inside atomic is now caught by the
+/// IO through a with-bound lambda called inside atomic is now caught by the
 /// IO-in-atomic check (the local binding's effects are visible).
 #[test]
 fn atomic_io_through_local_binding_rejected() {
@@ -254,9 +251,9 @@ type Item = {id: Int 1}
 main = do
   n <- atomic (do
     rows <- *items
-    let f = \u -> println "side effect"
-    x <- f {}
-    yield (count rows))
+    with {f: \u -> println "side effect"} (do
+      x <- f {}
+      yield (count rows)))
   println (show n)
   yield {}
 "#,
@@ -292,10 +289,9 @@ type Counter = {n: Int 1}
 *counter : [Counter]
 
 main = do
-  r <- atomic (do
-    let f = \u -> race *counter *counter
+  r <- atomic (with {f: \u -> race *counter *counter} (do
     x <- f {}
-    yield x)
+    yield x))
   println "done"
   yield {}
 "#,

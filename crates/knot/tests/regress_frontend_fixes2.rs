@@ -12,7 +12,7 @@
 //! 4. Formatter parenthesizes a `Pow` base that is itself a unit expression
 //!    (`(M^2)^3` must not print as `M^2^3`).
 //! 5. Time-unit literal sugar (`2 ms`) is suppressed when the identifier is
-//!    a locally-bound variable (lambda param, do-bind, do-let, let-in, case
+//!    a locally-bound variable (lambda param, do-bind, `with` field, case
 //!    binder).
 //! 6. Formatter keeps required parens around `yield` in application
 //!    argument position (`f (yield)`).
@@ -419,38 +419,15 @@ fn do_bind_named_seconds_is_not_unit_sugar() {
 }
 
 #[test]
-fn do_let_named_ms_is_not_unit_sugar() {
-    let src = "main = do\n  let ms = 5\n  yield g 2 ms\n";
+fn with_named_ms_is_not_unit_sugar() {
+    let src = "f = with {ms: 5} g 2 ms\n";
     let m = parse(src).expect("parse");
     let DeclKind::Fun { body: Some(b), .. } = &m.decls[0].node else {
         panic!("expected Fun");
     };
-    let ExprKind::Do(stmts) = &b.node else {
-        panic!("expected Do, got {:?}", b);
-    };
-    let StmtKind::Expr(yield_expr) = &stmts[1].node else {
-        panic!("expected Expr stmt, got {:?}", stmts[1]);
-    };
-    assert!(
-        expr_mentions_var(yield_expr, "ms"),
-        "`ms` was desugared to a unit factor: {:?}",
-        yield_expr
-    );
-}
-
-#[test]
-fn let_in_named_ms_is_not_unit_sugar() {
-    let src = "f = let ms = 5 in g 2 ms\n";
-    let m = parse(src).expect("parse");
-    let DeclKind::Fun { body: Some(b), .. } = &m.decls[0].node else {
-        panic!("expected Fun");
-    };
-    // let-in desugars to `(\ms -> g 2 ms) 5`.
-    let ExprKind::App { func, .. } = &b.node else {
-        panic!("expected App, got {:?}", b);
-    };
-    let ExprKind::Lambda { body, .. } = &func.node else {
-        panic!("expected Lambda, got {:?}", func);
+    // `with {ms: 5} g 2 ms` — the body must reference `ms` as a variable.
+    let ExprKind::With { body, .. } = &b.node else {
+        panic!("expected With, got {:?}", b);
     };
     assert!(
         expr_mentions_var(body, "ms"),

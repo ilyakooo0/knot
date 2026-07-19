@@ -335,6 +335,10 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
             walk_expr(func, r);
             walk_expr(arg, r);
         }
+        ExprKind::With { record, body } => {
+            walk_expr(record, r);
+            walk_expr(body, r);
+        }
         ExprKind::BinOp { lhs, rhs, .. } => {
             walk_expr(lhs, r);
             walk_expr(rhs, r);
@@ -390,7 +394,7 @@ fn walk_case_arm(arm: &CaseArm, r: &mut Refs) {
 
 fn walk_stmt(s: &Stmt, r: &mut Refs) {
     match &s.node {
-        StmtKind::Bind { pat, expr } | StmtKind::Let { pat, expr } => {
+        StmtKind::Bind { pat, expr } => {
             walk_pat(pat, r);
             walk_expr(expr, r);
         }

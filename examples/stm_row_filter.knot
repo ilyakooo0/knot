@@ -23,8 +23,8 @@ credit = \aid amount -> atomic do
   -- The `single (filter ...)` lookup is what the runtime SQL pushdown turns
   -- into a `WHERE "id" = ?` query — codegen extracts the predicate and the
   -- runtime calls `knot_stm_track_read_pred` to register a row-level filter.
-  let lookup = findById aid rows
-  *accounts = setBalance aid amount rows
+  with {lookup: findById aid rows}
+    (*accounts = setBalance aid amount rows)
 
 main = do
   replace *accounts = [

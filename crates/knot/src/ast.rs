@@ -223,6 +223,11 @@ pub enum ExprKind {
     /// `f x` — function application.
     App { func: Box<Expr>, arg: Box<Expr> },
 
+    /// `with record body` — every field of `record` (which must have a known
+    /// record type) is in scope as a variable inside `body`. The result is
+    /// `body`. Generalizes `let … in` for record-shaped bindings.
+    With { record: Box<Expr>, body: Box<Expr> },
+
     /// `a + b`, `x == y`, `xs |> filter f`
     BinOp {
         op: BinOp,
@@ -393,9 +398,6 @@ pub struct FieldPat {
 pub enum StmtKind {
     /// `pat <- expr` — monadic bind.
     Bind { pat: Pat, expr: Expr },
-
-    /// `let pat = expr` — local binding.
-    Let { pat: Pat, expr: Expr },
 
     /// `where cond` — guard / filter (requires `Alternative`).
     Where { cond: Expr },

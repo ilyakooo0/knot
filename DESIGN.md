@@ -127,22 +127,24 @@ Bind through multiple levels with `<-`:
 -- All people across all teams
 &allMembers = do
   teams <- *teams
-  let result = do
+  with {result: do
     t <- teams
     m <- t.members
-    yield {team: t.name, member: m.name}
-  yield result
+    yield {team: t.name, member: m.name}}
+  (do
+    yield result)
 
 -- Engineers on large teams
 &engineers = do
   teams <- *teams
-  let result = do
+  with {result: do
     t <- teams
     where (count t.members) > 10
     m <- t.members
     where m.role == "engineer"
-    yield {team: t.name, name: m.name}
-  yield result
+    yield {team: t.name, name: m.name}}
+  (do
+    yield result)
 ```
 
 #### Updating Nested Relations
@@ -182,22 +184,24 @@ type FlatMembership = {team: Text, member: Text, age: Int 1}
 -- Nest: group a flat relation into nested structure
 &nested = do
   memberships <- *memberships
-  let result = do
+  with {result: do
     t <- do m <- memberships; yield m.team
     yield {name: t, members: do
       m <- memberships
       where m.team == t
-      yield {name: m.member, age: m.age}}
-  yield result
+      yield {name: m.member, age: m.age}}}
+  (do
+    yield result)
 
 -- Flatten: expand nested relation into flat rows
 &flat = do
   teams <- *teams
-  let result = do
+  with {result: do
     t <- teams
     m <- t.members
-    yield {team: t.name, member: m.name, age: m.age}
-  yield result
+    yield {team: t.name, member: m.name, age: m.age}}
+  (do
+    yield result)
 ```
 
 #### Deeply Nested Relations
@@ -212,14 +216,15 @@ type Course = {name: Text, students: [{name: Text, grades: [{subject: Text, scor
 -- Find all failing grades across all departments
 &failing = do
   departments <- *departments
-  let result = do
+  with {result: do
     d <- departments
     c <- d.courses
     s <- c.students
     g <- s.grades
     where g.score < 50
-    yield {dept: d.name, course: c.name, student: s.name, subject: g.subject, score: g.score}
-  yield result
+    yield {dept: d.name, course: c.name, student: s.name, subject: g.subject, score: g.score}}
+  (do
+    yield result)
 ```
 
 ## Primitives
@@ -428,16 +433,17 @@ Relation comprehensions use `do` syntax with `yield` to produce rows. Since rela
 &richEmployees = do
   employees <- *employees
   departments <- *departments
-  let result = do
+  with {result: do
     e <- employees
     d <- departments
     where e.dept == d.name
     where d.budget > 1_000_000
-    yield {e.name, e.salary, d.budget}
-  yield result
+    yield {e.name, e.salary, d.budget}}
+  (do
+    yield result)
 ```
 
-The outer do-block is an IO do-block that binds from `*employees` (type `IO {} [Employee]`) and `*departments` (type `IO {} [Department]`). The inner `let result = do ...` is a pure comprehension over plain relation values. `<-` draws from a relation (like a `FROM` clause). `where` filters (like a `WHERE` clause). `yield` emits a row into the result relation.
+The outer do-block is an IO do-block that binds from `*employees` (type `IO {} [Employee]`) and `*departments` (type `IO {} [Department]`). The inner `with {result: do ...} ...` binds a pure comprehension over plain relation values to `result`. `<-` draws from a relation (like a `FROM` clause). `where` filters (like a `WHERE` clause). `yield` emits a row into the result relation.
 
 ### Pipe-Forward Composition
 
@@ -476,20 +482,22 @@ Pattern matching on `<-` filters and binds in one step:
 ```knot
 &bigCircleAreas = do
   shapes <- *shapes
-  let result = do
+  with {result: do
     Circle c <- shapes
     where c.radius > 10
-    yield {area: pi * c.radius * c.radius}
-  yield result
+    yield {area: pi * c.radius * c.radius}}
+  (do
+    yield result)
 
 &blockedDetails = do
   tickets <- *tickets
-  let result = do
+  with {result: do
     t <- tickets
     Blocked {dependencies} <- t.status
     dep <- dependencies
-    yield {t.title, dep}
-  yield result
+    yield {t.title, dep}}
+  (do
+    yield result)
 ```
 
 ### Cross-Variant Operations
@@ -524,12 +532,13 @@ describe = \rel -> case rel of
 ```knot
 &workload = do
   todos <- *todos
-  let result = do
+  with {result: do
     t <- todos
     where t.done == 0
     groupBy {t.owner}
-    yield {owner: t.owner, count: count t}
-  yield result
+    yield {owner: t.owner, count: count t}}
+  (do
+    yield result)
 ```
 
 The key expression is a record literal whose fields select the grouping columns. After `groupBy {t.owner}`, `t` is rebound from a single row to a sub-relation of all rows sharing that `owner` value. Field access on a group (e.g. `t.owner`) returns the shared key value. Aggregate functions like `count` operate on the whole group.
@@ -539,11 +548,12 @@ Multiple key fields group by their combination:
 ```knot
 &summary = do
   orders <- *orders
-  let result = do
+  with {result: do
     o <- orders
     groupBy {o.region, o.status}
-    yield {region: o.region, status: o.status, total: count o}
-  yield result
+    yield {region: o.region, status: o.status, total: count o}}
+  (do
+    yield result)
 ```
 
 Grouping is executed via SQLite — key columns are inserted into a temp table and sorted with `ORDER BY`, then consecutive rows with matching keys are collected into groups.
@@ -598,11 +608,12 @@ The pattern for querying relations is: IO-bind to get the value, then pure compr
 ```knot
 &richEmployees = do
   employees <- *employees       -- IO bind: [Employee] from IO {} [Employee]
-  let result = do               -- pure comprehension on the value
+  with {result: do              -- pure comprehension on the value
     e <- employees
     where e.salary > 100000
-    yield e
-  yield result
+    yield e}
+  (do
+    yield result)
 ```
 
 The compiler detects whether a do-block is IO or relational based on the types of bound expressions. IO do-blocks work correctly in all positions, including as branches of `if`/`then`/`else`.
@@ -779,14 +790,15 @@ The combination of `fork`, `atomic`, and `retry` enables STM-style concurrent co
 
 waitForCompletion = \id -> atomic do
   tasks <- *tasks
-  let task = do
+  with {task: do
     t <- tasks
     where t.id == id
     where t.status == "done"
-    yield t
-  where (count task) == 0
-  retry
-  yield task
+    yield t}
+  (do
+    where (count task) == 0
+    retry
+    yield task)
 
 main = do
   *tasks = [{id: 1, status: "pending"}]
@@ -934,12 +946,14 @@ Request headers become constructor fields, just like body/query/path params. The
 
 ```knot
 api = serve Api where
-  GetTodos = \{authorization} -> do
-    let todos = allTodos
-    yield Ok {value: {body: todos, headers: {xTotalCount: length todos, xPage: 1}}}
-  CreateTodo = \{title, authorization, xIdempotencyKey} -> do
-    let id = addTodo title
-    yield Ok {value: {body: {id: id}, headers: {}}}
+  GetTodos = \{authorization} ->
+    with {todos: allTodos}
+    (do
+      yield Ok {value: {body: todos, headers: {xTotalCount: length todos, xPage: 1}}})
+  CreateTodo = \{title, authorization, xIdempotencyKey} ->
+    with {id: addTodo title}
+    (do
+      yield Ok {value: {body: {id: id}, headers: {}}})
   HealthCheck = \{} -> yield Ok {value: {status: "ok"}}
 ```
 
@@ -1521,10 +1535,11 @@ type Measurement = {distance: Float M, time: Float S}
 -- Units flow through queries
 &speeds = do
   measurements <- *measurements
-  let result = do
+  with {result: do
     m <- measurements
-    yield {speed: m.distance / m.time}   -- Float (M/S)
-  yield result
+    yield {speed: m.distance / m.time}}   -- Float (M/S)
+  (do
+    yield result)
 ```
 
 #### Interaction with Traits
@@ -1774,9 +1789,10 @@ api = serve Api where
           people <- *people
           *people = union people [person]
         yield Ok {value: {ok: true, error: Nothing {}}}
-      Err {error} -> do
-        let msg = fold (\acc v -> acc ++ v.message ++ "; ") "" error.violations
-        yield Ok {value: {ok: false, error: Just {value: msg}}}
+      Err {error} ->
+        with {msg: fold (\acc v -> acc ++ v.message ++ "; ") "" error.violations}
+        (do
+          yield Ok {value: {ok: false, error: Just {value: msg}}})
 ```
 
 ### Traits
@@ -1925,12 +1941,13 @@ formatTitle = \title -> toUpper (take 1 title) ++ drop 1 title
 
 pendingFor = \user -> do
   todos <- *todos
-  let result = do
+  with {result: do
     t <- todos
     where t.owner == user
     Open {} <- t.status
-    yield {t.title, t.priority}
-  yield result
+    yield {t.title, t.priority}}
+  (do
+    yield result)
 
 add = \title owner priority -> do
   todos <- *todos
@@ -1954,12 +1971,13 @@ resolve = \title owner msg -> do
 
 &workload = do
   todos <- *todos
-  let result = do
+  with {result: do
     t <- todos
     Open {} <- t.status
     groupBy {t.owner}
-    yield {owner: t.owner, count: count t}
-  yield result
+    yield {owner: t.owner, count: count t}}
+  (do
+    yield result)
 
 api = serve Api where
   GetTodos = \{user} -> do

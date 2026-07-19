@@ -39,7 +39,7 @@ fn parse(src: &str) -> knot::ast::Module {
 fn check_src(src: &str) -> Vec<Diagnostic> {
     let mut module = parse(src);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, _refine, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields) =
+    let (diags, _monad, _type_info, _local, _refine, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields) =
         knot_compiler::infer::check(&mut module);
     diags
 }
@@ -169,11 +169,11 @@ fn unit_var_behind_substituted_lambda_param_is_not_generalized() {
     // (it is env-bound through p), so using g at both <M> and <S> is a
     // unit mismatch — previously this compiled.
     let src = r#"bad = \p -> do
-  let stripped = stripFloatUnit p
-  let g = \y -> y + p
-  println (show (g (1.0 : Float M)))
-  println (show (g (1.0 : Float S)))
-  yield {}
+  with {stripped: stripFloatUnit p} (do
+    with {g: \y -> y + p} (do
+      println (show (g (1.0 : Float M)))
+      println (show (g (1.0 : Float S)))
+      yield {}))
 main = bad (2.0 : Float M)
 "#;
     let diags = check_src(src);
@@ -825,12 +825,12 @@ fn do_blocks_at_identical_offsets_in_different_files_use_their_own_monads() {
     prog.push_str("\n  x <- r\n  yield (x + 1)\n");
     prog.push_str(
         r#"main = do
-  let res = f1 (Just {value: 41})
-  case res of
-    Just {value} -> println ("maybe: " ++ show value)
-    _ -> println "none"
-  println ("list: " ++ show (count (f2 [1, 2, 3])))
-  yield {}
+  with {res: f1 (Just {value: 41})} (do
+    case res of
+      Just {value} -> println ("maybe: " ++ show value)
+      _ -> println "none"
+    println ("list: " ++ show (count (f2 [1, 2, 3])))
+    yield {})
 "#,
     );
     let c = compile_files("monad_span_collision", &prog, &[("lib.knot", lib)]);
@@ -855,10 +855,10 @@ fn let_bound_io_lambda_in_do_compiles_and_runs() {
     let (stdout, stderr, ok) = compile_and_run(
         "let_bound_io_lambda",
         r#"main = do
-  let f = \y -> println (show y)
-  f 1
-  f 2
-  yield {}
+  with {f: \y -> println (show y)} (do
+    f 1
+    f 2
+    yield {})
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -917,11 +917,11 @@ fn traverse_empty_in_maybe_context_yields_just_empty() {
 noRows : [{n: Int 1}]
 noRows = []
 main = do
-  let res = traverse half noRows
-  case res of
-    Just {value} -> println ("got: " ++ show (count value))
-    _ -> println "nothing"
-  yield {}
+  with {res: traverse half noRows} (do
+    case res of
+      Just {value} -> println ("got: " ++ show (count value))
+      _ -> println "nothing"
+    yield {})
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -937,11 +937,11 @@ fn traverse_nonempty_still_dispatches_on_elements() {
         "traverse_nonempty",
         r#"half = \x -> if x.n > 0 then Just {value: x.n} else Nothing {}
 main = do
-  let res = traverse half [{n: 1}, {n: 2}]
-  case res of
-    Just {value} -> println ("got: " ++ show (count value))
-    _ -> println "nothing"
-  yield {}
+  with {res: traverse half [{n: 1}, {n: 2}]} (do
+    case res of
+      Just {value} -> println ("got: " ++ show (count value))
+      _ -> println "nothing"
+    yield {})
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -1072,7 +1072,7 @@ main = do
 
 #[test]
 fn out_of_range_int_literal_is_a_lex_error() {
-    let diags = lex_diags("main = do\n  let x = 99999999999999999999\n  yield {}\n");
+    let diags = lex_diags("main = with {x: 99999999999999999999} (do\n  yield {})\n");
     assert!(
         has_error(&diags, "integer literal is out of range"),
         "expected an out-of-range diagnostic, got: {diags:?}"
@@ -1083,7 +1083,7 @@ fn out_of_range_int_literal_is_a_lex_error() {
 fn out_of_range_int_literal_fails_the_build() {
     let stderr = compile_expect_error(
         "int_overflow",
-        "main = do\n  let x = 99999999999999999999\n  println (show x)\n  yield {}\n",
+        "main = with {x: 99999999999999999999} (do\n  println (show x)\n  yield {})\n",
     );
     assert!(
         stderr.contains("integer literal is out of range"),

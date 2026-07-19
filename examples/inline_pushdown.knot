@@ -22,8 +22,8 @@ case2 = do
 -- 3. filter then count, with predicate via helper.
 case3 = do
   emps <- *employees
-  let filtered = emps |> filter (\e -> isHighEarner e)
-  yield (count filtered)
+  with {filtered: emps |> filter (\e -> isHighEarner e)}
+    (yield (count filtered))
 
 -- 4. filter using a curried helper.
 case4 = do

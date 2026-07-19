@@ -503,6 +503,10 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::DerivedRef(_) => {
                 self.add(self.strip_parens(expr.span), TOK_NAMESPACE, MOD_READONLY);
             }
+            ast::ExprKind::With { record, body } => {
+                self.visit_expr(record);
+                self.visit_expr(body);
+            }
             ast::ExprKind::FieldAccess { expr: inner, field } => {
                 self.visit_expr(inner);
                 // Field name span: the part after the `.`. A parenthesized field
@@ -570,10 +574,6 @@ impl<'a> TokenCollector<'a> {
                 for stmt in stmts {
                     match &stmt.node {
                         ast::StmtKind::Bind { pat, expr } => {
-                            self.visit_expr(expr);
-                            self.visit_pat(pat, false);
-                        }
-                        ast::StmtKind::Let { pat, expr } => {
                             self.visit_expr(expr);
                             self.visit_pat(pat, false);
                         }

@@ -26,7 +26,7 @@ fn parse(src: &str) -> knot::ast::Module {
 fn check_src(src: &str) -> Vec<Diagnostic> {
     let mut module = parse(src);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, _targets, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields) =
+    let (diags, _monad, _type_info, _local, _targets, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields) =
         knot_compiler::infer::check(&mut module);
     diags
 }
@@ -193,12 +193,11 @@ fn ctor_pattern_bind_on_source_in_let_comprehension() {
     let src = r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 *shapes : [Shape]
 
-main = do
-  let circles = do
-        Circle c <- *shapes
-        yield {radius: c.radius}
+main = with {circles: do
+      Circle c <- *shapes
+      yield {radius: c.radius}} (do
   p <- println "ok"
-  yield {}
+  yield {})
 "#;
     let diags = check_src(src);
     assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
@@ -210,13 +209,12 @@ fn ctor_pattern_bind_via_intermediate_still_typechecks() {
     let src = r#"data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 *shapes : [Shape]
 
-main = do
-  let circles = do
-        rows <- *shapes
-        Circle c <- rows
-        yield {radius: c.radius}
+main = with {circles: do
+      rows <- *shapes
+      Circle c <- rows
+      yield {radius: c.radius}} (do
   p <- println "ok"
-  yield {}
+  yield {})
 "#;
     let diags = check_src(src);
     assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);

@@ -41,7 +41,7 @@ fn audit4() {
     probe_revert("messy_record", "main={a:1,b:2,c:3}\n");
     probe_revert("messy_nested_do_case", "main=do\n x<-foo\n case x of\n  Just{value:v}->do\n   println v\n   yield v\n  Nothing{}->yield 0\n");
     probe_revert("messy_if", "main=if   a then   b   else c\n");
-    probe_revert("messy_let_in", "main=let x=1 in let y=2 in x+y\n");
+    probe_revert("messy_with", "main=with {x:1} with {y:2} x+y\n");
     probe_revert("messy_lambda", "f=\\x    y->x+y\n");
     probe_revert("messy_trait", "trait Eq a where\n eq:a->a->Bool\n neq x y=not (eq x y)\n");
     probe_revert("messy_impl", "impl Eq Int where\n eq x y=x==y\n");

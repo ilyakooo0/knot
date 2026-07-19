@@ -39,7 +39,7 @@ fn check_src(src: &str) -> Vec<Diagnostic> {
     let mut module = parse(src);
     knot_compiler::base::inject_prelude(&mut module);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, _refine, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields) =
+    let (diags, _monad, _type_info, _local, _refine, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields) =
         knot_compiler::infer::check(&mut module);
     diags
 }
@@ -267,18 +267,17 @@ fn io_action_from_a_callback_param_is_the_block_result() {
 // ── 7. Pure `let` do-blocks ───────────────────────────────────────
 
 /// `do { let n = …; <expr> }` binds nothing monadic: no `<-`, no `where`, no
-/// `yield`. It is plain `let … in <expr>` and its type is the final
+/// `yield`. It is plain `with {n: …} <expr>` and its type is the final
 /// expression's — not `m Bool` for some invented monad `m`.
 #[test]
-fn pure_let_do_block_has_the_final_expressions_type() {
+fn pure_with_do_block_has_the_final_expressions_type() {
     let src = "isValidHex : Text -> Bool\n\
-               isValidHex = \\s -> do\n\
-               \x20 let n = length s\n\
-               \x20 n > 0 && n % 2 == 0\n\
+               isValidHex = \\s -> with {n: length s} (do\n\
+               \x20 n > 0 && n % 2 == 0)\n\
                main = do\n\
                \x20 println (show (isValidHex \"abc\"))\n\
                \x20 println (show (isValidHex \"abcd\"))\n";
-    let (stdout, stderr, ok) = compile_and_run("pure_let_do", src, &[]);
+    let (stdout, stderr, ok) = compile_and_run("pure_with_do", src, &[]);
     assert!(ok, "program failed: {stderr}");
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(
@@ -287,16 +286,15 @@ fn pure_let_do_block_has_the_final_expressions_type() {
     );
 }
 
-/// An explicit `yield` in an otherwise-pure `let` block still asks for the
-/// monadic reading — the block is a one-element comprehension, not a `let`.
+/// An explicit `yield` in an otherwise-pure `with` block still asks for the
+/// monadic reading — the block is a one-element comprehension, not a `with`.
 #[test]
-fn let_block_with_explicit_yield_stays_monadic() {
+fn with_block_with_explicit_yield_stays_monadic() {
     let src = "ones : [Int 1]\n\
-               ones = do\n\
-               \x20 let n = 1\n\
-               \x20 yield n\n\
+               ones = with {n: 1} (do\n\
+               \x20 yield n)\n\
                main = println (show (count ones))\n";
-    assert_clean(src, "a let block with an explicit yield");
+    assert_clean(src, "a with block with an explicit yield");
 }
 
 // ── 8 & 10. `main` annotations and `{}` as a result ───────────────
@@ -339,8 +337,8 @@ fn bare_unit_and_yield_unit_agree_as_an_io_result() {
         "an IO do-block ending in a bare `{}`",
     );
     assert_clean(
-        "main = do\n  println \"a\"\n  let done : {} = {}\n  done\n",
-        "an IO do-block ending in a let-bound unit",
+        "main = do\n  println \"a\"\n  with {done: ({} : {})} done\n",
+        "an IO do-block ending in a with-bound unit",
     );
 }
 

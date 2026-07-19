@@ -15,18 +15,18 @@ main = do
   sales <- *sales
 
   -- 1. fold over a bare source binding: total revenue across every row
-  let total = fold (\acc s -> acc + s.qty * s.price) 0 sales
-  println ("total revenue: " ++ show total)
+  with {total: fold (\acc s -> acc + s.qty * s.price) 0 sales} (do
+    println ("total revenue: " ++ show total)
 
-  -- 2. fold over a filter expression: revenue for high-qty items only
-  let bulk = fold (\acc s -> acc + s.qty * s.price) 0 (filter (\s -> s.qty > 3) sales)
-  println ("bulk-only revenue: " ++ show bulk)
+    -- 2. fold over a filter expression: revenue for high-qty items only
+    with {bulk: fold (\acc s -> acc + s.qty * s.price) 0 (filter (\s -> s.qty > 3) sales)} (do
+      println ("bulk-only revenue: " ++ show bulk)
 
-  -- 3. fold over a do-block (SQL plan): count rows priced > 25
-  let pricey = fold (\acc _ -> acc + 1) 0 do
-    s <- sales
-    where s.price > 25
-    yield s
-  println ("rows priced > 25: " ++ show pricey)
+      -- 3. fold over a do-block (SQL plan): count rows priced > 25
+      with {pricey: fold (\acc _ -> acc + 1) 0 do
+        s <- sales
+        where s.price > 25
+        yield s} (do
+        println ("rows priced > 25: " ++ show pricey)
 
-  yield {}
+        yield {})))

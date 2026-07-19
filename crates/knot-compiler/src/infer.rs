@@ -144,6 +144,11 @@ pub struct FromJsonTarget {
 /// Maps parseJson call-site spans to their resolved target info.
 pub type FromJsonTargets = HashMap<Span, FromJsonTarget>;
 
+/// Maps a `with` expression's span to the field names bound in its body.
+/// Codegen cannot re-derive these — the record's field names come from its
+/// *type*, not the AST — yet it must project each field into a local binding.
+pub type WithFields = HashMap<Span, Vec<String>>;
+
 /// Spans of field-access expressions (`t.members`) whose field type is a
 /// relation. Codegen cannot re-derive this — a record's field types are not
 /// reachable from the AST — yet it must know: a do-bind whose right-hand side
@@ -887,6 +892,9 @@ struct Infer {
     /// still an unsolved variable when the access is inferred, so the relation-
     /// valued ones are sieved out post-inference into `RelationFieldSpans`.
     field_accesses: Vec<(Span, Ty)>,
+    /// Field names bound by each `with` expression, keyed by the `with`'s span.
+    /// Codegen projects exactly these fields into locals for the body.
+    with_fields: Vec<(Span, Vec<String>)>,
     /// Refined-type names for which the directional refined-type check (which
     /// otherwise rejects implicitly introducing a refinement, e.g. a raw `Int`
     /// flowing where a `Nat` is required) is suppressed. `None` = suppress
@@ -980,6 +988,7 @@ impl Infer {
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
             field_accesses: Vec::new(),
+            with_fields: Vec::new(),
             suppress_refine_intro: None,
             deferred_unit_binops: Vec::new(),
             elem_pushdown_ok: ElemPushdownOk::default(),
@@ -5141,6 +5150,46 @@ impl Infer {
                 field_ty
             }
 
+            ast::ExprKind::With { record, body } => {
+                // Infer the record, then resolve its type to a concrete record
+                // so the field names are known. Each field is bound as a local
+                // variable for the body; the result is the body's type.
+                let record_ty = self.infer_expr(record);
+                let resolved = self.apply(&record_ty);
+                let fields = match &resolved {
+                    Ty::Record(fields, _) => fields.clone(),
+                    other => {
+                        let shown = self.display_ty(other);
+                        self.error(
+                            format!("`with` requires a record, but this has type {shown}"),
+                            record.span,
+                        );
+                        return Ty::Error;
+                    }
+                };
+                self.push_scope();
+                for (name, ty) in &fields {
+                    self.bind(name, Scheme::mono(ty.clone()));
+                }
+                // Register `with` field bindings in `let_bindings` (scoped to
+                // this body) so `value_references_source` can fold through
+                // them — same treatment `let` bindings got. If the record is
+                // a literal we can record the field expressions precisely.
+                let prev_let_bindings = self.let_bindings.clone();
+                if let ast::ExprKind::Record(field_exprs) = &record.node {
+                    for f in field_exprs {
+                        self.let_bindings
+                            .insert(f.name.clone(), f.value.clone());
+                    }
+                }
+                let body_ty = self.infer_expr(body);
+                self.let_bindings = prev_let_bindings;
+                self.pop_scope();
+                self.with_fields
+                    .push((expr.span, fields.keys().cloned().collect()));
+                body_ty
+            }
+
             ast::ExprKind::List(elems) => {
                 let elem_ty = self.fresh();
                 for e in elems {
@@ -5656,7 +5705,38 @@ impl Infer {
                 let annot_ty = self.ast_type_to_ty(ty);
                 self.in_type_annotation = saved_flag;
                 self.annotation_unit_vars = saved_unit_vars;
-                self.unify(&inner_ty, &annot_ty, inner.span);
+                // An inline `forall` ascription in infer mode must not coerce a
+                // monomorphic value to a polymorphic type: `(h : forall a. a -> a)`
+                // where `h` is an unannotated lambda param would otherwise unify
+                // the skolemised body against `h`'s flexible var, bind it toward
+                // the skolems, and — the skolems being dropped right after —
+                // generalise `g`'s inferred type into a lie (`g` usable at any
+                // argument type). Skolemise the quantified vars, unify the inner
+                // type against the skolemised body, then require the skolems to
+                // stay out of the enclosing environment — mirroring the escape
+                // check `check_expr` performs for an expected `forall`.
+                if let Ty::Forall(vars, body) = self.apply(&annot_ty) {
+                    let (skolemised, fresh_skolems) =
+                        self.skolemise_forall_body(&vars, &body);
+                    self.unify(&inner_ty, &skolemised, inner.span);
+                    let env_vars = self.free_vars_in_env();
+                    if fresh_skolems.iter().any(|s| env_vars.contains(s)) {
+                        self.error(
+                            "polymorphic type escapes its scope: this expression \
+                             must work for every type, but its type leaked into \
+                             the surrounding context — an inline `forall` \
+                             annotation cannot make a monomorphic value \
+                             polymorphic"
+                                .into(),
+                            expr.span,
+                        );
+                    }
+                    for s in fresh_skolems {
+                        self.skolems.remove(&s);
+                    }
+                } else {
+                    self.unify(&inner_ty, &annot_ty, inner.span);
+                }
                 annot_ty
             }
 
@@ -7033,7 +7113,7 @@ impl Infer {
     fn stmt_has_io(&self, stmts: &[ast::Stmt]) -> bool {
         for stmt in stmts {
             match &stmt.node {
-                ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } | ast::StmtKind::Expr(expr) => {
+                ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Expr(expr) => {
                     if self.expr_is_io_prescan(expr) {
                         return true;
                     }
@@ -7094,10 +7174,12 @@ impl Infer {
                 stmts.iter().any(|s| match &s.node {
                     ast::StmtKind::Bind { expr, .. } => self.expr_is_io_prescan(expr),
                     ast::StmtKind::Expr(expr) => self.expr_is_io_prescan(expr),
-                    ast::StmtKind::Let { expr, .. } => self.expr_is_io_prescan(expr),
                     ast::StmtKind::Where { cond } => self.expr_is_io_prescan(cond),
                     ast::StmtKind::GroupBy { key } => self.expr_is_io_prescan(key),
                 })
+            }
+            ast::ExprKind::With { record, body } => {
+                self.expr_is_io_prescan(record) || self.expr_is_io_prescan(body)
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io_prescan(body),
             ast::ExprKind::TimeUnitLit { value, .. } => self.expr_is_io_prescan(value),
@@ -7315,37 +7397,6 @@ impl Infer {
                             self.source_var_binds
                                 .insert(var_name.clone(), source_name.clone());
                         }
-                }
-                ast::StmtKind::Let { pat, expr } => {
-                    let expr_ty = self.infer_expr(expr);
-                    // A `let x = ioAction` only *binds* the IO action description;
-                    // it does not run it (only `x <- ioAction` sequences/executes
-                    // it). So a let-bound IO value must not contribute its effects
-                    // to the block, nor mark the block as IO — otherwise honest
-                    // effect annotations on never-executed actions are rejected.
-                    // Let-generalization: for simple variable patterns,
-                    // generalize the binding so it can be used polymorphically
-                    // (e.g., `let id = \x -> x` should be usable at multiple types).
-                    if let ast::PatKind::Var(name) = &pat.node {
-                        let applied = self.apply(&expr_ty);
-                        let scheme = self.generalize(&applied);
-                        self.bind(name, scheme);
-                        self.binding_types.push((pat.span, applied));
-                    } else {
-                        self.check_pattern(pat, &expr_ty);
-                    }
-
-                    // Track `let x = *foo` for `set` full-replacement detection.
-                    if let ast::PatKind::Var(var_name) = &pat.node {
-                        if let ast::ExprKind::SourceRef(source_name) = &expr.node {
-                            self.source_var_binds
-                                .insert(var_name.clone(), source_name.clone());
-                        }
-                        // Track the let body so the full-replacement check
-                        // can fold through `*rel = let_bound_var` when the
-                        // body references the source.
-                        self.let_bindings.insert(var_name.clone(), expr.clone());
-                    }
                 }
                 ast::StmtKind::Where { cond } => {
                     let cond_ty = self.infer_expr(cond);
@@ -10760,6 +10811,12 @@ fn value_references_source_inner(
                     arg, source_name, aliases, let_bindings, visited,
                 )
         }
+        ast::ExprKind::With { record, body } => {
+            value_references_source_inner(record, source_name, aliases, let_bindings, visited)
+                || value_references_source_inner(
+                    body, source_name, aliases, let_bindings, visited,
+                )
+        }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
             value_references_source_inner(lhs, source_name, aliases, let_bindings, visited)
                 || value_references_source_inner(
@@ -10793,9 +10850,6 @@ fn value_references_source_inner(
         }
         ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
             ast::StmtKind::Bind { expr, .. } => value_references_source_inner(
-                expr, source_name, aliases, let_bindings, visited,
-            ),
-            ast::StmtKind::Let { expr, .. } => value_references_source_inner(
                 expr, source_name, aliases, let_bindings, visited,
             ),
             ast::StmtKind::Where { cond } => value_references_source_inner(
@@ -10854,6 +10908,7 @@ pub type CheckOutput = (
     ShowUnitStrings,
     SumFloatSpans,
     RelationFieldSpans,
+    WithFields,
 );
 
 /// Run type inference on a parsed module. Returns diagnostics,
@@ -11264,8 +11319,9 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
     let type_info = infer.extract_type_info();
     let local_type_info = infer.extract_local_type_info();
     let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
+    let with_fields: WithFields = infer.with_fields.iter().cloned().collect();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans, relation_fields)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans, relation_fields, with_fields)
 }
 
 
@@ -11475,6 +11531,10 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
             f(func);
             f(arg);
         }
+        With { record, body } => {
+            f(record);
+            f(body);
+        }
         BinOp { lhs, rhs, .. } => {
             f(lhs);
             f(rhs);
@@ -11494,7 +11554,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
         Do(stmts) => {
             for s in stmts {
                 match &mut s.node {
-                    ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => f(expr),
+                    ast::StmtKind::Bind { expr, .. } => f(expr),
                     ast::StmtKind::Where { cond } => f(cond),
                     ast::StmtKind::GroupBy { key } => f(key),
                     ast::StmtKind::Expr(e) => f(e),
@@ -11712,14 +11772,14 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields) = check(&mut module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields) = check(&mut module);
         diags
     }
 
     fn type_info_for(src: &str) -> TypeInfo {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields) = check(&mut module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields) = check(&mut module);
         type_info
     }
 

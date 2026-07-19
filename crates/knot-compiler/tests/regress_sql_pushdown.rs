@@ -80,14 +80,14 @@ main = do
     {n: 6}, {n: 7}, {n: 8}, {n: 9}, {n: 10}
   ]
   all <- *items
-  let bad = all |> take 5 |> drop 2
-  println ("take_drop_count: " ++ show (count bad))
-  println ("take_drop: " ++ show bad)
-  let good = all |> drop 2 |> take 3
-  println ("drop_take: " ++ show good)
-  let sorted_after_take = all |> take 3 |> sortBy (\x -> x.n)
-  println ("sat_count: " ++ show (count sorted_after_take))
-  yield {}
+  with {bad: all |> take 5 |> drop 2} (do
+    println ("take_drop_count: " ++ show (count bad))
+    println ("take_drop: " ++ show bad)
+    with {good: all |> drop 2 |> take 3} (do
+      println ("drop_take: " ++ show good)
+      with {sorted_after_take: all |> take 3 |> sortBy (\x -> x.n)} (do
+        println ("sat_count: " ++ show (count sorted_after_take))
+        yield {})))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -110,9 +110,9 @@ fn pipe_count_after_take_respects_limit() {
 main = do
   replace *items = [{n: 1}, {n: 2}, {n: 3}, {n: 4}, {n: 5}]
   all <- *items
-  let n = all |> take 2 |> count
-  println ("n: " ++ show n)
-  yield {}
+  with {n: all |> take 2 |> count} (do
+    println ("n: " ++ show n)
+    yield {})
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -131,19 +131,19 @@ fn aggregates_resolve_through_yield_projection() {
 main = do
   replace *items = [{amt: 100, qty: 1}, {amt: 200, qty: 2}]
   items <- *items
-  let s = sum (map (\x -> x.amt) (do
+  with {s: sum (map (\x -> x.amt) (do
     i <- items
-    yield {amt: i.qty}))
-  println ("sum: " ++ show s)
-  let f = count (filter (\x -> x.amt > 1) (do
+    yield {amt: i.qty}))} (do
+    println ("sum: " ++ show s)
+    with {f: count (filter (\x -> x.amt > 1) (do
     i <- items
-    yield {amt: i.qty}))
-  println ("filtered: " ++ show f)
-  let cw = countWhere (\x -> x.amt > 1) (do
+    yield {amt: i.qty}))} (do
+      println ("filtered: " ++ show f)
+      with {cw: countWhere (\x -> x.amt > 1) (do
     i <- items
-    yield {amt: i.qty})
-  println ("countWhere: " ++ show cw)
-  yield {}
+    yield {amt: i.qty})} (do
+        println ("countWhere: " ++ show cw)
+        yield {})))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -226,10 +226,10 @@ writer = do
 
 waiter = atomic (do
   rows <- *flags
-  let n = countWhere (\g -> g.v == 1) (do
+  with {n: countWhere (\g -> g.v == 1) (do
     f <- rows
-    yield f)
-  if n == 0 then retry else n)
+    yield f)} (do
+    if n == 0 then retry else n))
 
 main = do
   replace *flags = [{id: 1, v: 0}]
@@ -269,10 +269,10 @@ offset = 100
 main = do
   replace *xs = [{n: 1}, {n: 2}]
   rows <- *xs
-  let offset = 5
-  let ys = map (\x -> x.n + offset) rows
-  println ("ys: " ++ show ys)
-  yield {}
+  with {offset: 5} (do
+    with {ys: map (\x -> x.n + offset) rows} (do
+      println ("ys: " ++ show ys)
+      yield {}))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -296,14 +296,14 @@ main = do
   replace *m = [{v: 5.5}, {v: 1.0}]
   replace *p = [{name: "ärger"}]
   rows <- *m
-  let a = countWhere (\r -> r.v * 2.0 > 3.0) rows
-  println ("arith: " ++ show a)
-  let b = countWhere (\r -> r.v % 2.0 > 1.2) rows
-  println ("fmod: " ++ show b)
-  ppl <- *p
-  let c = countWhere (\q -> toUpper q.name == "ÄRGER") ppl
-  println ("upper: " ++ show c)
-  yield {}
+  with {a: countWhere (\r -> r.v * 2.0 > 3.0) rows} (do
+    println ("arith: " ++ show a)
+    with {b: countWhere (\r -> r.v % 2.0 > 1.2) rows} (do
+      println ("fmod: " ++ show b)
+      ppl <- *p
+      with {c: countWhere (\q -> toUpper q.name == "ÄRGER") ppl} (do
+        println ("upper: " ++ show c)
+        yield {})))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -329,9 +329,9 @@ fn float_division_by_zero_in_where_keeps_ieee_semantics() {
 main = do
   replace *m = [{v: 0.0}, {v: 4.0}]
   rows <- *m
-  let n = countWhere (\r -> 10.0 / r.v > 1.0) rows
-  println ("n: " ++ show n)
-  yield {}
+  with {n: countWhere (\r -> 10.0 / r.v > 1.0) rows} (do
+    println ("n: " ++ show n)
+    yield {})
 "#,
     );
     assert!(ok, "float division by zero must not abort: {stderr}");
@@ -354,9 +354,9 @@ fn int_division_by_zero_in_where_panics_like_in_memory() {
 main = do
   replace *m = [{v: 0}, {v: 4}]
   rows <- *m
-  let n = countWhere (\r -> 10 / r.v > 1) rows
-  println ("n: " ++ show n)
-  yield {}
+  with {n: countWhere (\r -> 10 / r.v > 1) rows} (do
+    println ("n: " ++ show n)
+    yield {})
 "#,
     );
     // SQL NULL semantics would silently return 1; the in-memory semantics
@@ -378,9 +378,9 @@ fn division_by_literal_still_pushes_down_correctly() {
 main = do
   replace *m = [{v: 8.0}, {v: 1.0}]
   rows <- *m
-  let n = countWhere (\r -> r.v / 2.0 > 1.5) rows
-  println ("n: " ++ show n)
-  yield {}
+  with {n: countWhere (\r -> r.v / 2.0 > 1.5) rows} (do
+    println ("n: " ++ show n)
+    yield {})
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -400,11 +400,11 @@ fn case_referencing_bind_var_compiles_and_evaluates() {
 main = do
   replace *rs = [{x: 2, big: true}, {x: 1, big: false}, {x: 5, big: true}]
   rows <- *rs
-  let n = countWhere (\r -> r.x == (case r.big of
+  with {n: countWhere (\r -> r.x == (case r.big of
     True -> 2
-    _ -> 1)) rows
-  println ("n: " ++ show n)
-  yield {}
+    _ -> 1)) rows} (do
+    println ("n: " ++ show n)
+    yield {})
 "#,
     );
     // Previously an ICE: "codegen: undefined variable 'r'" — the case
@@ -425,11 +425,11 @@ fn int_arithmetic_where_still_correct() {
 main = do
   replace *m = [{a: 5, b: 2}, {a: 1, b: 9}]
   rows <- *m
-  let n = countWhere (\r -> r.a * r.b > 8) rows
-  println ("n: " ++ show n)
-  let q = countWhere (\r -> r.a % 2 == 1) rows
-  println ("q: " ++ show q)
-  yield {}
+  with {n: countWhere (\r -> r.a * r.b > 8) rows} (do
+    println ("n: " ++ show n)
+    with {q: countWhere (\r -> r.a % 2 == 1) rows} (do
+      println ("q: " ++ show q)
+      yield {}))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -455,8 +455,8 @@ main = do
   replace *items = []
   xs <- *items
   *items = union xs [{n: 5}]
-  let c = count xs
-  println (show c)
+  with {c: count xs} (do
+    println (show c))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -475,9 +475,9 @@ fn count_of_rebound_var_uses_rebound_value() {
 main = do
   replace *items = [{n: 1}, {n: 2}, {n: 3}]
   xs <- *items
-  let xs = filter (\x -> x.n > 2) xs
-  let c = count xs
-  println (show c)
+  with {xs: filter (\x -> x.n > 2) xs} (do
+    with {c: count xs} (do
+      println (show c)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -499,8 +499,8 @@ main = do
   atomic do
     cur <- *items
     *items = union cur [{n: 9}]
-  let c = count xs
-  println (show c)
+  with {c: count xs} (do
+    println (show c))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -522,8 +522,8 @@ main = do
   replace *items = []
   xs <- *items
   _ <- addItem 7
-  let c = count xs
-  println (show c)
+  with {c: count xs} (do
+    println (show c))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -544,12 +544,12 @@ fn lambda_param_inside_case_under_set_matcher() {
 main = do
   replace *items = []
   xs <- *items
-  let addRows = \flag -> union xs (case flag of
+  with {addRows: \flag -> union xs (case flag of
     true -> [{n: 1}]
-    _ -> [{n: 2}])
-  *items = addRows true
-  ys <- *items
-  println (show ys)
+    _ -> [{n: 2}])} (do
+    *items = addRows true
+    ys <- *items
+    println (show ys))
 "#,
     );
     // Previously an ICE: substitute_inner returned `case flag of ...`

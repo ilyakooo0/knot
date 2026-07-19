@@ -159,7 +159,7 @@ fn collect_containing_spans(expr: &ast::Expr, offset: usize, spans: &mut Vec<Spa
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
                 match &stmt.node {
-                    ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => {
+                    ast::StmtKind::Bind { expr, .. } => {
                         collect_containing_spans(expr, offset, spans);
                     }
                     ast::StmtKind::Expr(e) | ast::StmtKind::Where { cond: e } => {

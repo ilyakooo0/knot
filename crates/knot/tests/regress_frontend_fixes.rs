@@ -270,33 +270,48 @@ fn negative_case_arm_at_block_indent() {
 
 #[test]
 fn do_block_negative_statement_at_block_indent() {
-    let src = "main = do\n  let x = 5\n  -1\n";
+    let src = "main = do\n  with {x: 5} (do\n    -1)\n";
     let m = parse(src).unwrap_or_else(|e| panic!("do neg stmt: {}", e));
     match &decl_body(&m, "main").node {
         ExprKind::Do(stmts) => {
-            assert_eq!(stmts.len(), 2, "expected 2 statements, got {:?}", stmts);
+            assert_eq!(stmts.len(), 1, "expected 1 statement, got {:?}", stmts);
             match &stmts[0].node {
-                StmtKind::Let { expr, .. } => {
-                    assert!(
-                        matches!(&expr.node, ExprKind::Lit(_)),
-                        "let value absorbed `-1`: {:?}",
-                        expr.node
-                    );
-                }
-                other => panic!("expected Let, got {:?}", other),
+                StmtKind::Expr(e) => match &e.node {
+                    ExprKind::With { record, body } => {
+                        assert!(
+                            matches!(&record.node, ExprKind::Record(_)),
+                            "with record: {:?}",
+                            record.node
+                        );
+                        match &body.node {
+                            ExprKind::Do(inner) => {
+                                assert_eq!(
+                                    inner.len(),
+                                    1,
+                                    "expected 1 inner statement, got {:?}",
+                                    inner
+                                );
+                                // A prefix `-` over an integer literal folds into a
+                                // single negative literal at parse time (that is the
+                                // only way to write `i64::MIN`), so the statement is
+                                // `Lit(-1)`, not `Neg(Lit(1))`.
+                                assert!(
+                                    matches!(
+                                        &inner[0].node,
+                                        StmtKind::Expr(e)
+                                            if matches!(&e.node, ExprKind::Lit(Literal::Int(n)) if n == "-1")
+                                    ),
+                                    "inner stmt is not the negative literal -1: {:?}",
+                                    inner[0].node
+                                );
+                            }
+                            other => panic!("expected inner Do, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected With, got {:?}", other),
+                },
+                other => panic!("expected Expr(with), got {:?}", other),
             }
-            // A prefix `-` over an integer literal folds into a single negative
-            // literal at parse time (that is the only way to write `i64::MIN`),
-            // so the statement is `Lit(-1)`, not `Neg(Lit(1))`.
-            assert!(
-                matches!(
-                    &stmts[1].node,
-                    StmtKind::Expr(e)
-                        if matches!(&e.node, ExprKind::Lit(Literal::Int(n)) if n == "-1")
-                ),
-                "second stmt is not the negative literal -1: {:?}",
-                stmts[1].node
-            );
         }
         other => panic!("expected Do, got {:?}", other),
     }
@@ -325,20 +340,32 @@ fn deeper_indent_binop_continuation_still_works() {
 
 #[test]
 fn deeper_indent_binop_continuation_in_do_block() {
-    let src = "main = do\n  let x = 1\n    + 2\n  x\n";
+    // Operator indented PAST the block indent continues the expression —
+    // here the `with` record value absorbs the continuation.
+    let src = "main = do\n  with {x: 1\n    + 2} x\n";
     let m = parse(src).unwrap_or_else(|e| panic!("do continuation: {}", e));
     match &decl_body(&m, "main").node {
         ExprKind::Do(stmts) => {
-            assert_eq!(stmts.len(), 2, "expected 2 statements, got {:?}", stmts);
+            assert_eq!(stmts.len(), 1, "expected 1 statement, got {:?}", stmts);
             match &stmts[0].node {
-                StmtKind::Let { expr, .. } => {
-                    assert!(
-                        matches!(&expr.node, ExprKind::BinOp { op: BinOp::Add, .. }),
-                        "let value should be the continued Add: {:?}",
-                        expr.node
-                    );
-                }
-                other => panic!("expected Let, got {:?}", other),
+                StmtKind::Expr(e) => match &e.node {
+                    ExprKind::With { record, .. } => match &record.node {
+                        ExprKind::Record(fields) => {
+                            assert_eq!(fields.len(), 1, "expected 1 field");
+                            assert!(
+                                matches!(
+                                    &fields[0].value.node,
+                                    ExprKind::BinOp { op: BinOp::Add, .. }
+                                ),
+                                "with value should be the continued Add: {:?}",
+                                fields[0].value.node
+                            );
+                        }
+                        other => panic!("expected Record, got {:?}", other),
+                    },
+                    other => panic!("expected With, got {:?}", other),
+                },
+                other => panic!("expected Expr(with), got {:?}", other),
             }
         }
         other => panic!("expected Do, got {:?}", other),

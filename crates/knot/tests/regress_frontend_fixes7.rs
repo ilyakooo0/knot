@@ -8,10 +8,10 @@
 //!    declaration. It now `break`s on the malformed keyword, keeping any
 //!    effects parsed so far and a saner cursor, and recovers cleanly.
 //!
-//! 2. The synthetic `Annot` node wrapping a `let pat : Type = value` binding
-//!    took only the value's span, excluding the `: Type`. The span now covers
-//!    the union of the value and type spans (and crucially is never inverted —
-//!    in a `let` the type precedes the value).
+//! 2. A field annotation like `with {x: (value : Type)}` produced an `Annot`
+//!    node that took only the value's span, excluding the `: Type`. The span
+//!    now covers the union of the value and type spans (and crucially is never
+//!    inverted).
 
 use knot::ast::{DeclKind, ExprKind, StmtKind};
 
@@ -60,11 +60,11 @@ fn well_formed_effect_row_still_parses() {
 }
 
 #[test]
-fn let_annotation_span_covers_the_type() {
-    // The `Annot` wrapping `let x : Int = 5` must span both the type and the
+fn with_annotation_span_covers_the_type() {
+    // The `Annot` in `with {x: (5 : Int)}` must span both the type and the
     // value (never inverted). We locate the binding and assert its span covers
-    // the `Int = 5` source range.
-    let src = "main = do\n  let x : Int = 5\n  yield x\n";
+    // the `5 : Int` source range.
+    let src = "main = do\n  with {x: (5 : Int)} (yield x)\n";
     let (module, diags) = parse(src);
     assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
 
@@ -76,25 +76,33 @@ fn let_annotation_span_covers_the_type() {
         if let DeclKind::Fun { body: Some(b), .. } = &decl.node
             && let ExprKind::Do(stmts) = &b.node {
                 for st in stmts {
-                    if let StmtKind::Let { expr, .. } = &st.node
-                        && let ExprKind::Annot { ty, .. } = &expr.node {
-                            // span must be non-inverted and cover both the type
-                            // (which precedes the value) and the value.
-                            assert!(expr.span.start <= expr.span.end, "inverted span");
-                            assert!(
-                                expr.span.start <= int_off,
-                                "Annot span should start at/before the type"
-                            );
-                            assert!(
-                                expr.span.end > five_off,
-                                "Annot span should extend through the value"
-                            );
-                            // sanity: the type really is the `Int` we expect
-                            assert!(ty.span.start <= int_off + 3);
-                            found = true;
+                    if let StmtKind::Expr(e) = &st.node
+                        && let ExprKind::With { record, .. } = &e.node
+                        && let ExprKind::Record(fields) = &record.node {
+                            for f in fields {
+                                if let ExprKind::Annot { ty, .. } = &f.value.node {
+                                    // span must be non-inverted and cover both the
+                                    // type and the value.
+                                    assert!(
+                                        f.value.span.start <= f.value.span.end,
+                                        "inverted span"
+                                    );
+                                    assert!(
+                                        f.value.span.start <= five_off,
+                                        "Annot span should start at/before the value"
+                                    );
+                                    assert!(
+                                        f.value.span.end > int_off,
+                                        "Annot span should extend through the type"
+                                    );
+                                    // sanity: the type really is the `Int` we expect
+                                    assert!(ty.span.start <= int_off + 3);
+                                    found = true;
+                                }
+                            }
                         }
                 }
             }
     }
-    assert!(found, "did not find the annotated let binding");
+    assert!(found, "did not find the annotated with binding");
 }

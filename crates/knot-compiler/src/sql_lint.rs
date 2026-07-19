@@ -175,6 +175,10 @@ fn lint_expr(
             lint_expr(func, source_schemas, views, fun_bodies, diags);
             lint_expr(arg, source_schemas, views, fun_bodies, diags);
         }
+        ExprKind::With { record, body } => {
+            lint_expr(record, source_schemas, views, fun_bodies, diags);
+            lint_expr(body, source_schemas, views, fun_bodies, diags);
+        }
         ExprKind::If {
             cond,
             then_branch,
@@ -247,7 +251,6 @@ fn lint_stmt(
 ) {
     match &stmt.node {
         StmtKind::Bind { expr, .. } => lint_expr(expr, source_schemas, views, fun_bodies, diags),
-        StmtKind::Let { expr, .. } => lint_expr(expr, source_schemas, views, fun_bodies, diags),
         StmtKind::Where { cond } => lint_expr(cond, source_schemas, views, fun_bodies, diags),
         StmtKind::Expr(e) => lint_expr(e, source_schemas, views, fun_bodies, diags),
         StmtKind::GroupBy { .. } => {}
@@ -309,7 +312,7 @@ fn lint_do_block_skipping(
                 .position(|s| {
                     matches!(
                         &s.node,
-                        StmtKind::Bind { .. } | StmtKind::Let { .. } | StmtKind::GroupBy { .. }
+                        StmtKind::Bind { .. } | StmtKind::GroupBy { .. }
                     )
                 })
                 .map_or(stmts.len(), |p| i + 1 + p);
@@ -1104,6 +1107,9 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         ExprKind::App { func, arg } => {
             references_source(func, source_name) || references_source(arg, source_name)
         }
+        ExprKind::With { record, body } => {
+            references_source(record, source_name) || references_source(body, source_name)
+        }
         ExprKind::If {
             cond,
             then_branch,
@@ -1116,7 +1122,6 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         ExprKind::Lambda { body, .. } => references_source(body, source_name),
         ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
             StmtKind::Bind { expr, .. } => references_source(expr, source_name),
-            StmtKind::Let { expr, .. } => references_source(expr, source_name),
             StmtKind::Where { cond } => references_source(cond, source_name),
             StmtKind::Expr(e) => references_source(e, source_name),
             StmtKind::GroupBy { .. } => false,

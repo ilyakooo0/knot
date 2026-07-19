@@ -284,16 +284,18 @@ fn comprehension_binds_over_json_nested_fields() {
 main = do
   replace *drawings = [{name: "d1", shapes: [Circle {radius: 2.0}, Dot {}]}]
   replace *posts = [{title: "a", tags: ["x", "y"]}]
-  let circles = do
+  with {circles: do
         d <- *drawings
         Circle k <- d.shapes
-        yield {r: k.radius}
-  forEach circles (\c -> println ("r=" ++ show c.r))
-  let allTags = do
+        yield {r: k.radius}}
+    (do
+      forEach circles (\c -> println ("r=" ++ show c.r)))
+  with {allTags: do
         p <- *posts
         t <- p.tags
-        yield {tag: t}
-  forEach allTags (\t -> println ("tag=" ++ t.tag))
+        yield {tag: t}}
+    (do
+      forEach allTags (\t -> println ("tag=" ++ t.tag)))
 "#,
     );
 

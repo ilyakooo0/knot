@@ -246,10 +246,10 @@ struct EffectChecker {
     /// prevents under-reporting the caller's effects (and the spurious
     /// "declared effects are not used" warning it causes).
     fixed_row_effects: HashMap<String, EffectSet>,
-    /// Stack of local scopes mapping let-bound (or immediately-applied-
+    /// Stack of local scopes mapping with-bound (or immediately-applied-
     /// lambda-bound) function names to the effects of their bodies. Lets the
     /// checker see effects of calls through local bindings, e.g.
-    /// `do { let f = \u -> *items; rows <- f {} }` reads `items`.
+    /// `with {f: \u -> *items} (do { rows <- f {} })` reads `items`.
     ///
     /// The `bool` flags an *opaque mask*: an entry inserted only to shadow an
     /// outer effectful binding of the same name (a lambda/case parameter or a
@@ -929,6 +929,40 @@ impl EffectChecker {
 
             ast::ExprKind::UnaryOp { operand, .. } => self.infer_effects(operand),
 
+            ast::ExprKind::With { record, body } => {
+                let record_effects = self.infer_effects(record);
+                // A record-*literal* `with` exposes each field's bound
+                // sub-expression, so field binders can carry the latent
+                // effects of their values into the body — exactly like the
+                // old do-block `let` (which desugared to an immediately
+                // applied lambda and registered each lambda-valued binding
+                // in `local_fn_effects`). Without this, a with-bound lambda
+                // called in the body (`with {f: \u -> *items} (f {})`) drops
+                // the `r *items` read, and a with-bound callback passed by
+                // name to a higher-order function loses its IO effects.
+                if let ast::ExprKind::Record(fields) = &record.node {
+                    let mut scope = HashMap::new();
+                    for field in fields {
+                        let latent = self.latent_effects_of(&field.value);
+                        scope.insert(field.name.clone(), (latent, false));
+                    }
+                    let mark = self.shadowed.len();
+                    for field in fields {
+                        self.shadowed.push(field.name.clone());
+                    }
+                    self.local_fn_effects.push(scope);
+                    let body_effects = self.infer_effects(body);
+                    self.local_fn_effects.pop();
+                    self.shadowed.truncate(mark);
+                    record_effects.union(&body_effects)
+                } else {
+                    // Computed record — field values are opaque; effects of
+                    // evaluating the record itself were already charged.
+                    let body_effects = self.infer_effects(body);
+                    record_effects.union(&body_effects)
+                }
+            }
+
             ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
                 let is_replace = matches!(&expr.node, ast::ExprKind::ReplaceSet { .. });
                 let mut effects = self.infer_effects(value);
@@ -1126,39 +1160,17 @@ impl EffectChecker {
                 let shadow_mark = self.shadowed.len();
                 let mut effects = EffectSet::empty();
                 for stmt in stmts {
-                    // Register a let-bound value's latent effects under its
-                    // name so a later *execution* of it (`rows <- x`, or a bare
-                    // `x` statement) recovers them, while the `let` itself
-                    // charges nothing (binding an IO action ≠ running it). A
-                    // let-bound lambda contributes its body's effects when later
-                    // called (e.g. `let f = \u -> *items; rows <- f {}` reads
-                    // `items`); a let-bound IO action (e.g. `let x = readFile
-                    // "f"`) contributes the action's own effects when later
-                    // sequenced. An unused binding contributes nothing.
-                    if let ast::StmtKind::Let { pat, expr } = &stmt.node {
-                        // Record a latent-effect entry for every binder the
-                        // pattern introduces. A plain `let x = e` binds one
-                        // name, but a record destructure `let {fn} = {fn: \u ->
-                        // *items}` binds each field — and those field binders
-                        // must keep their value's latent effects too, or a
-                        // later `rows <- fn {}` silently drops the `r *items`
-                        // read (the value's effects are laundered past the
-                        // atomic gate / effect annotations).
-                        self.register_let_latent(pat, expr);
-                    }
                     let stmt_effects = self.infer_stmt_effects(stmt);
                     effects = effects.union(&stmt_effects);
                     // Binders come into scope for *later* statements.
-                    if let ast::StmtKind::Bind { pat, .. }
-                    | ast::StmtKind::Let { pat, .. } = &stmt.node
+                    if let ast::StmtKind::Bind { pat, .. } = &stmt.node
                     {
                         collect_pat_binders(pat, &mut self.shadowed);
                     }
                     // A `<-` bind rebinds its name to (opaque) relation rows, not
                     // an effectful action. Mask any same/outer-scope effect entry
                     // for that name so a later reference doesn't launder those
-                    // effects. (`let` names deliberately keep their latent-effect
-                    // entry registered above, so they are excluded here.)
+                    // effects.
                     if let ast::StmtKind::Bind { pat, .. } = &stmt.node {
                         let mut bind_names: Vec<String> = Vec::new();
                         collect_pat_binders(pat, &mut bind_names);
@@ -1281,24 +1293,26 @@ impl EffectChecker {
         visited: &mut HashSet<String>,
         known_params: &HashSet<String>,
     ) -> bool {
-        // Let-bound lambdas inside the body are analyzable: their bodies
+        // Locally-bound lambdas inside the body (with-bound record fields,
+        // immediately-applied-lambda parameters) are analyzable: their bodies
         // are part of the walked tree, so `touches_relations` and effect
         // inference both see through them. (The local_fn_effects scopes
         // those bindings lived in are already popped by the time the
         // Atomic arm runs this check, so collect them syntactically.)
-        // The same applies to lambda parameters bound to lambda-literal
-        // arguments — including the `(\f -> …) (\u -> …)` shape that
-        // desugared `let f = \u -> …` statements take.
         let mut local_lambdas: HashSet<String> = HashSet::new();
         walk_expr(expr, &mut |e| {
             match &e.node {
-                ast::ExprKind::Do(stmts) => {
-                    for stmt in stmts {
-                        if let ast::StmtKind::Let { pat, expr } = &stmt.node
-                            && let ast::PatKind::Var(name) = &pat.node
-                                && is_lambda_arg(expr) {
-                                    local_lambdas.insert(name.clone());
-                                }
+                // A record-literal `with` binds each field name to the field's
+                // value for the body — a lambda-valued field is analyzable
+                // exactly like an old `let`-bound lambda, so calls through it
+                // are NOT opaque.
+                ast::ExprKind::With { record, .. } => {
+                    if let ast::ExprKind::Record(fields) = &record.node {
+                        for field in fields {
+                            if is_lambda_arg(&field.value) {
+                                local_lambdas.insert(field.name.clone());
+                            }
+                        }
                     }
                 }
                 ast::ExprKind::App { .. } => {
@@ -1480,73 +1494,10 @@ impl EffectChecker {
     /// readFile`) contributes the builtin's effects so applying `f` later does
     /// not launder IO past the atomic gate; anything else contributes the
     /// value expression's own effects.
-    fn latent_effects_of(&mut self, expr: &ast::Expr) -> EffectSet {
-        if is_lambda_arg(expr) {
-            self.fun_body_effects(expr)
-        } else if let Some(alias) = self.builtin_alias_effects(expr) {
-            alias
-        } else {
-            self.infer_effects(expr)
-        }
-    }
-
-    /// Register latent-effect entries for the binders a `let` pattern
-    /// introduces, so a later reference recovers the effects of the value each
-    /// binder was bound to. A plain `let x = e` binds one name; a record
-    /// destructure `let {fn} = {fn: \u -> *items}` binds each field to the
-    /// matching sub-expression of the record *literal* value, and must keep
-    /// those effects too — otherwise `rows <- fn {}` drops the `r *items` read.
-    /// Nested record patterns recurse. When the value is not a record literal
-    /// there is no per-field sub-expression to attribute, so nothing is
-    /// recorded for the field binders (leaving them absent is the safe,
-    /// pre-existing behavior).
-    fn register_let_latent(&mut self, pat: &ast::Pat, value: &ast::Expr) {
-        match &pat.node {
-            ast::PatKind::Var(name) => {
-                let latent = self.latent_effects_of(value);
-                self.local_fn_effects
-                    .last_mut()
-                    .unwrap()
-                    .insert(name.clone(), (latent, false));
-            }
-            ast::PatKind::Record(field_pats) => {
-                // Only a record *literal* value exposes each field's bound
-                // sub-expression; a computed record (`let {fn} = mk {}`) is
-                // opaque here.
-                let ast::ExprKind::Record(value_fields) = &value.node else {
-                    return;
-                };
-                for fp in field_pats {
-                    let Some(vf) = value_fields.iter().find(|f| f.name == fp.name) else {
-                        continue;
-                    };
-                    match &fp.pattern {
-                        // Punned `{fn}` — the binder is the field name itself.
-                        None => {
-                            let latent = self.latent_effects_of(&vf.value);
-                            self.local_fn_effects
-                                .last_mut()
-                                .unwrap()
-                                .insert(fp.name.clone(), (latent, false));
-                        }
-                        // `{fn: p}` — recurse into the sub-pattern against the
-                        // field's value (handles `{fn: g}` and nested records).
-                        Some(sub) => self.register_let_latent(sub, &vf.value),
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
     /// Infer effects of a do-block statement.
     fn infer_stmt_effects(&mut self, stmt: &ast::Stmt) -> EffectSet {
         match &stmt.node {
             ast::StmtKind::Bind { expr, .. } => self.infer_effects(expr),
-            // `let x = ioAction` only binds the action description; it is not
-            // run unless later sequenced with `<-`. So it contributes no effects
-            // here (mirrors the same rule in infer.rs's `infer_do`).
-            ast::StmtKind::Let { .. } => EffectSet::empty(),
             ast::StmtKind::Where { cond } => self.infer_effects(cond),
             ast::StmtKind::GroupBy { key } => self.infer_effects(key),
             ast::StmtKind::Expr(expr) => self.infer_effects(expr),
@@ -1756,6 +1707,25 @@ impl EffectChecker {
         }
     }
 
+    /// Latent effects of a value bound by a `with` record field — the effects
+    /// a later *execution* of the bound name recovers, while the `with` itself
+    /// charges nothing (binding an IO action ≠ running it). A bound lambda
+    /// contributes its body's effects when later called (`with {f: \u ->
+    /// *items} (f {})` reads `items`); a point-free alias of a non-nullary IO
+    /// builtin contributes the builtin's effects so applying the field later
+    /// does not launder IO past the atomic gate; anything else contributes
+    /// the value expression's own effects. Mirrors the old do-block `let`
+    /// latent-effect registration.
+    fn latent_effects_of(&mut self, expr: &ast::Expr) -> EffectSet {
+        if is_lambda_arg(expr) {
+            self.fun_body_effects(expr)
+        } else if let Some(alias) = self.builtin_alias_effects(expr) {
+            alias
+        } else {
+            self.infer_effects(expr)
+        }
+    }
+
     /// Relation reads/writes performed by a closed-row (`fixed_row`) callee's
     /// *lambda* arguments. When `propagate_lambda` is false the callee "absorbs"
     /// its callbacks and we recover its *declared* row instead of the callbacks'
@@ -1897,6 +1867,10 @@ fn walk_expr(expr: &ast::Expr, f: &mut impl FnMut(&ast::Expr)) {
             walk_expr(func, f);
             walk_expr(arg, f);
         }
+        ast::ExprKind::With { record, body } => {
+            walk_expr(record, f);
+            walk_expr(body, f);
+        }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
             walk_expr(lhs, f);
             walk_expr(rhs, f);
@@ -1916,8 +1890,7 @@ fn walk_expr(expr: &ast::Expr, f: &mut impl FnMut(&ast::Expr)) {
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
                 match &stmt.node {
-                    ast::StmtKind::Bind { expr, .. }
-                    | ast::StmtKind::Let { expr, .. } => walk_expr(expr, f),
+                    ast::StmtKind::Bind { expr, .. } => walk_expr(expr, f),
                     ast::StmtKind::Where { cond } => walk_expr(cond, f),
                     ast::StmtKind::GroupBy { key } => walk_expr(key, f),
                     ast::StmtKind::Expr(expr) => walk_expr(expr, f),
@@ -2021,6 +1994,10 @@ fn collect_unshadowed_disallowed(
             collect_unshadowed_disallowed(func, shadowed, out);
             collect_unshadowed_disallowed(arg, shadowed, out);
         }
+        ast::ExprKind::With { record, body } => {
+            collect_unshadowed_disallowed(record, shadowed, out);
+            collect_unshadowed_disallowed(body, shadowed, out);
+        }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
             collect_unshadowed_disallowed(lhs, shadowed, out);
             collect_unshadowed_disallowed(rhs, shadowed, out);
@@ -2049,10 +2026,6 @@ fn collect_unshadowed_disallowed(
                     ast::StmtKind::Bind { pat, expr } => {
                         // The bound expression is evaluated before the
                         // binder comes into scope.
-                        collect_unshadowed_disallowed(expr, shadowed, out);
-                        collect_pat_binders(pat, shadowed);
-                    }
-                    ast::StmtKind::Let { pat, expr } => {
                         collect_unshadowed_disallowed(expr, shadowed, out);
                         collect_pat_binders(pat, shadowed);
                     }

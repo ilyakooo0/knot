@@ -139,11 +139,11 @@ fn source_bound_var_inner_do_still_pushes_down() {
 main = do
   replace *people = [{name: "Alice", age: 30}, {name: "Bob", age: 10}, {name: "Cara", age: 44}]
   rows <- *people
-  let adults = do
+  with {adults: do
         p <- rows
         where p.age >= 18
-        yield p
-  println (show (count adults))
+        yield p} (do
+    println (show (count adults)))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -247,8 +247,8 @@ fn shadowed_race_name_allowed_inside_atomic() {
 main = do
   c <- atomic (do
     rows <- *items
-    let pick = \race -> count race
-    yield (pick rows))
+    with {pick: \race -> count race} (do
+      yield (pick rows)))
   println (show c)
 "#,
     );

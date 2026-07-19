@@ -706,17 +706,44 @@ fn do_with_where() {
 }
 
 #[test]
-fn do_with_let() {
-    let src = "x = do\n  let y = 5\n  yield y";
+fn do_with_with_binding() {
+    // `with {y: 5} body` binds `y` in `body`; inside a do-block the
+    // continuation is a nested do.
+    let src = "x = do\n  with {y: 5} (do\n    yield y)";
     match fun_body(src) {
         ExprKind::Do(stmts) => {
-            assert_eq!(stmts.len(), 2);
+            assert_eq!(stmts.len(), 1);
             match &stmts[0].node {
-                StmtKind::Let { pat, expr } => {
-                    assert!(matches!(&pat.node, PatKind::Var(n) if n == "y"));
-                    assert!(matches!(&expr.node, ExprKind::Lit(Literal::Int(n)) if n == "5"));
-                }
-                other => panic!("expected Let, got {:?}", other),
+                StmtKind::Expr(e) => match &e.node {
+                    ExprKind::With { record, body } => {
+                        match &record.node {
+                            ExprKind::Record(fields) => {
+                                assert_eq!(fields.len(), 1);
+                                assert_eq!(fields[0].name, "y");
+                                assert!(
+                                    matches!(&fields[0].value.node, ExprKind::Lit(Literal::Int(n)) if n == "5")
+                                );
+                            }
+                            other => panic!("expected Record, got {:?}", other),
+                        }
+                        match &body.node {
+                            ExprKind::Do(inner) => {
+                                assert_eq!(inner.len(), 1);
+                                match &inner[0].node {
+                                    StmtKind::Expr(e) => {
+                                        assert!(e.node.as_yield_arg().is_some())
+                                    }
+                                    other => {
+                                        panic!("expected Expr(yield app), got {:?}", other)
+                                    }
+                                }
+                            }
+                            other => panic!("expected inner Do, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected With, got {:?}", other),
+                },
+                other => panic!("expected Expr(with), got {:?}", other),
             }
         }
         other => panic!("expected Do, got {:?}", other),
@@ -3322,18 +3349,40 @@ fn record_mixed_punned_and_explicit() {
     }
 }
 
-// ── Let-In Expressions ─────────────────────────────────────────────
+// ── With Expressions ───────────────────────────────────────────────
 
 #[test]
-fn let_in_expression() {
-    // let x = 1 in x + 1 desugars to (\x -> x + 1) 1
-    match fun_body("f = let x = 1 in x + 1") {
-        ExprKind::App { func, arg } => {
-            assert!(matches!(&func.node, ExprKind::Lambda { .. }));
-            assert!(matches!(&arg.node, ExprKind::Lit(Literal::Int(n)) if n == "1"));
+fn with_expression() {
+    // `with {x: 1} x + 1` parses as a With expression whose record binds `x`.
+    match fun_body("f = with {x: 1} x + 1") {
+        ExprKind::With { record, body } => {
+            match &record.node {
+                ExprKind::Record(fields) => {
+                    assert_eq!(fields.len(), 1);
+                    assert_eq!(fields[0].name, "x");
+                    assert!(
+                        matches!(&fields[0].value.node, ExprKind::Lit(Literal::Int(n)) if n == "1")
+                    );
+                }
+                other => panic!("expected Record, got {:?}", other),
+            }
+            assert!(
+                matches!(&body.node, ExprKind::BinOp { op: BinOp::Add, .. }),
+                "expected Add body, got {:?}",
+                body.node
+            );
         }
-        other => panic!("expected App(Lambda, Int) from let-in desugar, got {:?}", other),
+        other => panic!("expected With, got {:?}", other),
     }
+}
+
+#[test]
+fn do_let_statement_is_rejected() {
+    // The do-block `let` statement was removed in favour of `with`; the
+    // lexer still tokenizes `let`, so this must now be a parse error.
+    let src = "x = do\n  let y = 5\n  yield y";
+    let (_, diags) = parse_err(src);
+    assert!(!diags.is_empty(), "do-block `let` must no longer parse");
 }
 
 // ── Pattern Edge Cases ──────────────────────────────────────────────

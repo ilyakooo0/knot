@@ -610,6 +610,7 @@ pub fn analyze_document(
             _show_units,
             _sum_floats,
             _relation_fields,
+            _with_fields,
         ) = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_user));
         type_info = inferred_types;
@@ -1401,21 +1402,24 @@ mod tests {
         let mut import_cache: ImportCache = HashMap::new();
         let mut inference_cache: InferenceCache = HashMap::new();
 
-        // v1 has a `let y = ...` binding whose span is captured in
-        // local_type_info. The target byte offset in v1 is known.
-        let v1 = "f = \\x -> let y = x + 1 in y\n";
+        // v1 has a lambda parameter whose binder span is captured in
+        // local_type_info (the `with {y: x + 1} y` body exercises the
+        // binding form without a do-block). The target byte offset in v1
+        // is known.
+        let v1 = "f = \\x -> with {y: x + 1} y\n";
         std::fs::write(&path, v1).unwrap();
         let doc1 = analyze_document(&uri, v1, &mut import_cache, &mut inference_cache);
-        let v1_y_pos = v1.find("y =").expect("y = exists in v1");
+        // The lambda binder `x` is the first `x` in the source.
+        let v1_x_pos = v1.find('x').expect("x binder exists in v1");
 
-        let v1_y_span = doc1
+        let v1_x_span = doc1
             .local_type_info
             .keys()
-            .find(|s| s.start <= v1_y_pos && s.end > v1_y_pos)
+            .find(|s| s.start <= v1_x_pos && s.end > v1_x_pos)
             .copied()
-            .expect("v1 should have a span covering `y =`");
-        let v1_text = &v1[v1_y_span.start..v1_y_span.end];
-        assert_eq!(v1_text, "y", "v1 span should point at `y`");
+            .expect("v1 should have a span covering the `x` binder");
+        let v1_text = &v1[v1_x_span.start..v1_x_span.end];
+        assert_eq!(v1_text, "x", "v1 span should point at the binder `x`");
 
         // v2 prepends a comment line. AST shape is identical (fingerprint
         // matches), but every byte position has shifted by `prefix.len()`.
@@ -1424,25 +1428,26 @@ mod tests {
         std::fs::write(&path, &v2).unwrap();
         let doc2 = analyze_document(&uri, &v2, &mut import_cache, &mut inference_cache);
 
-        // The reused span should now point at `y` in v2 — i.e. shifted by the
-        // prefix length. If the cache returns the old span verbatim, the text
-        // it covers in v2 is no longer `y` (it's somewhere in the comment),
-        // and inlay hints / hover render against the wrong characters.
-        let v2_y_pos = v2.find("y =").expect("y = exists in v2");
-        let v2_y_span = doc2
+        // The reused span should now point at the binder `x` in v2 — i.e.
+        // shifted by the prefix length. If the cache returns the old span
+        // verbatim, the text it covers in v2 is no longer `x` (it's
+        // somewhere in the comment), and inlay hints / hover render
+        // against the wrong characters.
+        let v2_x_pos = v2.find('x').expect("x binder exists in v2");
+        let v2_x_span = doc2
             .local_type_info
             .keys()
-            .find(|s| s.start <= v2_y_pos && s.end > v2_y_pos)
+            .find(|s| s.start <= v2_x_pos && s.end > v2_x_pos)
             .copied()
-            .expect("v2 should have a span covering `y =` after fingerprint reuse");
-        let v2_text = &v2[v2_y_span.start..v2_y_span.end];
+            .expect("v2 should have a span covering the `x` binder after fingerprint reuse");
+        let v2_text = &v2[v2_x_span.start..v2_x_span.end];
         assert_eq!(
-            v2_text, "y",
-            "v2 reused span must point at `y` in the new source; got {v2_text:?} \
+            v2_text, "x",
+            "v2 reused span must point at `x` in the new source; got {v2_text:?} \
              (span {:?}, prefix len {}, expected start {})",
-            v2_y_span,
+            v2_x_span,
             prefix.len(),
-            v1_y_span.start + prefix.len()
+            v1_x_span.start + prefix.len()
         );
 
         let _ = std::fs::remove_dir_all(&dir);

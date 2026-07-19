@@ -156,7 +156,7 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
                 match &stmt.node {
-                    ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => {
+                    ast::StmtKind::Bind { expr, .. } => {
                         collect_folding_ranges_expr(expr, source, ranges);
                     }
                     ast::StmtKind::Expr(e) | ast::StmtKind::Where { cond: e } => {

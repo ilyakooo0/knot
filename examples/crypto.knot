@@ -9,43 +9,45 @@ main = do
   -- Encrypt is Maybe — Nothing if the public key is unusable (wrong length or
   -- a low-order point). Keys often come from a peer, so this is a value to
   -- handle, not a crash.
-  let message = textToBytes "Hello, cryptography!"
-  encrypted <- encrypt keys.publicKey message
-  case encrypted of
-    Nothing {} -> println "  Encryption failed: bad public key"
-    Just {value: ciphertext} -> do
-      println ("  Ciphertext: " ++ bytesToHex ciphertext)
+  with {message: textToBytes "Hello, cryptography!"} (do
+    encrypted <- encrypt keys.publicKey message
+    case encrypted of
+      Nothing {} -> println "  Encryption failed: bad public key"
+      Just {value: ciphertext} -> do
+        println ("  Ciphertext: " ++ bytesToHex ciphertext)
 
-      -- Decrypt is Maybe too — Nothing on a wrong key or tampered ciphertext.
-      case decrypt keys.privateKey ciphertext of
-        Nothing {} -> println "  Decryption failed: wrong key or tampered ciphertext"
-        Just {value: decrypted} -> case bytesToText decrypted of
-          Just t -> println ("  Decrypted: " ++ t.value)
-          Nothing -> println "  Decrypted: <invalid utf-8>"
+        -- Decrypt is Maybe too — Nothing on a wrong key or tampered ciphertext.
+        case decrypt keys.privateKey ciphertext of
+          Nothing {} -> println "  Decryption failed: wrong key or tampered ciphertext"
+          Just {value: decrypted} -> case bytesToText decrypted of
+            Just t -> println ("  Decrypted: " ++ t.value)
+            Nothing -> println "  Decrypted: <invalid utf-8>"
 
-      -- Tampering with the ciphertext is caught by the authentication tag.
-      let tampered = bytesConcat (bytesSlice 0 40 ciphertext) (textToBytes "XXXX")
-      case decrypt keys.privateKey tampered of
-        Nothing {} -> println "  Tampered ciphertext rejected"
-        Just {value: _} -> println "  BUG: tampered ciphertext decrypted"
+        -- Tampering with the ciphertext is caught by the authentication tag.
+        with {tampered: bytesConcat (bytesSlice 0 40 ciphertext) (textToBytes "XXXX")} (do
+          case decrypt keys.privateKey tampered of
+            Nothing {} -> println "  Tampered ciphertext rejected"
+            Just {value: _} -> println "  BUG: tampered ciphertext decrypted"
+          yield {})
 
-  -- Signing key pair generation (Ed25519)
-  sigKeys <- generateSigningKeyPair
-  println "Signing key pair generated"
-  println ("  Public key: " ++ bytesToHex sigKeys.publicKey)
+    -- Signing key pair generation (Ed25519)
+    sigKeys <- generateSigningKeyPair
+    println "Signing key pair generated"
+    println ("  Public key: " ++ bytesToHex sigKeys.publicKey)
 
-  -- Sign is Maybe — Nothing if the private key is not 32 bytes.
-  case sign sigKeys.privateKey message of
-    Nothing {} -> println "  Signing failed: bad private key"
-    Just {value: sig} -> do
-      println ("  Signature: " ++ bytesToHex sig)
+    -- Sign is Maybe — Nothing if the private key is not 32 bytes.
+    case sign sigKeys.privateKey message of
+      Nothing {} -> println "  Signing failed: bad private key"
+      Just {value: sig} -> do
+        println ("  Signature: " ++ bytesToHex sig)
 
-      let valid = verify sigKeys.publicKey message sig
-      println ("  Valid: " ++ show valid)
+        with {valid: verify sigKeys.publicKey message sig} (do
+          println ("  Valid: " ++ show valid)
 
-      -- Verify with wrong message should fail
-      let wrongMsg = textToBytes "Wrong message"
-      let invalid = verify sigKeys.publicKey wrongMsg sig
-      println ("  Invalid (wrong msg): " ++ show invalid)
+          -- Verify with wrong message should fail
+          with {wrongMsg: textToBytes "Wrong message"} (do
+            with {invalid: verify sigKeys.publicKey wrongMsg sig} (do
+              println ("  Invalid (wrong msg): " ++ show invalid)
+              yield {})))
 
-  yield {}
+    yield {})

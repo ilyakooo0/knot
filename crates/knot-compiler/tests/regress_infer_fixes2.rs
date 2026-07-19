@@ -41,7 +41,7 @@ fn check_src(src: &str) -> Vec<Diagnostic> {
     let mut module = parse(src);
     knot_compiler::base::inject_prelude(&mut module);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, _targets, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields) =
+    let (diags, _monad, _type_info, _local, _targets, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields) =
         knot_compiler::infer::check(&mut module);
     diags
 }
@@ -179,15 +179,16 @@ fn groupby_comprehension_types_as_io_relation() {
 
 main = do
   replace *todos = [{title: "a", owner: "Alice", done: 0}]
-  let workload = do
+  with {workload: do
     t <- *todos
     where t.done == 0
     groupBy {t.owner}
-    yield {owner: t.owner, n: count t}
-  c <- println (show (count workload))
-  w <- workload
-  p <- println (w.owner ++ ": " ++ show w.n)
-  yield {}
+    yield {owner: t.owner, n: count t}}
+    (do
+      c <- println (show (count workload))
+      w <- workload
+      p <- println (w.owner ++ ": " ++ show w.n)
+      yield {})
 "#,
     );
     assert_clean(&diags);
@@ -282,9 +283,8 @@ takesPoly = \f -> f 1
 
 g = \h -> takesPoly h
 
-main = do
-  let r = g (\x -> x + 1)
-  println (show r)
+main = with {r: g (\x -> x + 1)}
+  (println (show r))
 "#,
     );
     assert!(
@@ -324,9 +324,8 @@ type Nat = Int 1 where \x -> x >= 0
 
 main = do
   x <- []
-  let n = foo x
-  let r = ((refine x) : Result RefinementError Nat)
-  yield n
+  with {n: foo x, r: ((refine x) : Result RefinementError Nat)}
+    (yield n)
 "#,
     );
     assert!(

@@ -16,12 +16,12 @@ complete = \title -> do
 
 pending = \owner -> do
   todos <- *todos
-  let result = do
+  with {result: do
     t <- todos
     where t.done == 0
     where t.owner == owner
-    yield t.title
-  yield result
+    yield t.title}
+    (yield result)
 
 main = do
   add "Write parser" "Alice"

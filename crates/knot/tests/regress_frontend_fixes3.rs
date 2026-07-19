@@ -8,8 +8,8 @@
 //!    tab/space sibling indentation keeps its block structure. Additionally,
 //!    `format_module` re-parses its own output and returns the source
 //!    unchanged if the output fails to parse or changes the AST.
-//! 3. `let pat = value in body` prints back as let…in, not as the parser's
-//!    `(\pat -> body) value` desugaring.
+//! 3. `with {name: value} body` prints back as `with`, not as the parser's
+//!    internal representation.
 //! 4. Constructor payloads get the same postfix handling as function
 //!    application arguments: `Just x.y` parses as `Just (x.y)`.
 //! 5. A backslash at end-of-line inside a (byte) string literal reports an
@@ -119,6 +119,9 @@ fn expr_mentions_var(e: &knot::ast::Expr, name: &str) -> bool {
                 || fields.iter().any(|f| expr_mentions_var(&f.value, name))
         }
         ExprKind::FieldAccess { expr, .. } => expr_mentions_var(expr, name),
+        ExprKind::With { record, body } => {
+            expr_mentions_var(record, name) || expr_mentions_var(body, name)
+        }
         ExprKind::List(items) => items.iter().any(|i| expr_mentions_var(i, name)),
         ExprKind::Lambda { body, .. } => expr_mentions_var(body, name),
         ExprKind::App { func, arg } => {
@@ -138,8 +141,7 @@ fn expr_mentions_var(e: &knot::ast::Expr, name: &str) -> bool {
                 || arms.iter().any(|a| expr_mentions_var(&a.body, name))
         }
         ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
-            StmtKind::Bind { expr, .. }
-            | StmtKind::Let { expr, .. } => expr_mentions_var(expr, name),
+            StmtKind::Bind { expr, .. } => expr_mentions_var(expr, name),
             StmtKind::Where { cond } => expr_mentions_var(cond, name),
             StmtKind::GroupBy { key } => expr_mentions_var(key, name),
             StmtKind::Expr(e) => expr_mentions_var(e, name),
@@ -265,91 +267,97 @@ fn format_module_never_changes_the_ast() {
     check_str("verbatim_roundtrip", src);
 }
 
-// ── 3. let…in survives formatting ────────────────────────────────────
+// ── 3. with survives formatting ────────────────────────────────────
 
 #[test]
-fn let_in_prints_back_as_let_in() {
-    let out = check_str("let_in", "f = let x = 1 in x + 2\n");
+fn with_prints_back_as_with() {
+    let out = check_str("with_simple", "f = with {x: 1} x + 2\n");
     assert!(
-        out.contains("let x = 1 in x + 2"),
-        "let…in was rewritten:\n{}",
-        out
-    );
-    assert!(!out.contains("\\x ->"), "printed as lambda application:\n{}", out);
-}
-
-#[test]
-fn let_in_with_annotation_prints_back() {
-    let out = check_str("let_in_annot", "f = let x : Int = 5 in x\n");
-    assert!(
-        out.contains("let x : Int = 5 in x"),
-        "annotated let…in was rewritten:\n{}",
+        out.contains("with {x: 1} x + 2"),
+        "with was rewritten:\n{}",
         out
     );
 }
 
 #[test]
-fn nested_let_in_prints_back() {
-    let out = check_str("let_in_nested", "f = let x = 1 in let y = 2 in x + y\n");
+fn with_annotated_field_prints_back() {
+    let out = check_str("with_annot", "f = with {x: (5 : Int)} x\n");
     assert!(
-        out.contains("let x = 1 in let y = 2 in x + y"),
-        "nested let…in was rewritten:\n{}",
+        out.contains("with {x: (5 : Int)} x"),
+        "annotated with was rewritten:\n{}",
         out
     );
 }
 
 #[test]
-fn let_in_record_pattern_prints_back() {
-    let out = check_str("let_in_pat", "f = \\p -> let {lo, hi} = p in hi - lo\n");
+fn nested_with_prints_back() {
+    let out = check_str("with_nested", "f = with {x: 1} with {y: 2} x + y\n");
     assert!(
-        out.contains("let {lo, hi} = p in hi - lo"),
-        "pattern let…in was rewritten:\n{}",
+        out.contains("with {x: 1} with {y: 2} x + y"),
+        "nested with was rewritten:\n{}",
         out
     );
 }
 
 #[test]
-fn let_in_as_binop_operand_keeps_parens() {
-    let out = check_str("let_in_rhs", "f = 1 + (let x = 2 in x)\n");
+fn with_multi_field_record_prints_back() {
+    let out = check_str(
+        "with_multi",
+        "f = \\p -> with {lo: p.lo, hi: p.hi} hi - lo\n",
+    );
     assert!(
-        out.contains("1 + (let x = 2 in x)"),
-        "let…in operand lost parens:\n{}",
+        out.contains("with {lo: p.lo, hi: p.hi} hi - lo"),
+        "multi-field with was rewritten:\n{}",
         out
     );
 }
 
 #[test]
-fn let_in_under_postfix_annotation_keeps_parens() {
-    // The let…in body is parsed with `parse_expr`, which greedily reattaches
+fn with_as_binop_operand_keeps_parens() {
+    let out = check_str("with_rhs", "f = 1 + (with {x: 2} x)\n");
+    assert!(
+        out.contains("1 + (with {x: 2} x)"),
+        "with operand lost parens:\n{}",
+        out
+    );
+}
+
+#[test]
+fn with_under_postfix_annotation_keeps_parens() {
+    // The with body is parsed with `parse_expr`, which greedily reattaches
     // a trailing `: Type` — the formatter must keep the grouping parens.
-    check_str("let_in_annot_tail", "f = (let x = 1 in x) : Int\n");
+    check_str("with_annot_tail", "f = (with {x: 1} x) : Int\n");
 }
 
 #[test]
-fn let_in_with_do_body_round_trips() {
+fn with_do_body_round_trips() {
     check_str(
-        "let_in_do_body",
-        "f = let xs = [1, 2] in do\n  y <- xs\n  yield y\n",
+        "with_do_body",
+        "f = with {xs: [1, 2]} do\n  y <- xs\n  yield y\n",
     );
 }
 
 #[test]
-fn applied_let_in_keeps_parens() {
-    // `(let x = f in x) 2` — a let…in in application head position.
-    check_str("let_in_applied", "g = (let x = h in x) 2\n");
+fn applied_with_keeps_parens() {
+    // `(with {x: h} x) 2` — a with in application head position.
+    check_str("with_applied", "g = (with {x: h} x) 2\n");
 }
 
 #[test]
 fn explicit_lambda_application_still_prints_as_lambda() {
-    // A user-written `(\x -> x + 1) 2` is NOT a let…in (the lambda's span
-    // does not cover the whole application) and must print unchanged.
+    // A user-written `(\x -> x + 1) 2` must print unchanged (it is not a
+    // `with` expression).
     let out = check_str("real_lambda_app", "f = (\\x -> x + 1) 2\n");
     assert!(
         out.contains("(\\x -> x + 1) 2"),
         "explicit lambda application was rewritten:\n{}",
         out
     );
-    assert!(!out.contains("let"), "lambda app misdetected as let…in:\n{}", out);
+    assert!(
+        !out.contains("with"),
+        "lambda app misdetected as with:\n{}",
+        out
+    );
 }
 
 // ── 4. constructor payloads use application-argument postfix rules ──

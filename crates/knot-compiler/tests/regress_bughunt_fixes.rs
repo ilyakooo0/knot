@@ -14,7 +14,7 @@
 //!    back to correct in-memory evaluation).
 //!
 //! 3. A non-nullary IO builtin aliased to a name (`readIt = readFile` or a
-//!    local `let f = readFile`) and applied inside `atomic` laundered its
+//!    local `with {f: readFile}`) and applied inside `atomic` laundered its
 //!    effect past the atomic gate: the alias recorded empty effects. The
 //!    alias now carries the builtin's call effects.
 
@@ -96,12 +96,12 @@ fn or_in_do_block_where_does_not_escape_and_scope() {
 
 main = do
   replace *items = [{a: 1, b: 999}, {a: 2, b: 3}, {a: 5, b: 3}]
-  let rows = do
+  with {rows: do
     t <- *items
     where t.a == 1 || t.a == 2
     where t.b == 3
-    yield t
-  println (count rows)
+    yield t} (do
+    println (count rows))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -122,8 +122,9 @@ fn or_in_pipe_filters_does_not_escape_and_scope() {
 
 main = do
   replace *items = [{a: 1, b: 999}, {a: 2, b: 3}, {a: 5, b: 3}]
-  let n = *items |> filter (\t -> t.a == 1 || t.a == 2) |> filter (\t -> t.b == 3) |> count
-  println n
+  with {n: *items |> filter (\t -> t.a == 1 || t.a == 2) |> filter (\t -> t.b == 3) |> count} (do
+    println n
+    yield {})
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -152,9 +153,10 @@ cmp = \threshold p -> p.age > threshold
 
 main = do
   replace *people = [{age: 10, threshold: 100}, {age: 50, threshold: 100}, {age: 40, threshold: 100}]
-  let p = {age: 0, threshold: 25}
-  let matched = filter (cmp p.threshold) *people
-  println (count matched)
+  with {p: {age: 0, threshold: 25}} (
+    with {matched: filter (cmp p.threshold) *people} (do
+      println (count matched)
+      yield {}))
 "#,
     );
     assert!(ok, "program failed: {stderr}");
@@ -213,15 +215,15 @@ proc = atomic do
 }
 
 #[test]
-fn local_let_io_builtin_alias_is_caught_inside_atomic() {
+fn local_with_io_builtin_alias_is_caught_inside_atomic() {
     let diags = effect_diags(
         r#"*counter : [{n: Int 1}]
 
 proc = atomic do
   c <- *counter
-  let f = readFile
-  contents <- f "secret.txt"
-  yield contents
+  with {f: readFile} (do
+    contents <- f "secret.txt"
+    yield contents)
 "#,
     );
     assert_has_error(&diags, "IO effects are not allowed inside atomic blocks");

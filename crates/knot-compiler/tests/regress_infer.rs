@@ -22,7 +22,7 @@ fn check_full(
 ) -> (Vec<Diagnostic>, knot_compiler::infer::RefineTargets) {
     let mut module = parse(src);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, refine_targets, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields) =
+    let (diags, _monad, _type_info, _local, refine_targets, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields) =
         knot_compiler::infer::check(&mut module);
     (diags, refine_targets)
 }
@@ -357,13 +357,12 @@ route BApi where
 route All = AB | BApi
 route AB = AApi
 
-main = do
-  let server = serve All where
+main = with {server: serve All where
     GetA = \r -> do
       yield Ok {value: "a"}
     GetB = \r -> do
-      yield Ok {value: "b"}
-  listen 8080 server
+      yield Ok {value: "b"}}
+  (listen 8080 server)
 "#;
     let diags = check_src(src);
     assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
@@ -448,14 +447,13 @@ main = println (callGreet 1)
 #[test]
 fn do_let_generalized_structural_comparison() {
     // Eq/Ord traits removed from comparison operators — < is structural, no constraint needed.
-    let src = r#"main = do
-  let cmp = \a b -> a < b
-  println (show (cmp true false))
+    let src = r#"main = with {cmp: \a b -> a < b}
+  (println (show (cmp true false)))
 "#;
     let diags = check_src(src);
     assert!(
         diags.is_empty(),
-        "structural < in do-let should not require Ord: {:?}",
+        "structural < in with should not require Ord: {:?}",
         diags
     );
 }
@@ -617,11 +615,11 @@ fn self_multiply_lambda_is_unit_polymorphic() {
     // be applied at two different units. The deferred unit-composition is
     // captured on the scheme and freshened per use site.
     let src = r#"square = \x -> x * x
-main = do
-  let a = square (3.0 : Float M)
-  let b = square (4.0 : Float S)
-  println (show (stripFloatUnit a))
-  println (show (stripFloatUnit b))
+main = with {a: square (3.0 : Float M)}
+  (with {b: square (4.0 : Float S)}
+    (do
+      println (show (stripFloatUnit a))
+      println (show (stripFloatUnit b))))
 "#;
     let diags = check_src(src);
     assert!(diags.is_empty(), "square should be unit-polymorphic: {:?}", diags);
@@ -631,11 +629,11 @@ main = do
 fn multi_param_product_is_unit_polymorphic() {
     // Same generalization for a two-argument product used at distinct units.
     let src = r#"area = \w h -> w * h
-main = do
-  let a = area (6.0 : Float M) (2.0 : Float M)
-  let b = area (6.0 : Float S) (2.0 : Float S)
-  println (show (stripFloatUnit a))
-  println (show (stripFloatUnit b))
+main = with {a: area (6.0 : Float M) (2.0 : Float M)}
+  (with {b: area (6.0 : Float S) (2.0 : Float S)}
+    (do
+      println (show (stripFloatUnit a))
+      println (show (stripFloatUnit b))))
 "#;
     let diags = check_src(src);
     assert!(diags.is_empty(), "area should be unit-polymorphic: {:?}", diags);

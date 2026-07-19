@@ -108,11 +108,9 @@ fn show_appends_unit_computed_by_unit_algebra() {
     let stdout = compile_and_run(
         "algebra",
         r#"
-main = do
-  let distance = (100.0 : Float M)
-  let time = (4.0 : Float S)
+main = with {distance: (100.0 : Float M), time: (4.0 : Float S)} (do
   println (show (distance / time))
-  println (show (2.5 : Float Speed))
+  println (show (2.5 : Float Speed)))
 "#,
     );
     assert_printed(&stdout, "25.0 M/S");

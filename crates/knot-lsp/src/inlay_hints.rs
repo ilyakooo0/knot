@@ -586,8 +586,7 @@ fn add_record_pattern_field_hints(
             ast::ExprKind::Do(stmts) => {
                 for stmt in stmts {
                     match &stmt.node {
-                        ast::StmtKind::Bind { pat, expr }
-                        | ast::StmtKind::Let { pat, expr } => {
+                        ast::StmtKind::Bind { pat, expr } => {
                             walk_pat_for_records(pat, source, out);
                             walk_expr(expr, source, out);
                         }
@@ -821,8 +820,7 @@ fn add_unit_literal_hints(
         if let ast::ExprKind::Do(stmts) = &expr.node {
             for stmt in stmts {
                 match &stmt.node {
-                    ast::StmtKind::Let { pat, expr: rhs }
-                    | ast::StmtKind::Bind { pat, expr: rhs } => {
+                    ast::StmtKind::Bind { pat, expr: rhs } => {
                         out.push((pat.span, rhs.clone()));
                         walk_for_unit_bindings(rhs, out);
                     }
@@ -1013,9 +1011,7 @@ fn collect_binder_names(expr: &ast::Expr, out: &mut std::collections::HashSet<St
         }
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
-                if let ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } =
-                    &stmt.node
-                {
+                if let ast::StmtKind::Bind { pat, .. } = &stmt.node {
                     collect_pat_binder_names(&pat.node, out);
                 }
             }
@@ -1737,15 +1733,18 @@ checkGlobalRate = \t -> atomic do
         let mut ws = TestWorkspace::new();
         let uri = ws.open(
             "main",
-            "base : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> do\n  let y = base * 2.0\n  yield y\n",
+            "base : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> with {y: base * 2.0} (do\n  yield y)\n",
         );
         let doc = ws.doc(&uri);
-        // Sanity: the binding really inferred a unit — otherwise this test
-        // passes vacuously on the old code too.
+        // Sanity: the unit really flows into the compound RHS — `f`'s
+        // inferred type must mention the `M` from `base` (under `with`,
+        // the field binding registers no local_type_info span, so the old
+        // `let`-era sanity check on `local_type_info` can't see it).
+        // Otherwise this test passes vacuously on the old code too.
+        let f_ty = doc.type_info.get("f").expect("f has an inferred type");
         assert!(
-            doc.local_type_info.values().any(|t| t.contains("<M>")),
-            "setup: y should infer Float M; got {:?}",
-            doc.local_type_info
+            f_ty.contains('M'),
+            "setup: f's inferred type should mention the unit M; got {f_ty:?}"
         );
         let range = ws.whole_file_range(&uri);
         let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
@@ -1983,9 +1982,7 @@ checkGlobalRate = \t -> atomic do
                 ast::ExprKind::Case { arms, .. } => arms.iter().for_each(|a| pat(&a.pat, out)),
                 ast::ExprKind::Do(stmts) => {
                     for s in stmts {
-                        if let ast::StmtKind::Bind { pat: p, .. }
-                        | ast::StmtKind::Let { pat: p, .. } = &s.node
-                        {
+                        if let ast::StmtKind::Bind { pat: p, .. } = &s.node {
                             pat(p, out);
                         }
                     }

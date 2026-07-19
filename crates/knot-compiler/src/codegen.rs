@@ -112,6 +112,28 @@ pub struct Codegen {
     /// scope by `compile_io_do_eager`.
     io_relation_vars: HashSet<String>,
 
+    /// Top-level `name = <relation>` constants (from inference's `TypeInfo`,
+    /// which maps decl names to their inferred type strings). A `pat <- name`
+    /// bind in an IO do-block iterates these per row. Unlike
+    /// `io_relation_vars` this set is populated once at codegen start and
+    /// never scoped/restored: a global relation constant keeps its type
+    /// everywhere, including inside IO thunks compiled as separate
+    /// functions (whose deferred compilation sees no enclosing
+    /// `io_relation_vars` scope).
+    decl_relation_vars: HashSet<String>,
+
+    /// Relation-valued locals captured by the current closure (lambda / IO
+    /// thunk) compilation. Codegen compiles closures as separate Cranelift
+    /// functions whose bodies are emitted AFTER the enclosing scope that
+    /// registered a relation local (`io_relation_vars`, the `with`-arm
+    /// registration) has exited — so a `pat <- name` bind inside a closure
+    /// over a relation local used to fall back to whole-relation semantics
+    /// (silently iterating only the first row). The capture arms register
+    /// the names here (see `compile_lambda_inner` /
+    /// `compile_io_do_as_thunk`); the closure-definition functions seed
+    /// `io_relation_vars` from it for the body and restore it afterwards.
+    closure_relation_vars: HashSet<String>,
+
     // Constructor info: ctor_name -> [(field_name, field_type_str)]
     constructors: HashMap<String, Vec<(String, String)>>,
 
@@ -309,6 +331,21 @@ pub struct Codegen {
     // FromJSON dispatch) + wire schema (for Maybe-aware decoding)
     from_json_targets: crate::infer::FromJsonTargets,
 
+    // `with` expression span -> field names bound in its body. Codegen
+    // projects exactly these fields out of the record into locals.
+    with_fields: crate::infer::WithFields,
+
+    // Names of `with`-bound locals and whether each one's bound value is
+    // IO-producing (`self.expr_is_io(value)`). Such a name used inside the
+    // body (e.g. `f 1` where `f` was bound to `\y -> println (show y)`)
+    // must classify the enclosing do-block as IO so the calls actually run.
+    // This is a STACK of scopes, one entry per enclosing `with`: entering a
+    // `with` pushes the names it binds, leaving it pops. Lookups scan
+    // innermost-first and stop at the first scope that binds the name, so a
+    // nested `with` rebinding an outer IO name to a non-IO value correctly
+    // shadows the mark for its body.
+    with_io_locals: Vec<HashMap<String, bool>>,
+
     // Spans of `elem` haystack args whose element type is SQL-pushable
     // Spans of `elem` haystacks whose element type is SQL-pushable, split by
     // path: `literal` (the `IN (?, …)` list form) and `dynamic` (the
@@ -395,6 +432,11 @@ struct PendingLambda {
     param_pat: Option<ast::Pat>,
     body: ast::Expr,
     free_vars: Vec<String>,
+    /// Captured free vars that were relation-valued locals at the capture
+    /// site (`io_relation_vars`). Seeded into `closure_relation_vars` while
+    /// the lambda body is compiled so `x <- name` binds keep per-row
+    /// iteration across the deferred-compilation boundary.
+    captured_rel_vars: HashSet<String>,
 }
 
 /// A deferred IO do-block body compiled as a thunk function.
@@ -403,6 +445,11 @@ struct PendingIoThunk {
     func_id: FuncId,
     stmts: Vec<ast::Stmt>,
     free_vars: Vec<String>,
+    /// Captured free vars that were relation-valued locals at the capture
+    /// site (`io_relation_vars`). Seeded into `closure_relation_vars` while
+    /// the thunk body is compiled so `x <- name` binds keep per-row
+    /// iteration across the deferred-compilation boundary.
+    captured_rel_vars: HashSet<String>,
 }
 
 /// A deferred trampoline for a multi-param user function.
@@ -684,6 +731,7 @@ pub fn compile(
     show_unit_strings: &crate::infer::ShowUnitStrings,
     sum_float_spans: &crate::infer::SumFloatSpans,
     relation_fields: &crate::infer::RelationFieldSpans,
+    with_fields: &crate::infer::WithFields,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     crate::stack::grow(|| {
@@ -701,6 +749,7 @@ pub fn compile(
             show_unit_strings,
             sum_float_spans,
             relation_fields,
+            with_fields,
             compile_time_overrides,
         )
     })
@@ -721,9 +770,20 @@ fn compile_inner(
     show_unit_strings: &crate::infer::ShowUnitStrings,
     sum_float_spans: &crate::infer::SumFloatSpans,
     relation_fields: &crate::infer::RelationFieldSpans,
+    with_fields: &crate::infer::WithFields,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
+    // Seed the relation-typed top-level constant set from inference's type
+    // strings (`[T]` / `[T; units]` display forms). Used by
+    // `expr_is_relation_var` so `x <- some_global` binds in IO do-blocks
+    // iterate per row even though the bind is compiled inside a deferred IO
+    // thunk (a fresh scope with no enclosing `io_relation_vars`).
+    cg.decl_relation_vars = type_info
+        .iter()
+        .filter(|(_, ty)| ty.trim_start().starts_with('['))
+        .map(|(name, _)| name.clone())
+        .collect();
     // Derive database path from source filename: "foo.knot" → "foo.db"
     let stem = std::path::Path::new(source_file)
         .file_stem()
@@ -754,6 +814,7 @@ fn compile_inner(
         })
         .collect();
     cg.from_json_targets = from_json_targets.clone();
+    cg.with_fields = with_fields.clone();
     cg.elem_pushdown_ok = elem_pushdown_ok.clone();
     cg.show_unit_strings = show_unit_strings.clone();
     cg.sum_float_spans = sum_float_spans.clone();
@@ -974,6 +1035,8 @@ impl Codegen {
             fun_bodies: HashMap::new(),
             let_bindings: HashMap::new(),
             io_relation_vars: HashSet::new(),
+            decl_relation_vars: HashSet::new(),
+            closure_relation_vars: HashSet::new(),
             constructors: HashMap::new(),
             lambda_counter: 0,
             pending_lambdas: Vec::new(),
@@ -1025,6 +1088,8 @@ impl Codegen {
             refined_predicate_fns: HashMap::new(),
             source_refinements: HashMap::new(),
             from_json_targets: HashMap::new(),
+            with_fields: HashMap::new(),
+            with_io_locals: Vec::new(),
             elem_pushdown_ok: crate::infer::ElemPushdownOk::default(),
             show_unit_strings: HashMap::new(),
             sum_float_spans: crate::infer::SumFloatSpans::new(),
@@ -3627,6 +3692,13 @@ impl Codegen {
         let param_pat = lambda.param_pat.clone();
         let body = lambda.body.clone();
         let free_vars = lambda.free_vars.clone();
+        let captured_rel_vars = lambda.captured_rel_vars.clone();
+
+        // Mirror define_io_thunk_function: relation-valued captured locals
+        // must be visible to `expr_is_relation_var` while the lambda body is
+        // compiled, even though the registering scope is gone.
+        let prev_closure_relation_vars = self.closure_relation_vars.clone();
+        self.closure_relation_vars.extend(captured_rel_vars);
 
         self.build_function(func_id, sig, |cg, builder, entry| {
             let mut env = Env::new();
@@ -3678,6 +3750,8 @@ impl Codegen {
             };
             builder.ins().return_(&[result]);
         });
+
+        self.closure_relation_vars = prev_closure_relation_vars;
     }
 
     /// Compile a pending IO do-block thunk function.
@@ -3691,6 +3765,13 @@ impl Codegen {
         let func_id = thunk.func_id;
         let stmts = thunk.stmts.clone();
         let free_vars = thunk.free_vars.clone();
+        let captured_rel_vars = thunk.captured_rel_vars.clone();
+
+        // See the field's doc comment: relation-valued captured locals must
+        // be visible to `expr_is_relation_var` while the body is compiled,
+        // even though the scope that registered them is long gone.
+        let prev_closure_relation_vars = self.closure_relation_vars.clone();
+        self.closure_relation_vars.extend(captured_rel_vars);
 
         self.build_function(func_id, sig, |cg, builder, entry| {
             let mut env = Env::new();
@@ -3715,6 +3796,8 @@ impl Codegen {
             let result = cg.compile_io_do_eager(builder, &stmts, &mut env, db);
             builder.ins().return_(&[result]);
         });
+
+        self.closure_relation_vars = prev_closure_relation_vars;
     }
 
     /// Get or create a trampoline function that wraps a user function with the
@@ -3761,6 +3844,7 @@ impl Codegen {
                 param_pat: None,
                 body,
                 free_vars: vec![],
+                captured_rel_vars: HashSet::new(),
             });
         } else {
             // For multi-param functions: generate curry chain via build_function
@@ -4659,6 +4743,127 @@ impl Codegen {
                 let val = self.compile_expr(builder, expr, env, db);
                 let (key_ptr, key_len) = self.string_ptr(builder, field);
                 self.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len])
+            }
+
+            ast::ExprKind::With { record, body } => {
+                // Evaluate the record, then bind each of its fields (from
+                // inference's `with_fields`) as a local for the body. A cloned
+                // env gives lexical scoping: field bindings shadow outer ones
+                // inside the body and vanish after it.
+                let record_val = self.compile_expr(builder, record, env, db);
+                let mut body_env = env.clone();
+                // Determine IO-producing and relation-valued fields, so
+                // relation-valued IO fields (queries like `r: do i <- *src …;
+                // yield i`) can be unwrapped (`knot_io_run`) to the relation the
+                // body expects — mirroring the old `let r = do … yield …` which
+                // bound the run relation.
+                let mut io_scope = self
+                    .with_io_scope_for(expr.span, record)
+                    .unwrap_or_default();
+                let mut rel_fields: Vec<String> = Vec::new();
+                if let ast::ExprKind::Record(fields) = &record.node {
+                    for f in fields {
+                        // Unwrap only RELATION-valued IO fields (queries like
+                        // `r: do i <- *src …; yield i`) so the body iterates /
+                        // counts the relation. Bare IO ACTIONS (`println …`,
+                        // `readFile …`) and lambdas stay lazy — the old `let`
+                        // deferred them and only ran them when used.
+                        let rel_valued = matches!(&f.value.node, ast::ExprKind::List(_))
+                            || self.expr_is_known_relation(&f.value)
+                            || self.expr_is_relation_var(&f.value)
+                            || matches!(&f.value.node, ast::ExprKind::Do(stmts)
+                                if stmts.last().is_some_and(|s| matches!(&s.node,
+                                    ast::StmtKind::Expr(e) if e.node.as_yield_arg().is_some())))
+                            || self.desugared_monad_kind(&f.value) == Some(MonadKind::Relation);
+                        if rel_valued {
+                            rel_fields.push(f.name.clone());
+                        }
+                    }
+                }
+                // Unwrap relation-valued IO fields IN THE RECORD so every read
+                // of the field — including a deferred IO-thunk capturing it via
+                // the closure env — sees the relation, not the raw IO thunk.
+                // Non-relation IO fields (lambdas/actions) stay lazy.
+                for name in &rel_fields {
+                    let (key_ptr, key_len) = self.string_ptr(builder, name);
+                    let raw = self.call_rt(
+                        builder,
+                        "knot_record_field",
+                        &[record_val, key_ptr, key_len],
+                    );
+                    let unwrapped = self.call_rt(builder, "knot_io_run", &[db, raw]);
+                    let (kp2, kl2) = self.string_ptr(builder, name);
+                    self.call_rt_void(
+                        builder,
+                        "knot_record_set_field",
+                        &[record_val, kp2, kl2, unwrapped],
+                    );
+                    // The field is now a plain relation: drop its IO mark so
+                    // `expr_is_io(Var r)` is false and binds iterate per-row.
+                    io_scope.remove(name);
+                }
+                if let Some(fields) = self.with_fields.get(&expr.span).cloned() {
+                    for field in fields {
+                        let (key_ptr, key_len) = self.string_ptr(builder, &field);
+                        let field_val = self.call_rt(
+                            builder,
+                            "knot_record_field",
+                            &[record_val, key_ptr, key_len],
+                        );
+                        body_env.set(&field, field_val);
+                    }
+                }
+                // Track which bound fields hold IO-producing values so
+                // `expr_is_io(Var(name))` (and hence `is_io_do_block`)
+                // recognizes uses of e.g. a `with`-bound lambda wrapping
+                // `println` as IO while the body is being compiled. The
+                // scope is pushed before compiling the body and popped
+                // after; `expr_is_io`'s own `With` arm handles checks that
+                // start outside the `with`.
+                // Names of pure (non-IO) fields, captured before `io_scope` is
+                // moved by the push below.
+                let pure_field_names: Vec<String> = if let ast::ExprKind::Record(fes) = &record.node {
+                    fes.iter()
+                        .filter(|f| !io_scope.get(&f.name).copied().unwrap_or(false))
+                        .map(|f| f.name.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                self.with_io_locals.push(io_scope);
+                // Register relation-valued fields in `io_relation_vars` for
+                // the body so a bind `x <- r` over a `with`-bound relation
+                // iterates per-row (mirroring the old `let` behaviour).
+                let mut rel_added: Vec<String> = Vec::new();
+                for name in &rel_fields {
+                    if self.io_relation_vars.insert(name.clone()) {
+                        rel_added.push(name.clone());
+                    }
+                }
+                // Expose PURE (non-IO) with-fields to the optimizer as
+                // `let_bindings` for the body scope — the SQL planner and
+                // beta-reduction substituted old `let lim = 1` names textually,
+                // so `single (with {lim: 1} (do … where t.a == lim …))` must
+                // resolve `lim` the same way. Restored after the body.
+                let mut let_added: Vec<String> = Vec::new();
+                if let ast::ExprKind::Record(field_exprs) = &record.node {
+                    for f in field_exprs {
+                        let is_pure = pure_field_names.iter().any(|n| n == &f.name);
+                        if is_pure && !self.let_bindings.contains_key(&f.name) {
+                            self.let_bindings.insert(f.name.clone(), f.value.clone());
+                            let_added.push(f.name.clone());
+                        }
+                    }
+                }
+                let result = self.compile_expr(builder, body, &mut body_env, db);
+                for n in &let_added {
+                    self.let_bindings.remove(n);
+                }
+                for n in &rel_added {
+                    self.io_relation_vars.remove(n);
+                }
+                self.with_io_locals.pop();
+                result
             }
 
             ast::ExprKind::List(elems) => {
@@ -5751,6 +5956,10 @@ impl Codegen {
             TimeUnitLit { value, .. } => self.collect_direct_write_targets(value, out),
             Annot { expr: e, .. } => self.collect_direct_write_targets(e, out),
             FieldAccess { expr: e, .. } => self.collect_direct_write_targets(e, out),
+            With { record, body } => {
+                self.collect_direct_write_targets(record, out)
+                    && self.collect_direct_write_targets(body, out)
+            }
             App { func, arg } => {
                 // Mirror `expr_contains_writes`: a call through an unknown
                 // callee (parameter, do-local lambda, trait dispatcher,
@@ -5791,9 +6000,6 @@ impl Codegen {
                         Var(name) if !name_is_known_write_free(name)
                     );
                     !unknown_io && self.collect_direct_write_targets(expr, out)
-                }
-                ast::StmtKind::Let { expr, .. } => {
-                    self.collect_direct_write_targets(expr, out)
                 }
                 ast::StmtKind::Where { cond } => {
                     self.collect_direct_write_targets(cond, out)
@@ -6031,12 +6237,51 @@ impl Codegen {
                 }
 
                 // single (do { x <- *source; where ...; yield x }) → SQL plan + LIMIT 2
-                if let ast::ExprKind::Do(stmts) = &args[0].node
-                    && let Some(plan) = self.analyze_sql_plan(stmts, env) {
+                // See through a `with {lim: e, …} (do …)` wrapper: the fields are
+                // pure bindings (old `let`) that the SQL planner resolves as
+                // params, so register them in `let_bindings` around the plan.
+                let single_arg = &args[0];
+                let (plan_stmts, with_overlay): (&[ast::Stmt], Vec<(String, ast::Expr)>) =
+                    match &single_arg.node {
+                        ast::ExprKind::Do(stmts) => (stmts, Vec::new()),
+                        ast::ExprKind::With { record, body }
+                            if matches!(&body.node, ast::ExprKind::Do(_)) =>
+                        {
+                            let overlay = if let ast::ExprKind::Record(fes) = &record.node {
+                                fes.iter().map(|f| (f.name.clone(), f.value.clone())).collect()
+                            } else {
+                                Vec::new()
+                            };
+                            if let ast::ExprKind::Do(stmts) = &body.node {
+                                (stmts, overlay)
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                        _ => (&[], Vec::new()),
+                    };
+                let mut overlay_added: Vec<String> = Vec::new();
+                for (n, v) in &with_overlay {
+                    if !self.let_bindings.contains_key(n) {
+                        self.let_bindings.insert(n.clone(), v.clone());
+                        overlay_added.push(n.clone());
+                    }
+                    // Also bind the field's VALUE into `env` so SQL params that
+                    // reference it (`where t.a == lim`) resolve at runtime — the
+                    // old `let lim = 1` bound `lim` as an ordinary local.
+                    let val = self.compile_expr(builder, v, env, db);
+                    env.set(n, val);
+                }
+                let plan_result = if !plan_stmts.is_empty() {
+                    self.analyze_sql_plan(plan_stmts, env)
+                } else {
+                    None
+                };
+                if let Some(plan) = plan_result {
                         let mut sql = plan.build_sql();
                         sql.push_str(" LIMIT 2");
                         let result_schema = plan.build_result_schema();
-                        let preds = try_extract_preds_for_single_table_plan(stmts, &plan);
+                        let preds = try_extract_preds_for_single_table_plan(plan_stmts, &plan);
                         let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
                         for table in &plan.tables {
                             let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
@@ -6052,8 +6297,15 @@ impl Codegen {
                             "knot_source_query",
                             &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
                         );
-                        return self.call_rt(builder, "knot_relation_single", &[rel]);
+                        let out = self.call_rt(builder, "knot_relation_single", &[rel]);
+                        for n in &overlay_added {
+                            self.let_bindings.remove(n);
+                        }
+                        return out;
                     }
+                for n in &overlay_added {
+                    self.let_bindings.remove(n);
+                }
             }
 
         // Special case: fold f init <relation expression> → stream rows from SQLite
@@ -8206,7 +8458,7 @@ impl Codegen {
             return false;
         }
         stmts.iter().any(|stmt| match &stmt.node {
-            ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => self.expr_is_io(expr),
+            ast::StmtKind::Bind { expr, .. } => self.expr_is_io(expr),
             ast::StmtKind::Expr(expr) => self.expr_is_io(expr),
             ast::StmtKind::Where { cond } => self.expr_is_io(cond),
             ast::StmtKind::GroupBy { .. } => false,
@@ -8316,12 +8568,12 @@ impl Codegen {
                 stmts.iter().any(|s| match &s.node {
                     ast::StmtKind::Bind { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
                     ast::StmtKind::Expr(expr) => Self::expr_contains_io(expr, builtins, io_fns),
-                    ast::StmtKind::Let { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
                     ast::StmtKind::Where { cond } => Self::expr_contains_io(cond, builtins, io_fns),
                     ast::StmtKind::GroupBy { key } => Self::expr_contains_io(key, builtins, io_fns),
                 })
             }
             ast::ExprKind::Lambda { body, .. } => Self::expr_contains_io(body, builtins, io_fns),
+            ast::ExprKind::With { body, .. } => Self::expr_contains_io(body, builtins, io_fns),
             ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
                 Self::expr_contains_io(cond, builtins, io_fns)
                     || Self::expr_contains_io(then_branch, builtins, io_fns)
@@ -8534,7 +8786,6 @@ impl Codegen {
                     unknown_io_value(expr)
                         || Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns)
                 }
-                ast::StmtKind::Let { expr, .. } => Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns),
                 ast::StmtKind::Where { cond } => Self::expr_contains_writes(cond, write_fns, known_fns, passthrough_fns),
                 ast::StmtKind::GroupBy { key } => Self::expr_contains_writes(key, write_fns, known_fns, passthrough_fns),
             }),
@@ -8571,9 +8822,55 @@ impl Codegen {
     /// Check if an expression produces an IO value (calls an IO-returning builtin
     /// or a user-defined IO function).
     fn expr_is_io(&self, expr: &ast::Expr) -> bool {
+        // Top-level entry: seed the scope stack with the currently-active
+        // `with` scopes (codegen may be partway through compiling `with`
+        // bodies) and delegate to the scope-aware worker.
+        let mut scopes = self.with_io_locals.clone();
+        self.expr_is_io_scoped(expr, &mut scopes)
+    }
+
+    /// Compute the IO-marks a `with` expression's record contributes for its
+    /// body: for each field name bound by the `with` (per inference's
+    /// `with_fields`), whether the bound value is IO-producing. Only a
+    /// record LITERAL lets us classify values statically; anything else
+    /// (var, call, ...) marks every bound name non-IO, matching the
+    /// conservative behaviour for unknown records. Returns `None` when the
+    /// `with` binds nothing (no inference info), in which case no scope
+    /// should be pushed.
+    fn with_io_scope_for(&self, with_span: knot::ast::Span, record: &ast::Expr) -> Option<HashMap<String, bool>> {
+        let field_names = self.with_fields.get(&with_span)?;
+        let mut scope = HashMap::new();
+        if let ast::ExprKind::Record(field_exprs) = &record.node {
+            for name in field_names {
+                let is_io = field_exprs
+                    .iter()
+                    .find(|f| &f.name == name)
+                    .is_some_and(|f| {
+                        let mut scopes = self.with_io_locals.clone();
+                        self.expr_is_io_scoped(&f.value, &mut scopes)
+                    });
+                scope.insert(name.clone(), is_io);
+            }
+        } else {
+            for name in field_names {
+                scope.insert(name.clone(), false);
+            }
+        }
+        Some(scope)
+    }
+
+    /// Worker for `expr_is_io` carrying an explicit stack of `with`-bound
+    /// IO scopes (`scopes`, innermost last). The `With` arm computes its
+    /// record's IO-marks, pushes them, checks the body, and pops — so a
+    /// `with`-bound IO lambda (e.g. `with {f: \y -> println (show y)}`)
+    /// makes uses of `f` inside the body read as IO even when the check
+    /// starts OUTSIDE the `with` (e.g. an enclosing do-block's
+    /// `is_io_do_block`). `scopes` is separate from `&self` so the `&self`
+    /// signature stays intact.
+    fn expr_is_io_scoped(&self, expr: &ast::Expr, scopes: &mut Vec<HashMap<String, bool>>) -> bool {
         match &expr.node {
             ast::ExprKind::App { func, arg } => {
-                self.expr_is_io(func) || self.expr_is_io(arg)
+                self.expr_is_io_scoped(func, scopes) || self.expr_is_io_scoped(arg, scopes)
             }
             ast::ExprKind::Var(name) => {
                 crate::builtins::is_io_builtin(name)
@@ -8581,38 +8878,61 @@ impl Codegen {
                     name.as_str(),
                     "fork" | "race"
                 ) || self.io_functions.contains(name)
+                || Self::io_scopes_lookup(scopes, name)
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
-                self.expr_is_io(lhs) || self.expr_is_io(rhs)
+                self.expr_is_io_scoped(lhs, scopes) || self.expr_is_io_scoped(rhs, scopes)
             }
-            ast::ExprKind::UnaryOp { operand, .. } => self.expr_is_io(operand),
+            ast::ExprKind::UnaryOp { operand, .. } => self.expr_is_io_scoped(operand, scopes),
             ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
-                self.expr_is_io(cond)
-                    || self.expr_is_io(then_branch)
-                    || self.expr_is_io(else_branch)
+                self.expr_is_io_scoped(cond, scopes)
+                    || self.expr_is_io_scoped(then_branch, scopes)
+                    || self.expr_is_io_scoped(else_branch, scopes)
             }
             ast::ExprKind::Case { scrutinee, arms, .. } => {
-                self.expr_is_io(scrutinee)
-                    || arms.iter().any(|arm| self.expr_is_io(&arm.body))
+                self.expr_is_io_scoped(scrutinee, scopes)
+                    || arms.iter().any(|arm| self.expr_is_io_scoped(&arm.body, scopes))
             }
             ast::ExprKind::Do(stmts) => {
                 stmts.iter().any(|s| match &s.node {
-                    ast::StmtKind::Bind { expr, .. } => self.expr_is_io(expr),
-                    ast::StmtKind::Expr(expr) => self.expr_is_io(expr),
-                    ast::StmtKind::Let { expr, .. } => self.expr_is_io(expr),
-                    ast::StmtKind::Where { cond } => self.expr_is_io(cond),
-                    ast::StmtKind::GroupBy { key } => self.expr_is_io(key),
+                    ast::StmtKind::Bind { expr, .. } => self.expr_is_io_scoped(expr, scopes),
+                    ast::StmtKind::Expr(expr) => self.expr_is_io_scoped(expr, scopes),
+                    ast::StmtKind::Where { cond } => self.expr_is_io_scoped(cond, scopes),
+                    ast::StmtKind::GroupBy { key } => self.expr_is_io_scoped(key, scopes),
                 })
             }
-            ast::ExprKind::Lambda { body, .. } => self.expr_is_io(body),
-            ast::ExprKind::TimeUnitLit { value, .. } => self.expr_is_io(value),
-            ast::ExprKind::Annot { expr, .. } => self.expr_is_io(expr),
-            ast::ExprKind::Refine(inner) => self.expr_is_io(inner),
+            ast::ExprKind::Lambda { body, .. } => self.expr_is_io_scoped(body, scopes),
+            ast::ExprKind::With { record, body } => {
+                let sc = self.with_io_scope_for(expr.span, record);
+                if let Some(scope) = sc {
+                    scopes.push(scope);
+                    let r = self.expr_is_io_scoped(body, scopes);
+                    scopes.pop();
+                    r
+                } else {
+                    self.expr_is_io_scoped(body, scopes)
+                }
+            }
+            ast::ExprKind::TimeUnitLit { value, .. } => self.expr_is_io_scoped(value, scopes),
+            ast::ExprKind::Annot { expr, .. } => self.expr_is_io_scoped(expr, scopes),
+            ast::ExprKind::Refine(inner) => self.expr_is_io_scoped(inner, scopes),
             _ => false,
         }
+    }
+
+    /// Innermost-first lookup of `name` in a `with` IO scope stack; the
+    /// first scope that BINDS the name decides (so a nested `with`
+    /// rebinding an outer IO name to a non-IO value shadows the mark).
+    fn io_scopes_lookup(scopes: &[HashMap<String, bool>], name: &str) -> bool {
+        for scope in scopes.iter().rev() {
+            if let Some(is_io) = scope.get(name) {
+                return *is_io;
+            }
+        }
+        false
     }
 
     /// Check whether a do-block has relation-comprehension shape: every
@@ -8634,7 +8954,6 @@ impl Codegen {
                     &s.node,
                     ast::StmtKind::Bind { .. }
                         | ast::StmtKind::Where { .. }
-                        | ast::StmtKind::Let { .. }
                 )
             })
     }
@@ -8660,7 +8979,7 @@ impl Codegen {
                         return true;
                     }
                 }
-                ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. }
+                ast::StmtKind::Bind { pat, .. }
                     if pat_bound_names(pat).iter().any(|n| n == name) => {
                     return false;
                 }
@@ -8674,25 +8993,6 @@ impl Codegen {
     /// statements: a do-block ending in `yield` whose other statements are
     /// all Bind/Where/Let/GroupBy compiles through the relational loop
     /// paths and therefore produces a relation value.
-    fn do_block_is_relational_shape(stmts: &[ast::Stmt]) -> bool {
-        let Some((last, init)) = stmts.split_last() else {
-            return false;
-        };
-        let last_is_yield = matches!(
-            &last.node,
-            ast::StmtKind::Expr(e) if e.node.as_yield_arg().is_some()
-        );
-        last_is_yield
-            && init.iter().all(|s| {
-                matches!(
-                    &s.node,
-                    ast::StmtKind::Bind { .. }
-                        | ast::StmtKind::Where { .. }
-                        | ast::StmtKind::Let { .. }
-                        | ast::StmtKind::GroupBy { .. }
-                )
-            })
-    }
 
     /// Check whether an expression's IO-ness involves *external* effects
     /// (console/fs/network/clock/random builtins, fork/race, atomic blocks,
@@ -8735,12 +9035,12 @@ impl Codegen {
                 stmts.iter().any(|s| match &s.node {
                     ast::StmtKind::Bind { expr, .. } => self.expr_has_external_io(expr),
                     ast::StmtKind::Expr(expr) => self.expr_has_external_io(expr),
-                    ast::StmtKind::Let { expr, .. } => self.expr_has_external_io(expr),
                     ast::StmtKind::Where { cond } => self.expr_has_external_io(cond),
                     ast::StmtKind::GroupBy { key } => self.expr_has_external_io(key),
                 })
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_has_external_io(body),
+            ast::ExprKind::With { body, .. } => self.expr_has_external_io(body),
             ast::ExprKind::TimeUnitLit { value, .. } => self.expr_has_external_io(value),
             ast::ExprKind::Annot { expr, .. } => self.expr_has_external_io(expr),
             ast::ExprKind::Refine(inner) => self.expr_has_external_io(inner),
@@ -8789,6 +9089,18 @@ impl Codegen {
             .into_iter()
             .filter(|v| env.bindings.contains_key(v))
             .collect();
+        // Relation-valued locals captured into this thunk must stay
+        // per-row-iterable inside it. The thunk body is compiled later
+        // (`define_io_thunk_function`), after the enclosing scope that
+        // registered the relation local (`io_relation_vars`, the
+        // `with`-arm registration) has been torn down — without this the
+        // bind `x <- r` inside the thunk falls back to whole-relation
+        // semantics and silently iterates only the first row.
+        let captured_rel_vars: HashSet<String> = free_vars
+            .iter()
+            .filter(|v| self.io_relation_vars.contains(*v))
+            .cloned()
+            .collect();
 
         // Declare the thunk function: (db, env) -> result
         let mut sig = self.module.make_signature();
@@ -8805,6 +9117,7 @@ impl Codegen {
             func_id,
             stmts: stmts.to_vec(),
             free_vars: free_vars.clone(),
+            captured_rel_vars,
         });
 
         // Build the closure env: capture free variables (same pattern as lambdas)
@@ -9040,17 +9353,6 @@ impl Codegen {
                         && (matches!(&expr.node, ast::ExprKind::List(_))
                             || self.expr_is_known_relation(expr)
                             || self.expr_is_relation_var(expr)
-                            // A pure comprehension over the relation monad is
-                            // desugared before codegen into an `App` spine of
-                            // `__bind`/`__yield` (no longer an `ExprKind::Do`),
-                            // and inference types the bind pattern as the
-                            // ELEMENT type. The Let arm recognizes this shape
-                            // (via `desugared_monad_kind`, ~line 8434) to mark
-                            // the binding relation-valued; mirror it here so
-                            // `x <- do { a <- [1,2,3]; yield a }` iterates
-                            // per-row (x : element) instead of binding the whole
-                            // relation value (which prints the list once and
-                            // panics on field access).
                             || self.desugared_monad_kind(expr)
                                 == Some(MonadKind::Relation)))
                         || (pat_filters_rows && rhs_is_io_relation_source)
@@ -9118,102 +9420,6 @@ impl Codegen {
                     // variables bound from those sources are now stale.
                     self.invalidate_after_possible_writes(expr);
                     last_val = result;
-                }
-                ast::StmtKind::Let { pat, expr } => {
-                    // A let rebinding a name drops its source/let tracking.
-                    self.invalidate_rebound_pattern(pat);
-                    // Track let-bound expressions so SQL pushdown matchers
-                    // can fold through them when matching set/replace shapes
-                    // later in the do-block.
-                    if let ast::PatKind::Var(var_name) = &pat.node {
-                        self.let_bindings.insert(var_name.clone(), expr.clone());
-                    }
-                    // A let-bound relation comprehension (`let xs = do { t <-
-                    // *rel; where ...; yield t }`) is typed by inference as
-                    // the relation itself (`[T]`) — its IO-ness is only
-                    // relation reads, no external effects. Compile it through
-                    // the relational loop path (per-row iteration, `where` as
-                    // filter) and bind the resulting rows, instead of leaving
-                    // an unexecuted IO thunk with guard semantics. Other
-                    // relation-only IO expressions are run eagerly with
-                    // `knot_io_run` (identity on non-IO values). External-
-                    // effect IO (`let action = println "x"`) stays deferred
-                    // and runs at its use sites.
-                    let relation_only_io =
-                        self.expr_is_io(expr) && !self.expr_has_external_io(expr);
-                    let val = match &expr.node {
-                        ast::ExprKind::Do(stmts)
-                            if relation_only_io
-                                && Self::do_block_is_comprehension(stmts) =>
-                        {
-                            self.compile_do(builder, stmts, env, db)
-                        }
-                        // An `atomic` block compiles *eagerly* — the Atomic arm
-                        // of compile_expr emits the savepoint/retry loop inline
-                        // rather than producing a deferred IO thunk. Binding it
-                        // with the general `compile_expr` path below would run
-                        // the whole transaction once, right here at the `let`,
-                        // and bind the name to the transaction's *result value*.
-                        // Later uses (`let bump = atomic do {…}; bump; bump`)
-                        // would then be plain values, and each `knot_io_run` on
-                        // them a no-op — so the transaction fires once instead of
-                        // per use. Wrap the atomic in an IO thunk instead: the
-                        // bound name holds a deferred `Value::IO(fn_ptr, env)`,
-                        // and each use re-runs the whole transaction when
-                        // `knot_io_run` executes it (the thunk body compiles the
-                        // atomic eagerly via compile_io_do_eager → compile_expr,
-                        // but only when invoked).
-                        ast::ExprKind::Atomic(_) => {
-                            let do_stmts = vec![ast::Spanned::new(
-                                ast::StmtKind::Expr(expr.clone()),
-                                expr.span,
-                            )];
-                            self.compile_io_do_as_thunk(builder, &do_stmts, env, db)
-                        }
-                        _ => {
-                            let v = self.compile_expr(builder, expr, env, db);
-                            if relation_only_io {
-                                self.call_rt(builder, "knot_io_run", &[db, v])
-                            } else {
-                                v
-                            }
-                        }
-                    };
-                    // Track names whose let-bound value is statically a
-                    // relation (comprehension/groupBy do-blocks, source
-                    // reads, list literals, relation-returning stdlib calls,
-                    // or another relation-valued name) so a later
-                    // `row <- name` bind iterates instead of binding the
-                    // whole relation value.
-                    let is_relation_value = match &expr.node {
-                        ast::ExprKind::Do(do_stmts) => {
-                            !self.expr_has_external_io(expr)
-                                && Self::do_block_is_relational_shape(do_stmts)
-                        }
-                        ast::ExprKind::List(_)
-                        | ast::ExprKind::SourceRef(_)
-                        | ast::ExprKind::DerivedRef(_) => true,
-                        _ => {
-                            self.expr_is_known_relation(expr)
-                                || self.expr_is_relation_var(expr)
-                                // A pure comprehension over the relation monad
-                                // is desugared to an `App` of `__bind`/`__yield`
-                                // — recognize it here so `let xs = do { … }`
-                                // (relation-typed) is iterable downstream.
-                                || self.desugared_monad_kind(expr)
-                                    == Some(MonadKind::Relation)
-                        }
-                    };
-                    self.io_relation_vars.retain(|n| !pat_binds(pat, n));
-                    if is_relation_value
-                        && let ast::PatKind::Var(var_name) = &pat.node {
-                            self.io_relation_vars.insert(var_name.clone());
-                        }
-                    let mismatch_target =
-                        self.io_loop_skip_block.unwrap_or(done_block);
-                    self.bind_io_pattern(builder, pat, val, env, Some(mismatch_target));
-                    self.invalidate_after_possible_writes(expr);
-                    last_val = val;
                 }
                 ast::StmtKind::Where { cond } => {
                     // In IO do-blocks, where acts as a guard:
@@ -9688,7 +9894,6 @@ impl Codegen {
         // The primary bind is the most recent bind before groupBy — it is
         // the one rebound to each group sub-relation.
         let mut primary: Option<String> = None;
-        let mut first_bind_seen = false;
         let mut loop_local: HashSet<String> = HashSet::new();
         for stmt in &stmts[..group_pos] {
             match &stmt.node {
@@ -9696,18 +9901,9 @@ impl Codegen {
                     let mut names = HashSet::new();
                     collect_pat_binds(pat, &mut names);
                     loop_local.extend(names);
-                    first_bind_seen = true;
                     if let Some(p) = pat_primary_var(&pat.node) {
                         primary = Some(p);
                     }
-                }
-                // Lets BEFORE the first bind are emitted outside any loop
-                // and stay valid after groupBy; lets after it are emitted
-                // inside the loop bodies.
-                ast::StmtKind::Let { pat, .. } if first_bind_seen => {
-                    let mut names = HashSet::new();
-                    collect_pat_binds(pat, &mut names);
-                    loop_local.extend(names);
                 }
                 _ => {}
             }
@@ -9725,7 +9921,7 @@ impl Codegen {
                 ast::StmtKind::GroupBy { key } => Some(key),
                 ast::StmtKind::Where { cond } => Some(cond),
                 ast::StmtKind::Expr(e) => Some(e),
-                ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Let { expr, .. } => Some(expr),
+                ast::StmtKind::Bind { expr, .. } => Some(expr),
             };
             if let Some(e) = expr_to_check
                 && let Some(name) = live.iter().find(|n| expr_refs_var(e, n)).cloned() {
@@ -9749,7 +9945,7 @@ impl Codegen {
                 }
             // A post-group bind/let rebinding a loop-local name shadows it
             // for the remaining statements.
-            if let ast::StmtKind::Bind { pat, .. } | ast::StmtKind::Let { pat, .. } = &stmt.node {
+            if let ast::StmtKind::Bind { pat, .. } = &stmt.node {
                 let mut names = HashSet::new();
                 collect_pat_binds(pat, &mut names);
                 for n in names {
@@ -9933,7 +10129,6 @@ impl Codegen {
                         matches!(
                             &s.node,
                             ast::StmtKind::Bind { .. }
-                                | ast::StmtKind::Let { .. }
                                 | ast::StmtKind::GroupBy { .. }
                         )
                     })
@@ -10102,7 +10297,6 @@ impl Codegen {
                                         matches!(
                                             &s.node,
                                             ast::StmtKind::Bind { .. }
-                                                | ast::StmtKind::Let { .. }
                                                 | ast::StmtKind::GroupBy { .. }
                                         )
                                     })
@@ -10346,77 +10540,6 @@ impl Codegen {
                     }
                 }
 
-                ast::StmtKind::Let { pat, expr } => {
-                    // A let rebinding a name drops its source/let tracking.
-                    self.invalidate_rebound_pattern(pat);
-                    // Track let-bound expressions so SQL pushdown matchers
-                    // can fold through them when matching set/replace shapes
-                    // later in the do-block.
-                    if let ast::PatKind::Var(var_name) = &pat.node {
-                        self.let_bindings.insert(var_name.clone(), expr.clone());
-                    }
-                    let val = self.compile_expr(builder, expr, env, db);
-                    self.invalidate_after_possible_writes(expr);
-
-                    // Track schema of Let-bound relation variables for groupBy support.
-                    // If the expression is a known relation (source, derived, or var),
-                    // extract its schema and store it for later use in groupBy.
-                    if group_by_pos.is_some()
-                        && let ast::PatKind::Var(var_name) = &pat.node {
-                            match &expr.node {
-                                ast::ExprKind::SourceRef(name)
-                                | ast::ExprKind::DerivedRef(name) => {
-                                    if let Some(schema) = self.source_schemas.get(name).cloned() {
-                                        var_schemas.insert(var_name.clone(), schema);
-                                    }
-                                }
-                                ast::ExprKind::FieldAccess { expr: target, field } => {
-                                    if let ast::ExprKind::Var(parent_var) = &target.node
-                                        && let Some(parent_schema) = var_schemas.get(parent_var)
-                                            && let Some(child_schema) = extract_child_schema(parent_schema, field) {
-                                                var_schemas.insert(var_name.clone(), child_schema);
-                                            }
-                                }
-                                ast::ExprKind::Var(source_var) => {
-                                    // Let-bound from another variable — inherit its schema
-                                    if let Some(schema) = var_schemas.get(source_var).cloned() {
-                                        var_schemas.insert(var_name.clone(), schema);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-
-                    if matches!(
-                        &pat.node,
-                        ast::PatKind::Constructor { .. }
-                            | ast::PatKind::Lit(_)
-                            | ast::PatKind::List(_)
-                            | ast::PatKind::Cons { .. }
-                    ) {
-                        // All refutable patterns need filter branches so a
-                        // mismatched row is skipped (relational semantics),
-                        // not trapped. `bind_do_pattern` emits skip blocks
-                        // for Constructor/Lit/List/Cons uniformly.
-                        let mut pattern_skips = Vec::new();
-                        bind_do_pattern(builder, self, pat, val, env, &mut pattern_skips);
-                        if let Some(loop_info) = loop_stack.last_mut() {
-                            loop_info.where_skips.extend(pattern_skips);
-                        } else {
-                            // No loop context — seal skip blocks with guard failure
-                            let current_block = builder.current_block().unwrap();
-                            for skip in pattern_skips {
-                                builder.switch_to_block(skip);
-                                builder.seal_block(skip);
-                                self.call_rt_void(builder, "knot_guard_failed", &[]);
-                                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
-                            }
-                            builder.switch_to_block(current_block);
-                        }
-                    } else {
-                        self.bind_io_pattern(builder, pat, val, env, None);
-                    }
-                }
 
                 ast::StmtKind::GroupBy { key } => {
                     // ── Phase transition: pre-group → post-group ──
@@ -10917,6 +11040,15 @@ impl Codegen {
                     || (!self.user_fns.contains_key(v) && !is_builtin_name(v))
             })
             .collect();
+        // Relation-valued locals captured into this lambda must stay
+        // per-row-iterable inside it, exactly as for IO thunks (see
+        // `compile_io_do_as_thunk`): the body is compiled later, after the
+        // enclosing `io_relation_vars` scope has been torn down.
+        let captured_rel_vars: HashSet<String> = free_vars
+            .iter()
+            .filter(|v| self.io_relation_vars.contains(*v))
+            .cloned()
+            .collect();
 
         // Declare the lambda function: (db, env, arg) -> result
         let mut sig = self.module.make_signature();
@@ -10936,6 +11068,7 @@ impl Codegen {
             param_pat: if params.len() == 1 { Some(params[0].clone()) } else { None },
             body: body.clone(),
             free_vars: free_vars.clone(),
+            captured_rel_vars,
         });
 
         // Build the closure: capture free variables into a record
@@ -11328,6 +11461,10 @@ impl Codegen {
                 Self::references_source(func, source_name)
                     || Self::references_source(arg, source_name)
             }
+            ast::ExprKind::With { record, body } => {
+                Self::references_source(record, source_name)
+                    || Self::references_source(body, source_name)
+            }
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 Self::references_source(lhs, source_name)
                     || Self::references_source(rhs, source_name)
@@ -11346,7 +11483,6 @@ impl Codegen {
             }
             ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
                 ast::StmtKind::Bind { expr, .. } => Self::references_source(expr, source_name),
-                ast::StmtKind::Let { expr, .. } => Self::references_source(expr, source_name),
                 ast::StmtKind::Where { cond } => Self::references_source(cond, source_name),
                 ast::StmtKind::GroupBy { key } => Self::references_source(key, source_name),
                 ast::StmtKind::Expr(e) => Self::references_source(e, source_name),
@@ -11940,7 +12076,7 @@ impl Codegen {
         let mut tables: Vec<SqlTable> = Vec::new();
         let mut bind_to_alias: HashMap<String, String> = HashMap::new();
         let mut bind_to_schema: HashMap<String, String> = HashMap::new();
-        let mut let_binds: HashMap<String, ast::Expr> = HashMap::new();
+        let let_binds: HashMap<String, ast::Expr> = HashMap::new();
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<SqlParamSource> = Vec::new();
 
@@ -11976,38 +12112,6 @@ impl Codegen {
                         source_name,
                         alias,
                     });
-                }
-                ast::StmtKind::Let { pat, expr } => {
-                    // Only support simple variable patterns; bail on destructuring.
-                    let var_name = if let ast::PatKind::Var(name) = &pat.node {
-                        name.clone()
-                    } else {
-                        return None;
-                    };
-                    // The let expression must not reference any bind aliases
-                    // (it's a computed parameter, not a column alias).
-                    if bind_to_alias.keys().any(|k| Self::expr_refs_var(expr, k)) {
-                        return None;
-                    }
-                    // Close the expression over earlier do-local lets: a
-                    // chained `let a = 5; let b = a + 1` stores `b` as a
-                    // param expression that is later compiled in the
-                    // *enclosing* env, where `a` is not bound — substitute
-                    // previously-collected let bindings so every stored
-                    // expression only references outer-scope names. Entries
-                    // in `let_binds` are already closed (each was
-                    // substituted when stored), so a single pass suffices.
-                    let mut closed = expr.clone();
-                    for (k, v) in &let_binds {
-                        match substitute(&closed, k, v) {
-                            Some(s) => closed = s,
-                            // Substitution would capture a free variable —
-                            // bail out of the SQL plan entirely rather than
-                            // compile a param expr with unbound names.
-                            None => return None,
-                        }
-                    }
-                    let_binds.insert(var_name, closed);
                 }
                 ast::StmtKind::Where { cond } => {
                     let frag = Self::try_compile_multi_table_sql_expr(
@@ -13146,11 +13250,23 @@ impl Codegen {
     }
 
     /// Check if an expression is (possibly through annotation wrappers) a
-    /// variable bound earlier in the current IO do-block to a value that is
-    /// statically known to be a relation (see `io_relation_vars`).
+    /// variable whose value is statically known to be a relation. Three
+    /// scopes, outermost last:
+    ///   * `io_relation_vars` — locals bound earlier in the current IO
+    ///     do-block (see the field's doc comment);
+    ///   * `closure_relation_vars` — relation locals captured by the closure
+    ///     (lambda / IO thunk) currently being compiled; these were in
+    ///     `io_relation_vars` when the closure was created but that scope
+    ///     has exited by the time the deferred closure body is compiled;
+    ///   * `decl_relation_vars` — top-level relation constants, whose type
+    ///     is scope-independent.
     fn expr_is_relation_var(&self, expr: &ast::Expr) -> bool {
         match &strip_expr_wrappers(expr).node {
-            ast::ExprKind::Var(name) => self.io_relation_vars.contains(name),
+            ast::ExprKind::Var(name) => {
+                self.io_relation_vars.contains(name)
+                    || self.closure_relation_vars.contains(name)
+                    || self.decl_relation_vars.contains(name)
+            }
             _ => false,
         }
     }
@@ -13992,7 +14108,6 @@ fn expr_has_user_calls(expr: &ast::Expr, user_fns: &HashMap<String, (FuncId, usi
         ast::ExprKind::Refine(inner) => expr_has_user_calls(inner, user_fns),
         ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
             ast::StmtKind::Bind { expr, .. } => expr_has_user_calls(expr, user_fns),
-            ast::StmtKind::Let { expr, .. } => expr_has_user_calls(expr, user_fns),
             ast::StmtKind::Where { cond } => expr_has_user_calls(cond, user_fns),
             ast::StmtKind::GroupBy { key } => expr_has_user_calls(key, user_fns),
             ast::StmtKind::Expr(e) => expr_has_user_calls(e, user_fns),
@@ -14283,15 +14398,6 @@ fn try_extract_field_preds_from_where_stmts(
             }
             ast::StmtKind::Where { cond } => {
                 extract_preds_walk(bind_var, cond, &mut out)?;
-            }
-            ast::StmtKind::Let { .. } => {
-                // Let-bound names appear in Where conditions as Var nodes.
-                // `simple_value_param` accepts them as `Var` params, but
-                // they are NOT in the Cranelift env at the call site (the
-                // SQL plan substitutes their defining expressions instead of
-                // compiling the lets). `emit_stm_track_pred` detects such
-                // unresolvable params and skips the precision upgrade,
-                // leaving the broad `All` filter in place.
             }
             _ => return None,
         }
@@ -15083,6 +15189,11 @@ fn beta_reduce_inner(
             }
             Var(name.clone())
         }
+        With { record, body } => {
+            let r = beta_reduce_inner(record, fun_bodies, let_bindings, visited, fuel);
+            let b = beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel);
+            With { record: Box::new(r), body: Box::new(b) }
+        }
         App { func, arg } => {
             let f = beta_reduce_inner(func, fun_bodies, let_bindings, visited, fuel);
             let a = beta_reduce_inner(arg, fun_bodies, let_bindings, visited, fuel);
@@ -15244,6 +15355,10 @@ fn substitute_inner(
                 body: Box::new(substitute_inner(body, var, value, value_fv)?),
             }
         }
+        With { record, body } => With {
+            record: Box::new(substitute_inner(record, var, value, value_fv)?),
+            body: Box::new(substitute_inner(body, var, value, value_fv)?),
+        },
         App { func, arg } => App {
             func: Box::new(substitute_inner(func, var, value, value_fv)?),
             arg: Box::new(substitute_inner(arg, var, value, value_fv)?),
@@ -15333,7 +15448,6 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     let in_stmts = |stmts: &[ast::Stmt]| -> bool {
         stmts.iter().any(|s| match &s.node {
             ast::StmtKind::Bind { expr, .. }
-            | ast::StmtKind::Let { expr, .. }
             | ast::StmtKind::Expr(expr) => expr_mentions_var(expr, var),
             ast::StmtKind::Where { cond } => expr_mentions_var(cond, var),
             ast::StmtKind::GroupBy { key } => expr_mentions_var(key, var),
@@ -15352,6 +15466,9 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
         Lambda { body, .. } => expr_mentions_var(body, var),
         App { func, arg } => {
             expr_mentions_var(func, var) || expr_mentions_var(arg, var)
+        }
+        With { record, body } => {
+            expr_mentions_var(record, var) || expr_mentions_var(body, var)
         }
         BinOp { lhs, rhs, .. } => {
             expr_mentions_var(lhs, var) || expr_mentions_var(rhs, var)
@@ -15406,6 +15523,10 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             collect_free_vars_set(func, bound, free);
             collect_free_vars_set(arg, bound, free);
         }
+        With { record, body } => {
+            collect_free_vars_set(record, bound, free);
+            collect_free_vars_set(body, bound, free);
+        }
         BinOp { lhs, rhs, .. } => {
             collect_free_vars_set(lhs, bound, free);
             collect_free_vars_set(rhs, bound, free);
@@ -15457,10 +15578,6 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             for stmt in stmts {
                 match &stmt.node {
                     ast::StmtKind::Bind { pat, expr } => {
-                        collect_free_vars_set(expr, &do_bound, free);
-                        collect_pat_binds(pat, &mut do_bound);
-                    }
-                    ast::StmtKind::Let { pat, expr } => {
                         collect_free_vars_set(expr, &do_bound, free);
                         collect_pat_binds(pat, &mut do_bound);
                     }
@@ -16393,6 +16510,9 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::App { func, arg } => {
             expr_contains_derived_ref(func, name) || expr_contains_derived_ref(arg, name)
         }
+        ast::ExprKind::With { record, body } => {
+            expr_contains_derived_ref(record, name) || expr_contains_derived_ref(body, name)
+        }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
             expr_contains_derived_ref(lhs, name) || expr_contains_derived_ref(rhs, name)
         }
@@ -16408,7 +16528,6 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         }
         ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
             ast::StmtKind::Bind { expr, .. } => expr_contains_derived_ref(expr, name),
-            ast::StmtKind::Let { expr, .. } => expr_contains_derived_ref(expr, name),
             ast::StmtKind::Where { cond } => expr_contains_derived_ref(cond, name),
             ast::StmtKind::GroupBy { key } => expr_contains_derived_ref(key, name),
             ast::StmtKind::Expr(e) => expr_contains_derived_ref(e, name),
@@ -16517,6 +16636,10 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
             collect_free_vars(func, bound, free);
             collect_free_vars(arg, bound, free);
         }
+        ast::ExprKind::With { record, body } => {
+            collect_free_vars(record, bound, free);
+            collect_free_vars(body, bound, free);
+        }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
             collect_free_vars(lhs, bound, free);
             collect_free_vars(rhs, bound, free);
@@ -16546,10 +16669,6 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
             for stmt in stmts {
                 match &stmt.node {
                     ast::StmtKind::Bind { pat, expr } => {
-                        collect_free_vars(expr, &do_bound, free);
-                        collect_pat_bindings_set(pat, &mut do_bound);
-                    }
-                    ast::StmtKind::Let { pat, expr } => {
                         collect_free_vars(expr, &do_bound, free);
                         collect_pat_bindings_set(pat, &mut do_bound);
                     }
@@ -16644,6 +16763,9 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
+        ast::ExprKind::With { record, body } => {
+            expr_refs_var(record, var) || expr_refs_var(body, var)
+        }
         ast::ExprKind::BinOp { lhs, rhs, .. } => expr_refs_var(lhs, var) || expr_refs_var(rhs, var),
         ast::ExprKind::UnaryOp { operand, .. } => expr_refs_var(operand, var),
         ast::ExprKind::If { cond, then_branch, else_branch } => {
@@ -16672,7 +16794,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
                 match &stmt.node {
-                    ast::StmtKind::Bind { pat, expr: e } | ast::StmtKind::Let { pat, expr: e } => {
+                    ast::StmtKind::Bind { pat, expr: e } => {
                         if expr_refs_var(e, var) {
                             return true;
                         }
@@ -16746,6 +16868,9 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         ast::ExprKind::App { func, arg } => {
             expr_uses_var_as_value(func, var) || expr_uses_var_as_value(arg, var)
         }
+        ast::ExprKind::With { record, body } => {
+            expr_uses_var_as_value(record, var) || expr_uses_var_as_value(body, var)
+        }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
             expr_uses_var_as_value(lhs, var) || expr_uses_var_as_value(rhs, var)
         }
@@ -16783,7 +16908,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
                 match &stmt.node {
-                    ast::StmtKind::Bind { pat, expr: e } | ast::StmtKind::Let { pat, expr: e } => {
+                    ast::StmtKind::Bind { pat, expr: e } => {
                         if expr_uses_var_as_value(e, var) {
                             return true;
                         }
@@ -17084,6 +17209,9 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::FieldAccess { expr, field } => {
             format!("{}.{}", pretty_expr(expr), field)
         }
+        ast::ExprKind::With { record, body } => {
+            format!("with {} {}", pretty_expr(record), pretty_expr(body))
+        }
         ast::ExprKind::List(elems) => {
             let es: Vec<String> = elems.iter().map(pretty_expr).collect();
             format!("[{}]", es.join(", "))
@@ -17242,9 +17370,6 @@ fn pretty_stmt(stmt: &ast::Stmt) -> String {
     match &stmt.node {
         ast::StmtKind::Bind { pat, expr } => {
             format!("{} <- {}", pretty_pat(pat), pretty_expr(expr))
-        }
-        ast::StmtKind::Let { pat, expr } => {
-            format!("let {} = {}", pretty_pat(pat), pretty_expr(expr))
         }
         ast::StmtKind::Where { cond } => format!("where {}", pretty_expr(cond)),
         ast::StmtKind::GroupBy { key } => format!("groupBy {}", pretty_expr(key)),

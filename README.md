@@ -44,17 +44,18 @@ main = do
     {name: "Carol", age: 35}
   ]
   people <- *people
-  let seniors = do
+  with {seniors: do
     p <- people
     where p.age > 27
-    yield p
-  println ("Senior count: " ++ show (count seniors))
-  forEach seniors (\p -> println ("  " ++ p.name))
-  yield {}
+    yield p}
+  (do
+    println ("Senior count: " ++ show (count seniors))
+    forEach seniors (\p -> println ("  " ++ p.name))
+    yield {})
 ```
 
 `*people` is a *source relation* — declared with a type but no body, so
-it's persisted to SQLite on first run. The `let seniors = do ...` block is
+it's persisted to SQLite on first run. The `with {seniors: do ...}` block is
 a query expression that compiles to a single `SELECT ... WHERE age > 27`
 against the auto-indexed `age` column.
 

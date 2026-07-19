@@ -119,15 +119,15 @@ main = do
   as <- *a
   bs <- *b
   cs <- *c
-  let joined = do
+  with {joined: do
     x <- as
     y <- bs
     z <- cs
     where z.ka == x.k
     where z.kb == y.k
-    yield z.v
-  r <- joined
-  println (show r)
+    yield z.v} (do
+    r <- joined
+    println (show r))
 "#;
     let s = scratch("join_predicates");
     let out = run_build(&s.dir, src);

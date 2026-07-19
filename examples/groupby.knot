@@ -12,13 +12,13 @@ main = do
   ]
 
   -- Group pending todos by owner and count them
-  let workload = do
+  with {workload: do
     t <- *todos
     where t.done == 0
     groupBy {t.owner}
-    yield {owner: t.owner, count: count t}
+    yield {owner: t.owner, count: count t}} (do
 
-  println "Pending work per person:"
-  w <- workload
-  println (w.owner ++ ": " ++ show w.count)
-  yield {}
+    println "Pending work per person:"
+    w <- workload
+    println (w.owner ++ ": " ++ show w.count)
+    yield {})

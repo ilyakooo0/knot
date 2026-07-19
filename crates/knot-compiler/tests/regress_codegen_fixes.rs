@@ -119,12 +119,11 @@ fn single_plan_with_do_local_let_param() {
 
 main = do
   replace *items = [{a: 1}, {a: 2}]
-  let r = single (do
-    let lim = 1
+  with {r: single (with {lim: 1} (do
     t <- *items
     where t.a == lim
-    yield t)
-  println (show r)
+    yield t))} (do
+    println (show r))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -147,8 +146,8 @@ limitN = 2
 main = do
   replace *items = [{a: 1}, {a: 2}, {a: 3}]
   rows <- *items
-  let firstTwo = rows |> take limitN
-  println ("took: " ++ show (count firstTwo))
+  with {firstTwo: rows |> take limitN} (do
+    println ("took: " ++ show (count firstTwo)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -169,8 +168,8 @@ cutoff = 3
 
 main = do
   replace *items = [{age: 1}, {age: 4}, {age: 9}]
-  let n = count (filter (\t -> t.age > cutoff) *items)
-  println ("n: " ++ show n)
+  with {n: count (filter (\t -> t.age > cutoff) *items)} (do
+    println ("n: " ++ show n))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -294,8 +293,8 @@ fn user_primitive_eq_applies_inside_conditions() {
   eq a b = true
 
 main = do
-  let msg = if 1 == 2 then "impl" else "fallback"
-  println msg
+  with {msg: if 1 == 2 then "impl" else "fallback"} (do
+    println msg)
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -365,11 +364,11 @@ fn let_bound_relation_comprehension_materializes() {
 
 main = do
   replace *items = [{age: 1}, {age: 9}]
-  let xs = do
+  with {xs: do
     t <- *items
     where t.age > 3
-    yield t
-  println (show (count xs))
+    yield t} (do
+    println (show (count xs)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -386,8 +385,8 @@ fn let_bound_external_io_stays_deferred() {
     let (stdout, stderr, ok) = compile_and_run(
         "let_io_deferred",
         r#"main = do
-  let action = println "hi"
-  action
+  with {action: println "hi"} (do
+    action)
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -403,8 +402,8 @@ fn let_bound_unused_external_io_never_runs() {
     let (stdout, stderr, ok) = compile_and_run(
         "let_io_unused",
         r#"main = do
-  let action = println "never"
-  println "done"
+  with {action: println "never"} (do
+    println "done")
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -433,8 +432,8 @@ fn thirteen_param_function_curries_in_order() {
 apply = \g x -> g x
 
 main = do
-  let g = f13
-  println (apply (g 1 2 3 4 5 6 7 8 9 10 11 12) 13)
+  with {g: f13} (do
+    println (apply (g 1 2 3 4 5 6 7 8 9 10 11 12) 13))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -486,8 +485,8 @@ type T = {lvl: Level, n: Int 1}
 *t : [T]
 main = do
   replace *t = [{lvl: Low {}, n: 1}, {lvl: High {}, n: 2}]
-  let top = maxOn (\r -> r.lvl) *t
-  println ("top: " ++ show top)
+  with {top: maxOn (\r -> r.lvl) *t} (do
+    println ("top: " ++ show top))
 "#,
     );
     assert!(
@@ -511,10 +510,10 @@ fn atomic_loop_where_guard_skip_keeps_prior_writes() {
         r#"*log : [{id: Int 1}]
 
 process = atomic do
-  let items = [{id: 10, keep: true}, {id: 20, keep: false}]
-  row <- items
-  where row.keep
-  *log = union *log [{id: row.id}]
+  with {items: [{id: 10, keep: true}, {id: 20, keep: false}]} (do
+    row <- items
+    where row.keep
+    *log = union *log [{id: row.id}])
 
 main = do
   replace *log = []
@@ -541,9 +540,9 @@ fn atomic_loop_ctor_mismatch_skip_keeps_prior_writes() {
 *log : [{r: Int 1}]
 
 process = atomic do
-  let shapes = [Circle {r: 7}, Square {s: 3}]
-  Circle c <- shapes
-  *log = union *log [{r: c.r}]
+  with {shapes: [Circle {r: 7}, Square {s: 3}]} (do
+    Circle c <- shapes
+    *log = union *log [{r: c.r}])
 
 main = do
   replace *log = []
@@ -618,8 +617,8 @@ fn local_param_shadowing_user_fn_is_called() {
         r#"helper = \x -> x + 1
 run = \helper -> helper 5
 main = do
-  let r = run (\y -> y * 100)
-  println (show r)
+  with {r: run (\y -> y * 100)} (do
+    println (show r))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -637,9 +636,8 @@ fn local_param_shadowing_stdlib_fn_is_called() {
     let (stdout, stderr, ok) = compile_and_run(
         "shadow_stdlib_fn",
         r#"apply2 = \count -> count 7
-main = do
-  let r = apply2 (\n -> n * 2)
-  println (show r)
+main = with {r: apply2 (\n -> n * 2)} (do
+  println (show r))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -768,21 +766,21 @@ main = do
     r <- *items
     where r.v > 3
     yield r.k
-  let letted = do
+  with {letted: do
     r <- *items
     where r.v > 3
-    yield r.k
+    yield r.k} (do
 
-  -- first row passes: the guard reading yielded just that one row's value
-  -- ("a") instead of accumulating every match
-  boundAll <- do
-    r <- *items
-    where r.v > 0
-    yield r.k
+    -- first row passes: the guard reading yielded just that one row's value
+    -- ("a") instead of accumulating every match
+    boundAll <- do
+      r <- *items
+      where r.v > 0
+      yield r.k
 
-  println ("bound: " ++ show bound)
-  println ("letted: " ++ show letted)
-  println ("boundAll: " ++ show boundAll)
+    println ("bound: " ++ show bound)
+    println ("letted: " ++ show letted)
+    println ("boundAll: " ++ show boundAll))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");

@@ -4,8 +4,9 @@
 //!    a do-bind variable shadowing an outer variable used after the block
 //!    crashed the Cranelift verifier ("uses value vN from non-dominating
 //!    inst").
-//! 2. Chained do-local lets in a pushed-down WHERE (`let a = 5; let b =
-//!    a + 1; where m.x == b`) panicking "codegen: undefined variable 'a'".
+//! 2. Chained do-local withs in a pushed-down WHERE (`with {a: 5}` then
+//!    `with {b: a + 1}` over `where m.x == b`) panicking "codegen:
+//!    undefined variable 'a'".
 //! 3. View writes bypassing refined-type validation (invalid rows persisted
 //!    through a view of a refined source).
 //! 4. Binding from a local relation variable in an IO do-block not
@@ -127,13 +128,13 @@ fn do_bind_shadowing_outer_var_compiles_and_runs() {
 main = do
   replace *todos = [{title: "a", owner: "Alice", done: 0}]
   t <- now
-  let workload = do
+  with {workload: do
     t <- *todos
     where t.done == 0
     groupBy {t.owner}
-    yield {owner: t.owner, count: count t}
-  println (show t)
-  yield {}
+    yield {owner: t.owner, count: count t}} (do
+    println (show t)
+    yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -151,7 +152,7 @@ main = do
 
 #[test]
 fn chained_do_local_lets_in_pushed_where() {
-    // `let b = a + 1` references the earlier do-local `let a = 5`; the SQL
+    // `with {b: a + 1}` references the earlier do-local `with {a: 5}`; the SQL
     // plan stored `a + 1` as a param expression and compiled it in the
     // enclosing env where `a` is unbound — "codegen: undefined variable 'a'".
     let (stdout, stderr, ok) = compile_and_run(
@@ -160,13 +161,13 @@ fn chained_do_local_lets_in_pushed_where() {
 
 main = do
   replace *items = [{x: 5}, {x: 6}]
-  let r = do
-    m <- *items
-    let a = 5
-    let b = a + 1
-    where m.x == b
-    yield m
-  println (show (count r))
+  with {a: 5} (
+    with {b: a + 1} (
+      with {r: do
+        m <- *items
+        where m.x == b
+        yield m} (do
+        println (show (count r)))))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -246,7 +247,7 @@ main = do
 
 #[test]
 fn io_bind_from_let_bound_groupby_iterates_all_rows() {
-    // `w <- workload` where `workload` is a let-bound groupBy comprehension
+    // `w <- workload` where `workload` is a with-bound groupBy comprehension
     // used to bind only once (the whole relation / first row) — the second
     // group ("Bob") never printed.
     let (stdout, stderr, ok) = compile_and_run(
@@ -260,14 +261,14 @@ main = do
     {title: "c", owner: "Bob", done: 0},
     {title: "d", owner: "Alice", done: 1}
   ]
-  let workload = do
+  with {workload: do
     t <- *todos
     where t.done == 0
     groupBy {t.owner}
-    yield {owner: t.owner, count: count t}
-  w <- workload
-  println (w.owner ++ ": " ++ show w.count)
-  yield {}
+    yield {owner: t.owner, count: count t}} (do
+    w <- workload
+    println (w.owner ++ ": " ++ show w.count)
+    yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -279,20 +280,20 @@ main = do
 
 #[test]
 fn io_bind_from_let_bound_filter_comprehension_iterates() {
-    // Same shape without groupBy: a plain let-bound comprehension.
+    // Same shape without groupBy: a plain with-bound comprehension.
     let (stdout, stderr, ok) = compile_and_run(
         "io_bind_relation_var_plain",
         r#"*nums : [{n: Int 1}]
 
 main = do
   replace *nums = [{n: 1}, {n: 2}, {n: 3}]
-  let bigs = do
+  with {bigs: do
     x <- *nums
     where x.n > 1
-    yield x
-  b <- bigs
-  println (show b.n)
-  yield {}
+    yield x} (do
+    b <- bigs
+    println (show b.n)
+    yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -314,11 +315,11 @@ fn text_concat_equality_is_not_numeric() {
 
 main = do
   replace *items = [{a: "0", b: "7"}]
-  let r = do
+  with {r: do
     i <- *items
     where i.a ++ i.b == "7"
-    yield i
-  println (show (count r))
+    yield i} (do
+    println (show (count r)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -337,11 +338,11 @@ fn text_concat_ordering_is_bytewise() {
 
 main = do
   replace *items = [{a: "0", b: "7"}]
-  let r = do
+  with {r: do
     i <- *items
     where i.a ++ i.b < "1"
-    yield i
-  println (show (count r))
+    yield i} (do
+    println (show (count r)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -371,11 +372,11 @@ main = do
     {name: "a", st: Active {}},
     {name: "b", st: Banned {reason: "spam"}}
   ]
-  let r = do
+  with {r: do
     u <- *users
     where u.st == Active {}
-    yield u
-  println (show (count r))
+    yield u} (do
+    println (show (count r)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -399,11 +400,11 @@ impl Eq Color where
 
 main = do
   replace *marbles = [{n: 1, c: Red {}}, {n: 2, c: Blue {}}, {n: 3, c: Red {}}]
-  let r = do
+  with {r: do
     m <- *marbles
     where m.c == Red {}
-    yield m
-  println (show (count r))
+    yield m} (do
+    println (show (count r)))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -425,8 +426,8 @@ fn maxon_over_text_column_returns_text() {
 
 main = do
   replace *codes = [{c: "007"}, {c: "01"}]
-  let m = maxOn (\x -> x.c) *codes
-  println (show m)
+  with {m: maxOn (\x -> x.c) *codes}
+    (println (show m))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -444,8 +445,8 @@ fn minon_over_text_column_returns_text() {
 
 main = do
   replace *codes = [{c: "007"}, {c: "01"}]
-  let m = minOn (\x -> x.c) *codes
-  println (show m)
+  with {m: minOn (\x -> x.c) *codes}
+    (println (show m))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -464,8 +465,8 @@ fn maxon_over_int_column_still_pushes_and_is_numeric() {
 
 main = do
   replace *scores = [{s: 9}, {s: 10}]
-  let m = maxOn (\x -> x.s) *scores
-  println (show m)
+  with {m: maxOn (\x -> x.s) *scores}
+    (println (show m))
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
@@ -610,15 +611,15 @@ main = do
     {owner: "alice", bound: 5},
     {owner: "bob", bound: 7}
   ]
-  let grouped = do
+  with {grouped: do
     p <- *parents
     c <- *children
     where c.bound < p.pid
     groupBy {c.owner}
-    yield {owner: c.owner, n: count c}
-  g <- grouped
-  println (g.owner ++ ":" ++ show g.n)
-  yield {}
+    yield {owner: c.owner, n: count c}} (do
+    g <- grouped
+    println (g.owner ++ ":" ++ show g.n)
+    yield {})
 "#,
     );
     assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");

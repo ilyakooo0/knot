@@ -108,11 +108,9 @@ fn shared_constructor_dispatches_on_static_type() {
     // because both types spell the constructor `Circle`.
     let src = format!(
         "{SHARED_CTOR_PRELUDE}
-main = do
-  let s = Circle {{r: 2.0}} : Shape
-  let b = Circle {{r: 2.0}} : Blob
+main = with {{s: Circle {{r: 2.0}} : Shape, b: Circle {{r: 2.0}} : Blob}} (do
   println (show (area s))
-  println (show (area b))
+  println (show (area b)))
 "
     );
     let stdout = compile_and_run("static_type", &src);
@@ -129,11 +127,9 @@ fn shared_constructor_dispatches_multi_arg_method() {
     // Dispatch is on the first param; the extra arg must still be forwarded.
     let src = format!(
         "{SHARED_CTOR_PRELUDE}
-main = do
-  let s = Circle {{r: 2.0}} : Shape
-  let b = Circle {{r: 2.0}} : Blob
+main = with {{s: Circle {{r: 2.0}} : Shape, b: Circle {{r: 2.0}} : Blob}} (do
   println (show (scaled s 10.0))
-  println (show (scaled b 10.0))
+  println (show (scaled b 10.0)))
 "
     );
     let stdout = compile_and_run("multi_arg", &src);
@@ -151,11 +147,9 @@ fn shared_constructor_dispatches_when_method_is_a_bare_value() {
     // box the tag dispatcher; it must box the statically selected impl.
     let src = format!(
         "{SHARED_CTOR_PRELUDE}
-main = do
-  let shapes = [Circle {{r: 1.0}} : Shape]
-  let blobs = [Circle {{r: 1.0}} : Blob]
+main = with {{shapes: [Circle {{r: 1.0}} : Shape], blobs: [Circle {{r: 1.0}} : Blob]}} (do
   println (show (map area shapes))
-  println (show (map area blobs))
+  println (show (map area blobs)))
 "
     );
     let stdout = compile_and_run("bare_value", &src);

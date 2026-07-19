@@ -205,11 +205,13 @@ main = do
     {name: "c", qty: 2, price: 3.5}
   ]
   si <- byqty
-  let bi = sortBy (\x -> x.qty) si
-  println ("qty: " ++ show (map (\x -> x.qty) bi))
+  with {bi: sortBy (\x -> x.qty) si} (do
+    println ("qty: " ++ show (map (\x -> x.qty) bi))
+    yield {})
   sf <- byqty
-  let bf = sortBy (\x -> x.price) sf
-  println ("price: " ++ show (map (\x -> x.price) bf))
+  with {bf: sortBy (\x -> x.price) sf} (do
+    println ("price: " ++ show (map (\x -> x.price) bf))
+    yield {})
   yield {}
 "#,
     );

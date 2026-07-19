@@ -383,7 +383,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     let type_env = types::TypeEnv::from_module(&module);
 
     // Type inference
-    let (infer_diags, monad_info, type_info, _local_types, refine_targets, refined_types, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans, relation_fields) = infer::check(&mut module);
+    let (infer_diags, monad_info, type_info, _local_types, refine_targets, refined_types, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans, relation_fields, with_fields) = infer::check(&mut module);
     if !infer_diags.is_empty() {
         for diag in &infer_diags {
             eprintln!("{}", diag.render(&source, &filename));
@@ -446,7 +446,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     }
 
     // Code generation
-    let obj_bytes = match codegen::compile(&module, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, &elem_pushdown_ok, &trait_call_targets, &show_unit_strings, &sum_float_spans, &relation_fields, overrides) {
+    let obj_bytes = match codegen::compile(&module, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, &elem_pushdown_ok, &trait_call_targets, &show_unit_strings, &sum_float_spans, &relation_fields, &with_fields, overrides) {
         Ok(bytes) => bytes,
         Err(diags) => {
             for diag in &diags {

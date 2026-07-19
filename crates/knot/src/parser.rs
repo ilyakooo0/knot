@@ -2352,7 +2352,7 @@ impl Parser {
                     Span::new(start.start, end_sp.end),
                 ))
             }
-            TokenKind::Let => self.parse_let_in_expr(),
+            TokenKind::With => self.parse_with_expr(),
             _ => self.parse_expr_bp(0),
         }
     }
@@ -3547,67 +3547,40 @@ impl Parser {
         })
     }
 
-    fn parse_let_in_expr(&mut self) -> Option<Expr> {
+    /// `with record body` — `record` is an atom (record literal, variable, or
+    /// parenthesized expression, optionally with field-access chains); `body`
+    /// is the rest of the expression. Every field of the record's type is in
+    /// scope as a variable inside `body`; the result is `body`. Field names
+    /// are only known once the record's type is inferred, so the parser binds
+    /// nothing — it parses the two subexpressions and leaves scoping to
+    /// inference (field references parse as ordinary `Var`s).
+    fn parse_with_expr(&mut self) -> Option<Expr> {
         let start = self.span();
         if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
             return None;
         }
-        let result = self.in_context("let expression", |this| {
-            this.advance(); // consume `let`
-
-            let pat = this.parse_pat()?;
-
-            // Optional type annotation: `let x : Type = ...`
-            let annot_ty = if this.at(&TokenKind::Colon) {
-                this.advance();
-                Some(this.parse_type()?)
+        let result = self.in_context("with expression", |this| {
+            this.advance(); // consume `with`
+            let record = this.parse_postfix()?;
+            // Bind the record's field names for the body so `maybe_time_unit`
+            // suppresses unit sugar on collisions (`with {ms: 5} g 2 ms`
+            // applies `g` to `2` and `ms`, not `g (2 ms)`).
+            let pushed = if let ExprKind::Record(fields) = &record.node {
+                for f in fields {
+                    this.bound_vars.push(f.name.clone());
+                }
+                fields.len()
             } else {
-                None
+                0
             };
-
-            this.expect(&TokenKind::Eq, "expected '=' in let binding").ok()?;
-            let mut value = this.parse_expr()?;
             this.skip_newlines();
-            this.expect(&TokenKind::In, "expected 'in' after let binding").ok()?;
-            let scope_mark = this.bound_vars.len();
-            this.push_pat_vars(&pat);
-            let body = this.parse_expr();
-            this.bound_vars.truncate(scope_mark);
-            let body = body?;
-
-            // If there is a type annotation, wrap the value as `(value : Type)`
-            // so that inference sees the constraint. The span covers the
-            // `: Type` too, matching the other annotation forms. The type
-            // precedes the value here, so take the union of both spans (a
-            // (value.start, ty.end) span would be inverted).
-            if let Some(ty) = annot_ty {
-                let sp = Span::new(
-                    value.span.start.min(ty.span.start),
-                    value.span.end.max(ty.span.end),
-                );
-                value = Spanned::new(
-                    ExprKind::Annot {
-                        expr: Box::new(value),
-                        ty,
-                    },
-                    sp,
-                );
-            }
-
-            // Desugar `let pat = value in body` as a lambda application.
-            // `(\pat -> body) value`
+            let body = this.parse_expr()?;
+            this.bound_vars.truncate(this.bound_vars.len() - pushed);
             let end_sp = body.span;
-            let lam = Spanned::new(
-                ExprKind::Lambda {
-                    params: vec![pat],
-                    body: Box::new(body),
-                },
-                Span::new(start.start, end_sp.end),
-            );
             Some(Spanned::new(
-                ExprKind::App {
-                    func: Box::new(lam),
-                    arg: Box::new(value),
+                ExprKind::With {
+                    record: Box::new(record),
+                    body: Box::new(body),
                 },
                 Span::new(start.start, end_sp.end),
             ))
@@ -3667,53 +3640,6 @@ impl Parser {
             let end_sp = key.span;
             return Some(Spanned::new(
                 StmtKind::GroupBy { key },
-                Span::new(start.start, end_sp.end),
-            ));
-        }
-
-        // `let pat = expr` or `let pat : Type = expr`
-        if self.at(&TokenKind::Let) {
-            self.advance();
-            let pat = self.parse_pat()?;
-
-            // Optional type annotation: `let x : Type = ...`
-            let annot_ty = if self.at(&TokenKind::Colon) {
-                self.advance();
-                Some(self.parse_type()?)
-            } else {
-                None
-            };
-
-            self.expect(&TokenKind::Eq, "expected '=' in let statement").ok()?;
-            let mut expr = self.parse_expr()?;
-
-            // Wrap value with annotation so inference sees the constraint.
-            // The `Annot` span must cover the `: Type` too (matching the
-            // parenthesized and postfix forms in `parse_expr`), so diagnostics
-            // and hover underline the whole annotated value, not just the RHS.
-            // In a `let pat : Type = value` the type precedes the value, so use
-            // the union of both spans rather than (value.start, ty.end), which
-            // would be inverted.
-            if let Some(ty) = annot_ty {
-                let sp = Span::new(
-                    expr.span.start.min(ty.span.start),
-                    expr.span.end.max(ty.span.end),
-                );
-                expr = Spanned::new(
-                    ExprKind::Annot {
-                        expr: Box::new(expr),
-                        ty,
-                    },
-                    sp,
-                );
-            }
-
-            let end_sp = expr.span;
-            // Names bound by this let are in scope for the rest of the
-            // do-block (popped by `parse_do_expr`).
-            self.push_pat_vars(&pat);
-            return Some(Spanned::new(
-                StmtKind::Let { pat, expr },
                 Span::new(start.start, end_sp.end),
             ));
         }

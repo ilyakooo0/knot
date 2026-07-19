@@ -454,6 +454,14 @@ impl Parser {
         }
     }
 
+    /// Is the cursor at the start of a `field:` signature (a lowercase
+    /// identifier immediately followed by a colon)? Used to tell a new record
+    /// field apart from a wrapped field type when scanning a multiline record.
+    fn at_field_signature(&self) -> bool {
+        matches!(self.peek(), TokenKind::Lower(_))
+            && matches!(self.peek_ahead(1), TokenKind::Colon)
+    }
+
     fn at_eof(&self) -> bool {
         matches!(self.peek(), TokenKind::Eof)
     }
@@ -4350,6 +4358,12 @@ impl Parser {
         }
 
         // Record type: {field: Type, ... | rest?}
+        //
+        // Fields are separated by a comma OR by a newline — so a record type may
+        // be written one field per line without commas:
+        //   {name: Text
+        //    age: Int 1}
+        // A same-line field still requires a comma (`{name: Text, age: Int 1}`).
         let mut fields = Vec::new();
         loop {
             self.skip_newlines();
@@ -4365,10 +4379,21 @@ impl Parser {
                 name: fname,
                 value: ty,
             });
-            self.skip_newlines();
-            if !self.eat(&TokenKind::Comma) {
-                break;
+
+            // Field separator: an explicit comma, or a newline followed by
+            // another `field:` signature. Otherwise the record is done.
+            if self.eat(&TokenKind::Comma) {
+                continue;
             }
+            if self.at(&TokenKind::Newline) {
+                let saved = self.save();
+                self.skip_newlines();
+                if self.at_field_signature() {
+                    continue;
+                }
+                self.restore(saved);
+            }
+            break;
         }
 
         self.skip_newlines();

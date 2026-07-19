@@ -1017,6 +1017,75 @@ fn type_alias_with_params() {
     }
 }
 
+// ── Multiline record types (newline-separated field signatures) ─────
+
+#[test]
+fn record_type_newline_separated_fields() {
+    // Fields may be separated by a newline instead of a comma.
+    match first_decl("type Person = {name: Text\n  age: Int\n  email: Text}\n") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::Record { fields, rest } => {
+                let names: Vec<_> = fields.iter().map(|f| f.name.as_str()).collect();
+                assert_eq!(names, ["name", "age", "email"]);
+                assert!(rest.is_none());
+            }
+            other => panic!("expected Record type, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn record_type_mixed_comma_and_newline() {
+    // Commas and newlines may be mixed freely.
+    match first_decl("type Person = {name: Text,\n  age: Int\n  email: Text}\n") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::Record { fields, .. } => {
+                assert_eq!(fields.len(), 3);
+            }
+            other => panic!("expected Record type, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn record_type_newline_separated_with_row_var() {
+    match first_decl("type Person = {name: Text\n  age: Int | rest}\n") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::Record { fields, rest } => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(rest.as_deref(), Some("rest"));
+            }
+            other => panic!("expected Record type, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn record_type_field_type_spanning_lines_not_split() {
+    // A field whose TYPE wraps to the next line must not be mistaken for a new
+    // field: `handler: Int ->\n  Text` is one field (result type `Text`),
+    // followed by a genuine `name` field on its own line.
+    match first_decl("type P = {handler: Int ->\n  Text\n  name: Text}\n") {
+        DeclKind::TypeAlias { ty, .. } => match &ty.node {
+            TypeKind::Record { fields, .. } => {
+                let names: Vec<_> = fields.iter().map(|f| f.name.as_str()).collect();
+                assert_eq!(names, ["handler", "name"]);
+            }
+            other => panic!("expected Record type, got {:?}", other),
+        },
+        other => panic!("expected TypeAlias, got {:?}", other),
+    }
+}
+
+#[test]
+fn record_type_same_line_still_requires_comma() {
+    // Two fields on the SAME line without a comma is still an error.
+    parse_err("type P = {name: Text age: Int}\n");
+}
+
 // ── Source Declarations ─────────────────────────────────────────────
 
 #[test]

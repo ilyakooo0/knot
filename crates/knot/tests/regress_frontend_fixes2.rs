@@ -142,7 +142,7 @@ fn refined_response_type_keeps_rate_limit() {
                 base
             );
             match &predicate.node {
-                ExprKind::Lambda { params, body } => {
+                ExprKind::Lambda { params, body, .. } => {
                     assert_eq!(params.len(), 1);
                     assert!(
                         matches!(&body.node, ExprKind::BinOp { op: BinOp::Gt, .. }),

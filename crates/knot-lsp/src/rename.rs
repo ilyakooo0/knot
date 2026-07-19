@@ -1102,7 +1102,7 @@ pub(crate) fn collect_shadowed_names(
                 }
                 return;
             }
-            ast::ExprKind::Lambda { params, body } => {
+            ast::ExprKind::Lambda { params, body, .. } => {
                 let binds_old = params.iter().any(|p| pat_binds_name(p, old_name));
                 let binds_new = params.iter().any(|p| pat_binds_name(p, new_name));
                 // Siblings collapsing into one name is a duplicate binder even
@@ -1353,7 +1353,7 @@ pub(crate) fn collect_name_uses_in_decl(
                 }
                 return;
             }
-            ast::ExprKind::Lambda { params, body } => {
+            ast::ExprKind::Lambda { params, body, .. } => {
                 for p in params {
                     walk_pat_ctors(p, name, source, out);
                 }

@@ -1592,7 +1592,7 @@ impl EffectChecker {
                 EffectSet::empty()
             }
 
-            ast::ExprKind::Lambda { params, body } => {
+            ast::ExprKind::Lambda { params, body, .. } => {
                 // Immediately-applied lambda: effects are the body's effects
                 let mark = self.push_masking_binders(params.iter());
                 let effects = self.infer_effects(body);
@@ -1653,7 +1653,7 @@ impl EffectChecker {
     /// bound name inside the body see the callback's effects.
     fn head_call_effects(&mut self, head: &ast::Expr, args: &[&ast::Expr]) -> EffectSet {
         match &head.node {
-            ast::ExprKind::Lambda { params, body } => {
+            ast::ExprKind::Lambda { params, body, .. } => {
                 let mut scope = HashMap::new();
                 for (param, arg) in params.iter().zip(args.iter()) {
                     if let ast::PatKind::Var(name) = &param.node
@@ -1693,7 +1693,7 @@ impl EffectChecker {
     /// `\x y -> set *foo = ...` → effects of the `set` expression.
     fn fun_body_effects(&mut self, body: &ast::Expr) -> EffectSet {
         match &body.node {
-            ast::ExprKind::Lambda { body: inner, params } => {
+            ast::ExprKind::Lambda { body: inner, params, .. } => {
                 let mark = self.push_masking_binders(params.iter());
                 let effects = self.fun_body_effects(inner);
                 self.pop_masking_binders(mark);
@@ -1986,7 +1986,7 @@ fn collect_unshadowed_disallowed(
                 collect_unshadowed_disallowed(elem, shadowed, out);
             }
         }
-        ast::ExprKind::Lambda { params, body } => {
+        ast::ExprKind::Lambda { params, body, .. } => {
             let mark = shadowed.len();
             for p in params {
                 collect_pat_binders(p, shadowed);
@@ -2073,7 +2073,7 @@ fn collect_unshadowed_disallowed(
 fn lambda_param_names(expr: &ast::Expr) -> HashSet<String> {
     let mut names = HashSet::new();
     let mut cur = expr;
-    while let ast::ExprKind::Lambda { params, body } = &cur.node {
+    while let ast::ExprKind::Lambda { params, body, .. } = &cur.node {
         for p in params {
             if let ast::PatKind::Var(name) = &p.node {
                 names.insert(name.clone());
@@ -2257,7 +2257,7 @@ fn unwrap_lambda_params<'a>(
     params: &mut Vec<&'a str>,
 ) -> &'a ast::Expr {
     match &expr.node {
-        ast::ExprKind::Lambda { params: ps, body } => {
+        ast::ExprKind::Lambda { params: ps, body, .. } => {
             for p in ps {
                 match &p.node {
                     ast::PatKind::Var(n) => params.push(n.as_str()),
@@ -2615,6 +2615,7 @@ mod tests {
     fn set_writes_and_reads() {
         let body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("x".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::Set {
                 target: Box::new(spanned(ExprKind::SourceRef("todos".into()))),
                 value: Box::new(spanned(ExprKind::Var("x".into()))),
@@ -2632,6 +2633,7 @@ mod tests {
         // println "hello"
         let body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("x".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::App {
                 func: Box::new(spanned(ExprKind::Var("println".into()))),
                 arg: Box::new(spanned(ExprKind::Var("x".into()))),
@@ -2654,6 +2656,7 @@ mod tests {
     fn lambda_creation_is_pure() {
         let body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("x".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::App {
                 func: Box::new(spanned(ExprKind::Var("println".into()))),
                 arg: Box::new(spanned(ExprKind::Var("x".into()))),
@@ -2797,6 +2800,7 @@ mod tests {
             "forkIt",
             spanned(ExprKind::Lambda {
                 params: vec![spanned(PatKind::Var("a".into()))],
+                ty_params: vec![],
                 body: Box::new(spanned(ExprKind::App {
                     func: Box::new(spanned(ExprKind::Var("fork".into()))),
                     arg: Box::new(spanned(ExprKind::Var("a".into()))),
@@ -2843,6 +2847,7 @@ mod tests {
             "sink",
             spanned(ExprKind::Lambda {
                 params: vec![spanned(PatKind::Var("a".into()))],
+                ty_params: vec![],
                 body: Box::new(spanned(ExprKind::Var("a".into()))),
             }),
         );
@@ -2929,6 +2934,7 @@ mod tests {
         // x |> println
         let body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("x".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::BinOp {
                 op: BinOp::Pipe,
                 lhs: Box::new(spanned(ExprKind::Var("x".into()))),
@@ -2973,6 +2979,7 @@ mod tests {
         // f = \x -> do { println *people; yield x }
         let body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("x".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::Do(vec![
                 spanned(StmtKind::Expr(spanned(ExprKind::App {
                     func: Box::new(spanned(ExprKind::Var("println".into()))),
@@ -3006,6 +3013,7 @@ mod tests {
         // Declares only {r *people} but actually uses console too
         let body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("x".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::Do(vec![
                 spanned(StmtKind::Expr(spanned(ExprKind::App {
                     func: Box::new(spanned(ExprKind::Var("println".into()))),
@@ -3054,6 +3062,7 @@ mod tests {
         // f = \_ -> println "hello"
         let body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("x".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::App {
                 func: Box::new(spanned(ExprKind::Var("println".into()))),
                 arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
@@ -3077,6 +3086,7 @@ mod tests {
         // f : IO {console} {}
         let body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("x".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::App {
                 func: Box::new(spanned(ExprKind::Var("println".into()))),
                 arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
@@ -3186,6 +3196,7 @@ mod tests {
         // withCb = \cb -> cb 0
         let with_cb_body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("cb".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::App {
                 func: Box::new(spanned(ExprKind::Var("cb".into()))),
                 arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),
@@ -3216,6 +3227,7 @@ mod tests {
             func: Box::new(spanned(ExprKind::Var("withCb".into()))),
             arg: Box::new(spanned(ExprKind::Lambda {
                 params: vec![spanned(PatKind::Var("_".into()))],
+                ty_params: vec![],
                 body: Box::new(spanned(ExprKind::App {
                     func: Box::new(spanned(ExprKind::Var("println".into()))),
                     arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
@@ -3243,6 +3255,7 @@ mod tests {
         // runIt = \cb -> cb 0
         let run_it_body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("cb".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::App {
                 func: Box::new(spanned(ExprKind::Var("cb".into()))),
                 arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),
@@ -3273,6 +3286,7 @@ mod tests {
             func: Box::new(spanned(ExprKind::Var("runIt".into()))),
             arg: Box::new(spanned(ExprKind::Lambda {
                 params: vec![spanned(PatKind::Var("_".into()))],
+                ty_params: vec![],
                 body: Box::new(spanned(ExprKind::App {
                     func: Box::new(spanned(ExprKind::Var("println".into()))),
                     arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
@@ -3303,6 +3317,7 @@ mod tests {
         // runCb = \cb -> cb 0
         let run_cb_body = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("cb".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::App {
                 func: Box::new(spanned(ExprKind::Var("cb".into()))),
                 arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),
@@ -3337,6 +3352,7 @@ mod tests {
             func: Box::new(spanned(ExprKind::Var("runCb".into()))),
             arg: Box::new(spanned(ExprKind::Lambda {
                 params: vec![spanned(PatKind::Var("n".into()))],
+                ty_params: vec![],
                 body: Box::new(spanned(ExprKind::SourceRef("secrets".into()))),
             })),
         });
@@ -3414,6 +3430,7 @@ mod tests {
         // f = (\_ -> println "hi") |> (\g -> g 0)
         let lhs = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("_".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::App {
                 func: Box::new(spanned(ExprKind::Var("println".into()))),
                 arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
@@ -3421,6 +3438,7 @@ mod tests {
         });
         let rhs = spanned(ExprKind::Lambda {
             params: vec![spanned(PatKind::Var("g".into()))],
+            ty_params: vec![],
             body: Box::new(spanned(ExprKind::App {
                 func: Box::new(spanned(ExprKind::Var("g".into()))),
                 arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),

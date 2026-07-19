@@ -37,6 +37,71 @@ fn collect_pat_bound_names(pat: &ast::Pat, out: &mut Vec<String>) {
     }
 }
 
+/// Reinterpret an argument *expression* as a *type* AST. Used for Π-lite
+/// explicit type arguments: when a function's next parameter is a type-witness
+/// (kind `Type`), the argument expression is a type written in value syntax —
+/// a bare name `Int` / `T` (`Constructor`/`Var`) or an application `Maybe Int`.
+/// Returns `None` for expressions that can't denote a type (then the argument
+/// is treated as an ordinary value).
+fn expr_to_type(expr: &ast::Expr) -> Option<ast::Type> {
+    use knot::ast::{ExprKind, TypeKind};
+    let span = expr.span;
+    let node = match &expr.node {
+        // Bare numeric base as a type argument means dimensionless (`Int 1`).
+        // `ast_type_to_ty` rejects a bare `Int`/`Float` (unit enforcement), so
+        // elaborate it to the dimensionless form here.
+        ExprKind::Constructor(name)
+            if name == "Int" || name == "Float" =>
+        {
+            TypeKind::UnitAnnotated {
+                base: Box::new(knot::ast::Spanned {
+                    node: TypeKind::Named(name.clone()),
+                    span,
+                }),
+                unit: knot::ast::UnitExpr::Dimensionless,
+            }
+        }
+        // Type heads are uppercase (`Constructor`); lowercase `Var` is always
+        // a value (e.g. `f x`), never a type argument.
+        ExprKind::Constructor(name) => TypeKind::Named(name.clone()),
+        // `Int 1` — a numeric base applied to a dimensionless unit literal.
+        ExprKind::App { func, arg }
+            if matches!(&arg.node, ExprKind::Lit(knot::ast::Literal::Int(n)) if n == "1") =>
+        {
+            let base = expr_to_type(func)?;
+            TypeKind::UnitAnnotated {
+                base: Box::new(base),
+                unit: knot::ast::UnitExpr::Dimensionless,
+            }
+        }
+        ExprKind::App { func, arg } => {
+            let f = expr_to_type(func)?;
+            let a = expr_to_type(arg)?;
+            TypeKind::App {
+                func: Box::new(f),
+                arg: Box::new(a),
+            }
+        }
+        ExprKind::Annot { expr: inner, .. } => return expr_to_type(inner),
+        _ => return None,
+    };
+    Some(knot::ast::Spanned { node, span })
+}
+
+/// Flatten an application spine `f a b …` into `[f, a, b, …]` (head-first).
+/// A non-application expression yields a single-element vector.
+fn flatten_spine(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    let mut spine = Vec::new();
+    let mut cur = expr;
+    while let ast::ExprKind::App { func, arg } = &cur.node {
+        spine.push(arg.as_ref());
+        cur = func.as_ref();
+    }
+    spine.push(cur);
+    spine.reverse();
+    spine
+}
+
 // ── Monad info (shared with codegen) ──────────────────────────────
 
 /// Which monad a desugared do-block targets.
@@ -162,6 +227,12 @@ pub type RelationFieldSpans = HashSet<Span>;
 /// summands there is nothing to take the numeric type from, so `sum` over an
 /// empty `[Float]` would otherwise return `Int 0` instead of `Float 0.0`.
 pub type SumFloatSpans = HashSet<Span>;
+
+/// Spans of explicit type arguments consumed by the Π-lite application
+/// diversion (`apply Int …` — the `Int` head). Codegen drops these arguments
+/// (they are erased; the type-witness param has no runtime representation), so
+/// an application `f Int x` compiles to `f x`.
+pub type TypeArgSpans = HashSet<Span>;
 
 /// Spans of `elem needle haystack` haystack arguments whose element type is a
 /// SQL-pushable scalar (peeling aliases & refined types). Codegen consults these
@@ -720,6 +791,17 @@ struct Infer {
     /// Mapping from annotation type-variable names to TyVars (per-declaration).
     annotation_vars: HashMap<String, TyVar>,
 
+    /// Π-lite type-witness parameters in scope: a stack of scopes (one per
+    /// enclosing lambda that binds `\(T : Type)`), each mapping the witness
+    /// name to its rigid skolem TyVar. Consulted by `ast_type_to_ty`'s `Named`
+    /// arm so `x : T` inside the lambda resolves to the witness.
+    type_param_scopes: Vec<HashMap<String, TyVar>>,
+
+    /// Spans of application arguments that were consumed as a *type* (an
+    /// explicit type argument for a type-witness parameter), not a value.
+    /// Codegen erases these (emits no runtime argument for them).
+    type_arg_spans: std::collections::HashSet<Span>,
+
     /// Accumulated type errors.
     errors: Vec<(String, Span)>,
 
@@ -955,6 +1037,8 @@ impl Infer {
             aliases: HashMap::new(),
             param_aliases: HashMap::new(),
             annotation_vars: HashMap::new(),
+            type_param_scopes: Vec::new(),
+            type_arg_spans: std::collections::HashSet::new(),
             errors: Vec::new(),
             monad_vars: Vec::new(),
             empty_spans: std::collections::HashSet::new(),
@@ -4403,6 +4487,79 @@ impl Infer {
         Some(Ty::Alias(name.clone(), Box::new(expanded)))
     }
 
+    /// Arity (number of type arguments) of a type constructor by name.
+    /// Base scalar types are arity 0; ADTs use their `data` param count;
+    /// parameterized aliases use their param count. Unknown names default to 0
+    /// (treated as a saturated opaque type).
+    fn type_head_arity(&self, name: &str) -> usize {
+        match name {
+            "Int" | "Float" | "Text" | "Bool" | "Bytes" | "Uuid" => 0,
+            "Maybe" => 1,
+            "Result" => 2,
+            _ => {
+                if let Some(info) = self.data_types.get(name) {
+                    info.params.len()
+                } else if let Some((params, _)) = self.param_aliases.get(name) {
+                    params.len()
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Consume one *complete* type from the head of a flattened application
+    /// spine (`[head, a, b, …]`), arity-aware: a head of arity `n` eats the
+    /// next `n` spine elements (each recursively a complete type). Returns the
+    /// type AST and the number of spine elements consumed. `None` if the head
+    /// is not a type.
+    fn consume_type_arg<'a>(&self, spine: &[&'a ast::Expr]) -> Option<(ast::Type, usize)> {
+        use knot::ast::TypeKind;
+        let head = spine.first()?;
+        let mut head_expr = *head;
+        while let ast::ExprKind::Annot { expr: inner, .. } = &head_expr.node {
+            head_expr = inner;
+        }
+        let ast::ExprKind::Constructor(name) = &head_expr.node else {
+            return None;
+        };
+        let arity = self.type_head_arity(name);
+        let mut consumed = 1;
+        let mut ty = knot::ast::Spanned {
+            node: if name == "Int" || name == "Float" {
+                // Bare numeric base as a type argument means dimensionless.
+                TypeKind::UnitAnnotated {
+                    base: Box::new(knot::ast::Spanned {
+                        node: TypeKind::Named(name.clone()),
+                        span: head.span,
+                    }),
+                    unit: knot::ast::UnitExpr::Dimensionless,
+                }
+            } else {
+                TypeKind::Named(name.clone())
+            },
+            span: head.span,
+        };
+        for _ in 0..arity {
+            let sub = spine.get(consumed)?;
+            let sub_flat = flatten_spine(sub);
+            let (sub_ty, sub_consumed) = self.consume_type_arg(&sub_flat)?;
+            if sub_consumed != sub_flat.len() {
+                // The type argument itself must be a complete type (no trailing).
+                return None;
+            }
+            ty = knot::ast::Spanned {
+                node: TypeKind::App {
+                    func: Box::new(ty.clone()),
+                    arg: Box::new(sub_ty),
+                },
+                span: head.span,
+            };
+            consumed += 1;
+        }
+        Some((ty, consumed))
+    }
+
     fn ast_type_to_ty(&mut self, ty: &ast::Type) -> Ty {
         match &ty.node {
             ast::TypeKind::Named(name) => match name.as_str() {
@@ -4432,6 +4589,14 @@ impl Infer {
                 "Uuid" => Ty::Uuid,
                 "[]" => Ty::TyCon("[]".into()),
                 _ => {
+                    // Π-lite type-witness parameter: `x : T` inside a lambda
+                    // that binds `\(T : Type)` resolves to the witness skolem.
+                    // Checked before aliases so a witness shadows an alias.
+                    for scope in self.type_param_scopes.iter().rev() {
+                        if let Some(s) = scope.get(name) {
+                            return Ty::Var(*s);
+                        }
+                    }
                     // Parameterized alias referenced bare (`Pair` with 0 args).
                     if self.param_aliases.contains_key(name) {
                         if let Some(t) = self.expand_param_alias(ty) {
@@ -5292,8 +5457,24 @@ impl Infer {
                 Ty::Relation(Box::new(elem_ty))
             }
 
-            ast::ExprKind::Lambda { params, body } => {
+            ast::ExprKind::Lambda { params, ty_params, body } => {
                 self.push_scope();
+                // Type-witness params `\(T : Type)`: bind each to a rigid skolem
+                // and record it in a type-param scope so `x : T` annotations in
+                // the body resolve to the witness. The lambda's type prepends a
+                // kind-`Type` arrow per witness, consumed at the call site by an
+                // explicit type argument (erased at runtime).
+                let mut ty_skolems: Vec<TyVar> = Vec::new();
+                if !ty_params.is_empty() {
+                    let mut scope = HashMap::new();
+                    for tp in ty_params {
+                        let s = self.fresh_var();
+                        self.skolems.insert(s);
+                        scope.insert(tp.name.clone(), s);
+                        ty_skolems.push(s);
+                    }
+                    self.type_param_scopes.push(scope);
+                }
                 let mut param_types = Vec::new();
                 for param in params {
                     let t = self.fresh();
@@ -5301,11 +5482,33 @@ impl Infer {
                     param_types.push(t);
                 }
                 let body_ty = self.infer_expr(body);
+                if !ty_params.is_empty() {
+                    self.type_param_scopes.pop();
+                }
                 self.pop_scope();
 
                 let mut result = body_ty;
                 for pt in param_types.into_iter().rev() {
                     result = Ty::Fun(Box::new(pt), Box::new(result));
+                }
+                // Prepend the erased type-witness arrows (kind `Type`), one per
+                // type param, so application consumes the type argument first,
+                // then bind the witness skolems in a `Forall` so the caller
+                // instantiates the exact witness var with the type argument.
+                for _ in &ty_skolems {
+                    result = Ty::Fun(
+                        Box::new(Ty::Con("Type".into(), vec![])),
+                        Box::new(result),
+                    );
+                }
+                if !ty_skolems.is_empty() {
+                    // The skolems are bound by this lambda; quantify them so the
+                    // type is `∀ t. Type -> body`. They must not be treated as
+                    // free rigid skolems from here on.
+                    for s in &ty_skolems {
+                        self.skolems.remove(s);
+                    }
+                    result = Ty::Forall(ty_skolems, Box::new(result));
                 }
                 result
             }
@@ -5371,7 +5574,7 @@ impl Infer {
                 // types), matching the non-desugared do-block `let` path. This
                 // is sound: generalizing a let binding is always valid in a pure
                 // language, and the bound name does not escape the body.
-                if let ast::ExprKind::Lambda { params, body } = &func.node
+                if let ast::ExprKind::Lambda { params, body, .. } = &func.node
                     && params.len() == 1
                         && let ast::PatKind::Var(name) = &params[0].node {
                             let arg_ty = self.infer_expr(arg);
@@ -5447,6 +5650,93 @@ impl Infer {
                         }
                     }
 
+                    // Π-lite explicit type argument: a type-witness lambda has
+                    // type `∀ t. Type -> body`. An application `f Int` supplies
+                    // the type argument `Int`, which is substituted for the
+                    // bound witness var `t` throughout `body`, consuming the
+                    // leading erased `Type` arrow. Runs BEFORE `infer_expr(arg)`
+                    // so a bare uppercase type name is reinterpreted via
+                    // `ast_type_to_ty` rather than erroring as a constructor.
+                    if let Ty::Forall(vars, body) = &func_applied {
+                        let body_applied = self.apply(body);
+                        if let Ty::Fun(witness_slot, rest) = &body_applied
+                            && matches!(self.apply(witness_slot), Ty::Con(ref n, _) if n == "Type")
+                        {
+                            // The parser glues `apply Int 42` into
+                            // `apply (Int 42)` (constructor-application, like
+                            // `Some 5`). Split the glued spine arity-aware:
+                            // consume exactly one *complete* type (a head plus
+                            // its `arity` type-arguments) and treat the rest as
+                            // trailing value args. `Int 42` → type `Int`, value
+                            // `42`; `const2 Int Text 99` → type `Int`, trailing
+                            // `Text 99`; `f (Maybe Int) x` → type `Maybe Int`.
+                            let flat = flatten_spine(arg);
+                            if let Some((ty_ast, consumed)) = self.consume_type_arg(&flat) {
+                                let type_span = ty_ast.span;
+                                let mut pending: Vec<&ast::Expr> =
+                                    flat.into_iter().skip(consumed).collect();
+                                // Consume the (possibly several) leading type
+                                // arguments: each bound witness var eats one
+                                // complete type. `const2 Int Text 99` consumes
+                                // `Int` for `A` then `Text` for `B`, leaving
+                                // `99` as the sole value argument.
+                                let mut cur_ty: Ty = func_applied.clone();
+                                let mut first_ty: Option<ast::Type> = Some(ty_ast);
+                                loop {
+                                    let cur_applied = self.apply(&cur_ty);
+                                    let (vars, body) = match &cur_applied {
+                                        Ty::Forall(v, b) => (v, b),
+                                        _ => break,
+                                    };
+                                    let body_applied = self.apply(body);
+                                    let Some(witness_var) = vars.first().copied() else { break };
+                                    let Ty::Fun(_, rest) = &body_applied else { break };
+                                    let Some(ty_ast) = first_ty.take() else { break };
+                                    let arg_ty = self.ast_type_to_ty(&ty_ast);
+                                    self.type_arg_spans.insert(ty_ast.span);
+                                    let mut mapping: HashMap<TyVar, Ty> = HashMap::new();
+                                    mapping.insert(witness_var, arg_ty);
+                                    let mut result = self.subst_ty(rest, &mapping);
+                                    if vars.len() > 1 {
+                                        result = Ty::Forall(vars[1..].to_vec(), Box::new(result));
+                                    }
+                                    cur_ty = result;
+                                    // If the result is still a witness Forall
+                                    // and a pending arg is a type, consume it
+                                    // as the next type argument.
+                                    if matches!(self.apply(&cur_ty), Ty::Forall(..))
+                                        && !pending.is_empty()
+                                    {
+                                        let next_flat = flatten_spine(pending[0]);
+                                        if let Some((next_ty, next_consumed)) =
+                                            self.consume_type_arg(&next_flat)
+                                        {
+                                            first_ty = Some(next_ty);
+                                            pending = next_flat
+                                                .into_iter()
+                                                .skip(next_consumed)
+                                                .chain(pending.into_iter().skip(1))
+                                                .collect();
+                                            continue;
+                                        }
+                                    }
+                                    break;
+                                }
+                                let mut result = self.apply(&cur_ty);
+                                // Re-apply remaining value args left-to-right.
+                                for a in pending {
+                                    let a_ty = self.infer_expr(a);
+                                    let res = self.fresh();
+                                    let expected = Ty::Fun(Box::new(a_ty), Box::new(res.clone()));
+                                    self.unify(&result, &expected, a.span);
+                                    result = self.apply(&res);
+                                }
+                                let _ = type_span;
+                                return result;
+                            }
+                        }
+                    }
+
                     let arg_ty = self.infer_expr(arg);
                     let result_ty = self.fresh();
                     let expected = Ty::Fun(
@@ -5456,7 +5746,6 @@ impl Infer {
                     self.unify(&func_ty, &expected, arg.span);
                     (arg_ty, result_ty)
                 };
-
                 // Track parseJson calls for compile-time FromJSON dispatch
                 if let ast::ExprKind::Var(name) = &func.node
                     && name == "parseJson"
@@ -5956,13 +6245,34 @@ impl Infer {
                 self.check_expr(inner, &annot_ty);
                 self.unify(&annot_ty, expected, ty.span);
             }
-            ast::ExprKind::Lambda { params, body } => {
+            ast::ExprKind::Lambda { params, ty_params, body } => {
+                // Lambdas with type-witness params have an inherent
+                // `Fun(Con("Type"), …)` shape that `expected` may not supply
+                // (e.g. a bare fresh Var for an un-annotated top-level def).
+                // Synthesize via infer-mode (which builds the witness arrows)
+                // and unify, rather than peeling.
+                if !ty_params.is_empty() {
+                    let inferred = self.infer_expr(expr);
+                    // If `expected` is a bare unification var (an un-annotated
+                    // definition like `apply = \(T : Type) -> …`), bind it
+                    // directly to the inferred `∀ t. Type -> …` type. Routing
+                    // through `unify_dir` would *instantiate* the Forall
+                    // (provided side) and strip the quantifier, losing the
+                    // witness binding the caller needs to supply the type arg.
+                    if let Ty::Var(v) = self.apply(expected)
+                        && self.subst.get(&v).is_none()
+                    {
+                        self.subst.insert(v, inferred);
+                        return;
+                    }
+                    self.unify_dir(expected, &inferred, expr.span, false);
+                    return;
+                }
                 // Peel `Fun(p, r)` off `expected` for each lambda param,
                 // resolving substitutions as we go. If the expected type
                 // turns out to have fewer arrows than the lambda has
                 // params, fall back to synthesise + unify (mono).
-                let resolved = self.apply(expected);
-                let mut current = resolved;
+                let mut current = self.apply(expected);
                 let mut peeled: Vec<Ty> = Vec::new();
                 for _ in params {
                     match current {
@@ -11053,6 +11363,7 @@ pub type CheckOutput = (
     SumFloatSpans,
     RelationFieldSpans,
     WithFields,
+    TypeArgSpans,
 );
 
 /// Run type inference on a parsed module. Returns diagnostics,
@@ -11464,8 +11775,9 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
     let local_type_info = infer.extract_local_type_info();
     let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
     let with_fields: WithFields = infer.with_fields.iter().cloned().collect();
+    let type_arg_spans: TypeArgSpans = infer.type_arg_spans.clone();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans, relation_fields, with_fields)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans)
 }
 
 
@@ -11917,14 +12229,14 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields) = check(&mut module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args) = check(&mut module);
         diags
     }
 
     fn type_info_for(src: &str) -> TypeInfo {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields) = check(&mut module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args) = check(&mut module);
         type_info
     }
 

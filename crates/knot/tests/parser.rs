@@ -552,7 +552,7 @@ fn list_of_records() {
 #[test]
 fn simple_lambda() {
     match fun_body("x = \\a -> a") {
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, body, .. } => {
             assert_eq!(params.len(), 1);
             assert!(matches!(&params[0].node, PatKind::Var(n) if n == "a"));
             assert!(matches!(&body.node, ExprKind::Var(n) if n == "a"));
@@ -1197,7 +1197,7 @@ fn fun_as_lambda() {
         DeclKind::Fun { name, body: Some(body), .. } => {
             assert_eq!(name, "add");
             match &body.node {
-                ExprKind::Lambda { params, body } => {
+                ExprKind::Lambda { params, body, .. } => {
                     assert_eq!(params.len(), 2);
                     assert!(matches!(&body.node, ExprKind::BinOp { op: BinOp::Add, .. }));
                 }

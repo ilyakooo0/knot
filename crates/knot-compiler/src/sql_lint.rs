@@ -1294,7 +1294,7 @@ fn analyze_pipe_op(expr: &Expr) -> Option<LintPipeOp<'_>> {
 }
 
 fn extract_single_param_lambda(expr: &Expr) -> Option<(String, &Expr)> {
-    if let ExprKind::Lambda { params, body } = &expr.node
+    if let ExprKind::Lambda { params, body, .. } = &expr.node
         && params.len() == 1
             && let PatKind::Var(name) = &params[0].node {
                 return Some((name.clone(), body));

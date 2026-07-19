@@ -334,7 +334,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
                 shift_expr_spans(it, offset);
             }
         }
-        Lambda { params, body } => {
+        Lambda { params, body, .. } => {
             for p in params {
                 shift_pat_spans(p, offset);
             }

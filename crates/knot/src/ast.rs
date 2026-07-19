@@ -214,9 +214,15 @@ pub enum ExprKind {
     /// `["Alice", "Bob"]` or `[]`
     List(Vec<Expr>),
 
-    /// `\x -> expr` or `\x y -> expr`
+    /// `\x -> expr` or `\x y -> expr` — or, with leading type-witness params,
+    /// `\(T : Type) -> \x -> expr` (Π-lite explicit type arguments).
     Lambda {
         params: Vec<Pat>,
+        /// Leading type-witness parameters `\(T : Type)`. Each is an erased
+        /// type argument: at runtime it has no representation, and at a call
+        /// site the corresponding argument is a *type* (disambiguated by the
+        /// parameter's `Type` kind), not a value. Empty for ordinary lambdas.
+        ty_params: Vec<TyParam>,
         body: Box<Expr>,
     },
 
@@ -404,6 +410,15 @@ pub struct FieldPat {
     pub name_span: Span,
     /// `None` means punned: `{name}` is shorthand for `{name: name}`.
     pub pattern: Option<Pat>,
+}
+
+/// A type-witness parameter in a lambda: `\(T : Type)`. The witness is erased
+/// at runtime (no value representation); its only role is to let the caller
+/// pass a *type* explicitly that later parameters/annotations reference.
+#[derive(Debug, Clone)]
+pub struct TyParam {
+    pub name: Name,
+    pub span: Span,
 }
 
 // ── Do-block statements ────────────────────────────────────────────

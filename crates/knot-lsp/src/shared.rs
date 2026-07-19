@@ -923,7 +923,7 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
             ast::ExprKind::FieldAccess { expr: recv, field } => {
                 format!("{}.{field}", go(recv, true)?)
             }
-            ast::ExprKind::Lambda { params, body } => {
+            ast::ExprKind::Lambda { params, body, .. } => {
                 let ps: Vec<String> = params.iter().map(pat).collect();
                 let rendered = format!("\\{} -> {}", ps.join(" "), go(body, false)?);
                 return Some(if nested {
@@ -1115,7 +1115,7 @@ pub(crate) fn extract_param_names(module: &Module, func_name: &str) -> Vec<Strin
 pub(crate) fn collect_lambda_param_names(expr: &ast::Expr) -> Vec<String> {
     let mut names = Vec::new();
     let mut cur = expr;
-    while let ast::ExprKind::Lambda { params, body } = &cur.node {
+    while let ast::ExprKind::Lambda { params, body, .. } = &cur.node {
         for p in params {
             names.push(pat_to_simple_name(&p.node));
         }

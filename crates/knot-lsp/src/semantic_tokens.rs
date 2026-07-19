@@ -539,7 +539,7 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::Lit(ast::Literal::Bytes(_)) => {
                 self.add(self.strip_parens(expr.span), TOK_STRING, 0);
             }
-            ast::ExprKind::Lambda { params, body } => {
+            ast::ExprKind::Lambda { params, body, .. } => {
                 for p in params {
                     self.visit_pat(p, true);
                 }

@@ -326,7 +326,7 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
                 walk_expr(it, r);
             }
         }
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, body, .. } => {
             for p in params {
                 walk_pat(p, r);
             }

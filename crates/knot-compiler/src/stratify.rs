@@ -146,7 +146,7 @@ fn build_dependency_graph(module: &ast::Module) -> (HashSet<String>, HashMap<Str
 /// `diff x y` (x positive, y negative). Also recognizes the pipe-desugared
 /// form `\a b -> b |> diff a` (which is `diff a b` after beta-reduction).
 fn is_diff_wrapper(body: &ast::Expr) -> Option<[String; 2]> {
-    if let ast::ExprKind::Lambda { params, body } = &body.node {
+    if let ast::ExprKind::Lambda { params, body, .. } = &body.node {
         if params.len() != 2 {
             return None;
         }
@@ -352,7 +352,7 @@ fn collect_edges(
                 collect_edges(e, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             }
         }
-        ast::ExprKind::Lambda { params, body } => {
+        ast::ExprKind::Lambda { params, body, .. } => {
             // A lambda parameter shadows any outer alias of the same name.
             let mut inner = env.clone();
             let mut inner_partial = partial_diffs.clone();
@@ -941,7 +941,7 @@ mod tests {
             .into_iter()
             .map(|p| spanned(PatKind::Var(p.to_string())))
             .collect();
-        spanned(ExprKind::Lambda { params, body: Box::new(body) })
+        spanned(ExprKind::Lambda { params, ty_params: vec![], body: Box::new(body) })
     }
 
     fn derived_ref(name: &str) -> Expr {

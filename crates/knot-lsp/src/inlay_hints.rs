@@ -570,7 +570,7 @@ fn add_record_pattern_field_hints(
     }
     fn walk_expr(expr: &ast::Expr, source: &str, out: &mut Vec<RecordPat>) {
         match &expr.node {
-            ast::ExprKind::Lambda { params, body } => {
+            ast::ExprKind::Lambda { params, body, .. } => {
                 for p in params {
                     walk_pat_for_records(p, source, out);
                 }

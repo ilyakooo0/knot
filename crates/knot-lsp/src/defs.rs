@@ -670,7 +670,7 @@ impl<'a> DefResolver<'a> {
             ast::ExprKind::SourceRef(name) => self.add_ref(expr.span, name),
             ast::ExprKind::DerivedRef(name) => self.add_ref(expr.span, name),
 
-            ast::ExprKind::Lambda { params, body } => {
+            ast::ExprKind::Lambda { params, body, .. } => {
                 self.push_scope();
                 for p in params {
                     self.define_pat(p);

@@ -369,6 +369,10 @@ pub struct Codegen {
     // from a scalar one. See `infer::RelationFieldSpans`.
     relation_fields: crate::infer::RelationFieldSpans,
 
+    // Spans of explicit type arguments (Π-lite `apply Int …`) that are erased
+    // at runtime. See `infer::TypeArgSpans`.
+    type_arg_spans: crate::infer::TypeArgSpans,
+
     // Set by `compile_io_do_eager` when the statements it compiled ended in an
     // iterating bind, i.e. its value is that loop's relation of per-row results
     // rather than one row's value. An enclosing `compile_io_bind_loop` reads it
@@ -732,6 +736,7 @@ pub fn compile(
     sum_float_spans: &crate::infer::SumFloatSpans,
     relation_fields: &crate::infer::RelationFieldSpans,
     with_fields: &crate::infer::WithFields,
+    type_arg_spans: &crate::infer::TypeArgSpans,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     crate::stack::grow(|| {
@@ -750,6 +755,7 @@ pub fn compile(
             sum_float_spans,
             relation_fields,
             with_fields,
+            type_arg_spans,
             compile_time_overrides,
         )
     })
@@ -771,6 +777,7 @@ fn compile_inner(
     sum_float_spans: &crate::infer::SumFloatSpans,
     relation_fields: &crate::infer::RelationFieldSpans,
     with_fields: &crate::infer::WithFields,
+    type_arg_spans: &crate::infer::TypeArgSpans,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
@@ -819,6 +826,7 @@ fn compile_inner(
     cg.show_unit_strings = show_unit_strings.clone();
     cg.sum_float_spans = sum_float_spans.clone();
     cg.relation_fields = relation_fields.clone();
+    cg.type_arg_spans = type_arg_spans.clone();
     cg.source_refinements = type_env.source_refinements.clone();
     for (name, fields) in &type_env.constructors {
         let field_strs: Vec<(String, String)> = fields
@@ -1094,6 +1102,7 @@ impl Codegen {
             show_unit_strings: HashMap::new(),
             sum_float_spans: crate::infer::SumFloatSpans::new(),
             relation_fields: crate::infer::RelationFieldSpans::new(),
+            type_arg_spans: crate::infer::TypeArgSpans::new(),
             io_do_tail_iterated: false,
         }
     }
@@ -2956,7 +2965,7 @@ impl Codegen {
                         }
                         // If body is a lambda, extract its params for direct compilation.
                         match &body.node {
-                            ast::ExprKind::Lambda { params, body: lambda_body } => {
+                            ast::ExprKind::Lambda { params, body: lambda_body, .. } => {
                                 self.define_user_function(name, params, lambda_body);
                             }
                             _ => {
@@ -5047,7 +5056,7 @@ impl Codegen {
                 builder.block_params(merge_block)[0]
             }
 
-            ast::ExprKind::Lambda { params, body } => {
+            ast::ExprKind::Lambda { params, body, .. } => {
                 self.compile_lambda(builder, params, body, env, db)
             }
 
@@ -6068,6 +6077,65 @@ impl Codegen {
         }
     }
 
+    /// Does this argument expression have a Π-lite type-argument head? Only the
+    /// LEFTMOST head of the arg's application spine counts: `App(Int, x)` has
+    /// type head `Int`, but `App(f, App(Int, x))` (a complete call passed as an
+    /// argument) has head `f` and is an ordinary value — its inner type arg
+    /// belongs to `f`'s own application, compiled separately.
+    fn arg_has_type_head(&self, arg: &ast::Expr) -> bool {
+        let mut cur = arg;
+        loop {
+            match &cur.node {
+                ast::ExprKind::App { func, .. } => cur = func,
+                ast::ExprKind::Annot { expr, .. } => cur = expr,
+                ast::ExprKind::Constructor(_) => {
+                    return self.type_arg_spans.contains(&cur.span);
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Splice a possibly type-arg-glued argument into `out`. The parser glues
+    /// `f Int x` into `f (Int x)`, and multiple type args can nest either left
+    /// (`const2 (Int Text) 99`) or right (`const2 Int (Text 99)`). Fully
+    /// flatten the nested application, drop every constructor the typechecker
+    /// erased as a type argument, and push the surviving value args in order.
+    fn splice_type_arg<'a>(&self, arg: &'a ast::Expr, out: &mut Vec<&'a ast::Expr>) {
+        if !self.arg_has_type_head(arg) {
+            out.push(arg);
+            return;
+        }
+        // Fully flatten nested applications into a token stream (head-first).
+        fn flatten<'a>(e: &'a ast::Expr, acc: &mut Vec<&'a ast::Expr>) {
+            match &e.node {
+                ast::ExprKind::App { func, arg } => {
+                    flatten(func, acc);
+                    flatten(arg, acc);
+                }
+                ast::ExprKind::Annot { expr, .. } => flatten(expr, acc),
+                _ => acc.push(e),
+            }
+        }
+        let mut flat: Vec<&ast::Expr> = Vec::new();
+        flatten(arg, &mut flat);
+        // Drop leading erased type-argument constructors; keep the rest.
+        let mut i = 0;
+        while i < flat.len() {
+            let e = flat[i];
+            if matches!(&e.node, ast::ExprKind::Constructor(_))
+                && self.type_arg_spans.contains(&e.span)
+            {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        for v in flat.into_iter().skip(i) {
+            out.push(v);
+        }
+    }
+
     fn compile_app(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -6077,6 +6145,21 @@ impl Codegen {
     ) -> Value {
         // Uncurry nested applications
         let (func_expr, args) = uncurry_app(expr);
+        // Π-lite erasure: the parser glues `f Int x` into `f (Int x)`
+        // (constructor-application). The typechecker consumed the leading type
+        // argument `Int` (recorded in `type_arg_spans`); the remaining value
+        // args trail it in the same glued spine. Splice those trailing value
+        // args into the argument list so `f Int x` compiles to `f x` — the
+        // type argument itself has no runtime representation and is dropped.
+        let args: Vec<&ast::Expr> = if args.iter().any(|a| self.arg_has_type_head(a)) {
+            let mut flat: Vec<&ast::Expr> = Vec::with_capacity(args.len());
+            for a in &args {
+                self.splice_type_arg(a, &mut flat);
+            }
+            flat
+        } else {
+            args
+        };
 
         // A user-defined top-level function shadows any same-named builtin,
         // stdlib function, or SQL-pushdown special form. When present, skip all
@@ -8632,7 +8715,7 @@ impl Codegen {
                 // whether the innermost body returns one of them unapplied.
                 let mut params: HashSet<String> = HashSet::new();
                 let mut cur = strip_expr_wrappers(body);
-                while let ast::ExprKind::Lambda { params: ps, body: inner } = &cur.node {
+                while let ast::ExprKind::Lambda { params: ps, body: inner, .. } = &cur.node {
                     for p in ps {
                         collect_pat_var_names(p, &mut params);
                     }
@@ -11011,6 +11094,9 @@ impl Codegen {
             let inner_lambda = ast::Spanned::new(
                 ast::ExprKind::Lambda {
                     params: params[1..].to_vec(),
+                    // Type-witness params are erased before codegen, so a
+                    // lambda reaching here has none.
+                    ty_params: vec![],
                     body: Box::new(body.clone()),
                 },
                 body.span,
@@ -15025,7 +15111,7 @@ fn extract_single_param_lambda(
     let_bindings: &HashMap<String, ast::Expr>,
 ) -> Option<(String, ast::Expr)> {
     let reduced = beta_reduce(expr, fun_bodies, let_bindings);
-    if let ast::ExprKind::Lambda { params, body } = reduced.node
+    if let ast::ExprKind::Lambda { params, body, .. } = reduced.node
         && params.len() == 1
             && let ast::PatKind::Var(name) = &params[0].node {
                 return Some((name.clone(), *body));
@@ -15205,7 +15291,7 @@ fn beta_reduce_inner(
         App { func, arg } => {
             let f = beta_reduce_inner(func, fun_bodies, let_bindings, visited, fuel);
             let a = beta_reduce_inner(arg, fun_bodies, let_bindings, visited, fuel);
-            if let Lambda { params, body } = &f.node
+            if let Lambda { params, ty_params, body, .. } = &f.node
                 && !params.is_empty()
                     && let ast::PatKind::Var(name) = &params[0].node
                         // For a multi-param lambda the remaining params
@@ -15228,6 +15314,7 @@ fn beta_reduce_inner(
                             let new_lambda = ast::Spanned {
                                 node: Lambda {
                                     params: params[1..].to_vec(),
+                                    ty_params: ty_params.clone(),
                                     body: Box::new(substituted),
                                 },
                                 span: f.span,
@@ -15238,7 +15325,7 @@ fn beta_reduce_inner(
                         }
             App { func: Box::new(f), arg: Box::new(a) }
         }
-        Lambda { params, body } => {
+        Lambda { params, ty_params, body, .. } => {
             // A lambda parameter shadows any same-named do-local let or
             // top-level binding for the body: mask those names out of the
             // expansion maps so `\q -> q.value` is NOT rewritten to the
@@ -15252,6 +15339,7 @@ fn beta_reduce_inner(
                 masked_lets.retain(|k, _| !shadows(k));
                 Lambda {
                     params: params.clone(),
+                    ty_params: ty_params.clone(),
                     body: Box::new(beta_reduce_inner(
                         body, &masked_funs, &masked_lets, visited, fuel,
                     )),
@@ -15259,6 +15347,7 @@ fn beta_reduce_inner(
             } else {
                 Lambda {
                     params: params.clone(),
+                    ty_params: ty_params.clone(),
                     body: Box::new(beta_reduce_inner(
                         body, fun_bodies, let_bindings, visited, fuel,
                     )),
@@ -15352,7 +15441,7 @@ fn substitute_inner(
         Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | TypeCtor { .. } => {
             return Some(expr.clone())
         }
-        Lambda { params, body } => {
+        Lambda { params, ty_params, body, .. } => {
             if params.iter().any(|p| pat_binds(p, var)) {
                 return Some(expr.clone());
             }
@@ -15361,6 +15450,7 @@ fn substitute_inner(
             }
             Lambda {
                 params: params.clone(),
+                ty_params: ty_params.clone(),
                 body: Box::new(substitute_inner(body, var, value, value_fv)?),
             }
         }
@@ -15522,7 +15612,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             }
         }
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | TypeCtor { .. } => {}
-        Lambda { params, body } => {
+        Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
             for p in params {
                 collect_pat_binds(p, &mut new_bound);
@@ -16636,7 +16726,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
                 collect_free_vars(e, bound, free);
             }
         }
-        ast::ExprKind::Lambda { params, body } => {
+        ast::ExprKind::Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
             for p in params {
                 collect_pat_bindings_set(p, &mut new_bound);
@@ -16785,7 +16875,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
                 || expr_refs_var(then_branch, var)
                 || expr_refs_var(else_branch, var)
         }
-        ast::ExprKind::Lambda { params, body } => {
+        ast::ExprKind::Lambda { params, body, .. } => {
             if params.iter().any(pat_binds_var) {
                 false // shadowed
             } else {
@@ -16893,7 +16983,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
                 || expr_uses_var_as_value(then_branch, var)
                 || expr_uses_var_as_value(else_branch, var)
         }
-        ast::ExprKind::Lambda { params, body } => {
+        ast::ExprKind::Lambda { params, body, .. } => {
             if params.iter().any(pat_binds_var) {
                 false // shadowed
             } else {
@@ -17230,7 +17320,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
             let es: Vec<String> = elems.iter().map(pretty_expr).collect();
             format!("[{}]", es.join(", "))
         }
-        ast::ExprKind::Lambda { params, body } => {
+        ast::ExprKind::Lambda { params, body, .. } => {
             let ps: Vec<String> = params.iter().map(pretty_pat).collect();
             format!("\\{} -> {}", ps.join(" "), pretty_expr(body))
         }
@@ -17529,7 +17619,7 @@ fn method_params_body<'a>(
 ) -> (Vec<ast::Pat>, &'a ast::Expr) {
     let mut all: Vec<ast::Pat> = params.to_vec();
     let mut cur = body;
-    while let ast::ExprKind::Lambda { params: lambda_params, body: lambda_body } = &cur.node {
+    while let ast::ExprKind::Lambda { params: lambda_params, body: lambda_body, .. } = &cur.node {
         all.extend(lambda_params.iter().cloned());
         cur = lambda_body;
     }
@@ -17901,7 +17991,7 @@ fn eval_refine_predicate(pred: &ast::Expr, lit: &CompileLit) -> Option<bool> {
     // and body so we only substitute for the actual parameter, not any
     // other variable the predicate may reference (e.g. a top-level constant).
     let (param_name, body) = match &pred.node {
-        ast::ExprKind::Lambda { params, body } => {
+        ast::ExprKind::Lambda { params, body, .. } => {
             if params.len() != 1 { return None; }
             let name = match &params[0].node {
                 ast::PatKind::Var(n) => n.clone(),

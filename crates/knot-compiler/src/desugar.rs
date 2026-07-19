@@ -518,7 +518,7 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
                 desugar_expr(e, io_fns, source_vars);
             }
         }
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, body, .. } => {
             // Lambda params shadow any same-named source-bound variables
             // from the enclosing scope.
             let mut bound: Vec<String> = Vec::new();
@@ -1194,6 +1194,7 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
                     spanned(
                         ExprKind::Lambda {
                             params: vec![pat.clone()],
+                            ty_params: vec![],
                             body: Box::new(rest),
                         },
                         span,
@@ -1221,6 +1222,7 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
                 spanned(
                     ExprKind::Lambda {
                         params: vec![spanned(PatKind::Wildcard, span)],
+                        ty_params: vec![],
                         body: Box::new(rest),
                     },
                     span,
@@ -1251,6 +1253,7 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
                 spanned(
                     ExprKind::Lambda {
                         params: vec![spanned(PatKind::Wildcard, span)],
+                        ty_params: vec![],
                         body: Box::new(rest),
                     },
                     span,
@@ -1290,6 +1293,7 @@ fn desugar_ctor_bind(pat: &Pat, expr: &Expr, rest: &Expr, span: Span) -> Expr {
         spanned(
             ExprKind::Lambda {
                 params: vec![spanned(PatKind::Var(tmp), span)],
+                ty_params: vec![],
                 body: Box::new(case_expr),
             },
             span,

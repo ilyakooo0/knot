@@ -3291,6 +3291,39 @@ impl Parser {
         ))
     }
 
+    /// Lookahead: is the cursor at a type-witness parameter `(T : Type)`?
+    /// Matches `LParen Upper Colon Upper("Type") RParen`. `Type` is an ordinary
+    /// uppercase identifier (not a keyword), so compare by name.
+    fn at_ty_param(&self) -> bool {
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return false;
+        }
+        let is_upper = |k: &TokenKind| matches!(k, TokenKind::Upper(_));
+        let name_is = |k: &TokenKind, want: &str| matches!(k, TokenKind::Upper(n) if n == want);
+        is_upper(self.peek_ahead(1))
+            && matches!(self.peek_ahead(2), TokenKind::Colon)
+            && name_is(self.peek_ahead(3), "Type")
+            && matches!(self.peek_ahead(4), TokenKind::RParen)
+    }
+
+    /// Parse a type-witness parameter `(T : Type)` — assumes `at_ty_param()`.
+    fn parse_ty_param(&mut self) -> Option<crate::ast::TyParam> {
+        let start = self.span();
+        self.advance(); // (
+        let name = match self.advance().kind {
+            TokenKind::Upper(n) => n,
+            _ => return None,
+        };
+        self.advance(); // :
+        self.advance(); // Type
+        let end = self.span();
+        self.advance(); // )
+        Some(crate::ast::TyParam {
+            name,
+            span: Span::new(start.start, end.end),
+        })
+    }
+
     fn parse_lambda(&mut self) -> Option<Expr> {
         let start = self.span();
         // Deeply nested lambdas (`\x -> \x -> … x`) would otherwise grow the
@@ -3307,6 +3340,7 @@ impl Parser {
             this.advance(); // consume `\`
 
             let mut params = Vec::new();
+            let mut ty_params = Vec::new();
             while !this.at(&TokenKind::Arrow) && !this.at_eof() {
                 this.skip_newlines();
                 if this.at(&TokenKind::Arrow) { break; }
@@ -3315,6 +3349,13 @@ impl Parser {
                 // when `->` is missing.
                 if this.delimiter_depth == 0 && this.cur_column() == 0 {
                     break;
+                }
+                // Type-witness parameter `\(T : Type)`. Lookahead: LParen Upper
+                // Colon Upper("Type") RParen. Only valid in leading position
+                // (before any value param). Erased at runtime.
+                if params.is_empty() && this.at_ty_param() {
+                    ty_params.push(this.parse_ty_param()?);
+                    continue;
                 }
                 let p = this.parse_pat()?;
                 params.push(p);
@@ -3334,6 +3375,7 @@ impl Parser {
             Some(Spanned::new(
                 ExprKind::Lambda {
                     params,
+                    ty_params,
                     body: Box::new(body),
                 },
                 Span::new(start.start, end_sp.end),

@@ -1049,6 +1049,7 @@ fn synth_lambda(param: &str, body: Expr) -> Expr {
     Spanned::new(
         ExprKind::Lambda {
             params: vec![Spanned::new(PatKind::Var(param.into()), span)],
+            ty_params: vec![],
             body: Box::new(body),
         },
         span,

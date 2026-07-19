@@ -1557,7 +1557,7 @@ fn binop_str(op: BinOp) -> &'static str {
 fn as_let_in(e: &Expr) -> Option<(&Pat, Option<&Type>, &Expr, &Expr)> {
     if let ExprKind::App { func, arg } = &e.node
         && arg.span.end < func.span.end && arg.span.start > func.span.start
-            && let ExprKind::Lambda { params, body } = &func.node
+            && let ExprKind::Lambda { params, body, .. } = &func.node
                 && params.len() == 1 {
                     if let ExprKind::Annot { expr, ty } = &arg.node {
                         return Some((&params[0], Some(ty), expr, body));
@@ -1661,8 +1661,16 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             s.push(']');
             s
         }
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, ty_params, body } => {
             let mut s = String::from("\\");
+            for tp in ty_params {
+                s.push_str(&format!("({} : Type)", tp.name));
+                // Space after the witness only when value params follow, so a
+                // witness-only lambda renders `\(T : Type) -> …`, not `)  ->`.
+                if !params.is_empty() {
+                    s.push(' ');
+                }
+            }
             for (i, prm) in params.iter().enumerate() {
                 if i > 0 {
                     s.push(' ');
@@ -2007,13 +2015,19 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
         ExprKind::If { cond, then_branch, else_branch } => {
             render_if_block(p, cond, then_branch, else_branch, parent)
         }
-        ExprKind::Lambda { params, body } => {
-            // `\x y -> body` where body is multiline
+        ExprKind::Lambda { params, ty_params, body } => {
+            // `\(T : Type) \x y -> body` where body is multiline
             let need_parens = parent > Prec::Lowest;
             if need_parens {
                 p.write("(");
             }
             p.write("\\");
+            for tp in ty_params {
+                p.write(&format!("({} : Type)", tp.name));
+                if !params.is_empty() {
+                    p.write(" ");
+                }
+            }
             for (i, prm) in params.iter().enumerate() {
                 if i > 0 {
                     p.write(" ");

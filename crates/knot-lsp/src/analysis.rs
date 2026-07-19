@@ -611,6 +611,7 @@ pub fn analyze_document(
             _sum_floats,
             _relation_fields,
             _with_fields,
+            _type_args,
         ) = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_user));
         type_info = inferred_types;

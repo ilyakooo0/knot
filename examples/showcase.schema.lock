@@ -3,18 +3,9 @@
 
 data Priority = Low {} | Medium {} | High {} | Critical {}
 
-data Status
-  = Open {}
-  | InProgress {assignee: Text}
-  | Done {}
-  | Blocked {reason: Text}
+data Status = Open {} | InProgress {assignee: Text} | Done {} | Blocked {reason: Text}
 
-data Department
-  = Engineering {}
-  | Design {}
-  | Marketing {}
-  | Sales {}
-  | Support {}
+data Department = Engineering {} | Design {} | Marketing {} | Sales {} | Support {}
 
 data Active = Yes {} | No {}
 
@@ -32,12 +23,7 @@ type Order = {customer: Text, product: Text, quantity: Int 1, total: Float 1}
 
 type Product = {name: Text, price: Float 1, category: Category, inStock: Active}
 
-data Category
-  = Electronics {}
-  | Books {}
-  | Clothing {}
-  | Food {}
-  | Software {}
+data Category = Electronics {} | Books {} | Clothing {} | Food {} | Software {}
 
 type Team = {name: Text, members: [{name: Text, role: Text}]}
 

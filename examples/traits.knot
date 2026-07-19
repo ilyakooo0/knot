@@ -1,14 +1,8 @@
 -- Traits: runtime dispatch, default methods, and deriving
 
-data Shape
-  = Circle {radius: Int 1}
-  | Rect {width: Int 1, height: Int 1}
+data Shape = Circle {radius: Int 1} | Rect {width: Int 1, height: Int 1}
 
-data Color
-  = Red {}
-  | Green {}
-  | Blue {}
-  deriving (Describe)
+data Color = Red {} | Green {} | Blue {} deriving (Describe)
 
 trait Describe a where
   describe : a -> Text
@@ -24,8 +18,8 @@ impl Describe Text where
 
 impl Describe Shape where
   describe s = case s of
-    Circle { radius radius } -> "a circle"
-    Rect { width width height height } -> "a rectangle"
+    Circle {radius radius} -> "a circle"
+    Rect {width width height height} -> "a rectangle"
 
 impl Describe Color where
   describe c = case c of
@@ -35,16 +29,16 @@ impl Describe Color where
 
 impl Area Shape where
   area s = case s of
-    Circle { radius radius } -> radius * radius * 3
-    Rect { width width height height } -> width * height
+    Circle {radius radius} -> radius * radius * 3
+    Rect {width width height height} -> width * height
 
 main = do
   println (describe 42)
   println (describe "hello")
-  println (describe (Circle { radius 5 }))
-  println (describe (Rect { width 3 height 4 }))
-  println (area (Circle { radius 5 }))
-  println (area (Rect { width 3 height 4 }))
+  println (describe (Circle {radius 5}))
+  println (describe (Rect {width 3 height 4}))
+  println (area (Circle {radius 5}))
+  println (area (Rect {width 3 height 4}))
   println (describe (Red {}))
   println (describe (Green {}))
   println (describe (Blue {}))

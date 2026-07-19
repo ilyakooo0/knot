@@ -16,7 +16,7 @@ findById = \aid rows -> single (filter (\a -> a.id == aid) rows)
 
 setBalance = \aid newBalance rows -> do
   r <- rows
-  yield (if r.id == aid then { r | balance newBalance } else r)
+  yield (if r.id == aid then {r | balance newBalance} else r)
 
 credit = \aid amount -> atomic do
   rows <- *accounts
@@ -27,11 +27,7 @@ credit = \aid amount -> atomic do
     (*accounts = setBalance aid amount rows)
 
 main = do
-  replace *accounts = [
-    { id 1 balance 0 },
-    { id 2 balance 0 },
-    { id 3 balance 0 }
-  ]
+  replace *accounts = [{id 1 balance 0}, {id 2 balance 0}, {id 3 balance 0}]
   credit 1 100
   credit 2 50
   credit 3 25

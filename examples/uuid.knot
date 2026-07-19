@@ -3,8 +3,6 @@
 main = do
   u <- randomUuid
   println u
-
   v <- randomUuid
   println v
-
   yield {}

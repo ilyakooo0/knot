@@ -4,24 +4,17 @@ type Todo = {title: Text, owner: Text, done: Int 1}
 
 add = \title owner -> do
   todos <- *todos
-  *todos = union todos [{ title title owner owner done 0 }]
+  *todos = union todos [{title title owner owner done 0}]
 
 complete = \title -> do
   todos <- *todos
   *todos = do
     t <- todos
-    yield (if t.title == title
-      then { t | done 1 }
-      else t)
+    yield (if t.title == title then {t | done 1} else t)
 
 pending = \owner -> do
   todos <- *todos
-  with { result (do
-    t <- todos
-    where t.done == 0
-    where t.owner == owner
-    yield t.title) }
-    (yield result)
+  with {result (do t <- todos; where t.done == 0; where t.owner == owner; yield t.title)} yield result
 
 main = do
   add "Write parser" "Alice"

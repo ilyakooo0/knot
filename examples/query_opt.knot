@@ -15,56 +15,30 @@ countDemo = do
 filterDemo = do
   employees <- *employees
   println "High earners (salary > 75):"
-  with { filtered (do
-    e <- employees
-    where e.salary > 75
-    yield ("  " ++ e.name ++ " ($" ++ show e.salary ++ ")")) } (do
-    r <- filtered
-    println r
-    yield {})
+  with {filtered (do e <- employees; where e.salary > 75; yield ("  " ++ e.name ++ " ($" ++ show e.salary ++ ")"))} (do r <- filtered; println r; yield {})
 
 -- 3. Hash join: equi-join via hash index
 joinDemo = do
   employees <- *employees
   departments <- *departments
   println "Employee departments:"
-  with { joined (do
-    e <- employees
-    d <- departments
-    where e.dept == d.name
-    yield ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget: $" ++ show d.budget ++ ")")) } (do
-    r <- joined
-    println r
-    yield {})
+  with {joined (do e <- employees; d <- departments; where e.dept == d.name; yield ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget: $" ++ show d.budget ++ ")"))} (do r <- joined; println r; yield {})
 
 -- 4. Full SQL: single-table filter → one SQL SELECT
 filterQuery = do
   employees <- *employees
-  with { result (do
-    e <- employees
-    where e.salary > 75
-    yield { name e.name salary e.salary }) }
-    (yield result)
+  with {result (do e <- employees; where e.salary > 75; yield {name e.name salary e.salary})} yield result
 
 -- 5. Full SQL: multi-table join + filter → one SQL SELECT
 joinQuery = do
   employees <- *employees
   departments <- *departments
-  with { result (do
-    e <- employees
-    d <- departments
-    where e.dept == d.name
-    where e.salary > 75
-    yield { name e.name dept d.name budget d.budget }) }
-    (yield result)
+  with {result (do e <- employees; d <- departments; where e.dept == d.name; where e.salary > 75; yield {name e.name dept d.name budget d.budget})} yield result
 
 -- 6. Full SQL: yield entire row (single-table)
 allEmployees = do
   employees <- *employees
-  with { result (do
-    e <- employees
-    yield e) }
-    (yield result)
+  with {result (do e <- employees; yield e)} yield result
 
 printQuery = \label results -> do
   println (label ++ ":")
@@ -80,33 +54,27 @@ pipeFilter = do
 -- 8. Pipe: filter + map → SQL WHERE + SELECT
 pipeFilterMap = do
   employees <- *employees
-  yield (employees
-    |> filter (\e -> e.salary > 75)
-    |> map (\e -> { name e.name salary e.salary }))
+  yield (employees |> filter (\e -> e.salary > 75) |> map (\e -> {name e.name salary e.salary}))
 
 -- 9. Pipe: filter + count
 pipeFilterCount = do
   employees <- *employees
-  with { filtered (employees |> filter (\e -> e.salary > 75)) }
-    (yield (count filtered))
+  with {filtered (employees |> filter (\e -> e.salary > 75))} yield (count filtered)
 
 -- 10. Pipe: map only → SQL SELECT
 pipeMap = do
   employees <- *employees
-  yield (employees |> map (\e -> { name e.name dept e.dept }))
+  yield (employees |> map (\e -> {name e.name dept e.dept}))
 
 -- 11. minOn/maxOn projection → SQL MIN/MAX
 minMaxDemo = do
   employees <- *employees
-  with { lo (minOn (\e -> e.salary) employees) } (
-    with { hi (maxOn (\e -> e.salary) employees) }
-      (println ("min salary: " ++ show lo ++ ", max salary: " ++ show hi)))
+  with {lo (minOn (\e -> e.salary) employees)} with {hi (maxOn (\e -> e.salary) employees)} println ("min salary: " ++ show lo ++ ", max salary: " ++ show hi)
 
 -- 12. countWhere predicate → SQL COUNT(*) WHERE
 countWhereDemo = do
   employees <- *employees
-  with { n (countWhere (\e -> e.dept == "Eng") employees) }
-    (println ("eng headcount: " ++ show n))
+  with {n (countWhere (\e -> e.dept == "Eng") employees)} println ("eng headcount: " ++ show n)
 
 -- 13. Pipe: filter + minOn/maxOn → SQL aggregate with WHERE
 pipeFilterMin = do
@@ -123,16 +91,13 @@ pipeCountWhere = do
 
 main = do
   replace *employees = [
-    { name "Alice" dept "Eng" salary 90 },
-    { name "Bob" dept "Eng" salary 80 },
-    { name "Carol" dept "Sales" salary 70 },
-    { name "Dave" dept "Sales" salary 60 },
-    { name "Eve" dept "Eng" salary 100 }
+    {name "Alice" dept "Eng" salary 90},
+    {name "Bob" dept "Eng" salary 80},
+    {name "Carol" dept "Sales" salary 70},
+    {name "Dave" dept "Sales" salary 60},
+    {name "Eve" dept "Eng" salary 100}
   ]
-  replace *departments = [
-    { name "Eng" budget 500 },
-    { name "Sales" budget 200 }
-  ]
+  replace *departments = [{name "Eng" budget 500}, {name "Sales" budget 200}]
   countDemo
   filterDemo
   joinDemo

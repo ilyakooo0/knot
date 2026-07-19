@@ -5,43 +5,36 @@ type Todo = {title: Text, owner: Text, priority: Priority}
 *todos : [Todo]
 
 route TodoApi where
-  /todos
-    GET /{owner: Text} headers {xForwardedFor: Maybe Text} -> [Todo] = GetTodos
-    POST {title: Text, owner: Text, priority: Text} / -> Todo = CreateTodo
+  GET /todos/{owner: Text} headers {xForwardedFor: Maybe Text} -> [Todo] = GetTodos
+  POST {title: Text, owner: Text, priority: Text} /todos -> Todo = CreateTodo
 
 route AdminApi where
-  /admin
-    GET /count -> Int 1 = GetCount
+  GET /admin/count -> Int 1 = GetCount
 
 route Api = TodoApi | AdminApi
 
 addTodo = \title owner priority -> do
   todos <- *todos
-  *todos = union todos [{ title title owner owner priority (Low {}) }]
+  *todos = union todos [{title title owner owner priority (Low {})}]
 
 getTodos = \owner -> do
   todos <- *todos
-  with { result (do
-    t <- todos
-    where t.owner == owner
-    yield t) }
-    (yield result)
+  with {result (do t <- todos; where t.owner == owner; yield t)} yield result
 
 api = serve Api where
-  GetTodos = \{ owner owner xForwardedFor xForwardedFor } -> do
+  GetTodos = \{owner owner xForwardedFor xForwardedFor} -> do
     case xForwardedFor of
-      Just { value ip } -> logInfo ("GetTodos from " ++ ip)
+      Just {value ip} -> logInfo ("GetTodos from " ++ ip)
       Nothing {} -> logInfo "GetTodos (no proxy header)"
     todos <- getTodos owner
-    if (count todos) == 0 then
-      yield Err { error { status 404 message "no todos found for owner" } }
-    else
-      yield Ok { value todos }
-  CreateTodo = \{ title title owner owner priority priority } -> do
+    if count todos == 0
+      then yield (Err {error {status 404 message "no todos found for owner"}})
+      else yield (Ok {value todos})
+  CreateTodo = \{title title owner owner priority priority} -> do
     addTodo title owner priority
-    yield Ok { value { title title owner owner priority (Low {}) } }
+    yield (Ok {value {title title owner owner priority (Low {})}})
   GetCount = \{} -> do
     todos <- *todos
-    yield Ok { value (count todos) }
+    yield (Ok {value (count todos)})
 
 main = listen 8080 api

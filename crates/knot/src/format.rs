@@ -2321,11 +2321,13 @@ fn render_pat(p: &Pat) -> String {
             let mut s = String::from("{");
             for (i, f) in fields.iter().enumerate() {
                 if i > 0 {
-                    s.push_str(", ");
+                    s.push(' ');
                 }
                 s.push_str(&f.name);
+                // The parser always produces `Some` here (no punning exists);
+                // `None` is unreachable but handled defensively as a bare name.
                 if let Some(sub) = &f.pattern {
-                    s.push_str(": ");
+                    s.push(' ');
                     s.push_str(&render_pat(sub));
                 }
             }

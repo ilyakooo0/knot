@@ -855,7 +855,7 @@ fn set_value_comprehension_inside_if_branch() {
 main = do
   replace *other = [{name "a"}, {name "b"}]
   replace *items =
-    if True
+    if True {}
       then do
         x <- *other
         where x.name == "a"
@@ -866,9 +866,9 @@ main = do
 
   -- the same comprehension in the else branch, one level of nesting down
   replace *items =
-    if False
+    if False {}
       then []
-      else if True
+      else if True {}
         then do
           x <- *other
           yield x
@@ -878,7 +878,7 @@ main = do
 
   -- a branch that is not a comprehension still writes its own rows
   replace *items =
-    if False
+    if False {}
       then do
         x <- *other
         yield x
@@ -916,14 +916,14 @@ fn set_value_comprehension_inside_case_arm() {
 
 main = do
   replace *other = [{name "a"}, {name "b"}]
-  replace *items = case Copy of
+  replace *items = case Copy {} of
     Copy {} -> do
       x <- *other
       yield x
     Clear {} -> []
   copied <- *items
   println ("copy: " ++ show (count copied))
-  replace *items = case Clear of
+  replace *items = case Clear {} of
     Copy {} -> do
       x <- *other
       yield x
@@ -942,3 +942,80 @@ main = do
         "the non-comprehension arm must still clear the relation, got:\n{stdout}"
     );
 }
+
+// ── Uniform constructors: every ctor is a function from its record payload ──
+//
+// Bare nullary and non-nullary constructors are typed `fields -> T` and, when
+// used as a value (passed to a higher-order function, bound, returned), are
+// eta-expanded by codegen into a closure that applies the constructor. This
+// exercises `True : {} -> Bool`, a user nullary ctor, a non-nullary ctor, and
+// the nullable `Nothing` — all passed as function values.
+
+#[test]
+fn bare_constructor_is_first_class_function() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "ctor_first_class",
+        r#"data Box = Box {n: Int 1}
+data Mode = Copy {} | Clear {}
+
+apply : ({} -> Bool) -> Bool
+apply = \f -> f {}
+
+applyBox = \f -> f {n 7}
+applyMode = \f -> f {}
+
+main = do
+  println ("bool: " ++ show (apply True))
+  println ("box: " ++ show (applyBox Box))
+  println ("mode: " ++ show (applyMode Copy))
+  println ("nothing: " ++ show (with { mk Nothing } mk {}))
+  yield {}
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("bool: True"),
+        "apply True must yield True, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("box: Box {n: 7}"),
+        "applyBox Box must yield Box {{n: 7}}, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("mode: Copy {}"),
+        "applyMode Copy must yield Copy {{}}, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("nothing: Nothing {}"),
+        "Nothing as a closure applied to {{}} must yield Nothing, got:\n{stdout}"
+    );
+}
+
+/// A constructor immediately applied to its payload still emits the value
+/// directly (no closure round-trip): `if True {}`, `Just {value x}`.
+#[test]
+fn applied_constructor_still_direct() {
+    let (stdout, stderr, ok) = compile_and_run(
+        "ctor_applied_direct",
+        r#"main = do
+  if True {} then println "cond: yes" else println "cond: no"
+  println ("just: " ++ show (Just {value 5}))
+  println ("nothing: " ++ show (Nothing {}))
+  yield {}
+"#,
+    );
+    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("cond: yes"),
+        "if True {{}} must take the then branch, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("just: Just {value: 5}"),
+        "Just {{value 5}} must build the value, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("nothing: Nothing {}"),
+        "Nothing {{}} must build Nothing, got:\n{stdout}"
+    );
+}
+

@@ -266,6 +266,12 @@ pub struct Codegen {
     /// are conservatively treated as possibly-writing).
     top_fn_names: HashSet<String>,
 
+    /// Eta-expansion closures for constructors used as bare function values
+    /// (`f True`, `map Just xs`, `let g = None`). ctor_name -> the generated
+    /// `(db, env, payload) -> value` closure FuncId. Generated lazily on first
+    /// bare-value use; the closure captures nothing.
+    ctor_value_closures: HashMap<String, FuncId>,
+
     // Scalar sources: source names whose type is a bare primitive (e.g. `*counter : Int 1`)
     // rather than a relation of records. These get automatic wrap/unwrap of `_value` field.
     scalar_sources: HashSet<String>,
@@ -1088,6 +1094,7 @@ impl Codegen {
             write_functions: HashSet::new(),
             passthrough_functions: HashSet::new(),
             top_fn_names: HashSet::new(),
+            ctor_value_closures: HashMap::new(),
             scalar_sources: HashSet::new(),
             overridable_constants: HashMap::new(),
             overridable_defaults: HashMap::new(),
@@ -1523,6 +1530,88 @@ impl Codegen {
         self.module
             .declare_function(name, Linkage::Local, &sig)
             .unwrap()
+    }
+
+    /// Get-or-generate the eta-expansion closure for a constructor used as a
+    /// bare function value (`f True`, `map Just xs`, `let g = None`). The
+    /// closure has the standard `(db, env, payload) -> value` shape: it applies
+    /// the constructor to `payload`, ignoring `env`. Returns the closure's
+    /// FuncId. Generated lazily and cached per constructor name; the closure
+    /// captures nothing.
+    fn ctor_value_closure_id(&mut self, name: &str) -> FuncId {
+        if let Some(&id) = self.ctor_value_closures.get(name) {
+            return id;
+        }
+        let func_id = self.declare_closure_fn(&format!("__ctor_value_{}", name));
+        // Record before building so a self-referential build can't recurse.
+        self.ctor_value_closures.insert(name.to_string(), func_id);
+
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.params.push(AbiParam::new(self.ptr_type)); // env (ignored)
+        sig.params.push(AbiParam::new(self.ptr_type)); // payload
+        sig.returns.push(AbiParam::new(self.ptr_type));
+
+        let ctor_name = name.to_string();
+        self.build_function(func_id, sig, |cg, builder, entry| {
+            let payload = builder.block_params(entry)[2];
+            let result = cg.emit_ctor_applied_to_payload(builder, &ctor_name, payload);
+            builder.ins().return_(&[result]);
+        });
+        func_id
+    }
+
+    /// Emit the value of `Ctor payload` for a single already-compiled payload
+    /// value. Mirrors the `compile_application` Constructor-head logic so the
+    /// eta-expansion closure and direct application agree on the encoding:
+    /// `True`/`False` -> bool, nullable `None` -> null, nullable `Just` -> the
+    /// bare payload, anything else -> a tagged constructor value.
+    fn emit_ctor_applied_to_payload(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        name: &str,
+        payload: cranelift_codegen::ir::Value,
+    ) -> cranelift_codegen::ir::Value {
+        if name == "True" || name == "False" {
+            let val = if name == "True" { 1i64 } else { 0i64 };
+            let arg = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I32, val);
+            self.call_rt(builder, "knot_value_bool", &[arg])
+        } else {
+            match self.nullable_ctors.get(name).cloned() {
+                Some(NullableRole::None) => builder.ins().iconst(self.ptr_type, 0),
+                Some(NullableRole::Some) => payload,
+                None => {
+                    let (tag_ptr, tag_len) = self.string_ptr(builder, name);
+                    self.call_rt(
+                        builder,
+                        "knot_value_constructor",
+                        &[tag_ptr, tag_len, payload],
+                    )
+                }
+            }
+        }
+    }
+
+    /// Emit a bare constructor reference as a first-class function value:
+    /// `knot_value_function(closure_addr, unit_env, name_ptr, name_len)` where
+    /// the closure applies the constructor to its payload argument.
+    fn emit_ctor_as_function_value(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        name: &str,
+    ) -> cranelift_codegen::ir::Value {
+        let closure_id = self.ctor_value_closure_id(name);
+        let closure_ref = self.module.declare_func_in_func(closure_id, builder.func);
+        let fn_addr = builder.ins().func_addr(self.ptr_type, closure_ref);
+        let unit = self.call_rt(builder, "knot_value_unit", &[]);
+        let (name_ptr, name_len) = self.string_ptr(builder, name);
+        self.call_rt(
+            builder,
+            "knot_value_function",
+            &[fn_addr, unit, name_ptr, name_len],
+        )
     }
 
     /// Define a 1-param stdlib function that directly delegates to a runtime function.
@@ -4570,19 +4659,15 @@ impl Codegen {
             }
 
             ast::ExprKind::Constructor(name) => {
-                if name == "True" || name == "False" {
-                    let val = if name == "True" { 1i64 } else { 0i64 };
-                    let arg = builder.ins().iconst(cranelift_codegen::ir::types::I32, val);
-                    self.call_rt(builder, "knot_value_bool", &[arg])
-                } else if matches!(self.nullable_ctors.get(name), Some(NullableRole::None)) {
-                    // Nullable none: encode as null pointer
-                    builder.ins().iconst(self.ptr_type, 0)
-                } else {
-                    // Bare constructor reference — return as a unit constructor
-                    let (tag_ptr, tag_len) = self.string_ptr(builder, name);
-                    let unit = self.call_rt(builder, "knot_value_unit", &[]);
-                    self.call_rt(builder, "knot_value_constructor", &[tag_ptr, tag_len, unit])
-                }
+                // A bare constructor in a non-application position is a
+                // first-class function value (`True : {} -> Bool`, etc.).
+                // Eta-expand it into a closure that applies the constructor to
+                // its payload argument, so `f True` / `map Just xs` / `let g =
+                // None` pass a callable. Applied forms (`Ctor {..}`) are
+                // emitted directly by `compile_application`, never reaching
+                // here.
+                let name = name.clone();
+                self.emit_ctor_as_function_value(builder, &name)
             }
 
             ast::ExprKind::SourceRef(name) => {

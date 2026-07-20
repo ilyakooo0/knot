@@ -5292,25 +5292,19 @@ impl Infer {
                 if let Some((data_ty, record_ty)) =
                     self.instantiate_ctor(name, expr.span)
                 {
-                    // A bare *nullary* constructor (no fields) denotes its
-                    // value directly: codegen emits the unit constructor
-                    // value (`knot_value_constructor(tag, Unit)`), the Bool
-                    // value for `True`/`False`, or null for a nullable `None`
-                    // — never a function. Typing it as `{} -> T` would let a
-                    // well-typed program treat it as a first-class function
-                    // and then crash at runtime when codegen's value is
-                    // called. Non-nullary constructors must still be applied,
-                    // so they keep the `fields -> T` function type, and the
-                    // ambiguous (multi-ADT) case returns a non-record payload
-                    // so it stays in function form too. The applied form
-                    // `Ctor {fields}` is typed directly in the `App` arm.
-                    let is_nullary_value =
-                        matches!(&record_ty, Ty::Record(fs, None) if fs.is_empty());
-                    if is_nullary_value {
-                        data_ty
-                    } else {
-                        Ty::Fun(Box::new(record_ty), Box::new(data_ty))
-                    }
+                    // Every constructor — including nullary ones — is a
+                    // function from its record payload to its data type:
+                    // `True : {} -> Bool`, `Just : {value: a} -> Maybe a`,
+                    // `None : {} -> Maybe a`. A bare constructor reference is
+                    // therefore a first-class function value; codegen
+                    // eta-expands it into a closure when it isn't immediately
+                    // applied (see the `App` arm and codegen's Constructor
+                    // emission). This uniformity means `True False` parses and
+                    // type-checks as applying `True` to the payload `False`
+                    // (a type error, since `False : Bool` is not `{}`), and
+                    // passing `True` to a higher-order function passes a
+                    // closure.
+                    Ty::Fun(Box::new(record_ty), Box::new(data_ty))
                 } else {
                     // A capitalized name that isn't a constructor. Units are
                     // no longer declared, so there's no table to consult for

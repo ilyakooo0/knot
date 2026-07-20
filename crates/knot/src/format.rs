@@ -1808,6 +1808,22 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             };
             format!("type {}{} = {}", name, params, render_type(ty))
         }
+        ExprKind::DataCtor { name, params, constructors } => {
+            // Renders the embedded `data` line. As with `TypeCtor`, the record
+            // renderers emit the field-name line first, so here we emit only
+            // the `data Name … = Ctor {…} | …` part.
+            let params = if params.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", params.join(" "))
+            };
+            let ctors = constructors
+                .iter()
+                .map(render_constructor)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            format!("data {}{} = {}", name, params, ctors)
+        }
         ExprKind::Serve { api, handlers, .. } => {
             let mut s = format!("serve {} where", api);
             // The first handler follows `where` directly; `;` only separates

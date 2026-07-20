@@ -3178,6 +3178,49 @@ impl Parser {
                 });
                 continue;
             }
+            // `data Name p1 … = Ctor {…} | …` — an embedded data declaration.
+            // Contributes a field named `Name` whose value is the (erased)
+            // data-constructor namespace: the ctors become reachable as
+            // `rec.Name.<Ctor>` and the type `Name` enters type scope.
+            if self.at(&TokenKind::Data) {
+                self.advance(); // consume `data`
+                let (dname, dspan) = self
+                    .expect_upper("expected type name after 'data'")
+                    .ok()?;
+                let mut params = Vec::new();
+                while matches!(self.peek(), TokenKind::Lower(_)) {
+                    let tok = self.advance();
+                    let TokenKind::Lower(p) = tok.kind else { unreachable!() };
+                    params.push(p);
+                }
+                self.skip_newlines();
+                self.expect(&TokenKind::Eq, "expected '=' in data declaration").ok()?;
+                self.skip_newlines();
+                let mut constructors = vec![self.parse_constructor_def()?];
+                loop {
+                    let saved = self.save();
+                    self.skip_newlines();
+                    if !self.eat(&TokenKind::Pipe) {
+                        self.restore(saved);
+                        break;
+                    }
+                    self.skip_newlines();
+                    constructors.push(self.parse_constructor_def()?);
+                }
+                fields.push(RecordField {
+                    name: dname.clone(),
+                    value: Spanned::new(
+                        ExprKind::DataCtor {
+                            name: dname,
+                            params,
+                            constructors,
+                        },
+                        dspan,
+                    ),
+                    sig: None,
+                });
+                continue;
+            }
             // Signature line: `name : Type`. The value for `name` is supplied by
             // a later `name value` field. Parse the type with
             // `record_value_sig_type` set so a `Lower` on the next line (the

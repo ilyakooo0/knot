@@ -239,7 +239,7 @@ fn lint_expr(
         | ExprKind::Constructor(_)
         | ExprKind::SourceRef(_)
         | ExprKind::DerivedRef(_) => {}
-        ExprKind::TypeCtor { .. } => {}
+        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } => {}
     }
 }
 
@@ -1094,7 +1094,7 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         | ExprKind::Var(_)
         | ExprKind::Constructor(_)
         | ExprKind::DerivedRef(_) => false,
-        ExprKind::TypeCtor { .. } => false,
+        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } => false,
         ExprKind::Record(fields) => fields.iter().any(|f| references_source(&f.value, source_name)),
         ExprKind::RecordUpdate { base, fields } => {
             references_source(base, source_name)

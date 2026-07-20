@@ -2053,8 +2053,8 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
             }
         }
         ast::ExprKind::Lit(_) => {}
-        // A type-constructor field carries a TYPE name, not a value name — leaf.
-        ast::ExprKind::TypeCtor { .. } => {}
+        // A type/data-constructor field carries a TYPE name, not a value name — leaf.
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
     }
 }
 

@@ -6186,6 +6186,64 @@ impl Infer {
                     });
                 kind_type
             }
+
+            ast::ExprKind::DataCtor { name, params, constructors } => {
+                // A first-class (erased) `data` declaration embedded in a
+                // record value literal. The field is fully erased at runtime
+                // (compiles to unit), but statically its type is a RECORD of
+                // constructor functions `{Ctor: payload -> Name, …}` so that
+                // `rec.Name.Ctor` resolves via ordinary structural field
+                // access. The data type `Name` is registered so it can be
+                // referenced in annotations (`x : Name`).
+                //
+                // Register the constructors and the data-type metadata exactly
+                // as top-level collection does, so `instantiate_ctor` and the
+                // `x : Name` fallback both work.
+                let mut ctor_list = Vec::new();
+                for ctor in constructors {
+                    let fields: Vec<(String, ast::Type)> = ctor
+                        .fields
+                        .iter()
+                        .map(|f| (f.name.clone(), f.value.clone()))
+                        .collect();
+                    self.constructors
+                        .entry(ctor.name.clone())
+                        .or_default()
+                        .push(CtorInfo {
+                            data_type: name.clone(),
+                            data_params: params.clone(),
+                            fields: fields.clone(),
+                        });
+                    ctor_list.push((ctor.name.clone(), fields));
+                }
+                self.data_types.insert(
+                    name.clone(),
+                    DataInfo {
+                        params: params.clone(),
+                        ctors: ctor_list,
+                    },
+                );
+
+                // Build the namespace record: each ctor maps to its function
+                // type `payload -> data_ty` — including nullary ctors, which
+                // keep the `{} -> data_ty` form because the applied syntax is
+                // always `rec.Name.Ctor {}` (a record application), matching
+                // how `Ctor {}` is typed through the App arm. Using the bare
+                // `data_ty` for nullary ctors would make `rec.Name.Ctor {}`
+                // apply an empty record to a non-function.
+                let mut ns_fields = BTreeMap::new();
+                for ctor in constructors {
+                    if let Some((data_ty, record_ty)) =
+                        self.instantiate_ctor(&ctor.name, expr.span)
+                    {
+                        ns_fields.insert(
+                            ctor.name.clone(),
+                            Ty::Fun(Box::new(record_ty), Box::new(data_ty)),
+                        );
+                    }
+                }
+                Ty::Record(ns_fields, None)
+            }
         }
     }
 
@@ -11282,7 +11340,7 @@ fn value_references_source_inner(
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::DerivedRef(_) => false,
-        ast::ExprKind::TypeCtor { .. } => false,
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => false,
         ast::ExprKind::Record(fields) => fields.iter().any(|f| {
             value_references_source_inner(
                 &f.value, source_name, aliases, let_bindings, visited,
@@ -12012,7 +12070,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
     use ast::ExprKind::*;
     match &mut expr.node {
         Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
-        TypeCtor { .. } => {}
+        TypeCtor { .. } | DataCtor { .. } => {}
         Record(fields) => {
             for fl in fields {
                 f(&mut fl.value);

@@ -316,7 +316,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
     e.span.end += offset;
     match &mut e.node {
         Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
-        TypeCtor { .. } => {}
+        TypeCtor { .. } | DataCtor { .. } => {}
         Record(fields) => {
             for f in fields {
                 shift_expr_spans(&mut f.value, offset);
@@ -654,7 +654,7 @@ mod tests {
             TimeUnitLit { value, .. } => f(value),
             Serve { handlers, .. } => handlers.iter().for_each(|h| f(&h.body)),
             Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
-            TypeCtor { .. } => {}
+            TypeCtor { .. } | DataCtor { .. } => {}
         }
     }
 

@@ -302,6 +302,18 @@ pub enum ExprKind {
         ty: Type,
     },
 
+    /// A first-class, erased `data` declaration embedded in a record value
+    /// literal (`{data Status = Open {} | Done {}, …}`). The record field
+    /// `Status` is fully ERASED at runtime (compiles to unit, like `TypeCtor`),
+    /// but its constructors are reachable in value scope as `rec.Status.Open`,
+    /// `rec.Status.Done`, … and the data type name enters type scope so it can
+    /// be referenced in annotations (`x : Status`).
+    DataCtor {
+        name: Name,
+        params: Vec<Name>,
+        constructors: Vec<ConstructorDef>,
+    },
+
     /// `serve Api where E1 = expr1; E2 = expr2; ...` — typed server value.
     /// Each handler is bound to a route endpoint constructor; the whole
     /// expression has type `Server Api _` (a row variable when no handler

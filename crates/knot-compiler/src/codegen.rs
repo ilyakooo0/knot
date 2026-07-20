@@ -137,6 +137,13 @@ pub struct Codegen {
     // Constructor info: ctor_name -> [(field_name, field_type_str)]
     constructors: HashMap<String, Vec<(String, String)>>,
 
+    // Constructor names declared by an embedded `data` decl inside a record
+    // value literal (`{data Status = Open {} | …}`). Such a ctor is reached
+    // through field access (`rec.Status.Open`), but the data field is erased
+    // to unit at runtime — so `compile_app`/`compile_expr` must emit the
+    // constructor value directly rather than a runtime `knot_record_field`.
+    embedded_ctors: HashSet<String>,
+
     // Counter for generating unique lambda names
     lambda_counter: usize,
 
@@ -1046,6 +1053,7 @@ impl Codegen {
             decl_relation_vars: HashSet::new(),
             closure_relation_vars: HashSet::new(),
             constructors: HashMap::new(),
+            embedded_ctors: HashSet::new(),
             lambda_counter: 0,
             pending_lambdas: Vec::new(),
             pending_io_thunks: Vec::new(),
@@ -4745,6 +4753,19 @@ impl Codegen {
             }
 
             ast::ExprKind::FieldAccess { expr, field } => {
+                // `rec.Name.Ctor` where `Ctor` comes from an embedded `data`
+                // decl: the data field is erased to unit, so emit the
+                // constructor value directly rather than a runtime
+                // `knot_record_field` on unit.
+                if self.embedded_ctors.contains(field) {
+                    let (tag_ptr, tag_len) = self.string_ptr(builder, field);
+                    let unit = self.call_rt(builder, "knot_value_unit", &[]);
+                    return self.call_rt(
+                        builder,
+                        "knot_value_constructor",
+                        &[tag_ptr, tag_len, unit],
+                    );
+                }
                 let val = self.compile_expr(builder, expr, env, db);
                 let (key_ptr, key_len) = self.string_ptr(builder, field);
                 self.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len])
@@ -5570,6 +5591,18 @@ impl Codegen {
                 // it has no value content, so it compiles to unit.
                 self.call_rt(builder, "knot_value_unit", &[])
             }
+
+            ast::ExprKind::DataCtor { constructors, .. } => {
+                // An embedded `data` declaration is erased to unit like a type
+                // constructor, but its constructors stay reachable through
+                // field access (`rec.Name.Ctor`). Register them so the
+                // FieldAccess / compile_app arms emit the constructor value
+                // directly instead of a runtime `knot_record_field` on unit.
+                for c in constructors {
+                    self.embedded_ctors.insert(c.name.clone());
+                }
+                self.call_rt(builder, "knot_value_unit", &[])
+            }
         }
     }
 
@@ -6036,7 +6069,7 @@ impl Codegen {
                 .iter()
                 .all(|h| self.collect_direct_write_targets(&h.body, out)),
             Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => true,
-            TypeCtor { .. } => true,
+            TypeCtor { .. } | DataCtor { .. } => true,
         }
     }
 
@@ -7483,6 +7516,26 @@ impl Codegen {
                 let arg = builder.ins().iconst(cranelift_codegen::ir::types::I32, val);
                 self.call_rt(builder, "knot_value_bool", &[arg])
             }
+            // `rec.Name.Ctor payload` where `Ctor` comes from an embedded
+            // `data` decl: the data field is erased to unit, so build the
+            // constructor value directly (same as a `Constructor` head)
+            // rather than a runtime `knot_record_field` on unit.
+            ast::ExprKind::FieldAccess { field, .. }
+                if self.embedded_ctors.contains(field) =>
+            {
+                let (tag_ptr, tag_len) = self.string_ptr(builder, field);
+                let payload = if compiled_args.len() == 1 {
+                    compiled_args[0]
+                } else {
+                    self.call_rt(builder, "knot_value_unit", &[])
+                };
+                self.call_rt(
+                    builder,
+                    "knot_value_constructor",
+                    &[tag_ptr, tag_len, payload],
+                )
+            }
+
             ast::ExprKind::Constructor(name) => {
                 match self.nullable_ctors.get(name).cloned() {
                     Some(NullableRole::None) => {
@@ -11551,7 +11604,7 @@ impl Codegen {
             | ast::ExprKind::Var(_)
             | ast::ExprKind::Constructor(_)
             | ast::ExprKind::DerivedRef(_) => false,
-            ast::ExprKind::TypeCtor { .. } => false,
+            ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => false,
             ast::ExprKind::Record(fields) => {
                 fields.iter().any(|f| Self::references_source(&f.value, source_name))
             }
@@ -15428,7 +15481,7 @@ fn beta_reduce_inner(
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | Case { .. } | Do(_)
         | Set { .. } | ReplaceSet { .. } | Atomic(_) | TimeUnitLit { .. }
-        | Annot { .. } | Refine(_) | Serve { .. } | TypeCtor { .. } => return expr.clone(),
+        | Annot { .. } | Refine(_) | Serve { .. } | TypeCtor { .. } | DataCtor { .. } => return expr.clone(),
     };
     ast::Spanned { node: new_node, span }
 }
@@ -15451,7 +15504,8 @@ fn substitute_inner(
     let span = expr.span;
     let new_node = match &expr.node {
         Var(name) if name == var => return Some(value.clone()),
-        Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | TypeCtor { .. } => {
+        Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | TypeCtor { .. }
+        | DataCtor { .. } => {
             return Some(expr.clone())
         }
         Lambda { params, ty_params, body, .. } => {
@@ -15568,7 +15622,8 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     };
     match &expr.node {
         Var(name) => name == var,
-        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | TypeCtor { .. } => false,
+        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | TypeCtor { .. }
+        | DataCtor { .. } => false,
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
         RecordUpdate { base, fields } => {
             expr_mentions_var(base, var)
@@ -15624,7 +15679,8 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
                 free.insert(name.clone());
             }
         }
-        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | TypeCtor { .. } => {}
+        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | TypeCtor { .. }
+        | DataCtor { .. } => {}
         Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
             for p in params {
@@ -16640,7 +16696,8 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
     match &expr.node {
         ast::ExprKind::DerivedRef(n) => n == name,
         ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef(_) | ast::ExprKind::TypeCtor { .. } => false,
+        | ast::ExprKind::SourceRef(_) | ast::ExprKind::TypeCtor { .. }
+        | ast::ExprKind::DataCtor { .. } => false,
         ast::ExprKind::Record(fields) => {
             fields.iter().any(|f| expr_contains_derived_ref(&f.value, name))
         }
@@ -16740,7 +16797,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         }
         ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => {}
         ast::ExprKind::SourceRef(_) => {}
-        ast::ExprKind::TypeCtor { .. } => {}
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
         ast::ExprKind::DerivedRef(name) => {
             // A recursive derived relation passes its in-progress accumulator
             // through the env under `__derived_self_<name>` (see the DerivedRef
@@ -16908,7 +16965,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
-        ast::ExprKind::TypeCtor { .. } => false,
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => false,
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
         ast::ExprKind::With { record, body } => {
@@ -17002,7 +17059,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
-        ast::ExprKind::TypeCtor { .. } => false,
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => false,
         // `var.field` is a ROW use, not a value use — the whole point of this
         // walker. A field access on anything else still recurses (`f x . name`
         // may well pass `var` to `f`), as does a nested base (`var.a.b` has
@@ -17340,6 +17397,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::Var(name) => name.clone(),
         ast::ExprKind::Constructor(name) => name.clone(),
         ast::ExprKind::TypeCtor { name, .. } => name.clone(),
+        ast::ExprKind::DataCtor { name, .. } => name.clone(),
         ast::ExprKind::SourceRef(name) => format!("*{}", name),
         ast::ExprKind::DerivedRef(name) => format!("&{}", name),
         ast::ExprKind::Record(fields) => {

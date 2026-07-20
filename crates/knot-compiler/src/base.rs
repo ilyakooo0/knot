@@ -315,7 +315,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
     e.span.start += offset;
     e.span.end += offset;
     match &mut e.node {
-        Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
+        Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
         TypeCtor { .. } | DataCtor { .. } => {}
         Record(fields) => {
             for f in fields {
@@ -653,7 +653,7 @@ mod tests {
             FieldAccess { expr, .. } | Annot { expr, .. } => f(expr),
             TimeUnitLit { value, .. } => f(value),
             Serve { handlers, .. } => handlers.iter().for_each(|h| f(&h.body)),
-            Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
+            Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
             TypeCtor { .. } | DataCtor { .. } => {}
         }
     }

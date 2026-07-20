@@ -199,6 +199,11 @@ pub enum ExprKind {
     /// `&seniors` — reference to a derived relation.
     DerivedRef(Name),
 
+    /// `^name` — implicit field projection: DFS the fields of in-scope record
+    /// bindings (innermost scope first, shallowest, earliest field) for a
+    /// field named `name` whose type unifies with the expected type.
+    ImplicitRef(Name),
+
     /// `{name: "Alice", age: 30}`
     Record(Vec<RecordField>),
 

@@ -348,6 +348,10 @@ pub struct Codegen {
     // projects exactly these fields out of the record into locals.
     with_fields: crate::infer::WithFields,
 
+    // `^name` span -> (root binding, field path) resolved during inference.
+    // Codegen emits the root `Var` followed by a `knot_record_field` chain.
+    implicit_refs: crate::infer::ImplicitRefs,
+
     // Names of `with`-bound locals and whether each one's bound value is
     // IO-producing (`self.expr_is_io(value)`). Such a name used inside the
     // body (e.g. `f 1` where `f` was bound to `\y -> println (show y)`)
@@ -749,6 +753,7 @@ pub fn compile(
     sum_float_spans: &crate::infer::SumFloatSpans,
     relation_fields: &crate::infer::RelationFieldSpans,
     with_fields: &crate::infer::WithFields,
+    implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
@@ -768,6 +773,7 @@ pub fn compile(
             sum_float_spans,
             relation_fields,
             with_fields,
+            implicit_refs,
             type_arg_spans,
             compile_time_overrides,
         )
@@ -790,6 +796,7 @@ fn compile_inner(
     sum_float_spans: &crate::infer::SumFloatSpans,
     relation_fields: &crate::infer::RelationFieldSpans,
     with_fields: &crate::infer::WithFields,
+    implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
@@ -835,6 +842,7 @@ fn compile_inner(
         .collect();
     cg.from_json_targets = from_json_targets.clone();
     cg.with_fields = with_fields.clone();
+    cg.implicit_refs = implicit_refs.clone();
     cg.elem_pushdown_ok = elem_pushdown_ok.clone();
     cg.show_unit_strings = show_unit_strings.clone();
     cg.sum_float_spans = sum_float_spans.clone();
@@ -1112,6 +1120,7 @@ impl Codegen {
             source_refinements: HashMap::new(),
             from_json_targets: HashMap::new(),
             with_fields: HashMap::new(),
+            implicit_refs: HashMap::new(),
             with_io_locals: Vec::new(),
             elem_pushdown_ok: crate::infer::ElemPushdownOk::default(),
             show_unit_strings: HashMap::new(),
@@ -4856,6 +4865,34 @@ impl Codegen {
                 self.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len])
             }
 
+            ast::ExprKind::ImplicitRef(name) => {
+                // `^name` was resolved during inference to a root binding plus a
+                // field path (recorded in `implicit_refs` by span). Emit the root
+                // `Var` followed by a `knot_record_field` chain — the same code a
+                // written-out `root.f1.f2.name` would produce.
+                let Some((root, path)) = self.implicit_refs.get(&expr.span).cloned() else {
+                    panic!(
+                        "codegen: `^{name}` at {:?} has no recorded resolution \
+                         (inference should have rejected it)",
+                        expr.span
+                    );
+                };
+                let mut val = self.compile_expr(
+                    builder,
+                    &ast::Expr {
+                        node: ast::ExprKind::Var(root),
+                        span: expr.span,
+                    },
+                    env,
+                    db,
+                );
+                for field in &path {
+                    let (key_ptr, key_len) = self.string_ptr(builder, field);
+                    val = self.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len]);
+                }
+                val
+            }
+
             ast::ExprKind::With { record, body } => {
                 // Evaluate the record, then bind each of its fields (from
                 // inference's `with_fields`) as a local for the body. A cloned
@@ -6078,6 +6115,8 @@ impl Codegen {
             // A bare reference to a possibly-writing function: it may be
             // invoked later through a value we can't track.
             Var(name) => !self.write_functions.contains(name),
+            // `^x` reads a record field; it never writes to a source.
+            ImplicitRef(_) => true,
             Atomic(inner) | Refine(inner) => {
                 self.collect_direct_write_targets(inner, out)
             }
@@ -11685,6 +11724,7 @@ impl Codegen {
     fn references_source(expr: &ast::Expr, source_name: &str) -> bool {
         match &expr.node {
             ast::ExprKind::SourceRef(name) => name == source_name,
+            ast::ExprKind::ImplicitRef(_) => false,
             ast::ExprKind::Lit(_)
             | ast::ExprKind::Var(_)
             | ast::ExprKind::Constructor(_)
@@ -15434,6 +15474,7 @@ fn beta_reduce_inner(
             }
             Var(name.clone())
         }
+        ImplicitRef(_) => expr.node.clone(),
         With { record, body } => {
             let r = beta_reduce_inner(record, fun_bodies, let_bindings, visited, fuel);
             let b = beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel);
@@ -15589,7 +15630,7 @@ fn substitute_inner(
     let span = expr.span;
     let new_node = match &expr.node {
         Var(name) if name == var => return Some(value.clone()),
-        Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | TypeCtor { .. }
+        Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
         | DataCtor { .. } => {
             return Some(expr.clone())
         }
@@ -15707,7 +15748,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     };
     match &expr.node {
         Var(name) => name == var,
-        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | TypeCtor { .. }
+        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
         | DataCtor { .. } => false,
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
         RecordUpdate { base, fields } => {
@@ -15764,7 +15805,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
                 free.insert(name.clone());
             }
         }
-        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | TypeCtor { .. }
+        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
         | DataCtor { .. } => {}
         Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
@@ -16781,7 +16822,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
     match &expr.node {
         ast::ExprKind::DerivedRef(n) => n == name,
         ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef(_) | ast::ExprKind::TypeCtor { .. }
+        | ast::ExprKind::SourceRef(_) | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::TypeCtor { .. }
         | ast::ExprKind::DataCtor { .. } => false,
         ast::ExprKind::Record(fields) => {
             fields.iter().any(|f| expr_contains_derived_ref(&f.value, name))
@@ -16882,6 +16923,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         }
         ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => {}
         ast::ExprKind::SourceRef(_) => {}
+        ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
         ast::ExprKind::DerivedRef(name) => {
             // A recursive derived relation passes its in-progress accumulator
@@ -17049,6 +17091,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => false,
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
@@ -17143,6 +17186,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => false,
         // `var.field` is a ROW use, not a value use — the whole point of this
@@ -17480,6 +17524,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
     match &expr.node {
         ast::ExprKind::Lit(lit) => pretty_lit(lit),
         ast::ExprKind::Var(name) => name.clone(),
+        ast::ExprKind::ImplicitRef(name) => format!("^{name}"),
         ast::ExprKind::Constructor(name) => name.clone(),
         ast::ExprKind::TypeCtor { name, .. } => name.clone(),
         ast::ExprKind::DataCtor { name, .. } => name.clone(),

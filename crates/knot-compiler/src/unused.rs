@@ -296,6 +296,11 @@ fn walk_route_entry(e: &RouteEntry, r: &mut Refs) {
 fn walk_expr(e: &Expr, r: &mut Refs) {
     match &e.node {
         ExprKind::Lit(_) => {}
+        // `^x` reads a field of an in-scope record, but which record is only
+        // known after type inference (recorded in `Infer::implicit_refs`);
+        // unused-analysis runs on the AST without that map, so it can't name
+        // the root binding. Treat as using nothing (no leaf refs).
+        ExprKind::ImplicitRef(_) => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } => {}
         ExprKind::Var(name) => {
             r.values.insert(name.clone());

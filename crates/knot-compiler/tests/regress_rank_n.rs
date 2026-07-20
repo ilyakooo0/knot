@@ -28,7 +28,7 @@ fn parse(src: &str) -> knot::ast::Module {
 fn check_src(src: &str) -> Vec<Diagnostic> {
     let mut module = parse(src);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _m, _t, _l, _tg, _r, _j, _e, _tc, _su, _sf, _rf, _wf, _ta) =
+    let (diags, _m, _t, _l, _tg, _r, _j, _e, _tc, _su, _sf, _rf, _wf, _ta, _ir) =
         knot_compiler::infer::check(&mut module);
     diags
 }

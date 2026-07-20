@@ -243,6 +243,7 @@ fn collect_edges(
         ast::ExprKind::DerivedRef(_)
         | ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
+        | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::SourceRef(_) => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
 

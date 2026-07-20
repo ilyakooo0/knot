@@ -215,6 +215,12 @@ pub type FromJsonTargets = HashMap<Span, FromJsonTarget>;
 /// *type*, not the AST — yet it must project each field into a local binding.
 pub type WithFields = HashMap<Span, Vec<String>>;
 
+/// Resolved `^name` implicit-field projections, keyed by the expression's
+/// span: (root binding name, field path from the root to the field).
+/// Codegen lowers `^name` to the root variable followed by one record-field
+/// projection per path element.
+pub type ImplicitRefs = HashMap<Span, (String, Vec<String>)>;
+
 /// Spans of field-access expressions (`t.members`) whose field type is a
 /// relation. Codegen cannot re-derive this — a record's field types are not
 /// reachable from the AST — yet it must know: a do-bind whose right-hand side
@@ -1016,6 +1022,10 @@ struct Infer {
     /// Field names bound by each `with` expression, keyed by the `with`'s span.
     /// Codegen projects exactly these fields into locals for the body.
     with_fields: Vec<(Span, Vec<String>)>,
+    /// Resolved `^name` implicit-field projections: span → (root binding,
+    /// field path). Populated when an `ImplicitRef` is resolved; handed to
+    /// codegen via `ImplicitRefs` so it can emit the projection chain.
+    implicit_refs: ImplicitRefs,
     /// Refined-type names for which the directional refined-type check (which
     /// otherwise rejects implicitly introducing a refinement, e.g. a raw `Int`
     /// flowing where a `Nat` is required) is suppressed. `None` = suppress
@@ -1115,6 +1125,7 @@ impl Infer {
             refine_vars: Vec::new(),
             field_accesses: Vec::new(),
             with_fields: Vec::new(),
+            implicit_refs: HashMap::new(),
             suppress_refine_intro: None,
             deferred_unit_binops: Vec::new(),
             elem_pushdown_ok: ElemPushdownOk::default(),
@@ -5216,6 +5227,112 @@ impl Infer {
 
     // ── Expression inference ─────────────────────────────────────
 
+    /// Resolve a `^name` implicit field projection against `expected`.
+    ///
+    /// Searches the fields of in-scope RECORD bindings (only records — plain
+    /// and function bindings are invisible) for a field named `name` whose
+    /// type unifies with `expected`. Search order: nearest scope first,
+    /// then shallowest record-nesting depth (a binding's own fields beat
+    /// fields of nested records), then fields in sorted order (record types
+    /// store fields in a `BTreeMap`, so source declaration order is
+    /// unavailable). Each candidate is tested with a speculative unify
+    /// against a throwaway clone of the real substitution; only the winning
+    /// candidate's constraints are committed to `self`. The resolved
+    /// (root binding, field path) is recorded in `implicit_refs` keyed by
+    /// `span` so codegen can lower `^name` to a projection chain.
+    fn resolve_implicit_ref(&mut self, name: &str, expected: &Ty, span: Span) -> Ty {
+        // Candidate search over an immutable view of the scopes. Walk
+        // innermost-to-outermost (nearest scope wins across the whole
+        // search) and BFS the record's fields shallowest-first; `fields` is
+        // a `BTreeMap`, so within a level iteration is by sorted field name.
+        let mut candidates: Vec<(String, Vec<String>, Ty)> = Vec::new();
+        'scopes: for scope in self.scopes.iter().rev() {
+            for (bind_name, scheme) in scope {
+                // A `with` field's binding scheme is the field's own type —
+                // no quantified vars to instantiate, so `scheme.ty` is the
+                // binding's type as-is.
+                let root_ty = self.apply(&scheme.ty);
+                let mut frontier: Vec<(Vec<String>, Ty)> = match root_ty.peel_alias() {
+                    Ty::Record(fields, _) => fields
+                        .iter()
+                        .map(|(f, t)| (vec![f.clone()], t.clone()))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                while !frontier.is_empty() {
+                    let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
+                    for (path, field_ty) in frontier {
+                        if *path.last().expect("non-empty path") == name {
+                            candidates.push((bind_name.clone(), path.clone(), field_ty.clone()));
+                        }
+                        // Descend into nested record fields (without
+                        // committing anything: `apply` is read-only).
+                        if let Ty::Record(sub, _) = self.apply(&field_ty).peel_alias().clone() {
+                            for (f, t) in sub {
+                                let mut p = path.clone();
+                                p.push(f);
+                                next.push((p, t));
+                            }
+                        }
+                    }
+                    // Shallowest depth wins: if this depth produced any
+                    // candidate, deeper nesting is never considered.
+                    if !candidates.is_empty() {
+                        break;
+                    }
+                    frontier = next;
+                }
+            }
+            if !candidates.is_empty() {
+                break 'scopes;
+            }
+        }
+
+        // Speculatively unify each candidate against `expected` in order.
+        // The speculative substitution CLONES the real one but points every
+        // variable straight at its fully-resolved type, so bindings made
+        // during the trial are all at fresh or resolved-root variables and
+        // never reach a shared deeper chain — applying the winner's diff to
+        // the real substitution is then a faithful replay.
+        let mut searched: Vec<String> = Vec::new();
+        for (root, path, field_ty) in &candidates {
+            let mut trial: HashMap<TyVar, Ty> = HashMap::with_capacity(self.subst.len());
+            for v in self.subst.keys() {
+                let resolved = self.apply(&Ty::Var(*v));
+                trial.insert(*v, resolved);
+            }
+            let mut trial_errors: Vec<(String, Span)> = Vec::new();
+            std::mem::swap(&mut self.subst, &mut trial);
+            std::mem::swap(&mut self.errors, &mut trial_errors);
+            self.unify(&field_ty.clone(), expected, span);
+            std::mem::swap(&mut self.subst, &mut trial);
+            std::mem::swap(&mut self.errors, &mut trial_errors);
+            // `trial` now holds the post-unify speculative substitution.
+            if trial_errors.is_empty() {
+                for (v, t) in trial {
+                    self.subst.insert(v, t);
+                }
+                self.implicit_refs
+                    .insert(span, (root.clone(), path.clone()));
+                return field_ty.clone();
+            }
+            searched.push(format!("{}.{} : {}", root, path.join("."), self.display_ty(field_ty)));
+        }
+
+        let detail = if searched.is_empty() {
+            "no in-scope record binding has a field with this name".to_string()
+        } else {
+            format!("searched: {}", searched.join(", "))
+        };
+        self.error(
+            format!(
+                "no in-scope record field '{name}' matches the expected type ({detail})"
+            ),
+            span,
+        );
+        Ty::Error
+    }
+
     fn infer_expr(&mut self, expr: &ast::Expr) -> Ty {
         match &expr.node {
             ast::ExprKind::Lit(lit) => self.literal_type(lit),
@@ -5315,6 +5432,15 @@ impl Infer {
                     );
                     Ty::Error
                 }
+            }
+
+            ast::ExprKind::ImplicitRef(name) => {
+                // `^name` — implicit field projection. Resolve against a
+                // fresh expected-type variable; the first in-scope record
+                // field named `name` that unifies wins, and the path is
+                // recorded for codegen (see `resolve_implicit_ref`).
+                let expected = self.fresh();
+                self.resolve_implicit_ref(name, &expected, expr.span)
             }
 
             ast::ExprKind::SourceRef(name) => {
@@ -6394,6 +6520,15 @@ impl Infer {
             return;
         }
         match &expr.node {
+            ast::ExprKind::ImplicitRef(name) => {
+                // `^name` — resolve against the EXPECTED type directly so a
+                // concrete expectation (e.g. `println ^size` wanting `Text`)
+                // disambiguates between same-named fields of different types.
+                // `resolve_implicit_ref` already unifies the chosen field's
+                // type with `expected`.
+                let name = name.clone();
+                self.resolve_implicit_ref(&name, expected, expr.span);
+            }
             ast::ExprKind::Annot { expr: inner, ty } => {
                 // See the infer-mode `Annot` arm: lowercase units in an inline
                 // ascription must be polymorphic unit variables, not concrete.
@@ -11422,6 +11557,8 @@ fn value_references_source_inner(
 ) -> bool {
     match &expr.node {
         ast::ExprKind::SourceRef(name) => name == source_name,
+        // `^x` reads a record field, never a source relation directly.
+        ast::ExprKind::ImplicitRef(_) => false,
         ast::ExprKind::Var(name) => {
             if aliases.get(name).map(|s| s.as_str()) == Some(source_name) {
                 return true;
@@ -11570,6 +11707,7 @@ pub type CheckOutput = (
     RelationFieldSpans,
     WithFields,
     TypeArgSpans,
+    ImplicitRefs,
 );
 
 /// Run type inference on a parsed module. Returns diagnostics,
@@ -11982,8 +12120,9 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
     let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
     let with_fields: WithFields = infer.with_fields.iter().cloned().collect();
     let type_arg_spans: TypeArgSpans = infer.type_arg_spans.clone();
+    let implicit_refs: ImplicitRefs = infer.implicit_refs.clone();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs)
 }
 
 
@@ -12170,7 +12309,7 @@ fn rewrite_decl_results(decl: &mut ast::Decl, pure_spans: &HashSet<Span>) {
 fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Expr)) {
     use ast::ExprKind::*;
     match &mut expr.node {
-        Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => {}
+        Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
         TypeCtor { .. } | DataCtor { .. } => {}
         Record(fields) => {
             for fl in fields {
@@ -12435,14 +12574,14 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args) = check(&mut module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) = check(&mut module);
         diags
     }
 
     fn type_info_for(src: &str) -> TypeInfo {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args) = check(&mut module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) = check(&mut module);
         type_info
     }
 

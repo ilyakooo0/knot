@@ -1975,6 +1975,7 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
         | ast::ExprKind::DerivedRef(n) => {
             out.insert(n.clone());
         }
+        ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::Lambda { body, .. } => collect_names_in_expr(body, out),
         ast::ExprKind::App { func, arg } => {
             collect_names_in_expr(func, out);

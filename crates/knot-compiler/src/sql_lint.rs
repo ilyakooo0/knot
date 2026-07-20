@@ -238,6 +238,7 @@ fn lint_expr(
         | ExprKind::Var(_)
         | ExprKind::Constructor(_)
         | ExprKind::SourceRef(_)
+        | ExprKind::ImplicitRef(_)
         | ExprKind::DerivedRef(_) => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } => {}
     }
@@ -1093,6 +1094,7 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         ExprKind::Lit(_)
         | ExprKind::Var(_)
         | ExprKind::Constructor(_)
+        | ExprKind::ImplicitRef(_)
         | ExprKind::DerivedRef(_) => false,
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } => false,
         ExprKind::Record(fields) => fields.iter().any(|f| references_source(&f.value, source_name)),

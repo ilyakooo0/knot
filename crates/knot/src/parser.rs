@@ -2410,6 +2410,24 @@ impl Parser {
                 }
             }
 
+            // `^name` begins a fresh implicit-field-projection term (an
+            // application argument), not a binary operator — break out so the
+            // application machinery picks it up. Mirrors `*name` above.
+            if matches!(self.peek(), TokenKind::Caret) {
+                let caret_span = self.peek_token().span;
+                let right_adjacent = match self.tokens.get(self.pos + 1) {
+                    Some(next) => {
+                        matches!(next.kind, TokenKind::Lower(_))
+                            && next.span.start == caret_span.end
+                    }
+                    None => false,
+                };
+                if right_adjacent {
+                    self.restore(saved_pos);
+                    break;
+                }
+            }
+
             let (op, l_bp, r_bp) = match self.peek() {
                 TokenKind::PipeGt => (BinOp::Pipe, 1, 2),
                 TokenKind::OrOr => (BinOp::Or, 3, 4),
@@ -2726,6 +2744,16 @@ impl Parser {
                     false
                 }
             }
+            TokenKind::Caret => {
+                // Implicit field projection `^name` only when `^` is immediately
+                // adjacent to a Lower token (mirrors `&name`).
+                if let Some(next) = self.tokens.get(self.pos + 1) {
+                    let cur_end = self.peek_token().span.end;
+                    matches!(next.kind, TokenKind::Lower(_)) && next.span.start == cur_end
+                } else {
+                    false
+                }
+            }
             _ => false,
         }
     }
@@ -2945,6 +2973,26 @@ impl Parser {
                     }
                     _ => {
                         self.error("expected identifier after '*' for source reference");
+                        None
+                    }
+                }
+            }
+            TokenKind::Caret => {
+                // ^name — implicit field projection
+                self.advance();
+                match self.peek() {
+                    TokenKind::Lower(_) => {
+                        let tok = self.advance();
+                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                        Some(Spanned::new(
+                            ExprKind::ImplicitRef(name),
+                            Span::new(start.start, tok.span.end),
+                        ))
+                    }
+                    _ => {
+                        self.error(
+                            "expected identifier after '^' for implicit field projection",
+                        );
                         None
                     }
                 }

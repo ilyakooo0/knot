@@ -115,7 +115,7 @@ fn deep_do_block_reaches_codegen_without_overflow() {
     knot_compiler::desugar::desugar(&mut module);
 
     let type_env = knot_compiler::types::TypeEnv::from_module(&module);
-    let (diags, monad_info, type_info, _local, refine_targets, refined, from_json, elem, trait_calls, show_units, sum_floats, relation_fields, with_fields, type_arg_spans) =
+    let (diags, monad_info, type_info, _local, refine_targets, refined, from_json, elem, trait_calls, show_units, sum_floats, relation_fields, with_fields, type_arg_spans, implicit_refs) =
         knot_compiler::infer::check(&mut module);
     assert!(errors(&diags).is_empty(), "{:?}", errors(&diags));
 
@@ -134,6 +134,7 @@ fn deep_do_block_reaches_codegen_without_overflow() {
         &sum_floats,
         &relation_fields,
         &with_fields,
+        &implicit_refs,
         &type_arg_spans,
         &std::collections::HashMap::new(),
     )

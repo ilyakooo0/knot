@@ -1621,6 +1621,7 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         ExprKind::Constructor(n) => n.clone(),
         ExprKind::SourceRef(n) => format!("*{}", n),
         ExprKind::DerivedRef(n) => format!("&{}", n),
+        ExprKind::ImplicitRef(n) => format!("^{}", n),
         ExprKind::Record(fields) => render_record_inline(fields),
         ExprKind::RecordUpdate { base, fields } => {
             let mut s = String::from("{");

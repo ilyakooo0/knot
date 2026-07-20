@@ -503,6 +503,9 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::DerivedRef(_) => {
                 self.add(self.strip_parens(expr.span), TOK_NAMESPACE, MOD_READONLY);
             }
+            ast::ExprKind::ImplicitRef(_) => {
+                self.add(self.strip_parens(expr.span), TOK_VARIABLE, MOD_READONLY);
+            }
             ast::ExprKind::With { record, body } => {
                 self.visit_expr(record);
                 self.visit_expr(body);

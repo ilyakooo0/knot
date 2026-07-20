@@ -670,6 +670,9 @@ impl<'a> DefResolver<'a> {
             ast::ExprKind::Constructor(name) => self.add_ref(expr.span, name),
             ast::ExprKind::SourceRef(name) => self.add_ref(expr.span, name),
             ast::ExprKind::DerivedRef(name) => self.add_ref(expr.span, name),
+            // `^name` resolves to a record field at inference time; no single
+            // binding site to reference here.
+            ast::ExprKind::ImplicitRef(_) => {},
 
             ast::ExprKind::Lambda { params, body, .. } => {
                 self.push_scope();

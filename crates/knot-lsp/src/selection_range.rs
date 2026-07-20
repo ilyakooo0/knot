@@ -50,24 +50,6 @@ fn build_selection_range(module: &Module, source: &str, offset: usize) -> Select
                     collect_containing_spans(body, offset, &mut spans);
                 }
                 DeclKind::Fun { body: None, .. } => {}
-                DeclKind::Impl { items, .. } => {
-                    for item in items {
-                        if let ast::ImplItem::Method { body, .. } = item {
-                            collect_containing_spans(body, offset, &mut spans);
-                        }
-                    }
-                }
-                DeclKind::Trait { items, .. } => {
-                    for item in items {
-                        if let ast::TraitItem::Method {
-                            default_body: Some(body),
-                            ..
-                        } = item
-                        {
-                            collect_containing_spans(body, offset, &mut spans);
-                        }
-                    }
-                }
                 _ => {}
             }
         }

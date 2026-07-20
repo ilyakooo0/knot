@@ -28,42 +28,9 @@ fn check_src(src: &str) -> Vec<Diagnostic> {
     let mut module = parse(src);
     knot_compiler::base::inject_prelude(&mut module);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, _targets, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) =
+    let (diags, _monad, _type_info, _local, _targets, _refined, _json, _elem,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) =
         knot_compiler::infer::check(&mut module);
     diags
-}
-
-const USER_MONAD: &str = r#"data Box a = Box {value: a}
-
-impl Functor Box where
-  map f b = case b of
-    Box {value value} -> Box {value (f value)}
-
-impl Applicative Box where
-  yield x = Box {value x}
-  ap fs xs = case fs of
-    Box {value f} -> case xs of
-      Box {value x} -> Box {value (f x)}
-
-impl Monad Box where
-  bind f b = case b of
-    Box {value value} -> f value
-"#;
-
-#[test]
-fn where_guard_in_monad_without_alternative_reports_clean_diagnostic() {
-    let src = format!(
-        "{}\nuseit : Box Int 1\nuseit = do\n  where True\n  yield 5\n",
-        USER_MONAD
-    );
-    let diags = check_src(&src);
-    assert!(
-        diags
-            .iter()
-            .any(|d| d.message.contains("Alternative") && d.message.contains("Box")),
-        "expected an Alternative-impl diagnostic mentioning Box, got: {:?}",
-        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-    );
 }
 
 #[test]

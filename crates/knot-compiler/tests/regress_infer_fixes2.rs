@@ -41,7 +41,7 @@ fn check_src(src: &str) -> Vec<Diagnostic> {
     let mut module = parse(src);
     knot_compiler::base::inject_prelude(&mut module);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, _targets, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) =
+    let (diags, _monad, _type_info, _local, _targets, _refined, _json, _elem,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) =
         knot_compiler::infer::check(&mut module);
     diags
 }
@@ -223,44 +223,6 @@ main = do
     assert_clean(&diags);
 }
 
-// ── 3. Impl methods checked against skolemised trait signature ──────
-
-#[test]
-fn impl_pinning_method_type_var_rejected() {
-    // `conv : a -> b` promises a caller-chosen `b`; the impl returning
-    // Int pins it and must be rejected.
-    let diags = check_src(
-        r#"trait Conv a where
-  conv : a -> b
-
-impl Conv Int where
-  conv = \x -> x + 1
-
-main = println "x"
-"#,
-    );
-    assert!(
-        has_error(&diags, "less polymorphic"),
-        "expected 'less polymorphic' error, got: {:?}",
-        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn impl_leaving_method_type_var_polymorphic_ok() {
-    let diags = check_src(
-        r#"trait Pick a where
-  pick : a -> b -> a
-
-impl Pick Int where
-  pick = \x y -> x
-
-main = println (show (pick 1 "anything"))
-"#,
-    );
-    assert_clean(&diags);
-}
-
 // ── 4. Rank-2 skolem escape through unannotated wrappers ────────────
 
 #[test]
@@ -294,34 +256,6 @@ main = println (show (takesPoly (\x -> x)))
 "#,
     );
     assert_clean(&diags);
-}
-
-// ── 8. Refine-target unification before constraint checking ─────────
-
-#[test]
-fn constraint_on_refine_concretized_var_is_checked() {
-    // `foo x` defers a `Foo` constraint on x's type variable (which stays
-    // out of main's generalized type — `x <- []` keeps it monomorphic and
-    // local); the refine annotation resolves x to Int (Nat's base) only
-    // during refine-target unification. Pre-fix, check_constraints ran
-    // BEFORE that unification, hit the Ty::Var skip, and the missing
-    // `Foo Int` impl was silently not reported.
-    let diags = check_src(
-        r#"trait Foo a where
-  foo : a -> Int 1
-
-type Nat = Int 1 where \x -> x >= 0
-
-main = do
-  x <- []
-  with {n (foo x) r ((refine x) : Result RefinementError Nat)} yield n
-"#,
-    );
-    assert!(
-        has_error(&diags, "no implementation of trait 'Foo'"),
-        "expected missing-impl error, got: {:?}",
-        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-    );
 }
 
 // ── 9. Alias bodies with free type variables ─────────────────────────

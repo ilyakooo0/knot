@@ -207,26 +207,19 @@ pub(crate) fn handle_rename(
     // the owner is that imported file's decl, not this file.
     let owner = resolve_canonical_owner(state, uri, doc, offset, &old_name)?;
 
-    // If the rename targets a trait method, compute the set of traits (from the
-    // owner module) that declare it. The shared cross-file oracle uses this to
-    // confine impl-method edits to the target method's own trait(s); an empty
-    // set means "not a trait method" and no impl tokens are rewritten.
-    let target_traits =
-        owner_trait_method_scope(state, &owner.canonical_path, owner.name_span, &old_name);
-
     let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
 
     // Phase 2: visit every file in the workspace and emit edits if it
     // either owns the symbol or imports it from the owner. Open files use
     // the cached `DocumentState`; closed files are read off disk.
     let scanned =
-        scan_workspace_files(state, &owner, &old_name, new_name, &target_traits, &mut changes);
+        scan_workspace_files(state, &owner, &old_name, new_name, &mut changes);
 
     // Phase 3: scan unopened workspace files for references via on-disk
     // parse. We narrow by the reverse-import graph when possible — most
     // files don't reach the owner, and skipping them avoids per-file
     // parse cost.
-    scan_disk_files(state, &owner, &old_name, new_name, &target_traits, &scanned, &mut changes);
+    scan_disk_files(state, &owner, &old_name, new_name, &scanned, &mut changes);
 
     // Defensive de-duplication: the owner-file path can discover the same
     // name-token span through both the declaration edit and a reference
@@ -615,33 +608,6 @@ fn span_is_record_pun(module: &Module, source: &str, span: Span) -> bool {
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => pun_in_expr(body, source, span, &mut found),
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { params, body, .. } = item {
-                        if params.iter().any(|p| pun_in_pat(p, source, span)) {
-                            found = true;
-                        }
-                        pun_in_expr(body, source, span, &mut found);
-                    }
-                }
-            }
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method {
-                        default_params,
-                        default_body,
-                        ..
-                    } = item
-                    {
-                        if default_params.iter().any(|p| pun_in_pat(p, source, span)) {
-                            found = true;
-                        }
-                        if let Some(body) = default_body {
-                            pun_in_expr(body, source, span, &mut found);
-                        }
-                    }
-                }
-            }
             DeclKind::Migrate { using_fn, .. } => pun_in_expr(using_fn, source, span, &mut found),
             _ => {}
         }
@@ -711,7 +677,6 @@ fn scan_workspace_files(
     owner: &CanonicalOwner,
     old_name: &str,
     new_name: &str,
-    target_traits: &HashSet<String>,
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
 ) -> HashSet<PathBuf> {
     let mut scanned = HashSet::new();
@@ -770,7 +735,7 @@ fn scan_workspace_files(
                 }));
         if is_owner || imports_owner {
             emit_edits_for_open_doc(
-                other_uri, other_doc, owner, old_name, new_name, target_traits, is_owner, changes,
+                other_uri, other_doc, owner, old_name, new_name, is_owner, changes,
             );
         }
         // Always mark open documents as scanned, even when they neither own
@@ -784,80 +749,16 @@ fn scan_workspace_files(
     scanned
 }
 
-/// Trait names whose `impl … <method> =` definition tokens should be rewritten
-/// when renaming a trait method. Impl-method name tokens aren't linked to the
-/// trait method in `references`/`resolve_definitions`, so a trait-method rename
-/// has to find them structurally — but *only* when the rename actually targets
-/// a trait method. `owner_name_span` is the rename target's resolved name-token
-/// span; a trait's method qualifies only when its own declaration token is
-/// exactly that span. Returns empty when the rename targets something else that
-/// merely shares the name — a local binding, a top-level function, or a method
-/// of a *different* trait — so those impls are left untouched.
-fn traits_declaring_renamed_method(
-    decls: &[ast::Decl],
-    method: &str,
-    owner_name_span: Span,
-) -> HashSet<String> {
-    decls
-        .iter()
-        .filter_map(|d| match &d.node {
-            DeclKind::Trait { name, items, .. }
-                if items.iter().any(|it| {
-                    matches!(it,
-                        ast::TraitItem::Method { name: m, name_span, .. }
-                            if m == method && *name_span == owner_name_span)
-                }) =>
-            {
-                Some(name.clone())
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-/// Trait scope for the shared cross-file oracle (`collect_name_uses_in_decl`).
-/// Returns the trait names — declared in the owner module at `owner_path` — whose
-/// method named `name` is the exact rename/reference target, disambiguated by
-/// `owner_decl_span` (the owner's declaration or name-token span). Empty when
-/// `name` isn't a trait method, so importer/disk files leave every `impl … where
-/// name =` token alone. The owner module is read from an open buffer when one is
-/// available (authoritative), else the disk/cache copy; a fetch miss yields an
-/// empty set (safe: under-match rather than corrupt an unrelated impl).
-pub(crate) fn owner_trait_method_scope(
-    state: &ServerState,
-    owner_path: &Path,
-    owner_decl_span: Span,
-    name: &str,
-) -> HashSet<String> {
-    for (u, d) in &state.documents {
-        if canonical_for_uri(u).as_deref() == Some(owner_path) {
-            let name_span =
-                name_span_within(&d.source, owner_decl_span, name).unwrap_or(owner_decl_span);
-            return traits_declaring_renamed_method(&d.module.decls, name, name_span);
-        }
-    }
-    if let Some((module, source)) = get_or_parse_file_shared(owner_path, &state.import_cache) {
-        let name_span =
-            name_span_within(&source, owner_decl_span, name).unwrap_or(owner_decl_span);
-        return traits_declaring_renamed_method(&module.decls, name, name_span);
-    }
-    HashSet::new()
-}
-
 /// Apply rename edits to a single open document. The owner-file branch uses
 /// the AST-derived `references` to find usages; the importer-file branch
 /// walks the AST directly because imported-symbol uses don't appear in
 /// `references` (which only resolves local decls).
-// Each argument carries distinct rename context; bundling would not clarify
-// the call site.
-#[allow(clippy::too_many_arguments)]
 fn emit_edits_for_open_doc(
     uri: &Uri,
     doc: &DocumentState,
     owner: &CanonicalOwner,
     old_name: &str,
     new_name: &str,
-    target_traits: &HashSet<String>,
     is_owner: bool,
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
 ) {
@@ -889,35 +790,6 @@ fn emit_edits_for_open_doc(
                 });
             }
         }
-        // Impl-method definition tokens don't appear in `doc.references`
-        // (defs.rs never links them to the trait method), so a same-file
-        // trait-method rename would leave `impl … method =` stale. When the
-        // rename actually targets a trait method (its declaration token is
-        // `name_span`), rename every impl method of that name — but only for
-        // impls of the owning trait(s), so an unrelated same-named symbol or a
-        // method of a different trait isn't corrupted. (Other files are handled
-        // by the importer path via `collect_name_uses_in_decl`.)
-        let target_traits =
-            traits_declaring_renamed_method(&doc.module.decls, old_name, name_span);
-        if !target_traits.is_empty() {
-            for decl in &doc.module.decls {
-                if let DeclKind::Impl { trait_name, items, .. } = &decl.node {
-                    if !target_traits.contains(trait_name) {
-                        continue;
-                    }
-                    for item in items {
-                        if let ast::ImplItem::Method { name: m, name_span, .. } = item
-                            && m == old_name
-                        {
-                            changes.entry(uri.clone()).or_default().push(TextEdit {
-                                range: span_to_range(*name_span, &doc.source),
-                                new_text: new_name.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
     } else {
         // Importer file. If the file declares its own top-level symbol with
         // the same name, every local reference resolves to that declaration
@@ -942,7 +814,7 @@ fn emit_edits_for_open_doc(
         // ref/derived-ref site that names the symbol, and rewrite each.
         let mut sites: Vec<Span> = Vec::new();
         for decl in &doc.module.decls {
-            collect_name_uses_in_decl(decl, old_name, &doc.source, target_traits, &mut sites);
+            collect_name_uses_in_decl(decl, old_name, &doc.source, &mut sites);
         }
         // Selective import items: `import foo {bar, baz}` — if the rename
         // targets `bar`, the import line itself needs updating. These sit
@@ -977,9 +849,9 @@ fn emit_edits_for_open_doc(
 }
 
 /// Whether `module` declares `name` at top level (function, type alias,
-/// source, view, derived, data type or its constructors, trait or its
-/// methods, route). Used to decide that an importer's local references
-/// resolve to its own declaration rather than the imported symbol.
+/// source, view, derived, data type or its constructors, route). Used to
+/// decide that an importer's local references resolve to its own declaration
+/// rather than the imported symbol.
 pub(crate) fn module_defines_name(module: &Module, name: &str) -> bool {
     module.decls.iter().any(|d| match &d.node {
         DeclKind::Fun { name: n, .. }
@@ -999,12 +871,6 @@ pub(crate) fn module_defines_name(module: &Module, name: &str) -> bool {
             constructors,
             ..
         } => n == name || constructors.iter().any(|c| c.name == name),
-        DeclKind::Trait { name: n, items, .. } => {
-            n == name
-                || items.iter().any(|item| {
-                    matches!(item, ast::TraitItem::Method { name: m, .. } if m == name)
-                })
-        }
         _ => false,
     })
 }
@@ -1174,37 +1040,6 @@ pub(crate) fn collect_shadowed_names(
             | DeclKind::Derived { body, .. } => {
                 walk(body, old_name, new_name, &mut Vec::new(), out);
             }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { params, body, .. } = item {
-                        let binds_old = params.iter().any(|p| pat_binds_name(p, old_name));
-                        let binds_new = params.iter().any(|p| pat_binds_name(p, new_name));
-                        if binds_old && binds_new {
-                            out.push(body.span);
-                        }
-                        walk(body, old_name, new_name, &mut vec![(binds_old, binds_new)], out);
-                    }
-                }
-            }
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method {
-                        default_params,
-                        default_body: Some(body),
-                        ..
-                    } = item
-                    {
-                        let binds_old =
-                            default_params.iter().any(|p| pat_binds_name(p, old_name));
-                        let binds_new =
-                            default_params.iter().any(|p| pat_binds_name(p, new_name));
-                        if binds_old && binds_new {
-                            out.push(body.span);
-                        }
-                        walk(body, old_name, new_name, &mut vec![(binds_old, binds_new)], out);
-                    }
-                }
-            }
             DeclKind::Migrate { using_fn, .. } => {
                 walk(using_fn, old_name, new_name, &mut Vec::new(), out);
             }
@@ -1214,9 +1049,9 @@ pub(crate) fn collect_shadowed_names(
 }
 
 /// Walk `decl` and collect every span where `name` appears as a value-level
-/// reference (Var / Constructor / SourceRef / DerivedRef), a type-level
+/// reference (Var / Constructor / SourceRef / DerivedRef) or a type-level
 /// reference (`Named` types in annotations, aliases, source/data decls,
-/// routes), or an impl method-name token. This is the importer-file
+/// routes). This is the importer-file
 /// rename oracle: the inferencer doesn't track cross-file references in
 /// `doc.references`, so we walk the AST directly — mirroring what
 /// `doc.references` covers for owner files.
@@ -1226,18 +1061,10 @@ pub(crate) fn collect_shadowed_names(
 /// occurrences underneath that binder refer to the local and are skipped.
 /// Constructor / SourceRef / DerivedRef / type occurrences live in
 /// namespaces value binders can't shadow and are always collected.
-///
-/// `target_traits` scopes impl-method name tokens: an `impl T Foo where name =`
-/// token is only a use of the renamed symbol when `name` is a trait method AND
-/// `T` is one of the traits that declares it (computed from the owner module via
-/// `owner_trait_method_scope`). An empty set means the symbol isn't a trait
-/// method, so no impl-method token is a use of it — leaving e.g. an unrelated
-/// `impl Draw Foo where present =` untouched when renaming `Show.present`.
 pub(crate) fn collect_name_uses_in_decl(
     decl: &ast::Decl,
     name: &str,
     source: &str,
-    target_traits: &HashSet<String>,
     out: &mut Vec<Span>,
 ) {
     // Collect constructor-pattern name tokens (`Ctor pat <- …`, `case … of
@@ -1416,42 +1243,9 @@ pub(crate) fn collect_name_uses_in_decl(
         }
         recurse_expr(expr, |e| walk_expr(e, name, source, shadowed, out));
     }
-    // Recover rename sites for a textually-ordered sequence of *spanless*
-    // trait-name tokens (an `impl`'s trait, a supertrait, or a `Trait a =>`
-    // constraint) within `[from, to)`. Each name is located in source order
-    // with a moving cursor (searching for its own text) so distinct trait
-    // names in one clause each anchor on their own token; a token equal to the
-    // renamed `name` is recorded. Without this, renaming a trait leaves
-    // `impl Show …` and `Show a =>` bounds stale and corrupts the source.
-    fn push_trait_name_refs<'b>(
-        names: impl Iterator<Item = &'b str>,
-        name: &str,
-        source: &str,
-        from: usize,
-        to: usize,
-        out: &mut Vec<Span>,
-    ) {
-        let mut cursor = from;
-        for tn in names {
-            if let Some(span) = find_word_in_source(source, tn, cursor, to) {
-                cursor = span.end;
-                if tn == name {
-                    out.push(span);
-                }
-            }
-        }
-    }
     match &decl.node {
         DeclKind::Fun { ty, body, .. } => {
             if let Some(scheme) = ty {
-                push_trait_name_refs(
-                    scheme.constraints.iter().map(|c| c.trait_name.as_str()),
-                    name,
-                    source,
-                    decl.span.start,
-                    scheme.ty.span.start,
-                    out,
-                );
                 walk_scheme(scheme, name, source, out);
             }
             if let Some(body) = body {
@@ -1460,14 +1254,6 @@ pub(crate) fn collect_name_uses_in_decl(
         }
         DeclKind::View { ty, body, .. } | DeclKind::Derived { ty, body, .. } => {
             if let Some(scheme) = ty {
-                push_trait_name_refs(
-                    scheme.constraints.iter().map(|c| c.trait_name.as_str()),
-                    name,
-                    source,
-                    decl.span.start,
-                    scheme.ty.span.start,
-                    out,
-                );
                 walk_scheme(scheme, name, source, out);
             }
             walk_expr(body, name, source, false, out);
@@ -1479,108 +1265,6 @@ pub(crate) fn collect_name_uses_in_decl(
             for ctor in constructors {
                 for f in &ctor.fields {
                     walk_type(&f.value, name, source, out);
-                }
-            }
-        }
-        DeclKind::Impl { trait_name, args, constraints, items, .. } => {
-            // Impl head: `impl (Constraint =>)* TraitName args*`. All trait-name
-            // tokens precede the first arg, in constraint-then-head order.
-            let head_end = args.first().map(|a| a.span.start).unwrap_or(decl.span.end);
-            push_trait_name_refs(
-                constraints
-                    .iter()
-                    .map(|c| c.trait_name.as_str())
-                    .chain(std::iter::once(trait_name.as_str())),
-                name,
-                source,
-                decl.span.start,
-                head_end,
-                out,
-            );
-            for arg in args {
-                walk_type(arg, name, source, out);
-            }
-            for c in constraints {
-                for arg in &c.args {
-                    walk_type(arg, name, source, out);
-                }
-            }
-            // Only an impl of one of the renamed method's own trait(s) has a
-            // method-name token that refers to the renamed symbol. Renaming
-            // `Show.present` must not touch `impl Draw Foo where present = …`
-            // (a different trait that happens to declare a `present` method) —
-            // the owner-file path scopes this the same way via
-            // `traits_declaring_renamed_method`.
-            let impl_method_is_target = target_traits.contains(trait_name);
-            for item in items {
-                match item {
-                    ast::ImplItem::Method { name: m, name_span, params, body } => {
-                        // The method-name token references the trait's
-                        // method declaration.
-                        if m == name && impl_method_is_target {
-                            out.push(*name_span);
-                        }
-                        for p in params {
-                            walk_pat_ctors(p, name, source, out);
-                        }
-                        let sh = params.iter().any(|p| pat_binds_name(p, name));
-                        walk_expr(body, name, source, sh, out);
-                    }
-                    ast::ImplItem::AssociatedType { args, ty, .. } => {
-                        for a in args {
-                            walk_type(a, name, source, out);
-                        }
-                        walk_type(ty, name, source, out);
-                    }
-                }
-            }
-        }
-        DeclKind::Trait { items, supertraits, .. } => {
-            // `trait T a : Super1, Super2` — each supertrait name references
-            // that trait and must be renamed with it.
-            push_trait_name_refs(
-                supertraits.iter().map(|c| c.trait_name.as_str()),
-                name,
-                source,
-                decl.span.start,
-                decl.span.end,
-                out,
-            );
-            for c in supertraits {
-                for arg in &c.args {
-                    walk_type(arg, name, source, out);
-                }
-            }
-            for item in items {
-                if let ast::TraitItem::Method {
-                    name_span,
-                    ty,
-                    default_body,
-                    default_params,
-                    ..
-                } = item
-                {
-                    // A method's own `Trait a =>` constraint trait names
-                    // (`eq : Show a => Bool`) are spanless; `walk_scheme` covers
-                    // the type and constraint args but not the trait names, so
-                    // recover them between the method name and its type (mirrors
-                    // the `Fun`/supertrait handling).
-                    push_trait_name_refs(
-                        ty.constraints.iter().map(|c| c.trait_name.as_str()),
-                        name,
-                        source,
-                        name_span.end,
-                        ty.ty.span.start,
-                        out,
-                    );
-                    walk_scheme(ty, name, source, out);
-                    if let Some(body) = default_body {
-                        for p in default_params {
-                            walk_pat_ctors(p, name, source, out);
-                        }
-                        let sh = default_params.iter().any(|p| pat_binds_name(p, name));
-                        walk_expr(body, name, source, sh, out);
-                    }
                 }
             }
         }
@@ -1683,7 +1367,6 @@ fn scan_disk_files(
     owner: &CanonicalOwner,
     old_name: &str,
     new_name: &str,
-    target_traits: &HashSet<String>,
     already_scanned: &HashSet<PathBuf>,
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
 ) {
@@ -1762,7 +1445,6 @@ fn scan_disk_files(
                 &owner.canonical_path,
                 old_name,
                 new_name,
-                target_traits,
                 changes,
             );
         }
@@ -1798,39 +1480,6 @@ fn apply_owner_disk_edits(
             }
         }
     }
-    // Impl-method definition tokens are not linked to the trait method in
-    // `resolve_definitions`, so — exactly as the open-doc owner path does — when
-    // this (disk) owner module's rename targets a trait method, rename every
-    // `impl … <old_name> =` token for impls of the owning trait(s). Without this,
-    // renaming a trait method from an importer's call site left every impl in an
-    // *unopened* owner file stale. The target trait method is identified by the
-    // resolved definition span of `old_name` (`resolve_definitions` records each
-    // trait method at its own name token), so renaming an unrelated same-named
-    // symbol — or a method of a *different* trait — doesn't touch these impls.
-    let owner_name_span = defs
-        .get(old_name)
-        .map(|decl_span| name_span_within(source, *decl_span, old_name).unwrap_or(*decl_span))
-        .unwrap_or(owner.name_span);
-    let target_traits = traits_declaring_renamed_method(&module.decls, old_name, owner_name_span);
-    if !target_traits.is_empty() {
-        for decl in &module.decls {
-            if let DeclKind::Impl { trait_name, items, .. } = &decl.node {
-                if !target_traits.contains(trait_name) {
-                    continue;
-                }
-                for item in items {
-                    if let ast::ImplItem::Method { name: m, name_span, .. } = item
-                        && m == old_name
-                    {
-                        changes.entry(uri.clone()).or_default().push(TextEdit {
-                            range: span_to_range(*name_span, source),
-                            new_text: new_name.to_string(),
-                        });
-                    }
-                }
-            }
-        }
-    }
 }
 
 // Each argument carries distinct rename context (uri, module, source, paths,
@@ -1844,7 +1493,6 @@ fn apply_importer_disk_edits(
     owner_path: &Path,
     old_name: &str,
     new_name: &str,
-    target_traits: &HashSet<String>,
     changes: &mut HashMap<Uri, Vec<TextEdit>>,
 ) {
     // Same shadowing discipline as the open-doc importer path: a file that
@@ -1861,7 +1509,7 @@ fn apply_importer_disk_edits(
     }
     let mut sites: Vec<Span> = Vec::new();
     for decl in &module.decls {
-        collect_name_uses_in_decl(decl, old_name, source, target_traits, &mut sites);
+        collect_name_uses_in_decl(decl, old_name, source, &mut sites);
     }
     // Import items live inside braces but are not record puns — plain
     // replacement, no pun expansion.
@@ -2080,24 +1728,6 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
             }
             field_sites_in_expr(body, source, f);
         }
-        DeclKind::Impl { items, .. } => {
-            for item in items {
-                match item {
-                    ast::ImplItem::Method { params, body, .. } => {
-                        for p in params {
-                            field_sites_in_pat(p, source, f);
-                        }
-                        field_sites_in_expr(body, source, f);
-                    }
-                    // An associated type can spell out an inline record type
-                    // (`type Item = {field: T}`); its fields are rename sites too
-                    // — mirrors the symbol-rename walker `collect_name_uses_in_decl`.
-                    ast::ImplItem::AssociatedType { ty, .. } => {
-                        field_sites_in_type(ty, source, f);
-                    }
-                }
-            }
-        }
         DeclKind::Data { constructors, .. } => {
             // Constructor fields appear sequentially in source order, so a
             // single running cursor across all constructors keeps each
@@ -2128,25 +1758,6 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
         }
         DeclKind::TypeAlias { ty, .. } | DeclKind::Source { ty, .. } => {
             field_sites_in_type(ty, source, f);
-        }
-        DeclKind::Trait { items, .. } => {
-            for item in items {
-                if let ast::TraitItem::Method {
-                    ty,
-                    default_params,
-                    default_body,
-                    ..
-                } = item
-                {
-                    field_sites_in_type(&ty.ty, source, f);
-                    for p in default_params {
-                        field_sites_in_pat(p, source, f);
-                    }
-                    if let Some(body) = default_body {
-                        field_sites_in_expr(body, source, f);
-                    }
-                }
-            }
         }
         DeclKind::Migrate {
             from_ty,
@@ -2556,187 +2167,6 @@ mod tests {
     }
 
     #[test]
-    fn rename_trait_updates_impl_head() {
-        // Regression: `impl Show Foo`'s trait-name token was never collected —
-        // `collect_name_uses_in_decl`'s Impl arm dropped `trait_name`. Renaming
-        // the trait left `impl Show` stale, breaking the file. Renaming `Show`
-        // must also update the `impl Show` occurrence.
-        let mut ws = TestWorkspace::new();
-        let src = "trait Show a where\n  present : a -> Text\ndata Foo = Foo {}\nimpl Show Foo where\n  present = \\x -> \"foo\"\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("Show").expect("trait def");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "Display"))
-            .expect("rename produces edits");
-        let mut changes = edit.changes.expect("changes present");
-        let edits = changes.remove(&uri).expect("file has edits");
-
-        let impl_off = doc.source.find("impl Show").expect("impl head") + "impl ".len();
-        let impl_pos = offset_to_position(&doc.source, impl_off);
-        assert!(
-            edits
-                .iter()
-                .any(|e| e.range.start == impl_pos && e.new_text.contains("Display")),
-            "trait name in `impl Show` must be renamed; edits: {edits:?}"
-        );
-    }
-
-    #[test]
-    fn rename_trait_method_updates_impl_method_same_file() {
-        // Regression: a same-file trait-method rename left the `impl … method =`
-        // definition stale. Impl-method name tokens aren't in `doc.references`
-        // (defs.rs never links them to the trait method), and the collector that
-        // does know them ran only on importer files — so the owner file's impl
-        // was skipped, producing a trait method with no matching impl.
-        let mut ws = TestWorkspace::new();
-        let src = "trait Show a where\n  present : a -> Text\ndata Foo = Foo {}\nimpl Show Foo where\n  present = \\x -> \"foo\"\nmain = present (Foo {})\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        // Initiate the rename from the trait-method declaration.
-        let off = doc.source.find("present").expect("trait method decl");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "render"))
-            .expect("rename produces edits");
-        let mut changes = edit.changes.expect("changes present");
-        let edits = changes.remove(&uri).expect("file has edits");
-
-        // The impl method definition token must be renamed too.
-        let impl_off = doc.source.find("present = ").expect("impl method def");
-        let impl_pos = offset_to_position(&doc.source, impl_off);
-        assert!(
-            edits
-                .iter()
-                .any(|e| e.range.start == impl_pos && e.new_text.contains("render")),
-            "impl method `present =` must be renamed; edits: {edits:?}"
-        );
-    }
-
-    #[test]
-    fn rename_defaulted_trait_method_updates_signature() {
-        // Regression: a *defaulted* trait method is parsed as two
-        // `TraitItem::Method` entries — the signature (`greet : T`) and the
-        // default body (`greet = …`), each with its own `name_span`. defs.rs
-        // registered both via last-write-wins, so the signature token was
-        // invisible to rename; renaming from the body/usage left `greet : T`
-        // stale, corrupting the trait. Renaming must rewrite BOTH tokens.
-        let mut ws = TestWorkspace::new();
-        let src = "trait Greet a where\n  greet : a -> Text\n  greet = \\x -> \"hi\"\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        // Initiate the rename from the default-body line.
-        let off = doc.source.find("greet = ").expect("default body");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "hello"))
-            .expect("rename produces edits");
-        let mut changes = edit.changes.expect("changes present");
-        let edits = changes.remove(&uri).expect("file has edits");
-
-        // Both the signature and the default-body tokens must be renamed.
-        let sig_off = doc.source.find("greet : ").expect("signature");
-        let sig_pos = offset_to_position(&doc.source, sig_off);
-        let body_off = doc.source.find("greet = ").expect("default body");
-        let body_pos = offset_to_position(&doc.source, body_off);
-        assert!(
-            edits
-                .iter()
-                .any(|e| e.range.start == sig_pos && e.new_text.contains("hello")),
-            "signature `greet :` must be renamed; edits: {edits:?}"
-        );
-        assert!(
-            edits
-                .iter()
-                .any(|e| e.range.start == body_pos && e.new_text.contains("hello")),
-            "default body `greet =` must be renamed; edits: {edits:?}"
-        );
-    }
-
-    #[test]
-    fn rename_local_does_not_touch_impl_method_of_same_name() {
-        // Regression: the trait-method impl rewrite fired for *any* symbol that
-        // merely shared a trait method's name. Renaming a local binding named
-        // like a trait method must not rewrite the unrelated `impl … method =`
-        // token (nor the trait method's own signature).
-        let mut ws = TestWorkspace::new();
-        let src = "trait Show a where\n  present : a -> Text\ndata Foo = Foo {}\nimpl Show Foo where\n  present = \\x -> \"foo\"\nf = \\present -> present\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        // Rename the local `present` from its usage in `f`'s body.
-        let off = doc.source.find("-> present").expect("local usage") + 3;
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "p"))
-            .expect("rename produces edits");
-        let mut changes = edit.changes.expect("changes present");
-        let edits = changes.remove(&uri).expect("file has edits");
-
-        // Sanity: the local usage itself was renamed (test isn't vacuous).
-        let usage_pos = offset_to_position(&doc.source, off);
-        assert!(
-            edits
-                .iter()
-                .any(|e| e.range.start == usage_pos && e.new_text.contains('p')),
-            "local usage must be renamed; edits: {edits:?}"
-        );
-        // The unrelated impl method definition token must NOT be renamed.
-        let impl_off = doc.source.find("present = ").expect("impl method def");
-        let impl_pos = offset_to_position(&doc.source, impl_off);
-        assert!(
-            edits.iter().all(|e| e.range.start != impl_pos),
-            "unrelated impl method `present =` must not be renamed; edits: {edits:?}"
-        );
-        // The trait method's signature token must also be untouched.
-        let trait_off = doc.source.find("present :").expect("trait method decl");
-        let trait_pos = offset_to_position(&doc.source, trait_off);
-        assert!(
-            edits.iter().all(|e| e.range.start != trait_pos),
-            "unrelated trait method decl must not be renamed; edits: {edits:?}"
-        );
-    }
-
-    #[test]
-    fn collect_name_uses_scopes_impl_methods_by_trait() {
-        // Regression (shared cross-file oracle): `collect_name_uses_in_decl`
-        // rewrote every `impl … where present =` method token that matched the
-        // renamed method name, ignoring which trait the impl belonged to.
-        // Renaming `Show.present` (target scope `{Show}`) must collect the
-        // `impl Show` method token but NOT the `impl Draw` one — a different
-        // trait that merely declares a same-named method.
-        let src = "impl Show Foo where\n  present = \\x -> \"foo\"\nimpl Draw Bar where\n  present = \\x -> \"bar\"\n";
-        let (tokens, _) = knot::lexer::Lexer::new(src).tokenize();
-        let (module, _) = knot::parser::Parser::new(src.to_string(), tokens).parse_module();
-        let show_off = src.find("present = \\x -> \"foo\"").expect("Show impl method");
-        let draw_off = src.find("present = \\x -> \"bar\"").expect("Draw impl method");
-
-        let mut scope = HashSet::new();
-        scope.insert("Show".to_string());
-        let mut sites = Vec::new();
-        for decl in &module.decls {
-            collect_name_uses_in_decl(decl, "present", src, &scope, &mut sites);
-        }
-        assert!(
-            sites.iter().any(|s| s.start == show_off),
-            "impl Show method token must be collected; sites: {sites:?}"
-        );
-        assert!(
-            sites.iter().all(|s| s.start != draw_off),
-            "impl Draw method token (different trait) must NOT be collected; sites: {sites:?}"
-        );
-
-        // Empty scope (`present` isn't a trait method at all) collects no impl
-        // method token — a plain-function rename must never touch impls.
-        let mut none_sites = Vec::new();
-        for decl in &module.decls {
-            collect_name_uses_in_decl(decl, "present", src, &HashSet::new(), &mut none_sites);
-        }
-        assert!(
-            none_sites
-                .iter()
-                .all(|s| s.start != show_off && s.start != draw_off),
-            "no impl method token collected when scope is empty; sites: {none_sites:?}"
-        );
-    }
-
-    #[test]
     fn broken_sibling_import_does_not_suppress_importer_edits() {
         // Regression (Bug 4): a consumer with a valid `import ./owner` PLUS a
         // broken `import ./nonexistent` had ALL its edits suppressed — the
@@ -2765,30 +2195,6 @@ mod tests {
                 .iter()
                 .any(|e| e.range.start == call_pos && e.new_text.contains("parsed")),
             "consumer usage must be renamed despite a broken sibling import; edits: {consumer_edits:?}"
-        );
-    }
-
-    #[test]
-    fn rename_trait_updates_constraint() {
-        // A `Show a =>` bound's trait name must rename with the trait too.
-        let mut ws = TestWorkspace::new();
-        let src = "trait Show a where\n  present : a -> Text\nfmtAll : Show a => a -> Text\nfmtAll = \\x -> present x\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("Show").expect("trait def");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "Display"))
-            .expect("rename produces edits");
-        let mut changes = edit.changes.expect("changes present");
-        let edits = changes.remove(&uri).expect("file has edits");
-
-        let bound_off = doc.source.find("Show a =>").expect("constraint");
-        let bound_pos = offset_to_position(&doc.source, bound_off);
-        assert!(
-            edits
-                .iter()
-                .any(|e| e.range.start == bound_pos && e.new_text.contains("Display")),
-            "trait name in `Show a =>` constraint must be renamed; edits: {edits:?}"
         );
     }
 

@@ -137,22 +137,6 @@ pub enum DeclKind {
         body: Option<Expr>,
     },
 
-    /// `trait Functor (f : Type -> Type) where ...`
-    Trait {
-        name: Name,
-        params: Vec<TraitParam>,
-        supertraits: Vec<Constraint>,
-        items: Vec<TraitItem>,
-    },
-
-    /// `impl Functor [] where ...`
-    Impl {
-        trait_name: Name,
-        args: Vec<Type>,
-        constraints: Vec<Constraint>,
-        items: Vec<ImplItem>,
-    },
-
     /// `route Api where ...`
     Route {
         name: Name,
@@ -601,57 +585,6 @@ pub struct RecordField {
 pub struct ConstructorDef {
     pub name: Name,
     pub fields: Vec<Field<Type>>,
-}
-
-// ── Traits ─────────────────────────────────────────────────────────
-
-/// A type parameter in a trait declaration, with optional kind annotation.
-#[derive(Debug, Clone)]
-pub struct TraitParam {
-    pub name: Name,
-    /// e.g. `Type -> Type` for higher-kinded params. `None` = inferred.
-    pub kind: Option<Type>,
-}
-
-/// An item inside a `trait` block.
-// `Method` is inherently larger than `AssociatedType`; boxing a field would push
-// `Box` indirection through every construction and pattern-match site across the
-// compiler and LSP with no real payoff — trait items aren't stored in bulk.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
-pub enum TraitItem {
-    /// A method signature with optional default body.
-    Method {
-        name: Name,
-        /// Span of the method name token; used by editor tooling to point
-        /// document symbols and go-to-definition at the method itself
-        /// rather than the enclosing trait.
-        name_span: Span,
-        ty: TypeScheme,
-        default_params: Vec<Pat>,
-        default_body: Option<Expr>,
-    },
-    /// `type Item c` — associated type declaration.
-    AssociatedType { name: Name, params: Vec<Name> },
-}
-
-/// An item inside an `impl` block.
-#[derive(Debug, Clone)]
-pub enum ImplItem {
-    /// A method implementation.
-    Method {
-        name: Name,
-        /// Span of the method name token; used by editor tooling.
-        name_span: Span,
-        params: Vec<Pat>,
-        body: Expr,
-    },
-    /// `type Item [a] = a` — associated type definition.
-    AssociatedType {
-        name: Name,
-        args: Vec<Type>,
-        ty: Type,
-    },
 }
 
 // ── Routes ─────────────────────────────────────────────────────────

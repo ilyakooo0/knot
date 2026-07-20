@@ -41,6 +41,7 @@ pub const CONCURRENCY_BUILTINS: &[&str] = &["fork", "retry", "race"];
 pub const PURE_BUILTINS: &[&str] = &[
     "show", "union", "count", "filter", "match", "map",
     "fold", "single", "any", "all", "diff", "inter", "sum", "avg",
+    "head", "findFirst",
     "toUpper", "toLower", "take", "drop",
     "length", "trim", "contains", "elem", "reverse", "chars",
     "id", "not", "toJson", "parseJson",

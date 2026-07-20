@@ -18,39 +18,8 @@ use crate::codegen::{
 };
 use crate::types::TypeEnv;
 
-/// Mirror of codegen's `sql_pushdown_disabled_by_user_impls`: when the program
-/// defines a user impl of an operator method (`eq`/`compare`/`add`/…) on a
-/// primitive type, codegen disables SQL pushdown wholesale and evaluates every
-/// comparison/arithmetic in memory. In that mode none of the pushdown lints
-/// hold — staying silent on a construct would falsely imply it pushes down to
-/// SQL — so the lint suppresses its pushdown diagnostics entirely.
-fn pushdown_disabled_by_user_impls(module: &Module) -> bool {
-    const OP_METHODS: &[&str] = &["eq", "compare", "add", "sub", "mul", "div", "mod", "negate"];
-    module.decls.iter().any(|d| match &d.node {
-        DeclKind::Impl { args, items, .. } => {
-            let on_primitive = matches!(
-                args.first().map(|t| &t.node),
-                Some(TypeKind::Named(n)) if type_name_to_tag(n.as_str()).is_some()
-            );
-            on_primitive
-                && items.iter().any(|it| {
-                    matches!(it,
-                        ImplItem::Method { name, .. } if OP_METHODS.contains(&name.as_str()))
-                })
-        }
-        _ => false,
-    })
-}
-
 /// Run the SQL lint analysis on a module and return informational diagnostics.
 pub fn check(module: &Module, type_env: &TypeEnv) -> Vec<Diagnostic> {
-    // When pushdown is globally disabled by a user primitive operator impl,
-    // codegen evaluates every query in memory; the pushdown lints no longer
-    // describe real behavior, so emit nothing rather than diverge from codegen.
-    if pushdown_disabled_by_user_impls(module) {
-        return Vec::new();
-    }
-
     let views: HashSet<&str> = module
         .decls
         .iter()

@@ -53,7 +53,6 @@ pub(crate) fn handle_code_lens(
             | DeclKind::View { name, .. }
             | DeclKind::Derived { name, .. }
             | DeclKind::Data { name, .. }
-            | DeclKind::Trait { name, .. }
             | DeclKind::Route { name, .. }
             | DeclKind::RouteComposite { name, .. } => name.as_str(),
             _ => continue,
@@ -261,118 +260,6 @@ pub(crate) fn handle_code_lens(
                 }
             }
             _ => {}
-        }
-
-        // For traits: show implementations with clickable lens, plus a
-        // per-method dispatch lens listing which types each method is
-        // implemented for. The per-method lens is informational (no nav),
-        // putting the dispatch surface directly on the method declaration.
-        if let DeclKind::Trait { name, items, .. } = &decl.node {
-            let impls: Vec<&ast::Decl> = doc
-                .module
-                .decls
-                .iter()
-                .filter(|d| matches!(&d.node, DeclKind::Impl { trait_name, .. } if trait_name == name))
-                .collect();
-            let impl_locations: Vec<Location> = impls
-                .iter()
-                .map(|d| Location {
-                    uri: uri.clone(),
-                    range: span_to_range(d.span, &doc.source),
-                })
-                .collect();
-            let impl_count = impl_locations.len();
-            if impl_count > 0 {
-                let title = if impl_count == 1 {
-                    "1 implementation".to_string()
-                } else {
-                    format!("{impl_count} implementations")
-                };
-                lenses.push(CodeLens {
-                    range: Range {
-                        start: range.start,
-                        end: range.start,
-                    },
-                    command: Some(Command {
-                        title,
-                        command: "editor.action.showReferences".to_string(),
-                        arguments: Some(vec![
-                            serde_json::to_value(uri.as_str()).unwrap(),
-                            serde_json::to_value(range.start).unwrap(),
-                            serde_json::to_value(&impl_locations).unwrap(),
-                        ]),
-                    }),
-                    data: None,
-                });
-            }
-
-            // Per-method dispatch lens: for each method declared in the trait,
-            // list every impl that supplies it (or notes when it falls back to
-            // the default body). Anchored at the method declaration itself.
-            for item in items {
-                if let ast::TraitItem::Method {
-                    name: method_name,
-                    default_body,
-                    ..
-                } = item
-                {
-                    let mut providing: Vec<String> = Vec::new();
-                    let mut defaulted: Vec<String> = Vec::new();
-                    for impl_decl in &impls {
-                        if let DeclKind::Impl { args, items: impl_items, .. } = &impl_decl.node {
-                            let type_label = args
-                                .iter()
-                                .map(|a| format_type_kind(&a.node))
-                                .collect::<Vec<_>>()
-                                .join(" ");
-                            let provides = impl_items.iter().any(|i| {
-                                matches!(i, ast::ImplItem::Method { name: n, .. } if n == method_name)
-                            });
-                            if provides {
-                                providing.push(type_label);
-                            } else if default_body.is_some() {
-                                defaulted.push(type_label);
-                            }
-                        }
-                    }
-                    if providing.is_empty() && defaulted.is_empty() {
-                        continue;
-                    }
-                    // Anchor the lens to the method's name token. The trait
-                    // body may span many lines, so a method-local position
-                    // keeps the lens close to the declaration.
-                    let method_pos = find_word_in_source(
-                        &doc.source,
-                        method_name,
-                        decl.span.start,
-                        decl.span.end,
-                    )
-                    .map(|s| span_to_range(s, &doc.source).start)
-                    .unwrap_or(range.start);
-                    let mut parts: Vec<String> = Vec::new();
-                    if !providing.is_empty() {
-                        parts.push(format!("dispatch: {}", providing.join(", ")));
-                    }
-                    if !defaulted.is_empty() {
-                        parts.push(format!(
-                            "default: {}",
-                            defaulted.join(", ")
-                        ));
-                    }
-                    lenses.push(CodeLens {
-                        range: Range {
-                            start: method_pos,
-                            end: method_pos,
-                        },
-                        command: Some(Command {
-                            title: parts.join(" · "),
-                            command: String::new(),
-                            arguments: None,
-                        }),
-                        data: None,
-                    });
-                }
-            }
         }
     }
 

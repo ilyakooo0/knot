@@ -305,31 +305,6 @@ main = do
     assert!(stdout.contains("{cnt: 1, k: b}"), "got: {stdout}");
 }
 
-// ── Bug 5: user impls on primitives disable SQL pushdown ───────────
-
-#[test]
-fn user_eq_impl_on_int_disables_where_pushdown() {
-    let (stdout, stderr, ok) = compile_and_run(
-        "user_eq_no_pushdown",
-        r#"type T = {n: Int 1}
-*items : [T]
-
-impl Eq Int where
-  eq = \a b -> false
-
-main = do
-  replace *items = [{n 1}, {n 2}]
-  rows <- *items
-  with {c (countWhere (\r -> r.n == 1) rows)} (do println ("c: " ++ show c); with {f (count (filter (\r -> r.n == 1) rows))} (do println ("f: " ++ show f)))
-"#,
-    );
-    assert!(ok, "program failed: {stderr}");
-    // With `eq = \a b -> false`, no row can match — pushed-down SQL `=`
-    // would wrongly count 1.
-    assert!(stdout.contains("c: 0"), "countWhere must use the user eq impl, got: {stdout}");
-    assert!(stdout.contains("f: 0"), "filter must use the user eq impl, got: {stdout}");
-}
-
 // ── Bug 6: Int 1/Int division pushed to SQL stays Int-typed ──────────
 
 #[test]
@@ -490,61 +465,6 @@ main = do
     assert!(stdout.contains("gt: 0"), "got: {stdout}");
 }
 
-// ── Bug 12: ordered comparisons on tag columns stay in memory ──────
-
-#[test]
-fn ordered_comparison_on_tag_column_uses_ord_impl() {
-    let (stdout, stderr, ok) = compile_and_run(
-        "tag_ordered_cmp",
-        r#"data Level = Low {} | High {}
-
-impl Eq Level where
-  eq = \a b -> show a == show b
-
-impl Ord Level where
-  compare = \a b -> case a of
-    Low x -> case b of
-      Low y -> EQ {}
-      _ -> LT {}
-    High x -> case b of
-      High y -> EQ {}
-      _ -> GT {}
-
-type T = {lvl: Level, n: Int 1}
-*t : [T]
-
-main = do
-  replace *t = [{lvl (Low {}) n 1}, {lvl (High {}) n 2}]
-  with {r (do i <- *t; where i.lvl < High {}; yield i)} (do println ("r: " ++ show (count r)))
-"#,
-    );
-    assert!(ok, "program failed: {stderr}");
-    // Ord says Low < High → 1 row. Pushed SQL compared 'Low' < 'High'
-    // byte-wise ('L' > 'H') → 0 rows.
-    assert!(stdout.contains("r: 1"), "got: {stdout}");
-}
-
-#[test]
-fn equality_on_tag_column_still_works() {
-    let (stdout, stderr, ok) = compile_and_run(
-        "tag_eq_still_works",
-        r#"data Level = Low {} | High {}
-
-impl Eq Level where
-  eq = \a b -> show a == show b
-
-type T = {lvl: Level, n: Int 1}
-*t : [T]
-
-main = do
-  replace *t = [{lvl (Low {}) n 1}, {lvl (High {}) n 2}, {lvl (Low {}) n 3}]
-  with {r (do i <- *t; where i.lvl == Low {}; yield i)} (do println ("r: " ++ show (count r)))
-"#,
-    );
-    assert!(ok, "program failed: {stderr}");
-    assert!(stdout.contains("r: 2"), "got: {stdout}");
-}
-
 // ── Bug 13: minOn/maxOn over a genuine Text column push down but must
 //    return Text verbatim (the runtime's `is_text` flag), never re-parse a
 //    numeric-looking string back to Int. ──────────────────────────────────
@@ -569,49 +489,4 @@ main = do
     assert!(ok, "program failed: {stderr}");
     assert!(stdout.contains("hi: 007"), "expected Text max '007', got: {stdout}");
     assert!(stdout.contains("lo: 003"), "expected Text min '003', got: {stdout}");
-}
-
-// ── Bug 14: maxOn/minOn over a tag (all-nullary ADT) column must NOT push
-//    down. SQLite would compare constructor names alphabetically ('Low' >
-//    'High') and hand back a bare Text, silently diverging from Knot's Ord
-//    semantics. The pushdown must be rejected so this can never produce a
-//    wrong answer. (In-memory ADT comparison via maxOn is a separate
-//    limitation — what matters here is that no silently-wrong value escapes.)
-
-#[test]
-fn maxon_over_tag_column_does_not_push_down_wrong_answer() {
-    let (stdout, _stderr, _ok) = compile_and_run(
-        "maxon_tag_col",
-        r#"data Level = Low {} | High {}
-
-impl Eq Level where
-  eq = \a b -> show a == show b
-
-impl Ord Level where
-  compare = \a b -> case a of
-    Low x -> case b of
-      Low y -> EQ {}
-      _ -> LT {}
-    High x -> case b of
-      High y -> EQ {}
-      _ -> GT {}
-
-type T = {lvl: Level, n: Int 1}
-*t : [T]
-
-main = do
-  replace *t = [{lvl (Low {}) n 1}, {lvl (High {}) n 2}]
-  -- Ord says Low < High, so the true max is High. A byte-wise SQL MAX over
-  -- the tag strings would wrongly pick 'Low' ('L' > 'H') as bare Text.
-  with {top (maxOn (\r -> r.lvl) *t)} (do
-    println ("top: " ++ show top))
-"#,
-    );
-    // Must never emit the byte-wise SQL MAX 'Low'. (Without pushdown the
-    // current runtime aborts on ADT comparison rather than returning a
-    // wrong value, which is acceptable; the corruption is what we guard.)
-    assert!(
-        !stdout.contains("top: Low"),
-        "tag maxOn must not push down to a byte-wise SQL MAX, got: {stdout}"
-    );
 }

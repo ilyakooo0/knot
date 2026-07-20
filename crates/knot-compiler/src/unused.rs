@@ -16,11 +16,7 @@
 //! injection / import resolution / desugaring so that only user code is in
 //! scope. Imports and prelude can never reference user-defined names anyway.
 
-use knot::ast::{
-    self, CaseArm, ConstructorDef, Constraint, Decl, DeclKind, Effect, Expr, ExprKind,
-    ImplItem, Pat, PatKind, PathSegment, RouteEntry, Stmt, StmtKind, TraitItem, Type,
-    TypeKind, TypeScheme,
-};
+use knot::ast::{CaseArm, ConstructorDef, Constraint, Decl, DeclKind, Effect, Expr, ExprKind, Pat, PatKind, PathSegment, RouteEntry, Stmt, StmtKind, Type, TypeKind, TypeScheme};
 use knot::diagnostic::Diagnostic;
 use std::collections::HashSet;
 
@@ -108,8 +104,8 @@ pub fn check(decls: &[Decl]) -> Vec<Diagnostic> {
                     diags.push(make_warning("derived relation", name, decl.span));
                 }
             }
-            // Skip everything else: traits/impls (implicitly used at dispatch),
-            // routes (top-level API surface), migrations, and subset constraints.
+            // Skip everything else: routes (top-level API surface),
+            // migrations, and subset constraints.
             _ => {}
         }
     }
@@ -130,7 +126,7 @@ where
         .any(|(j, r)| j != my_idx && get(r).contains(name))
 }
 
-fn make_warning(kind: &str, name: &str, span: ast::Span) -> Diagnostic {
+fn make_warning(kind: &str, name: &str, span: knot::ast::Span) -> Diagnostic {
     Diagnostic::warning(format!("unused {}: `{}`", kind, name))
         .label(span, "defined here but never used")
         .note("prefix the name with `_` to silence this warning, mark it `export`, or remove it".to_string())
@@ -173,25 +169,6 @@ fn walk_decl(decl: &DeclKind, r: &mut Refs) {
                 walk_expr(b, r);
             }
         }
-        DeclKind::Trait { items, supertraits, .. } => {
-            for c in supertraits {
-                walk_constraint(c, r);
-            }
-            for item in items {
-                walk_trait_item(item, r);
-            }
-        }
-        DeclKind::Impl { args, constraints, items, .. } => {
-            for a in args {
-                walk_type(a, r);
-            }
-            for c in constraints {
-                walk_constraint(c, r);
-            }
-            for item in items {
-                walk_impl_item(item, r);
-            }
-        }
         DeclKind::Route { entries, .. } => {
             for e in entries {
                 walk_route_entry(e, r);
@@ -231,38 +208,6 @@ fn walk_scheme(s: &TypeScheme, r: &mut Refs) {
         walk_constraint(c, r);
     }
     walk_type(&s.ty, r);
-}
-
-fn walk_trait_item(item: &TraitItem, r: &mut Refs) {
-    match item {
-        TraitItem::Method { ty, default_body, default_params, .. } => {
-            walk_scheme(ty, r);
-            for p in default_params {
-                walk_pat(p, r);
-            }
-            if let Some(b) = default_body {
-                walk_expr(b, r);
-            }
-        }
-        TraitItem::AssociatedType { .. } => {}
-    }
-}
-
-fn walk_impl_item(item: &ImplItem, r: &mut Refs) {
-    match item {
-        ImplItem::Method { params, body, .. } => {
-            for p in params {
-                walk_pat(p, r);
-            }
-            walk_expr(body, r);
-        }
-        ImplItem::AssociatedType { args, ty, .. } => {
-            for a in args {
-                walk_type(a, r);
-            }
-            walk_type(ty, r);
-        }
-    }
 }
 
 fn walk_route_entry(e: &RouteEntry, r: &mut Refs) {
@@ -499,7 +444,7 @@ fn walk_effect(e: &Effect, r: &mut Refs) {
 mod tests {
     use super::*;
 
-    fn parse(src: &str) -> ast::Module {
+    fn parse(src: &str) -> knot::ast::Module {
         let lexer = knot::lexer::Lexer::new(src);
         let (tokens, lex_diags) = lexer.tokenize();
         assert!(

@@ -167,32 +167,6 @@ fn units_match_across_a_module_boundary() {
     );
 }
 
-// ── 3. Impls of a trait from another module cross the export filter ──────
-
-#[test]
-fn impl_of_a_trait_declared_elsewhere_survives_the_export_filter() {
-    let s = Scratch::new("export_impls");
-    // `circle` exports its data type but declares no trait of its own — the
-    // trait it implements comes from `shapes`. Its `impl` used to be dropped
-    // because only impls of traits the module itself exported were kept.
-    s.write("shapes.knot", "export trait Area a where\n  area : a -> Float 1\n");
-    s.write(
-        "circle.knot",
-        "import ./shapes\n\nexport data Circle = Circle {radius: Float 1}\n\n\
-         impl Area Circle where\n  area = \\c -> case c of\n    Circle x -> 3.14 * x.radius * x.radius\n",
-    );
-    s.write(
-        "main.knot",
-        "import ./circle\nimport ./shapes\n\nmain = do\n  \
-         println (show (area (Circle {radius 2.0})))\n  yield {}\n",
-    );
-
-    assert!(
-        s.build_and_run("main.knot", "main").contains("12.56"),
-        "the imported impl of `Area` must still be in scope"
-    );
-}
-
 // ── 4. A selective import must not claim the module for the program ──────
 
 #[test]

@@ -37,24 +37,6 @@ pub(crate) fn handle_folding_range(
                 collect_folding_ranges_expr(body, &doc.source, &mut ranges);
             }
             DeclKind::Fun { body: None, .. } => {}
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        collect_folding_ranges_expr(body, &doc.source, &mut ranges);
-                    }
-                }
-            }
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method {
-                        default_body: Some(body),
-                        ..
-                    } = item
-                    {
-                        collect_folding_ranges_expr(body, &doc.source, &mut ranges);
-                    }
-                }
-            }
             DeclKind::Migrate { using_fn, .. } => {
                 collect_folding_ranges_expr(using_fn, &doc.source, &mut ranges);
             }

@@ -411,13 +411,6 @@ fn export_filter(decls: Vec<ast::Decl>) -> Vec<ast::Decl> {
         .filter(|d| d.exported)
         .filter_map(|d| decl_name(&d.node))
         .collect();
-    let own_traits: HashSet<&str> = decls
-        .iter()
-        .filter_map(|d| match &d.node {
-            ast::DeclKind::Trait { name, .. } => Some(name.as_str()),
-            _ => None,
-        })
-        .collect();
     decls
         .iter()
         .filter(|d| {
@@ -428,15 +421,6 @@ fn export_filter(decls: Vec<ast::Decl>) -> Vec<ast::Decl> {
                     // of a module's interface, and are always visible.
                     ast::DeclKind::Migrate { .. }
                     | ast::DeclKind::SubsetConstraint { .. } => true,
-                    // An impl is visible with the trait it implements. A trait
-                    // this module declares must be exported to carry its impls
-                    // out; a trait from anywhere else (another module, the
-                    // prelude) is already visible to the importer, so its impls
-                    // travel with the module that defines them.
-                    ast::DeclKind::Impl { trait_name, .. } => {
-                        !own_traits.contains(trait_name.as_str())
-                            || exported_names.contains(trait_name)
-                    }
                     _ => false,
                 }
         })
@@ -444,37 +428,9 @@ fn export_filter(decls: Vec<ast::Decl>) -> Vec<ast::Decl> {
         .collect()
 }
 
-/// The names a selective import pulls in: the ones it lists, plus data types
-/// defined in the same module that a selected trait's methods mention (e.g.
-/// `Ordering` for `Ord`), which imported impls would otherwise reference
-/// without a definition in scope.
-fn selected_names(visible: &[ast::Decl], items: &[ast::ImportItem]) -> HashSet<String> {
-    let mut names: HashSet<String> = items.iter().map(|i| i.name.clone()).collect();
-    let data_names: Vec<&str> = visible
-        .iter()
-        .filter_map(|d| match &d.node {
-            ast::DeclKind::Data { name, .. } => Some(name.as_str()),
-            _ => None,
-        })
-        .collect();
-    let mut extra: Vec<String> = Vec::new();
-    for d in visible {
-        if let ast::DeclKind::Trait { name, items, .. } = &d.node
-            && names.contains(name.as_str())
-        {
-            for item in items {
-                if let ast::TraitItem::Method { ty, .. } = item {
-                    for data_name in &data_names {
-                        if type_references_name(&ty.ty, data_name) {
-                            extra.push((*data_name).to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    names.extend(extra);
-    names
+/// The names a selective import pulls in.
+fn selected_names(_visible: &[ast::Decl], items: &[ast::ImportItem]) -> HashSet<String> {
+    items.iter().map(|i| i.name.clone()).collect()
 }
 
 /// The namespace a declaration's name occupies. Names in different namespaces
@@ -486,7 +442,6 @@ enum Namespace {
     Value,
     Relation,
     Type,
-    Trait,
 }
 
 /// The name a declaration *defines*, and the namespace it defines it in.
@@ -506,10 +461,7 @@ fn duplicate_key(decl: &ast::DeclKind) -> Option<(Namespace, String)> {
         | ast::DeclKind::TypeAlias { name, .. }
         | ast::DeclKind::Route { name, .. }
         | ast::DeclKind::RouteComposite { name, .. } => Some((Namespace::Type, name.clone())),
-        ast::DeclKind::Trait { name, .. } => Some((Namespace::Trait, name.clone())),
-        ast::DeclKind::Impl { .. }
-        | ast::DeclKind::Migrate { .. }
-        | ast::DeclKind::SubsetConstraint { .. } => None,
+        ast::DeclKind::Migrate { .. } | ast::DeclKind::SubsetConstraint { .. } => None,
     }
 }
 
@@ -522,12 +474,9 @@ fn decl_name(decl: &ast::DeclKind) -> Option<String> {
         | ast::DeclKind::View { name, .. }
         | ast::DeclKind::Derived { name, .. }
         | ast::DeclKind::Fun { name, .. }
-        | ast::DeclKind::Trait { name, .. }
         | ast::DeclKind::Route { name, .. }
         | ast::DeclKind::RouteComposite { name, .. } => Some(name.clone()),
-        ast::DeclKind::Impl { .. }
-        | ast::DeclKind::Migrate { .. }
-        | ast::DeclKind::SubsetConstraint { .. } => None,
+        ast::DeclKind::Migrate { .. } | ast::DeclKind::SubsetConstraint { .. } => None,
     }
 }
 
@@ -568,9 +517,6 @@ fn should_include_decl(decl: &ast::Decl, names: &HashSet<String>) -> bool {
         ast::DeclKind::View { name, .. } => names.contains(name.as_str()),
         ast::DeclKind::Derived { name, .. } => names.contains(name.as_str()),
         ast::DeclKind::Fun { name, .. } => names.contains(name.as_str()),
-        // Traits and impls: include if trait name is in the list
-        ast::DeclKind::Trait { name, .. } => names.contains(name.as_str()),
-        ast::DeclKind::Impl { trait_name, .. } => names.contains(trait_name.as_str()),
         // Routes
         ast::DeclKind::Route { name, .. } => names.contains(name.as_str()),
         ast::DeclKind::RouteComposite { name, .. } => names.contains(name.as_str()),

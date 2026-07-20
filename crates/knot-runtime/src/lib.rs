@@ -6084,6 +6084,24 @@ pub extern "C-unwind" fn knot_relation_drop(
     }
 }
 
+/// `take n x` overloaded on Text and relation — dispatches on the value tag.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_take(n: *mut Value, x: *mut Value) -> *mut Value {
+    match unsafe { as_ref(x) } {
+        Value::Text(_) => knot_text_take(n, x),
+        _ => knot_relation_take(n, x),
+    }
+}
+
+/// `drop n x` overloaded on Text and relation — dispatches on the value tag.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_drop(n: *mut Value, x: *mut Value) -> *mut Value {
+    match unsafe { as_ref(x) } {
+        Value::Text(_) => knot_text_drop(n, x),
+        _ => knot_relation_drop(n, x),
+    }
+}
+
 /// Sort a relation by a key function, returning a new relation.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_sort_by(
@@ -9636,6 +9654,88 @@ pub extern "C-unwind" fn knot_relation_traverse_kind(
         };
     }
     knot_relation_traverse(db, func, rel)
+}
+
+/// forEach(rel, action) — IO-effect iterator over a relation. Relation-FIRST
+/// arg order (unlike knot_relation_map). Returns an `IO {}` thunk: nothing
+/// runs until the thunk is executed (mirroring knot_io_bind laziness). On
+/// execution, calls `action` on each row via knot_value_call and immediately
+/// runs the resulting IO for its side effect, in row order, discarding each
+/// result. The action's effect row propagates to the caller at the type
+/// level (`forEach : [a] -> (a -> IO {|r} {}) -> IO {|r} {}`).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_relation_for_each(
+    db: *mut c_void,
+    rel: *mut Value,
+    action: *mut Value,
+) -> *mut Value {
+    let _ = db;
+    let env = alloc(Value::Pair(rel, action));
+
+    extern "C-unwind" fn for_each_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let (rel, action) = pair_unpack(env);
+        match unsafe { as_ref(rel) } {
+            Value::Relation(rows) => {
+                for &row in rows {
+                    let io = knot_value_call(db, action, row);
+                    knot_io_run(db, io);
+                }
+            }
+            Value::Unit => {}
+            _ => panic!(
+                "knot runtime: forEach expected Relation, got {}",
+                type_name(rel)
+            ),
+        }
+        alloc(Value::Unit)
+    }
+
+    alloc(Value::IO(for_each_thunk as *const u8, env))
+}
+
+/// head(rel) — first element of a relation as `Just {value: x}`, or
+/// `Nothing {}` on the empty relation. Relation-FIRST arg order.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_relation_head(rel: *mut Value) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: head expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    if let Some(&first) = rows.first() {
+        knot_maybe_yield(first)
+    } else {
+        knot_maybe_empty()
+    }
+}
+
+/// findFirst(rel, pred) — first row satisfying `pred` as `Just {value: x}`,
+/// else `Nothing {}`. Relation-FIRST arg order. Short-circuits on the first
+/// match.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_relation_find_first(
+    db: *mut c_void,
+    rel: *mut Value,
+    pred: *mut Value,
+) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: findFirst expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    for &row in rows {
+        let v = knot_value_call(db, pred, row);
+        match unsafe { as_ref(v) } {
+            Value::Bool(true) => return knot_maybe_yield(row),
+            Value::Bool(false) => {}
+            _ => panic!("knot runtime: findFirst predicate must return Bool"),
+        }
+    }
+    knot_maybe_empty()
 }
 
 /// Sequence [IO a] into IO [a] — creates a single IO thunk that runs each action in order.
@@ -14956,6 +15056,59 @@ pub extern "C-unwind" fn knot_random_uuid() -> *mut Value {
 }
 
 // ── Subset constraints ────────────────────────────────────────────
+
+// ── Maybe monad operations ───────────────────────────────────────
+
+/// Maybe.bind: (a -> Maybe b) -> Maybe a -> Maybe b
+/// If Just {value: v}, apply function to v. If Nothing, propagate.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_maybe_bind(
+    db: *mut c_void,
+    func: *mut Value,
+    maybe: *mut Value,
+) -> *mut Value {
+    match unsafe { as_ref(maybe) } {
+        Value::Constructor(tag, payload) if &**tag == "Just" => {
+            let v = knot_record_field(*payload, "value".as_ptr(), "value".len());
+            knot_value_call(db, func, v)
+        }
+        Value::Constructor(tag, _) if &**tag == "Nothing" => maybe,
+        _ => maybe,
+    }
+}
+
+/// Maybe.yield (pure/return): a -> Maybe a
+/// Wraps value in Just {value: a}
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_maybe_yield(value: *mut Value) -> *mut Value {
+    let rec = alloc(Value::Record(vec![
+        RecordField { name: "value".into(), value },
+    ]));
+    alloc(Value::Constructor("Just".into(), rec))
+}
+
+/// Maybe.map: (a -> b) -> Maybe a -> Maybe b
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_maybe_map(
+    db: *mut c_void,
+    func: *mut Value,
+    maybe: *mut Value,
+) -> *mut Value {
+    match unsafe { as_ref(maybe) } {
+        Value::Constructor(tag, payload) if &**tag == "Just" => {
+            let v = knot_record_field(*payload, "value".as_ptr(), "value".len());
+            knot_maybe_yield(knot_value_call(db, func, v))
+        }
+        Value::Constructor(tag, _) if &**tag == "Nothing" => maybe,
+        _ => maybe,
+    }
+}
+
+/// Maybe.empty: Maybe a (always Nothing)
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_maybe_empty() -> *mut Value {
+    alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit)))
+}
 
 // ── Result monad operations ──────────────────────────────────────
 

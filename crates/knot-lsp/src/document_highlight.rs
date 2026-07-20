@@ -2,7 +2,7 @@
 
 use lsp_types::*;
 
-use crate::rename::{collect_name_uses_in_decl, is_at_record_field, owner_trait_method_scope};
+use crate::rename::{collect_name_uses_in_decl, is_at_record_field};
 use crate::state::ServerState;
 use crate::utils::{ident_lookup_offset, position_to_offset, span_to_range, word_at_position};
 
@@ -65,13 +65,9 @@ pub(crate) fn handle_document_highlight(
         let word = word_at_position(&doc.source, pos)?;
         let (owner_path, decl_span) = doc.import_defs.get(word)?;
         let symbol_name = word.to_string();
-        // Trait-method scope: confine impl-method highlights to the imported
-        // method's own trait(s) (empty for non-trait-method symbols), mirroring
-        // the rename / references oracle.
-        let target_traits = owner_trait_method_scope(state, owner_path, *decl_span, &symbol_name);
         let mut sites = Vec::new();
         for decl in &doc.module.decls {
-            collect_name_uses_in_decl(decl, &symbol_name, &doc.source, &target_traits, &mut sites);
+            collect_name_uses_in_decl(decl, &symbol_name, &doc.source, &mut sites);
         }
         // The import item that surfaces the name (`import ./m {name}`) is also a
         // local occurrence worth highlighting.

@@ -449,48 +449,6 @@ impl EffectChecker {
                 _ => None,
             })
             .collect();
-        // Store each method's params alongside its body so the effect walk
-        // can push them as shadowing binders: a param named after an IO
-        // builtin (e.g. `pretty now = show now`) must shadow the builtin, or
-        // the method's inferred effects are poisoned (here, a spurious
-        // `{clock}` from the `now` builtin). See `push_masking_binders`.
-        let mut method_bodies: std::collections::BTreeMap<
-            String,
-            Vec<(&[ast::Pat], &ast::Expr)>,
-        > = std::collections::BTreeMap::new();
-        for decl in &module.decls {
-            match &decl.node {
-                ast::DeclKind::Impl { items, .. } => {
-                    for item in items {
-                        if let ast::ImplItem::Method { name, params, body, .. } = item
-                            && !fun_names.contains(name.as_str()) {
-                                method_bodies
-                                    .entry(name.clone())
-                                    .or_default()
-                                    .push((params.as_slice(), body));
-                            }
-                    }
-                }
-                ast::DeclKind::Trait { items, .. } => {
-                    for item in items {
-                        if let ast::TraitItem::Method {
-                            name,
-                            default_params,
-                            default_body: Some(body),
-                            ..
-                        } = item
-                            && !fun_names.contains(name.as_str()) {
-                                method_bodies
-                                    .entry(name.clone())
-                                    .or_default()
-                                    .push((default_params.as_slice(), body));
-                            }
-                    }
-                }
-                _ => {}
-            }
-        }
-
         // Group declarations so the final diagnostic pass keeps a stable
         // order (derived, then views, then funs).
         let mut derived = Vec::new();
@@ -534,23 +492,6 @@ impl EffectChecker {
                     changed = true;
                 }
             }
-            // Trait methods: union of all impl bodies and the trait
-            // default body, so trait-method call sites are sound for the
-            // atomic gate and relation reads/writes inside impls are
-            // visible.
-            for (name, bodies) in &method_bodies {
-                let mut effects = EffectSet::empty();
-                for (params, body) in bodies {
-                    let mark = self.push_masking_binders(params.iter());
-                    effects = effects.union(&self.fun_body_effects(body));
-                    self.pop_masking_binders(mark);
-                }
-                let old = self.decl_effects.get(name);
-                if old.is_none_or(|o| *o != effects) {
-                    self.decl_effects.insert(name.clone(), effects);
-                    changed = true;
-                }
-            }
             self.diagnostics = saved_diags;
             if !changed { break; }
         }
@@ -588,19 +529,6 @@ impl EffectChecker {
                         changed = true;
                     }
                 }
-                for (name, bodies) in &method_bodies {
-                    let mut effects = EffectSet::empty();
-                    for (params, body) in bodies {
-                        let mark = self.push_masking_binders(params.iter());
-                        effects = effects.union(&self.fun_body_effects(body));
-                        self.pop_masking_binders(mark);
-                    }
-                    let old = self.decl_effects_atomic_safe.get(name);
-                    if old.is_none_or(|o| *o != effects) {
-                        self.decl_effects_atomic_safe.insert(name.clone(), effects);
-                        changed = true;
-                    }
-                }
                 if !changed { break; }
             }
             self.diagnostics = saved_diags;
@@ -617,24 +545,6 @@ impl EffectChecker {
         for decl in &funs {
             self.process_decl(decl);
         }
-        // Impl-method and trait-default bodies were only walked with
-        // diagnostics suppressed during the fixpoint — walk them once more
-        // so atomic-safety violations inside them are reported. Set
-        // `current_decl_name` per method group and register the body under it
-        // so the Atomic arm's enclosing-body root lookup (decl_bodies) resolves
-        // to the method's own body — not a stale leftover from the last
-        // top-level fun, which produced both false negatives (a laundered IO
-        // lambda in the method's own scope was missed) and false positives.
-        for (name, bodies) in &method_bodies {
-            self.current_decl_name = Some(name.clone());
-            for (params, body) in bodies {
-                self.decl_bodies.insert(name.clone(), (**body).clone());
-                let mark = self.push_masking_binders(params.iter());
-                let _ = self.fun_body_effects(body);
-                self.pop_masking_binders(mark);
-            }
-        }
-        self.current_decl_name = None;
     }
 
     fn process_decl(&mut self, decl: &ast::Decl) {

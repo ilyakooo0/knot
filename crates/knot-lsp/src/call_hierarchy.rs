@@ -42,7 +42,7 @@ pub(crate) fn handle_call_hierarchy_prepare(
             DeclKind::Source { name, .. }
             | DeclKind::View { name, .. }
             | DeclKind::Derived { name, .. } => name,
-            DeclKind::Data { name, .. } | DeclKind::Trait { name, .. } => name,
+            DeclKind::Data { name, .. } => name,
             _ => continue,
         };
         if name != word {
@@ -75,7 +75,6 @@ pub(crate) fn handle_call_hierarchy_prepare(
         let kind = match &decl.node {
             DeclKind::Fun { .. } => SymbolKind::FUNCTION,
             DeclKind::Data { .. } => SymbolKind::STRUCT,
-            DeclKind::Trait { .. } => SymbolKind::INTERFACE,
             _ => SymbolKind::VARIABLE,
         };
 
@@ -152,7 +151,6 @@ pub(crate) fn handle_call_hierarchy_incoming(
             .map(|d| match &d.node {
                 DeclKind::Fun { .. } | DeclKind::View { .. } | DeclKind::Derived { .. } => SymbolKind::FUNCTION,
                 DeclKind::Data { .. } => SymbolKind::STRUCT,
-                DeclKind::Trait { .. } => SymbolKind::INTERFACE,
                 _ => SymbolKind::VARIABLE,
             })
             .unwrap_or(SymbolKind::FUNCTION);
@@ -179,10 +177,6 @@ pub(crate) fn handle_call_hierarchy_incoming(
     // — scope-aware, so shadowed locals are skipped — mirroring `references.rs`.
     let owner_path = uri_to_path(target_uri).and_then(|p| p.canonicalize().ok());
     if let Some(owner_path) = owner_path {
-        // A trait method could over-collect across unrelated impls; call
-        // hierarchy incoming is dominated by ordinary function calls, so an
-        // empty trait scope (no confinement) is the safe, simple default.
-        let target_traits: HashSet<String> = HashSet::new();
         for (other_uri, other_doc) in &state.documents {
             if other_uri == target_uri {
                 continue;
@@ -209,13 +203,7 @@ pub(crate) fn handle_call_hierarchy_incoming(
                     _ => continue,
                 };
                 let mut sites: Vec<Span> = Vec::new();
-                collect_name_uses_in_decl(
-                    decl,
-                    target_name,
-                    &other_doc.source,
-                    &target_traits,
-                    &mut sites,
-                );
+                collect_name_uses_in_decl(decl, target_name, &other_doc.source, &mut sites);
                 if sites.is_empty() {
                     continue;
                 }
@@ -335,7 +323,6 @@ pub(crate) fn handle_call_hierarchy_outgoing(
             .map(|d| match &d.node {
                 DeclKind::Fun { .. } | DeclKind::View { .. } | DeclKind::Derived { .. } => SymbolKind::FUNCTION,
                 DeclKind::Data { .. } => SymbolKind::STRUCT,
-                DeclKind::Trait { .. } => SymbolKind::INTERFACE,
                 _ => SymbolKind::VARIABLE,
             })
             .unwrap_or(SymbolKind::FUNCTION);

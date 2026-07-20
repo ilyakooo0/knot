@@ -1,30 +1,9 @@
--- Generic monadic do-blocks with Result
+-- Monadic do-blocks with Result
 --
 -- Result e a represents a computation that can fail with an error of type e
--- or succeed with a value of type a. Like Maybe, it uses the prelude's trait
--- hierarchy (Functor, Applicative, Monad). Errors short-circuit through bind.
-
-data Result e a = Err {error: e} | Ok {value: a}
-
--- Implementations for Result
-
-impl Functor (Result e) where
-  map f m = case m of
-    Err {error error} -> Err {error error}
-    Ok {value value} -> Ok {value (f value)}
-
-impl Applicative (Result e) where
-  yield x = Ok {value x}
-  ap fs xs = case fs of
-    Err {error error} -> Err {error error}
-    Ok {value f} -> case xs of
-      Err {error error} -> Err {error error}
-      Ok {value x} -> Ok {value (f x)}
-
-impl Monad (Result e) where
-  bind f m = case m of
-    Err {error error} -> Err {error error}
-    Ok {value value} -> f value
+-- or succeed with a value of type a. Result's monad operations are intrinsic
+-- builtins (the Functor/Applicative/Monad impls were removed with the trait
+-- system). Errors short-circuit through bind.
 
 -- Test: basic do-block chaining with Result
 safeDivide = \x y -> if y == 0 then Err {error "division by zero"} else Ok {value (x / y)}

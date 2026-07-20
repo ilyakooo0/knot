@@ -225,21 +225,6 @@ impl TypeEnv {
                         aliases.insert(name.clone(), ResolvedType::Adt(adt_ctors));
                     }
                 }
-                DeclKind::Impl { items, .. } => {
-                    for item in items {
-                        if let ImplItem::AssociatedType { name, args, ty } =
-                            item
-                        {
-                            associated_types
-                                .entry(name.clone())
-                                .or_default()
-                                .push(AssocTypeDef {
-                                    args: args.clone(),
-                                    ty: ty.clone(),
-                                });
-                        }
-                    }
-                }
                 _ => {}
             }
         }

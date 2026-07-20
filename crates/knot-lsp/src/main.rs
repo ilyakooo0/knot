@@ -36,7 +36,6 @@ mod semantic_tokens;
 mod shared;
 mod signature_help;
 mod state;
-mod type_hierarchy;
 #[cfg(test)]
 mod test_support;
 mod type_format;
@@ -67,9 +66,7 @@ use crate::document_link::handle_document_link;
 use crate::document_symbol::handle_document_symbol;
 use crate::folding::handle_folding_range;
 use crate::formatting::{handle_formatting, handle_on_type_formatting, handle_range_formatting};
-use crate::goto::{
-    handle_goto_definition, handle_goto_implementation, handle_goto_type_definition,
-};
+use crate::goto::{handle_goto_definition, handle_goto_type_definition};
 use crate::hover::handle_hover;
 use crate::inlay_hints::handle_inlay_hint;
 use crate::legend::semantic_token_legend;
@@ -84,10 +81,6 @@ use crate::signature_help::handle_signature_help;
 use crate::state::{
     send_internal_error, send_invalid_params, send_method_not_found, send_response,
     AnalysisResult, AnalysisTask, PendingSource, ServerConfig, ServerState, WorkspaceSymbolCache,
-};
-use crate::type_hierarchy::{
-    handle_prepare_type_hierarchy, handle_type_hierarchy_subtypes,
-    handle_type_hierarchy_supertypes,
 };
 use crate::utils::{offset_to_position, position_to_offset, uri_to_path};
 use crate::workspace_diagnostics::{
@@ -124,7 +117,6 @@ fn main() {
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
-        implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".into(), "*".into(), "&".into(), "/".into()]),
@@ -214,17 +206,6 @@ fn main() {
         ..Default::default()
     })
     .expect("server capabilities are static and always serialize cleanly");
-
-    // Advertise typeHierarchyProvider directly in the JSON — lsp-types 0.97
-    // doesn't yet model this field on `ServerCapabilities`, but the wire
-    // protocol accepts it. The handlers route `textDocument/prepareTypeHierarchy`
-    // and the supertype/subtype follow-ups manually.
-    if let Some(obj) = server_capabilities.as_object_mut() {
-        obj.insert(
-            "typeHierarchyProvider".into(),
-            serde_json::Value::Bool(true),
-        );
-    }
 
     let init_params = match connection.initialize(server_capabilities) {
         Ok(params) => params,
@@ -991,7 +972,6 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
     try_handle!(&req, conn, request::DocumentSymbolRequest, |p| handle_document_symbol(state, &p));
     try_handle!(&req, conn, request::GotoDefinition, |p| handle_goto_definition(state, &p));
     try_handle!(&req, conn, request::GotoTypeDefinition, |p| handle_goto_type_definition(state, &p));
-    try_handle!(&req, conn, request::GotoImplementation, |p| handle_goto_implementation(state, &p));
     try_handle!(&req, conn, request::HoverRequest, |p| handle_hover(state, &p));
     try_handle!(&req, conn, request::Completion, |p| handle_completion(state, &p));
     try_handle!(&req, conn, request::References, |p| handle_references(state, &p));
@@ -1046,10 +1026,6 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
         Cast::Other => {}
     }
     try_handle!(&req, conn, request::WillRenameFiles, |p| handle_will_rename_files(state, &p));
-    try_handle!(&req, conn, request::TypeHierarchyPrepare, |p| handle_prepare_type_hierarchy(state, &p));
-    try_handle!(&req, conn, request::TypeHierarchySupertypes, |p| handle_type_hierarchy_supertypes(state, &p));
-    try_handle!(&req, conn, request::TypeHierarchySubtypes, |p| handle_type_hierarchy_subtypes(state, &p));
-
     // Fallback: every known method is handled above, so reaching here means
     // the client sent something we don't implement. Replying with
     // `MethodNotFound` (-32601) is mandatory — without a response the client

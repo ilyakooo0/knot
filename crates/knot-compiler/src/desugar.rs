@@ -79,12 +79,9 @@ fn detect_io_functions(decls: &[Decl]) -> IoFns {
         .collect();
 
     let mut fun_bodies: Vec<(&str, &Expr)> = Vec::new();
-    let mut method_bodies: Vec<(&str, &Expr)> = Vec::new();
-    let mut trait_sig_io: HashSet<String> = HashSet::new();
     // Collect function names whose declared type returns IO, so the
-    // fixpoint seed recognizes them even when the body's IO is only
-    // through trait-method calls (e.g. `yield`) that expr_contains_io
-    // can't see. Mirrors the trait-signature seeding for `trait_sig_io`.
+    // fixpoint seed recognizes them even when the body's IO is not
+    // syntactically visible to expr_contains_io.
     let mut fun_sig_io: HashSet<String> = HashSet::new();
     for decl in decls {
         match &decl.node {
@@ -96,31 +93,6 @@ fn detect_io_functions(decls: &[Decl]) -> IoFns {
             }
             DeclKind::Fun { name, body: Some(body), .. } => {
                 fun_bodies.push((name, body));
-            }
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let TraitItem::Method {
-                        name,
-                        ty,
-                        default_body,
-                        ..
-                    } = item
-                    {
-                        if type_returns_io(&ty.ty) {
-                            trait_sig_io.insert(name.clone());
-                        }
-                        if let Some(body) = default_body {
-                            method_bodies.push((name, body));
-                        }
-                    }
-                }
-            }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ImplItem::Method { name, body, .. } = item {
-                        method_bodies.push((name, body));
-                    }
-                }
             }
             _ => {}
         }
@@ -148,22 +120,17 @@ fn detect_io_functions(decls: &[Decl]) -> IoFns {
         }
     }
 
-    // Base set: Fun bodies plus impl/trait-default method bodies — mirrors
-    // codegen's detect_io_functions (which scans the same body kinds), so
-    // exclusion driven by this set always lines up with codegen's
-    // is_io_do_block routing to compile_io_do.
-    let mut all_bodies = fun_bodies;
-    all_bodies.extend(method_bodies);
+    // Base set: Fun bodies — mirrors codegen's detect_io_functions (which
+    // scans the same body kinds), so exclusion driven by this set always
+    // lines up with codegen's is_io_do_block routing to compile_io_do.
+    let all_bodies = fun_bodies;
     let mut base = HashSet::new();
     base.extend(fun_sig_io.clone());
     fixpoint(&all_bodies, &io_builtins, &mut base);
 
-    // Full set: additionally seeded with trait-signature IO methods (a
-    // declared `IO ...` return type is authoritative even when no impl body
-    // in this module syntactically reveals IO), then re-fixpointed so
-    // functions calling such methods are recognized too.
+    // Full set: additionally seeded with IO-signature functions, then
+    // re-fixpointed so functions calling them are recognized too.
     let mut all = base.clone();
-    all.extend(trait_sig_io);
     all.extend(fun_sig_io);
     fixpoint(&all_bodies, &io_builtins, &mut all);
 
@@ -405,24 +372,6 @@ fn desugar_decl(decl: &mut DeclKind, io_fns: &IoFns, source_vars: &HashSet<Strin
         }
         DeclKind::Derived { body, .. } => desugar_expr(body, io_fns, source_vars),
         DeclKind::Migrate { using_fn, .. } => desugar_expr(using_fn, io_fns, source_vars),
-        DeclKind::Impl { items, .. } => {
-            for item in items {
-                if let ImplItem::Method { body, .. } = item {
-                    desugar_expr(body, io_fns, source_vars);
-                }
-            }
-        }
-        DeclKind::Trait { items, .. } => {
-            for item in items {
-                if let TraitItem::Method {
-                    default_body: Some(body),
-                    ..
-                } = item
-                {
-                    desugar_expr(body, io_fns, source_vars);
-                }
-            }
-        }
         DeclKind::Route { entries, .. } => {
             // A route's `rateLimit` expression (e.g. its `key` lambda body) can
             // contain a `do` block. It is otherwise never visited by

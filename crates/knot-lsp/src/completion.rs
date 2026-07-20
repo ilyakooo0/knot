@@ -417,13 +417,6 @@ pub(crate) fn handle_completion(
                         ..Default::default()
                     });
                 }
-                DeclKind::Trait { name, .. } => {
-                    items.push(CompletionItem {
-                        label: name.clone(),
-                        kind: Some(CompletionItemKind::INTERFACE),
-                        ..Default::default()
-                    });
-                }
                 _ => {}
             }
         }
@@ -540,14 +533,6 @@ pub(crate) fn handle_completion(
                     detail: doc.type_info.get(name.as_str()).cloned(),
                     insert_text: snippet,
                     insert_text_format: Some(InsertTextFormat::SNIPPET),
-                    ..Default::default()
-                });
-            }
-            DeclKind::Trait { name, .. } => {
-                items.push(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(CompletionItemKind::INTERFACE),
-                    detail: doc.details.get(name).cloned(),
                     ..Default::default()
                 });
             }
@@ -688,7 +673,6 @@ pub(crate) fn handle_completion(
                     DeclKind::Fun { name, .. } => (name.clone(), CompletionItemKind::FUNCTION),
                     DeclKind::Data { name, .. } => (name.clone(), CompletionItemKind::STRUCT),
                     DeclKind::TypeAlias { name, .. } => (name.clone(), CompletionItemKind::STRUCT),
-                    DeclKind::Trait { name, .. } => (name.clone(), CompletionItemKind::INTERFACE),
                     _ => continue,
                 };
                 // Skip names already defined locally or already suggested
@@ -1106,20 +1090,6 @@ fn find_enclosing_do_span(module: &Module, offset: usize) -> Option<Span> {
             }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => walk(body, offset, &mut best),
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method { default_body: Some(body), .. } = item {
-                        walk(body, offset, &mut best);
-                    }
-                }
-            }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, offset, &mut best);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -1156,14 +1126,6 @@ fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -
                 if body.span.start <= offset && offset < body.span.end => {
                     return SnippetContext::Expression;
                 }
-            ast::DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item
-                        && body.span.start <= offset && offset < body.span.end {
-                            return SnippetContext::Expression;
-                        }
-                }
-            }
             _ => {}
         }
     }
@@ -1780,26 +1742,10 @@ pub(crate) fn handle_resolve_completion_item(
         if let Some(summary) = format_route_constructor_hover(&doc.module, &label) {
             push_unique(&mut sections, summary);
         }
-        // Trait method default body: when a method is declared with a default
-        // body, render the source so it's visible in the completion expansion.
-        if let Some(default_src) = trait_method_default_source(&doc.module, &doc.source, &label)
-        {
-            push_unique(
-                &mut sections,
-                format!("*Default impl:*\n```knot\n{default_src}\n```"),
-            );
-        }
         // Data constructor list: hovering over a type name shouldn't require
         // a separate trip — show the constructors inline.
         if let Some(ctors) = data_constructor_summary(&doc.module, &label) {
             push_unique(&mut sections, ctors);
-        }
-        // Trait dispatch: when the user is completing a method declared by a
-        // trait, list the types that supply it. The companion code-lens shows
-        // the same info inline in the source — completion resolve makes it
-        // discoverable from the picker too.
-        if let Some(dispatch) = trait_method_dispatch_summary(&doc.module, &label) {
-            push_unique(&mut sections, dispatch);
         }
         // Function-level trait constraints: surface the `Display a => …`
         // requirements so the user notices that calling this function brings
@@ -1830,55 +1776,6 @@ pub(crate) fn handle_resolve_completion_item(
     item
 }
 
-/// If `name` resolves to a trait method declared in `module`, render a list
-/// of impls in the same module that supply the method. Returns `None` when
-/// the name isn't a trait method or no impls exist locally.
-fn trait_method_dispatch_summary(module: &Module, name: &str) -> Option<String> {
-    let mut owning_trait: Option<String> = None;
-    for decl in &module.decls {
-        if let DeclKind::Trait { name: tn, items, .. } = &decl.node {
-            for item in items {
-                if let ast::TraitItem::Method { name: mn, .. } = item
-                    && mn == name {
-                        owning_trait = Some(tn.clone());
-                    }
-            }
-        }
-    }
-    let trait_name = owning_trait?;
-    let mut providing: Vec<String> = Vec::new();
-    for decl in &module.decls {
-        if let DeclKind::Impl { trait_name: tn, args, items, .. } = &decl.node {
-            if tn != &trait_name {
-                continue;
-            }
-            let provides = items.iter().any(|i| {
-                matches!(i, ast::ImplItem::Method { name: n, .. } if n == name)
-            });
-            if !provides {
-                continue;
-            }
-            let label = args
-                .iter()
-                .map(|a| format_type_kind(&a.node))
-                .collect::<Vec<_>>()
-                .join(" ");
-            providing.push(label);
-        }
-    }
-    if providing.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "*Method of `{trait_name}`* — impls: {}",
-        providing
-            .iter()
-            .map(|t| format!("`{t}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ))
-}
-
 /// If `name` resolves to a function with declared trait constraints in
 /// `module`, render the constraint list. Returns `None` when no such
 /// function exists or it has no constraints.
@@ -1900,29 +1797,6 @@ fn function_constraint_summary(module: &Module, name: &str) -> Option<String> {
                     .collect();
                 return Some(format!("*Constraints:* {}", cs.join(", ")));
             }
-    }
-    None
-}
-
-/// If `name` resolves to a trait method with a default body in `module`,
-/// return the default-body source slice for completion preview.
-fn trait_method_default_source(module: &Module, source: &str, name: &str) -> Option<String> {
-    for decl in &module.decls {
-        if let DeclKind::Trait { items, .. } = &decl.node {
-            for item in items {
-                if let ast::TraitItem::Method {
-                    name: m,
-                    default_body: Some(body),
-                    ..
-                } = item
-                    && m == name {
-                        let s = body.span;
-                        if s.start < s.end && s.end <= source.len() {
-                            return Some(source[s.start..s.end].to_string());
-                        }
-                    }
-            }
-        }
     }
     None
 }

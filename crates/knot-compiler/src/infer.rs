@@ -167,23 +167,6 @@ pub type RefineTargets = HashMap<Span, String>;
 /// Refined type info exported for codegen: type_name → predicate expression.
 pub type RefinedTypeInfoMap = HashMap<String, knot::ast::Expr>;
 
-/// Resolved static dispatch types for trait method references, keyed by the
-/// span of the method's `Var` occurrence and the trait it belongs to.
-///
-/// Trait dispatch cannot key on a value's runtime constructor tag: two ADTs
-/// may declare the same constructor name (`data Shape = Circle … `,
-/// `data Blob = Circle …`), so a tag alone does not identify the type whose
-/// impl should run. Inference already resolves the trait's parameter to a
-/// concrete type at every monomorphic call site; recording it here lets
-/// codegen call that impl directly instead of guessing from the tag.
-///
-/// Keying on `(span, trait_name)` — not span alone — keeps a method's own
-/// trait separate from any supertrait or bound constraints instantiated at
-/// the same occurrence. A span is absent when the site is still polymorphic
-/// (e.g. inside a `Area a => a -> Float` function body), where the type is
-/// genuinely unknown until run time.
-pub type TraitCallTargets = HashMap<(Span, String), String>;
-
 /// Maps `show` call-site spans to the canonical unit string of the argument
 /// (e.g. `"M"`, `"M/S^2"`). Only concrete units appear: units are erased at
 /// runtime, so this is the sole channel by which the unit reaches the emitted
@@ -786,22 +769,6 @@ struct Infer {
     /// Names that are views (for lenient set checking).
     view_names: HashSet<String>,
 
-    /// Associated type names (from trait declarations).
-    assoc_type_names: HashSet<String>,
-
-    /// Associated-type definitions from impls, keyed by associated-type name.
-    /// Each entry is `(head, body, pattern_vars)` parsed from
-    /// `type AssocName <head> = <body>` (e.g. `type Elem [a] = a` stores head
-    /// `[a]`, body `a`, and the pattern var for `a`). Used to reduce
-    /// `Ty::Assoc(name, arg)` by matching `arg` against `head`.
-    assoc_impls: HashMap<String, Vec<(Ty, Ty, Vec<TyVar>)>>,
-
-    /// Re-entrancy depth of associated-type reduction during `apply`. Guards
-    /// against a self-referential type-family body (`type F X = F X`) that would
-    /// otherwise drive `apply → reduce_assoc → apply` into an unbounded
-    /// recursion and overflow the stack instead of stalling as a rigid Assoc.
-    assoc_reduce_depth: std::cell::Cell<u32>,
-
     /// Type aliases: name → resolved Ty.
     aliases: HashMap<String, Ty>,
 
@@ -894,23 +861,15 @@ struct Infer {
     /// solved by a later constraint. See `show_unit_strings`.
     show_calls: Vec<(Span, Ty)>,
 
-    /// Trait method → trait name mapping (e.g. "display" → "Display").
-    trait_method_traits: HashMap<String, String>,
-
-    /// Trait method → list of trait param TyVars in the method's scheme.
-    /// Used to map trait params to impl types during impl validation.
-    trait_method_param_vars: HashMap<String, Vec<TyVar>>,
-
-    /// Known trait implementations: (trait_name, type_name).
+    /// Known trait implementations: (trait_name, type_name). Only the
+    /// intrinsic operator kernel remains: `deriving (Eq, Ord, …)` registrations
+    /// plus the builtin primitive seeding in `check_inner` — these back the
+    /// `+`/`<`/`++`/unary-`-`/`==` operator checks.
     known_impls: HashSet<(String, String)>,
 
     /// Deferred trait constraint checks, resolved after inference.
     deferred_constraints: Vec<DeferredConstraint>,
 
-    /// Trait constraint instantiation sites: (occurrence span, trait name,
-    /// freshened trait-param var). Resolved after inference into
-    /// `TraitCallTargets` so codegen can dispatch on the static type.
-    trait_call_vars: Vec<(Span, String, TyVar)>,
     /// Next sequence number to stamp onto a pushed `DeferredConstraint`.
     next_constraint_seq: u64,
 
@@ -931,15 +890,6 @@ struct Infer {
     /// `resolve_effect_union`. Multiple bounds intersect (most restrictive wins).
     /// The `Span` anchors the violation diagnostic at the offending unify site.
     effect_union_upper_bounds: HashMap<TyVar, (BTreeSet<IoEffect>, Span)>,
-
-    /// Trait constraints declared in an enclosing function signature, keyed
-    /// by the skolem TyVar they apply to. Lets us reject use sites that
-    /// require a constraint not promised by the signature (e.g. using `<` on
-    /// `a -> a -> a` without `Ord a =>`).
-    declared_skolem_constraints: HashMap<TyVar, HashSet<String>>,
-
-    /// Trait definitions: trait_name → list of param names.
-    trait_params: HashMap<String, Vec<String>>,
 
     /// Spans of local variable bindings and their types (for LSP hover).
     binding_types: Vec<(Span, Ty)>,
@@ -1074,9 +1024,6 @@ impl Infer {
             source_types: HashMap::new(),
             derived_types: HashMap::new(),
             view_names: HashSet::new(),
-            assoc_type_names: HashSet::new(),
-            assoc_impls: HashMap::new(),
-            assoc_reduce_depth: std::cell::Cell::new(0),
             aliases: HashMap::new(),
             param_aliases: HashMap::new(),
             record_type_scopes: Vec::new(),
@@ -1094,18 +1041,13 @@ impl Infer {
             traverse_calls: Vec::new(),
             sum_calls: Vec::new(),
             from_json_calls: Vec::new(),
-            trait_call_vars: Vec::new(),
             show_calls: Vec::new(),
-            trait_method_traits: HashMap::new(),
-            trait_method_param_vars: HashMap::new(),
             known_impls: HashSet::new(),
             deferred_constraints: Vec::new(),
             next_constraint_seq: 0,
             pending_effect_unions: Vec::new(),
             effect_union_upper_bounds: HashMap::new(),
-            declared_skolem_constraints: HashMap::new(),
             binding_types: Vec::new(),
-            trait_params: HashMap::new(),
             fetch_response_types: HashMap::new(),
             route_entries_by_api: HashMap::new(),
             fetch_response_headers: HashMap::new(),
@@ -1686,132 +1628,7 @@ impl Infer {
             Ty::Alias(name, inner) => {
                 Ty::Alias(name.clone(), Box::new(self.apply_impl(inner, excluded)))
             }
-            Ty::Assoc(name, inner) => {
-                let inner = self.apply_impl(inner, excluded);
-                // Reduce once the argument is concrete enough to match an
-                // impl's associated-type head; otherwise stay a rigid Assoc.
-                // Bound the reduction depth: a self-referential family body
-                // (`type F X = F X`) would loop here forever, so once we exceed
-                // the cap we leave the projection rigid rather than overflow.
-                const MAX_ASSOC_REDUCE_DEPTH: u32 = 100;
-                if self.assoc_reduce_depth.get() >= MAX_ASSOC_REDUCE_DEPTH {
-                    return Ty::Assoc(name.clone(), Box::new(inner));
-                }
-                self.assoc_reduce_depth.set(self.assoc_reduce_depth.get() + 1);
-                let result = match self.reduce_assoc(name, &inner) {
-                    Some(reduced) => reduced,
-                    None => Ty::Assoc(name.clone(), Box::new(inner)),
-                };
-                self.assoc_reduce_depth.set(self.assoc_reduce_depth.get() - 1);
-                result
-            }
             _ => ty.clone(),
-        }
-    }
-
-    /// Try to reduce an associated-type projection `AssocName arg` to a
-    /// concrete type by matching `arg` against the head of an impl definition
-    /// `type AssocName <head> = <body>` and substituting into `<body>`. Returns
-    /// `None` when `arg` doesn't (yet) match any head — e.g. it's still a
-    /// variable — so the projection stays unresolved and rigid.
-    fn reduce_assoc(&self, name: &str, arg: &Ty) -> Option<Ty> {
-        let defs = self.assoc_impls.get(name)?;
-        for (head, body, pattern_vars) in defs {
-            let mut binding: HashMap<TyVar, Ty> = HashMap::new();
-            if self.match_pattern(head, arg, pattern_vars, &mut binding) {
-                // Apply the matched substitution to the body, then resolve
-                // again in case the body is itself a projection.
-                let substituted = self.subst_ty(body, &binding);
-                return Some(self.apply(&substituted));
-            }
-        }
-        None
-    }
-
-    /// One-directional structural match of an impl-head pattern against a
-    /// concrete type, binding the head's `pattern_vars`. Pure: never touches
-    /// the global substitution. Returns false on any mismatch (including when
-    /// `actual` is an unresolved variable in a non-pattern position).
-    fn match_pattern(
-        &self,
-        pat: &Ty,
-        actual: &Ty,
-        pattern_vars: &[TyVar],
-        binding: &mut HashMap<TyVar, Ty>,
-    ) -> bool {
-        let actual = self.apply(actual);
-        // A pattern variable binds to whatever the actual type is (consistently
-        // across multiple occurrences).
-        if let Ty::Var(v) = pat
-            && pattern_vars.contains(v) {
-                return match binding.get(v) {
-                    Some(bound) => self.apply(bound) == actual,
-                    None => {
-                        binding.insert(*v, actual);
-                        true
-                    }
-                };
-            }
-        // Normalize alias wrappers exactly as unification does (see
-        // `unify_dir`): a nominal `data` alias (a single-variant record data
-        // type that is also registered as a record alias) keeps its identity
-        // and matches by name as `Con(name)`; a pure `type` alias is
-        // transparent and peels to its body. `apply` preserves `Ty::Alias`
-        // wrappers, so without this an impl head (or head argument) that is a
-        // `Ty::Alias` — which `ast_type_to_ty` produces for both single-variant
-        // record data types and transparent aliases — could never match, and
-        // the associated-type projection would stay rigid.
-        let pat = self.peel_match_alias(pat);
-        let actual = self.peel_match_alias(&actual);
-        match (&pat, &actual) {
-            (Ty::Var(a), Ty::Var(b)) => a == b,
-            (Ty::Int, Ty::Int)
-            | (Ty::Float, Ty::Float)
-            | (Ty::Text, Ty::Text)
-            | (Ty::Bool, Ty::Bool)
-            | (Ty::Bytes, Ty::Bytes)
-            | (Ty::Uuid, Ty::Uuid) => true,
-            (Ty::Relation(p), Ty::Relation(a)) => {
-                self.match_pattern(p, a, pattern_vars, binding)
-            }
-            (Ty::Fun(p1, p2), Ty::Fun(a1, a2)) => {
-                self.match_pattern(p1, a1, pattern_vars, binding)
-                    && self.match_pattern(p2, a2, pattern_vars, binding)
-            }
-            (Ty::Con(pn, pa), Ty::Con(an, aa)) => {
-                pn == an
-                    && pa.len() == aa.len()
-                    && pa
-                        .iter()
-                        .zip(aa.iter())
-                        .all(|(p, a)| self.match_pattern(p, a, pattern_vars, binding))
-            }
-            (Ty::TyCon(pn), Ty::TyCon(an)) => pn == an,
-            (Ty::App(pf, pa), Ty::App(af, aa)) => {
-                self.match_pattern(pf, af, pattern_vars, binding)
-                    && self.match_pattern(pa, aa, pattern_vars, binding)
-            }
-            (Ty::Assoc(pn, pa), Ty::Assoc(an, aa)) => {
-                pn == an && self.match_pattern(pa, aa, pattern_vars, binding)
-            }
-            _ => false,
-        }
-    }
-
-    /// Peel `Ty::Alias` wrappers for impl-head pattern matching, mirroring
-    /// `unify_dir`: a nominal `data` alias (single-variant record data type)
-    /// collapses to `Con(name)` so it matches by identity, while a pure `type`
-    /// alias is transparent and peels to its body.
-    fn peel_match_alias(&self, t: &Ty) -> Ty {
-        match t {
-            Ty::Alias(name, inner) => {
-                if self.data_types.contains_key(name) {
-                    Ty::Con(name.clone(), vec![])
-                } else {
-                    self.peel_match_alias(inner)
-                }
-            }
-            _ => t.clone(),
         }
     }
 
@@ -3526,14 +3343,6 @@ impl Infer {
                 span,
                 seq,
             });
-            // The same variable that decides *whether* an impl exists also
-            // decides *which* impl runs. Remember it so codegen can dispatch
-            // on the static type rather than the value's constructor tag.
-            self.trait_call_vars.push((
-                span,
-                c.trait_name.clone(),
-                target_var,
-            ));
         }
         // Freshen effect-union constraints alongside the type — each
         // instantiation gets its own copy so a polymorphic `\/`-typed
@@ -3636,10 +3445,6 @@ impl Infer {
                 span,
                 seq,
             });
-            self.declared_skolem_constraints
-                .entry(target_var)
-                .or_default()
-                .insert(c.trait_name.clone());
         }
         // Freshen effect-union constraints to track row-union semantics
         // through the function body's type check.
@@ -3847,15 +3652,9 @@ impl Infer {
                 name.clone(),
                 Box::new(self.subst_ty(inner, mapping)),
             ),
-            // Substitute through the projection argument so instantiation
-            // freshens it; then try to reduce in case the argument became
-            // concrete (this is what links `Elem c` to the call-site `c`).
             Ty::Assoc(name, inner) => {
                 let inner = self.subst_ty(inner, mapping);
-                match self.reduce_assoc(name, &inner) {
-                    Some(reduced) => reduced,
-                    None => Ty::Assoc(name.clone(), Box::new(inner)),
-                }
+                Ty::Assoc(name.clone(), Box::new(inner))
             }
             _ => ty.clone(),
         }
@@ -4772,16 +4571,6 @@ impl Infer {
                 if let Some(t) = self.expand_param_alias(ty) {
                     return t;
                 }
-                // Associated-type application `AssocName arg` (e.g. `Elem c`).
-                // Preserve it as a projection so it can be reduced once `arg`
-                // resolves to a concrete type matching an impl definition,
-                // rather than erasing it to an unconstrained fresh variable
-                // (which would let `[Elem c]` unify with any element type).
-                if let ast::TypeKind::Named(name) = &func.node
-                    && self.assoc_type_names.contains(name) {
-                        let arg_ty = self.ast_type_to_ty(arg);
-                        return Ty::Assoc(name.clone(), Box::new(arg_ty));
-                    }
                 let arg_ty = self.ast_type_to_ty(arg);
                 let func_ty = self.ast_type_to_ty(func);
                 match func_ty {
@@ -8575,19 +8364,6 @@ impl Infer {
                 );
             }
         }
-
-        // Third pass: collect associated type names from traits
-        for decl in &module.decls {
-            if let ast::DeclKind::Trait { items, .. } = &decl.node {
-                for item in items {
-                    if let ast::TraitItem::AssociatedType { name, .. } =
-                        item
-                    {
-                        self.assoc_type_names.insert(name.clone());
-                    }
-                }
-            }
-        }
     }
 
     // ── Source/view collection (phase 2) ──────────────────────────
@@ -8629,20 +8405,6 @@ impl Infer {
     fn collect_impls(&mut self, module: &ast::Module) {
         for decl in &module.decls {
             match &decl.node {
-                ast::DeclKind::Impl {
-                    trait_name, args, ..
-                } => {
-                    // Extract type name from impl args
-                    // e.g. `impl Display Int where` → ("Display", "Int")
-                    // e.g. `impl Functor [] where` → ("Functor", "[]")
-                    if let Some(first_arg) = args.first() {
-                        let type_name = Self::type_name_from_ast(first_arg);
-                        if let Some(name) = type_name {
-                            self.known_impls
-                                .insert((trait_name.clone(), name));
-                        }
-                    }
-                }
                 // `data T = ... deriving (Eq, Ord, ...)` generates impls in
                 // codegen, so the type checker must treat the type as having
                 // each derived trait's impl — otherwise `==`/`<`/trait-method
@@ -8657,15 +8419,6 @@ impl Infer {
                 }
                 _ => {}
             }
-        }
-    }
-
-    /// Extract a simple type name from an AST type node.
-    fn type_name_from_ast(ty: &ast::Type) -> Option<String> {
-        match &ty.node {
-            ast::TypeKind::Named(name) => Some(name.clone()),
-            ast::TypeKind::Relation(_) => Some("[]".into()),
-            _ => None,
         }
     }
 
@@ -8798,48 +8551,6 @@ impl Infer {
                     } else {
                         let var = self.fresh();
                         self.bind_top(name, Scheme::mono(var));
-                    }
-                }
-                ast::DeclKind::Trait {
-                    name: trait_name,
-                    items,
-                    params,
-                    ..
-                } => {
-                    self.register_trait_methods(trait_name, params, items);
-                }
-                ast::DeclKind::Impl { items, .. } => {
-                    // Record each impl's associated-type definition
-                    // (`type Elem [a] = a`) so `Ty::Assoc` projections can be
-                    // reduced when their argument matches the head pattern.
-                    for item in items {
-                        if let ast::ImplItem::AssociatedType { name, args, ty } = item {
-                            self.annotation_vars.clear();
-                            self.annotation_unit_vars.clear();
-                            self.in_type_annotation = true;
-                            // Parse head pattern and body in one annotation
-                            // scope so their shared pattern vars (e.g. `a`)
-                            // map to the same TyVar.
-                            let head = match args.split_first() {
-                                Some((first, rest)) => {
-                                    let mut acc = self.ast_type_to_ty(first);
-                                    for a in rest {
-                                        let at = self.ast_type_to_ty(a);
-                                        acc = Ty::App(Box::new(acc), Box::new(at));
-                                    }
-                                    acc
-                                }
-                                None => self.fresh(),
-                            };
-                            let body = self.ast_type_to_ty(ty);
-                            self.in_type_annotation = false;
-                            let pattern_vars: Vec<TyVar> =
-                                self.annotation_vars.values().copied().collect();
-                            self.assoc_impls
-                                .entry(name.clone())
-                                .or_default()
-                                .push((head, body, pattern_vars));
-                        }
                     }
                 }
                 ast::DeclKind::Route { name, entries } => {
@@ -9556,8 +9267,147 @@ impl Infer {
             ),
         );
 
-        // map and fold are now trait methods (Functor.map, Foldable.fold)
-        // registered via the prelude's trait declarations.
+        // map : ∀a b. (a -> b) -> [a] -> [b]  (builtin → knot_relation_map)
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "map",
+            Scheme::poly(
+                vec![a, b],
+                Ty::Fun(
+                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
+                    )),
+                ),
+            ),
+        );
+
+        // forEach : ∀a r. [a] -> (a -> IO {|r} {}) -> IO {|r} {}  (builtin →
+        // knot_relation_for_each). Relation-FIRST arg order (unlike map).
+        // IO-effect iterator: runs `action` on each row for its side effects.
+        // The action's effect row propagates through to the caller (like fork).
+        {
+            let a = self.fresh_var();
+            let r = self.fresh_var();
+            self.bind_top(
+                "forEach",
+                Scheme::poly(
+                    vec![a, r],
+                    Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Fun(
+                                Box::new(Ty::Var(a)),
+                                Box::new(Ty::IO(
+                                    BTreeSet::new(),
+                                    Some(r),
+                                    Box::new(Ty::unit()),
+                                )),
+                            )),
+                            Box::new(Ty::IO(
+                                BTreeSet::new(),
+                                Some(r),
+                                Box::new(Ty::unit()),
+                            )),
+                        )),
+                    ),
+                ),
+            );
+        }
+
+        // fold : ∀a b. (b -> a -> b) -> b -> [a] -> b  (builtin → knot_relation_fold)
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "fold",
+            Scheme::poly(
+                vec![a, b],
+                Ty::Fun(
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Var(b)),
+                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                    )),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Var(b)),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                            Box::new(Ty::Var(b)),
+                        )),
+                    )),
+                ),
+            ),
+        );
+
+        // bind : ∀a b. (a -> Maybe b) -> Maybe a -> Maybe b  (builtin → knot_relation_bind)
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "bind",
+            Scheme::poly(
+                vec![a, b],
+                Ty::Fun(
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Var(a)),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
+                    )),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
+                    )),
+                ),
+            ),
+        );
+
+        // traverse : ∀a b f. (a -> f b) -> [a] -> f [b]  (builtin →
+        // knot_relation_traverse_kind). The applicative `f` stays a type
+        // variable applied via Ty::App; Phase 5b resolves each call site's
+        // applicative kind from the result type and codegen hands it to the
+        // runtime, which needs it ONLY to pick `pure []` for empty inputs
+        // (non-empty inputs dispatch on the first mapped element).
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        let f = self.fresh_var();
+        self.bind_top(
+            "traverse",
+            Scheme::poly(
+                vec![a, b, f],
+                Ty::Fun(
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Var(a)),
+                        Box::new(Ty::App(Box::new(Ty::Var(f)), Box::new(Ty::Var(b)))),
+                    )),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::App(
+                            Box::new(Ty::Var(f)),
+                            Box::new(Ty::Relation(Box::new(Ty::Var(b)))),
+                        )),
+                    )),
+                ),
+            ),
+        );
+
+        // take / drop : ∀s. Int -> s -> s  — overloaded over Text and
+        // relations (formerly the Sequence trait). The open `s` covers both
+        // (`take 3 rows`, `take 1 s`); codegen's inner closure dispatches on
+        // the second argument's runtime tag (knot_text_take/drop vs
+        // knot_relation_take/drop). SQL/pipe special cases in codegen
+        // intercept source-pipe calls first.
+        for name in ["take", "drop"] {
+            let s = self.fresh_var();
+            self.bind_top(
+                name,
+                Scheme::poly(
+                    vec![s],
+                    Ty::Fun(
+                        Box::new(Ty::Int),
+                        Box::new(Ty::Fun(Box::new(Ty::Var(s)), Box::new(Ty::Var(s)))),
+                    ),
+                ),
+            );
+        }
 
         // sortBy : ∀a b. (a -> b) -> [a] -> [a]
         let a = self.fresh_var();
@@ -9753,6 +9603,43 @@ impl Infer {
                 ),
             ),
         );
+
+        // head : ∀a. [a] -> Maybe a  (builtin → knot_relation_head).
+        // Relation-FIRST arg order. First element as `Just {value: x}`, or
+        // `Nothing {}` on the empty relation.
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "head",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(a)])),
+                    ),
+                ),
+            );
+        }
+
+        // findFirst : ∀a. [a] -> (a -> Bool) -> Maybe a  (builtin →
+        // knot_relation_find_first). Relation-FIRST arg order. First row
+        // satisfying `pred` as `Just {value: x}`, else `Nothing {}`.
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "findFirst",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
+                            Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(a)])),
+                        )),
+                    ),
+                ),
+            );
+        }
 
         // single : ∀a. [a] -> Maybe a
         let a = self.fresh_var();
@@ -10235,100 +10122,6 @@ impl Infer {
         );
     }
 
-    fn register_trait_methods(
-        &mut self,
-        trait_name: &str,
-        params: &[ast::TraitParam],
-        items: &[ast::TraitItem],
-    ) {
-        // Record trait param names
-        self.trait_params.insert(
-            trait_name.to_string(),
-            params.iter().map(|p| p.name.clone()).collect(),
-        );
-
-        for item in items {
-            if let ast::TraitItem::Method { name, ty, .. } = item {
-                // Skip default-body entries with placeholder types.
-                // The parser emits these with `TypeKind::Hole` (not
-                // `Named("_")`), so the old guard never matched and the
-                // placeholder overwrote the real signature — pinning the
-                // method to a single unquantified type variable shared
-                // across all call sites (first use wins, second fails).
-                let is_placeholder = match &ty.ty.node {
-                    ast::TypeKind::Hole => true,
-                    ast::TypeKind::Named(n) => n == "_",
-                    _ => false,
-                };
-                if is_placeholder {
-                    continue;
-                }
-                self.annotation_vars.clear();
-                self.annotation_unit_vars.clear();
-                self.in_type_annotation = true;
-                // Register trait params as annotation vars
-                for p in params {
-                    self.annotation_var(&p.name);
-                }
-                let method_ty = self.ast_type_to_ty(&ty.ty);
-                self.in_type_annotation = false;
-                let vars: Vec<TyVar> =
-                    self.annotation_vars.values().copied().collect();
-                let unit_vars: Vec<UnitVar> =
-                    self.annotation_unit_vars.values().copied().collect();
-
-                // Build constraints: each trait param must implement this trait
-                let mut constraints: Vec<TyConstraint> = params
-                    .iter()
-                    .filter_map(|p| {
-                        self.annotation_vars.get(&p.name).map(|&v| TyConstraint {
-                            trait_name: trait_name.to_string(),
-                            type_var: v,
-                            span: Span::new(0, 0),
-                        })
-                    })
-                    .collect();
-
-                // Also include per-method constraints from the type scheme
-                // (e.g., `Applicative f =>` on Traversable.traverse). Lowercase
-                // type variables parse as `TypeKind::Var`, but a constraint
-                // could also reference an explicit type-parameter name parsed
-                // as `TypeKind::Named`; accept either.
-                for c in &ty.constraints {
-                    if c.args.len() == 1 {
-                        let var_name = match &c.args[0].node {
-                            ast::TypeKind::Var(n) | ast::TypeKind::Named(n) => Some(n),
-                            _ => None,
-                        };
-                        if let Some(var_name) = var_name
-                            && let Some(&v) = self.annotation_vars.get(var_name) {
-                                constraints.push(TyConstraint {
-                                    trait_name: c.trait_name.clone(),
-                                    type_var: v,
-                                    span: Span::new(0, 0),
-                                });
-                            }
-                    }
-                }
-
-                // Record method → trait mapping
-                self.trait_method_traits
-                    .insert(name.clone(), trait_name.to_string());
-
-                // Record which scheme vars are trait params (for impl validation)
-                let param_vars: Vec<TyVar> = params.iter()
-                    .filter_map(|p| self.annotation_vars.get(&p.name).copied())
-                    .collect();
-                self.trait_method_param_vars
-                    .insert(name.clone(), param_vars);
-
-                self.bind_top(
-                    name,
-                    Scheme { vars, unit_vars, constraints, effect_unions: vec![], unit_binops: vec![], ty: method_ty },
-                );
-            }
-        }
-    }
 
     // ── Declaration inference (phase 4) ──────────────────────────
 
@@ -10344,15 +10137,9 @@ impl Infer {
                             }
                             None => (self.fresh(), Vec::new(), Vec::new()),
                         };
-                        let pre_body_constraints = self.next_constraint_seq;
                         self.check_expr(body, &expected);
-                        self.check_skolem_constraints(
-                            &fresh_skolems,
-                            pre_body_constraints,
-                        );
                         for s in &fresh_skolems {
                             self.skolems.remove(s);
-                            self.declared_skolem_constraints.remove(s);
                         }
                         for u in &fresh_unit_skolems {
                             self.unit_skolems.remove(u);
@@ -10554,14 +10341,6 @@ impl Infer {
                     };
                     self.unify(&inferred, &expected, body.span);
                 }
-                ast::DeclKind::Impl {
-                    trait_name,
-                    args,
-                    items,
-                    ..
-                } => {
-                    self.check_impl_items(trait_name, args, items);
-                }
                 ast::DeclKind::Route { entries, .. } => {
                     for entry in entries {
                         self.check_route_field_collisions(entry);
@@ -10654,136 +10433,6 @@ impl Infer {
         // types, so no trait constraint is needed on the key value type.
     }
 
-    fn check_impl_items(
-        &mut self,
-        trait_name: &str,
-        impl_args: &[ast::Type],
-        items: &[ast::ImplItem],
-    ) {
-        // Build mapping from trait type params to the impl's concrete types.
-        // e.g. `trait Display a` + `impl Display Int` → { a_var => Int }
-        self.annotation_vars.clear();
-        // Impl targets name the type *constructor* (`impl Display Int`), not a
-        // dimensionless value annotation — bare `Int`/`Float` is correct here.
-        let saved_enforce = self.enforce_units;
-        self.enforce_units = false;
-        let impl_types: Vec<Ty> = impl_args.iter().map(|a| self.ast_type_to_ty(a)).collect();
-        self.enforce_units = saved_enforce;
-
-        for item in items {
-            if let ast::ImplItem::Method {
-                name, params, body, ..
-            } = item
-            {
-                // Constraints deferred while checking this body may land on
-                // the method-local skolems below; remember where they start.
-                let pre_body_constraints = self.next_constraint_seq;
-                // Type-check each impl method body
-                self.push_scope();
-                let mut param_types = Vec::new();
-                for param in params {
-                    let t = self.fresh();
-                    self.check_pattern(param, &t);
-                    param_types.push(t);
-                }
-                let body_ty = self.infer_expr(body);
-
-                // Build the inferred method type: params -> body_ty
-                let mut inferred_method_ty = body_ty;
-                for pt in param_types.iter().rev() {
-                    inferred_method_ty = Ty::Fun(
-                        Box::new(pt.clone()),
-                        Box::new(inferred_method_ty),
-                    );
-                }
-
-                self.pop_scope();
-
-                // Validate against the trait's declared method type
-                if let Some(scheme) = self.lookup(name).cloned() {
-                    // Map only trait param vars to impl types; other vars
-                    // (local type vars like `a`) get fresh variables.
-                    let param_vars = self.trait_method_param_vars
-                        .get(name.as_str())
-                        .cloned()
-                        .unwrap_or_default();
-                    let mut mapping: HashMap<TyVar, Ty> = HashMap::new();
-                    for (pv, impl_ty) in param_vars.iter().zip(impl_types.iter()) {
-                        mapping.insert(*pv, impl_ty.clone());
-                    }
-                    // Skolemise the remaining scheme vars (method-local
-                    // type variables like the `b` in `conv : a -> b`):
-                    // the impl must be at least as polymorphic as the
-                    // trait signature. A flexible fresh var here would
-                    // let the impl pin a caller-chosen variable to a
-                    // concrete type (e.g. `conv = \x -> x + 1` against
-                    // `conv : a -> b`), producing runtime type confusion
-                    // at call sites that picked a different `b`.
-                    let mut fresh_skolems: Vec<TyVar> = Vec::new();
-                    for v in &scheme.vars {
-                        if !mapping.contains_key(v) {
-                            let s = self.fresh_var();
-                            self.skolems.insert(s);
-                            fresh_skolems.push(s);
-                            mapping.insert(*v, Ty::Var(s));
-                        }
-                    }
-                    // Constraints the trait declared on those vars (e.g.
-                    // `Ord b =>`) are promises the impl body may rely on.
-                    for c in &scheme.constraints {
-                        if let Some(Ty::Var(sv)) = mapping.get(&c.type_var)
-                            && fresh_skolems.contains(sv) {
-                                self.declared_skolem_constraints
-                                    .entry(*sv)
-                                    .or_default()
-                                    .insert(c.trait_name.clone());
-                            }
-                    }
-                    let expected = self.subst_ty(&scheme.ty, &mapping);
-                    let errors_before = self.errors.len();
-                    self.unify(&inferred_method_ty, &expected, body.span);
-                    self.check_skolem_constraints(
-                        &fresh_skolems,
-                        pre_body_constraints,
-                    );
-                    if !fresh_skolems.is_empty()
-                        && self.errors.len() > errors_before
-                    {
-                        self.error(
-                            format!(
-                                "impl method '{}' is less polymorphic than \
-                                 its declaration in trait '{}' — the trait \
-                                 signature's type variables must not be \
-                                 constrained to concrete types by the impl",
-                                name, trait_name
-                            ),
-                            body.span,
-                        );
-                    }
-                    for s in &fresh_skolems {
-                        self.skolems.remove(s);
-                        self.declared_skolem_constraints.remove(s);
-                    }
-                } else {
-                    // Method not found in scope — check if it belongs to a
-                    // different trait or is simply unknown.  Default-body
-                    // methods registered with placeholder types won't have
-                    // a lookup entry, so only error when the method isn't
-                    // associated with this trait at all.
-                    let belongs_to = self.trait_method_traits.get(name);
-                    if belongs_to != Some(&trait_name.to_string()) {
-                        self.error(
-                            format!(
-                                "method '{}' is not declared in trait '{}'",
-                                name, trait_name
-                            ),
-                            body.span,
-                        );
-                    }
-                }
-            }
-        }
-    }
 
     // ── Constraint checking ─────────────────────────────────────
 
@@ -10834,52 +10483,6 @@ impl Infer {
         let s = self.next_constraint_seq;
         self.next_constraint_seq += 1;
         s
-    }
-
-    fn check_skolem_constraints(
-        &mut self,
-        fresh_skolems: &[TyVar],
-        start: u64,
-    ) {
-        if fresh_skolems.is_empty() {
-            return;
-        }
-        let skolem_set: HashSet<TyVar> = fresh_skolems.iter().copied().collect();
-        let new_constraints: Vec<DeferredConstraint> = self
-            .deferred_constraints
-            .iter()
-            .filter(|dc| dc.seq >= start)
-            .cloned()
-            .collect();
-        let mut reported: HashSet<(TyVar, String)> = HashSet::new();
-        for dc in &new_constraints {
-            let resolved = self.apply(&Ty::Var(dc.type_var));
-            let v = match resolved {
-                Ty::Var(v) => v,
-                _ => continue,
-            };
-            if !skolem_set.contains(&v) {
-                continue;
-            }
-            let declared = self
-                .declared_skolem_constraints
-                .get(&v)
-                .is_some_and(|s| s.contains(&dc.trait_name));
-            if declared {
-                continue;
-            }
-            if !reported.insert((v, dc.trait_name.clone())) {
-                continue;
-            }
-            self.error(
-                format!(
-                    "use here requires constraint '{} a' on the type variable; \
-                     add '{} a =>' to the function signature",
-                    dc.trait_name, dc.trait_name
-                ),
-                dc.span,
-            );
-        }
     }
 
     /// Check all deferred constraints after inference is complete.
@@ -11701,7 +11304,6 @@ pub type CheckOutput = (
     RefinedTypeInfoMap,
     FromJsonTargets,
     ElemPushdownOk,
-    TraitCallTargets,
     ShowUnitStrings,
     SumFloatSpans,
     RelationFieldSpans,
@@ -11762,6 +11364,13 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
         infer
             .known_impls
             .insert((trait_name.to_string(), "IO".to_string()));
+    }
+    // Maybe's HKT impls are registered intrinsically in codegen
+    // (`register_builtin_maybe_impls`), so the checker treats them as known.
+    for trait_name in &["Functor", "Applicative", "Monad", "Alternative"] {
+        infer
+            .known_impls
+            .insert((trait_name.to_string(), "Maybe".to_string()));
     }
     // Primitive impls registered intrinsically in codegen. `==`/`<` on these
     // dispatch to the runtime `knot_value_eq` / `knot_value_compare` fallbacks
@@ -11900,21 +11509,6 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
 
     // Phase 4d: Compress substitution chains for faster resolution
     infer.compress_substitution();
-
-    // Phase 4e: Resolve trait constraint sites to the concrete type whose impl
-    // should run there. Sites that stay polymorphic are left out — codegen
-    // falls back to runtime dispatch for those.
-    let mut trait_call_targets = TraitCallTargets::new();
-    let trait_call_vars = std::mem::take(&mut infer.trait_call_vars);
-    for (span, trait_name, var) in trait_call_vars {
-        let resolved = infer.apply(&Ty::Var(var));
-        if matches!(resolved.peel_alias(), Ty::Var(_)) {
-            continue;
-        }
-        if let Some(type_name) = infer.type_name_of(&resolved) {
-            trait_call_targets.insert((span, trait_name), type_name);
-        }
-    }
 
     // Phase 5: Resolve monad types from desugared do-blocks
     let mut monad_info = MonadInfo::new();
@@ -12122,7 +11716,7 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
     let type_arg_spans: TypeArgSpans = infer.type_arg_spans.clone();
     let implicit_refs: ImplicitRefs = infer.implicit_refs.clone();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, trait_call_targets, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs)
 }
 
 
@@ -12277,20 +11871,6 @@ fn rewrite_decl_results(decl: &mut ast::Decl, pure_spans: &HashSet<Span>) {
             }
         }
         View { body, .. } | Derived { body, .. } => rewrite_result_markers(body, pure_spans),
-        Trait { items, .. } => {
-            for item in items {
-                if let ast::TraitItem::Method { default_body: Some(b), .. } = item {
-                    rewrite_result_markers(b, pure_spans);
-                }
-            }
-        }
-        Impl { items, .. } => {
-            for item in items {
-                if let ast::ImplItem::Method { body, .. } = item {
-                    rewrite_result_markers(body, pure_spans);
-                }
-            }
-        }
         Route { entries, .. } => {
             for e in entries {
                 if let Some(expr) = &mut e.rate_limit {
@@ -12574,14 +12154,14 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) = check(&mut module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) = check(&mut module);
         diags
     }
 
     fn type_info_for(src: &str) -> TypeInfo {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) = check(&mut module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) = check(&mut module);
         type_info
     }
 
@@ -12873,302 +12453,6 @@ main = applyPred (\\r -> r.x == r.y)\
         assert!(has_error(&diags, "type mismatch"));
     }
 
-    #[test]
-    fn trait_method() {
-        assert!(check_src(
-            "trait Show a where\n  show_ : a -> Text\nimpl Show Int where\n  show_ n = \"int\"\nmain = show_ 42"
-        ).is_empty());
-    }
-
-    #[test]
-    fn record_update() {
-        assert!(check_src(
-            "main = {name: \"Alice\", age: 30} |> \\r -> {r | age: r.age + 1}"
-        ).is_empty());
-    }
-
-    #[test]
-    fn higher_order_function() {
-        assert!(check_src(
-            "apply = \\f x -> f x\nmain = apply (\\x -> x + 1) 5"
-        ).is_empty());
-    }
-
-    #[test]
-    fn now_builtin() {
-        // now should type as IO {clock} Int — cannot directly add to Int
-        assert!(!check_src("main = now + 1000").is_empty());
-        // But using in IO do-block works:
-        assert!(check_src("main = do\n  t <- now\n  println t").is_empty());
-    }
-
-    // ── Exhaustiveness checking ─────────────────────────────────
-
-    #[test]
-    fn exhaustive_case_all_constructors() {
-        // Covering all constructors is fine.
-        assert!(check_src(
-            "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
-             f = \\s -> case s of\n  Circle {r r} -> r\n  Rect {w w h h} -> w * h\n\
-             main = f (Circle {r 5})"
-        ).is_empty());
-    }
-
-    #[test]
-    fn exhaustive_case_wildcard() {
-        // A wildcard catch-all makes any match exhaustive.
-        assert!(check_src(
-            "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
-             f = \\s -> case s of\n  Circle {r r} -> r\n  _ -> 0\n\
-             main = f (Circle {r 5})"
-        ).is_empty());
-    }
-
-    #[test]
-    fn exhaustive_case_var_catchall() {
-        // A variable catch-all also makes it exhaustive.
-        assert!(check_src(
-            "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
-             f = \\s -> case s of\n  Circle {r r} -> r\n  other -> 0\n\
-             main = f (Circle {r: 5})"
-        ).is_empty());
-    }
-
-    #[test]
-    fn non_exhaustive_case_missing_constructor() {
-        // Missing Rect — should produce an error.
-        let diags = check_src(
-            "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\n\
-             f = \\s -> case s of\n  Circle {r r} -> r\n\
-             main = f (Circle {r 5})"
-        );
-        assert!(has_error(&diags, "non-exhaustive"));
-        assert!(has_error(&diags, "Rect"));
-    }
-
-    #[test]
-    fn non_exhaustive_case_missing_multiple() {
-        // Missing two out of three constructors.
-        let diags = check_src(
-            "data Color = Red {} | Green {} | Blue {}\n\
-             f = \\c -> case c of\n  Red {} -> 1\n\
-             main = f (Red {})"
-        );
-        assert!(has_error(&diags, "non-exhaustive"));
-        assert!(has_error(&diags, "Green"));
-        assert!(has_error(&diags, "Blue"));
-    }
-
-    #[test]
-    fn exhaustive_case_single_constructor() {
-        // Data type with one constructor — a single arm is exhaustive.
-        assert!(check_src(
-            "data Wrapper = Wrap {val: Int 1}\n\
-             f = \\w -> case w of\n  Wrap {val} -> val\n\
-             main = f (Wrap {val: 42})"
-        ).is_empty());
-    }
-
-    #[test]
-    fn case_on_primitive_skips_exhaustiveness() {
-        // Matching on Int — no exhaustiveness check (infinite domain).
-        assert!(check_src(
-            "f = \\n -> case n of\n  0 -> 1\n  1 -> 2\n\
-             main = f 0"
-        ).is_empty());
-    }
-
-    // ── Higher-kinded types ───────────────────────────────────────
-
-    #[test]
-    fn hkt_trait_method_with_relation() {
-        // map : (a -> b) -> f a -> f b, used with [] (relation)
-        assert!(check_src(
-            "trait Functor (f : Type -> Type) where\n\
-             \x20 fmap : (a -> b) -> f a -> f b\n\
-             impl Functor [] where\n\
-             \x20 fmap f rel = do\n\
-             \x20   x <- rel\n\
-             \x20   yield (f x)\n\
-             main = fmap (\\x -> x + 1) [1, 2, 3]"
-        ).is_empty());
-    }
-
-    #[test]
-    fn hkt_trait_method_type_propagation() {
-        // The result of fmap should have the correct element type
-        assert!(check_src(
-            "trait Functor (f : Type -> Type) where\n\
-             \x20 fmap : (a -> b) -> f a -> f b\n\
-             impl Functor [] where\n\
-             \x20 fmap f rel = do\n\
-             \x20   x <- rel\n\
-             \x20   yield (f x)\n\
-             main = do\n\
-             \x20 x <- fmap (\\n -> show n) [1, 2, 3]\n\
-             \x20 yield (x ++ \"!\")"
-        ).is_empty());
-    }
-
-    #[test]
-    fn hkt_trait_method_type_error() {
-        // fmap expects a function, not a plain value
-        let diags = check_src(
-            "trait Functor (f : Type -> Type) where\n\
-             \x20 fmap : (a -> b) -> f a -> f b\n\
-             impl Functor [] where\n\
-             \x20 fmap f rel = do\n\
-             \x20   x <- rel\n\
-             \x20   yield (f x)\n\
-             main = fmap 42 [1, 2, 3]"
-        );
-        assert!(has_error(&diags, "type mismatch"));
-    }
-
-    #[test]
-    fn hkt_with_adt() {
-        // HKT trait with an ADT type constructor
-        assert!(check_src(
-            "data Maybe a = Nothing {} | Just {value: a}\n\
-             trait Functor (f : Type -> Type) where\n\
-             \x20 fmap : (a -> b) -> f a -> f b\n\
-             impl Functor Maybe where\n\
-             \x20 fmap f m = case m of\n\
-             \x20   Nothing {} -> Nothing {}\n\
-             \x20   Just {value value} -> Just {value (f value)}\n\
-             main = fmap (\\x -> x + 1) (Just {value 42})"
-        ).is_empty());
-    }
-
-    #[test]
-    fn hkt_multiple_methods() {
-        // Trait with multiple HK-parameterized methods
-        assert!(check_src(
-            "trait Container (f : Type -> Type) where\n\
-             \x20 wrap : a -> f a\n\
-             \x20 unwrap : f a -> f a\n\
-             impl Container [] where\n\
-             \x20 wrap x = [x]\n\
-             \x20 unwrap rel = do\n\
-             \x20   x <- rel\n\
-             \x20   yield x\n\
-             main = wrap 42"
-        ).is_empty());
-    }
-
-    #[test]
-    fn hkt_bare_relation_constructor() {
-        // [] used as a bare type in impl should work
-        assert!(check_src(
-            "trait Empty (f : Type -> Type) where\n\
-             \x20 empty : f a\n\
-             impl Empty [] where\n\
-             \x20 empty = []\n\
-             main = empty"
-        ).is_empty());
-    }
-
-    #[test]
-    fn hkt_tycon_unifies_with_relation() {
-        // When HK var is solved to [], App([], a) should equal [a]
-        // Uses in-memory relation (not source ref) since source refs are IO.
-        assert!(check_src(
-            "trait Functor (f : Type -> Type) where\n\
-             \x20 fmap : (a -> b) -> f a -> f b\n\
-             impl Functor [] where\n\
-             \x20 fmap f rel = do\n\
-             \x20   x <- rel\n\
-             \x20   yield (f x)\n\
-             main = fmap (\\x -> x + 1) [1, 2, 3]"
-        ).is_empty());
-    }
-
-    #[test]
-    fn hkt_multi_arg_type_application() {
-        // Multi-arg type constructors in annotations should work
-        assert!(check_src(
-            "data Pair a b = MkPair {fst: a, snd: b}\n\
-             main = MkPair {fst: 1, snd: \"hello\"}"
-        ).is_empty());
-    }
-
-    // ── Trait bounds ────────────────────────────────────────────────
-
-    #[test]
-    fn explicit_trait_bound_satisfied() {
-        // Calling a function with explicit trait bounds on a type that has an impl
-        assert!(check_src(
-            "trait Display a where\n\
-             \x20 display : a -> Text\n\
-             impl Display Int where\n\
-             \x20 display n = show n\n\
-             printAll : Display a => [a] -> [Text]\n\
-             printAll = \\rel -> do\n\
-             \x20 r <- rel\n\
-             \x20 yield (display r)\n\
-             main = printAll [1, 2, 3]"
-        ).is_empty());
-    }
-
-    #[test]
-    fn explicit_trait_bound_unsatisfied() {
-        // Calling a function with trait bounds on a type without an impl
-        let diags = check_src(
-            "trait Display a where\n\
-             \x20 display : a -> Text\n\
-             impl Display Int where\n\
-             \x20 display n = show n\n\
-             printAll : Display a => [a] -> [Text]\n\
-             printAll = \\rel -> do\n\
-             \x20 r <- rel\n\
-             \x20 yield (display r)\n\
-             main = printAll [\"hello\"]"
-        );
-        assert!(has_error(&diags, "no implementation of trait 'Display' for type 'Text'"));
-    }
-
-    #[test]
-    fn trait_method_constraint_satisfied() {
-        // Using a trait method directly with a type that has an impl
-        assert!(check_src(
-            "trait Display a where\n\
-             \x20 display : a -> Text\n\
-             impl Display Int where\n\
-             \x20 display n = show n\n\
-             main = display 42"
-        ).is_empty());
-    }
-
-    #[test]
-    fn trait_method_constraint_unsatisfied() {
-        // Using a trait method with a type that doesn't have an impl
-        let diags = check_src(
-            "trait Display a where\n\
-             \x20 display : a -> Text\n\
-             impl Display Int where\n\
-             \x20 display n = show n\n\
-             main = display \"hello\""
-        );
-        assert!(has_error(&diags, "no implementation of trait 'Display' for type 'Text'"));
-    }
-
-    #[test]
-    fn multiple_trait_bounds() {
-        // Multiple constraints: Display a => Eq a => ...
-        assert!(check_src(
-            "trait Display a where\n\
-             \x20 display : a -> Text\n\
-             trait Eq_ a where\n\
-             \x20 eq : a -> a -> Bool\n\
-             impl Display Int where\n\
-             \x20 display n = show n\n\
-             impl Eq_ Int where\n\
-             \x20 eq a b = a == b\n\
-             showAndCompare : Display a => Eq_ a => a -> a -> Text\n\
-             showAndCompare = \\x y -> if eq x y then display x else display y\n\
-             main = showAndCompare 1 2"
-        ).is_empty());
-    }
 
     #[test]
     fn multiple_trait_bounds_one_missing() {
@@ -13188,128 +12472,6 @@ main = applyPred (\\r -> r.x == r.y)\
         assert!(has_error(&diags, "no implementation of trait 'Eq_' for type 'Int'"));
     }
 
-    #[test]
-    fn trait_bound_polymorphic_passthrough() {
-        // When a constrained function is called with a still-polymorphic
-        // variable, the constraint should not trigger (it's checked later)
-        assert!(check_src(
-            "trait Display a where\n\
-             \x20 display : a -> Text\n\
-             impl Display Int where\n\
-             \x20 display n = show n\n\
-             printAll : Display a => [a] -> [Text]\n\
-             printAll = \\rel -> do\n\
-             \x20 r <- rel\n\
-             \x20 yield (display r)\n\
-             main = println 42"
-        ).is_empty());
-    }
-
-    #[test]
-    fn lt_on_polymorphic_param_is_structural() {
-        // Eq/Ord traits removed from comparison operators — < is structural, no constraint needed.
-        assert!(check_src(
-            "myMin : a -> a -> a\\n\
-             myMin = \\a b -> if a < b then a else b\\n\
-             main = println (show (myMin 1 2))"
-        ).is_empty());
-    }
-
-    #[test]
-    fn lt_with_ord_constraint_typechecks() {
-        assert!(check_src(
-            "myMin : Ord a => a -> a -> a\n\
-             myMin = \\a b -> if a < b then a else b\n\
-             main = println (show (myMin 1 2))"
-        ).is_empty());
-    }
-
-    #[test]
-    fn eq_on_polymorphic_param_is_structural() {
-        // Eq/Ord traits removed from comparison operators — == is structural, no constraint needed.
-        assert!(check_src(
-            "same : a -> a -> Bool\\n\
-             same = \\a b -> a == b\\n\
-             main = println (show (same 1 1))"
-        ).is_empty());
-    }
-
-    #[test]
-    fn add_on_polymorphic_param_requires_num_constraint() {
-        let diags = check_src(
-            "double : a -> a\n\
-             double = \\a -> a + a\n\
-             main = println (show (double 3))"
-        );
-        assert!(has_error(&diags, "constraint 'Num a'"));
-    }
-
-    #[test]
-    fn neg_on_polymorphic_param_requires_num_constraint() {
-        let diags = check_src(
-            "flip : a -> a\n\
-             flip = \\a -> -a\n\
-             main = println (show (flip 3))"
-        );
-        assert!(has_error(&diags, "constraint 'Num a'"));
-    }
-
-    #[test]
-    fn concat_on_polymorphic_param_requires_semigroup_constraint() {
-        let diags = check_src(
-            "twice : a -> a\n\
-             twice = \\a -> a ++ a\n\
-             main = println (twice \"hi\")"
-        );
-        assert!(has_error(&diags, "constraint 'Semigroup a'"));
-    }
-
-    #[test]
-    fn lt_on_bool_rejected_at_concrete_call() {
-        let diags = check_src(
-            "myMin : Ord a => a -> a -> a\n\
-             myMin = \\a b -> if a < b then a else b\n\
-             main = println (show (myMin True False))"
-        );
-        assert!(has_error(&diags, "no implementation of trait 'Ord' for type 'Bool'"));
-    }
-
-    #[test]
-    fn list_concat_typechecks_without_annotation() {
-        assert!(check_src(
-            "main = println (show ([1, 2] ++ [3, 4]))"
-        ).is_empty());
-    }
-
-    #[test]
-    fn hkt_trait_bound_satisfied() {
-        // HKT trait method call with [] should succeed (impl exists)
-        assert!(check_src(
-            "trait Functor (f : Type -> Type) where\n\
-             \x20 fmap : (a -> b) -> f a -> f b\n\
-             impl Functor [] where\n\
-             \x20 fmap f rel = do\n\
-             \x20   x <- rel\n\
-             \x20   yield (f x)\n\
-             main = fmap (\\x -> x + 1) [1, 2, 3]"
-        ).is_empty());
-    }
-
-    #[test]
-    fn hkt_trait_bound_unsatisfied() {
-        // HKT trait method call with a type that doesn't have an impl
-        let diags = check_src(
-            "data Box a = MkBox {value: a}\n\
-             trait Functor (f : Type -> Type) where\n\
-             \x20 fmap : (a -> b) -> f a -> f b\n\
-             impl Functor [] where\n\
-             \x20 fmap f rel = do\n\
-             \x20   x <- rel\n\
-             \x20   yield (f x)\n\
-             main = fmap (\\x -> x + 1) (MkBox {value 42})"
-        );
-        assert!(has_error(&diags, "no implementation of trait 'Functor'"));
-    }
 
     // ── Row-polymorphic variants ─────────────────────────────────
 
@@ -13748,37 +12910,6 @@ main = applyPred (\\r -> r.x == r.y)\
         assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 
-    #[test]
-    fn refined_type_uses_base_trait_impl() {
-        // A trait impl on the base type should satisfy a constraint on the
-        // refined type, since refined types are erased at runtime.
-        let diags = check_src(
-            "type Nat = Int 1 where \\x -> x >= 0\n\
-             trait Show_ a where\n  show_ : a -> Text\n\
-             impl Show_ Int where\n  show_ n = \"int\"\n\
-             f : Nat -> Text\n\
-             f = \\n -> show_ n\n\
-             main = 0"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn refined_type_chain_uses_base_trait_impl() {
-        // Stacked refinements should also resolve to the ultimate base type's impl.
-        let diags = check_src(
-            "type Nat = Int 1 where \\x -> x >= 0\n\
-             type Age = Nat where \\x -> x <= 150\n\
-             trait Show_ a where\n  show_ : a -> Text\n\
-             impl Show_ Int where\n  show_ n = \"int\"\n\
-             f : Age -> Text\n\
-             f = \\n -> show_ n\n\
-             main = 0"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    // ── Unit annotations on stdlib functions ─────────────────────
 
     #[test]
     fn unit_randomint_preserves_unit() {

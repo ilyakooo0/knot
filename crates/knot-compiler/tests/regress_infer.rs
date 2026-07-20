@@ -22,7 +22,7 @@ fn check_full(
 ) -> (Vec<Diagnostic>, knot_compiler::infer::RefineTargets) {
     let mut module = parse(src);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, refine_targets, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) =
+    let (diags, _monad, _type_info, _local, refine_targets, _refined, _json, _elem,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) =
         knot_compiler::infer::check(&mut module);
     (diags, refine_targets)
 }
@@ -393,25 +393,6 @@ fn route_composition_cycle_is_an_error() {
 // ── 8. Trait constraints must survive let-generalization ──
 
 #[test]
-fn unannotated_fn_constraint_checked_at_use_site() {
-    // `callGreet` is unannotated; the `Greet` obligation from its body must
-    // be captured by generalization and re-checked when applied to Bool.
-    let src = r#"trait Greet a where
-  greet : a -> Text
-impl Greet Int where
-  greet n = "int"
-callGreet = \x -> greet x
-main = println (callGreet true)
-"#;
-    let diags = check_src(src);
-    assert!(
-        has_error(&diags, "no implementation of trait 'Greet' for type 'Bool'"),
-        "dropped constraint must resurface at the use site: {:?}",
-        diags
-    );
-}
-
-#[test]
 fn unannotated_fn_ord_comparison_is_structural() {
     // Eq/Ord traits removed from comparison operators — < is structural, no constraint needed.
     let src = r#"myMin = \a b -> if a < b then a else b
@@ -423,20 +404,6 @@ main = println (show (myMin true false))
         "structural < should not require Ord: {:?}",
         diags
     );
-}
-
-#[test]
-fn unannotated_fn_constraint_satisfied_use_accepted() {
-    // The same generalized function applied at a type WITH the impl is fine.
-    let src = r#"trait Greet a where
-  greet : a -> Text
-impl Greet Int where
-  greet n = "int"
-callGreet = \x -> greet x
-main = println (callGreet 1)
-"#;
-    let diags = check_src(src);
-    assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
 }
 
 #[test]

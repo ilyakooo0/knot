@@ -388,7 +388,6 @@ pub fn extract_doc_comments(source: &str, module: &Module) -> HashMap<String, St
             | DeclKind::Source { name, .. }
             | DeclKind::View { name, .. }
             | DeclKind::Derived { name, .. }
-            | DeclKind::Trait { name, .. }
             | DeclKind::Route { name, .. }
             | DeclKind::RouteComposite { name, .. } => name.clone(),
             _ => continue,

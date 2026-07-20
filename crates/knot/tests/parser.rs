@@ -1516,98 +1516,6 @@ f = \\x -> x";
     assert!(matches!(&m.decls[4].node, DeclKind::Fun { .. }));
 }
 
-// ── Trait Declarations ──────────────────────────────────────────────
-
-#[test]
-fn simple_trait() {
-    let src = "trait Display a where\n  display : a -> Text";
-    match first_decl(src) {
-        DeclKind::Trait {
-            name,
-            params,
-            items,
-            ..
-        } => {
-            assert_eq!(name, "Display");
-            assert_eq!(params.len(), 1);
-            assert_eq!(params[0].name, "a");
-            assert!(params[0].kind.is_none());
-            assert_eq!(items.len(), 1);
-            match &items[0] {
-                TraitItem::Method { name, .. } => assert_eq!(name, "display"),
-                other => panic!("expected Method, got {:?}", other),
-            }
-        }
-        other => panic!("expected Trait, got {:?}", other),
-    }
-}
-
-#[test]
-fn trait_with_hkt_param() {
-    let src = "trait Functor (f : Type -> Type) where\n  map : (a -> b) -> f a -> f b";
-    match first_decl(src) {
-        DeclKind::Trait { params, .. } => {
-            assert_eq!(params[0].name, "f");
-            assert!(params[0].kind.is_some());
-        }
-        other => panic!("expected Trait with HKT, got {:?}", other),
-    }
-}
-
-#[test]
-fn trait_multiple_methods() {
-    let src = "trait Eq a where\n  eq : a -> a -> Bool\n  neq : a -> a -> Bool";
-    match first_decl(src) {
-        DeclKind::Trait { items, .. } => {
-            assert_eq!(items.len(), 2);
-        }
-        other => panic!("expected Trait, got {:?}", other),
-    }
-}
-
-// ── Impl Declarations ──────────────────────────────────────────────
-
-#[test]
-fn simple_impl() {
-    let src = "impl Display Int where\n  display n = n";
-    match first_decl(src) {
-        DeclKind::Impl {
-            trait_name,
-            args,
-            items,
-            ..
-        } => {
-            assert_eq!(trait_name, "Display");
-            assert_eq!(args.len(), 1);
-            assert!(matches!(&args[0].node, TypeKind::Named(n) if n == "Int"));
-            assert_eq!(items.len(), 1);
-            match &items[0] {
-                ImplItem::Method { name, params, .. } => {
-                    assert_eq!(name, "display");
-                    assert_eq!(params.len(), 1);
-                }
-                other => panic!("expected Method, got {:?}", other),
-            }
-        }
-        other => panic!("expected Impl, got {:?}", other),
-    }
-}
-
-#[test]
-fn impl_for_relation_type() {
-    let src = "impl Functor [] where\n  map f rel = rel";
-    match first_decl(src) {
-        DeclKind::Impl {
-            trait_name, args, ..
-        } => {
-            assert_eq!(trait_name, "Functor");
-            assert_eq!(args.len(), 1);
-            assert!(matches!(&args[0].node, TypeKind::Named(n) if n == "[]"));
-        }
-        other => panic!("expected Impl for [], got {:?}", other),
-    }
-}
-
 // ── Route Declarations ──────────────────────────────────────────────
 
 #[test]
@@ -2709,43 +2617,6 @@ fn derived_with_inline_type_annotation() {
 }
 
 #[test]
-fn trait_method_with_constraint() {
-    let src = "trait Collection c where\n  toList : Eq a => c a -> [a]";
-    match first_decl(src) {
-        DeclKind::Trait { items, .. } => {
-            assert_eq!(items.len(), 1);
-            match &items[0] {
-                TraitItem::Method { name, ty, .. } => {
-                    assert_eq!(name, "toList");
-                    assert!(!ty.constraints.is_empty());
-                    assert_eq!(ty.constraints[0].trait_name, "Eq");
-                }
-                other => panic!("expected Method, got {:?}", other),
-            }
-        }
-        other => panic!("expected Trait, got {:?}", other),
-    }
-}
-
-#[test]
-fn multiple_constraints() {
-    let src = "trait Container c where\n  sort : Ord a => Eq a => c a -> c a";
-    match first_decl(src) {
-        DeclKind::Trait { items, .. } => {
-            match &items[0] {
-                TraitItem::Method { ty, .. } => {
-                    assert_eq!(ty.constraints.len(), 2);
-                    assert_eq!(ty.constraints[0].trait_name, "Ord");
-                    assert_eq!(ty.constraints[1].trait_name, "Eq");
-                }
-                other => panic!("expected Method, got {:?}", other),
-            }
-        }
-        other => panic!("expected Trait, got {:?}", other),
-    }
-}
-
-#[test]
 fn multiline_type_signature_break_before_arrow() {
     // Newline before each `->`
     let src = "add : Int\n   -> Int\n   -> Int\nadd = \\x y -> x + y";
@@ -2787,62 +2658,6 @@ fn multiline_type_signature_break_after_arrow() {
             other => panic!("expected nested Function type, got {:?}", other),
         },
         other => panic!("expected Fun with type signature, got {:?}", other),
-    }
-}
-
-#[test]
-fn multiline_type_signature_break_before_fat_arrow() {
-    // Newline before each `=>`
-    let src = "trait C c where\n  m : Ord a\n   => Eq a\n   => c a -> c a";
-    match first_decl(src) {
-        DeclKind::Trait { items, .. } => match &items[0] {
-            TraitItem::Method { ty, .. } => {
-                assert_eq!(ty.constraints.len(), 2);
-                assert_eq!(ty.constraints[0].trait_name, "Ord");
-                assert_eq!(ty.constraints[1].trait_name, "Eq");
-            }
-            other => panic!("expected Method, got {:?}", other),
-        },
-        other => panic!("expected Trait, got {:?}", other),
-    }
-}
-
-#[test]
-fn multiline_type_signature_break_after_fat_arrow() {
-    // Newline after each `=>`
-    let src = "trait C c where\n  m : Ord a =>\n      Eq a =>\n      c a -> c a";
-    match first_decl(src) {
-        DeclKind::Trait { items, .. } => match &items[0] {
-            TraitItem::Method { ty, .. } => {
-                assert_eq!(ty.constraints.len(), 2);
-                assert_eq!(ty.constraints[0].trait_name, "Ord");
-                assert_eq!(ty.constraints[1].trait_name, "Eq");
-            }
-            other => panic!("expected Method, got {:?}", other),
-        },
-        other => panic!("expected Trait, got {:?}", other),
-    }
-}
-
-#[test]
-fn multiline_type_signature_constraints_and_arrows() {
-    // Constraints split across lines, then function type also split.
-    let src = "trait C c where\n  m : Ord a\n   => Eq a\n   => c a\n   -> c a\n   -> [a]";
-    match first_decl(src) {
-        DeclKind::Trait { items, .. } => match &items[0] {
-            TraitItem::Method { ty, .. } => {
-                assert_eq!(ty.constraints.len(), 2);
-                // c a -> (c a -> [a])
-                match &ty.ty.node {
-                    TypeKind::Function { result, .. } => {
-                        assert!(matches!(&result.node, TypeKind::Function { .. }));
-                    }
-                    other => panic!("expected nested Function type, got {:?}", other),
-                }
-            }
-            other => panic!("expected Method, got {:?}", other),
-        },
-        other => panic!("expected Trait, got {:?}", other),
     }
 }
 
@@ -2920,155 +2735,6 @@ fn multiline_type_signature_app_does_not_consume_next_decl() {
     assert_eq!(m.decls.len(), 2);
     assert!(matches!(&m.decls[0].node, DeclKind::Fun { name, body: None, .. } if name == "foo"));
     assert!(matches!(&m.decls[1].node, DeclKind::Fun { name, body: None, .. } if name == "bar"));
-}
-
-#[test]
-fn multiline_type_signature_app_in_trait_block() {
-    // Type-application across lines inside a trait method signature, where
-    // block_indent is set to the indent of the methods.
-    let src = "trait Foo c where\n  m : Map String\n        Int\n  n : Int";
-    match first_decl(src) {
-        DeclKind::Trait { items, .. } => {
-            assert_eq!(items.len(), 2);
-            match &items[0] {
-                TraitItem::Method { name, ty, .. } => {
-                    assert_eq!(name, "m");
-                    assert!(matches!(&ty.ty.node, TypeKind::App { .. }));
-                }
-                other => panic!("expected Method, got {:?}", other),
-            }
-            match &items[1] {
-                TraitItem::Method { name, .. } => assert_eq!(name, "n"),
-                other => panic!("expected second Method, got {:?}", other),
-            }
-        }
-        other => panic!("expected Trait, got {:?}", other),
-    }
-}
-
-// ── Trait/Impl Advanced ─────────────────────────────────────────────
-
-#[test]
-fn trait_with_supertrait() {
-    let src = "trait Functor f => Applicative (f : Type -> Type) where\n  pure : a -> f a";
-    match first_decl(src) {
-        DeclKind::Trait {
-            name,
-            supertraits,
-            params,
-            items,
-        } => {
-            assert_eq!(name, "Applicative");
-            assert_eq!(supertraits.len(), 1);
-            assert_eq!(supertraits[0].trait_name, "Functor");
-            assert_eq!(params[0].name, "f");
-            assert!(params[0].kind.is_some());
-            assert_eq!(items.len(), 1);
-        }
-        other => panic!("expected Trait with supertrait, got {:?}", other),
-    }
-}
-
-#[test]
-fn trait_with_associated_type() {
-    let src = "trait Collection c where\n  type Item c\n  empty : c";
-    match first_decl(src) {
-        DeclKind::Trait { items, .. } => {
-            assert_eq!(items.len(), 2);
-            match &items[0] {
-                TraitItem::AssociatedType { name, params } => {
-                    assert_eq!(name, "Item");
-                    assert_eq!(params, &["c"]);
-                }
-                other => panic!("expected AssociatedType, got {:?}", other),
-            }
-            assert!(matches!(&items[1], TraitItem::Method { name, .. } if name == "empty"));
-        }
-        other => panic!("expected Trait, got {:?}", other),
-    }
-}
-
-#[test]
-fn trait_with_default_impl() {
-    let src = "trait Eq a where\n  eq : a -> a -> Bool\n  neq x y = not (eq x y)";
-    match first_decl(src) {
-        DeclKind::Trait { items, .. } => {
-            assert_eq!(items.len(), 2);
-            match &items[0] {
-                TraitItem::Method {
-                    name,
-                    default_body, ..
-                } => {
-                    assert_eq!(name, "eq");
-                    assert!(default_body.is_none());
-                }
-                other => panic!("expected Method, got {:?}", other),
-            }
-            match &items[1] {
-                TraitItem::Method {
-                    name,
-                    default_body, ..
-                } => {
-                    assert_eq!(name, "neq");
-                    assert!(default_body.is_some());
-                }
-                other => panic!("expected Method with default, got {:?}", other),
-            }
-        }
-        other => panic!("expected Trait, got {:?}", other),
-    }
-}
-
-#[test]
-fn impl_with_associated_type() {
-    let src = "impl Collection [] where\n  type Item [] = Int\n  empty = []";
-    match first_decl(src) {
-        DeclKind::Impl { items, .. } => {
-            assert_eq!(items.len(), 2);
-            match &items[0] {
-                ImplItem::AssociatedType { name, ty, .. } => {
-                    assert_eq!(name, "Item");
-                    assert!(matches!(&ty.node, TypeKind::Named(n) if n == "Int"));
-                }
-                other => panic!("expected AssociatedType, got {:?}", other),
-            }
-        }
-        other => panic!("expected Impl, got {:?}", other),
-    }
-}
-
-#[test]
-fn impl_with_constraints() {
-    let src = "impl Eq a => Ord [a] where\n  compare xs ys = 0";
-    match first_decl(src) {
-        DeclKind::Impl {
-            trait_name,
-            constraints,
-            ..
-        } => {
-            assert_eq!(trait_name, "Ord");
-            assert_eq!(constraints.len(), 1);
-            assert_eq!(constraints[0].trait_name, "Eq");
-        }
-        other => panic!("expected Impl with constraint, got {:?}", other),
-    }
-}
-
-#[test]
-fn impl_method_no_params() {
-    let src = "impl Default Int where\n  default = 0";
-    match first_decl(src) {
-        DeclKind::Impl { items, .. } => {
-            match &items[0] {
-                ImplItem::Method { name, params, .. } => {
-                    assert_eq!(name, "default");
-                    assert!(params.is_empty());
-                }
-                other => panic!("expected Method, got {:?}", other),
-            }
-        }
-        other => panic!("expected Impl, got {:?}", other),
-    }
 }
 
 // ── Route Advanced ──────────────────────────────────────────────────
@@ -3664,18 +3330,6 @@ fn multi_arg_type_application() {
     }
 }
 
-#[test]
-fn empty_relation_type_constructor() {
-    // [] as a type constructor (used in impl Functor [] where ...)
-    match first_decl("impl Functor [] where\n  map f xs = xs") {
-        DeclKind::Impl { args, .. } => {
-            assert_eq!(args.len(), 1);
-            assert!(matches!(&args[0].node, TypeKind::Named(n) if n == "[]"));
-        }
-        other => panic!("expected Impl, got {:?}", other),
-    }
-}
-
 // ── Do Block Edge Cases ─────────────────────────────────────────────
 
 #[test]
@@ -3871,12 +3525,6 @@ fn error_missing_colon_in_source() {
     assert!(diags
         .iter()
         .any(|d| d.message.contains(":") || d.message.contains("=")));
-}
-
-#[test]
-fn error_missing_where_in_trait() {
-    let (_, diags) = parse_err("trait Foo a\n  bar : Int");
-    assert!(diags.iter().any(|d| d.message.contains("where")));
 }
 
 #[test]

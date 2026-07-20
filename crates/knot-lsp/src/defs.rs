@@ -5,7 +5,7 @@
 //! Also lives here: `build_details`, which formats per-declaration "summary"
 //! strings used as completion details and hover headlines.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use knot::ast::{self, DeclKind, Module, Span, Type, TypeKind};
 
@@ -50,26 +50,6 @@ fn advance_past_field_block(source: &str, from: usize, end: usize) -> usize {
         i += 1;
     }
     from
-}
-
-/// Canonical definition span of trait method `method` as declared by the trait
-/// named `trait_name` in this module, if any. Mirrors the scope-0 registration
-/// in `resolve_definitions` (the `Trait` arm), which anchors a method on its
-/// *first* `TraitItem::Method` entry — the signature token for a defaulted
-/// method. Used to link an `impl`'s method token to the trait method it
-/// implements. Resolves precisely through `trait_name` rather than the
-/// name-keyed scope map, which can't disambiguate two traits that declare a
-/// method of the same name.
-fn trait_method_def_span(module: &Module, trait_name: &str, method: &str) -> Option<Span> {
-    module.decls.iter().find_map(|d| match &d.node {
-        DeclKind::Trait { name, items, .. } if name == trait_name => {
-            items.iter().find_map(|it| match it {
-                ast::TraitItem::Method { name: m, name_span, .. } if m == method => Some(*name_span),
-                _ => None,
-            })
-        }
-        _ => None,
-    })
 }
 
 /// Definition resolution result: name → def span, (use span, def span)
@@ -145,46 +125,6 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                 // definition span.
                 resolver.register_extra_definition_tokens(decl.span, name, span);
             }
-            DeclKind::Trait { name, items, .. } => {
-                resolver.define(name, name_span(name));
-                // Methods live after `where`; searching from the trait header
-                // (`name_span` starts at `decl.span.start`) lets a method name
-                // collide with the trait name, a supertrait, or a type
-                // parameter (`trait T a where  a : a -> Int` anchors method `a`
-                // on the header's `a`). Start the search past `where` so each
-                // method resolves to its own signature token. Mirrors the Data
-                // arm's `=`-anchored search above. Use a whole-word search for
-                // the keyword so a trait/supertrait/param name that merely
-                // *contains* the substring `where` (e.g. `Nowhere`) doesn't
-                // anchor the search before the real keyword.
-                // Each method carries an authoritative `name_span` pointing at
-                // its own signature token (see `ast::TraitItem::Method`). Use it
-                // directly — a non-advancing text search anchored past `where`
-                // mis-resolves a method to an *earlier* method's default-body
-                // reference of the same name (e.g. `eq` calling `neq` before
-                // `neq`'s own signature appears). Mirrors document_symbol.rs.
-                // A defaulted method is parsed as TWO `TraitItem::Method`
-                // entries — the signature (`foo : T`, `default_body: None`) and
-                // the default body (`foo = …`, `default_body: Some`), each with
-                // its own `name_span`. Registering both via `define` keeps only
-                // the last (the body), leaving the signature token invisible to
-                // rename/references/highlight and corrupting the trait on
-                // rename. Define the first occurrence of each method name as
-                // canonical and cross-link any later same-name token as a
-                // self-reference (mirrors the `Fun` arm — but per-method, so we
-                // don't capture a *reference* from another method's default body
-                // of the same name, e.g. `eq` calling `neq`).
-                let mut method_defs: HashSet<&str> = HashSet::new();
-                for item in items {
-                    if let ast::TraitItem::Method { name, name_span, .. } = item {
-                        if method_defs.insert(name.as_str()) {
-                            resolver.define(name, *name_span);
-                        } else {
-                            resolver.add_ref(*name_span, name);
-                        }
-                    }
-                }
-            }
             DeclKind::Route { name, entries, .. } => {
                 resolver.define(name, name_span(name));
                 // Each endpoint's constructor (`… -> Response = GetUsers`) is a
@@ -257,114 +197,6 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                 for ctor in constructors {
                     for f in &ctor.fields {
                         resolver.resolve_type(&f.value, source);
-                    }
-                }
-            }
-            DeclKind::Impl { trait_name, args, items, constraints, .. } => {
-                // The impl head is `impl (Constraint =>)* TraitName args*`, so
-                // every trait-name token (the constraints' trait names then the
-                // impl's own) precedes the first arg. Recover them in order so
-                // goto/find-references/rename reach `impl Show …` and any
-                // `Show a =>` bound — otherwise renaming the trait leaves them
-                // stale.
-                let head_end = args.first().map(|a| a.span.start).unwrap_or(decl.span.end);
-                resolver.resolve_trait_names(
-                    constraints
-                        .iter()
-                        .map(|c| c.trait_name.as_str())
-                        .chain(std::iter::once(trait_name.as_str())),
-                    decl.span.start,
-                    head_end,
-                );
-                for arg in args {
-                    resolver.resolve_type(arg, source);
-                }
-                for c in constraints {
-                    for arg in &c.args {
-                        resolver.resolve_type(arg, source);
-                    }
-                }
-                for item in items {
-                    match item {
-                        ast::ImplItem::Method { name, name_span, params, body } => {
-                            // Link the method's definition token to the trait
-                            // method it implements, so find-references/goto from
-                            // the trait method reach every impl in this file
-                            // (rename.rs already does this out-of-band; without
-                            // the link, references.rs' local path — which relies
-                            // solely on these refs — misses impl definitions).
-                            // Resolve precisely through this impl's `trait_name`
-                            // rather than the ambiguous scope-0 name map.
-                            if let Some(def_span) =
-                                trait_method_def_span(module, trait_name, name)
-                            {
-                                resolver.refs.push((*name_span, def_span));
-                            }
-                            resolver.push_scope();
-                            for p in params {
-                                resolver.define_pat(p);
-                            }
-                            resolver.resolve_expr(body);
-                            resolver.pop_scope();
-                        }
-                        ast::ImplItem::AssociatedType { args, ty, .. } => {
-                            // `type Item [a] = SomeType` — the argument and
-                            // definition types name real types; resolve them so
-                            // goto/find-references reach those definitions
-                            // (mirrors the rename walker).
-                            for arg in args {
-                                resolver.resolve_type(arg, source);
-                            }
-                            resolver.resolve_type(ty, source);
-                        }
-                    }
-                }
-            }
-            DeclKind::Trait { items, supertraits, .. } => {
-                // `trait T a : Super1, Super2` — each supertrait's trait name is
-                // a reference to that trait's definition.
-                resolver.resolve_trait_names(
-                    supertraits.iter().map(|c| c.trait_name.as_str()),
-                    decl.span.start,
-                    decl.span.end,
-                );
-                for c in supertraits {
-                    for arg in &c.args {
-                        resolver.resolve_type(arg, source);
-                    }
-                }
-                for item in items {
-                    if let ast::TraitItem::Method {
-                        name_span,
-                        default_params,
-                        default_body,
-                        ty,
-                        ..
-                    } = item
-                    {
-                        // A method's own `Trait a =>` constraint trait names
-                        // (`eq : Show a => Bool`) are spanless — recover them
-                        // between the method name and its type, so goto/rename
-                        // reach the constrained trait (mirrors the `Fun` arm).
-                        resolver.resolve_trait_names(
-                            ty.constraints.iter().map(|c| c.trait_name.as_str()),
-                            name_span.end,
-                            ty.ty.span.start,
-                        );
-                        resolver.resolve_type(&ty.ty, source);
-                        for c in &ty.constraints {
-                            for arg in &c.args {
-                                resolver.resolve_type(arg, source);
-                            }
-                        }
-                        if let Some(body) = default_body {
-                            resolver.push_scope();
-                            for p in default_params {
-                                resolver.define_pat(p);
-                            }
-                            resolver.resolve_expr(body);
-                            resolver.pop_scope();
-                        }
                     }
                 }
             }
@@ -882,24 +714,6 @@ pub fn build_details(module: &Module) -> HashMap<String, String> {
                     .unwrap_or_default();
                 details.insert(name.clone(), format!("{name}{ty_str}"));
             }
-            DeclKind::Trait { name, params, .. } => {
-                let params_str = params
-                    .iter()
-                    .map(|p| {
-                        if let Some(kind) = &p.kind {
-                            format!("({} : {})", p.name, format_type_kind(&kind.node))
-                        } else {
-                            p.name.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                details.insert(name.clone(), format!("trait {name} {params_str}"));
-            }
-            DeclKind::Impl { trait_name, args, .. } => {
-                let args_str = args.iter().map(|a| format_type_kind(&a.node)).collect::<Vec<_>>().join(" ");
-                details.insert(format!("{trait_name}@{args_str}"), format!("impl {trait_name} {args_str}"));
-            }
             DeclKind::Route { name, .. } => {
                 details.insert(name.clone(), format!("route {name}"));
             }
@@ -925,24 +739,6 @@ mod tests {
         module
     }
 
-    #[test]
-    fn trait_method_def_anchors_on_signature_not_header() {
-        // A trait method whose name collides with a token in the trait
-        // header (here the type parameter `a`) must resolve to its own
-        // signature line, not the header occurrence — otherwise goto/rename
-        // on calls of the method jump to / edit the type parameter.
-        let source = "trait T a where\n  a : a -> Int 1\n";
-        let module = parse(source);
-        let (defs, _, _) = resolve_definitions(&module, source);
-        let span = defs.get("a").expect("method `a` is defined");
-        // The header `a` is on line 0; the method signature is on line 1.
-        assert!(
-            span.start > source.find('\n').unwrap(),
-            "method def should anchor after the header line, got {span:?}"
-        );
-        assert_eq!(&source[span.start..span.end], "a");
-    }
-
     /// True if some recorded reference's usage span is exactly `text` and
     /// points at the definition of `def_name`.
     fn has_ref_to(defs: &Definitions, source: &str, text: &str, def_name: &str) -> bool {
@@ -956,32 +752,6 @@ mod tests {
     }
 
     #[test]
-    fn impl_trait_name_is_recorded_as_reference() {
-        // `impl Show Foo` must record its `Show` token as a reference to the
-        // trait definition, so goto/find-references reach it.
-        let source =
-            "trait Show a where\n  present : a -> Text\ndata Foo = Foo {}\nimpl Show Foo where\n  present = \\x -> \"foo\"\n";
-        let module = parse(source);
-        let defs = resolve_definitions(&module, source);
-        assert!(
-            has_ref_to(&defs, source, "Show", "Show"),
-            "the `impl Show` trait token must be a reference to trait `Show`"
-        );
-    }
-
-    #[test]
-    fn constraint_trait_name_is_recorded_as_reference() {
-        let source =
-            "trait Show a where\n  present : a -> Text\nfmtAll : Show a => a -> Text\nfmtAll = \\x -> present x\n";
-        let module = parse(source);
-        let defs = resolve_definitions(&module, source);
-        assert!(
-            has_ref_to(&defs, source, "Show", "Show"),
-            "the `Show a =>` constraint token must be a reference to trait `Show`"
-        );
-    }
-
-    #[test]
     fn migrate_relation_is_recorded_as_reference() {
         let source = "*users : [{v: Int 1}]\nf = \\x -> x\nmigrate *users from Int to Int using f\n";
         let module = parse(source);
@@ -990,22 +760,5 @@ mod tests {
             has_ref_to(&defs, source, "users", "users"),
             "the migrated `*users` relation token must be a reference to source `users`"
         );
-    }
-
-    #[test]
-    fn trait_method_anchor_ignores_where_substring_in_header() {
-        // The trait name "Nowhere" contains the substring "where". Anchoring
-        // the method search on the first *substring* `where` would land inside
-        // the name, before the real keyword, and resolve method `a` to the
-        // header type parameter `a`. A whole-word keyword search must skip it.
-        let source = "trait Nowhere a where\n  a : a -> Int 1\n";
-        let module = parse(source);
-        let (defs, _, _) = resolve_definitions(&module, source);
-        let span = defs.get("a").expect("method `a` is defined");
-        assert!(
-            span.start > source.find('\n').unwrap(),
-            "method def should anchor after the header line, got {span:?}"
-        );
-        assert_eq!(&source[span.start..span.end], "a");
     }
 }

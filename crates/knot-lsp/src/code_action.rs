@@ -136,157 +136,6 @@ pub(crate) fn handle_code_action(
             }
             _ => {}
         }
-
-        // Action: Add missing trait methods to impl blocks
-        if let DeclKind::Impl {
-            trait_name, items, ..
-        } = &decl.node
-        {
-            // Find the trait declaration to know which methods are required.
-            // We need the full TraitItem (not just the name) so we can look up
-            // each method's type signature for param-count and default body.
-            let trait_items: Vec<&ast::TraitItem> = doc
-                .module
-                .decls
-                .iter()
-                .filter_map(|d| {
-                    if let DeclKind::Trait {
-                        name,
-                        items: trait_items,
-                        ..
-                    } = &d.node
-                        && name == trait_name {
-                            return Some(trait_items);
-                        }
-                    None
-                })
-                .flatten()
-                .filter(|item| {
-                    matches!(
-                        item,
-                        ast::TraitItem::Method {
-                            default_body: None,
-                            ..
-                        }
-                    )
-                })
-                .collect();
-
-            // The parser emits a defaulted trait method as TWO items: the
-            // signature (`default_body: None`) and the body (`default_body:
-            // Some`). The signature survives the `default_body: None` filter
-            // above, so collect the names that ALSO carry a default body and
-            // exclude them — an impl may legally omit a defaulted method, and
-            // stubbing it with `= todo` would override a working default with
-            // the undefined identifier `todo`.
-            let defaulted_method_names: HashSet<&str> = doc
-                .module
-                .decls
-                .iter()
-                .filter_map(|d| {
-                    if let DeclKind::Trait {
-                        name,
-                        items: trait_items,
-                        ..
-                    } = &d.node
-                        && name == trait_name {
-                            return Some(trait_items);
-                        }
-                    None
-                })
-                .flatten()
-                .filter_map(|item| {
-                    if let ast::TraitItem::Method {
-                        name,
-                        default_body: Some(_),
-                        ..
-                    } = item
-                    {
-                        Some(name.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let impl_methods: HashSet<&str> = items
-                .iter()
-                .filter_map(|item| {
-                    if let ast::ImplItem::Method { name, .. } = item {
-                        Some(name.as_str())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let missing: Vec<&&ast::TraitItem> = trait_items
-                .iter()
-                .filter(|item| {
-                    if let ast::TraitItem::Method { name, .. } = item {
-                        !impl_methods.contains(name.as_str())
-                            && !defaulted_method_names.contains(name.as_str())
-                    } else {
-                        false
-                    }
-                })
-                .collect();
-
-            if !missing.is_empty() {
-                // Insert after the last non-whitespace byte of the impl —
-                // the decl span includes the trailing newline run, and the
-                // stubs must attach to the impl block, not the next decl.
-                let insert_pos =
-                    offset_to_position(&doc.source, decl_text_end(&doc.source, decl.span));
-                // Match the impl block's existing indentation instead of
-                // hardcoding two spaces.
-                let indent = impl_block_indent(&doc.source, decl.span);
-                let stubs: String = missing
-                    .iter()
-                    .map(|item| build_trait_method_stub(item, &indent))
-                    .collect();
-
-                let mut changes = HashMap::new();
-                changes.insert(
-                    uri.clone(),
-                    vec![TextEdit {
-                        range: Range {
-                            start: insert_pos,
-                            end: insert_pos,
-                        },
-                        new_text: stubs,
-                    }],
-                );
-
-                let missing_names: Vec<String> = missing
-                    .iter()
-                    .filter_map(|item| {
-                        if let ast::TraitItem::Method { name, .. } = item {
-                            Some(name.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: format!("Add missing methods: {}", missing_names.join(", ")),
-                    kind: Some(CodeActionKind::QUICKFIX),
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }));
-            }
-
-            // Convert empty / fully-default impl to a `deriving` clause on the
-            // data declaration. The user wrote `impl Eq for Foo where` with no
-            // body and the trait's required methods all have default bodies —
-            // `deriving (Eq)` is the more idiomatic spelling.
-            if let Some(action) = build_deriving_action(decl, trait_name, items, doc, uri) {
-                actions.push(action);
-            }
-        }
     }
 
     // Diagnostic-attached quick fixes: suggest similar names for unknown identifiers
@@ -565,13 +414,6 @@ pub(crate) fn handle_code_action(
                 find_case_actions(body, doc, uri, range_start, range_end, &mut actions);
             }
             DeclKind::Fun { body: None, .. } => {}
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        find_case_actions(body, doc, uri, range_start, range_end, &mut actions);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -778,13 +620,6 @@ pub(crate) fn handle_code_action(
                 find_inline_actions(body, doc, uri, range_start, &mut actions);
             }
             DeclKind::Fun { body: None, .. } => {}
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        find_inline_actions(body, doc, uri, range_start, &mut actions);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -1307,14 +1142,6 @@ fn find_add_wildcard_arm_at(
                     return Some(hit);
                 }
             }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item
-                        && let Some(hit) = walk(body, source, offset) {
-                            return Some(hit);
-                        }
-                }
-            }
             _ => {}
         }
     }
@@ -1441,15 +1268,6 @@ fn find_if_negate_at(
                     return Some(hit);
                 }
             }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item
-                        && let Some(hit) = walk(body, source, offset)
-                    {
-                        return Some(hit);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -1558,21 +1376,6 @@ fn find_wrap_in_err_at(
                     return Some((span, format!("Err {{error {body}}}")));
                 }
             }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item
-                        && let Some(span) = walk(body, range_start, range_end)
-                    {
-                        let text = source.get(span.start..span.end)?;
-                        let body = if is_atomic_expr_text(text) {
-                            text.to_string()
-                        } else {
-                            format!("({text})")
-                        };
-                        return Some((span, format!("Err {{error {body}}}")));
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -1659,9 +1462,6 @@ fn selection_matches_expr_node(module: &Module, source: &str, lo: usize, hi: usi
         }
         | DeclKind::View { body, .. }
         | DeclKind::Derived { body, .. } => walk(body, source, target),
-        DeclKind::Impl { items, .. } => items.iter().any(|item| {
-            matches!(item, ast::ImplItem::Method { body, .. } if walk(body, source, target))
-        }),
         _ => false,
     })
 }
@@ -1865,46 +1665,6 @@ fn collect_referenced_names(module: &Module) -> HashSet<String> {
                 // `deriving` clause referencing an undefined trait.
                 for trait_name in deriving {
                     names.insert(trait_name.clone());
-                }
-            }
-            DeclKind::Trait {
-                items, supertraits, ..
-            } => {
-                for sup in supertraits {
-                    names.insert(sup.trait_name.clone());
-                }
-                for item in items {
-                    if let ast::TraitItem::Method {
-                        ty,
-                        default_body: Some(b),
-                        ..
-                    } = item
-                    {
-                        collect_names_in_type(&ty.ty, &mut names);
-                        collect_names_in_expr(b, &mut names);
-                    } else if let ast::TraitItem::Method { ty, .. } = item {
-                        collect_names_in_type(&ty.ty, &mut names);
-                    }
-                }
-            }
-            DeclKind::Impl {
-                trait_name,
-                args,
-                items,
-                constraints,
-                ..
-            } => {
-                names.insert(trait_name.clone());
-                for c in constraints {
-                    names.insert(c.trait_name.clone());
-                }
-                for arg in args {
-                    collect_names_in_type(arg, &mut names);
-                }
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        collect_names_in_expr(body, &mut names);
-                    }
                 }
             }
             DeclKind::Migrate {
@@ -2359,252 +2119,6 @@ fn detect_wrap_suggestions(
     // don't know if the user wants the side-effect, so this is best left to
     // the user manually. Skip.
     out
-}
-
-/// Build a "Convert to deriving" code action for an empty impl whose trait is
-/// fully default-bodied and whose target is a local data type without an
-/// existing entry for that trait. Returns `None` when any precondition fails.
-fn build_deriving_action(
-    impl_decl: &ast::Decl,
-    trait_name: &str,
-    impl_items: &[ast::ImplItem],
-    doc: &DocumentState,
-    uri: &Uri,
-) -> Option<CodeActionOrCommand> {
-    // Only consider literally-empty impls. A non-empty impl with hand-written
-    // bodies isn't equivalent to `deriving` — users may rely on the override.
-    if !impl_items.is_empty() {
-        return None;
-    }
-
-    // The impl arg list must be a single Named type referring to a local data
-    // declaration. Refuse multi-arg impls (HKT impls like `impl Functor []`)
-    // and impls over non-data types — `deriving` only works on data decls.
-    let target_name = doc
-        .module
-        .decls
-        .iter()
-        .find_map(|d| match &d.node {
-            DeclKind::Impl { args, .. }
-                if d.span == impl_decl.span && args.len() == 1 =>
-            {
-                if let TypeKind::Named(n) = &args[0].node {
-                    Some(n.clone())
-                } else {
-                    None
-                }
-            }
-            _ => None,
-        })?;
-
-    // Find the data decl. Bail if it already lists this trait — the impl is
-    // redundant in that case but `deriving` would be a no-op edit.
-    let data_decl = doc.module.decls.iter().find(|d| {
-        matches!(&d.node, DeclKind::Data { name, .. } if name == &target_name)
-    })?;
-    let existing_deriving = match &data_decl.node {
-        DeclKind::Data { deriving, .. } => deriving.clone(),
-        _ => return None,
-    };
-    // `data_decl.span.end` covers everything up to (but not including) the
-    // start of the next decl — including any existing `deriving (...)`
-    // clause (which is why the non-empty case below edits the clause in
-    // place) AND the trailing newline run, which must be trimmed so the
-    // inserted clause attaches to the data decl rather than the next one.
-    let data_decl_end = decl_text_end(&doc.source, data_decl.span);
-    if existing_deriving.iter().any(|n| n == trait_name) {
-        return None;
-    }
-
-    // The trait must be fully default-bodied so deriving produces equivalent
-    // behavior. If we can't find the trait in this module, bail — the trait
-    // may live in another file and we'd need cross-file analysis to verify.
-    let trait_decl = doc.module.decls.iter().find_map(|d| {
-        if let DeclKind::Trait { name, items, .. } = &d.node
-            && name == trait_name {
-                return Some(items.clone());
-            }
-        None
-    })?;
-    // The Knot parser splits a method's signature line and its default body
-    // line into two separate `TraitItem::Method` entries with the same name —
-    // one with `default_body: None` (the signature) and one with
-    // `default_body: Some(...)` (the default impl). For deriving to be valid,
-    // every distinct method name in the trait must have at least one item
-    // carrying a default body.
-    use std::collections::HashSet as _HashSet;
-    let mut all_method_names: _HashSet<&str> = _HashSet::new();
-    let mut names_with_default: _HashSet<&str> = _HashSet::new();
-    for item in &trait_decl {
-        if let ast::TraitItem::Method {
-            name,
-            default_body,
-            ..
-        } = item
-        {
-            all_method_names.insert(name.as_str());
-            if default_body.is_some() {
-                names_with_default.insert(name.as_str());
-            }
-        }
-    }
-    if all_method_names.is_empty() {
-        return None;
-    }
-    if all_method_names != names_with_default {
-        return None;
-    }
-
-    // Build the edit: either insert `\n  deriving (Trait)` after the last
-    // constructor (no existing clause), or rewrite the existing
-    // `deriving (...)` clause in place with the combined trait list — the
-    // decl span includes the clause, so appending at span.end would produce
-    // a duplicate `deriving` and a parse error. Then remove the impl decl.
-
-    // Compute the impl removal range — include the trailing newline so we
-    // don't leave a blank gap behind. Decl spans include the trailing-newline
-    // run, so scan from the trimmed text end (`decl_text_end`); scanning from
-    // the raw `span.end` would land on the *next* declaration's newline and
-    // delete that whole line too.
-    let impl_text_end = decl_text_end(&doc.source, impl_decl.span);
-    let impl_line_end = doc.source[impl_text_end..]
-        .find('\n')
-        .map(|p| impl_text_end + p + 1)
-        .unwrap_or(impl_text_end);
-    let impl_line_start = doc.source[..impl_decl.span.start]
-        .rfind('\n')
-        .map(|p| p + 1)
-        .unwrap_or(impl_decl.span.start);
-
-    let deriving_edit = if existing_deriving.is_empty() {
-        let insert_pos = offset_to_position(&doc.source, data_decl_end);
-        TextEdit {
-            range: Range {
-                start: insert_pos,
-                end: insert_pos,
-            },
-            new_text: format!("\n  deriving ({trait_name})"),
-        }
-    } else {
-        // Replace the existing clause (`deriving` keyword through its
-        // closing paren) with the combined list.
-        let decl_text = safe_slice(&doc.source, data_decl.span);
-        let deriving_pos = decl_text.rfind("deriving")?;
-        let close_rel = decl_text[deriving_pos..].find(')')?;
-        let clause_start = data_decl.span.start + deriving_pos;
-        let clause_end = data_decl.span.start + deriving_pos + close_rel + 1;
-        let mut all = existing_deriving.clone();
-        all.push(trait_name.to_string());
-        TextEdit {
-            range: Range {
-                start: offset_to_position(&doc.source, clause_start),
-                end: offset_to_position(&doc.source, clause_end),
-            },
-            new_text: format!("deriving ({})", all.join(", ")),
-        }
-    };
-
-    let mut changes = HashMap::new();
-    changes.insert(
-        uri.clone(),
-        vec![
-            deriving_edit,
-            TextEdit {
-                range: Range {
-                    start: offset_to_position(&doc.source, impl_line_start),
-                    end: offset_to_position(&doc.source, impl_line_end),
-                },
-                new_text: String::new(),
-            },
-        ],
-    );
-
-    Some(CodeActionOrCommand::CodeAction(CodeAction {
-        title: format!("Convert to `deriving ({trait_name})` on `{target_name}`"),
-        kind: Some(CodeActionKind::REFACTOR_REWRITE),
-        edit: Some(WorkspaceEdit {
-            changes: Some(changes),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }))
-}
-
-/// Leading indentation for method lines inside an impl block. Prefers the
-/// indentation of an existing item line (any indented non-empty line after
-/// the header); falls back to two spaces for empty impls.
-fn impl_block_indent(source: &str, decl_span: Span) -> String {
-    let text = safe_slice(source, decl_span);
-    for line in text.lines().skip(1) {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let indent = &line[..line.len() - trimmed.len()];
-        if !indent.is_empty() {
-            return indent.to_string();
-        }
-    }
-    "  ".to_string()
-}
-
-/// Build a trait method stub `name p1 p2 = todo` from a trait method
-/// declaration, indented with `indent` to match the impl block. Impl methods
-/// take parameters on the left-hand side (`method x = body` — see
-/// `ImplItem::Method { params, .. }`), unlike top-level functions.
-/// Counts arrows in the type signature to determine arity, then synthesizes
-/// fresh `a`, `b`, `c`... parameter names.
-fn build_trait_method_stub(item: &ast::TraitItem, indent: &str) -> String {
-    let (name, arity) = match item {
-        ast::TraitItem::Method { name, ty, .. } => {
-            let arity = count_function_arity(&ty.ty);
-            (name.clone(), arity)
-        }
-        _ => return String::new(),
-    };
-    let params: Vec<String> = (0..arity)
-        .map(|i| {
-            // Generate a, b, c, ... aa, ab, ...
-            let mut s = String::new();
-            let mut n = i;
-            loop {
-                s.insert(0, (b'a' + (n % 26) as u8) as char);
-                n /= 26;
-                if n == 0 {
-                    break;
-                }
-                n -= 1;
-            }
-            s
-        })
-        .collect();
-    let params_str = if params.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", params.join(" "))
-    };
-    format!("\n{indent}{name}{params_str} = todo")
-}
-
-/// Count the arity of a function type by walking the arrow spine.
-/// `Int -> Text -> Bool` → 2.
-fn count_function_arity(ty: &ast::Type) -> usize {
-    let mut count = 0;
-    let mut cur = ty;
-    loop {
-        match &cur.node {
-            ast::TypeKind::Function { result, .. } => {
-                count += 1;
-                cur = result;
-            }
-            // Look through Forall, IO, and Effectful wrappers
-            ast::TypeKind::Forall { ty: inner, .. } => cur = inner,
-            ast::TypeKind::IO { ty: inner, .. } => cur = inner,
-            ast::TypeKind::Effectful { ty: inner, .. } => cur = inner,
-            _ => break,
-        }
-    }
-    count
 }
 
 /// Compute the indentation prefix for a new case arm, matching the existing arms
@@ -3155,7 +2669,6 @@ fn module_declares_name(module: &Module, name: &str) -> bool {
             | DeclKind::View { name: dname, .. }
             | DeclKind::Derived { name: dname, .. }
             | DeclKind::Fun { name: dname, .. }
-            | DeclKind::Trait { name: dname, .. }
             | DeclKind::Route { name: dname, .. }
             | DeclKind::RouteComposite { name: dname, .. }
                 if dname == name => {
@@ -3265,13 +2778,6 @@ pub(crate) fn enclosing_do_stmt_range(
             }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => walk(body, sel_start, sel_end, &mut best),
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, sel_start, sel_end, &mut best);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -3412,13 +2918,6 @@ fn find_if_to_case_at(
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best),
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, source, offset, &mut best);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -3508,13 +3007,6 @@ fn find_flip_binary_at(
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best),
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, source, offset, &mut best);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -3622,13 +3114,6 @@ fn find_pipe_conversion_at(
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, false, false),
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, source, offset, &mut best, false, false);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -4008,113 +3493,6 @@ mod tests {
     }
 
     #[test]
-    fn deriving_action_offered_for_empty_impl_with_default_methods() {
-        let mut tw = TempWorkspace::new();
-        let uri = tw.write_and_open(
-            "main.knot",
-            r#"data Color
-  = Red {}
-  | Green {}
-  | Blue {}
-
-trait Describe a where
-  describe : a -> Text
-  describe x = show x
-
-impl Describe Color where
-"#,
-        );
-        let doc = tw.workspace.doc(&uri);
-        let off = doc.source.find("impl Describe Color").unwrap();
-        let range = Range {
-            start: crate::utils::offset_to_position(&doc.source, off),
-            end: crate::utils::offset_to_position(&doc.source, off + 4),
-        };
-        let params = CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range,
-            context: CodeActionContext {
-                diagnostics: Vec::new(),
-                only: None,
-                trigger_kind: None,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        };
-        let actions = handle_code_action(&tw.workspace.state, &params)
-            .expect("expected action response");
-        let derive_action = actions.iter().find_map(|a| match a {
-            CodeActionOrCommand::CodeAction(ca)
-                if ca.title.starts_with("Convert to `deriving (Describe)`") =>
-            {
-                Some(ca)
-            }
-            _ => None,
-        });
-        let action = derive_action
-            .expect("deriving action not found");
-        let edits = action
-            .edit
-            .as_ref()
-            .unwrap()
-            .changes
-            .as_ref()
-            .unwrap()
-            .get(&uri)
-            .unwrap();
-        // Expect 2 edits: insert deriving on data decl + remove impl decl.
-        assert_eq!(edits.len(), 2, "expected 2 edits");
-        let has_deriving = edits.iter().any(|e| e.new_text.contains("deriving (Describe)"));
-        assert!(has_deriving, "no edit inserts deriving clause");
-        let has_remove = edits.iter().any(|e| e.new_text.is_empty());
-        assert!(has_remove, "no edit removes the empty impl");
-    }
-
-    #[test]
-    fn deriving_action_skipped_when_impl_has_methods() {
-        let mut tw = TempWorkspace::new();
-        let uri = tw.write_and_open(
-            "main.knot",
-            r#"data Color
-  = Red {}
-
-trait Describe a where
-  describe : a -> Text
-  describe x = show x
-
-impl Describe Color where
-  describe c = "red"
-"#,
-        );
-        let doc = tw.workspace.doc(&uri);
-        let off = doc.source.find("impl Describe Color").unwrap();
-        let range = Range {
-            start: crate::utils::offset_to_position(&doc.source, off),
-            end: crate::utils::offset_to_position(&doc.source, off + 4),
-        };
-        let params = CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range,
-            context: CodeActionContext {
-                diagnostics: Vec::new(),
-                only: None,
-                trigger_kind: None,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        };
-        let actions = handle_code_action(&tw.workspace.state, &params).unwrap_or_default();
-        let has = actions.iter().any(|a| match a {
-            CodeActionOrCommand::CodeAction(ca) => ca.title.starts_with("Convert to `deriving"),
-            _ => false,
-        });
-        assert!(
-            !has,
-            "should not offer deriving for impl that overrides methods"
-        );
-    }
-
-    #[test]
     fn auto_import_inserts_after_existing_imports() {
         let mut tw = TempWorkspace::new();
         let _ = tw.write_and_open(
@@ -4422,45 +3800,6 @@ mod regress_fixes_tests {
         assert_eq!(edit.range.start.line, 0);
         assert_eq!(edit.range.start.character, eq_col);
         assert_eq!(edit.range.start, edit.range.end);
-    }
-
-    /// Item 2: "Convert to deriving" with an existing `deriving (...)` clause
-    /// must rewrite that clause with the combined list, not append a second
-    /// clause after it.
-    #[test]
-    fn convert_to_deriving_merges_existing_clause() {
-        let mut tw = TestWorkspace::new();
-        let src = "trait Greet a where\n  greet : a -> Text\n  greet x = \"hello\"\n\ndata Person = MkPerson {name: Text}\n  deriving (Eq)\n\nimpl Greet Person where\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "impl Greet");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start: pos, end: pos }),
-        )
-        .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.contains("deriving (Greet)"))
-            .expect("deriving action offered");
-        let edits = edits_for(action, &uri);
-        let deriving_edit = edits
-            .iter()
-            .find(|e| e.new_text.contains("deriving"))
-            .expect("deriving edit present");
-        assert_eq!(deriving_edit.new_text, "deriving (Eq, Greet)");
-        assert_ne!(
-            deriving_edit.range.start, deriving_edit.range.end,
-            "must replace the existing clause in place, not insert a second one"
-        );
-        // Applying the deriving edit must leave exactly one `deriving` clause.
-        let doc = tw.doc(&uri);
-        let start = crate::utils::position_to_offset(&doc.source, deriving_edit.range.start);
-        let end = crate::utils::position_to_offset(&doc.source, deriving_edit.range.end);
-        let mut applied = doc.source.clone();
-        applied.replace_range(start..end, &deriving_edit.new_text);
-        assert_eq!(
-            applied.matches("deriving").count(),
-            1,
-            "duplicate deriving clause after edit:\n{applied}"
-        );
     }
 
     /// Item 3: "Organize imports" must preserve selective item lists and
@@ -4860,33 +4199,6 @@ mod regress_fixes_tests {
         );
     }
 
-    /// "Convert to deriving" has the same span-end pitfall.
-    #[test]
-    fn convert_to_deriving_attaches_to_data_decl_not_next_decl() {
-        let mut tw = TestWorkspace::new();
-        let src = "trait Greet a where\n  greet : a -> Text\n  greet x = \"hi\"\n\ndata Color = Red {} | Blue {}\n\nimpl Greet Color where\n\nnext = 1\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "impl Greet");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start: pos, end: pos }),
-        )
-        .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Convert to `deriving"))
-            .expect("convert-to-deriving offered for empty impl of defaulted trait");
-        let edits = edits_for(action, &uri);
-        let deriving_edit = edits
-            .iter()
-            .find(|e| e.new_text.contains("deriving"))
-            .expect("deriving edit");
-        // The insertion must land at the end of the data decl's TEXT
-        // (line 4, right after `Blue {}`), not at the start of a later decl.
-        assert_eq!(
-            deriving_edit.range.start.line, 4,
-            "deriving must attach to the data decl line; edits: {edits:?}"
-        );
-    }
-
     /// "Widen declared effects" must rewrite the RESULT row, not the first
     /// textual `IO {` (which can be a callback parameter's row).
     #[test]
@@ -5034,36 +4346,6 @@ mod regress_fixes_tests {
         assert!(
             out.contains("import ./a\nimport ./b"),
             "imports must be sorted:\n{out}"
-        );
-    }
-
-    /// "Add missing methods" must match the impl block's actual indentation
-    /// and attach to the impl text, not after its trailing newline run.
-    #[test]
-    fn add_missing_methods_matches_impl_indentation() {
-        let mut tw = TestWorkspace::new();
-        let src = "trait Shape a where\n  area : a -> Int 1\n  name : a -> Text\n\ndata Sq = Sq {s: Int 1}\n\nimpl Shape Sq where\n    area x = 1\n\nnext = 1\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "impl Shape");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start: pos, end: pos }),
-        )
-        .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Add missing methods"))
-            .expect("add-missing-methods offered");
-        let edits = edits_for(action, &uri);
-        assert_eq!(edits.len(), 1);
-        assert!(
-            edits[0].new_text.starts_with("\n    name"),
-            "stub must reuse the impl's 4-space indent; got: {:?}",
-            edits[0].new_text
-        );
-        // Insertion anchors at the end of `area x = 1` (line 7), before the
-        // blank line — not glued onto `next = 1`.
-        assert_eq!(
-            edits[0].range.start.line, 7,
-            "stub must attach to the impl block; edits: {edits:?}"
         );
     }
 }

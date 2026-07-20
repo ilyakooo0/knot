@@ -706,12 +706,6 @@ fn render_decl(p: &mut Printer, d: &Decl) {
         DeclKind::Fun { name, ty, body } => {
             render_fun(p, name, ty.as_ref(), body.as_ref());
         }
-        DeclKind::Trait { name, params, supertraits, items } => {
-            render_trait(p, name, params, supertraits, items);
-        }
-        DeclKind::Impl { trait_name, args, constraints, items } => {
-            render_impl(p, trait_name, args, constraints, items);
-        }
         DeclKind::Route { name, entries } => {
             render_route(p, name, entries);
         }
@@ -950,143 +944,6 @@ fn render_fun(p: &mut Printer, name: &str, ty: Option<&TypeScheme>, body: Option
         render_expr(p, b, Prec::Lowest);
     } else {
         p.write(name);
-    }
-}
-
-fn render_trait(
-    p: &mut Printer,
-    name: &str,
-    params: &[TraitParam],
-    supertraits: &[Constraint],
-    items: &[TraitItem],
-) {
-    p.write("trait ");
-    if !supertraits.is_empty() {
-        for c in supertraits {
-            p.write(&render_constraint(c));
-            p.write(" => ");
-        }
-    }
-    p.write(name);
-    for prm in params {
-        if let Some(k) = &prm.kind {
-            p.write(" (");
-            p.write(&prm.name);
-            p.write(" : ");
-            p.write(&render_type(k));
-            p.write(")");
-        } else {
-            p.write(" ");
-            p.write(&prm.name);
-        }
-    }
-    p.write(" where");
-    p.newline();
-    p.with_indent(|p| {
-        for (i, it) in items.iter().enumerate() {
-            render_trait_item(p, it);
-            if i + 1 < items.len() {
-                p.newline();
-            }
-        }
-    });
-}
-
-fn render_trait_item(p: &mut Printer, it: &TraitItem) {
-    match it {
-        TraitItem::Method { name, ty, default_params, default_body, .. } => {
-            // The parser emits one TraitItem per syntactic line: a signature
-            // (`describe : a -> Text`) is one item; a default body
-            // (`describe x = ...`) is another with a Hole type. Render each
-            // accordingly.
-            let is_body_only = matches!(ty.ty.node, TypeKind::Hole) && default_body.is_some();
-            if is_body_only {
-                p.write(name);
-                for prm in default_params {
-                    p.write(" ");
-                    p.write(&render_pat(prm));
-                }
-                p.write(" = ");
-                render_expr(p, default_body.as_ref().unwrap(), Prec::Lowest);
-            } else {
-                p.write(name);
-                p.write(" : ");
-                p.write(&render_type_scheme(ty));
-                if let Some(body) = default_body {
-                    p.newline();
-                    p.write(name);
-                    for prm in default_params {
-                        p.write(" ");
-                        p.write(&render_pat(prm));
-                    }
-                    p.write(" = ");
-                    render_expr(p, body, Prec::Lowest);
-                }
-            }
-        }
-        TraitItem::AssociatedType { name, params } => {
-            p.write("type ");
-            p.write(name);
-            for pname in params {
-                p.write(" ");
-                p.write(pname);
-            }
-        }
-    }
-}
-
-fn render_impl(
-    p: &mut Printer,
-    trait_name: &str,
-    args: &[Type],
-    constraints: &[Constraint],
-    items: &[ImplItem],
-) {
-    p.write("impl ");
-    if !constraints.is_empty() {
-        for c in constraints {
-            p.write(&render_constraint(c));
-            p.write(" => ");
-        }
-    }
-    p.write(trait_name);
-    for a in args {
-        p.write(" ");
-        p.write(&render_type_atom(a));
-    }
-    p.write(" where");
-    p.newline();
-    p.with_indent(|p| {
-        for (i, it) in items.iter().enumerate() {
-            render_impl_item(p, it);
-            if i + 1 < items.len() {
-                p.newline();
-            }
-        }
-    });
-}
-
-fn render_impl_item(p: &mut Printer, it: &ImplItem) {
-    match it {
-        ImplItem::Method { name, params, body, .. } => {
-            p.write(name);
-            for prm in params {
-                p.write(" ");
-                p.write(&render_pat(prm));
-            }
-            p.write(" = ");
-            render_expr(p, body, Prec::Lowest);
-        }
-        ImplItem::AssociatedType { name, args, ty } => {
-            p.write("type ");
-            p.write(name);
-            for a in args {
-                p.write(" ");
-                p.write(&render_type_atom(a));
-            }
-            p.write(" = ");
-            p.write(&render_type(ty));
-        }
     }
 }
 
@@ -2623,13 +2480,6 @@ mod tests {
     }
 
     #[test]
-    fn impl_method_curried_args() {
-        let src = "impl Functor Maybe where\n  map f m = case m of\n    Just {value value} -> Just {value (f value)}\n    Nothing {} -> Nothing {}";
-        let out = fmt(src);
-        assert!(out.contains("map f m = case m of"));
-    }
-
-    #[test]
     fn comments_preserved_between_decls() {
         let src = "-- top\ntype A = Int\n\n-- middle\ntype B = Text\n";
         let out = fmt(src);
@@ -2652,7 +2502,6 @@ mod tests {
             "type Person = {name: Text, age: Int}\n",
             "main = do\n  println \"hi\"\n  yield {}\n",
             "data Maybe a = Nothing {} | Just {value: a}\n",
-            "trait Eq a where\n  eq : a -> a -> Bool\n",
         ];
         for i in inputs {
             assert_idempotent(i);

@@ -531,17 +531,6 @@ fn route_is_listened_inner(
                     return true;
                 }
             }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        let mut found = false;
-                        walk(body, route_name, &mut found, 0);
-                        if found {
-                            return true;
-                        }
-                    }
-                }
-            }
             // A composite `route Api = A | B` that is itself listened/served
             // wires in every component route.
             DeclKind::RouteComposite { name, components }
@@ -605,20 +594,6 @@ pub(crate) fn find_enclosing_application(
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => {
                 find_app_in_expr(body, source, offset, &mut best);
-            }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        find_app_in_expr(body, source, offset, &mut best);
-                    }
-                }
-            }
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method { default_body: Some(body), .. } = item {
-                        find_app_in_expr(body, source, offset, &mut best);
-                    }
-                }
             }
             // `migrate … using <expr>` and route `rateLimit` expressions
             // can contain applications that need signature help.
@@ -784,21 +759,6 @@ pub(crate) fn find_enclosing_atomic_expr(
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, 0),
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, source, offset, &mut best, 0);
-                    }
-                }
-            }
-            // Trait default method bodies can contain atomic expressions.
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method { default_body: Some(body), .. } = item {
-                        walk(body, source, offset, &mut best, 0);
-                    }
-                }
-            }
             // `migrate … using <expr>` — the using function is user code.
             DeclKind::Migrate { using_fn, .. } => walk(using_fn, source, offset, &mut best, 0),
             // Route `rateLimit` expressions are user-edited code.
@@ -1058,57 +1018,21 @@ pub(crate) fn extract_record_fields(type_str: &str) -> Vec<String> {
 // ── Function parameter introspection ────────────────────────────────
 
 /// Extract parameter names from a function declaration's body.
-/// Returns an empty Vec if the function isn't directly a lambda chain or
-/// trait/impl method. Used by signature_help and parameter-name inlay hints.
-///
-/// For trait methods, prefers the trait declaration's `default_params` (the
-/// names the trait author chose, which match the user's mental model of the
-/// API). When the trait method has no default body, falls back to scanning
-/// impl methods — those carry meaningful names that are still better than
-/// the synthesized `a`/`b`/`c` fallback.
+/// Returns an empty Vec if the function isn't directly a lambda chain.
+/// Used by signature_help and parameter-name inlay hints.
 pub(crate) fn extract_param_names(module: &Module, func_name: &str) -> Vec<String> {
-    let mut from_impl: Option<Vec<String>> = None;
     for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun {
-                name,
-                body: Some(body),
-                ..
-            } if name == func_name => {
-                return collect_lambda_param_names(body);
-            }
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method {
-                        name,
-                        default_params,
-                        ..
-                    } = item
-                        && name == func_name && !default_params.is_empty() {
-                            return default_params
-                                .iter()
-                                .map(|p| pat_to_simple_name(&p.node))
-                                .collect();
-                        }
-                }
-            }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { name, params, .. } = item
-                        && name == func_name && from_impl.is_none() {
-                            from_impl = Some(
-                                params
-                                    .iter()
-                                    .map(|p| pat_to_simple_name(&p.node))
-                                    .collect(),
-                            );
-                        }
-                }
-            }
-            _ => {}
+        if let DeclKind::Fun {
+            name,
+            body: Some(body),
+            ..
+        } = &decl.node
+            && name == func_name
+        {
+            return collect_lambda_param_names(body);
         }
     }
-    from_impl.unwrap_or_default()
+    Vec::new()
 }
 
 /// Walk a chain of nested lambdas (`\a -> \b -> body`) and collect param names.
@@ -1243,23 +1167,6 @@ pub(crate) fn find_field_access_at_offset(
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, 0),
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, source, offset, &mut best, 0);
-                    }
-                }
-            }
-            // Trait default method bodies also contain field accesses
-            // (`r.count`); without this arm a hover there falls back to a
-            // same-named global's signature.
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method { default_body: Some(body), .. } = item {
-                        walk(body, source, offset, &mut best, 0);
-                    }
-                }
-            }
             // `migrate *rel from … to … using <expr>` — the `using` function is
             // real user code that can dereference record fields.
             DeclKind::Migrate { using_fn, .. } => walk(using_fn, source, offset, &mut best, 0),
@@ -1376,13 +1283,6 @@ pub(crate) fn resolve_var_to_source(
             | DeclKind::Derived { body, .. } => {
                 walk(body, var_name, &mut found, 0);
             }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, var_name, &mut found, 0);
-                    }
-                }
-            }
             _ => {}
         }
         if found.is_some() {
@@ -1455,31 +1355,19 @@ fn scheme_contains_offset(scheme: &ast::TypeScheme, offset: usize) -> bool {
         .any(|c| c.args.iter().any(|t| type_contains_offset(t, offset)))
 }
 
-/// If the cursor is inside a function/view/derived/trait-method's type
-/// signature, return the `TypeScheme` plus the decl name. Used by hover to
-/// surface trait constraints that mention a generic parameter under the
-/// cursor.
+/// If the cursor is inside a function/view/derived's type
+/// signature, return the `TypeScheme` plus the decl name.
 pub(crate) fn find_enclosing_type_scheme(
     module: &Module,
     offset: usize,
 ) -> Option<(&ast::TypeScheme, &str)> {
     for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun { name, ty: Some(scheme), .. }
-            | DeclKind::View { name, ty: Some(scheme), .. }
-            | DeclKind::Derived { name, ty: Some(scheme), .. }
-                if scheme_contains_offset(scheme, offset) => {
-                    return Some((scheme, name.as_str()));
-                }
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method { name, ty, .. } = item
-                        && scheme_contains_offset(ty, offset) {
-                            return Some((ty, name.as_str()));
-                        }
-                }
-            }
-            _ => {}
+        if let DeclKind::Fun { name, ty: Some(scheme), .. }
+        | DeclKind::View { name, ty: Some(scheme), .. }
+        | DeclKind::Derived { name, ty: Some(scheme), .. } = &decl.node
+            && scheme_contains_offset(scheme, offset)
+        {
+            return Some((scheme, name.as_str()));
         }
     }
     None

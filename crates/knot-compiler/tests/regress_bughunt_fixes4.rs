@@ -85,7 +85,9 @@ store = \race -> atomic (do cur <- *items; replace *items = [{v race}])
 main = do
   store 7
   xs <- *items
-  forEach xs (\x -> println ("v = " ++ show x.v))
+  case xs of
+    Cons x _ -> println ("v = " ++ show x.v)
+    _ -> println "empty"
   yield {}
 "#,
     );

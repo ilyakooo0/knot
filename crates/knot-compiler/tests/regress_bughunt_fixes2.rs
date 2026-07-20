@@ -76,64 +76,6 @@ fn compile_and_run(test_name: &str, source: &str) -> (String, String, bool) {
 
 // ── Finding 1: associated-type reduction on Ty::Alias heads ───────────
 
-#[test]
-fn associated_type_reduces_on_single_variant_data() {
-    let (stdout, stderr, ok) = compile_and_run(
-        "assoc_single_variant",
-        r#"trait Container c where
-  type Elem c
-  toList : c -> [Elem c]
-
-data IntBox = IntBox {v: Int 1}
-
-impl Container IntBox where
-  type Elem IntBox = Int 1
-  toList b = case b of
-    IntBox {v v} -> [v]
-
-useit : IntBox -> [Int 1]
-useit = \b -> toList b
-
-main = do
-  println (show (toList (IntBox {v 5})))
-  yield {}
-"#,
-    );
-    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
-    assert!(
-        stdout.contains("[5]"),
-        "expected toList (IntBox 5) == [5], got:\n{stdout}"
-    );
-}
-
-#[test]
-fn associated_type_reduces_with_multi_variant_control() {
-    // Control: a multi-variant `data` head is a `Ty::Con` and already worked —
-    // pin it alongside the single-variant (Ty::Alias) fix so both paths stay
-    // green.
-    let (stdout, stderr, ok) = compile_and_run(
-        "assoc_multi_variant",
-        r#"trait Container c where
-  type Elem c
-  toList : c -> [Elem c]
-
-data Two = A {v: Int 1} | B {v: Int 1}
-
-impl Container Two where
-  type Elem Two = Int 1
-  toList t = case t of
-    A {v v} -> [v]
-    B {v v} -> [v]
-
-main = do
-  println (show (toList (A {v 9})))
-  yield {}
-"#,
-    );
-    assert!(ok, "program failed:\nstdout: {stdout}\nstderr: {stderr}");
-    assert!(stdout.contains("[9]"), "expected [9], got:\n{stdout}");
-}
-
 // ── Finding 3: lone-yield do-block dispatches on the resolved monad ──
 
 #[test]

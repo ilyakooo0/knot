@@ -43,21 +43,6 @@ pub(crate) fn build_workspace_symbol_entries(
             DeclKind::View { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
             DeclKind::Derived { name, .. } => (format!("&{name}"), SymbolKind::VARIABLE, None),
             DeclKind::Fun { name, .. } => (name.clone(), SymbolKind::FUNCTION, None),
-            DeclKind::Trait { name, .. } => (name.clone(), SymbolKind::INTERFACE, None),
-            DeclKind::Impl {
-                trait_name, args, ..
-            } => {
-                let args_str = args
-                    .iter()
-                    .map(|a| format_type_kind(&a.node))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                (
-                    format!("impl {trait_name} {args_str}"),
-                    SymbolKind::OBJECT,
-                    None,
-                )
-            }
             DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
                 (format!("route {name}"), SymbolKind::MODULE, None)
             }

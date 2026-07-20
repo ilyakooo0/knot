@@ -327,10 +327,7 @@ fn adt_payload_column_equality_finds_matching_row() {
     // the column stores JSON — the matching row was silently dropped.
     let (stdout, stderr, ok) = compile_and_run(
         "adt_payload_eq",
-        r#"data Status = Active {} | Banned {reason: Text}
-
-impl Eq Status where
-  eq = \a b -> show a == show b
+        r#"data Status = Active {} | Banned {reason: Text} deriving (Eq)
 
 *users : [{name: Text, st: Status}]
 
@@ -351,10 +348,7 @@ fn nullary_adt_tag_column_equality_still_works() {
     // All-nullary ("tag") ADT columns remain pushable and must keep working.
     let (stdout, stderr, ok) = compile_and_run(
         "adt_tag_eq",
-        r#"data Color = Red {} | Blue {}
-
-impl Eq Color where
-  eq = \a b -> show a == show b
+        r#"data Color = Red {} | Blue {} deriving (Eq)
 
 *marbles : [{n: Int 1, c: Color}]
 

@@ -362,55 +362,6 @@ impl<'a> TokenCollector<'a> {
                 }
                 self.visit_expr(body);
             }
-            DeclKind::Trait { name, items, .. } => {
-                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
-                    self.add(s, TOK_TYPE, MOD_DECLARATION);
-                }
-                for item in items {
-                    match item {
-                        ast::TraitItem::Method {
-                            name_span,
-                            ty,
-                            default_params,
-                            default_body,
-                            ..
-                        } => {
-                            // Highlight the method name and its signature even
-                            // when it has no default body (mirrors the `Fun`
-                            // arm) — otherwise a bodyless `eq : a -> a -> Bool`
-                            // gets no tokens at all.
-                            self.add(*name_span, TOK_FUNCTION, MOD_DECLARATION);
-                            self.visit_type(&ty.ty);
-                            if let Some(body) = default_body {
-                                for p in default_params {
-                                    self.visit_pat(p, true);
-                                }
-                                self.visit_expr(body);
-                            }
-                        }
-                        ast::TraitItem::AssociatedType { .. } => {}
-                    }
-                }
-            }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    match item {
-                        ast::ImplItem::Method { name_span, params, body, .. } => {
-                            self.add(*name_span, TOK_FUNCTION, MOD_DECLARATION);
-                            for p in params {
-                                self.visit_pat(p, true);
-                            }
-                            self.visit_expr(body);
-                        }
-                        ast::ImplItem::AssociatedType { args, ty, .. } => {
-                            for arg in args {
-                                self.visit_type(arg);
-                            }
-                            self.visit_type(ty);
-                        }
-                    }
-                }
-            }
             DeclKind::Route { name, entries, .. } => {
                 if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
                     self.add(s, TOK_TYPE, MOD_DECLARATION);

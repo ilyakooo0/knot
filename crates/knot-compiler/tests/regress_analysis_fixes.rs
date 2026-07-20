@@ -39,7 +39,7 @@ fn parse(src: &str) -> knot::ast::Module {
 fn check_src(src: &str) -> Vec<Diagnostic> {
     let mut module = parse(src);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, _refine, _refined, _json, _elem, _trait_calls, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) =
+    let (diags, _monad, _type_info, _local, _refine, _refined, _json, _elem, _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) =
         knot_compiler::infer::check(&mut module);
     diags
 }
@@ -646,33 +646,6 @@ main = println "ok"
     assert_eq!(
         migs[0].1, "customer:text,qty:int",
         "to-schema must unwrap the relation"
-    );
-}
-
-#[test]
-fn sql_lint_suppressed_when_user_primitive_impl_disables_pushdown() {
-    // An out-of-order pipe (`take` before `filter`) cannot push to SQL, so the
-    // lint normally reports it. But when the program defines a user operator
-    // impl on a primitive type, codegen disables SQL pushdown wholesale and
-    // evaluates everything in memory — so the lint must stay silent rather
-    // than imply (by reporting only this construct) that others push down.
-    let base = r#"*items : [{name: Text, qty: Int 1}]
-firstFew : IO {} [{name: Text, qty: Int 1}]
-firstFew = *items |> take 3 |> filter (\m -> m.qty > 0)
-main = println "ok"
-"#;
-    let baseline = sql_lint_diags(base);
-    assert!(
-        !baseline.is_empty(),
-        "out-of-order pipe should normally produce a pushdown lint"
-    );
-
-    let with_impl = format!("{base}\nimpl Eq Int where eq = \\a b -> True\n");
-    let gated = sql_lint_diags(&with_impl);
-    assert!(
-        gated.is_empty(),
-        "a user primitive operator impl must suppress pushdown lints, got: {:?}",
-        gated.iter().map(|d| &d.message).collect::<Vec<_>>()
     );
 }
 

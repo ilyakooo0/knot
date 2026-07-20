@@ -180,9 +180,9 @@ impl ModuleFingerprint {
     }
 }
 
-/// Build a stable key for a decl. Named decls use their name; impls and
-/// other unnamed decls fall back to a positional key combined with their
-/// shape so reordering doesn't alias.
+/// Build a stable key for a decl. Named decls use their name; unnamed decls
+/// fall back to a positional key combined with their shape so reordering
+/// doesn't alias.
 fn decl_key(decl: &ast::Decl, index: usize) -> String {
     match &decl.node {
         DeclKind::Fun { name, .. }
@@ -191,18 +191,7 @@ fn decl_key(decl: &ast::Decl, index: usize) -> String {
         | DeclKind::Derived { name, .. }
         | DeclKind::Data { name, .. }
         | DeclKind::TypeAlias { name, .. }
-        | DeclKind::Trait { name, .. }
         | DeclKind::Route { name, .. } => name.clone(),
-        DeclKind::Impl { trait_name, args, .. } => {
-            // Impls aren't named — combine trait + first-arg shape so two
-            // distinct impls don't collide.
-            let arg_shape: String = args
-                .iter()
-                .map(|a| format!("{:?}", a.node))
-                .collect::<Vec<_>>()
-                .join("/");
-            format!("__impl[{trait_name}]({arg_shape})#{index}")
-        }
         DeclKind::Migrate { .. } => format!("__migrate#{index}"),
         DeclKind::SubsetConstraint { .. } => format!("__subset#{index}"),
         DeclKind::RouteComposite { name, .. } => format!("__route_comp:{name}"),
@@ -326,16 +315,6 @@ fn hash_structure(module: &Module) -> u64 {
             DeclKind::TypeAlias { name, .. } => {
                 ("alias", name).hash(&mut h);
                 strip_spans(&format!("{:?}", decl.node)).hash(&mut h);
-            }
-            DeclKind::Trait { name, .. } => {
-                ("trait", name).hash(&mut h);
-                strip_spans(&format!("{:?}", decl.node)).hash(&mut h);
-            }
-            DeclKind::Impl { trait_name, args, .. } => {
-                ("impl", trait_name).hash(&mut h);
-                for a in args {
-                    strip_spans(&format!("{:?}", a.node)).hash(&mut h);
-                }
             }
             DeclKind::Route { name, .. } => {
                 ("route", name).hash(&mut h);
@@ -491,51 +470,6 @@ fn collect_decl_deps(decl: &ast::Decl) -> HashSet<String> {
             for ctor in constructors {
                 for field in &ctor.fields {
                     collect_type_names(&field.value, &mut deps);
-                }
-            }
-        }
-        DeclKind::Impl { args, constraints, items, .. } => {
-            // Collect type names from impl type arguments and constraints
-            // so changes to those types propagate through the dirty closure.
-            for arg in args {
-                collect_type_names(arg, &mut deps);
-            }
-            for c in constraints {
-                for arg in &c.args {
-                    collect_type_names(arg, &mut deps);
-                }
-            }
-            for item in items {
-                match item {
-                    ast::ImplItem::Method { body, .. } => collect_expr_names(body, &mut deps),
-                    ast::ImplItem::AssociatedType { args, ty, .. } => {
-                        for arg in args {
-                            collect_type_names(arg, &mut deps);
-                        }
-                        collect_type_names(ty, &mut deps);
-                    }
-                }
-            }
-        }
-        DeclKind::Trait { supertraits, items, .. } => {
-            // Collect type names from supertrait constraints and method
-            // signatures so changes propagate.
-            for st in supertraits {
-                for arg in &st.args {
-                    collect_type_names(arg, &mut deps);
-                }
-            }
-            for item in items {
-                if let ast::TraitItem::Method { ty, default_body, .. } = item {
-                    collect_type_names(&ty.ty, &mut deps);
-                    for c in &ty.constraints {
-                        for arg in &c.args {
-                            collect_type_names(arg, &mut deps);
-                        }
-                    }
-                    if let Some(body) = default_body {
-                        collect_expr_names(body, &mut deps);
-                    }
                 }
             }
         }

@@ -319,11 +319,9 @@ impl Parser {
     /// `maybe_time_unit` suppress unit sugar for those names. Covers:
     ///   * top-level declarations (column-0 `name =`/`name :`, optionally
     ///     behind a `*`/`&`/`export` sigil),
-    ///   * selectively imported item names (`import ./time (ms)`),
-    ///   * trait/impl method names (indented `name :`/`name =` inside a
-    ///     `trait …`/`impl …` block body).
+    ///   * selectively imported item names (`import ./time (ms)`).
     ///
-    /// Without the latter two, `import ./time (ms)` then `g = f 2 ms` would
+    /// Without the latter, `import ./time (ms)` then `g = f 2 ms` would
     /// silently parse as `f (2 * 1)`, dropping the `ms` argument.
     fn scan_top_level_names(&self, imports: &[Import]) -> HashSet<String> {
         const TIME_UNITS: &[&str] =
@@ -343,26 +341,14 @@ impl Parser {
         }
 
         let n = self.tokens.len();
-        // Track whether we are inside a `trait …`/`impl …` block body: the
-        // keyword sits at column 0 and its (indented) body — up to the next
-        // column-0 token that starts a new top-level declaration — holds method
-        // declarations, each an indented `name :`/`name =` at line start.
-        let mut in_trait_impl_body = false;
         for i in 0..n {
-            // Any column-0 token ends the previous trait/impl body and opens a
-            // new one only when it is itself a `trait`/`impl` keyword.
-            if self.token_cols[i] == 0 {
-                in_trait_impl_body =
-                    matches!(self.tokens[i].kind, TokenKind::Trait | TokenKind::Impl);
-            }
-
             let TokenKind::Lower(s) = &self.tokens[i].kind else {
                 continue;
             };
             if !TIME_UNITS.contains(&s.as_str()) {
                 continue;
             }
-            // Must be followed by `=` or `:` to be a declaration/method name.
+            // Must be followed by `=` or `:` to be a declaration name.
             if i + 1 >= n {
                 continue;
             }
@@ -379,16 +365,6 @@ impl Parser {
                 && self.token_cols[i - 1] == 0;
             if self.token_cols[i] == 0 || preceded_by_sigil_at_col0 {
                 names.insert(s.clone());
-                continue;
-            }
-            // A trait/impl method name: the first token on its line (preceded
-            // by a layout newline) inside a trait/impl block body.
-            if in_trait_impl_body {
-                let at_line_start =
-                    i == 0 || matches!(self.tokens[i - 1].kind, TokenKind::Newline);
-                if at_line_start {
-                    names.insert(s.clone());
-                }
             }
         }
         names
@@ -544,8 +520,6 @@ impl Parser {
                     TokenKind::Export
                     | TokenKind::Data
                     | TokenKind::Type
-                    | TokenKind::Trait
-                    | TokenKind::Impl
                     | TokenKind::Route
                     | TokenKind::Migrate
                     | TokenKind::Star
@@ -584,8 +558,6 @@ impl Parser {
             | TokenKind::Import
             | TokenKind::Data
             | TokenKind::Type
-            | TokenKind::Trait
-            | TokenKind::Impl
             | TokenKind::Route
             | TokenKind::Serve
             | TokenKind::Migrate
@@ -933,8 +905,6 @@ impl Parser {
             TokenKind::Star => self.parse_source_or_view(),
             TokenKind::Ampersand => self.parse_derived(),
             TokenKind::Lower(_) => self.parse_fun(),
-            TokenKind::Trait => self.parse_trait_decl(),
-            TokenKind::Impl => self.parse_impl_decl(),
             TokenKind::Route => self.parse_route_decl(),
             TokenKind::Migrate => self.parse_migrate(),
             _ => {
@@ -1438,273 +1408,6 @@ impl Parser {
                 exported: false,
             })
         })
-    }
-
-    // ── trait ─────────────────────────────────────────────────────────
-
-    fn parse_trait_decl(&mut self) -> Option<Decl> {
-        let start = self.span();
-        self.in_context("trait declaration", |this| {
-            this.advance(); // consume `trait`
-
-            let mut supertraits = Vec::new();
-
-            let saved = this.save();
-            if let Some(constraints) = this.try_parse_constraints() {
-                supertraits = constraints;
-            } else {
-                this.restore(saved);
-            }
-
-            let (name, _) = this.expect_upper("expected trait name").ok()?;
-
-            // Parse trait parameters: (name : kind?) or just lowercase name
-            let mut params = Vec::new();
-            loop {
-                if this.eat(&TokenKind::LParen) {
-                    let (pname, _) = this
-                        .expect_lower("expected type parameter name in trait declaration")
-                        .ok()?;
-                    let kind = if this.eat(&TokenKind::Colon) {
-                        Some(this.parse_type()?)
-                    } else {
-                        None
-                    };
-                    this.expect(&TokenKind::RParen, "expected ')' after trait parameter")
-                        .ok()?;
-                    params.push(TraitParam { name: pname, kind });
-                } else if matches!(this.peek(), TokenKind::Lower(_)) {
-                    let tok = this.advance();
-                    let TokenKind::Lower(pname) = tok.kind else { unreachable!() };
-                    params.push(TraitParam {
-                        name: pname,
-                        kind: None,
-                    });
-                } else {
-                    break;
-                }
-            }
-
-            this.expect(&TokenKind::Where, "expected 'where' in trait declaration")
-                .ok()?;
-
-            let items = this.parse_block(|p| p.parse_trait_item());
-
-            let end = this.prev_span();
-            Some(Decl {
-                node: DeclKind::Trait {
-                    name,
-                    params,
-                    supertraits,
-                    items,
-                },
-                span: Span::new(start.start, end.end),
-                exported: false,
-            })
-        })
-    }
-
-    fn parse_trait_item(&mut self) -> Option<TraitItem> {
-        self.skip_newlines();
-        if self.at_eof() {
-            return None;
-        }
-
-        // `type Name params*` — associated type
-        if self.at(&TokenKind::Type) {
-            self.advance();
-            let (name, _) = self.expect_upper("expected associated type name").ok()?;
-            let mut assoc_params = Vec::new();
-            while matches!(self.peek(), TokenKind::Lower(_)) {
-                let tok = self.advance();
-                let TokenKind::Lower(p) = tok.kind else { unreachable!() };
-                assoc_params.push(p);
-            }
-            return Some(TraitItem::AssociatedType {
-                name,
-                params: assoc_params,
-            });
-        }
-
-        // Method: name : type_scheme  (or name params = expr for default)
-        let method_name = match self.peek() {
-            TokenKind::Lower(_) => Some(self.expect_lower("expected method name").ok()?),
-            _ => {
-                self.error("expected method name or 'type' in trait definition");
-                return None;
-            }
-        };
-        if let Some((name, name_span)) = method_name {
-
-            if self.at(&TokenKind::Colon) {
-                self.advance();
-                let ts = self.parse_type_scheme()?;
-
-                // Check for default body on next line.
-                // For simplicity, don't handle default bodies in this pass.
-                return Some(TraitItem::Method {
-                    name,
-                    name_span,
-                    ty: ts,
-                    default_params: Vec::new(),
-                    default_body: None,
-                });
-            }
-
-            // Default implementation: name params = expr
-            let mut params = Vec::new();
-            while self.can_start_pat() && !self.at(&TokenKind::Eq) {
-                if let Some(p) = self.try_parse_pat() {
-                    params.push(p);
-                } else {
-                    break;
-                }
-            }
-
-            if self.eat(&TokenKind::Eq) {
-                // Register the default-body parameters as bound variables so
-                // the time-unit sugar (`2 ms`) doesn't consume a parameter
-                // named `ms`/`seconds`/... as a unit suffix — mirrors
-                // parse_lambda and parse_impl_item.
-                let scope_mark = self.bound_vars.len();
-                for p in &params {
-                    self.push_pat_vars(p);
-                }
-                let body = self.parse_expr();
-                self.bound_vars.truncate(scope_mark);
-                let body = body?;
-                // We need a type for the trait item — use a hole for inference.
-                return Some(TraitItem::Method {
-                    name,
-                    name_span,
-                    ty: TypeScheme {
-                        constraints: vec![],
-                        ty: Spanned::new(TypeKind::Hole, self.span()),
-                    },
-                    default_params: params,
-                    default_body: Some(body),
-                });
-            }
-
-            // Method name consumed but no ':' (type signature) or '=' (default body) found
-            self.error(format!("expected ':' or '=' after method name '{}'", name));
-        }
-
-        None
-    }
-
-    // ── impl ─────────────────────────────────────────────────────────
-
-    fn parse_impl_decl(&mut self) -> Option<Decl> {
-        let start = self.span();
-        self.in_context("impl declaration", |this| {
-            this.advance(); // consume `impl`
-
-            // Parse optional constraints: (Constraint =>)*
-            let mut constraints = Vec::new();
-            let saved = this.save();
-            if let Some(cs) = this.try_parse_constraints() {
-                constraints = cs;
-            } else {
-                this.restore(saved);
-            }
-
-            let (trait_name, _) = this.expect_upper("expected trait name in impl").ok()?;
-
-            // Parse type arguments.
-            let mut args = Vec::new();
-            while this.can_start_type_atom()
-                && !this.at(&TokenKind::Where)
-                && !this.at(&TokenKind::Newline)
-                && !this.at_eof()
-            {
-                if let Some(ty) = this.try_parse_type_atom() {
-                    args.push(ty);
-                } else {
-                    break;
-                }
-            }
-
-            this.expect(&TokenKind::Where, "expected 'where' in impl declaration")
-                .ok()?;
-
-            let items = this.parse_block(|p| p.parse_impl_item());
-
-            let end = this.prev_span();
-            Some(Decl {
-                node: DeclKind::Impl {
-                    trait_name,
-                    args,
-                    constraints,
-                    items,
-                },
-                span: Span::new(start.start, end.end),
-                exported: false,
-            })
-        })
-    }
-
-    fn parse_impl_item(&mut self) -> Option<ImplItem> {
-        self.skip_newlines();
-        if self.at_eof() {
-            return None;
-        }
-
-        // Associated type: `type Name args* = type`
-        if self.at(&TokenKind::Type) {
-            self.advance();
-            let (name, _) = self.expect_upper("expected associated type name").ok()?;
-            let mut assoc_args = Vec::new();
-            while self.can_start_type_atom() && !self.at(&TokenKind::Eq) {
-                if let Some(ty) = self.try_parse_type_atom() {
-                    assoc_args.push(ty);
-                } else {
-                    break;
-                }
-            }
-            self.expect(&TokenKind::Eq, "expected '=' in associated type definition")
-                .ok()?;
-            let ty = self.parse_type()?;
-            return Some(ImplItem::AssociatedType {
-                name,
-                args: assoc_args,
-                ty,
-            });
-        }
-
-        // Method: name params* = expr
-        let method_name = match self.peek() {
-            TokenKind::Lower(_) => Some(self.expect_lower("expected method name in impl").ok()?),
-            _ => {
-                self.error("expected method name or 'type' in impl definition");
-                return None;
-            }
-        };
-        if let Some((name, name_span)) = method_name {
-            let mut params = Vec::new();
-            while self.can_start_pat() && !self.at(&TokenKind::Eq) {
-                if let Some(p) = self.try_parse_pat() {
-                    params.push(p);
-                } else {
-                    break;
-                }
-            }
-            self.expect(&TokenKind::Eq, "expected '=' in method definition")
-                .ok()?;
-            // Register the method parameters as bound variables so the
-            // time-unit sugar (`2 ms`) doesn't consume a parameter named
-            // `ms`/`seconds`/... as a unit suffix — mirrors parse_lambda.
-            let scope_mark = self.bound_vars.len();
-            for p in &params {
-                self.push_pat_vars(p);
-            }
-            let body = self.parse_expr();
-            self.bound_vars.truncate(scope_mark);
-            let body = body?;
-            return Some(ImplItem::Method { name, name_span, params, body });
-        }
-
-        None
     }
 
     // ── route ────────────────────────────────────────────────────────

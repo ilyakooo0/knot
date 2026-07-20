@@ -88,34 +88,6 @@ pub(crate) fn handle_linked_editing_range(
                 }
                 collect_field_name_spans(body, word, &doc.source, &mut linked_spans, &mut pun_seen);
             }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { params, body, .. } = item {
-                        // Walk the parameter patterns too — a record-pattern
-                        // parameter (`greet {name: n} = …`) carries field-name
-                        // tokens that must be renamed alongside the body, and a
-                        // punned parameter (`greet {name} = …`) must set
-                        // `pun_seen` so linked editing bails to full rename.
-                        // Mirrors rename.rs::field_sites_in_decl.
-                        for p in params {
-                            collect_pat_field_spans(
-                                p,
-                                word,
-                                &doc.source,
-                                &mut linked_spans,
-                                &mut pun_seen,
-                            );
-                        }
-                        collect_field_name_spans(
-                            body,
-                            word,
-                            &doc.source,
-                            &mut linked_spans,
-                            &mut pun_seen,
-                        );
-                    }
-                }
-            }
             _ => {}
         }
         if pun_seen {

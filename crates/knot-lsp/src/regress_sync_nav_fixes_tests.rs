@@ -299,64 +299,6 @@ fn call_hierarchy_incoming_finds_cross_file_callers() {
     );
 }
 
-// ── Finding 8: type-hierarchy whole-token supertype match ────────────
-
-fn th_supertypes_params(uri: &Uri, kind: &str, name: &str) -> TypeHierarchySupertypesParams {
-    TypeHierarchySupertypesParams {
-        item: TypeHierarchyItem {
-            name: name.to_string(),
-            kind: SymbolKind::CLASS,
-            tags: None,
-            detail: None,
-            uri: uri.clone(),
-            range: Range::default(),
-            selection_range: Range::default(),
-            data: Some(serde_json::json!({"kind": kind, "name": name})),
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-    }
-}
-
-#[test]
-fn type_hierarchy_supertypes_require_whole_token_match() {
-    let mut ws = TestWorkspace::new();
-    let uri = ws.open(
-        "main",
-        r#"data Id = MkId {v: Int 1}
-data UserId = MkUserId {v: Int 1}
-trait Display a where
-  display : a -> Text
-impl Display UserId where
-  display x = "user"
-"#,
-    );
-
-    // `UserId` implements Display — supertypes must include the trait.
-    let user_id = crate::type_hierarchy::handle_type_hierarchy_supertypes(
-        &ws.state,
-        &th_supertypes_params(&uri, "data", "UserId"),
-    )
-    .expect("UserId has Display as supertype");
-    assert!(
-        user_id.iter().any(|i| i.name.contains("Display")),
-        "got: {:?}",
-        user_id.iter().map(|i| &i.name).collect::<Vec<_>>()
-    );
-
-    // `Id` does NOT implement Display; the substring match
-    // ("UserId".contains("Id")) used to report it anyway.
-    let id = crate::type_hierarchy::handle_type_hierarchy_supertypes(
-        &ws.state,
-        &th_supertypes_params(&uri, "data", "Id"),
-    );
-    assert!(
-        id.is_none(),
-        "Id must not inherit Display via substring match; got: {:?}",
-        id.map(|v| v.iter().map(|i| i.name.clone()).collect::<Vec<_>>())
-    );
-}
-
 // ── Finding 9: goto type definition picks the innermost span ─────────
 
 #[test]
@@ -416,11 +358,7 @@ fn document_symbol_children_select_name_tokens() {
     let mut ws = TestWorkspace::new();
     let uri = ws.open(
         "main",
-        r#"trait Display a where
-  display : a -> Text
-impl Display Int where
-  display x = "int"
-route Api where
+        r#"route Api where
   /things
     GET /count -> Int 1 = GetCount
 "#,
@@ -437,38 +375,6 @@ route Api where
         _ => panic!("expected nested"),
     };
 
-    let trait_sym = nested
-        .iter()
-        .find(|s| s.name == "Display")
-        .expect("trait symbol");
-    let method = trait_sym
-        .children
-        .as_ref()
-        .and_then(|c| c.iter().find(|m| m.name == "display"))
-        .expect("trait method child");
-    assert_eq!(
-        method.selection_range.start.line, 1,
-        "trait method selection range must sit on its name token (line 1), \
-         not the whole trait decl"
-    );
-    assert_ne!(
-        method.selection_range, trait_sym.range,
-        "selection range must be narrower than the parent decl span"
-    );
-
-    let impl_sym = nested
-        .iter()
-        .find(|s| s.name.starts_with("impl Display"))
-        .expect("impl symbol");
-    if let Some(children) = impl_sym.children.as_ref() {
-        let m = children.iter().find(|m| m.name == "display").expect("impl method");
-        assert_ne!(
-            m.selection_range, impl_sym.range,
-            "impl method selection range must be its name token"
-        );
-        assert_eq!(m.selection_range.start.line, 3);
-    }
-
     if let Some(route_sym) = nested.iter().find(|s| s.name == "route Api")
         && let Some(children) = route_sym.children.as_ref() {
             let entry = children
@@ -479,7 +385,7 @@ route Api where
                 entry.selection_range, route_sym.range,
                 "route entry selection range must be its constructor token"
             );
-            assert_eq!(entry.selection_range.start.line, 6);
+            assert_eq!(entry.selection_range.start.line, 2);
         }
 }
 

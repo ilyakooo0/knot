@@ -326,7 +326,6 @@ fn add_dirty_decl_telemetry(
             DeclKind::Fun { name, .. }
             | DeclKind::Data { name, .. }
             | DeclKind::TypeAlias { name, .. }
-            | DeclKind::Trait { name, .. }
             | DeclKind::View { name, .. }
             | DeclKind::Derived { name, .. }
             | DeclKind::Source { name, .. }
@@ -419,20 +418,6 @@ fn add_closing_label_hints(
             }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => collect(body, &doc.source, &mut spans),
-            DeclKind::Trait { items, .. } => {
-                for item in items {
-                    if let ast::TraitItem::Method { default_body: Some(body), .. } = item {
-                        collect(body, &doc.source, &mut spans);
-                    }
-                }
-            }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        collect(body, &doc.source, &mut spans);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -607,16 +592,6 @@ fn add_record_pattern_field_hints(
             ast::DeclKind::Fun { body: Some(body), .. }
             | ast::DeclKind::View { body, .. }
             | ast::DeclKind::Derived { body, .. } => walk_expr(body, &doc.source, &mut record_pats),
-            ast::DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { params, body, .. } = item {
-                        for p in params {
-                            walk_pat_for_records(p, &doc.source, &mut record_pats);
-                        }
-                        walk_expr(body, &doc.source, &mut record_pats);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -801,13 +776,6 @@ fn add_unit_literal_hints(
             | DeclKind::Derived { body, .. } => {
                 walk_for_unit_bindings(body, out);
             }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk_for_unit_bindings(body, out);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -967,18 +935,6 @@ fn add_parameter_name_hints(
                 let mut shadowed = std::collections::HashSet::new();
                 collect_binder_names(body, &mut shadowed);
                 walk_apps(body, doc, &shadowed, range_start, range_end, hints);
-            }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { params, body, .. } = item {
-                        let mut shadowed = std::collections::HashSet::new();
-                        for p in params {
-                            collect_pat_binder_names(&p.node, &mut shadowed);
-                        }
-                        collect_binder_names(body, &mut shadowed);
-                        walk_apps(body, doc, &shadowed, range_start, range_end, hints);
-                    }
-                }
             }
             _ => {}
         }
@@ -1219,13 +1175,6 @@ fn add_monad_context_hints(
             | DeclKind::Derived { body, .. } => {
                 walk(body, doc, range_start, range_end, hints);
             }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, doc, range_start, range_end, hints);
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -1312,28 +1261,6 @@ fn add_constraint_hints(
                         .collect();
                     return Some(cs);
                 }
-                DeclKind::Trait { items, .. } => {
-                    for item in items {
-                        if let ast::TraitItem::Method {
-                            name: n, ty, ..
-                        } = item
-                            && n == name {
-                                let cs: Vec<String> = ty
-                                    .constraints
-                                    .iter()
-                                    .map(|c| {
-                                        let args: Vec<String> = c
-                                            .args
-                                            .iter()
-                                            .map(|t| format_type_kind(&t.node))
-                                            .collect();
-                                        format!("{} {}", c.trait_name, args.join(" "))
-                                    })
-                                    .collect();
-                                return Some(cs);
-                            }
-                    }
-                }
                 _ => {}
             }
         }
@@ -1354,13 +1281,6 @@ fn add_constraint_hints(
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => {
                 walk(body, doc, range_start, range_end, hints);
-            }
-            DeclKind::Impl { items, .. } => {
-                for item in items {
-                    if let ast::ImplItem::Method { body, .. } = item {
-                        walk(body, doc, range_start, range_end, hints);
-                    }
-                }
             }
             _ => {}
         }
@@ -1999,14 +1919,6 @@ checkGlobalRate = \t -> atomic do
             match &d.node {
                 DeclKind::Fun { body: Some(b), .. } => expr(b, &mut out),
                 DeclKind::View { body, .. } | DeclKind::Derived { body, .. } => expr(body, &mut out),
-                DeclKind::Impl { items, .. } => {
-                    for item in items {
-                        if let ast::ImplItem::Method { params, body, .. } = item {
-                            params.iter().for_each(|p| pat(p, &mut out));
-                            expr(body, &mut out);
-                        }
-                    }
-                }
                 _ => {}
             }
         }

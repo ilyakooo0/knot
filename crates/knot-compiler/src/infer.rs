@@ -720,6 +720,22 @@ struct DataInfo {
     ctors: Vec<(String, Vec<(String, ast::Type)>)>,
 }
 
+/// A type name brought into scope by a `with` peel over a record containing an
+/// embedded `type`/`data` declaration. Confined to the `with` body.
+#[derive(Debug, Clone)]
+enum RecordTypeBinding {
+    /// A parameterized embedded `type` alias referenced bare (`Pair`) — an
+    /// unapplied type constructor. (Nullary embedded aliases are injected into
+    /// the global `aliases` map for the body instead, so they behave exactly
+    /// like top-level aliases.)
+    TyCon,
+    /// Embedded `data Name params = ctors`. Only the param count is needed:
+    /// the type name resolves to a nominal `Ty::Con` (or a `TyCon` when
+    /// parameterized), while constructor VALUES are reached through the
+    /// record's namespace field (`rec.Name.Ctor`), not this binding.
+    Data { params: Vec<String> },
+}
+
 // ── Inference engine ──────────────────────────────────────────────
 
 struct Infer {
@@ -788,6 +804,22 @@ struct Infer {
     /// body with FRESH parameter variables and substitute the actual arguments,
     /// avoiding the shared-var pinning that resolving once would cause.
     param_aliases: HashMap<String, (Vec<String>, ast::Type)>,
+
+    /// Lexically-scoped type names introduced by a `with` peel over a record
+    /// that contains an embedded `type`/`data` declaration. A stack of scopes
+    /// (one per enclosing `with`), each mapping a type name to its confined
+    /// meaning. Consulted FIRST in `ast_type_to_ty`'s `Named` arm so these
+    /// shadow everything else and vanish when the `with` body ends — nothing
+    /// defined inside a record leaks into the enclosing type namespace.
+    record_type_scopes: Vec<HashMap<String, RecordTypeBinding>>,
+
+    /// Per-`with` stack of global-alias saves: when a `with` peels a record
+    /// containing an embedded `type` alias, the alias is temporarily injected
+    /// into the global `aliases` map (so it behaves exactly like a top-level
+    /// alias) and the previous binding is recorded here. Each `with` pushes one
+    /// frame; on body end the frame is popped and the prior aliases restored,
+    /// so the alias never leaks past the body.
+    with_alias_saves: Vec<Vec<(String, Option<Ty>)>>,
 
     /// Mapping from annotation type-variable names to TyVars (per-declaration).
     annotation_vars: HashMap<String, TyVar>,
@@ -1037,6 +1069,8 @@ impl Infer {
             assoc_reduce_depth: std::cell::Cell::new(0),
             aliases: HashMap::new(),
             param_aliases: HashMap::new(),
+            record_type_scopes: Vec::new(),
+            with_alias_saves: Vec::new(),
             annotation_vars: HashMap::new(),
             type_param_scopes: Vec::new(),
             type_arg_spans: std::collections::HashSet::new(),
@@ -4591,6 +4625,32 @@ impl Infer {
                 "Uuid" => Ty::Uuid,
                 "[]" => Ty::TyCon("[]".into()),
                 _ => {
+                    // Record-confined type name from an enclosing `with` peel
+                    // over an embedded `type`/`data`. Consulted FIRST so it
+                    // shadows any outer/global meaning, and it only exists for
+                    // the duration of the `with` body.
+                    let mut record_binding = None;
+                    for scope in self.record_type_scopes.iter().rev() {
+                        if let Some(b) = scope.get(name) {
+                            record_binding = Some(b.clone());
+                            break;
+                        }
+                    }
+                    if let Some(binding) = record_binding {
+                        match binding {
+                            RecordTypeBinding::TyCon => {
+                                // Parameterized embedded alias referenced bare:
+                                // an unapplied type constructor.
+                                return Ty::TyCon(name.clone());
+                            }
+                            RecordTypeBinding::Data { params, .. } => {
+                                if params.is_empty() {
+                                    return Ty::Con(name.clone(), vec![]);
+                                }
+                                return Ty::TyCon(name.clone());
+                            }
+                        }
+                    }
                     // Π-lite type-witness parameter: `x : T` inside a lambda
                     // that binds `\(T : Type)` resolves to the witness skolem.
                     // Checked before aliases so a witness shadows an alias.
@@ -5431,6 +5491,52 @@ impl Infer {
                 for (name, ty) in &fields {
                     self.bind(name, Scheme::mono(ty.clone()));
                 }
+                // Peel the record's embedded `type`/`data` declarations into a
+                // scoped type env, confined to this `with` body. Only when the
+                // record is a literal can we see the declarations; the bindings
+                // vanish when the body ends (one layer — nested `with` pushes
+                // its own frame).
+                if let ast::ExprKind::Record(field_exprs) = &record.node {
+                    let mut type_scope: HashMap<String, RecordTypeBinding> =
+                        HashMap::new();
+                    self.with_alias_saves.push(Vec::new());
+                    for f in field_exprs {
+                        match &f.value.node {
+                            ast::ExprKind::TypeCtor { name, params, ty } => {
+                                // Embedded `type` alias: resolve the body now and
+                                // inject it into the global `aliases` map for the
+                                // DURATION of this `with` body only (saved and
+                                // restored below). This makes the confined alias
+                                // behave byte-for-byte like a top-level alias.
+                                // Parameterized aliases stay as TyCons.
+                                if params.is_empty() {
+                                    let resolved = self.ast_type_to_ty(ty);
+                                    let save = (name.clone(), self.aliases.get(name).cloned());
+                                    self.with_alias_saves
+                                        .last_mut()
+                                        .expect("frame just pushed")
+                                        .push(save);
+                                    self.aliases.insert(name.clone(), resolved);
+                                } else {
+                                    type_scope.insert(
+                                        name.clone(),
+                                        RecordTypeBinding::TyCon,
+                                    );
+                                }
+                            }
+                            ast::ExprKind::DataCtor { name, params, .. } => {
+                                type_scope.insert(
+                                    name.clone(),
+                                    RecordTypeBinding::Data {
+                                        params: params.clone(),
+                                    },
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.record_type_scopes.push(type_scope);
+                }
                 // Register `with` field bindings in `let_bindings` (scoped to
                 // this body) so `value_references_source` can fold through
                 // them — same treatment `let` bindings got. If the record is
@@ -5444,6 +5550,23 @@ impl Infer {
                 }
                 let body_ty = self.infer_expr(body);
                 self.let_bindings = prev_let_bindings;
+                if let ast::ExprKind::Record(_) = &record.node {
+                    self.record_type_scopes.pop();
+                    // Restore any global aliases shadowed by this `with`'s
+                    // embedded `type` decls, so nothing leaks past the body.
+                    if let Some(frame) = self.with_alias_saves.pop() {
+                        for (aname, saved) in frame {
+                            match saved {
+                                Some(prev) => {
+                                    self.aliases.insert(aname, prev);
+                                }
+                                None => {
+                                    self.aliases.remove(&aname);
+                                }
+                            }
+                        }
+                    }
+                }
                 self.pop_scope();
                 self.with_fields
                     .push((expr.span, fields.keys().cloned().collect()));
@@ -6156,7 +6279,7 @@ impl Infer {
                 self.infer_serve(api, *api_span, handlers, expr.span)
             }
 
-            ast::ExprKind::TypeCtor { name, params, ty } => {
+            ast::ExprKind::TypeCtor { name: _, params, .. } => {
                 // A first-class (erased) type-constructor value from an
                 // embedded `type` alias line. Statically its type is the alias's
                 // KIND: `Type` (0 params), `Type -> Type` (1 param), …, one
@@ -6164,19 +6287,10 @@ impl Infer {
                 // here is the same opaque named type knot already accepts in
                 // signatures like `f : Type -> Type` (i.e. `Ty::Con("Type", [])`).
                 //
-                // Bring the alias into type scope. Parameterized aliases mirror
-                // the (currently limited) top-level behaviour: a nullary alias
-                // registers its body so `x : Name` resolves; a parameterized
-                // alias registers as an unapplied type constructor so it can be
-                // referenced by name.
-                if params.is_empty() {
-                    let body = self.ast_type_to_ty(ty);
-                    self.aliases
-                        .insert(name.clone(), Ty::Alias(name.clone(), Box::new(body)));
-                } else {
-                    self.aliases
-                        .insert(name.clone(), Ty::TyCon(name.clone()));
-                }
+                // CONFINEMENT: nothing is registered into the global `aliases`
+                // map. The alias name is reachable only via the record value
+                // (`rec.Name`) or a `with` peel (scoped type env), so it never
+                // leaks into the enclosing type namespace.
                 let kind_type =
                     (0..params.len()).fold(Ty::Con("Type".into(), vec![]), |acc, _| {
                         Ty::Fun(
@@ -6193,55 +6307,48 @@ impl Infer {
                 // (compiles to unit), but statically its type is a RECORD of
                 // constructor functions `{Ctor: payload -> Name, …}` so that
                 // `rec.Name.Ctor` resolves via ordinary structural field
-                // access. The data type `Name` is registered so it can be
-                // referenced in annotations (`x : Name`).
+                // access.
                 //
-                // Register the constructors and the data-type metadata exactly
-                // as top-level collection does, so `instantiate_ctor` and the
-                // `x : Name` fallback both work.
-                let mut ctor_list = Vec::new();
-                for ctor in constructors {
-                    let fields: Vec<(String, ast::Type)> = ctor
-                        .fields
-                        .iter()
-                        .map(|f| (f.name.clone(), f.value.clone()))
-                        .collect();
-                    self.constructors
-                        .entry(ctor.name.clone())
-                        .or_default()
-                        .push(CtorInfo {
-                            data_type: name.clone(),
-                            data_params: params.clone(),
-                            fields: fields.clone(),
-                        });
-                    ctor_list.push((ctor.name.clone(), fields));
-                }
-                self.data_types.insert(
-                    name.clone(),
-                    DataInfo {
-                        params: params.clone(),
-                        ctors: ctor_list,
-                    },
-                );
+                // CONFINEMENT: unlike a top-level `data` decl, this registers
+                // NOTHING into the global `constructors`/`data_types` maps.
+                // The type `Name` and its constructors are reachable ONLY
+                // through the record value (`rec.Name.Ctor`) or a `with` peel
+                // (which pushes them into the scoped type env for the body).
+                // The namespace record is built directly from the AST decl,
+                // exactly as `instantiate_ctor` would, but self-contained.
+                //
+                // Freshen the type params (each use site gets its own vars).
+                let saved_annotation_vars = self.annotation_vars.clone();
+                self.annotation_vars.clear();
+                let param_tys: Vec<Ty> = params
+                    .iter()
+                    .map(|p| {
+                        let v = self.fresh_var();
+                        self.annotation_vars.insert(p.clone(), v);
+                        Ty::Var(v)
+                    })
+                    .collect();
+                let data_ty = Ty::Con(name.clone(), param_tys);
 
                 // Build the namespace record: each ctor maps to its function
                 // type `payload -> data_ty` — including nullary ctors, which
                 // keep the `{} -> data_ty` form because the applied syntax is
                 // always `rec.Name.Ctor {}` (a record application), matching
-                // how `Ctor {}` is typed through the App arm. Using the bare
-                // `data_ty` for nullary ctors would make `rec.Name.Ctor {}`
-                // apply an empty record to a non-function.
+                // how `Ctor {}` is typed through the App arm.
                 let mut ns_fields = BTreeMap::new();
                 for ctor in constructors {
-                    if let Some((data_ty, record_ty)) =
-                        self.instantiate_ctor(&ctor.name, expr.span)
-                    {
-                        ns_fields.insert(
-                            ctor.name.clone(),
-                            Ty::Fun(Box::new(record_ty), Box::new(data_ty)),
-                        );
-                    }
+                    let field_tys: BTreeMap<String, Ty> = ctor
+                        .fields
+                        .iter()
+                        .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
+                        .collect();
+                    let record_ty = Ty::Record(field_tys, None);
+                    ns_fields.insert(
+                        ctor.name.clone(),
+                        Ty::Fun(Box::new(record_ty), Box::new(data_ty.clone())),
+                    );
                 }
+                self.annotation_vars = saved_annotation_vars;
                 Ty::Record(ns_fields, None)
             }
         }

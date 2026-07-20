@@ -77,3 +77,32 @@ fn record_type_alias_coexists_with_other_fields_and_sigs() {
     );
     assert_clean(&diags);
 }
+
+#[test]
+fn record_type_alias_does_not_leak_globally() {
+    // A top-level `x : Point` referencing an embedded alias must NOT resolve
+    // outside the record / a `with` peel.
+    let diags = check_src(
+        "g = with {r {type Point = {x: Int 1}}} 0\n\
+         s : Point\n\
+         s = {x 5}\n\
+         main = println s\n",
+    );
+    assert!(
+        !diags.is_empty(),
+        "embedded alias leaked into global type scope: {:?}",
+        diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn record_type_alias_scoped_under_with() {
+    // Inside a `with` peel over the record that directly contains the `type`,
+    // the alias IS usable in an annotation (one layer of peeling).
+    let diags = check_src(
+        "getx = with {type Point = {x: Int 1}}\n\
+         (\\(p : Point) -> p.x)\n\
+         main = println (getx {x 5})\n",
+    );
+    assert_clean(&diags);
+}

@@ -1,0 +1,30 @@
+-- Trait replacement: records + `with` + `^` field projection.
+--
+-- Traits are gone. The idiomatic replacement is to pass a plain RECORD of
+-- functions (a "dictionary") and bring it into scope with `with`; `(^field)`
+-- then projects that field out of the lexically-innermost in-scope record.
+-- No trait decl, no impl, no constraint — the dictionary is just a value.
+
+-- Two "Show dictionaries", one per type.
+intShow  = {show (\n -> "int:" ++ show n)}
+textShow = {show (\s -> "text:" ++ s)}
+
+-- "Multiple constraints" is just a record with several fields.
+greeter = {greet (\n -> "hi " ++ show n) farewell (\n -> "bye " ++ show n)}
+
+main = do
+  -- `^show` resolves to whichever dictionary is lexically in scope.
+  with intShow (println ((^show) 41))         -- intShow's show
+  with textShow (println ((^show) "hello"))   -- textShow's show
+
+  -- Project different fields from one dictionary.
+  with greeter (println ((^greet) 7))
+  with greeter (println ((^farewell) 7))
+
+  -- Nesting `with` shadows lexically: the inner dictionary wins inside its
+  -- own body, and the outer one is unaffected afterwards.
+  with intShow (
+    with {show (\n -> "INNER:" ++ show n)} (println ((^show) 1))
+  )
+  with intShow (println ((^show) 2))
+  yield {}

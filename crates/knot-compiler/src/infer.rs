@@ -204,6 +204,14 @@ pub type WithFields = HashMap<Span, Vec<String>>;
 /// projection per path element.
 pub type ImplicitRefs = HashMap<Span, (String, Vec<String>)>;
 
+/// Prefix for the unique, per-`with`-site alias a `with` field is also bound
+/// under during inference (and codegen's flat `Env`): `{PREFIX}{with_span_start}@{field}`.
+/// `^field` resolves against the alias so its codegen `Var` hits the lexically
+/// correct slot; the bare field name keeps working for direct references.
+/// `\0` makes the alias unutterable in source, so it can never collide with a
+/// user binding. Shared with codegen (`crate::infer::WITH_FIELD_ALIAS_PREFIX`).
+pub const WITH_FIELD_ALIAS_PREFIX: &str = "\0with:";
+
 /// Spans of field-access expressions (`t.members`) whose field type is a
 /// relation. Codegen cannot re-derive this — a record's field types are not
 /// reachable from the AST — yet it must know: a do-bind whose right-hand side
@@ -972,6 +980,14 @@ struct Infer {
     /// Field names bound by each `with` expression, keyed by the `with`'s span.
     /// Codegen projects exactly these fields into locals for the body.
     with_fields: Vec<(Span, Vec<String>)>,
+    /// Stack of `(with_expr_span, field → scheme)` frames for the `with`
+    /// expressions enclosing the expression currently being inferred — parallel
+    /// to `self.scopes` (a `with` pushes exactly one scope). Lets the `Var` arm
+    /// detect that a variable resolved to a `with` FIELD and redirect codegen's
+    /// flat-`Env` lookup to that `with` site's unique alias (see the `Var` arm
+    /// and `WITH_FIELD_ALIAS_PREFIX`). A `None` scope entry keeps the two stacks
+    /// aligned when a non-`with` construct pushes a scope.
+    with_scope_stack: Vec<Option<(Span, HashMap<String, Scheme>)>>,
     /// Resolved `^name` implicit-field projections: span → (root binding,
     /// field path). Populated when an `ImplicitRef` is resolved; handed to
     /// codegen via `ImplicitRefs` so it can emit the projection chain.
@@ -1019,6 +1035,7 @@ impl Infer {
             skolems: HashSet::new(),
             alias_free_vars: HashSet::new(),
             scopes: vec![HashMap::new()],
+            // One `None` per starting scope (the global scope is not a `with`).
             constructors: HashMap::new(),
             data_types: HashMap::new(),
             source_types: HashMap::new(),
@@ -1067,6 +1084,7 @@ impl Infer {
             refine_vars: Vec::new(),
             field_accesses: Vec::new(),
             with_fields: Vec::new(),
+            with_scope_stack: vec![None],
             implicit_refs: HashMap::new(),
             suppress_refine_intro: None,
             deferred_unit_binops: Vec::new(),
@@ -4236,10 +4254,15 @@ impl Infer {
 
     fn push_scope(&mut self) {
         self.scopes.push(HashMap::new());
+        // Keep the `with`-frame stack aligned with `scopes` (one entry per
+        // scope, `None` for non-`with` scopes). The `With` arm overwrites the
+        // entry it just pushed with `Some((span, fields))`.
+        self.with_scope_stack.push(None);
     }
 
     fn pop_scope(&mut self) {
         self.scopes.pop();
+        self.with_scope_stack.pop();
     }
 
     fn bind(&mut self, name: &str, scheme: Scheme) {
@@ -5030,11 +5053,47 @@ impl Infer {
     /// (root binding, field path) is recorded in `implicit_refs` keyed by
     /// `span` so codegen can lower `^name` to a projection chain.
     fn resolve_implicit_ref(&mut self, name: &str, expected: &Ty, span: Span) -> Ty {
+        // A `with` binds each of the record's fields DIRECTLY into its body
+        // scope. The record-BFS below only finds fields nested inside
+        // record-typed bindings, so it misses a `with` field whose value is
+        // not itself a record (e.g. `with {show (\n -> …)}` binds `show : fn`,
+        // and the BFS would fall through to an OUTER same-named record field —
+        // resolving `^show` to a lexically-wrong dictionary: two sequential
+        // `with` blocks would both hit the same outer record, and a nested
+        // `with` could not shadow the outer). A direct `with`-field binding
+        // for `name` therefore takes precedence: it is candidate 0, rooted at
+        // the `with` site's unique alias (see `WITH_FIELD_ALIAS_PREFIX` and
+        // codegen's `With` arm, which binds the field's value under that
+        // alias), and the innermost such `with` wins (nested shadows, siblings
+        // don't collide). A direct NON-`with` binding keeps its historical
+        // meaning — the BFS field projection off that binding.
+        let mut with_candidate: Option<(String, Vec<String>, Ty)> = None;
+        for (with_frame, scope) in self
+            .with_scope_stack
+            .iter()
+            .zip(self.scopes.iter())
+            .rev()
+        {
+            if let Some((with_span, field_schemes)) = with_frame
+                && let Some(scheme) = field_schemes.get(name)
+            {
+                let alias =
+                    format!("{WITH_FIELD_ALIAS_PREFIX}{}@{name}", with_span.start);
+                with_candidate = Some((alias, Vec::new(), scheme.ty.clone()));
+                break;
+            }
+            if scope.contains_key(name) {
+                // A non-`with` binding shadows any outer `with` field — the
+                // BFS below projects `name` off it, as before.
+                break;
+            }
+        }
         // Candidate search over an immutable view of the scopes. Walk
         // innermost-to-outermost (nearest scope wins across the whole
         // search) and BFS the record's fields shallowest-first; `fields` is
         // a `BTreeMap`, so within a level iteration is by sorted field name.
-        let mut candidates: Vec<(String, Vec<String>, Ty)> = Vec::new();
+        let mut candidates: Vec<(String, Vec<String>, Ty)> =
+            with_candidate.into_iter().collect();
         'scopes: for scope in self.scopes.iter().rev() {
             for (bind_name, scheme) in scope {
                 // A `with` field's binding scheme is the field's own type —
@@ -5184,6 +5243,69 @@ impl Infer {
                     );
                 }
                 if let Some(ty) = self.lookup_instantiate_at(name, expr.span) {
+                    // If this Var resolved to a field of a `with` that codegen
+                    // binds in the CURRENT env frame, redirect codegen's `Var`
+                    // lookup to that `with` site's unique alias slot. Codegen's
+                    // runtime `Env` is a FLAT HashMap, so the bare field name
+                    // is a single slot shared by every `with` whose body is
+                    // being compiled — whichever `with` set it most recently at
+                    // RUNTIME would win, ignoring lexical scope (e.g. two
+                    // sequential `with {show …}` blocks both compiling
+                    // `^show`'s root `Var("show")`, or a rebound/shadowing
+                    // local clobbering a `with` field). The alias
+                    // (`{PREFIX}{with_span}@{field}`, bound by codegen's `With`
+                    // arm alongside the bare name) is unique per `with` site,
+                    // so the emitted `Var(alias)` hits the lexically correct
+                    // dictionary.
+                    //
+                    // Codegen's `Env` frames fork at every `With` arm, so an
+                    // infer scope that binds `name` between the Var and the
+                    // `with` frame (a lambda param, a do-block bind, …) is
+                    // indistinguishable at runtime from the `with` frame itself
+                    // — both live in the same flat env. The redirect therefore
+                    // fires whenever the INNERMOST binder of `name` is a
+                    // `with` frame, no matter how many scopes intervene.
+                    //
+                    // The one place codegen's env genuinely diverges from the
+                    // infer scopes is a `with`'s OPERAND: codegen compiles it
+                    // in an env derived from the ENCLOSING env with every
+                    // `with` binding masked (nested shadowing), while infer
+                    // pushes the new `with`'s frame before inferring the
+                    // operand. So when the innermost enclosing `with` frame
+                    // belongs to the `with` whose operand is currently being
+                    // inferred, codegen's operand env has no alias slot for it
+                    // — and a Var resolved to that frame must NOT redirect
+                    // (its bare name reads the enclosing env's value, exactly
+                    // as the old runtime-frame-popping behaviour produced).
+                    // Deeper `with` frames are restored before the body compiles
+                    // and their aliases ARE present in the operand env's
+                    // prototype, so they still redirect.
+                    let innermost_with_idx = self
+                        .with_scope_stack
+                        .iter()
+                        .rposition(Option::is_some);
+                    for (idx, (with_frame, scope)) in self
+                        .with_scope_stack
+                        .iter()
+                        .zip(self.scopes.iter())
+                        .enumerate()
+                        .rev()
+                    {
+                        if let Some((with_span, field_schemes)) = with_frame
+                            && let Some(scheme) = field_schemes.get(name)
+                            && Some(idx) != innermost_with_idx
+                        {
+                            let alias = format!(
+                                "{WITH_FIELD_ALIAS_PREFIX}{}@{name}",
+                                with_span.start
+                            );
+                            self.implicit_refs.insert(expr.span, (alias, Vec::new()));
+                            return scheme.ty.clone();
+                        }
+                        if scope.contains_key(name) {
+                            break;
+                        }
+                    }
                     ty
                 } else {
                     self.error(
@@ -5383,7 +5505,61 @@ impl Infer {
                 // Infer the record, then resolve its type to a concrete record
                 // so the field names are known. Each field is bound as a local
                 // variable for the body; the result is the body's type.
-                let record_ty = self.infer_expr(record);
+                //
+                // For a RECORD-LITERAL operand, each field value is inferred
+                // with only the ENCLOSING `with` frames' SAME-NAMED binding
+                // masked (self-reference masking): `with` scopes a record's
+                // fields over the BODY only, so a field's own value must not
+                // capture an outer `with`'s same-named field (e.g. in
+                // `with i (with {show (\n -> … show …)} …)` the inner lambda's
+                // `show` must see the bindings that were in scope OUTSIDE the
+                // outer `with` — the builtin — not i's `show`, else it would
+                // produce "INNEROUTER1"). Other names stay fully visible:
+                // argument-position references to outer `with` fields
+                // (`with {ctor r.Pair}`, `with {xs (filter … xs)}` rebinding
+                // `xs` from its outer value) keep working. Non-`with` scopes
+                // are never masked, so ordinary locals stay visible too.
+                let record_ty = if let ast::ExprKind::Record(field_exprs) =
+                    &record.node
+                {
+                    let mut field_tys: Vec<(String, Ty)> =
+                        Vec::with_capacity(field_exprs.len());
+                    for f in field_exprs {
+                        // Save any enclosing `with` frame that binds this
+                        // field's name (innermost-to-outermost), masking it
+                        // only while THIS field's value is inferred.
+                        let mut masked: Vec<(
+                            usize,
+                            HashMap<String, Scheme>,
+                            _,
+                        )> = Vec::new();
+                        for idx in (0..self.scopes.len()).rev() {
+                            let is_with = self.with_scope_stack[idx]
+                                .as_ref()
+                                .is_some_and(|(_, fs)| fs.contains_key(&f.name));
+                            if is_with {
+                                let frame =
+                                    self.with_scope_stack[idx].take().expect(
+                                        "checked Some above",
+                                    );
+                                let scope =
+                                    std::mem::take(&mut self.scopes[idx]);
+                                masked.push((idx, scope, frame));
+                            }
+                        }
+                        let val_ty = self.infer_expr(&f.value);
+                        for (idx, scope, frame) in masked.into_iter().rev() {
+                            self.scopes[idx] = scope;
+                            self.with_scope_stack[idx] = Some(frame);
+                        }
+                        field_tys.push((f.name.clone(), val_ty));
+                    }
+                    Ty::Record(field_tys.into_iter().collect(), None)
+                } else {
+                    // Non-literal operand: nothing to mask (no field values
+                    // visible), infer as-is.
+                    self.infer_expr(record)
+                };
                 let resolved = self.apply(&record_ty);
                 let fields = match &resolved {
                     Ty::Record(fields, _) => fields.clone(),
@@ -5400,6 +5576,17 @@ impl Infer {
                 for (name, ty) in &fields {
                     self.bind(name, Scheme::mono(ty.clone()));
                 }
+                // Mark this scope as a `with` frame (span + field schemes) so
+                // the `Var` arm can redirect a `with`-field reference to the
+                // per-`with`-site alias codegen binds (lexical scoping in the
+                // flat runtime `Env`).
+                *self.with_scope_stack.last_mut().expect("just pushed") = Some((
+                    expr.span,
+                    fields
+                        .iter()
+                        .map(|(n, t)| (n.clone(), Scheme::mono(t.clone())))
+                        .collect(),
+                ));
                 // Peel the record's embedded `type`/`data` declarations into a
                 // scoped type env, confined to this `with` body. Only when the
                 // record is a literal can we see the declarations; the bindings

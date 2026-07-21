@@ -3686,6 +3686,19 @@ impl Codegen {
                 // hijack the binding (and, for `retry`, emit STM control flow
                 // instead of reading the variable).
                 if let Some(&val) = env.bindings.get(name.as_str()) {
+                    // Inference may have resolved this Var to a field of the
+                    // innermost enclosing `with` and recorded the `with` site's
+                    // unique alias in `implicit_refs` (see infer's `Var` arm).
+                    // The bare name's slot in the flat `Env` is shared by every
+                    // in-scope `with`, so reading it would return whichever
+                    // dictionary was set most recently at RUNTIME — the alias
+                    // slot holds the LEXICALLY correct one. Look the alias up
+                    // first; fall back to the bare slot if it is absent.
+                    if let Some((alias, _)) = self.implicit_refs.get(&expr.span)
+                        && let Some(&aval) = env.bindings.get(alias.as_str())
+                    {
+                        return aval;
+                    }
                     return val;
                 }
                 // A user-defined top-level declaration whose name collides with
@@ -4010,7 +4023,77 @@ impl Codegen {
                 // inference's `with_fields`) as a local for the body. A cloned
                 // env gives lexical scoping: field bindings shadow outer ones
                 // inside the body and vanish after it.
-                let record_val = self.compile_expr(builder, record, env, db);
+                // For a RECORD-LITERAL operand, each field value is compiled
+                // with only the enclosing `with`s' SAME-NAMED bindings masked
+                // (bare field name + per-site alias), mirroring inference's
+                // self-reference masking (see infer's `With` arm): `with`
+                // scopes its fields over the BODY only, so a field's own value
+                // must not capture an outer `with`'s same-named field —
+                // instead its free `Var`s resolve to the bindings that were in
+                // scope OUTSIDE the outer `with` (e.g. a builtin `show`). All
+                // other names stay visible, so argument-position references to
+                // outer `with` fields (`with {ctor r.Pair}`,
+                // `with {xs (filter … xs)}`) keep working.
+                let record_val = if let ast::ExprKind::Record(field_exprs) =
+                    &record.node
+                {
+                    let mut compiled_fields: Vec<(&String, Value)> =
+                        Vec::with_capacity(field_exprs.len());
+                    for f in field_exprs {
+                        let mut field_env = env.clone();
+                        // Self-reference masking (mirror of inference): this
+                        // field's value must not capture an enclosing `with`'s
+                        // SAME-NAMED bare binding — that binding is only in
+                        // `env` because an outer `with` bound it for ITS body.
+                        // Removing it lets the value's free `Var(f)` fall
+                        // through to the builtin / outer-scope binding (as
+                        // inference resolved it), so a nested `with {show …}`
+                        // lambda sees the builtin `show`, not the outer
+                        // `with`'s. Other names stay visible, so
+                        // argument-position captures keep working. (Per-site
+                        // aliases `\0with:…@f` never appear in a field value's
+                        // free vars — they start with `\0`, unutterable in
+                        // source — so only the bare name needs removal.)
+                        if field_env.bindings.contains_key(&f.name)
+                            && self
+                                .with_fields
+                                .values()
+                                .any(|fs| fs.iter().any(|n| n == &f.name))
+                        {
+                            field_env.bindings.remove(&f.name);
+                        }
+                        let v = self.compile_expr(
+                            builder,
+                            &f.value,
+                            &mut field_env,
+                            db,
+                        );
+                        compiled_fields.push((&f.name, v));
+                    }
+                    // Assemble the record from the compiled field values,
+                    // sorted by field name exactly like the `Record` arm
+                    // (runtime expects pre-sorted pairs).
+                    let mut compiled_sorted = compiled_fields;
+                    compiled_sorted.sort_by_key(|(name, _)| name.as_str());
+                    let n = compiled_sorted.len();
+                    let ptr_bytes = self.ptr_type.bytes() as i32;
+                    let slot_size = (3 * n as u32) * ptr_bytes as u32;
+                    let slot = builder.create_sized_stack_slot(
+                        StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
+                    );
+                    for (i, (name, val)) in compiled_sorted.iter().enumerate() {
+                        let (key_ptr, key_len) = self.string_ptr(builder, name);
+                        let base = (i as i32) * (3 * ptr_bytes);
+                        builder.ins().stack_store(key_ptr, slot, base);
+                        builder.ins().stack_store(key_len, slot, base + ptr_bytes);
+                        builder.ins().stack_store(*val, slot, base + 2 * ptr_bytes);
+                    }
+                    let data_ptr = builder.ins().stack_addr(self.ptr_type, slot, 0);
+                    let count = builder.ins().iconst(self.ptr_type, n as i64);
+                    self.call_rt(builder, "knot_record_from_pairs", &[data_ptr, count])
+                } else {
+                    self.compile_expr(builder, record, env, db)
+                };
                 let mut body_env = env.clone();
                 // Determine IO-producing and relation-valued fields, so
                 // relation-valued IO fields (queries like `r: do i <- *src …;
@@ -4071,6 +4154,21 @@ impl Codegen {
                             &[record_val, key_ptr, key_len],
                         );
                         body_env.set(&field, field_val);
+                        // Also bind the per-`with`-site alias inference
+                        // resolved `^field` to (see infer's `With` arm and
+                        // `resolve_implicit_ref`). The alias
+                        // (`\0with:<with_span>@<field>`) is unique to this
+                        // `with` site, so `^field`'s emitted `Var(alias)`
+                        // hits THIS block's dictionary in the flat `Env` —
+                        // two `with` blocks projecting the same field name no
+                        // longer collide on the shared bare-name slot.
+                        let alias = format!(
+                            "{}{}@{}",
+                            crate::infer::WITH_FIELD_ALIAS_PREFIX,
+                            expr.span.start,
+                            field
+                        );
+                        body_env.set(&alias, field_val);
                     }
                 }
                 // Track which bound fields hold IO-producing values so

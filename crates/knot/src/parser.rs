@@ -1888,6 +1888,36 @@ impl Parser {
             let saved = self.save();
             // Allow newlines between constraints (e.g. after a previous `=>`).
             self.skip_newlines();
+            // Implicit-field constraint: `(^field : Type) =>`.
+            if matches!(self.peek(), TokenKind::LParen) {
+                let after_lparen = self.save();
+                self.advance(); // `(`
+                if matches!(self.peek(), TokenKind::Caret) {
+                    self.advance(); // `^`
+                    if let TokenKind::Lower(field) = self.peek().clone() {
+                        self.advance();
+                        self.skip_newlines();
+                        if self.eat(&TokenKind::Colon) {
+                            self.skip_newlines();
+                            if let Some(ty) = self.parse_type() {
+                                self.skip_newlines();
+                                if self.eat(&TokenKind::RParen) {
+                                    let pre_arrow = self.save();
+                                    self.skip_newlines();
+                                    if self.eat(&TokenKind::FatArrow) {
+                                        constraints.push(Constraint::ImplicitField { field, ty });
+                                        continue;
+                                    }
+                                    self.restore(pre_arrow);
+                                }
+                            }
+                        }
+                    }
+                }
+                self.restore(after_lparen);
+                self.restore(saved);
+                break;
+            }
             if matches!(self.peek(), TokenKind::Upper(_)) {
                 let tok = self.advance();
                 let TokenKind::Upper(trait_name) = tok.kind else { unreachable!() };
@@ -1908,10 +1938,7 @@ impl Parser {
                 let pre_arrow = self.save();
                 self.skip_newlines();
                 if self.eat(&TokenKind::FatArrow) {
-                    constraints.push(Constraint {
-                        trait_name,
-                        args,
-                    });
+                    constraints.push(Constraint::Trait { trait_name, args });
                     continue;
                 }
                 self.restore(pre_arrow);

@@ -1352,7 +1352,7 @@ fn scheme_contains_offset(scheme: &ast::TypeScheme, offset: usize) -> bool {
     scheme
         .constraints
         .iter()
-        .any(|c| c.args.iter().any(|t| type_contains_offset(t, offset)))
+        .any(|c| c.types().iter().any(|t| type_contains_offset(t, offset)))
 }
 
 /// If the cursor is inside a function/view/derived's type
@@ -1383,8 +1383,11 @@ pub(crate) fn constraints_for_type_var<'a>(
     scheme
         .constraints
         .iter()
-        .filter(|c| {
-            c.args.iter().any(|t| type_mentions_var(t, var_name))
+        .filter(|c| match c {
+            ast::Constraint::Trait { args, .. } => {
+                args.iter().any(|t| type_mentions_var(t, var_name))
+            }
+            ast::Constraint::ImplicitField { ty, .. } => type_mentions_var(ty, var_name),
         })
         .collect()
 }

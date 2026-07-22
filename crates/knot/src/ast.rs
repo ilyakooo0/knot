@@ -538,11 +538,34 @@ pub struct TypeScheme {
     pub ty: Type,
 }
 
-/// A trait constraint: `Display a`, `Num n`.
+/// A signature constraint: either a trait constraint (`Display a`) or an
+/// implicit-field constraint (`^compare : a -> a -> Ordering`).
 #[derive(Debug, Clone)]
-pub struct Constraint {
-    pub trait_name: Name,
-    pub args: Vec<Type>,
+pub enum Constraint {
+    /// `Display a`, `Num n` — a trait constraint (legacy; traits removed).
+    Trait { trait_name: Name, args: Vec<Type> },
+    /// `(^field : Type)` — an implicit-field constraint. The function takes a
+    /// hidden dictionary argument; callsites resolve it by searching scope for
+    /// a record providing `field` at `Type`.
+    ImplicitField { field: Name, ty: Type },
+}
+
+impl Constraint {
+    /// The constraint's display name (trait name or `^field`).
+    pub fn name(&self) -> &str {
+        match self {
+            Constraint::Trait { trait_name, .. } => trait_name,
+            Constraint::ImplicitField { field, .. } => field,
+        }
+    }
+
+    /// All types mentioned by the constraint (trait args, or the field type).
+    pub fn types(&self) -> Vec<&Type> {
+        match self {
+            Constraint::Trait { args, .. } => args.iter().collect(),
+            Constraint::ImplicitField { ty, .. } => vec![ty],
+        }
+    }
 }
 
 // ── Effects ────────────────────────────────────────────────────────

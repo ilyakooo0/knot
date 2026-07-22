@@ -1160,7 +1160,7 @@ pub(crate) fn collect_name_uses_in_decl(
     fn walk_scheme(scheme: &ast::TypeScheme, name: &str, source: &str, out: &mut Vec<Span>) {
         walk_type(&scheme.ty, name, source, out);
         for c in &scheme.constraints {
-            for arg in &c.args {
+            for arg in c.types() {
                 walk_type(arg, name, source, out);
             }
         }

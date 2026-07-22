@@ -13,8 +13,16 @@ const MAX_FORMAT_DEPTH: usize = 64;
 pub fn format_type_scheme(ts: &TypeScheme) -> String {
     let mut s = String::new();
     for c in &ts.constraints {
-        let args: Vec<String> = c.args.iter().map(|a| format_type_kind(&a.node)).collect();
-        s.push_str(&format!("{} {} => ", c.trait_name, args.join(" ")));
+        match c {
+            ast::Constraint::Trait { trait_name, args } => {
+                let args: Vec<String> =
+                    args.iter().map(|a| format_type_kind(&a.node)).collect();
+                s.push_str(&format!("{} {} => ", trait_name, args.join(" ")));
+            }
+            ast::Constraint::ImplicitField { field, ty } => {
+                s.push_str(&format!("(^ {} : {}) => ", field, format_type_kind(&ty.node)));
+            }
+        }
     }
     s.push_str(&format_type_kind(&ts.ty.node));
     s

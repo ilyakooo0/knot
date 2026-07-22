@@ -156,13 +156,18 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                     // `Show a =>` constraint trait names precede the type; they
                     // are spanless, so recover them before walking the type.
                     resolver.resolve_trait_names(
-                        scheme.constraints.iter().map(|c| c.trait_name.as_str()),
+                        scheme.constraints.iter().filter_map(|c| match c {
+                            knot::ast::Constraint::Trait { trait_name, .. } => {
+                                Some(trait_name.as_str())
+                            }
+                            knot::ast::Constraint::ImplicitField { .. } => None,
+                        }),
                         decl.span.start,
                         scheme.ty.span.start,
                     );
                     resolver.resolve_type(&scheme.ty, source);
                     for c in &scheme.constraints {
-                        for arg in &c.args {
+                        for arg in c.types() {
                             resolver.resolve_type(arg, source);
                         }
                     }
@@ -174,13 +179,18 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
             DeclKind::View { body, ty, .. } | DeclKind::Derived { body, ty, .. } => {
                 if let Some(scheme) = ty {
                     resolver.resolve_trait_names(
-                        scheme.constraints.iter().map(|c| c.trait_name.as_str()),
+                        scheme.constraints.iter().filter_map(|c| match c {
+                            knot::ast::Constraint::Trait { trait_name, .. } => {
+                                Some(trait_name.as_str())
+                            }
+                            knot::ast::Constraint::ImplicitField { .. } => None,
+                        }),
                         decl.span.start,
                         scheme.ty.span.start,
                     );
                     resolver.resolve_type(&scheme.ty, source);
                     for c in &scheme.constraints {
-                        for arg in &c.args {
+                        for arg in c.types() {
                             resolver.resolve_type(arg, source);
                         }
                     }

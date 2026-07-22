@@ -438,7 +438,7 @@ fn collect_decl_deps(decl: &ast::Decl) -> HashSet<String> {
             if let Some(ts) = ty {
                 collect_type_names(&ts.ty, &mut deps);
                 for c in &ts.constraints {
-                    for arg in &c.args {
+                    for arg in c.types() {
                         collect_type_names(arg, &mut deps);
                     }
                 }
@@ -453,7 +453,7 @@ fn collect_decl_deps(decl: &ast::Decl) -> HashSet<String> {
                 // Collect constraint arg types — matches the Fun arm so
                 // changes to types used in view/derived constraints propagate.
                 for c in &ts.constraints {
-                    for arg in &c.args {
+                    for arg in c.types() {
                         collect_type_names(arg, &mut deps);
                     }
                 }

@@ -198,8 +198,13 @@ fn walk_ctor_def(c: &ConstructorDef, r: &mut Refs) {
 }
 
 fn walk_constraint(c: &Constraint, r: &mut Refs) {
-    for arg in &c.args {
-        walk_type(arg, r);
+    match c {
+        Constraint::Trait { args, .. } => {
+            for arg in args {
+                walk_type(arg, r);
+            }
+        }
+        Constraint::ImplicitField { ty, .. } => walk_type(ty, r),
     }
 }
 

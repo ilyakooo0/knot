@@ -8684,14 +8684,21 @@ impl Infer {
                         // Convert AST constraints to internal constraints
                         let mut constraints = Vec::new();
                         for c in &scheme.constraints {
-                            for arg in &c.args {
-                                if let ast::TypeKind::Var(var_name) = &arg.node {
-                                    let v = self.annotation_var(var_name);
-                                    constraints.push(TyConstraint {
-                                        trait_name: c.trait_name.clone(),
-                                        type_var: v,
-                                        span: arg.span,
-                                    });
+                            match c {
+                                ast::Constraint::Trait { trait_name, args } => {
+                                    for arg in args {
+                                        if let ast::TypeKind::Var(var_name) = &arg.node {
+                                            let v = self.annotation_var(var_name);
+                                            constraints.push(TyConstraint {
+                                                trait_name: trait_name.clone(),
+                                                type_var: v,
+                                                span: arg.span,
+                                            });
+                                        }
+                                    }
+                                }
+                                ast::Constraint::ImplicitField { .. } => {
+                                    // Handled in the implicit-field pipeline.
                                 }
                             }
                         }
@@ -10353,16 +10360,23 @@ impl Infer {
                             self.in_type_annotation = true;
                             let mut constraints = Vec::new();
                             for c in &ts.constraints {
-                                for arg in &c.args {
-                                    if let ast::TypeKind::Var(var_name) =
-                                        &arg.node
-                                    {
-                                        let v = self.annotation_var(var_name);
-                                        constraints.push(TyConstraint {
-                                            trait_name: c.trait_name.clone(),
-                                            type_var: v,
-                                            span: arg.span,
-                                        });
+                                match c {
+                                    ast::Constraint::Trait { trait_name, args } => {
+                                        for arg in args {
+                                            if let ast::TypeKind::Var(var_name) =
+                                                &arg.node
+                                            {
+                                                let v = self.annotation_var(var_name);
+                                                constraints.push(TyConstraint {
+                                                    trait_name: trait_name.clone(),
+                                                    type_var: v,
+                                                    span: arg.span,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    ast::Constraint::ImplicitField { .. } => {
+                                        // Handled in the implicit-field pipeline.
                                     }
                                 }
                             }

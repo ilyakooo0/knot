@@ -1251,12 +1251,19 @@ fn render_type_scheme(ts: &TypeScheme) -> String {
 }
 
 fn render_constraint(c: &Constraint) -> String {
-    let mut s = c.trait_name.clone();
-    for a in &c.args {
-        s.push(' ');
-        s.push_str(&render_type_atom(a));
+    match c {
+        Constraint::Trait { trait_name, args } => {
+            let mut s = trait_name.clone();
+            for a in args {
+                s.push(' ');
+                s.push_str(&render_type_atom(a));
+            }
+            s
+        }
+        Constraint::ImplicitField { field, ty } => {
+            format!("(^{field} : {})", render_type(ty))
+        }
     }
-    s
 }
 
 fn render_unit_expr(u: &UnitExpr) -> String {

@@ -1786,13 +1786,17 @@ fn function_constraint_summary(module: &Module, name: &str) -> Option<String> {
                 let cs: Vec<String> = scheme
                     .constraints
                     .iter()
-                    .map(|c| {
-                        let args: Vec<String> = c
-                            .args
-                            .iter()
-                            .map(|t| format_type_kind(&t.node))
-                            .collect();
-                        format!("`{} {}`", c.trait_name, args.join(" "))
+                    .map(|c| match c {
+                        knot::ast::Constraint::Trait { trait_name, args } => {
+                            let args: Vec<String> = args
+                                .iter()
+                                .map(|t| format_type_kind(&t.node))
+                                .collect();
+                            format!("`{} {}`", trait_name, args.join(" "))
+                        }
+                        knot::ast::Constraint::ImplicitField { field, ty } => {
+                            format!("`(^ {} : {})`", field, format_type_kind(&ty.node))
+                        }
                     })
                     .collect();
                 return Some(format!("*Constraints:* {}", cs.join(", ")));

@@ -326,13 +326,17 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         let decl_name = enclosing_scheme.map(|(_, n)| n).unwrap_or("");
         let rendered: Vec<String> = type_var_constraints
             .iter()
-            .map(|c| {
-                let args: Vec<String> = c
-                    .args
-                    .iter()
-                    .map(|t| format_type_kind(&t.node))
-                    .collect();
-                format!("`{} {}`", c.trait_name, args.join(" "))
+            .map(|c| match c {
+                knot::ast::Constraint::Trait { trait_name, args } => {
+                    let args: Vec<String> = args
+                        .iter()
+                        .map(|t| format_type_kind(&t.node))
+                        .collect();
+                    format!("`{} {}`", trait_name, args.join(" "))
+                }
+                knot::ast::Constraint::ImplicitField { field, ty } => {
+                    format!("`(^ {} : {})`", field, format_type_kind(&ty.node))
+                }
             })
             .collect();
         if !value.is_empty() {

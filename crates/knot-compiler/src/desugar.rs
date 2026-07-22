@@ -355,9 +355,176 @@ fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> 
         .collect()
 }
 
+/// Name of the hidden dictionary parameter introduced for a `^field`
+/// constraint: `__dict_<field>`.
+fn dict_param_name(field: &str) -> Name {
+    format!("__dict_{field}")
+}
+
+/// Rewrite every `^field` implicit projection in `expr` to an explicit
+/// dictionary projection `__dict_<field>.field`, so the constrained function's
+/// body reads its operations off the hidden dictionary parameter.
+fn rewrite_implicit_refs(expr: &mut Expr, field: &str) {
+    if let ExprKind::ImplicitRef(name) = &expr.node
+        && name == field
+    {
+        let span = expr.span;
+        expr.node = ExprKind::FieldAccess {
+            expr: Box::new(Spanned::new(
+                ExprKind::Var(dict_param_name(field)),
+                span,
+            )),
+            field: field.to_string(),
+        };
+        return;
+    }
+    walk_expr_children(expr, &mut |child| rewrite_implicit_refs(child, field));
+}
+
+/// Recurse over all direct child expressions of `expr`.
+fn walk_expr_children(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
+    match &mut expr.node {
+        ExprKind::App { func, arg } => {
+            f(func);
+            f(arg);
+        }
+        ExprKind::Lambda { body, .. } => f(body),
+        ExprKind::Record(fields) => {
+            for field in fields {
+                f(&mut field.value);
+            }
+        }
+        ExprKind::RecordUpdate { base, fields } => {
+            f(base);
+            for field in fields {
+                f(&mut field.value);
+            }
+        }
+        ExprKind::FieldAccess { expr: e, .. } => f(e),
+        ExprKind::List(elems) => {
+            for e in elems {
+                f(e);
+            }
+        }
+        ExprKind::With { record, body } => {
+            f(record);
+            f(body);
+        }
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
+        ExprKind::UnaryOp { operand, .. } => f(operand),
+        ExprKind::If { cond, then_branch, else_branch } => {
+            f(cond);
+            f(then_branch);
+            f(else_branch);
+        }
+        ExprKind::Case { scrutinee, arms } => {
+            f(scrutinee);
+            for arm in arms {
+                f(&mut arm.body);
+            }
+        }
+        ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                match &mut stmt.node {
+                    StmtKind::Bind { expr: e, .. } => f(e),
+                    StmtKind::Where { cond } => f(cond),
+                    StmtKind::GroupBy { key } => f(key),
+                    StmtKind::Expr(e) => f(e),
+                }
+            }
+        }
+        ExprKind::Set { value, .. } | ExprKind::ReplaceSet { value, .. } => f(value),
+        ExprKind::Atomic(e) | ExprKind::Refine(e) => f(e),
+        ExprKind::TimeUnitLit { value, .. } => f(value),
+        ExprKind::Annot { expr: e, .. } => f(e),
+        ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                f(&mut h.body);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn desugar_decl(decl: &mut DeclKind, io_fns: &IoFns, source_vars: &HashSet<String>) {
     match decl {
-        DeclKind::Fun { body: Some(body), .. } => desugar_expr(body, io_fns, source_vars),
+        DeclKind::Fun { body: Some(body), ty, .. } => {
+            // Elaborate signature-level `^`-field constraints into a hidden
+            // leading dictionary parameter: a function declared
+            //   f : (^compare : a -> a -> Int) => a -> a -> a
+            //   f = \x -> … (^compare) …
+            // is rewritten to take a hidden record `__dict_compare` as its
+            // first parameter, and each body occurrence of `(^compare)` becomes
+            // `__dict_compare.compare`. The callsite supplies the dictionary
+            // Constraint metadata is left on the type scheme so inference
+            // knows the callsite must resolve it; the declared type is also
+            // elaborated to expose the hidden dictionary as a leading record
+            // parameter, so the body (now `\__dict_<field> -> …`) type-checks.
+            let implicit: Vec<(Name, Type)> = ty
+                .as_ref()
+                .map(|ts| {
+                    ts.constraints
+                        .iter()
+                        .filter_map(|c| match c {
+                            Constraint::ImplicitField { field, ty } => {
+                                Some((field.clone(), ty.clone()))
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !implicit.is_empty() {
+                let span = body.span;
+                for (field, _) in &implicit {
+                    rewrite_implicit_refs(body, field);
+                }
+                for (field, _) in implicit.iter().rev() {
+                    let dict = dict_param_name(field);
+                    let placeholder =
+                        Spanned::new(ExprKind::Lit(Literal::Bool(false)), span);
+                    let old_body = std::mem::replace(body, placeholder);
+                    *body = Spanned::new(
+                        ExprKind::Lambda {
+                            params: vec![Spanned::new(PatKind::Var(dict), span)],
+                            ty_params: vec![],
+                            body: Box::new(old_body),
+                        },
+                        span,
+                    );
+                }
+                // Elaborate the declared type: prepend `{field : F} ->` for
+                // each implicit-field constraint (innermost constraint last, so
+                // the first declared constraint is the outermost/first param).
+                if let Some(ts) = ty {
+                    for (field, fty) in implicit.iter().rev() {
+                        let dict_ty = Spanned::new(
+                            TypeKind::Record {
+                                fields: vec![Field {
+                                    name: field.clone(),
+                                    value: fty.clone(),
+                                }],
+                                rest: None,
+                            },
+                            fty.span,
+                        );
+                        let old_span = ts.ty.span;
+                        let old = std::mem::replace(&mut ts.ty, dict_ty.clone());
+                        ts.ty = Spanned::new(
+                            TypeKind::Function {
+                                param: Box::new(dict_ty),
+                                result: Box::new(old),
+                            },
+                            old_span,
+                        );
+                    }
+                }
+            }
+            desugar_expr(body, io_fns, source_vars)
+        }
         DeclKind::Fun { body: None, .. } => {},
         DeclKind::View { body, .. } => {
             // Don't desugar the top-level do block of a view body

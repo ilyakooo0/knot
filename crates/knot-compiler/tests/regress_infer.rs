@@ -22,7 +22,7 @@ fn check_full(
 ) -> (Vec<Diagnostic>, knot_compiler::infer::RefineTargets) {
     let mut module = parse(src);
     knot_compiler::desugar::desugar(&mut module);
-    let (diags, _monad, _type_info, _local, refine_targets, _refined, _json, _elem,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) =
+    let (diags, _monad, _type_info, _local, refine_targets, _refined, _json, _elem,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs, _implicit_dict_args) =
         knot_compiler::infer::check(&mut module);
     (diags, refine_targets)
 }

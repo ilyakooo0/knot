@@ -204,6 +204,11 @@ pub type WithFields = HashMap<Span, Vec<String>>;
 /// projection per path element.
 pub type ImplicitRefs = HashMap<Span, (String, Vec<String>)>;
 
+/// Callsite resolutions for implicit dictionaries: application span → the
+/// `(root_binding, field_path)` of the in-scope record supplying the
+/// dictionary. Codegen splices the projected record as the leading argument.
+pub type ImplicitDictArgs = HashMap<Span, (String, Vec<String>)>;
+
 /// Prefix for the unique, per-`with`-site alias a `with` field is also bound
 /// under during inference (and codegen's flat `Env`): `{PREFIX}{with_span_start}@{field}`.
 /// `^field` resolves against the alias so its codegen `Var` hits the lexically
@@ -211,6 +216,14 @@ pub type ImplicitRefs = HashMap<Span, (String, Vec<String>)>;
 /// `\0` makes the alias unutterable in source, so it can never collide with a
 /// user binding. Shared with codegen (`crate::infer::WITH_FIELD_ALIAS_PREFIX`).
 pub const WITH_FIELD_ALIAS_PREFIX: &str = "\0with:";
+
+/// Prefix for the unique, per-`with`-site alias a `with` block's RECORD VALUE
+/// is bound under during codegen, so an implicit dictionary resolved to that
+/// `with` frame can project the whole record: `{PREFIX}{with_span_start}`.
+/// Distinct from `WITH_FIELD_ALIAS_PREFIX` (which aliases each *field*); the
+/// record alias is only created when a `^`-constrained callsite inside the
+/// body resolved its dictionary to this `with`. Shared with codegen.
+pub const WITH_RECORD_ALIAS_PREFIX: &str = "\0withrec:";
 
 /// Spans of field-access expressions (`t.members`) whose field type is a
 /// relation. Codegen cannot re-derive this — a record's field types are not
@@ -875,6 +888,21 @@ struct Infer {
     /// `+`/`<`/`++`/unary-`-`/`==` operator checks.
     known_impls: HashSet<(String, String)>,
 
+    /// Top-level functions carrying signature-level `^`-field constraints:
+    /// name → ordered `(field, field_type)` list. The function's stored scheme
+    /// has already been elaborated to take a leading dictionary record per
+    /// constraint (see desugar); this side-table records WHICH leading
+    /// parameters are implicit dictionaries so each callsite can resolve them
+    /// from scope instead of receiving them explicitly.
+    implicit_dict_fns: HashMap<String, Vec<(String, Ty)>>,
+
+    /// Callsite resolutions for implicit dictionaries: application span → the
+    /// `(root_binding, field_path)` of the in-scope record that supplies the
+    /// dictionary. Codegen splices the projected record as the leading
+    /// argument at that application. Keyed by the application's span (the
+    /// outermost `App` node's span).
+    implicit_dict_args: HashMap<Span, (String, Vec<String>)>,
+
     /// Deferred trait constraint checks, resolved after inference.
     deferred_constraints: Vec<DeferredConstraint>,
 
@@ -1060,6 +1088,8 @@ impl Infer {
             from_json_calls: Vec::new(),
             show_calls: Vec::new(),
             known_impls: HashSet::new(),
+            implicit_dict_fns: HashMap::new(),
+            implicit_dict_args: HashMap::new(),
             deferred_constraints: Vec::new(),
             next_constraint_seq: 0,
             pending_effect_unions: Vec::new(),
@@ -5039,6 +5069,188 @@ impl Infer {
 
     // ── Expression inference ─────────────────────────────────────
 
+    /// Resolve an application of a `^`-constrained function whose leading
+    /// dictionary arguments are implicit. Returns `Some(result_ty)` when the
+    /// spine's head names such a function and the dictionaries were resolved
+    /// from scope; `None` to fall through to the generic application path
+    /// (head not constrained, or dictionaries already supplied explicitly).
+    fn try_infer_implicit_dict_app(&mut self, expr: &ast::Expr) -> Option<Ty> {
+        // Peel the application spine into (head, args in application order).
+        let mut args: Vec<&ast::Expr> = Vec::new();
+        let mut head = expr;
+        while let ast::ExprKind::App { func, arg } = &head.node {
+            args.push(arg);
+            head = func;
+        }
+        args.reverse();
+        let ast::ExprKind::Var(name) = &head.node else {
+            return None;
+        };
+        let dicts = self.implicit_dict_fns.get(name)?.clone();
+        let n_dicts = dicts.len();
+        // If the caller already supplied the dictionaries explicitly (more
+        // args than the non-dict parameters), don't treat this as implicit.
+        // The non-dict arity is the function's curried arity minus the dicts;
+        // with exactly `arity - n_dicts` args the dicts are implicit.
+        let scheme = self.lookup(name)?.clone();
+        let arity = curry_arity(&scheme.ty);
+        let explicit_arity = arity - n_dicts;
+        if args.len() != explicit_arity {
+            return None;
+        }
+
+        // Instantiate and resolve each leading dictionary from scope. We must
+        // ground the dictionary type from the supplied arguments first, so
+        // type the full application (with fresh dict placeholders) and then
+        // solve each placeholder against the scope.
+        let mut inst = self.instantiate_at(&scheme, expr.span);
+        let mut dict_tys: Vec<Ty> = Vec::with_capacity(n_dicts);
+        for _ in 0..n_dicts {
+            let Ty::Fun(param, rest) = inst else {
+                return None;
+            };
+            dict_tys.push((*param).clone());
+            inst = (*rest).clone();
+        }
+        // Type the explicit arguments against the remaining curried type.
+        let mut result = inst;
+        for a in &args {
+            let arg_ty = self.infer_expr(a);
+            let ret = self.fresh();
+            self.unify(&result, &Ty::Fun(Box::new(arg_ty), Box::new(ret.clone())), a.span);
+            result = ret;
+        }
+        // Now the dictionary types are ground; resolve each against the
+        // in-scope records and record the splice for codegen.
+        for (i, (field, _)) in dicts.iter().enumerate() {
+            let dict_ty = self.apply(&dict_tys[i]);
+            let field_ty = match dict_ty.peel_alias() {
+                Ty::Record(fields, _) => fields.get(field).cloned().unwrap_or(dict_ty),
+                _ => dict_ty,
+            };
+            if let Some((root, path)) = self.resolve_dict(field, &field_ty, expr.span) {
+                self.implicit_dict_args.insert(expr.span, (root, path));
+            }
+        }
+        Some(result)
+    }
+
+    /// Find an in-scope RECORD supplying `field` at `field_ty`, for splicing
+    /// as an implicit dictionary. Unlike `resolve_implicit_ref` (which returns
+    /// the *field value* projection for `^field`), this returns the *record*
+    /// that owns the field. Mirrors its search order: nearest scope first,
+    /// then shallowest nesting, then sorted field order.
+    ///
+    /// - A named record `intOrd = {compare …}` resolves to `(intOrd, [path…])`.
+    /// - A `with {compare …}` / `with intOrdDesc` frame resolves to the `with`
+    ///   record value, bound by codegen under `\0withrec:<span>`; the path is
+    ///   the field's nesting inside that record (minus the field itself).
+    fn resolve_dict(&mut self, field: &str, field_ty: &Ty, span: Span) -> Option<(String, Vec<String>)> {
+        // Candidate 0: an enclosing `with` frame that binds `field`. Snapshot
+        // the frames first (immutable scan) so the speculative unify below can
+        // borrow `self` mutably.
+        let with_frames: Vec<(Span, Ty, bool)> = self
+            .with_scope_stack
+            .iter()
+            .zip(self.scopes.iter())
+            .rev()
+            .filter_map(|(with_frame, scope)| {
+                if let Some((with_span, field_schemes)) = with_frame
+                    && let Some(scheme) = field_schemes.get(field)
+                {
+                    return Some((*with_span, scheme.ty.clone(), true));
+                }
+                if scope.contains_key(field) {
+                    return Some((Span::new(0, 0), Ty::Error, false)); // shadow marker
+                }
+                None
+            })
+            .collect();
+        for (with_span, scheme_ty, is_with) in with_frames {
+            if !is_with {
+                break;
+            }
+            let mut trial = self.subst.clone();
+            std::mem::swap(&mut self.subst, &mut trial);
+            let errs_before = self.errors.len();
+            self.unify(&scheme_ty, field_ty, span);
+            let ok = self.errors.len() == errs_before;
+            self.errors.truncate(errs_before);
+            std::mem::swap(&mut self.subst, &mut trial);
+            if ok {
+                self.subst = trial;
+                let alias = format!("{WITH_RECORD_ALIAS_PREFIX}{}", with_span.start);
+                // The `with` record itself is the dictionary (its `field` is
+                // bound directly by the frame).
+                return Some((alias, Vec::new()));
+            }
+        }
+
+        // General case: BFS in-scope record bindings for one with a `field`
+        // unifying with `field_ty`. The dict is the record projected along the
+        // path to `field`, minus the field itself.
+        let mut candidates: Vec<(String, Vec<String>, Ty)> = Vec::new();
+        'scopes: for scope in self.scopes.iter().rev() {
+            for (bind_name, scheme) in scope {
+                let root_ty = self.apply(&scheme.ty);
+                let mut frontier: Vec<(Vec<String>, Ty)> = match root_ty.peel_alias() {
+                    Ty::Record(fields, _) => fields
+                        .iter()
+                        .map(|(f, t)| (vec![f.clone()], t.clone()))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                while !frontier.is_empty() {
+                    let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
+                    for (path, fty) in frontier {
+                        if *path.last().expect("non-empty path") == field {
+                            candidates.push((bind_name.clone(), path.clone(), fty.clone()));
+                        }
+                        if let Ty::Record(sub, _) = self.apply(&fty).peel_alias().clone() {
+                            for (f, t) in sub {
+                                let mut p = path.clone();
+                                p.push(f);
+                                next.push((p, t));
+                            }
+                        }
+                    }
+                    if !candidates.is_empty() {
+                        break;
+                    }
+                    frontier = next;
+                }
+            }
+            if !candidates.is_empty() {
+                break 'scopes;
+            }
+        }
+
+        for (root, path, fty) in &candidates {
+            let mut trial = self.subst.clone();
+            std::mem::swap(&mut self.subst, &mut trial);
+            let errs_before = self.errors.len();
+            let fty = fty.clone();
+            self.unify(&fty, field_ty, span);
+            let ok = self.errors.len() == errs_before;
+            self.errors.truncate(errs_before);
+            std::mem::swap(&mut self.subst, &mut trial);
+            if ok {
+                self.subst = trial;
+                let dict_path = if path.len() > 1 {
+                    path[..path.len() - 1].to_vec()
+                } else {
+                    Vec::new()
+                };
+                return Some((root.clone(), dict_path));
+            }
+        }
+        self.error(
+            format!("no in-scope record supplies an implicit dictionary field '{field}'"),
+            span,
+        );
+        None
+    }
+
     /// Resolve a `^name` implicit field projection against `expected`.
     ///
     /// Searches the fields of in-scope RECORD bindings (only records — plain
@@ -5739,6 +5951,17 @@ impl Infer {
                 // response type can be resolved from route metadata.
                 if let Some(ty) = self.try_infer_fetch(expr) {
                     return ty;
+                }
+
+                // Implicit-dictionary callsite: `clamp 0 10 42` where `clamp`
+                // carries a `^`-field constraint. The function's scheme was
+                // elaborated to take a leading dictionary record (see desugar);
+                // here we resolve that dictionary from the in-scope records
+                // (nearest scope wins, via the same search as `^field`), record
+                // it for codegen to splice as the leading argument, and type
+                // the application with the dictionary parameter consumed.
+                if let Some(result) = self.try_infer_implicit_dict_app(expr) {
+                    return result;
                 }
 
                 // `__result e` — a desugared do-block's final bare expression,
@@ -10376,13 +10599,32 @@ impl Infer {
                                         }
                                     }
                                     ast::Constraint::ImplicitField { .. } => {
-                                        // Handled in the implicit-field pipeline.
+                                        // Recorded into `implicit_dict_fns` below.
                                     }
                                 }
                             }
                             let unions_before =
                                 self.pending_effect_unions.len();
                             let ann_ty = self.ast_type_to_ty(&ts.ty);
+                            // Record the implicit-field dictionaries this
+                            // function takes, in declared order, so each
+                            // callsite resolves them from scope. The field
+                            // types are converted NOW (while `annotation_vars`
+                            // is live) so they share the scheme's quantified
+                            // vars and unify with the body's dictionary use.
+                            let implicit: Vec<(String, Ty)> = ts
+                                .constraints
+                                .iter()
+                                .filter_map(|c| match c {
+                                    ast::Constraint::ImplicitField { field, ty } => {
+                                        Some((field.clone(), self.ast_type_to_ty(ty)))
+                                    }
+                                    _ => None,
+                                })
+                                .collect();
+                            if !implicit.is_empty() {
+                                self.implicit_dict_fns.insert(name.clone(), implicit);
+                            }
                             self.in_type_annotation = false;
                             let mut vars: Vec<TyVar> = self
                                 .annotation_vars
@@ -11511,6 +11753,7 @@ pub type CheckOutput = (
     WithFields,
     TypeArgSpans,
     ImplicitRefs,
+    ImplicitDictArgs,
 );
 
 /// Run type inference on a parsed module. Returns diagnostics,
@@ -11916,8 +12159,9 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
     let with_fields: WithFields = infer.with_fields.iter().cloned().collect();
     let type_arg_spans: TypeArgSpans = infer.type_arg_spans.clone();
     let implicit_refs: ImplicitRefs = infer.implicit_refs.clone();
+    let implicit_dict_args: ImplicitDictArgs = infer.implicit_dict_args.clone();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args)
 }
 
 
@@ -11930,6 +12174,16 @@ fn takes_two_args(ty: &Ty) -> bool {
         Ty::Forall(_, body) => takes_two_args(body),
         Ty::Fun(_, rest) => matches!(rest.as_ref(), Ty::Fun(..)),
         _ => false,
+    }
+}
+
+/// The number of leading `Ty::Fun` arrows in a type — a function's curried
+/// arity. Peels `Forall` wrappers.
+fn curry_arity(ty: &Ty) -> usize {
+    match ty {
+        Ty::Forall(_, body) => curry_arity(body),
+        Ty::Fun(_, rest) => 1 + curry_arity(rest),
+        _ => 0,
     }
 }
 
@@ -12355,14 +12609,14 @@ mod tests {
     fn check_src(src: &str) -> Vec<Diagnostic> {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) = check(&mut module);
+        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs, _implicit_dict) = check(&mut module);
         diags
     }
 
     fn type_info_for(src: &str) -> TypeInfo {
         let mut module = parse(src);
         crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs) = check(&mut module);
+        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs, _implicit_dict) = check(&mut module);
         type_info
     }
 

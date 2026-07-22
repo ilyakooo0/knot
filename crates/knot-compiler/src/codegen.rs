@@ -323,6 +323,11 @@ pub struct Codegen {
     // Codegen emits the root `Var` followed by a `knot_record_field` chain.
     implicit_refs: crate::infer::ImplicitRefs,
 
+    // Implicit-dictionary callsite span -> (root binding, field path) of the
+    // record supplying the dictionary, resolved during inference. Codegen
+    // splices the projected record as the leading argument at that application.
+    implicit_dict_args: crate::infer::ImplicitDictArgs,
+
     // Names of `with`-bound locals and whether each one's bound value is
     // IO-producing (`self.expr_is_io(value)`). Such a name used inside the
     // body (e.g. `f 1` where `f` was bound to `\y -> println (show y)`)
@@ -678,6 +683,7 @@ pub fn compile(
     with_fields: &crate::infer::WithFields,
     implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
+    implicit_dict_args: &crate::infer::ImplicitDictArgs,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     crate::stack::grow(|| {
@@ -697,6 +703,7 @@ pub fn compile(
             with_fields,
             implicit_refs,
             type_arg_spans,
+            implicit_dict_args,
             compile_time_overrides,
         )
     })
@@ -719,6 +726,7 @@ fn compile_inner(
     with_fields: &crate::infer::WithFields,
     implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
+    implicit_dict_args: &crate::infer::ImplicitDictArgs,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
@@ -763,6 +771,7 @@ fn compile_inner(
     cg.from_json_targets = from_json_targets.clone();
     cg.with_fields = with_fields.clone();
     cg.implicit_refs = implicit_refs.clone();
+    cg.implicit_dict_args = implicit_dict_args.clone();
     cg.elem_pushdown_ok = elem_pushdown_ok.clone();
     cg.show_unit_strings = show_unit_strings.clone();
     cg.sum_float_spans = sum_float_spans.clone();
@@ -1030,6 +1039,7 @@ impl Codegen {
             from_json_targets: HashMap::new(),
             with_fields: HashMap::new(),
             implicit_refs: HashMap::new(),
+            implicit_dict_args: HashMap::new(),
             with_io_locals: Vec::new(),
             elem_pushdown_ok: crate::infer::ElemPushdownOk::default(),
             show_unit_strings: HashMap::new(),
@@ -4146,6 +4156,12 @@ impl Codegen {
                     io_scope.remove(name);
                 }
                 if let Some(fields) = self.with_fields.get(&expr.span).cloned() {
+                    // Bind the whole `with` record under a per-site alias so an
+                    // implicit dictionary resolved to this `with` frame (an
+                    // `\0withrec:<span>` root) projects it.
+                    let rec_alias =
+                        format!("{}{}", crate::infer::WITH_RECORD_ALIAS_PREFIX, expr.span.start);
+                    body_env.set(&rec_alias, record_val);
                     for field in fields {
                         let (key_ptr, key_len) = self.string_ptr(builder, &field);
                         let field_val = self.call_rt(
@@ -5499,6 +5515,34 @@ impl Codegen {
         }
     }
 
+    /// Emit the record at `(root, path)` — the root `Var` followed by one
+    /// `knot_record_field` projection per path element. Shared by `^name`
+    /// (`implicit_refs`) and implicit-dictionary splices (`implicit_dict_args`).
+    fn compile_root_path(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        root: &str,
+        path: &[String],
+        span: ast::Span,
+        env: &mut Env,
+        db: Value,
+    ) -> Value {
+        let mut val = self.compile_expr(
+            builder,
+            &ast::Expr {
+                node: ast::ExprKind::Var(root.to_string()),
+                span,
+            },
+            env,
+            db,
+        );
+        for field in path {
+            let (key_ptr, key_len) = self.string_ptr(builder, field);
+            val = self.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len]);
+        }
+        val
+    }
+
     fn compile_app(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -6461,10 +6505,17 @@ impl Codegen {
                     );
                 }
 
-        let compiled_args: Vec<Value> = args
-            .iter()
-            .map(|a| self.compile_arg_expr(builder, a, env, db))
-            .collect();
+        // Implicit dictionary: prepend the record resolved during inference as
+        // the leading argument (the function was elaborated to take it first).
+        let mut compiled_args: Vec<Value> = Vec::new();
+        if let Some((root, path)) = self.implicit_dict_args.get(&expr.span).cloned() {
+            let dict_val =
+                self.compile_root_path(builder, &root, &path, expr.span, env, db);
+            compiled_args.push(dict_val);
+        }
+        compiled_args.extend(
+            args.iter().map(|a| self.compile_arg_expr(builder, a, env, db)),
+        );
 
         match &func_expr.node {
             // Monadic bind: __bind(f, m) — dispatch based on monad type

@@ -1913,6 +1913,48 @@ impl Summarize Shape where
   -- detailed uses the default
 ```
 
+### Implicit Dictionaries: `(^field : T) =>`
+
+Traits are gone; the replacement is **record dictionaries** — ordinary records
+whose fields carry the operations, resolved from lexical scope. The lightest
+form is the implicit-field reference `^field` inside a function body, which
+projects `field` off whichever in-scope record supplies it. The
+`(^field : T) =>` signature constraint lifts that to a *function type*: it
+declares that the function needs a dictionary record providing `field` at type
+`T`, without naming the record.
+
+```knot
+clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
+clamp = \lo hi x -> if ((^compare) x lo) < 0 then lo else if ((^compare) x hi) > 0 then hi else x
+```
+
+`clamp` is elaborated to take a hidden leading dictionary parameter (a record
+`{compare : a -> a -> Int 1}`); each `(^compare)` in the body reads the
+`compare` field of that record. At a **full-arity callsite** the compiler
+searches the lexical scope for a record supplying `compare` at the required
+type and splices it in as the leading argument:
+
+```knot
+intOrd     = {compare (\a b -> if a > b then 1 else if a < b then (0 - 1) else 0)}
+textOrd    = {compare (\a b -> if a > b then 1 else if a < b then (0 - 1) else 0)}
+intOrdDesc = {compare (\a b -> if a < b then 1 else if a > b then (0 - 1) else 0)}
+
+clamp 0 10 42                     -- resolves to intOrd     → 10
+clamp "a" "m" "z"                 -- resolves to textOrd    → "m"
+with intOrdDesc (clamp 0 10 42)   -- `with` shadows outer  → 0
+```
+
+Resolution is **per-callsite** (the dictionary is chosen by the instantiation —
+`a` becomes `Int` vs `Text`) and **lexical** (the innermost scope wins; a `with`
+frame binding `compare` shadows outer records). If no in-scope record supplies
+the field, the callsite is a compile error
+(`no in-scope record supplies an implicit dictionary field 'compare'`).
+
+Current limitation: only **full-arity** callsites resolve a dictionary. Passing
+a constrained function partially applied (e.g. `map (clamp lo hi) xs`) does not
+yet thread the dictionary — it must be applied to all its explicit arguments at
+once.
+
 ### Type Inference
 
 Full Hindley-Milner style inference extended with row polymorphism and trait bounds. Type signatures are always optional — the compiler infers trait bounds from usage just like it infers everything else.

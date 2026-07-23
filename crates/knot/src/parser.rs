@@ -3278,11 +3278,32 @@ impl Parser {
                 pending_sigs.push((sname, sty));
                 continue;
             }
+            let field_col = self.cur_column();
             let (fname, _) = self
                 .expect_lower("expected field name in record")
                 .ok()?;
             self.skip_newlines();
-            let Some(value) = self.parse_postfix() else {
+            // A bare lambda field value (`greet \name -> …`). Field values
+            // normally use `parse_postfix` so a value can't greedily absorb a
+            // following field as a function application — but `\` isn't a
+            // postfix head, so a bare lambda would be rejected. Route it to
+            // `parse_lambda`, and pin `block_indent`/`block_delim` to the
+            // field's column so the lambda body (a `parse_expr`) terminates at
+            // the next field (same column) via `at_layout_boundary` instead of
+            // absorbing it as an application argument. Mirrors the `using`
+            // clause in `parse_source_migration`.
+            let Some(value) = (if self.at(&TokenKind::Backslash) {
+                let prev_bi = self.block_indent;
+                let prev_bd = self.block_delim;
+                self.block_indent = field_col;
+                self.block_delim = self.delimiter_depth;
+                let lam = self.parse_lambda();
+                self.block_indent = prev_bi;
+                self.block_delim = prev_bd;
+                lam
+            } else {
+                self.parse_postfix()
+            }) else {
                 self.error("expected field value after field name in record");
                 return None;
             };

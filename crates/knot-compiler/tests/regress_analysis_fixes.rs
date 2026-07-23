@@ -1024,6 +1024,72 @@ main = println "ok"
     );
 }
 
+// ── 20. implicit-dictionary elaboration for record-field funs ───────
+
+#[test]
+fn record_fun_implicit_dict_with_frame() {
+    // A record-field fun with a `^`-field constraint resolves its dictionary
+    // from an enclosing `with` frame at the callsite, exactly like a top-level
+    // constrained fun.
+    let (stdout, _stderr, ok) = compile_and_run(
+        "record_fun_implicit_dict_with",
+        r#"fns =
+  { clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
+    clamp \lo hi x -> if ((^compare) x lo) < 0 then lo else if ((^compare) x hi) > 0 then hi else x
+  }
+intOrd = { compare \a b -> if a > b then 1 else if a < b then (0 - 1) else 0 }
+main = do
+  println (show (with intOrd (fns.clamp 0 10 42)))
+  println (show (with intOrd (fns.clamp 0 10 5)))
+  yield {}
+"#,
+    );
+    assert!(ok, "with-frame dict resolution failed");
+    assert!(stdout.contains("10"), "stdout={stdout}");
+    assert!(stdout.contains("5"), "stdout={stdout}");
+}
+
+#[test]
+fn record_fun_implicit_dict_polymorphic_callsites() {
+    // The constrained record fun is polymorphic in `a`: one field used at Int
+    // and Text, each callsite resolving its own dictionary.
+    let (stdout, _stderr, ok) = compile_and_run(
+        "record_fun_implicit_dict_poly",
+        r#"fns =
+  { clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
+    clamp \lo hi x -> if ((^compare) x lo) < 0 then lo else if ((^compare) x hi) > 0 then hi else x
+  }
+intOrd = { compare \a b -> if a > b then 1 else if a < b then (0 - 1) else 0 }
+textOrd = { compare \a b -> if a > b then 1 else if a < b then (0 - 1) else 0 }
+main = do
+  println (show (with intOrd (fns.clamp 0 10 42)))
+  println (show (with textOrd (fns.clamp "a" "m" "z")))
+  yield {}
+"#,
+    );
+    assert!(ok, "polymorphic dict callsites failed");
+    assert!(stdout.contains("10"), "stdout={stdout}");
+    assert!(stdout.contains("\"m\""), "stdout={stdout}");
+}
+
+#[test]
+fn record_fun_implicit_dict_named_record_scope() {
+    // With no `with` frame, a named in-scope record supplies the dictionary
+    // (here a descending order, so `clamp 0 10 42` clamps to the max `0`).
+    let (stdout, _stderr, ok) = compile_and_run(
+        "record_fun_implicit_dict_named",
+        r#"fns =
+  { clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
+    clamp \lo hi x -> if ((^compare) x lo) < 0 then lo else if ((^compare) x hi) > 0 then hi else x
+  }
+intOrdDesc = { compare \a b -> if a < b then 1 else if a > b then (0 - 1) else 0 }
+main = println (show (fns.clamp 0 10 42))
+"#,
+    );
+    assert!(ok, "named-record dict resolution failed");
+    assert!(stdout.contains("0"), "stdout={stdout}");
+}
+
 // ── 13. traverse over an empty relation ────────────────────────────
 
 #[test]

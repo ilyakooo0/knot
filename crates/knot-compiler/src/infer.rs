@@ -5074,6 +5074,38 @@ impl Infer {
     /// spine's head names such a function and the dictionaries were resolved
     /// from scope; `None` to fall through to the generic application path
     /// (head not constrained, or dictionaries already supplied explicitly).
+    /// Resolve the type of a `Var`-rooted field-access path (`fns.greet`) by
+    /// instantiating the root's scheme and walking the record fields. Needed
+    /// for implicit-dict callsites: the field's (elaborated) function type
+    /// exposes the leading dictionary params, which `infer_expr` on the same
+    /// expression would hide behind a fresh unification var.
+    fn resolve_field_path_ty(&mut self, expr: &ast::Expr) -> Option<Ty> {
+        let mut fields = Vec::new();
+        let mut cur = expr;
+        let root = loop {
+            match &cur.node {
+                ast::ExprKind::FieldAccess { expr: base, field } => {
+                    fields.push(field.clone());
+                    cur = base;
+                }
+                ast::ExprKind::Var(root) => break root.clone(),
+                _ => return None,
+            }
+        };
+        fields.reverse();
+        let scheme = self.lookup(&root)?.clone();
+        let mut ty = self.instantiate_at(&scheme, expr.span);
+        for field in fields {
+            let resolved = self.apply(&ty);
+            let next = match resolved.peel_alias() {
+                Ty::Record(fmap, _) => fmap.get(&field).cloned()?,
+                _ => return None,
+            };
+            ty = next;
+        }
+        Some(ty)
+    }
+
     fn try_infer_implicit_dict_app(&mut self, expr: &ast::Expr) -> Option<Ty> {
         // Peel the application spine into (head, args in application order).
         let mut args: Vec<&ast::Expr> = Vec::new();
@@ -5084,7 +5116,56 @@ impl Infer {
         }
         args.reverse();
         let ast::ExprKind::Var(name) = &head.node else {
-            return None;
+            // A record-field fun with a `^`-field constraint is called through
+            // a field path (`fns.greet`). Register/look up its dictionaries
+            // under the dotted path so scope resolution works the same way.
+            let Some(path) = implicit_dict_head_path(head) else {
+                return None;
+            };
+            let dicts = self.implicit_dict_fns.get(&path)?.clone();
+            let n_dicts = dicts.len();
+            // Resolve the field's type structurally from the record root's
+            // scheme (walking the path), so the leading dictionary params the
+            // desugarer prepended are visible. `infer_expr(head)` would return
+            // a fresh unification var, not the function type.
+            let Some(head_ty) = self.resolve_field_path_ty(head) else {
+                return None;
+            };
+            let arity = curry_arity(&head_ty);
+            let explicit_arity = arity - n_dicts;
+            if args.len() != explicit_arity {
+                return None;
+            }
+            // The field's type is monomorphic within its record (no `Forall`
+            // to instantiate): split off the leading dictionary params
+            // structurally, then type the explicit args against the rest.
+            let mut inst = head_ty;
+            let mut dict_tys: Vec<Ty> = Vec::with_capacity(n_dicts);
+            for _ in 0..n_dicts {
+                let Ty::Fun(param, rest) = inst else {
+                    return None;
+                };
+                dict_tys.push((*param).clone());
+                inst = (*rest).clone();
+            }
+            let mut result = inst;
+            for a in &args {
+                let arg_ty = self.infer_expr(a);
+                let ret = self.fresh();
+                self.unify(&result, &Ty::Fun(Box::new(arg_ty), Box::new(ret.clone())), a.span);
+                result = ret;
+            }
+            for (i, (field, _)) in dicts.iter().enumerate() {
+                let dict_ty = self.apply(&dict_tys[i]);
+                let field_ty = match dict_ty.peel_alias() {
+                    Ty::Record(fields, _) => fields.get(field).cloned().unwrap_or(dict_ty),
+                    _ => dict_ty,
+                };
+                if let Some((root, path)) = self.resolve_dict(field, &field_ty, expr.span) {
+                    self.implicit_dict_args.insert(expr.span, (root, path));
+                }
+            }
+            return Some(result);
         };
         let dicts = self.implicit_dict_fns.get(name)?.clone();
         let n_dicts = dicts.len();
@@ -10611,6 +10692,41 @@ impl Infer {
                             None => (self.fresh(), Vec::new(), Vec::new()),
                         };
                         self.check_expr(body, &expected);
+                        // Record-field funs with `^`-field constraints: register
+                        // each under its record path (`fns.greet`) so the
+                        // callsite resolver can find it through a field-access
+                        // head. The constraint field types are converted while
+                        // the body's annotation vars are live, so they share the
+                        // field's quantified vars.
+                        if let ast::ExprKind::Record(fields) = &body.node {
+                            for f in fields {
+                                if let Some(sig) = &f.sig {
+                                    let saved_flag = self.in_type_annotation;
+                                    let saved_av = std::mem::take(&mut self.annotation_vars);
+                                    let saved_auv = std::mem::take(&mut self.annotation_unit_vars);
+                                    self.in_type_annotation = true;
+                                    let fimplicit: Vec<(String, Ty)> = sig
+                                        .constraints
+                                        .iter()
+                                        .filter_map(|c| match c {
+                                            ast::Constraint::ImplicitField { field, ty } => {
+                                                Some((field.clone(), self.ast_type_to_ty(&ty)))
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    self.in_type_annotation = saved_flag;
+                                    self.annotation_vars = saved_av;
+                                    self.annotation_unit_vars = saved_auv;
+                                    if !fimplicit.is_empty() {
+                                        self.implicit_dict_fns.insert(
+                                            format!("{name}.{}", f.name),
+                                            fimplicit,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         for s in &fresh_skolems {
                             self.skolems.remove(s);
                         }
@@ -12245,6 +12361,28 @@ fn curry_arity(ty: &Ty) -> usize {
         Ty::Forall(_, body) => curry_arity(body),
         Ty::Fun(_, rest) => 1 + curry_arity(rest),
         _ => 0,
+    }
+}
+
+/// Dotted field path for a `Var`-rooted field-access chain (`fns.greet` →
+/// `Some("fns.greet")`), used to key record-field fun dictionaries. Returns
+/// `None` for anything else (a `Var` head, or a non-`Var` base).
+fn implicit_dict_head_path(expr: &ast::Expr) -> Option<String> {
+    let mut fields = Vec::new();
+    let mut cur = expr;
+    loop {
+        match &cur.node {
+            ast::ExprKind::FieldAccess { expr: base, field } => {
+                fields.push(field.as_str());
+                cur = base;
+            }
+            ast::ExprKind::Var(root) => {
+                fields.push(root.as_str());
+                fields.reverse();
+                return Some(fields.join("."));
+            }
+            _ => return None,
+        }
     }
 }
 

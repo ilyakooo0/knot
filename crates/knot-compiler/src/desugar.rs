@@ -489,6 +489,75 @@ fn dict_param_name(field: &str) -> Name {
     format!("__dict_{field}")
 }
 
+/// Elaborate a function's `^`-field signature constraints into hidden leading
+/// dictionary parameters, rewriting each body occurrence of `^field` to
+/// `__dict_<field>.field` and prepending `{field : F} ->` to the declared
+/// type. Shared by top-level funs and record-field funs. Returns the implicit
+/// constraints in declared order.
+fn elaborate_implicit_dicts(body: &mut Expr, ty: &mut Option<TypeScheme>) -> Vec<(Name, Type)> {
+    let implicit: Vec<(Name, Type)> = ty
+        .as_ref()
+        .map(|ts| {
+            ts.constraints
+                .iter()
+                .filter_map(|c| match c {
+                    Constraint::ImplicitField { field, ty } => {
+                        Some((field.clone(), ty.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if implicit.is_empty() {
+        return implicit;
+    }
+    let span = body.span;
+    for (field, _) in &implicit {
+        rewrite_implicit_refs(body, field);
+    }
+    for (field, _) in implicit.iter().rev() {
+        let dict = dict_param_name(field);
+        let placeholder = Spanned::new(ExprKind::Lit(Literal::Bool(false)), span);
+        let old_body = std::mem::replace(body, placeholder);
+        *body = Spanned::new(
+            ExprKind::Lambda {
+                params: vec![Spanned::new(PatKind::Var(dict), span)],
+                ty_params: vec![],
+                body: Box::new(old_body),
+            },
+            span,
+        );
+    }
+    // Elaborate the declared type: prepend `{field : F} ->` for each
+    // implicit-field constraint (innermost constraint last, so the first
+    // declared constraint is the outermost/first param).
+    if let Some(ts) = ty {
+        for (field, fty) in implicit.iter().rev() {
+            let dict_ty = Spanned::new(
+                TypeKind::Record {
+                    fields: vec![Field {
+                        name: field.clone(),
+                        value: fty.clone(),
+                    }],
+                    rest: None,
+                },
+                fty.span,
+            );
+            let old_span = ts.ty.span;
+            let old = std::mem::replace(&mut ts.ty, dict_ty.clone());
+            ts.ty = Spanned::new(
+                TypeKind::Function {
+                    param: Box::new(dict_ty),
+                    result: Box::new(old),
+                },
+                old_span,
+            );
+        }
+    }
+    implicit
+}
+
 /// Rewrite every `^field` implicit projection in `expr` to an explicit
 /// dictionary projection `__dict_<field>.field`, so the constrained function's
 /// body reads its operations off the hidden dictionary parameter.
@@ -590,69 +659,18 @@ fn desugar_decl(decl: &mut DeclKind, io_fns: &IoFns, source_vars: &HashSet<Strin
             //   f = \x -> … (^compare) …
             // is rewritten to take a hidden record `__dict_compare` as its
             // first parameter, and each body occurrence of `(^compare)` becomes
-            // `__dict_compare.compare`. The callsite supplies the dictionary
+            // `__dict_compare.compare`. The callsite supplies the dictionary.
             // Constraint metadata is left on the type scheme so inference
             // knows the callsite must resolve it; the declared type is also
             // elaborated to expose the hidden dictionary as a leading record
             // parameter, so the body (now `\__dict_<field> -> …`) type-checks.
-            let implicit: Vec<(Name, Type)> = ty
-                .as_ref()
-                .map(|ts| {
-                    ts.constraints
-                        .iter()
-                        .filter_map(|c| match c {
-                            Constraint::ImplicitField { field, ty } => {
-                                Some((field.clone(), ty.clone()))
-                            }
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if !implicit.is_empty() {
-                let span = body.span;
-                for (field, _) in &implicit {
-                    rewrite_implicit_refs(body, field);
-                }
-                for (field, _) in implicit.iter().rev() {
-                    let dict = dict_param_name(field);
-                    let placeholder =
-                        Spanned::new(ExprKind::Lit(Literal::Bool(false)), span);
-                    let old_body = std::mem::replace(body, placeholder);
-                    *body = Spanned::new(
-                        ExprKind::Lambda {
-                            params: vec![Spanned::new(PatKind::Var(dict), span)],
-                            ty_params: vec![],
-                            body: Box::new(old_body),
-                        },
-                        span,
-                    );
-                }
-                // Elaborate the declared type: prepend `{field : F} ->` for
-                // each implicit-field constraint (innermost constraint last, so
-                // the first declared constraint is the outermost/first param).
-                if let Some(ts) = ty {
-                    for (field, fty) in implicit.iter().rev() {
-                        let dict_ty = Spanned::new(
-                            TypeKind::Record {
-                                fields: vec![Field {
-                                    name: field.clone(),
-                                    value: fty.clone(),
-                                }],
-                                rest: None,
-                            },
-                            fty.span,
-                        );
-                        let old_span = ts.ty.span;
-                        let old = std::mem::replace(&mut ts.ty, dict_ty.clone());
-                        ts.ty = Spanned::new(
-                            TypeKind::Function {
-                                param: Box::new(dict_ty),
-                                result: Box::new(old),
-                            },
-                            old_span,
-                        );
-                    }
+            elaborate_implicit_dicts(body, ty);
+            // Record-field funs with `^`-field constraints get the same
+            // elaboration, keyed on their record path (`fns.greet`) so a
+            // callsite can resolve the dictionary from scope.
+            if let ExprKind::Record(fields) = &mut body.node {
+                for f in fields {
+                    elaborate_implicit_dicts(&mut f.value, &mut f.sig);
                 }
             }
             desugar_expr(body, io_fns, source_vars)

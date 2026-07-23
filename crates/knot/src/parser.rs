@@ -3283,24 +3283,27 @@ impl Parser {
                 .expect_lower("expected field name in record")
                 .ok()?;
             self.skip_newlines();
-            // A bare lambda field value (`greet \name -> …`). Field values
-            // normally use `parse_postfix` so a value can't greedily absorb a
-            // following field as a function application — but `\` isn't a
-            // postfix head, so a bare lambda would be rejected. Route it to
-            // `parse_lambda`, and pin `block_indent`/`block_delim` to the
-            // field's column so the lambda body (a `parse_expr`) terminates at
-            // the next field (same column) via `at_layout_boundary` instead of
-            // absorbing it as an application argument. Mirrors the `using`
-            // clause in `parse_source_migration`.
-            let Some(value) = (if self.at(&TokenKind::Backslash) {
+            // A bare lambda (`greet \name -> …`) or do-block (`run do …`) field
+            // value. Field values normally use `parse_postfix` so a value can't
+            // greedily absorb a following field as a function application — but
+            // neither `\` nor `do` is a postfix head, so they'd be rejected.
+            // Route them to their parsers, and pin `block_indent`/`block_delim`
+            // to the field's column so the value's body terminates at the next
+            // field (same column) via `at_layout_boundary` instead of absorbing
+            // it. Mirrors the `using` clause in `parse_source_migration`.
+            let Some(value) = (if self.at(&TokenKind::Backslash) || self.at(&TokenKind::Do) {
                 let prev_bi = self.block_indent;
                 let prev_bd = self.block_delim;
                 self.block_indent = field_col;
                 self.block_delim = self.delimiter_depth;
-                let lam = self.parse_lambda();
+                let v = if self.at(&TokenKind::Backslash) {
+                    self.parse_lambda()
+                } else {
+                    self.parse_do_expr()
+                };
                 self.block_indent = prev_bi;
                 self.block_delim = prev_bd;
-                lam
+                v
             } else {
                 self.parse_postfix()
             }) else {

@@ -1720,6 +1720,14 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
                 None => format!("&{} = {}", name, render_expr_inline(body, Prec::Lowest)),
             }
         }
+        ExprKind::SubsetConstraint { sub, sup } => {
+            // Renders the embedded constraint: `*a.f <= *b.g` / `*a <= *b`.
+            let path = |p: &crate::ast::RelationPath| match &p.field {
+                Some(f) => format!("*{}.{}", p.relation, f),
+                None => format!("*{}", p.relation),
+            };
+            format!("{} <= {}", path(sub), path(sup))
+        }
         ExprKind::Serve { api, handlers, .. } => {
             let mut s = format!("serve {} where", api);
             // The first handler follows `where` directly; `;` only separates

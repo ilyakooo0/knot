@@ -610,6 +610,8 @@ impl<'a> TokenCollector<'a> {
             // A source-declaration field's type is highlighted (`*todos : [Todo]`
             // highlights `Todo`).
             ast::ExprKind::SourceDecl { ty, .. } => self.visit_type(ty),
+            // A subset constraint carries no type or value tokens.
+            ast::ExprKind::SubsetConstraint { .. } => {}
             // A view field's annotation and body are highlighted.
             ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {
                 if let Some(scheme) = ty {

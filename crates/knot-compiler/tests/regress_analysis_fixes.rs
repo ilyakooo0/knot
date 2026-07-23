@@ -852,6 +852,79 @@ main = println "ok"
     );
 }
 
+// ── 18. record-embedded subset constraints ───────────────────────
+
+#[test]
+fn record_subset_constraint_registers() {
+    let src = r#"db =
+  { *orders : [{customer: Text, amount: Int 1}]
+    *people : [{name: Text}]
+    *orders.customer <= *people.name
+  }
+main = println "ok"
+"#;
+    let module = parse(src);
+    let env = knot_compiler::types::TypeEnv::from_module(&module);
+    assert!(
+        env.subset_constraints.iter().any(|(sub, sup)| {
+            sub.relation == "orders"
+                && sub.field.as_deref() == Some("customer")
+                && sup.relation == "people"
+                && sup.field.as_deref() == Some("name")
+        }),
+        "record-embedded subset constraint not registered: {:?}",
+        env.subset_constraints
+    );
+}
+
+#[test]
+fn record_subset_constraint_relation_only() {
+    let src = r#"db =
+  { *a : [{x: Int 1}]
+    *b : [{x: Int 1}]
+    *a <= *b
+  }
+main = println "ok"
+"#;
+    let module = parse(src);
+    let env = knot_compiler::types::TypeEnv::from_module(&module);
+    assert!(
+        env.subset_constraints.iter().any(|(sub, sup)| {
+            sub.relation == "a" && sub.field.is_none()
+                && sup.relation == "b" && sup.field.is_none()
+        }),
+        "relation-only record subset constraint not registered: {:?}",
+        env.subset_constraints
+    );
+}
+
+#[test]
+fn record_subset_constraint_enforced_at_runtime() {
+    // Inserting an order whose customer is not in people must fail the
+    // subset constraint, exactly like a top-level `<=` decl.
+    let (stdout, stderr, ok) = compile_and_run(
+        "record_subset_enforced",
+        r#"db =
+  { *orders : [{customer: Text}]
+    *people : [{name: Text}]
+    *orders.customer <= *people.name
+  }
+main = do
+  replace *orders = [{customer "nobody"}]
+  println "inserted"
+  yield {}
+"#,
+    );
+    assert!(
+        !ok,
+        "violating insert should fail the subset constraint; stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("inserted"),
+        "insert must not commit; stdout={stdout}"
+    );
+}
+
 // ── 13. traverse over an empty relation ────────────────────────────
 
 #[test]

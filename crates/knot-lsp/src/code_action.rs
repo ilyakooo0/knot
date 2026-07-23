@@ -1809,6 +1809,7 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
         // A source-declaration field carries a source name; its TYPE may hold
         // names worth collecting.
         ast::ExprKind::SourceDecl { ty, .. } => collect_names_in_type(ty, out),
+        ast::ExprKind::SubsetConstraint { .. } => {}
         // A view field carries a source name; its annotation may hold type
         // names and its body value names.
         ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {

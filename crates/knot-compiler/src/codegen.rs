@@ -5011,6 +5011,12 @@ impl Codegen {
                 // record value.
                 self.call_rt(builder, "knot_value_unit", &[])
             }
+            ast::ExprKind::SubsetConstraint { .. } => {
+                // An embedded subset constraint is a pure static marker
+                // (registered via `TypeEnv::subset_constraints`); it carries
+                // no runtime value.
+                self.call_rt(builder, "knot_value_unit", &[])
+            }
 
             ast::ExprKind::ViewDecl { .. } | ast::ExprKind::DerivedDecl { .. } => {
                 // An embedded view/derived declaration is likewise a static marker:
@@ -5487,7 +5493,7 @@ impl Codegen {
                 .iter()
                 .all(|h| self.collect_direct_write_targets(&h.body, out)),
             Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => true,
-            TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } => true,
+            TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => true,
             ViewDecl { body, .. } | DerivedDecl { body, .. } => self.collect_direct_write_targets(body, out),
         }
     }
@@ -11055,7 +11061,7 @@ impl Codegen {
             | ast::ExprKind::Var(_)
             | ast::ExprKind::Constructor(_)
             | ast::ExprKind::DerivedRef(_) => false,
-            ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
+            ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
             ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => Self::references_source(body, source_name),
             ast::ExprKind::Record(fields) => {
                 fields.iter().any(|f| Self::references_source(&f.value, source_name))
@@ -14504,6 +14510,7 @@ fn beta_reduce_inner(
             Var(name.clone())
         }
         ImplicitRef(_) => expr.node.clone(),
+        SubsetConstraint { .. } => expr.node.clone(),
         With { record, body } => {
             let r = beta_reduce_inner(record, fun_bodies, let_bindings, visited, fuel);
             let b = beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel);
@@ -14661,7 +14668,7 @@ fn substitute_inner(
     let new_node = match &expr.node {
         Var(name) if name == var => return Some(value.clone()),
         Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } => {
+        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {
             return Some(expr.clone())
         }
         Lambda { params, ty_params, body, .. } => {
@@ -14789,7 +14796,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     match &expr.node {
         Var(name) => name == var,
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } => false,
+        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => false,
         ViewDecl { body, .. } | DerivedDecl { body, .. } => expr_mentions_var(body, var),
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
         RecordUpdate { base, fields } => {
@@ -14847,7 +14854,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             }
         }
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } => {}
+        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         ViewDecl { body, .. } | DerivedDecl { body, .. } => collect_free_vars_set(body, bound, free),
         Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
@@ -15865,7 +15872,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::DerivedRef(n) => n == name,
         ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_) | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::TypeCtor { .. }
-        | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
+        | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_contains_derived_ref(body, name),
         ast::ExprKind::Record(fields) => {
             fields.iter().any(|f| expr_contains_derived_ref(&f.value, name))
@@ -15967,6 +15974,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => {}
         ast::ExprKind::SourceRef(_) => {}
         ast::ExprKind::SourceDecl { .. } => {}
+        ast::ExprKind::SubsetConstraint { .. } => {}
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => collect_free_vars(body, bound, free),
         ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
@@ -16138,7 +16146,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_refs_var(body, var),
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
@@ -16234,7 +16242,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_uses_var_as_value(body, var),
         // `var.field` is a ROW use, not a value use — the whole point of this
         // walker. A field access on anything else still recurses (`f x . name`
@@ -16576,6 +16584,13 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::TypeCtor { name, .. } => name.clone(),
         ast::ExprKind::DataCtor { name, .. } => name.clone(),
         ast::ExprKind::SourceDecl { name, .. } => format!("*{}", name),
+        ast::ExprKind::SubsetConstraint { sub, sup } => {
+            let path = |p: &ast::RelationPath| match &p.field {
+                Some(f) => format!("*{}.{}", p.relation, f),
+                None => format!("*{}", p.relation),
+            };
+            format!("{} <= {}", path(sub), path(sup))
+        }
         ast::ExprKind::ViewDecl { name, .. } => format!("*{}", name),
         ast::ExprKind::DerivedDecl { name, .. } => format!("&{}", name),
         ast::ExprKind::SourceRef(name) => format!("*{}", name),

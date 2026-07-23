@@ -242,7 +242,7 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         // unused-analysis runs on the AST without that map, so it can't name
         // the root binding. Treat as using nothing (no leaf refs).
         ExprKind::ImplicitRef(_) => {}
-        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
+        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
         ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => walk_expr(body, r),
         ExprKind::Var(name) => {
             r.values.insert(name.clone());

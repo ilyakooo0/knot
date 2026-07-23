@@ -747,6 +747,7 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
         ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Constructor(_)
         | ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) | ExprKind::ImplicitRef(_) => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
+        ExprKind::SubsetConstraint { .. } => {}
         ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
             desugar_expr(body, io_fns, source_vars)
         }

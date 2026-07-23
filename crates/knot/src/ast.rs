@@ -338,6 +338,16 @@ pub enum ExprKind {
         body: Box<Expr>,
     },
 
+    /// A subset constraint embedded in a record value literal:
+    /// `{…, *orders.customer <= *people.name, …}` (or the whole-relation form
+    /// `*a <= *b`). Mirrors the top-level `DeclKind::SubsetConstraint`; the
+    /// field is a pure marker — it contributes no runtime value, the
+    /// constraint is registered statically alongside top-level ones.
+    SubsetConstraint {
+        sub: RelationPath,
+        sup: RelationPath,
+    },
+
     /// `serve Api where E1 = expr1; E2 = expr2; ...` — typed server value.
     /// Each handler is bound to a route endpoint constructor; the whole
     /// expression has type `Server Api _` (a row variable when no handler

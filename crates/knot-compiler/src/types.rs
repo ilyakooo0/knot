@@ -298,6 +298,9 @@ impl TypeEnv {
                 && let ExprKind::Record(fields) = &value.node
             {
                 for f in fields {
+                    if let ExprKind::SubsetConstraint { sub, sup } = &f.value.node {
+                        subset_constraints.push((sub.clone(), sup.clone()));
+                    }
                     if let ExprKind::SourceDecl { name, ty, migrations } = &f.value.node {
                         let schema = schema_for_source(
                             ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params,

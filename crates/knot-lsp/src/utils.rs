@@ -567,7 +567,8 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
         | ast::ExprKind::DerivedRef(_)
         | ast::ExprKind::TypeCtor { .. }
         | ast::ExprKind::DataCtor { .. }
-        | ast::ExprKind::SourceDecl { .. } => {}
+        | ast::ExprKind::SourceDecl { .. }
+        | ast::ExprKind::SubsetConstraint { .. } => {}
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => f(body),
     }
 }

@@ -6685,6 +6685,12 @@ impl Infer {
                 effects.insert(IoEffect::Reads(name.clone()));
                 Ty::IO(effects, None, Box::new(resolved))
             }
+            ast::ExprKind::SubsetConstraint { .. } => {
+                // A record-embedded subset constraint is a pure static marker
+                // (registered via `TypeEnv::subset_constraints`); the field
+                // has no meaningful value.
+                Ty::unit()
+            }
             ast::ExprKind::ViewDecl { name, ty, .. } => {
                 // A view embedded in a record value literal (`{*openTodos = …}`).
                 // The actual relation type is registered by the hoisted
@@ -11674,7 +11680,7 @@ fn value_references_source_inner(
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::DerivedRef(_) => false,
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
             value_references_source_inner(
                 body, source_name, aliases, let_bindings, visited,
@@ -12399,7 +12405,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
     use ast::ExprKind::*;
     match &mut expr.node {
         Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
-        TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } => {}
+        TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         ViewDecl { body, .. } | DerivedDecl { body, .. } => f(body),
         Record(fields) => {
             for fl in fields {

@@ -624,6 +624,8 @@ impl<'a> DefResolver<'a> {
             // A source-declaration field's type is navigable (`*todos : [Todo]`
             // references the `Todo` type).
             ast::ExprKind::SourceDecl { ty, .. } => self.resolve_type(ty, self.source),
+            // A subset constraint references relations, not value bindings.
+            ast::ExprKind::SubsetConstraint { .. } => {}
             // A view field's annotation and body are both navigable.
             ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {
                 if let Some(scheme) = ty {

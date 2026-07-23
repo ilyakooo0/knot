@@ -3027,6 +3027,67 @@ impl Parser {
                 let sspan = tok.span;
                 let bare_name = sname.trim_start_matches('*').to_string();
 
+                // Subset constraint: `*rel.field <= *rel.field` / `*a <= *b`.
+                // A marker field — no runtime value.
+                if self.at(&TokenKind::Dot) || self.at(&TokenKind::Le) {
+                    let left_field = if self.eat(&TokenKind::Dot) {
+                        let (fld, _) = self.expect_lower("expected field name after '.'").ok()?;
+                        Some(fld)
+                    } else {
+                        None
+                    };
+                    self.expect(&TokenKind::Le, "expected '<=' in subset constraint").ok()?;
+                    let right_relation = match self.peek() {
+                        TokenKind::StarIdent(_) => {
+                            let t = self.advance();
+                            let TokenKind::StarIdent(n) = t.kind else { unreachable!() };
+                            n.trim_start_matches('*').to_string()
+                        }
+                        TokenKind::Star => {
+                            self.advance();
+                            let (n, _) = self
+                                .expect_lower("expected relation name after '*' in subset constraint")
+                                .ok()?;
+                            n
+                        }
+                        _ => {
+                            self.error("expected '*' before relation name in subset constraint");
+                            return None;
+                        }
+                    };
+                    let right_field = if self.eat(&TokenKind::Dot) {
+                        let (fld, _) = self.expect_lower("expected field name after '.'").ok()?;
+                        Some(fld)
+                    } else {
+                        None
+                    };
+                    let end = self.prev_span();
+                    // A subset constraint is a marker, not a value field. Give it
+                    // a synthetic name that can never collide with a real source
+                    // (`*orders`) or with another constraint on the same
+                    // relation — it is registered statically, not exposed as
+                    // `db.*name`. `fields.len()` guarantees uniqueness.
+                    let marker_name = format!("*{}#subset{}", bare_name, fields.len());
+                    fields.push(RecordField {
+                        name: marker_name,
+                        value: Spanned::new(
+                            ExprKind::SubsetConstraint {
+                                sub: crate::ast::RelationPath {
+                                    relation: bare_name,
+                                    field: left_field,
+                                },
+                                sup: crate::ast::RelationPath {
+                                    relation: right_relation,
+                                    field: right_field,
+                                },
+                            },
+                            Span::new(sspan.start, end.end),
+                        ),
+                        sig: None,
+                    });
+                    continue;
+                }
+
                 if self.eat(&TokenKind::Colon) {
                     self.skip_newlines();
                     let saved_flag = self.record_value_sig_type;

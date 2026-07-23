@@ -5019,10 +5019,10 @@ impl Codegen {
                 self.call_rt(builder, "knot_value_unit", &[])
             }
 
-            ast::ExprKind::ViewDecl { .. } => {
-                // An embedded view declaration is likewise a static marker:
-                // the view relation is registered and compiled via the
-                // hoisted top-level `DeclKind::View` (desugar
+            ast::ExprKind::ViewDecl { .. } | ast::ExprKind::DerivedDecl { .. } => {
+                // An embedded view/derived declaration is likewise a static marker:
+                // the relation is registered and compiled via the
+                // hoisted top-level `DeclKind::View`/`Derived` (desugar
                 // `hoist_record_views`); the record field compiles to unit.
                 self.call_rt(builder, "knot_value_unit", &[])
             }
@@ -5495,7 +5495,7 @@ impl Codegen {
                 .all(|h| self.collect_direct_write_targets(&h.body, out)),
             Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => true,
             TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } => true,
-            ViewDecl { body, .. } => self.collect_direct_write_targets(body, out),
+            ViewDecl { body, .. } | DerivedDecl { body, .. } => self.collect_direct_write_targets(body, out),
         }
     }
 
@@ -11063,7 +11063,7 @@ impl Codegen {
             | ast::ExprKind::Constructor(_)
             | ast::ExprKind::DerivedRef(_) => false,
             ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
-            ast::ExprKind::ViewDecl { body, .. } => Self::references_source(body, source_name),
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => Self::references_source(body, source_name),
             ast::ExprKind::Record(fields) => {
                 fields.iter().any(|f| Self::references_source(&f.value, source_name))
             }
@@ -14644,7 +14644,7 @@ fn beta_reduce_inner(
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | Case { .. } | Do(_)
         | Set { .. } | ReplaceSet { .. } | Atomic(_) | TimeUnitLit { .. }
         | Annot { .. } | Refine(_) | Serve { .. } | TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. }
-        | ViewDecl { .. } => return expr.clone(),
+        | ViewDecl { .. } | DerivedDecl { .. } => return expr.clone(),
     };
     ast::Spanned { node: new_node, span }
 }
@@ -14689,6 +14689,11 @@ fn substitute_inner(
             body: Box::new(substitute_inner(body, var, value, value_fv)?),
         },
         ViewDecl { name, ty, body } => ViewDecl {
+            name: name.clone(),
+            ty: ty.clone(),
+            body: Box::new(substitute_inner(body, var, value, value_fv)?),
+        },
+        DerivedDecl { name, ty, body } => DerivedDecl {
             name: name.clone(),
             ty: ty.clone(),
             body: Box::new(substitute_inner(body, var, value, value_fv)?),
@@ -14792,7 +14797,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
         Var(name) => name == var,
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } => false,
-        ViewDecl { body, .. } => expr_mentions_var(body, var),
+        ViewDecl { body, .. } | DerivedDecl { body, .. } => expr_mentions_var(body, var),
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
         RecordUpdate { base, fields } => {
             expr_mentions_var(base, var)
@@ -14850,7 +14855,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
         }
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } => {}
-        ViewDecl { body, .. } => collect_free_vars_set(body, bound, free),
+        ViewDecl { body, .. } | DerivedDecl { body, .. } => collect_free_vars_set(body, bound, free),
         Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
             for p in params {
@@ -15868,7 +15873,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_) | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::TypeCtor { .. }
         | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
-        ast::ExprKind::ViewDecl { body, .. } => expr_contains_derived_ref(body, name),
+        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_contains_derived_ref(body, name),
         ast::ExprKind::Record(fields) => {
             fields.iter().any(|f| expr_contains_derived_ref(&f.value, name))
         }
@@ -15969,7 +15974,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => {}
         ast::ExprKind::SourceRef(_) => {}
         ast::ExprKind::SourceDecl { .. } => {}
-        ast::ExprKind::ViewDecl { body, .. } => collect_free_vars(body, bound, free),
+        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => collect_free_vars(body, bound, free),
         ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
         ast::ExprKind::DerivedRef(name) => {
@@ -16141,7 +16146,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
-        ast::ExprKind::ViewDecl { body, .. } => expr_refs_var(body, var),
+        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_refs_var(body, var),
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
         ast::ExprKind::With { record, body } => {
@@ -16237,7 +16242,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
-        ast::ExprKind::ViewDecl { body, .. } => expr_uses_var_as_value(body, var),
+        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_uses_var_as_value(body, var),
         // `var.field` is a ROW use, not a value use — the whole point of this
         // walker. A field access on anything else still recurses (`f x . name`
         // may well pass `var` to `f`), as does a nested base (`var.a.b` has
@@ -16579,6 +16584,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::DataCtor { name, .. } => name.clone(),
         ast::ExprKind::SourceDecl { name, .. } => format!("*{}", name),
         ast::ExprKind::ViewDecl { name, .. } => format!("*{}", name),
+        ast::ExprKind::DerivedDecl { name, .. } => format!("&{}", name),
         ast::ExprKind::SourceRef(name) => format!("*{}", name),
         ast::ExprKind::DerivedRef(name) => format!("&{}", name),
         ast::ExprKind::Record(fields) => {

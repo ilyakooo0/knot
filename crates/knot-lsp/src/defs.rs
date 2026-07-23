@@ -639,7 +639,7 @@ impl<'a> DefResolver<'a> {
             // references the `Todo` type).
             ast::ExprKind::SourceDecl { ty, .. } => self.resolve_type(ty, self.source),
             // A view field's annotation and body are both navigable.
-            ast::ExprKind::ViewDecl { ty, body, .. } => {
+            ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {
                 if let Some(scheme) = ty {
                     self.resolve_type(&scheme.ty, self.source);
                 }

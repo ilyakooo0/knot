@@ -6703,6 +6703,23 @@ impl Infer {
                 effects.insert(IoEffect::Reads(name.clone()));
                 Ty::IO(effects, None, Box::new(resolved))
             }
+            ast::ExprKind::DerivedDecl { name, ty, .. } => {
+                // A derived relation embedded in a record value literal
+                // (`{&seniors = …}`). The relation type is registered by the
+                // hoisted top-level `DeclKind::Derived` (desugar
+                // `hoist_record_views`); the field reads through it. Derived
+                // reads aren't known at this site (mirrors `DerivedRef`) — the
+                // effect-checker pass tracks them, so effects start empty.
+                let resolved = match ty {
+                    Some(scheme) => {
+                        self.annotation_vars.clear();
+                        self.ast_type_to_ty(&scheme.ty)
+                    }
+                    None => self.derived_types.get(name).cloned().unwrap_or_else(|| self.fresh()),
+                };
+                self.derived_types.insert(name.clone(), resolved.clone());
+                Ty::IO(BTreeSet::new(), None, Box::new(resolved))
+            }
         }
     }
 
@@ -11658,9 +11675,11 @@ fn value_references_source_inner(
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
-        ast::ExprKind::ViewDecl { body, .. } => value_references_source_inner(
-            body, source_name, aliases, let_bindings, visited,
-        ),
+        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+            value_references_source_inner(
+                body, source_name, aliases, let_bindings, visited,
+            )
+        }
         ast::ExprKind::Record(fields) => fields.iter().any(|f| {
             value_references_source_inner(
                 &f.value, source_name, aliases, let_bindings, visited,
@@ -12382,7 +12401,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
     match &mut expr.node {
         Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } => {}
-        ViewDecl { body, .. } => f(body),
+        ViewDecl { body, .. } | DerivedDecl { body, .. } => f(body),
         Record(fields) => {
             for fl in fields {
                 f(&mut fl.value);

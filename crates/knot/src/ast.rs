@@ -334,6 +334,18 @@ pub enum ExprKind {
         body: Box<Expr>,
     },
 
+    /// `&seniors = expr` (or `&seniors : Type = expr`) inside a record
+    /// literal — an embedded derived declaration. Mirrors the top-level
+    /// `DeclKind::Derived`; the field is literally named `&name` and its value
+    /// is a marker (the derived relation is registered statically and resolved
+    /// by path).
+    DerivedDecl {
+        /// Field name WITHOUT the leading `&` (e.g. `seniors`).
+        name: Name,
+        ty: Option<TypeScheme>,
+        body: Box<Expr>,
+    },
+
     /// `serve Api where E1 = expr1; E2 = expr2; ...` — typed server value.
     /// Each handler is bound to a route endpoint constructor; the whole
     /// expression has type `Server Api _` (a row variable when no handler

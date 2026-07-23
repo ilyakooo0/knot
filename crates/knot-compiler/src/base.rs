@@ -196,7 +196,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
         }
         Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } => {}
-        ViewDecl { body, .. } => shift_expr_spans(body, offset),
+        ViewDecl { body, .. } | DerivedDecl { body, .. } => shift_expr_spans(body, offset),
     }
 }
 
@@ -439,7 +439,7 @@ mod tests {
             FieldAccess { expr, .. } | Annot { expr, .. } => f(expr),
             TimeUnitLit { value, .. } => f(value),
             Serve { handlers, .. } => handlers.iter().for_each(|h| f(&h.body)),
-            ViewDecl { body, .. } => f(body),
+            ViewDecl { body, .. } | DerivedDecl { body, .. } => f(body),
             Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
             TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } => {}
         }

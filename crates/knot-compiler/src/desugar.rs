@@ -50,11 +50,11 @@ fn desugar_inner(module: &mut Module) {
     }
 }
 
-/// Hoist record-embedded view declarations (`db = { … *openTodos = body … }`)
-/// into top-level-equivalent `DeclKind::View` decls so type-checking and
-/// codegen treat them exactly like a top-level `*openTodos = body`. The record
-/// field keeps its `ViewDecl` marker (the record is erased to unit at runtime);
-/// the hoisted decl carries the actual body. Runs AFTER
+/// Hoist record-embedded view/derived declarations (`db = { … *open = body …
+/// &sen = body … }`) into top-level-equivalent `DeclKind::View`/`Derived` decls
+/// so type-checking and codegen treat them exactly like a top-level decl. The
+/// record field keeps its `ViewDecl`/`DerivedDecl` marker (the record is erased
+/// to unit at runtime); the hoisted decl carries the actual body. Runs AFTER
 /// `rewrite_record_source_refs` so the body already references sibling sources
 /// as plain `SourceRef`s.
 fn hoist_record_views(module: &mut Module) {
@@ -64,8 +64,8 @@ fn hoist_record_views(module: &mut Module) {
             && let ExprKind::Record(fields) = &body.node
         {
             for f in fields {
-                if let ExprKind::ViewDecl { name, ty, body: vbody } = &f.value.node {
-                    hoisted.push(Decl {
+                match &f.value.node {
+                    ExprKind::ViewDecl { name, ty, body: vbody } => hoisted.push(Decl {
                         node: DeclKind::View {
                             name: name.clone(),
                             ty: ty.clone(),
@@ -73,7 +73,17 @@ fn hoist_record_views(module: &mut Module) {
                         },
                         span: f.value.span,
                         exported: false,
-                    });
+                    }),
+                    ExprKind::DerivedDecl { name, ty, body: dbody } => hoisted.push(Decl {
+                        node: DeclKind::Derived {
+                            name: name.clone(),
+                            ty: ty.clone(),
+                            body: (**dbody).clone(),
+                        },
+                        span: f.value.span,
+                        exported: false,
+                    }),
+                    _ => {}
                 }
             }
         }
@@ -81,19 +91,34 @@ fn hoist_record_views(module: &mut Module) {
     module.decls.extend(hoisted);
 }
 
-/// Map a top-level record-let name to the set of source names it declares via
-/// `*name : Type` fields.
-fn collect_record_source_fields(module: &Module) -> std::collections::HashMap<String, Vec<String>> {
+/// Whether a record-embedded relation field is a source/view (`*name`, read+write
+/// via `SourceRef`) or a derived relation (`&name`, read-only via `DerivedRef`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecordRelKind {
+    Source,
+    Derived,
+}
+
+/// Map a top-level record-let name to the relations it declares via `*name` /
+/// `&name` fields, tagged by kind.
+fn collect_record_source_fields(
+    module: &Module,
+) -> std::collections::HashMap<String, Vec<(String, RecordRelKind)>> {
     let mut out = std::collections::HashMap::new();
     for decl in &module.decls {
         if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
             && let ExprKind::Record(fields) = &body.node
         {
-            let names: Vec<String> = fields
+            let names: Vec<(String, RecordRelKind)> = fields
                 .iter()
                 .filter_map(|f| match &f.value.node {
-                    ExprKind::SourceDecl { name, .. } => Some(name.clone()),
-                    ExprKind::ViewDecl { name, .. } => Some(name.clone()),
+                    ExprKind::SourceDecl { name, .. } => {
+                        Some((name.clone(), RecordRelKind::Source))
+                    }
+                    ExprKind::ViewDecl { name, .. } => Some((name.clone(), RecordRelKind::Source)),
+                    ExprKind::DerivedDecl { name, .. } => {
+                        Some((name.clone(), RecordRelKind::Derived))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -105,8 +130,8 @@ fn collect_record_source_fields(module: &Module) -> std::collections::HashMap<St
     out
 }
 
-/// Rewrite `rec.*name` → `SourceRef(name)` when `rec` is a static source-record
-/// that declares `*name`.
+/// Rewrite `rec.*name` → `SourceRef(name)` / `rec.&name` → `DerivedRef(name)`
+/// when `rec` is a static source-record that declares that relation.
 fn rewrite_record_source_refs(module: &mut Module) {
     let map = collect_record_source_fields(module);
     if map.is_empty() {
@@ -121,19 +146,26 @@ fn rewrite_record_source_refs(module: &mut Module) {
 
 fn rewrite_source_refs_in_expr(
     expr: &mut Expr,
-    map: &std::collections::HashMap<String, Vec<String>>,
+    map: &std::collections::HashMap<String, Vec<(String, RecordRelKind)>>,
 ) {
-    // Rewrite this node first (top-down so a rewritten SourceRef isn't
-    // descended into).
+    // Rewrite this node first (top-down so a rewritten ref isn't descended into).
     if let ExprKind::FieldAccess { expr: base, field } = &expr.node
-        && let Some(src) = field.strip_prefix('*')
         && let ExprKind::Var(rec) = &base.node
-        && map.get(rec).is_some_and(|names| names.iter().any(|n| n == src))
+        && let Some(names) = map.get(rec)
     {
-        let span = expr.span;
-        expr.node = ExprKind::SourceRef(src.to_string());
-        let _ = span;
-        return;
+        let stripped = field
+            .strip_prefix('*')
+            .map(|n| (n, RecordRelKind::Source))
+            .or_else(|| field.strip_prefix('&').map(|n| (n, RecordRelKind::Derived)));
+        if let Some((bare, kind)) = stripped
+            && names.iter().any(|(n, k)| n == bare && *k == kind)
+        {
+            expr.node = match kind {
+                RecordRelKind::Source => ExprKind::SourceRef(bare.to_string()),
+                RecordRelKind::Derived => ExprKind::DerivedRef(bare.to_string()),
+            };
+            return;
+        }
     }
     walk_expr_children(expr, &mut |child| rewrite_source_refs_in_expr(child, map));
 }
@@ -716,7 +748,9 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
         ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Constructor(_)
         | ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) | ExprKind::ImplicitRef(_) => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
-        ExprKind::ViewDecl { body, .. } => desugar_expr(body, io_fns, source_vars),
+        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+            desugar_expr(body, io_fns, source_vars)
+        }
 
         ExprKind::Record(fields) => {
             for f in fields {

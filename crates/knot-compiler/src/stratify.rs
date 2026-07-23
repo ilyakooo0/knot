@@ -246,7 +246,7 @@ fn collect_edges(
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::SourceRef(_) => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => {}
-        ast::ExprKind::ViewDecl { body, .. } => {
+        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
             collect_edges(body, polarity, node_names, env, partial_diffs, diff_wrappers, out)
         }
 

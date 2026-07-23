@@ -1727,6 +1727,19 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
                 None => format!("*{} = {}", name, render_expr_inline(body, Prec::Lowest)),
             }
         }
+        ExprKind::DerivedDecl { name, ty, body } => {
+            // Renders the embedded derived line: `&name = body` or
+            // `&name : Type = body`. The field is literally named `&name`.
+            match ty {
+                Some(scheme) => format!(
+                    "&{} : {} = {}",
+                    name,
+                    render_type(&scheme.ty),
+                    render_expr_inline(body, Prec::Lowest)
+                ),
+                None => format!("&{} = {}", name, render_expr_inline(body, Prec::Lowest)),
+            }
+        }
         ExprKind::Serve { api, handlers, .. } => {
             let mut s = format!("serve {} where", api);
             // The first handler follows `where` directly; `;` only separates

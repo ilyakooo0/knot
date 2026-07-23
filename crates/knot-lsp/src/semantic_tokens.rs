@@ -614,7 +614,7 @@ impl<'a> TokenCollector<'a> {
             // highlights `Todo`).
             ast::ExprKind::SourceDecl { ty, .. } => self.visit_type(ty),
             // A view field's annotation and body are highlighted.
-            ast::ExprKind::ViewDecl { ty, body, .. } => {
+            ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {
                 if let Some(scheme) = ty {
                     self.visit_type(&scheme.ty);
                 }

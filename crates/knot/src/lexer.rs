@@ -74,6 +74,9 @@ pub enum TokenKind {
     /// whitespace, so a `*` directly abutting a lowercase letter is always a
     /// source identifier, never multiplication.
     StarIdent(String),
+    /// `&name` — derived identifier, a single token (string includes the `&`),
+    /// used for record-embedded derived declarations/access (`db.&seniors`).
+    AmpersandIdent(String),
     Slash,
     Percent,
     PlusPlus,
@@ -161,6 +164,7 @@ impl TokenKind {
             TokenKind::Minus => "'-'",
             TokenKind::Star => "'*'",
             TokenKind::StarIdent(_) => "source identifier",
+            TokenKind::AmpersandIdent(_) => "derived identifier",
             TokenKind::Slash => "'/'",
             TokenKind::Percent => "'%'",
             TokenKind::PlusPlus => "'++'",
@@ -1022,6 +1026,15 @@ impl<'src> Lexer<'src> {
             b'&' => {
                 if self.eat(b'&') {
                     TokenKind::AndAnd
+                } else if matches!(self.peek(), Some(b) if b.is_ascii_lowercase()) {
+                    // `&name` (no space, lowercase after) is a derived-relation
+                    // identifier — a single AmpersandIdent token (mirrors
+                    // StarIdent for sources). Spaced `&` stays Ampersand.
+                    let start = self.pos - 1; // include the consumed `&`
+                    while self.is_ident_continue() {
+                        self.advance();
+                    }
+                    TokenKind::AmpersandIdent(self.slice(start, self.pos).to_owned())
                 } else {
                     TokenKind::Ampersand
                 }

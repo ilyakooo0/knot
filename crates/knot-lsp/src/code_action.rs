@@ -1821,7 +1821,7 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
         ast::ExprKind::SourceDecl { ty, .. } => collect_names_in_type(ty, out),
         // A view field carries a source name; its annotation may hold type
         // names and its body value names.
-        ast::ExprKind::ViewDecl { ty, body, .. } => {
+        ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {
             if let Some(scheme) = ty {
                 collect_names_in_type(&scheme.ty, out);
             }

@@ -160,22 +160,17 @@ fn format_module_inner(source: &str, module: &Module) -> String {
     let comments = collect_comments(source);
 
     enum Block<'a> {
-        Import(&'a Import),
         Decl(&'a Decl),
     }
     impl<'a> Block<'a> {
         fn span(&self) -> Span {
             match self {
-                Block::Import(i) => i.span,
                 Block::Decl(d) => d.span,
             }
         }
     }
 
     let mut blocks: Vec<Block> = Vec::new();
-    for imp in &module.imports {
-        blocks.push(Block::Import(imp));
-    }
     for d in &module.decls {
         blocks.push(Block::Decl(d));
     }
@@ -189,16 +184,11 @@ fn format_module_inner(source: &str, module: &Module) -> String {
         .first()
         .map(|b| b.span().start)
         .unwrap_or(source.len());
-    // An exported declaration's `export` keyword sits in the gap before the
-    // decl's span, so a comment on the `export` line (`export -- keep me`) is
-    // non-standalone yet must still be emitted above the decl. Include such
-    // comments alongside the standalone ones and emit them in source order, so
-    // they are neither dropped nor reordered relative to the standalone
-    // comments in the same gap.
-    let first_exported = matches!(blocks.first(), Some(Block::Decl(d)) if d.exported);
+    // Standalone comments in the gap before the first declaration are emitted
+    // above it in source order.
     let mut leading_comments: Vec<&Comment> = comments
         .iter()
-        .filter(|c| (c.standalone || first_exported) && c.span.end <= first_start)
+        .filter(|c| c.standalone && c.span.end <= first_start)
         .collect();
     leading_comments.sort_by_key(|c| c.span.start);
     if !leading_comments.is_empty() {
@@ -238,17 +228,14 @@ fn format_module_inner(source: &str, module: &Module) -> String {
             out.push('\n');
 
             // Comments between the previous block and this one, in source
-            // order. Standalone comments always qualify; when this block is an
-            // exported declaration, a comment on its `export` line is
-            // non-standalone but belongs here too (see the leading section).
-            // The previous block's own trailing comment (on `prev_line`) is
-            // emitted with that block, so exclude it.
-            let this_exported = matches!(block, Block::Decl(d) if d.exported);
+            // order. Standalone comments always qualify. The previous block's
+            // own trailing comment (on `prev_line`) is emitted with that
+            // block, so exclude it.
             let prev_line = line_of(source, prev_end);
             let mut between: Vec<&Comment> = comments
                 .iter()
                 .filter(|c| {
-                    (c.standalone || (this_exported && c.line != prev_line))
+                    (c.standalone || c.line != prev_line)
                         && c.span.start >= prev_end
                         && c.span.end <= block_start
                 })
@@ -286,7 +273,6 @@ fn format_module_inner(source: &str, module: &Module) -> String {
         }
 
         let rendered = match block {
-            Block::Import(i) => render_import(i),
             Block::Decl(d) => render_decl_with_fallback(source, d, &comments),
         };
         out.push_str(rendered.trim_end());
@@ -510,25 +496,6 @@ fn trailing_line_comment<'a>(
         .find(|c| c.line == line && !c.standalone && c.span.start >= after)
 }
 
-
-// ── Imports ─────────────────────────────────────────────────────────
-
-fn render_import(i: &Import) -> String {
-    let mut s = String::from("import ");
-    s.push_str(&i.path);
-    if let Some(items) = &i.items {
-        s.push_str(" (");
-        for (idx, it) in items.iter().enumerate() {
-            if idx > 0 {
-                s.push_str(", ");
-            }
-            s.push_str(&it.name);
-        }
-        s.push(')');
-    }
-    s
-}
-
 // ── Decl entry point with comment-preservation fallback ───────────
 
 fn render_decl_with_fallback(source: &str, d: &Decl, comments: &[Comment<'_>]) -> String {
@@ -536,13 +503,8 @@ fn render_decl_with_fallback(source: &str, d: &Decl, comments: &[Comment<'_>]) -
         .iter()
         .any(|c| c.span.start > d.span.start && c.span.end <= d.span.end);
     if has_internal {
-        // `d.span` starts at the declaration keyword, not at a preceding
-        // `export`, so the prefix must be re-attached to the verbatim copy.
-        let verbatim = normalize_source_slice(&source[d.span.start..d.span.end]);
-        if d.exported {
-            return format!("export {}", verbatim);
-        }
-        return verbatim;
+        // Fall back to a verbatim copy of the declaration's source span.
+        return normalize_source_slice(&source[d.span.start..d.span.end]);
     }
     let mut p = Printer::new();
     render_decl(&mut p, d);
@@ -681,12 +643,6 @@ impl Printer {
 // ── Declarations ───────────────────────────────────────────────────
 
 fn render_decl(p: &mut Printer, d: &Decl) {
-    // The parser accepts `export` before any declaration form and records it
-    // on the `Decl` (the decl's span starts *after* the keyword), so the
-    // prefix must be re-emitted here for every declaration kind.
-    if d.exported {
-        p.write("export ");
-    }
     match &d.node {
         DeclKind::Data { name, params, constructors, deriving } => {
             render_data(p, name, params, constructors, deriving);

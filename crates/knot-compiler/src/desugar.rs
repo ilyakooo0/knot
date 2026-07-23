@@ -76,7 +76,6 @@ fn hoist_record_routes(module: &mut Module) {
                             entries: entries.clone(),
                         },
                         span: f.value.span,
-                        exported: false,
                     }),
                     ExprKind::RouteCompositeDecl { name, components } => {
                         // A component may itself be a record-embedded route
@@ -90,7 +89,6 @@ fn hoist_record_routes(module: &mut Module) {
                                 components: components.clone(),
                             },
                             span: f.value.span,
-                            exported: false,
                         })
                     }
                     _ => {}
@@ -124,7 +122,6 @@ fn hoist_record_views(module: &mut Module) {
                             body: (**vbody).clone(),
                         },
                         span: f.value.span,
-                        exported: false,
                     }),
                     ExprKind::DerivedDecl { name, ty, body: dbody } => hoisted.push(Decl {
                         node: DeclKind::Derived {
@@ -133,7 +130,6 @@ fn hoist_record_views(module: &mut Module) {
                             body: (**dbody).clone(),
                         },
                         span: f.value.span,
-                        exported: false,
                     }),
                     _ => {}
                 }
@@ -465,7 +461,6 @@ fn desugar_routes(module: &mut Module) {
                         deriving: vec![],
                     },
                     span: decl.span,
-                    exported: decl.exported,
                 });
             }
             DeclKind::RouteComposite { name, .. } => {
@@ -479,7 +474,6 @@ fn desugar_routes(module: &mut Module) {
                         deriving: vec![],
                     },
                     span: decl.span,
-                    exported: decl.exported,
                 });
             }
             _ => {}
@@ -1411,10 +1405,10 @@ fn fresh_var() -> String {
 /// Globally unique spans for synthesized `__bind`/`__yield`/`__empty` Var
 /// nodes. `monad_info` is keyed by these spans (type inference records the
 /// resolved monad per helper Var; codegen dispatches on it), and real file
-/// offsets COLLIDE across merged files — the prelude and imports are merged
-/// with unshifted per-file spans, so two do-blocks at identical byte
-/// offsets in different files would otherwise share one monad slot (and a
-/// `Maybe` comprehension could get compiled with Relation binds). Spans are
+/// offsets COLLIDE with merged decls — the prelude is merged with unshifted
+/// spans, so two do-blocks at identical byte offsets could otherwise share
+/// one monad slot (and a `Maybe` comprehension could get compiled with
+/// Relation binds). Spans are
 /// allocated above any plausible real file offset so they never alias a
 /// user expression. Diagnostics still anchor on the surrounding App/do
 /// spans, which keep their real locations.

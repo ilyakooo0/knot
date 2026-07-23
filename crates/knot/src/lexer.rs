@@ -22,11 +22,8 @@ pub enum TokenKind {
     Upper(String),
 
     // Keywords
-    Import,
     Data,
     Type,
-    Trait,
-    Impl,
     Route,
     Serve,
     Migrate,
@@ -44,7 +41,6 @@ pub enum TokenKind {
     Atomic,
     Deriving,
     With,
-    Export,
     Refine,
     Forall,
 
@@ -122,11 +118,8 @@ impl TokenKind {
             TokenKind::Bool(false) => "'false'",
             TokenKind::Lower(_) => "identifier",
             TokenKind::Upper(_) => "type name",
-            TokenKind::Import => "'import'",
             TokenKind::Data => "'data'",
             TokenKind::Type => "'type'",
-            TokenKind::Trait => "'trait'",
-            TokenKind::Impl => "'impl'",
             TokenKind::Route => "'route'",
             TokenKind::Serve => "'serve'",
             TokenKind::Migrate => "'migrate'",
@@ -144,7 +137,6 @@ impl TokenKind {
             TokenKind::Atomic => "'atomic'",
             TokenKind::Deriving => "'deriving'",
             TokenKind::With => "'with'",
-            TokenKind::Export => "'export'",
             TokenKind::Refine => "'refine'",
             TokenKind::Forall => "'forall'",
             TokenKind::LParen => "'('",
@@ -194,11 +186,8 @@ impl TokenKind {
     /// If this token is a keyword, return its string representation.
     pub fn keyword_str(&self) -> Option<&'static str> {
         match self {
-            TokenKind::Import => Some("import"),
             TokenKind::Data => Some("data"),
             TokenKind::Type => Some("type"),
-            TokenKind::Trait => Some("trait"),
-            TokenKind::Impl => Some("impl"),
             TokenKind::Route => Some("route"),
             TokenKind::Serve => Some("serve"),
             TokenKind::Migrate => Some("migrate"),
@@ -216,7 +205,6 @@ impl TokenKind {
             TokenKind::Atomic => Some("atomic"),
             TokenKind::Deriving => Some("deriving"),
             TokenKind::With => Some("with"),
-            TokenKind::Export => Some("export"),
             TokenKind::Refine => Some("refine"),
             TokenKind::Forall => Some("forall"),
             _ => None,
@@ -474,11 +462,8 @@ impl<'src> Lexer<'src> {
         // Keywords (only lowercase identifiers can be keywords)
         if first.is_ascii_lowercase() || first == b'_' {
             match text {
-                "import" => return TokenKind::Import,
                 "data" => return TokenKind::Data,
                 "type" => return TokenKind::Type,
-                "trait" => return TokenKind::Trait,
-                "impl" => return TokenKind::Impl,
                 "route" => return TokenKind::Route,
                 "serve" => return TokenKind::Serve,
                 "migrate" => return TokenKind::Migrate,
@@ -496,7 +481,6 @@ impl<'src> Lexer<'src> {
                 "atomic" => return TokenKind::Atomic,
                 "deriving" => return TokenKind::Deriving,
                 "with" => return TokenKind::With,
-                "export" => return TokenKind::Export,
                 "refine" => return TokenKind::Refine,
                 "forall" => return TokenKind::Forall,
                 "true" => return TokenKind::Bool(true),

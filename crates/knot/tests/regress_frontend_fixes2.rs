@@ -20,7 +20,6 @@
 //!    (which would reparse via the reserved `Cons head tail` path).
 //! 8. Formatter parenthesizes the right operand of unit `*`/`/` so
 //!    right-nested products don't re-associate on reparse.
-//! 9. `import ./foo-bar` — dashed import path segments parse.
 
 use knot::ast::{BinOp, DeclKind, ExprKind, PatKind, StmtKind, TypeKind};
 use knot::diagnostic::Severity;
@@ -552,30 +551,4 @@ fn right_nested_unit_quotient_round_trips() {
 fn left_nested_unit_product_stays_minimal() {
     let out = check_str("unit_mul_left", "x : Float (M * S * Kg)\nx = 1.0\n");
     assert!(out.contains("M * S * Kg"), "output: {}", out);
-}
-
-// ── 9. Dashed import path segments ──────────────────────────────────
-
-#[test]
-fn dashed_import_path_parses() {
-    let src = "import ./foo-bar\n\nmain = 1\n";
-    let m = parse(src).expect("parse");
-    assert_eq!(m.imports.len(), 1);
-    assert_eq!(m.imports[0].path, "./foo-bar");
-}
-
-#[test]
-fn dashed_import_path_with_items_parses() {
-    let src = "import ../lib/my-utils-extra (helper, Thing)\n\nmain = 1\n";
-    let m = parse(src).expect("parse");
-    assert_eq!(m.imports.len(), 1);
-    assert_eq!(m.imports[0].path, "../lib/my-utils-extra");
-    let items = m.imports[0].items.as_ref().expect("items");
-    assert_eq!(items.len(), 2);
-}
-
-#[test]
-fn dashed_import_round_trips() {
-    let out = check_str("dashed_import", "import ./foo-bar\n\nmain = 1\n");
-    assert!(out.contains("import ./foo-bar"), "output: {}", out);
 }

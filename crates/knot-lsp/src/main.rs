@@ -14,7 +14,6 @@ mod completion;
 mod defs;
 mod diagnostics;
 mod document_highlight;
-mod document_link;
 mod document_symbol;
 mod folding;
 mod formatting;
@@ -62,7 +61,6 @@ use crate::code_action::handle_code_action;
 use crate::code_lens::handle_code_lens;
 use crate::completion::{handle_completion, handle_resolve_completion_item};
 use crate::document_highlight::handle_document_highlight;
-use crate::document_link::handle_document_link;
 use crate::document_symbol::handle_document_symbol;
 use crate::folding::handle_folding_range;
 use crate::formatting::{handle_formatting, handle_on_type_formatting, handle_range_formatting};
@@ -100,7 +98,7 @@ fn main() {
 
     let (connection, io_threads) = Connection::stdio();
 
-    let mut server_capabilities = serde_json::to_value(ServerCapabilities {
+    let server_capabilities = serde_json::to_value(ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(
             TextDocumentSyncOptions {
                 open_close: Some(true),
@@ -159,10 +157,6 @@ fn main() {
         document_formatting_provider: Some(OneOf::Left(true)),
         document_range_formatting_provider: Some(OneOf::Left(true)),
         document_highlight_provider: Some(OneOf::Left(true)),
-        document_link_provider: Some(DocumentLinkOptions {
-            resolve_provider: Some(false),
-            work_done_progress_options: Default::default(),
-        }),
         document_on_type_formatting_provider: Some(DocumentOnTypeFormattingOptions {
             first_trigger_character: "\n".into(),
             more_trigger_character: None,
@@ -185,23 +179,7 @@ fn main() {
                 supported: Some(true),
                 change_notifications: Some(OneOf::Left(true)),
             }),
-            // willRename surfaces upcoming file moves *before* the rename
-            // happens, so we can return a WorkspaceEdit that updates every
-            // `import` line referencing the old path. Filter to `.knot` files
-            // so the editor doesn't bother us for unrelated renames.
-            file_operations: Some(WorkspaceFileOperationsServerCapabilities {
-                will_rename: Some(FileOperationRegistrationOptions {
-                    filters: vec![FileOperationFilter {
-                        scheme: Some("file".into()),
-                        pattern: FileOperationPattern {
-                            glob: "**/*.knot".into(),
-                            matches: Some(FileOperationPatternKind::File),
-                            options: None,
-                        },
-                    }],
-                }),
-                ..Default::default()
-            }),
+            ..Default::default()
         }),
         ..Default::default()
     })
@@ -286,7 +264,6 @@ fn main() {
         pending_sources: HashMap::new(),
         dropped_analysis_retry: HashMap::new(),
         analysis_tx,
-        reverse_imports: HashMap::new(),
         inference_cache,
         semantic_token_cache: HashMap::new(),
         semantic_token_counter: 0,
@@ -438,12 +415,6 @@ fn prune_caches_outside_roots(state: &mut ServerState) {
     state
         .workspace_diag_cache
         .retain(|p, _| in_scope(p));
-    state
-        .reverse_imports
-        .retain(|p, _| in_scope(p));
-    for importers in state.reverse_imports.values_mut() {
-        importers.retain(|p| in_scope(p));
-    }
     if let Ok(mut cache) = state.import_cache.lock() {
         cache.retain(|p, _| in_scope(p));
     }
@@ -512,146 +483,6 @@ fn prewarm_workspace_symbol_cache(
             c.insert_capped(canonical, (on_disk_mtime, hash, entries));
         }
     }
-}
-
-/// `workspace/willRenameFiles` — return a `WorkspaceEdit` that updates every
-/// `import` line referencing the moved file. Runs synchronously before the
-/// editor performs the rename; if we miss any importer, the user gets a
-/// diagnostic on the next analysis cycle.
-fn handle_will_rename_files(
-    state: &ServerState,
-    params: &RenameFilesParams,
-) -> Option<WorkspaceEdit> {
-    use std::collections::HashMap as Map;
-    let mut changes: Map<Uri, Vec<TextEdit>> = Map::new();
-
-    for rename in &params.files {
-        let old_uri: Uri = match rename.old_uri.parse() {
-            Ok(u) => u,
-            Err(_) => continue,
-        };
-        let new_uri: Uri = match rename.new_uri.parse() {
-            Ok(u) => u,
-            Err(_) => continue,
-        };
-        let old_path = match uri_to_path(&old_uri).and_then(|p| p.canonicalize().ok()) {
-            Some(p) => p,
-            None => continue,
-        };
-        let new_path = match uri_to_path(&new_uri) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        for (importer_uri, doc) in &state.documents {
-            let importer_path = match uri_to_path(importer_uri) {
-                Some(p) => p,
-                None => continue,
-            };
-            let importer_dir = match importer_path.parent() {
-                Some(p) => p,
-                None => continue,
-            };
-            // Build edits against the freshest text the client knows about.
-            // `doc.source`/`doc.module` reflect the last *analyzed* state; if
-            // the user has in-flight edits (pending source mid-debounce),
-            // spans computed against the analyzed text would land in the
-            // wrong place once the client applies the WorkspaceEdit to its
-            // live buffer. Re-parse the pending source so import spans match
-            // the text the edit will be applied to.
-            let pending_reparsed = state
-                .pending_sources
-                .get(importer_uri)
-                .filter(|p| p.source != doc.source)
-                .map(|p| {
-                    let lexer = knot::lexer::Lexer::new(&p.source);
-                    let (tokens, _) = lexer.tokenize();
-                    let parser = knot::parser::Parser::new(p.source.clone(), tokens);
-                    let (module, _) = parser.parse_module();
-                    (p.source.clone(), module.imports)
-                });
-            let (live_source, live_imports): (&str, &[knot::ast::Import]) =
-                match &pending_reparsed {
-                    Some((src, imports)) => (src.as_str(), imports.as_slice()),
-                    None => (doc.source.as_str(), doc.module.imports.as_slice()),
-                };
-            for imp in live_imports {
-                // Match the compiler's import resolution (see
-                // `knot-compiler/src/modules.rs`): `with_extension("knot")`
-                // *replaces* any existing suffix, so `import ./lib.v2` resolves
-                // to `lib.knot` — not `lib.v2.knot`. Using `format!("{}.knot")`
-                // here would compute a different path than the one the compiler
-                // loads, so a matching file move would be silently skipped.
-                let resolved =
-                    importer_dir.join(PathBuf::from(&imp.path).with_extension("knot"));
-                let canonical = match resolved.canonicalize() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                if canonical != old_path {
-                    continue;
-                }
-                // `relative_import_path` takes the importer file (not its dir)
-                // and the destination, normalizes separators to `/`, and adds
-                // a `./` prefix for same-directory paths.
-                let new_rel = match crate::code_action::relative_import_path(
-                    &importer_path,
-                    &new_path,
-                ) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                // The import statement's span covers `import path` — replace
-                // just the path portion. Compute it by finding the first
-                // non-whitespace after `import`.
-                let span = imp.span;
-                let span_text = match live_source.get(span.start..span.end) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let path_offset_in_span = span_text
-                    .find("import")
-                    .map(|i| i + "import".len())
-                    .unwrap_or(0);
-                let leading_ws: usize = span_text[path_offset_in_span..]
-                    .chars()
-                    .take_while(|c| c.is_whitespace())
-                    .map(|c| c.len_utf8())
-                    .sum();
-                let path_start = span.start + path_offset_in_span + leading_ws;
-                // The path ends at the first whitespace or `(` (selective
-                // import list) after it — NOT at `span.end`, which for
-                // `import ./foo (bar, baz)` extends through the closing `)`.
-                // Replacing up to `span.end` would silently delete the
-                // import list.
-                let path_portion = &span_text[path_offset_in_span + leading_ws..];
-                let path_rel_end = path_portion
-                    .find(|c: char| c.is_whitespace() || c == '(')
-                    .unwrap_or(path_portion.len());
-                let path_end = path_start + path_rel_end;
-                let path_start_pos = offset_to_position(live_source, path_start);
-                let path_end_pos = offset_to_position(live_source, path_end);
-                changes
-                    .entry(importer_uri.clone())
-                    .or_default()
-                    .push(TextEdit {
-                        range: Range {
-                            start: path_start_pos,
-                            end: path_end_pos,
-                        },
-                        new_text: new_rel,
-                    });
-            }
-        }
-    }
-
-    if changes.is_empty() {
-        return None;
-    }
-    Some(WorkspaceEdit {
-        changes: Some(changes),
-        ..Default::default()
-    })
 }
 
 /// Construct the `client/registerCapability` request that asks the editor to
@@ -747,49 +578,6 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
         state.config.warn_unused_imports,
     );
 
-    // Update the reverse-import graph for cross-file diagnostics. Each
-    // analyzed module knows which files it imported (`imported_files`); we
-    // invert that map so a later edit to an imported file can re-queue every
-    // open consumer for re-analysis.
-    if let Some(this_path) = uri_to_path(&result.uri).and_then(|p| p.canonicalize().ok()) {
-        // Drop any prior incoming edges from this importer — a removed
-        // `import X` statement should stop pulling X back in for re-checks.
-        for importers in state.reverse_imports.values_mut() {
-            importers.remove(&this_path);
-        }
-        for imported in result.doc.imported_files.keys() {
-            state
-                .reverse_imports
-                .entry(imported.clone())
-                .or_default()
-                .insert(this_path.clone());
-        }
-        // Drop now-empty importer sets and bound the map. The remove loop
-        // above only clears edges, so without this sweep the keys for
-        // files whose last importer just dropped would pile up across
-        // long sessions.
-        crate::state::prune_reverse_imports(&mut state.reverse_imports);
-
-        // Selective dependent re-analysis: when a file changes, only
-        // re-queue downstream files whose `import_defs` actually reference
-        // a *signature-changed* decl name. Body-only edits to a typed
-        // function don't move its outward-facing type, so dependents of
-        // that name don't need a fresh inference pass — the broader
-        // `changed_decl_names` set is used in-file for telemetry only.
-        // Without this filter, every keystroke on a popular utility module
-        // re-analyzes its entire dependency closure even when the user is
-        // just editing a function body that no consumer depends on directly.
-        let changed: HashSet<&str> = result
-            .doc
-            .signature_changed_decl_names
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        if !changed.is_empty() {
-            requeue_dependents_for_changed_decls(state, &result.uri, &this_path, &changed);
-        }
-    }
-
     // Update `state.documents` *before* publishing or sending the diagnostic
     // refresh. Pull-mode clients (JetBrains) react to the refresh by
     // immediately re-pulling via `textDocument/diagnostic`; that handler
@@ -830,75 +618,6 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
     // The worker just drained (at least) one task — re-queue anything that
     // was dropped on channel overflow so no file stays permanently stale.
     retry_dropped_analysis(state);
-}
-
-/// Re-queue analysis for open documents whose imports reference any of the
-/// changed decl names. Walks the reverse-import graph transitively so the
-/// downstream chain (A imports B imports C; C changes) reaches the right set
-/// of consumers.
-fn requeue_dependents_for_changed_decls(
-    state: &mut ServerState,
-    source_uri: &Uri,
-    changed_path: &Path,
-    changed_names: &HashSet<&str>,
-) {
-    // Transitive set of importers via BFS over reverse_imports.
-    let mut to_visit = vec![changed_path.to_path_buf()];
-    let mut visited: HashSet<PathBuf> = HashSet::new();
-    let mut affected: HashSet<PathBuf> = HashSet::new();
-    while let Some(p) = to_visit.pop() {
-        if !visited.insert(p.clone()) {
-            continue;
-        }
-        if let Some(importers) = state.reverse_imports.get(&p) {
-            for imp in importers {
-                if affected.insert(imp.clone()) {
-                    to_visit.push(imp.clone());
-                }
-            }
-        }
-    }
-
-    let dependents: Vec<(Uri, PathBuf, String)> = state
-        .documents
-        .iter()
-        .filter(|(other_uri, _)| *other_uri != source_uri)
-        .filter_map(|(uri, doc)| {
-            let path = uri_to_path(uri).and_then(|p| p.canonicalize().ok())?;
-            if !affected.contains(&path) {
-                return None;
-            }
-            // Only re-queue if the dependent imports at least one of the
-            // changed names from `changed_path`. Two-level filter: first
-            // we narrow to importers (via `affected`), then we narrow to
-            // importers that actually use one of the changed names.
-            let uses_changed = doc.import_defs.iter().any(|(n, (origin, _))| {
-                origin == changed_path && changed_names.contains(n.as_str())
-            });
-            if !uses_changed {
-                return None;
-            }
-            let src = state
-                .pending_sources
-                .get(uri)
-                .map(|p| p.source.clone())
-                .unwrap_or_else(|| doc.source.clone());
-            Some((uri.clone(), path, src))
-        })
-        .collect();
-
-    if dependents.is_empty() {
-        return;
-    }
-
-    if let Ok(mut cache) = state.inference_cache.lock() {
-        let dep_paths: HashSet<&PathBuf> = dependents.iter().map(|(_, p, _)| p).collect();
-        cache.retain(|(p, _), _| !dep_paths.contains(p));
-    }
-
-    for (dep_uri, _, dep_source) in dependents {
-        queue_analysis(state, dep_uri, dep_source, None);
-    }
 }
 
 // ── Request dispatch ────────────────────────────────────────────────
@@ -989,7 +708,6 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
     try_handle!(&req, conn, request::RangeFormatting, |p| handle_range_formatting(state, &p));
     try_handle!(&req, conn, request::OnTypeFormatting, |p| handle_on_type_formatting(state, &p));
     try_handle!(&req, conn, request::DocumentHighlightRequest, |p| handle_document_highlight(state, &p));
-    try_handle!(&req, conn, request::DocumentLinkRequest, |p| handle_document_link(state, &p));
     try_handle!(&req, conn, request::CodeActionRequest, |p| handle_code_action(state, &p));
     // Keep workspace_symbol_cache from growing unbounded — pruning happens
     // inside the handler via the on-disk scan.
@@ -1025,7 +743,6 @@ fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
         }
         Cast::Other => {}
     }
-    try_handle!(&req, conn, request::WillRenameFiles, |p| handle_will_rename_files(state, &p));
     // Fallback: every known method is handled above, so reaching here means
     // the client sent something we don't implement. Replying with
     // `MethodNotFound` (-32601) is mandatory — without a response the client
@@ -1350,79 +1067,32 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             .collect();
 
         if !changed_paths.is_empty() || !deleted_paths.is_empty() {
-            // Staleness propagates TRANSITIVELY through the import graph of
-            // open documents: when C changes on disk and open B imports C
-            // while open A imports B, A's analysis is just as stale as B's.
-            // Compute the affected-path closure over the open docs' direct
-            // import edges, then requeue every open doc whose imports touch
-            // that closure.
-            let open_imports: Vec<(PathBuf, Vec<PathBuf>)> = state
-                .documents
-                .iter()
-                .filter_map(|(uri, doc)| {
-                    let path = uri_to_path(uri).and_then(|p| p.canonicalize().ok())?;
-                    Some((path, doc.imported_files.keys().cloned().collect()))
-                })
-                .collect();
-            let seed: HashSet<PathBuf> = changed_paths
-                .iter()
-                .chain(deleted_paths.iter())
-                .cloned()
-                .collect();
-            let affected = transitively_affected_paths(&open_imports, &seed);
-
-            let dependents: Vec<(Uri, PathBuf, String)> = state
-                .documents
-                .iter()
-                .filter(|(_, doc)| {
-                    doc.imported_files.keys().any(|p| affected.contains(p))
-                })
-                .filter_map(|(uri, doc)| {
-                    let path = uri_to_path(uri).and_then(|p| p.canonicalize().ok())?;
-                    let src = state
-                        .pending_sources
-                        .get(uri)
-                        .map(|p| p.source.clone())
-                        .unwrap_or_else(|| doc.source.clone());
-                    Some((uri.clone(), path, src))
-                })
-                .collect();
-
-            // Evict cached snapshots for affected dependents and the
-            // changed paths themselves — the inference for a file whose
-            // imports just changed on disk is no longer valid.
+            // Evict cached inference snapshots for the changed paths — the
+            // on-disk bytes moved, so any prior snapshot is stale.
             if let Ok(mut cache) = state.inference_cache.lock() {
                 let affected: HashSet<&PathBuf> = changed_paths
                     .iter()
                     .chain(deleted_paths.iter())
-                    .chain(dependents.iter().map(|(_, p, _)| p))
                     .collect();
                 cache.retain(|(p, _), _| !affected.contains(p));
             }
 
-            // Same logic applied to the workspace-diagnostic cache: any
-            // unopened-file diagnostics that referenced the changed file's
-            // exports are stale now. Without eager invalidation, the next
-            // workspace-diag request would replay last run's diagnostics.
+            // Any unopened-file diagnostics for the changed file are stale
+            // now. Without eager invalidation, the next workspace-diag
+            // request would replay last run's diagnostics.
             let mut diag_invalidate = changed_paths.clone();
             diag_invalidate.extend(deleted_paths.iter().cloned());
             invalidate_workspace_diag_cache_for(state, &diag_invalidate);
 
             // Hard-evict deleted files from every cache that's keyed by a
-            // disk path. Without this, the parsed AST, the reverse-import
-            // edges, and the workspace-symbol entries for a removed file
-            // outlive the file itself for the rest of the session — slow
-            // leaks plus the risk of handlers handing back data anchored to
-            // bytes that no longer exist on disk.
+            // disk path. Without this, the parsed AST and the
+            // workspace-symbol entries for a removed file outlive the file
+            // itself for the rest of the session — slow leaks plus the risk
+            // of handlers handing back data anchored to bytes that no longer
+            // exist on disk.
             if !deleted_paths.is_empty() {
                 if let Ok(mut cache) = state.import_cache.lock() {
                     cache.retain(|p, _| !deleted_paths.contains(p));
-                }
-                state
-                    .reverse_imports
-                    .retain(|p, _| !deleted_paths.contains(p));
-                for importers in state.reverse_imports.values_mut() {
-                    importers.retain(|p| !deleted_paths.contains(p));
                 }
                 if let Ok(mut sym) = state.workspace_symbol_cache.lock() {
                     sym.by_path.retain(|p, _| !deleted_paths.contains(p));
@@ -1430,10 +1100,6 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 state
                     .workspace_diag_cache
                     .retain(|p, _| !deleted_paths.contains(p));
-            }
-
-            for (dep_uri, _, dep_source) in dependents {
-                queue_analysis(state, dep_uri, dep_source, None);
             }
         }
     } else if not.method == notification::DidSaveTextDocument::METHOD {
@@ -1679,34 +1345,6 @@ fn shift_byte_ranges_for_edit(
 /// - `Disconnected`: the worker thread has died. Other features still work
 ///   against the last good analysis, so log and continue rather than crash.
 ///
-/// Fixpoint closure of staleness over the open documents' import edges.
-/// `open_imports` maps each open doc's canonical path to its DIRECT imports;
-/// `seed` is the set of paths that changed (or were deleted) on disk. A doc
-/// becomes affected when any of its direct imports is affected — iterating
-/// until stable captures transitive chains (A imports B imports changed C).
-fn transitively_affected_paths(
-    open_imports: &[(PathBuf, Vec<PathBuf>)],
-    seed: &HashSet<PathBuf>,
-) -> HashSet<PathBuf> {
-    let mut affected: HashSet<PathBuf> = seed.clone();
-    loop {
-        let mut grew = false;
-        for (path, imports) in open_imports {
-            if affected.contains(path) {
-                continue;
-            }
-            if imports.iter().any(|p| affected.contains(p)) {
-                affected.insert(path.clone());
-                grew = true;
-            }
-        }
-        if !grew {
-            break;
-        }
-    }
-    affected
-}
-
 fn queue_analysis(state: &mut ServerState, uri: Uri, source: String, version: Option<i32>) {
     use crossbeam_channel::TrySendError;
     // Anything parked from an earlier overflow is superseded by the fresher
@@ -1756,33 +1394,17 @@ fn retry_dropped_analysis(state: &mut ServerState) {
     }
 }
 
-/// Eagerly evict workspace-diagnostic cache entries for `changed` and every
-/// file that transitively imports any of them. Without this, the cache can
-/// hand stale diagnostics to the editor between a file edit and the next
-/// pull-mode `workspace/diagnostic` request — the lazy `prune_stale_…` pass
-/// only runs on workspace-diag requests, so cross-file errors caused by an
-/// upstream edit linger until the user happens to ask for them again.
+/// Eagerly evict workspace-diagnostic cache entries for `changed`. Without
+/// this, the cache can hand stale diagnostics to the editor between a file
+/// edit and the next pull-mode `workspace/diagnostic` request — the lazy
+/// `prune_stale_…` pass only runs on workspace-diag requests.
 fn invalidate_workspace_diag_cache_for(state: &mut ServerState, changed: &HashSet<PathBuf>) {
     if changed.is_empty() {
         return;
     }
-    // Transitive closure over the reverse-import graph. We start the BFS from
-    // every changed path and pull in any file that imports them, directly or
-    // through a chain of imports.
-    let mut affected: HashSet<PathBuf> = changed.iter().cloned().collect();
-    let mut frontier: Vec<PathBuf> = changed.iter().cloned().collect();
-    while let Some(p) = frontier.pop() {
-        if let Some(importers) = state.reverse_imports.get(&p) {
-            for imp in importers {
-                if affected.insert(imp.clone()) {
-                    frontier.push(imp.clone());
-                }
-            }
-        }
-    }
     state
         .workspace_diag_cache
-        .retain(|path, _| !affected.contains(path));
+        .retain(|path, _| !changed.contains(path));
 }
 
 #[cfg(test)]
@@ -1876,7 +1498,6 @@ mod tests {
             pending_sources: HashMap::new(),
             dropped_analysis_retry: HashMap::new(),
             analysis_tx,
-            reverse_imports: HashMap::new(),
             inference_cache: Arc::new(Mutex::new(HashMap::new())),
             semantic_token_cache: HashMap::new(),
             semantic_token_counter: 0,
@@ -2241,27 +1862,11 @@ main = do
             dropped_path.clone(),
             (0, Vec::new(), 0, None),
         );
-        state
-            .reverse_imports
-            .entry(kept_path.clone())
-            .or_default()
-            .insert(dropped_path.clone());
-        state
-            .reverse_imports
-            .entry(dropped_path.clone())
-            .or_default()
-            .insert(kept_path.clone());
 
         prune_caches_outside_roots(&mut state);
 
         assert!(state.workspace_diag_cache.contains_key(&kept_path));
         assert!(!state.workspace_diag_cache.contains_key(&dropped_path));
-        assert!(state.reverse_imports.contains_key(&kept_path));
-        assert!(!state.reverse_imports.contains_key(&dropped_path));
-        // The remaining edge set on `kept_path` must also drop the stale
-        // pointer to a now-out-of-scope importer.
-        let importers = state.reverse_imports.get(&kept_path).unwrap();
-        assert!(!importers.contains(&dropped_path));
     }
 
     /// Reproduce: user opens a file with multiple unused-decl warnings,
@@ -2455,27 +2060,5 @@ main = do
         );
     }
 
-    /// Watched-file staleness must propagate TRANSITIVELY through open
-    /// documents: C changes on disk; open B imports C; open A imports B —
-    /// A must be in the affected closure, not just B.
-    #[test]
-    fn transitively_affected_paths_walks_open_import_graph() {
-        let a = PathBuf::from("/w/a.knot");
-        let b = PathBuf::from("/w/b.knot");
-        let c = PathBuf::from("/w/c.knot");
-        let d = PathBuf::from("/w/unrelated.knot");
-        let open_imports = vec![
-            (a.clone(), vec![b.clone()]),
-            (b.clone(), vec![c.clone()]),
-            (d.clone(), vec![]),
-        ];
-        let mut seed = HashSet::new();
-        seed.insert(c.clone());
-        let affected = transitively_affected_paths(&open_imports, &seed);
-        assert!(affected.contains(&c), "seed retained");
-        assert!(affected.contains(&b), "direct importer affected");
-        assert!(affected.contains(&a), "TRANSITIVE importer affected");
-        assert!(!affected.contains(&d), "unrelated doc untouched");
-    }
 }
 

@@ -41,24 +41,6 @@ pub(crate) fn handle_folding_range(
         }
     }
 
-    // Fold imports if there are multiple
-    if doc.module.imports.len() > 1 {
-        let first = &doc.module.imports[0];
-        let last = &doc.module.imports[doc.module.imports.len() - 1];
-        let start = span_to_range(first.span, &doc.source);
-        let end = span_to_range(last.span, &doc.source);
-        if end.end.line > start.start.line {
-            ranges.push(FoldingRange {
-                start_line: start.start.line,
-                start_character: None,
-                end_line: end.end.line,
-                end_character: None,
-                kind: Some(FoldingRangeKind::Imports),
-                ..Default::default()
-            });
-        }
-    }
-
     // The `if/then/else` arm in `collect_folding_ranges_expr` explicitly folds
     // its `then`/`else` branches, and the recursion below also folds them when
     // a branch is a foldable container (do/case/lambda/atomic/record), so the

@@ -184,15 +184,6 @@ impl Parser {
     pub fn parse_module(mut self) -> (Module, Vec<Diagnostic>) {
         self.skip_newlines();
 
-        // Parse imports (must come before other declarations)
-        let mut imports = Vec::new();
-        while self.at(&TokenKind::Import) {
-            if let Some(imp) = self.parse_import() {
-                imports.push(imp);
-            }
-            self.skip_newlines();
-        }
-
         // Set block_indent so that multiline expressions inside declarations
         // can continue across newlines (parse_application checks column > block_indent).
         // Top-level declarations live at delimiter depth 0.
@@ -201,19 +192,16 @@ impl Parser {
         // Pre-scan for top-level declaration names that collide with
         // time-unit words so `maybe_time_unit` doesn't silently rewrite
         // `2 ms` as `2 * 1` when `ms` is a user-defined top-level value.
-        self.top_level_names = self.scan_top_level_names(&imports);
+        self.top_level_names = self.scan_top_level_names();
         let mut decls = Vec::new();
         while !self.at_eof() {
             self.skip_newlines();
             if self.at_eof() {
                 break;
             }
-            let exported = self.eat(&TokenKind::Export);
-            self.skip_newlines();
             let decl_start = self.pos;
             match self.parse_decl() {
-                Some(mut d) => {
-                    d.exported = exported;
+                Some(d) => {
                     decls.push(d);
                 }
                 None => {
@@ -236,7 +224,7 @@ impl Parser {
             self.skip_newlines();
         }
 
-        (Module { imports, decls }, self.diagnostics)
+        (Module { decls }, self.diagnostics)
     }
 }
 
@@ -316,29 +304,13 @@ impl Parser {
     /// Pre-scan the token stream for names that collide with time-unit words
     /// (`ms`, `seconds`, `minutes`, `hours`, `days`, `weeks`) and are actually
     /// user-defined values rather than the built-in unit. This lets
-    /// `maybe_time_unit` suppress unit sugar for those names. Covers:
-    ///   * top-level declarations (column-0 `name =`/`name :`, optionally
-    ///     behind a `*`/`&`/`export` sigil),
-    ///   * selectively imported item names (`import ./time (ms)`).
-    ///
-    /// Without the latter, `import ./time (ms)` then `g = f 2 ms` would
-    /// silently parse as `f (2 * 1)`, dropping the `ms` argument.
-    fn scan_top_level_names(&self, imports: &[Import]) -> HashSet<String> {
+    /// `maybe_time_unit` suppress unit sugar for those names. Covers
+    /// top-level declarations (column-0 `name =`/`name :`, optionally
+    /// behind a `*`/`&`/`export` sigil).
+    fn scan_top_level_names(&self) -> HashSet<String> {
         const TIME_UNITS: &[&str] =
             &["ms", "seconds", "minutes", "hours", "days", "weeks"];
         let mut names = HashSet::new();
-
-        // Selectively imported item names shadow the built-in units in this
-        // module, so a time-unit-named import must suppress sugar too.
-        for imp in imports {
-            if let Some(items) = &imp.items {
-                for item in items {
-                    if TIME_UNITS.contains(&item.name.as_str()) {
-                        names.insert(item.name.clone());
-                    }
-                }
-            }
-        }
 
         let n = self.tokens.len();
         for i in 0..n {
@@ -356,11 +328,11 @@ impl Parser {
                 continue;
             }
             // A top-level declaration name is at column 0, or immediately
-            // preceded by a `*`/`&`/`export` token that is itself at column 0.
+            // preceded by a `*`/`&` sigil token that is itself at column 0.
             let preceded_by_sigil_at_col0 = i >= 1
                 && matches!(
                     self.tokens[i - 1].kind,
-                    TokenKind::Star | TokenKind::Ampersand | TokenKind::Export
+                    TokenKind::Star | TokenKind::Ampersand
                 )
                 && self.token_cols[i - 1] == 0;
             if self.token_cols[i] == 0 || preceded_by_sigil_at_col0 {
@@ -517,8 +489,7 @@ impl Parser {
             let col = self.cur_column();
             if col == 0 {
                 match self.peek() {
-                    TokenKind::Export
-                    | TokenKind::Data
+                    TokenKind::Data
                     | TokenKind::Type
                     | TokenKind::Route
                     | TokenKind::Migrate
@@ -557,15 +528,13 @@ impl Parser {
             | TokenKind::Atomic
             | TokenKind::Deriving
             | TokenKind::With
-            | TokenKind::Import
             | TokenKind::Data
             | TokenKind::Type
             | TokenKind::Route
             | TokenKind::Serve
             | TokenKind::Migrate
             | TokenKind::Refine
-            | TokenKind::Forall
-            | TokenKind::Export => {
+            | TokenKind::Forall => {
                 let kw = format!("{:?}", self.peek()).to_lowercase();
                 self.error(format!(
                     "'{kw}' is a keyword and cannot be used as a variable name"
@@ -595,165 +564,12 @@ impl Parser {
     }
 }
 
-// ── Imports ─────────────────────────────────────────────────────────
-
 impl Parser {
-    /// Parse `import ./path` or `import ./path (A, b)`.
-    /// Path is assembled from Dot, Slash, and identifier tokens.
-    fn parse_import(&mut self) -> Option<Import> {
-        let start = self.span();
-        self.advance(); // consume `import`
-
-        // Parse the relative path: ./foo, ../bar/baz, etc.
-        let mut path = String::new();
-
-        // Must start with `.`
-        if !self.at(&TokenKind::Dot) {
-            self.error("expected relative path starting with '.' after 'import'");
-            return None;
-        }
-        self.advance();
-        path.push('.');
-
-        // Could be `..` (parent directory)
-        if self.at(&TokenKind::Dot) {
-            self.advance();
-            path.push('.');
-            if self.at(&TokenKind::Dot) {
-                self.error("invalid import path: too many leading dots (use '.' or '..')");
-                return None;
-            }
-        }
-
-        // Consume `/segment` pairs (segment can be an identifier or `..`)
-        loop {
-            if !self.at(&TokenKind::Slash) {
-                break;
-            }
-            self.advance();
-            path.push('/');
-
-            if self.at(&TokenKind::Dot) {
-                // `..` parent directory segment within path
-                self.advance();
-                path.push('.');
-                if self.at(&TokenKind::Dot) {
-                    self.advance();
-                    path.push('.');
-                }
-            } else {
-                match self.peek() {
-                    TokenKind::Lower(_) | TokenKind::Upper(_) => {
-                        let tok = self.advance();
-                        let name = match tok.kind {
-                            TokenKind::Lower(n) | TokenKind::Upper(n) => n,
-                            _ => unreachable!(),
-                        };
-                        path.push_str(&name);
-                        self.consume_import_dashed_suffix(&mut path);
-                    }
-                    tok if tok.keyword_str().is_some() => {
-                        let tok = self.advance();
-                        match tok.kind.keyword_str() {
-                            Some(s) => path.push_str(s),
-                            None => {
-                                self.error("expected path segment after '/'");
-                                return None;
-                            }
-                        }
-                        self.consume_import_dashed_suffix(&mut path);
-                    }
-                    _ => {
-                        self.error("expected path segment after '/'");
-                        return None;
-                    }
-                }
-            }
-        }
-
-        // Optional selective import list: (A, b, C)
-        let items = if self.at(&TokenKind::LParen) {
-            self.advance();
-            let mut items = Vec::new();
-            loop {
-                if self.at(&TokenKind::RParen) {
-                    self.advance();
-                    break;
-                }
-                let item_span = self.span();
-                let name = match self.peek() {
-                    TokenKind::Upper(_) | TokenKind::Lower(_) => {
-                        let tok = self.advance();
-                        match tok.kind {
-                            TokenKind::Upper(n) | TokenKind::Lower(n) => n,
-                            _ => unreachable!(),
-                        }
-                    }
-                    _ => {
-                        self.error("expected name in import list");
-                        return None;
-                    }
-                };
-                items.push(ImportItem {
-                    name,
-                    span: item_span,
-                });
-                if !self.eat(&TokenKind::Comma) {
-                    self.expect(&TokenKind::RParen, "expected ',' or ')' in import list")
-                        .ok()?;
-                    break;
-                }
-            }
-            Some(items)
-        } else {
-            None
-        };
-
-        let end = self.prev_span();
-        let span = Span::new(start.start, end.end);
-        Some(Import { path, items, span })
-    }
-
-    /// Extend the just-consumed import path segment with `-`-joined parts
-    /// (`./foo-bar` lexes as `foo`, `-`, `bar`). Only joins when the tokens
-    /// are span-adjacent (no intervening whitespace), so a following binary
-    /// minus is never absorbed into the path. Mirrors the dashed-literal
-    /// handling in `parse_route_path`.
-    fn consume_import_dashed_suffix(&mut self, path: &mut String) {
-        loop {
-            if !self.at(&TokenKind::Minus) {
-                break;
-            }
-            let minus_span = self.span();
-            if minus_span.start != self.prev_span().end {
-                break;
-            }
-            let Some(next) = self.tokens.get(self.pos + 1) else {
-                break;
-            };
-            if next.span.start != minus_span.end {
-                break;
-            }
-            let part: Option<String> = match &next.kind {
-                TokenKind::Lower(n) | TokenKind::Upper(n) => Some(n.clone()),
-                k => k.keyword_str().map(|s| s.to_string()),
-            };
-            let Some(part) = part else {
-                break;
-            };
-            self.advance(); // consume `-`
-            self.advance(); // consume the segment part
-            path.push('-');
-            path.push_str(&part);
-        }
-    }
-
     /// Extend a route path literal segment with `-`-joined parts, but only
     /// when the `-` and the following identifier are span-adjacent (no
     /// intervening whitespace). Without this, `/foo - bar` (a spaced,
     /// binary-minus-looking sequence) would be glued into the single literal
-    /// `foo-bar`, silently parsing a different path than written. Mirrors
-    /// `consume_import_dashed_suffix`.
+    /// `foo-bar`, silently parsing a different path than written.
     fn consume_route_dashed_suffix(&mut self, seg: &mut String) {
         loop {
             if !self.at(&TokenKind::Minus) {
@@ -1113,7 +929,6 @@ impl Parser {
                     deriving,
                 },
                 span: Span::new(start.start, end.end),
-                exported: false,
             })
         })
     }
@@ -1173,7 +988,6 @@ impl Parser {
             Some(Decl {
                 node: DeclKind::TypeAlias { name, params, ty },
                 span: Span::new(start.start, end.end),
-                exported: false,
             })
         })
     }
@@ -1230,7 +1044,6 @@ impl Parser {
                             body,
                         },
                         span: Span::new(start.start, end.end),
-                        exported: false,
                     });
                 }
 
@@ -1238,7 +1051,6 @@ impl Parser {
                 Some(Decl {
                     node: DeclKind::Source { name, ty },
                     span: Span::new(start.start, end.end),
-                    exported: false,
                 })
             } else if this.eat(&TokenKind::Eq) {
                 // View declaration: *name = expr
@@ -1251,7 +1063,6 @@ impl Parser {
                         body,
                     },
                     span: Span::new(start.start, end.end),
-                    exported: false,
                 })
             } else {
                 this.error("expected ':', '=', or '<=' after source/view name");
@@ -1316,7 +1127,6 @@ impl Parser {
                 },
             },
                 span: Span::new(start.start, end.end),
-                exported: false,
             })
         })
     }
@@ -1357,7 +1167,6 @@ impl Parser {
             Some(Decl {
                 node: DeclKind::Derived { name, ty, body },
                 span: Span::new(start.start, end.end),
-                exported: false,
             })
         })
     }
@@ -1387,7 +1196,6 @@ impl Parser {
                                 body: Some(body),
                             },
                             span: Span::new(start.start, end.end),
-                            exported: false,
                         });
                     }
                 }
@@ -1410,7 +1218,6 @@ impl Parser {
                                     body: Some(body),
                                 },
                                 span: Span::new(start.start, end.end),
-                                exported: false,
                             });
                         } else {
                             // parse_expr failed — restore to before the name
@@ -1433,7 +1240,6 @@ impl Parser {
                         body: None,
                     },
                     span: Span::new(start.start, end.end),
-                    exported: false,
                 });
             }
 
@@ -1449,7 +1255,6 @@ impl Parser {
                     body: Some(body),
                 },
                 span: Span::new(start.start, end.end),
-                exported: false,
             })
         })
     }
@@ -1476,7 +1281,6 @@ impl Parser {
                 return Some(Decl {
                     node: DeclKind::RouteComposite { name, components },
                     span: Span::new(start.start, end.end),
-                    exported: false,
                 });
             }
 
@@ -1490,7 +1294,6 @@ impl Parser {
             Some(Decl {
                 node: DeclKind::Route { name, entries },
                 span: Span::new(start.start, end.end),
-                exported: false,
             })
         })
     }

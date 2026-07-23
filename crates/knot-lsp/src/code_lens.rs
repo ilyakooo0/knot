@@ -5,12 +5,11 @@ use std::collections::HashMap;
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind};
+use knot::ast::DeclKind;
 
 use crate::shared::{format_route_path, http_method_str, plural, route_is_listened};
 use crate::state::ServerState;
-use crate::type_format::format_type_kind;
-use crate::utils::{find_word_in_source, span_to_range};
+use crate::utils::span_to_range;
 
 // ── Code Lens ───────────────────────────────────────────────────────
 

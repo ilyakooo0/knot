@@ -271,14 +271,11 @@ fn hash_decl_signature(decl: &ast::Decl) -> u64 {
     h.finish()
 }
 
-/// Hash module-level structure: imports plus the *signature* of each decl
-/// (no bodies). When this changes, the import graph or trait surface
-/// shifted and even "clean-bodied" decls may need re-checking.
+/// Hash module-level structure: the *signature* of each decl (no bodies).
+/// When this changes, the trait surface shifted and even "clean-bodied"
+/// decls may need re-checking.
 fn hash_structure(module: &Module) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    for imp in &module.imports {
-        imp.path.hash(&mut h);
-    }
     for decl in &module.decls {
         match &decl.node {
             DeclKind::Fun { name, ty, .. } => {

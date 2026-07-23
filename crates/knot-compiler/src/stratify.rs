@@ -929,15 +929,15 @@ mod tests {
     }
 
     fn derived(name: &str, body: Expr) -> Decl {
-        Decl { node: DeclKind::Derived { name: name.to_string(), ty: None, body }, span: span(), exported: false }
+        Decl { node: DeclKind::Derived { name: name.to_string(), ty: None, body }, span: span() }
     }
 
     fn view(name: &str, body: Expr) -> Decl {
-        Decl { node: DeclKind::View { name: name.to_string(), ty: None, body }, span: span(), exported: false }
+        Decl { node: DeclKind::View { name: name.to_string(), ty: None, body }, span: span() }
     }
 
     fn fun(name: &str, body: Expr) -> Decl {
-        Decl { node: DeclKind::Fun { name: name.to_string(), ty: None, body: Some(body) }, span: span(), exported: false }
+        Decl { node: DeclKind::Fun { name: name.to_string(), ty: None, body: Some(body) }, span: span() }
     }
 
     fn lambda(params: Vec<&str>, body: Expr) -> Expr {
@@ -965,7 +965,7 @@ mod tests {
     }
 
     fn module(decls: Vec<Decl>) -> Module {
-        Module { imports: Vec::new(), decls }
+        Module { decls }
     }
 
     /// `diff a b` → `App(App(Var("diff"), a), b)`

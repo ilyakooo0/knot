@@ -560,26 +560,16 @@ pub fn dropped_sources(source_path: &Path, type_env: &TypeEnv) -> Vec<String> {
 }
 
 /// Write the lockfile after a successful compile.
-/// Only writes if there are source declarations to track (in the entry module
-/// or any imported module).
-/// `imported_type_snippets` carries type alias / data declarations from
-/// imported modules (sliced from their own source files), so types referenced
-/// by source declarations still resolve when the lockfile is parsed alone.
-/// `imported_source_snippets` carries the source declarations from imported
-/// modules, so schema changes to them are tracked by the lockfile just like
-/// entry-module sources (rather than only surfacing as a runtime startup panic).
+/// Only writes if there are source declarations to track.
 pub fn update(
     source_path: &Path,
     source_text: &str,
     module: &Module,
-    imported_type_snippets: &[String],
-    imported_source_snippets: &[String],
 ) -> Result<(), String> {
     let has_sources = module
         .decls
         .iter()
         .any(|d| matches!(&d.node, DeclKind::Source { .. }))
-        || !imported_source_snippets.is_empty()
         || !record_embedded_sources(module).is_empty();
 
     let lock_path = lockfile_path(source_path);
@@ -594,7 +584,7 @@ pub fn update(
         return Ok(());
     }
 
-    let content = generate(module, source_text, imported_type_snippets, imported_source_snippets);
+    let content = generate(module, source_text);
     // Atomic write: write to a temp file then rename, so a crash mid-write
     // doesn't leave a corrupt lockfile that hard-errors every compile.
     let tmp_path = lock_path.with_extension("lock.tmp");
@@ -648,24 +638,10 @@ fn find_migrate_span(module: &Module, name: &str) -> Span {
 }
 
 /// Generate lockfile content by extracting declarations from source text.
-fn generate(module: &Module, source_text: &str, imported_type_snippets: &[String], imported_source_snippets: &[String]) -> String {
+fn generate(module: &Module, source_text: &str) -> String {
     let mut out = String::new();
     out.push_str("-- schema.lock (auto-generated, do not edit)\n");
     out.push_str("-- Commit to source control.\n");
-
-    // Type declarations from imported modules (sliced from their own sources)
-    for snippet in imported_type_snippets {
-        out.push('\n');
-        out.push_str(snippet);
-        out.push('\n');
-    }
-
-    // Source declarations from imported modules
-    for snippet in imported_source_snippets {
-        out.push('\n');
-        out.push_str(snippet);
-        out.push('\n');
-    }
 
     // Type aliases (non-parameterized) and data declarations
     for decl in &module.decls {

@@ -2,9 +2,8 @@
 
 use lsp_types::*;
 
-use crate::rename::{collect_name_uses_in_decl, is_at_record_field};
 use crate::state::ServerState;
-use crate::utils::{ident_lookup_offset, position_to_offset, span_to_range, word_at_position};
+use crate::utils::{ident_lookup_offset, position_to_offset, span_to_range};
 
 // ── Document Highlights ─────────────────────────────────────────────
 
@@ -48,52 +47,8 @@ pub(crate) fn handle_document_highlight(
                 .copied()
         });
 
-    // Cursor sits on a usage of an imported symbol. Those usages are not
-    // recorded in `doc.references` (which only resolves module-local
-    // declarations), so the local resolution above fails — fall back to
-    // `import_defs`, exactly like goto-definition and find-references. Without
-    // this, highlight returned nothing for imported symbols even though goto
-    // and references both resolved them.
     let Some(def_span) = def_span else {
-        // Guard the name-keyed `import_defs` lookup like goto does: a
-        // record-field token (`p.name`) is never in `references`, so it always
-        // falls through here and must not resolve to an imported symbol that
-        // merely shares its name.
-        if is_at_record_field(&doc.module, &doc.source, offset) {
-            return None;
-        }
-        let word = word_at_position(&doc.source, pos)?;
-        let (owner_path, decl_span) = doc.import_defs.get(word)?;
-        let symbol_name = word.to_string();
-        let mut sites = Vec::new();
-        for decl in &doc.module.decls {
-            collect_name_uses_in_decl(decl, &symbol_name, &doc.source, &mut sites);
-        }
-        // The import item that surfaces the name (`import ./m {name}`) is also a
-        // local occurrence worth highlighting.
-        for imp in &doc.module.imports {
-            if let Some(items) = &imp.items {
-                for item in items {
-                    if item.name == symbol_name {
-                        sites.push(item.span);
-                    }
-                }
-            }
-        }
-        sites.sort_by_key(|s| s.start);
-        sites.dedup_by_key(|s| s.start);
-        let highlights: Vec<DocumentHighlight> = sites
-            .into_iter()
-            .map(|span| DocumentHighlight {
-                range: span_to_range(span, &doc.source),
-                kind: Some(DocumentHighlightKind::READ),
-            })
-            .collect();
-        return if highlights.is_empty() {
-            None
-        } else {
-            Some(highlights)
-        };
+        return None;
     };
 
     let mut highlights = Vec::new();
@@ -148,43 +103,6 @@ mod tests {
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
         }
-    }
-
-    #[test]
-    fn highlights_imported_symbol_usages() {
-        // Regression (Bug 2): document highlight resolved only via module-local
-        // `references`/`definitions`, so an imported symbol resolved to nothing
-        // and no usages were highlighted — even though goto-definition and
-        // find-references both resolve it. It now consults `import_defs` and
-        // highlights the local usages.
-        let mut tw = TempWorkspace::new();
-        let _owner = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
-        let consumer_uri = tw.write_and_open(
-            "consumer.knot",
-            "import ./owner\na = parse 1\nb = parse 2\n",
-        );
-        let consumer_doc = tw.workspace.doc(&consumer_uri);
-        let off = consumer_doc.source.find("parse 1").expect("first use");
-        let pos = offset_to_position(&consumer_doc.source, off);
-        let hls =
-            handle_document_highlight(&tw.workspace.state, &highlight_params(&consumer_uri, pos))
-                .expect("highlights for imported symbol");
-        let use1 = offset_to_position(
-            &consumer_doc.source,
-            consumer_doc.source.find("parse 1").unwrap(),
-        );
-        let use2 = offset_to_position(
-            &consumer_doc.source,
-            consumer_doc.source.find("parse 2").unwrap(),
-        );
-        assert!(
-            hls.iter().any(|h| h.range.start == use1),
-            "first imported usage must be highlighted; got: {hls:?}"
-        );
-        assert!(
-            hls.iter().any(|h| h.range.start == use2),
-            "second imported usage must be highlighted; got: {hls:?}"
-        );
     }
 
     #[test]

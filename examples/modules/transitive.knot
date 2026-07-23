@@ -1,5 +1,0 @@
-import ./lib/helpers
-
-main = do
-  println (greet "World")
-  yield {}

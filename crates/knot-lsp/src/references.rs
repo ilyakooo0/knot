@@ -1,21 +1,12 @@
 //! `textDocument/references` handler.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 
 use lsp_types::*;
 
-use crate::analysis::get_or_parse_file_shared;
-use crate::defs::resolve_definitions;
-use crate::rename::{
-    collect_name_uses_in_decl, file_imports_owner, imports_name_from_other_module,
-    module_defines_name,
-};
-use crate::shared::scan_knot_files_in_roots;
 use crate::state::ServerState;
 use crate::utils::{
-    ident_lookup_offset, path_to_uri, position_to_offset, span_to_range, uri_to_path,
-    word_at_position,
+    ident_lookup_offset, position_to_offset, span_to_range, word_at_position,
 };
 
 /// Cap on the number of locations returned by a single `textDocument/references`
@@ -86,8 +77,7 @@ pub(crate) fn handle_references(
     // name-keyed fallback would misfire — on a record field (or any other
     // token) that merely *shares its name* with a top-level symbol, it
     // returned that unrelated symbol's references.
-    let word = word_at_position(&doc.source, pos)?;
-    let symbol_name = word.to_string();
+    word_at_position(&doc.source, pos)?;
 
     // Case A (mirrors `rename::resolve_canonical_owner`): a recorded reference
     // covering the cursor, or the cursor on a definition's own name token —
@@ -104,300 +94,43 @@ pub(crate) fn handle_references(
             doc.definitions.values().find(|span| span.start <= offset && offset < span.end).copied()
         });
 
-    let current_path = uri_to_path(uri).and_then(|p| p.canonicalize().ok());
-
-    // Case B: the cursor sits on a *usage* of an imported symbol. These usages
-    // are not recorded in `doc.references` (which only resolves module-local
-    // declarations), so Case A fails — fall back to `import_defs` to recover
-    // the owning file, exactly like `rename`. Without this, Find References on
-    // an imported symbol's use returned nothing even though Rename worked from
-    // the same cursor. A local definition takes priority over an import of the
-    // same name (when this file both declares and imports `parse`, references
-    // here resolve to the local declaration).
-    // The `import_defs` lookup is name-keyed, so guard it like Case A is
-    // position-based: a record-field token must not fall through to an imported
-    // symbol that merely shares its name (field tokens aren't in `references`, so
-    // Case A always fails for them and they'd otherwise hit this fallback).
-    let imported_owner: Option<PathBuf> = if local_def.is_none()
-        && !crate::rename::is_at_record_field(&doc.module, &doc.source, offset)
-    {
-        doc.import_defs.get(&symbol_name).map(|(p, _)| p.clone())
-    } else {
-        None
-    };
-
-    // Nothing resolved: not a definition, a local usage, or an imported symbol.
-    if local_def.is_none() && imported_owner.is_none() {
+    // Nothing resolved: not a definition and not a local usage.
+    let Some(def_span) = local_def else {
         return None;
-    }
+    };
 
     let mut locations = Vec::new();
 
-    // Current-document contributions.
-    if let Some(def_span) = local_def {
-        // Include declaration if requested.
-        if params.context.include_declaration {
-            locations.push(Location {
-                uri: uri.clone(),
-                range: span_to_range(def_span, &doc.source),
-            });
+    // Include declaration if requested.
+    if params.context.include_declaration {
+        locations.push(Location {
+            uri: uri.clone(),
+            range: span_to_range(def_span, &doc.source),
+        });
+    }
+    // All local usages resolving to this definition. Local binders record a
+    // self-reference (usage == def) so position-based resolution works from
+    // the binder token; skip it here — the declaration is handled above
+    // (and only emitted when `include_declaration` is set), so without this
+    // guard the binder would surface as a usage even for
+    // `include_declaration = false`. Mirrors `document_highlight`.
+    for (usage_span, target_span) in &doc.references {
+        if locations.len() >= MAX_REFERENCE_LOCATIONS {
+            break;
         }
-        // All local usages resolving to this definition. Local binders record a
-        // self-reference (usage == def) so position-based resolution works from
-        // the binder token; skip it here — the declaration is handled above
-        // (and only emitted when `include_declaration` is set), so without this
-        // guard the binder would surface as a usage even for
-        // `include_declaration = false`. Mirrors `document_highlight`.
-        for (usage_span, target_span) in &doc.references {
-            if locations.len() >= MAX_REFERENCE_LOCATIONS {
-                break;
-            }
-            if *usage_span == def_span {
+        if *usage_span == def_span {
+            continue;
+        }
+        if *target_span == def_span {
+            // Skip declaration-name tokens of multi-line decls; they're
+            // recorded as self-references but are not usages.
+            if is_declaration_token(&doc.source, *usage_span) {
                 continue;
-            }
-            if *target_span == def_span {
-                // Skip declaration-name tokens of multi-line decls; they're
-                // recorded as self-references but are not usages.
-                if is_declaration_token(&doc.source, *usage_span) {
-                    continue;
-                }
-                locations.push(Location {
-                    uri: uri.clone(),
-                    range: span_to_range(*usage_span, &doc.source),
-                });
-            }
-        }
-    } else {
-        // Imported symbol: its usages in this file are not in `doc.references`,
-        // so walk the AST (scope-aware, skipping shadowed locals) plus the
-        // import items that surface the name — mirroring the importer branches
-        // below.
-        let mut sites = Vec::new();
-        for decl in &doc.module.decls {
-            collect_name_uses_in_decl(decl, &symbol_name, &doc.source, &mut sites);
-        }
-        for imp in &doc.module.imports {
-            if let Some(items) = &imp.items {
-                for item in items {
-                    if item.name == symbol_name {
-                        sites.push(item.span);
-                    }
-                }
-            }
-        }
-        for site in sites {
-            if locations.len() >= MAX_REFERENCE_LOCATIONS {
-                break;
             }
             locations.push(Location {
                 uri: uri.clone(),
-                range: span_to_range(site, &doc.source),
+                range: span_to_range(*usage_span, &doc.source),
             });
-        }
-    }
-
-    // Origin discipline (mirrors the rename path): cross-file usages count
-    // only when the other file imports the symbol from its owning file and
-    // doesn't declare a same-named symbol of its own. Resolve where the
-    // symbol's canonical definition lives:
-    // - declared at top level in the current doc → the current file;
-    // - a local binding (lambda param, let, do-bind) → nowhere else; other
-    //   files can't reference it, so cross-file matching is skipped;
-    // - a usage of an imported symbol → the imported (owning) file.
-    let owner_path: Option<PathBuf> = match (&local_def, &imported_owner) {
-        (Some(def_span), _) if doc.definitions.values().any(|s| s == def_span) => {
-            current_path.clone()
-        }
-        (Some(_), _) => None,
-        (None, Some(p)) => Some(p.clone()),
-        (None, None) => None,
-    };
-
-    // Cross-file: search all other open documents for references that resolve
-    // to the same origin.
-    if let Some(owner_path) = &owner_path {
-        'open_docs: for (other_uri, other_doc) in &state.documents {
-            if locations.len() >= MAX_REFERENCE_LOCATIONS {
-                break;
-            }
-            if other_uri == uri {
-                continue;
-            }
-            let other_path = uri_to_path(other_uri).and_then(|p| p.canonicalize().ok());
-            if other_path.as_ref() == Some(owner_path) {
-                // The owning file itself (open while we started from an
-                // importer): its own references to the definition count.
-                if let Some(other_def) = other_doc.definitions.get(&symbol_name).copied() {
-                    if params.context.include_declaration {
-                        locations.push(Location {
-                            uri: other_uri.clone(),
-                            range: span_to_range(other_def, &other_doc.source),
-                        });
-                    }
-                    for (usage_span, target_span) in &other_doc.references {
-                        if locations.len() >= MAX_REFERENCE_LOCATIONS {
-                            break 'open_docs;
-                        }
-                        if *target_span == other_def {
-                            if is_declaration_token(&other_doc.source, *usage_span) {
-                                continue;
-                            }
-                            locations.push(Location {
-                                uri: other_uri.clone(),
-                                range: span_to_range(*usage_span, &other_doc.source),
-                            });
-                        }
-                    }
-                }
-            } else if other_doc.definitions.contains_key(&symbol_name) {
-                // The other file declares its own, unrelated symbol with the
-                // same name — every reference there resolves locally.
-                continue;
-            } else if other_doc
-                .import_defs
-                .get(&symbol_name)
-                .map(|(p, _)| p == owner_path)
-                .unwrap_or(false)
-            {
-                // Importer of the same origin. If it ALSO imports the name
-                // from a different module, its body references are ambiguous —
-                // skip rather than misattribute them (mirrors the rename path).
-                if let Some(other_path) = &other_path
-                    && imports_name_from_other_module(
-                        &other_doc.module,
-                        other_path,
-                        owner_path,
-                        &symbol_name,
-                    ) {
-                        continue;
-                    }
-                // Imported-symbol usages don't appear in `references` (which
-                // only resolves local decls), so walk the AST — scope-aware,
-                // skipping shadowed locals.
-                let mut sites = Vec::new();
-                for decl in &other_doc.module.decls {
-                    collect_name_uses_in_decl(decl, &symbol_name, &other_doc.source, &mut sites);
-                }
-                for imp in &other_doc.module.imports {
-                    if let Some(items) = &imp.items {
-                        for item in items {
-                            if item.name == symbol_name {
-                                sites.push(item.span);
-                            }
-                        }
-                    }
-                }
-                for site in sites {
-                    if locations.len() >= MAX_REFERENCE_LOCATIONS {
-                        break 'open_docs;
-                    }
-                    locations.push(Location {
-                        uri: other_uri.clone(),
-                        range: span_to_range(site, &other_doc.source),
-                    });
-                }
-            }
-        }
-    }
-
-    // Cross-file: scan workspace files that are not currently open. Cheap when
-    // they're already cached in `import_cache`; falls back to a one-shot parse
-    // otherwise. The same origin discipline applies: a file only contributes
-    // usages when it imports the owner (and doesn't define its own same-named
-    // symbol); the unopened owner file contributes its declaration + local
-    // references.
-    if let Some(owner_path) = &owner_path {
-        let open_paths: HashSet<PathBuf> = state
-            .documents
-            .keys()
-            .filter_map(uri_to_path)
-            .filter_map(|p| p.canonicalize().ok())
-            .collect();
-        let workspace_files =
-            scan_knot_files_in_roots(&state.workspace_roots, state.workspace_root.as_deref());
-        for file_path in workspace_files {
-            if locations.len() >= MAX_REFERENCE_LOCATIONS {
-                break;
-            }
-            let canonical = match file_path.canonicalize() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if open_paths.contains(&canonical) {
-                continue;
-            }
-            let (module, source) =
-                match get_or_parse_file_shared(&canonical, &state.import_cache) {
-                    Some(p) => p,
-                    None => continue,
-                };
-            // Quick rejection before any AST walk.
-            if !source.contains(symbol_name.as_str()) {
-                continue;
-            }
-            // Skip files whose path can't be encoded as a URI rather than
-            // emitting a junk `file:///` location — locations with nonsense
-            // URIs would silently mislead the editor's references pane.
-            let Some(other_uri) = path_to_uri(&canonical) else {
-                continue;
-            };
-            if canonical == *owner_path {
-                // Unopened owner: recompute defs/refs from the disk copy.
-                let (defs, refs, _) = resolve_definitions(&module, &source);
-                if let Some(def) = defs.get(&symbol_name).copied() {
-                    if params.context.include_declaration {
-                        locations.push(Location {
-                            uri: other_uri.clone(),
-                            range: span_to_range(def, &source),
-                        });
-                    }
-                    for (usage_span, target_span) in &refs {
-                        if locations.len() >= MAX_REFERENCE_LOCATIONS {
-                            break;
-                        }
-                        if *target_span == def {
-                            if is_declaration_token(&source, *usage_span) {
-                                continue;
-                            }
-                            locations.push(Location {
-                                uri: other_uri.clone(),
-                                range: span_to_range(*usage_span, &source),
-                            });
-                        }
-                    }
-                }
-            } else if !module_defines_name(&module, &symbol_name)
-                && file_imports_owner(&module, &canonical, owner_path, &symbol_name)
-                && !imports_name_from_other_module(
-                    &module,
-                    &canonical,
-                    owner_path,
-                    &symbol_name,
-                )
-            {
-                let mut sites = Vec::new();
-                for decl in &module.decls {
-                    collect_name_uses_in_decl(decl, &symbol_name, &source, &mut sites);
-                }
-                for imp in &module.imports {
-                    if let Some(items) = &imp.items {
-                        for item in items {
-                            if item.name == symbol_name {
-                                sites.push(item.span);
-                            }
-                        }
-                    }
-                }
-                for site in sites {
-                    if locations.len() >= MAX_REFERENCE_LOCATIONS {
-                        break;
-                    }
-                    locations.push(Location {
-                        uri: other_uri.clone(),
-                        range: span_to_range(site, &source),
-                    });
-                }
-            }
         }
     }
 
@@ -542,75 +275,6 @@ main = println (show (double 3))
             "usages of the unrelated same-named local must be excluded; got: {locs:?}"
         );
         let _ = unrelated_uri;
-    }
-
-    #[test]
-    fn references_includes_importer_usages_but_not_shadowed_locals() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
-        let consumer_uri = tw.write_and_open(
-            "consumer.knot",
-            "import ./owner\n\nrun = parse 1\nshadow = \\parse -> parse 2\n",
-        );
-        let owner_doc = tw.workspace.doc(&owner_uri);
-        let pos = offset_to_position(
-            &owner_doc.source,
-            owner_doc.source.find("parse =").expect("def"),
-        );
-        let locs = handle_references(&tw.workspace.state, &ref_params(&owner_uri, pos, false))
-            .expect("references found");
-        let consumer_doc = tw.workspace.doc(&consumer_uri);
-        let consumer_locs: Vec<_> = locs.iter().filter(|l| l.uri == consumer_uri).collect();
-        assert_eq!(
-            consumer_locs.len(),
-            1,
-            "only the import-resolved call site counts; got: {locs:?}"
-        );
-        let expected = offset_to_position(
-            &consumer_doc.source,
-            consumer_doc.source.find("parse 1").expect("call site"),
-        );
-        assert_eq!(
-            consumer_locs[0].range.start, expected,
-            "the included usage must be `parse 1`, not the shadowed lambda body"
-        );
-    }
-
-    #[test]
-    fn references_disk_scan_respects_origin() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
-        // Unopened files on disk: one imports the owner (its usage counts),
-        // one declares its own same-named symbol (must be excluded).
-        std::fs::write(
-            tw.root.join("importer.knot"),
-            "import ./owner\nrun = parse 1\n",
-        )
-        .unwrap();
-        std::fs::write(
-            tw.root.join("unrelated.knot"),
-            "parse = \\y -> y\nz = parse 3\n",
-        )
-        .unwrap();
-        let owner_doc = tw.workspace.doc(&owner_uri);
-        let pos = offset_to_position(
-            &owner_doc.source,
-            owner_doc.source.find("parse =").expect("def"),
-        );
-        let locs = handle_references(&tw.workspace.state, &ref_params(&owner_uri, pos, false))
-            .expect("references found");
-        assert!(
-            locs.iter()
-                .any(|l| l.uri.as_str().ends_with("importer.knot")),
-            "the unopened importer's usage must be included; got: {locs:?}"
-        );
-        assert!(
-            locs.iter()
-                .all(|l| !l.uri.as_str().ends_with("unrelated.knot")),
-            "the unopened file with its own `parse` must be excluded; got: {locs:?}"
-        );
     }
 
     #[test]

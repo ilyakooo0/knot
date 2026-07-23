@@ -1,13 +1,10 @@
 //! Regression tests for a bug-hunt batch (compiler side):
 //!
-//! 1. Transitive exports leaked into an importer's export scan: a module with
-//!    no `export` of its own was wrongly treated as "export-only" (and its own
-//!    declarations dropped) just because a module it imported had exports.
-//! 2. `set` on a *scalar* source emitted a spurious `r *rel` read effect, so an
+//! 1. `set` on a *scalar* source emitted a spurious `r *rel` read effect, so an
 //!    honest `{w *rel}` signature was rejected and had to be widened to
 //!    `{rw *rel}`. Both the type-level (`infer`) and the effect-checker
 //!    (`effects`) paths carried the defect.
-//! 3. Stratification's `diff`-negation detector only matched a bare
+//! 2. Stratification's `diff`-negation detector only matched a bare
 //!    `Var("diff")` head, so a self-negating recursive derived relation written
 //!    through a local alias (`let d = diff`) or a transparent wrapper
 //!    (`(diff : T)`) escaped the check and oscillated at runtime instead of
@@ -75,52 +72,6 @@ impl Scratch {
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
-}
-
-// ── Finding 1: transitive exports must not hide an importer's own decls ──
-
-#[test]
-fn transitive_export_does_not_hide_middle_modules_own_decls() {
-    let s = Scratch::new("transitive_export");
-    // `core` exports something; `helpers` has NO export of its own but imports
-    // `core`; `main` imports `helpers` and uses its non-exported `greet`.
-    s.write("core.knot", "export greeting = \"Hello\"\n");
-    s.write(
-        "helpers.knot",
-        "import ./core\n\ngreet = \\name -> greeting ++ \", \" ++ name ++ \"!\"\n",
-    );
-    s.write(
-        "main.knot",
-        "import ./helpers\n\nmain = do\n  println (greet \"World\")\n  yield {}\n",
-    );
-
-    let (ok, stdout, stderr) = s.build("main.knot");
-    assert!(
-        ok,
-        "build should succeed — `helpers` has no own export so `greet` stays visible.\nstdout: {stdout}\nstderr: {stderr}"
-    );
-    assert!(
-        s.run("main").contains("Hello, World!"),
-        "expected the greeting in program output"
-    );
-}
-
-#[test]
-fn own_exports_still_hide_non_exported_decls() {
-    // Control for Finding 1: a module WITH its own exports must still hide its
-    // non-exported declarations from importers.
-    let s = Scratch::new("own_exports_hide");
-    s.write("lib.knot", "export a = 1\n\nb = 2\n");
-    s.write(
-        "main.knot",
-        "import ./lib\n\nmain = do\n  println (show b)\n  yield {}\n",
-    );
-    let (ok, _stdout, stderr) = s.build("main.knot");
-    assert!(!ok, "importing non-exported `b` must fail");
-    assert!(
-        stderr.contains("undefined variable 'b'"),
-        "expected an 'undefined variable b' error, got:\n{stderr}"
-    );
 }
 
 // ── Finding 2: `set` on a scalar source is write-only ────────────────────

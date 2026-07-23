@@ -8,7 +8,7 @@ use knot::ast::{self, DeclKind};
 use crate::shared::extract_principal_type_name;
 use crate::state::ServerState;
 use crate::utils::{
-    find_word_in_source, ident_lookup_offset, path_to_uri, position_to_offset, span_to_range,
+    find_word_in_source, ident_lookup_offset, position_to_offset, span_to_range,
     word_at_position,
 };
 
@@ -95,23 +95,7 @@ pub(crate) fn handle_goto_definition(
         }));
     }
 
-    // Cross-file: check imported definitions. The `import_defs` lookup is purely
-    // name-keyed, so guard it the same way the local path above is position-based:
-    // a record-field token must not fall through to an imported symbol that merely
-    // shares its name (field tokens are never recorded in `references`, so without
-    // this guard `b.size` jumps to an imported `size` function).
-    if crate::rename::is_at_record_field(&doc.module, &doc.source, offset) {
-        return None;
-    }
-    let word = word_at_position(&doc.source, pos)?;
-    let (path, span) = doc.import_defs.get(word)?;
-    let imported_source = doc.imported_files.get(path)?;
-    let range = span_to_range(*span, imported_source);
-    let import_uri = path_to_uri(path)?;
-    Some(GotoDefinitionResponse::Scalar(Location {
-        uri: import_uri,
-        range,
-    }))
+    None
 }
 
 // ── Go to type definition ────────────────────────────────────────────
@@ -188,24 +172,13 @@ pub(crate) fn handle_goto_type_definition(
         }));
     }
 
-    // Check imported definitions
-    if let Some((path, span)) = doc.import_defs.get(&type_name) {
-        let imported_source = doc.imported_files.get(path)?;
-        let range = span_to_range(*span, imported_source);
-        let import_uri = path_to_uri(path)?;
-        return Some(GotoDefinitionResponse::Scalar(Location {
-            uri: import_uri,
-            range,
-        }));
-    }
-
     None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TempWorkspace, TestWorkspace};
+    use crate::test_support::TestWorkspace;
     use crate::utils::offset_to_position;
 
     fn goto_params(uri: &Uri, position: Position) -> GotoDefinitionParams {

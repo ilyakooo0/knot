@@ -761,28 +761,3 @@ pub fn build_details(module: &Module) -> HashMap<String, String> {
 
     details
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse(source: &str) -> Module {
-        let lexer = knot::lexer::Lexer::new(source);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(source.to_string(), tokens);
-        let (module, _) = parser.parse_module();
-        module
-    }
-
-    /// True if some recorded reference's usage span is exactly `text` and
-    /// points at the definition of `def_name`.
-    fn has_ref_to(defs: &Definitions, source: &str, text: &str, def_name: &str) -> bool {
-        let (name_map, refs, _) = defs;
-        let Some(def) = name_map.get(def_name) else {
-            return false;
-        };
-        refs.iter().any(|(usage, d)| {
-            d == def && source.get(usage.start..usage.end) == Some(text)
-        })
-    }
-}

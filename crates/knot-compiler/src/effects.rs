@@ -2481,14 +2481,14 @@ mod tests {
     // ── Expression inference tests ───────────────────────────────
 
     fn check_module(decls: Vec<Decl>) -> (Vec<Diagnostic>, HashMap<String, EffectSet>) {
-        let module = Module { imports: vec![], decls };
+        let module = Module { decls };
         let mut checker = EffectChecker::new();
         checker.run(&module);
         (checker.diagnostics, checker.decl_effects)
     }
 
     fn make_decl(node: DeclKind) -> Decl {
-        Decl { node, span: span(), exported: false }
+        Decl { node, span: span() }
     }
 
     fn make_source(name: &str) -> Decl {
@@ -3096,7 +3096,6 @@ mod tests {
                 body: Some(body),
             },
             span: Span::new(0, 200), // wide decl span, would cover comments
-            exported: false,
         };
         let (diags, _) = check_module(vec![decl]);
         assert_eq!(diags.len(), 1, "expected unused-effects warning");

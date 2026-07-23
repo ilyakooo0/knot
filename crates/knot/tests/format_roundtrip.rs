@@ -347,41 +347,6 @@ fn lexer_byte_string_valid_hex_still_works() {
     }
 }
 
-// ── 7. `export` prefix must survive formatting ──
-
-#[test]
-fn export_fun_round_trips() {
-    let out = check_str("export_fun", "export add = \\x y -> x + y\n");
-    assert!(out.contains("export add"), "output: {}", out);
-}
-
-#[test]
-fn export_various_decl_kinds_round_trip() {
-    let src = "export type Person = {name: Text}\n\
-               export data Color = Red {} | Blue {}\n\
-               export *users : [{name: Text}]\n\
-               export add = \\x y -> x + y\n\
-               nonExported = 1\n";
-    let out = check_str("export_kinds", src);
-    assert!(out.contains("export type Person"), "output: {}", out);
-    assert!(out.contains("export data Color"), "output: {}", out);
-    assert!(out.contains("export *users"), "output: {}", out);
-    assert!(out.contains("export add"), "output: {}", out);
-    assert!(out.contains("\nnonExported"), "output: {}", out);
-}
-
-#[test]
-fn export_survives_verbatim_comment_fallback() {
-    // A decl containing an inline comment takes the verbatim-copy path,
-    // whose span starts after `export` — the prefix must be re-attached.
-    let src = "export add = \\x y ->\n  -- inline comment\n  x + y\n";
-    let m = parse(src).unwrap();
-    let out = knot::format::format_module(src, &m);
-    assert!(out.contains("export add"), "output: {}", out);
-    let m2 = parse(&out).unwrap_or_else(|e| panic!("reparse failed:\n{}\n{}", out, e));
-    assert!(m2.decls[0].exported, "exported flag lost: {}", out);
-}
-
 // ── 8. Set/ReplaceSet keep parens in non-head positions ──
 
 #[test]

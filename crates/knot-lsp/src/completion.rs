@@ -10,12 +10,11 @@ use lsp_types::*;
 use knot::ast::{self, DeclKind, Module, Span, TypeKind};
 use knot_compiler::infer::MonadKind;
 
-use crate::analysis::get_or_parse_file_shared;
 use crate::builtins::ATOMIC_DISALLOWED_BUILTINS;
 use crate::shared::{
     collect_lambda_param_names, extract_record_fields, find_enclosing_atomic_expr,
     find_field_refinement, format_route_constructor_hover, predicate_to_source,
-    resolve_var_to_source, scan_knot_files_in_roots,
+    resolve_var_to_source,
 };
 use crate::state::{
     builtins as state_builtins, DocumentState, ServerState, SnippetContext, KEYWORDS, SNIPPETS,
@@ -540,37 +539,12 @@ pub(crate) fn handle_completion(
         }
     }
 
-    // Imported symbols (selective or wildcard imports): they're in scope, so
-    // they belong in the list alongside local declarations. Local decls of
-    // the same name shadow the import and were already pushed above.
-    for name in doc.import_defs.keys() {
-        if doc.definitions.contains_key(name) {
-            continue;
-        }
-        let kind = if name.chars().next().is_some_and(|c| c.is_uppercase()) {
-            CompletionItemKind::STRUCT
-        } else {
-            CompletionItemKind::FUNCTION
-        };
-        let detail = doc.type_info.get(name.as_str()).cloned().or_else(|| {
-            doc.import_origins
-                .get(name)
-                .map(|origin| format!("imported from {origin}"))
-        });
-        items.push(CompletionItem {
-            label: name.clone(),
-            kind: Some(kind),
-            detail,
-            ..Default::default()
-        });
-    }
-
     // Built-in functions with type info. Synthesize a snippet from the
     // arity recorded in `type_info` so users get tab stops on call.
-    // A user declaration (or import) of the same name shadows the builtin —
-    // offering both produced duplicate items with divergent snippets.
+    // A user declaration of the same name shadows the builtin — offering
+    // both produced duplicate items with divergent snippets.
     for name in state_builtins() {
-        if doc.definitions.contains_key(name) || doc.import_defs.contains_key(name) {
+        if doc.definitions.contains_key(name) {
             continue;
         }
         let detail = doc.type_info.get(name).cloned();
@@ -585,128 +559,6 @@ pub(crate) fn handle_completion(
             insert_text_format: Some(InsertTextFormat::SNIPPET),
             ..Default::default()
         });
-    }
-
-    // Auto-import completions: scan workspace for symbols not in current document.
-    // Uses the parsed-import cache (populated lazily as imports are resolved
-    // for any open file) plus a one-shot disk read for files we haven't parsed
-    // yet. Modules are not re-parsed across completion requests within a single
-    // analyze cycle.
-    {
-        // Cap auto-import suggestions so a workspace with thousands of exported
-        // symbols can't generate a giant payload on every keystroke. The user
-        // will type-filter further; clients also typically truncate before
-        // rendering.
-        const MAX_AUTO_IMPORT_ITEMS: usize = 500;
-
-        let source_path = uri_to_path(uri);
-        let current_canonical = source_path.as_ref().and_then(|p| p.canonicalize().ok());
-        let existing_imports: HashSet<String> = doc.module.imports.iter().map(|i| i.path.clone()).collect();
-        // Names already in scope — local declarations AND symbols brought in
-        // by existing imports. Suggesting an auto-import for a name the file
-        // can already see would add a redundant (or conflicting) import line.
-        let local_names: HashSet<&str> = doc
-            .definitions
-            .keys()
-            .map(|s| s.as_str())
-            .chain(doc.import_defs.keys().map(|s| s.as_str()))
-            .collect();
-
-        // De-dupe by name across files: if two workspace files both export
-        // `parse`, prefer the one whose path sorts first. `scan_knot_files_*`
-        // pushes files in `read_dir` order, which is filesystem-dependent, so
-        // sort first — otherwise which file's import target wins (and the
-        // suggested import line) is nondeterministic across runs and machines.
-        let mut seen_names: HashSet<String> = HashSet::new();
-        let mut auto_imports_added: usize = 0;
-
-        let mut files = scan_knot_files_in_roots(
-            &state.workspace_roots,
-            state.workspace_root.as_deref(),
-        );
-        files.sort();
-        'files: for file_path in files {
-            if auto_imports_added >= MAX_AUTO_IMPORT_ITEMS {
-                break;
-            }
-            let canonical = match file_path.canonicalize() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            // Skip current file
-            if current_canonical.as_ref() == Some(&canonical) {
-                continue;
-            }
-            // Compute the import path relative to the current file. Use the
-            // same `./`-prefixed form the parser stores for imports
-            // (`./helpers`, `../shared/x`) — a bare `helpers` would never
-            // match `existing_imports` (so already-imported files keep being
-            // offered) and produces a parse error when accepted.
-            let import_path = match current_canonical.as_ref() {
-                Some(cur) => {
-                    match crate::code_action::relative_import_path(cur, &canonical) {
-                        Some(rel) => rel,
-                        None => continue,
-                    }
-                }
-                None => continue,
-            };
-            // Skip already imported files
-            if existing_imports.contains(&import_path) {
-                continue;
-            }
-
-            // Reuse the cached parsed module if available (populated by
-            // resolve_import_navigation when other files have imported it),
-            // and populate the cache if not — auto-import completion is
-            // typically the first request that touches new workspace files.
-            let module = match get_or_parse_file_shared(&canonical, &state.import_cache)
-            {
-                Some((m, _)) => m,
-                None => continue,
-            };
-
-            for decl in &module.decls {
-                // Only suggest exported names (or all top-level if `export`
-                // isn't being used in this file)
-                let (name, kind) = match &decl.node {
-                    DeclKind::Fun { name, .. } => (name.clone(), CompletionItemKind::FUNCTION),
-                    DeclKind::Data { name, .. } => (name.clone(), CompletionItemKind::STRUCT),
-                    DeclKind::TypeAlias { name, .. } => (name.clone(), CompletionItemKind::STRUCT),
-                    _ => continue,
-                };
-                // Skip names already defined locally or already suggested
-                if local_names.contains(name.as_str()) || seen_names.contains(&name) {
-                    continue;
-                }
-                seen_names.insert(name.clone());
-
-                // Defer `additional_text_edits` computation to resolve —
-                // produce a marker payload via `data` instead. The resolve
-                // handler computes the import-line edit only for the item
-                // the user actually selects, avoiding O(workspace_files ×
-                // decls) edit construction per keystroke.
-                let data = serde_json::json!({
-                    "kind": "auto_import",
-                    "name": name,
-                    "import_path": import_path,
-                    "source_uri": uri.to_string(),
-                });
-
-                items.push(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(kind),
-                    detail: Some(format!("auto-import from {import_path}")),
-                    sort_text: Some(format!("zz_{name}")), // sort after local items
-                    data: Some(data),
-                    ..Default::default()
-                });
-                auto_imports_added += 1;
-                if auto_imports_added >= MAX_AUTO_IMPORT_ITEMS {
-                    break 'files;
-                }
-            }
-        }
     }
 
     // Monad-aware ranking: inside a do-block, items whose type sits in the
@@ -915,12 +767,10 @@ fn lookup_local_binding_type(doc: &DocumentState, name: &str, offset: usize) -> 
 /// Within a category items keep their original alphabetical order (the
 /// editor sorts on `sort_text`, falling back to `label`).
 fn apply_default_category_ranking(items: &mut [CompletionItem], doc: &DocumentState) {
-    // Imported names rank with locals: both are already in scope.
     let local_names: std::collections::HashSet<&str> = doc
         .definitions
         .keys()
         .map(String::as_str)
-        .chain(doc.import_defs.keys().map(String::as_str))
         .collect();
     for item in items.iter_mut() {
         // Skip items that already carry a contextual prefix — those bumps are
@@ -1663,48 +1513,6 @@ pub(crate) fn handle_resolve_completion_item(
     // Strip the relation/derived prefix so lookups succeed for `*todos`/`&seniors`.
     let label = item.label.trim_start_matches(['*', '&']).to_string();
 
-    // If this is an auto-import marker (added by the workspace scan in
-    // `handle_completion`), resolve the actual TextEdit lazily here.
-    if let Some(data) = item.data.clone()
-        && data.get("kind").and_then(|v| v.as_str()) == Some("auto_import") {
-            let import_path = data.get("import_path").and_then(|v| v.as_str()).unwrap_or("");
-            let source_uri = data.get("source_uri").and_then(|v| v.as_str()).unwrap_or("");
-            if !import_path.is_empty() && !source_uri.is_empty()
-                && let Ok(uri) = source_uri.parse::<Uri>()
-                    && let Some(doc) = state.documents.get(&uri) {
-                        // The insert position is computed against the analyzed
-                        // text; if the buffer has newer pending edits the
-                        // position could land mid-edit and corrupt the file.
-                        // Skip the lazy import edit in that window — the item
-                        // still completes, just without auto-import.
-                        let is_stale = state
-                            .pending_sources
-                            .get(&uri)
-                            .is_some_and(|p| p.source != doc.source);
-                        if !is_stale {
-                            // Shared with the code-action quickfix path:
-                            // anchors to the byte offset after the last
-                            // import's newline (or EOF with a leading `\n`
-                            // when the file lacks a trailing newline), instead
-                            // of a possibly-nonexistent `line + 1` position
-                            // that clients clamp into the middle of the last
-                            // line.
-                            let (import_insert_pos, import_line) =
-                                crate::code_action::import_insert_position_and_text(
-                                    doc,
-                                    import_path,
-                                );
-                            item.additional_text_edits = Some(vec![TextEdit {
-                                range: Range {
-                                    start: import_insert_pos,
-                                    end: import_insert_pos,
-                                },
-                                new_text: import_line,
-                            }]);
-                        }
-                    }
-        }
-
     // Aggregate enrichment across all open documents — workspace-symbol-style
     // labels can come from any file, and effect/doc/type info may live in
     // different files (e.g. trait declared in A, impl in B).
@@ -2055,18 +1863,6 @@ mod tests {
         }
     }
 
-    fn auto_import_item(uri: &Uri, import_path: &str) -> CompletionItem {
-        CompletionItem {
-            label: "helper".into(),
-            data: Some(serde_json::json!({
-                "kind": "auto_import",
-                "import_path": import_path,
-                "source_uri": uri.as_str(),
-            })),
-            ..Default::default()
-        }
-    }
-
     /// Regression: completion derived its trigger character from the last
     /// *analyzed* text. During the analysis debounce window the just-typed
     /// `.` isn't in that text yet, so dot completion silently degraded to
@@ -2102,81 +1898,6 @@ mod tests {
             !labels.iter().any(|l| l == "do"),
             "dot completion must not fall back to the generic keyword list; got: {labels:?}"
         );
-    }
-
-    /// The lazy auto-import edit is computed against the analyzed text; when
-    /// newer text is pending the insert position may no longer be valid, so
-    /// the resolve path must skip the edit rather than risk corrupting the
-    /// buffer.
-    #[test]
-    fn auto_import_resolve_skips_edit_when_doc_is_stale() {
-        use crate::state::PendingSource;
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "import ./a\nmain = helper 1\n");
-        ws.state.pending_sources.insert(
-            uri.clone(),
-            PendingSource {
-                source: "import ./a\nimport ./b\nmain = helper 1\n".into(),
-                version: Some(2),
-            },
-        );
-        let resolved =
-            handle_resolve_completion_item(&ws.state, auto_import_item(&uri, "./helpers"));
-        assert!(
-            resolved.additional_text_edits.is_none(),
-            "stale doc must not produce auto-import edits; got: {:?}",
-            resolved.additional_text_edits
-        );
-    }
-
-    /// Regression: the resolve path inserted the auto-import line at
-    /// `Position::new(last_import_end.line + 1, 0)`. When the last import is
-    /// the final line with no trailing newline, that position doesn't exist
-    /// and clients clamp it to end-of-document, gluing the text onto the
-    /// previous import (`import ./aimport foo`). The insert must land at EOF
-    /// with a leading newline instead.
-    #[test]
-    fn auto_import_resolve_no_trailing_newline_at_eof() {
-        let mut ws = TestWorkspace::new();
-        let source = "import ./a"; // final line, no trailing newline
-        let uri = ws.open("main", source);
-        let resolved =
-            handle_resolve_completion_item(&ws.state, auto_import_item(&uri, "./helpers"));
-        let edits = resolved
-            .additional_text_edits
-            .expect("auto-import edit resolved");
-        assert_eq!(edits.len(), 1);
-        let edit = &edits[0];
-        // Insert position must exist in the document (clamping target = EOF).
-        let eof = offset_to_position(source, source.len());
-        assert_eq!(
-            edit.range.start, eof,
-            "insert position must be end-of-document, not a nonexistent line"
-        );
-        assert_eq!(
-            edit.new_text, "\nimport ./helpers\n",
-            "a leading newline must separate the new import from the last line"
-        );
-        // Applying the edit yields well-formed imports, not glued text.
-        let mut applied = source.to_string();
-        applied.insert_str(source.len(), &edit.new_text);
-        assert!(applied.contains("import ./a\nimport ./helpers\n"), "got: {applied:?}");
-    }
-
-    /// The common case (imports followed by more lines) still inserts right
-    /// after the last import line.
-    #[test]
-    fn auto_import_resolve_inserts_after_last_import_line() {
-        let mut ws = TestWorkspace::new();
-        let source = "import ./a\n\nmain = 1\n";
-        let uri = ws.open("main", source);
-        let resolved =
-            handle_resolve_completion_item(&ws.state, auto_import_item(&uri, "./helpers"));
-        let edits = resolved
-            .additional_text_edits
-            .expect("auto-import edit resolved");
-        assert_eq!(edits[0].range.start, Position::new(1, 0));
-        assert_eq!(edits[0].new_text, "import ./helpers\n");
     }
 
     #[test]
@@ -2619,40 +2340,6 @@ mod regress_fixes_tests {
             map_items.len(),
             1,
             "user `map` must shadow the builtin; got: {map_items:?}"
-        );
-    }
-
-    /// Bug 12: imported symbols appear in normal completion, and the
-    /// auto-import path must not re-suggest names already in scope.
-    #[test]
-    fn imported_symbols_complete_without_auto_import_duplicate() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        std::fs::write(tw.root.join("lib.knot"), "helper = \\x -> x\n").unwrap();
-        let uri = tw.write_and_open("main.knot", "import ./lib\n\nmain = helper 1\n");
-        let doc = tw.workspace.doc(&uri);
-        let off = doc.source.find("helper 1").expect("usage");
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_completion(&tw.workspace.state, &comp_params(&uri, pos, None))
-            .expect("completion returns");
-        let items = resp_items(resp);
-        assert!(
-            items
-                .iter()
-                .any(|i| i.label == "helper" && i.data.is_none()),
-            "imported `helper` must surface as a plain completion item"
-        );
-        let dup_auto_import = items.iter().any(|i| {
-            i.label == "helper"
-                && i.data
-                    .as_ref()
-                    .and_then(|d| d.get("kind"))
-                    .and_then(|k| k.as_str())
-                    == Some("auto_import")
-        });
-        assert!(
-            !dup_auto_import,
-            "auto-import must not re-suggest a symbol already imported"
         );
     }
 

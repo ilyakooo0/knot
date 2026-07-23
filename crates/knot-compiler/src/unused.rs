@@ -5,7 +5,6 @@
 //! whose names are never referenced from any other declaration.
 //!
 //! Exempt from warnings:
-//! - Exported declarations (`exported = true`).
 //! - The `main` function (program entry point).
 //! - Names beginning with `_` (intentionally-unused convention).
 //! - Signature-only `Fun` decls (no body — interface stubs).
@@ -42,9 +41,6 @@ pub fn check(decls: &[Decl]) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
 
     for (i, decl) in decls.iter().enumerate() {
-        if decl.exported {
-            continue;
-        }
         match &decl.node {
             DeclKind::Fun { name, body, .. } => {
                 if name == "main" || starts_with_underscore(name) {
@@ -129,7 +125,7 @@ where
 fn make_warning(kind: &str, name: &str, span: knot::ast::Span) -> Diagnostic {
     Diagnostic::warning(format!("unused {}: `{}`", kind, name))
         .label(span, "defined here but never used")
-        .note("prefix the name with `_` to silence this warning, mark it `export`, or remove it".to_string())
+        .note("prefix the name with `_` to silence this warning, or remove it".to_string())
 }
 
 // ── Per-declaration reference collection ─────────────────────────────
@@ -504,18 +500,6 @@ main = println (show (helper 1))
         let warnings = warns(
             r#"
 _helper = \x -> x + 1
-
-main = println "hi"
-"#,
-        );
-        assert!(warnings.is_empty(), "got: {:?}", warnings);
-    }
-
-    #[test]
-    fn exported_does_not_warn() {
-        let warnings = warns(
-            r#"
-export helper = \x -> x + 1
 
 main = println "hi"
 "#,

@@ -8,11 +8,6 @@
 //!    dropped the entire `main` declaration. It now reports a missing
 //!    expression and leaves the next declaration intact.
 //!
-//! 2. The formatter dropped a comment sitting between a standalone `export`
-//!    and its declaration (`export -- keep me\ntype A = Int`): the comment is
-//!    non-standalone and lies before the decl's span (which starts after
-//!    `export`), so it matched none of the comment-association branches.
-
 use knot::ast::DeclKind;
 use knot::diagnostic::Severity;
 
@@ -71,22 +66,4 @@ fn indented_continuation_still_parses_as_one_body() {
     let (names, errs) = parse("f =\n  g x\nmain = f\n");
     assert_eq!(names, vec!["f".to_string(), "main".to_string()]);
     assert!(errs.is_empty(), "indented continuation should parse cleanly, got: {errs:?}");
-}
-
-#[test]
-fn formatter_preserves_comment_between_export_and_decl() {
-    let src = "export -- keep me\ntype A = Int\n";
-    let lexer = knot::lexer::Lexer::new(src);
-    let (tokens, _) = lexer.tokenize();
-    let parser = knot::parser::Parser::new(src.to_string(), tokens);
-    let (module, _) = parser.parse_module();
-    let formatted = knot::format::format_module(src, &module);
-    assert!(
-        formatted.contains("-- keep me"),
-        "comment on the `export` line must be preserved, got:\n{formatted}"
-    );
-    assert!(
-        formatted.contains("type A = Int"),
-        "the declaration must still be present, got:\n{formatted}"
-    );
 }

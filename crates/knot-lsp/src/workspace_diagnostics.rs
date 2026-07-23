@@ -406,84 +406,6 @@ pub(crate) fn handle_workspace_diagnostics(
                 }
             }
 
-            // Record reverse-import edges for every file we just (re)parsed.
-            // `state.reverse_imports` is otherwise only fed by OPEN-document
-            // analysis, so without this the invalidation below could never
-            // reach an importer that was never opened. Mirrors
-            // `apply_analysis_result`: drop this importer's stale outgoing
-            // edges first, then add the current ones.
-            for w in &to_analyze {
-                for importers in state.reverse_imports.values_mut() {
-                    importers.remove(&w.canonical);
-                }
-            }
-            for w in &to_analyze {
-                let base = w.canonical.parent().unwrap_or(Path::new("."));
-                for imp in &w.module.imports {
-                    let rel = PathBuf::from(&imp.path).with_extension("knot");
-                    if let Ok(target) = base.join(&rel).canonicalize() {
-                        state
-                            .reverse_imports
-                            .entry(target)
-                            .or_default()
-                            .insert(w.canonical.clone());
-                    }
-                }
-            }
-            crate::state::prune_reverse_imports(&mut state.reverse_imports);
-
-            // Cross-file staleness (unopened importers): when a pulled
-            // file's content hash changed relative to its prior cache
-            // entry, every transitive reverse-importer's cached diagnostics
-            // may reference its old exports. Evict those entries NOW —
-            // before this pull writes the changed file's refreshed entry —
-            // otherwise the post-pull prune sees no hash mismatch anywhere
-            // and the importers' stale diagnostics survive indefinitely.
-            // Importers that were about to be served from cache in this
-            // same pull are re-analyzed instead.
-            if !hash_changed.is_empty() {
-                let mut affected: HashSet<PathBuf> = HashSet::new();
-                let mut frontier = hash_changed;
-                while let Some(p) = frontier.pop() {
-                    if let Some(importers) = state.reverse_imports.get(&p) {
-                        for imp in importers {
-                            if affected.insert(imp.clone()) {
-                                frontier.push(imp.clone());
-                            }
-                        }
-                    }
-                }
-                if !affected.is_empty() {
-                    state
-                        .workspace_diag_cache
-                        .retain(|p, _| !affected.contains(p));
-                    let mut kept: Vec<(Uri, Vec<Diagnostic>, PathBuf)> =
-                        Vec::with_capacity(cached_results.len());
-                    for (file_uri, diags, canonical) in cached_results {
-                        if !affected.contains(&canonical) {
-                            kept.push((file_uri, diags, canonical));
-                            continue;
-                        }
-                        // Stat before read — same ordering rule as Phase A.
-                        let mtime = current_mtime(&canonical);
-                        if let Some((module, source)) =
-                            get_or_parse_file_shared(&canonical, &state.import_cache)
-                        {
-                            let hash = content_hash(&source);
-                            to_analyze.push(WorkItem {
-                                canonical,
-                                file_uri,
-                                hash,
-                                module,
-                                source,
-                                mtime,
-                            });
-                        }
-                    }
-                    cached_results = kept;
-                }
-            }
-
             // Phase B: parallel analysis. `analyze_unopened_file` allocates its
             // own type/effect/stratify/sql-lint state per call, so the only
             // shared resource is the import cache (already Arc<Mutex<>>). We
@@ -683,23 +605,9 @@ pub(crate) fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
         }
     }
 
-    // Propagate invalidation along the reverse-imports graph: any file that
-    // imports a changed file (transitively) must also be evicted, because its
-    // cached diagnostics may have referenced types/effects from the now-stale
-    // import.
-    let mut affected = changed.clone();
-    let mut frontier: Vec<PathBuf> = changed.into_iter().collect();
-    while let Some(p) = frontier.pop() {
-        if let Some(importers) = state.reverse_imports.get(&p) {
-            for imp in importers {
-                if affected.insert(imp.clone()) {
-                    frontier.push(imp.clone());
-                }
-            }
-        }
-    }
-
-    state.workspace_diag_cache.retain(|path, _| !affected.contains(path));
+    // Evict the changed files' own cache entries; their diagnostics are
+    // stale now.
+    state.workspace_diag_cache.retain(|path, _| !changed.contains(path));
 
     enforce_workspace_diag_cap(state);
 }
@@ -755,7 +663,7 @@ fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 fn analyze_unopened_file_inner(
     module: &Module,
     source: &str,
-    path: &Path,
+    _path: &Path,
     uri: &Uri,
 ) -> Vec<Diagnostic> {
     let mut all_diags = Vec::new();
@@ -777,42 +685,24 @@ fn analyze_unopened_file_inner(
         .any(|d| matches!(d.severity, diagnostic::Severity::Error));
 
     if !has_parse_errors {
-        // The importer's own top-level declaration spans, captured *before*
-        // imports/prelude are merged in. `resolve_imports` inlines copies of
-        // imported declarations whose spans index a *different* file's source;
-        // analysis passes over the combined module can emit diagnostics anchored
-        // in those foreign spans, which — if mapped against this file's `source`
-        // — would surface as phantom errors at unrelated locations (or relocate
-        // to 0:0). We keep only diagnostics anchored within this file's own
+        // The file's own top-level declaration spans, captured *before* the
+        // prelude is merged in. The prelude inlines copies of declarations
+        // whose spans index a *different* source; analysis passes over the
+        // combined module can emit diagnostics anchored in those foreign
+        // spans, which — if mapped against this file's `source` — would
+        // surface as phantom errors at unrelated locations (or relocate to
+        // 0:0). We keep only diagnostics anchored within this file's own
         // declarations.
         let own_ranges: Vec<(usize, usize)> =
             module.decls.iter().map(|d| (d.span.start, d.span.end)).collect();
 
         let mut analysis_module = module.clone();
 
-        // Track the byte ranges of the inlined imported declarations. A foreign
-        // diagnostic's span coincidentally falling inside one of the importer's
-        // own decl ranges must still be rejected, so imported-region membership
-        // overrides the `own_ranges` numeric containment below. `resolve_imports`
-        // prepends imported decls, so this file's own decls remain the trailing
-        // `own_decl_count` entries and the prefix is exactly the imported content.
-        let own_decl_count = module.decls.len();
-        let _ = knot_compiler::modules::resolve_imports(&mut analysis_module, path);
-        let imported_count = analysis_module.decls.len().saturating_sub(own_decl_count);
-        let imported_ranges: Vec<(usize, usize)> = analysis_module.decls[..imported_count]
-            .iter()
-            .map(|d| (d.span.start, d.span.end))
-            .collect();
-
         let anchored_in_importer = |d: &diagnostic::Diagnostic| -> bool {
             d.labels.iter().any(|l| {
-                let in_imported = imported_ranges
+                own_ranges
                     .iter()
-                    .any(|(s, e)| *s <= l.span.start && l.span.end <= *e);
-                !in_imported
-                    && own_ranges
-                        .iter()
-                        .any(|(s, e)| *s <= l.span.start && l.span.end <= *e)
+                    .any(|(s, e)| *s <= l.span.start && l.span.end <= *e)
             })
         };
 

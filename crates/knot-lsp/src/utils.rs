@@ -429,11 +429,8 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
     let mut positions = Vec::new();
     for token in tokens {
         let tok_type = match &token.kind {
-            TokenKind::Import
-            | TokenKind::Data
+            TokenKind::Data
             | TokenKind::Type
-            | TokenKind::Trait
-            | TokenKind::Impl
             | TokenKind::Route
             | TokenKind::Migrate
             | TokenKind::Where
@@ -450,7 +447,6 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
             | TokenKind::Atomic
             | TokenKind::Deriving
             | TokenKind::With
-            | TokenKind::Export
             | TokenKind::Refine
             | TokenKind::Serve
             | TokenKind::Forall => Some(TOK_KEYWORD),

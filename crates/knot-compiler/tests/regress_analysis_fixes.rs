@@ -8,7 +8,6 @@
 //! 7. parameterized ADT fields (Maybe/Result) persisted as json columns
 //! 8. nested/stacked/ADT-constructor refinement enforcement
 //! 9. migrate with relation-wrapped types
-//! 10. monad_info keying across merged files (prelude/import span collisions)
 //! 11. expr_is_io and do-local let-bound IO lambdas
 //! 12. unused-source detection for relations referenced only by `migrate`
 //! 13. `traverse f []` empty-input result per applicative
@@ -766,48 +765,6 @@ main = do
     );
     assert!(ok, "bracketed migrate must not panic at startup: {stderr}");
     assert!(stdout.contains("rows: 0"), "got: {stdout}");
-}
-
-// ── 10. monad_info keying across merged files ──────────────────────
-
-#[test]
-fn do_blocks_at_identical_offsets_in_different_files_use_their_own_monads() {
-    // lib.knot holds a Maybe comprehension; prog.knot holds a [Int]
-    // comprehension. The padding comment places prog's `do` at exactly the
-    // same byte offset as lib's `do`, which used to collide in monad_info
-    // (spans are not shifted when imported modules are merged) and compile
-    // the Maybe do-block with Relation binds — a runtime panic.
-    let lib = "f1 : Maybe Int 1 -> Maybe Int 1\nf1 = \\m -> do\n  x <- m\n  yield (x + 1)\n";
-    let lib_do_off = lib.find("do").unwrap();
-    let prefix = "import ./lib\n";
-    let fn_line = "f2 = \\r -> do";
-    // Pad with a comment so that prog's `do` starts at lib_do_off.
-    let do_col = fn_line.len() - 2; // offset of "do" within fn_line
-    let pad_len = lib_do_off
-        .checked_sub(prefix.len() + do_col + 1) // +1 for the newline after the comment
-        .expect("lib do offset too small for padding");
-    let padding = format!("--{}\n", "p".repeat(pad_len.saturating_sub(3)));
-    let mut prog = String::new();
-    prog.push_str(prefix);
-    prog.push_str(&padding);
-    prog.push_str(fn_line);
-    prog.push_str("\n  x <- r\n  yield (x + 1)\n");
-    prog.push_str(
-        r#"main = do
-  with {res (f1 (Just {value 41}))} (do (case res of Just {value value} -> println ("maybe: " ++ show value); _ -> println "none"); println ("list: " ++ show (count (f2 [1, 2, 3]))); yield {})
-"#,
-    );
-    let c = compile_files("monad_span_collision", &prog, &[("lib.knot", lib)]);
-    let (stdout, stderr, ok) = run(&c);
-    assert!(ok, "program failed: {stderr}");
-    assert!(
-        stdout.contains("maybe: 42"),
-        "Maybe do-block must use the Maybe monad, got: {stdout}"
-    );
-    assert!(
-        stdout.contains("list: 3"),
-        "[Int 1] do-block must use the Relation monad, got: {stdout}"
-    );
 }
 
 // ── 11. do-local let-bound IO lambdas ──────────────────────────────

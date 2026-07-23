@@ -11,7 +11,6 @@ use knot::ast::{DeclKind, Module};
 use crate::analysis::get_or_parse_file_shared;
 use crate::shared::scan_knot_files_in_roots;
 use crate::state::{content_hash, ServerState, WorkspaceSymbolEntry};
-use crate::type_format::format_type_kind;
 use crate::utils::{path_to_uri, span_to_range, uri_to_path};
 
 // ── Workspace Symbols ───────────────────────────────────────────────

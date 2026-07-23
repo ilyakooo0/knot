@@ -1,20 +1,16 @@
 //! `textDocument/prepareRename` and `textDocument/rename` handlers.
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 
 use lsp_types::*;
 
 use knot::ast::{self, DeclKind, Module, Span};
 
-use crate::analysis::get_or_parse_file_shared;
-use crate::defs::resolve_definitions;
-use crate::shared::scan_knot_files_in_roots;
 use crate::state::{builtins, DocumentState, ServerState, KEYWORDS};
 use crate::utils::{
-    find_word_after_eq, find_word_in_source, find_word_last_in_source, ident_lookup_offset, path_to_uri,
+    find_word_in_source, find_word_last_in_source, ident_lookup_offset,
     position_to_offset, recurse_expr,
-    safe_slice, span_to_range, uri_to_path, word_at_position,
+    safe_slice, span_to_range, word_at_position,
 };
 
 // ── Rename ──────────────────────────────────────────────────────────
@@ -56,9 +52,8 @@ pub(crate) fn handle_prepare_rename(
         .any(|(usage, _)| usage.start <= offset && offset < usage.end);
     let is_def = doc.definitions.values().any(|span| span.start <= offset && offset < span.end);
     let is_field = is_at_record_field(&doc.module, &doc.source, offset);
-    let is_imported = doc.import_defs.contains_key(word);
 
-    if !is_ref && !is_def && !is_field && !is_imported {
+    if !is_ref && !is_def && !is_field {
         return None;
     }
 
@@ -75,7 +70,6 @@ pub(crate) fn handle_prepare_rename(
         && !is_ref
         && !is_field
         && !doc.definitions.contains_key(word)
-        && !is_imported
     {
         return None;
     }
@@ -202,24 +196,32 @@ pub(crate) fn handle_rename(
         }
     }
 
-    // Phase 1: identify the canonical owner — the file + span where the
-    // symbol's definition lives. If the cursor is on an imported symbol,
-    // the owner is that imported file's decl, not this file.
-    let owner = resolve_canonical_owner(state, uri, doc, offset, &old_name)?;
+    // Identify the symbol's definition in this file. Rename is confined to
+    // the current document — the language no longer has imports, so a symbol
+    // is only ever visible within its own file.
+    let (decl_span, owner_name_span) = resolve_local_owner(doc, offset, &old_name)?;
 
     let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
 
-    // Phase 2: visit every file in the workspace and emit edits if it
-    // either owns the symbol or imports it from the owner. Open files use
-    // the cached `DocumentState`; closed files are read off disk.
-    let scanned =
-        scan_workspace_files(state, &owner, &old_name, new_name, &mut changes);
-
-    // Phase 3: scan unopened workspace files for references via on-disk
-    // parse. We narrow by the reverse-import graph when possible — most
-    // files don't reach the owner, and skipping them avoids per-file
-    // parse cost.
-    scan_disk_files(state, &owner, &old_name, new_name, &scanned, &mut changes);
+    // Rename the declaration itself.
+    let name_span =
+        name_span_within(&doc.source, decl_span, &old_name).unwrap_or(owner_name_span);
+    changes.entry(uri.clone()).or_default().push(TextEdit {
+        range: span_to_range(name_span, &doc.source),
+        new_text: pun_aware_new_text(&doc.module, &doc.source, name_span, &old_name, new_name),
+    });
+    // Rename every local usage that resolves to this definition.
+    for (usage_span, target_span) in &doc.references {
+        if *target_span == decl_span || *target_span == name_span {
+            // `SourceRef`/`DerivedRef` usage spans include the `*`/`&`
+            // sigil — the edit must only replace the name.
+            let span = edit_span(&doc.source, *usage_span);
+            changes.entry(uri.clone()).or_default().push(TextEdit {
+                range: span_to_range(span, &doc.source),
+                new_text: pun_aware_new_text(&doc.module, &doc.source, span, &old_name, new_name),
+            });
+        }
+    }
 
     // Defensive de-duplication: the owner-file path can discover the same
     // name-token span through both the declaration edit and a reference
@@ -337,30 +339,15 @@ fn workspace_edit_with_conflict_warning(
     }
 }
 
-/// The canonical owner of a symbol — the file path and span where the symbol
-/// was originally declared. Cross-file rename uses this as the source of
-/// truth: every other file's references must point back to this same
-/// `(path, span)` pair to be considered the same symbol.
-struct CanonicalOwner {
-    canonical_path: PathBuf,
-    /// Span of the *whole* declaration in the owning file.
-    decl_span: Span,
-    /// Span of just the symbol's name token within the declaration.
-    name_span: Span,
-    /// Whether the resolved definition is a top-level declaration of the
-    /// owner file (and therefore visible to importers). Local bindings —
-    /// lambda params, do-binds, let-binds, case patterns — set this to
-    /// `false`, restricting the rename strictly to the owner file.
-    is_top_level: bool,
-}
-
-fn resolve_canonical_owner(
-    state: &ServerState,
-    uri: &Uri,
+/// Resolve the local definition of the symbol at `offset` in this document.
+/// Returns `(decl_span, name_span)` — the whole declaration span and the
+/// symbol's name-token span within it. Rename is confined to the current
+/// file, so we never look beyond `doc`.
+fn resolve_local_owner(
     doc: &DocumentState,
     offset: usize,
     name: &str,
-) -> Option<CanonicalOwner> {
+) -> Option<(Span, Span)> {
     // Case A: the cursor is on a local def or usage that resolves locally.
     // Pick the *innermost* (smallest) covering usage span, matching
     // `references::find_local_def`, `goto`, and `document_highlight`. Using
@@ -381,43 +368,10 @@ fn resolve_canonical_owner(
                 .copied()
         });
     if let Some(decl_span) = local_def {
-        let canonical_path = uri_to_path(uri)
-            .and_then(|p| p.canonicalize().ok())
-            .unwrap_or_else(|| PathBuf::from(uri.as_str()));
         let name_span = name_span_within(&doc.source, decl_span, name).unwrap_or(decl_span);
-        // Top-level definitions are registered (by name) in `doc.definitions`
-        // with their name-token span; if the resolved span matches one of
-        // those, the symbol is an export. Otherwise it's a local binding and
-        // the rename must not leak into importers.
-        let is_top_level = doc.definitions.values().any(|s| *s == decl_span);
-        return Some(CanonicalOwner {
-            canonical_path,
-            decl_span,
-            name_span,
-            is_top_level,
-        });
+        return Some((decl_span, name_span));
     }
 
-    // Case B: the cursor is on a usage of an imported symbol. The doc's
-    // `import_defs` map records `(path, span)` for each imported name.
-    if let Some((other_path, decl_span)) = doc.import_defs.get(name) {
-        let other_source = doc
-            .imported_files
-            .get(other_path)
-            .cloned()
-            .or_else(|| {
-                let cache = state.import_cache.lock().ok()?;
-                cache.get(other_path).map(|e| e.source.clone())
-            })
-            .unwrap_or_default();
-        let name_span = name_span_within(&other_source, *decl_span, name).unwrap_or(*decl_span);
-        return Some(CanonicalOwner {
-            canonical_path: other_path.clone(),
-            decl_span: *decl_span,
-            name_span,
-            is_top_level: true,
-        });
-    }
     None
 }
 
@@ -659,221 +613,6 @@ fn edit_span(source: &str, span: Span) -> Span {
     }
 }
 
-/// Resolve a URI to a stable canonical path, falling back to the URI-as-path
-/// when canonicalize fails (e.g. synthetic test URIs that don't hit disk).
-/// The fallback must mirror `resolve_canonical_owner`'s fallback so equality
-/// checks line up across both call sites.
-fn canonical_for_uri(uri: &Uri) -> Option<PathBuf> {
-    let path = uri_to_path(uri)?;
-    Some(path.canonicalize().unwrap_or_else(|_| PathBuf::from(uri.as_str())))
-}
-
-/// Walk every open document. Emit edits when the doc owns the symbol or
-/// imports it from the canonical owner. Returns the set of canonical paths
-/// already handled so the disk-scan phase can skip them.
-fn scan_workspace_files(
-    state: &ServerState,
-    owner: &CanonicalOwner,
-    old_name: &str,
-    new_name: &str,
-    changes: &mut HashMap<Uri, Vec<TextEdit>>,
-) -> HashSet<PathBuf> {
-    let mut scanned = HashSet::new();
-    for (other_uri, other_doc) in &state.documents {
-        // Staleness guard for *other* open documents, mirroring the
-        // originating-file guard in `handle_rename`. When the editor holds
-        // newer text for `other_uri` than the last analyzed `other_doc.source`,
-        // every span we'd compute here indexes into the old bytes — applying
-        // those edits to the new buffer corrupts it. Skip this document and
-        // let the disk phase handle it from on-disk bytes instead. Crucially,
-        // do NOT mark it `scanned`: doing so would make the disk phase skip it
-        // too, so a stale *owner* document would never get its declaration
-        // renamed while non-stale importers were rewritten — a partial edit.
-        // Leaving it unscanned lets the disk phase still process it.
-        if state
-            .pending_sources
-            .get(other_uri)
-            .is_some_and(|p| p.source != other_doc.source)
-        {
-            continue;
-        }
-        let other_path = canonical_for_uri(other_uri);
-        let is_owner = other_path.as_ref() == Some(&owner.canonical_path);
-        // Span comparison must be containment-tolerant: when the rename
-        // starts in the owner file (Case A), `owner.decl_span` is the
-        // name-token span, while `import_defs` stores whole-declaration
-        // spans. Exact equality would silently skip open importers and
-        // push them onto the disk-scan path, which computes edits against
-        // the on-disk bytes instead of their (possibly unsaved) buffers.
-        let imports_owner = owner.is_top_level
-            && (other_doc
-                .import_defs
-                .get(old_name)
-                .map(|(p, span)| {
-                    *p == owner.canonical_path
-                        && (*span == owner.decl_span
-                            || (span.start <= owner.decl_span.start
-                                && owner.decl_span.end <= span.end)
-                            || (owner.decl_span.start <= span.start
-                                && span.end <= owner.decl_span.end))
-                })
-                .unwrap_or(false)
-                // Lenient fallback mirroring the disk-scan import check
-                // (`file_imports_owner`). When `import_defs` span-containment
-                // misses an open importer, it must still be handled here —
-                // against its live (possibly unsaved) buffer — rather than
-                // falling through to the disk scan, which computes edits from
-                // on-disk bytes and corrupts the unsaved buffer's ranges.
-                || other_path.as_ref().is_some_and(|p| {
-                    file_imports_owner(
-                        &other_doc.module,
-                        p,
-                        &owner.canonical_path,
-                        old_name,
-                    )
-                }));
-        if is_owner || imports_owner {
-            emit_edits_for_open_doc(
-                other_uri, other_doc, owner, old_name, new_name, is_owner, changes,
-            );
-        }
-        // Always mark open documents as scanned, even when they neither own
-        // nor import the symbol. The disk phase must never recompute an open
-        // document's edits from on-disk bytes — those can differ from the
-        // editor's unsaved buffer, producing edits at the wrong offsets.
-        if let Some(p) = other_path {
-            scanned.insert(p);
-        }
-    }
-    scanned
-}
-
-/// Apply rename edits to a single open document. The owner-file branch uses
-/// the AST-derived `references` to find usages; the importer-file branch
-/// walks the AST directly because imported-symbol uses don't appear in
-/// `references` (which only resolves local decls).
-fn emit_edits_for_open_doc(
-    uri: &Uri,
-    doc: &DocumentState,
-    owner: &CanonicalOwner,
-    old_name: &str,
-    new_name: &str,
-    is_owner: bool,
-    changes: &mut HashMap<Uri, Vec<TextEdit>>,
-) {
-    if is_owner {
-        // Rename the declaration itself.
-        let name_span = name_span_within(&doc.source, owner.decl_span, old_name)
-            .unwrap_or(owner.name_span);
-        changes.entry(uri.clone()).or_default().push(TextEdit {
-            range: span_to_range(name_span, &doc.source),
-            new_text: pun_aware_new_text(&doc.module, &doc.source, name_span, old_name, new_name),
-        });
-        // Rename every local usage that resolves to the canonical decl.
-        //
-        // `owner.decl_span` can be either the name-token span (rename started
-        // in this file — Case A) or the *whole-declaration* span (rename
-        // started at an importer's call site — Case B resolves via
-        // `import_defs`, which stores whole-decl spans). The open doc's
-        // `references` always target name-token spans, so compare against the
-        // resolved name token too; otherwise the owner's internal usages keep
-        // the old name and the rename breaks the code.
-        for (usage_span, target_span) in &doc.references {
-            if *target_span == owner.decl_span || *target_span == name_span {
-                // `SourceRef`/`DerivedRef` usage spans include the `*`/`&`
-                // sigil — the edit must only replace the name.
-                let span = edit_span(&doc.source, *usage_span);
-                changes.entry(uri.clone()).or_default().push(TextEdit {
-                    range: span_to_range(span, &doc.source),
-                    new_text: pun_aware_new_text(&doc.module, &doc.source, span, old_name, new_name),
-                });
-            }
-        }
-    } else {
-        // Importer file. If the file declares its own top-level symbol with
-        // the same name, every local reference resolves to that declaration
-        // — not to the import — so renaming the owner's export must leave
-        // this file untouched.
-        if module_defines_name(&doc.module, old_name) {
-            return;
-        }
-        // If this file also imports `old_name` from a module other than the
-        // owner, its body references are ambiguous; leave them untouched
-        // rather than corrupt the other module's references.
-        if let Some(file_path) = uri_to_path(uri)
-            && imports_name_from_other_module(
-                &doc.module,
-                &file_path,
-                &owner.canonical_path,
-                old_name,
-            ) {
-                return;
-            }
-        // Walk the AST to find every Var/Constructor/source-
-        // ref/derived-ref site that names the symbol, and rewrite each.
-        let mut sites: Vec<Span> = Vec::new();
-        for decl in &doc.module.decls {
-            collect_name_uses_in_decl(decl, old_name, &doc.source, &mut sites);
-        }
-        // Selective import items: `import foo {bar, baz}` — if the rename
-        // targets `bar`, the import line itself needs updating. These sit
-        // inside braces but are NOT record puns, so they must bypass the
-        // pun expansion below.
-        let mut import_sites: Vec<Span> = Vec::new();
-        for imp in &doc.module.imports {
-            if let Some(items) = &imp.items {
-                for item in items {
-                    if item.name == old_name {
-                        import_sites.push(item.span);
-                    }
-                }
-            }
-        }
-        sites.sort_by_key(|s| s.start);
-        sites.dedup_by_key(|s| s.start);
-        for span in sites {
-            let span = edit_span(&doc.source, span);
-            changes.entry(uri.clone()).or_default().push(TextEdit {
-                range: span_to_range(span, &doc.source),
-                new_text: pun_aware_new_text(&doc.module, &doc.source, span, old_name, new_name),
-            });
-        }
-        for span in import_sites {
-            changes.entry(uri.clone()).or_default().push(TextEdit {
-                range: span_to_range(span, &doc.source),
-                new_text: new_name.to_string(),
-            });
-        }
-    }
-}
-
-/// Whether `module` declares `name` at top level (function, type alias,
-/// source, view, derived, data type or its constructors, route). Used to
-/// decide that an importer's local references resolve to its own declaration
-/// rather than the imported symbol.
-pub(crate) fn module_defines_name(module: &Module, name: &str) -> bool {
-    module.decls.iter().any(|d| match &d.node {
-        DeclKind::Fun { name: n, .. }
-        | DeclKind::TypeAlias { name: n, .. }
-        | DeclKind::Source { name: n, .. }
-        | DeclKind::View { name: n, .. }
-        | DeclKind::Derived { name: n, .. }
-        | DeclKind::RouteComposite { name: n, .. } => n == name,
-        // A route both defines its own name AND each endpoint's constructor
-        // (a first-class top-level definition — see `defs.rs`). Both are rename
-        // sites, so the origin-discipline guard must recognize either.
-        DeclKind::Route { name: n, entries } => {
-            n == name || entries.iter().any(|e| e.constructor == name)
-        }
-        DeclKind::Data {
-            name: n,
-            constructors,
-            ..
-        } => n == name || constructors.iter().any(|c| c.name == name),
-        _ => false,
-    })
-}
-
 /// True if binding `pat` introduces a local variable called `name` —
 /// shadowing any imported symbol of the same name within the pattern's scope.
 fn pat_binds_name(pat: &ast::Pat, name: &str) -> bool {
@@ -1042,579 +781,6 @@ pub(crate) fn collect_shadowed_names(
             _ => {}
         }
     }
-}
-
-/// Walk `decl` and collect every span where `name` appears as a value-level
-/// reference (Var / Constructor / SourceRef / DerivedRef) or a type-level
-/// reference (`Named` types in annotations, aliases, source/data decls,
-/// routes). This is the importer-file
-/// rename oracle: the inferencer doesn't track cross-file references in
-/// `doc.references`, so we walk the AST directly — mirroring what
-/// `doc.references` covers for owner files.
-///
-/// Scope-aware: a local binder (lambda param, do-bind, do-let, case pattern,
-/// `let … in`) with the same name shadows the imported symbol, so `Var`
-/// occurrences underneath that binder refer to the local and are skipped.
-/// Constructor / SourceRef / DerivedRef / type occurrences live in
-/// namespaces value binders can't shadow and are always collected.
-pub(crate) fn collect_name_uses_in_decl(
-    decl: &ast::Decl,
-    name: &str,
-    source: &str,
-    out: &mut Vec<Span>,
-) {
-    // Collect constructor-pattern name tokens (`Ctor pat <- …`, `case … of
-    // Ctor …`) — these reference the renamed symbol when it's a constructor.
-    fn walk_pat_ctors(pat: &ast::Pat, name: &str, source: &str, out: &mut Vec<Span>) {
-        match &pat.node {
-            ast::PatKind::Constructor { name: n, payload } => {
-                if n == name {
-                    // The constructor name does NOT always lead the pattern
-                    // span: a parenthesized pattern (`(Circle c)`, the normal
-                    // form for destructuring in a lambda/case) rewrites the
-                    // span to start at `(`. Locate the actual name token via
-                    // word search rather than assuming `start + n.len()`,
-                    // which would otherwise corrupt the source on rename.
-                    if let Some(span) =
-                        find_word_in_source(source, n, pat.span.start, pat.span.end)
-                    {
-                        out.push(span);
-                    } else if safe_slice(source, pat.span) == name {
-                        out.push(pat.span);
-                    }
-                }
-                walk_pat_ctors(payload, name, source, out);
-            }
-            ast::PatKind::Record(fields) => {
-                for f in fields {
-                    if let Some(p) = &f.pattern {
-                        walk_pat_ctors(p, name, source, out);
-                    }
-                }
-            }
-            ast::PatKind::List(pats) => {
-                for p in pats {
-                    walk_pat_ctors(p, name, source, out);
-                }
-            }
-            ast::PatKind::Cons { head, tail } => {
-                walk_pat_ctors(head, name, source, out);
-                walk_pat_ctors(tail, name, source, out);
-            }
-            _ => {}
-        }
-    }
-    // Type-level references: `Named` nodes matching `name`. The recorded
-    // span is just the name token (recovered via word search inside the
-    // type node's span), so edits don't clobber surrounding syntax.
-    fn walk_type(ty: &ast::Type, name: &str, source: &str, out: &mut Vec<Span>) {
-        match &ty.node {
-            ast::TypeKind::Named(n) => {
-                if n == name {
-                    if let Some(span) =
-                        find_word_in_source(source, name, ty.span.start, ty.span.end)
-                    {
-                        out.push(span);
-                    } else if safe_slice(source, ty.span) == name {
-                        out.push(ty.span);
-                    }
-                }
-            }
-            ast::TypeKind::Var(_) | ast::TypeKind::Hole => {}
-            ast::TypeKind::App { func, arg } => {
-                walk_type(func, name, source, out);
-                walk_type(arg, name, source, out);
-            }
-            ast::TypeKind::Record { fields, .. } => {
-                for f in fields {
-                    walk_type(&f.value, name, source, out);
-                }
-            }
-            ast::TypeKind::Relation(inner) => walk_type(inner, name, source, out),
-            ast::TypeKind::Function { param, result } => {
-                walk_type(param, name, source, out);
-                walk_type(result, name, source, out);
-            }
-            ast::TypeKind::Variant { constructors, .. } => {
-                for ctor in constructors {
-                    for f in &ctor.fields {
-                        walk_type(&f.value, name, source, out);
-                    }
-                }
-            }
-            ast::TypeKind::Effectful { ty: inner, .. }
-            | ast::TypeKind::IO { ty: inner, .. } => walk_type(inner, name, source, out),
-            ast::TypeKind::Unit(_) => {},
-            ast::TypeKind::UnitAnnotated { base, .. } => walk_type(base, name, source, out),
-            ast::TypeKind::Refined { base, predicate } => {
-                walk_type(base, name, source, out);
-                walk_expr(predicate, name, source, false, out);
-            }
-            ast::TypeKind::Forall { ty: inner, .. } => walk_type(inner, name, source, out),
-        }
-    }
-    fn walk_scheme(scheme: &ast::TypeScheme, name: &str, source: &str, out: &mut Vec<Span>) {
-        walk_type(&scheme.ty, name, source, out);
-        for c in &scheme.constraints {
-            for arg in c.types() {
-                walk_type(arg, name, source, out);
-            }
-        }
-    }
-    fn walk_expr(expr: &ast::Expr, name: &str, source: &str, shadowed: bool, out: &mut Vec<Span>) {
-        match &expr.node {
-            ast::ExprKind::Var(n) => {
-                if !shadowed && n == name {
-                    out.push(expr.span);
-                }
-                return;
-            }
-            ast::ExprKind::Constructor(n)
-            | ast::ExprKind::SourceRef(n)
-            | ast::ExprKind::DerivedRef(n) => {
-                if n == name {
-                    out.push(expr.span);
-                }
-                return;
-            }
-            ast::ExprKind::Lambda { params, body, .. } => {
-                for p in params {
-                    walk_pat_ctors(p, name, source, out);
-                }
-                let sh = shadowed || params.iter().any(|p| pat_binds_name(p, name));
-                walk_expr(body, name, source, sh, out);
-                return;
-            }
-            ast::ExprKind::Case { scrutinee, arms } => {
-                walk_expr(scrutinee, name, source, shadowed, out);
-                for arm in arms {
-                    walk_pat_ctors(&arm.pat, name, source, out);
-                    let sh = shadowed || pat_binds_name(&arm.pat, name);
-                    walk_expr(&arm.body, name, source, sh, out);
-                }
-                return;
-            }
-            ast::ExprKind::Do(stmts) => {
-                let mut sh = shadowed;
-                for stmt in stmts {
-                    match &stmt.node {
-                        ast::StmtKind::Bind { pat, expr } => {
-                            // The RHS is evaluated before the pattern binds,
-                            // so it sees the pre-bind shadow status.
-                            walk_expr(expr, name, source, sh, out);
-                            walk_pat_ctors(pat, name, source, out);
-                            if pat_binds_name(pat, name) {
-                                sh = true;
-                            }
-                        }
-                        ast::StmtKind::Where { cond } | ast::StmtKind::Expr(cond) => {
-                            walk_expr(cond, name, source, sh, out);
-                        }
-                        ast::StmtKind::GroupBy { key } => walk_expr(key, name, source, sh, out),
-                    }
-                }
-                return;
-            }
-            ast::ExprKind::Annot { expr: inner, ty } => {
-                // Type annotations reference type names — `(x : Shape)` must
-                // be rewritten when `Shape` is renamed.
-                walk_type(ty, name, source, out);
-                walk_expr(inner, name, source, shadowed, out);
-                return;
-            }
-            ast::ExprKind::Serve { api, api_span, handlers } => {
-                if api == name {
-                    out.push(*api_span);
-                }
-                for h in handlers {
-                    // Endpoint names reference route endpoint constructors.
-                    if h.endpoint == name {
-                        out.push(h.endpoint_span);
-                    }
-                    walk_expr(&h.body, name, source, shadowed, out);
-                }
-                return;
-            }
-            _ => {}
-        }
-        recurse_expr(expr, |e| walk_expr(e, name, source, shadowed, out));
-    }
-    match &decl.node {
-        DeclKind::Fun { ty, body, .. } => {
-            if let Some(scheme) = ty {
-                walk_scheme(scheme, name, source, out);
-            }
-            if let Some(body) = body {
-                walk_expr(body, name, source, false, out);
-            }
-        }
-        DeclKind::View { ty, body, .. } | DeclKind::Derived { ty, body, .. } => {
-            if let Some(scheme) = ty {
-                walk_scheme(scheme, name, source, out);
-            }
-            walk_expr(body, name, source, false, out);
-        }
-        DeclKind::Source { ty, .. } | DeclKind::TypeAlias { ty, .. } => {
-            walk_type(ty, name, source, out);
-        }
-        DeclKind::Data { constructors, .. } => {
-            for ctor in constructors {
-                for f in &ctor.fields {
-                    walk_type(&f.value, name, source, out);
-                }
-            }
-        }
-        DeclKind::Route { entries, .. } => {
-            let mut ctor_cursor = decl.span.start;
-            for entry in entries {
-                for f in entry
-                    .body_fields
-                    .iter()
-                    .chain(&entry.query_params)
-                    .chain(&entry.request_headers)
-                    .chain(&entry.response_headers)
-                {
-                    walk_type(&f.value, name, source, out);
-                }
-                if let Some(resp) = &entry.response_ty {
-                    walk_type(resp, name, source, out);
-                }
-                for seg in &entry.path {
-                    if let ast::PathSegment::Param { ty, .. } = seg {
-                        walk_type(ty, name, source, out);
-                    }
-                }
-                // The `rateLimit <expr>` clause references user names (e.g.
-                // `rateLimit {key: keyByIp, ...}`). Walk it so renaming a
-                // function/constructor used inside it updates those sites too —
-                // otherwise the rename leaves stale names and breaks the source.
-                if let Some(rl) = &entry.rate_limit {
-                    walk_expr(rl, name, source, false, out);
-                }
-                // The endpoint constructor (`… -> Response = GetUsers`) is a
-                // definition referenced by `serve API where GetUsers = …` and
-                // `fetch url (GetUsers {…})`. It's spanless in the AST, so
-                // recover its `= Ctor` token by scanning the decl source;
-                // without this a rename updates the serve/fetch sites but
-                // leaves the route declaration dangling.
-                if entry.constructor == name
-                    && let Some(span) =
-                        find_word_after_eq(source, name, ctor_cursor, decl.span.end)
-                {
-                    ctor_cursor = span.end;
-                    out.push(span);
-                }
-            }
-        }
-        DeclKind::RouteComposite { components, .. } => {
-            // `route Api = A | B` — each component references another route by
-            // name. Components are spanless in the AST, so recover each token
-            // span by scanning the decl source. A moving cursor lets repeated
-            // component names each get their own span.
-            let mut cursor = decl.span.start;
-            for comp in components {
-                if comp == name
-                    && let Some(span) =
-                        find_word_in_source(source, name, cursor, decl.span.end)
-                    {
-                        cursor = span.end;
-                        out.push(span);
-                    }
-            }
-        }
-        DeclKind::SubsetConstraint { sub, sup } => {
-            // `*orders.customer <= *people.name` references source relations by
-            // name. `RelationPath` is spanless, so recover each relation-name
-            // occurrence by scanning the decl source with a moving cursor (both
-            // sides may name the same relation, e.g. `*users <= *users.email`).
-            // The `*` sigil is a word boundary for the search. Without this, a
-            // source rename leaves the constraint dangling and broken.
-            let mut cursor = decl.span.start;
-            for rel in [&sub.relation, &sup.relation] {
-                if rel.as_str() == name
-                    && let Some(span) =
-                        find_word_in_source(source, name, cursor, decl.span.end)
-                {
-                    cursor = span.end;
-                    out.push(span);
-                }
-            }
-        }
-    }
-}
-
-fn scan_disk_files(
-    state: &ServerState,
-    owner: &CanonicalOwner,
-    old_name: &str,
-    new_name: &str,
-    already_scanned: &HashSet<PathBuf>,
-    changes: &mut HashMap<Uri, Vec<TextEdit>>,
-) {
-    // A local binding (lambda param, do-bind, let, case pattern) is invisible
-    // outside its scope in the owner file — which is necessarily open, since
-    // the rename started there. Touching any other file would rewrite
-    // unrelated same-named identifiers.
-    if !owner.is_top_level {
-        return;
-    }
-    // Start from "files known to reference the owner" via the reverse-import
-    // graph (cheap, already in memory).
-    let candidate_paths = transitive_importers(state, &owner.canonical_path);
-    // The owner itself is always a candidate (the rename starts there too).
-    let mut to_scan: Vec<PathBuf> = candidate_paths.into_iter().collect();
-    to_scan.push(owner.canonical_path.clone());
-    // The reverse-import graph only has edges for files that have been
-    // ANALYZED — i.e. open documents. An unopened importer that was never
-    // analyzed is invisible to `transitive_importers`, so gating the disk
-    // sweep on the graph being empty silently skipped such files whenever
-    // ANY importer happened to be open. Always sweep the workspace for
-    // files not already covered by the graph; the cheap
-    // `contains(old_name)` rejection below keeps the per-file cost low.
-    let known: HashSet<PathBuf> = to_scan.iter().cloned().collect();
-    let all = scan_knot_files_in_roots(
-        &state.workspace_roots,
-        state.workspace_root.as_deref(),
-    );
-    for f in all {
-        let c = f.canonicalize().unwrap_or(f);
-        if !known.contains(&c) && !already_scanned.contains(&c) {
-            to_scan.push(c);
-        }
-    }
-
-    for path in to_scan {
-        if already_scanned.contains(&path) {
-            continue;
-        }
-        // Skip non-owner files that have a pending (unsaved) source in the
-        // document cache — the on-disk content may differ from the editor's
-        // live buffer, so edits computed against disk bytes would have wrong
-        // positions. The owner is NOT skipped: when it's stale, the in-memory
-        // scan skipped it, and the disk phase must rename its declaration
-        // from the stable on-disk bytes (B70 regression test covers this).
-        let is_owner = path == owner.canonical_path;
-        if !is_owner {
-            if let Some(file_uri) = path_to_uri(&path) {
-                if state.pending_sources.get(&file_uri).is_some() {
-                    continue;
-                }
-            }
-        }
-        let (module, file_source) =
-            match get_or_parse_file_shared(&path, &state.import_cache) {
-                Some(v) => v,
-                None => continue,
-            };
-        // Quick rejection — if the source bytes don't even mention the name
-        // anywhere, no edits are needed and we can skip the heavier walk.
-        if !file_source.contains(old_name) {
-            continue;
-        }
-        let Some(file_uri) = path_to_uri(&path) else {
-            continue;
-        };
-        let is_owner = path == owner.canonical_path;
-        if is_owner {
-            apply_owner_disk_edits(&file_uri, &module, &file_source, owner, old_name, new_name, changes);
-        } else if file_imports_owner(&module, &path, &owner.canonical_path, old_name) {
-            apply_importer_disk_edits(
-                &file_uri,
-                &module,
-                &file_source,
-                &path,
-                &owner.canonical_path,
-                old_name,
-                new_name,
-                changes,
-            );
-        }
-    }
-}
-
-/// Apply rename edits to the owner file when it isn't currently open. We
-/// re-parse the disk copy to recover refs/defs.
-fn apply_owner_disk_edits(
-    uri: &Uri,
-    module: &Module,
-    source: &str,
-    owner: &CanonicalOwner,
-    old_name: &str,
-    new_name: &str,
-    changes: &mut HashMap<Uri, Vec<TextEdit>>,
-) {
-    let (defs, refs, _) = resolve_definitions(module, source);
-    if let Some(decl_span) = defs.get(old_name) {
-        let name_span = name_span_within(source, *decl_span, old_name).unwrap_or(*decl_span);
-        changes.entry(uri.clone()).or_default().push(TextEdit {
-            range: span_to_range(name_span, source),
-            new_text: pun_aware_new_text(module, source, name_span, old_name, new_name),
-        });
-        for (usage_span, target_span) in &refs {
-            if target_span == decl_span {
-                // Skip the `*`/`&` sigil on relation references.
-                let span = edit_span(source, *usage_span);
-                changes.entry(uri.clone()).or_default().push(TextEdit {
-                    range: span_to_range(span, source),
-                    new_text: pun_aware_new_text(module, source, span, old_name, new_name),
-                });
-            }
-        }
-    }
-}
-
-// Each argument carries distinct rename context (uri, module, source, paths,
-// old/new name, output map); bundling them would not clarify the call sites.
-#[allow(clippy::too_many_arguments)]
-fn apply_importer_disk_edits(
-    uri: &Uri,
-    module: &Module,
-    source: &str,
-    file_path: &Path,
-    owner_path: &Path,
-    old_name: &str,
-    new_name: &str,
-    changes: &mut HashMap<Uri, Vec<TextEdit>>,
-) {
-    // Same shadowing discipline as the open-doc importer path: a file that
-    // declares its own top-level `old_name` resolves references locally,
-    // so the imported symbol's rename must not rewrite anything here.
-    if module_defines_name(module, old_name) {
-        return;
-    }
-    // If the file also imports `old_name` from a different module, its body
-    // references are ambiguous — leave them untouched rather than corrupt the
-    // other module's references.
-    if imports_name_from_other_module(module, file_path, owner_path, old_name) {
-        return;
-    }
-    let mut sites: Vec<Span> = Vec::new();
-    for decl in &module.decls {
-        collect_name_uses_in_decl(decl, old_name, source, &mut sites);
-    }
-    // Import items live inside braces but are not record puns — plain
-    // replacement, no pun expansion.
-    let mut import_sites: Vec<Span> = Vec::new();
-    for imp in &module.imports {
-        if let Some(items) = &imp.items {
-            for item in items {
-                if item.name == old_name {
-                    import_sites.push(item.span);
-                }
-            }
-        }
-    }
-    sites.sort_by_key(|s| s.start);
-    sites.dedup_by_key(|s| s.start);
-    for span in sites {
-        let span = edit_span(source, span);
-        changes.entry(uri.clone()).or_default().push(TextEdit {
-            range: span_to_range(span, source),
-            new_text: pun_aware_new_text(module, source, span, old_name, new_name),
-        });
-    }
-    for span in import_sites {
-        changes.entry(uri.clone()).or_default().push(TextEdit {
-            range: span_to_range(span, source),
-            new_text: new_name.to_string(),
-        });
-    }
-}
-
-/// True if `module` brings `name` into scope via an import whose target is a
-/// module *other than* the owner. When that happens, in-body references to
-/// `name` are ambiguous — they may resolve to the other module's export — so a
-/// rename of the owner's symbol must not rewrite them; doing so would silently
-/// break the reference to the other module. Name-only resolution can't tell
-/// the two apart, so we conservatively skip rewriting body references in such
-/// files (an unresolvable import that surfaces the name is also treated as a
-/// potential other source).
-pub(crate) fn imports_name_from_other_module(
-    module: &Module,
-    file_path: &Path,
-    owner_path: &Path,
-    name: &str,
-) -> bool {
-    let base_dir = file_path.parent().unwrap_or(Path::new("."));
-    for imp in &module.imports {
-        // Does this import surface `name`? Wildcards surface everything;
-        // selective imports must list it explicitly.
-        let is_wildcard = imp.items.is_none();
-        let surfaces = match &imp.items {
-            Some(items) => items.iter().any(|i| i.name == name),
-            None => true,
-        };
-        if !surfaces {
-            continue;
-        }
-        let rel = PathBuf::from(&imp.path).with_extension("knot");
-        let abs = base_dir.join(&rel);
-        match abs.canonicalize() {
-            Ok(p) if p == owner_path => {} // the owner import itself — expected
-            Ok(p) => {
-                // A selective import that lists `name` is a definite other
-                // source. A *wildcard* import surfaces `name` only if the module
-                // actually exports it — otherwise the file has no competing
-                // `name` and must still be rewritten, so don't skip it. (Bailing
-                // for every wildcard import of any unrelated module left the
-                // owner's definition renamed but importer uses dangling.)
-                if !is_wildcard || module_at_path_defines(&p, name) {
-                    return true;
-                }
-            }
-            // An import that can't be resolved on disk cannot *define* `name`, so
-            // it is not a competing other-module source — skip it and keep
-            // checking the remaining imports. Bailing with `true` here would let a
-            // single broken/dangling `import ./nonexistent` suppress every edit /
-            // reference in a consumer that legitimately imports the owner.
-            Err(_) => continue,
-        }
-    }
-    false
-}
-
-/// Parse the module at `path` from disk and report whether it defines `name`
-/// as a top-level export. Used to decide whether a wildcard import genuinely
-/// surfaces `name`. On any read/parse failure returns `true` conservatively —
-/// treat it as a potential other source rather than risk a bad rewrite.
-fn module_at_path_defines(path: &Path, name: &str) -> bool {
-    let Ok(source) = std::fs::read_to_string(path) else {
-        return true;
-    };
-    let (tokens, _) = knot::lexer::Lexer::new(&source).tokenize();
-    let (module, _) = knot::parser::Parser::new(source, tokens).parse_module();
-    module_defines_name(&module, name)
-}
-
-/// Quick check: does `module` import `owner_path` and does that import surface
-/// `old_name`? Used to filter disk files before doing any AST walking.
-pub(crate) fn file_imports_owner(
-    module: &Module,
-    file_path: &Path,
-    owner_path: &Path,
-    old_name: &str,
-) -> bool {
-    let base_dir = file_path.parent().unwrap_or(Path::new("."));
-    for imp in &module.imports {
-        let rel = PathBuf::from(&imp.path).with_extension("knot");
-        let abs = base_dir.join(&rel);
-        let canonical = match abs.canonicalize() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if canonical == owner_path {
-            // Selective imports: must list the name explicitly.
-            if let Some(items) = &imp.items {
-                if items.iter().any(|i| i.name == old_name) {
-                    return true;
-                }
-            } else {
-                // Wildcard import — always brings in everything.
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// True if `offset` lands on a record field name. Field names live in:
@@ -1982,23 +1148,6 @@ fn field_sites_in_type<F: FnMut(&str, Span)>(ty: &ast::Type, source: &str, f: &m
     }
 }
 
-/// BFS over `state.reverse_imports` to collect every file that transitively
-/// imports `owner`. The graph is keyed by canonical paths.
-fn transitive_importers(state: &ServerState, owner: &Path) -> HashSet<PathBuf> {
-    let mut out: HashSet<PathBuf> = HashSet::new();
-    let mut frontier: Vec<PathBuf> = vec![owner.to_path_buf()];
-    while let Some(p) = frontier.pop() {
-        if let Some(importers) = state.reverse_imports.get(&p) {
-            for imp in importers {
-                if out.insert(imp.clone()) {
-                    frontier.push(imp.clone());
-                }
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2138,38 +1287,6 @@ mod tests {
     }
 
     #[test]
-    fn broken_sibling_import_does_not_suppress_importer_edits() {
-        // Regression (Bug 4): a consumer with a valid `import ./owner` PLUS a
-        // broken `import ./nonexistent` had ALL its edits suppressed — the
-        // unresolvable import's `Err(_)` arm claimed the name was imported from
-        // another module. A broken import can't define the name, so it must not
-        // gate the rename.
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
-        let consumer_uri = tw.write_and_open(
-            "consumer.knot",
-            "import ./owner\nimport ./nonexistent\nrun = parse 1\n",
-        );
-        let owner_doc = tw.workspace.doc(&owner_uri);
-        let off = owner_doc.source.find("parse =").expect("owner def");
-        let pos = offset_to_position(&owner_doc.source, off);
-        let edit = handle_rename(&tw.workspace.state, &rename_params(&owner_uri, pos, "parsed"))
-            .expect("rename produces edits");
-        let changes = edit.changes.expect("changes present");
-        let consumer_doc = tw.workspace.doc(&consumer_uri);
-        let consumer_edits = changes.get(&consumer_uri).cloned().unwrap_or_default();
-        let call_off = consumer_doc.source.find("parse 1").expect("call site");
-        let call_pos = offset_to_position(&consumer_doc.source, call_off);
-        assert!(
-            consumer_edits
-                .iter()
-                .any(|e| e.range.start == call_pos && e.new_text.contains("parsed")),
-            "consumer usage must be renamed despite a broken sibling import; edits: {consumer_edits:?}"
-        );
-    }
-
-    #[test]
     fn prepare_rename_accepts_known_symbol() {
         let mut ws = TestWorkspace::new();
         let uri = ws.open("main", "id = \\x -> x\nmain = id 5\n");
@@ -2217,99 +1334,6 @@ mod tests {
         let pos = offset_to_position(&doc.source, off);
         let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos));
         assert!(resp.is_none(), "unexpected accept: {resp:?}");
-    }
-
-    #[test]
-    fn rename_propagates_across_imported_files() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        // Owner file declares `parse`. Consumer imports it.
-        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
-        let consumer_uri = tw.write_and_open(
-            "consumer.knot",
-            "import ./owner\n\nmain = parse 5\n",
-        );
-        // Cursor on `parse` at the consumer's call site.
-        let consumer_doc = tw.workspace.doc(&consumer_uri);
-        let off = consumer_doc.source.find("parse 5").expect("call site");
-        let pos = offset_to_position(&consumer_doc.source, off);
-        let edit = handle_rename(&tw.workspace.state, &rename_params(&consumer_uri, pos, "parsed"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        // Both files should receive edits.
-        assert!(
-            changes.contains_key(&owner_uri),
-            "owner file missed edit; got: {changes:?}"
-        );
-        assert!(
-            changes.contains_key(&consumer_uri),
-            "consumer file missed edit; got: {changes:?}"
-        );
-        for edits in changes.values() {
-            assert!(
-                edits.iter().all(|e| e.new_text == "parsed"),
-                "all edits should rewrite to `parsed`; got: {edits:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn rename_still_edits_owner_when_owner_doc_is_stale() {
-        // B70 regression: a rename initiated from a fresh importer must not
-        // produce a *partial* workspace edit when the owner's open document is
-        // mid-debounce (pending analysis differs from the analyzed source).
-        // The old code skipped the stale owner in the open-doc scan AND marked
-        // it `scanned`, so the disk phase skipped it too — importers renamed,
-        // owner declaration untouched. Now the stale owner is left unscanned so
-        // the disk phase rewrites its declaration from the on-disk bytes.
-        use crate::state::PendingSource;
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
-        let consumer_uri = tw.write_and_open(
-            "consumer.knot",
-            "import ./owner\n\nmain = parse 5\n",
-        );
-        // Make the owner document stale: the editor holds newer, not-yet-
-        // analyzed text (still declaring `parse`, but different bytes) so the
-        // per-doc staleness guard in `scan_workspace_files` trips for it. The
-        // on-disk file still holds the analyzable `parse` declaration.
-        tw.workspace.state.pending_sources.insert(
-            owner_uri.clone(),
-            PendingSource {
-                source: "-- mid-edit\nparse = \\x -> x\n".into(),
-                version: Some(2),
-            },
-        );
-        // Rename from the *fresh* consumer's call site.
-        let consumer_doc = tw.workspace.doc(&consumer_uri);
-        let off = consumer_doc.source.find("parse 5").expect("call site");
-        let pos = offset_to_position(&consumer_doc.source, off);
-        let edit = handle_rename(&tw.workspace.state, &rename_params(&consumer_uri, pos, "parsed"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        // The consumer (fresh) is edited via the open-doc scan.
-        assert!(
-            changes.contains_key(&consumer_uri),
-            "consumer file missed edit; got: {changes:?}"
-        );
-        // The stale owner must still be edited — via the disk phase, keyed by
-        // its canonical path. Match on canonical path rather than raw URI.
-        let owner_canon = canonical_for_uri(&owner_uri).expect("owner canonical path");
-        let owner_edits = changes
-            .iter()
-            .find(|(u, _)| canonical_for_uri(u).as_ref() == Some(&owner_canon))
-            .map(|(_, e)| e)
-            .unwrap_or_else(|| {
-                panic!("owner declaration left un-renamed (partial edit); got: {changes:?}")
-            });
-        // Disk phase reads the on-disk bytes, so apply against those.
-        let owner_disk = "parse = \\x -> x\n";
-        let renamed = apply_edits(owner_disk, owner_edits);
-        assert_eq!(
-            renamed, "parsed = \\x -> x\n",
-            "owner declaration should be renamed from on-disk bytes; got: {renamed:?}"
-        );
     }
 
     #[test]
@@ -2653,99 +1677,6 @@ mod tests {
             "f = \\r -> (r : {label: Text})\ng = {label 1}\n",
             "annotation field must rename too; got edits: {edits:?}"
         );
-    }
-
-    #[test]
-    fn rename_from_importer_rewrites_owner_internal_usages() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        // The owner uses `parse` internally; the rename starts at the
-        // consumer's call site. The owner's declaration AND its internal
-        // usage must both be rewritten — previously only the declaration
-        // token changed because the whole-decl span from `import_defs`
-        // never matched the owner doc's name-token reference targets.
-        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\nmain = parse 5\n");
-        let consumer_uri =
-            tw.write_and_open("consumer.knot", "import ./owner\n\nrun = parse 1\n");
-        let consumer_doc = tw.workspace.doc(&consumer_uri);
-        let off = consumer_doc.source.find("parse 1").expect("call site");
-        let pos = offset_to_position(&consumer_doc.source, off);
-        let edit = handle_rename(
-            &tw.workspace.state,
-            &rename_params(&consumer_uri, pos, "parsed"),
-        )
-        .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let owner_doc = tw.workspace.doc(&owner_uri);
-        let owner_edits = changes.get(&owner_uri).expect("owner file edited");
-        let new_owner = apply_edits(&owner_doc.source, owner_edits);
-        assert_eq!(
-            new_owner, "parsed = \\x -> x\nmain = parsed 5\n",
-            "owner declaration AND internal usage must be renamed; edits: {owner_edits:?}"
-        );
-        let consumer_edits = changes.get(&consumer_uri).expect("consumer file edited");
-        let new_consumer = apply_edits(&consumer_doc.source, consumer_edits);
-        assert_eq!(new_consumer, "import ./owner\n\nrun = parsed 1\n");
-    }
-
-    #[test]
-    fn rename_skips_shadowed_locals_in_importer() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
-        let consumer_uri = tw.write_and_open(
-            "consumer.knot",
-            "import ./owner\n\nuse1 = parse 2\nshadow = \\parse -> parse 1\n",
-        );
-        let owner_doc = tw.workspace.doc(&owner_uri);
-        let off = owner_doc.source.find("parse =").expect("def");
-        let pos = offset_to_position(&owner_doc.source, off);
-        let edit = handle_rename(
-            &tw.workspace.state,
-            &rename_params(&owner_uri, pos, "parsed"),
-        )
-        .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let consumer_doc = tw.workspace.doc(&consumer_uri);
-        let consumer_edits = changes.get(&consumer_uri).expect("consumer file edited");
-        let new_consumer = apply_edits(&consumer_doc.source, consumer_edits);
-        assert_eq!(
-            new_consumer,
-            "import ./owner\n\nuse1 = parsed 2\nshadow = \\parse -> parse 1\n",
-            "the lambda-bound `parse` and its scoped use refer to the local — \
-             they must not be rewritten; edits: {consumer_edits:?}"
-        );
-    }
-
-    #[test]
-    fn renaming_local_binding_does_not_touch_unopened_importers() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        let owner_uri = tw.write_and_open("owner.knot", "f = \\count -> count + 1\n");
-        // An unopened file on disk that imports the owner and mentions the
-        // same identifier. A *local* rename in the owner must never reach it.
-        let other_path = tw.root.join("other.knot");
-        std::fs::write(&other_path, "import ./owner\ng = \\x -> count\n").unwrap();
-
-        let owner_doc = tw.workspace.doc(&owner_uri);
-        // Start the rename at the local *usage* so it resolves to the lambda
-        // binder.
-        let off = owner_doc.source.find("count + 1").expect("usage");
-        let pos = offset_to_position(&owner_doc.source, off);
-        let edit = handle_rename(
-            &tw.workspace.state,
-            &rename_params(&owner_uri, pos, "total"),
-        )
-        .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        assert_eq!(
-            changes.len(),
-            1,
-            "local rename must stay in the owner file; got: {changes:?}"
-        );
-        let owner_edits = changes.get(&owner_uri).expect("owner file edited");
-        let new_owner = apply_edits(&owner_doc.source, owner_edits);
-        assert_eq!(new_owner, "f = \\total -> total + 1\n");
     }
 
     #[test]
@@ -3176,74 +2107,6 @@ mod regress_rename_fixes_tests {
         assert_eq!(resp.ranges.len(), 2, "field name + access; got: {:?}", resp.ranges);
     }
 
-    // ── Finding 6: local declaration outranks a same-named import ──
-
-    #[test]
-    fn references_prefer_local_definition_over_import() {
-        use crate::references::handle_references;
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\nmain = parse 9\n");
-        let consumer_uri = tw.write_and_open(
-            "consumer.knot",
-            "import ./owner\n\nparse = \\y -> y\nrun = parse 1\n",
-        );
-        let consumer_doc = tw.workspace.doc(&consumer_uri);
-        let off = consumer_doc.source.find("parse 1").expect("local usage");
-        let pos = offset_to_position(&consumer_doc.source, off);
-        let params = ReferenceParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier {
-                    uri: consumer_uri.clone(),
-                },
-                position: pos,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: ReferenceContext {
-                include_declaration: true,
-            },
-        };
-        let locs = handle_references(&tw.workspace.state, &params)
-            .expect("references found");
-        assert!(
-            locs.iter().all(|l| l.uri == consumer_uri),
-            "the local `parse` must not merge the imported module's references; got: {locs:?}"
-        );
-        let _ = owner_uri;
-    }
-
-    // ── Finding 10: importer-side rename rewrites type annotations ──
-
-    #[test]
-    fn rename_type_updates_importer_annotations() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        let owner_uri = tw.write_and_open("owner.knot", "type Shape = {radius: Int 1}\n");
-        let consumer_uri = tw.write_and_open(
-            "consumer.knot",
-            "import ./owner\n\nf : Shape -> Int 1\nf = \\s -> 1\n",
-        );
-        let owner_doc = tw.workspace.doc(&owner_uri);
-        let off = owner_doc.source.find("Shape").expect("type def");
-        let pos = offset_to_position(&owner_doc.source, off);
-        let edit = handle_rename(
-            &tw.workspace.state,
-            &rename_params(&owner_uri, pos, "Form"),
-        )
-        .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let consumer_doc = tw.workspace.doc(&consumer_uri);
-        let consumer_edits = changes
-            .get(&consumer_uri)
-            .expect("consumer annotation must be edited");
-        let out = apply_edits(&consumer_doc.source, consumer_edits);
-        assert_eq!(
-            out, "import ./owner\n\nf : Form -> Int 1\nf = \\s -> 1\n",
-            "the importer's type annotation must be rewritten; edits: {consumer_edits:?}"
-        );
-    }
-
     // ── Body-line definition token of typed functions ────────────────
     //
     // The parser merges `f : T` ⏎ `f = body` into ONE DeclKind::Fun. Rename
@@ -3292,39 +2155,6 @@ mod regress_rename_fixes_tests {
         assert_eq!(
             out,
             "triple : Int 1 -> Int 1\ntriple = \\x -> x * 2\nmain = triple 2\n"
-        );
-    }
-
-    #[test]
-    fn rename_typed_function_in_unopened_disk_file() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        // Owner exists ONLY on disk — never opened — and has a separate
-        // type signature, exercising `apply_owner_disk_edits`.
-        let owner_src = "parse : Int 1 -> Int 1\nparse = \\x -> x\n";
-        std::fs::write(tw.root.join("owner.knot"), owner_src).expect("write owner");
-        let consumer_uri = tw.write_and_open(
-            "consumer.knot",
-            "import ./owner\n\nmain = parse 5\n",
-        );
-        let consumer_doc = tw.workspace.doc(&consumer_uri);
-        let off = consumer_doc.source.find("parse 5").expect("call site");
-        let pos = offset_to_position(&consumer_doc.source, off);
-        let edit = handle_rename(
-            &tw.workspace.state,
-            &rename_params(&consumer_uri, pos, "parsed"),
-        )
-        .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let owner_uri_entry = changes
-            .iter()
-            .find(|(u, _)| u.as_str().contains("owner.knot"))
-            .expect("owner file must be edited");
-        let out = apply_edits(owner_src, owner_uri_entry.1);
-        assert_eq!(
-            out, "parsed : Int 1 -> Int 1\nparsed = \\x -> x\n",
-            "disk-path rename must edit BOTH definition lines; edits: {:?}",
-            owner_uri_entry.1
         );
     }
 
@@ -3382,55 +2212,6 @@ mod regress_rename_fixes_tests {
             let edit = handle_rename(&ws.state, &rename_params(&uri, pos, kw));
             assert!(edit.is_none(), "rename to keyword `{kw}` must be rejected");
         }
-    }
-
-    // ── Cross-file rename must reach unopened importers even when the
-    // reverse-import graph is non-empty (it only has edges for OPEN docs) ──
-
-    #[test]
-    fn rename_reaches_unopened_importer_when_another_importer_is_open() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
-        let _open_consumer =
-            tw.write_and_open("consumer1.knot", "import ./owner\n\nuse1 = parse 1\n");
-        // A second importer exists ONLY on disk — never opened, never analyzed.
-        let c2_src = "import ./owner\n\nuse2 = parse 2\n";
-        std::fs::write(tw.root.join("consumer2.knot"), c2_src).unwrap();
-        // Simulate the reverse-import graph the real server builds from open
-        // docs: owner ← consumer1 (and ONLY consumer1 — consumer2 was never
-        // analyzed, so it has no edge). The old code skipped the workspace
-        // sweep whenever this graph was non-empty, silently missing
-        // consumer2.
-        let owner_path = tw.root.join("owner.knot").canonicalize().unwrap();
-        let c1_path = tw.root.join("consumer1.knot").canonicalize().unwrap();
-        tw.workspace
-            .state
-            .reverse_imports
-            .entry(owner_path)
-            .or_default()
-            .insert(c1_path);
-
-        let owner_doc = tw.workspace.doc(&owner_uri);
-        let off = owner_doc.source.find("parse").expect("def");
-        let pos = offset_to_position(&owner_doc.source, off);
-        let edit = handle_rename(
-            &tw.workspace.state,
-            &rename_params(&owner_uri, pos, "parsed"),
-        )
-        .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let c2_entry = changes
-            .iter()
-            .find(|(u, _)| u.as_str().contains("consumer2.knot"))
-            .expect("UNOPENED importer must receive edits");
-        let out = apply_edits(c2_src, c2_entry.1);
-        assert_eq!(out, "import ./owner\n\nuse2 = parsed 2\n");
-        assert!(
-            changes.keys().any(|u| u.as_str().contains("consumer1.knot")),
-            "open importer must still be edited; got {:?}",
-            changes.keys().collect::<Vec<_>>()
-        );
     }
 
     #[test]

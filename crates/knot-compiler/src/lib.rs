@@ -6,7 +6,6 @@ pub mod effects;
 pub mod infer;
 pub mod linker;
 pub mod lockfile;
-pub mod modules;
 pub mod sql_lint;
 pub mod stack;
 pub mod stratify;

@@ -11,7 +11,7 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use lsp_types::Uri;
 
-use knot::ast::{self, DeclKind, Module, Span};
+use knot::ast::{self, Module, Span};
 use knot::diagnostic::{self, Diagnostic};
 use knot_compiler::effects::EffectSet;
 use knot_compiler::infer::MonadKind;
@@ -23,7 +23,7 @@ use crate::state::{
     InferenceCache, InferenceSnapshot, ANALYSIS_DEBOUNCE, ANALYSIS_MAX_WAIT,
 };
 use crate::utils::{
-    collect_keyword_operator_positions, extract_doc_comments, find_word_in_source, uri_to_path,
+    collect_keyword_operator_positions, extract_doc_comments, uri_to_path,
 };
 
 /// Soft cap on cached inference snapshots — undo/redo and rapid file
@@ -313,7 +313,6 @@ fn panic_recovery_state(source: &str, message: &str) -> DocumentState {
     DocumentState {
         source: source.to_string(),
         module: Module {
-            imports: Vec::new(),
             decls: Vec::new(),
         },
         references: Vec::new(),
@@ -326,9 +325,6 @@ fn panic_recovery_state(source: &str, message: &str) -> DocumentState {
         effect_info: HashMap::new(),
         effect_sets: HashMap::new(),
         knot_diagnostics: vec![diag],
-        imported_files: HashMap::new(),
-        import_defs: HashMap::new(),
-        import_origins: HashMap::new(),
         doc_comments: HashMap::new(),
         keyword_tokens: Vec::new(),
         refined_types: HashMap::new(),
@@ -337,7 +333,6 @@ fn panic_recovery_state(source: &str, message: &str) -> DocumentState {
         monad_info: HashMap::new(),
         unit_info: HashMap::new(),
         changed_decl_names: Vec::new(),
-        signature_changed_decl_names: Vec::new(),
         dirty_decl_closure: std::collections::HashSet::new(),
     }
 }
@@ -362,7 +357,6 @@ pub fn analyze_document(
     let mut monad_info: HashMap<Span, MonadKind> = HashMap::new();
     let mut unit_info: HashMap<Span, String> = HashMap::new();
     let mut changed_decl_names: Vec<String> = Vec::new();
-    let mut signature_changed_decl_names: Vec<String> = Vec::new();
     let mut dirty_decl_closure: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     let lexer = knot::lexer::Lexer::new(source);
@@ -421,12 +415,6 @@ pub fn analyze_document(
     let details = build_details(&module);
     let doc_comments = extract_doc_comments(source, &module);
 
-    let (imported_files, import_defs, import_origins) = if let Some(path) = uri_to_path(uri) {
-        resolve_import_navigation(&module.imports, &path, import_cache)
-    } else {
-        (HashMap::new(), HashMap::new(), HashMap::new())
-    };
-
     let has_parse_errors = all_diags
         .iter()
         .any(|d| matches!(d.severity, diagnostic::Severity::Error));
@@ -481,15 +469,6 @@ pub fn analyze_document(
                 changed_decl_names = dirty.into_iter().collect();
                 changed_decl_names.sort();
 
-                // The cross-file dependent re-queue (handled by
-                // `apply_analysis_result::requeue_dependents_for_changed_decls`)
-                // only needs to fire when an externally-visible signature
-                // moved. Body-only changes to a *typed* function don't shift
-                // its declared type, so its dependents can sit tight.
-                let sig_dirty = new_fingerprint
-                    .signature_changed_decls(&latest.1.fingerprint);
-                signature_changed_decl_names = sig_dirty.into_iter().collect();
-                signature_changed_decl_names.sort();
                 if std::env::var("KNOT_LSP_TRACE_DIRTY").is_ok() && !changed_decl_names.is_empty() {
                     eprintln!(
                         "knot-lsp: {} dirty decls in {}: {}",
@@ -520,44 +499,16 @@ pub fn analyze_document(
                     definitions,
                     details,
                     literal_types,
-                    imported_files,
-                    import_defs,
-                    import_origins,
                     doc_comments,
                     keyword_tokens,
                     all_diags,
                     changed_decl_names,
-                    signature_changed_decl_names,
                     dirty_decl_closure,
                 );
             }
         }
 
         let mut analysis_module = module.clone();
-
-        // Byte ranges in the inlined module that come from *imported* files.
-        // `resolve_imports` prepends copies of imported declarations whose
-        // spans index a *different* file's source. A diagnostic anchored in
-        // one of those foreign spans can, by numeric coincidence, fall inside
-        // one of this file's own decl spans and slip past `anchored_in_user`
-        // as a phantom squiggle. Recording the imported spans lets the filter
-        // reject any diagnostic whose label lands in foreign content, since a
-        // foreign label points into the same coordinate space as the imported
-        // decl it belongs to.
-        let mut imported_regions: Vec<Span> = Vec::new();
-        if let Some(path) = uri_to_path(uri) {
-            // Count this file's own decls before inlining; `resolve_imports`
-            // prepends imported decls, leaving the own decls as the trailing
-            // entries (see `modules::resolve_recursive`). The prefix is
-            // therefore exactly the inlined imported content.
-            let own_decl_count = module.decls.len();
-            let _ = knot_compiler::modules::resolve_imports(&mut analysis_module, &path);
-            let imported_count = analysis_module.decls.len().saturating_sub(own_decl_count);
-            imported_regions = analysis_module.decls[..imported_count]
-                .iter()
-                .map(|d| d.span)
-                .collect();
-        }
 
         knot_compiler::base::inject_prelude(&mut analysis_module);
         knot_compiler::desugar::desugar(&mut analysis_module);
@@ -568,30 +519,19 @@ pub fn analyze_document(
         let pre_inference_len = all_diags.len();
 
         // Inference/effects/stratify/sql_lint run on `analysis_module` — the
-        // prelude-injected, import-inlined module. Binding spans and diagnostic
-        // labels recorded for prelude and imported decls are byte offsets into
-        // OTHER sources; treating them as offsets into this document produces
-        // ghost inlay hints, wrong hover types, and — for diagnostics —
-        // phantom errors that relocate to 0:0 when mapped against this file's
-        // source (and duplicate the real error the importee reports for itself).
-        // Keep only entries anchored inside one of the *user's* own decl spans
-        // (`module` is the pre-injection parse of this file). Mirrors
-        // `workspace_diagnostics`' `anchored_in_importer` filter.
+        // prelude-injected module. Binding spans and diagnostic labels recorded
+        // for prelude decls are byte offsets into OTHER sources; treating them
+        // as offsets into this document produces ghost inlay hints, wrong hover
+        // types, and — for diagnostics — phantom errors that relocate to 0:0
+        // when mapped against this file's source. Keep only entries anchored
+        // inside one of the *user's* own decl spans (`module` is the
+        // pre-injection parse of this file). Mirrors `workspace_diagnostics`'
+        // `anchored_in_importer` filter.
         let user_decl_spans: Vec<Span> = module.decls.iter().map(|d| d.span).collect();
-        // A span that lands inside an imported decl's range belongs to foreign
-        // content, even when it *also* numerically falls inside a user decl
-        // span. Treat imported-region membership as the decisive signal so a
-        // foreign span never counts as "in the user's source".
-        let in_imported_region = |s: &Span| {
-            imported_regions
-                .iter()
-                .any(|r| r.start <= s.start && s.end <= r.end)
-        };
         let in_user_decl = |s: &Span| {
-            !in_imported_region(s)
-                && user_decl_spans
-                    .iter()
-                    .any(|d| d.start <= s.start && s.end <= d.end)
+            user_decl_spans
+                .iter()
+                .any(|d| d.start <= s.start && s.end <= d.end)
         };
         let anchored_in_user = |d: &Diagnostic| -> bool {
             d.labels.iter().any(|l| in_user_decl(&l.span))
@@ -719,9 +659,6 @@ pub fn analyze_document(
         effect_info,
         effect_sets,
         knot_diagnostics: all_diags,
-        imported_files,
-        import_defs,
-        import_origins,
         doc_comments,
         keyword_tokens,
         refined_types,
@@ -730,7 +667,6 @@ pub fn analyze_document(
         monad_info,
         unit_info,
         changed_decl_names,
-        signature_changed_decl_names,
         dirty_decl_closure,
     }
 }
@@ -765,14 +701,10 @@ fn reuse_snapshot(
     definitions: HashMap<String, Span>,
     details: HashMap<String, String>,
     literal_types: Vec<(Span, String)>,
-    imported_files: HashMap<PathBuf, String>,
-    import_defs: HashMap<String, (PathBuf, Span)>,
-    import_origins: HashMap<String, String>,
     doc_comments: HashMap<String, String>,
     keyword_tokens: Vec<(Span, u32)>,
     mut all_diags: Vec<diagnostic::Diagnostic>,
     changed_decl_names: Vec<String>,
-    signature_changed_decl_names: Vec<String>,
     dirty_decl_closure: std::collections::HashSet<String>,
 ) -> DocumentState {
     all_diags.extend(snap.diagnostics.iter().cloned());
@@ -790,9 +722,6 @@ fn reuse_snapshot(
         effect_info: snap.effect_info.clone(),
         effect_sets: snap.effect_sets.clone(),
         knot_diagnostics: all_diags,
-        imported_files,
-        import_defs,
-        import_origins,
         doc_comments,
         keyword_tokens,
         refined_types: snap.refined_types.clone(),
@@ -801,47 +730,11 @@ fn reuse_snapshot(
         monad_info: snap.monad_info.clone(),
         unit_info: snap.unit_info.clone(),
         changed_decl_names,
-        signature_changed_decl_names,
         dirty_decl_closure,
     }
 }
 
 // ── File caching ────────────────────────────────────────────────────
-
-/// Read, lex, and parse a `.knot` file off disk, reusing the content-hash-keyed
-/// cache when possible. Returns `None` only if the file is missing or unreadable.
-///
-/// This is the single funnel through which every off-disk read in the LSP flows
-/// (rename across unopened files, workspace symbol search, workspace diagnostics,
-/// auto-import completion, import resolution).
-pub fn get_or_parse_file(
-    path: &Path,
-    cache: &mut ImportCache,
-) -> Option<(Module, String)> {
-    let source = std::fs::read_to_string(path).ok()?;
-    let hash = content_hash(&source);
-    let new_clock = next_import_clock(cache);
-    if let Some(entry) = cache.get_mut(path)
-        && entry.content_hash == hash {
-            entry.access_clock = new_clock;
-            return Some((entry.module.clone(), entry.source.clone()));
-        }
-    let lexer = knot::lexer::Lexer::new(&source);
-    let (tokens, _) = lexer.tokenize();
-    let parser = knot::parser::Parser::new(source.clone(), tokens);
-    let (module, _) = parser.parse_module();
-    cache.insert(
-        path.to_path_buf(),
-        ImportCacheEntry {
-            content_hash: hash,
-            module: module.clone(),
-            source: source.clone(),
-            access_clock: new_clock,
-        },
-    );
-    enforce_import_cache_cap(cache);
-    Some((module, source))
-}
 
 /// Like `get_or_parse_file`, but operates against the `Arc<Mutex<…>>` cache held
 /// by `ServerState`. Reads the file and (on cache miss) parses it *outside* the
@@ -882,116 +775,6 @@ pub fn get_or_parse_file_shared(
     }
     Some((module, source))
 }
-
-// ── Import navigation ───────────────────────────────────────────────
-
-/// Import navigation resolution: imported file sources, import def sites
-/// (name → (path, span)), and import origin module names (name → module).
-type ImportNavigation = (
-    HashMap<PathBuf, String>,
-    HashMap<String, (PathBuf, Span)>,
-    HashMap<String, String>,
-);
-
-/// Resolve imported files for cross-file navigation.
-pub fn resolve_import_navigation(
-    imports: &[ast::Import],
-    source_path: &Path,
-    import_cache: &mut ImportCache,
-) -> ImportNavigation {
-    let mut imported_files = HashMap::new();
-    let mut import_defs = HashMap::new();
-    let mut import_origins = HashMap::new();
-
-    let base_dir = source_path.parent().unwrap_or(Path::new("."));
-
-    for imp in imports {
-        let rel_path = PathBuf::from(&imp.path).with_extension("knot");
-        let full_path = base_dir.join(&rel_path);
-
-        let canonical = match full_path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        let (module, source) = match get_or_parse_file(&canonical, import_cache) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        // Selective imports: `import ./lib {parse}` only brings the listed
-        // names into scope. Mirror the compiler's filter
-        // (`knot_compiler::modules::should_include_decl`): every named decl
-        // kind is gated on its own name; impl methods ride along with their
-        // trait; a data type's constructors come with the data type itself.
-        // Without this, every decl of every imported module landed in
-        // `import_defs`, so a later import could shadow the true binder —
-        // corrupting rename's owner resolution, goto-definition, and
-        // prepare_rename.
-        let allowed: Option<std::collections::HashSet<&str>> = imp
-            .items
-            .as_ref()
-            .map(|items| items.iter().map(|i| i.name.as_str()).collect());
-        let included = |name: &str| allowed.as_ref().is_none_or(|s| s.contains(name));
-
-        for decl in &module.decls {
-            match &decl.node {
-                DeclKind::Data {
-                    name, constructors, ..
-                } => {
-                    if !included(name) {
-                        continue;
-                    }
-                    import_defs.insert(name.clone(), (canonical.clone(), decl.span));
-                    import_origins.insert(name.clone(), imp.path.clone());
-                    for ctor in constructors {
-                        // Search from after the `=` in the decl span to avoid
-                        // matching the type name when constructor and type
-                        // share a name (e.g. `data Wrapper = Wrapper Int`).
-                        let search_start = source[decl.span.start..decl.span.end]
-                            .find('=')
-                            .map(|p| decl.span.start + p + 1)
-                            .unwrap_or(decl.span.start);
-                        let ctor_span = find_word_in_source(
-                            &source,
-                            &ctor.name,
-                            search_start,
-                            decl.span.end,
-                        )
-                        .unwrap_or(decl.span);
-                        import_defs.insert(ctor.name.clone(), (canonical.clone(), ctor_span));
-                        import_origins.insert(ctor.name.clone(), imp.path.clone());
-                    }
-                }
-                DeclKind::TypeAlias { name, .. }
-                | DeclKind::Source { name, .. }
-                | DeclKind::View { name, .. }
-                | DeclKind::Derived { name, .. }
-                | DeclKind::Fun { name, .. }
-                | DeclKind::Route { name, .. }
-                | DeclKind::RouteComposite { name, .. } => {
-                    if !included(name) {
-                        continue;
-                    }
-                    import_defs.insert(name.clone(), (canonical.clone(), decl.span));
-                    import_origins.insert(name.clone(), imp.path.clone());
-                }
-                _ => {}
-            }
-        }
-
-        imported_files.insert(canonical, source);
-    }
-
-    (imported_files, import_defs, import_origins)
-}
-
-// Diagnostic publishing now lives in `main.rs::publish_diagnostics_dedup` so
-// it can compare against the per-URI `published_lsp_diagnostics` cache and
-// skip redundant LSP roundtrips. The legacy `publish_diagnostics` helper
-// here was removed when that move happened.
-
-// ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1162,7 +945,6 @@ mod tests {
                 ImportCacheEntry {
                     content_hash: i as u64,
                     module: Module {
-                        imports: Vec::new(),
                         decls: Vec::new(),
                     },
                     source: String::new(),
@@ -1497,110 +1279,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Reverting a file to a previously-cached state must still report a
-    /// non-empty `signature_changed_decl_names` when the most recent
-    /// snapshot's signatures differ. Otherwise `apply_analysis_result` skips
-    /// the dependent re-queue, and any diagnostic a dependent picked up
-    /// from the divergent state lingers after the revert.
-    #[test]
-    fn revert_to_cached_source_still_reports_signature_changes() {
-        let dir = std::env::temp_dir().join(format!(
-            "knot-lsp-revert-cache-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("r.knot");
-        std::fs::write(&path, "").unwrap();
-        let canonical = path.canonicalize().unwrap();
-        let uri = fake_uri(&format!("file://{}", canonical.display()));
-
-        let mut import_cache: ImportCache = HashMap::new();
-        let mut inference_cache: InferenceCache = HashMap::new();
-
-        let v1 = "foo : Int 1 -> Int 1\nfoo = \\x -> x\n";
-        let v2 = "foo : Int 1 -> Text\nfoo = \\x -> show x\n";
-
-        std::fs::write(&path, v1).unwrap();
-        let _ = analyze_document(&uri, v1, &mut import_cache, &mut inference_cache);
-
-        std::fs::write(&path, v2).unwrap();
-        let doc_v2 = analyze_document(&uri, v2, &mut import_cache, &mut inference_cache);
-        assert!(
-            doc_v2.signature_changed_decl_names.contains(&"foo".to_string()),
-            "v1 → v2 must report `foo` as signature-changed; got: {:?}",
-            doc_v2.signature_changed_decl_names
-        );
-
-        // Revert to v1: cache hit on the v1 snapshot. The diff against the
-        // most-recent snapshot (v2) must still surface `foo` so dependents
-        // re-queue and clear their stale errors.
-        std::fs::write(&path, v1).unwrap();
-        let doc_revert = analyze_document(&uri, v1, &mut import_cache, &mut inference_cache);
-        assert!(
-            doc_revert.signature_changed_decl_names.contains(&"foo".to_string()),
-            "revert v2 → v1 must still report `foo` as signature-changed; got: {:?}",
-            doc_revert.signature_changed_decl_names
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Bug fix: `resolve_import_navigation` ignored selective import lists,
-    /// so EVERY decl of EVERY imported module landed in `import_defs` — a
-    /// later import could shadow the true binder, corrupting rename's
-    /// owner resolution, goto-definition, and prepare_rename. The filter
-    /// must mirror `knot_compiler::modules::should_include_decl`.
-    #[test]
-    fn selective_imports_filter_import_defs() {
-        let dir = std::env::temp_dir().join(format!(
-            "knot-lsp-selective-imports-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        // lib1 exports `parse` (selected) and `hidden` (not selected).
-        std::fs::write(dir.join("lib1.knot"), "parse = \\x -> x\nhidden = 1\n").unwrap();
-        // lib2 also defines `parse` — but the import only selects `other`,
-        // so lib2's `parse` must NOT shadow lib1's.
-        std::fs::write(dir.join("lib2.knot"), "parse = \\y -> y\nother = 2\n").unwrap();
-        let main_path = dir.join("main.knot");
-        let main_src = "import ./lib1 (parse)\nimport ./lib2 (other)\n\nrun = parse 1\n";
-        std::fs::write(&main_path, main_src).unwrap();
-        let canonical = main_path.canonicalize().unwrap();
-        let uri = fake_uri(&format!("file://{}", canonical.display()));
-
-        let mut import_cache: ImportCache = HashMap::new();
-        let mut inference_cache: InferenceCache = HashMap::new();
-        let doc = analyze_document(&uri, main_src, &mut import_cache, &mut inference_cache);
-
-        let lib1_canon = dir.join("lib1.knot").canonicalize().unwrap();
-        let lib2_canon = dir.join("lib2.knot").canonicalize().unwrap();
-        let (parse_owner, _) = doc
-            .import_defs
-            .get("parse")
-            .expect("selected name `parse` must be in import_defs");
-        assert_eq!(
-            parse_owner, &lib1_canon,
-            "lib2's unselected `parse` must not shadow lib1's"
-        );
-        let (other_owner, _) = doc
-            .import_defs
-            .get("other")
-            .expect("selected name `other` must be in import_defs");
-        assert_eq!(other_owner, &lib2_canon);
-        assert!(
-            !doc.import_defs.contains_key("hidden"),
-            "unselected `hidden` must not be in import_defs"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn worker_clears_diagnostic_after_fix_edit() {
         // End-to-end-ish: feed the worker the bad source, then the fix.
@@ -1781,10 +1459,6 @@ main = do
             ("data_dangling_bar", "data Foo = A |"),
             ("partial_record_type", "type R = {name:"),
             ("partial_route", "route R where"),
-            ("partial_import", "import"),
-            ("import_no_path", "import "),
-            ("import_trailing_slash", "import foo/"),
-            ("import_keyword_segment", "import foo/where"),
             ("partial_trait", "trait T where"),
             ("partial_impl", "impl T for"),
             ("source_no_type", "*xs :"),
@@ -1842,7 +1516,6 @@ main = do
             "data Foo = A |",
             "(((((",
             "type R = {a:",
-            "import foo/",
             "x = case y of",
             "*xs :",
         ];

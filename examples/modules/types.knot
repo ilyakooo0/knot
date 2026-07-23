@@ -1,5 +1,0 @@
-export type Person = {name: Text, age: Int 1}
-
-export data Priority = Low {} | Medium {} | High {}
-
-internalHelper = \x -> x + 1

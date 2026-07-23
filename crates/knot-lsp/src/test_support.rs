@@ -45,7 +45,6 @@ impl TestWorkspace {
             pending_sources: HashMap::new(),
             dropped_analysis_retry: HashMap::new(),
             analysis_tx,
-            reverse_imports: HashMap::new(),
             inference_cache: Arc::new(Mutex::new(HashMap::new())),
             semantic_token_cache: HashMap::new(),
             semantic_token_counter: 0,

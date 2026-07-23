@@ -278,7 +278,7 @@ mod tests {
     /// `PRELUDE_SPAN_OFFSET` guarantees they can never collide with user spans.
     #[test]
     fn prelude_spans_shifted_out_of_user_range() {
-        let mut module = ast::Module { imports: vec![], decls: vec![] };
+        let mut module = ast::Module { decls: vec![] };
         inject_prelude(&mut module);
 
         // Every decl came from the prelude (the user module was empty), so all
@@ -459,7 +459,7 @@ mod tests {
     /// prelude decl may remain in user-file range.
     #[test]
     fn every_prelude_value_span_is_shifted() {
-        let mut module = ast::Module { imports: vec![], decls: vec![] };
+        let mut module = ast::Module { decls: vec![] };
         inject_prelude(&mut module);
         assert!(!module.decls.is_empty(), "prelude should inject decls");
 

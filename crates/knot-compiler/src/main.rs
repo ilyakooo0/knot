@@ -2,7 +2,7 @@
 //!
 //! Usage: knot build <file.knot>
 
-use knot_compiler::{base, codegen, desugar, effects, infer, linker, lockfile, modules, stratify, types, unused};
+use knot_compiler::{base, codegen, desugar, effects, infer, linker, lockfile, stratify, types, unused};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -336,20 +336,9 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         process::exit(1);
     }
 
-    // Save original decls before mutations (imports/prelude/desugar add decls
+    // Save original decls before mutations (prelude/desugar add decls
     // with spans referencing other source texts — lockfile needs original spans).
     let original_decls = module.decls.clone();
-
-    // Resolve imports — load, parse, and merge imported modules
-    let imported_snippets = match modules::resolve_imports(&mut module, &source_path) {
-        Ok(snippets) => snippets,
-        Err(diags) => {
-            for diag in &diags {
-                eprintln!("{}", diag);
-            }
-            process::exit(1);
-        }
-    };
 
     // Inject built-in trait declarations and primitive impls
     base::inject_prelude(&mut module);
@@ -483,12 +472,11 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     }
 
     // Update schema lockfile (use original decls — the mutated module contains
-    // prelude/import decls whose spans don't correspond to this source text).
+    // prelude decls whose spans don't correspond to this source text).
     let lockfile_module = knot::ast::Module {
-        imports: vec![],
         decls: original_decls,
     };
-    if let Err(e) = lockfile::update(&source_path, &source, &lockfile_module, &imported_snippets.types, &imported_snippets.sources) {
+    if let Err(e) = lockfile::update(&source_path, &source, &lockfile_module) {
         eprintln!("Warning: {}", e);
     }
 

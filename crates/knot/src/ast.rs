@@ -42,7 +42,6 @@ pub type Type = Spanned<TypeKind>;
 pub struct Decl {
     pub node: DeclKind,
     pub span: Span,
-    pub exported: bool,
 }
 pub type Stmt = Spanned<StmtKind>;
 
@@ -51,23 +50,7 @@ pub type Stmt = Spanned<StmtKind>;
 /// A complete Knot source file.
 #[derive(Debug, Clone)]
 pub struct Module {
-    pub imports: Vec<Import>,
     pub decls: Vec<Decl>,
-}
-
-/// `import ./path` or `import ./path (A, b)`
-#[derive(Debug, Clone)]
-pub struct Import {
-    pub path: String,
-    pub items: Option<Vec<ImportItem>>,
-    pub span: Span,
-}
-
-/// A single item in a selective import list.
-#[derive(Debug, Clone)]
-pub struct ImportItem {
-    pub name: Name,
-    pub span: Span,
 }
 
 // ── Units of Measure ──────────────────────────────────────────────

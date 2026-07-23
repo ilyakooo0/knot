@@ -1,3 +1,0 @@
-import ./core
-
-greet = \name -> greeting ++ ", " ++ name ++ "!"

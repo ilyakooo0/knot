@@ -97,11 +97,6 @@ pub type ImportCache = HashMap<PathBuf, ImportCacheEntry>;
 // the corresponding cache forever. The caps below are a final safety net —
 // well above any realistic open-document count, but bounded.
 
-/// Hard ceiling on the number of distinct *imported* paths tracked in
-/// `reverse_imports`. The map is naturally bounded by the transitive import
-/// closure of every open document; this cap only kicks in for pathological
-/// workspaces where one project imports thousands of unique files.
-pub const MAX_REVERSE_IMPORT_KEYS: usize = 4096;
 /// Cap on the per-URI semantic-token cache. Each entry carries the full
 /// encoded token list; a few hundred fits comfortably in memory and is
 /// far more than any editor opens at once.
@@ -122,25 +117,6 @@ pub const MAX_PENDING_SOURCES: usize = 256;
 /// query — without it, the per-open-doc inserts in Phase 1 of
 /// `handle_workspace_symbol` would accumulate forever.
 pub const MAX_WORKSPACE_SYMBOL_CACHE: usize = 4096;
-
-/// Drop reverse-import entries whose importer set went empty after the last
-/// re-analysis pruned the final incoming edge. An empty set can never
-/// trigger a useful re-queue, but unpruned keys would otherwise accumulate
-/// across long sessions as files are touched and abandoned. After the
-/// retain pass, fall back to a hard cap so a pathological workspace can't
-/// blow the map up either.
-pub fn prune_reverse_imports(
-    map: &mut HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
-) {
-    map.retain(|_, importers| !importers.is_empty());
-    if map.len() > MAX_REVERSE_IMPORT_KEYS {
-        let drop_count = map.len() - MAX_REVERSE_IMPORT_KEYS;
-        let victims: Vec<PathBuf> = map.keys().take(drop_count).cloned().collect();
-        for k in victims {
-            map.remove(&k);
-        }
-    }
-}
 
 /// Bound a per-URI cache to `cap` entries. First evicts URIs that are no
 /// longer open in the editor — those entries serve no purpose once the
@@ -210,12 +186,6 @@ pub struct DocumentState {
     /// operations (e.g. atomic-context filtering).
     pub effect_sets: HashMap<String, EffectSet>,
     pub knot_diagnostics: Vec<diagnostic::Diagnostic>,
-    /// Imported files: canonical path → source text
-    pub imported_files: HashMap<PathBuf, String>,
-    /// Definitions from imported files: name → (canonical path, span in that file)
-    pub import_defs: HashMap<String, (PathBuf, Span)>,
-    /// Which import path each name originated from (for scoped cross-file matching).
-    pub import_origins: HashMap<String, String>,
     /// Doc comments for declarations: name → comment text.
     pub doc_comments: HashMap<String, String>,
     /// Keyword/operator token positions for semantic highlighting.
@@ -248,13 +218,6 @@ pub struct DocumentState {
     /// inference pass.
     #[allow(dead_code)]
     pub changed_decl_names: Vec<String>,
-    /// Strict subset of `changed_decl_names` containing only those decls
-    /// whose externally-visible signature moved. A typed `Fun` whose body
-    /// changed but whose signature is intact lands in `changed_decl_names`
-    /// but NOT here — its dependents needn't be re-analyzed because the
-    /// outward type is unchanged. Drives `apply_analysis_result`'s
-    /// cross-file dependent re-queue.
-    pub signature_changed_decl_names: Vec<String>,
     /// Transitive in-file closure of `changed_decl_names` — every decl whose
     /// inferred type or effects could conceivably have shifted since the
     /// previous analysis, accounting for the per-decl reverse-dependency
@@ -330,12 +293,6 @@ pub struct ServerState {
     pub dropped_analysis_retry: HashMap<Uri, (String, Option<i32>)>,
     /// Sender side of the analysis-task channel. Cloned per outgoing task.
     pub analysis_tx: Sender<AnalysisTask>,
-    /// Reverse-import graph: importer → set of imported files. Built from the
-    /// `imported_files` of every doc + the on-disk modules in `import_cache`.
-    /// Used by cross-file diagnostics to re-check downstream consumers when
-    /// a file changes. The map stores absolute canonical paths for both keys
-    /// and values so it works uniformly for open and unopened files.
-    pub reverse_imports: HashMap<PathBuf, std::collections::HashSet<PathBuf>>,
     /// Cached inference snapshots keyed by (canonical path, content hash).
     /// Skips re-running the type/effect/stratify/sql_lint pipeline when the
     /// source bytes match a previous successful analysis. Bounded eviction
@@ -552,9 +509,9 @@ impl ServerConfig {
 /// `true`/`false` lex as `Bool` literals and are included because renaming a
 /// symbol *to* them would re-lex as a literal.
 pub const KEYWORDS: &[&str] = &[
-    "import", "data", "type", "trait", "impl", "route", "serve", "migrate", "where", "do",
+    "data", "type", "route", "serve", "migrate", "where", "do",
     "yield", "if", "then", "else", "case", "of", "let", "in", "not", "replace", "atomic",
-    "deriving", "with", "export", "unit", "refine", "forall", "true", "false",
+    "deriving", "with", "unit", "refine", "forall", "true", "false",
 ];
 
 /// Context tag for a snippet — used by `handle_completion` to filter snippets
@@ -731,18 +688,6 @@ pub const SNIPPETS: &[(&str, &str, &str, SnippetContext)] = &[
         "derived",
         "derived relation",
         "&${1:name} = do\n  ${2:x} <- *${3:source}\n  yield ${4:x}",
-        SnippetContext::TopLevel,
-    ),
-    (
-        "trait",
-        "trait declaration",
-        "trait ${1:Name} ${2:a} where\n  ${3:method} : ${4:Type}",
-        SnippetContext::TopLevel,
-    ),
-    (
-        "impl",
-        "impl block",
-        "impl ${1:Trait} ${2:Type} where\n  ${3:method} ${4:x} = ${5:body}",
         SnippetContext::TopLevel,
     ),
     (

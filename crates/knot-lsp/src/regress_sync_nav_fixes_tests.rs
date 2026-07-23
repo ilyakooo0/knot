@@ -1,6 +1,5 @@
 //! Regression tests for the sync/state/navigation bug-fix batch:
 //! - stale analysis results racing an undo (apply_analysis_result guard)
-//! - willRenameFiles edits computed against pending (live) source
 //! - trait-bound changes included in signature fingerprints
 //! - code-lens reference counts / call-hierarchy prepare comparing against
 //!   name-token definition spans
@@ -92,45 +91,6 @@ fn matching_pending_analysis_result_is_applied() {
         !ws.state.pending_sources.contains_key(&uri),
         "pending entry consumed on apply"
     );
-}
-
-// ── Finding 5: willRenameFiles uses pending (live) source ───────────
-
-#[test]
-fn will_rename_files_computes_edits_against_pending_source() {
-    let mut tmp = TempWorkspace::new();
-    let target_uri = tmp.write_and_open("target.knot", "helper = \\x -> x\n");
-    let importer_uri =
-        tmp.write_and_open("importer.knot", "import ./target\nmain = helper 1\n");
-
-    // Live buffer has a comment line above the import: the import statement
-    // now lives on line 1, not line 0 as in the last-analyzed source.
-    tmp.workspace.state.pending_sources.insert(
-        importer_uri.clone(),
-        PendingSource {
-            source: "-- moved\nimport ./target\nmain = helper 1\n".to_string(),
-            version: Some(2),
-        },
-    );
-
-    let canonical_root = tmp.root.canonicalize().expect("root exists");
-    let new_uri = format!("file://{}", canonical_root.join("moved.knot").display());
-    let params = RenameFilesParams {
-        files: vec![FileRename {
-            old_uri: target_uri.as_str().to_string(),
-            new_uri,
-        }],
-    };
-    let edit = crate::handle_will_rename_files(&tmp.workspace.state, &params)
-        .expect("rewrite edit produced");
-    let changes = edit.changes.expect("changes map");
-    let edits = changes.get(&importer_uri).expect("importer has edits");
-    assert_eq!(edits.len(), 1);
-    assert_eq!(
-        edits[0].range.start.line, 1,
-        "edit range must target the import's position in the PENDING source"
-    );
-    assert_eq!(edits[0].new_text, "./moved");
 }
 
 // ── Finding 3: trait bounds participate in signature fingerprint ─────
@@ -253,49 +213,6 @@ fn call_hierarchy_incoming_excludes_self_declaration_token() {
     assert!(
         callers.contains(&"main"),
         "the genuine caller `main` must be present: {callers:?}"
-    );
-}
-
-#[test]
-fn call_hierarchy_incoming_finds_cross_file_callers() {
-    // Regression (M4): incoming-calls only searched the target document, so a
-    // caller in another open file that imports the target was missed entirely.
-    // It now also walks the other open documents (mirroring find-references'
-    // origin discipline).
-    let mut tmp = TempWorkspace::new();
-    let owner_uri = tmp.write_and_open("owner.knot", "helper = \\x -> x\n");
-    let consumer_uri =
-        tmp.write_and_open("consumer.knot", "import ./owner\nrun = helper 1\n");
-    let owner_doc = tmp.workspace.doc(&owner_uri);
-    let helper_def = *owner_doc.definitions.get("helper").expect("helper defined");
-    let params = CallHierarchyIncomingCallsParams {
-        item: CallHierarchyItem {
-            name: "helper".to_string(),
-            kind: SymbolKind::FUNCTION,
-            tags: None,
-            detail: None,
-            uri: owner_uri.clone(),
-            range: crate::utils::span_to_range(helper_def, &owner_doc.source),
-            selection_range: crate::utils::span_to_range(helper_def, &owner_doc.source),
-            data: None,
-        },
-        work_done_progress_params: Default::default(),
-        partial_result_params: Default::default(),
-    };
-    let incoming =
-        crate::call_hierarchy::handle_call_hierarchy_incoming(&tmp.workspace.state, &params)
-            .expect("helper has a cross-file incoming call from consumer.knot");
-    let from_consumer = incoming
-        .iter()
-        .find(|c| c.from.name == "run")
-        .expect("the cross-file caller `run` must be present");
-    assert_eq!(
-        from_consumer.from.uri, consumer_uri,
-        "the caller must be attributed to consumer.knot"
-    );
-    assert!(
-        !from_consumer.from_ranges.is_empty(),
-        "the call site range in consumer.knot must be reported"
     );
 }
 

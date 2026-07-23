@@ -629,11 +629,12 @@ main = do
 #[test]
 fn migrate_bracketed_relation_types_produce_record_schemas() {
     let src = r#"type Order = {customer: Text, qty: Int 1}
-*orders : [Order]
-migrate *orders
-  from [{customer: Text}]
-  to [{customer: Text, qty: Int 1}]
-  using \r -> {customer r.customer qty 0}
+db =
+  { *orders : [Order]
+      migrate from [{customer: Text}]
+      to [{customer: Text, qty: Int 1}]
+      using \r -> {customer r.customer qty 0}
+  }
 main = println "ok"
 "#;
     let module = parse(src);
@@ -690,8 +691,7 @@ fn migrate_scalar_source_runs_end_to_end() {
     assert!(ok1, "phase 1 (Int source) should build and run");
 
     let (stdout, ok2) = build_run(
-        "*counter : Float 1\n\
-         migrate *counter from Int to Float using \\old -> 0.0\n\
+        "db =\n  { *counter : Float 1\n      migrate from Int to Float using \\old -> 0.0\n  }\n\
          main = do\n  c <- *counter\n  println (show c)\n  yield {}\n",
     );
     let _ = fs::remove_dir_all(&dir);
@@ -708,8 +708,10 @@ fn migrate_scalar_source_schema_matches_source_schema() {
     // path must wrap its from/to schemas the same way; otherwise the lockfile
     // (`_value:int`) and the migrate descriptor (`int`) never match and scalar
     // source migrations are impossible.
-    let src = r#"*counter : Float 1
-migrate *counter from Int to Float using \old -> 0.0
+    let src = r#"db =
+  { *counter : Float 1
+      migrate from Int to Float using \old -> 0.0
+  }
 main = println "ok"
 "#;
     let module = parse(src);
@@ -729,8 +731,10 @@ main = println "ok"
 #[test]
 fn migrate_relation_of_scalar_schema_matches_source_schema() {
     // Same contract for a relation-of-scalar source (`[Text]` → `_value:text`).
-    let src = r#"*tags : [Int 1]
-migrate *tags from [Text] to [Int 1] using \r -> r
+    let src = r#"db =
+  { *tags : [Int 1]
+      migrate from [Text] to [Int 1] using \r -> r
+  }
 main = println "ok"
 "#;
     let module = parse(src);
@@ -748,11 +752,12 @@ fn migrate_bracketed_relation_types_run_end_to_end() {
     let (stdout, stderr, ok) = compile_and_run(
         "migrate_bracketed",
         r#"type Order = {customer: Text, qty: Int 1}
-*orders : [Order]
-migrate *orders
-  from [{customer: Text}]
-  to [{customer: Text, qty: Int 1}]
-  using \r -> {customer r.customer qty 0}
+db =
+  { *orders : [Order]
+      migrate from [{customer: Text}]
+      to [{customer: Text, qty: Int 1}]
+      using \r -> {customer r.customer qty 0}
+  }
 main = do
   rows <- *orders
   println ("rows: " ++ show (count rows))
@@ -828,11 +833,12 @@ fn let_bound_io_lambda_in_do_compiles_and_runs() {
 
 #[test]
 fn source_referenced_only_by_migrate_is_not_unused() {
-    let src = r#"*orders : [{customer: Text}]
-migrate *orders
-  from [{customer: Text}]
-  to [{customer: Text}]
-  using \r -> r
+    let src = r#"db =
+  { *orders : [{customer: Text}]
+      migrate from [{customer: Text}]
+      to [{customer: Text}]
+      using \r -> r
+  }
 main = println "ok"
 "#;
     let module = parse(src);

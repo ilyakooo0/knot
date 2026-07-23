@@ -608,7 +608,6 @@ fn span_is_record_pun(module: &Module, source: &str, span: Span) -> bool {
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => pun_in_expr(body, source, span, &mut found),
-            DeclKind::Migrate { using_fn, .. } => pun_in_expr(using_fn, source, span, &mut found),
             _ => {}
         }
         if found {
@@ -1040,9 +1039,6 @@ pub(crate) fn collect_shadowed_names(
             | DeclKind::Derived { body, .. } => {
                 walk(body, old_name, new_name, &mut Vec::new(), out);
             }
-            DeclKind::Migrate { using_fn, .. } => {
-                walk(using_fn, old_name, new_name, &mut Vec::new(), out);
-            }
             _ => {}
         }
     }
@@ -1267,21 +1263,6 @@ pub(crate) fn collect_name_uses_in_decl(
                     walk_type(&f.value, name, source, out);
                 }
             }
-        }
-        DeclKind::Migrate { relation, from_ty, to_ty, using_fn, .. } => {
-            // `migrate *rel from … to …` — the migrated relation references its
-            // source declaration; rename it too so the migrate doesn't dangle.
-            // `relation` is the bare name (no `*`), recovered from the source;
-            // the `*` sigil is a word boundary for the search.
-            if relation == name
-                && let Some(span) =
-                    find_word_in_source(source, name, decl.span.start, decl.span.end)
-            {
-                out.push(span);
-            }
-            walk_type(from_ty, name, source, out);
-            walk_type(to_ty, name, source, out);
-            walk_expr(using_fn, name, source, false, out);
         }
         DeclKind::Route { entries, .. } => {
             let mut ctor_cursor = decl.span.start;
@@ -1759,16 +1740,6 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
         DeclKind::TypeAlias { ty, .. } | DeclKind::Source { ty, .. } => {
             field_sites_in_type(ty, source, f);
         }
-        DeclKind::Migrate {
-            from_ty,
-            to_ty,
-            using_fn,
-            ..
-        } => {
-            field_sites_in_type(from_ty, source, f);
-            field_sites_in_type(to_ty, source, f);
-            field_sites_in_expr(using_fn, source, f);
-        }
         DeclKind::Route { entries, .. } => {
             // Route field names are declared inline (`body {userId: Int}`,
             // `?{q: Text}`, `headers {auth: Text}`, and the response record
@@ -2195,32 +2166,6 @@ mod tests {
                 .iter()
                 .any(|e| e.range.start == call_pos && e.new_text.contains("parsed")),
             "consumer usage must be renamed despite a broken sibling import; edits: {consumer_edits:?}"
-        );
-    }
-
-    #[test]
-    fn rename_source_updates_migrate_relation() {
-        // Regression: `migrate *users …`'s relation token was never collected —
-        // the Migrate arm dropped `relation`. Renaming the source left the
-        // migrate dangling. Renaming `users` must also update `migrate *users`.
-        let mut ws = TestWorkspace::new();
-        let src = "*users : [{v: Int 1}]\nf = \\x -> x\nmigrate *users from Int to Int using f\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("users").expect("source def");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "accounts"))
-            .expect("rename produces edits");
-        let mut changes = edit.changes.expect("changes present");
-        let edits = changes.remove(&uri).expect("file has edits");
-
-        let migrate_off = doc.source.find("migrate *users").expect("migrate") + "migrate *".len();
-        let migrate_pos = offset_to_position(&doc.source, migrate_off);
-        assert!(
-            edits
-                .iter()
-                .any(|e| e.range.start == migrate_pos && e.new_text.contains("accounts")),
-            "migrated relation `*users` must be renamed; edits: {edits:?}"
         );
     }
 

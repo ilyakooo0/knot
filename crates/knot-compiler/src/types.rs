@@ -346,39 +346,6 @@ impl TypeEnv {
                         source_refinements.insert(name.clone(), refinements);
                     }
                 }
-                DeclKind::Migrate {
-                    relation,
-                    from_ty,
-                    to_ty,
-                    ..
-                } => {
-                    // Unwrap relation types (`[{...}]`, or aliases that
-                    // resolve to one) the same way `schema_for_source`
-                    // does — `schema_descriptor` on a `Relation` collapses
-                    // to a bare "text", which breaks every startup.
-                    let unwrap_relation = |r: ResolvedType| match r {
-                        ResolvedType::Relation(inner) => *inner,
-                        other => other,
-                    };
-                    let old_resolved = unwrap_relation(
-                        resolve_type(from_ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params),
-                    );
-                    let new_resolved = unwrap_relation(
-                        resolve_type(to_ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params),
-                    );
-                    // Use `relation_inner_schema` (not bare `schema_descriptor`)
-                    // so scalar element types are wrapped as `_value:<scalar>`,
-                    // matching how `schema_for_source` records the source's
-                    // schema in the lockfile. Otherwise scalar / relation-of-
-                    // scalar source migrations could never match the lockfile
-                    // (`_value:int` vs `int`) and always failed validation.
-                    let old_schema = relation_inner_schema(&old_resolved);
-                    let new_schema = relation_inner_schema(&new_resolved);
-                    migrate_schemas
-                        .entry(relation.clone())
-                        .or_default()
-                        .push((old_schema, new_schema));
-                }
                 DeclKind::Derived { name, ty: Some(scheme), .. } => {
                     // Compute schema for derived relations with type annotations
                     // so groupBy can use them
@@ -560,20 +527,53 @@ pub fn check_reserved_field_names(module: &Module) -> Vec<knot::diagnostic::Diag
                 walker.relation = name.clone();
                 walker.walk(ty, &mut HashSet::new());
             }
-            DeclKind::Migrate {
-                relation,
-                from_ty,
-                to_ty,
-                ..
-            } => {
-                walker.relation = relation.clone();
-                walker.walk(from_ty, &mut HashSet::new());
-                walker.walk(to_ty, &mut HashSet::new());
+            DeclKind::Fun { body: Some(body), .. } => {
+                // Record-embedded sources (`{ *todos : [Todo] migrate … }`)
+                // persist tables too — walk the source element type and both
+                // sides of every attached migrate clause. The types live in
+                // the module AST, which outlives the walker.
+                let mut sources: Vec<(&str, &knot::ast::Type, &[knot::ast::SourceMigration])> =
+                    Vec::new();
+                walk_record_sources(body, &mut |name, ty, migrations| {
+                    sources.push((name, ty, migrations));
+                });
+                for (name, ty, migrations) in sources {
+                    walker.relation = name.to_string();
+                    walker.walk(ty, &mut HashSet::new());
+                    for m in migrations {
+                        walker.walk(&m.from_ty, &mut HashSet::new());
+                        walker.walk(&m.to_ty, &mut HashSet::new());
+                    }
+                }
             }
             _ => {}
         }
     }
     walker.diags
+}
+
+/// Visit every record-embedded `SourceDecl` reachable in `e`, invoking `f`
+/// with the field name, the source element type, and its migrate clauses.
+fn walk_record_sources<'m>(
+    e: &'m knot::ast::Expr,
+    f: &mut impl FnMut(&'m str, &'m knot::ast::Type, &'m [knot::ast::SourceMigration]),
+) {
+    use knot::ast::ExprKind;
+    match &e.node {
+        ExprKind::SourceDecl { name, ty, migrations } => f(name, ty, migrations),
+        ExprKind::Record(fields) => {
+            for fld in fields {
+                walk_record_sources(&fld.value, f);
+            }
+        }
+        ExprKind::RecordUpdate { base, fields } => {
+            walk_record_sources(base, f);
+            for fld in fields {
+                walk_record_sources(&fld.value, f);
+            }
+        }
+        _ => {}
+    }
 }
 
 struct ReservedFieldWalker<'a> {

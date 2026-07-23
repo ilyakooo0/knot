@@ -720,26 +720,6 @@ fn render_decl(p: &mut Printer, d: &Decl) {
                 p.write(c);
             }
         }
-        DeclKind::Migrate { relation, from_ty, to_ty, using_fn } => {
-            // Always use the multi-line layout: on a single line,
-            // `parse_type_app` would greedily consume the `to`/`using` clause
-            // keywords as type-variable applications. With each clause on its
-            // own line at one indent, the parser's migrate `block_indent`
-            // guard stops type continuation at the sibling clause keywords.
-            p.write("migrate *");
-            p.write(relation);
-            p.newline();
-            p.with_indent(|p| {
-                p.write("from ");
-                p.write(&render_type(from_ty));
-                p.newline();
-                p.write("to ");
-                p.write(&render_type(to_ty));
-                p.newline();
-                p.write("using ");
-                render_expr(p, using_fn, Prec::Lowest);
-            });
-        }
         DeclKind::SubsetConstraint { sub, sup } => {
             render_relpath(p, sub);
             p.write(" <= ");

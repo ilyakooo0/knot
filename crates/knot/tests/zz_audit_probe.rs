@@ -50,7 +50,6 @@ fn audit4() {
     probe_revert("messy_type_alias", "type   T={x:Int,y:Int}\n");
     probe_revert("messy_nested_records", "main={a:{b:{c:{d:1}}}}\n");
     probe_revert("messy_view", "*active=do\n u<-*users\n where u.active\n yield u\n");
-    probe_revert("messy_migrate", "migrate *u\n from {a:Int}\n to {a:Int,b:Text}\n using \\r->{r|b:\"\"}\n");
     probe_revert("messy_pipe", "main=xs|>filter f|>map g\n");
     probe_revert("messy_binop_parens", "main=(a+b)*(c+d)\n");
     probe_revert("messy_deep_app", "main=f a b c d e\n");

@@ -910,7 +910,6 @@ impl Parser {
             TokenKind::AmpersandIdent(_) => self.parse_derived(),
             TokenKind::Lower(_) => self.parse_fun(),
             TokenKind::Route => self.parse_route_decl(),
-            TokenKind::Migrate => self.parse_migrate(),
             _ => {
                 self.error_at(start, "expected declaration");
                 None
@@ -1838,106 +1837,6 @@ impl Parser {
     }
 
     // ── migrate ──────────────────────────────────────────────────────
-
-    fn parse_migrate(&mut self) -> Option<Decl> {
-        let start = self.span();
-        self.in_context("migrate declaration", |this| {
-            this.advance(); // consume `migrate`
-
-            // Expect `*name` (single StarIdent token, or legacy Star + Lower).
-            let relation = match this.peek() {
-                TokenKind::StarIdent(_) => {
-                    let tok = this.advance();
-                    let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
-                    n.trim_start_matches('*').to_string()
-                }
-                TokenKind::Star => {
-                    this.advance();
-                    let (n, _) = this
-                        .expect_lower("expected relation name after '*' in migrate")
-                        .ok()?;
-                    n
-                }
-                _ => {
-                    this.error("expected '*' before relation name in migrate");
-                    return None;
-                }
-            };
-
-            this.skip_newlines();
-            // `from`/`to`/`using` clause keywords sit at one indent inside
-            // the migrate header. Set `block_indent` to the column of the
-            // first clause so that multi-line type continuations (in
-            // `parse_type_app`) only fire when the next line is indented
-            // *past* the sibling clause keywords, not at their column.
-            let prev_block_indent = this.block_indent;
-            this.block_indent = this.cur_column();
-
-            if !matches!(this.peek(), TokenKind::Lower(s) if s == "from") {
-                this.error("expected 'from' in migrate declaration");
-                this.block_indent = prev_block_indent;
-                return None;
-            }
-            this.advance();
-
-            // Stop type application at the `to`/`using` clause keywords so
-            // the single-line form `migrate *r from T to U using f` parses
-            // (otherwise `parse_type_app` consumes them as type variables).
-            this.stop_type_at_migrate_clauses = true;
-            let from_ty = match this.parse_type() {
-                Some(t) => t,
-                None => {
-                    this.stop_type_at_migrate_clauses = false;
-                    this.block_indent = prev_block_indent;
-                    return None;
-                }
-            };
-
-            this.skip_newlines();
-            // `to`
-            if !matches!(this.peek(), TokenKind::Lower(s) if s == "to") {
-                this.error("expected 'to' in migrate declaration");
-                this.stop_type_at_migrate_clauses = false;
-                this.block_indent = prev_block_indent;
-                return None;
-            }
-            this.advance();
-
-            let to_ty = match this.parse_type() {
-                Some(t) => t,
-                None => {
-                    this.stop_type_at_migrate_clauses = false;
-                    this.block_indent = prev_block_indent;
-                    return None;
-                }
-            };
-            this.stop_type_at_migrate_clauses = false;
-
-            this.skip_newlines();
-            // `using`
-            if !matches!(this.peek(), TokenKind::Lower(s) if s == "using") {
-                this.error("expected 'using' in migrate declaration");
-                this.block_indent = prev_block_indent;
-                return None;
-            }
-            this.advance();
-            this.block_indent = prev_block_indent;
-
-            let using_fn = this.parse_expr()?;
-
-            let end = this.prev_span();
-            Some(Decl {
-                node: DeclKind::Migrate {
-                    relation,
-                    from_ty,
-                    to_ty,
-                    using_fn,
-                },
-                span: Span::new(start.start, end.end),
-                exported: false,
-            })
-        })
-    }
 
     /// Try to parse `(Constraint =>)+`. Returns None if it doesn't look like constraints.
     fn try_parse_constraints(&mut self) -> Option<Vec<Constraint>> {

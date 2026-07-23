@@ -46,12 +46,6 @@ pub(crate) fn build_workspace_symbol_entries(
             DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
                 (format!("route {name}"), SymbolKind::MODULE, None)
             }
-            // Mirror `document_symbol` (which indexes migrate as EVENT) so a
-            // `migrate *rel` is findable via workspace-symbol search, not just
-            // in the single-file outline.
-            DeclKind::Migrate { relation, .. } => {
-                (format!("migrate *{relation}"), SymbolKind::EVENT, None)
-            }
             _ => continue,
         };
         out.push(WorkspaceSymbolEntry {

@@ -292,18 +292,6 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            DeclKind::Migrate { relation, .. } => {
-                symbols.push(DocumentSymbol {
-                    name: format!("migrate *{relation}"),
-                    detail: None,
-                    kind: SymbolKind::EVENT,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: None,
-                });
-            }
             DeclKind::SubsetConstraint { .. } => {}
         }
     }

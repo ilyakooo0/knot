@@ -210,20 +210,6 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                     }
                 }
             }
-            DeclKind::Migrate { relation, from_ty, to_ty, using_fn, .. } => {
-                // `migrate *rel from … to … using …` — the migrated relation is
-                // a reference to its source declaration. `relation` is spanless
-                // (the bare name, no `*`), so recover its token from the decl
-                // source; the `*` sigil is a word boundary for the search.
-                if let Some(span) =
-                    find_word_in_source(source, relation, decl.span.start, decl.span.end)
-                {
-                    resolver.add_ref(span, relation);
-                }
-                resolver.resolve_type(from_ty, source);
-                resolver.resolve_type(to_ty, source);
-                resolver.resolve_expr(using_fn);
-            }
             DeclKind::Route { entries, .. } => {
                 for entry in entries {
                     for f in &entry.body_fields {
@@ -769,16 +755,5 @@ mod tests {
         refs.iter().any(|(usage, d)| {
             d == def && source.get(usage.start..usage.end) == Some(text)
         })
-    }
-
-    #[test]
-    fn migrate_relation_is_recorded_as_reference() {
-        let source = "*users : [{v: Int 1}]\nf = \\x -> x\nmigrate *users from Int to Int using f\n";
-        let module = parse(source);
-        let defs = resolve_definitions(&module, source);
-        assert!(
-            has_ref_to(&defs, source, "users", "users"),
-            "the migrated `*users` relation token must be a reference to source `users`"
-        );
     }
 }

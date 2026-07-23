@@ -458,28 +458,6 @@ fn simple_patterns_stay_minimal() {
     assert!(out.contains("Cons h t ->"), "output: {}", out);
 }
 
-// ── 10. migrate formats to the multi-line layout that reparses ──
-
-#[test]
-fn migrate_round_trips_multiline() {
-    let src = "migrate *orders\n  from [{customer: Text}]\n  to [{customer: Text, amount: Int}]\n  using \\o -> {customer o.customer amount 0}\n";
-    let out = check_str("migrate", src);
-    assert!(out.contains("migrate *orders\n"), "output: {}", out);
-    assert!(out.contains("\n  from "), "output: {}", out);
-    assert!(out.contains("\n  to "), "output: {}", out);
-    assert!(out.contains("\n  using "), "output: {}", out);
-}
-
-#[test]
-fn migrate_single_line_parses_and_reformats() {
-    // The parser now stops type application at the `to`/`using` clause
-    // keywords, so the single-line form parses; the formatter normalizes
-    // it to the multi-line layout.
-    let src = "migrate *orders from [{customer: Text}] to [{customer: Text, amount: Int}] using \\o -> {customer o.customer amount 0}\n";
-    let out = check_str("migrate_single_line", src);
-    assert!(out.contains("migrate *orders\n  from"), "output: {}", out);
-}
-
 // ── 11. Float literal overflow is a lex error, not silent `inf` ──
 
 #[test]

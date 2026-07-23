@@ -670,7 +670,6 @@ fn desugar_decl(decl: &mut DeclKind, io_fns: &IoFns, source_vars: &HashSet<Strin
             }
         }
         DeclKind::Derived { body, .. } => desugar_expr(body, io_fns, source_vars),
-        DeclKind::Migrate { using_fn, .. } => desugar_expr(using_fn, io_fns, source_vars),
         DeclKind::Route { entries, .. } => {
             // A route's `rateLimit` expression (e.g. its `key` lambda body) can
             // contain a `do` block. It is otherwise never visited by

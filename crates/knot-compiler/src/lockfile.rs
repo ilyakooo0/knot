@@ -641,13 +641,9 @@ fn find_source_span(module: &Module, name: &str) -> Span {
 }
 
 fn find_migrate_span(module: &Module, name: &str) -> Span {
-    module
-        .decls
-        .iter()
-        .find_map(|d| match &d.node {
-            DeclKind::Migrate { relation, .. } if relation == name => Some(d.span),
-            _ => None,
-        })
+    record_embedded_sources(module)
+        .into_iter()
+        .find_map(|(n, _, span)| (n == name).then_some(span))
         .unwrap_or(Span::new(0, 0))
 }
 
@@ -710,15 +706,6 @@ fn generate(module: &Module, source_text: &str, imported_type_snippets: &[String
         }
         out.push('\n');
         out.push_str(&format!("*{} : {}\n", name, knot::format::render_type(&ty)));
-    }
-
-    // Migrate declarations
-    for decl in &module.decls {
-        if let DeclKind::Migrate { .. } = &decl.node {
-            out.push('\n');
-            out.push_str(&source_text[decl.span.start..decl.span.end]);
-            out.push('\n');
-        }
     }
 
     // Migrations attached to record-embedded source fields

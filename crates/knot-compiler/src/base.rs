@@ -114,7 +114,6 @@ fn shift_decl_spans(decl: &mut ast::Decl, offset: usize) {
                 }
             }
         }
-        Migrate { using_fn, .. } => shift_expr_spans(using_fn, offset),
         // No embedded expressions to shift.
         Data { .. } | TypeAlias { .. } | Source { .. } | RouteComposite { .. }
         | SubsetConstraint { .. } => {}
@@ -376,7 +375,6 @@ mod tests {
             ast::DeclKind::View { body, .. } | ast::DeclKind::Derived { body, .. } => {
                 expr(body, out)
             }
-            ast::DeclKind::Migrate { using_fn, .. } => expr(using_fn, out),
             ast::DeclKind::Route { entries, .. } => {
                 for e in entries {
                     if let Some(rl) = &e.rate_limit {

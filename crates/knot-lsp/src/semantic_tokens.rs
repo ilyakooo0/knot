@@ -397,9 +397,6 @@ impl<'a> TokenCollector<'a> {
                     self.add(s, TOK_TYPE, MOD_DECLARATION);
                 }
             }
-            DeclKind::Migrate { using_fn, .. } => {
-                self.visit_expr(using_fn);
-            }
             _ => {}
         }
     }

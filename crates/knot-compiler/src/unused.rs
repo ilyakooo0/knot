@@ -175,15 +175,6 @@ fn walk_decl(decl: &DeclKind, r: &mut Refs) {
             }
         }
         DeclKind::RouteComposite { .. } => {}
-        DeclKind::Migrate { relation, from_ty, to_ty, using_fn } => {
-            // A migration references its relation — a source touched only
-            // by a `migrate` block is still in use (mirrors the
-            // SubsetConstraint arm below).
-            r.sources.insert(relation.clone());
-            walk_type(from_ty, r);
-            walk_type(to_ty, r);
-            walk_expr(using_fn, r);
-        }
         DeclKind::SubsetConstraint { sub, sup } => {
             r.sources.insert(sub.relation.clone());
             r.sources.insert(sup.relation.clone());

@@ -113,7 +113,6 @@ fn probe_all() {
         ("route", "route Api where\n  GET /todos -> [Todo]"),
         ("route-body", "route Api where\n  POST {name: Text} /todos -> Todo"),
         ("route-composite", "route All = A | B"),
-        ("migrate", "migrate *r from Int to Text using f"),
         ("subset", "*orders.customer <= *people.name"),
         ("cons-pat", "f = \\xs -> case xs of\n  Cons h t -> h\n  [] -> 0"),
         ("cons-ctor-empty", "f = \\x -> case x of\n  Cons -> 1\n  _ -> 0"),

@@ -1608,27 +1608,6 @@ fn composite_route() {
     }
 }
 
-// ── Migrate Declarations ────────────────────────────────────────────
-
-#[test]
-fn simple_migrate() {
-    let src = "migrate *people\n  from {name: Text}\n  to {name: Text, age: Int}\n  using (\\old -> {old | age 0})";
-    match first_decl(src) {
-        DeclKind::Migrate {
-            relation,
-            from_ty,
-            to_ty,
-            using_fn,
-        } => {
-            assert_eq!(relation, "people");
-            assert!(matches!(&from_ty.node, TypeKind::Record { fields, .. } if fields.len() == 1));
-            assert!(matches!(&to_ty.node, TypeKind::Record { fields, .. } if fields.len() == 2));
-            assert!(matches!(&using_fn.node, ExprKind::Lambda { .. }));
-        }
-        other => panic!("expected Migrate, got {:?}", other),
-    }
-}
-
 // ── Complex / Integration Tests ─────────────────────────────────────
 
 #[test]
@@ -3564,32 +3543,6 @@ fn error_missing_arrow_in_case() {
 }
 
 // ── Migrate Edge Cases ──────────────────────────────────────────────
-
-#[test]
-fn migrate_with_nested_type() {
-    let src = "\
-migrate *teams
-  from {name: Text}
-  to {name: Text, members: [Person]}
-  using (\\old -> {old | members []})";
-    match first_decl(src) {
-        DeclKind::Migrate {
-            relation,
-            to_ty,
-            ..
-        } => {
-            assert_eq!(relation, "teams");
-            match &to_ty.node {
-                TypeKind::Record { fields, .. } => {
-                    assert_eq!(fields.len(), 2);
-                    assert_eq!(fields[1].name, "members");
-                }
-                other => panic!("expected Record type, got {:?}", other),
-            }
-        }
-        other => panic!("expected Migrate, got {:?}", other),
-    }
-}
 
 // ── Case Single Arm ────────────────────────────────────────────────
 

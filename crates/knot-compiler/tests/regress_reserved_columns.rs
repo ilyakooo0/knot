@@ -154,11 +154,12 @@ fn reserved_field_in_migrate_type_rejected() {
     let diags = check(
         r#"type Old = {_id: Int 1, name: Text}
 type New = {name: Text}
-*people : [New]
-migrate *people
-  from [Old]
-  to [New]
-  using \p -> {name p.name}
+db =
+  { *people : [New]
+      migrate from [Old]
+      to [New]
+      using \p -> {name p.name}
+  }
 main = 1
 "#,
     );

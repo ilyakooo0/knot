@@ -3480,20 +3480,13 @@ impl Codegen {
             // Apply pending migrations (before source init)
             let migrate_schemas = cg.migrate_schemas.clone();
             let mut migrate_counters: HashMap<String, usize> = HashMap::new();
-            // Collect migration sites: top-level `migrate *rel …` decls AND
-            // migrations attached to record-embedded source fields
-            // (`{ *todos : [Todo] migrate from A to B using f }`). Both are
-            // keyed by bare relation name in `migrate_schemas`.
+            // Collect migration sites from record-embedded source fields
+            // (`{ *todos : [Todo] migrate from A to B using f }`), keyed by
+            // bare relation name in `migrate_schemas`.
             let mut migrate_sites: Vec<(String, ast::Expr)> = Vec::new();
             for decl in &decls {
-                match &decl.node {
-                    ast::DeclKind::Migrate { relation, using_fn, .. } => {
-                        migrate_sites.push((relation.clone(), using_fn.clone()));
-                    }
-                    ast::DeclKind::Fun { body: Some(body), .. } => {
-                        collect_record_migrations(body, &mut migrate_sites);
-                    }
-                    _ => {}
+                if let ast::DeclKind::Fun { body: Some(body), .. } = &decl.node {
+                    collect_record_migrations(body, &mut migrate_sites);
                 }
             }
             for (relation, using_fn) in &migrate_sites {

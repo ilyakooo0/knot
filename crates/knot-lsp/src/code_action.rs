@@ -1667,16 +1667,6 @@ fn collect_referenced_names(module: &Module) -> HashSet<String> {
                     names.insert(trait_name.clone());
                 }
             }
-            DeclKind::Migrate {
-                using_fn,
-                from_ty,
-                to_ty,
-                ..
-            } => {
-                collect_names_in_expr(using_fn, &mut names);
-                collect_names_in_type(from_ty, &mut names);
-                collect_names_in_type(to_ty, &mut names);
-            }
             DeclKind::Route { entries, .. } => {
                 for e in entries {
                     for seg in &e.path {

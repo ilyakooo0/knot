@@ -149,14 +149,6 @@ pub enum DeclKind {
         components: Vec<Name>,
     },
 
-    /// `migrate *rel from T1 to T2 using f`
-    Migrate {
-        relation: Name,
-        from_ty: Type,
-        to_ty: Type,
-        using_fn: Expr,
-    },
-
     /// `*orders.customer <= *people.name`
     SubsetConstraint {
         sub: RelationPath,

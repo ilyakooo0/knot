@@ -12388,7 +12388,6 @@ fn rewrite_decl_results(decl: &mut ast::Decl, pure_spans: &HashSet<Span>) {
                 }
             }
         }
-        Migrate { using_fn, .. } => rewrite_result_markers(using_fn, pure_spans),
         Data { .. } | TypeAlias { .. } | Source { .. } | RouteComposite { .. }
         | SubsetConstraint { .. } => {}
     }

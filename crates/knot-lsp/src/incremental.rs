@@ -192,7 +192,6 @@ fn decl_key(decl: &ast::Decl, index: usize) -> String {
         | DeclKind::Data { name, .. }
         | DeclKind::TypeAlias { name, .. }
         | DeclKind::Route { name, .. } => name.clone(),
-        DeclKind::Migrate { .. } => format!("__migrate#{index}"),
         DeclKind::SubsetConstraint { .. } => format!("__subset#{index}"),
         DeclKind::RouteComposite { name, .. } => format!("__route_comp:{name}"),
     }
@@ -506,11 +505,6 @@ fn collect_decl_deps(decl: &ast::Decl) -> HashSet<String> {
             for comp in components {
                 deps.insert(comp.clone());
             }
-        }
-        DeclKind::Migrate { from_ty, to_ty, using_fn, .. } => {
-            collect_type_names(from_ty, &mut deps);
-            collect_type_names(to_ty, &mut deps);
-            collect_expr_names(using_fn, &mut deps);
         }
         DeclKind::SubsetConstraint { sub, sup, .. } => {
             deps.insert(sub.relation.clone());

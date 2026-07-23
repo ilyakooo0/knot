@@ -595,11 +595,8 @@ pub(crate) fn find_enclosing_application(
             | DeclKind::Derived { body, .. } => {
                 find_app_in_expr(body, source, offset, &mut best);
             }
-            // `migrate … using <expr>` and route `rateLimit` expressions
-            // can contain applications that need signature help.
-            DeclKind::Migrate { using_fn, .. } => {
-                find_app_in_expr(using_fn, source, offset, &mut best);
-            }
+            // Route `rateLimit` expressions can contain applications that
+            // need signature help.
             DeclKind::Route { entries, .. } => {
                 for entry in entries {
                     if let Some(rl) = &entry.rate_limit {
@@ -759,8 +756,6 @@ pub(crate) fn find_enclosing_atomic_expr(
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, 0),
-            // `migrate … using <expr>` — the using function is user code.
-            DeclKind::Migrate { using_fn, .. } => walk(using_fn, source, offset, &mut best, 0),
             // Route `rateLimit` expressions are user-edited code.
             DeclKind::Route { entries, .. } => {
                 for entry in entries {
@@ -1167,9 +1162,6 @@ pub(crate) fn find_field_access_at_offset(
             DeclKind::Fun { body: Some(body), .. }
             | DeclKind::View { body, .. }
             | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, 0),
-            // `migrate *rel from … to … using <expr>` — the `using` function is
-            // real user code that can dereference record fields.
-            DeclKind::Migrate { using_fn, .. } => walk(using_fn, source, offset, &mut best, 0),
             // The `rateLimit <expr>` clause on a route entry is user-edited
             // code (`{key: \input ctx -> …}`) that dereferences fields.
             DeclKind::Route { entries, .. } => {

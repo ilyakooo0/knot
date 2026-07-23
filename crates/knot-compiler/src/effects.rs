@@ -616,7 +616,11 @@ impl EffectChecker {
 
             ast::ExprKind::ImplicitRef(_) => EffectSet::empty(),
 
-            ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => EffectSet::empty(),
+            ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => EffectSet::empty(),
+
+            // An embedded view's body reads sources — infer its effects like
+            // any other expression.
+            ast::ExprKind::ViewDecl { body, .. } => self.infer_effects(body),
 
             ast::ExprKind::Var(name) => {
                 // A locally shadowed name is a local value, not the builtin
@@ -1760,7 +1764,8 @@ fn walk_expr(expr: &ast::Expr, f: &mut impl FnMut(&ast::Expr)) {
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => {}
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => {}
+        ast::ExprKind::ViewDecl { body, .. } => walk_expr(body, f),
         ast::ExprKind::Record(fields) => {
             for field in fields {
                 walk_expr(&field.value, f);
@@ -1881,7 +1886,10 @@ fn collect_unshadowed_disallowed(
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => {}
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => {}
+        ast::ExprKind::ViewDecl { body, .. } => {
+            collect_unshadowed_disallowed(body, shadowed, out)
+        }
         ast::ExprKind::Record(fields) => {
             for field in fields {
                 collect_unshadowed_disallowed(&field.value, shadowed, out);

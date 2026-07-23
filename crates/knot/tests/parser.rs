@@ -147,21 +147,35 @@ fn add_two_vars() {
 }
 
 #[test]
-fn spaceless_mul_is_multiplication_not_source_ref() {
-    // `a*b` (no surrounding whitespace) must parse as multiplication, not as
-    // `a` applied to the source reference `*b`. The `*` touches both operands,
-    // so it is the binary operator.
-    for src in ["x = a*b", "x = a* b"] {
+fn spaced_mul_is_multiplication_not_source_ref() {
+    // Binary operators require surrounding whitespace, so `a * b` (spaced) is
+    // multiplication. The `*` has a space on both sides, so it cannot be a
+    // source-reference sigil.
+    match fun_body("x = a * b") {
+        ExprKind::BinOp {
+            op: BinOp::Mul,
+            lhs,
+            rhs,
+        } => {
+            assert!(matches!(&lhs.node, ExprKind::Var(n) if n == "a"));
+            assert!(matches!(&rhs.node, ExprKind::Var(n) if n == "b"));
+        }
+        other => panic!("expected Mul for spaced a * b, got {other:?}"),
+    }
+}
+
+#[test]
+fn spaceless_star_is_source_ref_not_multiplication() {
+    // `*b` abutting a lowercase letter lexes as a single source-reference
+    // token, so `a*b` and `a *b` are `a` applied to the source ref `*b`, never
+    // multiplication. (Multiplication requires spaces: `a * b`.)
+    for src in ["x = a*b", "x = a *b"] {
         match fun_body(src) {
-            ExprKind::BinOp {
-                op: BinOp::Mul,
-                lhs,
-                rhs,
-            } => {
-                assert!(matches!(&lhs.node, ExprKind::Var(n) if n == "a"), "{src}");
-                assert!(matches!(&rhs.node, ExprKind::Var(n) if n == "b"), "{src}");
+            ExprKind::App { func, arg } => {
+                assert!(matches!(&func.node, ExprKind::Var(n) if n == "a"), "{src}");
+                assert!(matches!(&arg.node, ExprKind::SourceRef(n) if n == "b"), "{src}");
             }
-            other => panic!("expected Mul for {src:?}, got {other:?}"),
+            other => panic!("expected App(a, *b) for {src:?}, got {other:?}"),
         }
     }
 }

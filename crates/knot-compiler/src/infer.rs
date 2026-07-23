@@ -6670,6 +6670,39 @@ impl Infer {
                 self.annotation_vars = saved_annotation_vars;
                 Ty::Record(ns_fields, None)
             }
+
+            ast::ExprKind::SourceDecl { name, ty, .. } => {
+                // A persisted source-relation declaration embedded in a record
+                // value literal (`{*todos : [Todo], …}`). Register the source
+                // (by its bare field name — qualified-path registration is a
+                // follow-up) so it participates in schema/migrations, and give
+                // the field the type of a source READ (`IO {Reads name} [T]`)
+                // so `db.*todos` resolves through ordinary field access.
+                self.annotation_vars.clear();
+                let resolved = self.ast_type_to_ty(ty);
+                self.source_types.insert(name.clone(), resolved.clone());
+                let mut effects = BTreeSet::new();
+                effects.insert(IoEffect::Reads(name.clone()));
+                Ty::IO(effects, None, Box::new(resolved))
+            }
+            ast::ExprKind::ViewDecl { name, ty, .. } => {
+                // A view embedded in a record value literal (`{*openTodos = …}`).
+                // The actual relation type is registered by the hoisted
+                // top-level `DeclKind::View` (desugar `hoist_record_views`);
+                // here the field reads through it, so type it as a view READ
+                // (`IO {Reads name} [T]`). With an annotation use it, else a
+                // fresh var the hoisted decl's check will pin down.
+                self.annotation_vars.clear();
+                let resolved = match ty {
+                    Some(scheme) => self.ast_type_to_ty(&scheme.ty),
+                    None => self.source_types.get(name).cloned().unwrap_or_else(|| self.fresh()),
+                };
+                self.source_types.insert(name.clone(), resolved.clone());
+                self.view_names.insert(name.clone());
+                let mut effects = BTreeSet::new();
+                effects.insert(IoEffect::Reads(name.clone()));
+                Ty::IO(effects, None, Box::new(resolved))
+            }
         }
     }
 
@@ -11624,7 +11657,10 @@ fn value_references_source_inner(
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::DerivedRef(_) => false,
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => false,
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
+        ast::ExprKind::ViewDecl { body, .. } => value_references_source_inner(
+            body, source_name, aliases, let_bindings, visited,
+        ),
         ast::ExprKind::Record(fields) => fields.iter().any(|f| {
             value_references_source_inner(
                 &f.value, source_name, aliases, let_bindings, visited,
@@ -12345,7 +12381,8 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
     use ast::ExprKind::*;
     match &mut expr.node {
         Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
-        TypeCtor { .. } | DataCtor { .. } => {}
+        TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } => {}
+        ViewDecl { body, .. } => f(body),
         Record(fields) => {
             for fl in fields {
                 f(&mut fl.value);

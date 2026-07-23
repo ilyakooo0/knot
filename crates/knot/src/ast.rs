@@ -303,6 +303,37 @@ pub enum ExprKind {
         constructors: Vec<ConstructorDef>,
     },
 
+    /// A persisted source-relation declaration embedded in a record value
+    /// literal (`{*todos : [Todo], …}`). The record field is literally named
+    /// `*todos` (the `*` is part of the field NAME, not a prefix operator).
+    /// Reading `db.*todos` yields the relation value `[Todo]`; writing
+    /// `db.*todos = …` is a source write. The source's qualified identity is
+    /// `<record>.<field>` (e.g. `db.*todos`), used for the schema lockfile,
+    /// migrations, effects, and the physical table name. Like `DataCtor`, the
+    /// record field itself is a marker — the source is registered statically
+    /// and resolved by path, not carried as a runtime value.
+    SourceDecl {
+        /// Field name WITHOUT the leading `*` (e.g. `todos`).
+        name: Name,
+        ty: Type,
+        /// Migrations attached to the source:
+        /// `*todos : [Todo] migrate from A to B using f migrate from B to C using g`.
+        /// Mirrors top-level `migrate` decls (cumulative — all historical
+        /// migrations are kept) but hangs off the source field itself.
+        migrations: Vec<SourceMigration>,
+    },
+
+    /// `*openTodos = expr` (or `*openTodos : Type = expr`) inside a record
+    /// literal — an embedded view declaration. Mirrors the top-level
+    /// `DeclKind::View`; the field is literally named `*name` and its value is
+    /// a marker (the view is registered statically and resolved by path).
+    ViewDecl {
+        /// Field name WITHOUT the leading `*` (e.g. `openTodos`).
+        name: Name,
+        ty: Option<TypeScheme>,
+        body: Box<Expr>,
+    },
+
     /// `serve Api where E1 = expr1; E2 = expr2; ...` — typed server value.
     /// Each handler is bound to a route endpoint constructor; the whole
     /// expression has type `Server Api _` (a row variable when no handler
@@ -601,6 +632,15 @@ pub struct RecordField {
     pub name: Name,
     pub value: Expr,
     pub sig: Option<Type>,
+}
+
+/// A migration attached to a record-embedded source field:
+/// `*todos : [Todo] migrate from Old to New using f`.
+#[derive(Debug, Clone)]
+pub struct SourceMigration {
+    pub from_ty: Type,
+    pub to_ty: Type,
+    pub using_fn: Expr,
 }
 
 /// A constructor in a `data` declaration: `Circle {radius: Float}`.

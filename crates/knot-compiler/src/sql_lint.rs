@@ -202,6 +202,9 @@ fn lint_expr(
                 lint_expr(&h.body, source_schemas, views, fun_bodies, diags);
             }
         }
+        ExprKind::ViewDecl { body, .. } => {
+            lint_expr(body, source_schemas, views, fun_bodies, diags);
+        }
         // Terminals — nothing to recurse into
         ExprKind::Lit(_)
         | ExprKind::Var(_)
@@ -209,7 +212,7 @@ fn lint_expr(
         | ExprKind::SourceRef(_)
         | ExprKind::ImplicitRef(_)
         | ExprKind::DerivedRef(_) => {}
-        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } => {}
+        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
     }
 }
 
@@ -1065,7 +1068,8 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         | ExprKind::Constructor(_)
         | ExprKind::ImplicitRef(_)
         | ExprKind::DerivedRef(_) => false,
-        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } => false,
+        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => false,
+        ExprKind::ViewDecl { body, .. } => references_source(body, source_name),
         ExprKind::Record(fields) => fields.iter().any(|f| references_source(&f.value, source_name)),
         ExprKind::RecordUpdate { base, fields } => {
             references_source(base, source_name)

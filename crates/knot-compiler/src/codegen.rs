@@ -164,6 +164,11 @@ pub struct Codegen {
     // Migration schemas: relation_name -> Vec<(old_schema, new_schema)>
     migrate_schemas: HashMap<String, Vec<(String, String)>>,
 
+    // Sources dropped from the codebase but still in the schema lockfile —
+    // codegen emits a `knot_source_drop` call for each so the stored table is
+    // deleted on startup.
+    dropped_sources: Vec<String>,
+
     // View declarations: view_name -> provenance info
     views: HashMap<String, ViewInfo>,
 
@@ -753,6 +758,12 @@ fn compile_inner(
         }
     }
     cg.migrate_schemas = type_env.migrate_schemas.clone();
+    // Sources the codebase no longer declares but the schema lockfile still
+    // tracks: emit a startup DROP for each so removed relations don't linger.
+    cg.dropped_sources = crate::lockfile::dropped_sources(
+        std::path::Path::new(source_file),
+        type_env,
+    );
     cg.type_aliases = type_env.aliases.clone();
     cg.subset_constraints = type_env.subset_constraints.clone();
     cg.monad_info = monad_info.clone();
@@ -1003,6 +1014,7 @@ impl Codegen {
             io_thunk_counter: 0,
             db_path: String::new(),
             migrate_schemas: HashMap::new(),
+            dropped_sources: Vec::new(),
             views: HashMap::new(),
             diagnostics: Vec::new(),
             data_constructors: HashMap::new(),
@@ -1147,6 +1159,7 @@ impl Codegen {
         self.declare_rt("knot_db_close", &[p], &[]);
         self.declare_rt("knot_db_exec", &[p, p, p], &[]);
         self.declare_rt("knot_source_init", &[p, p, p, p, p], &[]);
+        self.declare_rt("knot_source_drop", &[p, p, p], &[]);
         self.declare_rt("knot_source_read", &[p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_count", &[p, p, p], &[p]);
         self.declare_rt("knot_source_query_count", &[p, p, p, p], &[p]);
@@ -3467,23 +3480,36 @@ impl Codegen {
             // Apply pending migrations (before source init)
             let migrate_schemas = cg.migrate_schemas.clone();
             let mut migrate_counters: HashMap<String, usize> = HashMap::new();
+            // Collect migration sites: top-level `migrate *rel …` decls AND
+            // migrations attached to record-embedded source fields
+            // (`{ *todos : [Todo] migrate from A to B using f }`). Both are
+            // keyed by bare relation name in `migrate_schemas`.
+            let mut migrate_sites: Vec<(String, ast::Expr)> = Vec::new();
             for decl in &decls {
-                if let ast::DeclKind::Migrate {
-                    relation,
-                    using_fn,
-                    ..
-                } = &decl.node
-                    && let Some(migrations) = migrate_schemas.get(relation) {
+                match &decl.node {
+                    ast::DeclKind::Migrate { relation, using_fn, .. } => {
+                        migrate_sites.push((relation.clone(), using_fn.clone()));
+                    }
+                    ast::DeclKind::Fun { body: Some(body), .. } => {
+                        collect_record_migrations(body, &mut migrate_sites);
+                    }
+                    _ => {}
+                }
+            }
+            for (relation, using_fn) in &migrate_sites {
+                let relation = relation.clone();
+                let using_fn = using_fn.clone();
+                if let Some(migrations) = migrate_schemas.get(&relation) {
                         let idx = migrate_counters.entry(relation.clone()).or_insert(0);
                         if let Some((old_schema, new_schema)) = migrations.get(*idx) {
-                            let (name_ptr, name_len) = cg.string_ptr(builder, relation);
+                            let (name_ptr, name_len) = cg.string_ptr(builder, &relation);
                             let (old_ptr, old_len) = cg.string_ptr(builder, old_schema);
                             let (new_ptr, new_len) = cg.string_ptr(builder, new_schema);
 
                             // Compile the using expression (typically a lambda)
                             let mut env = Env::new();
                             let migrate_fn_val =
-                                cg.compile_expr(builder, using_fn, &mut env, db);
+                                cg.compile_expr(builder, &using_fn, &mut env, db);
 
                             // Validate refinements on the transformed rows
                             // before committing the migration. Every other
@@ -3497,7 +3523,7 @@ impl Codegen {
                             // value shape set/replace validate; if there are
                             // no refinements on this source the check is a
                             // no-op.
-                            if cg.source_refinements.contains_key(relation) {
+                            if cg.source_refinements.contains_key(&relation) {
                                 let preview = cg.call_rt(
                                     builder,
                                     "knot_source_migrate_preview",
@@ -3508,7 +3534,7 @@ impl Codegen {
                                 );
                                 cg.emit_refinement_checks(
                                     builder,
-                                    relation,
+                                    &relation,
                                     preview,
                                     &mut env,
                                     db,
@@ -3528,22 +3554,33 @@ impl Codegen {
                     }
             }
 
-            // Initialize source tables
-            for decl in &decls {
-                if let ast::DeclKind::Source { name, .. } = &decl.node {
-                    let schema = cg
-                        .source_schemas
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_default();
-                    let (name_ptr, name_len) = cg.string_ptr(builder, name);
-                    let (schema_ptr, schema_len) = cg.string_ptr(builder, &schema);
-                    let init_ref = cg.import_rt(builder, "knot_source_init");
-                    builder.ins().call(
-                        init_ref,
-                        &[db, name_ptr, name_len, schema_ptr, schema_len],
-                    );
-                }
+            // Drop sources removed from the codebase (still tracked by the
+            // schema lockfile) before initializing the current ones.
+            let dropped = cg.dropped_sources.clone();
+            for name in dropped {
+                let (name_ptr, name_len) = cg.string_ptr(builder, &name);
+                let drop_ref = cg.import_rt(builder, "knot_source_drop");
+                builder.ins().call(drop_ref, &[db, name_ptr, name_len]);
+            }
+
+            // Initialize source tables. Iterate the schema map (which includes
+            // both top-level `*name : [T]` decls AND sources embedded as
+            // `*name : Type` fields in record-let literals) so every known
+            // source gets its table created.
+            let source_names: Vec<String> = cg.source_schemas.keys().cloned().collect();
+            for name in source_names {
+                let schema = cg
+                    .source_schemas
+                    .get(&name)
+                    .cloned()
+                    .unwrap_or_default();
+                let (name_ptr, name_len) = cg.string_ptr(builder, &name);
+                let (schema_ptr, schema_len) = cg.string_ptr(builder, &schema);
+                let init_ref = cg.import_rt(builder, "knot_source_init");
+                builder.ins().call(
+                    init_ref,
+                    &[db, name_ptr, name_len, schema_ptr, schema_len],
+                );
             }
 
             // Register subset constraints
@@ -3993,6 +4030,28 @@ impl Codegen {
                         builder,
                         "knot_value_constructor",
                         &[tag_ptr, tag_len, unit],
+                    );
+                }
+                // `db.*name` — a source-relation field (the field name starts
+                // with `*`) on a record that declares it via `SourceDecl`. The
+                // record value is erased to unit, so a runtime
+                // `knot_record_field` would yield unit. Emit a source READ
+                // instead, exactly as a bare `*name` SourceRef would.
+                if let Some(src_name) = field.strip_prefix('*')
+                    && let ast::ExprKind::Var(rec_name) = &expr.node
+                    && self.record_has_source_decl(rec_name, src_name)
+                {
+                    let schema = self
+                        .source_schemas
+                        .get(src_name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let (name_ptr, name_len) = self.string_ptr(builder, src_name);
+                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                    return self.call_rt(
+                        builder,
+                        "knot_source_read",
+                        &[db, name_ptr, name_len, schema_ptr, schema_len],
                     );
                 }
                 let val = self.compile_expr(builder, expr, env, db);
@@ -4951,6 +5010,22 @@ impl Codegen {
                 }
                 self.call_rt(builder, "knot_value_unit", &[])
             }
+
+            ast::ExprKind::SourceDecl { .. } => {
+                // A source-relation declaration embedded in a record is a
+                // static marker: it compiles to unit. Reads/writes through
+                // `db.*name` are resolved by qualified path, not via this
+                // record value.
+                self.call_rt(builder, "knot_value_unit", &[])
+            }
+
+            ast::ExprKind::ViewDecl { .. } => {
+                // An embedded view declaration is likewise a static marker:
+                // the view relation is registered and compiled via the
+                // hoisted top-level `DeclKind::View` (desugar
+                // `hoist_record_views`); the record field compiles to unit.
+                self.call_rt(builder, "knot_value_unit", &[])
+            }
         }
     }
 
@@ -5419,7 +5494,8 @@ impl Codegen {
                 .iter()
                 .all(|h| self.collect_direct_write_targets(&h.body, out)),
             Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => true,
-            TypeCtor { .. } | DataCtor { .. } => true,
+            TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } => true,
+            ViewDecl { body, .. } => self.collect_direct_write_targets(body, out),
         }
     }
 
@@ -10955,6 +11031,28 @@ impl Codegen {
 
     // ── Set-expression analysis ──────────────────────────────────
 
+    /// Whether `rec_name` is a top-level record-let literal that declares a
+    /// `SourceDecl` field named `src_name` (bare, no `*`). Used to route
+    /// `db.*src` field access to a source read instead of a runtime
+    /// `knot_record_field` on the erased (unit) record value.
+    fn record_has_source_decl(&self, rec_name: &str, src_name: &str) -> bool {
+        // The source must actually be registered (it is, when a SourceDecl was
+        // seen during type/schema collection).
+        if !self.source_schemas.contains_key(src_name) {
+            return false;
+        }
+        // And `rec_name` must be a record literal that carries that SourceDecl.
+        let Some(body) = self.fun_bodies.get(rec_name) else {
+            return false;
+        };
+        let ast::ExprKind::Record(fields) = &body.node else {
+            return false;
+        };
+        fields.iter().any(|f| {
+            matches!(&f.value.node, ast::ExprKind::SourceDecl { name, .. } if name == src_name)
+        })
+    }
+
     /// Check whether an expression references `*<source_name>` anywhere.
     fn references_source(expr: &ast::Expr, source_name: &str) -> bool {
         match &expr.node {
@@ -10964,7 +11062,8 @@ impl Codegen {
             | ast::ExprKind::Var(_)
             | ast::ExprKind::Constructor(_)
             | ast::ExprKind::DerivedRef(_) => false,
-            ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => false,
+            ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
+            ast::ExprKind::ViewDecl { body, .. } => Self::references_source(body, source_name),
             ast::ExprKind::Record(fields) => {
                 fields.iter().any(|f| Self::references_source(&f.value, source_name))
             }
@@ -14544,7 +14643,8 @@ fn beta_reduce_inner(
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | Case { .. } | Do(_)
         | Set { .. } | ReplaceSet { .. } | Atomic(_) | TimeUnitLit { .. }
-        | Annot { .. } | Refine(_) | Serve { .. } | TypeCtor { .. } | DataCtor { .. } => return expr.clone(),
+        | Annot { .. } | Refine(_) | Serve { .. } | TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. }
+        | ViewDecl { .. } => return expr.clone(),
     };
     ast::Spanned { node: new_node, span }
 }
@@ -14568,7 +14668,7 @@ fn substitute_inner(
     let new_node = match &expr.node {
         Var(name) if name == var => return Some(value.clone()),
         Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
-        | DataCtor { .. } => {
+        | DataCtor { .. } | SourceDecl { .. } => {
             return Some(expr.clone())
         }
         Lambda { params, ty_params, body, .. } => {
@@ -14586,6 +14686,11 @@ fn substitute_inner(
         }
         With { record, body } => With {
             record: Box::new(substitute_inner(record, var, value, value_fv)?),
+            body: Box::new(substitute_inner(body, var, value, value_fv)?),
+        },
+        ViewDecl { name, ty, body } => ViewDecl {
+            name: name.clone(),
+            ty: ty.clone(),
             body: Box::new(substitute_inner(body, var, value, value_fv)?),
         },
         App { func, arg } => App {
@@ -14686,7 +14791,8 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     match &expr.node {
         Var(name) => name == var,
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
-        | DataCtor { .. } => false,
+        | DataCtor { .. } | SourceDecl { .. } => false,
+        ViewDecl { body, .. } => expr_mentions_var(body, var),
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
         RecordUpdate { base, fields } => {
             expr_mentions_var(base, var)
@@ -14743,7 +14849,8 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             }
         }
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
-        | DataCtor { .. } => {}
+        | DataCtor { .. } | SourceDecl { .. } => {}
+        ViewDecl { body, .. } => collect_free_vars_set(body, bound, free),
         Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
             for p in params {
@@ -15760,7 +15867,8 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::DerivedRef(n) => n == name,
         ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_) | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::TypeCtor { .. }
-        | ast::ExprKind::DataCtor { .. } => false,
+        | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
+        ast::ExprKind::ViewDecl { body, .. } => expr_contains_derived_ref(body, name),
         ast::ExprKind::Record(fields) => {
             fields.iter().any(|f| expr_contains_derived_ref(&f.value, name))
         }
@@ -15860,6 +15968,8 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         }
         ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => {}
         ast::ExprKind::SourceRef(_) => {}
+        ast::ExprKind::SourceDecl { .. } => {}
+        ast::ExprKind::ViewDecl { body, .. } => collect_free_vars(body, bound, free),
         ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
         ast::ExprKind::DerivedRef(name) => {
@@ -16030,7 +16140,8 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => false,
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
+        ast::ExprKind::ViewDecl { body, .. } => expr_refs_var(body, var),
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
         ast::ExprKind::With { record, body } => {
@@ -16125,7 +16236,8 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => false,
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => false,
+        ast::ExprKind::ViewDecl { body, .. } => expr_uses_var_as_value(body, var),
         // `var.field` is a ROW use, not a value use — the whole point of this
         // walker. A field access on anything else still recurses (`f x . name`
         // may well pass `var` to `f`), as does a nested base (`var.a.b` has
@@ -16465,6 +16577,8 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::Constructor(name) => name.clone(),
         ast::ExprKind::TypeCtor { name, .. } => name.clone(),
         ast::ExprKind::DataCtor { name, .. } => name.clone(),
+        ast::ExprKind::SourceDecl { name, .. } => format!("*{}", name),
+        ast::ExprKind::ViewDecl { name, .. } => format!("*{}", name),
         ast::ExprKind::SourceRef(name) => format!("*{}", name),
         ast::ExprKind::DerivedRef(name) => format!("&{}", name),
         ast::ExprKind::Record(fields) => {
@@ -16736,6 +16850,22 @@ fn collect_type_refinements(
             collect_type_refinements(arg, &sub, alias_ast, visiting, out);
         }
         _ => {}
+    }
+}
+
+/// Collect `(relation, using_fn)` migration sites from record-embedded source
+/// fields (`{ *todos : [Todo] migrate from A to B using f }`). Only the direct
+/// record body is scanned — matching how record-embedded sources are
+/// registered (top-level record-let literals, not arbitrarily nested records).
+fn collect_record_migrations(body: &ast::Expr, out: &mut Vec<(String, ast::Expr)>) {
+    if let ast::ExprKind::Record(fields) = &body.node {
+        for f in fields {
+            if let ast::ExprKind::SourceDecl { name, migrations, .. } = &f.value.node {
+                for m in migrations {
+                    out.push((name.clone(), m.using_fn.clone()));
+                }
+            }
+        }
     }
 }
 

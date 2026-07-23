@@ -1816,6 +1816,17 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
         ast::ExprKind::Lit(_) => {}
         // A type/data-constructor field carries a TYPE name, not a value name — leaf.
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
+        // A source-declaration field carries a source name; its TYPE may hold
+        // names worth collecting.
+        ast::ExprKind::SourceDecl { ty, .. } => collect_names_in_type(ty, out),
+        // A view field carries a source name; its annotation may hold type
+        // names and its body value names.
+        ast::ExprKind::ViewDecl { ty, body, .. } => {
+            if let Some(scheme) = ty {
+                collect_names_in_type(&scheme.ty, out);
+            }
+            collect_names_in_expr(body, out);
+        }
     }
 }
 

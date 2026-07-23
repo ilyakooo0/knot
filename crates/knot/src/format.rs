@@ -1054,8 +1054,18 @@ fn method_str(m: HttpMethod) -> &'static str {
 
 // ── Type printing ───────────────────────────────────────────────────
 
-fn render_type(t: &Type) -> String {
+/// Render a type back to Knot source syntax. Used by the formatter and by the
+/// schema lockfile, which synthesizes `*name : <ty>` declarations for sources
+/// embedded in record literals.
+pub fn render_type(t: &Type) -> String {
     render_type_prec(t, TyPrec::Function)
+}
+
+/// Render an expression back to Knot source syntax (inline). Used by the
+/// schema lockfile, which synthesizes `migrate *name … using <fn>` lines for
+/// migrations attached to record-embedded source fields.
+pub fn render_expr_source(e: &Expr) -> String {
+    render_expr_inline(e, Prec::Lowest)
 }
 
 fn render_type_atom(t: &Type) -> String {
@@ -1689,6 +1699,34 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
                 .join(" | ");
             format!("data {}{} = {}", name, params, ctors)
         }
+        ExprKind::SourceDecl { name, ty, migrations } => {
+            // Renders the embedded source line. The field is literally named
+            // `*name`; here we emit the `*name : Type` declaration, plus any
+            // attached migration clauses.
+            let mut s = format!("*{} : {}", name, render_type(ty));
+            for m in migrations {
+                s.push_str(&format!(
+                    " migrate from {} to {} using {}",
+                    render_type(&m.from_ty),
+                    render_type(&m.to_ty),
+                    render_expr_inline(&m.using_fn, Prec::Lowest)
+                ));
+            }
+            s
+        }
+        ExprKind::ViewDecl { name, ty, body } => {
+            // Renders the embedded view line: `*name = body` or
+            // `*name : Type = body`. The field is literally named `*name`.
+            match ty {
+                Some(scheme) => format!(
+                    "*{} : {} = {}",
+                    name,
+                    render_type(&scheme.ty),
+                    render_expr_inline(body, Prec::Lowest)
+                ),
+                None => format!("*{} = {}", name, render_expr_inline(body, Prec::Lowest)),
+            }
+        }
         ExprKind::Serve { api, handlers, .. } => {
             let mut s = format!("serve {} where", api);
             // The first handler follows `where` directly; `;` only separates
@@ -1810,6 +1848,13 @@ fn render_record_inline(fields: &[RecordField]) -> String {
         // A type-constructor field renders as the bare embedded `type` alias
         // line — the field name is the alias name, so no separate `name value`.
         if let ExprKind::TypeCtor { .. } = &f.value.node {
+            s.push_str(&render_expr_inline(&f.value, Prec::Atom));
+            continue;
+        }
+        // A source-declaration field renders as the bare `*name : Type` line —
+        // the field name is the source name (with `*`), so no separate
+        // `name value`.
+        if let ExprKind::SourceDecl { .. } = &f.value.node {
             s.push_str(&render_expr_inline(&f.value, Prec::Atom));
             continue;
         }
@@ -2133,6 +2178,13 @@ fn render_record_block(p: &mut Printer, fields: &[RecordField]) {
             // A type-constructor field renders as the bare embedded `type`
             // alias line — the field name is the alias name.
             if let ExprKind::TypeCtor { .. } = &f.value.node {
+                render_expr(p, &f.value, Prec::Atom);
+                p.newline();
+                continue;
+            }
+            // A source-declaration field renders as the bare `*name : Type`
+            // line — the field name is the source name (with `*`).
+            if let ExprKind::SourceDecl { .. } = &f.value.node {
                 render_expr(p, &f.value, Prec::Atom);
                 p.newline();
                 continue;

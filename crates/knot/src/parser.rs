@@ -903,6 +903,7 @@ impl Parser {
             TokenKind::Data => self.parse_data(),
             TokenKind::Type => self.parse_type_alias(),
             TokenKind::Star => self.parse_source_or_view(),
+            TokenKind::StarIdent(_) => self.parse_source_or_view(),
             TokenKind::Ampersand => self.parse_derived(),
             TokenKind::Lower(_) => self.parse_fun(),
             TokenKind::Route => self.parse_route_decl(),
@@ -1180,9 +1181,25 @@ impl Parser {
     fn parse_source_or_view(&mut self) -> Option<Decl> {
         let start = self.span();
         self.in_context("source/view declaration", |this| {
-            this.advance(); // consume `*`
-
-            let (name, _) = this.expect_lower("expected name after '*'").ok()?;
+            // Consume the source/view name. `*name` lexes as a single StarIdent
+            // token (name includes the `*`, which we strip); fall back to the
+            // legacy `Star` + `Lower` form for robustness.
+            let name = match this.peek() {
+                TokenKind::StarIdent(_) => {
+                    let tok = this.advance();
+                    let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
+                    n.trim_start_matches('*').to_string()
+                }
+                TokenKind::Star => {
+                    this.advance(); // consume `*`
+                    let (n, _) = this.expect_lower("expected name after '*'").ok()?;
+                    n
+                }
+                _ => {
+                    this.error("expected source/view name (e.g. *name)");
+                    return None;
+                }
+            };
 
             // Subset constraint: *name.field <= ... or *name <= ...
             if this.at(&TokenKind::Dot) || this.at(&TokenKind::Le) {
@@ -1256,12 +1273,26 @@ impl Parser {
 
             this.expect(&TokenKind::Le, "expected '<=' in subset constraint").ok()?;
 
-            // Parse right side: *relation.field or *relation
-            this.expect(&TokenKind::Star, "expected '*' before relation name in subset constraint")
-                .ok()?;
-            let (right_relation, _) = this
-                .expect_lower("expected relation name after '*' in subset constraint")
-                .ok()?;
+            // Parse right side: *relation.field or *relation. The `*name` may
+            // arrive as a single StarIdent token or legacy Star + Lower.
+            let right_relation = match this.peek() {
+                TokenKind::StarIdent(_) => {
+                    let tok = this.advance();
+                    let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
+                    n.trim_start_matches('*').to_string()
+                }
+                TokenKind::Star => {
+                    this.advance();
+                    let (n, _) = this
+                        .expect_lower("expected relation name after '*' in subset constraint")
+                        .ok()?;
+                    n
+                }
+                _ => {
+                    this.error("expected '*' before relation name in subset constraint");
+                    return None;
+                }
+            };
 
             let right_field = if this.eat(&TokenKind::Dot) {
                 let (field, _) = this.expect_lower("expected field name after '.'").ok()?;
@@ -1799,12 +1830,25 @@ impl Parser {
         self.in_context("migrate declaration", |this| {
             this.advance(); // consume `migrate`
 
-            // Expect `*name`
-            this.expect(&TokenKind::Star, "expected '*' before relation name in migrate")
-                .ok()?;
-            let (relation, _) = this
-                .expect_lower("expected relation name after '*' in migrate")
-                .ok()?;
+            // Expect `*name` (single StarIdent token, or legacy Star + Lower).
+            let relation = match this.peek() {
+                TokenKind::StarIdent(_) => {
+                    let tok = this.advance();
+                    let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
+                    n.trim_start_matches('*').to_string()
+                }
+                TokenKind::Star => {
+                    this.advance();
+                    let (n, _) = this
+                        .expect_lower("expected relation name after '*' in migrate")
+                        .ok()?;
+                    n
+                }
+                _ => {
+                    this.error("expected '*' before relation name in migrate");
+                    return None;
+                }
+            };
 
             this.skip_newlines();
             // `from`/`to`/`using` clause keywords sit at one indent inside
@@ -2008,6 +2052,25 @@ impl Parser {
             TokenKind::Case => self.parse_case(),
             TokenKind::Do => self.parse_do_expr(),
             TokenKind::Serve => self.parse_serve_expr(),
+            TokenKind::StarIdent(_) => {
+                // `*name = expr` is a set expression; otherwise just an
+                // ordinary source-ref expression handled by Pratt parsing.
+                let start = self.span();
+                let target = self.parse_expr_bp(0)?;
+                if self.eat(&TokenKind::Eq) {
+                    let value = self.parse_expr()?;
+                    let end_sp = value.span;
+                    Some(Spanned::new(
+                        ExprKind::Set {
+                            target: Box::new(target),
+                            value: Box::new(value),
+                        },
+                        Span::new(start.start, end_sp.end),
+                    ))
+                } else {
+                    Some(target)
+                }
+            }
             TokenKind::Star => {
                 // `*name = expr` is a set expression; otherwise just an
                 // ordinary source-ref expression handled by Pratt parsing.
@@ -2028,13 +2091,21 @@ impl Parser {
                 }
             }
             TokenKind::Replace => {
-                // `replace *rel = expr` is a replace-set expression. Otherwise
-                // `replace` is treated as a regular identifier.
+                // `replace *rel = expr` is a replace-set expression. So is
+                // `replace db.*rel = expr` (a source-field on a record-var:
+                // `Lower` `.` `StarIdent`). Otherwise `replace` is treated as
+                // a regular identifier.
                 let mut offset = 1;
                 while self.peek_ahead(offset) == &TokenKind::Newline {
                     offset += 1;
                 }
-                if self.peek_ahead(offset) == &TokenKind::Star {
+                let next = self.peek_ahead(offset);
+                let is_source_target = next == &TokenKind::Star || matches!(next, TokenKind::StarIdent(_));
+                // `db.*rel` — a record-var target whose field is a source.
+                let is_record_source_target = matches!(next, TokenKind::Lower(_))
+                    && self.peek_ahead(offset + 1) == &TokenKind::Dot
+                    && matches!(self.peek_ahead(offset + 2), TokenKind::StarIdent(_));
+                if is_source_target || is_record_source_target {
                     let replace_start = self.span();
                     self.advance(); // consume `replace`
                     self.skip_newlines();
@@ -2112,33 +2183,11 @@ impl Parser {
             }
 
             // `*name` is a source reference, not multiplication — but only when
-            // the `*` hugs the following identifier AND is detached from the
-            // term on its left (whitespace or a newline before it), i.e. it
-            // begins a fresh term. This still keeps the binop loop from
-            // gobbling a `*relation = ...` statement on the next line, while
-            // letting spaceless multiplication like `a*b` parse as a product
-            // (there the `*` touches both operands). The asymmetry is the point:
-            // `a*b` and `a* b` are products; `a *b` and a newline-led `*b` are
-            // source references.
-            if matches!(self.peek(), TokenKind::Star) {
-                let star_span = self.peek_token().span;
-                let right_adjacent = match self.tokens.get(self.pos + 1) {
-                    Some(next) => {
-                        matches!(next.kind, TokenKind::Lower(_))
-                            && next.span.start == star_span.end
-                    }
-                    None => false,
-                };
-                let left_adjacent = self.pos > 0
-                    && self
-                        .tokens
-                        .get(self.pos - 1)
-                        .is_some_and(|prev| prev.span.end == star_span.start);
-                if right_adjacent && !left_adjacent {
-                    self.restore(saved_pos);
-                    break;
-                }
-            }
+            // `*name` now lexes as a single `StarIdent` token, so a `Star`
+            // reaching the binop loop is ALWAYS the multiplication operator —
+            // the old left/right-adjacency heuristic is obsolete (it existed
+            // only to disambiguate `*` as a separate token). No special-casing
+            // needed here.
 
             // `^name` begins a fresh implicit-field-projection term (an
             // application argument), not a binary operator — break out so the
@@ -2443,27 +2492,11 @@ impl Parser {
                     && !(self.stop_type_at_headers && (n == "headers" || n == "rateLimit"))
                     && !(self.stop_type_at_migrate_clauses && (n == "to" || n == "using"))
             }
-            TokenKind::Star => {
-                // Source ref `*name` (an application argument) only when `*`
-                // hugs the following Lower token AND is detached from the term
-                // on its left. When `*` touches both sides (`a*b`) it is the
-                // multiplication operator, not the start of an argument — so we
-                // must NOT treat it as an atom here, leaving it for the binop
-                // loop. This mirrors the rule in `parse_expr_bp`.
-                let star_span = self.peek_token().span;
-                let right_adjacent = match self.tokens.get(self.pos + 1) {
-                    Some(next) => {
-                        matches!(next.kind, TokenKind::Lower(_))
-                            && next.span.start == star_span.end
-                    }
-                    None => false,
-                };
-                let left_adjacent = self.pos > 0
-                    && self
-                        .tokens
-                        .get(self.pos - 1)
-                        .is_some_and(|prev| prev.span.end == star_span.start);
-                right_adjacent && !left_adjacent
+            TokenKind::StarIdent(_) => {
+                // `*name` is a single source-reference token — always a valid
+                // application argument. (The `Star` operator never reaches here
+                // as an atom starter; it's handled by the binop loop.)
+                true
             }
             TokenKind::Ampersand => {
                 // Derived ref `&name` only when `&` is immediately adjacent to a Lower token.
@@ -2535,7 +2568,26 @@ impl Parser {
                 self.advance();
                 // Field names are normally lowercase; a record may also carry a
                 // first-class type-constructor field named after a `type` alias
-                // (uppercase), accessed the same way (`r.Pair`).
+                // (uppercase), accessed the same way (`r.Pair`). A
+                // source-relation field is literally named `*name` (a
+                // StarIdent), accessed as `db.*todos` — the field name KEEPS
+                // the leading `*`.
+                if matches!(self.peek(), TokenKind::StarIdent(_)) {
+                    let tok = self.advance();
+                    let TokenKind::StarIdent(field) = tok.kind else { unreachable!() };
+                    let field_span = tok.span;
+                    if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
+                    spine_charged += 1;
+                    let span = Span::new(expr.span.start, field_span.end);
+                    expr = Spanned::new(
+                        ExprKind::FieldAccess {
+                            expr: Box::new(expr),
+                            field,
+                        },
+                        span,
+                    );
+                    continue;
+                }
                 let field_result = if matches!(self.peek(), TokenKind::Upper(_)) {
                     self.expect_upper("expected field name after '.'")
                 } else {
@@ -2689,8 +2741,17 @@ impl Parser {
                 let tok = self.advance();
                 Some(Spanned::new(ExprKind::Var("replace".into()), tok.span))
             }
+            TokenKind::StarIdent(_) => {
+                // `*name` lexed as a single token — source reference.
+                let tok = self.advance();
+                let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
+                Some(Spanned::new(
+                    ExprKind::SourceRef(n.trim_start_matches('*').to_string()),
+                    Span::new(start.start, tok.span.end),
+                ))
+            }
             TokenKind::Star => {
-                // *name — source reference
+                // *name — source reference (legacy Star + Lower form)
                 self.advance();
                 match self.peek() {
                     TokenKind::Lower(_) => {
@@ -2916,6 +2977,13 @@ impl Parser {
             if self.at(&TokenKind::RBrace) {
                 break;
             }
+            // A nested record value used as a field value (e.g. a migration's
+            // `using` fn `\r -> {title r.title …}`) must terminate when the
+            // next field sits at/below the enclosing block indent — otherwise
+            // it would greedily absorb an OUTER record's following field.
+            if self.at_layout_boundary() {
+                break;
+            }
             // `type Name p1 p2 … = <type>` — an embedded type-alias line. It
             // contributes a field named `Name` whose value is the (erased) type
             // constructor itself; the alias is also brought into type scope.
@@ -2999,6 +3067,101 @@ impl Parser {
                 });
                 continue;
             }
+            // `*name : Type` — an embedded source-relation declaration; or
+            // `*name = expr` / `*name : Type = expr` — an embedded view. The
+            // field is literally named `*name`; its value is a marker (the
+            // relation is registered statically and resolved by path). Parses
+            // the type with `record_value_sig_type` set so a following field
+            // on the next line is not absorbed as a type arg. Mirrors the
+            // top-level `:`-vs-`=` disambiguation in `parse_source_or_view`.
+            if matches!(self.peek(), TokenKind::StarIdent(_))
+            {
+                let tok = self.advance();
+                let TokenKind::StarIdent(sname) = tok.kind else { unreachable!() };
+                let sspan = tok.span;
+                let bare_name = sname.trim_start_matches('*').to_string();
+
+                if self.eat(&TokenKind::Colon) {
+                    self.skip_newlines();
+                    let saved_flag = self.record_value_sig_type;
+                    self.record_value_sig_type = true;
+                    let sty = self.parse_type();
+                    self.record_value_sig_type = saved_flag;
+                    let Some(sty) = sty else {
+                        self.error("expected type after ':' in record source declaration");
+                        return None;
+                    };
+                    // Annotated view: `*name : Type = body`.
+                    if self.eat(&TokenKind::Eq) {
+                        self.skip_newlines();
+                        let Some(body) = self.parse_expr() else {
+                            self.error("expected view body after '=' in record view declaration");
+                            return None;
+                        };
+                        fields.push(RecordField {
+                            name: sname.clone(),
+                            value: Spanned::new(
+                                ExprKind::ViewDecl {
+                                    name: bare_name,
+                                    ty: Some(crate::ast::TypeScheme {
+                                        constraints: vec![],
+                                        ty: sty,
+                                    }),
+                                    body: Box::new(body),
+                                },
+                                sspan,
+                            ),
+                            sig: None,
+                        });
+                        continue;
+                    }
+                    // Source: optional migration clauses hanging off the field:
+                    // `*todos : [Todo] migrate from A to B using f …`. Mirrors
+                    // top-level `migrate` decls (cumulative).
+                    let mut migrations = Vec::new();
+                    while let Some(m) = self.parse_source_field_migration() {
+                        migrations.push(m);
+                    }
+                    fields.push(RecordField {
+                        name: sname.clone(),
+                        value: Spanned::new(
+                            ExprKind::SourceDecl {
+                                name: bare_name,
+                                ty: sty,
+                                migrations,
+                            },
+                            sspan,
+                        ),
+                        sig: None,
+                    });
+                    continue;
+                }
+
+                // Unannotated view: `*name = body`.
+                if self.eat(&TokenKind::Eq) {
+                    self.skip_newlines();
+                    let Some(body) = self.parse_expr() else {
+                        self.error("expected view body after '=' in record view declaration");
+                        return None;
+                    };
+                    fields.push(RecordField {
+                        name: sname.clone(),
+                        value: Spanned::new(
+                            ExprKind::ViewDecl {
+                                name: bare_name,
+                                ty: None,
+                                body: Box::new(body),
+                            },
+                            sspan,
+                        ),
+                        sig: None,
+                    });
+                    continue;
+                }
+
+                self.error("expected ':' or '=' after record source/view field name");
+                return None;
+            }
             // Signature line: `name : Type`. The value for `name` is supplied by
             // a later `name value` field. Parse the type with
             // `record_value_sig_type` set so a `Lower` on the next line (the
@@ -3053,6 +3216,72 @@ impl Parser {
             .ok()?;
         let full_span = Span::new(start.start, end_tok.span.end);
         Some(Spanned::new(ExprKind::Record(fields), full_span))
+    }
+
+    /// Parse an optional `migrate from T to U using f` clause hanging off a
+    /// record-embedded source field. Returns `None` when the next token is not
+    /// `migrate`. Mirrors `parse_migrate`'s clause handling but with no
+    /// relation name (the source field supplies it).
+    fn parse_source_field_migration(&mut self) -> Option<crate::ast::SourceMigration> {
+        self.skip_newlines();
+        if !self.at(&TokenKind::Migrate) {
+            return None;
+        }
+        self.advance(); // consume `migrate`
+
+        let prev_block_indent = self.block_indent;
+        self.block_indent = self.cur_column();
+
+        if !matches!(self.peek(), TokenKind::Lower(s) if s == "from") {
+            self.error("expected 'from' in source migration");
+            self.block_indent = prev_block_indent;
+            return None;
+        }
+        self.advance();
+
+        self.stop_type_at_migrate_clauses = true;
+        let from_ty = match self.parse_type() {
+            Some(t) => t,
+            None => {
+                self.stop_type_at_migrate_clauses = false;
+                self.block_indent = prev_block_indent;
+                return None;
+            }
+        };
+
+        self.skip_newlines();
+        if !matches!(self.peek(), TokenKind::Lower(s) if s == "to") {
+            self.error("expected 'to' in source migration");
+            self.stop_type_at_migrate_clauses = false;
+            self.block_indent = prev_block_indent;
+            return None;
+        }
+        self.advance();
+
+        let to_ty = match self.parse_type() {
+            Some(t) => t,
+            None => {
+                self.stop_type_at_migrate_clauses = false;
+                self.block_indent = prev_block_indent;
+                return None;
+            }
+        };
+        self.stop_type_at_migrate_clauses = false;
+
+        self.skip_newlines();
+        if !matches!(self.peek(), TokenKind::Lower(s) if s == "using") {
+            self.error("expected 'using' in source migration");
+            self.block_indent = prev_block_indent;
+            return None;
+        }
+        self.advance();
+        // Keep `block_indent` at the migrate-clause column while parsing
+        // `using_fn` so a following record field at the outer indent terminates
+        // the using-fn's record literal via `at_layout_boundary` instead of
+        // being absorbed as one of its fields. Restore after.
+        let using_fn = self.parse_expr()?;
+        self.block_indent = prev_block_indent;
+        Some(crate::ast::SourceMigration { from_ty, to_ty, using_fn })
     }
 
     /// Parse the `name value …` fields after the `|` in a record update
@@ -3377,8 +3606,14 @@ impl Parser {
             "set expression"
         };
         self.in_context(ctx, |this| {
-            // The caller has already positioned the parser at the target.
-            let target = this.parse_expr_bp(0)?;
+            // The caller has already positioned the parser at the target. A
+            // set/replace target is a field-access chain (`*rel`, `x`,
+            // `rec.field`, or `db.*rel` on a source-record) — never an
+            // application or binary op — so parse it with `parse_postfix`,
+            // which handles the `.`-chain including the `*name` source-field
+            // form. (`parse_expr_bp` would stop at `db` and leave `.*todos`
+            // dangling.)
+            let target = this.parse_postfix()?;
 
             this.expect(&TokenKind::Eq, "expected '=' after target")
                 .ok()?;
@@ -4455,6 +4690,32 @@ impl Parser {
         rest
     }
 
+    /// Parse the relation name in an effect row after `r`/`w`/`rw`. Accepts a
+    /// single `StarIdent` token (`r *name`) or the legacy `Star` + `Lower`
+    /// form. Returns the bare relation name (no `*`).
+    fn parse_effect_relation_name(&mut self, kw: &str) -> Option<Name> {
+        match self.peek() {
+            TokenKind::StarIdent(_) => {
+                let tok = self.advance();
+                let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
+                Some(n.trim_start_matches('*').to_string())
+            }
+            TokenKind::Star => {
+                if self.expect(&TokenKind::Star, "expected '*' after effect keyword").is_err() {
+                    return None;
+                }
+                let (n, _) = self
+                    .expect_lower(&format!("expected relation name after '{} *'", kw))
+                    .ok()?;
+                Some(n)
+            }
+            _ => {
+                self.error(&format!("expected '*' after '{}'", kw));
+                None
+            }
+        }
+    }
+
     fn try_parse_effects(&mut self) -> Option<Vec<Effect>> {
         let mut effects = Vec::new();
         loop {
@@ -4468,40 +4729,27 @@ impl Parser {
                 // surrounding type-row parse.
                 TokenKind::Lower(s) if s == "r" => {
                     self.advance();
-                    if self.expect(&TokenKind::Star, "expected '*' after 'r'").is_err() {
-                        break;
+                    match self.parse_effect_relation_name("r") {
+                        Some(name) => effects.push(Effect::Reads(name)),
+                        None => break,
                     }
-                    let Some((name, _)) =
-                        self.expect_lower("expected relation name after 'r *'").ok()
-                    else {
-                        break;
-                    };
-                    effects.push(Effect::Reads(name));
                 }
                 TokenKind::Lower(s) if s == "w" => {
                     self.advance();
-                    if self.expect(&TokenKind::Star, "expected '*' after 'w'").is_err() {
-                        break;
+                    match self.parse_effect_relation_name("w") {
+                        Some(name) => effects.push(Effect::Writes(name)),
+                        None => break,
                     }
-                    let Some((name, _)) =
-                        self.expect_lower("expected relation name after 'w *'").ok()
-                    else {
-                        break;
-                    };
-                    effects.push(Effect::Writes(name));
                 }
                 TokenKind::Lower(s) if s == "rw" => {
                     self.advance();
-                    if self.expect(&TokenKind::Star, "expected '*' after 'rw'").is_err() {
-                        break;
+                    match self.parse_effect_relation_name("rw") {
+                        Some(name) => {
+                            effects.push(Effect::Reads(name.clone()));
+                            effects.push(Effect::Writes(name));
+                        }
+                        None => break,
                     }
-                    let Some((name, _)) =
-                        self.expect_lower("expected relation name after 'rw *'").ok()
-                    else {
-                        break;
-                    };
-                    effects.push(Effect::Reads(name.clone()));
-                    effects.push(Effect::Writes(name));
                 }
                 // Bare effect keywords must not be a record field name: if the
                 // next token is `:`, this is `{console: Type}` (a record), not an

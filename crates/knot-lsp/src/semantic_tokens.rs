@@ -610,6 +610,16 @@ impl<'a> TokenCollector<'a> {
                     }
                 }
             }
+            // A source-declaration field's type is highlighted (`*todos : [Todo]`
+            // highlights `Todo`).
+            ast::ExprKind::SourceDecl { ty, .. } => self.visit_type(ty),
+            // A view field's annotation and body are highlighted.
+            ast::ExprKind::ViewDecl { ty, body, .. } => {
+                if let Some(scheme) = ty {
+                    self.visit_type(&scheme.ty);
+                }
+                self.visit_expr(body);
+            }
         }
     }
 

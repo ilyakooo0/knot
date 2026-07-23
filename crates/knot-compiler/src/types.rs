@@ -289,6 +289,51 @@ impl TypeEnv {
         // Second pass: compute source schemas, migration schemas, and subset constraints
         let mut subset_constraints = Vec::new();
         let mut source_refinements: HashMap<String, Vec<(Option<String>, String, Expr)>> = HashMap::new();
+        // Collect source schemas from `*name : Type` fields embedded in
+        // top-level record-let literals (`db = { *todos : [Todo], … }`). These
+        // are the same persisted relations as top-level `*name : [T]` decls;
+        // keyed here by bare field name (qualified-path keying is a follow-up).
+        for decl in &module.decls {
+            if let DeclKind::Fun { body: Some(value), .. } = &decl.node
+                && let ExprKind::Record(fields) = &value.node
+            {
+                for f in fields {
+                    if let ExprKind::SourceDecl { name, ty, migrations } = &f.value.node {
+                        let schema = schema_for_source(
+                            ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params,
+                        );
+                        source_schemas.insert(name.clone(), schema);
+                        let refinements = collect_source_refinements(
+                            ty, &refined_types, &alias_ast_types, &data_ctor_decls,
+                        );
+                        if !refinements.is_empty() {
+                            source_refinements.insert(name.clone(), refinements);
+                        }
+                        // Attached `migrate from A to B using f` clauses register
+                        // into `migrate_schemas` exactly like top-level
+                        // `migrate *name …` decls.
+                        for m in migrations {
+                            let unwrap_relation = |r: ResolvedType| match r {
+                                ResolvedType::Relation(inner) => *inner,
+                                other => other,
+                            };
+                            let old_resolved = unwrap_relation(
+                                resolve_type(&m.from_ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params),
+                            );
+                            let new_resolved = unwrap_relation(
+                                resolve_type(&m.to_ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params),
+                            );
+                            let old_schema = relation_inner_schema(&old_resolved);
+                            let new_schema = relation_inner_schema(&new_resolved);
+                            migrate_schemas
+                                .entry(name.clone())
+                                .or_default()
+                                .push((old_schema, new_schema));
+                        }
+                    }
+                }
+            }
+        }
         for decl in &module.decls {
             match &decl.node {
                 DeclKind::Source { name, ty } => {

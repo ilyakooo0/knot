@@ -537,6 +537,28 @@ pub fn check(source_path: &Path, module: &Module, type_env: &TypeEnv) -> Vec<Dia
     diags
 }
 
+/// Sources present in the lockfile but absent from the current source —
+/// i.e. relations the codebase no longer declares. Codegen emits a
+/// `DROP TABLE` for each so a removed source's stored data is deleted on the
+/// next build's startup (after migrations, before source init). Returns an
+/// empty vec when there is no lockfile or it fails to parse (the `check`
+/// pass reports parse errors separately).
+pub fn dropped_sources(source_path: &Path, type_env: &TypeEnv) -> Vec<String> {
+    let lock_path = lockfile_path(source_path);
+    if !lock_path.exists() {
+        return Vec::new();
+    }
+    let old = match parse_lockfile(&lock_path) {
+        Ok(info) => info,
+        Err(_) => return Vec::new(),
+    };
+    old.sources
+        .keys()
+        .filter(|name| !type_env.source_schemas.contains_key(*name))
+        .cloned()
+        .collect()
+}
+
 /// Write the lockfile after a successful compile.
 /// Only writes if there are source declarations to track (in the entry module
 /// or any imported module).
@@ -557,12 +579,21 @@ pub fn update(
         .decls
         .iter()
         .any(|d| matches!(&d.node, DeclKind::Source { .. }))
-        || !imported_source_snippets.is_empty();
-    if !has_sources {
+        || !imported_source_snippets.is_empty()
+        || !record_embedded_sources(module).is_empty();
+
+    let lock_path = lockfile_path(source_path);
+
+    // Even when no sources remain in the codebase, prune a pre-existing
+    // lockfile. Codegen already emitted a startup DROP for the removed
+    // sources into this build's binary (computed from the pre-prune
+    // lockfile), so keeping the entry would re-drop on every subsequent
+    // build and fire the orphan warning forever. Rewriting with no sources
+    // yields a header-only lockfile.
+    if !has_sources && !lock_path.exists() {
         return Ok(());
     }
 
-    let lock_path = lockfile_path(source_path);
     let content = generate(module, source_text, imported_type_snippets, imported_source_snippets);
     // Atomic write: write to a temp file then rename, so a crash mid-write
     // doesn't leave a corrupt lockfile that hard-errors every compile.
@@ -573,6 +604,26 @@ pub fn update(
         .map_err(|e| format!("cannot rename {} to {}: {}", tmp_path.display(), lock_path.display(), e))
 }
 
+/// Collect the record-embedded `*name : <ty>` source declarations from a
+/// module's top-level record-let literals (`db = { *todos : [Todo], … }`),
+/// paired with the field's span for diagnostics. Duplicate source names are a
+/// compile error, so name-keyed iteration is unambiguous.
+fn record_embedded_sources(module: &Module) -> Vec<(String, Type, Span)> {
+    let mut out = Vec::new();
+    for decl in &module.decls {
+        if let DeclKind::Fun { body: Some(value), .. } = &decl.node
+            && let ExprKind::Record(fields) = &value.node
+        {
+            for f in fields {
+                if let ExprKind::SourceDecl { name, ty, .. } = &f.value.node {
+                    out.push((name.clone(), ty.clone(), f.value.span));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn find_source_span(module: &Module, name: &str) -> Span {
     module
         .decls
@@ -580,6 +631,11 @@ fn find_source_span(module: &Module, name: &str) -> Span {
         .find_map(|d| match &d.node {
             DeclKind::Source { name: n, .. } if n == name => Some(d.span),
             _ => None,
+        })
+        .or_else(|| {
+            record_embedded_sources(module)
+                .into_iter()
+                .find_map(|(n, _, span)| (n == name).then_some(span))
         })
         .unwrap_or(Span::new(0, 0))
 }
@@ -641,12 +697,52 @@ fn generate(module: &Module, source_text: &str, imported_type_snippets: &[String
         }
     }
 
+    // Sources embedded in record-let literals (`db = { *todos : [Todo], … }`)
+    // have no standalone source span to slice; synthesize an equivalent
+    // top-level `*name : <ty>` declaration. Duplicate names are a compile
+    // error, so a name already emitted above as a top-level decl is skipped.
+    for (name, ty, _) in record_embedded_sources(module) {
+        let already = module.decls.iter().any(|d| {
+            matches!(&d.node, DeclKind::Source { name: n, .. } if *n == name)
+        });
+        if already {
+            continue;
+        }
+        out.push('\n');
+        out.push_str(&format!("*{} : {}\n", name, knot::format::render_type(&ty)));
+    }
+
     // Migrate declarations
     for decl in &module.decls {
         if let DeclKind::Migrate { .. } = &decl.node {
             out.push('\n');
             out.push_str(&source_text[decl.span.start..decl.span.end]);
             out.push('\n');
+        }
+    }
+
+    // Migrations attached to record-embedded source fields
+    // (`{ *todos : [Todo] migrate from A to B using f }`). Synthesize the
+    // equivalent top-level `migrate *name …` line so the lockfile records the
+    // migration the same way regardless of where it was declared.
+    for decl in &module.decls {
+        if let DeclKind::Fun { body: Some(body), .. } = &decl.node
+            && let ExprKind::Record(fields) = &body.node
+        {
+            for f in fields {
+                if let ExprKind::SourceDecl { name, migrations, .. } = &f.value.node {
+                    for m in migrations {
+                        out.push('\n');
+                        out.push_str(&format!(
+                            "migrate *{}\n  from {}\n  to {}\n  using {}\n",
+                            name,
+                            knot::format::render_type(&m.from_ty),
+                            knot::format::render_type(&m.to_ty),
+                            knot::format::render_expr_source(&m.using_fn),
+                        ));
+                    }
+                }
+            }
         }
     }
 

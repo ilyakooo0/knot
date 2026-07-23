@@ -11217,9 +11217,32 @@ pub extern "C-unwind" fn knot_source_migrate(
         )
         .ok();
 
+    // A schema is a comma-separated `col:type` list. Compare by column set so a
+    // migrate step is a no-op not only when `stored == new_schema` (this step
+    // already applied) but also when a LATER migration in the chain already
+    // ran — i.e. `stored` still contains every column of `new_schema`.
+    let cols = |s: &str| -> std::collections::HashSet<String> {
+        s.split(',')
+            .filter(|c| !c.is_empty())
+            .map(|c| c.split(':').next().unwrap_or(c).to_string())
+            .collect()
+    };
+    let new_cols = cols(new_schema);
+    let stored_at_or_past_new = stored
+        .as_deref()
+        .map(|s| {
+            let sc = cols(s);
+            !new_cols.is_empty() && new_cols.iter().all(|c| sc.contains(c))
+        })
+        .unwrap_or(false);
+
     match &stored {
         Some(s) if s == new_schema => return,
         Some(s) if s == old_schema => {}
+        // A later migration already ran (stored is at/past `new`) — this step
+        // is a no-op. Without this, chained migrations (2+ migrate blocks for
+        // one source) panic on the second run.
+        Some(_) if stored_at_or_past_new => return,
         Some(s) => panic!(
             "knot runtime: source '{}' has schema '{}', expected '{}' (pre-migration) or '{}' (post-migration).\n\
              Check your migrate block.",
@@ -12501,6 +12524,62 @@ pub extern "C-unwind" fn knot_source_init(
             rusqlite::params![name, schema],
         )
         .expect("knot runtime: failed to record schema");
+}
+
+/// Drop a source relation whose declaration was removed from the codebase.
+/// Emitted by codegen for every source present in the schema lockfile but
+/// absent from the current source, so the stored table is deleted on the next
+/// build's startup rather than lingering as orphaned data. Also drops nested
+/// child tables (recursively) and removes the `_knot_schema` row so a later
+/// re-add of the same name starts clean.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_source_drop(db: *mut c_void, name_ptr: *const u8, name_len: usize) {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let name = unsafe { str_from_raw(name_ptr, name_len) };
+
+    let table_name = format!("_knot_{}", name);
+
+    // Recursively drop nested child tables (deepest first), mirroring the
+    // nested-drop in knot_source_migrate. The child-table names are derived
+    // from the *stored* schema (the source no longer declares one).
+    let stored: Option<String> = db_ref
+        .conn
+        .query_row(
+            "SELECT schema FROM _knot_schema WHERE name = ?1;",
+            rusqlite::params![name],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(schema) = stored
+        && !is_adt_schema(&schema)
+    {
+        let rec = parse_record_schema(&schema);
+        fn drop_nested(conn: &rusqlite::Connection, parent: &str, nested: &[NestedField]) {
+            for nf in nested {
+                let child = child_table_name(parent, &nf.name);
+                drop_nested(conn, &child, &nf.nested);
+                let sql = format!("DROP TABLE IF EXISTS {};", quote_ident(&child));
+                debug_sql(&sql);
+                let _ = conn.execute_batch(&sql);
+            }
+        }
+        drop_nested(&db_ref.conn, &table_name, &rec.nested);
+    }
+
+    let sql = format!("DROP TABLE IF EXISTS {};", quote_ident(&table_name));
+    debug_sql(&sql);
+    db_ref
+        .conn
+        .execute_batch(&sql)
+        .unwrap_or_else(|e| panic!("knot runtime: failed to drop removed source '*{}': {}", name, e));
+
+    db_ref
+        .conn
+        .execute(
+            "DELETE FROM _knot_schema WHERE name = ?1;",
+            rusqlite::params![name],
+        )
+        .expect("knot runtime: failed to remove schema record for dropped source");
 }
 
 /// Read all rows from a source relation.

@@ -37,9 +37,105 @@ fn desugar_inner(module: &mut Module) {
     desugar_routes(module);
     let io_fns = detect_io_functions(&module.decls);
     let no_source_vars = HashSet::new();
+    // Rewrite `rec.*name` field access on a static source-record
+    // (`db = { *todos : [Todo], … }`) to a plain `SourceRef(name)`. The record
+    // value is erased to unit at runtime and every downstream source-read
+    // path (do-block binds, `count`, SQL pushdown, STM tracking) keys on
+    // `SourceRef` — routing through them unchanged is far less invasive than
+    // teaching each to recognise `FieldAccess` on a source-record.
+    rewrite_record_source_refs(module);
+    hoist_record_views(module);
     for decl in &mut module.decls {
         desugar_decl(&mut decl.node, &io_fns, &no_source_vars);
     }
+}
+
+/// Hoist record-embedded view declarations (`db = { … *openTodos = body … }`)
+/// into top-level-equivalent `DeclKind::View` decls so type-checking and
+/// codegen treat them exactly like a top-level `*openTodos = body`. The record
+/// field keeps its `ViewDecl` marker (the record is erased to unit at runtime);
+/// the hoisted decl carries the actual body. Runs AFTER
+/// `rewrite_record_source_refs` so the body already references sibling sources
+/// as plain `SourceRef`s.
+fn hoist_record_views(module: &mut Module) {
+    let mut hoisted: Vec<Decl> = Vec::new();
+    for decl in &module.decls {
+        if let DeclKind::Fun { body: Some(body), .. } = &decl.node
+            && let ExprKind::Record(fields) = &body.node
+        {
+            for f in fields {
+                if let ExprKind::ViewDecl { name, ty, body: vbody } = &f.value.node {
+                    hoisted.push(Decl {
+                        node: DeclKind::View {
+                            name: name.clone(),
+                            ty: ty.clone(),
+                            body: (**vbody).clone(),
+                        },
+                        span: f.value.span,
+                        exported: false,
+                    });
+                }
+            }
+        }
+    }
+    module.decls.extend(hoisted);
+}
+
+/// Map a top-level record-let name to the set of source names it declares via
+/// `*name : Type` fields.
+fn collect_record_source_fields(module: &Module) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    for decl in &module.decls {
+        if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
+            && let ExprKind::Record(fields) = &body.node
+        {
+            let names: Vec<String> = fields
+                .iter()
+                .filter_map(|f| match &f.value.node {
+                    ExprKind::SourceDecl { name, .. } => Some(name.clone()),
+                    ExprKind::ViewDecl { name, .. } => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !names.is_empty() {
+                out.insert(name.clone(), names);
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite `rec.*name` → `SourceRef(name)` when `rec` is a static source-record
+/// that declares `*name`.
+fn rewrite_record_source_refs(module: &mut Module) {
+    let map = collect_record_source_fields(module);
+    if map.is_empty() {
+        return;
+    }
+    for decl in &mut module.decls {
+        if let DeclKind::Fun { body: Some(body), .. } = &mut decl.node {
+            rewrite_source_refs_in_expr(body, &map);
+        }
+    }
+}
+
+fn rewrite_source_refs_in_expr(
+    expr: &mut Expr,
+    map: &std::collections::HashMap<String, Vec<String>>,
+) {
+    // Rewrite this node first (top-down so a rewritten SourceRef isn't
+    // descended into).
+    if let ExprKind::FieldAccess { expr: base, field } = &expr.node
+        && let Some(src) = field.strip_prefix('*')
+        && let ExprKind::Var(rec) = &base.node
+        && map.get(rec).is_some_and(|names| names.iter().any(|n| n == src))
+    {
+        let span = expr.span;
+        expr.node = ExprKind::SourceRef(src.to_string());
+        let _ = span;
+        return;
+    }
+    walk_expr_children(expr, &mut |child| rewrite_source_refs_in_expr(child, map));
 }
 
 /// IO-producing function names, split by how they were detected.
@@ -436,7 +532,10 @@ fn walk_expr_children(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
                 }
             }
         }
-        ExprKind::Set { value, .. } | ExprKind::ReplaceSet { value, .. } => f(value),
+        ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
+            f(target);
+            f(value);
+        }
         ExprKind::Atomic(e) | ExprKind::Refine(e) => f(e),
         ExprKind::TimeUnitLit { value, .. } => f(value),
         ExprKind::Annot { expr: e, .. } => f(e),
@@ -445,6 +544,7 @@ fn walk_expr_children(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
                 f(&mut h.body);
             }
         }
+        ExprKind::ViewDecl { body, .. } => f(body),
         _ => {}
     }
 }
@@ -615,7 +715,8 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
     match &mut expr.node {
         ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Constructor(_)
         | ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) | ExprKind::ImplicitRef(_) => {}
-        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } => {}
+        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
+        ExprKind::ViewDecl { body, .. } => desugar_expr(body, io_fns, source_vars),
 
         ExprKind::Record(fields) => {
             for f in fields {

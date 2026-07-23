@@ -67,6 +67,13 @@ pub enum TokenKind {
     Plus,
     Minus,
     Star,
+    /// `*name` — a source-relation identifier: `*` immediately followed by a
+    /// lowercase letter, lexed as ONE token whose string INCLUDES the leading
+    /// `*` (e.g. `"*todos"`). Distinguished from the `Star` multiplication
+    /// operator by the no-space rule: binary operators require surrounding
+    /// whitespace, so a `*` directly abutting a lowercase letter is always a
+    /// source identifier, never multiplication.
+    StarIdent(String),
     Slash,
     Percent,
     PlusPlus,
@@ -153,6 +160,7 @@ impl TokenKind {
             TokenKind::Plus => "'+'",
             TokenKind::Minus => "'-'",
             TokenKind::Star => "'*'",
+            TokenKind::StarIdent(_) => "source identifier",
             TokenKind::Slash => "'/'",
             TokenKind::Percent => "'%'",
             TokenKind::PlusPlus => "'++'",
@@ -991,7 +999,24 @@ impl<'src> Lexer<'src> {
                     TokenKind::Plus
                 }
             }
-            b'*' => TokenKind::Star,
+            b'*' => {
+                // `*name` (no space, lowercase letter immediately after) is a
+                // source-relation identifier — a single StarIdent token whose
+                // string includes the `*`. Binary operators require surrounding
+                // whitespace, so a spaced `*` (or `*` before a non-letter, e.g.
+                // `x * 2`, `a * (b)`) stays the multiplication operator. The
+                // `*` was already consumed by `lex_operator`'s `advance()`, so
+                // `start` is one byte back and `peek()` is the char after `*`.
+                if matches!(self.peek(), Some(b) if b.is_ascii_lowercase()) {
+                    let start = self.pos - 1; // include the consumed `*`
+                    while self.is_ident_continue() {
+                        self.advance();
+                    }
+                    TokenKind::StarIdent(self.slice(start, self.pos).to_owned())
+                } else {
+                    TokenKind::Star
+                }
+            }
             b'/' => TokenKind::Slash,
             b'%' => TokenKind::Percent,
             b'&' => {

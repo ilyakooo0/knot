@@ -245,7 +245,10 @@ fn collect_edges(
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::SourceRef(_) => {}
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } => {}
+        ast::ExprKind::ViewDecl { body, .. } => {
+            collect_edges(body, polarity, node_names, env, partial_diffs, diff_wrappers, out)
+        }
 
         // `diff` is a curried 2-arg stdlib function. In the AST after
         // desugaring it appears as `App(App(Var("diff"), a), b)`.

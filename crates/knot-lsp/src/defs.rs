@@ -635,6 +635,16 @@ impl<'a> DefResolver<'a> {
                     }
                 }
             }
+            // A source-declaration field's type is navigable (`*todos : [Todo]`
+            // references the `Todo` type).
+            ast::ExprKind::SourceDecl { ty, .. } => self.resolve_type(ty, self.source),
+            // A view field's annotation and body are both navigable.
+            ast::ExprKind::ViewDecl { ty, body, .. } => {
+                if let Some(scheme) = ty {
+                    self.resolve_type(&scheme.ty, self.source);
+                }
+                self.resolve_expr(body);
+            }
         }
     }
 }

@@ -925,6 +925,105 @@ main = do
     );
 }
 
+// ── 19. full function support in record fields ──────────────────────
+
+#[test]
+fn record_fun_field_self_recursion() {
+    // A record field lambda can recurse through the record path.
+    let (stdout, _stderr, ok) = compile_and_run(
+        "record_fun_self_recursion",
+        r#"fns = { fact \n -> if n <= 1 then 1 else n * fns.fact (n - 1) }
+main = println (show (fns.fact 6))
+"#,
+    );
+    assert!(ok, "self-recursive record fun failed");
+    assert!(stdout.contains("720"), "stdout={stdout}");
+}
+
+#[test]
+fn record_fun_field_mutual_recursion() {
+    // Sibling fields can call each other through the record path.
+    let (stdout, _stderr, ok) = compile_and_run(
+        "record_fun_mutual_recursion",
+        r#"fns =
+  { even \n -> if n == 0 then True else fns.odd (n - 1)
+    odd  \n -> if n == 0 then False else fns.even (n - 1)
+  }
+main = println (show (fns.even 10))
+"#,
+    );
+    assert!(ok, "mutually-recursive record funs failed");
+    assert!(stdout.contains("True"), "stdout={stdout}");
+}
+
+#[test]
+fn record_fun_field_polymorphic_generalization() {
+    // A record field lambda generalizes: `id` used at two types.
+    let (stdout, _stderr, ok) = compile_and_run(
+        "record_fun_polymorphic",
+        r#"fns = { id \x -> x }
+a = fns.id 5
+b = fns.id "hi"
+main = println (show a)
+"#,
+    );
+    assert!(ok, "polymorphic record fun failed");
+    assert!(stdout.contains("5"), "stdout={stdout}");
+}
+
+#[test]
+fn record_fun_field_sig_line_enforced() {
+    // A `name : Type` sig line constrains the field value's type.
+    let (stdout, _stderr, ok) = compile_and_run(
+        "record_fun_sig_line",
+        r#"fns =
+  { double : Int 1 -> Int 1
+    double \x -> x * 2
+  }
+main = println (show (fns.double 21))
+"#,
+    );
+    assert!(ok, "sig-line record fun failed");
+    assert!(stdout.contains("42"), "stdout={stdout}");
+}
+
+#[test]
+fn record_fun_field_sig_with_implicit_constraint_parses() {
+    // A field sig is a full type scheme: implicit-field constraints
+    // (`(^name : Text) =>`) parse and round-trip through the formatter. The
+    // body here does not project `^name`, so no dictionary elaboration is
+    // required (that elaboration is a separate top-level-fun mechanism).
+    let src = r#"fns =
+  { greet : (^name : Text) => {} -> Text
+    greet \_ -> "hi"
+  }
+main = println "ok"
+"#;
+    let module = parse(src);
+    // The constraint must survive parsing into the field's sig scheme.
+    let sig = module
+        .decls
+        .iter()
+        .find_map(|d| match &d.node {
+            knot::ast::DeclKind::Fun { name, body: Some(b), .. } if name == "fns" => {
+                if let knot::ast::ExprKind::Record(fields) = &b.node {
+                    fields.iter().find(|f| f.name == "greet").and_then(|f| f.sig.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .expect("greet field sig");
+    assert!(
+        sig.constraints
+            .iter()
+            .any(|c| matches!(c, knot::ast::Constraint::ImplicitField { field, .. } if field == "name")),
+        "implicit-field constraint lost from record field sig: {:?}",
+        sig.constraints
+    );
+}
+
 // ── 13. traverse over an empty relation ────────────────────────────
 
 #[test]

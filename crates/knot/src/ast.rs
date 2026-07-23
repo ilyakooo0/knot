@@ -640,12 +640,14 @@ pub struct Field<T> {
 /// `name : Type` sig line:
 ///   {name : Text
 ///    name "a"}
-/// The sig (when present) is enforced against the value's type.
+/// The sig (when present) is enforced against the value's type. It is a full
+/// type scheme so a field function can take implicit-field constraints:
+/// `{greet : (^name : Text) => {} -> Text  greet \_ -> ^name}`.
 #[derive(Debug, Clone)]
 pub struct RecordField {
     pub name: Name,
     pub value: Expr,
-    pub sig: Option<Type>,
+    pub sig: Option<TypeScheme>,
 }
 
 /// A migration attached to a record-embedded source field:

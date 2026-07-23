@@ -5624,7 +5624,7 @@ impl Infer {
                             let saved_flag = self.in_type_annotation;
                             let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
                             self.in_type_annotation = true;
-                            let sig_ty = self.ast_type_to_ty(sig);
+                            let sig_ty = self.ast_type_to_ty(&sig.ty);
                             self.in_type_annotation = saved_flag;
                             self.annotation_unit_vars = saved_unit_vars;
                             self.unify(&val_ty, &sig_ty, f.value.span);
@@ -6885,7 +6885,7 @@ impl Infer {
                             let saved_unit_vars =
                                 std::mem::take(&mut self.annotation_unit_vars);
                             self.in_type_annotation = true;
-                            let sig_ty = self.ast_type_to_ty(sig);
+                            let sig_ty = self.ast_type_to_ty(&sig.ty);
                             self.in_type_annotation = saved_flag;
                             self.annotation_unit_vars = saved_unit_vars;
                             self.check_expr(&f.value, &sig_ty);

@@ -2917,7 +2917,7 @@ impl Parser {
         // The sig is attached to its value field and enforced by the checker;
         // the sig-line layout is preserved through the formatter.
         let mut fields: Vec<RecordField> = Vec::new();
-        let mut pending_sigs: Vec<(Name, Type)> = Vec::new();
+        let mut pending_sigs: Vec<(Name, TypeScheme)> = Vec::new();
         loop {
             self.skip_newlines();
             if self.at(&TokenKind::RBrace) {
@@ -3229,7 +3229,7 @@ impl Parser {
                 self.skip_newlines();
                 let saved_flag = self.record_value_sig_type;
                 self.record_value_sig_type = true;
-                let sty = self.parse_type();
+                let sty = self.parse_type_scheme();
                 self.record_value_sig_type = saved_flag;
                 let Some(sty) = sty else {
                     self.error("expected type after ':' in record field signature");

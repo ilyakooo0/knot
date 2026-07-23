@@ -1862,7 +1862,7 @@ fn render_record_inline(fields: &[RecordField]) -> String {
         if let Some(sig) = &f.sig {
             s.push_str(&f.name);
             s.push_str(" : ");
-            s.push_str(&render_type(sig));
+            s.push_str(&render_type_scheme(sig));
             s.push(' ');
         }
         s.push_str(&f.name);
@@ -2195,7 +2195,7 @@ fn render_record_block(p: &mut Printer, fields: &[RecordField]) {
             if let Some(sig) = &f.sig {
                 p.write(&f.name);
                 p.write(" : ");
-                p.write(&render_type(sig));
+                p.write(&render_type_scheme(sig));
                 p.newline();
             }
             p.write(&f.name);

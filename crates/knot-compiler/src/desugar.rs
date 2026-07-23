@@ -45,10 +45,62 @@ fn desugar_inner(module: &mut Module) {
     // teaching each to recognise `FieldAccess` on a source-record.
     rewrite_record_source_refs(module);
     hoist_record_views(module);
+    hoist_record_routes(module);
     for decl in &mut module.decls {
         desugar_decl(&mut decl.node, &io_fns, &no_source_vars);
     }
 }
+
+/// Hoist record-embedded route declarations (`api = { route TodoApi where …
+/// }`) into top-level-equivalent `DeclKind::Route`/`RouteComposite` decls so
+/// type-checking and codegen treat them exactly like a top-level route. The
+/// hoisted route is keyed by its qualified path (`api.TodoApi`), so
+/// `serve api.TodoApi` / `fetch url (api.TodoApi.Ctor …)` resolve by path.
+/// The record field keeps its `RouteDecl`/`RouteCompositeDecl` marker (the
+/// record is erased to unit at runtime). Mirrors `hoist_record_views`.
+fn hoist_record_routes(module: &mut Module) {
+    let mut hoisted: Vec<Decl> = Vec::new();
+    for decl in &module.decls {
+        if let DeclKind::Fun {
+            name: rec_name,
+            body: Some(body),
+            ..
+        } = &decl.node
+            && let ExprKind::Record(fields) = &body.node
+        {
+            for f in fields {
+                match &f.value.node {
+                    ExprKind::RouteDecl { name, entries } => hoisted.push(Decl {
+                        node: DeclKind::Route {
+                            name: format!("{rec_name}.{name}"),
+                            entries: entries.clone(),
+                        },
+                        span: f.value.span,
+                        exported: false,
+                    }),
+                    ExprKind::RouteCompositeDecl { name, components } => {
+                        // A component may itself be a record-embedded route
+                        // referenced by path (`other.AdminApi`); pass it
+                        // through unchanged — top-level composites already
+                        // carry arbitrary name strings, and route resolution
+                        // looks each up in `route_entries_by_api`.
+                        hoisted.push(Decl {
+                            node: DeclKind::RouteComposite {
+                                name: format!("{rec_name}.{name}"),
+                                components: components.clone(),
+                            },
+                            span: f.value.span,
+                            exported: false,
+                        })
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    module.decls.extend(hoisted);
+}
+
 
 /// Hoist record-embedded view/derived declarations (`db = { … *open = body …
 /// &sen = body … }`) into top-level-equivalent `DeclKind::View`/`Derived` decls
@@ -766,6 +818,7 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
         | ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) | ExprKind::ImplicitRef(_) => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
         ExprKind::SubsetConstraint { .. } => {}
+        ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
         ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
             desugar_expr(body, io_fns, source_vars)
         }

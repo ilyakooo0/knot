@@ -212,7 +212,7 @@ fn lint_expr(
         | ExprKind::SourceRef(_)
         | ExprKind::ImplicitRef(_)
         | ExprKind::DerivedRef(_) => {}
-        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
+        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
     }
 }
 
@@ -1068,7 +1068,7 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         | ExprKind::Constructor(_)
         | ExprKind::ImplicitRef(_)
         | ExprKind::DerivedRef(_) => false,
-        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } => false,
+        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => false,
         ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => references_source(body, source_name),
         ExprKind::Record(fields) => fields.iter().any(|f| references_source(&f.value, source_name)),
         ExprKind::RecordUpdate { base, fields } => {

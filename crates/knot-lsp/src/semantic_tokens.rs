@@ -612,6 +612,30 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::SourceDecl { ty, .. } => self.visit_type(ty),
             // A subset constraint carries no type or value tokens.
             ast::ExprKind::SubsetConstraint { .. } => {}
+            // A route field's entries carry types to highlight; a composite
+            // only names other routes.
+            ast::ExprKind::RouteDecl { entries, .. } => {
+                for entry in entries {
+                    for seg in &entry.path {
+                        if let ast::PathSegment::Param { ty, .. } = seg {
+                            self.visit_type(ty);
+                        }
+                    }
+                    for f in entry
+                        .body_fields
+                        .iter()
+                        .chain(&entry.query_params)
+                        .chain(&entry.request_headers)
+                        .chain(&entry.response_headers)
+                    {
+                        self.visit_type(&f.value);
+                    }
+                    if let Some(resp) = &entry.response_ty {
+                        self.visit_type(resp);
+                    }
+                }
+            }
+            ast::ExprKind::RouteCompositeDecl { .. } => {}
             // A view field's annotation and body are highlighted.
             ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {
                 if let Some(scheme) = ty {

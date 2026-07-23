@@ -626,6 +626,33 @@ impl<'a> DefResolver<'a> {
             ast::ExprKind::SourceDecl { ty, .. } => self.resolve_type(ty, self.source),
             // A subset constraint references relations, not value bindings.
             ast::ExprKind::SubsetConstraint { .. } => {}
+            // A route field's entries carry navigable types; a composite only
+            // references other routes by name.
+            ast::ExprKind::RouteDecl { entries, .. } => {
+                for entry in entries {
+                    for seg in &entry.path {
+                        if let ast::PathSegment::Param { ty, .. } = seg {
+                            self.resolve_type(ty, self.source);
+                        }
+                    }
+                    for f in &entry.body_fields {
+                        self.resolve_type(&f.value, self.source);
+                    }
+                    for f in &entry.query_params {
+                        self.resolve_type(&f.value, self.source);
+                    }
+                    for f in &entry.request_headers {
+                        self.resolve_type(&f.value, self.source);
+                    }
+                    for f in &entry.response_headers {
+                        self.resolve_type(&f.value, self.source);
+                    }
+                    if let Some(resp) = &entry.response_ty {
+                        self.resolve_type(resp, self.source);
+                    }
+                }
+            }
+            ast::ExprKind::RouteCompositeDecl { .. } => {}
             // A view field's annotation and body are both navigable.
             ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {
                 if let Some(scheme) = ty {

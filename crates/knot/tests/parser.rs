@@ -1608,6 +1608,78 @@ fn composite_route() {
     }
 }
 
+#[test]
+fn route_in_record() {
+    let src = "routes =\n  { route TodoApi where\n      GET /todos = ListTodos\n  }";
+    let m = parse_ok(src);
+    match &m.decls[0].node {
+        DeclKind::Fun { body: Some(body), .. } => match &body.node {
+            knot::ast::ExprKind::Record(fields) => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].name, "TodoApi");
+                match &fields[0].value.node {
+                    knot::ast::ExprKind::RouteDecl { name, entries } => {
+                        assert_eq!(name, "TodoApi");
+                        assert_eq!(entries.len(), 1);
+                        assert_eq!(entries[0].constructor, "ListTodos");
+                    }
+                    other => panic!("expected RouteDecl, got {:?}", other),
+                }
+            }
+            other => panic!("expected Record, got {:?}", other),
+        },
+        other => panic!("expected Fun, got {:?}", other),
+    }
+}
+
+#[test]
+fn composite_route_in_record_with_paths() {
+    let src = "routes =\n  { route TodoApi where\n      GET /todos = ListTodos\n    route Api = routes.TodoApi\n  }";
+    let m = parse_ok(src);
+    match &m.decls[0].node {
+        DeclKind::Fun { body: Some(body), .. } => match &body.node {
+            knot::ast::ExprKind::Record(fields) => {
+                assert_eq!(fields.len(), 2);
+                match &fields[1].value.node {
+                    knot::ast::ExprKind::RouteCompositeDecl { name, components } => {
+                        assert_eq!(name, "Api");
+                        assert_eq!(components, &vec!["routes.TodoApi".to_string()]);
+                    }
+                    other => panic!("expected RouteCompositeDecl, got {:?}", other),
+                }
+            }
+            other => panic!("expected Record, got {:?}", other),
+        },
+        other => panic!("expected Fun, got {:?}", other),
+    }
+}
+
+#[test]
+fn serve_with_route_path() {
+    let src = "routes =\n  { route TodoApi where\n      GET /todos -> Int 1 = ListTodos\n  }\nmain = listen 1 (serve routes.TodoApi where ListTodos = \\{} -> yield (Ok {value 1}))";
+    let m = parse_ok(src);
+    match &m.decls[1].node {
+        DeclKind::Fun { body: Some(body), .. } => {
+            // `listen port (serve …)` — find the Serve node in the app chain.
+            fn find_serve(e: &knot::ast::Expr) -> Option<&knot::ast::Expr> {
+                match &e.node {
+                    knot::ast::ExprKind::Serve { .. } => Some(e),
+                    knot::ast::ExprKind::App { func, arg } => {
+                        find_serve(func).or_else(|| find_serve(arg))
+                    }
+                    _ => None,
+                }
+            }
+            let serve = find_serve(body).expect("expected a serve expression");
+            match &serve.node {
+                knot::ast::ExprKind::Serve { api, .. } => assert_eq!(api, "routes.TodoApi"),
+                other => panic!("expected Serve, got {:?}", other),
+            }
+        }
+        other => panic!("expected Fun, got {:?}", other),
+    }
+}
+
 // ── Complex / Integration Tests ─────────────────────────────────────
 
 #[test]

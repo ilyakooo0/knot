@@ -243,6 +243,7 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         // the root binding. Treat as using nothing (no leaf refs).
         ExprKind::ImplicitRef(_) => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
+        ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
         ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => walk_expr(body, r),
         ExprKind::Var(name) => {
             r.values.insert(name.clone());

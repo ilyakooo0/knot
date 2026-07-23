@@ -348,6 +348,30 @@ pub enum ExprKind {
         sup: RelationPath,
     },
 
+    /// A `route Name where …` declaration embedded in a record value literal
+    /// (`{route Api where …, …}`). Mirrors the top-level `DeclKind::Route`.
+    /// The field is a pure marker — it contributes no runtime value (erased
+    /// like `DataCtor`); the route's entries and endpoint constructors are
+    /// registered statically under the record path (`rec.Api`) and resolved
+    /// by path at `serve rec.Api` / `fetch url (rec.Api.Ctor …)` call sites.
+    RouteDecl {
+        /// Route name (e.g. `Api`), also the record field name.
+        name: Name,
+        entries: Vec<RouteEntry>,
+    },
+
+    /// A `route Name = A | B` composite embedded in a record value literal
+    /// (`{route Api = TodoApi | AdminApi, …}`). Mirrors the top-level
+    /// `DeclKind::RouteComposite`; components may themselves be field paths
+    /// (e.g. `other.TodoApi`). The field is a pure marker, resolved to a
+    /// fixpoint during inference/codegen exactly like top-level composites.
+    RouteCompositeDecl {
+        /// Route name (e.g. `Api`), also the record field name.
+        name: Name,
+        /// Component route references, each a dotted path (`Api` or `rec.Api`).
+        components: Vec<String>,
+    },
+
     /// `serve Api where E1 = expr1; E2 = expr2; ...` — typed server value.
     /// Each handler is bound to a route endpoint constructor; the whole
     /// expression has type `Server Api _` (a row variable when no handler

@@ -195,6 +195,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
         }
         Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
+        RouteDecl { .. } | RouteCompositeDecl { .. } => {}
         ViewDecl { body, .. } | DerivedDecl { body, .. } => shift_expr_spans(body, offset),
     }
 }
@@ -440,6 +441,7 @@ mod tests {
             ViewDecl { body, .. } | DerivedDecl { body, .. } => f(body),
             Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
             TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
+        RouteDecl { .. } | RouteCompositeDecl { .. } => {}
         }
     }
 

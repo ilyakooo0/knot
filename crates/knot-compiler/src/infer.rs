@@ -6772,6 +6772,26 @@ impl Infer {
                 // has no meaningful value.
                 Ty::unit()
             }
+            ast::ExprKind::RouteDecl { name, entries } => {
+                // A record-embedded route declaration. Like an embedded `data`
+                // decl, its static type is a structural namespace record
+                // `{Ctor: payload -> RouteTy, …}` so `rec.Api.Ctor` resolves via
+                // ordinary field access. The endpoint type is the path-qualified
+                // `Ty::Con("rec.Api")` produced by the hoisted `DeclKind::Route`
+                // (desugar `hoist_record_routes`); the record value itself is
+                // erased to unit at runtime.
+                let mut ns_fields = BTreeMap::new();
+                for entry in entries {
+                    let input_ty = self.route_input_record_ty(entry);
+                    ns_fields.insert(entry.constructor.clone(), Ty::Fun(Box::new(input_ty), Box::new(Ty::Con(name.clone(), vec![]))));
+                }
+                Ty::Record(ns_fields, None)
+            }
+            ast::ExprKind::RouteCompositeDecl { .. } => {
+                // A route composite contributes no constructors of its own; it
+                // merges other routes' endpoints. It carries no value namespace.
+                Ty::unit()
+            }
             ast::ExprKind::ViewDecl { name, ty, .. } => {
                 // A view embedded in a record value literal (`{*openTodos = …}`).
                 // The actual relation type is registered by the hoisted
@@ -11797,6 +11817,7 @@ fn value_references_source_inner(
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
+        ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
             value_references_source_inner(
                 body, source_name, aliases, let_bindings, visited,
@@ -12544,6 +12565,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
     match &mut expr.node {
         Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
+        RouteDecl { .. } | RouteCompositeDecl { .. } => {}
         ViewDecl { body, .. } | DerivedDecl { body, .. } => f(body),
         Record(fields) => {
             for fl in fields {
@@ -12754,16 +12776,18 @@ fn fetch_ctor_name(expr: &ast::Expr) -> Option<&str> {
     let ast::ExprKind::App { func, arg } = &expr.node else {
         return None;
     };
-    // The last argument should be a constructor application
+    // The last argument should be a constructor application. The constructor
+    // may be a bare `Ctor` or a path into a record-embedded route namespace
+    // (`rec.Api.Ctor`); the endpoint constructor is registered under its leaf
+    // name, so a field path reduces to its final segment.
     let ctor_name = match &arg.node {
-        ast::ExprKind::App { func: ctor_func, .. } => {
-            if let ast::ExprKind::Constructor(name) = &ctor_func.node {
-                name.as_str()
-            } else {
-                return None;
-            }
-        }
+        ast::ExprKind::App { func: ctor_func, .. } => match &ctor_func.node {
+            ast::ExprKind::Constructor(name) => name.as_str(),
+            ast::ExprKind::FieldAccess { field, .. } => field.as_str(),
+            _ => return None,
+        },
         ast::ExprKind::Constructor(name) => name.as_str(),
+        ast::ExprKind::FieldAccess { field, .. } => field.as_str(),
         _ => return None,
     };
     // Walk the function chain to find Var("fetch") or Var("fetchWith") at the root

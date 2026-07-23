@@ -1032,6 +1032,15 @@ fn method_str(m: HttpMethod) -> &'static str {
     }
 }
 
+/// Render a single route entry as a standalone string (used for the embedded
+/// `route … where` marker inside a record literal, where the record renderer
+/// manages indentation itself).
+fn render_route_entry_inline(e: &RouteEntry) -> String {
+    let mut p = Printer::new();
+    render_route_entry(&mut p, e);
+    p.finish()
+}
+
 // ── Type printing ───────────────────────────────────────────────────
 
 /// Render a type back to Knot source syntax. Used by the formatter and by the
@@ -1727,6 +1736,21 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
                 None => format!("*{}", p.relation),
             };
             format!("{} <= {}", path(sub), path(sup))
+        }
+        ExprKind::RouteDecl { name, entries } => {
+            // Embedded route declaration. Renders `route Name where` followed
+            // by the entries on their own lines (the record renderers indent
+            // the whole block). Entries reuse the top-level entry renderer.
+            let mut s = format!("route {} where", name);
+            for e in entries {
+                s.push('\n');
+                s.push_str(&render_route_entry_inline(e));
+            }
+            s
+        }
+        ExprKind::RouteCompositeDecl { name, components } => {
+            // `route Name = A | rec.B | …` — components may be field paths.
+            format!("route {} = {}", name, components.join(" | "))
         }
         ExprKind::Serve { api, handlers, .. } => {
             let mut s = format!("serve {} where", api);

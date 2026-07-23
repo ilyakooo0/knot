@@ -5025,6 +5025,14 @@ impl Codegen {
                 // `hoist_record_views`); the record field compiles to unit.
                 self.call_rt(builder, "knot_value_unit", &[])
             }
+
+            ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {
+                // An embedded route declaration is a static marker: the
+                // route's entries are registered statically (path-keyed) and
+                // the serving table is built in `main` from the registered
+                // routes. The record field carries no runtime value.
+                self.call_rt(builder, "knot_value_unit", &[])
+            }
         }
     }
 
@@ -5417,6 +5425,8 @@ impl Codegen {
             Var(name) => !self.write_functions.contains(name),
             // `^x` reads a record field; it never writes to a source.
             ImplicitRef(_) => true,
+            // A route declaration marker carries no value and never writes.
+            RouteDecl { .. } | RouteCompositeDecl { .. } => true,
             Atomic(inner) | Refine(inner) => {
                 self.collect_direct_write_targets(inner, out)
             }
@@ -7063,20 +7073,25 @@ impl Codegen {
             (null, args[1])
         };
 
-        // Extract constructor name and record argument from the AST
+        // Extract constructor name and record argument from the AST. The
+        // constructor may be a bare `Ctor` or a path into a record-embedded
+        // route namespace (`rec.Api.Ctor`); the endpoint constructor is
+        // registered under its leaf name, so a field path reduces to its
+        // final segment.
         let (ctor_name, record_expr) = match &ctor_expr.node {
-            ast::ExprKind::App { func, arg } => {
-                if let ast::ExprKind::Constructor(name) = &func.node {
-                    (name.clone(), Some(arg.as_ref()))
-                } else {
+            ast::ExprKind::App { func, arg } => match &func.node {
+                ast::ExprKind::Constructor(name) => (name.clone(), Some(arg.as_ref())),
+                ast::ExprKind::FieldAccess { field, .. } => (field.clone(), Some(arg.as_ref())),
+                _ => {
                     return self.push_codegen_error(
                         builder,
                         ctor_expr.span,
                         "fetch: expected constructor application as last argument",
                     );
                 }
-            }
+            },
             ast::ExprKind::Constructor(name) => (name.clone(), None),
+            ast::ExprKind::FieldAccess { field, .. } => (field.clone(), None),
             _ => {
                 return self.push_codegen_error(
                     builder,
@@ -11062,6 +11077,7 @@ impl Codegen {
             | ast::ExprKind::Constructor(_)
             | ast::ExprKind::DerivedRef(_) => false,
             ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
+            ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
             ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => Self::references_source(body, source_name),
             ast::ExprKind::Record(fields) => {
                 fields.iter().any(|f| Self::references_source(&f.value, source_name))
@@ -14511,6 +14527,7 @@ fn beta_reduce_inner(
         }
         ImplicitRef(_) => expr.node.clone(),
         SubsetConstraint { .. } => expr.node.clone(),
+        RouteDecl { .. } | RouteCompositeDecl { .. } => expr.node.clone(),
         With { record, body } => {
             let r = beta_reduce_inner(record, fun_bodies, let_bindings, visited, fuel);
             let b = beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel);
@@ -14668,7 +14685,7 @@ fn substitute_inner(
     let new_node = match &expr.node {
         Var(name) if name == var => return Some(value.clone()),
         Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {
+        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {
             return Some(expr.clone())
         }
         Lambda { params, ty_params, body, .. } => {
@@ -14796,7 +14813,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     match &expr.node {
         Var(name) => name == var,
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => false,
+        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => false,
         ViewDecl { body, .. } | DerivedDecl { body, .. } => expr_mentions_var(body, var),
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
         RecordUpdate { base, fields } => {
@@ -14854,7 +14871,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             }
         }
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
+        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {}
         ViewDecl { body, .. } | DerivedDecl { body, .. } => collect_free_vars_set(body, bound, free),
         Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
@@ -15873,6 +15890,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_) | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::TypeCtor { .. }
         | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
+        ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_contains_derived_ref(body, name),
         ast::ExprKind::Record(fields) => {
             fields.iter().any(|f| expr_contains_derived_ref(&f.value, name))
@@ -15975,6 +15993,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::SourceRef(_) => {}
         ast::ExprKind::SourceDecl { .. } => {}
         ast::ExprKind::SubsetConstraint { .. } => {}
+        ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => collect_free_vars(body, bound, free),
         ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
@@ -16147,6 +16166,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
+        ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_refs_var(body, var),
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
@@ -16243,6 +16263,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
+        ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_uses_var_as_value(body, var),
         // `var.field` is a ROW use, not a value use — the whole point of this
         // walker. A field access on anything else still recurses (`f x . name`
@@ -16593,6 +16614,9 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         }
         ast::ExprKind::ViewDecl { name, .. } => format!("*{}", name),
         ast::ExprKind::DerivedDecl { name, .. } => format!("&{}", name),
+        ast::ExprKind::RouteDecl { name, .. } | ast::ExprKind::RouteCompositeDecl { name, .. } => {
+            format!("route {}", name)
+        }
         ast::ExprKind::SourceRef(name) => format!("*{}", name),
         ast::ExprKind::DerivedRef(name) => format!("&{}", name),
         ast::ExprKind::Record(fields) => {

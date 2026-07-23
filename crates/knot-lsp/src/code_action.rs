@@ -1810,6 +1810,31 @@ fn collect_names_in_expr(expr: &ast::Expr, out: &mut HashSet<String>) {
         // names worth collecting.
         ast::ExprKind::SourceDecl { ty, .. } => collect_names_in_type(ty, out),
         ast::ExprKind::SubsetConstraint { .. } => {}
+        // A route field's entries carry types (path params, body fields,
+        // query params, headers, response) worth collecting; a composite
+        // only names other routes.
+        ast::ExprKind::RouteDecl { entries, .. } => {
+            for e in entries {
+                for seg in &e.path {
+                    if let ast::PathSegment::Param { ty, .. } = seg {
+                        collect_names_in_type(ty, out);
+                    }
+                }
+                for f in &e.body_fields {
+                    collect_names_in_type(&f.value, out);
+                }
+                for f in &e.query_params {
+                    collect_names_in_type(&f.value, out);
+                }
+                for f in &e.request_headers {
+                    collect_names_in_type(&f.value, out);
+                }
+                if let Some(t) = &e.response_ty {
+                    collect_names_in_type(t, out);
+                }
+            }
+        }
+        ast::ExprKind::RouteCompositeDecl { .. } => {}
         // A view field carries a source name; its annotation may hold type
         // names and its body value names.
         ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {

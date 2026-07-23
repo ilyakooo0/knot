@@ -616,7 +616,7 @@ impl EffectChecker {
 
             ast::ExprKind::ImplicitRef(_) => EffectSet::empty(),
 
-            ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => EffectSet::empty(),
+            ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => EffectSet::empty(),
 
             // An embedded view's body reads sources — infer its effects like
             // any other expression.
@@ -1764,7 +1764,7 @@ fn walk_expr(expr: &ast::Expr, f: &mut impl FnMut(&ast::Expr)) {
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => {}
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => walk_expr(body, f),
         ast::ExprKind::Record(fields) => {
             for field in fields {
@@ -1886,7 +1886,7 @@ fn collect_unshadowed_disallowed(
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::DerivedRef(_) => {}
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
             collect_unshadowed_disallowed(body, shadowed, out)
         }

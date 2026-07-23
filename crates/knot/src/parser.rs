@@ -1495,6 +1495,36 @@ impl Parser {
         })
     }
 
+    /// Parse a route reference: a bare route name (`Api`) or a dotted field
+    /// path to a record-embedded route (`rec.Api`, `a.b.TodoApi`). Used by
+    /// composite components (`route X = A | rec.B`) and by `serve`'s API head.
+    fn parse_route_component_path(&mut self) -> Option<String> {
+        // First segment may be a record field (lowercase) or a route name
+        // (uppercase); every later segment is a route name (uppercase) since
+        // routes are always declared with an uppercase field name.
+        let mut path = match self.peek().clone() {
+            TokenKind::Lower(_) | TokenKind::Upper(_) => {
+                let tok = self.advance();
+                match tok.kind {
+                    TokenKind::Lower(s) | TokenKind::Upper(s) => s,
+                    _ => unreachable!(),
+                }
+            }
+            _ => {
+                self.error("expected route name");
+                return None;
+            }
+        };
+        while self.eat(&TokenKind::Dot) {
+            let (seg, _) = self
+                .expect_upper("expected route name after '.' in route path")
+                .ok()?;
+            path.push('.');
+            path.push_str(&seg);
+        }
+        Some(path)
+    }
+
     /// Parse route entries, supporting path prefix nesting.
     /// A line starting with `/` (no HTTP method) introduces a prefix group;
     /// nested entries under it have the prefix prepended to their paths.
@@ -3013,6 +3043,63 @@ impl Parser {
                 });
                 continue;
             }
+            // `route Name where …` / `route Name = A | B` — an embedded route
+            // declaration. Contributes a field named `Name` whose value is a
+            // pure marker (erased like a data decl): the route's entries are
+            // registered statically under the record path (`rec.Name`) and
+            // resolved by path at `serve rec.Name` / `fetch url (rec.Name.Ctor
+            // …)` call sites. Composite components may themselves be field
+            // paths (`other.TodoApi`).
+            if self.at(&TokenKind::Route) {
+                let rspan = self.span();
+                let route_col = self.cur_column();
+                self.advance(); // consume `route`
+                let (rname, _) = self
+                    .expect_upper("expected route name after 'route'")
+                    .ok()?;
+
+                // Composite: `route Name = A | B | other.C`
+                if self.eat(&TokenKind::Eq) {
+                    let mut components = Vec::new();
+                    components.push(self.parse_route_component_path()?);
+                    while self.eat(&TokenKind::Pipe) {
+                        components.push(self.parse_route_component_path()?);
+                    }
+                    fields.push(RecordField {
+                        name: rname.clone(),
+                        value: Spanned::new(
+                            ExprKind::RouteCompositeDecl {
+                                name: rname,
+                                components,
+                            },
+                            rspan,
+                        ),
+                        sig: None,
+                    });
+                    continue;
+                }
+
+                self.expect(&TokenKind::Where, "expected 'where' or '=' after route name")
+                    .ok()?;
+                let no_prefix: Vec<PathSegment> = vec![];
+                // Route entries are indented one level deeper than the `route`
+                // line inside the record, so the group's floor is the `route`
+                // keyword's column.
+                let entries =
+                    self.parse_route_entries_with_prefix(&no_prefix, route_col);
+                fields.push(RecordField {
+                    name: rname.clone(),
+                    value: Spanned::new(
+                        ExprKind::RouteDecl {
+                            name: rname,
+                            entries,
+                        },
+                        rspan,
+                    ),
+                    sig: None,
+                });
+                continue;
+            }
             // `*name : Type` — an embedded source-relation declaration; or
             // `*name = expr` / `*name : Type = expr` — an embedded view. The
             // field is literally named `*name`; its value is a marker (the
@@ -3645,7 +3732,8 @@ impl Parser {
         }
         let result = self.in_context("serve expression", |this| {
             this.advance(); // consume `serve`
-            let (api, api_span) = this.expect_upper("expected route name after 'serve'").ok()?;
+            let api_span = this.span();
+            let api = this.parse_route_component_path()?;
             this.skip_newlines();
             this.expect(&TokenKind::Where, "expected 'where' after API name in 'serve'")
                 .ok()?;

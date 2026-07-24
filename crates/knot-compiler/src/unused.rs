@@ -264,7 +264,16 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
                 walk_expr(&f.value, r);
             }
         }
-        ExprKind::FieldAccess { expr, .. } => walk_expr(expr, r),
+        ExprKind::FieldAccess { expr, field } => {
+            // Qualified constructor `Color.Red`: the base is the data type and
+            // `field` is the constructor. Count the ctor as used so the data
+            // type isn't flagged unused. (`Constructor("Color")` itself is also
+            // walked, recording the type-name reference.)
+            if let ExprKind::Constructor(_) = &expr.node {
+                r.ctors.insert(field.clone());
+            }
+            walk_expr(expr, r);
+        }
         ExprKind::List(items) => {
             for it in items {
                 walk_expr(it, r);

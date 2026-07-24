@@ -1,3 +1,4 @@
+with {
 -- Showcase: exercises many data types, ADTs, nested relations, and bulk data
 -- Run: knot build examples/showcase.knot && ./examples/showcase
 -- Then: ./examples/showcase db
@@ -50,178 +51,178 @@ type Metric = {name: Text, value: Float 1, tags: Text}
 
 -- ── Seed data ────────────────────────────────────────────────────
 
-seedEmployees = do
+seedEmployees (do
   replace *employees = [
-    {name "Alice Chen" age 34 salary 142000.0 dept (Engineering {}) active (Yes {})},
-    {name "Bob Martinez" age 28 salary 95000.0 dept (Engineering {}) active (Yes {})},
-    {name "Carol Davis" age 41 salary 155000.0 dept (Engineering {}) active (Yes {})},
-    {name "Dan Wilson" age 25 salary 78000.0 dept (Engineering {}) active (Yes {})},
-    {name "Eve Johnson" age 37 salary 130000.0 dept (Design {}) active (Yes {})},
-    {name "Frank Lee" age 45 salary 160000.0 dept (Engineering {}) active (Yes {})},
-    {name "Grace Kim" age 30 salary 112000.0 dept (Marketing {}) active (Yes {})},
-    {name "Hank Brown" age 52 salary 175000.0 dept (Engineering {}) active (No {})},
-    {name "Iris Patel" age 29 salary 98000.0 dept (Support {}) active (Yes {})},
-    {name "Jack Thompson" age 33 salary 125000.0 dept (Sales {}) active (Yes {})},
-    {name "Kate White" age 38 salary 140000.0 dept (Design {}) active (Yes {})},
-    {name "Leo Garcia" age 26 salary 85000.0 dept (Engineering {}) active (Yes {})},
-    {name "Mia Robinson" age 44 salary 168000.0 dept (Engineering {}) active (Yes {})},
-    {name "Noah Clark" age 31 salary 105000.0 dept (Marketing {}) active (Yes {})},
-    {name "Olivia Hall" age 36 salary 138000.0 dept (Sales {}) active (Yes {})},
-    {name "Pat Young" age 48 salary 152000.0 dept (Support {}) active (Yes {})},
-    {name "Quinn Adams" age 27 salary 92000.0 dept (Design {}) active (Yes {})},
-    {name "Rita Baker" age 39 salary 145000.0 dept (Engineering {}) active (Yes {})},
-    {name "Sam Torres" age 42 salary 158000.0 dept (Marketing {}) active (No {})},
-    {name "Tina Flores" age 35 salary 132000.0 dept (Sales {}) active (Yes {})}
+    {name "Alice Chen" age 34 salary 142000.0 dept (Department.Engineering {}) active (Active.Yes {})},
+    {name "Bob Martinez" age 28 salary 95000.0 dept (Department.Engineering {}) active (Active.Yes {})},
+    {name "Carol Davis" age 41 salary 155000.0 dept (Department.Engineering {}) active (Active.Yes {})},
+    {name "Dan Wilson" age 25 salary 78000.0 dept (Department.Engineering {}) active (Active.Yes {})},
+    {name "Eve Johnson" age 37 salary 130000.0 dept (Department.Design {}) active (Active.Yes {})},
+    {name "Frank Lee" age 45 salary 160000.0 dept (Department.Engineering {}) active (Active.Yes {})},
+    {name "Grace Kim" age 30 salary 112000.0 dept (Department.Marketing {}) active (Active.Yes {})},
+    {name "Hank Brown" age 52 salary 175000.0 dept (Department.Engineering {}) active (Active.No {})},
+    {name "Iris Patel" age 29 salary 98000.0 dept (Department.Support {}) active (Active.Yes {})},
+    {name "Jack Thompson" age 33 salary 125000.0 dept (Department.Sales {}) active (Active.Yes {})},
+    {name "Kate White" age 38 salary 140000.0 dept (Department.Design {}) active (Active.Yes {})},
+    {name "Leo Garcia" age 26 salary 85000.0 dept (Department.Engineering {}) active (Active.Yes {})},
+    {name "Mia Robinson" age 44 salary 168000.0 dept (Department.Engineering {}) active (Active.Yes {})},
+    {name "Noah Clark" age 31 salary 105000.0 dept (Department.Marketing {}) active (Active.Yes {})},
+    {name "Olivia Hall" age 36 salary 138000.0 dept (Department.Sales {}) active (Active.Yes {})},
+    {name "Pat Young" age 48 salary 152000.0 dept (Department.Support {}) active (Active.Yes {})},
+    {name "Quinn Adams" age 27 salary 92000.0 dept (Department.Design {}) active (Active.Yes {})},
+    {name "Rita Baker" age 39 salary 145000.0 dept (Department.Engineering {}) active (Active.Yes {})},
+    {name "Sam Torres" age 42 salary 158000.0 dept (Department.Marketing {}) active (Active.No {})},
+    {name "Tina Flores" age 35 salary 132000.0 dept (Department.Sales {}) active (Active.Yes {})}
   ]
-  yield {}
+  yield {})
 
-seedProjects = do
+seedProjects (do
   replace *projects = [
-    {name "Phoenix" lead "Alice Chen" budget 500000.0 priority (Critical {})},
-    {name "Atlas" lead "Carol Davis" budget 350000.0 priority (High {})},
-    {name "Meridian" lead "Frank Lee" budget 200000.0 priority (Medium {})},
-    {name "Horizon" lead "Mia Robinson" budget 750000.0 priority (Critical {})},
-    {name "Compass" lead "Eve Johnson" budget 150000.0 priority (Low {})},
-    {name "Vanguard" lead "Rita Baker" budget 420000.0 priority (High {})},
-    {name "Echo" lead "Bob Martinez" budget 180000.0 priority (Medium {})},
-    {name "Nimbus" lead "Kate White" budget 280000.0 priority (High {})}
+    {name "Phoenix" lead "Alice Chen" budget 500000.0 priority (Priority.Critical {})},
+    {name "Atlas" lead "Carol Davis" budget 350000.0 priority (Priority.High {})},
+    {name "Meridian" lead "Frank Lee" budget 200000.0 priority (Priority.Medium {})},
+    {name "Horizon" lead "Mia Robinson" budget 750000.0 priority (Priority.Critical {})},
+    {name "Compass" lead "Eve Johnson" budget 150000.0 priority (Priority.Low {})},
+    {name "Vanguard" lead "Rita Baker" budget 420000.0 priority (Priority.High {})},
+    {name "Echo" lead "Bob Martinez" budget 180000.0 priority (Priority.Medium {})},
+    {name "Nimbus" lead "Kate White" budget 280000.0 priority (Priority.High {})}
   ]
-  yield {}
+  yield {})
 
-seedTickets = do
+seedTickets (do
   replace *tickets = [
     {
       title "Fix auth timeout"
       project "Phoenix"
-      status (InProgress {assignee "Bob Martinez"})
-      priority (Critical {})
+      status (Status.InProgress {assignee "Bob Martinez"})
+      priority (Priority.Critical {})
       points 8
     },
-    {title "Add dark mode" project "Phoenix" status (Open {}) priority (Medium {}) points 5},
+    {title "Add dark mode" project "Phoenix" status (Status.Open {}) priority (Priority.Medium {}) points 5},
     {
       title "Optimize query planner"
       project "Phoenix"
-      status (InProgress {assignee "Alice Chen"})
-      priority (High {})
+      status (Status.InProgress {assignee "Alice Chen"})
+      priority (Priority.High {})
       points 13
     },
-    {title "Write API docs" project "Phoenix" status (Done {}) priority (Low {}) points 3},
+    {title "Write API docs" project "Phoenix" status (Status.Done {}) priority (Priority.Low {}) points 3},
     {
       title "Database migration tool"
       project "Atlas"
-      status (Blocked {reason "Waiting for schema freeze"})
-      priority (High {})
+      status (Status.Blocked {reason "Waiting for schema freeze"})
+      priority (Priority.High {})
       points 8
     },
-    {title "Add CSV export" project "Atlas" status (Open {}) priority (Medium {}) points 5},
+    {title "Add CSV export" project "Atlas" status (Status.Open {}) priority (Priority.Medium {}) points 5},
     {
       title "Fix N+1 queries"
       project "Atlas"
-      status (InProgress {assignee "Dan Wilson"})
-      priority (Critical {})
+      status (Status.InProgress {assignee "Dan Wilson"})
+      priority (Priority.Critical {})
       points 8
     },
-    {title "Update CI pipeline" project "Meridian" status (Done {}) priority (Medium {}) points 3},
-    {title "Add rate limiting" project "Meridian" status (Open {}) priority (High {}) points 5},
+    {title "Update CI pipeline" project "Meridian" status (Status.Done {}) priority (Priority.Medium {}) points 3},
+    {title "Add rate limiting" project "Meridian" status (Status.Open {}) priority (Priority.High {}) points 5},
     {
       title "Redesign dashboard"
       project "Horizon"
-      status (InProgress {assignee "Eve Johnson"})
-      priority (High {})
+      status (Status.InProgress {assignee "Eve Johnson"})
+      priority (Priority.High {})
       points 13
     },
     {
       title "Mobile responsive layout"
       project "Horizon"
-      status (Open {})
-      priority (Medium {})
+      status (Status.Open {})
+      priority (Priority.Medium {})
       points 8
     },
     {
       title "Fix memory leak"
       project "Horizon"
-      status (Blocked {reason "Need profiler access"})
-      priority (Critical {})
+      status (Status.Blocked {reason "Need profiler access"})
+      priority (Priority.Critical {})
       points 5
     },
-    {title "Logo redesign" project "Compass" status (Done {}) priority (Low {}) points 2},
+    {title "Logo redesign" project "Compass" status (Status.Done {}) priority (Priority.Low {}) points 2},
     {
       title "Brand guidelines doc"
       project "Compass"
-      status (InProgress {assignee "Kate White"})
-      priority (Low {})
+      status (Status.InProgress {assignee "Kate White"})
+      priority (Priority.Low {})
       points 3
     },
-    {title "Set up monitoring" project "Vanguard" status (Open {}) priority (High {}) points 5},
+    {title "Set up monitoring" project "Vanguard" status (Status.Open {}) priority (Priority.High {}) points 5},
     {
       title "Implement caching layer"
       project "Vanguard"
-      status (InProgress {assignee "Carol Davis"})
-      priority (Critical {})
+      status (Status.InProgress {assignee "Carol Davis"})
+      priority (Priority.Critical {})
       points 13
     },
-    {title "Add search indexing" project "Vanguard" status (Open {}) priority (Medium {}) points 8},
-    {title "Fix date parsing bug" project "Echo" status (Done {}) priority (High {}) points 3},
-    {title "Add webhook support" project "Echo" status (Open {}) priority (Medium {}) points 8},
+    {title "Add search indexing" project "Vanguard" status (Status.Open {}) priority (Priority.Medium {}) points 8},
+    {title "Fix date parsing bug" project "Echo" status (Status.Done {}) priority (Priority.High {}) points 3},
+    {title "Add webhook support" project "Echo" status (Status.Open {}) priority (Priority.Medium {}) points 8},
     {
       title "Migrate to new SDK"
       project "Echo"
-      status (Blocked {reason "SDK not released yet"})
-      priority (Low {})
+      status (Status.Blocked {reason "SDK not released yet"})
+      priority (Priority.Low {})
       points 5
     },
     {
       title "Design system components"
       project "Nimbus"
-      status (InProgress {assignee "Quinn Adams"})
-      priority (High {})
+      status (Status.InProgress {assignee "Quinn Adams"})
+      priority (Priority.High {})
       points 8
     },
-    {title "Accessibility audit" project "Nimbus" status (Open {}) priority (Medium {}) points 5},
-    {title "Performance benchmarks" project "Phoenix" status (Open {}) priority (High {}) points 5},
-    {title "Implement SSO" project "Phoenix" status (Open {}) priority (Critical {}) points 13},
-    {title "Add telemetry" project "Atlas" status (Open {}) priority (Medium {}) points 5}
+    {title "Accessibility audit" project "Nimbus" status (Status.Open {}) priority (Priority.Medium {}) points 5},
+    {title "Performance benchmarks" project "Phoenix" status (Status.Open {}) priority (Priority.High {}) points 5},
+    {title "Implement SSO" project "Phoenix" status (Status.Open {}) priority (Priority.Critical {}) points 13},
+    {title "Add telemetry" project "Atlas" status (Status.Open {}) priority (Priority.Medium {}) points 5}
   ]
-  yield {}
+  yield {})
 
-seedCustomers = do
+seedCustomers (do
   replace *customers = [
-    {name "Acme Corp" email "admin@acme.com" tier (Enterprise {})},
-    {name "Widgets Inc" email "hello@widgets.io" tier (Pro {})},
-    {name "Startup Labs" email "team@startuplabs.dev" tier (Free {})},
-    {name "MegaTech" email "info@megatech.com" tier (Enterprise {})},
-    {name "Cloud Nine" email "ops@cloudnine.co" tier (Pro {})},
-    {name "DataFlow" email "admin@dataflow.io" tier (Pro {})},
-    {name "ByteWorks" email "hello@byteworks.dev" tier (Free {})},
-    {name "Quantum Systems" email "sales@quantumsys.com" tier (Enterprise {})},
-    {name "NexGen" email "support@nexgen.io" tier (Pro {})},
-    {name "TechVista" email "info@techvista.com" tier (Free {})},
-    {name "Alpine Digital" email "hello@alpine.digital" tier (Pro {})},
-    {name "CoreStack" email "admin@corestack.io" tier (Enterprise {})}
+    {name "Acme Corp" email "admin@acme.com" tier (Tier.Enterprise {})},
+    {name "Widgets Inc" email "hello@widgets.io" tier (Tier.Pro {})},
+    {name "Startup Labs" email "team@startuplabs.dev" tier (Tier.Free {})},
+    {name "MegaTech" email "info@megatech.com" tier (Tier.Enterprise {})},
+    {name "Cloud Nine" email "ops@cloudnine.co" tier (Tier.Pro {})},
+    {name "DataFlow" email "admin@dataflow.io" tier (Tier.Pro {})},
+    {name "ByteWorks" email "hello@byteworks.dev" tier (Tier.Free {})},
+    {name "Quantum Systems" email "sales@quantumsys.com" tier (Tier.Enterprise {})},
+    {name "NexGen" email "support@nexgen.io" tier (Tier.Pro {})},
+    {name "TechVista" email "info@techvista.com" tier (Tier.Free {})},
+    {name "Alpine Digital" email "hello@alpine.digital" tier (Tier.Pro {})},
+    {name "CoreStack" email "admin@corestack.io" tier (Tier.Enterprise {})}
   ]
-  yield {}
+  yield {})
 
-seedProducts = do
+seedProducts (do
   replace *products = [
-    {name "Laptop Pro 16" price 2499.99 category (Electronics {}) inStock (Yes {})},
-    {name "Wireless Mouse" price 49.99 category (Electronics {}) inStock (Yes {})},
-    {name "USB-C Hub" price 79.99 category (Electronics {}) inStock (No {})},
-    {name "Mechanical KB" price 159.99 category (Electronics {}) inStock (Yes {})},
-    {name "4K Monitor" price 599.99 category (Electronics {}) inStock (Yes {})},
-    {name "Clean Code" price 39.99 category (Books {}) inStock (Yes {})},
-    {name "SICP" price 65.0 category (Books {}) inStock (Yes {})},
-    {name "The Art of SQL" price 45.5 category (Books {}) inStock (No {})},
-    {name "Hoodie (Black)" price 59.99 category (Clothing {}) inStock (Yes {})},
-    {name "T-Shirt (Logo)" price 24.99 category (Clothing {}) inStock (Yes {})},
-    {name "Coffee Beans 1kg" price 18.99 category (Food {}) inStock (Yes {})},
-    {name "Green Tea Box" price 12.5 category (Food {}) inStock (Yes {})},
-    {name "IDE License" price 199.99 category (Software {}) inStock (Yes {})},
-    {name "CI/CD Platform" price 499.99 category (Software {}) inStock (Yes {})},
-    {name "Monitoring Suite" price 299.99 category (Software {}) inStock (Yes {})}
+    {name "Laptop Pro 16" price 2499.99 category (Category.Electronics {}) inStock (Active.Yes {})},
+    {name "Wireless Mouse" price 49.99 category (Category.Electronics {}) inStock (Active.Yes {})},
+    {name "USB-C Hub" price 79.99 category (Category.Electronics {}) inStock (Active.No {})},
+    {name "Mechanical KB" price 159.99 category (Category.Electronics {}) inStock (Active.Yes {})},
+    {name "4K Monitor" price 599.99 category (Category.Electronics {}) inStock (Active.Yes {})},
+    {name "Clean Code" price 39.99 category (Category.Books {}) inStock (Active.Yes {})},
+    {name "SICP" price 65.0 category (Category.Books {}) inStock (Active.Yes {})},
+    {name "The Art of SQL" price 45.5 category (Category.Books {}) inStock (Active.No {})},
+    {name "Hoodie (Black)" price 59.99 category (Category.Clothing {}) inStock (Active.Yes {})},
+    {name "T-Shirt (Logo)" price 24.99 category (Category.Clothing {}) inStock (Active.Yes {})},
+    {name "Coffee Beans 1kg" price 18.99 category (Category.Food {}) inStock (Active.Yes {})},
+    {name "Green Tea Box" price 12.5 category (Category.Food {}) inStock (Active.Yes {})},
+    {name "IDE License" price 199.99 category (Category.Software {}) inStock (Active.Yes {})},
+    {name "CI/CD Platform" price 499.99 category (Category.Software {}) inStock (Active.Yes {})},
+    {name "Monitoring Suite" price 299.99 category (Category.Software {}) inStock (Active.Yes {})}
   ]
-  yield {}
+  yield {})
 
-seedOrders = do
+seedOrders (do
   replace *orders = [
     {customer "Acme Corp" product "Laptop Pro 16" quantity 50 total 124999.5},
     {customer "Acme Corp" product "4K Monitor" quantity 50 total 29999.5},
@@ -249,9 +250,9 @@ seedOrders = do
     {customer "CoreStack" product "IDE License" quantity 75 total 14999.25},
     {customer "CoreStack" product "CI/CD Platform" quantity 2 total 999.98}
   ]
-  yield {}
+  yield {})
 
-seedTeams = do
+seedTeams (do
   replace *teams = [
     {
       name "Platform"
@@ -293,119 +294,119 @@ seedTeams = do
       members [{name "Iris Patel" role "Lead"}, {name "Pat Young" role "Senior"}]
     }
   ]
-  yield {}
+  yield {})
 
-seedLogs = do
+seedLogs (do
   replace *logs = [
-    {timestamp 1710900000 level (Info {}) message "Server started on port 8080" source "main"},
+    {timestamp 1710900000 level (Level.Info {}) message "Server started on port 8080" source "main"},
     {
       timestamp 1710900001
-      level (Info {})
+      level (Level.Info {})
       message "Database connection pool initialized (10)"
       source "db"
     },
-    {timestamp 1710900005 level (Debug {}) message "Loading configuration from env" source "config"},
+    {timestamp 1710900005 level (Level.Debug {}) message "Loading configuration from env" source "config"},
     {
       timestamp 1710900012
-      level (Info {})
+      level (Level.Info {})
       message "Health check endpoint registered"
       source "routes"
     },
-    {timestamp 1710900030 level (Warn {}) message "Slow query detected: 2340ms" source "db"},
+    {timestamp 1710900030 level (Level.Warn {}) message "Slow query detected: 2340ms" source "db"},
     {
       timestamp 1710900045
-      level (Info {})
+      level (Level.Info {})
       message "Request: GET /api/users (200, 45ms)"
       source "http"
     },
     {
       timestamp 1710900046
-      level (Info {})
+      level (Level.Info {})
       message "Request: POST /api/orders (201, 120ms)"
       source "http"
     },
-    {timestamp 1710900047 level (Debug {}) message "Cache miss for key: user:1234" source "cache"},
+    {timestamp 1710900047 level (Level.Debug {}) message "Cache miss for key: user:1234" source "cache"},
     {
       timestamp 1710900048
-      level (Info {})
+      level (Level.Info {})
       message "Request: GET /api/products (200, 32ms)"
       source "http"
     },
     {
       timestamp 1710900060
-      level (Error {})
+      level (Level.Error {})
       message "Connection refused: redis://localhost:6379"
       source "cache"
     },
-    {timestamp 1710900061 level (Warn {}) message "Falling back to in-memory cache" source "cache"},
+    {timestamp 1710900061 level (Level.Warn {}) message "Falling back to in-memory cache" source "cache"},
     {
       timestamp 1710900090
-      level (Info {})
+      level (Level.Info {})
       message "Request: PUT /api/users/42 (200, 88ms)"
       source "http"
     },
     {
       timestamp 1710900100
-      level (Error {})
+      level (Level.Error {})
       message "Timeout: external payment API (5000ms)"
       source "payments"
     },
     {
       timestamp 1710900101
-      level (Warn {})
+      level (Level.Warn {})
       message "Retrying payment request (attempt 2/3)"
       source "payments"
     },
     {
       timestamp 1710900105
-      level (Info {})
+      level (Level.Info {})
       message "Payment processed: order #7821"
       source "payments"
     },
-    {timestamp 1710900120 level (Debug {}) message "GC pause: 12ms" source "runtime"},
+    {timestamp 1710900120 level (Level.Debug {}) message "GC pause: 12ms" source "runtime"},
     {
       timestamp 1710900150
-      level (Info {})
+      level (Level.Info {})
       message "Cron: daily report generation started"
       source "scheduler"
     },
     {
       timestamp 1710900180
-      level (Info {})
+      level (Level.Info {})
       message "Report generated: 1,247 rows exported"
       source "scheduler"
     },
-    {timestamp 1710900200 level (Warn {}) message "Disk usage at 82%" source "monitor"},
+    {timestamp 1710900200 level (Level.Warn {}) message "Disk usage at 82%" source "monitor"},
     {
       timestamp 1710900300
-      level (Info {})
+      level (Level.Info {})
       message "Request: DELETE /api/sessions/old (200)"
       source "http"
     },
-    {timestamp 1710900301 level (Info {}) message "Cleaned 847 expired sessions" source "auth"},
+    {timestamp 1710900301 level (Level.Info {}) message "Cleaned 847 expired sessions" source "auth"},
     {
       timestamp 1710900400
-      level (Error {})
+      level (Level.Error {})
       message "TLS certificate expires in 7 days"
       source "monitor"
     },
     {
       timestamp 1710900500
-      level (Info {})
+      level (Level.Info {})
       message "Backup completed: 2.4GB compressed"
       source "backup"
     },
-    {timestamp 1710900600 level (Debug {}) message "WebSocket connections: 142 active" source "ws"},
+    {timestamp 1710900600 level (Level.Debug {}) message "WebSocket connections: 142 active" source "ws"},
     {
       timestamp 1710900700
-      level (Info {})
+      level (Level.Info {})
       message "Rate limit applied: 10.0.5.23 (429)"
       source "http"
     }
   ]
-  yield {}
+  yield {})
 
-seedMetrics = do
+seedMetrics (do
   replace *metrics = [
     {name "http_requests_total" value 48291.0 tags "method=GET,status=200"},
     {name "http_requests_total" value 12847.0 tags "method=POST,status=201"},
@@ -438,11 +439,11 @@ seedMetrics = do
     {name "disk_usage_percent" value 82.3 tags "mount=/data"},
     {name "disk_usage_percent" value 45.1 tags "mount=/logs"}
   ]
-  yield {}
-
+  yield {})
 -- ── Main ─────────────────────────────────────────────────────────
 
-main = do
+}
+(do
   seedEmployees
   seedProjects
   seedTickets
@@ -453,3 +454,5 @@ main = do
   seedLogs
   seedMetrics
   yield (show (count *employees) ++ " employees, " ++ show (count *projects) ++ " projects, " ++ show (count *tickets) ++ " tickets, " ++ show (count *customers) ++ " customers, " ++ show (count *products) ++ " products, " ++ show (count *orders) ++ " orders, " ++ show (count *teams) ++ " teams, " ++ show (count *logs) ++ " logs, " ++ show (count *metrics) ++ " metrics")
+
+)

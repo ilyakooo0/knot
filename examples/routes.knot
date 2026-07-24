@@ -1,3 +1,4 @@
+with {
 data Priority = Low {} | Medium {} | High {} | Critical {}
 
 type Todo = {title: Text, owner: Text, priority: Priority}
@@ -13,15 +14,15 @@ route AdminApi where
 
 route Api = TodoApi | AdminApi
 
-addTodo = \title owner priority -> do
+addTodo (\title owner priority -> do
   todos <- *todos
-  *todos = union todos [{title title owner owner priority (Low {})}]
+  *todos = union todos [{title title owner owner priority (Priority.Low {})}])
 
-getTodos = \owner -> do
+getTodos (\owner -> do
   todos <- *todos
-  with {result (do t <- todos; where t.owner == owner; yield t)} yield result
+  with {result (do t <- todos; where t.owner == owner; yield t)} yield result)
 
-api = serve Api where
+api (serve Api where
   GetTodos = \{owner owner xForwardedFor xForwardedFor} -> do
     case xForwardedFor of
       Just {value ip} -> logInfo ("GetTodos from " ++ ip)
@@ -32,9 +33,9 @@ api = serve Api where
       else yield (Ok {value todos})
   CreateTodo = \{title title owner owner priority priority} -> do
     addTodo title owner priority
-    yield (Ok {value {title title owner owner priority (Low {})}})
+    yield (Ok {value {title title owner owner priority (Priority.Low {})}})
   GetCount = \{} -> do
     todos <- *todos
-    yield (Ok {value (count todos)})
-
-main = listen 8080 api
+    yield (Ok {value (count todos)}))
+}
+(listen 8080 api)

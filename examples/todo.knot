@@ -1,25 +1,26 @@
+with {
 type Todo = {title: Text, owner: Text, done: Int 1}
 
 *todos : [Todo]
 
-add = \title owner -> do
+add (\title owner -> do
   todos <- *todos
-  *todos = union todos [{title title owner owner done 0}]
+  *todos = union todos [{title title owner owner done 0}])
 
-complete = \title -> do
+complete (\title -> do
   todos <- *todos
   *todos = do
     t <- todos
-    yield (if t.title == title then {t | done 1} else t)
+    yield (if t.title == title then {t | done 1} else t))
 
-pending = \owner -> do
+pending (\owner -> do
   todos <- *todos
-  with {result (do t <- todos; where t.done == 0; where t.owner == owner; yield t.title)} yield result
-
-main = do
+  with {result (do t <- todos; where t.done == 0; where t.owner == owner; yield t.title)} yield result)
+}
+(do
   add "Write parser" "Alice"
   add "Write codegen" "Alice"
   add "Write runtime" "Bob"
   complete "Write parser"
   result <- pending "Alice"
-  println result
+  println result)

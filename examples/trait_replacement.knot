@@ -4,15 +4,15 @@
 -- functions (a "dictionary") and bring it into scope with `with`; `(^field)`
 -- then projects that field out of the lexically-innermost in-scope record.
 -- No trait decl, no impl, no constraint — the dictionary is just a value.
-
+with {
 -- Two "Show dictionaries", one per type.
-intShow  = {show (\n -> "int:" ++ show n)}
-textShow = {show (\s -> "text:" ++ s)}
+intShow {show (\n -> "int:" ++ show n)}
+textShow {show (\s -> "text:" ++ s)}
 
 -- "Multiple constraints" is just a record with several fields.
-greeter = {greet (\n -> "hi " ++ show n) farewell (\n -> "bye " ++ show n)}
-
-main = do
+greeter {greet (\n -> "hi " ++ show n) farewell (\n -> "bye " ++ show n)}
+}
+(do
   -- `^show` resolves to whichever dictionary is lexically in scope.
   with intShow (println ((^show) 41))         -- intShow's show
   with textShow (println ((^show) "hello"))   -- textShow's show
@@ -27,4 +27,4 @@ main = do
     with {show (\n -> "INNER:" ++ show n)} (println ((^show) 1))
   )
   with intShow (println ((^show) 2))
-  yield {}
+  yield {})

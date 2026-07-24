@@ -1,6 +1,6 @@
 -- ByteString example
 
-main = with { raw (b"hello") } (do
+with { raw (b"hello") } (do
   -- Byte string literals
   println (bytesLength raw)        -- 5
 

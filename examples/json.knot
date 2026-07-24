@@ -1,4 +1,4 @@
-main = do
+(do
   -- Encode values to JSON
   println (toJson 42)
   println (toJson 3.14)
@@ -30,4 +30,4 @@ main = do
         Just { value value } -> println (show value)
         Nothing {} -> println "parse failed (as expected)"
 
-      yield {}))
+      yield {})))

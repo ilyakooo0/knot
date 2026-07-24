@@ -1,9 +1,10 @@
+with {
 type Person = {name: Text, age: Int 1}
 
 *people : [Person]
-
-main = do
+}
+(do
   replace *people = [{name "Alice" age 30}, {name "Bob" age 25}, {name "Carol" age 35}]
   p <- *people
   where p.age > 27
-  yield p.name
+  yield p.name)

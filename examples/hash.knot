@@ -1,6 +1,6 @@
 -- Hash builtin smoke-test (BLAKE3, polymorphic over any value)
 
-main = do
+(do
   -- Bytes: BLAKE3 of "abc" — expected 6437b3ac...9d85
   println (bytesToHex (hash (textToBytes "abc")))
 
@@ -22,4 +22,4 @@ main = do
   println (bytesToHex (hash true))
   println (bytesToHex (hash [1, 2, 3]))
 
-  yield {}
+  yield {})

@@ -4,31 +4,31 @@
 -- The post-trait idiom: an `Ord` "instance" is a record of functions. A
 -- function that works for any ordered type takes that record as an explicit
 -- parameter and calls its fields with `ord.compare` / `ord.max`.
-
+with {
 -- compare a b == 1 when a > b, -1 when a < b, 0 when equal.
-intOrd = {
+intOrd {
   compare (\a b -> if a > b then 1 else if a < b then (0 - 1) else 0)
   max     (\a b -> if a > b then a else b)
 }
 
-textOrd = {
+textOrd {
   compare (\a b -> if a > b then 1 else if a < b then (0 - 1) else 0)
   max     (\a b -> if a > b then a else b)
 }
 
 -- A different ordering for the same type: descending.
-intOrdDesc = {
+intOrdDesc {
   compare (\a b -> if a < b then 1 else if a > b then (0 - 1) else 0)
   max     (\a b -> if a < b then a else b)
 }
 
 -- `clamp lo hi ord x` is generic: pass any type's Ord dictionary.
-clamp = \lo hi ord x ->
+clamp (\lo hi ord x ->
   if ((ord.compare x lo) == (0 - 1)) then lo
   else if ((ord.compare x hi) == 1) then hi
-  else x
-
-main = do
+  else x)
+}
+(do
   -- Same function, different types — just different dictionaries.
   println (show (clamp 0 10 intOrd 42))          -- 10  (Int, clamped high)
   println (show (clamp 0 10 intOrd 3))           -- 3   (Int, in range)
@@ -38,4 +38,4 @@ main = do
   println (show (clamp 0 10 intOrdDesc 42))      -- 0
   println (show ((intOrd.max) 3 7))              -- 7  (ascending max)
   println (show ((intOrdDesc.max) 3 7))          -- 3  (descending "max")
-  yield {}
+  yield {})

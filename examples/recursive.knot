@@ -1,15 +1,15 @@
 -- Derived relations: read-only computed views over source relations.
 -- A `&name = body` declaration is recomputed on each access — never persisted.
-
+with {
 *manages : [{manager: Text, report: Text}]
 
-&directReports = do
+&directReports = (do
   manages <- *manages
   yield (do
     m <- manages
-    yield {manager m.manager report m.report})
-
-main = do
+    yield {manager m.manager report m.report}))
+}
+(do
   replace *manages = [
     {manager "Alice" report "Bob"},
     {manager "Alice" report "Carol"},
@@ -19,4 +19,4 @@ main = do
   rows <- &directReports
   println (show rows)
   println ("Total: " ++ show (count rows))
-  yield {}
+  yield {})

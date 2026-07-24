@@ -3,38 +3,38 @@
 -- Maybe's monad operations are intrinsic builtins (Functor/Applicative/Monad/
 -- Alternative were removed with the trait system). Do-blocks over Maybe
 -- dispatch structurally to the intrinsic Maybe bind/yield/empty.
-
+with {
 -- Test: a simple do-block that uses Maybe as the monad
-safeDivide = \x y -> if y == 0 then Nothing {} else Just {value (x / y)}
+safeDivide (\x y -> if y == 0 then Nothing {} else Just {value (x / y)})
 
-result1 = do
+result1 (do
   a <- Just {value 10}
   b <- Just {value 2}
   c <- safeDivide a b
-  yield c
+  yield c)
 
-result2 = do
+result2 (do
   a <- Just {value 10}
   b <- Just {value 0}
   c <- safeDivide a b
-  yield c
+  yield c)
 
 -- Test where clause (uses empty for filtering)
-result3 = do
+result3 (do
   a <- Just {value 10}
   b <- Just {value 3}
   where b > 2
-  yield (a + b)
+  yield (a + b))
 
-result4 = do
+result4 (do
   a <- Just {value 10}
   b <- Just {value 1}
   where b > 2
-  yield (a + b)
-
-main = do
+  yield (a + b))
+}
+(do
   println (show result1)
   println (show result2)
   println (show result3)
   println (show result4)
-  yield {}
+  yield {})

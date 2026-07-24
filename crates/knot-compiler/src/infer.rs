@@ -781,6 +781,12 @@ struct Infer {
     /// Data type definitions: type_name → info.
     data_types: HashMap<String, DataInfo>,
 
+    /// Names of the built-in ADTs (`Bool`, `Maybe`, `Result`). Their
+    /// constructors stay referenceable bare (`True`, `Just`, `Ok`); every
+    /// user-declared constructor must be qualified. Populated by the built-in
+    /// registration; user `data` decls never add to it.
+    builtin_data_types: std::collections::HashSet<String>,
+
     /// Source/view relation types: name → full type (always Relation(...)).
     source_types: HashMap<String, Ty>,
 
@@ -1066,6 +1072,7 @@ impl Infer {
             // One `None` per starting scope (the global scope is not a `with`).
             constructors: HashMap::new(),
             data_types: HashMap::new(),
+            builtin_data_types: std::collections::HashSet::new(),
             source_types: HashMap::new(),
             derived_types: HashMap::new(),
             view_names: HashSet::new(),
@@ -5013,14 +5020,14 @@ impl Infer {
 
     /// Returns (data_type, field_record_type) with fresh vars for params.
     /// Is `name` a constructor provided ONLY by built-in ADTs (`Bool`,
-    /// `Maybe`)? Built-ins stay referenceable bare (`True`, `Just`); every
-    /// user-defined constructor must be qualified (`Color.Red`). Returns
-    /// false when the name is unknown or any user ADT provides it.
+    /// `Maybe`, `Result`)? Built-ins stay referenceable bare (`True`, `Just`,
+    /// `Ok`); every user-defined constructor must be qualified (`Color.Red`).
+    /// Returns false when the name is unknown or any user ADT provides it.
     fn is_builtin_ctor(&self, name: &str) -> bool {
         match self.constructors.get(name) {
             Some(infos) if !infos.is_empty() => infos
                 .iter()
-                .all(|i| i.data_type == "Bool" || i.data_type == "Maybe"),
+                .all(|i| self.builtin_data_types.contains(&i.data_type)),
             _ => false,
         }
     }
@@ -9382,6 +9389,10 @@ impl Infer {
     }
 
     fn register_builtins(&mut self) {
+        // Built-in ADTs whose constructors stay referenceable bare.
+        for n in ["Maybe", "Bool", "Result"] {
+            self.builtin_data_types.insert(n.to_string());
+        }
         // Built-in ADT: data Maybe a = Nothing {} | Just {value: a}
         let dummy_span = Span::new(0, 0);
         self.constructors.insert(

@@ -1,11 +1,11 @@
 -- Nested relations: a record field can hold its own relation `[T]`.
 -- Stored in a child table linked by `_parent_id`; reads/writes are transparent.
-
+with {
 type Person = {name: Text, age: Int 1}
 
 *teams : [{name: Text, members: [Person]}]
-
-main = do
+}
+(do
   replace *teams = [
     { name "Engineering" members [{ name "Alice" age 30 }, { name "Bob" age 25 }, { name "Eve" age 22 }] },
     { name "Design" members [{ name "Carol" age 35 }, { name "Eve" age 22 }] }
@@ -30,4 +30,4 @@ main = do
   forEach teams2 (\t -> do
     forEach t.members (\m -> println ("  " ++ t.name ++ ": " ++ m.name)))
 
-  yield {}
+  yield {})

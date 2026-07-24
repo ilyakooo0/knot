@@ -1,6 +1,6 @@
 -- Test forEach builtin.
 
-main = do
+(do
   -- Basic case: print each integer
   forEach [1, 2, 3] (\x -> println (show x))
   -- Empty list: action shouldn't run
@@ -9,4 +9,4 @@ main = do
   forEach ["a", "b", "c"] (\s -> println s)
   -- After forEach: subsequent actions still run
   println "done"
-  yield {}
+  yield {})

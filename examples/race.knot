@@ -4,16 +4,16 @@
 -- and the loser's sleep is interrupted via its cancel-condvar so the
 -- race returns close to the winner's wall-clock time rather than the
 -- loser's.
-
-slow = do
+with {
+slow (do
   sleep (1000 : Int Ms)
-  yield "slow"
+  yield "slow")
 
-fast = do
+fast (do
   sleep (50 : Int Ms)
-  yield "fast"
-
-main = do
+  yield "fast")
+}
+(do
   start1 <- now
   r1 <- race slow fast
   end1 <- now
@@ -27,4 +27,4 @@ main = do
   case r2 of
     Err {error a} -> println ("left won: " ++ a)
     Ok {value b} -> println ("right won: " ++ b)
-  println ("  race 2 took " ++ show (stripUnit (end2 - start2)) ++ "ms")
+  println ("  race 2 took " ++ show (stripUnit (end2 - start2)) ++ "ms"))

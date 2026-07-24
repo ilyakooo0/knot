@@ -1902,6 +1902,15 @@ impl Codegen {
                         ctors.iter().map(|c| c.name.clone()).collect();
                     self.data_constructors.insert(name.clone(), ctor_names);
 
+                    // Qualified constructors: `Name.Ctor` (and the bare
+                    // function value `Name.Ctor`) emit the constructor value
+                    // directly, like an embedded `data` decl. Register each
+                    // ctor so the FieldAccess arms route to it. The data type
+                    // itself is erased (no runtime `Name` value).
+                    for c in ctors {
+                        self.embedded_ctors.insert(c.name.clone());
+                    }
+
                     // NOTE: nullable pointer encoding for Maybe-isomorphic types
                     // (2 constructors, one nullary, one with fields) is disabled.
                     // The runtime reconstructs ADT values from SQLite as

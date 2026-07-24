@@ -184,47 +184,143 @@ impl Parser {
     pub fn parse_module(mut self) -> (Module, Vec<Diagnostic>) {
         self.skip_newlines();
 
-        // Set block_indent so that multiline expressions inside declarations
-        // can continue across newlines (parse_application checks column > block_indent).
-        // Top-level declarations live at delimiter depth 0.
+        // A `.knot` file is a single expression; its value is the program's
+        // result. There are no top-level declarations — where declarations
+        // are needed they live as fields inside a record literal (typically
+        // via `with { ...decls... } body`).
+        //
+        // The parser parses the whole file as ONE expression, then lowers it
+        // to the internal `Module { decls }` IR that the rest of the compiler
+        // still consumes (Phase 1 bridge). The lowering recognises three
+        // shapes:
+        //   * `with {record} body`  -> record fields become decls, `body` -> main
+        //   * a bare record literal -> fields become decls, `main` = unit record
+        //   * any other expression  -> that expression becomes `main`
         self.block_indent = 0;
         self.block_delim = 0;
-        // Pre-scan for top-level declaration names that collide with
-        // time-unit words so `maybe_time_unit` doesn't silently rewrite
-        // `2 ms` as `2 * 1` when `ms` is a user-defined top-level value.
         self.top_level_names = self.scan_top_level_names();
-        let mut decls = Vec::new();
-        while !self.at_eof() {
-            self.skip_newlines();
-            if self.at_eof() {
-                break;
-            }
-            let decl_start = self.pos;
-            match self.parse_decl() {
-                Some(d) => {
-                    decls.push(d);
+
+        let decls = if self.at_eof() {
+            Vec::new()
+        } else {
+            match self.parse_expr() {
+                Some(expr) => {
+                    // Trailing tokens after the single expression are an error.
+                    self.skip_newlines();
+                    if !self.at_eof() {
+                        let span = self.span();
+                        self.diagnostics.push(
+                            Diagnostic::error(
+                                "unexpected tokens after the file's expression",
+                            )
+                            .label(span, "a .knot file is a single expression"),
+                        );
+                    }
+                    Self::lower_file_expr(expr)
                 }
                 None => {
-                    // Error recovery: clear stale parser context entries
-                    // left by early returns via `?` in parse functions.
                     self.context.clear();
-                    // Skip to next declaration boundary. Only force a one-token
-                    // advance when the failed parse consumed nothing — otherwise
-                    // it may have already parked the cursor exactly on the next
-                    // column-0 declaration (e.g. a lambda missing its `->`),
-                    // and advancing would drop that whole declaration.
-                    if !self.at_eof() {
-                        if self.pos == decl_start {
-                            self.advance();
-                        }
-                        self.skip_to_decl_boundary();
-                    }
+                    Vec::new()
                 }
             }
-            self.skip_newlines();
-        }
+        };
 
         (Module { decls }, self.diagnostics)
+    }
+
+    /// Lower the file's single expression into the internal declaration IR.
+    ///
+    /// See `parse_module` for the three recognised shapes. Each record field
+    /// that names a declaration becomes a top-level `Decl`; the program body
+    /// becomes a `main` declaration.
+    fn lower_file_expr(expr: Expr) -> Vec<Decl> {
+        let span = expr.span;
+        match expr.node {
+            // `with {record} body`
+            ExprKind::With { record, body } => {
+                let mut decls = match record.node {
+                    ExprKind::Record(fields) => Self::record_fields_to_decls(fields),
+                    _ => Vec::new(),
+                };
+                let body_span = body.span;
+                decls.push(Decl {
+                    node: DeclKind::Fun {
+                        name: "main".to_string(),
+                        ty: None,
+                        body: Some(*body),
+                    },
+                    span: body_span,
+                });
+                decls
+            }
+            // A bare record literal: fields are decls, body is unit.
+            ExprKind::Record(fields) => {
+                let mut decls = Self::record_fields_to_decls(fields);
+                decls.push(Decl {
+                    node: DeclKind::Fun {
+                        name: "main".to_string(),
+                        ty: None,
+                        body: Some(Spanned::new(ExprKind::Record(Vec::new()), span)),
+                    },
+                    span,
+                });
+                decls
+            }
+            // Any other expression is the program body itself.
+            _ => vec![Decl {
+                node: DeclKind::Fun {
+                    name: "main".to_string(),
+                    ty: None,
+                    body: Some(expr),
+                },
+                span,
+            }],
+        }
+    }
+
+    /// Convert record-literal fields that name declarations into `Decl`s.
+    /// Plain value fields (`name = expr`) become `Fun` declarations.
+    fn record_fields_to_decls(fields: Vec<crate::ast::RecordField>) -> Vec<Decl> {
+        fields
+            .into_iter()
+            .map(|f| {
+                let span = f.value.span;
+                let node = match f.value.node {
+                    ExprKind::DataCtor { name, params, constructors } => DeclKind::Data {
+                        name,
+                        params,
+                        constructors,
+                        deriving: Vec::new(),
+                    },
+                    ExprKind::TypeCtor { name, params, ty } => DeclKind::TypeAlias { name, params, ty },
+                    ExprKind::SourceDecl { name, ty, .. } => DeclKind::Source { name, ty },
+                    ExprKind::ViewDecl { name, ty, body } => DeclKind::View {
+                        name,
+                        ty,
+                        body: *body,
+                    },
+                    ExprKind::DerivedDecl { name, ty, body } => DeclKind::Derived {
+                        name,
+                        ty,
+                        body: *body,
+                    },
+                    ExprKind::RouteDecl { name, entries } => DeclKind::Route { name, entries },
+                    ExprKind::RouteCompositeDecl { name, components } => {
+                        DeclKind::RouteComposite { name, components }
+                    }
+                    ExprKind::SubsetConstraint { sub, sup } => {
+                        DeclKind::SubsetConstraint { sub, sup }
+                    }
+                    // A plain value field: `name = expr` (functions are lambdas).
+                    value => DeclKind::Fun {
+                        name: f.name,
+                        ty: f.sig,
+                        body: Some(Spanned::new(value, span)),
+                    },
+                };
+                Decl { node, span }
+            })
+            .collect()
     }
 }
 
@@ -3796,7 +3892,20 @@ impl Parser {
             }
             TokenKind::Upper(_) => {
                 let tok = self.advance();
-                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(mut name) = tok.kind else { unreachable!() };
+                // Qualified constructor: `Type.Ctor`. Consume `.` + the ctor
+                // segment; matching is by the ctor tag (`Ctor`), with `Type`
+                // providing resolution/confinement context (dropped here —
+                // the type checker validates membership). Loops to allow
+                // deeper qualification (`a.b.Ctor`).
+                while self.at(&TokenKind::Dot)
+                    && matches!(self.peek_ahead(1), TokenKind::Upper(_))
+                {
+                    self.advance(); // consume `.`
+                    let ctor_tok = self.advance();
+                    let TokenKind::Upper(seg) = ctor_tok.kind else { unreachable!() };
+                    name = seg;
+                }
                 // `Cons head tail` — non-empty relation pattern (reserved name).
                 // The built-in form has exactly TWO atom sub-patterns; a single
                 // atom after `Cons` (e.g. `Cons {head: h, tail: t}` or `Cons c`)

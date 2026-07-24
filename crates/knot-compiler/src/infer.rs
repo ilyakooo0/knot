@@ -5067,6 +5067,54 @@ impl Infer {
         Some((data_ty, record_ty))
     }
 
+    /// Instantiate a constructor reached through its declaring data type:
+    /// `Color.Red` resolves `Red` **within `Color`** specifically, never via
+    /// the global constructor map. This is the confined, qualified-constructor
+    /// path — the bare-ctor open-variant behavior does not apply here.
+    ///
+    /// Returns `(data_ty, payload_record_ty)` like `instantiate_ctor`, or
+    /// `None` when `data_name` is not a data type or has no such constructor.
+    fn instantiate_qualified_ctor(
+        &mut self,
+        data_name: &str,
+        ctor_name: &str,
+    ) -> Option<(Ty, Ty)> {
+        let info = self.data_types.get(data_name)?.clone();
+        let fields = info
+            .ctors
+            .iter()
+            .find(|(n, _)| n == ctor_name)?
+            .1
+            .clone();
+
+        let saved_annotation_vars = self.annotation_vars.clone();
+        self.annotation_vars.clear();
+        let param_tys: Vec<Ty> = info
+            .params
+            .iter()
+            .map(|p| {
+                let v = self.fresh_var();
+                self.annotation_vars.insert(p.clone(), v);
+                Ty::Var(v)
+            })
+            .collect();
+
+        let field_tys: BTreeMap<String, Ty> = fields
+            .iter()
+            .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
+            .collect();
+
+        let data_ty = if data_name == "Bool" {
+            Ty::Bool
+        } else {
+            Ty::Con(data_name.to_string(), param_tys)
+        };
+        let record_ty = Ty::Record(field_tys, None);
+
+        self.annotation_vars = saved_annotation_vars;
+        Some((data_ty, record_ty))
+    }
+
     // ── Expression inference ─────────────────────────────────────
 
     /// Resolve an application of a `^`-constrained function whose leading
@@ -5773,6 +5821,30 @@ impl Infer {
             }
 
             ast::ExprKind::FieldAccess { expr: e, field } => {
+                // Qualified constructor: `Color.Red`. The base parsed as a
+                // `Constructor` (capitalized) but names a DATA TYPE; resolve
+                // the field as that type's constructor, returning the ctor
+                // function `payload -> DataTy`. Confined to `Color` — no
+                // global/open-variant resolution.
+                if let ast::ExprKind::Constructor(type_name) = &e.node
+                    && self.data_types.contains_key(type_name)
+                {
+                    if let Some((data_ty, record_ty)) =
+                        self.instantiate_qualified_ctor(type_name, field)
+                    {
+                        let ty = Ty::Fun(Box::new(record_ty), Box::new(data_ty));
+                        self.field_accesses.push((expr.span, ty.clone()));
+                        return ty;
+                    }
+                    self.error(
+                        format!(
+                            "data type '{}' has no constructor '{}'",
+                            type_name, field
+                        ),
+                        expr.span,
+                    );
+                    return Ty::Error;
+                }
                 let expr_ty = self.infer_expr(e);
                 let resolved = self.apply(&expr_ty);
                 // If the expression is a relation (e.g., after groupBy), unwrap

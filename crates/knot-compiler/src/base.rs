@@ -15,20 +15,27 @@ use knot::ast;
 pub(crate) const PRELUDE_SPAN_OFFSET: usize = 1 << 40;
 
 /// Knot source for the standard prelude.
+///
+/// Written in the file-is-an-expression form: a record literal whose fields
+/// are the prelude's declarations. `parse_module` lowers a bare record to
+/// top-level decls plus a synthesized unit `main`; `inject_prelude` drops
+/// that `main` (the prelude never defines the program's entry point).
 const PRELUDE_SOURCE: &str = r#"
+{
 data Ordering = LT {} | EQ {} | GT {}
 
 min : a -> a -> a
-min = \a b -> if a < b then a else b
+min (\a b -> if a < b then a else b)
 
 max : a -> a -> a
-max = \a b -> if a > b then a else b
+max (\a b -> if a > b then a else b)
 
 when : Bool -> IO {| e} {} -> IO {| e} {}
-when = \cond action -> if cond then action else yield {}
+when (\cond action -> if cond then action else yield {})
 
 unless : Bool -> IO {| e} {} -> IO {| e} {}
-unless = \cond action -> if cond then yield {} else action
+unless (\cond action -> if cond then yield {} else action)
+}
 "#;
 
 /// Parse the prelude source and prepend its declarations to the user's module.
@@ -66,7 +73,11 @@ pub fn inject_prelude(module: &mut ast::Module) {
         .decls
         .into_iter()
         .filter(|d| match &d.node {
-            ast::DeclKind::Fun { name, .. } => !user_names.contains(name.as_str()),
+            // Drop the synthesized unit `main` (from lowering the bare record)
+            // and any user-shadowed prelude function.
+            ast::DeclKind::Fun { name, .. } => {
+                name != "main" && !user_names.contains(name.as_str())
+            }
             _ => true,
         })
         .collect();

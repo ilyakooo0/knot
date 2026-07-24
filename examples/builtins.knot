@@ -1,30 +1,24 @@
--- Builtins showcase: operations that USED to be trait methods
--- (Functor/Applicative/Monad/Alternative) are now intrinsic builtins.
--- No `impl ... where` blocks needed.
-
--- `do` over Maybe is intrinsically a monad now.
+with {
 safeDiv : Int 1 -> Int 1 -> Maybe (Int 1)
-safeDiv = \x y -> if y == 0 then Nothing {} else Just {value (x / y)}
+safeDiv (\x y -> if y == 0 then Nothing {} else Just {value (x / y)})
 
-nums = [1, 2, 3, 4, 5]
+nums [1, 2, 3, 4, 5]
 
--- map / fold / filter / take / drop / head / findFirst over relations.
-doubled = map (\n -> n * 2) nums
-total = fold (\acc n -> acc + n) 0 nums
-evens = filter (\n -> n % 2 == 0) nums
+doubled (map (\n -> n * 2) nums)
+total (fold (\acc n -> acc + n) 0 nums)
+evens (filter (\n -> n % 2 == 0) nums)
 
--- A Maybe `do`-block: bind threads the monad, Nothing short-circuits.
-divChain = do
+divChain (do
   a <- safeDiv 20 4
   b <- safeDiv a 0
-  yield (b + 1)
+  yield (b + 1))
 
-divOk = do
+divOk (do
   a <- safeDiv 20 4
   b <- safeDiv a 5
-  yield b
-
-main = do
+  yield b)
+}
+(do
   println ("doubled: " ++ show doubled)
   println ("total:   " ++ show total)
   println ("evens:   " ++ show evens)
@@ -35,4 +29,4 @@ main = do
   forEach nums (\n -> println ("  item " ++ show n))
   println ("divChain (hits Nothing): " ++ show divChain)
   println ("divOk:                   " ++ show divOk)
-  yield {}
+  yield {})

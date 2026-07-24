@@ -510,7 +510,7 @@ impl ServerConfig {
 /// symbol *to* them would re-lex as a literal.
 pub const KEYWORDS: &[&str] = &[
     "data", "type", "route", "serve", "migrate", "where", "do",
-    "yield", "if", "then", "else", "case", "of", "let", "in", "not", "replace", "atomic",
+    "yield", "if", "then", "else", "case", "of", "not", "replace", "atomic",
     "deriving", "with", "unit", "refine", "forall", "true", "false",
 ];
 
@@ -604,12 +604,6 @@ pub const SNIPPETS: &[(&str, &str, &str, SnippetContext)] = &[
         "if expression",
         "if ${1:cond}\n  then ${2:a}\n  else ${3:b}",
         SnippetContext::Expression,
-    ),
-    (
-        "let",
-        "let binding (in do block)",
-        "let ${1:x} = ${2:expr}",
-        SnippetContext::DoBlock,
     ),
     (
         "atomic",

@@ -1150,7 +1150,7 @@ fn cursor_in_type_context(before: &str) -> bool {
         if let Some(ws) = word_start.take()
             && matches!(
                 &text[ws..i],
-                "case" | "of" | "if" | "then" | "else" | "do" | "let" | "yield" | "where"
+                "case" | "of" | "if" | "then" | "else" | "do" | "yield" | "where"
             ) {
                 ty = false;
             }

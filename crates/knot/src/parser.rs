@@ -51,8 +51,8 @@ pub struct Parser {
     /// (unary operators, constructor chaining, type arrows) to prevent
     /// stack overflow on pathological input.
     recursion_depth: usize,
-    /// Stack of locally-bound identifiers (lambda params, do-bind and
-    /// do-let names, `let ... in` names, case pattern binders). Used by
+    /// Stack of locally-bound identifiers (lambda params, do-bind names,
+    /// case pattern binders). Used by
     /// `maybe_time_unit` to suppress the `2 ms`/`5 seconds` literal sugar
     /// when the would-be unit name is actually a bound variable, so
     /// `\ms -> g 2 ms` applies `g` to `2` and `ms` rather than desugaring
@@ -521,8 +521,6 @@ impl Parser {
             | TokenKind::Else
             | TokenKind::Case
             | TokenKind::Of
-            | TokenKind::Let
-            | TokenKind::In
             | TokenKind::Not
             | TokenKind::Replace
             | TokenKind::Atomic
@@ -679,9 +677,7 @@ impl Parser {
                 break;
             }
             // Keywords that cannot start a new block item terminate the block.
-            // For example, `in` after `let active = do ...; yield x in ...`
-            // belongs to the enclosing `let...in`, not to the do block.
-            if matches!(self.peek(), TokenKind::In | TokenKind::Then | TokenKind::Else | TokenKind::Of) {
+            if matches!(self.peek(), TokenKind::Then | TokenKind::Else | TokenKind::Of) {
                 break;
             }
             // Peek past newlines to check if the next item is still in
@@ -2017,7 +2013,7 @@ impl Parser {
                 self.error("expected expression after binary operator");
                 break;
             }
-            // Allow let/if/case/do/lambda/atomic/refine on the RHS of
+            // Allow if/case/do/lambda/atomic/refine on the RHS of
             // binary operators.  These are handled by `parse_expr` but not by
             // the Pratt sub-parser, so we delegate to `parse_expr` when we see
             // one of these keyword tokens.
@@ -2033,8 +2029,7 @@ impl Parser {
             if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
             let rhs = if matches!(
                 self.peek(),
-                TokenKind::Let
-                    | TokenKind::If
+                TokenKind::If
                     | TokenKind::Case
                     | TokenKind::Do
                     | TokenKind::Backslash
@@ -3353,8 +3348,7 @@ impl Parser {
         // is dispatched from `parse_expr_head`, NOT `parse_atom`, so it never
         // gets the delimiter charge that guards `((((…))))`. Charge the budget
         // here so pathological nesting diagnoses instead of overflowing.
-        // (Mirrors `parse_do_expr`. Same applies to `parse_if`/`parse_case`/
-        // `parse_let_in_expr` below.)
+        // (Mirrors `parse_do_expr`. Same applies to `parse_if`/`parse_case`.)
         if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
             return None;
         }

@@ -440,8 +440,6 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
             | TokenKind::Else
             | TokenKind::Case
             | TokenKind::Of
-            | TokenKind::Let
-            | TokenKind::In
             | TokenKind::Not
             | TokenKind::Replace
             | TokenKind::Atomic

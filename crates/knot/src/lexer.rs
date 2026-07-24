@@ -34,8 +34,6 @@ pub enum TokenKind {
     Else,
     Case,
     Of,
-    Let,
-    In,
     Not,
     Replace,
     Atomic,
@@ -130,8 +128,6 @@ impl TokenKind {
             TokenKind::Else => "'else'",
             TokenKind::Case => "'case'",
             TokenKind::Of => "'of'",
-            TokenKind::Let => "'let'",
-            TokenKind::In => "'in'",
             TokenKind::Not => "'not'",
             TokenKind::Replace => "'replace'",
             TokenKind::Atomic => "'atomic'",
@@ -198,8 +194,6 @@ impl TokenKind {
             TokenKind::Else => Some("else"),
             TokenKind::Case => Some("case"),
             TokenKind::Of => Some("of"),
-            TokenKind::Let => Some("let"),
-            TokenKind::In => Some("in"),
             TokenKind::Not => Some("not"),
             TokenKind::Replace => Some("replace"),
             TokenKind::Atomic => Some("atomic"),
@@ -474,8 +468,6 @@ impl<'src> Lexer<'src> {
                 "else" => return TokenKind::Else,
                 "case" => return TokenKind::Case,
                 "of" => return TokenKind::Of,
-                "let" => return TokenKind::Let,
-                "in" => return TokenKind::In,
                 "not" => return TokenKind::Not,
                 "replace" => return TokenKind::Replace,
                 "atomic" => return TokenKind::Atomic,
@@ -1129,9 +1121,9 @@ mod tests {
         // letter now starts an identifier and its full multi-byte form is
         // consumed intact (no mid-codepoint slice / no diagnostics).
         assert_eq!(
-            kinds("let café = 1"),
+            kinds("x café = 1"),
             vec![
-                TokenKind::Let,
+                TokenKind::Lower("x".into()),
                 TokenKind::Lower("café".into()),
                 TokenKind::Eq,
                 TokenKind::Int("1".into()),
@@ -1167,13 +1159,11 @@ mod tests {
     #[test]
     fn keywords() {
         assert_eq!(
-            kinds("if then else let in"),
+            kinds("if then else"),
             vec![
                 TokenKind::If,
                 TokenKind::Then,
                 TokenKind::Else,
-                TokenKind::Let,
-                TokenKind::In,
                 TokenKind::Eof,
             ],
         );

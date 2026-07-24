@@ -5012,6 +5012,19 @@ impl Infer {
     // ── Constructor instantiation ────────────────────────────────
 
     /// Returns (data_type, field_record_type) with fresh vars for params.
+    /// Is `name` a constructor provided ONLY by built-in ADTs (`Bool`,
+    /// `Maybe`)? Built-ins stay referenceable bare (`True`, `Just`); every
+    /// user-defined constructor must be qualified (`Color.Red`). Returns
+    /// false when the name is unknown or any user ADT provides it.
+    fn is_builtin_ctor(&self, name: &str) -> bool {
+        match self.constructors.get(name) {
+            Some(infos) if !infos.is_empty() => infos
+                .iter()
+                .all(|i| i.data_type == "Bool" || i.data_type == "Maybe"),
+            _ => false,
+        }
+    }
+
     fn instantiate_ctor(
         &mut self,
         name: &str,
@@ -5021,18 +5034,12 @@ impl Infer {
 
         // A constructor name shared by more than one ADT is genuinely
         // ambiguous at this site — without a known expected type we can't tell
-        // which ADT (or payload shape) is meant. Resolving it to one nominal
-        // ADT (last-write-wins) makes typing order-dependent and rejects
-        // correct programs. Instead, give it a row-polymorphic open variant
-        // `payload -> <name: payload | r>`: unifying against the expected
-        // type later (a nominal ADT via `con_to_variant`, or another open
-        // variant) pins down both the ADT and the payload.
+        // which ADT (or payload shape) is meant. With open variants removed,
+        // an ambiguous bare name is an error; only a single-ADT (built-in)
+        // bare constructor resolves here. User constructors go through the
+        // qualified path (`instantiate_qualified_ctor`).
         if infos.len() > 1 {
-            let payload = self.fresh();
-            let row = self.fresh_var();
-            let mut ctors = BTreeMap::new();
-            ctors.insert(name.to_string(), payload.clone());
-            return Some((Ty::Variant(ctors, Some(row)), payload));
+            return None;
         }
         let info = infos.into_iter().next()?;
 
@@ -5658,7 +5665,19 @@ impl Infer {
             }
 
             ast::ExprKind::Constructor(name) => {
-                if let Some((data_ty, record_ty)) =
+                if !self.is_builtin_ctor(name) && self.constructors.contains_key(name) {
+                    // A USER-defined constructor referenced bare. Constructors
+                    // are always qualified — require `Type.Ctor`. Built-ins
+                    // (`True`, `Just`) fall through to the bare path below.
+                    self.error(
+                        format!(
+                            "constructor '{}' must be qualified (e.g. `Type.{}`)",
+                            name, name
+                        ),
+                        expr.span,
+                    );
+                    Ty::Error
+                } else if let Some((data_ty, record_ty)) =
                     self.instantiate_ctor(name, expr.span)
                 {
                     // Every constructor — including nullary ones — is a
@@ -6154,13 +6173,27 @@ impl Infer {
                 // below would otherwise try to unify a value type with
                 // `arg -> result`. Only the unambiguous record-payload case
                 // is handled here; the ambiguous row-polymorphic-variant
-                // constructor falls through to the generic path.
-                if let ast::ExprKind::Constructor(name) = &func.node
-                    && let Some((data_ty, record_ty)) = self.instantiate_ctor(name, func.span)
+                // constructor falls through to the generic path. A USER-defined
+                // constructor applied bare is an error — constructors are
+                // always qualified (`Color.Red {…}`); only built-ins
+                // (`Just {…}`, `Nothing {}`) apply bare.
+                if let ast::ExprKind::Constructor(name) = &func.node {
+                    if !self.is_builtin_ctor(name) && self.constructors.contains_key(name) {
+                        self.error(
+                            format!(
+                                "constructor '{}' must be qualified (e.g. `Type.{}`)",
+                                name, name
+                            ),
+                            func.span,
+                        );
+                        return Ty::Error;
+                    }
+                    if let Some((data_ty, record_ty)) = self.instantiate_ctor(name, func.span)
                         && matches!(record_ty, Ty::Record(..))
-                {
-                    self.check_expr(arg, &record_ty);
-                    return data_ty;
+                    {
+                        self.check_expr(arg, &record_ty);
+                        return data_ty;
+                    }
                 }
 
                 // Let-binding: an immediately-applied single-variable lambda
@@ -7929,24 +7962,22 @@ impl Infer {
                             );
                         }
                     }
-                } else if let Some((_data_ty, record_ty)) =
-                    self.instantiate_ctor(name, pat.span)
-                {
-                    // Unqualified constructor (legacy): row-polymorphic open
-                    // variant. Slated for removal — constructors are meant to
-                    // be qualified.
-                    let row_var = self.fresh_var();
-                    let mut ctors = BTreeMap::new();
-                    ctors.insert(name.clone(), record_ty.clone());
-                    let variant_ty =
-                        Ty::Variant(ctors, Some(row_var));
-                    self.unify(&variant_ty, expected, pat.span);
-                    self.check_pattern(payload, &record_ty);
+                } else if self.is_builtin_ctor(name) {
+                    // Unqualified BUILT-IN constructor (`True`, `Just`): stays
+                    // bare. Resolve nominally within its (single) built-in ADT.
+                    if let Some((data_ty, record_ty)) =
+                        self.instantiate_ctor(name, pat.span)
+                    {
+                        self.unify(&data_ty, expected, pat.span);
+                        self.check_pattern(payload, &record_ty);
+                    }
                 } else {
+                    // A USER-defined constructor used bare. Constructors are
+                    // always qualified — require `Type.Ctor`.
                     self.error(
                         format!(
-                            "unknown constructor '{}' in pattern",
-                            name
+                            "constructor '{}' must be qualified (e.g. `Type.{}`)",
+                            name, name
                         ),
                         pat.span,
                     );

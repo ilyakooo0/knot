@@ -1,8 +1,9 @@
+with {
 type Todo = {title: Text, owner: Text, done: Int 1}
 
 *todos : [Todo]
-
-main = do
+}
+(do
   replace *todos = [
     { title "Write parser" owner "Alice" done 0 },
     { title "Write codegen" owner "Alice" done 0 },
@@ -21,4 +22,4 @@ main = do
     println "Pending work per person:"
     w <- workload
     println (w.owner ++ ": " ++ show w.count)
-    yield {})
+    yield {}))

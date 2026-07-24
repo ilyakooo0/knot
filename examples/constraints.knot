@@ -1,5 +1,5 @@
 -- Example: subset constraints
-
+with {
 type Person = {name: Text, age: Int 1, email: Text}
 
 *people : [Person]
@@ -10,8 +10,8 @@ type Person = {name: Text, age: Int 1, email: Text}
 
 -- Uniqueness: email uniquely identifies a person
 *people <= *people.email
-
-main = do
+}
+(do
   -- Insert some people
   replace *people = [{ name "Alice" age 30 email "alice@example.com" }, { name "Bob" age 25 email "bob@example.com" }]
 
@@ -23,4 +23,4 @@ main = do
   println (show *people)
   println "Orders:"
   println (show *orders)
-  yield {}
+  yield {})

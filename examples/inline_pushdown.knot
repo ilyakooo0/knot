@@ -1,40 +1,40 @@
 -- Cases that should push down to SQL after full inlining.
-
+with {
 type Employee = {name: Text, dept: Text, salary: Int 1}
 
 *employees : [Employee]
 
 -- Helper functions used inside lambda bodies.
-isHighEarner = \e -> e.salary > 75
-salaryOf = \e -> e.salary
-inDept = \name e -> e.dept == name
+isHighEarner (\e -> e.salary > 75)
+salaryOf (\e -> e.salary)
+inDept (\name e -> e.dept == name)
 
 -- 1. filter where the predicate body calls a helper function.
-case1 = do
+case1 (do
   emps <- *employees
-  yield (emps |> filter (\e -> isHighEarner e))
+  yield (emps |> filter (\e -> isHighEarner e)))
 
 -- 2. minOn where the projection lambda body calls a helper.
-case2 = do
+case2 (do
   emps <- *employees
-  yield (emps |> minOn (\e -> salaryOf e))
+  yield (emps |> minOn (\e -> salaryOf e)))
 
 -- 3. filter then count, with predicate via helper.
-case3 = do
+case3 (do
   emps <- *employees
-  with {filtered (emps |> filter (\e -> isHighEarner e))} yield (count filtered)
+  with {filtered (emps |> filter (\e -> isHighEarner e))} yield (count filtered))
 
 -- 4. filter using a curried helper.
-case4 = do
+case4 (do
   emps <- *employees
-  yield (filter (inDept "Eng") emps)
+  yield (filter (inDept "Eng") emps))
 
 -- 5. countWhere with helper-built predicate.
-case5 = do
+case5 (do
   emps <- *employees
-  yield (countWhere (\e -> isHighEarner e) emps)
-
-main = do
+  yield (countWhere (\e -> isHighEarner e) emps))
+}
+(do
   replace *employees = [
     {name "Alice" dept "Eng" salary 90},
     {name "Bob" dept "Eng" salary 80},
@@ -52,4 +52,4 @@ main = do
   println ("case4: " ++ show c4)
   c5 <- case5
   println ("case5: " ++ show c5)
-  yield {}
+  yield {})

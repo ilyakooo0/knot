@@ -1,27 +1,27 @@
 -- Verifies that SQL pushdown matchers fold through `with` bindings.
 -- Each pattern below stores its rewrite in a local `with` record first; the
 -- compiler inlines the bound body when matching the set/replace shape.
-
+with {
 type Item = {name: Text, price: Int 1}
 
 *items : [Item]
 
 -- Append: `union items new` hidden behind a with.
-appendDemo = do
+appendDemo (do
   items <- *items
-  with {extra [{name "Charlie" price 30}]} with {merged (union items extra)} *items = merged
+  with {extra [{name "Charlie" price 30}]} with {merged (union items extra)} *items = merged)
 
 -- Conditional update: do-block update body bound to a with.
-discountDemo = do
+discountDemo (do
   items <- *items
-  with {discounted (do i <- items; yield (if i.price > 20 then {i | price (i.price - 5)} else i))} *items = discounted
+  with {discounted (do i <- items; yield (if i.price > 20 then {i | price (i.price - 5)} else i))} *items = discounted)
 
 -- Filter only: do-block filter body bound to a with.
-pruneDemo = do
+pruneDemo (do
   items <- *items
-  with {kept (do i <- items; where i.price > 0; yield i)} *items = kept
-
-main = do
+  with {kept (do i <- items; where i.price > 0; yield i)} *items = kept)
+}
+(do
   replace *items = [{name "Alice" price 10}, {name "Bob" price 25}]
   appendDemo
   rows1 <- *items
@@ -32,4 +32,4 @@ main = do
   pruneDemo
   rows3 <- *items
   println ("after prune: " ++ show rows3)
-  yield {}
+  yield {})

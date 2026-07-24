@@ -1,8 +1,9 @@
+with {
 type Sale = {item: Text, qty: Int 1, price: Int 1}
 
 *sales : [Sale]
-
-main = do
+}
+(do
   replace *sales = [
     { item "apple" qty 3 price 50 },
     { item "banana" qty 7 price 20 },
@@ -29,4 +30,4 @@ main = do
         yield s) } (do
         println ("rows priced > 25: " ++ show pricey)
 
-        yield {})))
+        yield {}))))

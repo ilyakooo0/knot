@@ -311,6 +311,16 @@ impl Parser {
                     ExprKind::SubsetConstraint { sub, sup } => {
                         DeclKind::SubsetConstraint { sub, sup }
                     }
+                    // Signature-only field (`name : Type`, no value): the record
+                    // parser emits an empty-record placeholder value. Lower to a
+                    // body-less `Fun` — a required CLI constant.
+                    ExprKind::Record(ref fs) if fs.is_empty() && f.sig.is_some() => {
+                        DeclKind::Fun {
+                            name: f.name,
+                            ty: f.sig,
+                            body: None,
+                        }
+                    }
                     // A plain value field: `name = expr` (functions are lambdas).
                     value => DeclKind::Fun {
                         name: f.name,
@@ -3263,13 +3273,17 @@ impl Parser {
             });
         }
 
-        // Any leftover sig has no matching value field.
-        if let Some((sname, _)) = pending_sigs.first() {
-            self.error(&format!(
-                "record field signature '{}' has no matching value field",
-                sname
-            ));
-            return None;
+        // Leftover sigs name signature-only fields: `name : Type` with no
+        // value. These are required CLI constants — body-less `Fun` decls the
+        // codegen registers as startup `--name=value` lookups. Emit each as a
+        // field with an empty-record placeholder value; the lowering recognises
+        // sig-present + empty-record as "no body" and produces `Fun{body:None}`.
+        for (sname, sty) in pending_sigs {
+            fields.push(RecordField {
+                name: sname,
+                value: Spanned::new(ExprKind::Record(Vec::new()), start),
+                sig: Some(sty),
+            });
         }
 
         self.skip_newlines();

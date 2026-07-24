@@ -1,6 +1,6 @@
 -- Elliptic curve cryptography demo
 
-main = do
+(do
   -- Key pair generation for encryption (X25519)
   keys <- generateKeyPair
   println "Encryption key pair generated"
@@ -51,3 +51,4 @@ main = do
               yield {})))
 
     yield {})
+)

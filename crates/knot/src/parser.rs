@@ -59,7 +59,7 @@ pub struct Parser {
     /// to `g (2 * 1)`.
     bound_vars: Vec<Name>,
     /// Top-level declaration names that collide with time-unit words
-    /// (`ms`/`seconds`/...). Populated by a pre-scan in `parse_module` so
+    /// (`ms`/`seconds`/...). Populated by a pre-scan in `parse_file_expr` so
     /// that `maybe_time_unit` can suppress sugar for `ms = 5; ... 2 ms`
     /// (where `ms` is a user-defined top-level value, not the unit).
     top_level_names: HashSet<String>,
@@ -181,27 +181,23 @@ impl Parser {
             && col <= self.block_indent
     }
 
-    pub fn parse_module(mut self) -> (Module, Vec<Diagnostic>) {
+    /// Parse the entire `.knot` file as a single expression. There are no
+    /// top-level declarations — a `.knot` file IS one expression whose value
+    /// is the program's result. Where declarations are needed they live as
+    /// fields inside a record literal (typically via `with { ...decls... }
+    /// body`).
+    ///
+    /// Returns the file's expression (an empty unit record `{}` for an empty
+    /// file) plus any diagnostics.
+    pub fn parse_file_expr(mut self) -> (Expr, Vec<Diagnostic>) {
         self.skip_newlines();
-
-        // A `.knot` file is a single expression; its value is the program's
-        // result. There are no top-level declarations — where declarations
-        // are needed they live as fields inside a record literal (typically
-        // via `with { ...decls... } body`).
-        //
-        // The parser parses the whole file as ONE expression, then lowers it
-        // to the internal `Module { decls }` IR that the rest of the compiler
-        // still consumes (Phase 1 bridge). The lowering recognises three
-        // shapes:
-        //   * `with {record} body`  -> record fields become decls, `body` -> main
-        //   * a bare record literal -> fields become decls, `main` = unit record
-        //   * any other expression  -> that expression becomes `main`
         self.block_indent = 0;
         self.block_delim = 0;
         self.top_level_names = self.scan_top_level_names();
 
-        let decls = if self.at_eof() {
-            Vec::new()
+        let expr = if self.at_eof() {
+            let span = self.eof_span();
+            Spanned::new(ExprKind::Record(Vec::new()), span)
         } else {
             match self.parse_expr() {
                 Some(expr) => {
@@ -216,121 +212,17 @@ impl Parser {
                             .label(span, "a .knot file is a single expression"),
                         );
                     }
-                    Self::lower_file_expr(expr)
+                    expr
                 }
                 None => {
                     self.context.clear();
-                    Vec::new()
+                    let span = self.eof_span();
+                    Spanned::new(ExprKind::Record(Vec::new()), span)
                 }
             }
         };
 
-        (Module { decls }, self.diagnostics)
-    }
-
-    /// Lower the file's single expression into the internal declaration IR.
-    ///
-    /// See `parse_module` for the three recognised shapes. Each record field
-    /// that names a declaration becomes a top-level `Decl`; the program body
-    /// becomes a `main` declaration.
-    fn lower_file_expr(expr: Expr) -> Vec<Decl> {
-        let span = expr.span;
-        match expr.node {
-            // `with {record} body`
-            ExprKind::With { record, body } => {
-                let mut decls = match record.node {
-                    ExprKind::Record(fields) => Self::record_fields_to_decls(fields),
-                    _ => Vec::new(),
-                };
-                let body_span = body.span;
-                decls.push(Decl {
-                    node: DeclKind::Fun {
-                        name: "main".to_string(),
-                        ty: None,
-                        body: Some(*body),
-                    },
-                    span: body_span,
-                });
-                decls
-            }
-            // A bare record literal: fields are decls, body is unit.
-            ExprKind::Record(fields) => {
-                let mut decls = Self::record_fields_to_decls(fields);
-                decls.push(Decl {
-                    node: DeclKind::Fun {
-                        name: "main".to_string(),
-                        ty: None,
-                        body: Some(Spanned::new(ExprKind::Record(Vec::new()), span)),
-                    },
-                    span,
-                });
-                decls
-            }
-            // Any other expression is the program body itself.
-            _ => vec![Decl {
-                node: DeclKind::Fun {
-                    name: "main".to_string(),
-                    ty: None,
-                    body: Some(expr),
-                },
-                span,
-            }],
-        }
-    }
-
-    /// Convert record-literal fields that name declarations into `Decl`s.
-    /// Plain value fields (`name = expr`) become `Fun` declarations.
-    fn record_fields_to_decls(fields: Vec<crate::ast::RecordField>) -> Vec<Decl> {
-        fields
-            .into_iter()
-            .map(|f| {
-                let span = f.value.span;
-                let node = match f.value.node {
-                    ExprKind::DataCtor { name, params, constructors } => DeclKind::Data {
-                        name,
-                        params,
-                        constructors,
-                        deriving: Vec::new(),
-                    },
-                    ExprKind::TypeCtor { name, params, ty } => DeclKind::TypeAlias { name, params, ty },
-                    ExprKind::SourceDecl { name, ty, .. } => DeclKind::Source { name, ty },
-                    ExprKind::ViewDecl { name, ty, body } => DeclKind::View {
-                        name,
-                        ty,
-                        body: *body,
-                    },
-                    ExprKind::DerivedDecl { name, ty, body } => DeclKind::Derived {
-                        name,
-                        ty,
-                        body: *body,
-                    },
-                    ExprKind::RouteDecl { name, entries } => DeclKind::Route { name, entries },
-                    ExprKind::RouteCompositeDecl { name, components } => {
-                        DeclKind::RouteComposite { name, components }
-                    }
-                    ExprKind::SubsetConstraint { sub, sup } => {
-                        DeclKind::SubsetConstraint { sub, sup }
-                    }
-                    // Signature-only field (`name : Type`, no value): the record
-                    // parser emits an empty-record placeholder value. Lower to a
-                    // body-less `Fun` — a required CLI constant.
-                    ExprKind::Record(ref fs) if fs.is_empty() && f.sig.is_some() => {
-                        DeclKind::Fun {
-                            name: f.name,
-                            ty: f.sig,
-                            body: None,
-                        }
-                    }
-                    // A plain value field: `name = expr` (functions are lambdas).
-                    value => DeclKind::Fun {
-                        name: f.name,
-                        ty: f.sig,
-                        body: Some(Spanned::new(value, span)),
-                    },
-                };
-                Decl { node, span }
-            })
-            .collect()
+        (expr, self.diagnostics)
     }
 }
 
@@ -581,36 +473,6 @@ impl Parser {
         self.diagnostics.push(diag);
     }
 
-    /// Skip tokens until we reach a comma or `}` — the boundary between two
-    /// record fields, or the end of the record. Used to recover from a bad
-    /// field value without aborting the whole record literal. Stops at the
-    /// boundary token *without consuming it* so the surrounding loop can
-    /// inspect and react (continue on `,`, exit on `}`).
-    /// Skip tokens until we reach what looks like a new declaration boundary.
-    fn skip_to_decl_boundary(&mut self) {
-        loop {
-            if self.at_eof() {
-                break;
-            }
-            let col = self.cur_column();
-            if col == 0 {
-                match self.peek() {
-                    TokenKind::Data
-                    | TokenKind::Type
-                    | TokenKind::Route
-                    | TokenKind::Migrate
-                    | TokenKind::Star
-                    | TokenKind::StarIdent(_)
-                    | TokenKind::Ampersand
-                    | TokenKind::AmpersandIdent(_)
-                    | TokenKind::Lower(_)
-                    | TokenKind::Upper(_) => break,
-                    _ => {}
-                }
-            }
-            self.advance();
-        }
-    }
 
     /// Expect a lower-case identifier, returning the name.
     fn expect_lower(&mut self, msg: &str) -> Result<(Name, Span), ()> {
@@ -817,23 +679,6 @@ impl Parser {
 // ── Declarations ────────────────────────────────────────────────────
 
 impl Parser {
-    fn parse_decl(&mut self) -> Option<Decl> {
-        let start = self.span();
-        match self.peek() {
-            TokenKind::Data => self.parse_data(),
-            TokenKind::Type => self.parse_type_alias(),
-            TokenKind::Star => self.parse_source_or_view(),
-            TokenKind::StarIdent(_) => self.parse_source_or_view(),
-            TokenKind::Ampersand => self.parse_derived(),
-            TokenKind::AmpersandIdent(_) => self.parse_derived(),
-            TokenKind::Lower(_) => self.parse_fun(),
-            TokenKind::Route => self.parse_route_decl(),
-            _ => {
-                self.error_at(start, "expected declaration");
-                None
-            }
-        }
-    }
 
     /// Parse a unit expression: products, quotients, powers of named units.
     /// Grammar:
@@ -956,84 +801,6 @@ impl Parser {
 
     // ── data ─────────────────────────────────────────────────────────
 
-    fn parse_data(&mut self) -> Option<Decl> {
-        let start = self.span();
-        self.in_context("data declaration", |this| {
-            this.advance(); // consume `data`
-
-            let (name, _) = this.expect_upper("expected type name after 'data'").ok()?;
-
-            // Parse type parameters (lowercase identifiers before `=`).
-            let mut params = Vec::new();
-            while matches!(this.peek(), TokenKind::Lower(_)) {
-                let tok = this.advance();
-                let TokenKind::Lower(p) = tok.kind else { unreachable!() };
-                params.push(p);
-            }
-
-            this.skip_newlines();
-            this.expect(&TokenKind::Eq, "expected '=' in data declaration").ok()?;
-            this.skip_newlines();
-
-            let mut constructors = vec![this.parse_constructor_def()?];
-            loop {
-                // Probe past newlines for a continuation `|`. If there isn't
-                // one, restore so the cursor stays right after the last
-                // constructor — otherwise the decl's span would swallow the
-                // trailing newline and any same-line comment.
-                let saved = this.save();
-                this.skip_newlines();
-                if !this.eat(&TokenKind::Pipe) {
-                    this.restore(saved);
-                    break;
-                }
-                this.skip_newlines();
-                constructors.push(this.parse_constructor_def()?);
-            }
-
-            // End of the constructor list. Capture it before skipping
-            // newlines to probe for an optional `deriving` clause, so that
-            // when there is no `deriving`, the decl's span doesn't swallow the
-            // trailing newline (and any same-line trailing comment) — which
-            // would otherwise make the formatter treat that comment as
-            // internal and fall back to verbatim copying.
-            let mut end = this.prev_span();
-
-            // Optional deriving clause (possibly on a following line).
-            let saved = this.save();
-            this.skip_newlines();
-            let mut deriving = Vec::new();
-            if this.eat(&TokenKind::Deriving) {
-                this.expect(&TokenKind::LParen, "expected '(' after 'deriving'").ok()?;
-                loop {
-                    if matches!(this.peek(), TokenKind::Upper(_)) {
-                        let tok = this.advance();
-                        let TokenKind::Upper(n) = tok.kind else { unreachable!() };
-                        deriving.push(n);
-                    } else {
-                        break;
-                    }
-                    if !this.eat(&TokenKind::Comma) {
-                        break;
-                    }
-                }
-                this.expect(&TokenKind::RParen, "expected ')' to close deriving list")
-                    .ok()?;
-                end = this.prev_span();
-            } else {
-                this.restore(saved);
-            }
-            Some(Decl {
-                node: DeclKind::Data {
-                    name,
-                    params,
-                    constructors,
-                    deriving,
-                },
-                span: Span::new(start.start, end.end),
-            })
-        })
-    }
 
     fn parse_constructor_def(&mut self) -> Option<ConstructorDef> {
         let (name, _) = self.expect_upper("expected constructor name").ok()?;
@@ -1069,338 +836,40 @@ impl Parser {
 
     // ── type alias ───────────────────────────────────────────────────
 
-    fn parse_type_alias(&mut self) -> Option<Decl> {
-        let start = self.span();
-        self.in_context("type alias", |this| {
-            this.advance(); // consume `type`
-
-            let (name, _) = this.expect_upper("expected type name after 'type'").ok()?;
-
-            let mut params = Vec::new();
-            while matches!(this.peek(), TokenKind::Lower(_)) {
-                let tok = this.advance();
-                let TokenKind::Lower(p) = tok.kind else { unreachable!() };
-                params.push(p);
-            }
-
-            this.expect(&TokenKind::Eq, "expected '=' in type alias").ok()?;
-            let ty = this.parse_type()?;
-
-            let end = this.prev_span();
-            Some(Decl {
-                node: DeclKind::TypeAlias { name, params, ty },
-                span: Span::new(start.start, end.end),
-            })
-        })
-    }
 
     // ── source / view ────────────────────────────────────────────────
 
-    fn parse_source_or_view(&mut self) -> Option<Decl> {
-        let start = self.span();
-        self.in_context("source/view declaration", |this| {
-            // Consume the source/view name. `*name` lexes as a single StarIdent
-            // token (name includes the `*`, which we strip); fall back to the
-            // legacy `Star` + `Lower` form for robustness.
-            let name = match this.peek() {
-                TokenKind::StarIdent(_) => {
-                    let tok = this.advance();
-                    let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
-                    n.trim_start_matches('*').to_string()
-                }
-                TokenKind::Star => {
-                    this.advance(); // consume `*`
-                    let (n, _) = this.expect_lower("expected name after '*'").ok()?;
-                    n
-                }
-                _ => {
-                    this.error("expected source/view name (e.g. *name)");
-                    return None;
-                }
-            };
-
-            // Subset constraint: *name.field <= ... or *name <= ...
-            if this.at(&TokenKind::Dot) || this.at(&TokenKind::Le) {
-                return this.parse_subset_constraint_rest(start, name);
-            }
-
-            // Peek: if `:` → source declaration, if `=` → view declaration.
-            if this.eat(&TokenKind::Colon) {
-                // Source declaration: *name : type
-                // Or annotated view: *name : type = body
-                let ty = this.parse_type()?;
-
-                // Inline annotated view: *name : Type = body
-                if this.at(&TokenKind::Eq) {
-                    this.advance();
-                    let body = this.parse_expr()?;
-                    let end = this.prev_span();
-                    let scheme = TypeScheme {
-                        constraints: vec![],
-                        ty,
-                    };
-                    return Some(Decl {
-                        node: DeclKind::View {
-                            name,
-                            ty: Some(scheme),
-                            body,
-                        },
-                        span: Span::new(start.start, end.end),
-                    });
-                }
-
-                let end = this.prev_span();
-                Some(Decl {
-                    node: DeclKind::Source { name, ty },
-                    span: Span::new(start.start, end.end),
-                })
-            } else if this.eat(&TokenKind::Eq) {
-                // View declaration: *name = expr
-                let body = this.parse_expr()?;
-                let end = this.prev_span();
-                Some(Decl {
-                    node: DeclKind::View {
-                        name,
-                        ty: None,
-                        body,
-                    },
-                    span: Span::new(start.start, end.end),
-                })
-            } else {
-                this.error("expected ':', '=', or '<=' after source/view name");
-                None
-            }
-        })
-    }
 
     // ── subset constraint ────────────────────────────────────────────
 
     /// Parse the rest of a subset constraint after `*name` has been consumed.
     /// Handles: `*name.field <= *other.field` and `*name <= *other.field`.
-    fn parse_subset_constraint_rest(&mut self, start: Span, left_relation: Name) -> Option<Decl> {
-        self.in_context("subset constraint", |this| {
-            let left_field = if this.eat(&TokenKind::Dot) {
-                let (field, _) = this.expect_lower("expected field name after '.'").ok()?;
-                Some(field)
-            } else {
-                None
-            };
-
-            this.expect(&TokenKind::Le, "expected '<=' in subset constraint").ok()?;
-
-            // Parse right side: *relation.field or *relation. The `*name` may
-            // arrive as a single StarIdent token or legacy Star + Lower.
-            let right_relation = match this.peek() {
-                TokenKind::StarIdent(_) => {
-                    let tok = this.advance();
-                    let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
-                    n.trim_start_matches('*').to_string()
-                }
-                TokenKind::Star => {
-                    this.advance();
-                    let (n, _) = this
-                        .expect_lower("expected relation name after '*' in subset constraint")
-                        .ok()?;
-                    n
-                }
-                _ => {
-                    this.error("expected '*' before relation name in subset constraint");
-                    return None;
-                }
-            };
-
-            let right_field = if this.eat(&TokenKind::Dot) {
-                let (field, _) = this.expect_lower("expected field name after '.'").ok()?;
-                Some(field)
-            } else {
-                None
-            };
-
-            let end = this.prev_span();
-        Some(Decl {
-            node: DeclKind::SubsetConstraint {
-                sub: RelationPath {
-                    relation: left_relation,
-                    field: left_field,
-                },
-                sup: RelationPath {
-                    relation: right_relation,
-                    field: right_field,
-                },
-            },
-                span: Span::new(start.start, end.end),
-            })
-        })
-    }
 
     // ── derived ──────────────────────────────────────────────────────
 
-    fn parse_derived(&mut self) -> Option<Decl> {
-        let start = self.span();
-        self.in_context("derived declaration", |this| {
-            // `&name` lexes as a single AmpersandIdent (name includes the `&`);
-            // fall back to the legacy `Ampersand` + `Lower` form for robustness.
-            let name = match this.peek() {
-                TokenKind::AmpersandIdent(_) => {
-                    let tok = this.advance();
-                    let TokenKind::AmpersandIdent(n) = tok.kind else { unreachable!() };
-                    n.trim_start_matches('&').to_string()
-                }
-                _ => {
-                    this.advance(); // consume `&`
-                    let (n, _) = this.expect_lower("expected name after '&'").ok()?;
-                    n
-                }
-            };
-
-            // Optional inline type annotation: `&name : Type = body`
-            let ty = if this.eat(&TokenKind::Colon) {
-                let scheme = this.parse_type_scheme()?;
-                Some(scheme)
-            } else {
-                None
-            };
-
-            this.expect(&TokenKind::Eq, "expected '=' in derived declaration")
-                .ok()?;
-            let body = this.parse_expr()?;
-
-            let end = this.prev_span();
-            Some(Decl {
-                node: DeclKind::Derived { name, ty, body },
-                span: Span::new(start.start, end.end),
-            })
-        })
-    }
 
     // ── function / constant ──────────────────────────────────────────
 
-    fn parse_fun(&mut self) -> Option<Decl> {
-        let start = self.span();
-        self.in_context("function declaration", |this| {
-            let (name, _) = this.expect_lower("expected function name").ok()?;
-
-            // Check: is this a type signature (name : type) or a definition?
-            if this.at(&TokenKind::Colon) {
-                // Type signature — parse it and try to attach to next definition.
-                this.advance(); // consume `:`
-                let ts = this.parse_type_scheme();
-
-                // Inline form: `name : Type = body` (no newline, no name repeat).
-                if this.at(&TokenKind::Eq) {
-                    this.advance(); // consume `=`
-                    if let Some(body) = this.parse_expr() {
-                        let end = this.prev_span();
-                        return Some(Decl {
-                            node: DeclKind::Fun {
-                                name,
-                                ty: ts,
-                                body: Some(body),
-                            },
-                            span: Span::new(start.start, end.end),
-                        });
-                    }
-                }
-
-                this.skip_newlines();
-
-                // Now check if the next line is the definition body.
-                if matches!(this.peek(), TokenKind::Lower(n) if *n == name) {
-                    let saved = this.save();
-                    let diag_len = this.diagnostics.len();
-                    this.advance(); // consume name again
-
-                    if this.eat(&TokenKind::Eq) {
-                        if let Some(body) = this.parse_expr() {
-                            let end = this.prev_span();
-                            return Some(Decl {
-                                node: DeclKind::Fun {
-                                    name,
-                                    ty: ts,
-                                    body: Some(body),
-                                },
-                                span: Span::new(start.start, end.end),
-                            });
-                        } else {
-                            // parse_expr failed — restore to before the name
-                            // so the tokens can be re-parsed as a separate decl.
-                            this.restore(saved);
-                            this.diagnostics.truncate(diag_len);
-                        }
-                    } else {
-                        // Not a definition after the signature — restore.
-                        this.restore(saved);
-                    }
-                }
-
-                // Return a Fun with just a type signature and no body.
-                let end = this.prev_span();
-                return Some(Decl {
-                    node: DeclKind::Fun {
-                        name,
-                        ty: ts,
-                        body: None,
-                    },
-                    span: Span::new(start.start, end.end),
-                });
-            }
-
-            this.expect(&TokenKind::Eq, "expected '=' in definition")
-                .ok()?;
-            let body = this.parse_expr()?;
-
-            let end = this.prev_span();
-            Some(Decl {
-                node: DeclKind::Fun {
-                    name,
-                    ty: None,
-                    body: Some(body),
-                },
-                span: Span::new(start.start, end.end),
-            })
-        })
-    }
 
     // ── route ────────────────────────────────────────────────────────
 
-    fn parse_route_decl(&mut self) -> Option<Decl> {
-        let start = self.span();
-        self.in_context("route declaration", |this| {
-            this.advance(); // consume `route`
-
-            let (name, _) = this.expect_upper("expected route name").ok()?;
-
-            // Composite: `route Api = TodoApi | AdminApi`
-            if this.eat(&TokenKind::Eq) {
-                let mut components = Vec::new();
-                let (first, _) = this.expect_upper("expected route name in composite").ok()?;
-                components.push(first);
-                while this.eat(&TokenKind::Pipe) {
-                    let (comp, _) = this.expect_upper("expected route name after '|'").ok()?;
-                    components.push(comp);
-                }
-                let end = this.prev_span();
-                return Some(Decl {
-                    node: DeclKind::RouteComposite { name, components },
-                    span: Span::new(start.start, end.end),
-                });
-            }
-
-            this.expect(&TokenKind::Where, "expected 'where' or '=' after route name")
-                .ok()?;
-
-            let no_prefix: Vec<PathSegment> = vec![];
-            let entries = this.parse_route_entries_with_prefix(&no_prefix, 0);
-
-            let end = this.prev_span();
-            Some(Decl {
-                node: DeclKind::Route { name, entries },
-                span: Span::new(start.start, end.end),
-            })
-        })
-    }
 
     /// Parse a route reference: a bare route name (`Api`) or a dotted field
+    /// path to a record-embedded route (`rec.Api`, `a.b.TodoApi`). Used by
+    /// composite components (`route X = A | rec.B`) and by `serve`'s API head.
+
+    /// Parse route entries, supporting path prefix nesting.
+    /// A line starting with `/` (no HTTP method) introduces a prefix group;
+    /// nested entries under it have the prefix prepended to their paths.
+    ///
+    /// Each `/`-prefixed group recurses, so a long run of `/...` lines would
+    /// otherwise grow the native call stack without bound and abort the
+    /// process. Charge the shared recursion budget so pathological input
+    /// surfaces a "nesting depth limit exceeded" diagnostic instead.
+    /// `floor` is the column of the `/prefix` line that introduced this group
+    /// (0 at the top level). Nested entries must be strictly more indented than
+    /// it, so a same-indent sibling is not absorbed into the group.
+    /// Parse a possibly-dotted route component path: a bare route name or a
     /// path to a record-embedded route (`rec.Api`, `a.b.TodoApi`). Used by
     /// composite components (`route X = A | rec.B`) and by `serve`'s API head.
     fn parse_route_component_path(&mut self) -> Option<String> {
@@ -1430,17 +899,6 @@ impl Parser {
         Some(path)
     }
 
-    /// Parse route entries, supporting path prefix nesting.
-    /// A line starting with `/` (no HTTP method) introduces a prefix group;
-    /// nested entries under it have the prefix prepended to their paths.
-    ///
-    /// Each `/`-prefixed group recurses, so a long run of `/...` lines would
-    /// otherwise grow the native call stack without bound and abort the
-    /// process. Charge the shared recursion budget so pathological input
-    /// surfaces a "nesting depth limit exceeded" diagnostic instead.
-    /// `floor` is the column of the `/prefix` line that introduced this group
-    /// (0 at the top level). Nested entries must be strictly more indented than
-    /// it, so a same-indent sibling is not absorbed into the group.
     fn parse_route_entries_with_prefix(
         &mut self,
         prefix: &[PathSegment],
@@ -2868,8 +2326,8 @@ impl Parser {
             // contributes a field named `Name` whose value is the (erased) type
             // constructor itself; the alias is also brought into type scope.
             if self.at(&TokenKind::Type) {
-                self.advance(); // consume `type`
-                let (tname, tspan) = self
+                let type_kw = self.advance(); // consume `type`
+                let (tname, _tspan) = self
                     .expect_upper("expected type name after 'type'")
                     .ok()?;
                 let mut params = Vec::new();
@@ -2890,6 +2348,7 @@ impl Parser {
                     self.error("expected type after '=' in record type alias");
                     return None;
                 };
+                let ty_end = ty.span.end;
                 fields.push(RecordField {
                     name: tname.clone(),
                     value: Spanned::new(
@@ -2898,7 +2357,10 @@ impl Parser {
                             params,
                             ty,
                         },
-                        tspan,
+                        Span {
+                            start: type_kw.span.start,
+                            end: ty_end,
+                        },
                     ),
                     sig: None,
                 });
@@ -2909,8 +2371,8 @@ impl Parser {
             // data-constructor namespace: the ctors become reachable as
             // `rec.Name.<Ctor>` and the type `Name` enters type scope.
             if self.at(&TokenKind::Data) {
-                self.advance(); // consume `data`
-                let (dname, dspan) = self
+                let data_kw = self.advance(); // consume `data`
+                let (dname, _dspan) = self
                     .expect_upper("expected type name after 'data'")
                     .ok()?;
                 let mut params = Vec::new();
@@ -2933,6 +2395,7 @@ impl Parser {
                     self.skip_newlines();
                     constructors.push(self.parse_constructor_def()?);
                 }
+                let data_end = self.prev_span().end;
                 fields.push(RecordField {
                     name: dname.clone(),
                     value: Spanned::new(
@@ -2941,7 +2404,10 @@ impl Parser {
                             params,
                             constructors,
                         },
-                        dspan,
+                        Span {
+                            start: data_kw.span.start,
+                            end: data_end,
+                        },
                     ),
                     sig: None,
                 });
@@ -4998,475 +4464,4 @@ impl Parser {
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    /// Helper: build a token list from (kind, start, end) triples.
-    fn toks(items: Vec<(TokenKind, usize, usize)>) -> Vec<Token> {
-        items
-            .into_iter()
-            .map(|(kind, start, end)| Token {
-                kind,
-                span: Span::new(start, end),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn parse_empty_module() {
-        let tokens = toks(vec![(TokenKind::Eof, 0, 0)]);
-        let (module, diags) = Parser::new(String::new(), tokens).parse_module();
-        assert!(diags.is_empty());
-        assert!(module.decls.is_empty());
-    }
-
-    #[test]
-    fn parse_simple_fun() {
-        // x = 42
-        let source = "x = 42".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("x".into()), 0, 1),
-            (TokenKind::Eq, 2, 3),
-            (TokenKind::Int("42".into()), 4, 6),
-            (TokenKind::Eof, 6, 6),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        assert_eq!(module.decls.len(), 1);
-        match &module.decls[0].node {
-            DeclKind::Fun { name, body: Some(body), .. } => {
-                assert_eq!(name, "x");
-                assert!(matches!(&body.node, ExprKind::Lit(Literal::Int(n)) if n == "42"));
-            }
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_binop() {
-        // a + b * c
-        let source = "x = a + b * c".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("x".into()), 0, 1),
-            (TokenKind::Eq, 2, 3),
-            (TokenKind::Lower("a".into()), 4, 5),
-            (TokenKind::Plus, 6, 7),
-            (TokenKind::Lower("b".into()), 8, 9),
-            (TokenKind::Star, 10, 11),
-            (TokenKind::Lower("c".into()), 12, 13),
-            (TokenKind::Eof, 13, 13),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        // Should parse as a + (b * c) due to precedence.
-        match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => match &body.node {
-                ExprKind::BinOp {
-                    op: BinOp::Add,
-                    lhs,
-                    rhs,
-                } => {
-                    assert!(matches!(&lhs.node, ExprKind::Var(n) if n == "a"));
-                    assert!(matches!(&rhs.node, ExprKind::BinOp { op: BinOp::Mul, .. }));
-                }
-                other => panic!("expected BinOp Add, got {:?}", other),
-            },
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_if_expr() {
-        // f = \x -> if x then 1 else 2
-        let source = r"f = \x -> if x then 1 else 2".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("f".into()), 0, 1),
-            (TokenKind::Eq, 2, 3),
-            (TokenKind::Backslash, 4, 5),
-            (TokenKind::Lower("x".into()), 5, 6),
-            (TokenKind::Arrow, 7, 9),
-            (TokenKind::If, 10, 12),
-            (TokenKind::Lower("x".into()), 13, 14),
-            (TokenKind::Then, 15, 19),
-            (TokenKind::Int("1".into()), 20, 21),
-            (TokenKind::Else, 22, 26),
-            (TokenKind::Int("2".into()), 27, 28),
-            (TokenKind::Eof, 28, 28),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
-                assert!(matches!(&body.node, ExprKind::Lambda { .. }));
-            }
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_data_decl() {
-        // data Bool = True {} | False {}
-        let source = "data Bool = True {} | False {}".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Data, 0, 4),
-            (TokenKind::Upper("Bool".into()), 5, 9),
-            (TokenKind::Eq, 10, 11),
-            (TokenKind::Upper("True".into()), 12, 16),
-            (TokenKind::LBrace, 17, 18),
-            (TokenKind::RBrace, 18, 19),
-            (TokenKind::Pipe, 20, 21),
-            (TokenKind::Upper("False".into()), 22, 27),
-            (TokenKind::LBrace, 28, 29),
-            (TokenKind::RBrace, 29, 30),
-            (TokenKind::Eof, 30, 30),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Data {
-                name,
-                constructors,
-                ..
-            } => {
-                assert_eq!(name, "Bool");
-                assert_eq!(constructors.len(), 2);
-                assert_eq!(constructors[0].name, "True");
-                assert_eq!(constructors[1].name, "False");
-            }
-            other => panic!("expected Data, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_source_decl() {
-        // *people : [Person]
-        let source = "*people : [Person]".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Star, 0, 1),
-            (TokenKind::Lower("people".into()), 1, 7),
-            (TokenKind::Colon, 8, 9),
-            (TokenKind::LBracket, 10, 11),
-            (TokenKind::Upper("Person".into()), 11, 17),
-            (TokenKind::RBracket, 17, 18),
-            (TokenKind::Eof, 18, 18),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Source { name, ty } => {
-                assert_eq!(name, "people");
-                assert!(matches!(&ty.node, TypeKind::Relation(_)));
-            }
-            other => panic!("expected Source, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_lambda() {
-        // f = \x -> x
-        let source = "f = \\x -> x".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("f".into()), 0, 1),
-            (TokenKind::Eq, 2, 3),
-            (TokenKind::Backslash, 4, 5),
-            (TokenKind::Lower("x".into()), 5, 6),
-            (TokenKind::Arrow, 7, 9),
-            (TokenKind::Lower("x".into()), 10, 11),
-            (TokenKind::Eof, 11, 11),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
-                assert!(matches!(&body.node, ExprKind::Lambda { .. }));
-            }
-            other => panic!("expected Fun with lambda body, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_record_expr() {
-        // r = {name "Alice" age 30}
-        let source = r#"r = {name "Alice" age 30}"#.to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("r".into()), 0, 1),
-            (TokenKind::Eq, 2, 3),
-            (TokenKind::LBrace, 4, 5),
-            (TokenKind::Lower("name".into()), 5, 9),
-            (TokenKind::Text("Alice".into()), 10, 17),
-            (TokenKind::Lower("age".into()), 18, 21),
-            (TokenKind::Int("30".into()), 22, 24),
-            (TokenKind::RBrace, 24, 25),
-            (TokenKind::Eof, 25, 25),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => match &body.node {
-                ExprKind::Record(fields) => {
-                    assert_eq!(fields.len(), 2);
-                    assert_eq!(fields[0].name, "name");
-                    assert_eq!(fields[1].name, "age");
-                }
-                other => panic!("expected Record, got {:?}", other),
-            },
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_type_alias() {
-        // type Person = {name: Text, age: Int}
-        let source = "type Person = {name: Text, age: Int}".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Type, 0, 4),
-            (TokenKind::Upper("Person".into()), 5, 11),
-            (TokenKind::Eq, 12, 13),
-            (TokenKind::LBrace, 14, 15),
-            (TokenKind::Lower("name".into()), 15, 19),
-            (TokenKind::Colon, 19, 20),
-            (TokenKind::Upper("Text".into()), 21, 25),
-            (TokenKind::Comma, 25, 26),
-            (TokenKind::Lower("age".into()), 27, 30),
-            (TokenKind::Colon, 30, 31),
-            (TokenKind::Upper("Int".into()), 32, 35),
-            (TokenKind::RBrace, 35, 36),
-            (TokenKind::Eof, 36, 36),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::TypeAlias { name, ty, .. } => {
-                assert_eq!(name, "Person");
-                assert!(matches!(&ty.node, TypeKind::Record { .. }));
-            }
-            other => panic!("expected TypeAlias, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_application_expr() {
-        // f = g x y
-        let source = "f = g x y".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("f".into()), 0, 1),
-            (TokenKind::Eq, 2, 3),
-            (TokenKind::Lower("g".into()), 4, 5),
-            (TokenKind::Lower("x".into()), 6, 7),
-            (TokenKind::Lower("y".into()), 8, 9),
-            (TokenKind::Eof, 9, 9),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
-                // g x y => App(App(g, x), y)
-                match &body.node {
-                    ExprKind::App { func, arg } => {
-                        assert!(matches!(&arg.node, ExprKind::Var(n) if n == "y"));
-                        assert!(matches!(&func.node, ExprKind::App { .. }));
-                    }
-                    other => panic!("expected App, got {:?}", other),
-                }
-            }
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_field_access() {
-        // f x = x.name
-        let source = "f = x.name".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("f".into()), 0, 1),
-            (TokenKind::Eq, 2, 3),
-            (TokenKind::Lower("x".into()), 4, 5),
-            (TokenKind::Dot, 5, 6),
-            (TokenKind::Lower("name".into()), 6, 10),
-            (TokenKind::Eof, 10, 10),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
-                assert!(matches!(&body.node, ExprKind::FieldAccess { field, .. } if field == "name"));
-            }
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn expect_lower_rejects_keywords() {
-        let source = "where".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Where, 0, 5),
-            (TokenKind::Eof, 5, 5),
-        ]);
-        let mut parser = Parser::new(source, tokens);
-        let result = parser.expect_lower("expected identifier");
-        assert!(result.is_err());
-        assert!(!parser.diagnostics.is_empty());
-        assert!(parser.diagnostics[0]
-            .message
-            .contains("keyword"));
-    }
-
-    #[test]
-    fn parse_derived_decl() {
-        // &seniors = x
-        let source = "&seniors = x".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Ampersand, 0, 1),
-            (TokenKind::Lower("seniors".into()), 1, 8),
-            (TokenKind::Eq, 9, 10),
-            (TokenKind::Lower("x".into()), 11, 12),
-            (TokenKind::Eof, 12, 12),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Derived { name, body, .. } => {
-                assert_eq!(name, "seniors");
-                assert!(matches!(&body.node, ExprKind::Var(n) if n == "x"));
-            }
-            other => panic!("expected Derived, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_list_expr() {
-        // xs = [1, 2, 3]
-        let source = "xs = [1, 2, 3]".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("xs".into()), 0, 2),
-            (TokenKind::Eq, 3, 4),
-            (TokenKind::LBracket, 5, 6),
-            (TokenKind::Int("1".into()), 6, 7),
-            (TokenKind::Comma, 7, 8),
-            (TokenKind::Int("2".into()), 9, 10),
-            (TokenKind::Comma, 10, 11),
-            (TokenKind::Int("3".into()), 12, 13),
-            (TokenKind::RBracket, 13, 14),
-            (TokenKind::Eof, 14, 14),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => match &body.node {
-                ExprKind::List(elems) => {
-                    assert_eq!(elems.len(), 3);
-                }
-                other => panic!("expected List, got {:?}", other),
-            },
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_unary_neg() {
-        // f = -x
-        let source = "f = -x".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("f".into()), 0, 1),
-            (TokenKind::Eq, 2, 3),
-            (TokenKind::Minus, 4, 5),
-            (TokenKind::Lower("x".into()), 5, 6),
-            (TokenKind::Eof, 6, 6),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
-                assert!(matches!(
-                    &body.node,
-                    ExprKind::UnaryOp {
-                        op: UnaryOp::Neg,
-                        ..
-                    }
-                ));
-            }
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_source_ref_and_derived_ref() {
-        // f = *people
-        let source = "f = *people".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("f".into()), 0, 1),
-            (TokenKind::Eq, 2, 3),
-            (TokenKind::Star, 4, 5),
-            (TokenKind::Lower("people".into()), 5, 11),
-            (TokenKind::Eof, 11, 11),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
-                assert!(matches!(&body.node, ExprKind::SourceRef(n) if n == "people"));
-            }
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_record_update() {
-        // f = {t | age 30}
-        let source = "f = {t | age 30}".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("f".into()), 0, 1),
-            (TokenKind::Eq, 2, 3),
-            (TokenKind::LBrace, 4, 5),
-            (TokenKind::Lower("t".into()), 5, 6),
-            (TokenKind::Pipe, 7, 8),
-            (TokenKind::Lower("age".into()), 9, 12),
-            (TokenKind::Int("30".into()), 13, 15),
-            (TokenKind::RBrace, 15, 16),
-            (TokenKind::Eof, 16, 16),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => match &body.node {
-                ExprKind::RecordUpdate { base, fields } => {
-                    assert!(matches!(&base.node, ExprKind::Var(n) if n == "t"));
-                    assert_eq!(fields.len(), 1);
-                    assert_eq!(fields[0].name, "age");
-                }
-                other => panic!("expected RecordUpdate, got {:?}", other),
-            },
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_error_recovery() {
-        // First decl has an error, second should still parse.
-        let source = "bad !!! stuff\nx = 1".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("bad".into()), 0, 3),
-            // Some junk tokens that won't form a valid declaration.
-            (TokenKind::Eq, 4, 5),
-            (TokenKind::Eq, 5, 6), // double `=` — error
-            (TokenKind::Eq, 6, 7),
-            (TokenKind::Newline, 13, 14),
-            // Second declaration at column 0.
-            (TokenKind::Lower("x".into()), 14, 15),
-            (TokenKind::Eq, 16, 17),
-            (TokenKind::Int("1".into()), 18, 19),
-            (TokenKind::Eof, 19, 19),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        // Should have at least one error from the first decl.
-        assert!(!diags.is_empty());
-        // But should still parse the second decl.
-        let fun_count = module
-            .decls
-            .iter()
-            .filter(|d| matches!(&d.node, DeclKind::Fun { name, .. } if name == "x"))
-            .count();
-        assert_eq!(fun_count, 1, "should recover and parse 'x = 1'");
-    }
-}

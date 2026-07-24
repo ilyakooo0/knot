@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind, Module, Span, TypeKind};
+use knot::ast::{self, Span, TypeKind};
 
 use crate::shared::{
     extract_principal_type_name, find_enclosing_atomic_expr, render_signature_with_effects,
@@ -13,7 +13,7 @@ use crate::shared::{
 use crate::state::{builtins as state_builtins, DocumentState, ServerState};
 use crate::utils::{
     edit_distance, offset_to_position, position_to_offset, safe_slice, span_to_range,
-    word_at_position,
+    top_fields, word_at_position,
 };
 
 // ── Code Actions ────────────────────────────────────────────────────
@@ -47,9 +47,9 @@ pub(crate) fn handle_code_action(
         if a <= b { (a, b) } else { (b, a) }
     };
 
-    for decl in &doc.module.decls {
+    for decl in top_fields(&doc.module) {
         // Only consider declarations overlapping the cursor range
-        if decl.span.end < range_start || decl.span.start > range_end {
+        if decl.value.span.end < range_start || decl.value.span.start > range_end {
             continue;
         }
 
@@ -58,8 +58,15 @@ pub(crate) fn handle_code_action(
         // merges any per-decl effect-checker findings into that row when HM
         // inference dropped them (e.g., forward references through annotated
         // callers can collapse the row to `{}`).
-        if let DeclKind::Fun { name, ty: None, .. } = &decl.node
-            && let Some(inferred) = doc.type_info.get(name) {
+        let is_unannotated_fn = decl.sig.is_none()
+            && !matches!(decl.value.node,
+                ast::ExprKind::ViewDecl { .. } | ast::ExprKind::DerivedDecl { .. }
+                | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+                | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+                | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. });
+        if is_unannotated_fn
+            && let Some(inferred) = doc.type_info.get(&decl.name) {
+                let name = &decl.name;
                 let signature = match doc.effect_sets.get(name) {
                     Some(eff) => render_signature_with_effects(inferred, eff),
                     None => inferred.clone(),
@@ -67,9 +74,9 @@ pub(crate) fn handle_code_action(
                 // Insert the annotation inline on the definition
                 // (`name : Sig = body`), mirroring the View/Derived branch
                 // below — not as a separate standalone signature line.
-                let decl_text = safe_slice(&doc.source, decl.span);
+                let decl_text = safe_slice(&doc.source, decl.value.span);
                 if let Some(eq_pos) = decl_text.find('=') {
-                    let insert_offset = decl.span.start + eq_pos;
+                    let insert_offset = decl.value.span.start + eq_pos;
                     let insert_pos = offset_to_position(&doc.source, insert_offset);
 
                     let mut changes = HashMap::new();
@@ -98,16 +105,16 @@ pub(crate) fn handle_code_action(
 
         // Action: Add type annotation to unannotated views/derived. Same
         // effect-merging treatment as the Fun case above.
-        match &decl.node {
-            DeclKind::View { name, ty: None, .. } | DeclKind::Derived { name, ty: None, .. } => {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { name, ty: None, .. } | ast::ExprKind::DerivedDecl { name, ty: None, .. } => {
                 if let Some(inferred) = doc.type_info.get(name) {
                     let signature = match doc.effect_sets.get(name) {
                         Some(eff) => render_signature_with_effects(inferred, eff),
                         None => inferred.clone(),
                     };
-                    let decl_text = safe_slice(&doc.source, decl.span);
+                    let decl_text = safe_slice(&doc.source, decl.value.span);
                     if let Some(eq_pos) = decl_text.find('=') {
-                        let insert_offset = decl.span.start + eq_pos;
+                        let insert_offset = decl.value.span.start + eq_pos;
                         let insert_pos = offset_to_position(&doc.source, insert_offset);
 
                         let mut changes = HashMap::new();
@@ -188,17 +195,20 @@ pub(crate) fn handle_code_action(
             // Extract the inferred-effects line from the diagnostic message
             if let Some(inferred) = extract_effect_set_from_message(msg, "inferred effects:") {
                 // Find the declaration whose span overlaps this diagnostic
-                if let Some((decl, fun_name)) = doc
-                    .module
-                    .decls
-                    .iter()
-                    .find_map(|d| match &d.node {
-                        DeclKind::Fun {
-                            name, ty: Some(_), ..
-                        } if d.span.start <= diag_offset && diag_offset < d.span.end => {
-                            Some((d, name.clone()))
+                if let Some((decl, fun_name)) = top_fields(&doc.module)
+                    .into_iter()
+                    .find_map(|d| {
+                        let in_span = d.value.span.start <= diag_offset && diag_offset < d.value.span.end;
+                        if d.sig.is_some() && in_span && !matches!(d.value.node,
+                            ast::ExprKind::ViewDecl { .. } | ast::ExprKind::DerivedDecl { .. }
+                            | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+                            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+                            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. })
+                        {
+                            Some((d, d.name.clone()))
+                        } else {
+                            None
                         }
-                        _ => None,
                     })
                     && let Some(edit) = build_effect_widen_edit(decl, &doc.source, &inferred) {
                         let mut changes = HashMap::new();
@@ -371,15 +381,17 @@ pub(crate) fn handle_code_action(
     }
 
     // Action: Fill case arms — check if cursor is inside a case expression
-    for decl in &doc.module.decls {
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+    for decl in top_fields(&doc.module) {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
                 find_case_actions(body, doc, uri, range_start, range_end, &mut actions);
             }
-            DeclKind::Fun { body: None, .. } => {}
-            _ => {}
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => {
+                find_case_actions(&decl.value, doc, uri, range_start, range_end, &mut actions);
+            }
         }
     }
 
@@ -528,12 +540,10 @@ pub(crate) fn handle_code_action(
 
             // Find the enclosing top-level declaration to place the function
             // before it.
-            let fn_insert_offset = doc
-                .module
-                .decls
+            let fn_insert_offset = top_fields(&doc.module)
                 .iter()
-                .find(|d| d.span.start <= sel_start && sel_end <= d.span.end)
-                .map(|d| d.span.start)
+                .find(|d| d.value.span.start <= sel_start && sel_end <= d.value.span.end)
+                .map(|d| d.value.span.start)
                 .unwrap_or(0);
             let fn_insert_pos = offset_to_position(&doc.source, fn_insert_offset);
 
@@ -571,18 +581,20 @@ pub(crate) fn handle_code_action(
     // Action: Inline variable — if the cursor is on a field NAME of a
     // `with {name: value} body` binding, offer to substitute the value at
     // every usage in `body` and unwrap the `with`.
-    for decl in &doc.module.decls {
-        if decl.span.end < range_start || decl.span.start > range_end {
+    for decl in top_fields(&doc.module) {
+        if decl.value.span.end < range_start || decl.value.span.start > range_end {
             continue;
         }
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
                 find_inline_actions(body, doc, uri, range_start, &mut actions);
             }
-            DeclKind::Fun { body: None, .. } => {}
-            _ => {}
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => {
+                find_inline_actions(&decl.value, doc, uri, range_start, &mut actions);
+            }
         }
     }
 
@@ -712,34 +724,6 @@ pub(crate) fn handle_code_action(
         }));
     }
 
-    // Action: add `deriving (Eq, Show)` clause to a data declaration that
-    // doesn't yet derive any traits. Common boilerplate for fresh ADTs.
-    if let Some((data_span, name, insert_pos)) =
-        find_deriving_insertion_at(&doc.module, &doc.source, range_start)
-    {
-        let mut changes = HashMap::new();
-        changes.insert(
-            uri.clone(),
-            vec![TextEdit {
-                range: Range {
-                    start: insert_pos,
-                    end: insert_pos,
-                },
-                new_text: " deriving (Eq, Show)".to_string(),
-            }],
-        );
-        let _ = data_span;
-        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: format!("Add `deriving (Eq, Show)` to `{name}`"),
-            kind: Some(CodeActionKind::REFACTOR_REWRITE),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }));
-    }
-
     // Action: add a wildcard `_ -> ...` arm to the case expression at the cursor.
     // Useful when the scrutinee is an open variant (constructor pattern from a
     // do-block bind) where exhaustiveness can't be statically verified, or as a
@@ -834,7 +818,7 @@ pub(crate) fn handle_code_action(
 /// last arm. The replacement reuses the existing arms verbatim and adds a new
 /// final arm with consistent indentation.
 fn find_add_wildcard_arm_at(
-    module: &Module,
+    module: &ast::Expr,
     source: &str,
     offset: usize,
 ) -> Option<(Span, String)> {
@@ -898,18 +882,21 @@ fn find_add_wildcard_arm_at(
         });
         found
     }
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun {
-                body: Some(body), ..
-            }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+    for decl in top_fields(module) {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
                 if let Some(hit) = walk(body, source, offset) {
                     return Some(hit);
                 }
             }
-            _ => {}
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => {
+                if let Some(hit) = walk(&decl.value, source, offset) {
+                    return Some(hit);
+                }
+            }
         }
     }
     None
@@ -920,15 +907,15 @@ fn find_add_wildcard_arm_at(
 /// Returns the alias span, the alias name, and the position to insert the
 /// `where \x -> True` clause (immediately after the base type).
 fn find_alias_to_refine_at(
-    module: &Module,
+    module: &ast::Expr,
     source: &str,
     offset: usize,
 ) -> Option<(Span, String, Position)> {
-    for decl in &module.decls {
-        if !(decl.span.start <= offset && offset < decl.span.end) {
+    for decl in top_fields(module) {
+        if !(decl.value.span.start <= offset && offset < decl.value.span.end) {
             continue;
         }
-        if let DeclKind::TypeAlias { name, ty, .. } = &decl.node {
+        if let ast::ExprKind::TypeCtor { name, ty, .. } = &decl.value.node {
             // Skip if already refined.
             if matches!(&ty.node, TypeKind::Refined { .. }) {
                 return None;
@@ -942,7 +929,7 @@ fn find_alias_to_refine_at(
             // Insert at the end of the base type's span — that's where the
             // `where` clause syntactically belongs.
             let pos = offset_to_position(source, ty.span.end);
-            return Some((decl.span, name.clone(), pos));
+            return Some((decl.value.span, name.clone(), pos));
         }
     }
     None
@@ -951,7 +938,7 @@ fn find_alias_to_refine_at(
 /// Find an `if cond then a else b` at `offset` and produce
 /// `if not cond then b else a` as the rewritten text.
 fn find_if_negate_at(
-    module: &Module,
+    module: &ast::Expr,
     source: &str,
     offset: usize,
 ) -> Option<(Span, String)> {
@@ -1024,18 +1011,21 @@ fn find_if_negate_at(
         });
         found
     }
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun {
-                body: Some(body), ..
-            }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+    for decl in top_fields(module) {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
                 if let Some(hit) = walk(body, source, offset) {
                     return Some(hit);
                 }
             }
-            _ => {}
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => {
+                if let Some(hit) = walk(&decl.value, source, offset) {
+                    return Some(hit);
+                }
+            }
         }
     }
     None
@@ -1050,45 +1040,11 @@ fn decl_text_end(source: &str, span: Span) -> usize {
     span.start.min(source.len()) + text.trim_end().len()
 }
 
-/// Locate a `data Name = ...` declaration at the cursor that has no `deriving`
-/// clause. Returns the decl span, the data type name, and the position to
-/// insert the deriving clause (immediately after the last constructor).
-fn find_deriving_insertion_at(
-    module: &Module,
-    source: &str,
-    offset: usize,
-) -> Option<(Span, String, Position)> {
-    for decl in &module.decls {
-        if !(decl.span.start <= offset && offset < decl.span.end) {
-            continue;
-        }
-        if let DeclKind::Data {
-            name,
-            constructors,
-            deriving,
-            ..
-        } = &decl.node
-        {
-            if !deriving.is_empty() {
-                return None;
-            }
-            let _ = constructors;
-            // Insert at the end of the declaration's TEXT, not its span —
-            // data decl spans include the trailing newline run (the parser's
-            // skip_newlines collapses them into the decl), so inserting at
-            // `span.end` would glue the clause onto the NEXT declaration.
-            let pos = offset_to_position(source, decl_text_end(source, decl.span));
-            return Some((decl.span, name.clone(), pos));
-        }
-    }
-    None
-}
-
 /// Wrap the cursor's enclosing expression in `Err {error: ...}` if it sits at
 /// an expression position. Best-effort: skips when the cursor isn't on a
 /// well-formed expression span.
 fn find_wrap_in_err_at(
-    module: &Module,
+    module: &ast::Expr,
     source: &str,
     range_start: usize,
     range_end: usize,
@@ -1126,13 +1082,9 @@ fn find_wrap_in_err_at(
     if range_start == range_end {
         return None;
     }
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun {
-                body: Some(body), ..
-            }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+    for decl in top_fields(module) {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
                 if let Some(span) = walk(body, range_start, range_end) {
                     let text = source.get(span.start..span.end)?;
                     let body = if is_atomic_expr_text(text) {
@@ -1143,7 +1095,20 @@ fn find_wrap_in_err_at(
                     return Some((span, format!("Err {{error {body}}}")));
                 }
             }
-            _ => {}
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => {
+                if let Some(span) = walk(&decl.value, range_start, range_end) {
+                    let text = source.get(span.start..span.end)?;
+                    let body = if is_atomic_expr_text(text) {
+                        text.to_string()
+                    } else {
+                        format!("({text})")
+                    };
+                    return Some((span, format!("Err {{error {body}}}")));
+                }
+            }
         }
     }
     None
@@ -1202,7 +1167,7 @@ fn strip_ws_and_enclosing_parens(source: &str, mut lo: usize, mut hi: usize) -> 
 /// or call, which only preserves program meaning when the selection is a
 /// complete sub-expression. A fragment straddling operator-precedence
 /// boundaries matches no node and is rejected.
-fn selection_matches_expr_node(module: &Module, source: &str, lo: usize, hi: usize) -> bool {
+fn selection_matches_expr_node(module: &ast::Expr, source: &str, lo: usize, hi: usize) -> bool {
     let target = strip_ws_and_enclosing_parens(source, lo, hi);
     // A whitespace-only or empty selection has no meaningful core.
     if target.0 >= target.1 {
@@ -1223,13 +1188,14 @@ fn selection_matches_expr_node(module: &Module, source: &str, lo: usize, hi: usi
         });
         found
     }
-    module.decls.iter().any(|decl| match &decl.node {
-        DeclKind::Fun {
-            body: Some(body), ..
+    top_fields(module).iter().any(|decl| match &decl.value.node {
+        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+            walk(body, source, target)
         }
-        | DeclKind::View { body, .. }
-        | DeclKind::Derived { body, .. } => walk(body, source, target),
-        _ => false,
+        ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+        | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+        | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
+        _ => walk(&decl.value, source, target),
     })
 }
 
@@ -1303,10 +1269,10 @@ fn find_case_actions(
 
             if let Some(type_name) = type_name {
                 // Find the data declaration for this type
-                for decl in &doc.module.decls {
-                    if let DeclKind::Data {
+                for decl in top_fields(&doc.module) {
+                    if let ast::ExprKind::DataCtor {
                         name, constructors, ..
-                    } = &decl.node
+                    } = &decl.value.node
                     {
                         if *name != type_name {
                             continue;
@@ -1403,12 +1369,12 @@ fn extract_effect_set_from_message(msg: &str, prefix: &str) -> Option<String> {
 
 /// Build a TextEdit that widens a function's declared effects to a target set.
 /// Looks for the `: ... -> ...` signature in the source and rewrites the head.
-fn build_effect_widen_edit(decl: &ast::Decl, source: &str, target_effects: &str) -> Option<TextEdit> {
+fn build_effect_widen_edit(decl: &ast::RecordField, source: &str, target_effects: &str) -> Option<TextEdit> {
     // The strategy: find the type annotation signature line that looks like
     // `name : ...` within the declaration span and replace the existing IO
     // effect set or insert one if none exists. We do a minimal textual rewrite
     // rather than re-rendering the whole type, to preserve user formatting.
-    let decl_text = source.get(decl.span.start..decl.span.end.min(source.len()))?;
+    let decl_text = source.get(decl.value.span.start..decl.value.span.end.min(source.len()))?;
     // Find `: ` after the function name to locate the start of the type signature
     let colon = decl_text.find(": ")?;
     let after_colon_off = colon + 2;
@@ -1440,8 +1406,8 @@ fn build_effect_widen_edit(decl: &ast::Decl, source: &str, target_effects: &str)
     // implements the depth-aware spine walk.
     let (row_start, row_end) = crate::shared::find_outermost_io_row(sig)?;
     // Replace the row INCLUDING braces (target_effects carries its own).
-    let abs_open = decl.span.start + after_colon_off + row_start - 1;
-    let abs_close = decl.span.start + after_colon_off + row_end + 1;
+    let abs_open = decl.value.span.start + after_colon_off + row_start - 1;
+    let abs_close = decl.value.span.start + after_colon_off + row_end + 1;
     Some(TextEdit {
         range: Range {
             start: offset_to_position(source, abs_open),
@@ -1940,7 +1906,7 @@ fn find_inline_actions(
 }
 
 pub(crate) fn enclosing_do_stmt_range(
-    module: &Module,
+    module: &ast::Expr,
     sel_start: usize,
     sel_end: usize,
 ) -> Option<(usize, usize)> {
@@ -1963,17 +1929,18 @@ pub(crate) fn enclosing_do_stmt_range(
         crate::utils::recurse_expr(expr, |e| walk(e, sel_start, sel_end, best));
     }
     let mut best = None;
-    for decl in &module.decls {
-        if decl.span.start > sel_start || sel_end > decl.span.end {
+    for decl in top_fields(module) {
+        if decl.value.span.start > sel_start || sel_end > decl.value.span.end {
             continue;
         }
-        match &decl.node {
-            DeclKind::Fun {
-                body: Some(body), ..
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+                walk(body, sel_start, sel_end, &mut best)
             }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, sel_start, sel_end, &mut best),
-            _ => {}
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => walk(&decl.value, sel_start, sel_end, &mut best),
         }
     }
     best
@@ -1983,7 +1950,7 @@ pub(crate) fn enclosing_do_stmt_range(
 /// cursor, and return its span plus the equivalent `case` rewrite. Returns
 /// `None` if the cursor isn't inside an if-expression.
 fn find_if_to_case_at(
-    module: &Module,
+    module: &ast::Expr,
     source: &str,
     offset: usize,
 ) -> Option<(Span, String)> {
@@ -2040,12 +2007,15 @@ fn find_if_to_case_at(
         crate::utils::recurse_expr(expr, |e| walk(e, source, offset, best));
     }
     let mut best = None;
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best),
-            _ => {}
+    for decl in top_fields(module) {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+                walk(body, source, offset, &mut best)
+            }
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => walk(&decl.value, source, offset, &mut best),
         }
     }
     best
@@ -2055,7 +2025,7 @@ fn find_if_to_case_at(
 /// returning the span and the operand-flipped source text. Limited to ops
 /// where flipping preserves semantics — `+`, `*`, `==`, `!=`, `&&`, `||`.
 fn find_flip_binary_at(
-    module: &Module,
+    module: &ast::Expr,
     source: &str,
     offset: usize,
 ) -> Option<(Span, String)> {
@@ -2129,12 +2099,15 @@ fn find_flip_binary_at(
         crate::utils::recurse_expr(expr, |e| walk(e, source, offset, best));
     }
     let mut best = None;
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best),
-            _ => {}
+    for decl in top_fields(module) {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+                walk(body, source, offset, &mut best)
+            }
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => walk(&decl.value, source, offset, &mut best),
         }
     }
     best
@@ -2145,7 +2118,7 @@ fn find_flip_binary_at(
 /// skipped — `f x y` could pipe in either argument and we'd rather not
 /// guess.
 fn find_pipe_conversion_at(
-    module: &Module,
+    module: &ast::Expr,
     source: &str,
     offset: usize,
 ) -> Option<(Span, String)> {
@@ -2236,1294 +2209,17 @@ fn find_pipe_conversion_at(
         }
     }
     let mut best = None;
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, false, false),
-            _ => {}
+    for decl in top_fields(module) {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+                walk(body, source, offset, &mut best, false, false)
+            }
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => walk(&decl.value, source, offset, &mut best, false, false),
         }
     }
     best
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse_module(src: &str) -> Module {
-        let (tokens, lex_diags) = knot::lexer::Lexer::new(src).tokenize();
-        assert!(lex_diags.is_empty(), "lex errors in test source: {lex_diags:?}");
-        let (module, parse_diags) = knot::parser::Parser::new(src.to_string(), tokens).parse_module();
-        assert!(parse_diags.is_empty(), "parse errors in test source: {parse_diags:?}");
-        module
-    }
-
-    fn parses_cleanly(src: &str) -> bool {
-        let (tokens, lex_diags) = knot::lexer::Lexer::new(src).tokenize();
-        let (_, parse_diags) = knot::parser::Parser::new(src.to_string(), tokens).parse_module();
-        lex_diags.is_empty() && parse_diags.is_empty()
-    }
-
-    #[test]
-    fn pipe_conversion_not_offered_inside_multi_arg_application() {
-        // Regression: with the cursor inside `f x` of `f x y`, the action used
-        // to rewrite the inner application to `x |> f`, producing `x |> f y`
-        // which parses as `f y x` — arguments silently swapped.
-        let src = "g = \\f x y -> f x y\n";
-        let module = parse_module(src);
-        let off = src.find("f x y").expect("application") + 2; // on `x`
-        assert!(
-            find_pipe_conversion_at(&module, src, off).is_none(),
-            "no pipe action may be offered anywhere in a multi-arg application"
-        );
-    }
-
-    #[test]
-    fn pipe_conversion_still_offered_for_single_arg_application() {
-        let src = "h = \\x -> show x\n";
-        let module = parse_module(src);
-        let off = src.find("show x").expect("application") + 1;
-        let (_, replacement) =
-            find_pipe_conversion_at(&module, src, off).expect("single-arg app offers pipe");
-        assert_eq!(replacement, "x |> show");
-    }
-
-    #[test]
-    fn if_to_case_inside_do_block_keeps_layout_parseable() {
-        // Regression: arms were emitted at a hard-coded 2-space indent, which
-        // collided with the do-block statement column and failed to reparse.
-        let src = "main = do\n  x <- *items\n  with {y (if x > 1 then 1 else 2)} (do\n    yield y)\n";
-        let module = parse_module(src);
-        let off = src.find("if x").expect("if expr");
-        let (span, replacement) =
-            find_if_to_case_at(&module, src, off).expect("if-to-case offered");
-        let mut out = src.to_string();
-        out.replace_range(span.start..span.end, &replacement);
-        assert!(
-            parses_cleanly(&out),
-            "if-to-case rewrite must reparse cleanly; got:\n{out}"
-        );
-    }
-
-    /// Bug B66: a parenthesized `if` in operand position folds its parens into
-    /// the expr span. Replacing the whole `(if …)` span with a bare `case …`
-    /// dropped the parens, so the trailing `* 2` bound into the last arm
-    /// (`False {} -> b * 2`). The rewrite must re-wrap in parens.
-    #[test]
-    fn if_to_case_reparenthesizes_operand_position() {
-        let src = "f = \\c a b -> (if c then a else b) * 2\n";
-        let module = parse_module(src);
-        let off = src.find("if c").expect("if expr");
-        let (span, replacement) =
-            find_if_to_case_at(&module, src, off).expect("if-to-case offered");
-        assert!(
-            replacement.starts_with('(') && replacement.ends_with(')'),
-            "parenthesized-if rewrite must stay parenthesized; got: {replacement}"
-        );
-        let mut out = src.to_string();
-        out.replace_range(span.start..span.end, &replacement);
-        assert!(
-            out.contains(") * 2"),
-            "trailing operand must stay outside the case; got:\n{out}"
-        );
-        assert!(
-            parses_cleanly(&out),
-            "reparenthesized if-to-case rewrite must reparse cleanly; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn if_negate_not_offered_for_multiline_branches() {
-        // Swapping multi-line branches inline breaks layout-sensitive parses;
-        // the action is suppressed instead.
-        let src = "f = \\x -> if x > 1\n  then do\n    yield 1\n  else do\n    yield 2\n";
-        if let Ok(module) = std::panic::catch_unwind(|| parse_module(src)) {
-            let off = src.find("if x").expect("if expr");
-            assert!(
-                find_if_negate_at(&module, src, off).is_none(),
-                "negate action must not be offered for multi-line branches"
-            );
-        }
-    }
-
-    fn plain_params(uri: &Uri, range: Range) -> CodeActionParams {
-        CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range,
-            context: CodeActionContext {
-                diagnostics: Vec::new(),
-                only: None,
-                trigger_kind: None,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        }
-    }
-
-    fn selection_range(source: &str, needle: &str) -> Range {
-        let off = source.find(needle).expect("needle found");
-        Range {
-            start: crate::utils::offset_to_position(source, off),
-            end: crate::utils::offset_to_position(source, off + needle.len()),
-        }
-    }
-
-    fn action_titles(actions: &[CodeActionOrCommand]) -> Vec<String> {
-        actions
-            .iter()
-            .filter_map(|a| match a {
-                CodeActionOrCommand::CodeAction(ca) => Some(ca.title.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// Regression: statement-form `with {x: e} (do …)` only parses inside
-    /// `do` blocks. The action used to be offered everywhere, producing
-    /// parse errors when applied in plain expression bodies.
-    #[test]
-    fn extract_to_with_not_offered_outside_do_block() {
-        use crate::test_support::TestWorkspace;
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\x -> x * 2 + 1\n");
-        let doc_source = ws.doc(&uri).source.clone();
-        let range = selection_range(&doc_source, "x * 2");
-        let actions = handle_code_action(&ws.state, &plain_params(&uri, range))
-            .expect("code action response");
-        let titles = action_titles(&actions);
-        assert!(
-            titles.iter().all(|t| !t.starts_with("Extract to with")),
-            "with-extraction must not be offered outside a do block; got: {titles:?}"
-        );
-        // The function-extraction variant works in expression position and
-        // should still be offered.
-        assert!(
-            titles.iter().any(|t| t.starts_with("Extract to function")),
-            "function extraction should remain available; got: {titles:?}"
-        );
-    }
-
-    /// A client may send a code-action request whose range is inverted
-    /// (start position after end). The handler must normalize it instead of
-    /// panicking while slicing `doc.source[range_start..range_end]`.
-    #[test]
-    fn inverted_range_does_not_panic() {
-        use crate::test_support::TestWorkspace;
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\x -> x * 2 + 1\n");
-        let doc_source = ws.doc(&uri).source.clone();
-        let normal = selection_range(&doc_source, "x * 2");
-        // Invert: start and end swapped so start > end.
-        let inverted = Range {
-            start: normal.end,
-            end: normal.start,
-        };
-        // Must not panic (used to panic in the extract-variable slice).
-        let _ = handle_code_action(&ws.state, &plain_params(&uri, inverted));
-    }
-
-    #[test]
-    fn extract_to_with_offered_inside_do_block() {
-        use crate::test_support::TestWorkspace;
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "main = do\n  x <- [1, 2]\n  yield (x * 2)\n");
-        let doc_source = ws.doc(&uri).source.clone();
-        let range = selection_range(&doc_source, "x * 2");
-        let actions = handle_code_action(&ws.state, &plain_params(&uri, range))
-            .expect("code action response");
-        let titles = action_titles(&actions);
-        assert!(
-            titles.iter().any(|t| t.starts_with("Extract to with")),
-            "with-extraction should be offered inside a do block; got: {titles:?}"
-        );
-    }
-
-    /// Regression: the `with` binding used to be inserted before the
-    /// *cursor's* line, splitting multi-line do-statements mid-expression.
-    /// It must be inserted before the START of the enclosing statement.
-    #[test]
-    fn extract_to_with_inserts_before_enclosing_do_stmt() {
-        use crate::test_support::TestWorkspace;
-        let mut ws = TestWorkspace::new();
-        // The `yield` statement starts on line 2 and continues onto line 3.
-        let source = "main = do\n  x <- [1, 2]\n  yield (x +\n    (x * 2))\n";
-        let uri = ws.open("main", source);
-        let doc_source = ws.doc(&uri).source.clone();
-        // Selection sits on the continuation line (line 3).
-        let range = selection_range(&doc_source, "(x * 2)");
-        let actions = handle_code_action(&ws.state, &plain_params(&uri, range))
-            .expect("code action response");
-        let with_action = actions
-            .iter()
-            .find_map(|a| match a {
-                CodeActionOrCommand::CodeAction(ca)
-                    if ca.title.starts_with("Extract to with") =>
-                {
-                    Some(ca)
-                }
-                _ => None,
-            })
-            .expect("with extraction offered inside do block");
-        let edits = with_action
-            .edit
-            .as_ref()
-            .unwrap()
-            .changes
-            .as_ref()
-            .unwrap()
-            .get(&uri)
-            .unwrap();
-        let insert = edits
-            .iter()
-            .find(|e| e.new_text.contains("with {"))
-            .expect("with insertion edit");
-        assert_eq!(
-            insert.range.start.line, 2,
-            "must insert before the `yield` statement's line, not the \
-             continuation line; edits: {edits:?}"
-        );
-        assert_eq!(insert.range.start.character, 0);
-        assert!(
-            insert.new_text.starts_with("  with {"),
-            "indent must match the statement's line; got: {:?}",
-            insert.new_text
-        );
-    }
-
-    /// Staleness guard: when the editor holds newer (pending) text than the
-    /// analyzed doc, span-derived edits would corrupt the buffer. The
-    /// handler must bail.
-    #[test]
-    fn code_action_bails_when_pending_text_is_newer() {
-        use crate::state::PendingSource;
-        use crate::test_support::TestWorkspace;
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "main = do\n  x <- [1, 2]\n  yield (x * 2)\n");
-        let doc_source = ws.doc(&uri).source.clone();
-        let range = selection_range(&doc_source, "x * 2");
-        ws.state.pending_sources.insert(
-            uri.clone(),
-            PendingSource {
-                source: format!("-- edited\n{doc_source}"),
-                version: Some(2),
-            },
-        );
-        let actions = handle_code_action(&ws.state, &plain_params(&uri, range));
-        assert!(
-            actions.is_none(),
-            "code actions against stale analysis must bail; got: {actions:?}"
-        );
-    }
-}
-
-// Regression tests for the 2026-06 LSP bug-fix batch (code-action group).
-// Kept in a separate module from `tests` above so the original test file
-// content stays untouched.
-#[cfg(test)]
-mod regress_fixes_tests {
-    use super::*;
-    use crate::test_support::{TempWorkspace, TestWorkspace};
-
-    fn params_for(uri: &Uri, range: Range) -> CodeActionParams {
-        CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range,
-            context: CodeActionContext {
-                diagnostics: Vec::new(),
-                only: None,
-                trigger_kind: None,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        }
-    }
-
-    fn action_titled(
-        actions: &[CodeActionOrCommand],
-        pred: impl Fn(&str) -> bool,
-    ) -> Option<&CodeAction> {
-        actions.iter().find_map(|a| match a {
-            CodeActionOrCommand::CodeAction(ca) if pred(&ca.title) => Some(ca),
-            _ => None,
-        })
-    }
-
-    fn edits_for<'a>(action: &'a CodeAction, uri: &Uri) -> &'a [TextEdit] {
-        action
-            .edit
-            .as_ref()
-            .and_then(|e| e.changes.as_ref())
-            .and_then(|c| c.get(uri))
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Item 1: "Add type annotation" for functions must produce the inline
-    /// form `name : Sig = body`, not a standalone signature line.
-    #[test]
-    fn add_type_annotation_is_inline_on_definition() {
-        let mut tw = TestWorkspace::new();
-        let src = "double = \\x -> x * 2\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "double");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start: pos, end: pos }),
-        )
-        .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Add type annotation"))
-            .expect("annotation action offered");
-        let edits = edits_for(action, &uri);
-        assert_eq!(edits.len(), 1);
-        let edit = &edits[0];
-        // Inserted inline before the `=`, like the View/Derived branch.
-        assert!(
-            edit.new_text.starts_with(": ") && edit.new_text.ends_with(' '),
-            "expected inline `: Sig ` insertion, got {:?}",
-            edit.new_text
-        );
-        assert!(
-            !edit.new_text.contains('\n'),
-            "annotation must not be a standalone line: {:?}",
-            edit.new_text
-        );
-        // Insertion point is exactly at the `=`.
-        let eq_col = src.find('=').unwrap() as u32;
-        assert_eq!(edit.range.start.line, 0);
-        assert_eq!(edit.range.start.character, eq_col);
-        assert_eq!(edit.range.start, edit.range.end);
-    }
-
-    /// Item 5: "Wrap in Err" with a selection covering `x + 1` inside
-    /// `\x -> x + 1` must wrap the whole BinOp, not just `x`.
-    #[test]
-    fn wrap_in_err_wraps_smallest_expr_containing_selection() {
-        let mut tw = TestWorkspace::new();
-        let src = "f = \\x -> x + 1\n";
-        let uri = tw.open("main", src);
-        let start = tw.position_of(&uri, "x + 1");
-        let end = tw.position_after(&uri, "x + 1");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start, end }),
-        )
-        .unwrap_or_default();
-        let action =
-            action_titled(&actions, |t| t == "Wrap in `Err`").expect("wrap action offered");
-        let edits = edits_for(action, &uri);
-        assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].new_text, "Err {error (x + 1)}");
-    }
-
-    /// Item 6: adding a wildcard arm to a single-line case must not emit the
-    /// new arm at column 0 (which would terminate the layout block).
-    #[test]
-    fn add_wildcard_arm_single_line_case_keeps_indentation() {
-        let mut tw = TestWorkspace::new();
-        let src = "data Color = Red {} | Blue {}\n\nf = \\c -> case c of Red {} -> 1\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "case c of");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start: pos, end: pos }),
-        )
-        .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.contains("wildcard"))
-            .expect("wildcard-arm action offered");
-        let edits = edits_for(action, &uri);
-        let new_text = &edits[0].new_text;
-        let last_line = new_text.lines().last().unwrap_or("");
-        assert!(
-            last_line.starts_with(' '),
-            "wildcard arm must be indented past column 0, got {new_text:?}"
-        );
-    }
-
-    /// Apply `TextEdit`s to `source`, back-to-front so offsets stay valid.
-    fn apply_edits_to(source: &str, edits: &[TextEdit]) -> String {
-        let mut spans: Vec<(usize, usize, &str)> = edits
-            .iter()
-            .map(|e| {
-                (
-                    crate::utils::position_to_offset(source, e.range.start),
-                    crate::utils::position_to_offset(source, e.range.end),
-                    e.new_text.as_str(),
-                )
-            })
-            .collect();
-        spans.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
-        let mut out = source.to_string();
-        for (start, end, text) in spans {
-            out.replace_range(start..end, text);
-        }
-        out
-    }
-
-    fn selection(source: &str, needle: &str) -> Range {
-        let off = source.find(needle).expect("needle found");
-        Range {
-            start: crate::utils::offset_to_position(source, off),
-            end: crate::utils::offset_to_position(source, off + needle.len()),
-        }
-    }
-
-    /// "Extract to function" must emit the lambda form for parameters —
-    /// `helper = \x -> body` — since `helper x = body` doesn't parse at
-    /// top level.
-    #[test]
-    fn extract_function_emits_lambda_form_for_free_vars() {
-        let mut tw = TestWorkspace::new();
-        let src = "f = \\n -> n * 2 + 1\n";
-        let uri = tw.open("main", src);
-        let range = selection(src, "n * 2");
-        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
-            .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
-            .expect("extract-to-function offered");
-        let edits = edits_for(action, &uri);
-        let helper = edits
-            .iter()
-            .find(|e| e.new_text.contains("= "))
-            .expect("helper insertion edit");
-        assert!(
-            helper.new_text.contains("= \\n -> n * 2"),
-            "helper must use the lambda form, got: {:?}",
-            helper.new_text
-        );
-        // The whole result must round-trip through the parser cleanly.
-        let out = apply_edits_to(src, edits);
-        let lexer = knot::lexer::Lexer::new(&out);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(out.clone(), tokens);
-        let (_, diags) = parser.parse_module();
-        assert!(
-            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
-            "extracted result must parse; got {diags:?}\nsource:\n{out}"
-        );
-    }
-
-    /// Bug B72: extract must not fire on a selection that straddles
-    /// operator-precedence boundaries. `2 * a + b` parses as `(2 * a) + b`, so
-    /// `a + b` is not an expression node; extracting it would rewrite the value
-    /// to `2 * (a + b)`. The action must be suppressed for such fragments.
-    #[test]
-    fn extract_not_offered_for_precedence_straddling_fragment() {
-        let mut tw = TestWorkspace::new();
-        let src = "f = \\a b -> 2 * a + b\n";
-        let uri = tw.open("main", src);
-        let range = selection(src, "a + b");
-        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
-            .unwrap_or_default();
-        assert!(
-            action_titled(&actions, |t| t.starts_with("Extract to function")).is_none(),
-            "extract must not be offered for a non-node fragment `a + b`; \
-             actions: {:?}",
-            actions
-                .iter()
-                .filter_map(|a| match a {
-                    CodeActionOrCommand::CodeAction(ca) => Some(ca.title.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        );
-    }
-
-    /// Companion to the B72 fragment check: a selection that DOES coincide with
-    /// a whole expression node (`2 * a` inside `2 * a + b`) must still offer the
-    /// extract, and the extracted result must round-trip through the parser.
-    #[test]
-    fn extract_offered_for_whole_expression_node() {
-        let mut tw = TestWorkspace::new();
-        let src = "f = \\a b -> 2 * a + b\n";
-        let uri = tw.open("main", src);
-        let range = selection(src, "2 * a");
-        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
-            .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
-            .expect("extract-to-function offered for a whole node");
-        let edits = edits_for(action, &uri);
-        let out = apply_edits_to(src, edits);
-        let lexer = knot::lexer::Lexer::new(&out);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(out.clone(), tokens);
-        let (_, diags) = parser.parse_module();
-        assert!(
-            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
-            "extracted result must parse; got {diags:?}\nsource:\n{out}"
-        );
-    }
-
-    /// B67: "Extract to function" must parenthesize the call site when the
-    /// helper takes arguments. Extracting the argument `(n + 2)` from
-    /// `show (n + 2)` must yield `show (extracted_fn n)`, not
-    /// `show extracted_fn n` — the latter parses as `(show extracted_fn) n`,
-    /// the wrong application order.
-    #[test]
-    fn extract_function_parenthesizes_call_site_with_args() {
-        let mut tw = TestWorkspace::new();
-        let src = "f = \\n -> show (n + 2)\n";
-        let uri = tw.open("main", src);
-        // Select the parenthesized argument, parens included — this is the
-        // shape that used to drop the wrapping and misapply the call.
-        let range = selection(src, "(n + 2)");
-        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
-            .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
-            .expect("extract-to-function offered");
-        let edits = edits_for(action, &uri);
-        let out = apply_edits_to(src, edits);
-        assert!(
-            out.contains("show (extracted_fn n)"),
-            "call site must be parenthesized as `(extracted_fn n)`; got:\n{out}"
-        );
-        assert!(
-            !out.contains("show extracted_fn n"),
-            "call site must not be a bare `show extracted_fn n`; got:\n{out}"
-        );
-        // The result must round-trip through the parser cleanly.
-        let lexer = knot::lexer::Lexer::new(&out);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(out.clone(), tokens);
-        let (_, diags) = parser.parse_module();
-        assert!(
-            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
-            "extracted result must parse; got {diags:?}\nsource:\n{out}"
-        );
-    }
-
-    /// A full-line selection carries the line's trailing newline. The extracted
-    /// helper is built from the TRIMMED text, so the replacement must cover only
-    /// the trimmed span — replacing the raw selection deletes the newline and
-    /// glues the call site onto the next declaration (`f = extracted_fng = 3`),
-    /// which no longer parses.
-    #[test]
-    fn extract_function_preserves_trailing_newline_of_full_line_selection() {
-        let mut tw = TestWorkspace::new();
-        let src = "f = 1 + 2\ng = 3\n";
-        let uri = tw.open("main", src);
-        // Selection runs to the start of the next line, newline included.
-        let range = selection(src, "1 + 2\n");
-        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
-            .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
-            .expect("extract-to-function offered");
-        let edits = edits_for(action, &uri);
-        let out = apply_edits_to(src, edits);
-        assert!(
-            out.contains("f = extracted_fn\n"),
-            "the selection's trailing newline must survive the replacement; got:\n{out}"
-        );
-        assert!(
-            out.contains("\ng = 3"),
-            "the following declaration must stay on its own line; got:\n{out}"
-        );
-        // The glued-together form is exactly what the raw-range replacement
-        // produced, so pin it explicitly.
-        assert!(
-            !out.contains("extracted_fng"),
-            "call site must not be glued to the next decl; got:\n{out}"
-        );
-        let lexer = knot::lexer::Lexer::new(&out);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(out.clone(), tokens);
-        let (_, diags) = parser.parse_module();
-        assert!(
-            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
-            "extracted result must parse; got {diags:?}\nsource:\n{out}"
-        );
-    }
-
-    /// Same trailing-newline hazard on the with path: eating the newline would
-    /// pull the next do-statement onto the `with` line and break the layout.
-    #[test]
-    fn extract_to_with_preserves_trailing_newline_of_full_line_selection() {
-        let mut tw = TestWorkspace::new();
-        let src = "main = do\n  println (1 + 2)\n  println \"next\"\n";
-        let uri = tw.open("main", src);
-        let range = selection(src, "1 + 2");
-        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
-            .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Extract to with"))
-            .expect("extract-to-with offered");
-        let edits = edits_for(action, &uri);
-        let out = apply_edits_to(src, edits);
-        assert!(
-            out.contains("extracted"),
-            "the selected expression must be bound to a name; got:\n{out}"
-        );
-        assert!(
-            out.contains("println \"next\""),
-            "the next do-statement must stay on its own line; got:\n{out}"
-        );
-        let lexer = knot::lexer::Lexer::new(&out);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(out.clone(), tokens);
-        let (_, diags) = parser.parse_module();
-        assert!(
-            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
-            "extracted result must parse; got {diags:?}\nsource:\n{out}"
-        );
-    }
-
-    /// A zero-arg extraction needs NO wrapping parens — the call is a single
-    /// atom already, so `show (1 + 2)` → `show extracted_fn` is correct.
-    #[test]
-    fn extract_function_no_parens_for_zero_arg_call() {
-        let mut tw = TestWorkspace::new();
-        let src = "f = show (1 + 2)\n";
-        let uri = tw.open("main", src);
-        let range = selection(src, "(1 + 2)");
-        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
-            .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Extract to function"))
-            .expect("extract-to-function offered");
-        let edits = edits_for(action, &uri);
-        let out = apply_edits_to(src, edits);
-        assert!(
-            out.contains("show extracted_fn\n"),
-            "zero-arg call needs no wrapping parens; got:\n{out}"
-        );
-        // Still must parse cleanly.
-        let lexer = knot::lexer::Lexer::new(&out);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(out.clone(), tokens);
-        let (_, diags) = parser.parse_module();
-        assert!(
-            diags.iter().all(|d| !matches!(d.severity, knot::diagnostic::Severity::Error)),
-            "extracted result must parse; got {diags:?}\nsource:\n{out}"
-        );
-    }
-
-    /// "Add deriving" must attach to the data decl itself — decl spans
-    /// include the trailing newline run, so inserting at span.end used to
-    /// glue the clause onto the NEXT declaration.
-    #[test]
-    fn add_deriving_attaches_to_data_decl_not_next_decl() {
-        let mut tw = TestWorkspace::new();
-        let src = "data Color = Red {} | Blue {}\n\nnext = 1\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "Color");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start: pos, end: pos }),
-        )
-        .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Add `deriving"))
-            .expect("add-deriving offered");
-        let edits = edits_for(action, &uri);
-        let out = apply_edits_to(src, edits);
-        assert_eq!(
-            out, "data Color = Red {} | Blue {} deriving (Eq, Show)\n\nnext = 1\n",
-            "deriving clause must end the data decl line"
-        );
-    }
-
-    /// "Widen declared effects" must rewrite the RESULT row, not the first
-    /// textual `IO {` (which can be a callback parameter's row).
-    #[test]
-    fn widen_effects_targets_result_row_not_callback_param() {
-        let src = "runCb : (Int 1 -> IO {} {}) -> IO {} {}\nrunCb = \\cb -> cb 1\n";
-        let lexer = knot::lexer::Lexer::new(src);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(src.to_string(), tokens);
-        let (module, _) = parser.parse_module();
-        let decl = module
-            .decls
-            .iter()
-            .find(|d| matches!(&d.node, DeclKind::Fun { name, .. } if name == "runCb"))
-            .expect("runCb decl");
-        let edit = build_effect_widen_edit(decl, src, "{console}")
-            .expect("widen edit produced");
-        let start = crate::utils::position_to_offset(src, edit.range.start);
-        let result_row = src.find("-> IO {} {}\n").expect("result row") + 3 + 3;
-        assert_eq!(
-            start, result_row,
-            "edit must target the result row's braces; got offset {start} \
-             (text {:?})",
-            &src[start..start + 4.min(src.len() - start)]
-        );
-        let end = crate::utils::position_to_offset(src, edit.range.end);
-        let mut out = src.to_string();
-        out.replace_range(start..end, &edit.new_text);
-        assert_eq!(
-            out,
-            "runCb : (Int 1 -> IO {} {}) -> IO {console} {}\nrunCb = \\cb -> cb 1\n"
-        );
-    }
-
-    /// "Inline variable" must parenthesize non-atomic values even without
-    /// spaces — `with {y (n-1)}` into `2 * y` is `2 * (n-1)`, not `2 * n-1`.
-    #[test]
-    fn inline_variable_parenthesizes_operator_value_without_spaces() {
-        let mut tw = TestWorkspace::new();
-        let src = "f = \\n -> with {y (n-1)} (2 * y)\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "y (");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start: pos, end: pos }),
-        )
-        .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Inline"))
-            .expect("inline action offered");
-        let edits = edits_for(action, &uri);
-        let out = apply_edits_to(src, edits);
-        assert!(
-            out.contains("2 * (n-1)"),
-            "inlined operator expression must be parenthesized:\n{out}"
-        );
-    }
-
-    /// Atomic values (bare identifiers/literals) stay unparenthesized.
-    #[test]
-    fn inline_variable_leaves_atomic_values_bare() {
-        let mut tw = TestWorkspace::new();
-        let src = "f = \\n -> with {y n} (2 * y)\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "y n");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start: pos, end: pos }),
-        )
-        .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Inline"))
-            .expect("inline action offered");
-        let edits = edits_for(action, &uri);
-        let out = apply_edits_to(src, edits);
-        assert!(
-            out.contains("2 * n") && !out.contains("(n)"),
-            "atomic value must inline without parens:\n{out}"
-        );
-    }
-
-    #[test]
-    fn is_atomic_expr_text_classification() {
-        assert!(is_atomic_expr_text("n"));
-        assert!(is_atomic_expr_text("x'"));
-        assert!(is_atomic_expr_text("42"));
-        assert!(is_atomic_expr_text("1_000.5"));
-        assert!(is_atomic_expr_text("\"hello\""));
-        assert!(is_atomic_expr_text("(a + b)"));
-        assert!(is_atomic_expr_text("{a: 1, b: 2}"));
-        assert!(is_atomic_expr_text("[1, 2]"));
-        // Field-access chains are atomic — a bare `p.x` never rebinds into
-        // an enclosing operator, so inlining it needs no parens.
-        assert!(is_atomic_expr_text("p.x"));
-        assert!(is_atomic_expr_text("a.b.c"));
-        assert!(!is_atomic_expr_text("n-1"));
-        assert!(!is_atomic_expr_text("n - 1"));
-        assert!(!is_atomic_expr_text("f x"));
-        assert!(!is_atomic_expr_text("(a) (b)"));
-        assert!(!is_atomic_expr_text(""));
-    }
-
-    /// "Convert if to case" must refuse multi-line branches — splicing
-    /// indented branch text at a new column breaks the layout parse.
-    #[test]
-    fn convert_if_to_case_refuses_multiline_branches() {
-        let mut tw = TestWorkspace::new();
-        let src = "f = \\x -> if x > 1\n  then do\n    yield 1\n  else do\n    yield 2\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "if x > 1");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start: pos, end: pos }),
-        )
-        .unwrap_or_default();
-        assert!(
-            action_titled(&actions, |t| t.contains("if") && t.contains("case")).is_none(),
-            "if-to-case must not be offered for multi-line branches"
-        );
-    }
-}
-
-#[cfg(test)]
-mod regress_case_arm_tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
-
-    fn params_at(uri: &Uri, pos: Position) -> CodeActionParams {
-        CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range: Range { start: pos, end: pos },
-            context: CodeActionContext {
-                diagnostics: Vec::new(),
-                only: None,
-                trigger_kind: None,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        }
-    }
-
-    /// Item 7 (2026-06 batch 2): a `_` wildcard arm makes the case
-    /// exhaustive — offering "Add missing case arms" would insert dead arms
-    /// after the wildcard. The action must be suppressed.
-    #[test]
-    fn fill_case_arms_not_offered_when_wildcard_arm_exists() {
-        let mut tw = TestWorkspace::new();
-        let src = "data Color = Red {} | Blue {} | Green {}\n\npick : Color -> Int 1\npick = \\v -> case v of\n  Red {} -> 1\n  _ -> 0\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "case v of");
-        let actions = handle_code_action(&tw.state, &params_at(&uri, pos)).unwrap_or_default();
-        assert!(
-            !actions.iter().any(|a| match a {
-                CodeActionOrCommand::CodeAction(ca) =>
-                    ca.title.starts_with("Add missing case arms"),
-                _ => false,
-            }),
-            "fill-case-arms must not be offered when a wildcard arm exists"
-        );
-    }
-
-    /// Same for a bare-variable catch-all arm (`other -> …`).
-    #[test]
-    fn fill_case_arms_not_offered_when_var_catch_all_exists() {
-        let mut tw = TestWorkspace::new();
-        let src = "data Color = Red {} | Blue {} | Green {}\n\npick : Color -> Int 1\npick = \\v -> case v of\n  Red {} -> 1\n  other -> 0\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "case v of");
-        let actions = handle_code_action(&tw.state, &params_at(&uri, pos)).unwrap_or_default();
-        assert!(
-            !actions.iter().any(|a| match a {
-                CodeActionOrCommand::CodeAction(ca) =>
-                    ca.title.starts_with("Add missing case arms"),
-                _ => false,
-            }),
-            "fill-case-arms must not be offered when a catch-all binder arm exists"
-        );
-    }
-
-    /// Item 4: scrutinee type resolution must be span-based (innermost
-    /// binding at the scrutinee), not text-matching across all bindings.
-    /// Two same-named bindings with different types in different scopes
-    /// must each resolve to their own type deterministically.
-    #[test]
-    fn fill_case_arms_resolves_scrutinee_by_span() {
-        let mut tw = TestWorkspace::new();
-        let src = "data Color = Red {} | Blue {} | Green {}\n\ndata Shape = Circle {} | Square {}\n\nuseShape : Shape -> Int 1\nuseShape = \\v -> 0\n\nother = \\v -> useShape v\n\npick : Color -> Int 1\npick = \\v -> case v of\n  Red {} -> 1\n";
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "case v of");
-        let actions = handle_code_action(&tw.state, &params_at(&uri, pos)).unwrap_or_default();
-        let fill = actions.iter().find_map(|a| match a {
-            CodeActionOrCommand::CodeAction(ca)
-                if ca.title.starts_with("Add missing case arms") =>
-            {
-                Some(ca)
-            }
-            _ => None,
-        });
-        let fill = fill.expect("fill-case-arms action offered");
-        assert!(
-            fill.title.contains("Blue") && fill.title.contains("Green"),
-            "expected Color arms, got: {}",
-            fill.title
-        );
-        assert!(
-            !fill.title.contains("Circle"),
-            "scrutinee resolved to the wrong same-named binding: {}",
-            fill.title
-        );
-    }
-}
-
-// Regression tests for the 2026-06 LSP bug-fix batch 2 (code-action group).
-// Kept in a separate module so the earlier regression files stay untouched.
-#[cfg(test)]
-mod regress_fixes_batch2_tests {
-    use super::*;
-    use crate::test_support::{TempWorkspace, TestWorkspace};
-
-    fn parse_module(src: &str) -> Module {
-        let (tokens, lex_diags) = knot::lexer::Lexer::new(src).tokenize();
-        assert!(lex_diags.is_empty(), "lex errors in test source: {lex_diags:?}");
-        let (module, parse_diags) =
-            knot::parser::Parser::new(src.to_string(), tokens).parse_module();
-        assert!(parse_diags.is_empty(), "parse errors in test source: {parse_diags:?}");
-        module
-    }
-
-    fn parses_cleanly(src: &str) -> bool {
-        let (tokens, lex_diags) = knot::lexer::Lexer::new(src).tokenize();
-        let (_, parse_diags) =
-            knot::parser::Parser::new(src.to_string(), tokens).parse_module();
-        lex_diags.is_empty() && parse_diags.is_empty()
-    }
-
-    fn params_for(uri: &Uri, range: Range) -> CodeActionParams {
-        CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range,
-            context: CodeActionContext {
-                diagnostics: Vec::new(),
-                only: None,
-                trigger_kind: None,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        }
-    }
-
-    fn action_titled(
-        actions: &[CodeActionOrCommand],
-        pred: impl Fn(&str) -> bool,
-    ) -> Option<&CodeAction> {
-        actions.iter().find_map(|a| match a {
-            CodeActionOrCommand::CodeAction(ca) if pred(&ca.title) => Some(ca),
-            _ => None,
-        })
-    }
-
-    fn edits_for<'a>(action: &'a CodeAction, uri: &Uri) -> &'a [TextEdit] {
-        action
-            .edit
-            .as_ref()
-            .and_then(|e| e.changes.as_ref())
-            .and_then(|c| c.get(uri))
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Apply `TextEdit`s to `source`, back-to-front so offsets stay valid.
-    fn apply_edits_to(source: &str, edits: &[TextEdit]) -> String {
-        let mut spans: Vec<(usize, usize, &str)> = edits
-            .iter()
-            .map(|e| {
-                (
-                    crate::utils::position_to_offset(source, e.range.start),
-                    crate::utils::position_to_offset(source, e.range.end),
-                    e.new_text.as_str(),
-                )
-            })
-            .collect();
-        spans.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
-        let mut out = source.to_string();
-        for (start, end, text) in spans {
-            out.replace_range(start..end, text);
-        }
-        out
-    }
-
-    /// Bug 1: converting `double x` to pipe form under a binary operator must
-    /// parenthesize the pipe — `1 + x |> double` parses as `(1 + x) |> double`
-    /// because `|>` has the lowest precedence.
-    #[test]
-    fn pipe_conversion_parenthesizes_under_binary_operator() {
-        let src = "double = \\x -> x * 2\n\nf = \\x -> 1 + double x\n";
-        let module = parse_module(src);
-        let off = src.rfind("double x").expect("application");
-        let (span, replacement) =
-            find_pipe_conversion_at(&module, src, off).expect("pipe action offered");
-        assert_eq!(replacement, "(x |> double)");
-        let mut out = src.to_string();
-        out.replace_range(span.start..span.end, &replacement);
-        assert!(parses_cleanly(&out), "pipe rewrite must reparse: {out}");
-        assert!(out.contains("1 + (x |> double)"), "got: {out}");
-    }
-
-    /// Bug 1 (control): top-level applications keep the bare pipe form.
-    #[test]
-    fn pipe_conversion_stays_bare_outside_operators() {
-        let src = "h = \\x -> show x\n";
-        let module = parse_module(src);
-        let off = src.find("show x").expect("application") + 1;
-        let (_, replacement) =
-            find_pipe_conversion_at(&module, src, off).expect("pipe action offered");
-        assert_eq!(replacement, "x |> show");
-    }
-
-    /// B63: converting the inner application of `g (f x)` to pipe form must
-    /// parenthesize the pipe. The parser gives the inner `App` a span that
-    /// covers the source parens, so an unparenthesized `x |> f` would replace
-    /// `(f x)` with `x |> f`, producing `g x |> f` — which parses as
-    /// `f (g x)`, silently reversing the application order.
-    #[test]
-    fn pipe_conversion_parenthesizes_in_argument_position() {
-        let src = "k = \\x -> g (f x)\n";
-        let module = parse_module(src);
-        let off = src.find("f x").expect("inner application"); // on `f`
-        let (span, replacement) =
-            find_pipe_conversion_at(&module, src, off).expect("pipe action offered");
-        assert_eq!(replacement, "(x |> f)");
-        let mut out = src.to_string();
-        out.replace_range(span.start..span.end, &replacement);
-        assert!(parses_cleanly(&out), "pipe rewrite must reparse: {out}");
-        assert!(
-            out.contains("g (x |> f)"),
-            "application order must be preserved: {out}"
-        );
-    }
-
-    /// Bug 2: adding a wildcard arm to a case whose first arm sits inline on
-    /// the `of` line must indent the new arm at the FIRST ARM's column (the
-    /// layout block indent), not case-column+2 — the latter is shallower than
-    /// the block indent and fails to parse.
-    #[test]
-    fn add_wildcard_arm_aligns_with_inline_first_arm() {
-        let src = "data Color = Red {} | Blue {}\n\nf = \\c -> case c of Red {} -> 1\n";
-        let module = parse_module(src);
-        let off = src.find("case c").expect("case expr");
-        let (span, replacement) =
-            find_add_wildcard_arm_at(&module, src, off).expect("wildcard action offered");
-        let mut out = src.to_string();
-        out.replace_range(span.start..span.end, &replacement);
-        assert!(
-            parses_cleanly(&out),
-            "wildcard arm rewrite must reparse cleanly; got:\n{out}"
-        );
-        // The new arm must sit at the first arm's column (`Red` is at col 20).
-        let arm_col = src.lines().nth(2).unwrap().find("Red").unwrap();
-        let last_line = replacement.lines().last().unwrap();
-        assert_eq!(
-            last_line.len() - last_line.trim_start().len(),
-            arm_col,
-            "new arm must align with the inline first arm; got {replacement:?}"
-        );
-    }
-
-    /// Bug 3: `if not a && b …` parses as `(not a) && b`, so the textual
-    /// `not `-prefix strip negated only the first conjunct. The whole
-    /// condition must be wrapped in `not (…)` instead.
-    #[test]
-    fn negate_condition_wraps_when_not_binds_only_first_conjunct() {
-        let src = "f = \\a b -> if not a && b then 1 else 2\n";
-        let module = parse_module(src);
-        let off = src.find("if not").expect("if expr");
-        let (span, replacement) =
-            find_if_negate_at(&module, src, off).expect("negate action offered");
-        assert_eq!(replacement, "if not (not a && b) then 2 else 1");
-        let mut out = src.to_string();
-        out.replace_range(span.start..span.end, &replacement);
-        assert!(parses_cleanly(&out), "negate rewrite must reparse: {out}");
-    }
-
-    /// Bug 3 (control): when the condition's AST root IS the negation, the
-    /// `not` is stripped so the double negation cancels.
-    #[test]
-    fn negate_condition_strips_root_level_not() {
-        let src = "f = \\a -> if not a then 1 else 2\n";
-        let module = parse_module(src);
-        let off = src.find("if not").expect("if expr");
-        let (_, replacement) =
-            find_if_negate_at(&module, src, off).expect("negate action offered");
-        assert_eq!(replacement, "if a then 2 else 1");
-    }
-
-    /// Bug B66: a parenthesized `if` in operand position folds its parens into
-    /// the expr span. Replacing the whole `(if …)` span with a bare `if …`
-    /// dropped the parens, so the trailing `* 2` bound into the else branch
-    /// (`if not c then b else a * 2`). The rewrite must re-wrap in parens.
-    #[test]
-    fn negate_condition_reparenthesizes_operand_position() {
-        let src = "f = \\c a b -> (if c then a else b) * 2\n";
-        let module = parse_module(src);
-        let off = src.find("if c").expect("if expr");
-        let (span, replacement) =
-            find_if_negate_at(&module, src, off).expect("negate action offered");
-        assert_eq!(replacement, "(if not (c) then b else a)");
-        let mut out = src.to_string();
-        out.replace_range(span.start..span.end, &replacement);
-        assert_eq!(out, "f = \\c a b -> (if not (c) then b else a) * 2\n");
-        assert!(parses_cleanly(&out), "negate rewrite must reparse: {out}");
-    }
-
-    /// Bug 4: flipping a commutative operator whose operand is a keyword form
-    /// must parenthesize the moved `if` — keyword forms greedily consume to
-    /// their right, so the bare flip `if … else 2 == 0` would swallow `== 0`
-    /// into the else branch. (`&&`/`||` are deliberately excluded from the
-    /// flippable set — see `flip_operands_excludes_short_circuit_ops` — so
-    /// this uses `==`, which evaluates both operands unconditionally.)
-    #[test]
-    fn flip_operands_parenthesizes_keyword_form_operand() {
-        let src = "g = \\x -> 0 == if x then 1 else 2\n";
-        let module = parse_module(src);
-        let off = src.find("0 ==").expect("lhs operand");
-        let (span, replacement) =
-            find_flip_binary_at(&module, src, off).expect("flip action offered");
-        assert_eq!(replacement, "(if x then 1 else 2) == 0");
-        let mut out = src.to_string();
-        out.replace_range(span.start..span.end, &replacement);
-        assert!(parses_cleanly(&out), "flip rewrite must reparse: {out}");
-    }
-
-    /// Bug B64a: `a / b * c` parses as `(a / b) * c`. Flipping the `*`'s
-    /// operands must produce `c * (a / b)`, not `c * a / b` — the latter
-    /// reparses as `(c * a) / b`, a re-association that changes the value
-    /// under integer division (a=1,b=2,c=4: 0 vs 2). The moved `a / b`
-    /// operand shares `*`'s precedence, so it must be parenthesized.
-    #[test]
-    fn flip_operands_parenthesizes_reassociating_operand() {
-        let src = "f = \\a b c -> a / b * c\n";
-        let module = parse_module(src);
-        let off = src.find("* c").expect("mul operator");
-        let (span, replacement) =
-            find_flip_binary_at(&module, src, off).expect("flip action offered");
-        assert_eq!(replacement, "c * (a / b)");
-        let mut out = src.to_string();
-        out.replace_range(span.start..span.end, &replacement);
-        assert_eq!(out, "f = \\a b c -> c * (a / b)\n");
-        assert!(parses_cleanly(&out), "flip rewrite must reparse: {out}");
-    }
-
-    /// Bug B64b: the parser folds enclosing parens into a binary expression's
-    /// own span, so `f (a == b)` has an `==` node whose span covers `(a == b)`.
-    /// Flipping must preserve the parens (`f (b == a)`); dropping them yields
-    /// `f b == a`, which reparses as `(f b) == a` — a completely different
-    /// expression.
-    #[test]
-    fn flip_operands_preserves_enclosing_parens() {
-        let src = "f = \\a b -> f (a == b)\n";
-        let module = parse_module(src);
-        let off = src.find("a ==").expect("eq operand");
-        let (span, replacement) =
-            find_flip_binary_at(&module, src, off).expect("flip action offered");
-        assert_eq!(replacement, "b == a");
-        let mut out = src.to_string();
-        out.replace_range(span.start..span.end, &replacement);
-        assert_eq!(out, "f = \\a b -> f (b == a)\n");
-        assert!(parses_cleanly(&out), "flip rewrite must reparse: {out}");
-    }
-
-    /// `&&` / `||` must NOT be flippable: they short-circuit, so swapping
-    /// operands can change evaluation semantics — e.g. flipping the
-    /// divide-by-zero guard `x != 0 && 10 / x > 1` would evaluate `10 / x`
-    /// first and panic.
-    #[test]
-    fn flip_operands_excludes_short_circuit_ops() {
-        for (src, needle) in [
-            ("g = \\x -> x != 0 && 10 / x > 1\n", "&&"),
-            ("g = \\a b -> a || b\n", "||"),
-        ] {
-            let module = parse_module(src);
-            let off = src.find(needle).expect("operator present");
-            assert!(
-                find_flip_binary_at(&module, src, off).is_none(),
-                "short-circuit operator `{needle}` must not be flippable: {src}"
-            );
-        }
-    }
-
-    /// Bug 5a: inlining a `with` binding that sits inline on the `do` line
-    /// must not delete `main = do` itself — only the statement's own text
-    /// goes.
-    #[test]
-    fn inline_variable_on_do_line_keeps_do_header() {
-        let mut tw = TestWorkspace::new();
-        let src = "main = do with {y 5} (do yield (y + 1))\n";
-        assert!(parses_cleanly(src), "fixture must parse");
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "y ");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start: pos, end: pos }),
-        )
-        .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Inline"))
-            .expect("inline action offered");
-        let out = apply_edits_to(src, edits_for(action, &uri));
-        assert!(
-            out.contains("main = do"),
-            "`main = do` header was deleted:\n{out}"
-        );
-        assert!(out.contains("yield (5 + 1)"), "usage not inlined:\n{out}");
-        assert!(parses_cleanly(&out), "inline result must reparse:\n{out}");
-    }
-
-    /// Bug 5a (control): a `with` statement on its own line still unwraps to
-    /// the rewritten body, dropping the whole statement.
-    #[test]
-    fn inline_variable_own_line_removes_whole_line() {
-        let mut tw = TestWorkspace::new();
-        let src = "main = do\n  with {y 5} (do\n    yield (y + 1))\n";
-        assert!(parses_cleanly(src), "fixture must parse");
-        let uri = tw.open("main", src);
-        let pos = tw.position_of(&uri, "y ");
-        let actions = handle_code_action(
-            &tw.state,
-            &params_for(&uri, Range { start: pos, end: pos }),
-        )
-        .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Inline"))
-            .expect("inline action offered");
-        let out = apply_edits_to(src, edits_for(action, &uri));
-        // The `with` statement unwraps to its (rewritten) body: the inner
-        // `do` stays, the binding line disappears wholesale.
-        assert_eq!(out, "main = do\n  do\n    yield (5 + 1)\n");
-        assert!(parses_cleanly(&out), "inline result must reparse:\n{out}");
-    }
-
-    /// Bug 5b: extracting to let from a statement that sits inline on the
-    /// `do` line must insert at the statement's own offset (after `do `),
-    /// not at column 0 before the declaration.
-    #[test]
-    fn extract_to_with_on_do_line_wraps_after_do() {
-        let mut tw = TestWorkspace::new();
-        let src = "main = do yield (1 + 2)\n";
-        assert!(parses_cleanly(src), "fixture must parse");
-        let uri = tw.open("main", src);
-        let doc_source = tw.doc(&uri).source.clone();
-        let off = doc_source.find("1 + 2").expect("selection");
-        let range = Range {
-            start: crate::utils::offset_to_position(&doc_source, off),
-            end: crate::utils::offset_to_position(&doc_source, off + "1 + 2".len()),
-        };
-        let actions = handle_code_action(&tw.state, &params_for(&uri, range))
-            .unwrap_or_default();
-        let action = action_titled(&actions, |t| t.starts_with("Extract to with"))
-            .expect("extract-to-with offered inside do block");
-        let out = apply_edits_to(src, edits_for(action, &uri));
-        assert!(
-            out.starts_with("main = do with {extracted (1 + 2)} (do"),
-            "with-binding must be inserted after `do `, wrapping the statement:\\n{out}"
-        );
-        assert!(
-            out.contains("yield (extracted)"),
-            "the selected expression must be replaced by the bound name:\\n{out}"
-        );
-        assert!(parses_cleanly(&out), "extract result must reparse:\\n{out}");
-    }
-
-    /// Bug 6: the "Wrap IO in `fork`" quickfix never fixed the IO-in-atomic
-    /// diagnostic (fork propagates its argument's effects) and re-offered
-    /// itself forever on the inner span. It must no longer be offered.
-    #[test]
-    fn no_fork_quickfix_for_io_in_atomic() {
-        let mut tw = TestWorkspace::new();
-        let src = "main = atomic (println \"hi\")\n";
-        let uri = tw.open("main", src);
-        let doc_source = tw.doc(&uri).source.clone();
-        let off = doc_source.find("println").expect("io call");
-        let range = Range {
-            start: crate::utils::offset_to_position(&doc_source, off),
-            end: crate::utils::offset_to_position(&doc_source, off + "println".len()),
-        };
-        let diag = Diagnostic {
-            range,
-            message: "IO effects are not allowed inside atomic blocks".into(),
-            severity: Some(DiagnosticSeverity::ERROR),
-            ..Default::default()
-        };
-        let params = CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range,
-            context: CodeActionContext {
-                diagnostics: vec![diag],
-                only: None,
-                trigger_kind: None,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        };
-        let actions = handle_code_action(&tw.state, &params).unwrap_or_default();
-        assert!(
-            action_titled(&actions, |t| t.contains("fork")).is_none(),
-            "the ineffective fork quickfix must not be offered"
-        );
-        // The effective fix (unwrapping `atomic`) remains available.
-        assert!(
-            action_titled(&actions, |t| t == "Remove `atomic` wrapper").is_some(),
-            "remove-atomic quickfix should still be offered"
-        );
-    }
-}

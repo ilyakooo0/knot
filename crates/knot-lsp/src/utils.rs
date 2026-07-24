@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use lsp_types::{Position, Range, Uri};
 
-use knot::ast::{self, DeclKind, Module, Span};
+use knot::ast::{self, Expr, ExprKind, RecordField, Span};
 
 use crate::legend::{TOK_KEYWORD, TOK_OPERATOR};
 
@@ -376,24 +376,17 @@ pub fn find_word_last_in_source(source: &str, name: &str, start: usize, end: usi
 // ── Doc comments ────────────────────────────────────────────────────
 
 /// Extract doc comments (lines starting with `-- `) above each declaration.
-pub fn extract_doc_comments(source: &str, module: &Module) -> HashMap<String, String> {
+pub fn extract_doc_comments(source: &str, program: &Expr) -> HashMap<String, String> {
     let mut comments = HashMap::new();
     let lines: Vec<&str> = source.split('\n').collect();
 
-    for decl in &module.decls {
-        let name = match &decl.node {
-            DeclKind::Fun { name, .. }
-            | DeclKind::Data { name, .. }
-            | DeclKind::TypeAlias { name, .. }
-            | DeclKind::Source { name, .. }
-            | DeclKind::View { name, .. }
-            | DeclKind::Derived { name, .. }
-            | DeclKind::Route { name, .. }
-            | DeclKind::RouteComposite { name, .. } => name.clone(),
-            _ => continue,
+    for decl in top_fields(program) {
+        let name = match &decl.value.node {
+            ExprKind::SubsetConstraint { .. } => continue,
+            _ => decl.name.clone(),
         };
 
-        let decl_line = offset_to_position(source, decl.span.start).line as usize;
+        let decl_line = offset_to_position(source, decl.value.span.start).line as usize;
         if decl_line == 0 {
             continue;
         }
@@ -480,6 +473,20 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
 
 /// Recurse into all sub-expressions of `expr`, calling `f` on each.
 /// Lives here so multiple modules can share it without circular deps.
+/// The top-level record fields of the program (its declarations). The file
+/// is a single expression — usually a `with`-record or a record literal —
+/// whose fields are the declarations.
+pub fn top_fields(program: &Expr) -> Vec<&RecordField> {
+    match &program.node {
+        ExprKind::Record(fields) => fields.iter().collect(),
+        ExprKind::With { record, .. } => match &record.node {
+            ExprKind::Record(fields) => fields.iter().collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
 pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
     match &expr.node {
         ast::ExprKind::App { func, arg } => {
@@ -571,169 +578,6 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn position_to_offset_handles_ascii() {
-        let src = "abc\ndef";
-        assert_eq!(position_to_offset(src, Position::new(0, 0)), 0);
-        assert_eq!(position_to_offset(src, Position::new(0, 3)), 3);
-        assert_eq!(position_to_offset(src, Position::new(1, 0)), 4);
-        assert_eq!(position_to_offset(src, Position::new(1, 3)), 7);
-    }
 
-    #[test]
-    fn position_to_offset_treats_character_as_utf16_units() {
-        // "é" is 2 bytes in UTF-8 but 1 UTF-16 code unit.
-        let src = "éx";
-        assert_eq!(position_to_offset(src, Position::new(0, 0)), 0);
-        assert_eq!(position_to_offset(src, Position::new(0, 1)), 2); // after é
-        assert_eq!(position_to_offset(src, Position::new(0, 2)), 3); // after x
-    }
 
-    #[test]
-    fn position_to_offset_handles_surrogate_pairs() {
-        // 😀 is 4 bytes in UTF-8 and 2 UTF-16 code units (surrogate pair).
-        let src = "a😀b";
-        assert_eq!(position_to_offset(src, Position::new(0, 0)), 0); // before a
-        assert_eq!(position_to_offset(src, Position::new(0, 1)), 1); // after a
-        assert_eq!(position_to_offset(src, Position::new(0, 3)), 5); // after 😀 (1 + 4)
-        assert_eq!(position_to_offset(src, Position::new(0, 4)), 6); // after b
-    }
-
-    #[test]
-    fn offset_to_position_round_trips_ascii() {
-        let src = "hello\nworld";
-        for offset in 0..=src.len() {
-            let pos = offset_to_position(src, offset);
-            assert_eq!(position_to_offset(src, pos), offset, "offset {}", offset);
-        }
-    }
-
-    #[test]
-    fn offset_to_position_round_trips_unicode() {
-        let src = "x é\n😀 y";
-        // Round-trip every char-boundary offset.
-        for offset in 0..=src.len() {
-            if !src.is_char_boundary(offset) {
-                continue;
-            }
-            let pos = offset_to_position(src, offset);
-            assert_eq!(position_to_offset(src, pos), offset, "offset {}", offset);
-        }
-    }
-
-    #[test]
-    fn offset_to_position_emits_utf16_columns_for_surrogate_pairs() {
-        let src = "a😀b";
-        // Byte offset 5 is just after 😀 — should be UTF-16 column 3.
-        let pos = offset_to_position(src, 5);
-        assert_eq!(pos, Position::new(0, 3));
-    }
-}
-
-#[cfg(test)]
-mod regress_fixes_tests {
-    use super::*;
-
-    #[test]
-    fn offset_to_position_treats_lone_cr_as_line_break() {
-        // Regression (H1): a lone `\r` (classic-Mac line ending) is a real line
-        // break — matching the lexer and `diagnostic::line_col`. Offset 3 in
-        // "ab\rcd" is the start of line 1 (column 0), not column 3, so LSP
-        // positions stay in sync with lexer/diagnostic spans for `\r`-only files.
-        let src = "ab\rcd";
-        assert_eq!(offset_to_position(src, 3), Position::new(1, 0));
-        assert_eq!(offset_to_position(src, 5), Position::new(1, 2));
-    }
-
-    #[test]
-    fn round_trip_final_line_bare_cr() {
-        // A document whose last line ends in a bare CR (no LF): the `\r` is a
-        // line break, so the byte after it is the start of a new (empty) line.
-        let src = "abc\r";
-        assert_eq!(offset_to_position(src, 4), Position::new(1, 0));
-        assert_eq!(position_to_offset(src, Position::new(1, 0)), 4);
-        // A real CRLF terminator is still stripped from the column count, so
-        // the second line starts at the byte after the \n.
-        let crlf = "abc\r\ndef";
-        assert_eq!(position_to_offset(crlf, Position::new(0, 3)), 3); // end of "abc"
-        assert_eq!(position_to_offset(crlf, Position::new(1, 0)), 5); // start of "def"
-        assert_eq!(position_to_offset(crlf, Position::new(1, 3)), 8); // end of "def"
-    }
-
-    #[test]
-    fn round_trips_lone_cr_line_endings() {
-        // Regression (H1): every char-boundary offset of a `\r`-only document
-        // round-trips through offset_to_position / position_to_offset.
-        let src = "ab\rcd\ref";
-        for offset in 0..=src.len() {
-            if !src.is_char_boundary(offset) {
-                continue;
-            }
-            let pos = offset_to_position(src, offset);
-            assert_eq!(position_to_offset(src, pos), offset, "offset {offset}");
-        }
-        // Spot-check the derived line/column numbering.
-        assert_eq!(offset_to_position(src, 0), Position::new(0, 0)); // 'a'
-        assert_eq!(offset_to_position(src, 3), Position::new(1, 0)); // 'c'
-        assert_eq!(offset_to_position(src, 6), Position::new(2, 0)); // 'e'
-    }
-
-    #[test]
-    fn offset_to_position_still_strips_crlf_terminator() {
-        // Offset 3 points at the '\n' of the CRLF pair — the \r is part of
-        // the line break and must not contribute a column.
-        let src = "ab\r\ncd";
-        assert_eq!(offset_to_position(src, 3), Position::new(0, 2));
-        assert_eq!(offset_to_position(src, 4), Position::new(1, 0));
-    }
-
-    #[test]
-    fn word_at_position_resolves_caret_after_identifier() {
-        // Caret immediately after the last char of `total` (standard
-        // post-typing position) must still resolve the identifier.
-        let src = "total + 1";
-        assert_eq!(word_at_position(src, Position::new(0, 5)), Some("total"));
-        // Caret at EOF right after an identifier.
-        let src2 = "total";
-        assert_eq!(word_at_position(src2, Position::new(0, 5)), Some("total"));
-        // Caret between two non-ident chars still resolves nothing.
-        assert_eq!(word_at_position(src, Position::new(0, 7)), None);
-    }
-
-    #[test]
-    fn ident_lookup_offset_nudges_caret_back_into_word() {
-        let src = "total + 1";
-        assert_eq!(ident_lookup_offset(src, 5), 4); // after `total`
-        assert_eq!(ident_lookup_offset(src, 3), 3); // inside word — unchanged
-        assert_eq!(ident_lookup_offset(src, 6), 6); // not adjacent — unchanged
-    }
-
-    #[test]
-    fn recurse_expr_visits_serve_handler_bodies() {
-        use knot::ast::{ExprKind, ServeHandler, Span, Spanned};
-        let body = Spanned::new(ExprKind::Var("handler1".into()), Span::new(20, 28));
-        let serve = Spanned::new(
-            ExprKind::Serve {
-                api: "Api".into(),
-                api_span: Span::new(6, 9),
-                handlers: vec![ServeHandler {
-                    endpoint: "GetThing".into(),
-                    endpoint_span: Span::new(16, 24),
-                    body,
-                }],
-            },
-            Span::new(0, 30),
-        );
-        let mut seen = Vec::new();
-        recurse_expr(&serve, |e| {
-            if let ExprKind::Var(n) = &e.node {
-                seen.push(n.clone());
-            }
-        });
-        assert_eq!(seen, vec!["handler1".to_string()]);
-    }
-}

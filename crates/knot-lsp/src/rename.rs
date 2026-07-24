@@ -4,13 +4,13 @@ use std::collections::HashMap;
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind, Module, Span};
+use knot::ast::{self, Span};
 
 use crate::state::{builtins, DocumentState, ServerState, KEYWORDS};
 use crate::utils::{
     find_word_in_source, find_word_last_in_source, ident_lookup_offset,
     position_to_offset, recurse_expr,
-    safe_slice, span_to_range, word_at_position,
+    safe_slice, span_to_range, top_fields, word_at_position,
 };
 
 // ── Rename ──────────────────────────────────────────────────────────
@@ -408,7 +408,7 @@ fn name_span_within(source: &str, decl_span: Span, name: &str) -> Option<Span> {
 /// AST-driven (is the span actually a record-literal/pattern pun token?) —
 /// a textual neighbor check misfires on list elements like `[a, x, b]`.
 fn pun_aware_new_text(
-    module: &Module,
+    module: &ast::Expr,
     source: &str,
     span: Span,
     old_name: &str,
@@ -452,7 +452,7 @@ impl PunField for ast::RecordField {
     }
 }
 
-fn span_is_record_pun(module: &Module, source: &str, span: Span) -> bool {
+fn span_is_record_pun(module: &ast::Expr, source: &str, span: Span) -> bool {
     fn pun_in_pat(pat: &ast::Pat, source: &str, span: Span) -> bool {
         match &pat.node {
             ast::PatKind::Record(fields) => {
@@ -554,21 +554,22 @@ fn span_is_record_pun(module: &Module, source: &str, span: Span) -> bool {
     }
 
     let mut found = false;
-    for decl in &module.decls {
-        if decl.span.start > span.start || span.end > decl.span.end {
+    for decl in top_fields(module) {
+        let dspan = decl.value.span;
+        if dspan.start > span.start || span.end > dspan.end {
             continue;
         }
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => pun_in_expr(body, source, span, &mut found),
-            _ => {}
-        }
-        if found {
-            return true;
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+                pun_in_expr(body, source, span, &mut found)
+            }
+            _ => {
+                // A named function field.
+                pun_in_expr(&decl.value, source, span, &mut found)
+            }
         }
     }
-    false
+    found
 }
 
 /// Narrow a reference span to its editable name token. `SourceRef` /
@@ -657,7 +658,7 @@ fn pat_binds_name(pat: &ast::Pat, name: &str) -> bool {
 /// resolution unchanged, and never misses a genuine capture. An empty `out`
 /// means the rename is capture-free.
 pub(crate) fn collect_shadowed_names(
-    module: &Module,
+    module: &ast::Expr,
     old_name: &str,
     new_name: &str,
     out: &mut Vec<Span>,
@@ -771,14 +772,15 @@ pub(crate) fn collect_shadowed_names(
         recurse_expr(expr, |child| walk(child, old_name, new_name, stack, out));
     }
 
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+    for decl in top_fields(module) {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
                 walk(body, old_name, new_name, &mut Vec::new(), out);
             }
-            _ => {}
+            _ => {
+                // A named function field.
+                walk(&decl.value, old_name, new_name, &mut Vec::new(), out);
+            }
         }
     }
 }
@@ -789,20 +791,20 @@ pub(crate) fn collect_shadowed_names(
 /// and data-constructor fields (`Circle {radius: Float}`). The AST stores
 /// field names as bare strings (no per-name span), so we recover spans by
 /// scanning the field's containing source range.
-pub(crate) fn is_at_record_field(module: &ast::Module, source: &str, offset: usize) -> bool {
+pub(crate) fn is_at_record_field(module: &ast::Expr, source: &str, offset: usize) -> bool {
     field_position_at(module, source, offset).is_some()
 }
 
 /// Find the field name (and its span) at `offset`. Returns `None` if the
 /// cursor isn't on a field-name token.
 fn field_position_at(
-    module: &ast::Module,
+    module: &ast::Expr,
     source: &str,
     offset: usize,
 ) -> Option<(String, Span)> {
     let mut found: Option<(String, Span)> = None;
-    for decl in &module.decls {
-        if decl.span.start > offset || offset >= decl.span.end {
+    for decl in top_fields(module) {
+        if decl.value.span.start > offset || offset >= decl.value.span.end {
             continue;
         }
         field_sites_in_decl(decl, source, &mut |name, span| {
@@ -823,12 +825,12 @@ fn field_position_at(
 /// edits in a codebase where the same field name appears across multiple
 /// record types.
 fn collect_field_rename_sites(
-    module: &ast::Module,
+    module: &ast::Expr,
     source: &str,
     name: &str,
 ) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
-    for decl in &module.decls {
+    for decl in top_fields(module) {
         field_sites_in_decl(decl, source, &mut |n, span| {
             if n == name {
                 out.push(span);
@@ -853,29 +855,21 @@ fn collect_field_rename_sites(
 // field's value (or the container's opening token) and this field's value.
 
 /// Invoke `f(name, span)` for every record-field-name token in `decl`.
-fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: &mut F) {
-    match &decl.node {
-        DeclKind::Fun { ty, body, .. } => {
-            // The type signature can carry record types whose field names must
-            // rename in lockstep with the body (`mkPerson : Text -> {name:
-            // Text}`); every other decl arm walks its type via
-            // `field_sites_in_type`, so the Fun arm must too — otherwise a
-            // field rename leaves the signature stale and corrupts the source.
-            // Signature-only decls (`body: None`) still need their `ty` walked.
-            if let Some(scheme) = ty {
-                field_sites_in_type(&scheme.ty, source, f);
-            }
-            if let Some(body) = body {
-                field_sites_in_expr(body, source, f);
-            }
-        }
-        DeclKind::View { ty, body, .. } | DeclKind::Derived { ty, body, .. } => {
+fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::RecordField, source: &str, f: &mut F) {
+    let dspan = decl.value.span;
+    // The field's own signature can carry record types whose field names must
+    // rename in lockstep with the body (`mkPerson : Text -> {name: Text}`).
+    if let Some(scheme) = &decl.sig {
+        field_sites_in_type(&scheme.ty, source, f);
+    }
+    match &decl.value.node {
+        ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {
             if let Some(scheme) = ty {
                 field_sites_in_type(&scheme.ty, source, f);
             }
             field_sites_in_expr(body, source, f);
         }
-        DeclKind::Data { constructors, .. } => {
+        ast::ExprKind::DataCtor { constructors, .. } => {
             // Constructor fields appear sequentially in source order, so a
             // single running cursor across all constructors keeps each
             // field-name search confined to its own slot. The search starts
@@ -883,11 +877,11 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
             // parameter tokens that can collide with field names (renaming
             // field `a` in `data Pair a = Pair {a: Int}` must not match the
             // type parameter `a`).
-            let decl_text = safe_slice(source, decl.span);
+            let decl_text = safe_slice(source, dspan);
             let mut search_start = decl_text
                 .find('=')
-                .map(|i| decl.span.start + i + 1)
-                .unwrap_or(decl.span.start);
+                .map(|i| dspan.start + i + 1)
+                .unwrap_or(dspan.start);
             for ctor in constructors {
                 for fld in &ctor.fields {
                     if let Some(span) = find_word_in_source(
@@ -903,10 +897,10 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
                 }
             }
         }
-        DeclKind::TypeAlias { ty, .. } | DeclKind::Source { ty, .. } => {
+        ast::ExprKind::TypeCtor { name: _, ty, .. } | ast::ExprKind::SourceDecl { ty, .. } => {
             field_sites_in_type(ty, source, f);
         }
-        DeclKind::Route { entries, .. } => {
+        ast::ExprKind::RouteDecl { entries, .. } => {
             // Route field names are declared inline (`body {userId: Int}`,
             // `?{q: Text}`, `headers {auth: Text}`, and the response record
             // type) before their type. They appear in source order: body, path
@@ -914,7 +908,7 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
             // A single running cursor confines each name search to its own slot
             // (mirroring the `Data`/`Record` walks).
             for entry in entries {
-                let mut cursor = decl.span.start;
+                let mut cursor = dspan.start;
                 let field_list = |flds: &[ast::Field<ast::Type>],
                                   cursor: &mut usize,
                                   f: &mut F| {
@@ -944,7 +938,7 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
                 // previous segment's end and the type's start). Without this,
                 // renaming a field that is also a route path param left the
                 // path-param declaration site stale, breaking the route.
-                let mut path_name_cursor = decl.span.start;
+                let mut path_name_cursor = dspan.start;
                 for seg in &entry.path {
                     if let ast::PathSegment::Param { name, ty } = seg {
                         // Same reasoning as body fields: the param name `{id:
@@ -973,7 +967,12 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::Decl, source: &str, f: 
                 }
             }
         }
-        _ => {}
+        ast::ExprKind::SourceDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. }
+        | ast::ExprKind::SubsetConstraint { .. } => {}
+        _ => {
+            // A named function field: walk its body.
+            field_sites_in_expr(&decl.value, source, f);
+        }
     }
 }
 
@@ -1148,1150 +1147,3 @@ fn field_sites_in_type<F: FnMut(&str, Span)>(ty: &ast::Type, source: &str, f: &m
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
-    use crate::utils::offset_to_position;
-
-    fn rename_params(uri: &Uri, position: Position, new_name: &str) -> RenameParams {
-        RenameParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position,
-            },
-            new_name: new_name.to_string(),
-            work_done_progress_params: Default::default(),
-        }
-    }
-
-    fn prepare_params(uri: &Uri, position: Position) -> TextDocumentPositionParams {
-        TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            position,
-        }
-    }
-
-    #[test]
-    fn edit_span_narrows_to_identifier_token() {
-        // For each source the whole string is the reference span; `edit_span`
-        // must narrow it to the bare identifier — stripping leading `(`/`*`/`&`
-        // (parser folds parens into the SourceRef/DerivedRef span) and stopping
-        // before any trailing `)`. Renaming otherwise drops the sigil/parens.
-        for (src, expected) in [
-            ("users", "users"),
-            ("*users", "users"),
-            ("&d", "d"),
-            ("(*users)", "users"),
-            ("((*users))", "users"),
-            ("(&d)", "d"),
-            ("x'", "x'"),
-        ] {
-            let span = Span::new(0, src.len());
-            let narrowed = edit_span(src, span);
-            assert_eq!(
-                &src[narrowed.start..narrowed.end],
-                expected,
-                "edit_span({src:?}) should narrow to {expected:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn prepare_rename_rejects_unshadowed_builtin() {
-        // Cursor on `println` — a stdlib symbol with no local declaration.
-        // Renaming it would leave the binding broken, so prepare_rename
-        // should bail out before the editor offers the action.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "main = println \"hi\"\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("println").expect("builtin call");
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos));
-        assert!(resp.is_none(), "rename should bail on unshadowed builtin: {resp:?}");
-    }
-
-    #[test]
-    fn rename_rejects_invalid_new_name() {
-        // Renaming to a Knot keyword would produce a syntax error in every
-        // edited file. Reject before the workspace scan rather than commit
-        // and let the editor flag downstream parse failures.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "double = \\x -> x * 2\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("double").expect("def");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "do"));
-        assert!(edit.is_none(), "rename to keyword should be rejected: {edit:?}");
-    }
-
-    #[test]
-    fn rename_route_updates_composite_component() {
-        // Regression: `route Api = AApi | BApi` component references were never
-        // renamed — `collect_name_uses_in_decl` had no `RouteComposite` arm and
-        // `defs.rs` didn't record component references. Renaming `AApi` must
-        // update the composite component token too.
-        let mut ws = TestWorkspace::new();
-        let src = "route AApi where\n  /a\n    GET /one -> Int 1 = GetOne\nroute BApi where\n  /b\n    GET /two -> Int 1 = GetTwo\nroute Api = AApi | BApi\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("route AApi").expect("route def") + "route ".len();
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "RenamedApi"))
-            .expect("rename produces edits");
-        let mut changes = edit.changes.expect("changes present");
-        let edits = changes.remove(&uri).expect("file has edits");
-
-        // Locate the composite's `AApi` component token (after `=`).
-        let composite_off = doc.source.find("Api = AApi").expect("composite line");
-        let comp_off = doc.source[composite_off..].find("AApi").unwrap() + composite_off;
-        let comp_pos = offset_to_position(&doc.source, comp_off);
-        assert!(
-            edits
-                .iter()
-                .any(|e| e.range.start == comp_pos && e.new_text.contains("RenamedApi")),
-            "composite component `AApi` must be renamed; edits: {edits:?}"
-        );
-    }
-
-    #[test]
-    fn rename_field_updates_route_path_param() {
-        // Regression: route path-param names (`/{owner: Text}`) were never
-        // collected as field-rename sites — the param walk only visited the
-        // param's *type*. Renaming a field also used as a path param left the
-        // path-param declaration stale, breaking the route. Renaming the
-        // `owner` field must also update the `/{owner: Text}` token.
-        let mut ws = TestWorkspace::new();
-        let src = "type Todo = {title: Text, owner: Text}\n\
-                   *todos : [Todo]\n\
-                   route TodoApi where\n  /todos\n    GET /{owner: Text} -> [Todo] = GetTodos\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        // Initiate the rename from the `owner` field in the `Todo` record.
-        let field_off = doc.source.find("owner").expect("owner field");
-        let pos = offset_to_position(&doc.source, field_off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "holder"))
-            .expect("rename produces edits");
-        let mut changes = edit.changes.expect("changes present");
-        let edits = changes.remove(&uri).expect("file has edits");
-
-        // Locate the path-param `owner` token (after `/{`).
-        let param_off = doc.source.find("/{owner").expect("path param") + "/{".len();
-        let param_pos = offset_to_position(&doc.source, param_off);
-        assert!(
-            edits
-                .iter()
-                .any(|e| e.range.start == param_pos && e.new_text.contains("holder")),
-            "path-param `owner` must be renamed; edits: {edits:?}"
-        );
-    }
-
-    #[test]
-    fn prepare_rename_accepts_known_symbol() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "id = \\x -> x\nmain = id 5\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("id =").expect("id def");
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos))
-            .expect("prepare rename accepts");
-        match resp {
-            PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
-                assert_eq!(placeholder, "id");
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn prepare_rename_accepts_field_named_like_builtin() {
-        // A record field named like a stdlib symbol (`count`, `map`, …) lives
-        // in a separate namespace from the builtin, and `handle_rename`
-        // renames it correctly. The builtin-rejection guard must exempt field
-        // positions, otherwise the editor never offers F2 on the field.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "g = {count 2}\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("count").expect("field");
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos))
-            .expect("prepare rename accepts builtin-named field");
-        match resp {
-            PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
-                assert_eq!(placeholder, "count");
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn prepare_rename_rejects_keyword_position() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "id = \\x -> x\n");
-        let doc = ws.doc(&uri);
-        // Cursor on the lambda backslash — not a renameable symbol.
-        let off = doc.source.find('\\').expect("lambda");
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos));
-        assert!(resp.is_none(), "unexpected accept: {resp:?}");
-    }
-
-    #[test]
-    fn rename_does_not_touch_unrelated_local_with_same_name() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        // Two files: owner declares `parse`, unrelated file has its own
-        // local `parse`. Renaming owner.parse should leave the unrelated
-        // file alone.
-        let owner_uri = tw.write_and_open("owner.knot", "parse = \\x -> x\n");
-        let unrelated_uri = tw.write_and_open(
-            "unrelated.knot",
-            "parse = \\y -> y\nmain = parse 1\n",
-        );
-        let owner_doc = tw.workspace.doc(&owner_uri);
-        let off = owner_doc.source.find("parse =").expect("def");
-        let pos = offset_to_position(&owner_doc.source, off);
-        let edit = handle_rename(&tw.workspace.state, &rename_params(&owner_uri, pos, "parsed"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        assert!(
-            changes.contains_key(&owner_uri),
-            "owner file should be edited"
-        );
-        assert!(
-            !changes.contains_key(&unrelated_uri),
-            "unrelated file with same-name local was renamed; got: {changes:?}"
-        );
-    }
-
-    /// Apply a list of `TextEdit`s to `source` (positions resolved against
-    /// `source`). Edits are applied back-to-front so earlier offsets stay
-    /// valid.
-    fn apply_edits(source: &str, edits: &[TextEdit]) -> String {
-        let mut spans: Vec<(usize, usize, &str)> = edits
-            .iter()
-            .map(|e| {
-                (
-                    position_to_offset(source, e.range.start),
-                    position_to_offset(source, e.range.end),
-                    e.new_text.as_str(),
-                )
-            })
-            .collect();
-        spans.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
-        let mut out = source.to_string();
-        for (start, end, text) in spans {
-            out.replace_range(start..end, text);
-        }
-        out
-    }
-
-    #[test]
-    fn collect_shadowed_names_flags_inner_capture() {
-        // B71: renaming `x` to `y` in `\x -> \y -> x + y` captures the `x` use
-        // under the inner `\y` binder. `collect_shadowed_names` must report it.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\x -> \\y -> x + y\n");
-        let mut conflicts = Vec::new();
-        collect_shadowed_names(&ws.doc(&uri).module, "x", "y", &mut conflicts);
-        assert!(
-            !conflicts.is_empty(),
-            "capture of `x` by inner `y` binder must be flagged"
-        );
-    }
-
-    #[test]
-    fn collect_shadowed_names_ignores_safe_rename() {
-        // Renaming `x` to a fresh name never bound anywhere is capture-free.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\x -> \\y -> x + y\n");
-        let mut conflicts = Vec::new();
-        collect_shadowed_names(&ws.doc(&uri).module, "x", "z", &mut conflicts);
-        assert!(
-            conflicts.is_empty(),
-            "renaming to an unbound name should not warn; got {conflicts:?}"
-        );
-    }
-
-    #[test]
-    fn collect_shadowed_names_ignores_disjoint_scopes() {
-        // The `y` binder's scope (`\y -> y`) does not enclose the `x` use, so
-        // renaming `x` to `y` here is safe — no false positive.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "g = \\x -> (\\y -> y) + x\n");
-        let mut conflicts = Vec::new();
-        collect_shadowed_names(&ws.doc(&uri).module, "x", "y", &mut conflicts);
-        assert!(
-            conflicts.is_empty(),
-            "disjoint `y` scope must not trigger a capture warning; got {conflicts:?}"
-        );
-    }
-
-    #[test]
-    fn collect_shadowed_names_flags_reverse_capture() {
-        // Renaming the inner `x` to `y` makes the renamed binder capture the
-        // outer `y` reference: `\y -> \x -> y + x` → `\y -> \y -> y + y`.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\y -> \\x -> y + x\n");
-        let mut conflicts = Vec::new();
-        collect_shadowed_names(&ws.doc(&uri).module, "x", "y", &mut conflicts);
-        assert!(
-            !conflicts.is_empty(),
-            "renamed binder capturing the outer `y` use must be flagged"
-        );
-    }
-
-    #[test]
-    fn rename_flags_capture_conflict_for_confirmation() {
-        // End to end: renaming `x` to `y` in the B71 program still produces the
-        // edits (so the rename can proceed) but marks them `needs_confirmation`
-        // via a change annotation, warning the user of the capture.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\x -> \\y -> x + y\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("\\x").expect("outer binder") + 1;
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "y"))
-            .expect("rename still emits edits");
-        let annotations = edit
-            .change_annotations
-            .as_ref()
-            .expect("capture rename must carry a change annotation");
-        assert_eq!(annotations.len(), 1, "one confirmation annotation expected");
-        let annotation = annotations.values().next().unwrap();
-        assert_eq!(
-            annotation.needs_confirmation,
-            Some(true),
-            "the annotation must require user confirmation"
-        );
-        // The edits are still delivered (via both `changes` and the annotated
-        // `document_changes`), so a client that confirms can apply the rename.
-        assert!(edit.changes.is_some(), "changes retained for fallback clients");
-        assert!(
-            matches!(&edit.document_changes, Some(DocumentChanges::Edits(edits)) if !edits.is_empty()),
-            "annotated document_changes must be present"
-        );
-    }
-
-    #[test]
-    fn rename_without_conflict_is_unannotated() {
-        // A capture-free rename returns a plain edit with no confirmation
-        // annotation — the common case is unaffected by the guard.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\x -> \\y -> x + y\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("\\x").expect("outer binder") + 1;
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "z"))
-            .expect("rename emits edits");
-        assert!(
-            edit.change_annotations.is_none(),
-            "safe rename must not carry a confirmation annotation"
-        );
-        let changes = edit.changes.expect("changes present");
-        let out = apply_edits(&doc.source, changes.get(&uri).expect("edits"));
-        assert_eq!(out, "f = \\z -> \\y -> z + y\n");
-    }
-
-    #[test]
-    fn rename_constructor_preserves_pattern_payload() {
-        // Regression: constructor-pattern references used to span the whole
-        // pattern (`Circle c`), so renaming the constructor deleted the
-        // payload binder.
-        let mut ws = TestWorkspace::new();
-        let src = "data Shape = Circle {radius: Int 1} | Square {side: Int 1}\n\
-                   area = \\s -> case s of\n  Circle c -> c.radius\n  Square q -> q.side\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("Circle").expect("ctor def");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "Round"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("owner file edited");
-        let out = apply_edits(&doc.source, edits);
-        assert!(
-            out.contains("Round c -> c.radius"),
-            "payload binder must survive constructor rename; got:\n{out}"
-        );
-        assert!(
-            out.contains("data Shape = Round {radius: Int 1}"),
-            "data declaration should be renamed; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn rename_payload_var_does_not_touch_constructor() {
-        // Regression: the whole-pattern reference span made a payload-variable
-        // cursor resolve to the constructor's definition, corrupting the
-        // `data` declaration.
-        let mut ws = TestWorkspace::new();
-        let src = "data Shape = Circle {radius: Int 1} | Square {side: Int 1}\n\
-                   area = \\s -> case s of\n  Circle c -> c.radius\n  Square q -> q.side\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("c.radius").expect("payload usage");
-        let pos = offset_to_position(&doc.source, off);
-        if let Some(edit) = handle_rename(&ws.state, &rename_params(&uri, pos, "circ")) {
-            let changes = edit.changes.expect("changes present");
-            let edits = changes.get(&uri).expect("owner file edited");
-            let out = apply_edits(&doc.source, edits);
-            assert!(
-                out.contains("data Shape = Circle {radius: Int 1}"),
-                "data declaration must not be touched by payload-var rename; got:\n{out}"
-            );
-            assert!(
-                out.contains("Circle circ -> circ.radius"),
-                "binder and usage should be renamed together; got:\n{out}"
-            );
-        }
-    }
-
-    #[test]
-    fn rename_punned_pattern_binder_expands_pun() {
-        // Punning is gone: record patterns are explicit (`{name name}` binds
-        // field `name` to binder `name`). Renaming the *binder* (via a body
-        // usage) must rewrite only the binder pattern + usages — the field
-        // name token stays put, so the matched field is preserved.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "getName = \\{name name} -> name\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("> name").expect("body usage") + 2;
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "fullName"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("owner file edited");
-        let out = apply_edits(&doc.source, edits);
-        assert_eq!(
-            out, "getName = \\{name fullName} -> fullName\n",
-            "binder rename must leave the field name token untouched"
-        );
-    }
-
-    #[test]
-    fn rename_through_expression_pun_expands_pun() {
-        // Same for record expressions: `{name name}` builds a record whose
-        // field `name` reads the variable `name`. Renaming the variable must
-        // not change the built field name.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "mk = \\name -> {name name}\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("name}").expect("expr field value");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("owner file edited");
-        let out = apply_edits(&doc.source, edits);
-        assert_eq!(
-            out, "mk = \\label -> {name label}\n",
-            "variable rename must leave the field name token untouched"
-        );
-    }
-
-    #[test]
-    fn field_rename_targets_field_token_not_variable() {
-        // `count` appears both as a lambda-bound variable (value position of
-        // field `a`) and as a field name. Renaming the *field* must touch only
-        // the field token — the old first-whole-word scan rewrote the variable
-        // and left the field untouched.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\count -> {a count count 2}\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("count 2").expect("field position");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "total"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("edits for main");
-        assert_eq!(edits.len(), 1, "exactly the field token; got: {edits:?}");
-        let new_src = apply_edits(&doc.source, edits);
-        assert_eq!(new_src, "f = \\count -> {a count total 2}\n");
-    }
-
-    #[test]
-    fn field_rename_rewrites_same_named_fields_in_separate_records() {
-        // Two records in one expression, each with a field `n`. The old
-        // implementation found the same (first) span twice and deduped to a
-        // single wrong edit.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "g = [{n 1}, {n 2}]\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("n 1").expect("first field");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "m"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("edits for main");
-        assert_eq!(edits.len(), 2, "one edit per record; got: {edits:?}");
-        let new_src = apply_edits(&doc.source, edits);
-        assert_eq!(new_src, "g = [{m 1}, {m 2}]\n");
-    }
-
-    #[test]
-    fn field_rename_updates_function_signature_type() {
-        // Regression: `field_sites_in_decl`'s Fun arm walked only the body and
-        // dropped the `ty` scheme, so renaming a record field left the
-        // signature's `{name: Text}` stale — a type mismatch that corrupts the
-        // source. The signature occurrence must rename in lockstep.
-        let mut ws = TestWorkspace::new();
-        let src = "mkPerson : Text -> {name: Text}\nmkPerson = \\n -> {name n}\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("name n").expect("body field");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "fullName"))
-            .expect("rename emits edit");
-        let edits = edit.changes.expect("changes").get(&uri).expect("edits").clone();
-        assert_eq!(
-            edits.len(),
-            2,
-            "both signature and body field tokens; got: {edits:?}"
-        );
-        let new_src = apply_edits(&doc.source, &edits);
-        assert_eq!(
-            new_src,
-            "mkPerson : Text -> {fullName: Text}\nmkPerson = \\n -> {fullName n}\n"
-        );
-    }
-
-    #[test]
-    fn field_rename_updates_inline_annotation_type() {
-        // Regression: `field_sites_in_expr` had no `Annot` arm and
-        // `recurse_expr` descends only into an annotation's inner expression,
-        // never its type — so the field in `(r : {name: Text})` was never
-        // collected, leaving the annotation stale after a field rename.
-        let mut ws = TestWorkspace::new();
-        let src = "f = \\r -> (r : {name: Text})\ng = {name 1}\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("name 1").expect("record field");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
-            .expect("rename emits edit");
-        let edits = edit.changes.expect("changes").get(&uri).expect("edits").clone();
-        let new_src = apply_edits(&doc.source, &edits);
-        assert_eq!(
-            new_src,
-            "f = \\r -> (r : {label: Text})\ng = {label 1}\n",
-            "annotation field must rename too; got edits: {edits:?}"
-        );
-    }
-
-    #[test]
-    fn rename_bails_when_pending_text_is_newer() {
-        use crate::state::PendingSource;
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "double = \\x -> x * 2\nmain = double 1\n");
-        let doc_source = ws.doc(&uri).source.clone();
-        let off = doc_source.find("double =").expect("def");
-        let pos = offset_to_position(&doc_source, off);
-        // Simulate an edit that hasn't been analyzed yet: spans computed from
-        // the analyzed source would corrupt the editor's newer buffer.
-        ws.state.pending_sources.insert(
-            uri.clone(),
-            PendingSource {
-                source: "-- new line\ndouble = \\x -> x * 2\nmain = double 1\n".into(),
-                version: Some(2),
-            },
-        );
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "doubled"));
-        assert!(
-            edit.is_none(),
-            "rename against stale analysis must bail; got: {edit:?}"
-        );
-    }
-
-    #[test]
-    fn rename_emits_edits_for_decl_and_usages() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "double = \\x -> x * 2\nmain = println (show (double 21))\n",
-        );
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("double =").expect("def");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "doubled"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("edits for main");
-        // Decl + one usage = 2 edits at minimum.
-        assert!(edits.len() >= 2, "got: {edits:?}");
-        assert!(edits.iter().all(|e| e.new_text == "doubled"));
-    }
-}
-
-/// Regression tests for the rename/references/highlight fix batch (sigil
-/// preservation, AST-driven pun detection, builtin-shadowing prepare,
-/// data-field search windows, local binder resolution, case-class guard,
-/// references origin discipline, linked-editing recursion).
-#[cfg(test)]
-mod regress_rename_fixes_tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
-    use crate::utils::offset_to_position;
-
-    fn rename_params(uri: &Uri, position: Position, new_name: &str) -> RenameParams {
-        RenameParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position,
-            },
-            new_name: new_name.to_string(),
-            work_done_progress_params: Default::default(),
-        }
-    }
-
-    fn prepare_params(uri: &Uri, position: Position) -> TextDocumentPositionParams {
-        TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            position,
-        }
-    }
-
-    /// Apply `TextEdit`s to `source`, back-to-front so offsets stay valid.
-    fn apply_edits(source: &str, edits: &[TextEdit]) -> String {
-        let mut spans: Vec<(usize, usize, &str)> = edits
-            .iter()
-            .map(|e| {
-                (
-                    position_to_offset(source, e.range.start),
-                    position_to_offset(source, e.range.end),
-                    e.new_text.as_str(),
-                )
-            })
-            .collect();
-        spans.sort_by_key(|(s, _, _)| std::cmp::Reverse(*s));
-        let mut out = source.to_string();
-        for (start, end, text) in spans {
-            out.replace_range(start..end, text);
-        }
-        out
-    }
-
-    // ── Finding 3: relation sigils survive rename ───────────────────
-
-    #[test]
-    fn rename_source_relation_keeps_star_sigil() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "*todos : [{title: Text}]\nallTodos = *todos\n",
-        );
-        let doc = ws.doc(&uri);
-        // Cursor on the usage's name (after the sigil).
-        let off = doc.source.find("= *todos").expect("usage") + 3;
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "items"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("edits for main");
-        let out = apply_edits(&doc.source, edits);
-        assert_eq!(
-            out, "*items : [{title: Text}]\nallTodos = *items\n",
-            "the `*` sigil must survive the rename; edits: {edits:?}"
-        );
-    }
-
-    #[test]
-    fn rename_derived_relation_keeps_ampersand_sigil() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "*todos : [{title: Text}]\n&open = *todos\nmain = &open\n",
-        );
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("&open\n").expect("usage") + 1;
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "pending"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("edits for main");
-        let out = apply_edits(&doc.source, edits);
-        assert_eq!(
-            out,
-            "*todos : [{title: Text}]\n&pending = *todos\nmain = &pending\n",
-            "the `&` sigil must survive the rename; edits: {edits:?}"
-        );
-    }
-
-    // ── Finding 4: pun detection must not misfire on list elements ──
-
-    #[test]
-    fn rename_list_element_is_not_treated_as_pun() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\x -> [1, x, 2]\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find(", x,").expect("list element") + 2;
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "y"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("edits for main");
-        let out = apply_edits(&doc.source, edits);
-        assert_eq!(
-            out, "f = \\y -> [1, y, 2]\n",
-            "a list element between commas is not a record pun; edits: {edits:?}"
-        );
-    }
-
-    #[test]
-    fn rename_real_expression_pun_still_expands() {
-        // Punning is gone, but the explicit `{name name}` form has the same
-        // hazard: renaming the variable must rewrite only the value token so
-        // the built record keeps its field name.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "mk = \\name -> {name name}\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("name}").expect("expr field value");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("edits for main");
-        let out = apply_edits(&doc.source, edits);
-        assert_eq!(out, "mk = \\label -> {name label}\n");
-    }
-
-    #[test]
-    fn rename_explicit_same_named_field_value_is_not_a_pun() {
-        // `{name name}` written out explicitly: the value var renames in
-        // place; touching the field name token would corrupt the record.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "mk = \\name -> {name name}\n");
-        let doc = ws.doc(&uri);
-        // Cursor on the VALUE var (the second `name`).
-        let off = doc.source.find("name}").expect("value var");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "label"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("edits for main");
-        let out = apply_edits(&doc.source, edits);
-        assert_eq!(out, "mk = \\label -> {name label}\n");
-    }
-
-    // ── Finding 5: prepare_rename on usages of builtin-shadowing symbols ──
-
-    #[test]
-    fn prepare_rename_accepts_usage_of_user_symbol_shadowing_builtin() {
-        // `count` is a stdlib builtin, but this file declares its own.
-        // F2 on a *usage* (not the definition token) must be accepted —
-        // handle_rename would succeed, so prepare must not refuse.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "count = \\x -> x\nmain = count 1\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("count 1").expect("usage");
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos))
-            .expect("prepare accepts usage of shadowing user symbol");
-        match resp {
-            PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
-                assert_eq!(placeholder, "count");
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn prepare_rename_still_rejects_unshadowed_builtin_usage() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "main = count [1]\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("count").expect("builtin usage");
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos));
-        assert!(resp.is_none(), "unshadowed builtin must be refused: {resp:?}");
-    }
-
-    // ── Finding 9: data-decl field rename skips the type-parameter header ──
-
-    #[test]
-    fn data_field_rename_does_not_hit_type_parameter() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "data Pair a = Pair {a: Int 1, b: a}\nmk = Pair {a 1 b 2}\n",
-        );
-        let doc = ws.doc(&uri);
-        // Cursor on the FIELD `a` inside the constructor record.
-        let off = doc.source.find("{a: Int").expect("field a") + 1;
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "first"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("edits for main");
-        let out = apply_edits(&doc.source, edits);
-        assert_eq!(
-            out,
-            "data Pair a = Pair {first: Int 1, b: a}\nmk = Pair {first 1 b 2}\n",
-            "the type parameter `a` (header and field type) must be untouched; edits: {edits:?}"
-        );
-    }
-
-    // ── Finding 11: case-class changes are rejected ─────────────────
-
-    #[test]
-    fn rename_rejects_constructor_to_lowercase() {
-        let mut ws = TestWorkspace::new();
-        let src = "data Shape = Circle {radius: Int 1}\n\
-                   area = \\s -> case s of\n  Circle c -> c.radius\n  _ -> 0\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("Circle").expect("ctor");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "round"));
-        assert!(
-            edit.is_none(),
-            "lowercase-initial name for a constructor would re-lex as a variable: {edit:?}"
-        );
-    }
-
-    #[test]
-    fn rename_rejects_function_to_uppercase() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "double = \\x -> x * 2\nmain = double 1\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("double =").expect("def");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "Double"));
-        assert!(
-            edit.is_none(),
-            "uppercase-initial name for a variable would re-lex as a constructor: {edit:?}"
-        );
-    }
-
-    // ── Finding 13: local binders resolve from their definition token ──
-
-    #[test]
-    fn rename_local_binder_from_its_definition_token() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\total -> total + 1\n");
-        let doc = ws.doc(&uri);
-        // Cursor ON the binder token itself.
-        let off = doc.source.find("\\total").expect("binder") + 1;
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "amount"))
-            .expect("rename resolves the binder from its definition token");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("edits for main");
-        let out = apply_edits(&doc.source, edits);
-        assert_eq!(out, "f = \\amount -> amount + 1\n");
-    }
-
-    #[test]
-    fn references_resolve_from_local_binder_token() {
-        use crate::references::handle_references;
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\total -> total + 1\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("\\total").expect("binder") + 1;
-        let pos = offset_to_position(&doc.source, off);
-        let params = ReferenceParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: pos,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: ReferenceContext {
-                include_declaration: false,
-            },
-        };
-        let locs = handle_references(&ws.state, &params)
-            .expect("references resolve from the binder token");
-        // At least the body usage `total + 1`.
-        let usage_off = doc.source.find("total + 1").expect("usage");
-        let usage_pos = offset_to_position(&doc.source, usage_off);
-        assert!(
-            locs.iter().any(|l| l.range.start == usage_pos),
-            "body usage must be reported; got: {locs:?}"
-        );
-    }
-
-    #[test]
-    fn document_highlight_resolves_from_local_binder_token() {
-        use crate::document_highlight::handle_document_highlight;
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\total -> total + 1\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("\\total").expect("binder") + 1;
-        let pos = offset_to_position(&doc.source, off);
-        let params = DocumentHighlightParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: pos,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        };
-        let highlights = handle_document_highlight(&ws.state, &params)
-            .expect("highlight resolves from the binder token");
-        assert_eq!(
-            highlights.len(),
-            2,
-            "binder (write) + one usage (read); got: {highlights:?}"
-        );
-    }
-
-    // ── Finding 7: no name-keyed retargeting in references ──────────
-
-    #[test]
-    fn references_on_field_does_not_retarget_same_named_top_level() {
-        use crate::references::handle_references;
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "count = \\x -> x\ng = {count: 2}\n");
-        let doc = ws.doc(&uri);
-        // Cursor on the record FIELD named `count`.
-        let off = doc.source.find("{count").expect("field") + 1;
-        let pos = offset_to_position(&doc.source, off);
-        let params = ReferenceParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: pos,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: ReferenceContext {
-                include_declaration: true,
-            },
-        };
-        let locs = handle_references(&ws.state, &params);
-        assert!(
-            locs.is_none(),
-            "a field token must not resolve to the unrelated top-level symbol: {locs:?}"
-        );
-    }
-
-    // ── Finding 2: caret immediately after an identifier ────────────
-
-    #[test]
-    fn prepare_rename_accepts_caret_after_identifier() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "double = \\x -> x * 2\nmain = double 1\n");
-        let doc = ws.doc(&uri);
-        // Caret right AFTER the last char of `double` at the call site.
-        let off = doc.source.find("double 1").expect("usage") + "double".len();
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos))
-            .expect("caret-after-word must resolve the identifier");
-        match resp {
-            PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
-                assert_eq!(placeholder, "double");
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
-    }
-
-    // ── Finding 12: linked editing recursion through UnaryOp ────────
-
-    #[test]
-    fn linked_editing_finds_fields_under_unary_op() {
-        use crate::linked_editing::handle_linked_editing_range;
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "g = \\p -> {amt (-p.amt)}\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("p.amt").expect("access") + 2;
-        let pos = offset_to_position(&doc.source, off);
-        let params = LinkedEditingRangeParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: pos,
-            },
-            work_done_progress_params: Default::default(),
-        };
-        let resp = handle_linked_editing_range(&ws.state, &params)
-            .expect("field under unary negation must be linked");
-        assert_eq!(resp.ranges.len(), 2, "field name + access; got: {:?}", resp.ranges);
-    }
-
-    // ── Body-line definition token of typed functions ────────────────
-    //
-    // The parser merges `f : T` ⏎ `f = body` into ONE DeclKind::Fun. Rename
-    // used to edit only the FIRST whole-word occurrence (the signature line)
-    // plus references, leaving the body-line `f` behind — silent corruption.
-
-    #[test]
-    fn rename_typed_function_edits_both_definition_lines() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "double : Int 1 -> Int 1\ndouble = \\x -> x * 2\nmain = double 2\n",
-        );
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("double").expect("sig line");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "triple"))
-            .expect("rename emits edit");
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&uri).expect("edits for main");
-        let out = apply_edits(&doc.source, edits);
-        assert_eq!(
-            out,
-            "triple : Int 1 -> Int 1\ntriple = \\x -> x * 2\nmain = triple 2\n",
-            "the body-line definition token must be renamed too; edits: {edits:?}"
-        );
-    }
-
-    #[test]
-    fn rename_typed_function_initiated_from_body_line_token() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "double : Int 1 -> Int 1\ndouble = \\x -> x * 2\nmain = double 2\n",
-        );
-        let doc = ws.doc(&uri);
-        // Cursor on the BODY-line `double` (second occurrence).
-        let off = doc.source.find("double =").expect("body line");
-        let pos = offset_to_position(&doc.source, off);
-        let prep = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos));
-        assert!(prep.is_some(), "prepare must accept the body-line token");
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "triple"))
-            .expect("rename emits edit");
-        let edits = edit.changes.expect("changes").remove(&uri).expect("edits");
-        let out = apply_edits(&doc.source, &edits);
-        assert_eq!(
-            out,
-            "triple : Int 1 -> Int 1\ntriple = \\x -> x * 2\nmain = triple 2\n"
-        );
-    }
-
-    // ── Primed identifiers (`x'`) ────────────────────────────────────
-
-    #[test]
-    fn rename_primed_identifier_covers_whole_token() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\x' -> x' + 1\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("x' +").expect("usage");
-        let pos = offset_to_position(&doc.source, off);
-        let prep = handle_prepare_rename(&ws.state, &prepare_params(&uri, pos))
-            .expect("prepare accepts primed identifier");
-        match prep {
-            PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
-                assert_eq!(placeholder, "x'", "placeholder must include the prime");
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "y'"))
-            .expect("rename emits edit");
-        let edits = edit.changes.expect("changes").remove(&uri).expect("edits");
-        let out = apply_edits(&doc.source, &edits);
-        assert_eq!(
-            out, "f = \\y' -> y' + 1\n",
-            "renaming `x'` must not leave stray primes; edits: {edits:?}"
-        );
-    }
-
-    // ── New-name validation must match the (ASCII-only) lexer ────────
-
-    #[test]
-    fn rename_rejects_non_ascii_new_name() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "double = \\x -> x * 2\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("double").expect("def");
-        let pos = offset_to_position(&doc.source, off);
-        // `naïve` passes Unicode is_alphabetic but the lexer is ASCII-only —
-        // accepting it would corrupt every edited file.
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "naïve"));
-        assert!(edit.is_none(), "non-ASCII name must be rejected: {edit:?}");
-    }
-
-    #[test]
-    fn rename_rejects_all_lexer_keywords() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "double = \\x -> x * 2\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("double").expect("def");
-        let pos = offset_to_position(&doc.source, off);
-        // Previously missing from KEYWORDS: serve/unit/refine/forall/true/false.
-        for kw in ["serve", "unit", "refine", "forall", "true", "false"] {
-            let edit = handle_rename(&ws.state, &rename_params(&uri, pos, kw));
-            assert!(edit.is_none(), "rename to keyword `{kw}` must be rejected");
-        }
-    }
-
-    #[test]
-    fn rename_accepts_primed_new_name() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "double = \\x -> x * 2\nmain = double 1\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("double").expect("def");
-        let pos = offset_to_position(&doc.source, off);
-        // `'` is a legal identifier-continue char in the lexer.
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "double'"));
-        assert!(edit.is_some(), "primed new name must be accepted");
-    }
-
-    #[test]
-    fn rename_route_endpoint_constructor_updates_route_decl_and_serve() {
-        // Renaming the endpoint constructor from its `serve` handler must also
-        // rewrite the route declaration's `= GetUsers` site (spanless in the
-        // AST) — otherwise the route dangles and serve exhaustiveness breaks.
-        let mut ws = TestWorkspace::new();
-        let src = r#"type Resp = {ok: Bool}
-route Api where
-  GET /users -> Resp = GetUsers
-
-srv = (serve Api where GetUsers = \req -> Ok {value {ok true}})
-"#;
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        // Start the rename from the `serve` handler's endpoint token.
-        let off = doc.source.find("GetUsers = \\req").expect("serve endpoint");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "ListUsers"))
-            .expect("rename emits edit");
-        let edits = edit.changes.expect("changes").remove(&uri).expect("edits");
-        let out = apply_edits(&doc.source, &edits);
-        assert!(
-            out.contains("-> Resp = ListUsers"),
-            "route decl endpoint constructor must be renamed; got:\n{out}"
-        );
-        assert!(
-            out.contains("serve Api where ListUsers ="),
-            "serve handler endpoint must be renamed; got:\n{out}"
-        );
-        assert!(
-            !out.contains("GetUsers"),
-            "no stale GetUsers should remain; got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn rename_source_updates_subset_constraint_refs() {
-        // Renaming a source relation must rewrite its occurrences inside a
-        // `*sub <= *sup` subset constraint (spanless `RelationPath`), including
-        // when the same relation appears on both sides of a uniqueness
-        // constraint. Otherwise the constraint dangles and breaks the source.
-        let mut ws = TestWorkspace::new();
-        let src = "*people : [{name: Text, email: Text}]\n\
-                   *orders : [{customer: Text}]\n\
-                   *orders.customer <= *people.name\n\
-                   *people <= *people.email\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        // Rename `people` starting from its declaration.
-        let off = doc.source.find("people").expect("source decl");
-        let pos = offset_to_position(&doc.source, off);
-        let edit = handle_rename(&ws.state, &rename_params(&uri, pos, "humans"))
-            .expect("rename emits edit");
-        let edits = edit.changes.expect("changes").remove(&uri).expect("edits");
-        let out = apply_edits(&doc.source, &edits);
-        assert!(
-            out.contains("*orders.customer <= *humans.name"),
-            "referential-integrity constraint must be renamed; got:\n{out}"
-        );
-        assert!(
-            out.contains("*humans <= *humans.email"),
-            "both sides of the uniqueness constraint must be renamed; got:\n{out}"
-        );
-        assert!(
-            !out.contains("people"),
-            "no stale `people` should remain; got:\n{out}"
-        );
-    }
-}

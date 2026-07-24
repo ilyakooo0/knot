@@ -2,7 +2,7 @@
 //!
 //! Usage: knot build <file.knot>
 
-use knot_compiler::{base, codegen, desugar, effects, infer, linker, lockfile, stratify, types, unused};
+use knot_compiler::{base, codegen, desugar, effects, infer, linker, lockfile, stratify, types};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -204,7 +204,7 @@ fn cmd_fmt(args: &[String]) {
         }
 
         let parser = knot::parser::Parser::new(source.clone(), tokens);
-        let (module, parse_diags) = parser.parse_module();
+        let (expr, parse_diags) = parser.parse_file_expr();
         let parse_errs: Vec<_> = parse_diags
             .iter()
             .filter(|d| d.severity == knot::diagnostic::Severity::Error)
@@ -217,7 +217,7 @@ fn cmd_fmt(args: &[String]) {
             process::exit(1);
         }
 
-        let formatted = knot::format::format_module(&source, &module);
+        let formatted = knot::format::format_expr(&source, &expr);
 
         if check {
             if formatted != source {
@@ -323,9 +323,9 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         }
     }
 
-    // Parse
+    // Parse — a `.knot` file is a single expression.
     let parser = knot::parser::Parser::new(source.clone(), tokens);
-    let (mut module, parse_diags) = parser.parse_module();
+    let (mut program, parse_diags) = parser.parse_file_expr();
     let has_errors = parse_diags
         .iter()
         .any(|d| d.severity == knot::diagnostic::Severity::Error);
@@ -336,20 +336,16 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         process::exit(1);
     }
 
-    // Save original decls before mutations (prelude/desugar add decls
-    // with spans referencing other source texts — lockfile needs original spans).
-    let original_decls = module.decls.clone();
-
-    // Inject built-in trait declarations and primitive impls
-    base::inject_prelude(&mut module);
+    // Inject the standard prelude: wraps the program in `with {prelude} …`.
+    base::inject_prelude(&mut program);
 
     // Desugar monadic do blocks into trait method calls
-    desugar::desugar(&mut module);
+    desugar::desugar(&mut program);
 
     // Detect recursive type aliases before resolution — a cyclic alias
     // (`type A = {x: A}`, mutual cycles) can never be resolved, so report
     // a diagnostic instead of letting resolution chase the cycle.
-    let cycle_diags = types::check_alias_cycles(&module);
+    let cycle_diags = types::check_alias_cycles(&program);
     if !cycle_diags.is_empty() {
         for diag in &cycle_diags {
             eprintln!("{}", diag.render(&source, &filename));
@@ -360,7 +356,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     // Reject persisted fields whose names collide with the runtime's internal
     // SQLite columns (`_id`, `_tag`, ...) — they used to compile clean and
     // abort at table init with "duplicate column name".
-    let reserved_diags = types::check_reserved_field_names(&module);
+    let reserved_diags = types::check_reserved_field_names(&program);
     if !reserved_diags.is_empty() {
         for diag in &reserved_diags {
             eprintln!("{}", diag.render(&source, &filename));
@@ -369,10 +365,10 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     }
 
     // Resolve types
-    let type_env = types::TypeEnv::from_module(&module);
+    let type_env = types::TypeEnv::from_program(&program);
 
     // Type inference
-    let (infer_diags, monad_info, type_info, _local_types, refine_targets, refined_types, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args) = infer::check(&mut module);
+    let (infer_diags, monad_info, type_info, _local_types, refine_targets, refined_types, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args) = infer::check(&mut program);
     if !infer_diags.is_empty() {
         for diag in &infer_diags {
             eprintln!("{}", diag.render(&source, &filename));
@@ -386,7 +382,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     }
 
     // Effect inference
-    let effect_diags = effects::check(&module);
+    let effect_diags = effects::check(&program);
     if !effect_diags.is_empty() {
         for diag in &effect_diags {
             eprintln!("{}", diag.render(&source, &filename));
@@ -399,15 +395,8 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         }
     }
 
-    // Unused-definition warnings (use original_decls to avoid flagging
-    // prelude/imports, and to anchor spans to the user's source text).
-    let unused_diags = unused::check(&original_decls);
-    for diag in &unused_diags {
-        eprintln!("{}", diag.render(&source, &filename));
-    }
-
     // Stratification check for recursive derived relations
-    let strat_diags = stratify::check(&module);
+    let strat_diags = stratify::check(&program);
     if !strat_diags.is_empty() {
         for diag in &strat_diags {
             eprintln!("{}", diag.render(&source, &filename));
@@ -421,7 +410,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     }
 
     // Check schema lockfile
-    let lock_diags = lockfile::check(&source_path, &module, &type_env);
+    let lock_diags = lockfile::check(&source_path, &program, &type_env);
     if !lock_diags.is_empty() {
         for diag in &lock_diags {
             eprintln!("{}", diag.render(&source, &filename));
@@ -435,7 +424,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     }
 
     // Code generation
-    let obj_bytes = match codegen::compile(&module, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, &elem_pushdown_ok, &show_unit_strings, &sum_float_spans, &relation_fields, &with_fields, &implicit_refs, &type_arg_spans, &implicit_dict_args, overrides) {
+    let obj_bytes = match codegen::compile(&program, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, &elem_pushdown_ok, &show_unit_strings, &sum_float_spans, &relation_fields, &with_fields, &implicit_refs, &type_arg_spans, &implicit_dict_args, overrides) {
         Ok(bytes) => bytes,
         Err(diags) => {
             for diag in &diags {
@@ -471,12 +460,8 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         let _ = std::fs::remove_file(&runtime_path);
     }
 
-    // Update schema lockfile (use original decls — the mutated module contains
-    // prelude decls whose spans don't correspond to this source text).
-    let lockfile_module = knot::ast::Module {
-        decls: original_decls,
-    };
-    if let Err(e) = lockfile::update(&source_path, &source, &lockfile_module) {
+    // Update schema lockfile from the (prelude-wrapped, desugared) program.
+    if let Err(e) = lockfile::update(&source_path, &source, &program) {
         eprintln!("Warning: {}", e);
     }
 

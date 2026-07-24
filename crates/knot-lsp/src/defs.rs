@@ -7,10 +7,10 @@
 
 use std::collections::HashMap;
 
-use knot::ast::{self, DeclKind, Module, Span, Type, TypeKind};
+use knot::ast::{self, Expr, ExprKind, Span, Type, TypeKind};
 
 use crate::type_format::{format_type_kind, format_type_scheme};
-use crate::utils::{find_word_after_eq, find_word_in_source};
+use crate::utils::{find_word_after_eq, find_word_in_source, top_fields};
 
 /// Given a byte offset just after a constructor's name token, return the
 /// offset just past that constructor's brace-balanced `{…}` field block, or
@@ -57,7 +57,7 @@ fn advance_past_field_block(source: &str, from: usize, end: usize) -> usize {
 type Definitions = (HashMap<String, Span>, Vec<(Span, Span)>, Vec<(Span, String)>);
 
 /// Resolve definitions: returns (name_map, span_references, literal_types).
-pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
+pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
     let mut resolver = DefResolver {
         source,
         scopes: vec![HashMap::new()],
@@ -66,13 +66,14 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
     };
 
     // Phase 1: register all top-level declarations
-    for decl in &module.decls {
+    for decl in top_fields(program) {
+        let dspan = decl.value.span;
         let name_span = |name: &str| {
-            find_word_in_source(source, name, decl.span.start, decl.span.end)
-                .unwrap_or(decl.span)
+            find_word_in_source(source, name, dspan.start, dspan.end)
+                .unwrap_or(dspan)
         };
-        match &decl.node {
-            DeclKind::Data {
+        match &decl.value.node {
+            ExprKind::DataCtor {
                 name, constructors, ..
             } => {
                 resolver.define(name, name_span(name));
@@ -83,134 +84,111 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                 // can't steal a later constructor's span. Mirrors
                 // document_symbol.rs / semantic_tokens.rs.
                 let mut search_from = source
-                    .get(decl.span.start..decl.span.end.min(source.len()))
+                    .get(dspan.start..dspan.end.min(source.len()))
                     .and_then(|t| t.find('='))
-                    .map(|p| decl.span.start + p + 1)
-                    .unwrap_or(decl.span.start);
+                    .map(|p| dspan.start + p + 1)
+                    .unwrap_or(dspan.start);
                 for ctor in constructors {
                     let ctor_span =
-                        find_word_in_source(source, &ctor.name, search_from, decl.span.end)
-                            .unwrap_or(decl.span);
+                        find_word_in_source(source, &ctor.name, search_from, dspan.end)
+                            .unwrap_or(dspan);
                     resolver.define(&ctor.name, ctor_span);
                     // Skip past this constructor's `{…}` field block so a type
                     // name reused inside the fields (`data T = A {x: B} | B {}`)
                     // can't be mistaken for the next constructor's token.
                     search_from =
-                        advance_past_field_block(source, ctor_span.end, decl.span.end);
+                        advance_past_field_block(source, ctor_span.end, dspan.end);
                 }
             }
-            DeclKind::TypeAlias { name, .. } => {
+            ExprKind::TypeCtor { name, .. } => {
                 resolver.define(name, name_span(name));
             }
-            DeclKind::Source { name, .. } | DeclKind::View { name, .. } => {
+            ExprKind::SourceDecl { name, .. } | ExprKind::ViewDecl { name, .. } => {
                 let span = name_span(name);
                 resolver.define(name, span);
-                resolver.register_extra_definition_tokens(decl.span, name, span);
+                resolver.register_extra_definition_tokens(dspan, name, span);
             }
-            DeclKind::Derived { name, .. } => {
+            ExprKind::DerivedDecl { name, .. } => {
                 let span = name_span(name);
                 resolver.define(name, span);
-                resolver.register_extra_definition_tokens(decl.span, name, span);
+                resolver.register_extra_definition_tokens(dspan, name, span);
             }
-            DeclKind::Fun { name, .. } => {
-                let span = name_span(name);
-                resolver.define(name, span);
-                // The parser merges a separate type signature and the body
-                // line (`f : T` ⏎ `f = body`) into ONE `DeclKind::Fun`
-                // spanning both lines. `name_span` finds only the FIRST
-                // whole-word occurrence (the signature line), so the
-                // body-line definition token would otherwise be invisible to
-                // rename/references/highlight — register every additional
-                // line-start occurrence as a self-reference to the canonical
-                // definition span.
-                resolver.register_extra_definition_tokens(decl.span, name, span);
-            }
-            DeclKind::Route { name, entries, .. } => {
+            ExprKind::RouteDecl { name, entries } => {
                 resolver.define(name, name_span(name));
                 // Each endpoint's constructor (`… -> Response = GetUsers`) is a
                 // definition referenced from `serve`/`fetch`. It's spanless, so
                 // recover its `= Ctor` token and register it so goto and
                 // find-references from those sites reach the route declaration.
-                let mut cursor = decl.span.start;
+                let mut cursor = dspan.start;
                 for entry in entries {
                     if let Some(span) =
-                        find_word_after_eq(source, &entry.constructor, cursor, decl.span.end)
+                        find_word_after_eq(source, &entry.constructor, cursor, dspan.end)
                     {
                         cursor = span.end;
                         resolver.define(&entry.constructor, span);
                     }
                 }
             }
-            DeclKind::RouteComposite { name, .. } => {
+            ExprKind::RouteCompositeDecl { name, .. } => {
                 resolver.define(name, name_span(name));
             }
-            _ => {}
+            _ => {
+                // A named function field: register its name and any extra
+                // signature/body-line occurrences.
+                let name = &decl.name;
+                let span = name_span(name);
+                resolver.define(name, span);
+                resolver.register_extra_definition_tokens(dspan, name, span);
+            }
         }
     }
 
     // Phase 2: walk declaration bodies to resolve references
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun { body, ty, .. } => {
-                if let Some(scheme) = ty {
-                    // `Show a =>` constraint trait names precede the type; they
-                    // are spanless, so recover them before walking the type.
-                    resolver.resolve_trait_names(
-                        scheme.constraints.iter().filter_map(|c| match c {
-                            knot::ast::Constraint::Trait { trait_name, .. } => {
-                                Some(trait_name.as_str())
-                            }
-                            knot::ast::Constraint::ImplicitField { .. } => None,
-                        }),
-                        decl.span.start,
-                        scheme.ty.span.start,
-                    );
-                    resolver.resolve_type(&scheme.ty, source);
-                    for c in &scheme.constraints {
-                        for arg in c.types() {
-                            resolver.resolve_type(arg, source);
-                        }
+    for decl in top_fields(program) {
+        let dspan = decl.value.span;
+        // Resolve the field's own signature (when present).
+        let resolve_scheme = |resolver: &mut DefResolver, scheme: &knot::ast::TypeScheme| {
+            resolver.resolve_trait_names(
+                scheme.constraints.iter().filter_map(|c| match c {
+                    knot::ast::Constraint::Trait { trait_name, .. } => {
+                        Some(trait_name.as_str())
                     }
-                }
-                if let Some(body) = body {
-                    resolver.resolve_expr(body);
+                    knot::ast::Constraint::ImplicitField { .. } => None,
+                }),
+                dspan.start,
+                scheme.ty.span.start,
+            );
+            resolver.resolve_type(&scheme.ty, source);
+            for c in &scheme.constraints {
+                for arg in c.types() {
+                    resolver.resolve_type(arg, source);
                 }
             }
-            DeclKind::View { body, ty, .. } | DeclKind::Derived { body, ty, .. } => {
+        };
+        if let Some(scheme) = &decl.sig {
+            resolve_scheme(&mut resolver, scheme);
+        }
+        match &decl.value.node {
+            ExprKind::ViewDecl { body, ty, .. } | ExprKind::DerivedDecl { body, ty, .. } => {
                 if let Some(scheme) = ty {
-                    resolver.resolve_trait_names(
-                        scheme.constraints.iter().filter_map(|c| match c {
-                            knot::ast::Constraint::Trait { trait_name, .. } => {
-                                Some(trait_name.as_str())
-                            }
-                            knot::ast::Constraint::ImplicitField { .. } => None,
-                        }),
-                        decl.span.start,
-                        scheme.ty.span.start,
-                    );
-                    resolver.resolve_type(&scheme.ty, source);
-                    for c in &scheme.constraints {
-                        for arg in c.types() {
-                            resolver.resolve_type(arg, source);
-                        }
-                    }
+                    resolve_scheme(&mut resolver, scheme);
                 }
                 resolver.resolve_expr(body);
             }
-            DeclKind::Source { ty, .. } => {
+            ExprKind::SourceDecl { ty, .. } => {
                 resolver.resolve_type(ty, source);
             }
-            DeclKind::TypeAlias { ty, .. } => {
+            ExprKind::TypeCtor { ty, .. } => {
                 resolver.resolve_type(ty, source);
             }
-            DeclKind::Data { constructors, .. } => {
+            ExprKind::DataCtor { constructors, .. } => {
                 for ctor in constructors {
                     for f in &ctor.fields {
                         resolver.resolve_type(&f.value, source);
                     }
                 }
             }
-            DeclKind::Route { entries, .. } => {
+            ExprKind::RouteDecl { entries, .. } => {
                 for entry in entries {
                     for f in &entry.body_fields {
                         resolver.resolve_type(&f.value, source);
@@ -240,42 +218,46 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
                     }
                 }
             }
-            DeclKind::RouteComposite { components, .. } => {
+            ExprKind::RouteCompositeDecl { components, .. } => {
                 // `route Api = A | B` — each component names another route.
                 // Register each as a reference so goto/rename/highlight reach
                 // the composed routes. Start after `=` so the composite's own
                 // name token isn't mistaken for a component, and advance the
                 // cursor so repeated names each resolve to their own span.
                 let mut search_from = source
-                    .get(decl.span.start..decl.span.end.min(source.len()))
+                    .get(dspan.start..dspan.end.min(source.len()))
                     .and_then(|t| t.find('='))
-                    .map(|p| decl.span.start + p + 1)
-                    .unwrap_or(decl.span.start);
+                    .map(|p| dspan.start + p + 1)
+                    .unwrap_or(dspan.start);
                 for comp in components {
                     if let Some(span) =
-                        find_word_in_source(source, comp, search_from, decl.span.end)
+                        find_word_in_source(source, comp, search_from, dspan.end)
                     {
                         search_from = span.end;
                         resolver.add_ref(span, comp);
                     }
                 }
             }
-            DeclKind::SubsetConstraint { sub, sup } => {
+            ExprKind::SubsetConstraint { sub, sup } => {
                 // `*orders.customer <= *people.name` references source
                 // relations by name. `RelationPath` is spanless, so recover
                 // each relation-name token from the decl source (the `*` sigil
                 // is a word boundary) and register it so goto/find-references/
                 // rename reach the referenced sources. A moving cursor lets
                 // both sides — including `*users <= *users.email` — resolve.
-                let mut search_from = decl.span.start;
+                let mut search_from = dspan.start;
                 for rel in [&sub.relation, &sup.relation] {
                     if let Some(span) =
-                        find_word_in_source(source, rel, search_from, decl.span.end)
+                        find_word_in_source(source, rel, search_from, dspan.end)
                     {
                         search_from = span.end;
                         resolver.add_ref(span, rel);
                     }
                 }
+            }
+            _ => {
+                // A named function field: walk its body.
+                resolver.resolve_expr(&decl.value);
             }
         }
     }
@@ -283,6 +265,7 @@ pub fn resolve_definitions(module: &Module, source: &str) -> Definitions {
     let name_map = resolver.scopes[0].clone();
     (name_map, resolver.refs, resolver.literals)
 }
+
 
 struct DefResolver<'a> {
     source: &'a str,
@@ -664,12 +647,12 @@ impl<'a> DefResolver<'a> {
     }
 }
 
-pub fn build_details(module: &Module) -> HashMap<String, String> {
+pub fn build_details(program: &Expr) -> HashMap<String, String> {
     let mut details = HashMap::new();
 
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Data {
+    for decl in top_fields(program) {
+        match &decl.value.node {
+            ExprKind::DataCtor {
                 name,
                 params,
                 constructors,
@@ -711,7 +694,7 @@ pub fn build_details(module: &Module) -> HashMap<String, String> {
                     details.insert(ctor.name.clone(), ctor_detail);
                 }
             }
-            DeclKind::TypeAlias { name, params, ty } => {
+            ExprKind::TypeCtor { name, params, ty, .. } => {
                 let params_str = if params.is_empty() {
                     String::new()
                 } else {
@@ -722,40 +705,42 @@ pub fn build_details(module: &Module) -> HashMap<String, String> {
                     format!("type {name}{params_str} = {}", format_type_kind(&ty.node)),
                 );
             }
-            DeclKind::Source { name, ty } => {
+            ExprKind::SourceDecl { name, ty, .. } => {
                 details.insert(
                     name.clone(),
                     format!("*{name} : [{}]", format_type_kind(&ty.node)),
                 );
             }
-            DeclKind::View { name, ty, .. } => {
+            ExprKind::ViewDecl { name, ty, .. } => {
                 let ty_str = ty
                     .as_ref()
                     .map(|t| format!(" : {}", format_type_scheme(t)))
                     .unwrap_or_default();
                 details.insert(name.clone(), format!("*{name}{ty_str} (view)"));
             }
-            DeclKind::Derived { name, ty, .. } => {
+            ExprKind::DerivedDecl { name, ty, .. } => {
                 let ty_str = ty
                     .as_ref()
                     .map(|t| format!(" : {}", format_type_scheme(t)))
                     .unwrap_or_default();
                 details.insert(name.clone(), format!("&{name}{ty_str} (derived)"));
             }
-            DeclKind::Fun { name, ty, .. } => {
-                let ty_str = ty
+            ExprKind::RouteDecl { name, .. } => {
+                details.insert(name.clone(), format!("route {name}"));
+            }
+            ExprKind::RouteCompositeDecl { name, components, .. } => {
+                details.insert(name.clone(), format!("route {name} = {}", components.join(" | ")));
+            }
+            _ => {
+                // A named function field: `name : Sig`.
+                let name = &decl.name;
+                let ty_str = decl
+                    .sig
                     .as_ref()
                     .map(|t| format!(" : {}", format_type_scheme(t)))
                     .unwrap_or_default();
                 details.insert(name.clone(), format!("{name}{ty_str}"));
             }
-            DeclKind::Route { name, .. } => {
-                details.insert(name.clone(), format!("route {name}"));
-            }
-            DeclKind::RouteComposite { name, components, .. } => {
-                details.insert(name.clone(), format!("route {name} = {}", components.join(" | ")));
-            }
-            _ => {}
         }
     }
 

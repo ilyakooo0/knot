@@ -1,6 +1,7 @@
 pub mod base;
 pub mod builtins;
 pub mod codegen;
+pub mod decl_view;
 pub mod desugar;
 pub mod effects;
 pub mod infer;

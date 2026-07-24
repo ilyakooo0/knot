@@ -4,13 +4,26 @@ use std::collections::{HashMap, HashSet};
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind, Span};
+use knot::ast::{self, ExprKind, Span};
 
 use crate::state::ServerState;
 use crate::utils::{
     find_word_in_source, ident_lookup_offset, position_to_offset, recurse_expr,
-    span_to_range, word_at_position,
+    span_to_range, top_fields, word_at_position,
 };
+
+/// A (name, kind-tag, value, span) view of a top-level declaration field.
+/// `kind_tag` is one of "fn", "view", "derived", "data", "source", "other".
+fn decl_info(decl: &knot::ast::RecordField) -> (&str, &str, &ast::Expr, Span) {
+    let dspan = decl.value.span;
+    match &decl.value.node {
+        ExprKind::ViewDecl { name, .. } => (name.as_str(), "view", &decl.value, dspan),
+        ExprKind::DerivedDecl { name, .. } => (name.as_str(), "derived", &decl.value, dspan),
+        ExprKind::DataCtor { name, .. } => (name.as_str(), "data", &decl.value, dspan),
+        ExprKind::SourceDecl { name, .. } => (name.as_str(), "source", &decl.value, dspan),
+        _ => (decl.name.as_str(), "fn", &decl.value, dspan),
+    }
+}
 
 // ── Call Hierarchy ───────────────────────────────────────────────────
 
@@ -35,15 +48,11 @@ pub(crate) fn handle_call_hierarchy_prepare(
     let word = word_at_position(&doc.source, pos)?;
 
     // Find the declaration containing this name
-    for decl in &doc.module.decls {
-        let name = match &decl.node {
-            DeclKind::Fun { name, .. } => name,
-            DeclKind::Source { name, .. }
-            | DeclKind::View { name, .. }
-            | DeclKind::Derived { name, .. } => name,
-            DeclKind::Data { name, .. } => name,
-            _ => continue,
-        };
+    for decl in top_fields(&doc.module) {
+        let (name, _tag, _value, dspan) = decl_info(decl);
+        if matches!(_tag, "other") {
+            continue;
+        }
         if name != word {
             continue;
         }
@@ -55,10 +64,10 @@ pub(crate) fn handle_call_hierarchy_prepare(
         // made prepare fail from every call site.
         let def_span = doc
             .definitions
-            .get(name.as_str())
+            .get(name)
             .copied()
-            .unwrap_or(decl.span);
-        let on_def = decl.span.start <= offset && offset < decl.span.end;
+            .unwrap_or(dspan);
+        let on_def = dspan.start <= offset && offset < dspan.end;
         let on_ref = doc.references.iter().any(|(usage, def)| {
             usage.start <= offset && offset < usage.end && *def == def_span
         });
@@ -66,19 +75,19 @@ pub(crate) fn handle_call_hierarchy_prepare(
             continue;
         }
 
-        let range = span_to_range(decl.span, &doc.source);
-        let selection_range = find_word_in_source(&doc.source, name, decl.span.start, decl.span.end)
+        let range = span_to_range(dspan, &doc.source);
+        let selection_range = find_word_in_source(&doc.source, name, dspan.start, dspan.end)
             .map(|s| span_to_range(s, &doc.source))
             .unwrap_or(range);
 
-        let kind = match &decl.node {
-            DeclKind::Fun { .. } => SymbolKind::FUNCTION,
-            DeclKind::Data { .. } => SymbolKind::STRUCT,
+        let kind = match _tag {
+            "fn" => SymbolKind::FUNCTION,
+            "data" => SymbolKind::STRUCT,
             _ => SymbolKind::VARIABLE,
         };
 
         return Some(vec![CallHierarchyItem {
-            name: name.clone(),
+            name: name.to_string(),
             kind,
             tags: None,
             detail: doc.type_info.get(name).cloned(),
@@ -104,13 +113,12 @@ pub(crate) fn handle_call_hierarchy_incoming(
     let target_def = doc.definitions.get(target_name)?;
     let mut calls: HashMap<String, (ast::Span, Vec<Span>)> = HashMap::new(); // caller_name -> (decl_span, [call_site_spans])
 
-    for decl in &doc.module.decls {
-        let caller_name = match &decl.node {
-            DeclKind::Fun { name, .. } => name.clone(),
-            DeclKind::View { name, .. } => name.clone(),
-            DeclKind::Derived { name, .. } => name.clone(),
-            _ => continue,
-        };
+    for decl in top_fields(&doc.module) {
+        let (caller_name, tag, _value, dspan) = decl_info(decl);
+        if !matches!(tag, "fn" | "view" | "derived") {
+            continue;
+        }
+        let caller_name = caller_name.to_string();
         // Collect call sites within this declaration that point to target_def.
         // Skip declaration tokens (the line-start name occurrence of a
         // multi-line decl, e.g. the `f =` body line of a `f : T` ⏎ `f = …`
@@ -123,15 +131,15 @@ pub(crate) fn handle_call_hierarchy_incoming(
             .iter()
             .filter(|(usage, def)| {
                 *def == *target_def
-                    && usage.start >= decl.span.start
-                    && usage.end <= decl.span.end
+                    && usage.start >= dspan.start
+                    && usage.end <= dspan.end
                     && !crate::references::is_declaration_token(&doc.source, *usage)
             })
             .map(|(usage, _)| *usage)
             .collect();
 
         if !call_sites.is_empty() {
-            calls.insert(caller_name, (decl.span, call_sites));
+            calls.insert(caller_name, (dspan, call_sites));
         }
     }
 
@@ -142,14 +150,12 @@ pub(crate) fn handle_call_hierarchy_incoming(
             .map(|s| span_to_range(s, &doc.source))
             .unwrap_or(range);
 
-        let kind = doc
-            .module
-            .decls
+        let kind = top_fields(&doc.module)
             .iter()
-            .find(|d| d.span == *decl_span)
-            .map(|d| match &d.node {
-                DeclKind::Fun { .. } | DeclKind::View { .. } | DeclKind::Derived { .. } => SymbolKind::FUNCTION,
-                DeclKind::Data { .. } => SymbolKind::STRUCT,
+            .find(|d| d.value.span == *decl_span)
+            .map(|d| match decl_info(d).1 {
+                "fn" | "view" | "derived" => SymbolKind::FUNCTION,
+                "data" => SymbolKind::STRUCT,
                 _ => SymbolKind::VARIABLE,
             })
             .unwrap_or(SymbolKind::FUNCTION);
@@ -181,16 +187,13 @@ pub(crate) fn handle_call_hierarchy_outgoing(
     let doc = state.documents.get(source_uri)?;
 
     // Find the declaration for the source item
-    let source_decl = doc
-        .module
-        .decls
-        .iter()
-        .find(|d| match &d.node {
-            DeclKind::Fun { name, .. }
-            | DeclKind::View { name, .. }
-            | DeclKind::Derived { name, .. } => name == source_name,
-            _ => false,
+    let source_decl = top_fields(&doc.module)
+        .into_iter()
+        .find(|d| {
+            let (n, tag, _, _) = decl_info(d);
+            matches!(tag, "fn" | "view" | "derived") && n == source_name
         })?;
+    let source_dspan = source_decl.value.span;
 
     // Higher-order call sites: a `Var(name)` that appears as the *argument* of
     // an `App` rather than its head means the function is being passed around
@@ -204,15 +207,14 @@ pub(crate) fn handle_call_hierarchy_outgoing(
             }
         recurse_expr(expr, |e| collect_higher_order_args(e, out));
     }
-    match &source_decl.node {
-        DeclKind::Fun {
-            body: Some(body), ..
-        }
-        | DeclKind::View { body, .. }
-        | DeclKind::Derived { body, .. } => {
+    match &source_decl.value.node {
+        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
             collect_higher_order_args(body, &mut higher_order_arg_spans);
         }
-        _ => {}
+        _ => {
+            // A named function field.
+            collect_higher_order_args(&source_decl.value, &mut higher_order_arg_spans);
+        }
     }
 
     // Collect all references within this declaration that point to other
@@ -221,7 +223,7 @@ pub(crate) fn handle_call_hierarchy_outgoing(
     let mut outgoing: HashMap<String, (Span, Vec<(Span, bool)>)> = HashMap::new();
 
     for (usage_span, def_span) in &doc.references {
-        if usage_span.start < source_decl.span.start || usage_span.end > source_decl.span.end {
+        if usage_span.start < source_dspan.start || usage_span.end > source_dspan.end {
             continue;
         }
         if let Some((name, _)) = doc.definitions.iter().find(|(_, s)| *s == def_span) {
@@ -244,14 +246,12 @@ pub(crate) fn handle_call_hierarchy_outgoing(
             .map(|s| span_to_range(s, &doc.source))
             .unwrap_or(range);
 
-        let kind = doc
-            .module
-            .decls
+        let kind = top_fields(&doc.module)
             .iter()
-            .find(|d| d.span == *def_span)
-            .map(|d| match &d.node {
-                DeclKind::Fun { .. } | DeclKind::View { .. } | DeclKind::Derived { .. } => SymbolKind::FUNCTION,
-                DeclKind::Data { .. } => SymbolKind::STRUCT,
+            .find(|d| d.value.span == *def_span)
+            .map(|d| match decl_info(d).1 {
+                "fn" | "view" | "derived" => SymbolKind::FUNCTION,
+                "data" => SymbolKind::STRUCT,
                 _ => SymbolKind::VARIABLE,
             })
             .unwrap_or(SymbolKind::FUNCTION);

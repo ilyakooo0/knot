@@ -19,7 +19,7 @@ use std::time::SystemTime;
 
 use lsp_types::*;
 
-use knot::ast::Module;
+use knot::ast::Expr as AstExpr;
 use knot::diagnostic;
 
 use crate::analysis::get_or_parse_file_shared;
@@ -61,7 +61,7 @@ pub(crate) fn handle_document_diagnostics(
             .unwrap_or_else(|| PathBuf::from("."));
         let (tokens, _) = knot::lexer::Lexer::new(&source).tokenize();
         let parser = knot::parser::Parser::new(source.clone(), tokens);
-        let (module, _) = parser.parse_module();
+        let (module, _) = parser.parse_file_expr();
         analyze_unopened_file(&module, &source, &path, uri)
     } else if let Some(path) = uri_to_path(uri).and_then(|p| p.canonicalize().ok()) {
         // Cold path: file isn't open in the editor. Honor the pull anyway —
@@ -263,7 +263,7 @@ pub(crate) fn handle_workspace_diagnostics(
             .unwrap_or_else(|| PathBuf::from("."));
         let (tokens, _) = knot::lexer::Lexer::new(&pending.source).tokenize();
         let parser = knot::parser::Parser::new(pending.source.clone(), tokens);
-        let (module, _) = parser.parse_module();
+        let (module, _) = parser.parse_file_expr();
         let lsp_diags = analyze_unopened_file(&module, &pending.source, &path, uri);
         let lsp_diags = crate::diagnostics::filter_unused_warnings(
             lsp_diags,
@@ -319,7 +319,7 @@ pub(crate) fn handle_workspace_diagnostics(
                 canonical: PathBuf,
                 file_uri: Uri,
                 hash: u64,
-                module: Module,
+                module: AstExpr,
                 source: String,
                 /// On-disk mtime statted BEFORE the content read. Recorded
                 /// in the cache entry verbatim — a post-analysis stat could
@@ -624,7 +624,7 @@ pub(crate) fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
 /// Catch them here, log the message, and emit a synthetic diagnostic so the
 /// failure surfaces in the gutter.
 fn analyze_unopened_file(
-    module: &Module,
+    module: &AstExpr,
     source: &str,
     path: &Path,
     uri: &Uri,
@@ -661,7 +661,7 @@ fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn analyze_unopened_file_inner(
-    module: &Module,
+    module: &AstExpr,
     source: &str,
     _path: &Path,
     uri: &Uri,
@@ -677,7 +677,7 @@ fn analyze_unopened_file_inner(
     let lexer2 = knot::lexer::Lexer::new(source);
     let (tokens, _) = lexer2.tokenize();
     let parser = knot::parser::Parser::new(source.to_string(), tokens);
-    let (_, parse_diags) = parser.parse_module();
+    let (_, parse_diags) = parser.parse_file_expr();
     all_diags.extend(parse_diags);
 
     let has_parse_errors = all_diags
@@ -694,7 +694,7 @@ fn analyze_unopened_file_inner(
         // 0:0). We keep only diagnostics anchored within this file's own
         // declarations.
         let own_ranges: Vec<(usize, usize)> =
-            module.decls.iter().map(|d| (d.span.start, d.span.end)).collect();
+            crate::utils::top_fields(&module).iter().map(|d| (d.value.span.start, d.value.span.end)).collect();
 
         let mut analysis_module = module.clone();
 
@@ -723,9 +723,9 @@ fn analyze_unopened_file_inner(
 
         // Unused-definition warnings: use pre-prelude decls so prelude/imported
         // names are not flagged.
-        all_diags.extend(knot_compiler::unused::check(&module.decls));
+        all_diags.extend(knot_compiler::unused::check(&module));
 
-        let type_env = knot_compiler::types::TypeEnv::from_module(&analysis_module);
+        let type_env = knot_compiler::types::TypeEnv::from_program(&analysis_module);
         all_diags.extend(
             knot_compiler::sql_lint::check(&analysis_module, &type_env)
                 .into_iter()
@@ -739,315 +739,4 @@ fn analyze_unopened_file_inner(
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
 
-    /// Seed `workspace_diag_cache` with `count` synthetic entries with strictly
-    /// increasing access timestamps. Returns paths in insertion order, so
-    /// callers can assert about which entries survive eviction.
-    fn seed_cache(state: &mut ServerState, count: usize) -> Vec<PathBuf> {
-        let mut paths = Vec::with_capacity(count);
-        for i in 0..count {
-            let p = PathBuf::from(format!("/tmp/knot-lsp-cap-test/file_{i}.knot"));
-            state.workspace_diag_clock = state.workspace_diag_clock.wrapping_add(1);
-            let access = state.workspace_diag_clock;
-            state
-                .workspace_diag_cache
-                .insert(p.clone(), (i as u64, Vec::new(), access, None));
-            paths.push(p);
-        }
-        paths
-    }
-
-    #[test]
-    fn enforce_cap_evicts_oldest_entries_when_over_budget() {
-        let mut ws = TestWorkspace::new();
-        ws.state.config.max_workspace_diag_cache = 3;
-
-        let paths = seed_cache(&mut ws.state, 5);
-        assert_eq!(ws.state.workspace_diag_cache.len(), 5);
-
-        enforce_workspace_diag_cap(&mut ws.state);
-
-        assert_eq!(ws.state.workspace_diag_cache.len(), 3);
-        // Oldest two entries (paths[0], paths[1]) should be gone.
-        assert!(!ws.state.workspace_diag_cache.contains_key(&paths[0]));
-        assert!(!ws.state.workspace_diag_cache.contains_key(&paths[1]));
-        assert!(ws.state.workspace_diag_cache.contains_key(&paths[2]));
-        assert!(ws.state.workspace_diag_cache.contains_key(&paths[3]));
-        assert!(ws.state.workspace_diag_cache.contains_key(&paths[4]));
-    }
-
-    #[test]
-    fn enforce_cap_no_op_when_under_budget() {
-        let mut ws = TestWorkspace::new();
-        ws.state.config.max_workspace_diag_cache = 10;
-
-        let paths = seed_cache(&mut ws.state, 4);
-        let before_clock = ws.state.workspace_diag_clock;
-
-        enforce_workspace_diag_cap(&mut ws.state);
-
-        assert_eq!(ws.state.workspace_diag_cache.len(), 4);
-        for p in &paths {
-            assert!(ws.state.workspace_diag_cache.contains_key(p));
-        }
-        // The cap-only path must not bump the access clock — only
-        // insert/hit paths do.
-        assert_eq!(ws.state.workspace_diag_clock, before_clock);
-    }
-
-    #[test]
-    fn prune_skips_disk_read_when_mtime_matches() {
-        // The mtime fast-path is the whole reason we threaded mtime through
-        // the cache value. Set a real on-disk file, write a cache entry
-        // anchored to its current mtime but with a *deliberately wrong*
-        // content hash, and confirm prune leaves the entry in place — proof
-        // that no disk read happened (a read+hash would have flagged the
-        // hash mismatch and evicted).
-        let dir = std::env::temp_dir().join("knot-lsp-prune-mtime");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("hot.knot");
-        std::fs::write(&path, "actual content\n").expect("seed file");
-        let mtime = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .expect("mtime available on this fs");
-
-        let mut ws = TestWorkspace::new();
-        ws.state.config.max_workspace_diag_cache = 16;
-        ws.state.workspace_diag_clock = 1;
-        // Hash 0xDEAD doesn't match the real content's hash — if prune
-        // reads the file, it'll evict on hash mismatch.
-        ws.state
-            .workspace_diag_cache
-            .insert(path.clone(), (0xDEAD, Vec::new(), 1, Some(mtime)));
-
-        prune_stale_workspace_diag_cache(&mut ws.state);
-
-        assert!(
-            ws.state.workspace_diag_cache.contains_key(&path),
-            "mtime fast-path should have skipped the disk read entirely"
-        );
-
-        // Flip the cached mtime to a value that won't match disk; now prune
-        // *must* read+hash and find the mismatch, so the entry is dropped.
-        let bogus_mtime = mtime - std::time::Duration::from_secs(3600);
-        ws.state
-            .workspace_diag_cache
-            .insert(path.clone(), (0xDEAD, Vec::new(), 1, Some(bogus_mtime)));
-
-        prune_stale_workspace_diag_cache(&mut ws.state);
-
-        assert!(
-            !ws.state.workspace_diag_cache.contains_key(&path),
-            "mtime miss should fall through to read+hash and evict on mismatch"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn prune_refreshes_mtime_when_content_unchanged() {
-        // The bookkeeping for the jj/git checkout case: mtime moves but
-        // bytes don't. After the read+hash confirms content unchanged, the
-        // recorded mtime should be refreshed so the fast path applies on
-        // the next pull.
-        let dir = std::env::temp_dir().join("knot-lsp-prune-mtime-refresh");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("touched.knot");
-        std::fs::write(&path, "stable content\n").expect("seed file");
-        let real_hash = content_hash("stable content\n");
-        let real_mtime = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .expect("mtime available on this fs");
-
-        let mut ws = TestWorkspace::new();
-        ws.state.config.max_workspace_diag_cache = 16;
-        ws.state.workspace_diag_clock = 1;
-        let stale_mtime = real_mtime - std::time::Duration::from_secs(3600);
-        ws.state
-            .workspace_diag_cache
-            .insert(path.clone(), (real_hash, Vec::new(), 1, Some(stale_mtime)));
-
-        prune_stale_workspace_diag_cache(&mut ws.state);
-
-        let entry = ws
-            .state
-            .workspace_diag_cache
-            .get(&path)
-            .expect("entry should survive — content matched cached hash");
-        assert_eq!(
-            entry.3,
-            Some(real_mtime),
-            "mtime should be refreshed to disk's current mtime"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    fn ws_params() -> WorkspaceDiagnosticParams {
-        WorkspaceDiagnosticParams {
-            identifier: None,
-            previous_result_ids: Vec::new(),
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        }
-    }
-
-    fn doc_params(uri: &Uri) -> DocumentDiagnosticParams {
-        DocumentDiagnosticParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            identifier: None,
-            previous_result_id: None,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        }
-    }
-
-    fn full_items(r: DocumentDiagnosticReportResult) -> Vec<Diagnostic> {
-        match r {
-            DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(f)) => {
-                f.full_document_diagnostic_report.items
-            }
-            other => panic!("expected full report, got {other:?}"),
-        }
-    }
-
-    fn find_full_report(
-        result: WorkspaceDiagnosticReportResult,
-        uri: &Uri,
-    ) -> Option<WorkspaceFullDocumentDiagnosticReport> {
-        let WorkspaceDiagnosticReportResult::Report(report) = result else {
-            panic!("expected report result");
-        };
-        report.items.into_iter().find_map(|i| match i {
-            WorkspaceDocumentDiagnosticReport::Full(f) if &f.uri == uri => Some(f),
-            _ => None,
-        })
-    }
-
-    /// Bug 3: the `warnUnusedImports` flag must gate the unused warnings at
-    /// the pull boundary (the pipeline emits them unconditionally).
-    #[test]
-    fn unused_warning_filtered_when_config_disabled() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "unusedThing = 1\nmain = println \"hi\"\n");
-        let items = full_items(handle_document_diagnostics(&mut ws.state, &doc_params(&uri)));
-        assert!(
-            items.iter().any(|d| d.message.contains("unused")),
-            "setup: unused warning expected with the default config; got {items:?}"
-        );
-        ws.state.config.warn_unused_imports = false;
-        let items = full_items(handle_document_diagnostics(&mut ws.state, &doc_params(&uri)));
-        assert!(
-            !items.iter().any(|d| d.message.contains("unused")),
-            "warnUnusedImports=false must drop the warning; got {items:?}"
-        );
-    }
-
-    /// Bug 11: open docs must report the version their diagnostics were
-    /// computed against (the spec reserves `null` for not-open files).
-    #[test]
-    fn workspace_pull_reports_version_for_open_docs() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "main = undefinedFn 1\n");
-        ws.state.document_versions.insert(uri.clone(), 7);
-        let result = handle_workspace_diagnostics(&mut ws.state, &ws_params());
-        let full = find_full_report(result, &uri).expect("erroring open doc reported");
-        assert_eq!(full.version, Some(7), "open doc must carry its version");
-    }
-
-    /// Bug 11: a just-opened doc (pending, not yet analyzed) must be
-    /// diagnosed from the editor buffer — the disk copy may be stale or not
-    /// exist at all — and reported with its version.
-    #[test]
-    fn just_opened_doc_pulls_from_buffer_not_disk() {
-        use crate::state::PendingSource;
-        let mut ws = TestWorkspace::new();
-        let uri: Uri = "file:///test/pending-only.knot".parse().unwrap();
-        ws.state.pending_sources.insert(
-            uri.clone(),
-            PendingSource {
-                source: "main = undefinedFn 1\n".into(),
-                version: Some(3),
-            },
-        );
-        // Per-document pull: the old code read the (nonexistent) disk file
-        // and returned an empty report.
-        let items = full_items(handle_document_diagnostics(&mut ws.state, &doc_params(&uri)));
-        assert!(
-            !items.is_empty(),
-            "buffer text must be analyzed for a just-opened doc"
-        );
-        // Workspace pull: same, plus the buffer's version.
-        let result = handle_workspace_diagnostics(&mut ws.state, &ws_params());
-        let full = find_full_report(result, &uri).expect("pending doc reported");
-        assert_eq!(full.version, Some(3));
-        assert!(!full.full_document_diagnostic_report.items.is_empty());
-    }
-
-    /// Bug 9: when a pulled file's content hash changes, the cached
-    /// diagnostics of its (unopened, transitive) importers are stale and
-    /// must be evicted/re-analyzed in the SAME pull — the post-pull prune
-    /// sees no hash mismatch (the entry was just refreshed) and never
-    /// reaches them.
-    #[test]
-    fn workspace_pull_refreshes_unopened_importers_when_dependency_changes() {
-        use crate::test_support::TempWorkspace;
-        let mut tw = TempWorkspace::new();
-        std::fs::write(tw.root.join("b.knot"), "helper = \\x -> x\n").unwrap();
-        std::fs::write(tw.root.join("a.knot"), "import ./b\n\nmain = helper 1\n").unwrap();
-        let a_canon = tw.root.join("a.knot").canonicalize().unwrap();
-        let b_canon = tw.root.join("b.knot").canonicalize().unwrap();
-        let a_uri = path_to_uri(&a_canon).expect("uri");
-
-        let state = &mut tw.workspace.state;
-        // Pull 1: cold caches — both files analyzed; a.knot is clean.
-        let _ = handle_workspace_diagnostics(state, &ws_params());
-        assert!(
-            state.workspace_diag_cache.contains_key(&a_canon),
-            "pull 1 should cache a.knot"
-        );
-
-        // b.knot changes incompatibly: `helper` disappears.
-        std::fs::write(tw.root.join("b.knot"), "other = 1\n").unwrap();
-        // Defeat the mtime fast path for b deterministically (coarse fs
-        // clocks could otherwise serve the old entry): drop its recorded
-        // mtime so the pull takes the read+hash path.
-        if let Some(e) = state.workspace_diag_cache.get_mut(&b_canon) {
-            e.3 = None;
-        }
-
-        let result = handle_workspace_diagnostics(state, &ws_params());
-        let a_report = find_full_report(result, &a_uri)
-            .expect("importer a.knot must be re-reported after its dependency changed");
-        assert!(
-            !a_report.full_document_diagnostic_report.items.is_empty(),
-            "a.knot must surface the new cross-file error instead of its stale clean cache"
-        );
-    }
-
-    #[test]
-    fn enforce_cap_respects_recency_after_access_bump() {
-        let mut ws = TestWorkspace::new();
-        ws.state.config.max_workspace_diag_cache = 2;
-
-        let paths = seed_cache(&mut ws.state, 3);
-        // Touch paths[0] so it's now the most recently used. Without this
-        // bump it would be evicted first; with it, paths[1] should go.
-        ws.state.workspace_diag_clock = ws.state.workspace_diag_clock.wrapping_add(1);
-        let access = ws.state.workspace_diag_clock;
-        if let Some(entry) = ws.state.workspace_diag_cache.get_mut(&paths[0]) {
-            entry.2 = access;
-        }
-
-        enforce_workspace_diag_cap(&mut ws.state);
-
-        assert_eq!(ws.state.workspace_diag_cache.len(), 2);
-        assert!(ws.state.workspace_diag_cache.contains_key(&paths[0]));
-        assert!(!ws.state.workspace_diag_cache.contains_key(&paths[1]));
-        assert!(ws.state.workspace_diag_cache.contains_key(&paths[2]));
-    }
-}

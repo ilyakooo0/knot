@@ -24,18 +24,17 @@
 use knot::ast::*;
 use std::collections::HashSet;
 
-/// Desugar a module in place. Transforms pure-comprehension do blocks
-/// into nested bind/yield/empty expressions, and routes into data declarations.
+/// Desugar the file's expression in place. Transforms pure-comprehension do
+/// blocks into nested bind/yield/empty expressions.
 ///
 /// Runs on a grown stack: `desugar_stmts` recurses once per do-block
 /// statement to build the bind chain, and the walkers then descend it.
-pub fn desugar(module: &mut Module) {
-    crate::stack::grow(|| desugar_inner(module))
+pub fn desugar(expr: &mut Expr) {
+    crate::stack::grow(|| desugar_inner(expr))
 }
 
-fn desugar_inner(module: &mut Module) {
-    desugar_routes(module);
-    let io_fns = detect_io_functions(&module.decls);
+fn desugar_inner(expr: &mut Expr) {
+    let io_fns = detect_io_functions(expr);
     let no_source_vars = HashSet::new();
     // Rewrite `rec.*name` field access on a static source-record
     // (`db = { *todos : [Todo], … }`) to a plain `SourceRef(name)`. The record
@@ -43,100 +42,124 @@ fn desugar_inner(module: &mut Module) {
     // path (do-block binds, `count`, SQL pushdown, STM tracking) keys on
     // `SourceRef` — routing through them unchanged is far less invasive than
     // teaching each to recognise `FieldAccess` on a source-record.
-    rewrite_record_source_refs(module);
-    hoist_record_views(module);
-    hoist_record_routes(module);
-    for decl in &mut module.decls {
-        desugar_decl(&mut decl.node, &io_fns, &no_source_vars);
-    }
+    rewrite_record_source_refs(expr);
+    desugar_expr(expr, &io_fns, &no_source_vars);
 }
 
-/// Hoist record-embedded route declarations (`api = { route TodoApi where …
-/// }`) into top-level-equivalent `DeclKind::Route`/`RouteComposite` decls so
-/// type-checking and codegen treat them exactly like a top-level route. The
-/// hoisted route is keyed by its qualified path (`api.TodoApi`), so
-/// `serve api.TodoApi` / `fetch url (api.TodoApi.Ctor …)` resolve by path.
-/// The record field keeps its `RouteDecl`/`RouteCompositeDecl` marker (the
-/// record is erased to unit at runtime). Mirrors `hoist_record_views`.
-fn hoist_record_routes(module: &mut Module) {
-    let mut hoisted: Vec<Decl> = Vec::new();
-    for decl in &module.decls {
-        if let DeclKind::Fun {
-            name: rec_name,
-            body: Some(body),
-            ..
-        } = &decl.node
-            && let ExprKind::Record(fields) = &body.node
-        {
-            for f in fields {
-                match &f.value.node {
-                    ExprKind::RouteDecl { name, entries } => hoisted.push(Decl {
-                        node: DeclKind::Route {
-                            name: format!("{rec_name}.{name}"),
-                            entries: entries.clone(),
-                        },
-                        span: f.value.span,
-                    }),
-                    ExprKind::RouteCompositeDecl { name, components } => {
-                        // A component may itself be a record-embedded route
-                        // referenced by path (`other.AdminApi`); pass it
-                        // through unchanged — top-level composites already
-                        // carry arbitrary name strings, and route resolution
-                        // looks each up in `route_entries_by_api`.
-                        hoisted.push(Decl {
-                            node: DeclKind::RouteComposite {
-                                name: format!("{rec_name}.{name}"),
-                                components: components.clone(),
-                            },
-                            span: f.value.span,
-                        })
-                    }
-                    _ => {}
+/// Map a `with`-bound record-variable name to the relations its record
+/// literal declares via `*name` / `&name` fields, tagged by kind.
+fn collect_record_source_fields(
+    expr: &Expr,
+) -> std::collections::HashMap<String, Vec<(String, RecordRelKind)>> {
+    let mut out = std::collections::HashMap::new();
+    collect_source_fields_in_expr(expr, &mut out);
+    out
+}
+
+fn collect_source_fields_in_expr(
+    expr: &Expr,
+    out: &mut std::collections::HashMap<String, Vec<(String, RecordRelKind)>>,
+) {
+    if let ExprKind::With { record, body } = &expr.node
+        && let ExprKind::Record(fields) = &record.node
+    {
+        let names: Vec<(String, RecordRelKind)> = fields
+            .iter()
+            .filter_map(|f| match &f.value.node {
+                ExprKind::SourceDecl { name, .. } => {
+                    Some((name.clone(), RecordRelKind::Source))
+                }
+                ExprKind::ViewDecl { name, .. } => Some((name.clone(), RecordRelKind::Source)),
+                ExprKind::DerivedDecl { name, .. } => {
+                    Some((name.clone(), RecordRelKind::Derived))
+                }
+                _ => None,
+            })
+            .collect();
+        if !names.is_empty() {
+            // The record variable is the With record itself; but a With has no
+            // variable name — its fields are scoped directly over the body.
+            // Field-path source refs arise on NAMED record bindings
+            // (`db = {…}; db.*todos`), handled below.
+            let _ = names;
+        }
+        collect_source_fields_in_expr(record, out);
+        collect_source_fields_in_expr(body, out);
+        return;
+    }
+    walk_expr_children_read(expr, &mut |child| collect_source_fields_in_expr(child, out));
+}
+
+/// Read-only variant of `walk_expr_children`.
+fn walk_expr_children_read(expr: &Expr, f: &mut impl FnMut(&Expr)) {
+    match &expr.node {
+        ExprKind::App { func, arg } => {
+            f(func);
+            f(arg);
+        }
+        ExprKind::Lambda { body, .. } => f(body),
+        ExprKind::Record(fields) => {
+            for field in fields {
+                f(&field.value);
+            }
+        }
+        ExprKind::RecordUpdate { base, fields } => {
+            f(base);
+            for field in fields {
+                f(&field.value);
+            }
+        }
+        ExprKind::FieldAccess { expr: e, .. } => f(e),
+        ExprKind::List(elems) => {
+            for e in elems {
+                f(e);
+            }
+        }
+        ExprKind::With { record, body } => {
+            f(record);
+            f(body);
+        }
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            f(lhs);
+            f(rhs);
+        }
+        ExprKind::UnaryOp { operand, .. } => f(operand),
+        ExprKind::If { cond, then_branch, else_branch } => {
+            f(cond);
+            f(then_branch);
+            f(else_branch);
+        }
+        ExprKind::Case { scrutinee, arms } => {
+            f(scrutinee);
+            for arm in arms {
+                f(&arm.body);
+            }
+        }
+        ExprKind::Do(stmts) => {
+            for stmt in stmts {
+                match &stmt.node {
+                    StmtKind::Bind { expr: e, .. } => f(e),
+                    StmtKind::Where { cond } => f(cond),
+                    StmtKind::GroupBy { key } => f(key),
+                    StmtKind::Expr(e) => f(e),
                 }
             }
         }
-    }
-    module.decls.extend(hoisted);
-}
-
-
-/// Hoist record-embedded view/derived declarations (`db = { … *open = body …
-/// &sen = body … }`) into top-level-equivalent `DeclKind::View`/`Derived` decls
-/// so type-checking and codegen treat them exactly like a top-level decl. The
-/// record field keeps its `ViewDecl`/`DerivedDecl` marker (the record is erased
-/// to unit at runtime); the hoisted decl carries the actual body. Runs AFTER
-/// `rewrite_record_source_refs` so the body already references sibling sources
-/// as plain `SourceRef`s.
-fn hoist_record_views(module: &mut Module) {
-    let mut hoisted: Vec<Decl> = Vec::new();
-    for decl in &module.decls {
-        if let DeclKind::Fun { body: Some(body), .. } = &decl.node
-            && let ExprKind::Record(fields) = &body.node
-        {
-            for f in fields {
-                match &f.value.node {
-                    ExprKind::ViewDecl { name, ty, body: vbody } => hoisted.push(Decl {
-                        node: DeclKind::View {
-                            name: name.clone(),
-                            ty: ty.clone(),
-                            body: (**vbody).clone(),
-                        },
-                        span: f.value.span,
-                    }),
-                    ExprKind::DerivedDecl { name, ty, body: dbody } => hoisted.push(Decl {
-                        node: DeclKind::Derived {
-                            name: name.clone(),
-                            ty: ty.clone(),
-                            body: (**dbody).clone(),
-                        },
-                        span: f.value.span,
-                    }),
-                    _ => {}
-                }
+        ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
+            f(target);
+            f(value);
+        }
+        ExprKind::Atomic(e) | ExprKind::Refine(e) => f(e),
+        ExprKind::TimeUnitLit { value, .. } => f(value),
+        ExprKind::Annot { expr: e, .. } => f(e),
+        ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                f(&h.body);
             }
         }
+        ExprKind::ViewDecl { body, .. } => f(body),
+        _ => {}
     }
-    module.decls.extend(hoisted);
 }
 
 /// Whether a record-embedded relation field is a source/view (`*name`, read+write
@@ -147,49 +170,14 @@ enum RecordRelKind {
     Derived,
 }
 
-/// Map a top-level record-let name to the relations it declares via `*name` /
-/// `&name` fields, tagged by kind.
-fn collect_record_source_fields(
-    module: &Module,
-) -> std::collections::HashMap<String, Vec<(String, RecordRelKind)>> {
-    let mut out = std::collections::HashMap::new();
-    for decl in &module.decls {
-        if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-            && let ExprKind::Record(fields) = &body.node
-        {
-            let names: Vec<(String, RecordRelKind)> = fields
-                .iter()
-                .filter_map(|f| match &f.value.node {
-                    ExprKind::SourceDecl { name, .. } => {
-                        Some((name.clone(), RecordRelKind::Source))
-                    }
-                    ExprKind::ViewDecl { name, .. } => Some((name.clone(), RecordRelKind::Source)),
-                    ExprKind::DerivedDecl { name, .. } => {
-                        Some((name.clone(), RecordRelKind::Derived))
-                    }
-                    _ => None,
-                })
-                .collect();
-            if !names.is_empty() {
-                out.insert(name.clone(), names);
-            }
-        }
-    }
-    out
-}
-
 /// Rewrite `rec.*name` → `SourceRef(name)` / `rec.&name` → `DerivedRef(name)`
 /// when `rec` is a static source-record that declares that relation.
-fn rewrite_record_source_refs(module: &mut Module) {
-    let map = collect_record_source_fields(module);
+fn rewrite_record_source_refs(expr: &mut Expr) {
+    let map = collect_record_source_fields(expr);
     if map.is_empty() {
         return;
     }
-    for decl in &mut module.decls {
-        if let DeclKind::Fun { body: Some(body), .. } = &mut decl.node {
-            rewrite_source_refs_in_expr(body, &map);
-        }
-    }
+    rewrite_source_refs_in_expr(expr, &map);
 }
 
 fn rewrite_source_refs_in_expr(
@@ -247,7 +235,118 @@ pub(crate) struct IoFns {
 
 /// Detect user functions whose bodies (transitively) produce IO values.
 /// Uses fixed-point iteration to handle transitive IO (e.g., genToken calls randomInt).
-fn detect_io_functions(decls: &[Decl]) -> IoFns {
+/// Collect named function bindings (a `with`-record field whose value is a
+/// lambda, possibly with a signature) so IO detection can see calls between
+/// them. Walks every `with {record}` in the expression.
+fn collect_fun_bodies<'a>(
+    expr: &'a Expr,
+    fun_bodies: &mut Vec<(&'a str, &'a Expr)>,
+    fun_sig_io: &mut HashSet<String>,
+) {
+    if let ExprKind::With { record, body } = &expr.node {
+        if let ExprKind::Record(fields) = &record.node {
+            for f in fields {
+                if matches!(f.value.node, ExprKind::Lambda { .. }) {
+                    fun_bodies.push((f.name.as_str(), &f.value));
+                    if let Some(ts) = &f.sig
+                        && type_returns_io(&ts.ty)
+                    {
+                        fun_sig_io.insert(f.name.clone());
+                    }
+                }
+                // Recurse into field values (nested `with`s).
+                collect_fun_bodies(&f.value, fun_bodies, fun_sig_io);
+            }
+        } else {
+            collect_fun_bodies(record, fun_bodies, fun_sig_io);
+        }
+        collect_fun_bodies(body, fun_bodies, fun_sig_io);
+        return;
+    }
+    // Generic recursion for non-With nodes (avoids the shared read-walker,
+    // whose closure can't capture the invariant `&mut Vec<(&'a …)>`).
+    match &expr.node {
+        ExprKind::App { func, arg } => {
+            collect_fun_bodies(func, fun_bodies, fun_sig_io);
+            collect_fun_bodies(arg, fun_bodies, fun_sig_io);
+        }
+        ExprKind::Lambda { body, .. } => collect_fun_bodies(body, fun_bodies, fun_sig_io),
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            collect_fun_bodies(lhs, fun_bodies, fun_sig_io);
+            collect_fun_bodies(rhs, fun_bodies, fun_sig_io);
+        }
+        ExprKind::UnaryOp { operand, .. } => {
+            collect_fun_bodies(operand, fun_bodies, fun_sig_io)
+        }
+        ExprKind::If { cond, then_branch, else_branch } => {
+            collect_fun_bodies(cond, fun_bodies, fun_sig_io);
+            collect_fun_bodies(then_branch, fun_bodies, fun_sig_io);
+            collect_fun_bodies(else_branch, fun_bodies, fun_sig_io);
+        }
+        ExprKind::Case { scrutinee, arms } => {
+            collect_fun_bodies(scrutinee, fun_bodies, fun_sig_io);
+            for arm in arms {
+                collect_fun_bodies(&arm.body, fun_bodies, fun_sig_io);
+            }
+        }
+        ExprKind::Do(stmts) => {
+            for s in stmts {
+                match &s.node {
+                    StmtKind::Bind { expr: e, .. } => {
+                        collect_fun_bodies(e, fun_bodies, fun_sig_io)
+                    }
+                    StmtKind::Where { cond } => {
+                        collect_fun_bodies(cond, fun_bodies, fun_sig_io)
+                    }
+                    StmtKind::GroupBy { key } => {
+                        collect_fun_bodies(key, fun_bodies, fun_sig_io)
+                    }
+                    StmtKind::Expr(e) => collect_fun_bodies(e, fun_bodies, fun_sig_io),
+                }
+            }
+        }
+        ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
+            collect_fun_bodies(target, fun_bodies, fun_sig_io);
+            collect_fun_bodies(value, fun_bodies, fun_sig_io);
+        }
+        ExprKind::Atomic(e) | ExprKind::Refine(e) => {
+            collect_fun_bodies(e, fun_bodies, fun_sig_io)
+        }
+        ExprKind::TimeUnitLit { value, .. } => {
+            collect_fun_bodies(value, fun_bodies, fun_sig_io)
+        }
+        ExprKind::Record(fields) => {
+            for fl in fields {
+                collect_fun_bodies(&fl.value, fun_bodies, fun_sig_io);
+            }
+        }
+        ExprKind::RecordUpdate { base, fields } => {
+            collect_fun_bodies(base, fun_bodies, fun_sig_io);
+            for fl in fields {
+                collect_fun_bodies(&fl.value, fun_bodies, fun_sig_io);
+            }
+        }
+        ExprKind::List(items) => {
+            for it in items {
+                collect_fun_bodies(it, fun_bodies, fun_sig_io);
+            }
+        }
+        ExprKind::FieldAccess { expr: e, .. } | ExprKind::Annot { expr: e, .. } => {
+            collect_fun_bodies(e, fun_bodies, fun_sig_io)
+        }
+        ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                collect_fun_bodies(&h.body, fun_bodies, fun_sig_io);
+            }
+        }
+        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+            collect_fun_bodies(body, fun_bodies, fun_sig_io)
+        }
+        _ => {}
+    }
+}
+
+fn detect_io_functions(expr: &Expr) -> IoFns {
     let io_builtins: HashSet<&str> = crate::builtins::EFFECTFUL_BUILTINS
         .iter()
         .filter(|n| **n != "retry")
@@ -255,24 +354,8 @@ fn detect_io_functions(decls: &[Decl]) -> IoFns {
         .collect();
 
     let mut fun_bodies: Vec<(&str, &Expr)> = Vec::new();
-    // Collect function names whose declared type returns IO, so the
-    // fixpoint seed recognizes them even when the body's IO is not
-    // syntactically visible to expr_contains_io.
     let mut fun_sig_io: HashSet<String> = HashSet::new();
-    for decl in decls {
-        match &decl.node {
-            DeclKind::Fun { name, body: Some(body), ty: Some(ts), .. } => {
-                if type_returns_io(&ts.ty) {
-                    fun_sig_io.insert(name.clone());
-                }
-                fun_bodies.push((name, body));
-            }
-            DeclKind::Fun { name, body: Some(body), .. } => {
-                fun_bodies.push((name, body));
-            }
-            _ => {}
-        }
-    }
+    collect_fun_bodies(expr, &mut fun_bodies, &mut fun_sig_io);
 
     fn fixpoint(
         bodies: &[(&str, &Expr)],
@@ -385,149 +468,7 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
     }
 }
 
-/// Generate `Data` declarations from `Route` and `RouteComposite` declarations.
-/// The original route declarations are kept in place for codegen to extract HTTP metadata.
-fn desugar_routes(module: &mut Module) {
-    let mut new_decls: Vec<Decl> = Vec::new();
 
-    // Resolve route entries by name. Plain `route ... where` declarations are
-    // known immediately; composites (`route All = A | B`) resolve to the
-    // concatenation of their components' entries. Composites may reference
-    // other composites in any declaration order, so iterate to a fixpoint
-    // instead of doing a single pass over plain routes only.
-    let mut resolved: std::collections::HashMap<String, Vec<RouteEntry>> =
-        std::collections::HashMap::new();
-    let mut pending: Vec<(String, Vec<Name>)> = Vec::new();
-    for d in &module.decls {
-        match &d.node {
-            DeclKind::Route { name, entries } => {
-                resolved.insert(name.clone(), entries.clone());
-            }
-            DeclKind::RouteComposite { name, components } => {
-                pending.push((name.clone(), components.clone()));
-            }
-            _ => {}
-        }
-    }
-    let composite_names: HashSet<String> = pending.iter().map(|(n, _)| n.clone()).collect();
-    // First, resolve composites in dependency order. A component name that is
-    // neither a route nor a composite resolves to nothing here; desugar has no
-    // diagnostics channel, so type inference reports unknown components.
-    loop {
-        let mut progressed = false;
-        pending.retain(|(name, components)| {
-            let blocked = components
-                .iter()
-                .any(|c| composite_names.contains(c) && !resolved.contains_key(c));
-            if blocked {
-                return true;
-            }
-            let mut all_entries: Vec<RouteEntry> = Vec::new();
-            for comp in components {
-                if let Some(entries) = resolved.get(comp) {
-                    all_entries.extend(entries.iter().cloned());
-                }
-            }
-            resolved.insert(name.clone(), all_entries);
-            progressed = true;
-            false
-        });
-        if pending.is_empty() || !progressed {
-            break;
-        }
-    }
-    // Anything still pending is part of a reference cycle — resolve it with
-    // whatever entries are available so every composite has a (possibly
-    // partial) entry set; inference reports the underlying error.
-    for (name, components) in &pending {
-        let mut all_entries: Vec<RouteEntry> = Vec::new();
-        for comp in components {
-            if let Some(entries) = resolved.get(comp) {
-                all_entries.extend(entries.iter().cloned());
-            }
-        }
-        resolved.insert(name.clone(), all_entries);
-    }
-
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Route { name, entries } => {
-                let ctors = route_entries_to_constructors(entries);
-                new_decls.push(Decl {
-                    node: DeclKind::Data {
-                        name: name.clone(),
-                        params: vec![],
-                        constructors: ctors,
-                        deriving: vec![],
-                    },
-                    span: decl.span,
-                });
-            }
-            DeclKind::RouteComposite { name, .. } => {
-                let all_entries = resolved.get(name).cloned().unwrap_or_default();
-                let ctors = route_entries_to_constructors(&all_entries);
-                new_decls.push(Decl {
-                    node: DeclKind::Data {
-                        name: name.clone(),
-                        params: vec![],
-                        constructors: ctors,
-                        deriving: vec![],
-                    },
-                    span: decl.span,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    // Prepend synthetic data decls so they're available before route decls
-    new_decls.append(&mut module.decls);
-    module.decls = new_decls;
-}
-
-/// Convert route entries into constructor definitions.
-/// Each constructor's fields are exactly the request inputs: path params,
-/// query params, body fields, and request headers. The endpoint's response
-/// type is enforced by `serve` typing — the constructor itself does not
-/// carry a `respond` callback.
-fn route_entries_to_constructors(entries: &[RouteEntry]) -> Vec<ConstructorDef> {
-    entries
-        .iter()
-        .map(|entry| {
-            let mut fields: Vec<Field<Type>> = Vec::new();
-            for seg in &entry.path {
-                if let PathSegment::Param { name, ty } = seg {
-                    fields.push(Field {
-                        name: name.clone(),
-                        value: ty.clone(),
-                    });
-                }
-            }
-            for qp in &entry.query_params {
-                fields.push(Field {
-                    name: qp.name.clone(),
-                    value: qp.value.clone(),
-                });
-            }
-            for bf in &entry.body_fields {
-                fields.push(Field {
-                    name: bf.name.clone(),
-                    value: bf.value.clone(),
-                });
-            }
-            for hf in &entry.request_headers {
-                fields.push(Field {
-                    name: hf.name.clone(),
-                    value: hf.value.clone(),
-                });
-            }
-            ConstructorDef {
-                name: entry.constructor.clone(),
-                fields,
-            }
-        })
-        .collect()
-}
 
 /// Name of the hidden dictionary parameter introduced for a `^field`
 /// constraint: `__dict_<field>`.
@@ -696,59 +637,6 @@ fn walk_expr_children(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
     }
 }
 
-fn desugar_decl(decl: &mut DeclKind, io_fns: &IoFns, source_vars: &HashSet<String>) {
-    match decl {
-        DeclKind::Fun { body: Some(body), ty, .. } => {
-            // Elaborate signature-level `^`-field constraints into a hidden
-            // leading dictionary parameter: a function declared
-            //   f : (^compare : a -> a -> Int) => a -> a -> a
-            //   f = \x -> … (^compare) …
-            // is rewritten to take a hidden record `__dict_compare` as its
-            // first parameter, and each body occurrence of `(^compare)` becomes
-            // `__dict_compare.compare`. The callsite supplies the dictionary.
-            // Constraint metadata is left on the type scheme so inference
-            // knows the callsite must resolve it; the declared type is also
-            // elaborated to expose the hidden dictionary as a leading record
-            // parameter, so the body (now `\__dict_<field> -> …`) type-checks.
-            elaborate_implicit_dicts(body, ty);
-            // Record-field funs with `^`-field constraints get the same
-            // elaboration, keyed on their record path (`fns.greet`) so a
-            // callsite can resolve the dictionary from scope.
-            if let ExprKind::Record(fields) = &mut body.node {
-                for f in fields {
-                    elaborate_implicit_dicts(&mut f.value, &mut f.sig);
-                }
-            }
-            desugar_expr(body, io_fns, source_vars)
-        }
-        DeclKind::Fun { body: None, .. } => {},
-        DeclKind::View { body, .. } => {
-            // Don't desugar the top-level do block of a view body
-            // (preserve structure for analyze_view), but recurse into sub-exprs.
-            // Unwrap wrappers in case the body is annotated.
-            let inner = unwrap_wrappers_mut(body);
-            if let ExprKind::Do(stmts) = &mut inner.node {
-                desugar_do_stmts(stmts, io_fns, source_vars);
-            } else {
-                desugar_expr(body, io_fns, source_vars);
-            }
-        }
-        DeclKind::Derived { body, .. } => desugar_expr(body, io_fns, source_vars),
-        DeclKind::Route { entries, .. } => {
-            // A route's `rateLimit` expression (e.g. its `key` lambda body) can
-            // contain a `do` block. It is otherwise never visited by
-            // desugaring, so codegen would receive a raw `Do` node and route it
-            // to the relational comprehension path instead of resolving the
-            // intended monad — recurse into it here like any other expression.
-            for entry in entries {
-                if let Some(rate_limit) = &mut entry.rate_limit {
-                    desugar_expr(rate_limit, io_fns, source_vars);
-                }
-            }
-        }
-        _ => {}
-    }
-}
 
 /// Recursively desugar expressions. The `Do` nodes that qualify as
 /// pure comprehensions are replaced with nested App/Lambda/Yield nodes.
@@ -1690,348 +1578,4 @@ fn mk_bind(func: Expr, collection: Expr, span: Span) -> Expr {
 
 // ── Tests ─────────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn synth_span_origins_stay_bounded() {
-        // Regression: `SYNTH_SPAN_ORIGINS` only ever inserted, so the
-        // long-running LSP (which re-desugars on every keystroke) grew it
-        // without bound. Flood well past the eviction threshold and confirm
-        // the map stays capped while a just-created span still resolves.
-        let origin = Span::new(5, 10);
-        let mut last = Span::new(0, 0);
-        for _ in 0..(2 * MAX_SYNTH_SPANS + 1000) {
-            last = fresh_monad_span(origin);
-        }
-        // Held under the lock, so the per-insert eviction invariant applies
-        // regardless of other tests touching the same global concurrently.
-        let len = SYNTH_SPAN_ORIGINS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|m| m.len())
-            .unwrap_or(0);
-        assert!(
-            len <= 2 * MAX_SYNTH_SPANS,
-            "map must stay bounded, got {len}"
-        );
-        // The most recent span (highest key) is never a candidate for eviction.
-        assert_eq!(synth_span_origin(last), Some(origin));
-    }
-
-    fn parse(src: &str) -> Module {
-        let lexer = knot::lexer::Lexer::new(src);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(src.to_string(), tokens);
-        let (module, _) = parser.parse_module();
-        module
-    }
-
-    fn has_bind_var(expr: &Expr) -> bool {
-        match &expr.node {
-            ExprKind::Var(name) => name == "__bind",
-            ExprKind::App { func, arg } => has_bind_var(func) || has_bind_var(arg),
-            ExprKind::Lambda { body, .. } => has_bind_var(body),
-            ExprKind::If { cond, then_branch, else_branch } => {
-                has_bind_var(cond) || has_bind_var(then_branch) || has_bind_var(else_branch)
-            }
-            ExprKind::Case { scrutinee, arms } => {
-                has_bind_var(scrutinee) || arms.iter().any(|a| has_bind_var(&a.body))
-            }
-            _ => false,
-        }
-    }
-
-    fn has_do_block(expr: &Expr) -> bool {
-        match &expr.node {
-            ExprKind::Do(_) => true,
-            ExprKind::App { func, arg } => has_do_block(func) || has_do_block(arg),
-            ExprKind::Lambda { body, .. } => has_do_block(body),
-            ExprKind::If { cond, then_branch, else_branch } => {
-                has_do_block(cond) || has_do_block(then_branch) || has_do_block(else_branch)
-            }
-            ExprKind::Case { scrutinee, arms } => {
-                has_do_block(scrutinee) || arms.iter().any(|a| has_do_block(&a.body))
-            }
-            ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
-                has_do_block(target) || has_do_block(value)
-            }
-            _ => false,
-        }
-    }
-
-    #[test]
-    fn pure_comprehension_is_desugared() {
-        // Use an in-memory relation (not a source ref) so the do-block
-        // is purely relational and eligible for desugaring.
-        let src = r#"
-            names = \people -> do
-              p <- people
-              where p.age > 27
-              yield p.name
-        "#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "names" {
-                    assert!(has_bind_var(body), "expected __bind in desugared body");
-                }
-        }
-    }
-
-    #[test]
-    fn mixed_do_block_not_desugared() {
-        let src = r#"*people : [{name: Text, age: Int 1}]
-main = do
-  *people = [{name "Alice" age 30}]
-  p <- *people
-  yield p.name
-"#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        // The main body should still be a Do block (mixed: has set + bind)
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "main" {
-                    assert!(matches!(&body.node, ExprKind::Do(_)),
-                        "mixed do block should not be desugared");
-                }
-        }
-    }
-
-    #[test]
-    fn set_value_do_not_desugared() {
-        let src = r#"*todos : [{title: Text, done: Int 1}]
-complete = \title -> *todos = do
-  t <- *todos
-  yield (if t.title == title then {t | done 1} else t)
-"#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        // The set value should still be a Do block
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "complete" {
-                    // body is a lambda whose body is a set
-                    if let ExprKind::Lambda { body: lbody, .. } = &body.node
-                        && let ExprKind::Set { value, .. } = &lbody.node {
-                            assert!(matches!(&value.node, ExprKind::Do(_)),
-                                "set value do block should not be desugared");
-                        }
-                }
-        }
-    }
-
-    #[test]
-    fn sequential_do_not_desugared() {
-        let src = r#"
-            main = do
-              println "hello"
-              println "world"
-              yield {}
-        "#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        // No bind/where → sequential, should not be desugared
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "main" {
-                    assert!(matches!(&body.node, ExprKind::Do(_)),
-                        "sequential do block should not be desugared");
-                }
-        }
-    }
-
-    #[test]
-    fn sql_compilable_do_preserved() {
-        // SQL-compilable do-blocks (Bind→SourceRef + Where + Yield(Var))
-        // are preserved as Do nodes for codegen to compile to SQL.
-        let src = r#"*items : [{x: Int 1}]
-filtered = do
-  i <- *items
-  where i.x > 0
-  yield i
-"#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "filtered" {
-                    assert!(
-                        matches!(&body.node, ExprKind::Do(_)),
-                        "sql-compilable do block should be preserved for codegen"
-                    );
-                }
-        }
-    }
-
-    #[test]
-    fn where_with_non_record_yield_desugared() {
-        // Use an in-memory relation so the do-block is purely relational.
-        let src = r#"
-            names = \items -> do
-              i <- items
-              where i.x > 0
-              yield i.name
-        "#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "names" {
-                    assert!(has_bind_var(body), "expected __bind in desugared body");
-                    assert!(!has_do_block(body), "expected no Do block after desugaring");
-                }
-        }
-    }
-
-    #[test]
-    fn groupby_do_not_desugared() {
-        let src = r#"*items : [{x: Int 1, cat: Text}]
-grouped = do
-  i <- *items
-  groupBy {cat i.cat}
-  yield {cat i.cat n (count i)}
-"#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        // groupBy do blocks must stay as Do nodes (loop-based codegen)
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "grouped" {
-                    assert!(
-                        matches!(&body.node, ExprKind::Do(_)),
-                        "groupBy do block should not be desugared"
-                    );
-                }
-        }
-    }
-
-    #[test]
-    fn multi_table_sql_compilable_preserved() {
-        let src = r#"*employees : [{name: Text, dept: Text}]
-*departments : [{name: Text, budget: Int 1}]
-joined = do
-  e <- *employees
-  d <- *departments
-  where e.dept == d.name
-  yield {name e.name budget d.budget}
-"#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "joined" {
-                    assert!(
-                        matches!(&body.node, ExprKind::Do(_)),
-                        "multi-table sql-compilable do block should be preserved"
-                    );
-                }
-        }
-    }
-
-    #[test]
-    fn var_bind_without_source_context_desugars() {
-        // `u <- m` over a lambda param (e.g. a Maybe) with `yield u` must
-        // desugar through __bind — it is NOT a SQL-compilable relation read
-        // even though the yield shape matches (regression: the Var-bind
-        // acceptance used to win unconditionally and the block was preserved
-        // as a raw Do node, breaking non-relation monads).
-        let src = r#"
-            firstAdult = \m -> do
-              u <- m
-              where u.age >= 18
-              yield u
-        "#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "firstAdult" {
-                    assert!(has_bind_var(body), "expected __bind in desugared body");
-                    assert!(!has_do_block(body), "expected no Do block after desugaring");
-                }
-        }
-    }
-
-    #[test]
-    fn io_trait_method_do_block_not_desugared() {
-        // A do-block calling a trait method whose signature returns IO must
-        // be excluded from pure-comprehension desugaring, exactly like a
-        // do-block calling a plain IO function.
-        let src = r#"
-            trait Ticker a where
-              tick : a -> IO {console} {}
-            impl Ticker Int where
-              tick = \v -> println (show v)
-            main = do
-              b <- [1, 2]
-              tick b
-        "#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "main" {
-                    assert!(
-                        matches!(&body.node, ExprKind::Do(_)),
-                        "IO trait-method do block should not be desugared"
-                    );
-                }
-        }
-    }
-
-    #[test]
-    fn io_impl_body_only_method_not_desugared() {
-        // The trait signature is polymorphic (no IO), but an impl body does
-        // IO — the fixpoint over impl bodies flags the method name.
-        let src = r#"
-            trait Runner a where
-              run : a -> a
-            impl Runner Int where
-              run = \v -> println (show v)
-            main = do
-              b <- [1, 2]
-              run b
-        "#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "main" {
-                    assert!(
-                        matches!(&body.node, ExprKind::Do(_)),
-                        "do block calling an IO-bodied impl method should not be desugared"
-                    );
-                }
-        }
-    }
-
-    #[test]
-    fn ctor_pattern_bind_not_desugared() {
-        // Constructor pattern binds may be value pattern matches
-        // (not monadic binds) — the desugarer can't distinguish, so
-        // these do blocks are left for direct codegen.
-        let src = r#"data Status = Open {} | Closed {}
-*items : [{name: Text, status: Status}]
-main = do
-  i <- *items
-  Open {} <- i.status
-  yield {name i.name}
-"#;
-        let mut module = parse(src);
-        desugar(&mut module);
-        for decl in &module.decls {
-            if let DeclKind::Fun { name, body: Some(body), .. } = &decl.node
-                && name == "main" {
-                    assert!(
-                        matches!(&body.node, ExprKind::Do(_)),
-                        "ctor pattern bind do block should not be desugared"
-                    );
-                }
-        }
-    }
-}

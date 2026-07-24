@@ -38,20 +38,7 @@ pub type Name = String;
 pub type Expr = Spanned<ExprKind>;
 pub type Pat = Spanned<PatKind>;
 pub type Type = Spanned<TypeKind>;
-#[derive(Debug, Clone)]
-pub struct Decl {
-    pub node: DeclKind,
-    pub span: Span,
-}
 pub type Stmt = Spanned<StmtKind>;
-
-// ── Module ─────────────────────────────────────────────────────────
-
-/// A complete Knot source file.
-#[derive(Debug, Clone)]
-pub struct Module {
-    pub decls: Vec<Decl>,
-}
 
 // ── Units of Measure ──────────────────────────────────────────────
 
@@ -71,72 +58,6 @@ pub enum UnitExpr {
     /// `_` — unit hole: a fresh unit variable, bound by unification (like a
     /// lowercase unit variable, but each occurrence is independent).
     Hole,
-}
-
-// ── Declarations ───────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub enum DeclKind {
-    /// `data Shape = Circle {radius: Float} | Rect {w: Float, h: Float}`
-    Data {
-        name: Name,
-        params: Vec<Name>,
-        constructors: Vec<ConstructorDef>,
-        deriving: Vec<Name>,
-    },
-
-    /// `type Person = {name: Text, age: Int}`
-    TypeAlias {
-        name: Name,
-        params: Vec<Name>,
-        ty: Type,
-    },
-
-    /// `*people : [Person]` — persisted, mutable, no body.
-    Source {
-        name: Name,
-        ty: Type,
-    },
-
-    /// `*openTodos = expr` — query over sources, settable.
-    View {
-        name: Name,
-        ty: Option<TypeScheme>,
-        body: Expr,
-    },
-
-    /// `&seniors = expr` — computed from sources, read-only.
-    Derived {
-        name: Name,
-        ty: Option<TypeScheme>,
-        body: Expr,
-    },
-
-    /// `add = \x y -> x + y` — constant binding (functions are lambdas).
-    /// `body` is `None` for signature-only declarations (e.g. `f : Int -> Int`).
-    Fun {
-        name: Name,
-        ty: Option<TypeScheme>,
-        body: Option<Expr>,
-    },
-
-    /// `route Api where ...`
-    Route {
-        name: Name,
-        entries: Vec<RouteEntry>,
-    },
-
-    /// `route Api = TodoApi | AdminApi`
-    RouteComposite {
-        name: Name,
-        components: Vec<Name>,
-    },
-
-    /// `*orders.customer <= *people.name`
-    SubsetConstraint {
-        sub: RelationPath,
-        sup: RelationPath,
-    },
 }
 
 // ── Expressions ────────────────────────────────────────────────────
@@ -299,8 +220,8 @@ pub enum ExprKind {
     },
 
     /// `*openTodos = expr` (or `*openTodos : Type = expr`) inside a record
-    /// literal — an embedded view declaration. Mirrors the top-level
-    /// `DeclKind::View`; the field is literally named `*name` and its value is
+    /// literal — an embedded view declaration. Mirrors a top-level
+    /// view declaration; the field is literally named `*name` and its value is
     /// a marker (the view is registered statically and resolved by path).
     ViewDecl {
         /// Field name WITHOUT the leading `*` (e.g. `openTodos`).
@@ -310,8 +231,8 @@ pub enum ExprKind {
     },
 
     /// `&seniors = expr` (or `&seniors : Type = expr`) inside a record
-    /// literal — an embedded derived declaration. Mirrors the top-level
-    /// `DeclKind::Derived`; the field is literally named `&name` and its value
+    /// literal — an embedded derived declaration. Mirrors a top-level
+    /// derived declaration; the field is literally named `&name` and its value
     /// is a marker (the derived relation is registered statically and resolved
     /// by path).
     DerivedDecl {
@@ -323,7 +244,7 @@ pub enum ExprKind {
 
     /// A subset constraint embedded in a record value literal:
     /// `{…, *orders.customer <= *people.name, …}` (or the whole-relation form
-    /// `*a <= *b`). Mirrors the top-level `DeclKind::SubsetConstraint`; the
+    /// `*a <= *b`). Mirrors a top-level subset constraint; the
     /// field is a pure marker — it contributes no runtime value, the
     /// constraint is registered statically alongside top-level ones.
     SubsetConstraint {
@@ -332,7 +253,7 @@ pub enum ExprKind {
     },
 
     /// A `route Name where …` declaration embedded in a record value literal
-    /// (`{route Api where …, …}`). Mirrors the top-level `DeclKind::Route`.
+    /// (`{route Api where …, …}`). Mirrors a top-level route declaration.
     /// The field is a pure marker — it contributes no runtime value (erased
     /// like `DataCtor`); the route's entries and endpoint constructors are
     /// registered statically under the record path (`rec.Api`) and resolved
@@ -344,8 +265,8 @@ pub enum ExprKind {
     },
 
     /// A `route Name = A | B` composite embedded in a record value literal
-    /// (`{route Api = TodoApi | AdminApi, …}`). Mirrors the top-level
-    /// `DeclKind::RouteComposite`; components may themselves be field paths
+    /// (`{route Api = TodoApi | AdminApi, …}`). Mirrors a top-level
+    /// route composite declaration; components may themselves be field paths
     /// (e.g. `other.TodoApi`). The field is a pure marker, resolved to a
     /// fixpoint during inference/codegen exactly like top-level composites.
     RouteCompositeDecl {

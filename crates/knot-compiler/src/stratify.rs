@@ -13,6 +13,7 @@
 //! (e.g. `where count self == 0`) oscillates instead of converging — caught
 //! here rather than panicking after 10000 fixpoint iterations at runtime.
 
+use crate::decl_view::{decl_views, DeclViewKind};
 use knot::ast;
 use knot::ast::Span;
 use knot::diagnostic::Diagnostic;
@@ -90,26 +91,22 @@ struct Edge {
 /// `\a b -> diff a b` (a curried alias of the `diff` builtin) to the
 /// positional parameter names, so a call like `minus self all` is
 /// recognized as negation rather than a pair of positive edges (B31).
-fn build_dependency_graph(module: &ast::Module) -> (HashSet<String>, HashMap<String, Vec<Edge>>) {
+fn build_dependency_graph(program: &ast::Expr) -> (HashSet<String>, HashMap<String, Vec<Edge>>) {
     let mut node_names = HashSet::new();
     let mut edges: HashMap<String, Vec<Edge>> = HashMap::new();
     let mut diff_wrappers: HashMap<String, [String; 2]> = HashMap::new();
 
     // First pass: collect all node names (derived relations and views),
     // and detect user functions that are curried aliases of `diff`.
-    for decl in &module.decls {
-        match &decl.node {
-            ast::DeclKind::Derived { name, .. } => {
-                node_names.insert(name.clone());
-                edges.entry(name.clone()).or_default();
+    for decl in decl_views(program) {
+        match decl.kind {
+            DeclViewKind::Derived { .. } | DeclViewKind::View { .. } => {
+                node_names.insert(decl.name.to_string());
+                edges.entry(decl.name.to_string()).or_default();
             }
-            ast::DeclKind::View { name, .. } => {
-                node_names.insert(name.clone());
-                edges.entry(name.clone()).or_default();
-            }
-            ast::DeclKind::Fun { name, body: Some(body), .. } => {
+            DeclViewKind::Fun { body: Some(body), .. } => {
                 if let Some(params) = is_diff_wrapper(body) {
-                    diff_wrappers.insert(name.clone(), params);
+                    diff_wrappers.insert(decl.name.to_string(), params);
                 }
             }
             _ => {}
@@ -117,21 +114,15 @@ fn build_dependency_graph(module: &ast::Module) -> (HashSet<String>, HashMap<Str
     }
 
     // Second pass: walk each node's body to find edges.
-    for decl in &module.decls {
-        match &decl.node {
-            ast::DeclKind::Derived { name, body, .. } => {
+    for decl in decl_views(program) {
+        match decl.kind {
+            DeclViewKind::Derived { body: Some(body), .. }
+            | DeclViewKind::View { body: Some(body), .. } => {
                 let mut found = Vec::new();
                 let env = HashMap::new();
                 let partial_diffs = HashMap::new();
                 collect_edges(body, Polarity::Positive, &node_names, &env, &partial_diffs, &diff_wrappers, &mut found);
-                edges.get_mut(name).unwrap().extend(found);
-            }
-            ast::DeclKind::View { name, body, .. } => {
-                let mut found = Vec::new();
-                let env = HashMap::new();
-                let partial_diffs = HashMap::new();
-                collect_edges(body, Polarity::Positive, &node_names, &env, &partial_diffs, &diff_wrappers, &mut found);
-                edges.get_mut(name).unwrap().extend(found);
+                edges.get_mut(decl.name).unwrap().extend(found);
             }
             _ => {}
         }
@@ -736,12 +727,12 @@ impl<'a> Tarjan<'a> {
 ///
 /// Runs on a grown stack — building the dependency graph walks expression
 /// bodies recursively, including desugared `do` chains.
-pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
-    crate::stack::grow(|| check_inner(module))
+pub fn check(program: &ast::Expr) -> Vec<Diagnostic> {
+    crate::stack::grow(|| check_inner(program))
 }
 
-fn check_inner(module: &ast::Module) -> Vec<Diagnostic> {
-    let (_, edges) = build_dependency_graph(module);
+fn check_inner(program: &ast::Expr) -> Vec<Diagnostic> {
+    let (_, edges) = build_dependency_graph(program);
     let sccs = Tarjan::run(&edges);
 
     // Collect declaration spans for error reporting, and track which nodes are
@@ -752,14 +743,15 @@ fn check_inner(module: &ast::Module) -> Vec<Diagnostic> {
     // tell the two apart when a single-node cycle is found below.
     let mut decl_spans: HashMap<String, Span> = HashMap::new();
     let mut view_names: HashSet<String> = HashSet::new();
-    for decl in &module.decls {
-        match &decl.node {
-            ast::DeclKind::Derived { name, .. } => {
-                decl_spans.insert(name.clone(), decl.span);
+    for decl in decl_views(program) {
+        let span = decl.body().map(|b| b.span).unwrap_or(ast::Span { start: 0, end: 0 });
+        match decl.kind {
+            DeclViewKind::Derived { .. } => {
+                decl_spans.insert(decl.name.to_string(), span);
             }
-            ast::DeclKind::View { name, .. } => {
-                decl_spans.insert(name.clone(), decl.span);
-                view_names.insert(name.clone());
+            DeclViewKind::View { .. } => {
+                decl_spans.insert(decl.name.to_string(), span);
+                view_names.insert(decl.name.to_string());
             }
             _ => {}
         }
@@ -915,661 +907,4 @@ fn check_inner(module: &ast::Module) -> Vec<Diagnostic> {
 
 // ── Tests ───────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use knot::ast::*;
 
-    fn span() -> Span {
-        Span::new(0, 0)
-    }
-
-    fn spanned<T>(node: T) -> Spanned<T> {
-        Spanned::new(node, span())
-    }
-
-    fn derived(name: &str, body: Expr) -> Decl {
-        Decl { node: DeclKind::Derived { name: name.to_string(), ty: None, body }, span: span() }
-    }
-
-    fn view(name: &str, body: Expr) -> Decl {
-        Decl { node: DeclKind::View { name: name.to_string(), ty: None, body }, span: span() }
-    }
-
-    fn fun(name: &str, body: Expr) -> Decl {
-        Decl { node: DeclKind::Fun { name: name.to_string(), ty: None, body: Some(body) }, span: span() }
-    }
-
-    fn lambda(params: Vec<&str>, body: Expr) -> Expr {
-        let params: Vec<Spanned<PatKind>> = params
-            .into_iter()
-            .map(|p| spanned(PatKind::Var(p.to_string())))
-            .collect();
-        spanned(ExprKind::Lambda { params, ty_params: vec![], body: Box::new(body) })
-    }
-
-    fn derived_ref(name: &str) -> Expr {
-        spanned(ExprKind::DerivedRef(name.to_string()))
-    }
-
-    fn var(name: &str) -> Expr {
-        spanned(ExprKind::Var(name.to_string()))
-    }
-
-    fn app(func: Expr, arg: Expr) -> Expr {
-        spanned(ExprKind::App { func: Box::new(func), arg: Box::new(arg) })
-    }
-
-    fn source_ref(name: &str) -> Expr {
-        spanned(ExprKind::SourceRef(name.to_string()))
-    }
-
-    fn module(decls: Vec<Decl>) -> Module {
-        Module { decls }
-    }
-
-    /// `diff a b` → `App(App(Var("diff"), a), b)`
-    fn diff(a: Expr, b: Expr) -> Expr {
-        app(app(var("diff"), a), b)
-    }
-
-    /// `union a b` → `App(App(Var("union"), a), b)`
-    fn union(a: Expr, b: Expr) -> Expr {
-        app(app(var("union"), a), b)
-    }
-
-    #[test]
-    fn positive_self_recursion_is_ok() {
-        // &reach = union *edges &reach
-        let m = module(vec![
-            derived("reach", union(source_ref("edges"), derived_ref("reach"))),
-        ]);
-        let diags = check(&m);
-        assert!(diags.is_empty(), "positive self-recursion should be fine");
-    }
-
-    /// `count r` → `App(Var("count"), r)`
-    fn count(r: Expr) -> Expr {
-        app(var("count"), r)
-    }
-
-    fn where_stmt(cond: Expr) -> Spanned<StmtKind> {
-        spanned(StmtKind::Where { cond })
-    }
-
-    fn eq(lhs: Expr, rhs: Expr) -> Expr {
-        spanned(ExprKind::BinOp { lhs: Box::new(lhs), rhs: Box::new(rhs), op: BinOp::Eq })
-    }
-
-    fn int_lit(n: i64) -> Expr {
-        spanned(ExprKind::Lit(Literal::Int(n.to_string())))
-    }
-
-    #[test]
-    fn negative_self_recursion_is_rejected() {
-        // &bad = diff *all &bad
-        let m = module(vec![
-            derived("bad", diff(source_ref("all"), derived_ref("bad"))),
-        ]);
-        let diags = check(&m);
-        assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("unstratifiable"));
-        assert!(diags[0].message.contains("&bad"));
-        // The cause here really is `diff`, so it must be the one named.
-        assert!(diags[0].message.contains("`diff`"), "got: {}", diags[0].message);
-        assert!(!diags[0].message.contains("aggregate"), "got: {}", diags[0].message);
-    }
-
-    #[test]
-    fn aggregate_self_recursion_blames_the_aggregate_not_diff() {
-        // &bad = do
-        //   self <- &bad
-        //   where count self == 0
-        //   x    <- *items
-        //   yield x
-        //
-        // The negative edge comes from `count` collapsing the recursive relation
-        // to a scalar — there is no `diff` anywhere in this program, so the
-        // diagnostic must name the aggregate rather than blaming `diff`.
-        let body = do_expr(vec![
-            bind_stmt("self", derived_ref("bad")),
-            where_stmt(eq(count(var("self")), int_lit(0))),
-            bind_stmt("x", source_ref("items")),
-            yield_stmt(var("x")),
-        ]);
-        let m = module(vec![derived("bad", body)]);
-        let diags = check(&m);
-        assert_eq!(diags.len(), 1, "one unstratifiable-recursion error");
-
-        let diag = &diags[0];
-        assert!(diag.message.contains("unstratifiable"), "got: {}", diag.message);
-        assert!(diag.message.contains("&bad"), "got: {}", diag.message);
-        assert!(
-            diag.message.contains("aggregate") && diag.message.contains("count"),
-            "message must name the aggregate that caused the negative edge, got: {}",
-            diag.message
-        );
-        assert!(
-            !diag.message.contains("`diff`"),
-            "no `diff` in this program — it must not be blamed, got: {}",
-            diag.message
-        );
-        assert!(
-            diag.labels.iter().any(|l| l.message.contains("aggregate")),
-            "label must name the aggregate, got: {:?}",
-            diag.labels.iter().map(|l| &l.message).collect::<Vec<_>>()
-        );
-        assert!(
-            diag.notes.iter().any(|n| n.contains("aggregate over itself")),
-            "self-aggregate note expected, got: {:?}",
-            diag.notes
-        );
-        assert!(
-            diag.notes.iter().all(|n| !n.contains("subtract")),
-            "must not suggest a subtraction that isn't there, got: {:?}",
-            diag.notes
-        );
-    }
-
-    #[test]
-    fn pipe_aggregate_mutual_recursion_blames_the_aggregate() {
-        // &a = do { self <- &b; where (self |> count) == 0; x <- *items; yield x }
-        // &b = union *source &a
-        //
-        // Same cause reached through the pipe form, across a mutual cycle: the
-        // note must talk about aggregating, not negating.
-        let body = do_expr(vec![
-            bind_stmt("self", derived_ref("b")),
-            where_stmt(eq(
-                spanned(ExprKind::BinOp {
-                    lhs: Box::new(var("self")),
-                    rhs: Box::new(var("count")),
-                    op: BinOp::Pipe,
-                }),
-                int_lit(0),
-            )),
-            bind_stmt("x", source_ref("items")),
-            yield_stmt(var("x")),
-        ]);
-        let m = module(vec![
-            derived("a", body),
-            derived("b", union(source_ref("source"), derived_ref("a"))),
-        ]);
-        let diags = check(&m);
-        assert_eq!(diags.len(), 1, "one unstratifiable-recursion error");
-
-        let diag = &diags[0];
-        assert!(diag.message.contains("unstratifiable"), "got: {}", diag.message);
-        assert!(diag.message.contains("aggregate"), "got: {}", diag.message);
-        assert!(!diag.message.contains("`diff`"), "got: {}", diag.message);
-        assert!(
-            diag.notes.iter().any(|n| n.contains("aggregating across")),
-            "mutual-cycle note must describe aggregation, got: {:?}",
-            diag.notes
-        );
-    }
-
-    #[test]
-    fn negative_dep_on_non_recursive_is_ok() {
-        // &a = *source
-        // &b = diff *all &a
-        let m = module(vec![
-            derived("a", source_ref("source")),
-            derived("b", diff(source_ref("all"), derived_ref("a"))),
-        ]);
-        let diags = check(&m);
-        assert!(diags.is_empty(), "negating a non-recursive dep is fine");
-    }
-
-    #[test]
-    fn mutual_recursion_with_negation_is_rejected() {
-        // &a = diff *source &b
-        // &b = union *source &a
-        let m = module(vec![
-            derived("a", diff(source_ref("source"), derived_ref("b"))),
-            derived("b", union(source_ref("source"), derived_ref("a"))),
-        ]);
-        let diags = check(&m);
-        assert!(!diags.is_empty(), "negative edge in mutual cycle should fail");
-    }
-
-    #[test]
-    fn mutual_recursion_all_positive_is_rejected_as_unsupported() {
-        // &a = union *source &b
-        // &b = union *source &a
-        // Positive mutual recursion is well-defined in Datalog, but codegen
-        // only emits a fixpoint for a *single* self-recursive relation — a
-        // mutual cycle compiles to unbounded mutual recompute (stack
-        // overflow). It must be rejected with a clear diagnostic rather than
-        // silently miscompiled.
-        let m = module(vec![
-            derived("a", union(source_ref("source"), derived_ref("b"))),
-            derived("b", union(source_ref("source"), derived_ref("a"))),
-        ]);
-        let diags = check(&m);
-        assert_eq!(diags.len(), 1, "one unsupported-mutual-recursion error");
-        assert!(
-            diags[0].message.contains("mutually recursive"),
-            "expected mutual-recursion diagnostic, got: {}",
-            diags[0].message
-        );
-        assert!(
-            !diags[0].message.contains("unstratifiable"),
-            "positive cycle is unsupported, not unstratifiable"
-        );
-    }
-
-    #[test]
-    fn indirect_positive_cycle_is_rejected() {
-        // &a = union *s &b ; &b = union *s &c ; &c = union *s &a
-        // A 3-relation cycle: none is directly self-recursive, so codegen's
-        // syntactic self-ref check misses all three and would emit looping
-        // recompute. The SCC detection must catch the whole cycle.
-        let m = module(vec![
-            derived("a", union(source_ref("s"), derived_ref("b"))),
-            derived("b", union(source_ref("s"), derived_ref("c"))),
-            derived("c", union(source_ref("s"), derived_ref("a"))),
-        ]);
-        let diags = check(&m);
-        assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("mutually recursive"));
-        assert!(diags[0].message.contains("&a"));
-        assert!(diags[0].message.contains("&c"));
-    }
-
-    #[test]
-    fn diff_first_arg_stays_positive() {
-        // &a = diff &a *source  (self-ref in positive position of diff, source in negative)
-        let m = module(vec![
-            derived("a", diff(derived_ref("a"), source_ref("source"))),
-        ]);
-        let diags = check(&m);
-        assert!(diags.is_empty(), "self-ref as first arg of diff is positive");
-    }
-
-    #[test]
-    fn boolean_not_does_not_create_negative_dep() {
-        // &a = if not (&b == []) then *source else []
-        // `not` is boolean negation, not set complement — &b is read
-        // positively (just checking emptiness), so this should NOT create
-        // a negative edge.
-        use knot::ast::{ExprKind, UnaryOp};
-        let not_expr = spanned(ExprKind::UnaryOp {
-            op: UnaryOp::Not,
-            operand: Box::new(spanned(ExprKind::BinOp {
-                lhs: Box::new(derived_ref("b")),
-                rhs: Box::new(spanned(ExprKind::List(vec![]))),
-                op: BinOp::Eq,
-            })),
-        });
-        let if_expr = spanned(ExprKind::If {
-            cond: Box::new(not_expr),
-            then_branch: Box::new(source_ref("source")),
-            else_branch: Box::new(spanned(ExprKind::List(vec![]))),
-        });
-        let m = module(vec![
-            derived("a", if_expr),
-            derived("b", source_ref("source")),
-        ]);
-        let diags = check(&m);
-        // If `not` incorrectly created a negative edge, &a → &b would be
-        // negative, and &b → *source is positive, so no cycle — this
-        // particular test doesn't produce a cycle.  But if &b also
-        // depended on &a, a false negative edge would create a spurious
-        // unstratifiable error.  The mutual case is tested below.
-        assert!(diags.is_empty(), "boolean `not` should not create negative dep");
-    }
-
-    #[test]
-    fn boolean_not_in_mutual_recursion_is_unstratifiable() {
-        // &a depends on &b through `not`, and &b depends on &a.
-        // `not` is negation-as-failure: it creates a negative edge.
-        // The cycle &a →(neg) &b →(pos) &a is unstratifiable.
-        use knot::ast::{ExprKind, UnaryOp};
-        let not_expr = spanned(ExprKind::UnaryOp {
-            op: UnaryOp::Not,
-            operand: Box::new(spanned(ExprKind::BinOp {
-                lhs: Box::new(derived_ref("b")),
-                rhs: Box::new(spanned(ExprKind::List(vec![]))),
-                op: BinOp::Eq,
-            })),
-        });
-        let if_a = spanned(ExprKind::If {
-            cond: Box::new(not_expr),
-            then_branch: Box::new(source_ref("source")),
-            else_branch: Box::new(spanned(ExprKind::List(vec![]))),
-        });
-        let m = module(vec![
-            derived("a", if_a),
-            derived("b", union(source_ref("source"), derived_ref("a"))),
-        ]);
-        let diags = check(&m);
-        // `not` correctly creates a negative edge, so the cycle
-        // &a →(neg) &b →(pos) &a is unstratifiable.
-        assert_eq!(diags.len(), 1);
-        assert!(
-            diags[0].message.contains("unstratifiable"),
-            "boolean `not` must create a negative edge: {}",
-            diags[0].message
-        );
-    }
-
-    #[test]
-    fn pipe_diff_creates_negative_dep() {
-        // &bad = &bad |> diff *all
-        // This is `diff *all &bad` — &bad is the subtracted (negative) arg.
-        // The pipe form must be recognized, otherwise the negative self-edge
-        // is missed and the unstratifiable recursion goes undetected.
-        let pipe = spanned(ExprKind::BinOp {
-            lhs: Box::new(derived_ref("bad")),
-            rhs: Box::new(app(var("diff"), source_ref("all"))),
-            op: BinOp::Pipe,
-        });
-        let m = module(vec![
-            derived("bad", pipe),
-        ]);
-        let diags = check(&m);
-        assert!(!diags.is_empty(), "pipe-diff self-recursion should be rejected");
-        assert!(diags[0].message.contains("unstratifiable"));
-    }
-
-    fn var_pat(name: &str) -> Pat {
-        spanned(PatKind::Var(name.to_string()))
-    }
-
-    fn bind_stmt(name: &str, expr: Expr) -> Spanned<StmtKind> {
-        spanned(StmtKind::Bind { pat: var_pat(name), expr })
-    }
-
-    fn yield_stmt(expr: Expr) -> Spanned<StmtKind> {
-        spanned(StmtKind::Expr(expr))
-    }
-
-    fn do_expr(stmts: Vec<Spanned<StmtKind>>) -> Expr {
-        spanned(ExprKind::Do(stmts))
-    }
-
-    #[test]
-    fn do_bind_self_negation_is_rejected() {
-        // &bad = do
-        //   self <- &bad
-        //   all  <- *items
-        //   d    <- diff all self
-        //   yield d
-        //
-        // `diff` is applied to the *variable* `self` (not `&bad` directly),
-        // which is how a self-negating derived relation must actually be
-        // written — `diff *all &bad` doesn't type-check inside a derived body.
-        // The alias `self -> &bad` must be tracked so the negative edge is
-        // recorded; otherwise this compiles and oscillates forever at runtime.
-        let body = do_expr(vec![
-            bind_stmt("self", derived_ref("bad")),
-            bind_stmt("all", source_ref("items")),
-            bind_stmt("d", diff(var("all"), var("self"))),
-            yield_stmt(var("d")),
-        ]);
-        let m = module(vec![derived("bad", body)]);
-        let diags = check(&m);
-        assert!(
-            !diags.is_empty(),
-            "self-negation laundered through a do-bind should be rejected"
-        );
-        assert!(diags[0].message.contains("unstratifiable"));
-        assert!(diags[0].message.contains("&bad"));
-    }
-
-    #[test]
-    fn do_bind_negating_non_recursive_alias_is_ok() {
-        // &a = *source
-        // &b = do
-        //   x   <- &a
-        //   all <- *items
-        //   d   <- diff all x
-        //   yield d
-        //
-        // Negating an alias of a *non-recursive* peer (&a) is a valid
-        // stratified negation — no cycle, so no error.
-        let body = do_expr(vec![
-            bind_stmt("x", derived_ref("a")),
-            bind_stmt("all", source_ref("items")),
-            bind_stmt("d", diff(var("all"), var("x"))),
-            yield_stmt(var("d")),
-        ]);
-        let m = module(vec![
-            derived("a", source_ref("source")),
-            derived("b", body),
-        ]);
-        let diags = check(&m);
-        assert!(
-            diags.is_empty(),
-            "negating an alias of a non-recursive derived relation is fine: {:?}",
-            diags.first().map(|d| &d.message)
-        );
-    }
-
-    #[test]
-    fn pipe_diff_mutual_creates_negative_dep() {
-        // &a = &b |> diff *all   (diff *all &b — &b is negative)
-        // &b = union *source &a   (&a is positive)
-        // The negative edge &a → &b in a cycle should be detected.
-        let pipe = spanned(ExprKind::BinOp {
-            lhs: Box::new(derived_ref("b")),
-            rhs: Box::new(app(var("diff"), source_ref("all"))),
-            op: BinOp::Pipe,
-        });
-        let m = module(vec![
-            derived("a", pipe),
-            derived("b", union(source_ref("source"), derived_ref("a"))),
-        ]);
-        let diags = check(&m);
-        assert!(
-            !diags.is_empty(),
-            "pipe-diff mutual recursion should be detected as unstratifiable"
-        );
-    }
-
-    #[test]
-    fn self_recursive_view_is_rejected() {
-        // *v = do
-        //   r <- *v
-        //   yield r
-        //
-        // A view has no fixpoint codegen (unlike a derived relation): reading
-        // itself makes `analyze_view` treat the view as its own base source, so
-        // the generated query hits a nonexistent `_knot_v` table and panics at
-        // runtime. It must be rejected at compile time instead.
-        let body = do_expr(vec![
-            bind_stmt("r", source_ref("v")),
-            yield_stmt(var("r")),
-        ]);
-        let m = module(vec![view("v", body)]);
-        let diags = check(&m);
-        assert_eq!(diags.len(), 1, "one self-recursive-view error");
-        assert!(
-            diags[0].message.contains("self-recursive view") && diags[0].message.contains("*v"),
-            "expected self-recursive-view diagnostic, got: {}",
-            diags[0].message
-        );
-    }
-
-    #[test]
-    fn self_recursive_derived_is_still_ok() {
-        // &v = do
-        //   r <- &v
-        //   yield r
-        //
-        // The view-specific rejection must NOT fire for a derived relation — a
-        // single-node positive self-loop on a derived relation is the supported
-        // recursive-derived-relation feature (fixpoint codegen).
-        let body = do_expr(vec![
-            bind_stmt("r", derived_ref("v")),
-            yield_stmt(var("r")),
-        ]);
-        let m = module(vec![derived("v", body)]);
-        let diags = check(&m);
-        assert!(
-            diags.is_empty(),
-            "self-recursive derived relation should compile: {:?}",
-            diags.first().map(|d| &d.message)
-        );
-    }
-
-    #[test]
-    fn non_recursive_view_is_ok() {
-        // *v = do
-        //   r <- *items
-        //   yield r
-        //
-        // Reading a *different*, concrete source is a perfectly ordinary view —
-        // no self-loop, no error.
-        let body = do_expr(vec![
-            bind_stmt("r", source_ref("items")),
-            yield_stmt(var("r")),
-        ]);
-        let m = module(vec![view("v", body)]);
-        let diags = check(&m);
-        assert!(diags.is_empty(), "non-recursive view should be fine");
-    }
-
-    #[test]
-    fn view_derived_mutual_cycle_is_rejected() {
-        // *v = do { x <- &d; yield x }
-        // &d = *v
-        //
-        // A 2-node cycle spanning a view and a derived relation is caught by the
-        // mutual-recursion branch (not the single-node view self-loop branch).
-        let v_body = do_expr(vec![
-            bind_stmt("x", derived_ref("d")),
-            yield_stmt(var("x")),
-        ]);
-        let m = module(vec![
-            view("v", v_body),
-            derived("d", source_ref("v")),
-        ]);
-        let diags = check(&m);
-        assert_eq!(diags.len(), 1, "one mutual-recursion error");
-        assert!(
-            diags[0].message.contains("mutually recursive"),
-            "expected mutual-recursion diagnostic, got: {}",
-            diags[0].message
-        );
-    }
-
-    #[test]
-    fn diff_wrapper_function_is_detected() {
-        // minus = \a b -> diff a b
-        // &bad = minus *all &bad
-        //
-        // The user-defined `minus` is a curried alias of `diff`; without
-        // expanding its body, `collect_edges` would see both args as positive
-        // and miss the negative self-edge — the unstratifiable recursion would
-        // only surface as a runtime "did not converge" panic (B31).
-        let minus_body = lambda(vec!["a", "b"], diff(var("a"), var("b")));
-        let m = module(vec![
-            fun("minus", minus_body),
-            derived("bad", app(app(var("minus"), source_ref("all")), derived_ref("bad"))),
-        ]);
-        let diags = check(&m);
-        assert!(
-            !diags.is_empty(),
-            "negation laundered through a user wrapper should be rejected"
-        );
-        assert!(diags[0].message.contains("unstratifiable"));
-        assert!(diags[0].message.contains("&bad"));
-    }
-
-    #[test]
-    fn diff_wrapper_through_do_bind_is_detected() {
-        // minus = \a b -> diff a b
-        // &bad = do
-        //   self <- &bad
-        //   all  <- *items
-        //   d    <- minus all self
-        //   yield d
-        //
-        // The wrapper is called on variables (aliases), not directly on the
-        // derived ref — the alias tracking must still attribute the negative
-        // edge to &bad through the wrapper.
-        let minus_body = lambda(vec!["a", "b"], diff(var("a"), var("b")));
-        let body = do_expr(vec![
-            bind_stmt("self", derived_ref("bad")),
-            bind_stmt("all", source_ref("items")),
-            bind_stmt("d", app(app(var("minus"), var("all")), var("self"))),
-            yield_stmt(var("d")),
-        ]);
-        let m = module(vec![
-            fun("minus", minus_body),
-            derived("bad", body),
-        ]);
-        let diags = check(&m);
-        assert!(
-            !diags.is_empty(),
-            "negation through a wrapper + do-bind alias should be rejected"
-        );
-        assert!(diags[0].message.contains("unstratifiable"));
-    }
-
-    #[test]
-    fn diff_wrapper_non_recursive_is_ok() {
-        // minus = \a b -> diff a b
-        // &a = *source
-        // &b = minus *all &a   (negating a non-recursive peer — fine)
-        let minus_body = lambda(vec!["a", "b"], diff(var("a"), var("b")));
-        let m = module(vec![
-            fun("minus", minus_body),
-            derived("a", source_ref("source")),
-            derived("b", app(app(var("minus"), source_ref("all")), derived_ref("a"))),
-        ]);
-        let diags = check(&m);
-        assert!(
-            diags.is_empty(),
-            "negating a non-recursive peer through a wrapper is fine: {:?}",
-            diags.first().map(|d| &d.message)
-        );
-    }
-
-    #[test]
-    fn non_diff_wrapper_is_not_negative() {
-        // myUnion = \a b -> union a b
-        // &reach = myUnion *edges &reach
-        //
-        // A wrapper around `union` (not `diff`) should NOT create negative
-        // edges — positive self-recursion through a union wrapper is fine.
-        let my_union_body = lambda(vec!["a", "b"], union(var("a"), var("b")));
-        let m = module(vec![
-            fun("myUnion", my_union_body),
-            derived("reach", app(app(var("myUnion"), source_ref("edges")), derived_ref("reach"))),
-        ]);
-        let diags = check(&m);
-        assert!(
-            diags.is_empty(),
-            "positive self-recursion through a union wrapper should be fine: {:?}",
-            diags.first().map(|d| &d.message)
-        );
-    }
-
-    #[test]
-    fn diff_wrapper_pipe_form_is_detected() {
-        // minus = \a b -> diff a b
-        // &bad = &bad |> minus *all
-        //
-        // The pipe form `x |> minus y` is `minus y x` = `diff y x` — `x`
-        // (the self-ref) is the subtracted (negative) argument.
-        let minus_body = lambda(vec!["a", "b"], diff(var("a"), var("b")));
-        let pipe = spanned(ExprKind::BinOp {
-            lhs: Box::new(derived_ref("bad")),
-            rhs: Box::new(app(var("minus"), source_ref("all"))),
-            op: BinOp::Pipe,
-        });
-        let m = module(vec![
-            fun("minus", minus_body),
-            derived("bad", pipe),
-        ]);
-        let diags = check(&m);
-        assert!(
-            !diags.is_empty(),
-            "pipe-form negation through a wrapper should be rejected"
-        );
-        assert!(diags[0].message.contains("unstratifiable"));
-    }
-}

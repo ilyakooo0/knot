@@ -4,6 +4,7 @@
 //! and checks safety constraints (e.g. no IO inside atomic blocks). Also
 //! validates explicit effect annotations against inferred effects.
 
+use crate::decl_view::{decl_views, DeclView, DeclViewKind};
 use knot::ast;
 use knot::ast::Span;
 use knot::diagnostic::Diagnostic;
@@ -377,56 +378,63 @@ impl EffectChecker {
         }
     }
 
-    fn run(&mut self, module: &ast::Module) {
+    fn run(&mut self, program: &ast::Expr) {
         // Collect source relation and view names, plus declaration bodies
         // for the atomic-gate's opaque-callee lambda scan.
-        for decl in &module.decls {
-            match &decl.node {
-                ast::DeclKind::Source { name, ty } => {
-                    self.source_names.insert(name.clone());
+        for decl in decl_views(program) {
+            match decl.kind {
+                DeclViewKind::Source { ty } => {
+                    self.source_names.insert(decl.name.to_string());
                     if !matches!(&ty.node, ast::TypeKind::Relation(_)) {
-                        self.scalar_source_names.insert(name.clone());
+                        self.scalar_source_names.insert(decl.name.to_string());
                     }
                 }
-                ast::DeclKind::View { name, body, .. }
-                | ast::DeclKind::Derived { name, body, .. } => {
-                    if let ast::DeclKind::View { .. } = &decl.node {
-                        self.view_names.insert(name.clone());
+                DeclViewKind::View { body, .. } | DeclViewKind::Derived { body, .. } => {
+                    if matches!(decl.kind, DeclViewKind::View { .. }) {
+                        self.view_names.insert(decl.name.to_string());
                     }
-                    self.decl_bodies.insert(name.clone(), body.clone());
+                    if let Some(b) = body {
+                        self.decl_bodies.insert(decl.name.to_string(), b.clone());
+                    }
                 }
-                ast::DeclKind::Fun { name, body: Some(body), .. } => {
-                    self.decl_bodies.insert(name.clone(), body.clone());
+                DeclViewKind::Fun { body: Some(body), .. } => {
+                    self.decl_bodies.insert(decl.name.to_string(), body.clone());
                 }
                 _ => {}
             }
             // Record `fork` wrappers so the atomic gate can strip the forwarded
             // argument's IO at the call site (see `fork_wrapper_params`).
-            if let ast::DeclKind::Fun { name, body: Some(body), .. }
-            | ast::DeclKind::View { name, body, .. }
-            | ast::DeclKind::Derived { name, body, .. } = &decl.node
-                && let Some(idx) = fork_wrapper_param(body) {
-                    self.fork_wrapper_params.insert(name.clone(), idx);
-                }
+            let body = match decl.kind {
+                DeclViewKind::Fun { body: Some(b), .. }
+                | DeclViewKind::View { body: Some(b), .. }
+                | DeclViewKind::Derived { body: Some(b), .. } => Some(b),
+                _ => None,
+            };
+            if let Some(b) = body
+                && let Some(idx) = fork_wrapper_param(b)
+            {
+                self.fork_wrapper_params.insert(decl.name.to_string(), idx);
+            }
         }
 
         // Collect declarations whose annotated signature uses an effect-row
         // variable (these propagate lambda-arg effects) and declarations
         // with a *closed* declared effect set (these absorb lambda-arg
         // effects). Everything else conservatively propagates.
-        for decl in &module.decls {
-            match &decl.node {
-                ast::DeclKind::Fun { name, ty: Some(scheme), .. }
-                | ast::DeclKind::View { name, ty: Some(scheme), .. }
-                | ast::DeclKind::Derived { name, ty: Some(scheme), .. } => {
-                    if type_has_effect_row_var(&scheme.ty) {
-                        self.row_poly_decls.insert(name.clone());
-                    } else if let Some(declared) = extract_effects(&scheme.ty) {
-                        self.fixed_row_decls.insert(name.clone());
-                        self.fixed_row_effects.insert(name.clone(), declared);
-                    }
+        for decl in decl_views(program) {
+            let scheme = match decl.kind {
+                DeclViewKind::Fun { ty: Some(s), .. }
+                | DeclViewKind::View { ty: Some(s), .. }
+                | DeclViewKind::Derived { ty: Some(s), .. } => Some(s),
+                _ => None,
+            };
+            if let Some(scheme) = scheme {
+                if type_has_effect_row_var(&scheme.ty) {
+                    self.row_poly_decls.insert(decl.name.to_string());
+                } else if let Some(declared) = extract_effects(&scheme.ty) {
+                    self.fixed_row_decls.insert(decl.name.to_string());
+                    self.fixed_row_effects.insert(decl.name.to_string(), declared);
                 }
-                _ => {}
             }
         }
 
@@ -436,11 +444,11 @@ impl EffectChecker {
         let mut views = Vec::new();
         let mut funs = Vec::new();
 
-        for decl in &module.decls {
-            match &decl.node {
-                ast::DeclKind::Derived { .. } => derived.push(decl),
-                ast::DeclKind::View { .. } => views.push(decl),
-                ast::DeclKind::Fun { .. } => funs.push(decl),
+        for decl in decl_views(program) {
+            match decl.kind {
+                DeclViewKind::Derived { .. } => derived.push(decl),
+                DeclViewKind::View { .. } => views.push(decl),
+                DeclViewKind::Fun { .. } => funs.push(decl),
                 _ => {}
             }
         }
@@ -456,20 +464,20 @@ impl EffectChecker {
         loop {
             let mut changed = false;
             let saved_diags = std::mem::take(&mut self.diagnostics);
-            for decl in &module.decls {
-                let (name, effects) = match &decl.node {
-                    ast::DeclKind::Derived { name, body, .. }
-                    | ast::DeclKind::View { name, body, .. } => {
-                        (name, self.infer_effects(body))
+            for decl in decl_views(program) {
+                let (name, effects) = match decl.kind {
+                    DeclViewKind::Derived { body: Some(b), .. }
+                    | DeclViewKind::View { body: Some(b), .. } => {
+                        (decl.name, self.infer_effects(b))
                     }
-                    ast::DeclKind::Fun { name, body: Some(body), .. } => {
-                        (name, self.fun_body_effects(body))
+                    DeclViewKind::Fun { body: Some(b), .. } => {
+                        (decl.name, self.fun_body_effects(b))
                     }
                     _ => continue,
                 };
                 let old = self.decl_effects.get(name);
                 if old.is_none_or(|o| *o != effects) {
-                    self.decl_effects.insert(name.clone(), effects);
+                    self.decl_effects.insert(name.to_string(), effects);
                     changed = true;
                 }
             }
@@ -493,20 +501,20 @@ impl EffectChecker {
             let saved_diags = std::mem::take(&mut self.diagnostics);
             loop {
                 let mut changed = false;
-                for decl in &module.decls {
-                    let (name, effects) = match &decl.node {
-                        ast::DeclKind::Derived { name, body, .. }
-                        | ast::DeclKind::View { name, body, .. } => {
-                            (name, self.infer_effects(body))
+                for decl in decl_views(program) {
+                    let (name, effects) = match decl.kind {
+                        DeclViewKind::Derived { body: Some(b), .. }
+                        | DeclViewKind::View { body: Some(b), .. } => {
+                            (decl.name, self.infer_effects(b))
                         }
-                        ast::DeclKind::Fun { name, body: Some(body), .. } => {
-                            (name, self.fun_body_effects(body))
+                        DeclViewKind::Fun { body: Some(b), .. } => {
+                            (decl.name, self.fun_body_effects(b))
                         }
                         _ => continue,
                     };
                     let old = self.decl_effects_atomic_safe.get(name);
                     if old.is_none_or(|o| *o != effects) {
-                        self.decl_effects_atomic_safe.insert(name.clone(), effects);
+                        self.decl_effects_atomic_safe.insert(name.to_string(), effects);
                         changed = true;
                     }
                 }
@@ -517,10 +525,10 @@ impl EffectChecker {
         }
 
         // Final pass: emit diagnostics and check annotations with converged effects
-        for decl in derived {
+        for decl in &derived {
             self.process_decl(decl);
         }
-        for decl in views {
+        for decl in &views {
             self.process_decl(decl);
         }
         for decl in &funs {
@@ -528,27 +536,22 @@ impl EffectChecker {
         }
     }
 
-    fn process_decl(&mut self, decl: &ast::Decl) {
-        self.current_decl_name = match &decl.node {
-            ast::DeclKind::Derived { name, .. }
-            | ast::DeclKind::View { name, .. }
-            | ast::DeclKind::Fun { name, .. } => Some(name.clone()),
-            _ => None,
-        };
-        match &decl.node {
-            ast::DeclKind::Derived { name, body, ty, .. } => {
-                let effects = self.infer_effects(body);
-                self.decl_effects.insert(name.clone(), effects.clone());
+    fn process_decl(&mut self, decl: &DeclView<'_>) {
+        self.current_decl_name = Some(decl.name.to_string());
+        match decl.kind {
+            DeclViewKind::Derived { body: Some(b), ty, .. } => {
+                let effects = self.infer_effects(b);
+                self.decl_effects.insert(decl.name.to_string(), effects.clone());
                 self.check_annotation(ty, &effects);
             }
-            ast::DeclKind::View { name, body, ty, .. } => {
-                let effects = self.infer_effects(body);
-                self.decl_effects.insert(name.clone(), effects.clone());
+            DeclViewKind::View { body: Some(b), ty, .. } => {
+                let effects = self.infer_effects(b);
+                self.decl_effects.insert(decl.name.to_string(), effects.clone());
                 self.check_annotation(ty, &effects);
             }
-            ast::DeclKind::Fun { name, body: Some(body), ty, .. } => {
-                let effects = self.fun_body_effects(body);
-                self.decl_effects.insert(name.clone(), effects.clone());
+            DeclViewKind::Fun { body: Some(b), ty, .. } => {
+                let effects = self.fun_body_effects(b);
+                self.decl_effects.insert(decl.name.to_string(), effects.clone());
                 self.check_annotation(ty, &effects);
             }
             _ => {}
@@ -1675,7 +1678,7 @@ impl EffectChecker {
     /// Anchors squiggles to the effect-bearing type subnode (e.g. the `IO {fs} Text`
     /// part of a signature) rather than the whole declaration span — a decl-wide
     /// span would also visibly underline any comments inside the body.
-    fn check_annotation(&mut self, ty: &Option<ast::TypeScheme>, inferred: &EffectSet) {
+    fn check_annotation(&mut self, ty: Option<&ast::TypeScheme>, inferred: &EffectSet) {
         let scheme = match ty {
             Some(s) => s,
             None => return,
@@ -2319,1043 +2322,19 @@ pub type EffectInfo = HashMap<String, EffectSet>;
 
 /// Runs on a grown stack — the effect walker recurses through the `__bind`
 /// chain a desugared `do` block expands into.
-pub fn check(module: &ast::Module) -> Vec<Diagnostic> {
-    check_with_effects(module).0
+pub fn check(program: &ast::Expr) -> Vec<Diagnostic> {
+    check_with_effects(program).0
 }
 
 /// Like `check` but also returns per-declaration effect information.
-pub fn check_with_effects(module: &ast::Module) -> (Vec<Diagnostic>, EffectInfo) {
+pub fn check_with_effects(program: &ast::Expr) -> (Vec<Diagnostic>, EffectInfo) {
     crate::stack::grow(|| {
         let mut checker = EffectChecker::new();
-        checker.run(module);
+        checker.run(program);
         (checker.diagnostics, checker.decl_effects)
     })
 }
 
 // ── Tests ────────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use knot::ast::*;
 
-    fn span() -> Span {
-        Span::new(0, 0)
-    }
-
-    fn spanned<T>(node: T) -> Spanned<T> {
-        Spanned::new(node, span())
-    }
-
-    // ── EffectSet unit tests ─────────────────────────────────────
-
-    #[test]
-    fn empty_is_pure() {
-        assert!(EffectSet::empty().is_pure());
-    }
-
-    #[test]
-    fn reads_is_not_pure() {
-        let mut e = EffectSet::empty();
-        e.reads.insert("people".into());
-        assert!(!e.is_pure());
-    }
-
-    #[test]
-    fn union_combines_effects() {
-        let mut a = EffectSet::empty();
-        a.reads.insert("people".into());
-        a.console = true;
-
-        let mut b = EffectSet::empty();
-        b.reads.insert("todos".into());
-        b.writes.insert("people".into());
-        b.clock = true;
-
-        let c = a.union(&b);
-        assert_eq!(c.reads.len(), 2);
-        assert!(c.reads.contains("people"));
-        assert!(c.reads.contains("todos"));
-        assert_eq!(c.writes.len(), 1);
-        assert!(c.writes.contains("people"));
-        assert!(c.console);
-        assert!(c.clock);
-        assert!(!c.network);
-    }
-
-    #[test]
-    fn subset_check() {
-        let mut small = EffectSet::empty();
-        small.reads.insert("people".into());
-
-        let mut big = EffectSet::empty();
-        big.reads.insert("people".into());
-        big.console = true;
-
-        assert!(small.is_subset_of(&big));
-        assert!(!big.is_subset_of(&small));
-    }
-
-    #[test]
-    fn difference_computes_extra() {
-        let mut inferred = EffectSet::empty();
-        inferred.reads.insert("people".into());
-        inferred.console = true;
-        inferred.clock = true;
-
-        let mut declared = EffectSet::empty();
-        declared.reads.insert("people".into());
-        declared.clock = true;
-
-        let diff = inferred.difference(&declared);
-        assert!(diff.reads.is_empty());
-        assert!(diff.console);
-        assert!(!diff.clock);
-    }
-
-    #[test]
-    fn has_io_flags() {
-        let mut e = EffectSet::empty();
-        assert!(!e.has_io());
-
-        e.console = true;
-        assert!(e.has_io());
-
-        e.console = false;
-        e.clock = true;
-        assert!(e.has_io());
-    }
-
-    #[test]
-    fn display_format() {
-        let mut e = EffectSet::empty();
-        e.reads.insert("people".into());
-        e.console = true;
-        assert_eq!(format!("{}", e), "{r *people, console}");
-    }
-
-    #[test]
-    fn display_coalesces_rw() {
-        let mut e = EffectSet::empty();
-        e.reads.insert("people".into());
-        e.writes.insert("people".into());
-        e.reads.insert("logs".into());
-        assert_eq!(format!("{}", e), "{r *logs, rw *people}");
-    }
-
-    #[test]
-    fn from_ast_effects_conversion() {
-        let effects = vec![
-            Effect::Reads("people".into()),
-            Effect::Writes("todos".into()),
-            Effect::Console,
-            Effect::Clock,
-        ];
-        let set = EffectSet::from_ast_effects(&effects);
-        assert!(set.reads.contains("people"));
-        assert!(set.writes.contains("todos"));
-        assert!(set.console);
-        assert!(set.clock);
-        assert!(!set.network);
-    }
-
-    // ── Expression inference tests ───────────────────────────────
-
-    fn check_module(decls: Vec<Decl>) -> (Vec<Diagnostic>, HashMap<String, EffectSet>) {
-        let module = Module { decls };
-        let mut checker = EffectChecker::new();
-        checker.run(&module);
-        (checker.diagnostics, checker.decl_effects)
-    }
-
-    fn make_decl(node: DeclKind) -> Decl {
-        Decl { node, span: span() }
-    }
-
-    fn make_source(name: &str) -> Decl {
-        make_decl(DeclKind::Source {
-            name: name.into(),
-            ty: spanned(TypeKind::Relation(Box::new(spanned(TypeKind::Named(
-                "T".into(),
-            ))))),
-        })
-    }
-
-    fn make_fun(name: &str, body: Expr) -> Decl {
-        make_decl(DeclKind::Fun {
-            name: name.into(),
-            ty: None,
-            body: Some(body),
-        })
-    }
-
-    fn make_fun_with_type(name: &str, body: Expr, ty: TypeScheme) -> Decl {
-        make_decl(DeclKind::Fun {
-            name: name.into(),
-            ty: Some(ty),
-            body: Some(body),
-        })
-    }
-
-    #[test]
-    fn literal_is_pure() {
-        let body = spanned(ExprKind::Lit(Literal::Int("42".into())));
-        let (diags, effects) = check_module(vec![make_fun("f", body)]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].is_pure());
-    }
-
-    #[test]
-    fn source_ref_reads() {
-        let body = spanned(ExprKind::SourceRef("people".into()));
-        let (diags, effects) =
-            check_module(vec![make_source("people"), make_fun("f", body)]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].reads.contains("people"));
-        assert!(effects["f"].writes.is_empty());
-    }
-
-    #[test]
-    fn set_writes_and_reads() {
-        let body = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("x".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::Set {
-                target: Box::new(spanned(ExprKind::SourceRef("todos".into()))),
-                value: Box::new(spanned(ExprKind::Var("x".into()))),
-            })),
-        });
-        let (diags, effects) =
-            check_module(vec![make_source("todos"), make_fun("f", body)]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].writes.contains("todos"));
-        assert!(effects["f"].reads.contains("todos"));
-    }
-
-    #[test]
-    fn println_has_console_effect() {
-        // println "hello"
-        let body = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("x".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("println".into()))),
-                arg: Box::new(spanned(ExprKind::Var("x".into()))),
-            })),
-        });
-        let (diags, effects) = check_module(vec![make_fun("f", body)]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].console);
-    }
-
-    #[test]
-    fn now_has_clock_effect() {
-        let body = spanned(ExprKind::Var("now".into()));
-        let (diags, effects) = check_module(vec![make_fun("f", body)]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].clock);
-    }
-
-    #[test]
-    fn lambda_creation_is_pure() {
-        let body = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("x".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("println".into()))),
-                arg: Box::new(spanned(ExprKind::Var("x".into()))),
-            })),
-        });
-        // Just referencing a lambda (not calling it) — pure at the expression level
-        let wrapper = spanned(ExprKind::Record(vec![RecordField {
-            name: "f".into(),
-            value: body,
-            sig: None,
-        }]));
-        let (diags, effects) = check_module(vec![make_fun("g", wrapper)]);
-        assert!(diags.is_empty());
-        assert!(effects["g"].is_pure());
-    }
-
-    #[test]
-    fn do_block_unions_effects() {
-        // do { p <- *people; println p; yield p }
-        let body = spanned(ExprKind::Do(vec![
-            spanned(StmtKind::Bind {
-                pat: spanned(PatKind::Var("p".into())),
-                expr: spanned(ExprKind::SourceRef("people".into())),
-            }),
-            spanned(StmtKind::Expr(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("println".into()))),
-                arg: Box::new(spanned(ExprKind::Var("p".into()))),
-            }))),
-            spanned(StmtKind::Expr(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("yield".into()))),
-                arg: Box::new(spanned(ExprKind::Var("p".into()))),
-            }))),
-        ]));
-        let (diags, effects) =
-            check_module(vec![make_source("people"), make_fun("f", body)]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].reads.contains("people"));
-        assert!(effects["f"].console);
-    }
-
-    #[test]
-    fn atomic_io_error() {
-        // atomic (println "hello")
-        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::App {
-            func: Box::new(spanned(ExprKind::Var("println".into()))),
-            arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hello".into())))),
-        }))));
-        let (diags, _effects) = check_module(vec![make_fun("f", body)]);
-        assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("IO effects"));
-    }
-
-    #[test]
-    fn atomic_reads_writes_ok() {
-        // atomic (set *people = [...])
-        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Set {
-            target: Box::new(spanned(ExprKind::SourceRef("people".into()))),
-            value: Box::new(spanned(ExprKind::List(vec![]))),
-        }))));
-        let (diags, effects) =
-            check_module(vec![make_source("people"), make_fun("f", body)]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].writes.contains("people"));
-    }
-
-    #[test]
-    fn atomic_fork_io_allowed() {
-        // atomic (do { _ <- *people; fork (println "spawned"); set *people = [] })
-        // `fork`'s spawned IO runs on its own connection and is intentionally
-        // permitted inside atomic, so the IO gate must NOT reject this — even
-        // though the console effect still propagates to the decl's effects.
-        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(vec![
-            spanned(StmtKind::Bind {
-                pat: spanned(PatKind::Wildcard),
-                expr: spanned(ExprKind::SourceRef("people".into())),
-            }),
-            spanned(StmtKind::Expr(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("fork".into()))),
-                arg: Box::new(spanned(ExprKind::App {
-                    func: Box::new(spanned(ExprKind::Var("println".into()))),
-                    arg: Box::new(spanned(ExprKind::Lit(Literal::Text(
-                        "spawned".into(),
-                    )))),
-                })),
-            }))),
-            spanned(StmtKind::Expr(spanned(ExprKind::Set {
-                target: Box::new(spanned(ExprKind::SourceRef("people".into()))),
-                value: Box::new(spanned(ExprKind::List(vec![]))),
-            }))),
-        ])))));
-        let (diags, effects) =
-            check_module(vec![make_source("people"), make_fun("f", body)]);
-        assert!(
-            diags.is_empty(),
-            "fork-spawned IO inside atomic should not be rejected: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-        // The spawned console effect still propagates to the decl's effects.
-        assert!(effects["f"].console, "fork's console effect should propagate");
-        assert!(effects["f"].writes.contains("people"));
-    }
-
-    #[test]
-    fn atomic_fork_plus_direct_io_error() {
-        // atomic (do { _ <- *people; fork (println "ok"); println "direct" })
-        // The direct (non-forked) println IO is still rejected.
-        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(vec![
-            spanned(StmtKind::Bind {
-                pat: spanned(PatKind::Wildcard),
-                expr: spanned(ExprKind::SourceRef("people".into())),
-            }),
-            spanned(StmtKind::Expr(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("fork".into()))),
-                arg: Box::new(spanned(ExprKind::App {
-                    func: Box::new(spanned(ExprKind::Var("println".into()))),
-                    arg: Box::new(spanned(ExprKind::Lit(Literal::Text("ok".into())))),
-                })),
-            }))),
-            spanned(StmtKind::Expr(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("println".into()))),
-                arg: Box::new(spanned(ExprKind::Lit(Literal::Text("direct".into())))),
-            }))),
-        ])))));
-        let (diags, _effects) =
-            check_module(vec![make_source("people"), make_fun("f", body)]);
-        assert!(
-            diags.iter().any(|d| d.message.contains("IO effects are not allowed inside atomic")),
-            "direct IO alongside fork should still be rejected: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn atomic_fork_through_wrapper_allowed() {
-        // forkIt = \a -> fork a
-        // f = atomic (do { _ <- *people; forkIt (println "spawned"); set *people = [] })
-        // The forwarded argument is spawned exactly like a syntactic `fork`, so
-        // the IO gate must not reject it. Regression: only a literal `fork`
-        // head was stripped, so fork-through-a-wrapper was falsely rejected.
-        let fork_it = make_fun(
-            "forkIt",
-            spanned(ExprKind::Lambda {
-                params: vec![spanned(PatKind::Var("a".into()))],
-                ty_params: vec![],
-                body: Box::new(spanned(ExprKind::App {
-                    func: Box::new(spanned(ExprKind::Var("fork".into()))),
-                    arg: Box::new(spanned(ExprKind::Var("a".into()))),
-                })),
-            }),
-        );
-        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(vec![
-            spanned(StmtKind::Bind {
-                pat: spanned(PatKind::Wildcard),
-                expr: spanned(ExprKind::SourceRef("people".into())),
-            }),
-            spanned(StmtKind::Expr(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("forkIt".into()))),
-                arg: Box::new(spanned(ExprKind::App {
-                    func: Box::new(spanned(ExprKind::Var("println".into()))),
-                    arg: Box::new(spanned(ExprKind::Lit(Literal::Text(
-                        "spawned".into(),
-                    )))),
-                })),
-            }))),
-            spanned(StmtKind::Expr(spanned(ExprKind::Set {
-                target: Box::new(spanned(ExprKind::SourceRef("people".into()))),
-                value: Box::new(spanned(ExprKind::List(vec![]))),
-            }))),
-        ])))));
-        let (diags, effects) =
-            check_module(vec![make_source("people"), fork_it, make_fun("f", body)]);
-        assert!(
-            diags.is_empty(),
-            "fork-through-wrapper IO inside atomic should not be rejected: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-        assert!(effects["f"].writes.contains("people"));
-    }
-
-    #[test]
-    fn atomic_non_fork_wrapper_io_still_rejected() {
-        // sink = \a -> a  (returns its argument unchanged — NOT a fork wrapper)
-        // f = atomic (do { _ <- *people; _ <- sink (println "x") })
-        // `_ <- sink (…)` runs the IO in the transaction, so the console effect
-        // must still trip the gate. Guards against the fork-wrapper stripping
-        // over-reaching and laundering real IO.
-        let sink = make_fun(
-            "sink",
-            spanned(ExprKind::Lambda {
-                params: vec![spanned(PatKind::Var("a".into()))],
-                ty_params: vec![],
-                body: Box::new(spanned(ExprKind::Var("a".into()))),
-            }),
-        );
-        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(vec![
-            spanned(StmtKind::Bind {
-                pat: spanned(PatKind::Wildcard),
-                expr: spanned(ExprKind::SourceRef("people".into())),
-            }),
-            spanned(StmtKind::Bind {
-                pat: spanned(PatKind::Wildcard),
-                expr: spanned(ExprKind::App {
-                    func: Box::new(spanned(ExprKind::Var("sink".into()))),
-                    arg: Box::new(spanned(ExprKind::App {
-                        func: Box::new(spanned(ExprKind::Var("println".into()))),
-                        arg: Box::new(spanned(ExprKind::Lit(Literal::Text("x".into())))),
-                    })),
-                }),
-            }),
-        ])))));
-        let (diags, _effects) =
-            check_module(vec![make_source("people"), sink, make_fun("f", body)]);
-        assert!(
-            diags
-                .iter()
-                .any(|d| d.message.contains("IO effects are not allowed inside atomic")),
-            "IO run through a non-fork wrapper must still be rejected: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn nested_atomic_io_violation_reported_once_per_block() {
-        // atomic (do { _ <- *people; _ <- atomic (do { _ <- *people; now }) })
-        // The inner atomic's clock violation must be reported exactly once for
-        // the inner block (plus once for the outer, which sees the propagated
-        // clock effect) — not duplicated by the outer block's fork-stripped
-        // gate re-traversal of `inner`.
-        let inner_atomic = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(
-            vec![
-                spanned(StmtKind::Bind {
-                    pat: spanned(PatKind::Wildcard),
-                    expr: spanned(ExprKind::SourceRef("people".into())),
-                }),
-                spanned(StmtKind::Expr(spanned(ExprKind::Var("now".into())))),
-            ],
-        )))));
-        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Do(vec![
-            spanned(StmtKind::Bind {
-                pat: spanned(PatKind::Wildcard),
-                expr: spanned(ExprKind::SourceRef("people".into())),
-            }),
-            spanned(StmtKind::Bind {
-                pat: spanned(PatKind::Wildcard),
-                expr: inner_atomic,
-            }),
-        ])))));
-        let (diags, _effects) =
-            check_module(vec![make_source("people"), make_fun("f", body)]);
-        let io_errors = diags
-            .iter()
-            .filter(|d| d.message.contains("IO effects are not allowed inside atomic"))
-            .count();
-        // One per atomic block (inner + outer), with no gate-traversal dupes.
-        assert_eq!(
-            io_errors, 2,
-            "nested atomic IO violation should be reported once per block, got {io_errors}: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn atomic_clock_without_relations_error() {
-        // atomic (now) — clock alone has no relation interaction
-        let body = spanned(ExprKind::Atomic(Box::new(spanned(ExprKind::Var(
-            "now".into(),
-        )))));
-        let (diags, _effects) = check_module(vec![make_fun("f", body)]);
-        assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("IO effects are not allowed inside atomic"));
-    }
-
-    #[test]
-    fn pipe_resolves_callee() {
-        // x |> println
-        let body = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("x".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::BinOp {
-                op: BinOp::Pipe,
-                lhs: Box::new(spanned(ExprKind::Var("x".into()))),
-                rhs: Box::new(spanned(ExprKind::Var("println".into()))),
-            })),
-        });
-        let (diags, effects) = check_module(vec![make_fun("f", body)]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].console);
-    }
-
-    #[test]
-    fn derived_ref_inherits_effects() {
-        // &seniors reads *people
-        let derived_body = spanned(ExprKind::Do(vec![
-            spanned(StmtKind::Bind {
-                pat: spanned(PatKind::Var("p".into())),
-                expr: spanned(ExprKind::SourceRef("people".into())),
-            }),
-            spanned(StmtKind::Expr(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("yield".into()))),
-                arg: Box::new(spanned(ExprKind::Var("p".into()))),
-            }))),
-        ]));
-        let derived = make_decl(DeclKind::Derived {
-            name: "seniors".into(),
-            ty: None,
-            body: derived_body,
-        });
-
-        // f = &seniors
-        let body = spanned(ExprKind::DerivedRef("seniors".into()));
-        let (diags, effects) =
-            check_module(vec![make_source("people"), derived, make_fun("f", body)]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].reads.contains("people"));
-    }
-
-    #[test]
-    fn annotation_ok_when_superset() {
-        // f : {r *people, console} Int -> Int
-        // f = \x -> do { println *people; yield x }
-        let body = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("x".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::Do(vec![
-                spanned(StmtKind::Expr(spanned(ExprKind::App {
-                    func: Box::new(spanned(ExprKind::Var("println".into()))),
-                    arg: Box::new(spanned(ExprKind::SourceRef("people".into()))),
-                }))),
-                spanned(StmtKind::Expr(spanned(ExprKind::App {
-                    func: Box::new(spanned(ExprKind::Var("yield".into()))),
-                    arg: Box::new(spanned(ExprKind::Var("x".into()))),
-                }))),
-            ]))),
-        });
-        let ty = TypeScheme {
-            constraints: vec![],
-            ty: spanned(TypeKind::Effectful {
-                effects: vec![Effect::Reads("people".into()), Effect::Console],
-                ty: Box::new(spanned(TypeKind::Function {
-                    param: Box::new(spanned(TypeKind::Named("Int".into()))),
-                    result: Box::new(spanned(TypeKind::Named("Int".into()))),
-                })),
-            }),
-        };
-        let (diags, _) = check_module(vec![
-            make_source("people"),
-            make_fun_with_type("f", body, ty),
-        ]);
-        assert!(diags.is_empty());
-    }
-
-    #[test]
-    fn annotation_error_when_missing_effect() {
-        // Declares only {r *people} but actually uses console too
-        let body = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("x".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::Do(vec![
-                spanned(StmtKind::Expr(spanned(ExprKind::App {
-                    func: Box::new(spanned(ExprKind::Var("println".into()))),
-                    arg: Box::new(spanned(ExprKind::SourceRef("people".into()))),
-                }))),
-            ]))),
-        });
-        let ty = TypeScheme {
-            constraints: vec![],
-            ty: spanned(TypeKind::Effectful {
-                effects: vec![Effect::Reads("people".into())],
-                ty: Box::new(spanned(TypeKind::Function {
-                    param: Box::new(spanned(TypeKind::Named("Int".into()))),
-                    result: Box::new(spanned(TypeKind::Named("Int".into()))),
-                })),
-            }),
-        };
-        let (diags, _) = check_module(vec![
-            make_source("people"),
-            make_fun_with_type("f", body, ty),
-        ]);
-        assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("exceed"));
-    }
-
-    #[test]
-    fn if_unions_branches() {
-        let body = spanned(ExprKind::If {
-            cond: Box::new(spanned(ExprKind::Lit(Literal::Int("1".into())))),
-            then_branch: Box::new(spanned(ExprKind::SourceRef("a".into()))),
-            else_branch: Box::new(spanned(ExprKind::SourceRef("b".into()))),
-        });
-        let (diags, effects) = check_module(vec![
-            make_source("a"),
-            make_source("b"),
-            make_fun("f", body),
-        ]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].reads.contains("a"));
-        assert!(effects["f"].reads.contains("b"));
-    }
-
-    #[test]
-    fn io_annotation_empty_rejects_console() {
-        // f : IO {} {}
-        // f = \_ -> println "hello"
-        let body = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("x".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("println".into()))),
-                arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
-            })),
-        });
-        let ty = TypeScheme {
-            constraints: vec![],
-            ty: spanned(TypeKind::IO {
-                effects: vec![],
-                rest: vec![],
-                ty: Box::new(spanned(TypeKind::Record { fields: vec![], rest: None })),
-            }),
-        };
-        let (diags, _) = check_module(vec![make_fun_with_type("f", body, ty)]);
-        assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("exceed"));
-    }
-
-    #[test]
-    fn io_annotation_with_console_accepts_println() {
-        // f : IO {console} {}
-        let body = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("x".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("println".into()))),
-                arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
-            })),
-        });
-        let ty = TypeScheme {
-            constraints: vec![],
-            ty: spanned(TypeKind::IO {
-                effects: vec![Effect::Console],
-                rest: vec![],
-                ty: Box::new(spanned(TypeKind::Record { fields: vec![], rest: None })),
-            }),
-        };
-        let (diags, _) = check_module(vec![make_fun_with_type("f", body, ty)]);
-        assert!(diags.is_empty());
-    }
-
-    #[test]
-    fn io_annotation_empty_rejects_reads() {
-        // f : IO {} [T] — reading from a source should be rejected
-        let body = spanned(ExprKind::SourceRef("people".into()));
-        let ty = TypeScheme {
-            constraints: vec![],
-            ty: spanned(TypeKind::IO {
-                effects: vec![],
-                rest: vec![],
-                ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
-                    TypeKind::Named("T".into()),
-                ))))),
-            }),
-        };
-        let (diags, _) = check_module(vec![
-            make_source("people"),
-            make_fun_with_type("f", body, ty),
-        ]);
-        assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("exceed"));
-    }
-
-    #[test]
-    fn io_annotation_with_reads_accepts_source_ref() {
-        // f : IO {r *people} [T] — reads declared, source ref allowed
-        let body = spanned(ExprKind::SourceRef("people".into()));
-        let ty = TypeScheme {
-            constraints: vec![],
-            ty: spanned(TypeKind::IO {
-                effects: vec![Effect::Reads("people".into())],
-                rest: vec![],
-                ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
-                    TypeKind::Named("T".into()),
-                ))))),
-            }),
-        };
-        let (diags, _) = check_module(vec![
-            make_source("people"),
-            make_fun_with_type("f", body, ty),
-        ]);
-        assert!(diags.is_empty());
-    }
-
-    /// Regression: effect-annotation diagnostics anchor to the IO/Effectful
-    /// subnode of the type, not the whole declaration. A decl-wide span runs
-    /// from the declaration's first token to the end of its body — when the
-    /// body contains comments, the LSP renders a squiggle through them, which
-    /// the user reported as "errors underline comments".
-    #[test]
-    fn annotation_diagnostic_label_targets_type_not_decl() {
-        let io_ty = Spanned::new(
-            TypeKind::IO {
-                effects: vec![Effect::Reads("people".into())],
-                rest: vec![],
-                ty: Box::new(spanned(TypeKind::Relation(Box::new(spanned(
-                    TypeKind::Named("T".into()),
-                ))))),
-            },
-            Span::new(100, 130),
-        );
-        let ty = TypeScheme { constraints: vec![], ty: io_ty };
-        let body = spanned(ExprKind::Lit(Literal::Int("42".into())));
-        let decl = Decl {
-            node: DeclKind::Fun {
-                name: "f".into(),
-                ty: Some(ty),
-                body: Some(body),
-            },
-            span: Span::new(0, 200), // wide decl span, would cover comments
-        };
-        let (diags, _) = check_module(vec![decl]);
-        assert_eq!(diags.len(), 1, "expected unused-effects warning");
-        let label_span = diags[0].labels[0].span;
-        assert_eq!(
-            label_span,
-            Span::new(100, 130),
-            "label must point at the IO type subnode (100..130), \
-             not the decl span (0..200) which would underline body comments"
-        );
-    }
-
-    /// Effects of a lambda passed to a row-polymorphic callee propagate to the
-    /// caller. Mirrors the HM behavior where the IO row variable in
-    /// `withCallback : (a -> IO {| e} b) -> IO {| e} b` unifies with the
-    /// lambda's effect row.
-    #[test]
-    fn row_poly_callee_propagates_lambda_effects() {
-        // withCb : (Int -> IO {| e} {}) -> IO {| e} {}
-        // withCb = \cb -> cb 0
-        let with_cb_body = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("cb".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("cb".into()))),
-                arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),
-            })),
-        });
-        let unit_ty = || spanned(TypeKind::Record { fields: vec![], rest: None });
-        let with_cb_ty = TypeScheme {
-            constraints: vec![],
-            ty: spanned(TypeKind::Function {
-                param: Box::new(spanned(TypeKind::Function {
-                    param: Box::new(spanned(TypeKind::Named("Int".into()))),
-                    result: Box::new(spanned(TypeKind::IO {
-                        effects: vec![],
-                        rest: vec!["e".into()],
-                        ty: Box::new(unit_ty()),
-                    })),
-                })),
-                result: Box::new(spanned(TypeKind::IO {
-                    effects: vec![],
-                    rest: vec!["e".into()],
-                    ty: Box::new(unit_ty()),
-                })),
-            }),
-        };
-
-        // f = withCb (\_ -> println "hi")
-        let f_body = spanned(ExprKind::App {
-            func: Box::new(spanned(ExprKind::Var("withCb".into()))),
-            arg: Box::new(spanned(ExprKind::Lambda {
-                params: vec![spanned(PatKind::Var("_".into()))],
-                ty_params: vec![],
-                body: Box::new(spanned(ExprKind::App {
-                    func: Box::new(spanned(ExprKind::Var("println".into()))),
-                    arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
-                })),
-            })),
-        });
-
-        let (diags, effects) = check_module(vec![
-            make_fun_with_type("withCb", with_cb_body, with_cb_ty),
-            make_fun("f", f_body),
-        ]);
-        assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
-        assert!(
-            effects["f"].console,
-            "lambda's println effect should propagate through row-poly callee"
-        );
-    }
-
-    /// A non-row-poly callee (e.g. `forEach : (a -> IO {} {}) -> IO {} {}`)
-    /// absorbs its callback's effects in its declared row, so we do *not*
-    /// propagate the lambda's body effects to the caller.
-    #[test]
-    fn non_row_poly_callee_does_not_propagate_lambda_effects() {
-        // runIt : (Int -> IO {} {}) -> IO {} {}
-        // runIt = \cb -> cb 0
-        let run_it_body = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("cb".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("cb".into()))),
-                arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),
-            })),
-        });
-        let unit_ty = || spanned(TypeKind::Record { fields: vec![], rest: None });
-        let run_it_ty = TypeScheme {
-            constraints: vec![],
-            ty: spanned(TypeKind::Function {
-                param: Box::new(spanned(TypeKind::Function {
-                    param: Box::new(spanned(TypeKind::Named("Int".into()))),
-                    result: Box::new(spanned(TypeKind::IO {
-                        effects: vec![],
-                        rest: vec![],
-                        ty: Box::new(unit_ty()),
-                    })),
-                })),
-                result: Box::new(spanned(TypeKind::IO {
-                    effects: vec![],
-                    rest: vec![],
-                    ty: Box::new(unit_ty()),
-                })),
-            }),
-        };
-
-        // g = runIt (\_ -> println "hi") — caller declares no console effect
-        let g_body = spanned(ExprKind::App {
-            func: Box::new(spanned(ExprKind::Var("runIt".into()))),
-            arg: Box::new(spanned(ExprKind::Lambda {
-                params: vec![spanned(PatKind::Var("_".into()))],
-                ty_params: vec![],
-                body: Box::new(spanned(ExprKind::App {
-                    func: Box::new(spanned(ExprKind::Var("println".into()))),
-                    arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
-                })),
-            })),
-        });
-
-        let (_diags, effects) = check_module(vec![
-            make_fun_with_type("runIt", run_it_body, run_it_ty),
-            make_fun("g", g_body),
-        ]);
-        assert!(
-            !effects["g"].console,
-            "non-row-poly callee should absorb lambda effects, not propagate"
-        );
-    }
-
-    /// Regression (bug B17): a closed-row (`fixed_row`) callee absorbs its
-    /// callback's *IO* effects into its declared row, but relation reads/writes
-    /// are invisible at the type level (`*rel` is `IO {}`) — no declared row can
-    /// express them. So a callback that reads a relation, laundered through a
-    /// closed-row callee, must still report that read at the call site;
-    /// otherwise a dishonest `leak : IO {} [Item]` passes and the honest
-    /// `leak : IO {r *secrets} [Item]` wrongly warns "declared effects unused".
-    #[test]
-    fn fixed_row_callee_propagates_lambda_db_reads() {
-        // runCb : (Int -> IO {} [Item]) -> IO {} [Item]
-        // runCb = \cb -> cb 0
-        let run_cb_body = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("cb".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("cb".into()))),
-                arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),
-            })),
-        });
-        let items_ty = || {
-            spanned(TypeKind::Relation(Box::new(spanned(TypeKind::Named(
-                "Item".into(),
-            )))))
-        };
-        let run_cb_ty = TypeScheme {
-            constraints: vec![],
-            ty: spanned(TypeKind::Function {
-                param: Box::new(spanned(TypeKind::Function {
-                    param: Box::new(spanned(TypeKind::Named("Int".into()))),
-                    result: Box::new(spanned(TypeKind::IO {
-                        effects: vec![],
-                        rest: vec![],
-                        ty: Box::new(items_ty()),
-                    })),
-                })),
-                result: Box::new(spanned(TypeKind::IO {
-                    effects: vec![],
-                    rest: vec![],
-                    ty: Box::new(items_ty()),
-                })),
-            }),
-        };
-
-        // leak = runCb (\n -> *secrets)
-        let leak_body = spanned(ExprKind::App {
-            func: Box::new(spanned(ExprKind::Var("runCb".into()))),
-            arg: Box::new(spanned(ExprKind::Lambda {
-                params: vec![spanned(PatKind::Var("n".into()))],
-                ty_params: vec![],
-                body: Box::new(spanned(ExprKind::SourceRef("secrets".into()))),
-            })),
-        });
-
-        let (_diags, effects) = check_module(vec![
-            make_source("secrets"),
-            make_fun_with_type("runCb", run_cb_body, run_cb_ty),
-            make_fun("leak", leak_body),
-        ]);
-        assert!(
-            effects["leak"].reads.contains("secrets"),
-            "callback's relation read must propagate through a closed-row callee"
-        );
-    }
-
-    /// Regression: an open effect row (`IO {| e} a` or `IO {console | e} a`)
-    /// must not be treated as a closed declared set. The row variable can
-    /// absorb extra effects, so the subset check would spuriously reject a
-    /// body that performs IO beyond the concrete prefix. Only `_` was
-    /// previously recognized as opting out; a named row variable was not.
-    #[test]
-    fn open_row_var_annotation_absorbs_body_effects() {
-        let unit_ty = || spanned(TypeKind::Record { fields: vec![], rest: None });
-        let g_body = spanned(ExprKind::App {
-            func: Box::new(spanned(ExprKind::Var("println".into()))),
-            arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
-        });
-        let g_ty = TypeScheme {
-            constraints: vec![],
-            ty: spanned(TypeKind::IO {
-                effects: vec![],
-                rest: vec!["e".into()],
-                ty: Box::new(unit_ty()),
-            }),
-        };
-        let (diags, _effects) = check_module(vec![make_fun_with_type("g", g_body, g_ty)]);
-        assert!(
-            diags.is_empty(),
-            "open row-var signature should absorb body effects: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn case_unions_arms() {
-        let body = spanned(ExprKind::Case {
-            scrutinee: Box::new(spanned(ExprKind::Var("x".into()))),
-            arms: vec![
-                CaseArm {
-                    pat: spanned(PatKind::Lit(Literal::Int("1".into()))),
-                    body: spanned(ExprKind::SourceRef("a".into())),
-                },
-                CaseArm {
-                    pat: spanned(PatKind::Wildcard),
-                    body: spanned(ExprKind::SourceRef("b".into())),
-                },
-            ],
-        });
-        let (diags, effects) = check_module(vec![
-            make_source("a"),
-            make_source("b"),
-            make_fun("f", body),
-        ]);
-        assert!(diags.is_empty());
-        assert!(effects["f"].reads.contains("a"));
-        assert!(effects["f"].reads.contains("b"));
-    }
-
-    /// Regression: when a lambda is piped into a non-Var callee (e.g. an
-    /// inline lambda), the pipe arm's `head_name(rhs)` returns None.
-    /// The default must be `true` (matching the App spine) so the lambda's
-    /// body effects propagate — otherwise IO slips past the atomic gate.
-    #[test]
-    fn pipe_lambda_into_non_var_callee_propagates_effects() {
-        // f = (\_ -> println "hi") |> (\g -> g 0)
-        let lhs = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("_".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("println".into()))),
-                arg: Box::new(spanned(ExprKind::Lit(Literal::Text("hi".into())))),
-            })),
-        });
-        let rhs = spanned(ExprKind::Lambda {
-            params: vec![spanned(PatKind::Var("g".into()))],
-            ty_params: vec![],
-            body: Box::new(spanned(ExprKind::App {
-                func: Box::new(spanned(ExprKind::Var("g".into()))),
-                arg: Box::new(spanned(ExprKind::Lit(Literal::Int("0".into())))),
-            })),
-        });
-        let body = spanned(ExprKind::BinOp {
-            op: BinOp::Pipe,
-            lhs: Box::new(lhs),
-            rhs: Box::new(rhs),
-        });
-        let (_diags, effects) = check_module(vec![make_fun("f", body)]);
-        assert!(
-            effects["f"].console,
-            "lambda piped into non-Var callee should still propagate console effect"
-        );
-    }
-}

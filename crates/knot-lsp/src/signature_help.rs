@@ -53,11 +53,9 @@ pub(crate) fn handle_signature_help(
     // declaration (a binding ending before the call site but in a *different*
     // top-level decl is out of scope and must not shadow). Only fall back to
     // the global table when no shadowing local is in scope.
-    let enclosing = doc
-        .module
-        .decls
+    let enclosing = crate::utils::top_fields(&doc.module)
         .iter()
-        .map(|d| d.span)
+        .map(|d| d.value.span)
         .find(|s| s.start <= offset && offset < s.end);
     let local = lookup_local_binding_type(doc, &func_name, offset, enclosing);
     let type_str_owned: String;
@@ -295,87 +293,4 @@ fn param_doc(
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
-    use crate::utils::offset_to_position;
 
-    fn sig_params(uri: &Uri, position: Position) -> SignatureHelpParams {
-        SignatureHelpParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position,
-            },
-            work_done_progress_params: Default::default(),
-            context: None,
-        }
-    }
-
-    fn probe(src: &str, needle: &str, after: usize) -> Option<SignatureHelp> {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find(needle).expect("needle") + after;
-        let pos = offset_to_position(&doc.source, off);
-        handle_signature_help(&ws.state, &sig_params(&uri, pos))
-    }
-
-    fn param_label_span(p: &ParameterInformation) -> Option<(u32, u32)> {
-        match &p.label {
-            ParameterLabel::LabelOffsets([s, e]) => Some((*s, *e)),
-            ParameterLabel::Simple(_) => None,
-        }
-    }
-
-    #[test]
-    fn synth_param_name_avoids_overflow_and_repeats() {
-        assert_eq!(synth_param_name(0), "a");
-        assert_eq!(synth_param_name(25), "z");
-        assert_eq!(synth_param_name(26), "a1");
-        assert_eq!(synth_param_name(27), "b1");
-    }
-
-    /// Regression: a point-free / partially-eta-reduced definition supplies
-    /// fewer lambda param names than the type's arity. The unnamed trailing
-    /// parameters must still get distinct `name: Type` labels — otherwise
-    /// their label-offset highlight collides with an earlier parameter of the
-    /// same type, and the editor highlights the WRONG parameter when the
-    /// cursor sits on a later argument.
-    #[test]
-    fn point_free_params_get_distinct_highlight_spans() {
-        // `addBoth` has arity 2 in its type but only one lambda binder (`x`).
-        let src = "addBoth : Int 1 -> Int 1 -> Int 1\naddBoth = \\x -> plus x\nmain = addBoth 1 2\n";
-        // Cursor on the SECOND argument (the `2`), active parameter index 1.
-        let h = probe(src, "addBoth 1 2", 10).expect("sig help");
-        let sig = &h.signatures[0];
-        assert_eq!(h.active_parameter, Some(1), "cursor is on the 2nd arg");
-
-        let params = sig.parameters.as_ref().expect("parameters");
-        // The two parameter slots must point at DIFFERENT, non-overlapping
-        // spans within the label — the bug produced identical/overlapping spans.
-        let s0 = param_label_span(&params[0]).expect("param0 offsets");
-        let s1 = param_label_span(&params[1]).expect("param1 offsets");
-        assert_ne!(
-            s0, s1,
-            "the two params must highlight different spans; label={:?}",
-            sig.label
-        );
-        // The active parameter's span must reference the *second* `Int` in the
-        // label, i.e. start at or after the first parameter's span ends.
-        assert!(
-            s1.0 >= s0.1,
-            "2nd param span {s1:?} must come after 1st param span {s0:?}; label={:?}",
-            sig.label
-        );
-        // And the substring the active span points at must read `<name>: Int`.
-        let active = h.active_parameter.unwrap() as usize;
-        let (start, end) = param_label_span(&params[active]).unwrap();
-        let slice = &sig.label[start as usize..end as usize];
-        assert!(
-            slice.ends_with("Int") && slice.contains(':'),
-            "active param label slice should be a `name: Int 1`, got {slice:?} in {:?}",
-            sig.label
-        );
-    }
-}

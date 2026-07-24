@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use lsp_types::*;
 
-use knot::ast::DeclKind;
+use knot::ast::ExprKind;
+use crate::utils::top_fields;
 
 use crate::shared::{format_route_path, http_method_str, plural, route_is_listened};
 use crate::state::ServerState;
@@ -28,12 +29,14 @@ pub(crate) fn handle_code_lens(
     // Built once per request; small enough that O(n × m) is fine.
     let mut readers: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
     let mut writers: HashMap<&str, Vec<&str>> = HashMap::new();
-    for d in &doc.module.decls {
-        let (name, kind) = match &d.node {
-            DeclKind::Fun { name, .. } => (name.as_str(), "fn"),
-            DeclKind::View { name, .. } => (name.as_str(), "view"),
-            DeclKind::Derived { name, .. } => (name.as_str(), "derived"),
-            _ => continue,
+    for d in top_fields(&doc.module) {
+        let (name, kind) = match &d.value.node {
+            ExprKind::ViewDecl { name, .. } => (name.as_str(), "view"),
+            ExprKind::DerivedDecl { name, .. } => (name.as_str(), "derived"),
+            ExprKind::SourceDecl { .. } | ExprKind::DataCtor { .. }
+            | ExprKind::TypeCtor { .. } | ExprKind::RouteDecl { .. }
+            | ExprKind::RouteCompositeDecl { .. } | ExprKind::SubsetConstraint { .. } => continue,
+            _ => (d.name.as_str(), "fn"),
         };
         if let Some(eff) = doc.effect_sets.get(name) {
             for r in &eff.reads {
@@ -45,16 +48,17 @@ pub(crate) fn handle_code_lens(
         }
     }
 
-    for decl in &doc.module.decls {
-        let decl_name = match &decl.node {
-            DeclKind::Fun { name, .. }
-            | DeclKind::Source { name, .. }
-            | DeclKind::View { name, .. }
-            | DeclKind::Derived { name, .. }
-            | DeclKind::Data { name, .. }
-            | DeclKind::Route { name, .. }
-            | DeclKind::RouteComposite { name, .. } => name.as_str(),
-            _ => continue,
+    for decl in top_fields(&doc.module) {
+        let dspan = decl.value.span;
+        let decl_name = match &decl.value.node {
+            ExprKind::SourceDecl { name, .. }
+            | ExprKind::ViewDecl { name, .. }
+            | ExprKind::DerivedDecl { name, .. }
+            | ExprKind::DataCtor { name, .. }
+            | ExprKind::RouteDecl { name, .. }
+            | ExprKind::RouteCompositeDecl { name, .. } => name.as_str(),
+            ExprKind::SubsetConstraint { .. } => continue,
+            _ => decl.name.as_str(),
         };
 
         // Collect reference locations for this declaration. Reference target
@@ -67,7 +71,7 @@ pub(crate) fn handle_code_lens(
             .definitions
             .get(decl_name)
             .copied()
-            .unwrap_or(decl.span);
+            .unwrap_or(dspan);
         // Filter out self-references the way `references.rs` and
         // `call_hierarchy.rs` do: the declaration's own name token (and, for
         // multi-line decls, the definition-line name token recorded by
@@ -88,7 +92,7 @@ pub(crate) fn handle_code_lens(
             .collect();
         let ref_count = ref_locations.len();
 
-        let range = span_to_range(decl.span, &doc.source);
+        let range = span_to_range(dspan, &doc.source);
         let title = if ref_count == 1 {
             "1 reference".to_string()
         } else {
@@ -118,16 +122,14 @@ pub(crate) fn handle_code_lens(
         // hidden behind two helper layers is easy to miss without this.
         // Suppress the lens for pure-by-construction decl kinds (sources,
         // data, traits) where the effect summary would be noise.
-        if matches!(
-            &decl.node,
-            DeclKind::Fun { .. } | DeclKind::View { .. } | DeclKind::Derived { .. }
-        ) {
-            let name = match &decl.node {
-                DeclKind::Fun { name, .. }
-                | DeclKind::View { name, .. }
-                | DeclKind::Derived { name, .. } => name.as_str(),
-                _ => "",
-            };
+        let eff_name = match &decl.value.node {
+            ExprKind::ViewDecl { name, .. } | ExprKind::DerivedDecl { name, .. } => Some(name.as_str()),
+            ExprKind::SourceDecl { .. } | ExprKind::DataCtor { .. }
+            | ExprKind::TypeCtor { .. } | ExprKind::RouteDecl { .. }
+            | ExprKind::RouteCompositeDecl { .. } | ExprKind::SubsetConstraint { .. } => None,
+            _ => Some(decl.name.as_str()),
+        };
+        if let Some(name) = eff_name {
             if let Some(effects) = doc.effect_info.get(name) {
                 lenses.push(CodeLens {
                     range: Range {
@@ -147,8 +149,8 @@ pub(crate) fn handle_code_lens(
         // Lineage lens: source declarations show their consumers; views/derived
         // show their producers. The lens command is informational (no nav target),
         // so we use a no-op command name and put the summary in the title.
-        match &decl.node {
-            DeclKind::Source { name, .. } => {
+        match &decl.value.node {
+            ExprKind::SourceDecl { name, .. } => {
                 let mut view_count = 0;
                 let mut derived_count = 0;
                 let mut fn_count = 0;
@@ -197,7 +199,7 @@ pub(crate) fn handle_code_lens(
                     });
                 }
             }
-            DeclKind::Derived { name, .. } | DeclKind::View { name, .. } => {
+            ExprKind::DerivedDecl { name, .. } | ExprKind::ViewDecl { name, .. } => {
                 if let Some(eff) = doc.effect_sets.get(name) {
                     let mut deps: Vec<String> = Vec::new();
                     for r in &eff.reads {
@@ -220,7 +222,7 @@ pub(crate) fn handle_code_lens(
                     }
                 }
             }
-            DeclKind::Route { name, entries } => {
+            ExprKind::RouteDecl { name, entries } => {
                 // Per-entry URL preview lens, anchored at the route header. Each
                 // entry's constructor is also separately hoverable for the same
                 // info; this lens makes the URL space visible at a glance.

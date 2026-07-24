@@ -1,0 +1,7 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+with {
+type Todo = {title: Text, owner: Text, done: Int 1}
+*todos : [Todo]
+}
+(main)

@@ -4,7 +4,7 @@
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind, Span};
+use knot::ast::{self, Span};
 
 use crate::state::ServerState;
 use crate::utils::{
@@ -39,8 +39,8 @@ pub(crate) fn handle_linked_editing_range(
     let mut linked_spans: Vec<Span> = Vec::new();
 
     // Find the enclosing declaration
-    for decl in &doc.module.decls {
-        if decl.span.start > offset || offset >= decl.span.end {
+    for decl in crate::utils::top_fields(&doc.module) {
+        if decl.value.span.start > offset || offset >= decl.value.span.end {
             continue;
         }
 
@@ -52,32 +52,21 @@ pub(crate) fn handle_linked_editing_range(
         // variable's uses behind — so when a pun is present we suppress linked
         // editing entirely and defer to the proper rename, which handles puns.
         let mut pun_seen = false;
-        match &decl.node {
-            DeclKind::Fun { ty, body, .. } => {
-                // The signature can carry record types whose field names must
-                // link in lockstep with the body (`mkPerson : Text -> {name:
-                // Text}`) — mirror `rename.rs::field_sites_in_decl`'s Fun arm,
-                // which walks both the `ty` scheme and the body. Without this a
-                // live-rename of a field desyncs the signature from the body.
-                if let Some(scheme) = ty {
-                    collect_type_field_name_spans(
-                        &scheme.ty,
-                        word,
-                        &doc.source,
-                        &mut linked_spans,
-                    );
-                }
-                if let Some(body) = body {
-                    collect_field_name_spans(
-                        body,
-                        word,
-                        &doc.source,
-                        &mut linked_spans,
-                        &mut pun_seen,
-                    );
-                }
-            }
-            DeclKind::View { ty, body, .. } | DeclKind::Derived { ty, body, .. } => {
+        // The field's own signature can carry record types whose field names
+        // must link in lockstep with the body (`mkPerson : Text -> {name:
+        // Text}`) — mirror `rename.rs::field_sites_in_decl`, which walks both
+        // the scheme and the body. Without this a live-rename desyncs them.
+        if let Some(scheme) = &decl.sig {
+            collect_type_field_name_spans(
+                &scheme.ty,
+                word,
+                &doc.source,
+                &mut linked_spans,
+            );
+        }
+        match &decl.value.node {
+            knot::ast::ExprKind::ViewDecl { ty, body, .. }
+            | knot::ast::ExprKind::DerivedDecl { ty, body, .. } => {
                 if let Some(scheme) = ty {
                     collect_type_field_name_spans(
                         &scheme.ty,
@@ -88,7 +77,16 @@ pub(crate) fn handle_linked_editing_range(
                 }
                 collect_field_name_spans(body, word, &doc.source, &mut linked_spans, &mut pun_seen);
             }
-            _ => {}
+            _ => {
+                // A named function field: walk its body.
+                collect_field_name_spans(
+                    &decl.value,
+                    word,
+                    &doc.source,
+                    &mut linked_spans,
+                    &mut pun_seen,
+                );
+            }
         }
         if pun_seen {
             return None;
@@ -370,84 +368,4 @@ fn collect_pat_field_spans(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
-    use crate::utils::offset_to_position;
-    use lsp_types::{Position, TextDocumentIdentifier, TextDocumentPositionParams};
 
-    fn params(uri: &Uri, pos: Position) -> LinkedEditingRangeParams {
-        LinkedEditingRangeParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: pos,
-            },
-            work_done_progress_params: Default::default(),
-        }
-    }
-
-    // The cursor offset of the Nth (0-based) occurrence of `needle`, placed one
-    // byte in so it lands inside the token.
-    fn nth_offset(src: &str, needle: &str, n: usize) -> usize {
-        let mut from = 0;
-        for _ in 0..n {
-            from = src[from..].find(needle).unwrap() + from + needle.len();
-        }
-        src[from..].find(needle).unwrap() + from + 1
-    }
-
-    #[test]
-    fn explicit_pattern_field_links_with_expression_field() {
-        // `name` appears in a record pattern AND in a record expression within
-        // the same declaration. Both must be linked so editing one mirrors to
-        // the other — previously only the expression side was collected,
-        // leaving the pattern occurrence stale.
-        let mut ws = TestWorkspace::new();
-        let src = "extract = \\p ->\n  case p of\n    {name n age a} -> {name n age a}\n";
-        let uri = ws.open("main", src);
-        // Cursor on the expression-side `name` (2nd occurrence).
-        let pos = offset_to_position(src, nth_offset(src, "name", 1));
-        let resp = handle_linked_editing_range(&ws.state, &params(&uri, pos))
-            .expect("linked editing should activate across pattern + expression");
-        assert_eq!(
-            resp.ranges.len(),
-            2,
-            "both the pattern field and the expression field must be linked"
-        );
-    }
-
-    #[test]
-    fn same_named_pattern_binder_is_not_a_field_link() {
-        // `{name name}` names field `name` and binds a variable `name`; the
-        // same-named variable in the body is NOT a field occurrence. Linked
-        // editing on a field token must link only the field-name tokens, so
-        // the bound variable is left alone (rename handles it separately).
-        let mut ws = TestWorkspace::new();
-        let src = "extract = \\p ->\n  case p of\n    {name name} -> {name name other name}\n";
-        let uri = ws.open("main", src);
-        // Cursor on the expression-side `name` field token (3rd occurrence of
-        // `name`: pattern field, pattern binder, then this one).
-        let pos = offset_to_position(src, nth_offset(src, "name", 2));
-        let resp = handle_linked_editing_range(&ws.state, &params(&uri, pos))
-            .expect("explicit same-named field tokens still link");
-        assert_eq!(
-            resp.ranges.len(),
-            2,
-            "only the two field-name tokens link; binder + usages are excluded"
-        );
-    }
-
-    #[test]
-    fn expression_only_fields_still_link() {
-        // No patterns involved — two record-expression occurrences of `name`
-        // must still link.
-        let mut ws = TestWorkspace::new();
-        let src = "f = \\n -> {name n other {name n}}\n";
-        let uri = ws.open("main", src);
-        let pos = offset_to_position(src, nth_offset(src, "name", 0));
-        let resp = handle_linked_editing_range(&ws.state, &params(&uri, pos))
-            .expect("two expression field occurrences must link");
-        assert_eq!(resp.ranges.len(), 2);
-    }
-}

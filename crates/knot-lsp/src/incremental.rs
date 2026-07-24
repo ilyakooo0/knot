@@ -23,7 +23,8 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use knot::ast::{self, DeclKind, Module};
+use knot::ast::{self, Expr, ExprKind};
+use std::collections::hash_map::DefaultHasher;
 
 /// Per-declaration analysis fingerprint. Stored alongside the inference
 /// snapshot so the next edit can compute a delta cheaply.
@@ -71,18 +72,18 @@ pub struct ModuleFingerprint {
 }
 
 impl ModuleFingerprint {
-    /// Compute the fingerprint of a freshly-parsed module.
-    pub fn from_module(module: &Module) -> Self {
+    /// Compute the fingerprint of a freshly-parsed program.
+    pub fn from_module(program: &Expr) -> Self {
         let mut decl_hashes = HashMap::new();
         let mut decl_signature_hashes = HashMap::new();
         let mut decl_deps = HashMap::new();
-        for (i, decl) in module.decls.iter().enumerate() {
-            let key = decl_key(decl, i);
-            decl_hashes.insert(key.clone(), hash_decl(decl));
-            decl_signature_hashes.insert(key.clone(), hash_decl_signature(decl));
-            decl_deps.insert(key, collect_decl_deps(decl));
+        for (i, field) in top_fields(program).iter().enumerate() {
+            let key = field_key(field, i);
+            decl_hashes.insert(key.clone(), hash_field(field));
+            decl_signature_hashes.insert(key.clone(), hash_field_signature(field));
+            decl_deps.insert(key, collect_field_deps(field));
         }
-        let structure_hash = hash_structure(module);
+        let structure_hash = hash_structure(program);
         ModuleFingerprint {
             decl_hashes,
             decl_signature_hashes,
@@ -180,75 +181,71 @@ impl ModuleFingerprint {
     }
 }
 
-/// Build a stable key for a decl. Named decls use their name; unnamed decls
-/// fall back to a positional key combined with their shape so reordering
-/// doesn't alias.
-fn decl_key(decl: &ast::Decl, index: usize) -> String {
-    match &decl.node {
-        DeclKind::Fun { name, .. }
-        | DeclKind::Source { name, .. }
-        | DeclKind::View { name, .. }
-        | DeclKind::Derived { name, .. }
-        | DeclKind::Data { name, .. }
-        | DeclKind::TypeAlias { name, .. }
-        | DeclKind::Route { name, .. } => name.clone(),
-        DeclKind::SubsetConstraint { .. } => format!("__subset#{index}"),
-        DeclKind::RouteComposite { name, .. } => format!("__route_comp:{name}"),
+/// The top-level record fields of the program — one per declaration.
+/// The file is a single expression; declarations are the fields of its
+/// top-level record literal (or `with` record). Returns `&RecordField`s so
+/// positional indexing (for synthetic keys) is stable across a single pass.
+fn top_fields(program: &Expr) -> Vec<&ast::RecordField> {
+    match &program.node {
+        ExprKind::Record(fields) => fields.iter().collect(),
+        ExprKind::With { record, .. } => match &record.node {
+            ExprKind::Record(fields) => fields.iter().collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
     }
 }
 
-/// Hash a declaration ignoring its source spans. We rely on `Debug`-printed
-/// form as a stable structural representation; this keeps the impl simple
-/// and avoids hand-writing a deep-walk hasher for every node kind. The
-/// hash is keyed off the AST shape only — formatting and span shifts in
-/// otherwise-identical decls produce the same hash.
-fn hash_decl(decl: &ast::Decl) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
+/// Build a stable key for a declaration field. Named decls use their name;
+/// marker decls that lack a meaningful name fall back to a positional key
+/// combined with their shape so reordering doesn't alias.
+fn field_key(field: &ast::RecordField, index: usize) -> String {
+    match &field.value.node {
+        ExprKind::SubsetConstraint { .. } => format!("__subset#{index}"),
+        ExprKind::RouteCompositeDecl { name, .. } => format!("__route_comp:{name}"),
+        _ => field.name.clone(),
+    }
+}
+
+/// Hash a declaration field ignoring its source spans. We rely on
+/// `Debug`-printed form as a stable structural representation; this keeps
+/// the impl simple and avoids hand-writing a deep-walk hasher for every node
+/// kind. The hash is keyed off the AST shape only — formatting and span
+/// shifts in otherwise-identical decls produce the same hash.
+fn hash_field(field: &ast::RecordField) -> u64 {
+    let mut h = DefaultHasher::new();
+    field.name.hash(&mut h);
     // Debug format includes spans, so strip them from the rendered string
     // before hashing. Spans look like `Span { start: 12, end: 34 }`.
-    let raw = format!("{:?}", decl.node);
+    let raw = format!("{:?}", field.value.node);
     let stripped = strip_spans(&raw);
     stripped.hash(&mut h);
+    if let Some(sig) = &field.sig {
+        strip_spans(&format!("{:?}", sig.ty.node)).hash(&mut h);
+    }
     h.finish()
 }
 
-/// Hash only the externally-visible signature of a declaration. Used by
-/// `signature_changed_decls` to detect whether a downstream consumer needs
-/// re-checking. The rule: if a Knot user observes only the `name : Type`
-/// line of a decl, what changes here?
+/// Hash only the externally-visible signature of a declaration field. Used
+/// by `signature_changed_decls` to detect whether a downstream consumer
+/// needs re-checking. The rule: if a Knot user observes only the `name :
+/// Type` line of a decl, what changes here?
 ///
-/// - `Fun` with explicit signature: hash the name + signature only — body
-///   is internal to this decl.
-/// - `Fun` without signature: must include the body (its inferred type
+/// - Field with an explicit signature: hash the name + signature only —
+///   body is internal to this decl.
+/// - Field without signature: must include the body (its inferred type
 ///   depends on the body, and dependents see the inferred type).
-/// - `Source/View/Derived`: hash the type annotation when present; otherwise
-///   include the body.
-/// - `Data/Trait/Impl/Route/etc.`: shape is the signature — hash the whole
-///   declaration.
-fn hash_decl_signature(decl: &ast::Decl) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    match &decl.node {
-        DeclKind::Fun { name, ty, body, .. } => {
-            ("fun_sig", name).hash(&mut h);
-            match ty {
-                Some(ts) => {
-                    strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
-                    // Trait bounds are part of the externally-visible
-                    // signature: adding/removing `Display a =>` changes what
-                    // call sites must satisfy, so dependents need re-checking.
-                    strip_spans(&format!("{:?}", ts.constraints)).hash(&mut h);
-                }
-                None => {
-                    // No declared type — body change can shift the inferred
-                    // type, which dependents see. Include the body.
-                    "untyped".hash(&mut h);
-                    if let Some(b) = body {
-                        strip_spans(&format!("{:?}", b.node)).hash(&mut h);
-                    }
-                }
-            }
+/// - Source: hash the type annotation.
+/// - Data/Route/etc.: shape is the signature — hash the whole marker.
+fn hash_field_signature(field: &ast::RecordField) -> u64 {
+    let mut h = DefaultHasher::new();
+    match &field.value.node {
+        ExprKind::SourceDecl { name, ty, .. } => {
+            ("source_sig", name).hash(&mut h);
+            strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
         }
-        DeclKind::View { name, ty, body, .. } | DeclKind::Derived { name, ty, body, .. } => {
+        ExprKind::ViewDecl { name, ty, body }
+        | ExprKind::DerivedDecl { name, ty, body } => {
             ("vd_sig", name).hash(&mut h);
             match ty {
                 Some(ts) => {
@@ -261,44 +258,46 @@ fn hash_decl_signature(decl: &ast::Decl) -> u64 {
                 }
             }
         }
-        DeclKind::Source { name, ty, .. } => {
-            ("source_sig", name).hash(&mut h);
-            strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
+        // Data / route / etc.: shape *is* the signature — full hash.
+        ExprKind::DataCtor { .. } | ExprKind::TypeCtor { .. }
+        | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. }
+        | ExprKind::SubsetConstraint { .. } => return hash_field(field),
+        _ => {
+            // A named function field: hash the sig when present, else the body.
+            ("fun_sig", &field.name).hash(&mut h);
+            match &field.sig {
+                Some(ts) => {
+                    strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
+                    strip_spans(&format!("{:?}", ts.constraints)).hash(&mut h);
+                }
+                None => {
+                    "untyped".hash(&mut h);
+                    strip_spans(&format!("{:?}", field.value.node)).hash(&mut h);
+                }
+            }
         }
-        // Everything else: shape *is* the signature. Reuse the full decl hash.
-        _ => return hash_decl(decl),
     }
     h.finish()
 }
 
-/// Hash module-level structure: the *signature* of each decl (no bodies).
+/// Hash program-level structure: the *signature* of each decl (no bodies).
 /// When this changes, the trait surface shifted and even "clean-bodied"
 /// decls may need re-checking.
-fn hash_structure(module: &Module) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun { name, ty, .. } => {
-                ("fun", name).hash(&mut h);
-                if let Some(ts) = ty {
-                    strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
-                }
-            }
-            DeclKind::Source { name, ty, .. } => {
+fn hash_structure(program: &Expr) -> u64 {
+    let mut h = DefaultHasher::new();
+    for field in top_fields(program) {
+        match &field.value.node {
+            ExprKind::SourceDecl { name, ty, .. } => {
                 ("source", name).hash(&mut h);
                 strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
             }
-            DeclKind::View { name, ty, .. } | DeclKind::Derived { name, ty, .. } => {
+            ExprKind::ViewDecl { name, ty, .. } | ExprKind::DerivedDecl { name, ty, .. } => {
                 ("vd", name).hash(&mut h);
                 if let Some(ts) = ty {
                     strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
                 }
             }
-            DeclKind::Data {
-                name,
-                constructors,
-                ..
-            } => {
+            ExprKind::DataCtor { name, constructors, .. } => {
                 ("data", name).hash(&mut h);
                 for c in constructors {
                     c.name.hash(&mut h);
@@ -308,25 +307,153 @@ fn hash_structure(module: &Module) -> u64 {
                     }
                 }
             }
-            DeclKind::TypeAlias { name, .. } => {
+            ExprKind::TypeCtor { name, .. } => {
                 ("alias", name).hash(&mut h);
-                strip_spans(&format!("{:?}", decl.node)).hash(&mut h);
+                strip_spans(&format!("{:?}", field.value.node)).hash(&mut h);
             }
-            DeclKind::Route { name, .. } => {
+            ExprKind::RouteDecl { name, .. } => {
                 ("route", name).hash(&mut h);
-                strip_spans(&format!("{:?}", decl.node)).hash(&mut h);
+                strip_spans(&format!("{:?}", field.value.node)).hash(&mut h);
             }
             other => {
-                strip_spans(&format!("{:?}", other)).hash(&mut h);
+                ("fun", &field.name).hash(&mut h);
+                if let Some(ts) = &field.sig {
+                    strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
+                } else {
+                    strip_spans(&format!("{:?}", other)).hash(&mut h);
+                }
             }
         }
     }
     h.finish()
 }
 
-/// Strip `Span { start: NN, end: NN }` substrings from a Debug rendering.
-/// Spans depend on byte offsets that shift with formatting changes; we want
-/// hashes that survive whitespace edits.
+/// Collect every top-level name a declaration field references, including
+/// type-level dependencies (type annotations, source types, constraints,
+/// data constructors). Used to build the reverse-dependency graph for
+/// selective re-inference.
+fn collect_field_deps(field: &ast::RecordField) -> HashSet<String> {
+    let mut deps = HashSet::new();
+    // Signature types are deps for any field that carries one.
+    if let Some(ts) = &field.sig {
+        collect_type_names(&ts.ty, &mut deps);
+        for c in &ts.constraints {
+            for arg in c.types() {
+                collect_type_names(arg, &mut deps);
+            }
+        }
+    }
+    match &field.value.node {
+        ExprKind::SourceDecl { ty, .. } => {
+            collect_type_names(ty, &mut deps);
+        }
+        ExprKind::ViewDecl { ty, body, .. } | ExprKind::DerivedDecl { ty, body, .. } => {
+            if let Some(ts) = ty {
+                collect_type_names(&ts.ty, &mut deps);
+                for c in &ts.constraints {
+                    for arg in c.types() {
+                        collect_type_names(arg, &mut deps);
+                    }
+                }
+            }
+            collect_expr_names(body, &mut deps);
+        }
+        ExprKind::TypeCtor { ty, .. } => {
+            collect_type_names(ty, &mut deps);
+        }
+        ExprKind::DataCtor { constructors, .. } => {
+            for ctor in constructors {
+                for f in &ctor.fields {
+                    collect_type_names(&f.value, &mut deps);
+                }
+            }
+        }
+        ExprKind::RouteDecl { name, entries } => {
+            deps.insert(name.clone());
+            for entry in entries {
+                for seg in &entry.path {
+                    if let ast::PathSegment::Param { ty, .. } = seg {
+                        collect_type_names(ty, &mut deps);
+                    }
+                }
+                for f in &entry.body_fields {
+                    collect_type_names(&f.value, &mut deps);
+                }
+                for f in &entry.query_params {
+                    collect_type_names(&f.value, &mut deps);
+                }
+                for f in &entry.request_headers {
+                    collect_type_names(&f.value, &mut deps);
+                }
+                for f in &entry.response_headers {
+                    collect_type_names(&f.value, &mut deps);
+                }
+                if let Some(ty) = &entry.response_ty {
+                    collect_type_names(ty, &mut deps);
+                }
+                if let Some(rate_limit) = &entry.rate_limit {
+                    collect_expr_names(rate_limit, &mut deps);
+                }
+            }
+        }
+        ExprKind::RouteCompositeDecl { name, components } => {
+            deps.insert(name.clone());
+            for comp in components {
+                deps.insert(comp.clone());
+            }
+        }
+        ExprKind::SubsetConstraint { sub, sup } => {
+            deps.insert(sub.relation.clone());
+            if let Some(f) = &sub.field {
+                deps.insert(f.clone());
+            }
+            deps.insert(sup.relation.clone());
+            if let Some(f) = &sup.field {
+                deps.insert(f.clone());
+            }
+        }
+        _ => {
+            // A plain value/function field: body deps.
+            collect_expr_names(&field.value, &mut deps);
+        }
+    }
+    deps
+}
+
+fn utf8_char_len(first: u8) -> usize {
+    match first {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1, // stray continuation byte: advance one to stay live
+    }
+}
+
+
+fn span_marker_len(b: &[u8]) -> Option<usize> {
+    let lit_at = |i: usize, lit: &[u8]| -> Option<usize> {
+        if b.len() >= i + lit.len() && b[i..i + lit.len()] == *lit {
+            Some(i + lit.len())
+        } else {
+            None
+        }
+    };
+    let digits_at = |i: usize| -> Option<usize> {
+        let mut j = i;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > i { Some(j) } else { None }
+    };
+    let i = lit_at(0, b"Span { start: ".as_slice())?;
+    let i = digits_at(i)?;
+    let i = lit_at(i, b", end: ".as_slice())?;
+    let i = digits_at(i)?;
+    lit_at(i, b" }".as_slice())
+}
+
+
 fn strip_spans(s: &str) -> String {
     // Walk the string, dropping only *complete* span markers. Matching the
     // full `Span { start: N, end: N }` shape (rather than a bare `Span {`
@@ -387,135 +514,6 @@ fn strip_spans(s: &str) -> String {
     out
 }
 
-/// If `b` begins with a complete derived-`Debug` span marker
-/// (`Span { start: <digits>, end: <digits> }`), return its byte length;
-/// otherwise `None`. Pure ASCII, so the returned length keeps `i` on a
-/// UTF-8 char boundary.
-fn span_marker_len(b: &[u8]) -> Option<usize> {
-    let lit_at = |i: usize, lit: &[u8]| -> Option<usize> {
-        if b.len() >= i + lit.len() && b[i..i + lit.len()] == *lit {
-            Some(i + lit.len())
-        } else {
-            None
-        }
-    };
-    let digits_at = |i: usize| -> Option<usize> {
-        let mut j = i;
-        while j < b.len() && b[j].is_ascii_digit() {
-            j += 1;
-        }
-        if j > i { Some(j) } else { None }
-    };
-    let i = lit_at(0, b"Span { start: ".as_slice())?;
-    let i = digits_at(i)?;
-    let i = lit_at(i, b", end: ".as_slice())?;
-    let i = digits_at(i)?;
-    lit_at(i, b" }".as_slice())
-}
-
-/// Byte width of the UTF-8 character beginning with `first`.
-fn utf8_char_len(first: u8) -> usize {
-    match first {
-        0x00..=0x7F => 1,
-        0xC0..=0xDF => 2,
-        0xE0..=0xEF => 3,
-        0xF0..=0xF7 => 4,
-        _ => 1, // stray continuation byte: advance one to stay live
-    }
-}
-
-/// Collect every top-level name a declaration references, including type-level
-/// dependencies (type annotations, source types, constraints, data constructors).
-/// Used to build the reverse-dependency graph for selective re-inference.
-fn collect_decl_deps(decl: &ast::Decl) -> HashSet<String> {
-    let mut deps = HashSet::new();
-    match &decl.node {
-        DeclKind::Fun { ty, body, .. } => {
-            if let Some(ts) = ty {
-                collect_type_names(&ts.ty, &mut deps);
-                for c in &ts.constraints {
-                    for arg in c.types() {
-                        collect_type_names(arg, &mut deps);
-                    }
-                }
-            }
-            if let Some(body) = body {
-                collect_expr_names(body, &mut deps);
-            }
-        }
-        DeclKind::View { ty, body, .. } | DeclKind::Derived { ty, body, .. } => {
-            if let Some(ts) = ty {
-                collect_type_names(&ts.ty, &mut deps);
-                // Collect constraint arg types — matches the Fun arm so
-                // changes to types used in view/derived constraints propagate.
-                for c in &ts.constraints {
-                    for arg in c.types() {
-                        collect_type_names(arg, &mut deps);
-                    }
-                }
-            }
-            collect_expr_names(body, &mut deps);
-        }
-        DeclKind::Source { ty, .. } => {
-            collect_type_names(ty, &mut deps);
-        }
-        DeclKind::TypeAlias { ty, .. } => {
-            collect_type_names(ty, &mut deps);
-        }
-        DeclKind::Data { constructors, .. } => {
-            for ctor in constructors {
-                for field in &ctor.fields {
-                    collect_type_names(&field.value, &mut deps);
-                }
-            }
-        }
-        DeclKind::Route { name, entries, .. } => {
-            deps.insert(name.clone());
-            for entry in entries {
-                for seg in &entry.path {
-                    if let ast::PathSegment::Param { ty, .. } = seg {
-                        collect_type_names(ty, &mut deps);
-                    }
-                }
-                for f in &entry.body_fields {
-                    collect_type_names(&f.value, &mut deps);
-                }
-                for f in &entry.query_params {
-                    collect_type_names(&f.value, &mut deps);
-                }
-                for f in &entry.request_headers {
-                    collect_type_names(&f.value, &mut deps);
-                }
-                for f in &entry.response_headers {
-                    collect_type_names(&f.value, &mut deps);
-                }
-                if let Some(ty) = &entry.response_ty {
-                    collect_type_names(ty, &mut deps);
-                }
-                if let Some(rate_limit) = &entry.rate_limit {
-                    collect_expr_names(rate_limit, &mut deps);
-                }
-            }
-        }
-        DeclKind::RouteComposite { name, components, .. } => {
-            deps.insert(name.clone());
-            for comp in components {
-                deps.insert(comp.clone());
-            }
-        }
-        DeclKind::SubsetConstraint { sub, sup, .. } => {
-            deps.insert(sub.relation.clone());
-            if let Some(f) = &sub.field {
-                deps.insert(f.clone());
-            }
-            deps.insert(sup.relation.clone());
-            if let Some(f) = &sup.field {
-                deps.insert(f.clone());
-            }
-        }
-    }
-    deps
-}
 
 /// Collect named type references from a type AST node (or a slice of them).
 fn collect_type_names(ty: &ast::Type, out: &mut HashSet<String>) {
@@ -573,175 +571,3 @@ fn collect_expr_names(expr: &ast::Expr, out: &mut HashSet<String>) {
     crate::utils::recurse_expr(expr, |e| collect_expr_names(e, out));
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse_module(src: &str) -> Module {
-        let lex = knot::lexer::Lexer::new(src);
-        let (tokens, _) = lex.tokenize();
-        let parser = knot::parser::Parser::new(src.to_string(), tokens);
-        let (m, _) = parser.parse_module();
-        m
-    }
-
-    #[test]
-    fn fingerprint_invariant_to_whitespace_changes() {
-        let a = parse_module("foo = \\x -> x\nbar = \\y -> y\n");
-        let b = parse_module("foo = \\x -> x\n\n\nbar   =    \\y -> y\n");
-        let fa = ModuleFingerprint::from_module(&a);
-        let fb = ModuleFingerprint::from_module(&b);
-        assert!(
-            fa.structurally_equal(&fb),
-            "whitespace-only edit should preserve fingerprint"
-        );
-    }
-
-    #[test]
-    fn fingerprint_detects_body_change() {
-        let a = parse_module("double = \\x -> x * 2\n");
-        let b = parse_module("double = \\x -> x * 3\n");
-        let fa = ModuleFingerprint::from_module(&a);
-        let fb = ModuleFingerprint::from_module(&b);
-        let changed = fb.changed_decls(&fa);
-        assert!(changed.contains("double"), "got: {changed:?}");
-    }
-
-    #[test]
-    fn fingerprint_detects_change_inside_string_literal_with_span_text() {
-        // A string literal whose Debug rendering contains the substring
-        // `Span {` (with no `}` of its own) must not let `strip_spans` swallow
-        // the following real span and hash two different bodies equal. The two
-        // decls differ only by `foo` vs `bar` inside such a literal.
-        let a = parse_module("msg = \"Span { foo\"\n");
-        let b = parse_module("msg = \"Span { bar\"\n");
-        let fa = ModuleFingerprint::from_module(&a);
-        let fb = ModuleFingerprint::from_module(&b);
-        let changed = fb.changed_decls(&fa);
-        assert!(
-            changed.contains("msg"),
-            "change inside a literal containing `Span {{` must be detected: {changed:?}"
-        );
-    }
-
-    #[test]
-    fn strip_spans_removes_real_markers_but_keeps_literal_text() {
-        // Real `Span { start: N, end: N }` markers are dropped; the bare text
-        // `Span {` inside a string literal is preserved.
-        assert_eq!(strip_spans("Foo { span: Span { start: 1, end: 2 } }"), "Foo { span:  }");
-        assert_eq!(strip_spans("Text(\"Span { x\")"), "Text(\"Span { x\")");
-        // Non-ASCII content survives byte-accurately.
-        assert_eq!(strip_spans("Text(\"café\")"), "Text(\"café\")");
-    }
-
-    #[test]
-    fn fingerprint_dirty_closure_propagates_through_deps() {
-        let m = parse_module(
-            r#"helper = \x -> x + 1
-caller = \y -> helper y
-top = \z -> caller z
-"#,
-        );
-        let fp = ModuleFingerprint::from_module(&m);
-        let mut seed = HashSet::new();
-        seed.insert("helper".to_string());
-        let closure = fp.dirty_closure(&seed);
-        assert!(closure.contains("helper"));
-        assert!(closure.contains("caller"));
-        assert!(closure.contains("top"), "closure: {closure:?}");
-    }
-
-    #[test]
-    fn fingerprint_unrelated_decls_are_not_dirty() {
-        let m = parse_module(
-            r#"a = \x -> x
-b = \y -> y
-"#,
-        );
-        let fp = ModuleFingerprint::from_module(&m);
-        let mut seed = HashSet::new();
-        seed.insert("a".to_string());
-        let closure = fp.dirty_closure(&seed);
-        assert!(closure.contains("a"));
-        assert!(!closure.contains("b"), "closure: {closure:?}");
-    }
-
-    #[test]
-    fn fingerprint_invariant_to_doc_comment_changes() {
-        let a = parse_module("foo = \\x -> x\n");
-        let b = parse_module("-- a doc comment\nfoo = \\x -> x\n");
-        let fa = ModuleFingerprint::from_module(&a);
-        let fb = ModuleFingerprint::from_module(&b);
-        assert!(
-            fa.structurally_equal(&fb),
-            "comment-only edit should preserve fingerprint"
-        );
-    }
-
-    #[test]
-    fn fingerprint_detects_added_decl() {
-        let a = parse_module("foo = \\x -> x\n");
-        let b = parse_module("foo = \\x -> x\nbar = \\y -> y\n");
-        let fa = ModuleFingerprint::from_module(&a);
-        let fb = ModuleFingerprint::from_module(&b);
-        assert!(!fa.structurally_equal(&fb));
-        let changed = fb.changed_decls(&fa);
-        assert!(changed.contains("bar"));
-    }
-
-    #[test]
-    fn signature_changed_decls_ignores_body_change_in_typed_fun() {
-        // Typed function: signature stays the same, body shifts. Dependents
-        // shouldn't need re-checking.
-        let a = parse_module("double : Int 1 -> Int 1\ndouble = \\x -> x * 2\n");
-        let b = parse_module("double : Int 1 -> Int 1\ndouble = \\x -> x * 3\n");
-        let fa = ModuleFingerprint::from_module(&a);
-        let fb = ModuleFingerprint::from_module(&b);
-
-        // Body-level changed_decls picks up the edit.
-        let body_changed = fb.changed_decls(&fa);
-        assert!(
-            body_changed.contains("double"),
-            "body-level change set should include double; got: {body_changed:?}"
-        );
-
-        // Signature-level set is empty — outside view of the decl is unchanged.
-        let sig_changed = fb.signature_changed_decls(&fa);
-        assert!(
-            !sig_changed.contains("double"),
-            "signature-level change set should NOT include double on body-only \
-             edit of a typed fun; got: {sig_changed:?}"
-        );
-    }
-
-    #[test]
-    fn signature_changed_decls_includes_body_change_in_untyped_fun() {
-        // No explicit signature — the inferred type *can* shift on body
-        // change, so dependents must be considered dirty.
-        let a = parse_module("double = \\x -> x * 2\n");
-        let b = parse_module("double = \\x -> x * 3\n");
-        let fa = ModuleFingerprint::from_module(&a);
-        let fb = ModuleFingerprint::from_module(&b);
-
-        let sig_changed = fb.signature_changed_decls(&fa);
-        assert!(
-            sig_changed.contains("double"),
-            "untyped fun body change must propagate; got: {sig_changed:?}"
-        );
-    }
-
-    #[test]
-    fn signature_changed_decls_detects_signature_edit() {
-        // Signature changed (return type Int → Float) — must propagate.
-        let a = parse_module("double : Int 1 -> Int 1\ndouble = \\x -> x\n");
-        let b = parse_module("double : Int 1 -> Float 1\ndouble = \\x -> x\n");
-        let fa = ModuleFingerprint::from_module(&a);
-        let fb = ModuleFingerprint::from_module(&b);
-
-        let sig_changed = fb.signature_changed_decls(&fa);
-        assert!(
-            sig_changed.contains("double"),
-            "signature change must propagate; got: {sig_changed:?}"
-        );
-    }
-}

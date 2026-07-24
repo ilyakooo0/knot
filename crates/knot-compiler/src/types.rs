@@ -64,12 +64,12 @@ pub struct TypeEnv {
 
 impl TypeEnv {
     #[allow(clippy::type_complexity)]
-    pub fn from_module(module: &Module) -> Self {
+    pub fn from_program(program: &Expr) -> Self {
         let mut aliases = HashMap::new();
         let mut constructors = HashMap::new();
         let mut source_schemas = HashMap::new();
         let mut migrate_schemas: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        let mut associated_types: HashMap<String, Vec<AssocTypeDef>> = HashMap::new();
+        let associated_types: HashMap<String, Vec<AssocTypeDef>> = HashMap::new();
 
         let mut refined_types: HashMap<String, Expr> = HashMap::new();
         // Original AST types for aliases — used to resolve refinements through aliases
@@ -92,140 +92,114 @@ impl TypeEnv {
         let mut multi_variant_params: HashMap<String, (Vec<String>, Vec<(String, Vec<(String, Type)>)>)> =
             HashMap::new();
 
-        // First pass: collect type aliases and data types
-        for decl in &module.decls {
-            match &decl.node {
-                DeclKind::TypeAlias { name, params, ty }
-                    if params.is_empty() => {
-                        alias_ast_types.insert(name.clone(), ty.clone());
-                        // Track refined type aliases separately
-                        if let TypeKind::Refined { base, predicate } = &ty.node {
-                            refined_types.insert(name.clone(), (**predicate).clone());
-                            let resolved =
-                                resolve_type(base, &aliases, &associated_types, &single_variant_params, &multi_variant_params);
-                            aliases.insert(name.clone(), resolved);
-                        } else {
-                            let resolved =
-                                resolve_type(ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params);
-                            aliases.insert(name.clone(), resolved);
-                        }
-                    }
-                DeclKind::Data {
-                    name,
-                    params,
-                    constructors: ctors,
-                    ..
-                } => {
-                    // For single-variant data types, treat as a record alias
-                    if ctors.len() == 1 {
-                        let ctor = &ctors[0];
-                        let fields: Vec<(String, ResolvedType)> = ctor
-                            .fields
-                            .iter()
-                            .map(|f| {
-                                (
-                                    f.name.clone(),
-                                    resolve_type(
-                                        &f.value,
-                                        &aliases,
-                                        &associated_types,
-                                        &single_variant_params,
-                                        &multi_variant_params,
-                                    ),
-                                )
-                            })
-                            .collect();
-                        aliases.insert(
-                            name.clone(),
-                            ResolvedType::Record(fields.clone()),
-                        );
-                        // For parameterized single-variant data types
-                        // (`data Box a = Box {value: a}`), capture the type
-                        // parameters and the raw field-type AST so an
-                        // application like `Box Int` can substitute the arg
-                        // into the field types at use site (otherwise the
-                        // resolved alias collapses every type parameter to
-                        // `Named("unknown")`, producing wrong column types).
-                        if !params.is_empty() {
-                            single_variant_params.insert(
-                                name.clone(),
-                                (
-                                    params.clone(),
-                                    ctor.fields
-                                        .iter()
-                                        .map(|f| (f.name.clone(), f.value.clone()))
-                                        .collect(),
-                                ),
-                            );
-                        }
-                        // Register the AST record view under the data-type name
-                        // too, so a source of this type (`*account : [Money]`)
-                        // has its field-level refinements collected via the
-                        // alias arm of `collect_source_refinements` — otherwise
-                        // single-variant data field refinements are silently
-                        // dropped (multi-variant ones go through data_ctor_decls).
-                        alias_ast_types.entry(name.clone()).or_insert_with(|| {
-                            Spanned::new(
-                                TypeKind::Record {
-                                    fields: ctor.fields.clone(),
-                                    rest: None,
-                                },
-                                decl.span,
-                            )
-                        });
-                        // First-wins: a duplicate ctor name across data types
-                        // is reported as an error in inference; here we just
-                        // need a consistent view of "the" Circle.
-                        constructors.entry(ctor.name.clone()).or_insert(fields);
-                    } else {
-                        // Multi-variant: register each constructor and create Adt alias
-                        data_ctor_decls.insert(name.clone(), ctors.clone());
-                        // For parameterized multi-variant ADTs, store the raw
-                        // AST field types so application sites can substitute
-                        // type arguments (mirrors single_variant_params).
-                        if !params.is_empty() {
-                            let ctor_fields: Vec<(String, Vec<(String, Type)>)> = ctors
-                                .iter()
-                                .map(|c| {
-                                    (
-                                        c.name.clone(),
-                                        c.fields
-                                            .iter()
-                                            .map(|f| (f.name.clone(), f.value.clone()))
-                                            .collect(),
-                                    )
-                                })
-                                .collect();
-                            multi_variant_params
-                                .insert(name.clone(), (params.clone(), ctor_fields));
-                        }
-                        let mut adt_ctors = Vec::new();
-                        for ctor in ctors {
-                            let fields: Vec<(String, ResolvedType)> = ctor
-                                .fields
-                                .iter()
-                                .map(|f| {
-                                    (
-                                        f.name.clone(),
-                                        resolve_type(
-                                            &f.value,
-                                            &aliases,
-                                            &associated_types,
-                                            &single_variant_params,
-                                            &multi_variant_params,
-                                        ),
-                                    )
-                                })
-                                .collect();
-                            constructors
-                                .entry(ctor.name.clone())
-                                .or_insert_with(|| fields.clone());
-                            adt_ctors.push((ctor.name.clone(), fields));
-                        }
-                        aliases.insert(name.clone(), ResolvedType::Adt(adt_ctors));
-                    }
+        // First pass: collect type aliases and data types from every
+        // `TypeCtor`/`DataCtor` record-field marker in the program.
+        for (name, params, ty, span) in collect_type_ctors(program) {
+            if params.is_empty() {
+                alias_ast_types.insert(name.clone(), ty.clone());
+                // Track refined type aliases separately
+                if let TypeKind::Refined { base, predicate } = &ty.node {
+                    refined_types.insert(name.clone(), (**predicate).clone());
+                    let resolved =
+                        resolve_type(base, &aliases, &associated_types, &single_variant_params, &multi_variant_params);
+                    aliases.insert(name.clone(), resolved);
+                } else {
+                    let resolved =
+                        resolve_type(&ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params);
+                    aliases.insert(name.clone(), resolved);
                 }
-                _ => {}
+            }
+            let _ = span;
+        }
+        for (name, params, ctors, span) in collect_data_ctors(program) {
+            // For single-variant data types, treat as a record alias
+            if ctors.len() == 1 {
+                let ctor = &ctors[0];
+                let fields: Vec<(String, ResolvedType)> = ctor
+                    .fields
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.name.clone(),
+                            resolve_type(
+                                &f.value,
+                                &aliases,
+                                &associated_types,
+                                &single_variant_params,
+                                &multi_variant_params,
+                            ),
+                        )
+                    })
+                    .collect();
+                aliases.insert(
+                    name.clone(),
+                    ResolvedType::Record(fields.clone()),
+                );
+                if !params.is_empty() {
+                    single_variant_params.insert(
+                        name.clone(),
+                        (
+                            params.clone(),
+                            ctor.fields
+                                .iter()
+                                .map(|f| (f.name.clone(), f.value.clone()))
+                                .collect(),
+                        ),
+                    );
+                }
+                alias_ast_types.entry(name.clone()).or_insert_with(|| {
+                    Spanned::new(
+                        TypeKind::Record {
+                            fields: ctor.fields.clone(),
+                            rest: None,
+                        },
+                        span,
+                    )
+                });
+                constructors.entry(ctor.name.clone()).or_insert(fields);
+            } else {
+                // Multi-variant: register each constructor and create Adt alias
+                data_ctor_decls.insert(name.clone(), ctors.clone());
+                if !params.is_empty() {
+                    let ctor_fields: Vec<(String, Vec<(String, Type)>)> = ctors
+                        .iter()
+                        .map(|c| {
+                            (
+                                c.name.clone(),
+                                c.fields
+                                    .iter()
+                                    .map(|f| (f.name.clone(), f.value.clone()))
+                                    .collect(),
+                            )
+                        })
+                        .collect();
+                    multi_variant_params
+                        .insert(name.clone(), (params.clone(), ctor_fields));
+                }
+                let mut adt_ctors = Vec::new();
+                for ctor in &ctors {
+                    let fields: Vec<(String, ResolvedType)> = ctor
+                        .fields
+                        .iter()
+                        .map(|f| {
+                            (
+                                f.name.clone(),
+                                resolve_type(
+                                    &f.value,
+                                    &aliases,
+                                    &associated_types,
+                                    &single_variant_params,
+                                    &multi_variant_params,
+                                ),
+                            )
+                        })
+                        .collect();
+                    constructors
+                        .entry(ctor.name.clone())
+                        .or_insert_with(|| fields.clone());
+                    adt_ctors.push((ctor.name.clone(), fields));
+                }
+                aliases.insert(name.clone(), ResolvedType::Adt(adt_ctors));
             }
         }
 
@@ -286,78 +260,51 @@ impl TypeEnv {
             constructors.insert(name.clone(), fixed);
         }
 
-        // Second pass: compute source schemas, migration schemas, and subset constraints
+        // Second pass: compute source schemas, migration schemas, and subset
+        // constraints from the `SourceDecl`/`DerivedDecl`/`SubsetConstraint`
+        // markers embedded in the program's record literals.
         let mut subset_constraints = Vec::new();
         let mut source_refinements: HashMap<String, Vec<(Option<String>, String, Expr)>> = HashMap::new();
-        // Collect source schemas from `*name : Type` fields embedded in
-        // top-level record-let literals (`db = { *todos : [Todo], … }`). These
-        // are the same persisted relations as top-level `*name : [T]` decls;
-        // keyed here by bare field name (qualified-path keying is a follow-up).
-        for decl in &module.decls {
-            if let DeclKind::Fun { body: Some(value), .. } = &decl.node
-                && let ExprKind::Record(fields) = &value.node
-            {
-                for f in fields {
-                    if let ExprKind::SubsetConstraint { sub, sup } = &f.value.node {
-                        subset_constraints.push((sub.clone(), sup.clone()));
-                    }
-                    if let ExprKind::SourceDecl { name, ty, migrations } = &f.value.node {
-                        let schema = schema_for_source(
-                            ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params,
-                        );
-                        source_schemas.insert(name.clone(), schema);
-                        let refinements = collect_source_refinements(
-                            ty, &refined_types, &alias_ast_types, &data_ctor_decls,
-                        );
-                        if !refinements.is_empty() {
-                            source_refinements.insert(name.clone(), refinements);
-                        }
-                        // Attached `migrate from A to B using f` clauses register
-                        // into `migrate_schemas` exactly like top-level
-                        // `migrate *name …` decls.
-                        for m in migrations {
-                            let unwrap_relation = |r: ResolvedType| match r {
-                                ResolvedType::Relation(inner) => *inner,
-                                other => other,
-                            };
-                            let old_resolved = unwrap_relation(
-                                resolve_type(&m.from_ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params),
-                            );
-                            let new_resolved = unwrap_relation(
-                                resolve_type(&m.to_ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params),
-                            );
-                            let old_schema = relation_inner_schema(&old_resolved);
-                            let new_schema = relation_inner_schema(&new_resolved);
-                            migrate_schemas
-                                .entry(name.clone())
-                                .or_default()
-                                .push((old_schema, new_schema));
-                        }
-                    }
+        for f in collect_record_field_markers(program) {
+            match &f.value.node {
+                ExprKind::SubsetConstraint { sub, sup } => {
+                    subset_constraints.push((sub.clone(), sup.clone()));
                 }
-            }
-        }
-        for decl in &module.decls {
-            match &decl.node {
-                DeclKind::Source { name, ty } => {
-                    let schema =
-                        schema_for_source(ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params);
+                ExprKind::SourceDecl { name, ty, migrations } => {
+                    let schema = schema_for_source(
+                        ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params,
+                    );
                     source_schemas.insert(name.clone(), schema);
-                    // Collect refined field info from the source type
-                    let refinements = collect_source_refinements(ty, &refined_types, &alias_ast_types, &data_ctor_decls);
+                    let refinements = collect_source_refinements(
+                        ty, &refined_types, &alias_ast_types, &data_ctor_decls,
+                    );
                     if !refinements.is_empty() {
                         source_refinements.insert(name.clone(), refinements);
                     }
+                    for m in migrations {
+                        let unwrap_relation = |r: ResolvedType| match r {
+                            ResolvedType::Relation(inner) => *inner,
+                            other => other,
+                        };
+                        let old_resolved = unwrap_relation(
+                            resolve_type(&m.from_ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params),
+                        );
+                        let new_resolved = unwrap_relation(
+                            resolve_type(&m.to_ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params),
+                        );
+                        let old_schema = relation_inner_schema(&old_resolved);
+                        let new_schema = relation_inner_schema(&new_resolved);
+                        migrate_schemas
+                            .entry(name.clone())
+                            .or_default()
+                            .push((old_schema, new_schema));
+                    }
                 }
-                DeclKind::Derived { name, ty: Some(scheme), .. } => {
-                    // Compute schema for derived relations with type annotations
-                    // so groupBy can use them
-                    let schema =
-                        schema_for_source(&scheme.ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params);
+                ExprKind::DerivedDecl { name, ty: Some(scheme), .. } => {
+                    let schema = schema_for_source(
+                        &scheme.ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params,
+                    );
                     source_schemas.insert(name.clone(), schema);
-                }
-                DeclKind::SubsetConstraint { sub, sup } => {
-                    subset_constraints.push((sub.clone(), sup.clone()));
                 }
                 _ => {}
             }
@@ -377,21 +324,248 @@ impl TypeEnv {
     }
 }
 
+// ── Expression walkers (declaration markers in record literals) ─────
+
+/// Visit every sub-expression of `e`.
+fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
+    f(e);
+    match &e.node {
+        ExprKind::App { func, arg } => {
+            walk_exprs(func, f);
+            walk_exprs(arg, f);
+        }
+        ExprKind::With { record, body } => {
+            walk_exprs(record, f);
+            walk_exprs(body, f);
+        }
+        ExprKind::Lambda { body, .. } => walk_exprs(body, f),
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            walk_exprs(lhs, f);
+            walk_exprs(rhs, f);
+        }
+        ExprKind::UnaryOp { operand, .. } => walk_exprs(operand, f),
+        ExprKind::If { cond, then_branch, else_branch } => {
+            walk_exprs(cond, f);
+            walk_exprs(then_branch, f);
+            walk_exprs(else_branch, f);
+        }
+        ExprKind::Case { scrutinee, arms } => {
+            walk_exprs(scrutinee, f);
+            for arm in arms {
+                walk_exprs(&arm.body, f);
+            }
+        }
+        ExprKind::Do(stmts) => {
+            for s in stmts {
+                match &s.node {
+                    StmtKind::Bind { expr, .. } => walk_exprs(expr, f),
+                    StmtKind::Where { cond } => walk_exprs(cond, f),
+                    StmtKind::GroupBy { key } => walk_exprs(key, f),
+                    StmtKind::Expr(e) => walk_exprs(e, f),
+                }
+            }
+        }
+        ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
+            walk_exprs(target, f);
+            walk_exprs(value, f);
+        }
+        ExprKind::Atomic(e) | ExprKind::Refine(e) => walk_exprs(e, f),
+        ExprKind::TimeUnitLit { value, .. } => walk_exprs(value, f),
+        ExprKind::Record(fields) => {
+            for fl in fields {
+                walk_exprs(&fl.value, f);
+            }
+        }
+        ExprKind::RecordUpdate { base, fields } => {
+            walk_exprs(base, f);
+            for fl in fields {
+                walk_exprs(&fl.value, f);
+            }
+        }
+        ExprKind::List(items) => {
+            for it in items {
+                walk_exprs(it, f);
+            }
+        }
+        ExprKind::FieldAccess { expr, .. } | ExprKind::Annot { expr, .. } => {
+            walk_exprs(expr, f)
+        }
+        ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                walk_exprs(&h.body, f);
+            }
+        }
+        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+            walk_exprs(body, f)
+        }
+        ExprKind::Lit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Constructor(_)
+        | ExprKind::SourceRef(_)
+        | ExprKind::DerivedRef(_)
+        | ExprKind::ImplicitRef(_)
+        | ExprKind::TypeCtor { .. }
+        | ExprKind::DataCtor { .. }
+        | ExprKind::SourceDecl { .. }
+        | ExprKind::SubsetConstraint { .. }
+        | ExprKind::RouteDecl { .. }
+        | ExprKind::RouteCompositeDecl { .. } => {}
+    }
+}
+
+/// Collect every `TypeCtor` (`type` alias) marker in the program:
+/// `(name, params, ty, span)`.
+fn collect_type_ctors(program: &Expr) -> Vec<(String, Vec<Name>, Type, Span)> {
+    let mut out = Vec::new();
+    walk_exprs(program, &mut |e| {
+        if let ExprKind::TypeCtor { name, params, ty } = &e.node {
+            out.push((name.clone(), params.clone(), ty.clone(), e.span));
+        }
+    });
+    out
+}
+
+/// Collect every `DataCtor` (`data`) marker in the program:
+/// `(name, params, constructors, span)`.
+fn collect_data_ctors(program: &Expr) -> Vec<(String, Vec<Name>, Vec<ConstructorDef>, Span)> {
+    let mut out = Vec::new();
+    walk_exprs(program, &mut |e| {
+        if let ExprKind::DataCtor { name, params, constructors } = &e.node {
+            out.push((name.clone(), params.clone(), constructors.clone(), e.span));
+        }
+    });
+    out
+}
+
+/// Collect every record-literal field in the program (for scanning the
+/// relation/constraint markers that appear as record field values).
+fn collect_record_field_markers(program: &Expr) -> Vec<RecordField> {
+    let mut out = Vec::new();
+    walk_exprs(program, &mut |e| {
+        if let ExprKind::Record(fields) = &e.node {
+            out.extend(fields.iter().cloned());
+        }
+    });
+    out
+}
+
+/// Reference-collecting variant of `walk_exprs` for `TypeCtor`/`DataCtor`
+/// markers. The shared `walk_exprs` closure can't capture invariant
+/// `&mut HashMap<&str, …>`, so this recurses directly.
+fn collect_type_and_data_refs<'a>(
+    e: &'a Expr,
+    aliases: &mut HashMap<&'a str, &'a Type>,
+    data_decls: &mut HashMap<&'a str, &'a Vec<ConstructorDef>>,
+) {
+    match &e.node {
+        ExprKind::TypeCtor { name, ty, .. } => {
+            aliases.insert(name.as_str(), ty);
+        }
+        ExprKind::DataCtor { name, constructors, .. } => {
+            data_decls.insert(name.as_str(), constructors);
+        }
+        _ => {}
+    }
+    // Recurse into children (mirrors walk_exprs).
+    match &e.node {
+        ExprKind::App { func, arg } => {
+            collect_type_and_data_refs(func, aliases, data_decls);
+            collect_type_and_data_refs(arg, aliases, data_decls);
+        }
+        ExprKind::With { record, body } => {
+            collect_type_and_data_refs(record, aliases, data_decls);
+            collect_type_and_data_refs(body, aliases, data_decls);
+        }
+        ExprKind::Lambda { body, .. } => collect_type_and_data_refs(body, aliases, data_decls),
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            collect_type_and_data_refs(lhs, aliases, data_decls);
+            collect_type_and_data_refs(rhs, aliases, data_decls);
+        }
+        ExprKind::UnaryOp { operand, .. } => {
+            collect_type_and_data_refs(operand, aliases, data_decls)
+        }
+        ExprKind::If { cond, then_branch, else_branch } => {
+            collect_type_and_data_refs(cond, aliases, data_decls);
+            collect_type_and_data_refs(then_branch, aliases, data_decls);
+            collect_type_and_data_refs(else_branch, aliases, data_decls);
+        }
+        ExprKind::Case { scrutinee, arms } => {
+            collect_type_and_data_refs(scrutinee, aliases, data_decls);
+            for arm in arms {
+                collect_type_and_data_refs(&arm.body, aliases, data_decls);
+            }
+        }
+        ExprKind::Do(stmts) => {
+            for s in stmts {
+                match &s.node {
+                    StmtKind::Bind { expr, .. } => {
+                        collect_type_and_data_refs(expr, aliases, data_decls)
+                    }
+                    StmtKind::Where { cond } => {
+                        collect_type_and_data_refs(cond, aliases, data_decls)
+                    }
+                    StmtKind::GroupBy { key } => {
+                        collect_type_and_data_refs(key, aliases, data_decls)
+                    }
+                    StmtKind::Expr(x) => collect_type_and_data_refs(x, aliases, data_decls),
+                }
+            }
+        }
+        ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
+            collect_type_and_data_refs(target, aliases, data_decls);
+            collect_type_and_data_refs(value, aliases, data_decls);
+        }
+        ExprKind::Atomic(x) | ExprKind::Refine(x) => {
+            collect_type_and_data_refs(x, aliases, data_decls)
+        }
+        ExprKind::TimeUnitLit { value, .. } => {
+            collect_type_and_data_refs(value, aliases, data_decls)
+        }
+        ExprKind::Record(fields) => {
+            for fl in fields {
+                collect_type_and_data_refs(&fl.value, aliases, data_decls);
+            }
+        }
+        ExprKind::RecordUpdate { base, fields } => {
+            collect_type_and_data_refs(base, aliases, data_decls);
+            for fl in fields {
+                collect_type_and_data_refs(&fl.value, aliases, data_decls);
+            }
+        }
+        ExprKind::List(items) => {
+            for it in items {
+                collect_type_and_data_refs(it, aliases, data_decls);
+            }
+        }
+        ExprKind::FieldAccess { expr, .. } | ExprKind::Annot { expr, .. } => {
+            collect_type_and_data_refs(expr, aliases, data_decls)
+        }
+        ExprKind::Serve { handlers, .. } => {
+            for h in handlers {
+                collect_type_and_data_refs(&h.body, aliases, data_decls);
+            }
+        }
+        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+            collect_type_and_data_refs(body, aliases, data_decls)
+        }
+        _ => {}
+    }
+}
+
 /// Detect cyclic type-alias definitions: direct (`type A = {x: A}`),
 /// mutual (`type A = B; type B = A`), and through any type structure
 /// (records, relations, functions, refined bases, ...). Returns one error
 /// diagnostic per cyclic alias.
 ///
-/// Must run before `TypeEnv::from_module`'s resolution: a cyclic alias can
+/// Must run before `TypeEnv::from_program`'s resolution: a cyclic alias can
 /// never be fully resolved, and downstream consumers (schema generation,
 /// codegen) have no representation for infinite types.
-pub fn check_alias_cycles(module: &Module) -> Vec<knot::diagnostic::Diagnostic> {
-    let mut alias_decls: Vec<(String, &Type, Span)> = Vec::new();
-    for decl in &module.decls {
-        if let DeclKind::TypeAlias { name, params, ty } = &decl.node
-            && params.is_empty() {
-                alias_decls.push((name.clone(), ty, decl.span));
-            }
+pub fn check_alias_cycles(program: &Expr) -> Vec<knot::diagnostic::Diagnostic> {
+    let mut alias_decls: Vec<(String, Type, Span)> = Vec::new();
+    for (name, params, ty, span) in collect_type_ctors(program) {
+        if params.is_empty() {
+            alias_decls.push((name, ty, span));
+        }
     }
     let alias_names: HashSet<String> =
         alias_decls.iter().map(|(n, _, _)| n.clone()).collect();
@@ -501,55 +675,33 @@ pub const RESERVED_COLUMNS: [&str; 5] =
 /// aliases, data declarations, and nested relations (whose child tables reserve
 /// their own columns). Types that are never persisted are not restricted.
 ///
-/// Runs before `TypeEnv::from_module`, which would otherwise bake the colliding
-/// name into a schema descriptor.
-pub fn check_reserved_field_names(module: &Module) -> Vec<knot::diagnostic::Diagnostic> {
+/// Runs before `TypeEnv::from_program`, which would otherwise bake the
+/// colliding name into a schema descriptor.
+pub fn check_reserved_field_names(program: &Expr) -> Vec<knot::diagnostic::Diagnostic> {
+    let mut aliases: HashMap<&str, &Type> = HashMap::new();
+    let mut data_decls: HashMap<&str, &Vec<ConstructorDef>> = HashMap::new();
+    collect_type_and_data_refs(program, &mut aliases, &mut data_decls);
     let mut walker = ReservedFieldWalker {
-        aliases: HashMap::new(),
-        data_decls: HashMap::new(),
+        aliases,
+        data_decls,
         relation: String::new(),
         reported: HashSet::new(),
         diags: Vec::new(),
     };
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::TypeAlias { name, ty, .. } => {
-                walker.aliases.insert(name.as_str(), ty);
-            }
-            DeclKind::Data {
-                name, constructors, ..
-            } => {
-                walker.data_decls.insert(name.as_str(), constructors);
-            }
-            _ => {}
-        }
-    }
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Source { name, ty } => {
-                walker.relation = name.clone();
-                walker.walk(ty, &mut HashSet::new());
-            }
-            DeclKind::Fun { body: Some(body), .. } => {
-                // Record-embedded sources (`{ *todos : [Todo] migrate … }`)
-                // persist tables too — walk the source element type and both
-                // sides of every attached migrate clause. The types live in
-                // the module AST, which outlives the walker.
-                let mut sources: Vec<(&str, &knot::ast::Type, &[knot::ast::SourceMigration])> =
-                    Vec::new();
-                walk_record_sources(body, &mut |name, ty, migrations| {
-                    sources.push((name, ty, migrations));
-                });
-                for (name, ty, migrations) in sources {
-                    walker.relation = name.to_string();
-                    walker.walk(ty, &mut HashSet::new());
-                    for m in migrations {
-                        walker.walk(&m.from_ty, &mut HashSet::new());
-                        walker.walk(&m.to_ty, &mut HashSet::new());
-                    }
-                }
-            }
-            _ => {}
+    // Every record-embedded source (`{ *todos : [Todo] migrate … }`) persists
+    // a table — walk the source element type and both sides of every attached
+    // migrate clause.
+    let mut sources: Vec<(&str, &knot::ast::Type, &[knot::ast::SourceMigration])> =
+        Vec::new();
+    walk_record_sources(program, &mut |name, ty, migrations| {
+        sources.push((name, ty, migrations));
+    });
+    for (name, ty, migrations) in sources {
+        walker.relation = name.to_string();
+        walker.walk(ty, &mut HashSet::new());
+        for m in migrations {
+            walker.walk(&m.from_ty, &mut HashSet::new());
+            walker.walk(&m.to_ty, &mut HashSet::new());
         }
     }
     walker.diags

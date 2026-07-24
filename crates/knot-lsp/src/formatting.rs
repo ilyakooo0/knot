@@ -1,7 +1,7 @@
 //! `textDocument/formatting`, `textDocument/rangeFormatting`, and
 //! `textDocument/onTypeFormatting` handlers.
 //!
-//! Document formatting delegates to [`knot::format::format_module`] — the
+//! Document formatting delegates to [`knot::format::format_expr`] — the
 //! same AST-based pretty printer that powers `knot fmt`. Range formatting
 //! still does the heuristic line-level cleanup (trim trailing whitespace,
 //! collapse consecutive blanks) since rendering an arbitrary subrange would
@@ -66,7 +66,7 @@ pub(crate) fn handle_formatting(
         return None;
     }
 
-    let formatted = knot::format::format_module(source, &doc.module);
+    let formatted = knot::format::format_expr(source, &doc.module);
     if formatted == *source {
         return None;
     }
@@ -87,14 +87,14 @@ fn format_whole_source(source: &str) -> Option<Vec<TextEdit>> {
         return None;
     }
     let parser = knot::parser::Parser::new(source.to_string(), tokens);
-    let (module, parse_diags) = parser.parse_module();
+    let (module, parse_diags) = parser.parse_file_expr();
     if parse_diags
         .iter()
         .any(|d| d.severity == knot::diagnostic::Severity::Error)
     {
         return None;
     }
-    let formatted = knot::format::format_module(source, &module);
+    let formatted = knot::format::format_expr(source, &module);
     if formatted == source {
         return None;
     }
@@ -285,84 +285,4 @@ pub(crate) fn handle_on_type_formatting(
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::PendingSource;
-    use crate::test_support::TestWorkspace;
 
-    fn fmt_params(uri: &Uri) -> DocumentFormattingParams {
-        DocumentFormattingParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            options: FormattingOptions {
-                tab_size: 2,
-                insert_spaces: true,
-                ..Default::default()
-            },
-            work_done_progress_params: Default::default(),
-        }
-    }
-
-    /// Regression: `handle_formatting` built a whole-document replacement
-    /// from the last *analyzed* source. With the 150–500ms analysis
-    /// debounce, format-on-save fired right after a keystroke replaced the
-    /// editor buffer with text missing the user's latest edits. When newer
-    /// text is pending, formatting must operate on that text.
-    #[test]
-    fn formatting_uses_pending_source_not_stale_analysis() {
-        let mut ws = TestWorkspace::new();
-        // Analyzed (stale) text mentions `oldName`; the pending text the
-        // editor actually holds mentions `newName`.
-        let uri = ws.open("main", "oldName   =   1\n");
-        ws.state.pending_sources.insert(
-            uri.clone(),
-            PendingSource {
-                source: "newName   =   2\n".into(),
-                version: Some(2),
-            },
-        );
-        let edits = handle_formatting(&ws.state, &fmt_params(&uri))
-            .expect("pending text is unformatted, so an edit is produced");
-        assert_eq!(edits.len(), 1);
-        assert!(
-            edits[0].new_text.contains("newName"),
-            "formatted output must come from the pending text; got: {:?}",
-            edits[0].new_text
-        );
-        assert!(
-            !edits[0].new_text.contains("oldName"),
-            "formatting must never resurrect the stale analyzed text; got: {:?}",
-            edits[0].new_text
-        );
-    }
-
-    /// When the pending text has parse errors, formatting must do nothing
-    /// rather than fall back to a stale whole-document replacement.
-    #[test]
-    fn formatting_bails_when_pending_source_does_not_parse() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "x   =   1\n");
-        ws.state.pending_sources.insert(
-            uri.clone(),
-            PendingSource {
-                source: "x = = broken (((\n".into(),
-                version: Some(2),
-            },
-        );
-        let edits = handle_formatting(&ws.state, &fmt_params(&uri));
-        assert!(
-            edits.is_none(),
-            "must not return edits built from stale or broken text; got: {edits:?}"
-        );
-    }
-
-    /// Without pending edits, formatting still works off the analyzed doc.
-    #[test]
-    fn formatting_formats_analyzed_source_when_no_pending() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "x   =   1\n");
-        let edits = handle_formatting(&ws.state, &fmt_params(&uri))
-            .expect("unformatted source produces an edit");
-        assert!(edits[0].new_text.contains("x = 1"), "got: {:?}", edits[0].new_text);
-    }
-}

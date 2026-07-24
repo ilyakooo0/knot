@@ -15,6 +15,7 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
+use crate::decl_view::{decl_views, DeclViewKind};
 use knot::ast;
 use std::collections::{HashMap, HashSet};
 
@@ -673,7 +674,7 @@ fn format_literal_display(lit: &ast::Literal) -> Option<String> {
 /// a desugared `do` block expands into, one level per statement.
 #[allow(clippy::too_many_arguments)]
 pub fn compile(
-    module: &ast::Module,
+    program: &ast::Expr,
     type_env: &TypeEnv,
     source_file: &str,
     monad_info: &MonadInfo,
@@ -693,7 +694,7 @@ pub fn compile(
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     crate::stack::grow(|| {
         compile_inner(
-            module,
+            program,
             type_env,
             source_file,
             monad_info,
@@ -716,7 +717,7 @@ pub fn compile(
 
 #[allow(clippy::too_many_arguments)]
 fn compile_inner(
-    module: &ast::Module,
+    program: &ast::Expr,
     type_env: &TypeEnv,
     source_file: &str,
     monad_info: &MonadInfo,
@@ -769,12 +770,11 @@ fn compile_inner(
     cg.monad_info = monad_info.clone();
     cg.refine_targets = refine_targets.clone();
     cg.refined_types = refined_types.clone();
-    cg.alias_ast = module
-        .decls
+    cg.alias_ast = decl_views(program)
         .iter()
-        .filter_map(|d| match &d.node {
-            ast::DeclKind::TypeAlias { name, params, ty } if params.is_empty() => {
-                Some((name.clone(), ty.clone()))
+        .filter_map(|d| match d.kind {
+            DeclViewKind::TypeAlias { params, ty } if params.is_empty() => {
+                Some((d.name.to_string(), ty.clone()))
             }
             _ => None,
         })
@@ -798,11 +798,12 @@ fn compile_inner(
     }
     cg.declare_runtime_fns();
     // Collect view declarations and analyze provenance
-    for decl in &module.decls {
-        if let ast::DeclKind::View { name, body, .. } = &decl.node {
+    for decl in decl_views(program) {
+        if let DeclViewKind::View { body: Some(body), .. } = decl.kind {
+            let name = decl.name;
             match analyze_view(body) {
                 Ok(Some(info)) => {
-                    cg.views.insert(name.clone(), info);
+                    cg.views.insert(name.to_string(), info);
                 }
                 Ok(None) => {}
                 Err((span, msg)) => {
@@ -814,17 +815,18 @@ fn compile_inner(
             }
         }
     }
-    cg.collect_declarations(module);
+    cg.collect_declarations(program);
     // Register body-less top-level constants as required CLI arguments.
     // Each becomes a 0-param user_fn whose body reads --<name>=value at startup,
     // exits if missing, and runs any attached refinement predicate.
-    for decl in &module.decls {
-        if let ast::DeclKind::Fun { name, body: None, ty: Some(ts), .. } = &decl.node {
+    for decl in decl_views(program) {
+        if let DeclViewKind::Fun { body: None, ty: Some(ts) } = decl.kind {
+            let name = decl.name;
             if name == "main" {
                 continue;
             }
             // Already registered (e.g. by a duplicate decl) — skip.
-            if cg.user_fns.contains_key(name.as_str()) {
+            if cg.user_fns.contains_key(name) {
                 continue;
             }
             let classified = classify_required_constant_type(
@@ -842,7 +844,7 @@ fn compile_inner(
                              this requires a scalar type (Int, Float, Text, Bool) or a refined alias of one",
                             name
                         ),
-                    ).label(decl.span, "unsupported type for required CLI constant"));
+                    ).label(ts.ty.span, "unsupported type for required CLI constant"));
                     continue;
                 }
             };
@@ -855,29 +857,30 @@ fn compile_inner(
                 .module
                 .declare_function(&func_name, Linkage::Local, &sig)
                 .unwrap();
-            cg.user_fns.insert(name.clone(), (func_id, 0));
-            cg.overridable_constants.insert(name.clone(), base_type.clone());
+            cg.user_fns.insert(name.to_string(), (func_id, 0));
+            cg.overridable_constants.insert(name.to_string(), base_type.clone());
             cg.required_constants.push(RequiredConstant {
-                name: name.clone(),
+                name: name.to_string(),
                 base_type,
                 refinement,
             });
         }
     }
     // Compute overridable constants: 0-param Fun declarations with scalar types
-    for decl in &module.decls {
-        if let ast::DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
+    for decl in decl_views(program) {
+        if let DeclViewKind::Fun { body: Some(body), .. } = decl.kind {
+            let name = decl.name;
             if name == "main" {
                 continue;
             }
-            if let Some((_, 0)) = cg.user_fns.get(name.as_str())
-                && let Some(ty_str) = type_info.get(name.as_str())
+            if let Some((_, 0)) = cg.user_fns.get(name)
+                && let Some(ty_str) = type_info.get(name)
                 && let Some(base_type) =
                     scalar_override_type(ty_str, &cg.type_aliases, &cg.refined_types)
             {
-                cg.overridable_constants.insert(name.clone(), base_type);
+                cg.overridable_constants.insert(name.to_string(), base_type);
                 if let Some(disp) = format_default_value_display(body) {
-                    cg.overridable_defaults.insert(name.clone(), disp);
+                    cg.overridable_defaults.insert(name.to_string(), disp);
                 }
             }
         }
@@ -929,8 +932,8 @@ fn compile_inner(
             ));
         }
     }
-    cg.define_functions(module, type_env);
-    cg.generate_main(module);
+    cg.define_functions(program, type_env);
+    cg.generate_main(program);
     // Drain lambdas and IO thunks created by generate_main (e.g., migration functions)
     while !cg.pending_lambdas.is_empty() || !cg.pending_io_thunks.is_empty() || !cg.pending_trampolines.is_empty() {
         let lambdas: Vec<PendingLambda> = std::mem::take(&mut cg.pending_lambdas);
@@ -1766,7 +1769,7 @@ impl Codegen {
 
     // ── Declaration collection ────────────────────────────────────
 
-    fn collect_declarations(&mut self, module: &ast::Module) {
+    fn collect_declarations(&mut self, program: &ast::Expr) {
         // Register built-in ADT constructors so trait dispatchers can find their
         // ctor lists. Inference treats these as built-in types (see
         // `register_builtins` in infer.rs), so they don't appear as user-source
@@ -1798,11 +1801,10 @@ impl Codegen {
         // this, the program type-checks against the user's semantics (inference
         // binds the user decl after `register_builtins`) but silently runs the
         // stdlib's.
-        self.user_shadowed_stdlib = module
-            .decls
+        self.user_shadowed_stdlib = decl_views(program)
             .iter()
-            .filter_map(|decl| match &decl.node {
-                ast::DeclKind::Fun { name, body: Some(_), .. } => Some(name.clone()),
+            .filter_map(|d| match d.kind {
+                DeclViewKind::Fun { body: Some(_), .. } => Some(d.name.to_string()),
                 _ => None,
             })
             .collect();
@@ -1836,13 +1838,14 @@ impl Codegen {
         // fixpoint after the declaration loop (see below).
         let mut composite_routes: Vec<(String, Vec<String>)> = Vec::new();
 
-        for decl in &module.decls {
-            match &decl.node {
-                ast::DeclKind::Fun { name, body: Some(body), .. } => {
+        for decl in decl_views(program) {
+            let name = decl.name;
+            match decl.kind {
+                DeclViewKind::Fun { body: Some(body), .. } => {
                     {
                         // Skip user functions that shadow stdlib builtins —
                         // the stdlib version is already registered.
-                        if self.user_fns.contains_key(name.as_str()) {
+                        if self.user_fns.contains_key(name) {
                             continue;
                         }
                         // If the body is a lambda, extract its params for direct-call optimization.
@@ -1860,11 +1863,11 @@ impl Codegen {
                             .module
                             .declare_function(&func_name, Linkage::Local, &sig)
                             .unwrap();
-                        self.user_fns.insert(name.clone(), (func_id, n_params));
-                        self.fun_bodies.insert(name.clone(), body.clone());
+                        self.user_fns.insert(name.to_string(), (func_id, n_params));
+                        self.fun_bodies.insert(name.to_string(), body.clone());
                     }
                 }
-                ast::DeclKind::Derived { name, body, .. } => {
+                DeclViewKind::Derived { body: Some(body), .. } => {
                     // Derived relations are 0-param functions (only db param)
                     let mut sig = self.module.make_signature();
                     sig.params.push(AbiParam::new(self.ptr_type)); // db
@@ -1874,11 +1877,11 @@ impl Codegen {
                         .module
                         .declare_function(&func_name, Linkage::Local, &sig)
                         .unwrap();
-                    self.user_fns.insert(name.clone(), (func_id, 0));
+                    self.user_fns.insert(name.to_string(), (func_id, 0));
 
                     // Detect self-referencing (recursive) derived relations
                     if expr_contains_derived_ref(body, name) {
-                        self.recursive_derived.insert(name.clone());
+                        self.recursive_derived.insert(name.to_string());
 
                         // Declare body function: (db, self_val) -> result
                         let mut body_sig = self.module.make_signature();
@@ -1890,17 +1893,13 @@ impl Codegen {
                             .module
                             .declare_function(&body_func_name, Linkage::Local, &body_sig)
                             .unwrap();
-                        self.recursive_body_fns.insert(name.clone(), body_func_id);
+                        self.recursive_body_fns.insert(name.to_string(), body_func_id);
                     }
                 }
-                ast::DeclKind::Data {
-                    name,
-                    constructors: ctors,
-                    ..
-                } => {
+                DeclViewKind::Data { ctors, .. } => {
                     let ctor_names: Vec<String> =
                         ctors.iter().map(|c| c.name.clone()).collect();
-                    self.data_constructors.insert(name.clone(), ctor_names);
+                    self.data_constructors.insert(name.to_string(), ctor_names);
 
                     // Qualified constructors: `Name.Ctor` (and the bare
                     // function value `Name.Ctor`) emit the constructor value
@@ -1918,8 +1917,8 @@ impl Codegen {
                     // a representation mismatch with null-encoded in-memory values
                     // that breaks equality and pattern matching.
                 }
-                ast::DeclKind::Route { name, entries } => {
-                    self.route_entries.insert(name.clone(), entries.clone());
+                DeclViewKind::Route { entries } => {
+                    self.route_entries.insert(name.to_string(), entries.to_vec());
                     // Last route entry (in source declaration order) with a
                     // given constructor name wins, matching infer's fetch
                     // metadata resolution so typecheck and codegen agree on
@@ -1929,11 +1928,11 @@ impl Codegen {
                             .insert(entry.constructor.clone(), entry.clone());
                     }
                 }
-                ast::DeclKind::RouteComposite { name, components } => {
+                DeclViewKind::RouteComposite { components } => {
                     // Deferred: resolved to a fixpoint after the loop so
                     // composition is order-independent (a composite may
                     // reference a route declared later in the file).
-                    composite_routes.push((name.clone(), components.clone()));
+                    composite_routes.push((name.to_string(), components.to_vec()));
                 }
                 _ => {}
             }
@@ -1976,9 +1975,9 @@ impl Codegen {
         }
 
         // Detect user functions that produce IO values (fixed-point iteration)
-        self.detect_io_functions(&module.decls);
-        self.detect_passthrough_functions(&module.decls);
-        self.detect_write_functions(&module.decls);
+        self.detect_io_functions(program);
+        self.detect_passthrough_functions(program);
+        self.detect_write_functions(program);
 
         // Register built-in [] impls for HKT traits (Functor, Applicative, Monad, Foldable)
         // These are registered directly in codegen to avoid span collision issues
@@ -2541,7 +2540,7 @@ impl Codegen {
 
     // ── Function definitions ──────────────────────────────────────
 
-    fn define_functions(&mut self, module: &ast::Module, _type_env: &TypeEnv) {
+    fn define_functions(&mut self, program: &ast::Expr, _type_env: &TypeEnv) {
         // __bind is no longer a standalone function — it dispatches through
         // Monad_{type}_bind trait impls (see compile_app).
 
@@ -2651,13 +2650,14 @@ impl Codegen {
         // Define built-in primitive impls for Eq, Ord, Num traits
         self.define_builtin_primitive_impls();
 
-        for decl in &module.decls {
-            match &decl.node {
-                ast::DeclKind::Fun { name, body: Some(body), .. } => {
+        for decl in decl_views(program) {
+            let name = decl.name;
+            match decl.kind {
+                DeclViewKind::Fun { body: Some(body), .. } => {
                     {
                         // Skip user functions that shadow stdlib builtins —
                         // the stdlib version is already defined above.
-                        if self.stdlib_fns.contains(name.as_str()) {
+                        if self.stdlib_fns.contains(name) {
                             continue;
                         }
                         // If body is a lambda, extract its params for direct compilation.
@@ -2668,7 +2668,7 @@ impl Codegen {
                         self.define_user_function(name, &vparams, vbody);
                     }
                 }
-                ast::DeclKind::Derived { name, body, .. } => {
+                DeclViewKind::Derived { body: Some(body), .. } => {
                     if self.recursive_derived.contains(name) {
                         self.define_recursive_derived(name, body);
                     } else {
@@ -3301,7 +3301,7 @@ impl Codegen {
 
     // ── Main function generation ──────────────────────────────────
 
-    fn generate_main(&mut self, module: &ast::Module) {
+    fn generate_main(&mut self, program: &ast::Expr) {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I32)); // argc
         sig.params.push(AbiParam::new(self.ptr_type)); // argv
@@ -3311,7 +3311,7 @@ impl Codegen {
             .declare_function("main", Linkage::Export, &sig)
             .unwrap();
 
-        let decls: Vec<ast::Decl> = module.decls.clone();
+        let decls = decl_views(program);
         let user_main = self.user_fns.get("main").copied();
         let all_routes: Vec<(String, Vec<ast::RouteEntry>)> =
             self.route_entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -3466,13 +3466,13 @@ impl Codegen {
             // constructors were written in, and a `Value::Constructor` carries
             // only its tag, so the runtime needs the order handed to it.
             for decl in &decls {
-                if let ast::DeclKind::Data { name, constructors, .. } = &decl.node {
-                    let ctor_list = constructors
+                if let DeclViewKind::Data { ctors, .. } = decl.kind {
+                    let ctor_list = ctors
                         .iter()
                         .map(|c| c.name.as_str())
                         .collect::<Vec<_>>()
                         .join(",");
-                    let (name_ptr, name_len) = cg.string_ptr(builder, name);
+                    let (name_ptr, name_len) = cg.string_ptr(builder, decl.name);
                     let (ctors_ptr, ctors_len) = cg.string_ptr(builder, &ctor_list);
                     cg.call_rt_void(
                         builder,
@@ -3494,7 +3494,7 @@ impl Codegen {
             // bare relation name in `migrate_schemas`.
             let mut migrate_sites: Vec<(String, ast::Expr)> = Vec::new();
             for decl in &decls {
-                if let ast::DeclKind::Fun { body: Some(body), .. } = &decl.node {
+                if let DeclViewKind::Fun { body: Some(body), .. } = decl.kind {
                     collect_record_migrations(body, &mut migrate_sites);
                 }
             }
@@ -8099,7 +8099,7 @@ impl Codegen {
 
     /// Detect user functions whose bodies (transitively) produce IO values.
     /// Uses fixed-point iteration to handle transitive IO (e.g., genToken calls randomInt).
-    fn detect_io_functions(&mut self, decls: &[ast::Decl]) {
+    fn detect_io_functions(&mut self, program: &ast::Expr) {
         let io_builtins: HashSet<&str> = crate::builtins::EFFECTFUL_BUILTINS
             .iter()
             .filter(|n| **n != "retry")
@@ -8108,24 +8108,20 @@ impl Codegen {
 
         // Collect function bodies for analysis
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
-        for decl in decls {
-            match &decl.node {
-                ast::DeclKind::Fun { name, body: Some(body), ty: Some(ts), .. } => {
+        for decl in decl_views(program) {
+            match decl.kind {
+                DeclViewKind::Fun { body: Some(body), ty: Some(ts), .. } => {
                     // Seed IO functions from type annotations (same as desugar's fun_sig_io).
                     // Functions like `forEach` whose IO comes from trait-method calls
                     // (yield) are not detected by body scan alone.
                     if Self::type_returns_io_codegen(&ts.ty) {
-                        self.io_functions.insert(name.clone());
+                        self.io_functions.insert(decl.name.to_string());
                     }
-                    fun_bodies.push((name.clone(), body));
+                    fun_bodies.push((decl.name.to_string(), body));
                 }
-                ast::DeclKind::Fun { name, body: Some(body), .. } => {
-                    fun_bodies.push((name.clone(), body));
+                DeclViewKind::Fun { body: Some(body), .. } => {
+                    fun_bodies.push((decl.name.to_string(), body));
                 }
-                // Trait methods are called by bare name (through the
-                // dispatcher) — if any impl body produces IO, calls of the
-                // method do too, so `tick 1; tick 2` in a do-block must be
-                // classified as IO sequencing rather than a comprehension.
                 _ => {}
             }
         }
@@ -8220,11 +8216,11 @@ impl Codegen {
     /// it), directly (`id = \x -> x`) or via branches (`when = \c a -> if c
     /// then a else yield {}`), or by forwarding a parameter into another
     /// passthrough function. Fixed-point to capture forwarding chains.
-    fn detect_passthrough_functions(&mut self, decls: &[ast::Decl]) {
+    fn detect_passthrough_functions(&mut self, program: &ast::Expr) {
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
-        for decl in decls {
-            if let ast::DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                fun_bodies.push((name.clone(), body));
+        for decl in decl_views(program) {
+            if let DeclViewKind::Fun { body: Some(body), .. } = decl.kind {
+                fun_bodies.push((decl.name.to_string(), body));
             }
         }
         loop {
@@ -8290,11 +8286,11 @@ impl Codegen {
         }
     }
 
-    fn detect_write_functions(&mut self, decls: &[ast::Decl]) {
+    fn detect_write_functions(&mut self, program: &ast::Expr) {
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
-        for decl in decls {
-            if let ast::DeclKind::Fun { name, body: Some(body), .. } = &decl.node {
-                fun_bodies.push((name.clone(), body));
+        for decl in decl_views(program) {
+            if let DeclViewKind::Fun { body: Some(body), .. } = decl.kind {
+                fun_bodies.push((decl.name.to_string(), body));
             }
         }
         self.top_fn_names = fun_bodies.iter().map(|(n, _)| n.clone()).collect();
@@ -17296,258 +17292,4 @@ fn eval_expr_num(expr: &ast::Expr, lit: &CompileLit, param_name: &str) -> Option
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    fn preds_for(source: &str, bv: &str) -> Option<Vec<StmFieldPred>> {
-        // Parse a Knot expression and run the STM predicate extractor on it.
-        let expr = parse_expr(source);
-        try_extract_field_preds(bv, &expr)
-    }
-
-    #[test]
-    fn stm_preds_extract_single_eq() {
-        let preds = preds_for("r.id == 5", "r").unwrap();
-        assert_eq!(preds.len(), 1);
-        assert_eq!(preds[0].col, "id");
-        assert!(matches!(preds[0].op, StmCmpOp::Eq));
-        assert_eq!(serialize_stm_preds(&preds), "id:=:0");
-    }
-
-    #[test]
-    fn stm_preds_extract_cmp_ops() {
-        for (src, op_str) in &[
-            ("r.qty > 100", ">"),
-            ("r.qty >= 100", ">="),
-            ("r.qty < 100", "<"),
-            ("r.qty <= 100", "<="),
-            ("r.qty != 100", "!="),
-        ] {
-            let preds = preds_for(src, "r").unwrap_or_else(|| panic!("{src}"));
-            assert_eq!(serialize_stm_preds(&preds), format!("qty:{}:0", op_str));
-        }
-    }
-
-    #[test]
-    fn stm_preds_reverse_value_then_field() {
-        // 100 < r.qty  ↦  qty > 100
-        let preds = preds_for("100 < r.qty", "r").unwrap();
-        assert_eq!(serialize_stm_preds(&preds), "qty:>:0");
-    }
-
-    #[test]
-    fn stm_preds_and_chain() {
-        let preds = preds_for(r#"r.status == "open" && r.qty > 100"#, "r").unwrap();
-        assert_eq!(preds.len(), 2);
-        assert_eq!(serialize_stm_preds(&preds), "status:=:0;qty:>:1");
-    }
-
-    #[test]
-    fn stm_preds_or_rejected() {
-        // OR breaks the conjunction model — fall back to All.
-        assert!(preds_for(r#"r.status == "open" || r.qty > 100"#, "r").is_none());
-    }
-
-    #[test]
-    fn stm_preds_arithmetic_value_rejected() {
-        // r.qty > a + b — value side is arithmetic; reject to avoid double-eval.
-        assert!(preds_for("r.qty > a + b", "r").is_none());
-    }
-
-    #[test]
-    fn stm_preds_function_call_rejected() {
-        // length(r.name) > 5 — function call on field side; reject.
-        assert!(preds_for("length r.name > 5", "r").is_none());
-    }
-
-    #[test]
-    fn stm_preds_in_literal_list() {
-        let preds = preds_for("elem r.id [1, 2, 3]", "r").unwrap();
-        assert_eq!(preds.len(), 1);
-        assert!(matches!(preds[0].op, StmCmpOp::In));
-        assert_eq!(preds[0].values.len(), 3);
-        assert_eq!(serialize_stm_preds(&preds), "id:in:0,1,2");
-    }
-
-    #[test]
-    fn stm_preds_in_empty_list_rejected() {
-        assert!(preds_for("elem r.id []", "r").is_none());
-    }
-
-    #[test]
-    fn stm_preds_mixed_indices_match_sql_param_order() {
-        // The walker should produce predicates with indices that align with
-        // try_compile_sql_expr's param ordering — left-to-right, one per
-        // simple comparison.
-        let preds =
-            preds_for(r#"r.a == 1 && r.b == 2 && r.c == 3"#, "r").unwrap();
-        assert_eq!(serialize_stm_preds(&preds), "a:=:0;b:=:1;c:=:2");
-    }
-
-    fn parse_expr(source: &str) -> ast::Expr {
-        // Wrap the source as a top-level binding so it parses as a module
-        // declaration; pull the body back out.
-        let module_src = format!("__test = {}\n", source);
-        let lexer = knot::lexer::Lexer::new(&module_src);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(module_src.clone(), tokens);
-        let (module, _) = parser.parse_module();
-        for decl in module.decls {
-            if let ast::DeclKind::Fun { body: Some(body), .. } = decl.node {
-                return body;
-            }
-        }
-        panic!("parse_expr: expected a single function declaration");
-    }
-
-    /// `-1` divisors are rejected (i64::MIN / -1 and i64::MIN % -1 overflow
-    /// in memory while SQLite silently produces REAL / 0); other nonzero
-    /// literals stay pushable.
-    #[test]
-    fn divisor_negative_one_not_pushable() {
-        assert!(!divisor_is_nonzero_int_literal(&parse_expr("-1")));
-        assert!(!divisor_is_nonzero_literal(&parse_expr("-1")));
-        assert!(divisor_is_nonzero_int_literal(&parse_expr("-2")));
-        assert!(divisor_is_nonzero_int_literal(&parse_expr("3")));
-        assert!(!divisor_is_nonzero_int_literal(&parse_expr("0")));
-        assert!(divisor_is_nonzero_literal(&parse_expr("-1.0")));
-        assert!(!divisor_is_nonzero_literal(&parse_expr("0.0")));
-    }
-
-    /// `Var(x)` resolves through `let_bindings` first, falling back to
-    /// `fun_bodies` when no local binding exists.  Local entries shadow
-    /// top-level functions of the same name.
-    #[test]
-    fn beta_reduce_folds_through_let_bindings() {
-        let value = parse_expr("merged");
-        let union_call = parse_expr("union 1 2");
-        let mut let_bindings = HashMap::new();
-        let_bindings.insert("merged".to_string(), union_call);
-        let fun_bodies = HashMap::new();
-
-        let reduced = beta_reduce(&value, &fun_bodies, &let_bindings);
-        match &reduced.node {
-            ast::ExprKind::App { func, arg: _ } => match &func.node {
-                ast::ExprKind::App { func: inner, .. } => match &inner.node {
-                    ast::ExprKind::Var(name) => assert_eq!(name, "union"),
-                    other => panic!("expected Var(union), got {:?}", other),
-                },
-                other => panic!("expected nested App, got {:?}", other),
-            },
-            other => panic!("expected App after inlining, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn beta_reduce_local_shadows_fun_bodies() {
-        let value = parse_expr("foo");
-        let mut fun_bodies = HashMap::new();
-        fun_bodies.insert("foo".to_string(), parse_expr("1"));
-        let mut let_bindings = HashMap::new();
-        let_bindings.insert("foo".to_string(), parse_expr("2"));
-
-        let reduced = beta_reduce(&value, &fun_bodies, &let_bindings);
-        match &reduced.node {
-            ast::ExprKind::Lit(ast::Literal::Int(n)) => assert_eq!(n, "2"),
-            other => panic!("expected literal 2, got {:?}", other),
-        }
-    }
-
-    /// A non-recursive top-level function is still inlined, so the SQL
-    /// matchers see through a named predicate to its definition.
-    #[test]
-    fn beta_reduce_inlines_non_recursive_functions() {
-        let mut fun_bodies = HashMap::new();
-        fun_bodies.insert("isAdult".to_string(), parse_expr("\\p -> p.age > 18"));
-
-        let reduced = beta_reduce(&parse_expr("isAdult r"), &fun_bodies, &HashMap::new());
-        match &reduced.node {
-            ast::ExprKind::BinOp { op: ast::BinOp::Gt, lhs, .. } => match &lhs.node {
-                ast::ExprKind::FieldAccess { field, .. } => assert_eq!(field, "age"),
-                other => panic!("expected r.age on the left, got {:?}", other),
-            },
-            other => panic!("expected the predicate body, got {:?}", other),
-        }
-    }
-
-    /// Issue #71: a self-recursive function must be left alone. Substituting
-    /// its body reintroduces the call, and every unroll copies the argument
-    /// into each occurrence of the parameter, so the term grows multiplicatively
-    /// and the reduction never finishes — the compiler used to hang here.
-    #[test]
-    fn beta_reduce_leaves_self_recursive_calls_unexpanded() {
-        let mut fun_bodies = HashMap::new();
-        fun_bodies.insert(
-            "afterChar".to_string(),
-            parse_expr(
-                "\\sep s -> if s == \"\" then \"\" \
-                 else if take 1 s == sep then drop 1 s \
-                 else afterChar sep (drop 1 s)",
-            ),
-        );
-
-        // Partially applied (`afterChar ","`), which is the shape that made the
-        // reduction blow up: the remaining binder is reduced under, unrolling
-        // the recursive call before the outer argument is substituted in.
-        let reduced = beta_reduce(&parse_expr("afterChar \",\" s"), &fun_bodies, &HashMap::new());
-        match &reduced.node {
-            ast::ExprKind::App { func, .. } => match &func.node {
-                ast::ExprKind::App { func: inner, .. } => match &inner.node {
-                    ast::ExprKind::Var(name) => assert_eq!(name, "afterChar"),
-                    other => panic!("expected Var(afterChar), got {:?}", other),
-                },
-                other => panic!("expected nested App, got {:?}", other),
-            },
-            other => panic!("expected the call left in place, got {:?}", other),
-        }
-    }
-
-    /// Mutual recursion is a cycle in the call graph just the same, and unrolls
-    /// just as endlessly.
-    #[test]
-    fn beta_reduce_leaves_mutually_recursive_calls_unexpanded() {
-        let mut fun_bodies = HashMap::new();
-        fun_bodies.insert(
-            "isEven".to_string(),
-            parse_expr("\\n -> if n == 0 then true else isOdd (n - 1)"),
-        );
-        fun_bodies.insert(
-            "isOdd".to_string(),
-            parse_expr("\\n -> if n == 0 then false else isEven (n - 1)"),
-        );
-
-        let reduced = beta_reduce(&parse_expr("isEven k"), &fun_bodies, &HashMap::new());
-        match &reduced.node {
-            ast::ExprKind::App { func, .. } => match &func.node {
-                ast::ExprKind::Var(name) => assert_eq!(name, "isEven"),
-                other => panic!("expected Var(isEven), got {:?}", other),
-            },
-            other => panic!("expected the call left in place, got {:?}", other),
-        }
-    }
-
-    /// A let body whose value also references another let entry is
-    /// resolved transitively; the matchers ultimately see the fully
-    /// expanded shape.
-    #[test]
-    fn beta_reduce_chains_through_nested_lets() {
-        let value = parse_expr("outer");
-        let mut let_bindings = HashMap::new();
-        let_bindings.insert("inner".to_string(), parse_expr("union 1 2"));
-        let_bindings.insert("outer".to_string(), parse_expr("inner"));
-        let fun_bodies = HashMap::new();
-
-        let reduced = beta_reduce(&value, &fun_bodies, &let_bindings);
-        match &reduced.node {
-            ast::ExprKind::App { func, .. } => match &func.node {
-                ast::ExprKind::App { func: inner, .. } => match &inner.node {
-                    ast::ExprKind::Var(n) => assert_eq!(n, "union"),
-                    other => panic!("expected Var(union), got {:?}", other),
-                },
-                other => panic!("expected nested App, got {:?}", other),
-            },
-            other => panic!("expected union App, got {:?}", other),
-        }
-    }
-}

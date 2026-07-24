@@ -3,13 +3,13 @@
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind, Span};
+use knot::ast::{self, Span};
 use knot_compiler::infer::MonadKind;
 
 use crate::shared::{extract_param_names, flatten_app_chain, parse_function_params};
 use crate::state::{DocumentState, ServerState};
 use crate::utils::{
-    offset_to_position, position_to_offset, recurse_expr, safe_slice,
+    offset_to_position, position_to_offset, recurse_expr, safe_slice, top_fields,
 };
 
 // ── Inlay Hints ─────────────────────────────────────────────────────
@@ -55,32 +55,56 @@ pub(crate) fn handle_inlay_hint(
     // `decls` is in source order (parser pushes them sequentially) so once the
     // start exceeds the visible range we can stop — the linear scan is bounded
     // by the visible-region size, not by the file's total decl count.
-    for decl in &doc.module.decls {
+    for decl in top_fields(&doc.module) {
         if !show_types {
             break;
         }
-        if decl.span.start > range_end {
+        let dspan = decl.value.span;
+        if dspan.start > range_end {
             break;
         }
-        if decl.span.end < range_start {
+        if dspan.end < range_start {
             continue;
         }
 
-        match &decl.node {
-            DeclKind::Fun { name, ty: None, .. } => {
+        // Classify the field: marker vs named-function, and whether it has a sig.
+        let (fname, fsig, is_relation_marker) = match &decl.value.node {
+            ast::ExprKind::ViewDecl { name, ty, .. } | ast::ExprKind::DerivedDecl { name, ty, .. } => {
+                (name.as_str(), ty.as_ref(), true)
+            }
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => continue,
+            _ => (decl.name.as_str(), decl.sig.as_ref(), false),
+        };
+        match (fname, fsig, is_relation_marker) {
+            (name, None, marker) => {
                 if let Some(inferred) = doc.type_info.get(name) {
-                    let decl_text = safe_slice(&doc.source, decl.span);
+                    let decl_text = safe_slice(&doc.source, dspan);
+                    // View/derived markers begin with a `*`/`&` sigil that
+                    // `dspan.start` points at; skip it before scanning for the
+                    // end of the name so the hint doesn't land on the sigil.
+                    let sigil_len = if marker {
+                        decl_text
+                            .chars()
+                            .next()
+                            .filter(|c| *c == '*' || *c == '&')
+                            .map_or(0, char::len_utf8)
+                    } else {
+                        0
+                    };
                     // `'` continues identifiers in the lexer (`x'` is one
                     // token), so the hint anchor must skip it too — otherwise
                     // `x' = 1` renders as `x : Int' = 1`.
-                    let name_end = decl_text
+                    let name_end = decl_text[sigil_len..]
                         .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
+                        .map(|p| sigil_len + p)
                         .unwrap_or(decl_text.len());
-                    let hint_offset = decl.span.start + name_end;
+                    let hint_offset = dspan.start + name_end;
                     let hint_pos = offset_to_position(&doc.source, hint_offset);
                     // Text edit emits the signature as a separate statement above the
                     // function, so anchor it at the declaration start, not at the hint.
-                    let edit_pos = offset_to_position(&doc.source, decl.span.start);
+                    let edit_pos = offset_to_position(&doc.source, dspan.start);
                     // Merge per-decl effect-checker findings into the IO row of
                     // the rendered type, in case HM inference dropped them.
                     let full_sig = match doc.effect_sets.get(name) {
@@ -104,7 +128,7 @@ pub(crate) fn handle_inlay_hint(
                     });
                 }
             }
-            DeclKind::Fun { name, ty: Some(scheme), .. } => {
+            (name, Some(scheme), false) => {
                 // Annotated function: show the inferred *effects* as a hint at
                 // the function body's start, only when the type doesn't already
                 // declare them. Helps with effect-row polymorphism debugging.
@@ -121,7 +145,7 @@ pub(crate) fn handle_inlay_hint(
                         // declaration — on a multi-line signature the latter
                         // lands mid-type, where the `--` hint reads as commenting
                         // out the continuation.
-                        let span_end = decl.span.end.min(doc.source.len());
+                        let span_end = dspan.end.min(doc.source.len());
                         let sig_end = scheme.ty.span.end.min(span_end);
                         // `sig_end`/`span_end` are clamped to `len` but a stale
                         // or mid-token span endpoint can land mid-multibyte-char;
@@ -142,47 +166,6 @@ pub(crate) fn handle_inlay_hint(
                             data: None,
                         });
                     }
-                }
-            }
-            DeclKind::View { name, ty: None, .. } | DeclKind::Derived { name, ty: None, .. } => {
-                if let Some(inferred) = doc.type_info.get(name) {
-                    let decl_text = safe_slice(&doc.source, decl.span);
-                    // View/derived decls begin with a `*`/`&` sigil and
-                    // `decl.span.start` points at it, so skip the sigil before
-                    // scanning for the end of the name — otherwise the scan
-                    // stops at offset 0 and the hint lands *on* the sigil,
-                    // rendering `*v = …` as `: T*v = …`.
-                    let sigil_len = decl_text
-                        .chars()
-                        .next()
-                        .filter(|c| *c == '*' || *c == '&')
-                        .map_or(0, char::len_utf8);
-                    // Anchor snug after the name token, scanning past identifier
-                    // characters (incl. the `'` that the lexer allows in `x'`),
-                    // not at the `=`. Anchoring at `=` lands after the trailing
-                    // space and renders `myView' = …` as `myView : T' = …`.
-                    let name_end = decl_text[sigil_len..]
-                        .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
-                        .map(|p| sigil_len + p)
-                        .unwrap_or(decl_text.len());
-                    let hint_offset = decl.span.start + name_end;
-                    let hint_pos = offset_to_position(&doc.source, hint_offset);
-                    let full_sig = match doc.effect_sets.get(name) {
-                        Some(eff) => crate::shared::render_signature_with_effects(inferred, eff),
-                        None => inferred.clone(),
-                    };
-                    hints.push(InlayHint {
-                        position: hint_pos,
-                        label: InlayHintLabel::String(format!(": {full_sig}")),
-                        kind: Some(InlayHintKind::TYPE),
-                        text_edits: None,
-                        tooltip: doc.effect_info.get(name).map(|e| {
-                            InlayHintTooltip::String(format!("Effects: {e}"))
-                        }),
-                        padding_left: Some(true),
-                        padding_right: Some(true),
-                        data: None,
-                    });
                 }
             }
             _ => {}
@@ -318,26 +301,19 @@ fn add_dirty_decl_telemetry(
     range_end: usize,
     hints: &mut Vec<InlayHint>,
 ) {
-    for decl in &doc.module.decls {
-        if decl.span.end < range_start || decl.span.start > range_end {
+    for decl in top_fields(&doc.module) {
+        if decl.value.span.end < range_start || decl.value.span.start > range_end {
             continue;
         }
-        let name = match &decl.node {
-            DeclKind::Fun { name, .. }
-            | DeclKind::Data { name, .. }
-            | DeclKind::TypeAlias { name, .. }
-            | DeclKind::View { name, .. }
-            | DeclKind::Derived { name, .. }
-            | DeclKind::Source { name, .. }
-            | DeclKind::Route { name, .. }
-            | DeclKind::RouteComposite { name, .. } => name.clone(),
-            _ => continue,
+        let name = match &decl.value.node {
+            ast::ExprKind::SubsetConstraint { .. } => continue,
+            _ => decl.name.clone(),
         };
         if !doc.dirty_decl_closure.contains(&name) {
             continue;
         }
         hints.push(InlayHint {
-            position: offset_to_position(&doc.source, decl.span.start),
+            position: offset_to_position(&doc.source, decl.value.span.start),
             label: InlayHintLabel::String("♻ ".into()),
             kind: None,
             text_edits: None,
@@ -411,14 +387,15 @@ fn add_closing_label_hints(
     }
 
     let mut spans: Vec<(Span, String)> = Vec::new();
-    for decl in &doc.module.decls {
-        match &decl.node {
-            DeclKind::Fun {
-                body: Some(body), ..
+    for decl in top_fields(&doc.module) {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+                collect(body, &doc.source, &mut spans)
             }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => collect(body, &doc.source, &mut spans),
-            _ => {}
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => collect(&decl.value, &doc.source, &mut spans),
         }
     }
 
@@ -587,12 +564,15 @@ fn add_record_pattern_field_hints(
     }
 
     let mut record_pats: Vec<RecordPat> = Vec::new();
-    for decl in &doc.module.decls {
-        match &decl.node {
-            ast::DeclKind::Fun { body: Some(body), .. }
-            | ast::DeclKind::View { body, .. }
-            | ast::DeclKind::Derived { body, .. } => walk_expr(body, &doc.source, &mut record_pats),
-            _ => {}
+    for decl in top_fields(&doc.module) {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+                walk_expr(body, &doc.source, &mut record_pats)
+            }
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => walk_expr(&decl.value, &doc.source, &mut record_pats),
         }
     }
 
@@ -609,8 +589,8 @@ fn add_record_pattern_field_hints(
         let mut fields_str: Vec<(String, String)> = Vec::new();
         let mut tooltip_source = String::from("destructured record");
         if let Some(ctor_name) = ctor_opt.as_deref() {
-            'ctor_lookup: for d in &doc.module.decls {
-                if let ast::DeclKind::Data { constructors, name: data_name, .. } = &d.node {
+            'ctor_lookup: for d in top_fields(&doc.module) {
+                if let ast::ExprKind::DataCtor { constructors, name: data_name, .. } = &d.value.node {
                     for c in constructors {
                         if c.name == ctor_name {
                             tooltip_source = format!("{ctor_name} (constructor of {data_name})");
@@ -767,16 +747,17 @@ fn add_unit_literal_hints(
         }
     }
 
-    fn collect_literals_in_decl(decl: &ast::Decl, out: &mut Vec<(Span, ast::Expr)>) {
-        match &decl.node {
-            DeclKind::Fun {
-                body: Some(body), ..
-            }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+    fn collect_literals_in_decl(decl: &ast::RecordField, out: &mut Vec<(Span, ast::Expr)>) {
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
                 walk_for_unit_bindings(body, out);
             }
-            _ => {}
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => {
+                walk_for_unit_bindings(&decl.value, out);
+            }
         }
     }
 
@@ -804,7 +785,7 @@ fn add_unit_literal_hints(
     }
 
     let mut bindings_with_rhs: Vec<(Span, ast::Expr)> = Vec::new();
-    for decl in &doc.module.decls {
+    for decl in top_fields(&doc.module) {
         collect_literals_in_decl(decl, &mut bindings_with_rhs);
     }
 
@@ -920,28 +901,26 @@ fn add_parameter_name_hints(
     }
 
     fn walk_decl(
-        decl: &ast::Decl,
+        decl: &ast::RecordField,
         doc: &DocumentState,
         range_start: usize,
         range_end: usize,
         hints: &mut Vec<InlayHint>,
     ) {
-        match &decl.node {
-            DeclKind::Fun {
-                body: Some(body), ..
-            }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
-                let mut shadowed = std::collections::HashSet::new();
-                collect_binder_names(body, &mut shadowed);
-                walk_apps(body, doc, &shadowed, range_start, range_end, hints);
-            }
-            _ => {}
-        }
+        let body = match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => body,
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
+            _ => &decl.value,
+        };
+        let mut shadowed = std::collections::HashSet::new();
+        collect_binder_names(body, &mut shadowed);
+        walk_apps(body, doc, &shadowed, range_start, range_end, hints);
     }
 
-    for decl in &doc.module.decls {
-        if decl.span.end < range_start || decl.span.start > range_end {
+    for decl in top_fields(&doc.module) {
+        if decl.value.span.end < range_start || decl.value.span.start > range_end {
             continue;
         }
         walk_decl(decl, doc, range_start, range_end, hints);
@@ -1161,26 +1140,24 @@ fn add_monad_context_hints(
     }
 
     fn walk_decl(
-        decl: &ast::Decl,
+        decl: &ast::RecordField,
         doc: &DocumentState,
         range_start: usize,
         range_end: usize,
         hints: &mut Vec<InlayHint>,
     ) {
-        match &decl.node {
-            DeclKind::Fun {
-                body: Some(body), ..
-            }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
-                walk(body, doc, range_start, range_end, hints);
-            }
-            _ => {}
-        }
+        let body = match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => body,
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
+            _ => &decl.value,
+        };
+        walk(body, doc, range_start, range_end, hints);
     }
 
-    for decl in &doc.module.decls {
-        if decl.span.end < range_start || decl.span.start > range_end {
+    for decl in top_fields(&doc.module) {
+        if decl.value.span.end < range_start || decl.value.span.start > range_end {
             continue;
         }
         walk_decl(decl, doc, range_start, range_end, hints);
@@ -1239,14 +1216,10 @@ fn add_constraint_hints(
         recurse_expr(expr, |e| walk(e, doc, range_start, range_end, hints));
     }
 
-    fn constraints_for_callee(module: &knot::ast::Module, name: &str) -> Option<Vec<String>> {
-        for decl in &module.decls {
-            match &decl.node {
-                DeclKind::Fun {
-                    name: n,
-                    ty: Some(scheme),
-                    ..
-                } if n == name => {
+    fn constraints_for_callee(program: &knot::ast::Expr, name: &str) -> Option<Vec<String>> {
+        for decl in top_fields(program) {
+            match (&decl.name, &decl.sig) {
+                (n, Some(scheme)) if n == name => {
                     let cs: Vec<String> = scheme
                         .constraints
                         .iter()
@@ -1272,26 +1245,24 @@ fn add_constraint_hints(
     }
 
     fn walk_decl(
-        decl: &ast::Decl,
+        decl: &ast::RecordField,
         doc: &DocumentState,
         range_start: usize,
         range_end: usize,
         hints: &mut Vec<InlayHint>,
     ) {
-        match &decl.node {
-            DeclKind::Fun {
-                body: Some(body), ..
-            }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
-                walk(body, doc, range_start, range_end, hints);
-            }
-            _ => {}
-        }
+        let body = match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => body,
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
+            _ => &decl.value,
+        };
+        walk(body, doc, range_start, range_end, hints);
     }
 
-    for decl in &doc.module.decls {
-        if decl.span.end < range_start || decl.span.start > range_end {
+    for decl in top_fields(&doc.module) {
+        if decl.value.span.end < range_start || decl.value.span.start > range_end {
             continue;
         }
         walk_decl(decl, doc, range_start, range_end, hints);
@@ -1314,669 +1285,4 @@ fn monad_tooltip(monad: &MonadKind) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
 
-    fn hint_params(uri: &Uri, range: Range) -> InlayHintParams {
-        InlayHintParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            range,
-            work_done_progress_params: Default::default(),
-        }
-    }
-
-    #[test]
-    fn inlay_hint_skips_bindings_outside_visible_range() {
-        // Two `let` bindings, far enough apart that a narrow viewport can
-        // include only one. The pre-indexed `local_type_info_sorted` should
-        // clip out the off-screen binding via binary search; the on-screen
-        // binding still appears.
-        let mut ws = TestWorkspace::new();
-        let src = "early = (\\_ -> let a = 1 in a) ()\nfiller1 = 0\nfiller2 = 0\nfiller3 = 0\nlate = (\\_ -> let z = 99 in z) ()\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        // Compute a range covering only the `late` line.
-        let late_pos = doc.source.find("late =").expect("late") as u32;
-        let late_end = doc.source.len() as u32;
-        let start = offset_to_position(&doc.source, late_pos as usize);
-        let end = offset_to_position(&doc.source, late_end as usize);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, Range { start, end }))
-            .unwrap_or_default();
-        // No hint position should sit on the `early` line (line 0).
-        let has_early_hint = hints.iter().any(|h| h.position.line == 0);
-        assert!(
-            !has_early_hint,
-            "off-screen binding produced a hint anyway: {hints:?}"
-        );
-    }
-
-    #[test]
-    fn inlay_hint_shows_inferred_type_for_unannotated_fun() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "id = \\x -> x\n");
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let labels: Vec<String> = hints
-            .iter()
-            .map(|h| match &h.label {
-                InlayHintLabel::String(s) => s.clone(),
-                _ => String::new(),
-            })
-            .collect();
-        // Expect at least one type-annotation hint (": Type").
-        assert!(
-            labels.iter().any(|l| l.starts_with(":")),
-            "expected `:T` hint; got: {labels:?}"
-        );
-    }
-
-    #[test]
-    fn inlay_hint_emits_per_field_types_for_record_destructure() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"data Person = Person {name: Text, age: Int 1}
-
-show1 = \p -> case p of
-  Person {name name age age} -> name
-"#,
-        );
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let labels: Vec<String> = hints
-            .iter()
-            .map(|h| match &h.label {
-                InlayHintLabel::String(s) => s.clone(),
-                _ => String::new(),
-            })
-            .collect();
-        // Expect per-field hints for `name` and `age` derived from the parent
-        // record's type. They render as `: Text` / `: Int`.
-        assert!(
-            labels.iter().any(|l| l == ": Text"),
-            "expected `: Text` hint for destructured `name`; got: {labels:?}"
-        );
-        assert!(
-            labels.iter().any(|l| l == ": Int"),
-            "expected `: Int` hint for destructured `age`; got: {labels:?}"
-        );
-    }
-
-
-    #[test]
-    fn suggestion_includes_effects_when_hm_dropped_them() {
-        // Reproduces the skrepka case: HM inference closes a function's IO row
-        // to `{}` because a forward reference goes through an annotated caller,
-        // but the per-decl effect-checker still tracks the real reads/writes.
-        // The suggestion must merge those back into the IO row.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"type Timestamp = Int Ms
-
-*globalRateCount : Int 1
-*globalRateWindowStart : Timestamp
-*drainPhase : Int 1
-
-globalRateWindowMs : Int Ms
-globalRateWindowMs = 1000
-
-maxGlobalRequestRate : Int 1
-maxGlobalRequestRate = 1000
-
-gateAuth : Timestamp -> (Text -> a) -> IO {r *drainPhase, r *globalRateCount, r *globalRateWindowStart, w *globalRateCount, w *globalRateWindowStart} a
-gateAuth = \t mkErr -> do
-  dp <- *drainPhase
-  g <- checkGlobalRate t
-  if g then yield (mkErr "rate_limited") else yield (mkErr "ok")
-
-checkGlobalRate = \t -> atomic do
-  ws <- *globalRateWindowStart
-  c <- *globalRateCount
-  if t - ws >= globalRateWindowMs then do
-    *globalRateWindowStart = t
-    *globalRateCount = 1
-    yield False {}
-  else if c >= maxGlobalRequestRate then yield True {}
-  else do
-    *globalRateCount = c + 1
-    yield False {}
-"#,
-        );
-        let doc = ws.doc(&uri);
-        let inferred = doc
-            .type_info
-            .get("checkGlobalRate")
-            .expect("checkGlobalRate should have a type");
-        let effects = doc
-            .effect_sets
-            .get("checkGlobalRate")
-            .expect("checkGlobalRate should have effects");
-        let suggested = crate::shared::render_signature_with_effects(inferred, effects);
-        assert!(
-            suggested.contains("rw *globalRateCount"),
-            "suggestion missing rw effect: {suggested}"
-        );
-        assert!(
-            suggested.contains("rw *globalRateWindowStart"),
-            "suggestion missing rw effect: {suggested}"
-        );
-        assert!(
-            !suggested.contains("*sessions"),
-            "suggestion has spurious sessions effect: {suggested}"
-        );
-    }
-
-
-    #[test]
-    fn inlay_hint_emits_monad_context_for_maybe_do_block() {
-        // Maybe is desugared (has Monad/Applicative/Alternative impls), so the
-        // inferencer populates monad_info for its do blocks. IO and pure
-        // sequential do blocks aren't desugared, so they don't get monad_info
-        // entries today — the inlay hint correctly hides itself in that case.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"safe = \x -> do
-  v <- Just {value x}
-  yield v.value
-"#,
-        );
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let labels: Vec<String> = hints
-            .iter()
-            .map(|h| match &h.label {
-                InlayHintLabel::String(s) => s.clone(),
-                _ => String::new(),
-            })
-            .collect();
-        // Monad-kind hint shows up as `[Maybe]` or similar.
-        let has_monad_hint = labels
-            .iter()
-            .any(|l| l.starts_with('[') && l.ends_with(']') && !l.contains(':'));
-        assert!(
-            has_monad_hint,
-            "expected `[Monad]` hint; got: {labels:?}"
-        );
-    }
-
-    /// Regression for B68: a parenthesized do block used as an argument
-    /// (`f (do ...)`) keeps the inner `Do` node but widens its span to include
-    /// the surrounding parens, so `span.start` points at `(`, not `do`. A blind
-    /// `span.start + 2` anchor lands mid-keyword (between `d` and `o`); the hint
-    /// must anchor just after the actual `do` token instead.
-    #[test]
-    fn monad_context_hint_anchors_at_do_keyword_for_parenthesized_do() {
-        let mut ws = TestWorkspace::new();
-        let src = "apply = \\m -> m\nsafe = \\x -> apply (do\n  v <- Just {value x}\n  yield v.value)\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-
-        // The one `do` in the source is the keyword we care about.
-        let do_off = doc.source.find("do").expect("do keyword");
-        // The hint should anchor immediately after `do`, not between `d`/`o`.
-        let expected = offset_to_position(&doc.source, do_off + 2);
-        let wrong_mid_keyword = offset_to_position(&doc.source, do_off + 1);
-
-        let monad_hint = hints
-            .iter()
-            .find(|h| match &h.label {
-                InlayHintLabel::String(s) => {
-                    s.starts_with('[') && s.ends_with(']') && !s.contains(':')
-                }
-                _ => false,
-            })
-            .expect("expected a `[Monad]` context hint");
-
-        assert_ne!(
-            monad_hint.position, wrong_mid_keyword,
-            "monad hint anchored mid-keyword (between `d` and `o`)"
-        );
-        assert_eq!(
-            monad_hint.position, expected,
-            "monad hint should anchor just after the `do` keyword"
-        );
-    }
-
-    /// Record-destructure field hints must anchor on the FIELD-NAME token,
-    /// not the first same-named token: in `P {a b b c}`, field `b`'s hint
-    /// belongs on the second `b` (the field name), not on the binder `b`
-    /// of field `a`.
-    #[test]
-    fn record_field_hints_anchor_on_field_name_not_binder() {
-        let mut ws = TestWorkspace::new();
-        let src = "data P = P {a: Int 1, b: Text}\n\nf = \\p -> case p of\n  P {a b b c} -> c\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-
-        // Expected anchor for field `b`: just after the SECOND `b` in the
-        // pattern (the field-name token of `b c`).
-        let pat_off = doc.source.find("P {a b b c}").expect("pattern");
-        let field_b_off = doc.source[pat_off..].find(" b c").map(|p| pat_off + p + 1).unwrap();
-        let expected_b_pos = offset_to_position(&doc.source, field_b_off + 1);
-        // And the WRONG anchor (the binder b of field a).
-        let binder_b_off = doc.source[pat_off..].find("a b").map(|p| pat_off + p + 2).unwrap();
-        let wrong_b_pos = offset_to_position(&doc.source, binder_b_off + 1);
-
-        let text_hints: Vec<(&Position, String)> = hints
-            .iter()
-            .filter_map(|h| match &h.label {
-                InlayHintLabel::String(s) if s == ": Text" => Some((&h.position, s.clone())),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            text_hints.iter().any(|(p, _)| **p == expected_b_pos),
-            "`: Text` hint must anchor on the field-name token of `b`; got: {text_hints:?} (expected {expected_b_pos:?})"
-        );
-        assert!(
-            text_hints.iter().all(|(p, _)| **p != wrong_b_pos),
-            "`: Text` hint anchored on the binder of field `a`: {text_hints:?}"
-        );
-    }
-
-    /// The constructor lookup must take the FIRST ADT declaring the
-    /// constructor — not accumulate fields from every ADT sharing the name.
-    #[test]
-    fn record_field_hints_do_not_accumulate_across_same_named_ctors() {
-        let mut ws = TestWorkspace::new();
-        let src = "data A = Mk {x: Int 1}\ndata B = Mk {y: Text}\n\nf = \\v -> case v of\n  Mk {x} -> x\n";
-        let uri = ws.open("main", src);
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        // The pattern destructures `x` only; no `: Text` hint may appear on
-        // the pattern (which would come from B's same-named constructor).
-        let doc = ws.doc(&uri);
-        let pat_off = doc.source.find("Mk {x}").expect("pattern");
-        let pat_line = offset_to_position(&doc.source, pat_off).line;
-        let leaked = hints.iter().any(|h| {
-            h.position.line == pat_line
-                && matches!(&h.label, InlayHintLabel::String(s) if s == ": Text")
-        });
-        assert!(!leaked, "fields from a second same-named ctor leaked: {hints:?}");
-    }
-
-    fn hint_labels(hints: &[InlayHint]) -> Vec<String> {
-        hints
-            .iter()
-            .map(|h| match &h.label {
-                InlayHintLabel::String(s) => s.clone(),
-                _ => String::new(),
-            })
-            .collect()
-    }
-
-    /// Bug 19: `'` continues identifiers — the type-hint anchor for `x' = 1`
-    /// must sit after the prime, not between `x` and `'`.
-    #[test]
-    fn type_hint_anchor_includes_primed_identifier() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "x' = 1\n");
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let type_hint = hints
-            .iter()
-            .find(|h| matches!(&h.label, InlayHintLabel::String(s) if s.starts_with(':')))
-            .expect("type hint for x'");
-        assert_eq!(
-            type_hint.position,
-            Position::new(0, 2),
-            "anchor must sit AFTER the prime (x'|), not inside the token"
-        );
-    }
-
-    /// Bug 18: an explicitly-annotated literal (`(42.0 : Float M)`) must not get
-    /// an additional `<M>` hint (used to render `42.0<M> <M>`).
-    #[test]
-    fn unit_hint_not_duplicated_on_annotated_literal() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "f = \\q -> do\n  let y = (42.0 : Float M)\n  yield y\n",
-        );
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let labels = hint_labels(&hints);
-        assert!(
-            !labels.iter().any(|l| l == "<M>"),
-            "explicitly-annotated literal must not get a unit hint; got {labels:?}"
-        );
-    }
-
-    /// Bug 18: in `base * 2.0` the `2.0` is dimensionless (`*` composes
-    /// units), so the binding's `<M>` must not be stamped onto it.
-    #[test]
-    fn unit_hint_skips_dimensionless_literal_in_compound_rhs() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "base : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> with {y (base * 2.0)} (do\n  yield y)\n",
-        );
-        let doc = ws.doc(&uri);
-        // Sanity: the unit really flows into the compound RHS — `f`'s
-        // inferred type must mention the `M` from `base` (under `with`,
-        // the field binding registers no local_type_info span, so the old
-        // `let`-era sanity check on `local_type_info` can't see it).
-        // Otherwise this test passes vacuously on the old code too.
-        let f_ty = doc.type_info.get("f").expect("f has an inferred type");
-        assert!(
-            f_ty.contains('M'),
-            "setup: f's inferred type should mention the unit M; got {f_ty:?}"
-        );
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let labels = hint_labels(&hints);
-        assert!(
-            !labels.iter().any(|l| l == "<M>"),
-            "dimensionless `2.0` must not be hinted `<M>`; got {labels:?}"
-        );
-    }
-
-    /// Bug 18: the `5 seconds` sugar desugars to `5 * 1000` where the
-    /// synthesized literal's span covers the word — no `<Ms>` hint after it.
-    #[test]
-    fn unit_hint_suppressed_on_time_word_sugar() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "f = \\q -> do\n  let t = 5 seconds\n  sleep t\n",
-        );
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let labels = hint_labels(&hints);
-        assert!(
-            !labels.iter().any(|l| l == "<Ms>"),
-            "time-word sugar must not get a `<Ms>` hint; got {labels:?}"
-        );
-    }
-
-    /// Bug 18 (positive case): a bare-literal RHS whose binding carries a
-    /// unit still gets the hint.
-    #[test]
-    fn unit_hint_still_fires_on_bare_literal_binding() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "base : Float M\nbase = (1.0 : Float M)\n\nf = \\q -> do\n  let y = 2.0\n  yield (base + y)\n",
-        );
-        let doc = ws.doc(&uri);
-        if !doc.local_type_info.values().any(|t| t.contains("<M>")) {
-            // Inference rendered `y` without a concrete unit — nothing for
-            // the hint to show; skip rather than assert on inference detail.
-            return;
-        }
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let labels = hint_labels(&hints);
-        assert!(
-            labels.iter().any(|l| l == "<M>"),
-            "bare literal with unit-carrying binding should be hinted; got {labels:?}"
-        );
-    }
-
-    /// Bug 3: `inlayTypes` config flag gates every type-ish hint category.
-    #[test]
-    fn inlay_types_flag_disables_type_hints() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "id = \\x -> x\n");
-        ws.state.config.inlay_types = false;
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let labels = hint_labels(&hints);
-        assert!(
-            !labels.iter().any(|l| l.starts_with(':')),
-            "inlayTypes=false must suppress type hints; got {labels:?}"
-        );
-    }
-
-    /// Bug 3: `inlayParameterNames` gates call-site parameter-name hints.
-    #[test]
-    fn inlay_parameter_names_flag_disables_param_hints() {
-        let mut ws = TestWorkspace::new();
-        let src = "addUp = \\first second -> first + second\nmain = addUp 1 2\n";
-        let uri = ws.open("main", src);
-        let range = ws.whole_file_range(&uri);
-        // Default config: parameter-name hints present.
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let labels = hint_labels(&hints);
-        assert!(
-            labels.iter().any(|l| l == "first:"),
-            "setup: param hints should fire by default; got {labels:?}"
-        );
-        ws.state.config.inlay_parameter_names = false;
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let labels = hint_labels(&hints);
-        assert!(
-            !labels.iter().any(|l| l.ends_with(':') && !l.starts_with(':')),
-            "inlayParameterNames=false must suppress param hints; got {labels:?}"
-        );
-    }
-
-    /// Effects hint for ANNOTATED functions must anchor at the end of the
-    /// signature line — anchoring right after the name splits `name` and `:`.
-    #[test]
-    fn effects_hint_anchors_at_end_of_signature_line() {
-        let mut ws = TestWorkspace::new();
-        let src = "*t : [{a: Int 1}]\n\nf : Int 1 -> IO {} [{a: Int 1}]\nf = \\x -> *t\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let range = ws.whole_file_range(&uri);
-        let hints = handle_inlay_hint(&ws.state, &hint_params(&uri, range)).unwrap_or_default();
-        let sig_line_start = doc.source.find("f : Int 1").expect("sig");
-        let sig_line = offset_to_position(&doc.source, sig_line_start).line;
-        // End-of-line anchor = length of the signature line EXCLUDING the
-        // trailing newline (the hint sits just before the '\n').
-        let sig_text_len = "f : Int 1 -> IO {} [{a: Int 1}]".len() as u32;
-        for h in &hints {
-            if let InlayHintLabel::String(s) = &h.label
-                && s.starts_with("-- effects:") {
-                    assert_eq!(h.position.line, sig_line, "hint on wrong line: {h:?}");
-                    assert_eq!(
-                        h.position.character, sig_text_len,
-                        "effects hint must sit at END of the signature line, \
-                         not after the name: {h:?}"
-                    );
-                    return;
-                }
-        }
-        panic!(
-            "expected an `-- effects:` hint for the annotated function; \
-             effect_info: {:?}, hints: {hints:?}",
-            ws.doc(&uri).effect_info
-        );
-    }
-
-    /// True when `offset` sits strictly INSIDE an identifier token — i.e. a
-    /// hint anchored there visually splits the token (`prior|ity` renders as
-    /// `prior: aity`). No legitimate hint anchor ever does this: every hint
-    /// category anchors at a token boundary.
-    fn splits_identifier(source: &str, offset: usize) -> bool {
-        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
-        let bytes = source.as_bytes();
-        offset > 0
-            && offset < bytes.len()
-            && is_ident(bytes[offset - 1])
-            && is_ident(bytes[offset])
-    }
-
-    fn assert_no_split_hints(ws: &ServerState, uri: &Uri, range: Range, ctx: &str) -> usize {
-        let hints = handle_inlay_hint(ws, &hint_params(uri, range)).unwrap_or_default();
-        let doc = ws.documents.get(uri).expect("doc");
-        for h in &hints {
-            let off = position_to_offset(&doc.source, h.position);
-            if splits_identifier(&doc.source, off) {
-                let lo = off.saturating_sub(24);
-                panic!(
-                    "{ctx}: inlay hint {:?} is anchored INSIDE an identifier at byte {off} \
-                     (line {}, col {}) — it renders mid-token: ⟪{}|{}⟫",
-                    h.label,
-                    h.position.line + 1,
-                    h.position.character,
-                    safe_slice(&doc.source, Span::new(lo, off)).replace('\n', "⏎"),
-                    safe_slice(&doc.source, Span::new(off, (off + 24).min(doc.source.len())))
-                        .replace('\n', "⏎"),
-                );
-            }
-        }
-        hints.len()
-    }
-
-    /// GitHub issue #4 — "wrong inlay hint position sometimes".
-    ///
-    /// Root cause: `inject_prelude` shifts prelude spans past `PRELUDE_SPAN_OFFSET`
-    /// so they can't alias user-file byte offsets, but it skipped
-    /// `FieldPat::name_span`. For a PUNNED record field that span IS the binder's
-    /// span, and the prelude's Maybe impls destructure `Just {value}` — so
-    /// inference recorded three raw PRELUDE_SOURCE offsets (1303/1640/1850) in
-    /// `local_type_info`. The LSP's provenance filter can only compare byte
-    /// ranges, so it could not tell those apart from real user spans: any user
-    /// decl that happened to STRADDLE one let the ghost through, and the hint got
-    /// anchored at that offset in the user's file — landing mid-token. Whether a
-    /// decl straddled a leaked offset depends purely on file layout, which is what
-    /// made it happen only "sometimes".
-    ///
-    /// `examples/query_opt.knot` reproduces it with no edits at all: a `: a` ghost
-    /// used to split `employees` into `employe|es`.
-    #[test]
-    fn no_inlay_hint_anchors_inside_an_identifier_token() {
-        let mut files: Vec<_> = std::fs::read_dir("../../examples")
-            .expect("examples dir")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "knot"))
-            .collect();
-        files.sort();
-        assert!(!files.is_empty(), "expected example programs to scan");
-
-        let mut total_hints = 0usize;
-        for path in &files {
-            let Ok(src) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            let mut ws = TestWorkspace::new();
-            let uri = ws.open("main", &src);
-            let range = ws.whole_file_range(&uri);
-            total_hints += assert_no_split_hints(
-                &ws.state,
-                &uri,
-                range,
-                &path.file_name().unwrap().to_string_lossy(),
-            );
-        }
-        // Guard against a vacuous pass (e.g. analysis silently producing nothing).
-        assert!(
-            total_hints > 50,
-            "expected the example corpus to produce hints to check; got {total_hints}"
-        );
-    }
-
-    /// Every binder span in the user's OWN parsed AST. `local_type_info` is keyed
-    /// by binder span, so a key that isn't in this set can only have come from a
-    /// foreign source (the prelude, or an inlined import) whose byte offsets are
-    /// meaningless in this document.
-    fn user_binder_spans(module: &ast::Module) -> std::collections::HashSet<Span> {
-        fn pat(p: &ast::Pat, out: &mut std::collections::HashSet<Span>) {
-            out.insert(p.span);
-            match &p.node {
-                ast::PatKind::Record(fields) => {
-                    for f in fields {
-                        // Punned `{value}`: the field-name token IS the binder.
-                        out.insert(f.name_span);
-                        if let Some(inner) = &f.pattern {
-                            pat(inner, out);
-                        }
-                    }
-                }
-                ast::PatKind::Constructor { payload, .. } => pat(payload, out),
-                ast::PatKind::List(items) => items.iter().for_each(|i| pat(i, out)),
-                ast::PatKind::Cons { head, tail } => {
-                    pat(head, out);
-                    pat(tail, out);
-                }
-                _ => {}
-            }
-        }
-        fn expr(e: &ast::Expr, out: &mut std::collections::HashSet<Span>) {
-            match &e.node {
-                ast::ExprKind::Lambda { params, .. } => params.iter().for_each(|p| pat(p, out)),
-                ast::ExprKind::Case { arms, .. } => arms.iter().for_each(|a| pat(&a.pat, out)),
-                ast::ExprKind::Do(stmts) => {
-                    for s in stmts {
-                        if let ast::StmtKind::Bind { pat: p, .. } = &s.node {
-                            pat(p, out);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            recurse_expr(e, |c| expr(c, out));
-        }
-
-        let mut out = std::collections::HashSet::new();
-        for d in &module.decls {
-            match &d.node {
-                DeclKind::Fun { body: Some(b), .. } => expr(b, &mut out),
-                DeclKind::View { body, .. } | DeclKind::Derived { body, .. } => expr(body, &mut out),
-                _ => {}
-            }
-        }
-        out
-    }
-
-    /// Issue #4 names `examples/routes.knot`. At its committed length the leaked
-    /// prelude offsets land just past the last decl, so the ghost is filtered by
-    /// luck — but any edit that shifts the decls surfaces it. Sweeping the leading
-    /// padding reproduces what a user sees while typing: with the ghost present, a
-    /// `: a` hint appears inside `main = listen| 8080 api`.
-    ///
-    /// Asserted as a set-membership property rather than "does it split a token":
-    /// a leaked span is wrong wherever it lands, and it only *sometimes* happens to
-    /// land mid-identifier. Every `local_type_info` key must be a binder that really
-    /// exists in this document's AST.
-    #[test]
-    fn routes_knot_local_types_contain_no_foreign_spans_as_the_file_shifts() {
-        let base = std::fs::read_to_string("../../examples/routes.knot").expect("routes.knot");
-        // The offsets the prelude's punned `Just {value}` binders used to leak at.
-        const LEAKED: [usize; 3] = [1303, 1640, 1850];
-        let mut straddled = false;
-
-        for pad in 0..24usize {
-            let src = format!("{}{}", "-- pad\n".repeat(pad), base);
-            let mut ws = TestWorkspace::new();
-            let uri = ws.open("main", &src);
-            let range = ws.whole_file_range(&uri);
-            assert_no_split_hints(&ws.state, &uri, range, &format!("routes.knot +{pad} lines"));
-
-            let doc = ws.doc(&uri);
-            // A foreign span only survives the LSP's byte-range provenance filter
-            // when a user decl fully contains it — record that we exercised that.
-            straddled |= doc.module.decls.iter().any(|d| {
-                LEAKED.iter().any(|o| d.span.start <= *o && o + 5 <= d.span.end)
-            });
-
-            let binders = user_binder_spans(&doc.module);
-            for span in doc.local_type_info.keys() {
-                assert!(
-                    binders.contains(span),
-                    "routes.knot +{pad} lines: local_type_info has span {span:?} \
-                     (source text {:?}) that is not a binder in this file — a foreign \
-                     (prelude/import) offset leaked in and will anchor a hint at a \
-                     meaningless position",
-                    safe_slice(&doc.source, *span),
-                );
-            }
-        }
-
-        assert!(
-            straddled,
-            "setup: no padding made a decl straddle a formerly-leaked prelude offset, \
-             so this test would pass vacuously — retune the sweep"
-        );
-    }
-}

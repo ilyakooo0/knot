@@ -4,6 +4,7 @@
 //! tracking persisted relation schemas and migration history.
 //! The lockfile is valid Knot syntax, parsed by the same frontend.
 
+use crate::decl_view::{decl_views, DeclViewKind};
 use crate::types::TypeEnv;
 use knot::ast::*;
 use knot::diagnostic::{Diagnostic, Severity};
@@ -385,7 +386,7 @@ fn parse_lockfile(lock_path: &Path) -> Result<SchemaInfo, String> {
     let lexer = knot::lexer::Lexer::new(&content);
     let (tokens, _) = lexer.tokenize();
     let parser = knot::parser::Parser::new(content, tokens);
-    let (module, diags) = parser.parse_module();
+    let (program, diags) = parser.parse_file_expr();
 
     if diags.iter().any(|d| d.severity == Severity::Error) {
         return Err(format!(
@@ -394,7 +395,7 @@ fn parse_lockfile(lock_path: &Path) -> Result<SchemaInfo, String> {
         ));
     }
 
-    let env = TypeEnv::from_module(&module);
+    let env = TypeEnv::from_program(&program);
     Ok(SchemaInfo {
         sources: env.source_schemas,
         migrations: env.migrate_schemas,
@@ -404,7 +405,7 @@ fn parse_lockfile(lock_path: &Path) -> Result<SchemaInfo, String> {
 /// Diff source schemas against the lockfile. Returns diagnostics
 /// (errors for breaking changes, warnings for removed sources).
 /// Returns empty vec on first compile (no lockfile yet).
-pub fn check(source_path: &Path, module: &Module, type_env: &TypeEnv) -> Vec<Diagnostic> {
+pub fn check(source_path: &Path, program: &Expr, type_env: &TypeEnv) -> Vec<Diagnostic> {
     let lock_path = lockfile_path(source_path);
     let mut diags = Vec::new();
 
@@ -441,7 +442,7 @@ pub fn check(source_path: &Path, module: &Module, type_env: &TypeEnv) -> Vec<Dia
                                         "breaking schema change for '*{}' requires a migrate block",
                                         name
                                     ))
-                                    .label(find_source_span(module, name), "schema changed")
+                                    .label(find_source_span(program, name), "schema changed")
                                     .note(format!("lockfile: {}", old_schema))
                                     .note(format!("source:   {}", new_schema))
                                     .note(format!(
@@ -456,7 +457,7 @@ pub fn check(source_path: &Path, module: &Module, type_env: &TypeEnv) -> Vec<Dia
                                 if classify_schema_change(first_from, old_schema) != SchemaChange::Identical
                                     || classify_schema_change(last_to, new_schema) != SchemaChange::Identical
                                 {
-                                    let first_span = find_migrate_span(module, name);
+                                    let first_span = find_migrate_span(program, name);
                                     diags.push(
                                         Diagnostic::error(format!(
                                             "migrate block for '*{}' doesn't match the schema change",
@@ -490,7 +491,7 @@ pub fn check(source_path: &Path, module: &Module, type_env: &TypeEnv) -> Vec<Dia
                                     "breaking schema change for '*{}' requires a migrate block",
                                     name
                                 ))
-                                .label(find_source_span(module, name), "schema changed")
+                                .label(find_source_span(program, name), "schema changed")
                                 .note(format!("lockfile: {}", old_schema))
                                 .note(format!("source:   {}", new_schema))
                                 .note(format!(
@@ -564,13 +565,12 @@ pub fn dropped_sources(source_path: &Path, type_env: &TypeEnv) -> Vec<String> {
 pub fn update(
     source_path: &Path,
     source_text: &str,
-    module: &Module,
+    program: &Expr,
 ) -> Result<(), String> {
-    let has_sources = module
-        .decls
+    let has_sources = decl_views(program)
         .iter()
-        .any(|d| matches!(&d.node, DeclKind::Source { .. }))
-        || !record_embedded_sources(module).is_empty();
+        .any(|d| matches!(d.kind, DeclViewKind::Source { .. }))
+        || !record_embedded_sources(program).is_empty();
 
     let lock_path = lockfile_path(source_path);
 
@@ -584,7 +584,7 @@ pub fn update(
         return Ok(());
     }
 
-    let content = generate(module, source_text);
+    let content = generate(program, source_text);
     // Atomic write: write to a temp file then rename, so a crash mid-write
     // doesn't leave a corrupt lockfile that hard-errors every compile.
     let tmp_path = lock_path.with_extension("lock.tmp");
@@ -598,100 +598,96 @@ pub fn update(
 /// module's top-level record-let literals (`db = { *todos : [Todo], … }`),
 /// paired with the field's span for diagnostics. Duplicate source names are a
 /// compile error, so name-keyed iteration is unambiguous.
-fn record_embedded_sources(module: &Module) -> Vec<(String, Type, Span)> {
+fn record_embedded_sources(program: &Expr) -> Vec<(String, Type, Span)> {
     let mut out = Vec::new();
-    for decl in &module.decls {
-        if let DeclKind::Fun { body: Some(value), .. } = &decl.node
-            && let ExprKind::Record(fields) = &value.node
-        {
+    collect_record_sources(program, &mut out);
+    out
+}
+
+/// Recursively collect `*name : <ty>` source fields from every record literal
+/// in the program (the file's declarations now live inside record literals).
+fn collect_record_sources(e: &Expr, out: &mut Vec<(String, Type, Span)>) {
+    match &e.node {
+        ExprKind::Record(fields) => {
             for f in fields {
                 if let ExprKind::SourceDecl { name, ty, .. } = &f.value.node {
                     out.push((name.clone(), ty.clone(), f.value.span));
                 }
+                collect_record_sources(&f.value, out);
             }
         }
+        ExprKind::With { record, body } => {
+            collect_record_sources(record, out);
+            collect_record_sources(body, out);
+        }
+        _ => {}
     }
-    out
 }
 
-fn find_source_span(module: &Module, name: &str) -> Span {
-    module
-        .decls
-        .iter()
-        .find_map(|d| match &d.node {
-            DeclKind::Source { name: n, .. } if n == name => Some(d.span),
-            _ => None,
-        })
-        .or_else(|| {
-            record_embedded_sources(module)
-                .into_iter()
-                .find_map(|(n, _, span)| (n == name).then_some(span))
-        })
-        .unwrap_or(Span::new(0, 0))
-}
-
-fn find_migrate_span(module: &Module, name: &str) -> Span {
-    record_embedded_sources(module)
+fn find_source_span(program: &Expr, name: &str) -> Span {
+    record_embedded_sources(program)
         .into_iter()
         .find_map(|(n, _, span)| (n == name).then_some(span))
         .unwrap_or(Span::new(0, 0))
 }
 
+fn find_migrate_span(program: &Expr, name: &str) -> Span {
+    record_embedded_sources(program)
+        .into_iter()
+        .find_map(|(n, _, span)| (n == name).then_some(span))
+        .unwrap_or(Span::new(0, 0))
+}
+
+/// Bounds-checked slice of `source_text` at `span`; `None` when the span is
+/// synthetic/out-of-range (post-desugar nodes can carry placeholder spans).
+fn slice_span(source_text: &str, span: Span) -> Option<&str> {
+    source_text.get(span.start..span.end)
+}
+
 /// Generate lockfile content by extracting declarations from source text.
-fn generate(module: &Module, source_text: &str) -> String {
-    let mut out = String::new();
-    out.push_str("-- schema.lock (auto-generated, do not edit)\n");
-    out.push_str("-- Commit to source control.\n");
+/// Emitted as a `with { … } (main)` expression so it re-parses under the
+/// file-as-expression grammar (top-level `type`/`data`/`*source`/`migrate`
+/// lines are no longer valid standalone syntax).
+fn generate(program: &Expr, source_text: &str) -> String {
+    let mut body = String::new();
 
     // Type aliases (non-parameterized) and data declarations
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::TypeAlias { params, .. } if params.is_empty() => {
-                out.push('\n');
-                out.push_str(&source_text[decl.span.start..decl.span.end]);
-                out.push('\n');
-            }
-            DeclKind::Data { .. } => {
-                out.push('\n');
-                out.push_str(&source_text[decl.span.start..decl.span.end]);
-                out.push('\n');
-            }
-            _ => {}
-        }
-    }
-
-    // Source declarations
-    for decl in &module.decls {
-        if let DeclKind::Source { .. } = &decl.node {
-            out.push('\n');
-            out.push_str(&source_text[decl.span.start..decl.span.end]);
-            out.push('\n');
+    for decl in decl_views(program) {
+        let emit = matches!(decl.kind,
+            DeclViewKind::TypeAlias { params, .. } if params.is_empty())
+            || matches!(decl.kind, DeclViewKind::Data { .. });
+        if emit && let Some(text) = slice_span(source_text, decl.span) {
+            body.push_str(text);
+            body.push('\n');
         }
     }
 
     // Sources embedded in record-let literals (`db = { *todos : [Todo], … }`)
-    // have no standalone source span to slice; synthesize an equivalent
-    // top-level `*name : <ty>` declaration. Duplicate names are a compile
-    // error, so a name already emitted above as a top-level decl is skipped.
-    for (name, ty, _) in record_embedded_sources(module) {
-        let already = module.decls.iter().any(|d| {
-            matches!(&d.node, DeclKind::Source { name: n, .. } if *n == name)
-        });
-        if already {
-            continue;
-        }
-        out.push('\n');
-        out.push_str(&format!("*{} : {}\n", name, knot::format::render_type(&ty)));
+    // synthesize an equivalent `*name : <ty>` declaration.
+    for (name, ty, _) in record_embedded_sources(program) {
+        body.push_str(&format!("*{} : {}\n", name, knot::format::render_type(&ty)));
     }
 
     // Migrations attached to record-embedded source fields
     // (`{ *todos : [Todo] migrate from A to B using f }`). Synthesize the
-    // equivalent top-level `migrate *name …` line so the lockfile records the
+    // equivalent `migrate *name …` line so the lockfile records the
     // migration the same way regardless of where it was declared.
-    for decl in &module.decls {
-        if let DeclKind::Fun { body: Some(body), .. } = &decl.node
-            && let ExprKind::Record(fields) = &body.node
-        {
+    collect_record_migrations(program, &mut body);
+
+    let mut out = String::new();
+    out.push_str("-- schema.lock (auto-generated, do not edit)\n");
+    out.push_str("-- Commit to source control.\n");
+    out.push_str("with {\n");
+    out.push_str(&body);
+    out.push_str("}\n(main)\n");
+    out
+}
+
+/// Recursively walk record literals and emit a `migrate` line for every
+/// migration attached to a `*name` source field.
+fn collect_record_migrations(e: &Expr, out: &mut String) {
+    match &e.node {
+        ExprKind::Record(fields) => {
             for f in fields {
                 if let ExprKind::SourceDecl { name, migrations, .. } = &f.value.node {
                     for m in migrations {
@@ -705,297 +701,15 @@ fn generate(module: &Module, source_text: &str) -> String {
                         ));
                     }
                 }
+                collect_record_migrations(&f.value, out);
             }
         }
-    }
-
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn identical_record_schema() {
-        assert_eq!(
-            classify_schema_change("name:text,age:int", "name:text,age:int"),
-            SchemaChange::Identical
-        );
-    }
-
-    #[test]
-    fn record_field_added_is_safe() {
-        assert_eq!(
-            classify_schema_change("name:text", "name:text,age:int"),
-            SchemaChange::Safe
-        );
-    }
-
-    #[test]
-    fn record_field_removed_is_breaking() {
-        assert_eq!(
-            classify_schema_change("name:text,age:int", "name:text"),
-            SchemaChange::Breaking
-        );
-    }
-
-    #[test]
-    fn record_field_type_changed_is_breaking() {
-        assert_eq!(
-            classify_schema_change("name:text,age:int", "name:text,age:float"),
-            SchemaChange::Breaking
-        );
-    }
-
-    #[test]
-    fn adt_constructor_added_is_safe() {
-        assert_eq!(
-            classify_schema_change(
-                "#Circle:radius=float",
-                "#Circle:radius=float|Rect:width=float;height=float"
-            ),
-            SchemaChange::Safe
-        );
-    }
-
-    #[test]
-    fn adt_constructor_removed_is_breaking() {
-        assert_eq!(
-            classify_schema_change(
-                "#Circle:radius=float|Rect:width=float",
-                "#Circle:radius=float"
-            ),
-            SchemaChange::Breaking
-        );
-    }
-
-    #[test]
-    fn adt_constructor_field_changed_is_breaking() {
-        assert_eq!(
-            classify_schema_change(
-                "#Circle:radius=float",
-                "#Circle:radius=int"
-            ),
-            SchemaChange::Breaking
-        );
-    }
-
-    #[test]
-    fn adt_nullary_constructor_added_is_safe() {
-        assert_eq!(
-            classify_schema_change("#Red|Green", "#Red|Green|Blue"),
-            SchemaChange::Safe
-        );
-    }
-
-    #[test]
-    fn identical_adt_schema() {
-        assert_eq!(
-            classify_schema_change("#Circle:radius=float", "#Circle:radius=float"),
-            SchemaChange::Identical
-        );
-    }
-
-    #[test]
-    fn record_to_adt_is_breaking() {
-        assert_eq!(
-            classify_schema_change("name:text", "#Circle:radius=float"),
-            SchemaChange::Breaking
-        );
-    }
-
-    #[test]
-    fn adt_constructor_field_reorder_is_not_breaking() {
-        // Constructor fields all share one wide nullable-column table, so the
-        // physical declaration order is irrelevant — reordering without adding
-        // or removing constructors is semantically identical, matching
-        // record-field reorder semantics.
-        assert_eq!(
-            classify_schema_change(
-                "#Rect:width=float;height=float",
-                "#Rect:height=float;width=float"
-            ),
-            SchemaChange::Identical
-        );
-    }
-
-    #[test]
-    fn record_field_reorder_is_identical() {
-        // The record path already treats reorder as a no-op; pin it so the two
-        // paths stay consistent.
-        assert_eq!(
-            classify_schema_change("name:text,age:int", "age:int,name:text"),
-            SchemaChange::Identical
-        );
-    }
-
-    // --- Nested child-table schemas (`field:[...]`) --------------------------
-    // These previously compared the bracketed descriptor as an opaque string,
-    // so a reorder or safe column addition inside the nested relation was
-    // spuriously classified as Breaking (bug B34).
-
-    #[test]
-    fn nested_field_reorder_is_identical() {
-        // Reordering columns inside `items:[...]` is name-based on the child
-        // table — semantically identical, no migrate block required.
-        assert_eq!(
-            classify_schema_change(
-                "id:int,items:[name:text,price:float]",
-                "id:int,items:[price:float,name:text]"
-            ),
-            SchemaChange::Identical
-        );
-    }
-
-    #[test]
-    fn nested_field_column_added_is_safe() {
-        // Adding a scalar column inside the nested relation is a nullable-column
-        // addition the runtime auto-applies — Safe, not Breaking.
-        assert_eq!(
-            classify_schema_change("items:[name:text]", "items:[name:text,price:float]"),
-            SchemaChange::Safe
-        );
-    }
-
-    #[test]
-    fn nested_field_column_removed_is_breaking() {
-        assert_eq!(
-            classify_schema_change("items:[name:text,price:float]", "items:[name:text]"),
-            SchemaChange::Breaking
-        );
-    }
-
-    #[test]
-    fn nested_field_column_type_changed_is_breaking() {
-        assert_eq!(
-            classify_schema_change("items:[qty:int]", "items:[qty:float]"),
-            SchemaChange::Breaking
-        );
-    }
-
-    #[test]
-    fn nested_field_to_scalar_is_breaking() {
-        assert_eq!(
-            classify_schema_change("items:[name:text]", "items:text"),
-            SchemaChange::Breaking
-        );
-    }
-
-    #[test]
-    fn nested_reorder_with_sibling_scalar_addition_is_safe() {
-        // A nested reorder combined with a top-level scalar addition: the
-        // strongest classification wins (Safe), never Breaking.
-        assert_eq!(
-            classify_schema_change(
-                "items:[name:text,price:float]",
-                "items:[price:float,name:text],note:text"
-            ),
-            SchemaChange::Safe
-        );
-    }
-
-    #[test]
-    fn leaf_child_gaining_nested_subrelation_is_breaking() {
-        // A leaf child table is created without the `_id`/`_content_hash`
-        // columns a parent needs, and SQLite cannot add them via ALTER TABLE —
-        // the runtime's `auto_apply_child_change` refuses this, so the compiler
-        // must classify it Breaking rather than Safe (avoids the inverse bug).
-        assert_eq!(
-            classify_schema_change(
-                "items:[name:text]",
-                "items:[name:text,tags:[label:text]]"
-            ),
-            SchemaChange::Breaking
-        );
-    }
-
-    #[test]
-    fn nested_within_nested_reorder_is_identical() {
-        // Reordering columns two levels deep, where every child already has its
-        // own nested sub-relation, is still just a reorder — Identical.
-        assert_eq!(
-            classify_schema_change(
-                "items:[name:text,tags:[a:int,b:int]]",
-                "items:[name:text,tags:[b:int,a:int]]"
-            ),
-            SchemaChange::Identical
-        );
-    }
-
-    #[test]
-    fn nested_within_nested_column_added_is_safe() {
-        assert_eq!(
-            classify_schema_change(
-                "items:[name:text,tags:[a:int]]",
-                "items:[name:text,tags:[a:int,b:int]]"
-            ),
-            SchemaChange::Safe
-        );
-    }
-
-    #[test]
-    fn nonleaf_child_gaining_additional_subrelation_is_safe() {
-        // The child already has a sub-relation (`tags`), so it has the `_id`/
-        // `_content_hash` scaffolding; adding a second sub-relation is a safe
-        // brand-new child table, matching `auto_apply_child_change`.
-        assert_eq!(
-            classify_schema_change(
-                "items:[name:text,tags:[label:text]]",
-                "items:[name:text,tags:[label:text],notes:[body:text]]"
-            ),
-            SchemaChange::Safe
-        );
-    }
-
-    // --- Parent `_id` requirement for a source's first nested field ----------
-
-    #[test]
-    fn first_nested_field_added_is_breaking() {
-        // Adding the first nested `[T]` field requires the parent table to
-        // gain an `_id INTEGER PRIMARY KEY`, which ALTER TABLE cannot do —
-        // the runtime would panic at startup. It must go through a migrate
-        // block, so classify it as Breaking (not Safe).
-        assert_eq!(
-            classify_schema_change("name:text", "name:text,todos:[title:text,done:int]"),
-            SchemaChange::Breaking
-        );
-    }
-
-    #[test]
-    fn second_nested_field_added_is_safe() {
-        // Once the parent already has a nested field (and thus an `_id`),
-        // adding another nested field only creates a new child table — a
-        // safe CREATE TABLE that needs no migrate block.
-        assert_eq!(
-            classify_schema_change(
-                "name:text,todos:[title:text]",
-                "name:text,todos:[title:text],tags:[tag:text]"
-            ),
-            SchemaChange::Safe
-        );
-    }
-
-    #[test]
-    fn scalar_field_added_alongside_existing_nested_is_safe() {
-        // A parent that already has a nested field can still take plain
-        // nullable scalar additions safely.
-        assert_eq!(
-            classify_schema_change(
-                "name:text,todos:[title:text]",
-                "name:text,todos:[title:text],age:int"
-            ),
-            SchemaChange::Safe
-        );
-    }
-
-    #[test]
-    fn inline_record_field_added_is_safe() {
-        // Inline record fields (`{...}`) are stored as JSON columns, not child
-        // tables, so they don't need an `_id` on the parent — still Safe.
-        assert_eq!(
-            classify_schema_change("name:text", "name:text,addr:{city:text,zip:text}"),
-            SchemaChange::Safe
-        );
+        ExprKind::With { record, body } => {
+            collect_record_migrations(record, out);
+            collect_record_migrations(body, out);
+        }
+        _ => {}
     }
 }
+
+

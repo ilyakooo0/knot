@@ -8838,32 +8838,30 @@ impl Infer {
 
     // ── Declaration collection (phase 1) ─────────────────────────
 
-    fn collect_types(&mut self, module: &ast::Module) {
+    fn collect_types(&mut self, program: &ast::Expr) {
         // First pass: type aliases (multi-pass to handle forward references)
         // Separate refined type aliases from regular ones.
         let mut alias_decls: Vec<(String, ast::Type, Span)> = Vec::new();
         let mut refined_alias_decls: Vec<(String, ast::Type, ast::Expr)> = Vec::new();
-        for decl in &module.decls {
-            if let ast::DeclKind::TypeAlias { name, params, ty } = &decl.node {
-                if params.is_empty() {
-                    if let ast::TypeKind::Refined { base, predicate } = &ty.node {
-                        refined_alias_decls.push((
-                            name.clone(),
-                            (**base).clone(),
-                            (**predicate).clone(),
-                        ));
-                    } else {
-                        alias_decls.push((name.clone(), ty.clone(), decl.span));
-                    }
+        for_each_type_ctor(program, &mut |name, params, ty, span| {
+            if params.is_empty() {
+                if let ast::TypeKind::Refined { base, predicate } = &ty.node {
+                    refined_alias_decls.push((
+                        name.to_string(),
+                        (**base).clone(),
+                        (**predicate).clone(),
+                    ));
                 } else {
-                    // Parameterized alias: keep the AST body + param names so
-                    // applications (`Pair Int Text`) elaborate fresh each time
-                    // and substitute the actual arguments.
-                    self.param_aliases
-                        .insert(name.clone(), (params.clone(), ty.clone()));
+                    alias_decls.push((name.to_string(), ty.clone(), span));
                 }
+            } else {
+                // Parameterized alias: keep the AST body + param names so
+                // applications (`Pair Int Text`) elaborate fresh each time
+                // and substitute the actual arguments.
+                self.param_aliases
+                    .insert(name.to_string(), (params.to_vec(), ty.clone()));
             }
-        }
+        });
         // Detect cyclic alias definitions (e.g. `type A = B; type B = A`)
         // before the fixpoint loop: each iteration would wrap another
         // `Ty::Alias` layer and never converge (stack overflow). A name is
@@ -8949,13 +8947,7 @@ impl Infer {
         self.enforce_units = saved_enforce;
 
         // Second pass: data types and constructors
-        for decl in &module.decls {
-            if let ast::DeclKind::Data {
-                name,
-                params,
-                constructors: ctors,
-                ..
-            } = &decl.node
+        for_each_data_ctor(program, &mut |name, params, ctors, span| {
             {
                 // Detect duplicate constructor names within the same `data`
                 // declaration. Distinct ADTs may share a constructor name
@@ -8972,7 +8964,7 @@ impl Infer {
                                     "duplicate constructor '{}' in data declaration '{}'",
                                     ctor.name, name
                                 ),
-                                decl.span,
+                                span,
                             );
                         }
                     }
@@ -8999,8 +8991,8 @@ impl Infer {
                         .entry(ctor.name.clone())
                         .or_default()
                         .push(CtorInfo {
-                            data_type: name.clone(),
-                            data_params: params.clone(),
+                            data_type: name.to_string(),
+                            data_params: params.to_vec(),
                             fields: fields.clone(),
                         });
                     ctor_list.push((ctor.name.clone(), fields));
@@ -9048,77 +9040,62 @@ impl Infer {
                         .collect();
                     if params.is_empty() {
                         self.aliases.insert(
-                            name.clone(),
+                            name.to_string(),
                             Ty::Record(field_tys, None),
                         );
                     }
                 }
 
                 self.data_types.insert(
-                    name.clone(),
+                    name.to_string(),
                     DataInfo {
-                        params: params.clone(),
+                        params: params.to_vec(),
                         ctors: ctor_list,
                     },
                 );
             }
-        }
+        });
     }
 
     // ── Source/view collection (phase 2) ──────────────────────────
 
-    fn collect_sources(&mut self, module: &ast::Module) {
-        for decl in &module.decls {
-            match &decl.node {
-                ast::DeclKind::Source { name, ty, .. } => {
+    fn collect_sources(&mut self, program: &ast::Expr) {
+        for_each_relation_marker(program, &mut |m| {
+            match m {
+                RelMarker::Source { name, ty } => {
                     self.annotation_vars.clear();
                     let resolved = self.ast_type_to_ty(ty);
-                    self.source_types.insert(name.clone(), resolved);
+                    self.source_types.insert(name.to_string(), resolved);
                 }
-                ast::DeclKind::View { name, ty, .. } => {
+                RelMarker::View { name, ty, .. } => {
                     let resolved = if let Some(scheme) = ty {
                         self.annotation_vars.clear();
                         self.ast_type_to_ty(&scheme.ty)
                     } else {
                         Ty::Relation(Box::new(self.fresh()))
                     };
-                    self.source_types.insert(name.clone(), resolved);
-                    self.view_names.insert(name.clone());
+                    self.source_types.insert(name.to_string(), resolved);
+                    self.view_names.insert(name.to_string());
                 }
-                ast::DeclKind::Derived { name, ty, .. } => {
+                RelMarker::Derived { name, ty, .. } => {
                     let resolved = if let Some(scheme) = ty {
                         self.annotation_vars.clear();
                         self.ast_type_to_ty(&scheme.ty)
                     } else {
                         self.fresh()
                     };
-                    self.derived_types.insert(name.clone(), resolved);
+                    self.derived_types.insert(name.to_string(), resolved);
                 }
-                _ => {}
             }
-        }
+        });
     }
 
     // ── Impl collection (phase 2b) ─────────────────────────────
 
-    fn collect_impls(&mut self, module: &ast::Module) {
-        for decl in &module.decls {
-            match &decl.node {
-                // `data T = ... deriving (Eq, Ord, ...)` generates impls in
-                // codegen, so the type checker must treat the type as having
-                // each derived trait's impl — otherwise `==`/`<`/trait-method
-                // uses on `T` are spuriously rejected at the call site.
-                ast::DeclKind::Data {
-                    name, deriving, ..
-                } => {
-                    for trait_name in deriving {
-                        self.known_impls
-                            .insert((trait_name.clone(), name.clone()));
-                    }
-                }
-                _ => {}
-            }
-        }
+    fn collect_impls(&mut self, _program: &ast::Expr) {
+        // Traits are gone — no user impl declarations exist. The intrinsic
+        // impls (`Eq`/`Ord`/`Num`/…) are registered unconditionally by
+        // `check_inner`, so there is nothing to collect from the program.
     }
 
     /// Get the type name of a resolved Ty for impl lookup.
@@ -9182,108 +9159,92 @@ impl Infer {
 
     // ── Pre-registration (phase 3) ───────────────────────────────
 
-    fn pre_register(&mut self, module: &ast::Module) {
+    fn pre_register(&mut self, program: &ast::Expr) {
         // Register built-in functions
         self.register_builtins();
 
-        for decl in &module.decls {
-            match &decl.node {
-                ast::DeclKind::Fun { name, ty, .. } => {
-                    if let Some(scheme) = ty {
-                        self.annotation_vars.clear();
-                        self.annotation_unit_vars.clear();
-                        self.in_type_annotation = true;
-                        // Convert AST constraints to internal constraints
-                        let mut constraints = Vec::new();
-                        for c in &scheme.constraints {
-                            match c {
-                                ast::Constraint::Trait { trait_name, args } => {
-                                    for arg in args {
-                                        if let ast::TypeKind::Var(var_name) = &arg.node {
-                                            let v = self.annotation_var(var_name);
-                                            constraints.push(TyConstraint {
-                                                trait_name: trait_name.clone(),
-                                                type_var: v,
-                                                span: arg.span,
-                                            });
-                                        }
-                                    }
-                                }
-                                ast::Constraint::ImplicitField { .. } => {
-                                    // Handled in the implicit-field pipeline.
+        // Named functions are `with`-record fields with a signature and/or a
+        // lambda value. Pre-register their schemes by name.
+        for_each_named_fn(program, &mut |name, sig, _value| {
+            if let Some(scheme) = sig {
+                self.annotation_vars.clear();
+                self.annotation_unit_vars.clear();
+                self.in_type_annotation = true;
+                // Convert AST constraints to internal constraints
+                let mut constraints = Vec::new();
+                for c in &scheme.constraints {
+                    match c {
+                        ast::Constraint::Trait { trait_name, args } => {
+                            for arg in args {
+                                if let ast::TypeKind::Var(var_name) = &arg.node {
+                                    let v = self.annotation_var(var_name);
+                                    constraints.push(TyConstraint {
+                                        trait_name: trait_name.clone(),
+                                        type_var: v,
+                                        span: arg.span,
+                                    });
                                 }
                             }
                         }
-                        let unions_before = self.pending_effect_unions.len();
-                        let raw_ty = self.ast_type_to_ty(&scheme.ty);
-                        self.in_type_annotation = false;
-                        let mut vars: Vec<TyVar> =
-                            self.annotation_vars.values().copied().collect();
-                        let unit_vars: Vec<UnitVar> =
-                            self.annotation_unit_vars.values().copied().collect();
-                        // Lift any outermost `Ty::Forall` into the Scheme so
-                        // standard instantiation handles its quantified vars.
-                        // Inner `Ty::Forall` (in arg positions) stays as-is
-                        // for higher-rank handling.
-                        let ty = match raw_ty {
-                            Ty::Forall(forall_vars, body) => {
-                                vars.extend(forall_vars);
-                                *body
-                            }
-                            other => other,
-                        };
-                        // `\/` effect unions registered while converting the
-                        // annotation belong to this scheme, not the global
-                        // pending list — otherwise every instantiation shares
-                        // the annotation's original row vars. The union's
-                        // result var (and any `_`-wildcard sources) are fresh
-                        // vars outside annotation_vars, so quantify them too.
-                        let effect_unions: Vec<EffectUnion> =
-                            self.pending_effect_unions.split_off(unions_before);
-                        for u in &effect_unions {
-                            if !vars.contains(&u.result) {
-                                vars.push(u.result);
-                            }
-                            for s in &u.sources {
-                                if !vars.contains(s) {
-                                    vars.push(*s);
-                                }
-                            }
+                        ast::Constraint::ImplicitField { .. } => {
+                            // Handled in the implicit-field pipeline.
                         }
-                        self.bind_top(
-                            name,
-                            Scheme { vars, unit_vars, constraints, effect_unions, unit_binops: vec![], ty },
-                        );
-                    } else {
-                        let var = self.fresh();
-                        self.bind_top(name, Scheme::mono(var));
                     }
                 }
-                ast::DeclKind::Route { name, entries } => {
-                    self.route_types.insert(name.clone());
-                    self.route_entries_by_api
-                        .insert(name.clone(), entries.clone());
-                    for entry in entries {
-                        if let Some(ref resp_ty) = entry.response_ty {
-                            self.fetch_response_types
-                                .insert(entry.constructor.clone(), resp_ty.clone());
+                let unions_before = self.pending_effect_unions.len();
+                let raw_ty = self.ast_type_to_ty(&scheme.ty);
+                self.in_type_annotation = false;
+                let mut vars: Vec<TyVar> =
+                    self.annotation_vars.values().copied().collect();
+                let unit_vars: Vec<UnitVar> =
+                    self.annotation_unit_vars.values().copied().collect();
+                let ty = match raw_ty {
+                    Ty::Forall(forall_vars, body) => {
+                        vars.extend(forall_vars);
+                        *body
+                    }
+                    other => other,
+                };
+                let effect_unions: Vec<EffectUnion> =
+                    self.pending_effect_unions.split_off(unions_before);
+                for u in &effect_unions {
+                    if !vars.contains(&u.result) {
+                        vars.push(u.result);
+                    }
+                    for s in &u.sources {
+                        if !vars.contains(s) {
+                            vars.push(*s);
                         }
-                        // Always insert (even when empty) so a later route
-                        // entry that reuses this constructor name but declares
-                        // no response headers overwrites an earlier one that
-                        // did — otherwise the stale headers survive and fetch
-                        // infers a chimera {body, headers} response type. Empty
-                        // is treated as "no headers" at the use site.
-                        self.fetch_response_headers
-                            .insert(entry.constructor.clone(), entry.response_headers.clone());
                     }
                 }
-                ast::DeclKind::RouteComposite { name, .. } => {
-                    self.route_types.insert(name.clone());
-                }
-                _ => {}
+                self.bind_top(
+                    name,
+                    Scheme { vars, unit_vars, constraints, effect_unions, unit_binops: vec![], ty },
+                );
+            } else {
+                let var = self.fresh();
+                self.bind_top(name, Scheme::mono(var));
             }
-        }
+        });
+
+        // Routes: register by name/path.
+        for_each_route_marker(program, &mut |name, entries| {
+            if let Some(entries) = entries {
+                self.route_types.insert(name.to_string());
+                self.route_entries_by_api
+                    .insert(name.to_string(), entries.to_vec());
+                for entry in entries {
+                    if let Some(ref resp_ty) = entry.response_ty {
+                        self.fetch_response_types
+                            .insert(entry.constructor.clone(), resp_ty.clone());
+                    }
+                    self.fetch_response_headers
+                        .insert(entry.constructor.clone(), entry.response_headers.clone());
+                }
+            } else {
+                self.route_types.insert(name.to_string());
+            }
+        });
 
         // Resolve composite routes: flatten their components' entries into
         // `route_entries_by_api` so `serve` can find them by composite name.
@@ -9292,16 +9253,10 @@ impl Infer {
         // components have entries. Anything left after the fixpoint either
         // references an unknown route or participates in a cycle — both get
         // a diagnostic instead of silently dropping endpoints.
-        let composites: Vec<(String, Vec<String>, Span)> = module
-            .decls
-            .iter()
-            .filter_map(|d| match &d.node {
-                ast::DeclKind::RouteComposite { name, components } => {
-                    Some((name.clone(), components.clone(), d.span))
-                }
-                _ => None,
-            })
-            .collect();
+        let mut composites: Vec<(String, Vec<String>, Span)> = Vec::new();
+        for_each_route_composite(program, &mut |name, components, span| {
+            composites.push((name.to_string(), components.to_vec(), span));
+        });
         let composite_names: HashSet<String> =
             composites.iter().map(|(n, _, _)| n.clone()).collect();
         let mut pending = composites;
@@ -10835,19 +10790,22 @@ impl Infer {
 
     // ── Declaration inference (phase 4) ──────────────────────────
 
-    fn infer_declarations(&mut self, module: &ast::Module) {
-        for decl in &module.decls {
-            match &decl.node {
-                ast::DeclKind::Fun { name, body: Some(body), ty, .. } => {
-                    {
-                        let scheme = self.lookup(name).cloned();
-                        let (expected, fresh_skolems, fresh_unit_skolems) = match scheme {
-                            Some(scheme) => {
-                                self.skolemise_scheme(&scheme, body.span)
-                            }
-                            None => (self.fresh(), Vec::new(), Vec::new()),
-                        };
-                        self.check_expr(body, &expected);
+    fn infer_declarations(&mut self, program: &ast::Expr) {
+        // Named functions: `with`-record fields with a lambda body.
+        for_each_named_fn(program, &mut |name, ty, body| {
+            let body = match body {
+                Some(b) => b,
+                None => return,
+            };
+            {
+                let scheme = self.lookup(name).cloned();
+                let (expected, fresh_skolems, fresh_unit_skolems) = match scheme {
+                    Some(scheme) => {
+                        self.skolemise_scheme(&scheme, body.span)
+                    }
+                    None => (self.fresh(), Vec::new(), Vec::new()),
+                };
+                self.check_expr(body, &expected);
                         // Record-field funs with `^`-field constraints: register
                         // each under its record path (`fns.greet`) so the
                         // callsite resolver can find it through a field-access
@@ -10895,7 +10853,7 @@ impl Infer {
                         // generalizing, so its free variables don't block
                         // quantification.
                         if let Some(scope) = self.scopes.first_mut() {
-                            scope.remove(name.as_str());
+                            scope.remove(name);
                         }
 
                         // If the function has explicit constraints in its
@@ -10945,13 +10903,13 @@ impl Infer {
                                 .iter()
                                 .filter_map(|c| match c {
                                     ast::Constraint::ImplicitField { field, ty } => {
-                                        Some((field.clone(), self.ast_type_to_ty(ty)))
+                                        Some((field.clone(), self.ast_type_to_ty(&ty)))
                                     }
                                     _ => None,
                                 })
                                 .collect();
                             if !implicit.is_empty() {
-                                self.implicit_dict_fns.insert(name.clone(), implicit);
+                                self.implicit_dict_fns.insert(name.to_string(), implicit);
                             }
                             self.in_type_annotation = false;
                             let mut vars: Vec<TyVar> = self
@@ -11068,8 +11026,12 @@ impl Infer {
                             self.bind_top(name, scheme);
                         }
                     }
-                }
-                ast::DeclKind::View { name, body, .. } => {
+        });
+
+        // Views and derived relations.
+        for_each_relation_marker(program, &mut |m| {
+            match m {
+                RelMarker::View { name, body: Some(body), .. } => {
                     let expected =
                         self.source_types.get(name).cloned().unwrap_or_else(
                             || self.fresh(),
@@ -11091,7 +11053,7 @@ impl Infer {
                     };
                     self.unify(&inferred, &expected, body.span);
                 }
-                ast::DeclKind::Derived { name, body, .. } => {
+                RelMarker::Derived { name, body: Some(body), .. } => {
                     let expected = self
                         .derived_types
                         .get(name)
@@ -11112,17 +11074,21 @@ impl Infer {
                     };
                     self.unify(&inferred, &expected, body.span);
                 }
-                ast::DeclKind::Route { entries, .. } => {
-                    for entry in entries {
-                        self.check_route_field_collisions(entry);
-                        if let Some(rate_limit_expr) = &entry.rate_limit {
-                            self.check_rate_limit_expr(entry, rate_limit_expr);
-                        }
-                    }
-                }
                 _ => {}
             }
-        }
+        });
+
+        // Routes: check field collisions and rate-limit exprs.
+        for_each_route_marker(program, &mut |_name, entries| {
+            if let Some(entries) = entries {
+                for entry in entries {
+                    self.check_route_field_collisions(entry);
+                    if let Some(rate_limit_expr) = &entry.rate_limit {
+                        self.check_rate_limit_expr(entry, rate_limit_expr);
+                    }
+                }
+            }
+        });
     }
 
     /// Reject a route endpoint whose request inputs (path params, query
@@ -12102,11 +12068,11 @@ pub type CheckOutput = (
 ///
 /// Runs on a grown stack: a desugared `do` block nests one `__bind` per
 /// statement, and `infer_expr` recurses through every level.
-pub fn check(module: &mut ast::Module) -> CheckOutput {
-    crate::stack::grow(|| check_inner(module))
+pub fn check(program: &mut ast::Expr) -> CheckOutput {
+    crate::stack::grow(|| check_inner(program))
 }
 
-fn check_inner(module: &mut ast::Module) -> CheckOutput {
+fn check_inner(program: &mut ast::Expr) -> CheckOutput {
     let mut infer = Infer::new();
 
     // Every user-written numeric type must carry an explicit unit (bare
@@ -12119,14 +12085,13 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
     infer.enforce_units = true;
 
     // Phase 1: Collect type aliases, data types, constructors
-    infer.collect_types(module);
+    infer.collect_types(program);
 
     // Phase 2: Register source/view/derived relation types
-    infer.collect_sources(module);
+    infer.collect_sources(program);
 
     // Phase 2b: Collect known trait implementations
-    infer.collect_impls(module);
-
+    infer.collect_impls(program);
     // Phase 2c: Register builtin [] and Result impls for HKT traits
     for trait_name in &["Functor", "Applicative", "Monad", "Alternative", "Foldable", "Traversable"] {
         infer
@@ -12173,10 +12138,10 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
     infer.known_impls.insert(("Sequence".to_string(), "[]".to_string()));
 
     // Phase 3: Pre-register top-level names (builtins, functions, trait methods)
-    infer.pre_register(module);
+    infer.pre_register(program);
 
     // Phase 4: Infer all declaration bodies
-    infer.infer_declarations(module);
+    infer.infer_declarations(program);
 
     // Phase 4a: Resolve any remaining effect-union (`r1 \/ r2`) constraints
     // so their result rows get bound to the union of their sources' effects.
@@ -12280,7 +12245,7 @@ fn check_inner(module: &mut ast::Module) -> CheckOutput {
     // or `e` itself — and rewrite the markers out of the AST. Runs before
     // check_constraints so the unifications it performs are visible to the
     // deferred trait checks.
-    resolve_result_markers(&mut infer, module);
+    resolve_result_markers(&mut infer, program);
 
     // Phase 4c: Check deferred trait constraints
     infer.check_constraints();
@@ -12605,7 +12570,7 @@ fn action_monad_of(ty: &Ty) -> Option<MonadKind> {
 /// marker's `App(m, a)` accordingly. When `e`'s type is too unresolved to
 /// classify, fall back to `pure` — the reading that makes an un-annotated
 /// `do { x <- act; someValue }` work.
-fn resolve_result_markers(infer: &mut Infer, module: &mut ast::Module) {
+fn resolve_result_markers(infer: &mut Infer, program: &mut ast::Expr) {
     let markers = std::mem::take(&mut infer.result_markers);
     // Spans of the markers that turned out to mean `pure e`; the rest are the
     // identity and get replaced by their argument.
@@ -12648,9 +12613,7 @@ fn resolve_result_markers(infer: &mut Infer, module: &mut ast::Module) {
         infer.pending_effect_unions = saved_unions;
     }
 
-    for decl in &mut module.decls {
-        rewrite_decl_results(decl, &pure_spans);
-    }
+    rewrite_result_markers(program, &pure_spans);
 }
 
 /// Replace each `__result` node: `pure`-classified markers become `__yield`
@@ -12671,27 +12634,6 @@ fn rewrite_result_markers(expr: &mut ast::Expr, pure_spans: &HashSet<Span>) {
         return;
     }
     walk_expr_children_mut(expr, &mut |e| rewrite_result_markers(e, pure_spans));
-}
-
-fn rewrite_decl_results(decl: &mut ast::Decl, pure_spans: &HashSet<Span>) {
-    use ast::DeclKind::*;
-    match &mut decl.node {
-        Fun { body, .. } => {
-            if let Some(b) = body {
-                rewrite_result_markers(b, pure_spans);
-            }
-        }
-        View { body, .. } | Derived { body, .. } => rewrite_result_markers(body, pure_spans),
-        Route { entries, .. } => {
-            for e in entries {
-                if let Some(expr) = &mut e.rate_limit {
-                    rewrite_result_markers(expr, pure_spans);
-                }
-            }
-        }
-        Data { .. } | TypeAlias { .. } | Source { .. } | RouteComposite { .. }
-        | SubsetConstraint { .. } => {}
-    }
 }
 
 /// Apply `f` to each direct sub-expression. Mirrors the AST shape walked by
@@ -12768,6 +12710,196 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
             }
         }
     }
+}
+
+// ── Declaration-marker walkers (expression model) ──────────────────
+
+/// A relation marker found in a record literal: a persisted source (`*name`),
+/// view, or derived (`&name`) relation.
+enum RelMarker<'a> {
+    Source {
+        name: &'a str,
+        ty: &'a ast::Type,
+    },
+    View {
+        name: &'a str,
+        ty: Option<&'a ast::TypeScheme>,
+        body: Option<&'a ast::Expr>,
+    },
+    Derived {
+        name: &'a str,
+        ty: Option<&'a ast::TypeScheme>,
+        body: Option<&'a ast::Expr>,
+    },
+}
+
+/// Read-only recursion over every sub-expression.
+fn walk_exprs_read<'a>(e: &'a ast::Expr, f: &mut impl FnMut(&'a ast::Expr)) {
+    f(e);
+    use ast::ExprKind::*;
+    match &e.node {
+        App { func, arg } => {
+            walk_exprs_read(func, f);
+            walk_exprs_read(arg, f);
+        }
+        With { record, body } => {
+            walk_exprs_read(record, f);
+            walk_exprs_read(body, f);
+        }
+        Lambda { body, .. } => walk_exprs_read(body, f),
+        BinOp { lhs, rhs, .. } => {
+            walk_exprs_read(lhs, f);
+            walk_exprs_read(rhs, f);
+        }
+        UnaryOp { operand, .. } => walk_exprs_read(operand, f),
+        If { cond, then_branch, else_branch } => {
+            walk_exprs_read(cond, f);
+            walk_exprs_read(then_branch, f);
+            walk_exprs_read(else_branch, f);
+        }
+        Case { scrutinee, arms } => {
+            walk_exprs_read(scrutinee, f);
+            for arm in arms {
+                walk_exprs_read(&arm.body, f);
+            }
+        }
+        Do(stmts) => {
+            for s in stmts {
+                match &s.node {
+                    ast::StmtKind::Bind { expr, .. } => walk_exprs_read(expr, f),
+                    ast::StmtKind::Where { cond } => walk_exprs_read(cond, f),
+                    ast::StmtKind::GroupBy { key } => walk_exprs_read(key, f),
+                    ast::StmtKind::Expr(x) => walk_exprs_read(x, f),
+                }
+            }
+        }
+        Set { target, value } | ReplaceSet { target, value } => {
+            walk_exprs_read(target, f);
+            walk_exprs_read(value, f);
+        }
+        Atomic(x) | Refine(x) => walk_exprs_read(x, f),
+        TimeUnitLit { value, .. } => walk_exprs_read(value, f),
+        Record(fields) => {
+            for fl in fields {
+                walk_exprs_read(&fl.value, f);
+            }
+        }
+        RecordUpdate { base, fields } => {
+            walk_exprs_read(base, f);
+            for fl in fields {
+                walk_exprs_read(&fl.value, f);
+            }
+        }
+        List(items) => {
+            for it in items {
+                walk_exprs_read(it, f);
+            }
+        }
+        FieldAccess { expr, .. } | Annot { expr, .. } => walk_exprs_read(expr, f),
+        Serve { handlers, .. } => {
+            for h in handlers {
+                walk_exprs_read(&h.body, f);
+            }
+        }
+        ViewDecl { body, .. } | DerivedDecl { body, .. } => walk_exprs_read(body, f),
+        _ => {}
+    }
+}
+
+/// Visit every `TypeCtor` (`type` alias) marker in the program.
+fn for_each_type_ctor<'a>(
+    program: &'a ast::Expr,
+    f: &mut impl FnMut(&'a str, &'a [ast::Name], &'a ast::Type, Span),
+) {
+    walk_exprs_read(program, &mut |e| {
+        if let ast::ExprKind::TypeCtor { name, params, ty } = &e.node {
+            f(name, params, ty, e.span);
+        }
+    });
+}
+
+/// Visit every `DataCtor` (`data`) marker in the program.
+fn for_each_data_ctor<'a>(
+    program: &'a ast::Expr,
+    f: &mut impl FnMut(&'a str, &'a [ast::Name], &'a [ast::ConstructorDef], Span),
+) {
+    walk_exprs_read(program, &mut |e| {
+        if let ast::ExprKind::DataCtor { name, params, constructors } = &e.node {
+            f(name, params, constructors, e.span);
+        }
+    });
+}
+
+/// Visit every relation marker (`*source` / view / `&derived`).
+fn for_each_relation_marker<'a>(program: &'a ast::Expr, f: &mut impl FnMut(RelMarker<'a>)) {
+    walk_exprs_read(program, &mut |e| match &e.node {
+        ast::ExprKind::SourceDecl { name, ty, .. } => {
+            f(RelMarker::Source { name, ty });
+        }
+        ast::ExprKind::ViewDecl { name, ty, body } => {
+            f(RelMarker::View {
+                name,
+                ty: ty.as_ref(),
+                body: Some(body),
+            });
+        }
+        ast::ExprKind::DerivedDecl { name, ty, body } => {
+            f(RelMarker::Derived {
+                name,
+                ty: ty.as_ref(),
+                body: Some(body),
+            });
+        }
+        _ => {}
+    });
+}
+
+/// Visit every named function binding: a record field whose value is a lambda
+/// (or has a signature). Yields `(name, signature, body)`.
+fn for_each_named_fn<'a>(
+    program: &'a ast::Expr,
+    f: &mut impl FnMut(&'a str, Option<&'a ast::TypeScheme>, Option<&'a ast::Expr>),
+) {
+    walk_exprs_read(program, &mut |e| {
+        if let ast::ExprKind::Record(fields) = &e.node {
+            for fl in fields {
+                let is_lambda = matches!(fl.value.node, ast::ExprKind::Lambda { .. });
+                if is_lambda || fl.sig.is_some() {
+                    f(&fl.name, fl.sig.as_ref(), Some(&fl.value));
+                }
+            }
+        }
+    });
+}
+
+/// Visit every route marker: `route Name = …` (with entries) and route
+/// composites (`route Name = A | B`, `entries` = `None`).
+fn for_each_route_marker<'a>(
+    program: &'a ast::Expr,
+    f: &mut impl FnMut(&'a str, Option<&'a [ast::RouteEntry]>),
+) {
+    walk_exprs_read(program, &mut |e| match &e.node {
+        ast::ExprKind::RouteDecl { name, entries } => {
+            f(name, Some(entries));
+        }
+        ast::ExprKind::RouteCompositeDecl { name, .. } => {
+            f(name, None);
+        }
+        _ => {}
+    });
+}
+
+/// Visit every route composite (`route Name = A | B`):
+/// `(name, components, span)`.
+fn for_each_route_composite<'a>(
+    program: &'a ast::Expr,
+    f: &mut impl FnMut(&'a str, &'a [String], Span),
+) {
+    walk_exprs_read(program, &mut |e| {
+        if let ast::ExprKind::RouteCompositeDecl { name, components } = &e.node {
+            f(name, components, e.span);
+        }
+    });
 }
 
 /// Classify a resolved monad/applicative type into a `MonadKind` for
@@ -12953,1257 +13085,4 @@ fn uncurry_fetch(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
 
 // ── Tests ─────────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    fn parse(src: &str) -> ast::Module {
-        let lexer = knot::lexer::Lexer::new(src);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(src.to_string(), tokens);
-        let (module, _) = parser.parse_module();
-        module
-    }
-
-    fn check_src(src: &str) -> Vec<Diagnostic> {
-        let mut module = parse(src);
-        crate::desugar::desugar(&mut module);
-        let (diags, _monad_info, _type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs, _implicit_dict) = check(&mut module);
-        diags
-    }
-
-    fn type_info_for(src: &str) -> TypeInfo {
-        let mut module = parse(src);
-        crate::desugar::desugar(&mut module);
-        let (_diags, _monad_info, type_info, _local_types, _refine_targets, _refined_types, _from_json, _elem_pushdown,  _show_units, _sum_floats, _rel_fields, _with_fields, _ty_args, _implicit_refs, _implicit_dict) = check(&mut module);
-        type_info
-    }
-
-    fn has_error(diags: &[Diagnostic], needle: &str) -> bool {
-        diags.iter().any(|d| d.message.contains(needle))
-    }
-
-    #[test]
-    fn literal_arithmetic() {
-        assert!(check_src("main = 1 + 2").is_empty());
-    }
-
-    #[test]
-    fn arithmetic_type_mismatch() {
-        let diags = check_src("main = 1 + \"hello\"");
-        assert!(has_error(&diags, "type mismatch"));
-    }
-
-    #[test]
-    fn boolean_ops_require_bool() {
-        let diags = check_src("main = 1 && 2");
-        assert!(has_error(&diags, "type mismatch"));
-    }
-
-    #[test]
-    fn concat_is_polymorphic() {
-        // ++ is now Semigroup: both sides must agree, but any type is allowed
-        assert!(check_src("main = \"a\" ++ \"b\"").is_empty());
-        assert!(check_src("main = [1, 2] ++ [3, 4]").is_empty());
-        let diags = check_src("main = \"a\" ++ 1");
-        assert!(has_error(&diags, "type mismatch"));
-    }
-
-    #[test]
-    fn if_branches_must_agree() {
-        assert!(check_src(
-            "main = if 1 == 1 then 42 else 0"
-        )
-        .is_empty());
-        let diags = check_src(
-            "main = if 1 == 1 then 42 else \"hello\"",
-        );
-        assert!(has_error(&diags, "type mismatch"));
-    }
-
-    #[test]
-    fn field_access_on_record() {
-        assert!(check_src("main = {name: \"Alice\"}.name").is_empty());
-    }
-
-    #[test]
-    fn field_access_nonexistent() {
-        let diags = check_src("main = {name \"Alice\"}.age");
-        assert!(has_error(&diags, "unexpected fields"));
-    }
-
-    #[test]
-    fn lambda_inference() {
-        assert!(check_src("f = \\x -> x + 1\nmain = f 42").is_empty());
-    }
-
-    #[test]
-    fn let_polymorphism() {
-        // id should work with both Int and Text
-        assert!(check_src(
-            "id = \\x -> x\nmain = do\n  println (id 42)\n  println (id \"hello\")\n  yield {}"
-        ).is_empty());
-    }
-
-    #[test]
-    fn recursive_function() {
-        assert!(check_src(
-            "fac = \\n -> if n == 0 then 1 else n * fac (n - 1)\nmain = fac 5"
-        ).is_empty());
-    }
-
-    #[test]
-    fn row_polymorphism() {
-        // getName should work on any record with a name field
-        assert!(check_src(
-            "getName = \\r -> r.name\nmain = do\n  let x = getName {name: \"A\", age: 1}\n  let y = getName {name: \"B\", email: \"b\"}\n  yield {}"
-        ).is_empty());
-    }
-
-    #[test]
-    fn rank2_row_polymorphic_field_access() {
-        // A rank-2 predicate may access any field listed in the row
-        // pattern. The skolemised row variable must stay rigid even when
-        // field-access constraints introduce extra fresh row variables.
-        let src = "\
-applyPred : (forall a. {x: Int 1, y: Int 1 | a} -> Bool) -> Int 1\n\
-applyPred = \\pred -> if pred {x: 1, y: 2} then 1 else 0\n\
-main = applyPred (\\r -> r.x == r.y)\
-";
-        let diags = check_src(src);
-        assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
-    }
-
-    #[test]
-    fn data_type_constructor() {
-        assert!(check_src(
-            "data Shape = Circle {radius: Int 1} | Rect {w: Int 1, h: Int 1}\nmain = Circle {radius: 5}"
-        ).is_empty());
-    }
-
-    #[test]
-    fn case_expression() {
-        assert!(check_src(
-            "data Shape = Circle {r: Int 1} | Rect {w: Int 1, h: Int 1}\nf = \\s -> case s of\n  Circle {r} -> r\n  Rect {w, h} -> w * h\nmain = f (Circle {r: 5})"
-        ).is_empty());
-    }
-
-    #[test]
-    fn case_branch_type_mismatch() {
-        let diags = check_src(
-            "data AB = A {} | B {}\nf = \\x -> case x of\n  A {} -> 42\n  B {} -> \"hello\"\nmain = f (A {})"
-        );
-        assert!(has_error(&diags, "type mismatch"));
-    }
-
-    #[test]
-    fn do_block_bind() {
-        assert!(check_src(
-            "*people : [{name: Text, age: Int 1}]\nmain = do\n  p <- *people\n  yield p.name"
-        ).is_empty());
-    }
-
-    #[test]
-    fn do_block_where_bool() {
-        let diags = check_src(
-            "*people : [{name: Text}]\nmain = do\n  p <- *people\n  where p.name\n  yield p"
-        );
-        assert!(has_error(&diags, "type mismatch"));
-    }
-
-    #[test]
-    fn undefined_variable() {
-        let diags = check_src("main = undefined_var");
-        assert!(has_error(&diags, "undefined variable"));
-    }
-
-    #[test]
-    fn pipe_operator() {
-        assert!(check_src(
-            "inc = \\x -> x + 1\nmain = 5 |> inc"
-        ).is_empty());
-    }
-
-    #[test]
-    fn set_type_matches_source() {
-        assert!(check_src(
-            "*nums : [Int 1]\nmain = replace *nums = [1, 2, 3]"
-        ).is_empty());
-    }
-
-    #[test]
-    fn bare_set_full_replacement_errors() {
-        // `*nums = [1, 2, 3]` doesn't reference *nums, so it's a full
-        // replacement and must use `replace` syntax.
-        let diags = check_src(
-            "*nums : [Int 1]\nmain = *nums = [1, 2, 3]"
-        );
-        assert!(has_error(&diags, "replace *nums"));
-    }
-
-    #[test]
-    fn bare_set_via_local_alias_ok() {
-        // `xs <- *people` makes `xs` an alias for *people, so writing
-        // `union xs [...]` counts as referencing the source.
-        let diags = check_src(
-            "type P = {name: Text, age: Int 1}\n\
-             *people : [P]\n\
-             insert = \\name age -> do\n  \
-               ps <- *people\n  \
-               *people = union ps [{name: name, age: age}]"
-        );
-        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
-    }
-
-    #[test]
-    fn bare_set_value_unrelated_to_source_errors() {
-        // Even with a local source bind, replacing with an unrelated value
-        // is a full replacement and must use `replace`.
-        let diags = check_src(
-            "type P = {name: Text, age: Int 1}\n\
-             *people : [P]\n\
-             *other : [P]\n\
-             copy = do\n  \
-               os <- *other\n  \
-               *people = os"
-        );
-        assert!(has_error(&diags, "replace *people"));
-    }
-
-    #[test]
-    fn replace_referencing_source_errors() {
-        // `replace *rel = expr` where the value references *rel is
-        // unnecessary — `set` would produce the same final state.
-        let diags = check_src(
-            "type P = {name: Text, age: Int 1}\n\
-             *people : [P]\n\
-             birthday = do\n  \
-               replace *people = do\n    \
-                 p <- *people\n    \
-                 yield {p | age: p.age + 1}\n  \
-               yield {}"
-        );
-        assert!(has_error(&diags, "`replace *people = ...` is unnecessary"));
-    }
-
-    #[test]
-    fn replace_referencing_source_via_alias_errors() {
-        // Aliases (`xs <- *rel`) count as referencing the source, so
-        // `replace *rel = union xs new` is also unnecessary.
-        let diags = check_src(
-            "type P = {name: Text, age: Int 1}\n\
-             *people : [P]\n\
-             insert = \\name age -> do\n  \
-               ps <- *people\n  \
-               replace *people = union ps [{name name age age}]\n  \
-               yield {}"
-        );
-        assert!(has_error(&diags, "`replace *people = ...` is unnecessary"));
-    }
-
-    #[test]
-    fn replace_with_literal_ok() {
-        // The canonical `replace` use case: replacing with a literal that
-        // doesn't reference the source.
-        let diags = check_src(
-            "type P = {name: Text, age: Int 1}\n\
-             *people : [P]\n\
-             main = do\n  \
-               replace *people = [{name: \"Alice\", age: 30}]\n  \
-               yield {}"
-        );
-        assert!(diags.is_empty(), "expected no diagnostics, got: {:?}", diags);
-    }
-
-    #[test]
-    fn set_type_mismatch() {
-        let diags = check_src(
-            "*nums : [Int 1]\nmain = replace *nums = [\"a\", \"b\"]"
-        );
-        assert!(has_error(&diags, "type mismatch"));
-    }
-
-    #[test]
-    fn union_builtin() {
-        assert!(check_src(
-            "main = union [1, 2] [3, 4]"
-        ).is_empty());
-    }
-
-    #[test]
-    fn count_builtin() {
-        assert!(check_src("main = count [1, 2, 3]").is_empty());
-    }
-
-    #[test]
-    fn min_builtin_int() {
-        // minOn : (a -> b) -> [a] -> b ; numeric projection
-        assert!(check_src(
-            "type T = {x: Int 1}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (minOn (\\t -> t.x) ts)"
-        ).is_empty());
-    }
-
-    #[test]
-    fn max_builtin_text() {
-        // maxOn works with Text projections (lexicographic ordering)
-        assert!(check_src(
-            "type T = {name: Text}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (maxOn (\\t -> t.name) ts)"
-        ).is_empty());
-    }
-
-    #[test]
-    fn count_where_builtin() {
-        assert!(check_src(
-            "type T = {x: Int 1}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (countWhere (\\t -> t.x > 5) ts)"
-        ).is_empty());
-    }
-
-    #[test]
-    fn count_where_rejects_non_bool() {
-        // countWhere predicate must return Bool
-        let diags = check_src(
-            "type T = {x: Int 1}\n*ts : [T]\nmain = do\n  ts <- *ts\n  yield (countWhere (\\t -> t.x) ts)"
-        );
-        assert!(has_error(&diags, "type mismatch"));
-    }
-
-
-    #[test]
-    fn multiple_trait_bounds_one_missing() {
-        // One of multiple bounds is unsatisfied
-        let diags = check_src(
-            "trait Display a where\n\
-             \x20 display : a -> Text\n\
-             trait Eq_ a where\n\
-             \x20 eq : a -> a -> Bool\n\
-             impl Display Int where\n\
-             \x20 display n = show n\n\
-             showAndCompare : Display a => Eq_ a => a -> a -> Text\n\
-             showAndCompare = \\x y -> display x\n\
-             main = showAndCompare 1 2"
-        );
-        // Eq_ Int is missing
-        assert!(has_error(&diags, "no implementation of trait 'Eq_' for type 'Int'"));
-    }
-
-
-    // ── Row-polymorphic variants ─────────────────────────────────
-
-    #[test]
-    fn closed_variant_unifies_with_matching_adt() {
-        let diags = check_src(
-            "data Shape = Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}\n\
-             f : <Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}> -> Float 1\n\
-             f = \\s -> 1.0\n\
-             main = f (Circle {radius: 3.0})",
-        );
-        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
-    }
-
-    #[test]
-    fn open_variant_accepts_adt_with_extra_constructors() {
-        let diags = check_src(
-            "data Shape = Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}\n\
-             f : <Circle {radius: Float 1} | r> -> Float 1\n\
-             f = \\s -> 1.0\n\
-             main = f (Circle {radius: 3.0})",
-        );
-        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
-    }
-
-    #[test]
-    fn variant_missing_constructor_error() {
-        let diags = check_src(
-            "data Color = Red {} | Blue {}\n\
-             f : <Red {} | Blue {} | Green {}> -> Int 1\n\
-             f = \\c -> 1\n\
-             main = f (Red {})",
-        );
-        assert!(has_error(&diags, "variant constructors don't match"));
-    }
-
-    #[test]
-    fn open_variant_polymorphic_function() {
-        let diags = check_src(
-            "data Status = Open {} | Closed {} | InProgress {assignee: Text}\n\
-             isOpen : <Open {} | r> -> Int 1\n\
-             isOpen = \\s -> 1\n\
-             main = isOpen (Open {})",
-        );
-        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
-    }
-
-    #[test]
-    fn case_pattern_infers_open_variant() {
-        // Matching one constructor with wildcard should accept any ADT
-        // that has that constructor — row-polymorphic variant inference.
-        let diags = check_src(
-            "data Status = Open {} | Closed {}\n\
-             data TaskStatus = Open {} | Done {}\n\
-             f = \\s -> case s of\n\
-             \x20 Open {} -> 1\n\
-             \x20 _ -> 0\n\
-             main = f (Open {})",
-        );
-        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
-    }
-
-    #[test]
-    fn case_all_constructors_closes_variant() {
-        // Matching all constructors without wildcard should close the
-        // variant and the exhaustiveness check should pass.
-        let diags = check_src(
-            "data Shape = Circle {r: Float 1} | Rect {w: Float 1, h: Float 1}\n\
-             area = \\s -> case s of\n\
-             \x20 Circle {r} -> r\n\
-             \x20 Rect {w, h} -> w * h\n\
-             main = area (Circle {r: 3.0})",
-        );
-        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
-    }
-
-    #[test]
-    fn open_variant_requires_wildcard() {
-        // Partial match without wildcard on an open variant.
-        let diags = check_src(
-            "data Color = Red {} | Green {} | Blue {}\n\
-             f = \\c -> case c of\n\
-             \x20 Red {} -> 1\n\
-             \x20 Green {} -> 2\n\
-             main = f (Red {})",
-        );
-        assert!(has_error(&diags, "non-exhaustive"));
-        assert!(has_error(&diags, "Blue"));
-    }
-
-    #[test]
-    fn do_bind_pattern_infers_open_variant() {
-        // Constructor pattern in do-bind should work with open variants.
-        let diags = check_src(
-            "data Status = Open {} | Closed {} | InProgress {assignee: Text}\n\
-             *items : [{name: Text, status: Status}]\n\
-             &openItems = do\n\
-             \x20 i <- *items\n\
-             \x20 Open {} <- i.status\n\
-             \x20 yield {name: i.name}\n\
-             main = &openItems",
-        );
-        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
-    }
-
-    #[test]
-    fn open_variant_applied_to_multiple_adts() {
-        // A function with an inferred open variant type should accept
-        // values from different ADTs that share the matched constructor.
-        let diags = check_src(
-            "data AB = A {} | B {}\n\
-             data AC = A {} | C {}\n\
-             hasA = \\x -> case x of\n\
-             \x20 A {} -> 1\n\
-             \x20 _ -> 0\n\
-             main = hasA (A {})",
-        );
-        assert!(diags.is_empty(), "unexpected errors: {:?}", diags);
-    }
-
-    #[test]
-    fn overloaded_ctor_expr_unifies_with_either_nominal_adt() {
-        // A constructor name shared by two ADTs, used as an expression against
-        // a *nominal* ADT parameter, must type-check regardless of declaration
-        // order (previously last-write-wins picked `Signal` and rejected this).
-        let prog = |first: &str| {
-            format!(
-                "{first}\n\
-                 classify : Color -> Text\n\
-                 classify = \\s -> case s of\n\
-                 \x20 Red {{}} -> \"stop\"\n\
-                 \x20 _ -> \"other\"\n\
-                 main = classify (Red {{}})",
-            )
-        };
-        // Color declared first…
-        let a = check_src(&prog(
-            "data Color = Red {} | Green {} | Blue {}\ndata Signal = Red {} | Green {}",
-        ));
-        assert!(a.is_empty(), "Color-first unexpected errors: {:?}", a);
-        // …and Color declared last — both orders must work.
-        let b = check_src(&prog(
-            "data Signal = Red {} | Green {}\ndata Color = Red {} | Green {} | Blue {}",
-        ));
-        assert!(b.is_empty(), "Color-last unexpected errors: {:?}", b);
-    }
-
-    // ── Units of measure ─────────────────────────────────────────
-    // Units live on types, not values. Literals are annotated via
-    // `(expr : Float M)` type ascriptions, not `42.0 M` suffixes.
-
-    #[test]
-    fn unit_literal_typechecks() {
-        assert!(check_src("main = (42.0 : Float M)").is_empty());
-    }
-
-    #[test]
-    fn unit_addition_same_unit() {
-        assert!(check_src("main = (10.0 : Float M) + (5.0 : Float M)").is_empty());
-    }
-
-    #[test]
-    fn unit_addition_mismatch() {
-        let diags = check_src("main = (10.0 : Float M) + (5.0 : Float S)");
-        assert!(has_error(&diags, "unit mismatch"));
-    }
-
-    #[test]
-    fn unit_multiplication_composes() {
-        // M * M should not error (produces M^2)
-        assert!(check_src("main = (10.0 : Float M) * (5.0 : Float M)").is_empty());
-    }
-
-    #[test]
-    fn unit_division_composes() {
-        // M / S should not error (produces M/S)
-        assert!(check_src("main = (100.0 : Float M) / (10.0 : Float S)").is_empty());
-    }
-
-    #[test]
-    fn unit_dimensionless_scalar_mul() {
-        // Float * Float M should produce Float M
-        assert!(check_src("main = 2.0 * (5.0 : Float M)").is_empty());
-    }
-
-    #[test]
-    fn unit_in_type_annotation() {
-        assert!(check_src("f : Float M -> Float M\nf = \\x -> x").is_empty());
-    }
-
-    #[test]
-    fn unit_derived_alias() {
-        assert!(check_src("main = (10.0 : Float Mps)").is_empty());
-    }
-
-    #[test]
-    fn unit_int_literal() {
-        assert!(check_src("main = (999 : Int Usd)").is_empty());
-    }
-
-    #[test]
-    fn unit_int_addition_mismatch() {
-        let diags = check_src("main = (100 : Int Usd) + (50 : Int Eur)");
-        assert!(has_error(&diags, "unit mismatch"));
-    }
-
-    #[test]
-    fn unit_in_record() {
-        assert!(check_src(
-            "main = {distance (100.0 : Float M) time (10.0 : Float S)}\n"
-        ).is_empty());
-    }
-
-    #[test]
-    fn unit_expr_annotation() {
-        // (expr : Type) syntax
-        let diags = check_src("main = (42.0 : Float M)");
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn unit_avg_preserves_unit() {
-        // avg should preserve the unit from the projection function
-        let diags = check_src(
-            "\
-             main = avg (\\p -> p.x) [{x: (1.0 : Float M)}, {x: (2.0 : Float M)}] + (1.0 : Float M)"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn unit_avg_mismatch() {
-        // avg result has unit from projection — adding mismatched unit should fail
-        let diags = check_src(
-            "\
-             main = avg (\\p -> p.x) [{x (1.0 : Float M)}] + (1.0 : Float S)"
-        );
-        assert!(!diags.is_empty(), "should reject adding Float M avg result to Float S");
-    }
-
-    #[test]
-    fn unit_negation_preserves() {
-        // Unary negation should preserve units
-        let diags = check_src(
-            "main = -((5.0 : Float M)) + (3.0 : Float M)"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn unit_annotation_on_function_concrete() {
-        // Function with concrete unit annotation (identity-style)
-        let diags = check_src(
-            "\
-             wrap : Float M -> Float M\n\
-             wrap = \\x -> x\n\
-             main = wrap (5.0 : Float M)"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn unit_annotation_concrete_rejects_wrong_unit() {
-        // Calling a concrete-annotated function with wrong unit should fail
-        let diags = check_src(
-            "\
-             wrap : Float M -> Float M\n\
-             wrap = \\x -> x\n\
-             main = wrap (5.0 : Float S)"
-        );
-        assert!(!diags.is_empty(), "should reject Float S for Float M param");
-    }
-
-    #[test]
-    fn unit_annotation_on_function_polymorphic() {
-        // Function with polymorphic unit variable should type-check
-        let diags = check_src(
-            "\
-             double : Float u -> Float u\n\
-             double = \\x -> x + x\n\
-             main = double (5.0 : Float M)"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn unit_annotation_polymorphic_mismatch() {
-        // Polymorphic unit annotation should reject unit mismatches
-        let diags = check_src(
-            "\
-             double : Float u -> Float u\n\
-             double = \\x -> x + x\n\
-             main = double (5.0 : Float M) + (1.0 : Float S)"
-        );
-        assert!(!diags.is_empty(), "should reject Float M + Float S");
-    }
-
-    #[test]
-    fn unit_annotation_polymorphic_reuse() {
-        // Polymorphic unit function can be called with different units at different sites
-        let diags = check_src(
-            "\
-             double : Float u -> Float u\n\
-             double = \\x -> x + x\n\
-             main = do\n  \
-               let a = double (5.0 : Float M)\n  \
-               let b = double (3.0 : Float S)\n  \
-               yield {}"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn type_info_renders_polymorphic_unit_vars_cleanly() {
-        // Inferred type signatures exposed to the LSP must render polymorphic
-        // unit variables as `u`, `u1`, ... — not as raw `?u104` substitutions.
-        let info = type_info_for("len = \\s -> length s");
-        let s = info.get("len").expect("len type should be inferred");
-        assert!(
-            !s.contains("?u"),
-            "type info should not leak raw unit vars: got {:?}",
-            s
-        );
-        assert_eq!(s, "Text -> Int u", "got {:?}", s);
-    }
-
-    // ── Refined types ─────────────────────────────────────────────
-
-    #[test]
-    fn refined_type_alias_definition() {
-        // Defining a refined type should not produce errors
-        let diags = check_src("type Nat = Int 1 where \\x -> x >= 0\nmain = 42");
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn refined_type_subsumption() {
-        // Forgetting a refinement is sound: a `Nat` value flows where an
-        // `Int` is required (the `\x -> x` body returns its `Nat` param as the
-        // declared `Int` result). The `Nat` is obtained soundly via `refine`.
-        let diags = check_src(
-            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value n} -> f n\n  Err {error _} -> 0"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn refined_type_introduction_requires_refine() {
-        // Introducing a refinement implicitly at a function boundary — passing
-        // a raw `Int` where a refined `Nat` is required — is rejected: no
-        // runtime check runs there, so a negative could masquerade as a `Nat`.
-        // `refine` is the only sound introduction form at such a boundary.
-        let diags = check_src(
-            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = f 42"
-        );
-        assert!(
-            has_error(&diags, "use `refine`"),
-            "expected refine-required error, got: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn refined_write_still_allows_base_value() {
-        // Conversely, writing a raw base value into a refined source field is
-        // allowed at type-check time — the write is validated at runtime — so
-        // it must NOT trip the refined-introduction check.
-        let diags = check_src(
-            "type Nat = Int 1 where \\x -> x >= 0\n*ages : [{age: Nat}]\nmain = replace *ages = [{age: 30}]"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn refined_type_in_record() {
-        // Inline refined type in a record should parse and type-check
-        let diags = check_src(
-            "type Person = {name: Text, age: Int 1 where \\x -> x >= 0}\nmain = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn refine_expr_with_case() {
-        // refine should return Result RefinementError T, usable with case
-        let diags = check_src(
-            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = case refine 42 of\n  Ok {value n} -> f n\n  Err {error _} -> 0"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn refine_expr_in_result_do_block() {
-        // refine in a do-block should use Result monad (bind short-circuits on Err)
-        let diags = check_src(
-            "type Nat = Int 1 where \\x -> x >= 0\nf : Nat -> Int 1\nf = \\x -> x\nmain = do\n  n <- refine 42\n  yield (f n)"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn refined_type_stacking() {
-        // Stacked refinements: Age = Nat where <= 150, Nat = Int where >= 0.
-        // Forgetting still walks the whole chain to the base, so an `Age`
-        // value (obtained soundly via `refine`) flows where `Int` is required.
-        let diags = check_src(
-            "type Nat = Int 1 where \\x -> x >= 0\ntype Age = Nat where \\x -> x <= 150\nf : Age -> Int 1\nf = \\x -> x\nmain = case refine 25 of\n  Ok {value a} -> f a\n  Err {error _} -> 0"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn refined_type_with_units() {
-        // Refinement and units are orthogonal
-        let diags = check_src(
-            "type PosFloat = Float 1 where \\x -> x > 0.0\nmain = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn refine_target_must_be_refined_type() {
-        // refine with a non-refined target should error
-        let diags = check_src(
-            "main = case refine 42 of\n  Ok {value: n} -> n\n  Err {error: _} -> 0"
-        );
-        assert!(has_error(&diags, "cannot infer refined type target"));
-    }
-
-    #[test]
-    fn refined_cross_field() {
-        // Cross-field refinement on a record type
-        let diags = check_src(
-            "type Range = {lo: Int 1, hi: Int 1} where \\r -> r.lo <= r.hi\nmain = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-
-    #[test]
-    fn unit_randomint_preserves_unit() {
-        // randomInt should preserve the unit from the bound argument
-        let diags = check_src(
-            "\
-             f : IO {random} Int Usd\n\
-             f = randomInt (100 : Int Usd)\n\
-             main = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn unit_randomint_mismatch() {
-        // randomInt result has unit from bound — annotating with wrong unit should fail
-        let diags = check_src(
-            "\
-             f : IO {random} Int Eur\n\
-             f = randomInt (100 : Int Usd)\n\
-             main = 1"
-        );
-        assert!(has_error(&diags, "unit mismatch"));
-    }
-
-    #[test]
-    fn unit_count_accepts_unit_context() {
-        // count result can unify with a unit context
-        let diags = check_src(
-            "\
-             main = count [1, 2, 3] + (0 : Int N)"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn unit_length_accepts_unit_context() {
-        // length result can unify with a unit context
-        let diags = check_src(
-            "\
-             main = length \"hello\" + (0 : Int N)"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn unit_sleep_accepts_ms() {
-        // sleep accepts Int Ms (built-in unit)
-        let diags = check_src(
-            "main = sleep (1000 : Int Ms)"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn unit_sleep_rejects_wrong_unit() {
-        // sleep requires Ms — passing a different unit should fail
-        let diags = check_src(
-            "\
-             main = sleep (1000 : Int Kg)"
-        );
-        assert!(has_error(&diags, "unit mismatch"));
-    }
-
-    #[test]
-    fn unit_now_returns_ms() {
-        // now returns IO {clock} Int Ms
-        let diags = check_src(
-            "f : IO {clock} Int Ms\n\
-             f = now\n\
-             main = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn unit_now_rejects_wrong_unit() {
-        // now returns Int Ms — annotating with wrong unit should fail
-        let diags = check_src(
-            "\
-             f : IO {clock} Int Kg\n\
-             f = now\n\
-             main = 1"
-        );
-        assert!(has_error(&diags, "unit mismatch"));
-    }
-
-    #[test]
-    fn strip_with_unit_int_round_trip() {
-        let diags = check_src(
-            "\
-             toS : Int Ms -> Int S\n\
-             toS = \\ms -> withUnit (stripUnit ms / 1000)\n\
-             main = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn strip_unit_float() {
-        let diags = check_src(
-            "\
-             f : Float M -> Float 1\n\
-             f = \\x -> stripFloatUnit x\n\
-             main = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn with_unit_float() {
-        let diags = check_src(
-            "\
-             f : Float 1 -> Float M\n\
-             f = \\x -> withFloatUnit x\n\
-             main = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn strip_unit_rejects_float_arg() {
-        // stripUnit is Int-only — passing a Float should fail
-        let diags = check_src(
-            "\
-             f = stripUnit (1.0 : Float M)\n\
-             main = 1"
-        );
-        assert!(!diags.is_empty());
-    }
-
-    // ── Units trait: strip / dress ───────────────────────────────────────
-
-    #[test]
-    fn units_strip_int() {
-        let diags = check_src(
-            "\
-             f : Int M -> Int 1\n\
-             f = \\x -> strip x\n\
-             main = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn units_dress_int() {
-        let diags = check_src(
-            "\
-             f : Int 1 -> Int M\n\
-             f = \\x -> dress x\n\
-             main = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn units_strip_float() {
-        let diags = check_src(
-            "\
-             f : Float (M / S) -> Float 1\n\
-             f = \\x -> strip x\n\
-             main = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn units_dress_float_compound() {
-        let diags = check_src(
-            "\
-             f : Float 1 -> Float (M / S^2)\n\
-             f = \\x -> dress x\n\
-             main = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn units_strip_dress_conversion_round_trip() {
-        // The motivating conversion: Ms -> S via strip / arithmetic / dress.
-        let diags = check_src(
-            "\
-             toS : Int Ms -> Int S\n\
-             toS = \\ms -> dress (strip ms / 1000)\n\
-             main = 1"
-        );
-        assert!(diags.is_empty(), "errors: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn units_dress_rejects_non_dimensionless_arg() {
-        // dress expects a dimensionless value; an M-tagged one is `1 vs M`.
-        let diags = check_src(
-            "\
-             f = dress (5 : Int M)\n\
-             main = 1"
-        );
-        assert!(!diags.is_empty());
-    }
-
-    #[test]
-    fn units_strip_rejects_text() {
-        // Only Int and Float implement Units.
-        let diags = check_src(
-            "\
-             f = strip \"hi\"\n\
-             main = 1"
-        );
-        assert!(!diags.is_empty());
-    }
-
-    #[test]
-    fn units_strip_rejects_bool() {
-        let diags = check_src(
-            "\
-             f = strip True\n\
-             main = 1"
-        );
-        assert!(!diags.is_empty());
-    }
-
-    #[test]
-    fn units_strip_rejects_list() {
-        // `u` in `strip : a u -> a 1` has kind `Unit` — a list's element type
-        // is not a unit, so the application must not typecheck.
-        let diags = check_src(
-            "\
-             f = strip [1, 2]\n\
-             main = 1"
-        );
-        assert!(!diags.is_empty());
-    }
-
-    #[test]
-    fn alias_preserved_in_record_type_hint() {
-        // type Person = {...} should appear as "Person" in the inferred
-        // type of any function that mentions it, not as the expanded form.
-        let info = type_info_for(
-            "type Person = {name: Text, age: Int 1}\n\
-             greet : Person -> Text\n\
-             greet = \\p -> p.name\n\
-             main = 1"
-        );
-        let ty = info.get("greet").expect("missing greet type");
-        assert!(
-            ty.contains("Person") && !ty.contains("name: Text"),
-            "expected alias preserved, got {}",
-            ty
-        );
-    }
-
-    #[test]
-    fn alias_preserved_in_text_synonym() {
-        let info = type_info_for(
-            "type UserId = Text\n\
-             format : UserId -> Text\n\
-             format = \\u -> u\n\
-             main = 1"
-        );
-        let ty = info.get("format").expect("missing format type");
-        assert!(
-            ty.contains("UserId"),
-            "expected UserId in type, got {}",
-            ty
-        );
-    }
-
-    #[test]
-    fn alias_record_field_access_works() {
-        // Field access through an alias must still type-check — the
-        // structural inspection has to peel the alias to find the field.
-        let diags = check_src(
-            "type Person = {name: Text, age: Int 1}\n\
-             greet : Person -> Text\n\
-             greet = \\p -> p.name\n\
-             main = greet {name: \"Alice\", age: 30}"
-        );
-        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
-    }
-
-    #[test]
-    fn alias_relation_bind_typechecks() {
-        // *people : [Person]; reading from it must still typecheck.
-        let diags = check_src(
-            "type Person = {name: Text, age: Int 1}\n\
-             *people : [Person]\n\
-             main = do\n  \
-               replace *people = [{name: \"A\", age: 1}]\n  \
-               p <- *people\n  \
-               yield p.name"
-        );
-        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
-    }
-
-    #[test]
-    fn alias_for_function_type() {
-        // type Handler = Int -> Text; calling a Handler must work.
-        let diags = check_src(
-            "type Handler = Int 1 -> Text\n\
-             apply : Handler -> Int 1 -> Text\n\
-             apply = \\h x -> h x\n\
-             main = apply (\\n -> show n) 42"
-        );
-        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
-    }
-
-    #[test]
-    fn alias_subsumes_base_type() {
-        // Bidirectional compatibility: alias and base should interoperate.
-        let diags = check_src(
-            "type UserId = Text\n\
-             toText : UserId -> Text\n\
-             toText = \\u -> u\n\
-             main = toText \"hello\""
-        );
-        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
-    }
-
-    #[test]
-    fn alias_unary_negation() {
-        // Negation on an aliased numeric type must work — the unary op
-        // path inspects the resolved type structurally.
-        let diags = check_src(
-            "type Cents = Int 1\n\
-             flip : Cents -> Cents\n\
-             flip = \\x -> -x\n\
-             main = flip 100"
-        );
-        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
-    }
-
-    #[test]
-    fn alias_case_on_data_type() {
-        // Pattern matching on an aliased data type must pass exhaustiveness.
-        let diags = check_src(
-            "data Color = Red {} | Green {} | Blue {}\n\
-             type Hue = Color\n\
-             name : Hue -> Text\n\
-             name = \\h -> case h of\n  Red {} -> \"red\"\n  Green {} -> \"green\"\n  Blue {} -> \"blue\"\n\
-             main = name (Red {})"
-        );
-        assert!(diags.is_empty(), "diagnostics: {:?}", diags);
-    }
-
-    #[test]
-    fn alias_case_non_exhaustive_detected() {
-        // Exhaustiveness must still flag missing constructors when the
-        // scrutinee is an alias of a data type — the check has to peel.
-        let diags = check_src(
-            "data Color = Red {} | Green {} | Blue {}\n\
-             type Hue = Color\n\
-             name : Hue -> Text\n\
-             name = \\h -> case h of\n  Red {} -> \"red\"\n  Green {} -> \"green\"\n\
-             main = name (Red {})"
-        );
-        assert!(
-            has_error(&diags, "non-exhaustive"),
-            "expected non-exhaustive error, got: {:?}",
-            diags
-        );
-    }
-
-    // ── serve / listen effect propagation ──────────────────────────
-    //
-    // `serve` returns `Server Api _` (effect-row tail rendered as `_` when
-    // polymorphic, `{effects}` when concrete). Internally Server carries an
-    // effect-row arg shared across every handler. `listen : Int u -> Server a
-    // r -> IO {network | r} {}` then unifies its row variable with the
-    // server's row, so every handler effect surfaces in the type of the
-    // program that calls `listen`.
-
-    #[test]
-    fn serve_propagates_console_effect() {
-        // A handler that calls `println` makes the surrounding program's
-        // type `IO {network, console} {}` rather than `IO {network} {}`.
-        let info = type_info_for(
-            "route Api where\n  GET / -> Text = Hello\n\
-             api = serve Api where\n  Hello = \\{} -> do\n    println \"hi\"\n    yield Ok {value: \"hello\"}\n\
-             main = listen 8080 api"
-        );
-        let main_ty = info.get("main").expect("missing main type");
-        assert!(
-            main_ty.contains("network") && main_ty.contains("console"),
-            "expected main to expose {{network, console}}, got: {}",
-            main_ty
-        );
-    }
-
-    #[test]
-    fn serve_pure_handler_keeps_listen_pure() {
-        // No external IO and no relation access in any handler — `main`
-        // should expose only `network` (from listen itself).
-        let info = type_info_for(
-            "route Api where\n  GET / -> Text = Hello\n\
-             api = serve Api where\n  Hello = \\{} -> Ok {value: \"hi\"}\n\
-             main = listen 8080 api"
-        );
-        let main_ty = info.get("main").expect("missing main type");
-        assert!(
-            main_ty.contains("network"),
-            "expected network in main, got: {}",
-            main_ty
-        );
-        assert!(
-            !main_ty.contains("console") && !main_ty.contains("fs"),
-            "expected no extra effects in pure-handler main, got: {}",
-            main_ty
-        );
-    }
-
-    #[test]
-    fn serve_handlers_with_different_effects_unify() {
-        // Regression: when handlers have *different* concrete effect sets
-        // (one calls println, another writes to a relation, a third reads
-        // a different relation), every handler must still type-check. A
-        // single shared row variable would close on the first handler and
-        // reject the rest with "IO effects don't match".
-        let src = "*log : [{msg: Text}]\n\
-             *items : [{name: Text}]\n\
-             route Api where\n  GET /a -> Text = HandlerA\n  POST /b -> Text = HandlerB\n  GET /c -> Text = HandlerC\n\
-             api = serve Api where\n\
-             \x20 HandlerA = \\{} -> do\n    println \"a\"\n    yield Ok {value \"a\"}\n\
-             \x20 HandlerB = \\{} -> do\n    replace *log = [{msg \"b\"}]\n    yield Ok {value \"b\"}\n\
-             \x20 HandlerC = \\{} -> do\n    items <- *items\n    yield Ok {value \"c\"}\n\
-             main = listen 8080 api";
-        let diags = check_src(src);
-        assert!(diags.is_empty(), "expected clean check, got: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-        let info = type_info_for(src);
-        let main_ty = info.get("main").expect("missing main type");
-        // The union of all three handlers' effects shows up in main.
-        assert!(
-            main_ty.contains("console") && main_ty.contains("network")
-                && (main_ty.contains("w *log") || main_ty.contains("rw *log"))
-                && main_ty.contains("r *items"),
-            "expected union of effects in main, got: {}", main_ty
-        );
-    }
-
-    #[test]
-    fn serve_propagates_relation_writes() {
-        // A handler that writes to a relation surfaces `w *foo` through
-        // listen's effect row.
-        let info = type_info_for(
-            "*counter : [{value: Int 1}]\n\
-             route Api where\n  POST / -> {value: Int 1} = Bump\n\
-             api = serve Api where\n  Bump = \\{} -> do\n    *counter = [{value 1}]\n    yield Ok {value {value 1}}\n\
-             main = listen 8080 api"
-        );
-        let main_ty = info.get("main").expect("missing main type");
-        assert!(
-            main_ty.contains("w *counter") || main_ty.contains("rw *counter"),
-            "expected write effect on counter to propagate, got: {}",
-            main_ty
-        );
-    }
-
-    fn effect_diags(src: &str) -> Vec<Diagnostic> {
-        let mut module = parse(src);
-        crate::desugar::desugar(&mut module);
-        crate::effects::check(&module)
-    }
-
-    #[test]
-    fn listen_rejects_pure_annotation_when_handler_uses_io() {
-        // A handler that does `println` produces a console effect; an
-        // explicit `IO {network} {}` annotation on main must be flagged
-        // because it omits console. The effect checker (parallel to type
-        // inference) is responsible for validating annotations.
-        let diags = effect_diags(
-            "route Api where\n  GET / -> Text = Hello\n\
-             api = serve Api where\n  Hello = \\{} -> do\n    println \"hi\"\n    yield Ok {value: \"hello\"}\n\
-             main : IO {network} {}\n\
-             main = listen 8080 api"
-        );
-        assert!(
-            diags.iter().any(|d| d.message.contains("inferred effects exceed declared")),
-            "expected an effect mismatch diagnostic, got: {:?}",
-            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
-        );
-    }
-
-}

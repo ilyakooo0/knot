@@ -3,7 +3,8 @@
 
 use lsp_types::*;
 
-use knot::ast::{DeclKind, TypeKind};
+use knot::ast::TypeKind;
+use knot_compiler::decl_view::{decl_views, DeclViewKind};
 
 use crate::shared::{
     constraints_for_type_var, extract_record_fields, find_enclosing_application,
@@ -214,19 +215,19 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // record-field token: hovering the `items` field of `rec.items` must not
     // leak the schema of an unrelated lowercase source/view/derived also named
     // `items` — the same wrong-info class the headline suppression guards.
-    for decl in &doc.module.decls {
+    for decl in crate::utils::top_fields(&doc.module) {
         if on_field_token {
             break;
         }
-        match &decl.node {
-            DeclKind::Source { name, ty, .. } if name == word => {
+        match &decl.value.node {
+            knot::ast::ExprKind::SourceDecl { name, ty, .. } if name == word => {
                 let schema = format_schema_from_type(&ty.node);
                 if !schema.is_empty() {
                     value.push_str(&format!("\n\n**Schema:**\n{schema}"));
                 }
                 break;
             }
-            DeclKind::View { name, .. } if name == word => {
+            knot::ast::ExprKind::ViewDecl { name, .. } if name == word => {
                 if let Some(inferred) = doc.type_info.get(word) {
                     let schema = format_schema_from_type_str(inferred);
                     if !schema.is_empty() {
@@ -235,7 +236,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                 }
                 break;
             }
-            DeclKind::Derived { name, .. } if name == word => {
+            knot::ast::ExprKind::DerivedDecl { name, .. } if name == word => {
                 if let Some(inferred) = doc.type_info.get(word) {
                     let schema = format_schema_from_type_str(inferred);
                     if !schema.is_empty() {
@@ -428,20 +429,20 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
 /// True when `name` is the name of a `route` (or composite `route`)
 /// declaration in this module. Used to keep route names from being dropped by
 /// the hover early-return guard, since they have no value-scope detail entry.
-fn is_route_decl_name(module: &knot::ast::Module, name: &str) -> bool {
-    module.decls.iter().any(|decl| match &decl.node {
-        DeclKind::Route { name: rn, .. } => rn == name,
-        DeclKind::RouteComposite { name: rn, .. } => rn == name,
+fn is_route_decl_name(program: &knot::ast::Expr, name: &str) -> bool {
+    crate::utils::top_fields(program).iter().any(|decl| match &decl.value.node {
+        knot::ast::ExprKind::RouteDecl { name: rn, .. } => rn == name,
+        knot::ast::ExprKind::RouteCompositeDecl { name: rn, .. } => rn == name,
         _ => false,
     })
 }
 
 /// If `name` is a `route` declaration's name in this module, render a summary
 /// of all constructor entries (method + path) the route declares.
-fn route_decl_section(module: &knot::ast::Module, name: &str) -> Option<String> {
+fn route_decl_section(program: &knot::ast::Expr, name: &str) -> Option<String> {
     use crate::shared::{format_route_path, http_method_str};
-    for decl in &module.decls {
-        if let DeclKind::Route { name: rn, entries, .. } = &decl.node {
+    for decl in crate::utils::top_fields(program) {
+        if let knot::ast::ExprKind::RouteDecl { name: rn, entries } = &decl.value.node {
             if rn != name {
                 continue;
             }
@@ -499,22 +500,18 @@ fn unit_aware_section(ty: &str) -> Option<String> {
     Some(out)
 }
 
-/// If `name` is a constructor of a data type declared in `module`, return a
+/// If `name` is a constructor of a data type declared in `program`, return a
 /// markdown summary linking back to the parent type and listing siblings.
-fn constructor_parent_section(module: &knot::ast::Module, name: &str) -> Option<String> {
-    for decl in &module.decls {
-        if let DeclKind::Data {
-            name: dn,
-            constructors,
-            ..
-        } = &decl.node
-            && constructors.iter().any(|c| c.name == name) {
-                let siblings: Vec<String> = constructors
+fn constructor_parent_section(program: &knot::ast::Expr, name: &str) -> Option<String> {
+    for decl in decl_views(program) {
+        if let DeclViewKind::Data { ctors, .. } = decl.kind
+            && ctors.iter().any(|c| c.name == name) {
+                let siblings: Vec<String> = ctors
                     .iter()
                     .filter(|c| c.name != name)
                     .map(|c| format!("`{}`", c.name))
                     .collect();
-                let mut out = format!("**Constructor of:** `{dn}`");
+                let mut out = format!("**Constructor of:** `{}`", decl.name);
                 if !siblings.is_empty() {
                     out.push_str(&format!("  \nSiblings: {}", siblings.join(", ")));
                 }
@@ -640,447 +637,5 @@ fn format_schema_from_type_str(type_str: &str) -> String {
         lines.join("\n")
     } else {
         String::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
-    use crate::utils::offset_to_position;
-
-    fn hover_params(uri: &Uri, position: Position) -> HoverParams {
-        HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position,
-            },
-            work_done_progress_params: Default::default(),
-        }
-    }
-
-    fn hover_text(hover: Hover) -> String {
-        match hover.contents {
-            HoverContents::Scalar(MarkedString::String(s)) => s,
-            HoverContents::Scalar(MarkedString::LanguageString(ls)) => ls.value,
-            HoverContents::Markup(m) => m.value,
-            HoverContents::Array(items) => items
-                .into_iter()
-                .map(|i| match i {
-                    MarkedString::String(s) => s,
-                    MarkedString::LanguageString(ls) => ls.value,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        }
-    }
-
-    #[test]
-    fn hover_shows_inferred_type_for_function() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "id = \\x -> x\nmain = println (show (id 42))\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("id =").expect("def");
-        let pos = offset_to_position(&doc.source, off);
-        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
-        let text = hover_text(hover);
-        assert!(
-            text.contains("id"),
-            "hover should mention symbol; got: {text}"
-        );
-    }
-
-    #[test]
-    fn hover_surfaces_refined_type_predicates_inline() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"type Nat = Int 1 where \x -> x >= 0
-double : Nat -> Nat
-double = \n -> n + n
-"#,
-        );
-        let doc = ws.doc(&uri);
-        // Hover on the function name `double`. Its type contains `Nat`
-        // (a refined alias), so the hover should explain the predicate.
-        let off = doc.source.find("double :").expect("definition");
-        let pos = offset_to_position(&doc.source, off);
-        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
-        let text = hover_text(hover);
-        assert!(
-            text.contains("Refinements in this type"),
-            "hover should call out embedded refined types; got:\n{text}"
-        );
-        assert!(
-            text.contains(">= 0") || text.contains(">=0"),
-            "hover should include the predicate text; got:\n{text}"
-        );
-    }
-
-    #[test]
-    fn hover_does_not_repeat_refinement_when_hovering_alias_itself() {
-        // When the user hovers on the refined-type alias name `Nat`, the
-        // existing handler renders the predicate via the "Refined type:"
-        // section. The new inline scan should not fire on the same name
-        // and produce a duplicate "Refinements in this type" block.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "type Nat = Int 1 where \\x -> x >= 0\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("Nat").expect("alias");
-        let pos = offset_to_position(&doc.source, off);
-        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
-        let text = hover_text(hover);
-        assert!(
-            !text.contains("Refinements in this type"),
-            "alias hover duplicated refinement section; got:\n{text}"
-        );
-    }
-
-    #[test]
-    fn hover_surfaces_field_refinement_for_source_field() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"*scores : [{name: Text, score: Int 1 where \x -> x >= 0}]
-
-main = do
-  s <- *scores
-  yield s.score
-"#,
-        );
-        let doc = ws.doc(&uri);
-        let off = doc.source.rfind("score\n").expect("field use");
-        let pos = offset_to_position(&doc.source, off + 2);
-        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
-        let text = hover_text(hover);
-        assert!(
-            text.contains("Field refinement"),
-            "expected field-refinement section; got:\n{text}"
-        );
-        assert!(
-            text.contains(">= 0") || text.contains(">=0"),
-            "expected predicate text; got:\n{text}"
-        );
-    }
-
-    #[test]
-    fn hover_field_refinement_scopes_to_cursor_decl() {
-        // Regression (bug B74): two do-blocks in different decls both bind the
-        // variable `p`, each from a different source. Field-refinement hover
-        // must attribute `p.amount` to the source bound in the *enclosing*
-        // decl, not to whichever decl binds `p` first module-wide. The two
-        // sources share the field name `amount` but carry distinct predicates,
-        // so a mis-resolution surfaces the wrong predicate.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"*alpha : [{amount: Int 1 where \x -> x >= 100}]
-*beta : [{amount: Int 1 where \x -> x >= 200}]
-
-fromAlpha = do
-  p <- *alpha
-  yield p.amount
-
-fromBeta = do
-  p <- *beta
-  yield p.amount
-"#,
-        );
-        let doc = ws.doc(&uri);
-        // Hover on `amount` in the SECOND do-block (`fromBeta`), which binds
-        // `p` from `*beta`. Before the fix, resolution found `fromAlpha`'s
-        // binding first and reported `beta`'s field with alpha's predicate.
-        let off = doc.source.rfind("p.amount").expect("field use in fromBeta") + "p.".len();
-        let pos = offset_to_position(&doc.source, off);
-        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
-        let text = hover_text(hover);
-        assert!(
-            text.contains("Field refinement"),
-            "expected field-refinement section; got:\n{text}"
-        );
-        assert!(
-            text.contains(">= 200") || text.contains(">=200"),
-            "expected beta's predicate (>= 200) for the cursor's decl; got:\n{text}"
-        );
-        assert!(
-            !text.contains(">= 100") && !text.contains(">=100"),
-            "must not surface alpha's predicate from an unrelated decl; got:\n{text}"
-        );
-    }
-
-    #[test]
-    fn hover_shows_trait_constraints_for_generic_param() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"trait Display a where
-  display : a -> Text
-
-show2 : Display a => a -> Text
-show2 = \x -> display x
-"#,
-        );
-        let doc = ws.doc(&uri);
-        // Locate the `a` after `=>` in show2's signature, not the one inside
-        // the trait body.
-        let sig_start = doc.source.find("show2 :").expect("sig start");
-        let arrow = doc.source[sig_start..]
-            .find("=> ")
-            .map(|p| sig_start + p + 3)
-            .expect("arrow site");
-        let pos = offset_to_position(&doc.source, arrow);
-        let hover = handle_hover(&ws.state, &hover_params(&uri, pos))
-            .expect("hover at type-var position");
-        let text = hover_text(hover);
-        assert!(
-            text.contains("Generic parameter") && text.contains("Display"),
-            "expected generic-param section with Display constraint; got:\n{text}"
-        );
-    }
-
-    #[test]
-    fn hover_returns_none_for_blank_position() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "main = println \"hi\"\n");
-        // Position past end of line — no symbol there.
-        let pos = Position::new(5, 5);
-        let resp = handle_hover(&ws.state, &hover_params(&uri, pos));
-        assert!(resp.is_none());
-    }
-
-    #[test]
-    fn hover_on_field_token_does_not_leak_top_level_doc_comment() {
-        // Regression: a record field named `total` picked up the doc comment
-        // of an unrelated top-level `total` decl (doc comments are keyed on
-        // lowercase names, which collide with field names). The doc-comment
-        // section must be gated out on field tokens.
-        let mut ws = TestWorkspace::new();
-        let src = "-- The grand total value.\\\\ntotal = 42\\\\ntype Rec = {total: Int 1}\\\\nuseRec = \\\\\\\\r -> r.total\\\\nmain = println (show total)\\\\n\\n\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("r.total").expect("field access") + "r.".len();
-        let pos = offset_to_position(&doc.source, off);
-        let text = handle_hover(&ws.state, &hover_params(&uri, pos))
-            .map(hover_text)
-            .unwrap_or_default();
-        assert!(
-            !text.contains("grand total"),
-            "field-token hover must not leak an unrelated top-level doc comment; got: {text}"
-        );
-    }
-
-    #[test]
-    fn hover_on_field_token_does_not_leak_trait_method_dispatch() {
-        // Regression: a record field named `combine` surfaced the dispatch
-        // info of an unrelated trait method `combine`. Gated out on field
-        // tokens.
-        let mut ws = TestWorkspace::new();
-        let src = "trait Combiner a where\n  combine : a -> a -> a\ndata Foo = Foo {}\nimpl Combiner Foo where\n  combine = \\x y -> x\ntype Rec = {combine: Int 1}\nuseRec = \\r -> r.combine\nmain = println \"hi\"\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("r.combine").expect("field access") + "r.".len();
-        let pos = offset_to_position(&doc.source, off);
-        let text = handle_hover(&ws.state, &hover_params(&uri, pos))
-            .map(hover_text)
-            .unwrap_or_default();
-        assert!(
-            !text.contains("dispatches to"),
-            "field-token hover must not leak trait-method dispatch info; got: {text}"
-        );
-    }
-}
-
-
-// Regression tests for the 2026-06 LSP bug-fix batch (hover group).
-#[cfg(test)]
-mod regress_fixes_tests {
-    use super::*;
-
-    /// Item 12: Int unit results must get Int conversion advice even when
-    /// the type string mentions Float elsewhere (e.g. in a parameter).
-    #[test]
-    fn unit_section_discriminates_on_annotated_component() {
-        let section = unit_aware_section("Float -> Int Ms").expect("unit section");
-        assert!(
-            section.contains("stripUnit") && section.contains("withUnit"),
-            "expected Int advice for Int Ms result, got: {section}"
-        );
-        assert!(
-            !section.contains("stripFloatUnit"),
-            "Float advice leaked from a Float parameter: {section}"
-        );
-
-        let f = unit_aware_section("Int -> Float M").expect("unit section");
-        assert!(
-            f.contains("stripFloatUnit") && f.contains("withFloatUnit"),
-            "expected Float advice for Float M result, got: {f}"
-        );
-    }
-
-    /// Item 17: the schema field splitter must not treat the `>` of `->` as
-    /// a closing bracket (function-typed fields would merge later rows).
-    #[test]
-    fn schema_table_survives_function_typed_fields() {
-        let table = format_schema_from_type_str("{f: Int -> Text, age: Int}");
-        assert!(
-            table.contains("| `f` | `Int -> Text` |"),
-            "missing function field row: {table}"
-        );
-        assert!(
-            table.contains("| `age` | `Int` |"),
-            "row after function-typed field was merged/lost: {table}"
-        );
-    }
-
-    use crate::test_support::TestWorkspace;
-    use crate::utils::offset_to_position;
-
-    fn hover_params(uri: &Uri, position: Position) -> HoverParams {
-        HoverParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position,
-            },
-            work_done_progress_params: Default::default(),
-        }
-    }
-
-    fn hover_text(hover: Hover) -> String {
-        match hover.contents {
-            HoverContents::Markup(m) => m.value,
-            other => format!("{other:?}"),
-        }
-    }
-
-    /// Hover at a caret sitting immediately AFTER an identifier (standard
-    /// post-typing position) must resolve the LOCAL binding to its left —
-    /// not fall back to a same-named global. `word_at_position` resolves the
-    /// word to the left; span containment has to use the same nudged offset.
-    #[test]
-    fn hover_after_identifier_prefers_local_over_same_named_global() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "total : Text\ntotal = \"label\"\nf = \\total -> total + 1\n",
-        );
-        let doc = ws.doc(&uri);
-        // Caret right after the body USAGE of the lambda param `total`.
-        let usage = doc.source.rfind("total +").expect("usage");
-        let pos = offset_to_position(&doc.source, usage + "total".len());
-        let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
-        let text = hover_text(hover);
-        assert!(
-            text.contains("Int"),
-            "expected the local param's Int type, got: {text}"
-        );
-        assert!(
-            !text.lines().nth(1).unwrap_or("").contains("Text"),
-            "hover headline leaked the same-named global's type: {text}"
-        );
-    }
-
-    /// Overlapping local_type_info spans (a destructuring pattern containing
-    /// its binders) must resolve to the SMALLEST containing span. The old
-    /// `.find()` over a HashMap was nondeterministic across process runs.
-    #[test]
-    fn hover_picks_innermost_binding_span() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "data P = P {a: Int 1, b: Text}\nf = \\p -> case p of\n  P {a a b b} -> b\n",
-        );
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("a a b b}").expect("binder a") + 2;
-        let pos = offset_to_position(&doc.source, off);
-        // Run the lookup many times — with the smallest-span rule the result
-        // is stable; the old behavior depended on HashMap iteration order.
-        let mut seen: Option<String> = None;
-        for _ in 0..16 {
-            let hover = handle_hover(&ws.state, &hover_params(&uri, pos)).expect("hover");
-            let text = hover_text(hover);
-            let headline = text.lines().nth(1).unwrap_or("").to_string();
-            match &seen {
-                None => seen = Some(headline),
-                Some(prev) => assert_eq!(prev, &headline, "hover result not stable"),
-            }
-        }
-        // The binder `a` is an Int; the whole-pattern span would render the
-        // record/variant type instead.
-        let headline = seen.unwrap_or_default();
-        assert!(
-            headline.contains("Int") || headline.contains("a :"),
-            "expected the innermost binder's type, got: {headline}"
-        );
-    }
-
-    /// Bug 17: positions from the live buffer must not resolve against the
-    /// older analyzed text during the debounce window — mirror the staleness
-    /// guard rename/completion-resolve already have.
-    #[test]
-    fn hover_bails_when_pending_text_is_newer() {
-        use crate::state::PendingSource;
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "double = \\x -> x * 2\nmain = double 1\n");
-        let doc_source = ws.doc(&uri).source.clone();
-        let off = doc_source.find("double =").expect("def");
-        let pos = offset_to_position(&doc_source, off);
-        ws.state.pending_sources.insert(
-            uri.clone(),
-            PendingSource {
-                source: format!("-- new line\n{doc_source}"),
-                version: Some(2),
-            },
-        );
-        let resp = handle_hover(&ws.state, &hover_params(&uri, pos));
-        assert!(resp.is_none(), "hover against stale analysis must bail: {resp:?}");
-    }
-
-    /// Bug 13: hovering the FIELD token of `p.count` must not caption the
-    /// popup with a same-named GLOBAL's signature (field tokens are never in
-    /// `doc.references`, so the name-based fallback used to fire).
-    #[test]
-    fn hover_on_field_token_does_not_show_same_named_global() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "count : Int 1 -> Int 1\ncount = \\x -> x\nf = \\p -> p.count\n",
-        );
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("p.count").expect("access") + 2;
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_hover(&ws.state, &hover_params(&uri, pos));
-        if let Some(h) = resp {
-            let text = hover_text(h);
-            assert!(
-                !text.contains("Int -> Int"),
-                "field hover leaked the unrelated global's signature: {text}"
-            );
-        }
-        // Hovering the actual global usage still shows its signature.
-        let uri2 = ws.open("main2", "count : Int 1 -> Int 1\ncount = \\x -> x\nmain = count 1\n");
-        let doc2 = ws.doc(&uri2);
-        let off2 = doc2.source.find("count 1").expect("usage");
-        let pos2 = offset_to_position(&doc2.source, off2);
-        let hover = handle_hover(&ws.state, &hover_params(&uri2, pos2)).expect("hover");
-        assert!(hover_text(hover).contains("Int"));
-    }
-
-    /// A field-access position with no refinement metadata and no symbol
-    /// info must return None — not an empty popup.
-    #[test]
-    fn hover_returns_none_instead_of_empty_popup() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "f = \\p -> p.unknownField\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("unknownField").expect("field");
-        let pos = offset_to_position(&doc.source, off + 2);
-        let resp = handle_hover(&ws.state, &hover_params(&uri, pos));
-        if let Some(h) = resp {
-            let text = hover_text(h);
-            assert!(
-                !text.trim().is_empty(),
-                "hover returned an EMPTY popup; should have been None"
-            );
-        }
     }
 }

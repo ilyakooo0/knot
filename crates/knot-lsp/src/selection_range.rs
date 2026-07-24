@@ -2,7 +2,7 @@
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind, Module, Span};
+use knot::ast::{self, Span};
 
 use crate::state::ServerState;
 use crate::utils::{offset_to_position, position_to_offset, span_to_range};
@@ -36,21 +36,25 @@ pub(crate) fn handle_selection_range(
     Some(results)
 }
 
-fn build_selection_range(module: &Module, source: &str, offset: usize) -> SelectionRange {
+fn build_selection_range(program: &ast::Expr, source: &str, offset: usize) -> SelectionRange {
     // Collect all AST spans that contain the offset, from largest to smallest
     let mut spans = Vec::new();
 
-    for decl in &module.decls {
-        if decl.span.start <= offset && offset < decl.span.end {
-            spans.push(decl.span);
-            match &decl.node {
-                DeclKind::Fun { body: Some(body), .. }
-                | DeclKind::View { body, .. }
-                | DeclKind::Derived { body, .. } => {
+    for decl in crate::utils::top_fields(program) {
+        let dspan = decl.value.span;
+        if dspan.start <= offset && offset < dspan.end {
+            spans.push(dspan);
+            match &decl.value.node {
+                ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
                     collect_containing_spans(body, offset, &mut spans);
                 }
-                DeclKind::Fun { body: None, .. } => {}
-                _ => {}
+                ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+                | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+                | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+                _ => {
+                    // A named function field.
+                    collect_containing_spans(&decl.value, offset, &mut spans);
+                }
             }
         }
     }

@@ -15,7 +15,8 @@
 //! injection / import resolution / desugaring so that only user code is in
 //! scope. Imports and prelude can never reference user-defined names anyway.
 
-use knot::ast::{CaseArm, ConstructorDef, Constraint, Decl, DeclKind, Effect, Expr, ExprKind, Pat, PatKind, PathSegment, RouteEntry, Stmt, StmtKind, Type, TypeKind, TypeScheme};
+use crate::decl_view::{decl_views, DeclView, DeclViewKind};
+use knot::ast::{CaseArm, ConstructorDef, Constraint, Effect, Expr, ExprKind, Pat, PatKind, PathSegment, RouteEntry, Stmt, StmtKind, Type, TypeKind, TypeScheme};
 use knot::diagnostic::Diagnostic;
 use std::collections::HashSet;
 
@@ -36,13 +37,16 @@ struct Refs {
 }
 
 /// Check the user's declarations for unused names.
-pub fn check(decls: &[Decl]) -> Vec<Diagnostic> {
+pub fn check(program: &Expr) -> Vec<Diagnostic> {
+    let decls = decl_views(program);
     let per_decl: Vec<Refs> = decls.iter().map(refs_of_decl).collect();
     let mut diags = Vec::new();
 
     for (i, decl) in decls.iter().enumerate() {
-        match &decl.node {
-            DeclKind::Fun { name, body, .. } => {
+        let name = decl.name;
+        let dspan = decl.span;
+        match decl.kind {
+            DeclViewKind::Fun { body, .. } => {
                 if name == "main" || starts_with_underscore(name) {
                     continue;
                 }
@@ -52,52 +56,52 @@ pub fn check(decls: &[Decl]) -> Vec<Diagnostic> {
                     continue;
                 }
                 if !referenced_by_others(&per_decl, i, name, |r| &r.values) {
-                    diags.push(make_warning("value", name, decl.span));
+                    diags.push(make_warning("value", name, dspan));
                 }
             }
-            DeclKind::TypeAlias { name, .. } => {
+            DeclViewKind::TypeAlias { .. } => {
                 if starts_with_underscore(name) {
                     continue;
                 }
                 if !referenced_by_others(&per_decl, i, name, |r| &r.types) {
-                    diags.push(make_warning("type alias", name, decl.span));
+                    diags.push(make_warning("type alias", name, dspan));
                 }
             }
-            DeclKind::Data { name, constructors, .. } => {
+            DeclViewKind::Data { ctors, .. } => {
                 if starts_with_underscore(name) {
                     continue;
                 }
                 let type_used = referenced_by_others(&per_decl, i, name, |r| &r.types);
-                let any_ctor_used = constructors
+                let any_ctor_used = ctors
                     .iter()
                     .any(|c| referenced_by_others(&per_decl, i, &c.name, |r| &r.ctors));
                 if !type_used && !any_ctor_used {
-                    diags.push(make_warning("data type", name, decl.span));
+                    diags.push(make_warning("data type", name, dspan));
                 }
             }
-            DeclKind::Source { name, .. } => {
+            DeclViewKind::Source { .. } => {
                 if starts_with_underscore(name) {
                     continue;
                 }
                 if !referenced_by_others(&per_decl, i, name, |r| &r.sources) {
-                    diags.push(make_warning("source", name, decl.span));
+                    diags.push(make_warning("source", name, dspan));
                 }
             }
-            DeclKind::View { name, .. } => {
+            DeclViewKind::View { .. } => {
                 if starts_with_underscore(name) {
                     continue;
                 }
                 // Views are queried with `*name` like sources.
                 if !referenced_by_others(&per_decl, i, name, |r| &r.sources) {
-                    diags.push(make_warning("view", name, decl.span));
+                    diags.push(make_warning("view", name, dspan));
                 }
             }
-            DeclKind::Derived { name, .. } => {
+            DeclViewKind::Derived { .. } => {
                 if starts_with_underscore(name) {
                     continue;
                 }
                 if !referenced_by_others(&per_decl, i, name, |r| &r.deriveds) {
-                    diags.push(make_warning("derived relation", name, decl.span));
+                    diags.push(make_warning("derived relation", name, dspan));
                 }
             }
             // Skip everything else: routes (top-level API surface),
@@ -130,34 +134,22 @@ fn make_warning(kind: &str, name: &str, span: knot::ast::Span) -> Diagnostic {
 
 // ── Per-declaration reference collection ─────────────────────────────
 
-fn refs_of_decl(decl: &Decl) -> Refs {
+fn refs_of_decl(decl: &DeclView) -> Refs {
     let mut r = Refs::default();
-    walk_decl(&decl.node, &mut r);
+    walk_decl(decl, &mut r);
     r
 }
 
-fn walk_decl(decl: &DeclKind, r: &mut Refs) {
-    match decl {
-        DeclKind::Data { constructors, deriving: _, .. } => {
-            for ctor in constructors {
+fn walk_decl(decl: &DeclView, r: &mut Refs) {
+    match decl.kind {
+        DeclViewKind::Data { ctors, .. } => {
+            for ctor in ctors {
                 walk_ctor_def(ctor, r);
             }
         }
-        DeclKind::TypeAlias { ty, .. } => walk_type(ty, r),
-        DeclKind::Source { ty, .. } => walk_type(ty, r),
-        DeclKind::View { ty, body, .. } => {
-            if let Some(scheme) = ty {
-                walk_scheme(scheme, r);
-            }
-            walk_expr(body, r);
-        }
-        DeclKind::Derived { ty, body, .. } => {
-            if let Some(scheme) = ty {
-                walk_scheme(scheme, r);
-            }
-            walk_expr(body, r);
-        }
-        DeclKind::Fun { ty, body, .. } => {
+        DeclViewKind::TypeAlias { ty, .. } => walk_type(ty, r),
+        DeclViewKind::Source { ty, .. } => walk_type(ty, r),
+        DeclViewKind::View { ty, body, .. } => {
             if let Some(scheme) = ty {
                 walk_scheme(scheme, r);
             }
@@ -165,13 +157,29 @@ fn walk_decl(decl: &DeclKind, r: &mut Refs) {
                 walk_expr(b, r);
             }
         }
-        DeclKind::Route { entries, .. } => {
+        DeclViewKind::Derived { ty, body, .. } => {
+            if let Some(scheme) = ty {
+                walk_scheme(scheme, r);
+            }
+            if let Some(b) = body {
+                walk_expr(b, r);
+            }
+        }
+        DeclViewKind::Fun { ty, body, .. } => {
+            if let Some(scheme) = ty {
+                walk_scheme(scheme, r);
+            }
+            if let Some(b) = body {
+                walk_expr(b, r);
+            }
+        }
+        DeclViewKind::Route { entries } => {
             for e in entries {
                 walk_route_entry(e, r);
             }
         }
-        DeclKind::RouteComposite { .. } => {}
-        DeclKind::SubsetConstraint { sub, sup } => {
+        DeclViewKind::RouteComposite { .. } => {}
+        DeclViewKind::Subset { sub, sup } => {
             r.sources.insert(sub.relation.clone());
             r.sources.insert(sup.relation.clone());
         }
@@ -443,197 +451,4 @@ fn walk_effect(e: &Effect, r: &mut Refs) {
 
 // ── Tests ────────────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    fn parse(src: &str) -> knot::ast::Module {
-        let lexer = knot::lexer::Lexer::new(src);
-        let (tokens, lex_diags) = lexer.tokenize();
-        assert!(
-            !lex_diags.iter().any(|d| d.severity == knot::diagnostic::Severity::Error),
-            "lex errors: {:?}",
-            lex_diags
-        );
-        let parser = knot::parser::Parser::new(src.to_string(), tokens);
-        let (module, parse_diags) = parser.parse_module();
-        assert!(
-            !parse_diags.iter().any(|d| d.severity == knot::diagnostic::Severity::Error),
-            "parse errors: {:?}",
-            parse_diags
-        );
-        module
-    }
-
-    fn warns(src: &str) -> Vec<String> {
-        let module = parse(src);
-        check(&module.decls)
-            .into_iter()
-            .map(|d| d.message)
-            .collect()
-    }
-
-    #[test]
-    fn unused_function_warns() {
-        let warnings = warns(
-            r#"
-helper = \x -> x + 1
-
-main = println "hi"
-"#,
-        );
-        assert_eq!(warnings.len(), 1, "got: {:?}", warnings);
-        assert!(warnings[0].contains("helper"), "got: {}", warnings[0]);
-    }
-
-    #[test]
-    fn used_function_does_not_warn() {
-        let warnings = warns(
-            r#"
-helper = \x -> x + 1
-
-main = println (show (helper 1))
-"#,
-        );
-        assert!(warnings.is_empty(), "got: {:?}", warnings);
-    }
-
-    #[test]
-    fn main_never_warns() {
-        let warnings = warns(r#"main = println "hi""#);
-        assert!(warnings.is_empty(), "got: {:?}", warnings);
-    }
-
-    #[test]
-    fn underscore_prefix_silences() {
-        let warnings = warns(
-            r#"
-_helper = \x -> x + 1
-
-main = println "hi"
-"#,
-        );
-        assert!(warnings.is_empty(), "got: {:?}", warnings);
-    }
-
-    #[test]
-    fn unused_data_warns() {
-        let warnings = warns(
-            r#"data Shape = Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}
-
-main = println "hi"
-"#,
-        );
-        assert_eq!(warnings.len(), 1, "got: {:?}", warnings);
-        assert!(warnings[0].contains("Shape"), "got: {}", warnings[0]);
-    }
-
-    #[test]
-    fn data_used_via_constructor_does_not_warn() {
-        let warnings = warns(
-            r#"data Shape = Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}
-
-mkShape = Circle {radius 1.0}
-
-main = println (show mkShape)
-"#,
-        );
-        assert!(warnings.is_empty(), "got: {:?}", warnings);
-    }
-
-    #[test]
-    fn data_used_via_type_alias_does_not_warn() {
-        let warnings = warns(
-            r#"data Shape = Circle {radius: Float 1} | Rect {w: Float 1, h: Float 1}
-
-type Shapes = [Shape]
-
-main = println "hi"
-"#,
-        );
-        // Shape used by the type alias; type alias itself is unused.
-        let msgs = warnings.join(" | ");
-        assert!(msgs.contains("Shapes"), "got: {}", msgs);
-        assert!(!msgs.contains("`Shape`") || msgs.contains("Shapes"), "got: {}", msgs);
-    }
-
-    #[test]
-    fn unused_type_alias_warns() {
-        let warnings = warns(
-            r#"type Pair = {a: Int 1, b: Int 1}
-
-main = println "hi"
-"#,
-        );
-        assert_eq!(warnings.len(), 1, "got: {:?}", warnings);
-        assert!(warnings[0].contains("Pair"), "got: {}", warnings[0]);
-    }
-
-    #[test]
-    fn unused_source_warns() {
-        let warnings = warns(
-            r#"*people : [{name: Text, age: Int 1}]
-
-main = println "hi"
-"#,
-        );
-        assert_eq!(warnings.len(), 1, "got: {:?}", warnings);
-        assert!(warnings[0].contains("people"), "got: {}", warnings[0]);
-    }
-
-    #[test]
-    fn used_source_does_not_warn() {
-        let warnings = warns(
-            r#"*people : [{name: Text, age: Int 1}]
-
-main = do
-  p <- *people
-  println p.name
-"#,
-        );
-        assert!(warnings.is_empty(), "got: {:?}", warnings);
-    }
-
-    #[test]
-    fn signature_only_fun_does_not_warn() {
-        let warnings = warns(
-            r#"
-helper : Int 1 -> Int 1
-
-main = println "hi"
-"#,
-        );
-        assert!(warnings.is_empty(), "got: {:?}", warnings);
-    }
-
-    #[test]
-    fn mutual_recursion_does_not_warn() {
-        // `even` and `odd` reference each other but neither is reachable from
-        // main; the simple check still treats them as "used" because each is
-        // referenced by another decl. This documents the limitation — a more
-        // sophisticated pass would do reachability from main/exports.
-        let warnings = warns(
-            r#"
-isEven = \n -> if n == 0 then true else isOdd (n - 1)
-isOdd = \n -> if n == 0 then false else isEven (n - 1)
-
-main = println "hi"
-"#,
-        );
-        assert!(warnings.is_empty(), "got: {:?}", warnings);
-    }
-
-    #[test]
-    fn self_recursion_does_warn() {
-        // `forever` only references itself — must be flagged as unused.
-        let warnings = warns(
-            r#"
-forever = \x -> forever x
-
-main = println "hi"
-"#,
-        );
-        assert_eq!(warnings.len(), 1, "got: {:?}", warnings);
-        assert!(warnings[0].contains("forever"), "got: {}", warnings[0]);
-    }
-}

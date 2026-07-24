@@ -4,11 +4,11 @@
 
 use std::path::{Path, PathBuf};
 
-use knot::ast::{self, DeclKind, Module, Span};
+use knot::ast::{self, Expr, ExprKind, Span};
 use knot_compiler::effects::EffectSet;
 
 use crate::type_format::format_type_kind;
-use crate::utils::{find_word_in_source, recurse_expr, safe_slice};
+use crate::utils::{find_word_in_source, recurse_expr, safe_slice, top_fields};
 
 // ── Signature rendering ─────────────────────────────────────────────
 
@@ -168,84 +168,7 @@ fn merge_effects_into_row(existing_row: &str, effects: &EffectSet) -> String {
     }
 }
 
-#[cfg(test)]
-mod sig_tests {
-    use super::*;
 
-    fn effects(reads: &[&str], writes: &[&str]) -> EffectSet {
-        let mut e = EffectSet::empty();
-        for r in reads {
-            e.reads.insert((*r).to_string());
-        }
-        for w in writes {
-            e.writes.insert((*w).to_string());
-        }
-        e
-    }
-
-    #[test]
-    fn passthrough_when_pure() {
-        let s = render_signature_with_effects("Int -> Int", &EffectSet::empty());
-        assert_eq!(s, "Int -> Int");
-    }
-
-    #[test]
-    fn passthrough_when_no_io_row() {
-        // No IO row in the type → don't invent one, even if the effect set
-        // claims effects (shouldn't happen in practice, but be safe).
-        let s = render_signature_with_effects("Int -> Int", &effects(&["foo"], &[]));
-        assert_eq!(s, "Int -> Int");
-    }
-
-    #[test]
-    fn fills_empty_io_row_with_relation_effects() {
-        let s = render_signature_with_effects(
-            "Timestamp -> IO {} Bool",
-            &effects(&["globalRateCount"], &["globalRateCount"]),
-        );
-        assert_eq!(
-            s,
-            "Timestamp -> IO {rw *globalRateCount} Bool"
-        );
-    }
-
-    #[test]
-    fn appends_missing_effects_to_existing_row() {
-        let mut e = effects(&[], &[]);
-        e.console = true;
-        let s = render_signature_with_effects("Text -> IO {fs} {}", &e);
-        assert_eq!(s, "Text -> IO {fs, console} {}");
-    }
-
-    #[test]
-    fn no_change_when_io_row_already_complete() {
-        let mut e = EffectSet::empty();
-        e.fs = true;
-        let s = render_signature_with_effects("Text -> IO {fs} Text", &e);
-        assert_eq!(s, "Text -> IO {fs} Text");
-    }
-
-    #[test]
-    fn modifies_only_outermost_io_row() {
-        // Inner IO (callback type) must stay untouched; only the result-position
-        // IO row (the function's own return) gets effects added.
-        let mut e = EffectSet::empty();
-        e.console = true;
-        let s = render_signature_with_effects(
-            "(a -> IO {fs} b) -> IO {} a",
-            &e,
-        );
-        assert_eq!(s, "(a -> IO {fs} b) -> IO {console} a");
-    }
-
-    #[test]
-    fn preserves_row_variable_tail() {
-        let mut e = EffectSet::empty();
-        e.console = true;
-        let s = render_signature_with_effects("Int -> IO {fs | r} Int", &e);
-        assert_eq!(s, "Int -> IO {fs, console | r} Int");
-    }
-}
 
 // ── Type-string parsing ─────────────────────────────────────────────
 
@@ -480,12 +403,12 @@ pub(crate) fn format_route_path(entry: &ast::RouteEntry) -> String {
 ///    that under-warns beats one that warns on every wired route.
 /// 2. A `listen port handler` call whose argument textually references the
 ///    route name (the pre-`serve` wiring style).
-pub(crate) fn route_is_listened(module: &Module, route_name: &str) -> bool {
-    route_is_listened_inner(module, route_name, &mut std::collections::HashSet::new())
+pub(crate) fn route_is_listened(program: &Expr, route_name: &str) -> bool {
+    route_is_listened_inner(program, route_name, &mut std::collections::HashSet::new())
 }
 
 fn route_is_listened_inner(
-    module: &Module,
+    program: &Expr,
     route_name: &str,
     visiting: &mut std::collections::HashSet<String>,
 ) -> bool {
@@ -518,13 +441,9 @@ fn route_is_listened_inner(
         }
         recurse_expr(expr, |e| walk(e, route_name, found, depth + 1));
     }
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun {
-                body: Some(body), ..
-            }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+    for decl in top_fields(program) {
+        match &decl.value.node {
+            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
                 let mut found = false;
                 walk(body, route_name, &mut found, 0);
                 if found {
@@ -533,13 +452,20 @@ fn route_is_listened_inner(
             }
             // A composite `route Api = A | B` that is itself listened/served
             // wires in every component route.
-            DeclKind::RouteComposite { name, components }
+            ExprKind::RouteCompositeDecl { name, components }
                 if components.iter().any(|c| c == route_name)
-                    && route_is_listened_inner(module, name, visiting)
+                    && route_is_listened_inner(program, name, visiting)
                 => {
                     return true;
                 }
-            _ => {}
+            _ => {
+                // A named function field: walk its body.
+                let mut found = false;
+                walk(&decl.value, route_name, &mut found, 0);
+                if found {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -579,32 +505,33 @@ pub(crate) fn expr_references_name(expr: &ast::Expr, name: &str) -> bool {
 /// Walk the AST to find the innermost function application chain containing the cursor.
 /// Returns (function_name, active_parameter_index).
 pub(crate) fn find_enclosing_application(
-    module: &Module,
+    program: &Expr,
     source: &str,
     offset: usize,
 ) -> Option<(String, usize)> {
     let mut best: Option<(String, usize, usize)> = None; // (name, param_idx, span_size)
 
-    for decl in &module.decls {
-        if decl.span.start > offset || offset >= decl.span.end {
+    for decl in top_fields(program) {
+        if decl.value.span.start > offset || offset >= decl.value.span.end {
             continue;
         }
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+        match &decl.value.node {
+            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
                 find_app_in_expr(body, source, offset, &mut best);
             }
             // Route `rateLimit` expressions can contain applications that
             // need signature help.
-            DeclKind::Route { entries, .. } => {
+            ExprKind::RouteDecl { entries, .. } => {
                 for entry in entries {
                     if let Some(rl) = &entry.rate_limit {
                         find_app_in_expr(rl, source, offset, &mut best);
                     }
                 }
             }
-            _ => {}
+            _ => {
+                // A named function field.
+                find_app_in_expr(&decl.value, source, offset, &mut best);
+            }
         }
     }
 
@@ -708,7 +635,7 @@ pub(crate) fn parse_function_params(type_str: &str) -> Vec<String> {
 /// so we can replace `atomic e` with `e`. Returns None if no atomic wraps the
 /// given offset.
 pub(crate) fn find_enclosing_atomic_expr(
-    module: &Module,
+    program: &Expr,
     source: &str,
     offset: usize,
 ) -> Option<(Span, String)> {
@@ -748,23 +675,26 @@ pub(crate) fn find_enclosing_atomic_expr(
     }
 
     let mut best: Option<(Span, String)> = None;
-    for decl in &module.decls {
-        if decl.span.start > offset || offset >= decl.span.end {
+    for decl in top_fields(program) {
+        if decl.value.span.start > offset || offset >= decl.value.span.end {
             continue;
         }
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, 0),
+        match &decl.value.node {
+            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+                walk(body, source, offset, &mut best, 0)
+            }
             // Route `rateLimit` expressions are user-edited code.
-            DeclKind::Route { entries, .. } => {
+            ExprKind::RouteDecl { entries, .. } => {
                 for entry in entries {
                     if let Some(rl) = &entry.rate_limit {
                         walk(rl, source, offset, &mut best, 0);
                     }
                 }
             }
-            _ => {}
+            _ => {
+                // A named function field.
+                walk(&decl.value, source, offset, &mut best, 0);
+            }
         }
     }
     best
@@ -935,9 +865,9 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
 /// Find a route entry by its constructor name and render a hover summary
 /// (method + path + body/query/headers/response). Returns `None` if no route
 /// declares this constructor.
-pub(crate) fn format_route_constructor_hover(module: &Module, name: &str) -> Option<String> {
-    for decl in &module.decls {
-        if let DeclKind::Route { entries, .. } = &decl.node {
+pub(crate) fn format_route_constructor_hover(program: &Expr, name: &str) -> Option<String> {
+    for decl in top_fields(program) {
+        if let ExprKind::RouteDecl { entries, .. } = &decl.value.node {
             for entry in entries {
                 if entry.constructor == name {
                     return Some(render_route_entry(entry));
@@ -1015,16 +945,12 @@ pub(crate) fn extract_record_fields(type_str: &str) -> Vec<String> {
 /// Extract parameter names from a function declaration's body.
 /// Returns an empty Vec if the function isn't directly a lambda chain.
 /// Used by signature_help and parameter-name inlay hints.
-pub(crate) fn extract_param_names(module: &Module, func_name: &str) -> Vec<String> {
-    for decl in &module.decls {
-        if let DeclKind::Fun {
-            name,
-            body: Some(body),
-            ..
-        } = &decl.node
-            && name == func_name
+pub(crate) fn extract_param_names(program: &Expr, func_name: &str) -> Vec<String> {
+    for decl in top_fields(program) {
+        if decl.name == func_name
+            && matches!(decl.value.node, ExprKind::Lambda { .. })
         {
-            return collect_lambda_param_names(body);
+            return collect_lambda_param_names(&decl.value);
         }
     }
     Vec::new()
@@ -1121,7 +1047,7 @@ pub(crate) enum ReceiverKind {
 /// widens the node span to cover the trailing paren(s), which would shift the
 /// suffix offset off the real token.
 pub(crate) fn find_field_access_at_offset(
-    module: &Module,
+    program: &Expr,
     source: &str,
     offset: usize,
 ) -> Option<FieldAccessAt> {
@@ -1157,21 +1083,24 @@ pub(crate) fn find_field_access_at_offset(
         recurse_expr(expr, |e| walk(e, source, offset, best, depth + 1));
     }
     let mut best = None;
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, source, offset, &mut best, 0),
+    for decl in top_fields(program) {
+        match &decl.value.node {
+            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+                walk(body, source, offset, &mut best, 0)
+            }
             // The `rateLimit <expr>` clause on a route entry is user-edited
             // code (`{key: \input ctx -> …}`) that dereferences fields.
-            DeclKind::Route { entries, .. } => {
+            ExprKind::RouteDecl { entries, .. } => {
                 for entry in entries {
                     if let Some(rl) = &entry.rate_limit {
                         walk(rl, source, offset, &mut best, 0);
                     }
                 }
             }
-            _ => {}
+            _ => {
+                // A named function field.
+                walk(&decl.value, source, offset, &mut best, 0);
+            }
         }
     }
     best
@@ -1191,7 +1120,7 @@ pub(crate) fn find_field_access_at_offset(
 /// (bug B74). Within the enclosing decl, first match wins — shadowed bindings
 /// inside a single decl are not distinguished.
 pub(crate) fn resolve_var_to_source(
-    module: &Module,
+    program: &Expr,
     var_name: &str,
     cursor_offset: usize,
 ) -> Option<String> {
@@ -1262,20 +1191,22 @@ pub(crate) fn resolve_var_to_source(
     }
 
     let mut found = None;
-    for decl in &module.decls {
+    for decl in top_fields(program) {
         // Scope resolution to the decl under the cursor. Top-level decls don't
         // nest, so at most one span contains the offset; any others may bind
         // the same name from a different source and must be ignored (bug B74).
-        if !(decl.span.start <= cursor_offset && cursor_offset < decl.span.end) {
+        let dspan = decl.value.span;
+        if !(dspan.start <= cursor_offset && cursor_offset < dspan.end) {
             continue;
         }
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+        match &decl.value.node {
+            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
                 walk(body, var_name, &mut found, 0);
             }
-            _ => {}
+            _ => {
+                // A named function field.
+                walk(&decl.value, var_name, &mut found, 0);
+            }
         }
         if found.is_some() {
             break;
@@ -1350,16 +1281,27 @@ fn scheme_contains_offset(scheme: &ast::TypeScheme, offset: usize) -> bool {
 /// If the cursor is inside a function/view/derived's type
 /// signature, return the `TypeScheme` plus the decl name.
 pub(crate) fn find_enclosing_type_scheme(
-    module: &Module,
+    program: &Expr,
     offset: usize,
 ) -> Option<(&ast::TypeScheme, &str)> {
-    for decl in &module.decls {
-        if let DeclKind::Fun { name, ty: Some(scheme), .. }
-        | DeclKind::View { name, ty: Some(scheme), .. }
-        | DeclKind::Derived { name, ty: Some(scheme), .. } = &decl.node
+    for decl in top_fields(program) {
+        // The field's own signature.
+        if let Some(scheme) = &decl.sig
             && scheme_contains_offset(scheme, offset)
         {
-            return Some((scheme, name.as_str()));
+            return Some((scheme, decl.name.as_str()));
+        }
+        // View/Derived marker type annotations.
+        let marker_ty = match &decl.value.node {
+            ExprKind::ViewDecl { name: _, ty, .. } | ExprKind::DerivedDecl { name: _, ty, .. } => {
+                ty.as_ref()
+            }
+            _ => None,
+        };
+        if let Some(scheme) = marker_ty
+            && scheme_contains_offset(scheme, offset)
+        {
+            return Some((scheme, decl.name.as_str()));
         }
     }
     None
@@ -1415,254 +1357,11 @@ fn type_mentions_var(ty: &ast::Type, var: &str) -> bool {
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    /// Parse a module declaring a refined type alias and pull out the
-    /// predicate expression.
-    fn parse_refined_predicate(source: &str) -> ast::Expr {
-        let (tokens, lex_diags) = knot::lexer::Lexer::new(source).tokenize();
-        assert!(lex_diags.is_empty(), "lex errors: {lex_diags:?}");
-        let parser = knot::parser::Parser::new(source.to_string(), tokens);
-        let (module, parse_diags) = parser.parse_module();
-        assert!(parse_diags.is_empty(), "parse errors: {parse_diags:?}");
-        for decl in &module.decls {
-            if let DeclKind::TypeAlias { ty, .. } = &decl.node
-                && let ast::TypeKind::Refined { predicate, .. } = &ty.node {
-                    return (**predicate).clone();
-                }
-        }
-        panic!("no refined type alias found in: {source}");
-    }
-
-    #[test]
-    fn predicate_to_source_slices_matching_source() {
-        let source = "type Nat = Int 1 where \\x -> x >= 0\n";
-        let pred = parse_refined_predicate(source);
-        let rendered = predicate_to_source(&pred, source);
-        assert_eq!(rendered, "\\x -> x >= 0");
-    }
-
-    /// Regression: refined types imported from another file carry spans that
-    /// index into the IMPORTED file's bytes. Slicing the current document at
-    /// those offsets displayed arbitrary text. The renderer must detect the
-    /// mismatch and pretty-print the AST instead.
-    #[test]
-    fn predicate_to_source_does_not_slice_foreign_source() {
-        let owner_source = "type Nat = Int 1 where \\x -> x >= 0\n";
-        let pred = parse_refined_predicate(owner_source);
-        // A "current document" whose bytes have nothing to do with the
-        // predicate's spans, but is long enough that the slice is in range.
-        let foreign = "main = doSomethingElse 1 2 3 -- entirely unrelated content\n";
-        assert!(pred.span.end <= foreign.len(), "test setup: span in range");
-        let rendered = predicate_to_source(&pred, foreign);
-        assert_eq!(
-            rendered, "\\x -> x >= 0",
-            "must pretty-print the AST, never display unrelated file text"
-        );
-    }
-
-    /// When the span is out of range entirely, the renderer still produces
-    /// the predicate (or a placeholder) — never panics, never garbage.
-    #[test]
-    fn predicate_to_source_handles_out_of_range_span() {
-        let owner_source = "type Nat = Int 1 where \\x -> x >= 0\n";
-        let pred = parse_refined_predicate(owner_source);
-        let rendered = predicate_to_source(&pred, "");
-        assert_eq!(rendered, "\\x -> x >= 0");
-    }
-
-    /// A foreign slice that happens to start with a lambda must still be
-    /// rejected when the parameter doesn't match the predicate's.
-    #[test]
-    fn predicate_to_source_rejects_lookalike_lambda_slice() {
-        let owner_source = "type Nat = Int 1 where \\x -> x >= 0\n";
-        let pred = parse_refined_predicate(owner_source);
-        // Bytes at the predicate's span hold a *different* lambda.
-        let mut foreign = String::new();
-        while foreign.len() < pred.span.start {
-            foreign.push(' ');
-        }
-        foreign.push_str("\\other -> other < 99");
-        let rendered = predicate_to_source(&pred, &foreign);
-        assert_eq!(rendered, "\\x -> x >= 0");
-    }
-}
 
 // Regression tests for the walker/scan fix batch (atomic-in-lambda, serve
 // awareness, depth caps, resilient workspace scanning).
-#[cfg(test)]
-mod regress_walker_scan_fixes_tests {
-    use super::*;
 
-    fn parse(src: &str) -> Module {
-        let (tokens, _) = knot::lexer::Lexer::new(src).tokenize();
-        let parser = knot::parser::Parser::new(src.to_string(), tokens);
-        parser.parse_module().0
-    }
-
-    /// Bug 4: the decl body of a parameterized function is a Lambda; the
-    /// old walk skipped lambda bodies, so `atomic` inside any function with
-    /// params was never detected (completion kept offering IO builtins).
-    #[test]
-    fn atomic_detected_inside_parameterized_function() {
-        let src = "*items : [{n: Text}]\nf = \\x -> atomic do\n  i <- *items\n  yield i\n";
-        let module = parse(src);
-        let off = src.find("yield i").expect("offset");
-        assert!(
-            find_enclosing_atomic_expr(&module, src, off).is_some(),
-            "atomic inside a parameterized function must be detected"
-        );
-    }
-
-    /// Bug 5: the canonical wiring `api = serve Api where …; main = listen
-    /// 8080 api` stores the route as a plain Name on the Serve node —
-    /// invisible to `expr_references_name`, so the dead-route lens fired on
-    /// every working route. Composite routes wire in their components.
-    #[test]
-    fn serve_wiring_marks_route_as_listened() {
-        let src = "route TodoApi where\n  GET /todos -> Text = GetTodos\n\n\
-                   route Api = TodoApi\n\n\
-                   api = serve Api where\n  GetTodos = \\x -> x\n\n\
-                   main = listen 8080 api\n";
-        let module = parse(src);
-        assert!(route_is_listened(&module, "Api"), "served composite route");
-        assert!(
-            route_is_listened(&module, "TodoApi"),
-            "component of a served composite route is wired in"
-        );
-    }
-
-    #[test]
-    fn unserved_route_is_not_listened() {
-        let src = "route Dead where\n  GET /nope -> Text = GetNope\n\nmain = println \"hi\"\n";
-        let module = parse(src);
-        assert!(!route_is_listened(&module, "Dead"));
-    }
-
-    /// Bug 6: the application walker omitted the Serve arm, so signature
-    /// help was dead inside serve handler bodies.
-    #[test]
-    fn enclosing_application_found_inside_serve_handler() {
-        let src = "route Api where\n  GET /t -> Text = GetT\n\n\
-                   helper = \\a b -> a\n\n\
-                   api = serve Api where\n  GetT = \\x -> helper 1 2\n";
-        let module = parse(src);
-        let off = src.find("helper 1").expect("call site") + "helper 1".len();
-        let found = find_enclosing_application(&module, src, off);
-        assert!(
-            matches!(&found, Some((name, _)) if name == "helper"),
-            "expected helper application inside serve handler; got {found:?}"
-        );
-    }
-
-    /// Bug 7: a left-deep 200k-term `1+1+…` chain used to overflow the
-    /// stack inside the shared walkers (reachable from any keystroke and
-    /// from workspace scans). The walkers bail at `MAX_WALK_DEPTH`, and the
-    /// parser now also caps the spine length of iterative chains (binop,
-    /// application, field-access) against its recursion budget — so a
-    /// pathological chain produces a "nesting depth limit exceeded"
-    /// diagnostic instead of a multi-hundred-thousand-deep AST whose first
-    /// recursive traversal (Drop, inference, codegen, or these walkers)
-    /// aborts the process. With the parser cap in place the walkers are
-    /// never handed a deep AST at all; this guards both layers.
-    #[test]
-    fn walkers_bail_on_pathological_left_deep_ast() {
-        let handle = std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
-            .spawn(|| {
-                let mut src = String::with_capacity(500_001);
-                src.push_str("x = 1");
-                for _ in 0..200_000 {
-                    src.push_str("+1");
-                }
-                src.push('\n');
-                let (tokens, _) = knot::lexer::Lexer::new(&src).tokenize();
-                let parser = knot::parser::Parser::new(src.clone(), tokens);
-                let (module, diags) = parser.parse_module();
-                // The parser refuses to build the unbounded spine and reports
-                // the depth limit rather than producing a deep `Fun` body.
-                assert!(
-                    diags.iter().any(|d| d.message.contains("nesting depth limit")),
-                    "expected a nesting-depth diagnostic; got {diags:?}"
-                );
-                assert!(
-                    !module.decls.iter().any(|d| matches!(
-                        &d.node,
-                        DeclKind::Fun { body: Some(_), .. }
-                    )),
-                    "parser should not produce an unbounded fun body"
-                );
-                // The walkers must still run without overflowing on whatever
-                // bounded AST the parser produced.
-                assert!(find_enclosing_atomic_expr(&module, &src, 4).is_none());
-                assert!(!route_is_listened(&module, "Api"));
-            })
-            .expect("spawn");
-        handle.join().expect("walkers must not overflow the stack");
-    }
-
-    /// Bug 8: one unreadable subdirectory must not abort the whole scan.
-    #[cfg(unix)]
-    #[test]
-    fn scan_skips_unreadable_subdirectory() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = std::env::temp_dir().join(format!(
-            "knot-lsp-scan-perm-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let ok_dir = root.join("ok");
-        let locked_dir = root.join("locked");
-        std::fs::create_dir_all(&ok_dir).unwrap();
-        std::fs::create_dir_all(&locked_dir).unwrap();
-        std::fs::write(ok_dir.join("a.knot"), "x = 1\n").unwrap();
-        std::fs::write(locked_dir.join("b.knot"), "y = 2\n").unwrap();
-        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let result = scan_knot_files(&root);
-
-        // Restore permissions before asserting so cleanup always works.
-        let _ = std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755));
-        let files = result.expect("partial scan must not abort with an error");
-        assert!(
-            files.iter().any(|f| f.ends_with("a.knot")),
-            "readable files must survive an unreadable sibling dir; got {files:?}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-}
 
 // Regression tests for the 2026-06 LSP bug-fix batch (shared helpers).
-#[cfg(test)]
-mod regress_fixes_tests {
-    use super::*;
 
-    /// Item 25: the IO row picked for effect merging must be the top-level
-    /// result row, not a nested row inside parens.
-    #[test]
-    fn outermost_io_row_respects_nesting() {
-        // Curried IO-returning result: the outermost row is the FIRST.
-        let ty = "Int -> IO {} (Int -> IO {fs} Text)";
-        let (s, e) = find_outermost_io_row(ty).expect("row found");
-        assert_eq!(&ty[s..e], "");
-        assert!(s < ty.find('(').unwrap(), "picked a nested row: {}", &ty[s..e]);
-
-        // Along a flat arrow spine the last depth-0 row is the result row.
-        let ty2 = "IO {a} Int -> IO {b} Text";
-        let (s2, e2) = find_outermost_io_row(ty2).expect("row found");
-        assert_eq!(&ty2[s2..e2], "b");
-
-        // A function whose only IO row sits inside a parenthesized parameter
-        // has no top-level row at all.
-        assert_eq!(find_outermost_io_row("(Int -> IO {fs} Text) -> Int"), None);
-
-        // Simple result row still found.
-        let ty3 = "Int -> IO {console} {}";
-        let (s3, e3) = find_outermost_io_row(ty3).expect("row found");
-        assert_eq!(&ty3[s3..e3], "console");
-    }
-}

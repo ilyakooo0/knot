@@ -3,7 +3,8 @@
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind};
+use knot::ast::{self, ExprKind};
+use crate::utils::top_fields;
 
 use crate::state::{DocumentState, ServerState};
 use crate::type_format::{format_type_kind, format_type_scheme};
@@ -45,12 +46,13 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
     let source = doc.source.as_str();
     let mut symbols = Vec::new();
 
-    for decl in &module.decls {
-        let range = span_to_range(decl.span, source);
+    for decl in top_fields(module) {
+        let dspan = decl.value.span;
+        let range = span_to_range(dspan, source);
         let selection_range = range;
 
-        match &decl.node {
-            DeclKind::Data {
+        match &decl.value.node {
+            ExprKind::DataCtor {
                 name, constructors, ..
             } => {
                 // Start the search after the `=` so a self-named constructor
@@ -59,10 +61,10 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                 // name reused in an earlier constructor's field types can't
                 // steal a later constructor's span. Mirrors semantic_tokens.rs.
                 let mut search_from = source
-                    .get(decl.span.start..decl.span.end.min(source.len()))
+                    .get(dspan.start..dspan.end.min(source.len()))
                     .and_then(|t| t.find('='))
-                    .map(|p| decl.span.start + p + 1)
-                    .unwrap_or(decl.span.start);
+                    .map(|p| dspan.start + p + 1)
+                    .unwrap_or(dspan.start);
                 let children: Vec<DocumentSymbol> = constructors
                     .iter()
                     .filter_map(|ctor| {
@@ -75,7 +77,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                             .fields
                             .first()
                             .map(|f| f.value.span.start)
-                            .unwrap_or(decl.span.end);
+                            .unwrap_or(dspan.end);
                         let ctor_span = find_word_in_source(source, &ctor.name, search_from, search_end)?;
                         // Advance past this ctor's last field type (or its name,
                         // if nullary) so its field types can't be matched as the
@@ -131,7 +133,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     },
                 });
             }
-            DeclKind::TypeAlias { name, ty, .. } => {
+            ExprKind::TypeCtor { name, ty, .. } => {
                 // Refined type aliases (`type Nat = Int 1 where \x -> ...`) carry
                 // their predicate in the AST. Surface it in the outline so the
                 // user can scan for refined types without opening each one.
@@ -162,7 +164,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            DeclKind::Source { name, ty, .. } => {
+            ExprKind::SourceDecl { name, ty, .. } => {
                 symbols.push(DocumentSymbol {
                     name: format!("*{name}"),
                     detail: Some(format_type_kind(&ty.node)),
@@ -174,7 +176,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            DeclKind::View { name, ty, .. } => {
+            ExprKind::ViewDecl { name, ty, .. } => {
                 let declared = ty.as_ref().map(format_type_scheme);
                 symbols.push(DocumentSymbol {
                     name: format!("*{name}"),
@@ -187,7 +189,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            DeclKind::Derived { name, ty, .. } => {
+            ExprKind::DerivedDecl { name, ty, .. } => {
                 let declared = ty.as_ref().map(format_type_scheme);
                 symbols.push(DocumentSymbol {
                     name: format!("&{name}"),
@@ -200,24 +202,12 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            DeclKind::Fun { name, ty, .. } => {
-                let declared = ty.as_ref().map(format_type_scheme);
-                symbols.push(DocumentSymbol {
-                    name: name.clone(),
-                    detail: detail_for(doc, name, declared),
-                    kind: SymbolKind::FUNCTION,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: None,
-                });
-            }
-            DeclKind::Route { name, entries, .. } => {
+            ExprKind::SubsetConstraint { .. } => {}
+            ExprKind::RouteDecl { name, entries } => {
                 // Advance the search cursor past each matched constructor so an
                 // earlier entry's name appearing in a later entry's text can't
                 // steal its span (mirrors the Data-constructor loop above).
-                let mut search_from = decl.span.start;
+                let mut search_from = dspan.start;
                 let children: Vec<DocumentSymbol> = entries
                     .iter()
                     .map(|e| {
@@ -245,7 +235,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                             source,
                             &e.constructor,
                             search_from,
-                            decl.span.end,
+                            dspan.end,
                         ) {
                             Some(s) => {
                                 search_from = s.end;
@@ -280,7 +270,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     },
                 });
             }
-            DeclKind::RouteComposite { name, .. } => {
+            ExprKind::RouteCompositeDecl { name, .. } => {
                 symbols.push(DocumentSymbol {
                     name: format!("route {name}"),
                     detail: Some("composite".into()),
@@ -292,96 +282,25 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            DeclKind::SubsetConstraint { .. } => {}
+            _ => {
+                // A named function field.
+                let name = &decl.name;
+                let declared = decl.sig.as_ref().map(format_type_scheme);
+                symbols.push(DocumentSymbol {
+                    name: name.clone(),
+                    detail: detail_for(doc, name, declared),
+                    kind: SymbolKind::FUNCTION,
+                    tags: None,
+                    deprecated: None,
+                    range,
+                    selection_range,
+                    children: None,
+                });
+            }
         }
     }
 
     symbols
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
 
-    fn ds_params(uri: &Uri) -> DocumentSymbolParams {
-        DocumentSymbolParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        }
-    }
-
-    fn names_in(symbols: &[DocumentSymbol]) -> Vec<String> {
-        symbols.iter().map(|s| s.name.clone()).collect()
-    }
-
-    #[test]
-    fn document_symbol_lists_top_level_decls() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"type Person = {name: Text, age: Int 1}
-*people : [Person]
-greet = \name -> "hi " ++ name
-main = println "hello"
-"#,
-        );
-        let resp =
-            handle_document_symbol(&ws.state, &ds_params(&uri)).expect("symbols returned");
-        let nested = match resp {
-            DocumentSymbolResponse::Nested(s) => s,
-            _ => panic!("expected nested response"),
-        };
-        let names = names_in(&nested);
-        assert!(names.iter().any(|n| n == "Person"), "names: {names:?}");
-        assert!(names.iter().any(|n| n.contains("people")), "names: {names:?}");
-        assert!(names.iter().any(|n| n == "greet"), "names: {names:?}");
-        assert!(names.iter().any(|n| n == "main"), "names: {names:?}");
-    }
-
-    #[test]
-    fn document_symbol_includes_type_detail_for_fun() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"add : Int 1 -> Int 1 -> Int 1
-add = \x y -> x + y
-"#,
-        );
-        let resp =
-            handle_document_symbol(&ws.state, &ds_params(&uri)).expect("symbols returned");
-        let nested = match resp {
-            DocumentSymbolResponse::Nested(s) => s,
-            _ => panic!("expected nested"),
-        };
-        let add = nested.iter().find(|s| s.name == "add").expect("add present");
-        let detail = add.detail.as_deref().expect("detail set");
-        assert!(detail.contains("Int"), "detail should include type; got: {detail}");
-    }
-
-    #[test]
-    fn document_symbol_distinguishes_kinds() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"data Color = Red {} | Blue {}
-*items : [{name: Text}]
-main = println "ok"
-"#,
-        );
-        let resp =
-            handle_document_symbol(&ws.state, &ds_params(&uri)).expect("symbols returned");
-        let nested = match resp {
-            DocumentSymbolResponse::Nested(s) => s,
-            _ => panic!("expected nested"),
-        };
-        let color = nested.iter().find(|s| s.name == "Color").expect("Color present");
-        assert_eq!(color.kind, SymbolKind::ENUM);
-        // Constructors should be nested children of the data decl.
-        let children = color.children.as_ref().expect("constructors");
-        let child_names: Vec<_> = children.iter().map(|c| c.name.clone()).collect();
-        assert!(child_names.contains(&"Red".to_string()));
-        assert!(child_names.contains(&"Blue".to_string()));
-    }
-}

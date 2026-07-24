@@ -2,7 +2,8 @@
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind};
+use knot::ast::{self, ExprKind};
+use crate::utils::top_fields;
 
 use crate::state::ServerState;
 use crate::utils::span_to_range;
@@ -16,8 +17,8 @@ pub(crate) fn handle_folding_range(
     let doc = state.documents.get(&params.text_document.uri)?;
     let mut ranges = Vec::new();
 
-    for decl in &doc.module.decls {
-        let range = span_to_range(decl.span, &doc.source);
+    for decl in top_fields(&doc.module) {
+        let range = span_to_range(decl.value.span, &doc.source);
         if range.end.line > range.start.line {
             ranges.push(FoldingRange {
                 start_line: range.start.line,
@@ -30,14 +31,17 @@ pub(crate) fn handle_folding_range(
         }
 
         // Fold sub-expressions within declarations
-        match &decl.node {
-            DeclKind::Fun { body: Some(body), .. }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => {
+        match &decl.value.node {
+            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
                 collect_folding_ranges_expr(body, &doc.source, &mut ranges);
             }
-            DeclKind::Fun { body: None, .. } => {}
-            _ => {}
+            ExprKind::SourceDecl { .. } | ExprKind::DataCtor { .. }
+            | ExprKind::TypeCtor { .. } | ExprKind::RouteDecl { .. }
+            | ExprKind::RouteCompositeDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
+            _ => {
+                // A named function field.
+                collect_folding_ranges_expr(&decl.value, &doc.source, &mut ranges);
+            }
         }
     }
 

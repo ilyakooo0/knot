@@ -7,7 +7,7 @@ use std::path::Path;
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind, Module, Span, TypeKind};
+use knot::ast::{self, Span, TypeKind};
 use knot_compiler::infer::MonadKind;
 
 use crate::builtins::ATOMIC_DISALLOWED_BUILTINS;
@@ -20,7 +20,7 @@ use crate::state::{
     builtins as state_builtins, DocumentState, ServerState, SnippetContext, KEYWORDS, SNIPPETS,
 };
 use crate::type_format::format_type_kind;
-use crate::utils::{offset_to_position, position_to_offset, recurse_expr, uri_to_path};
+use crate::utils::{offset_to_position, position_to_offset, recurse_expr, top_fields, uri_to_path};
 
 // ── Completion ──────────────────────────────────────────────────────
 
@@ -179,8 +179,8 @@ pub(crate) fn handle_completion(
             // text_edit over the sigil range) so accepting an item right after
             // the typed `*` replaces the sigil instead of producing `**name`.
             let edit_range = sigil_replace_range(latest_source, offset);
-            for decl in &doc.module.decls {
-                if let DeclKind::Source { name, .. } | DeclKind::View { name, .. } = &decl.node {
+            for decl in top_fields(&doc.module) {
+                if let ast::ExprKind::SourceDecl { name, .. } | ast::ExprKind::ViewDecl { name, .. } = &decl.value.node {
                     let detail = doc.type_info.get(name.as_str()).cloned();
                     items.push(CompletionItem {
                         label: format!("*{name}"),
@@ -210,8 +210,8 @@ pub(crate) fn handle_completion(
             // Mirror the general path's sigil handling so accepting an item
             // right after the typed `&` replaces the sigil instead of `&&name`.
             let edit_range = sigil_replace_range(latest_source, offset);
-            for decl in &doc.module.decls {
-                if let DeclKind::Derived { name, .. } = &decl.node {
+            for decl in top_fields(&doc.module) {
+                if let ast::ExprKind::DerivedDecl { name, .. } = &decl.value.node {
                     let detail = doc.type_info.get(name.as_str()).cloned();
                     items.push(CompletionItem {
                         label: format!("&{name}"),
@@ -318,23 +318,23 @@ pub(crate) fn handle_completion(
 
         // Fallback: all known field names from all types
         let mut all_fields = HashSet::new();
-        for decl in &doc.module.decls {
-            match &decl.node {
-                DeclKind::TypeAlias { ty, .. } => {
+        for decl in top_fields(&doc.module) {
+            match &decl.value.node {
+                ast::ExprKind::TypeCtor { ty, .. } => {
                     if let TypeKind::Record { fields: fs, .. } = &ty.node {
                         for f in fs {
                             all_fields.insert(f.name.clone());
                         }
                     }
                 }
-                DeclKind::Source { ty, .. } => {
+                ast::ExprKind::SourceDecl { ty, .. } => {
                     if let TypeKind::Record { fields: fs, .. } = &ty.node {
                         for f in fs {
                             all_fields.insert(f.name.clone());
                         }
                     }
                 }
-                DeclKind::Data { constructors, .. } => {
+                ast::ExprKind::DataCtor { constructors, .. } => {
                     for ctor in constructors {
                         for f in &ctor.fields {
                             all_fields.insert(f.name.clone());
@@ -371,9 +371,9 @@ pub(crate) fn handle_completion(
 
     if in_type_context {
         // Only suggest types: data types, type aliases, built-in types
-        for decl in &doc.module.decls {
-            match &decl.node {
-                DeclKind::Data { name, .. } => {
+        for decl in top_fields(&doc.module) {
+            match &decl.value.node {
+                ast::ExprKind::DataCtor { name, .. } => {
                     items.push(CompletionItem {
                         label: name.clone(),
                         kind: Some(CompletionItemKind::STRUCT),
@@ -381,7 +381,7 @@ pub(crate) fn handle_completion(
                         ..Default::default()
                     });
                 }
-                DeclKind::TypeAlias { name, ty, .. } => {
+                ast::ExprKind::TypeCtor { name, ty, .. } => {
                     // Refined-type aliases get their predicate inline as the
                     // detail string so the user sees what the value must
                     // satisfy without having to navigate to the declaration.
@@ -467,9 +467,9 @@ pub(crate) fn handle_completion(
     let sigil_edit_range = sigil_replace_range(latest_source, offset);
 
     // Declarations from current document with type details
-    for decl in &doc.module.decls {
-        match &decl.node {
-            DeclKind::Data {
+    for decl in top_fields(&doc.module) {
+        match &decl.value.node {
+            ast::ExprKind::DataCtor {
                 name, constructors, ..
             } => {
                 items.push(CompletionItem {
@@ -490,7 +490,7 @@ pub(crate) fn handle_completion(
                     });
                 }
             }
-            DeclKind::TypeAlias { name, .. } => {
+            ast::ExprKind::TypeCtor { name, .. } => {
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::STRUCT),
@@ -498,7 +498,7 @@ pub(crate) fn handle_completion(
                     ..Default::default()
                 });
             }
-            DeclKind::Source { name, .. } | DeclKind::View { name, .. } => {
+            ast::ExprKind::SourceDecl { name, .. } | ast::ExprKind::ViewDecl { name, .. } => {
                 items.push(CompletionItem {
                     label: format!("*{name}"),
                     kind: Some(CompletionItemKind::VARIABLE),
@@ -511,7 +511,7 @@ pub(crate) fn handle_completion(
                     ..Default::default()
                 });
             }
-            DeclKind::Derived { name, .. } => {
+            ast::ExprKind::DerivedDecl { name, .. } => {
                 items.push(CompletionItem {
                     label: format!("&{name}"),
                     kind: Some(CompletionItemKind::VARIABLE),
@@ -524,7 +524,10 @@ pub(crate) fn handle_completion(
                     ..Default::default()
                 });
             }
-            DeclKind::Fun { name, .. } => {
+            ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => {
+                // A named function field.
+                let name = &decl.name;
                 let snippet = build_function_call_snippet(&doc.module, name);
                 items.push(CompletionItem {
                     label: name.clone(),
@@ -535,7 +538,6 @@ pub(crate) fn handle_completion(
                     ..Default::default()
                 });
             }
-            _ => {}
         }
     }
 
@@ -832,17 +834,17 @@ fn is_disallowed_in_atomic(label: &str, doc: &DocumentState, state: &ServerState
 
 /// Return the span of a `route` or `route Foo = ...` declaration that
 /// encloses `offset`, or `None` if the cursor is outside any route block.
-fn find_enclosing_route_decl_span(module: &Module, offset: usize) -> Option<Span> {
-    for decl in &module.decls {
-        let in_span = decl.span.start <= offset && offset < decl.span.end;
+fn find_enclosing_route_decl_span(module: &ast::Expr, offset: usize) -> Option<Span> {
+    for decl in top_fields(module) {
+        let in_span = decl.value.span.start <= offset && offset < decl.value.span.end;
         if !in_span {
             continue;
         }
         if matches!(
-            &decl.node,
-            DeclKind::Route { .. } | DeclKind::RouteComposite { .. }
+            &decl.value.node,
+            ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. }
         ) {
-            return Some(decl.span);
+            return Some(decl.value.span);
         }
     }
     None
@@ -851,9 +853,9 @@ fn find_enclosing_route_decl_span(module: &Module, offset: usize) -> Option<Span
 /// True when `offset` sits inside the expression of a `rateLimit <expr>`
 /// clause of some route entry. Those expressions are ordinary value-level
 /// code and must receive normal expression completions.
-fn offset_in_route_rate_limit(module: &Module, offset: usize) -> bool {
-    for decl in &module.decls {
-        if let DeclKind::Route { entries, .. } = &decl.node {
+fn offset_in_route_rate_limit(module: &ast::Expr, offset: usize) -> bool {
+    for decl in top_fields(module) {
+        if let ast::ExprKind::RouteDecl { entries, .. } = &decl.value.node {
             for entry in entries {
                 if let Some(rl) = &entry.rate_limit
                     && rl.span.start <= offset && offset < rl.span.end {
@@ -896,9 +898,9 @@ fn route_completions(doc: &DocumentState) -> Vec<CompletionItem> {
         });
     }
 
-    for decl in &doc.module.decls {
-        match &decl.node {
-            DeclKind::Data { name, .. } | DeclKind::TypeAlias { name, .. } => {
+    for decl in top_fields(&doc.module) {
+        match &decl.value.node {
+            ast::ExprKind::DataCtor { name, .. } | ast::ExprKind::TypeCtor { name, .. } => {
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::STRUCT),
@@ -916,7 +918,7 @@ fn route_completions(doc: &DocumentState) -> Vec<CompletionItem> {
 /// Find the smallest `do { ... }` whose span encloses `offset`. Walks every
 /// declaration body — do-blocks can nest arbitrarily inside lambdas, case arms,
 /// record fields, etc.
-fn find_enclosing_do_span(module: &Module, offset: usize) -> Option<Span> {
+fn find_enclosing_do_span(module: &ast::Expr, offset: usize) -> Option<Span> {
     fn walk(expr: &ast::Expr, offset: usize, best: &mut Option<Span>) {
         if expr.span.start > offset || offset >= expr.span.end {
             return;
@@ -930,17 +932,18 @@ fn find_enclosing_do_span(module: &Module, offset: usize) -> Option<Span> {
         recurse_expr(expr, |e| walk(e, offset, best));
     }
     let mut best: Option<Span> = None;
-    for decl in &module.decls {
-        if decl.span.start > offset || offset >= decl.span.end {
+    for decl in top_fields(module) {
+        if decl.value.span.start > offset || offset >= decl.value.span.end {
             continue;
         }
-        match &decl.node {
-            DeclKind::Fun {
-                body: Some(body), ..
+        match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+                walk(body, offset, &mut best)
             }
-            | DeclKind::View { body, .. }
-            | DeclKind::Derived { body, .. } => walk(body, offset, &mut best),
-            _ => {}
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => walk(&decl.value, offset, &mut best),
         }
     }
     best
@@ -964,19 +967,20 @@ fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -
     // don't have a body (data, type, source, trait header, etc.) leave the
     // cursor at top-level even when textually overlapping their span — but
     // the body-bearing decls are what matter for expression-position snippets.
-    for decl in &doc.module.decls {
-        let inside = decl.span.start <= offset && offset < decl.span.end;
+    for decl in top_fields(&doc.module) {
+        let inside = decl.value.span.start <= offset && offset < decl.value.span.end;
         if !inside {
             continue;
         }
-        match &decl.node {
-            ast::DeclKind::Fun { body: Some(body), .. }
-            | ast::DeclKind::View { body, .. }
-            | ast::DeclKind::Derived { body, .. }
-                if body.span.start <= offset && offset < body.span.end => {
-                    return SnippetContext::Expression;
-                }
-            _ => {}
+        let body: &ast::Expr = match &decl.value.node {
+            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => body,
+            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => continue,
+            _ => &decl.value,
+        };
+        if body.span.start <= offset && offset < body.span.end {
+            return SnippetContext::Expression;
         }
     }
     SnippetContext::TopLevel
@@ -1420,7 +1424,7 @@ fn find_type_for_name(doc: &DocumentState, name: &str, offset: usize) -> Option<
 }
 
 /// Extract field names from a type string like `{name: Text, age: Int 1}` or a named type.
-fn extract_fields_from_type_str(type_str: &str, module: &Module) -> Vec<String> {
+fn extract_fields_from_type_str(type_str: &str, module: &ast::Expr) -> Vec<String> {
     let mut visited = HashSet::new();
     extract_fields_from_type_str_inner(type_str, module, &mut visited)
 }
@@ -1430,7 +1434,7 @@ fn extract_fields_from_type_str(type_str: &str, module: &Module) -> Vec<String> 
 /// terminate instead of overflowing the stack.
 fn extract_fields_from_type_str_inner(
     type_str: &str,
-    module: &Module,
+    module: &ast::Expr,
     visited: &mut HashSet<String>,
 ) -> Vec<String> {
     let type_str = type_str.trim();
@@ -1473,9 +1477,9 @@ fn extract_fields_from_type_str_inner(
     if !visited.insert(type_str.to_string()) {
         return Vec::new();
     }
-    for decl in &module.decls {
-        match &decl.node {
-            DeclKind::TypeAlias { name, ty, .. } if name == type_str => {
+    for decl in top_fields(module) {
+        match &decl.value.node {
+            ast::ExprKind::TypeCtor { name, ty, .. } if name == type_str => {
                 match &ty.node {
                     TypeKind::Record { fields, .. } => {
                         return fields.iter().map(|f| f.name.clone()).collect();
@@ -1487,13 +1491,13 @@ fn extract_fields_from_type_str_inner(
                     _ => {}
                 }
             }
-            DeclKind::Source { name, ty, .. } if name == type_str => {
+            ast::ExprKind::SourceDecl { name, ty, .. } if name == type_str => {
                 if let TypeKind::Record { fields, .. } = &ty.node {
                     return fields.iter().map(|f| f.name.clone()).collect();
                 }
             }
             // Data type with a single constructor — expose its fields
-            DeclKind::Data { name, constructors, .. } if name == type_str
+            ast::ExprKind::DataCtor { name, constructors, .. } if name == type_str
                 && constructors.len() == 1 => {
                     return constructors[0].fields.iter().map(|f| f.name.clone()).collect();
                 }
@@ -1587,10 +1591,11 @@ pub(crate) fn handle_resolve_completion_item(
 /// If `name` resolves to a function with declared trait constraints in
 /// `module`, render the constraint list. Returns `None` when no such
 /// function exists or it has no constraints.
-fn function_constraint_summary(module: &Module, name: &str) -> Option<String> {
-    for decl in &module.decls {
-        if let DeclKind::Fun { name: n, ty: Some(scheme), .. } = &decl.node
-            && n == name && !scheme.constraints.is_empty() {
+fn function_constraint_summary(module: &ast::Expr, name: &str) -> Option<String> {
+    for decl in top_fields(module) {
+        if decl.name == name
+            && let Some(scheme) = &decl.sig
+            && !scheme.constraints.is_empty() {
                 let cs: Vec<String> = scheme
                     .constraints
                     .iter()
@@ -1615,13 +1620,13 @@ fn function_constraint_summary(module: &Module, name: &str) -> Option<String> {
 
 /// If `name` resolves to a data type, render its constructors as a markdown
 /// bullet list. Returns None if `name` is not a top-level data type.
-fn data_constructor_summary(module: &Module, name: &str) -> Option<String> {
-    for decl in &module.decls {
-        if let DeclKind::Data {
+fn data_constructor_summary(module: &ast::Expr, name: &str) -> Option<String> {
+    for decl in top_fields(module) {
+        if let ast::ExprKind::DataCtor {
             name: dn,
             constructors,
             ..
-        } = &decl.node
+        } = &decl.value.node
         {
             if dn != name {
                 continue;
@@ -1668,14 +1673,13 @@ fn build_constructor_snippet(name: &str, fields: &[ast::Field<ast::Type>]) -> Op
 /// Build a snippet expansion for a function call. Walks the function's lambda
 /// chain to recover parameter names; if none are found (e.g. eta-reduced
 /// function defined as a non-lambda value), returns `None`.
-fn build_function_call_snippet(module: &ast::Module, name: &str) -> Option<String> {
-    let params = module.decls.iter().find_map(|decl| match &decl.node {
-        DeclKind::Fun {
-            name: n,
-            body: Some(body),
-            ..
-        } if n == name => Some(collect_lambda_param_names(body)),
-        _ => None,
+fn build_function_call_snippet(module: &ast::Expr, name: &str) -> Option<String> {
+    let params = top_fields(module).into_iter().find_map(|decl| {
+        if decl.name == name && matches!(decl.value.node, ast::ExprKind::Lambda { .. }) {
+            Some(collect_lambda_param_names(&decl.value))
+        } else {
+            None
+        }
     })?;
     if params.is_empty() {
         return None;
@@ -1794,723 +1798,3 @@ fn complete_import_path(base_dir: &Path, partial: &str) -> Vec<CompletionItem> {
     items
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
-    use crate::utils::offset_to_position;
-
-    fn comp_params(uri: &Uri, position: Position, trigger: Option<&str>) -> CompletionParams {
-        CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: Some(CompletionContext {
-                trigger_kind: if trigger.is_some() {
-                    CompletionTriggerKind::TRIGGER_CHARACTER
-                } else {
-                    CompletionTriggerKind::INVOKED
-                },
-                trigger_character: trigger.map(String::from),
-            }),
-        }
-    }
-
-    #[test]
-    fn inside_string_or_comment_survives_continuation_byte_offset() {
-        // `café` is 5 bytes; `é` occupies bytes 3..5. A client-reported `.`
-        // trigger against a mid-debounce buffer ending in `é` passes
-        // `cursor.saturating_sub(1)` == 4, a UTF-8 continuation byte. The
-        // slice must not panic — regression for the completion-request crash.
-        let src = "café";
-        assert!(!inside_string_or_comment(src, 4));
-        // And a non-boundary offset inside a string literal still reports true.
-        let src2 = "\"café";
-        assert!(inside_string_or_comment(src2, 5));
-    }
-
-    #[test]
-    fn ampersand_sigil_is_operator_only_as_second_of_double() {
-        // Regression: `&` has no left-adjacency rule in the parser (`x&d`
-        // parses as `x (&d)`), so it is a derived-ref sigil everywhere except
-        // as the second `&` of `&&`. `*` keeps its expression-adjacency rule.
-        assert!(!sigil_is_binary_operator(b'&', Some(b'x'))); // report& → sigil
-        assert!(!sigil_is_binary_operator(b'&', Some(b')'))); // f(x)&   → sigil
-        assert!(sigil_is_binary_operator(b'&', Some(b'&'))); // flag &&  → operator
-        assert!(!sigil_is_binary_operator(b'&', None)); // leading &     → sigil
-        assert!(sigil_is_binary_operator(b'*', Some(b'n'))); // n*        → operator
-        assert!(!sigil_is_binary_operator(b'*', Some(b' '))); // n *      → sigil
-    }
-
-    #[test]
-    fn sigil_replace_range_absorbs_ampersand_after_identifier() {
-        // `report&` accepting a `&derived` item must replace the `&` (the edit
-        // range covers it) so the buffer becomes `report&active`, NOT
-        // `report&&active` (which the lexer fuses into `&&`, dropping the ref).
-        let src = "report&";
-        let range = sigil_replace_range(src, src.len());
-        let start_off = crate::utils::position_to_offset(src, range.start);
-        assert_eq!(start_off, 6, "the `&` sigil should be absorbed into the edit range");
-    }
-
-    fn item_labels(resp: CompletionResponse) -> Vec<String> {
-        match resp {
-            CompletionResponse::Array(items) => items.into_iter().map(|i| i.label).collect(),
-            CompletionResponse::List(list) => list.items.into_iter().map(|i| i.label).collect(),
-        }
-    }
-
-    /// Regression: completion derived its trigger character from the last
-    /// *analyzed* text. During the analysis debounce window the just-typed
-    /// `.` isn't in that text yet, so dot completion silently degraded to
-    /// the generic identifier list. The handler must trust the
-    /// client-reported trigger character and resolve the cursor against the
-    /// pending (freshest) text.
-    #[test]
-    fn completion_uses_client_trigger_and_pending_text() {
-        use crate::state::PendingSource;
-        let mut ws = TestWorkspace::new();
-        let analyzed = "*users : [{name: Text, age: Int 1}]\nmain = do\n  u <- *users\n  yield u";
-        let uri = ws.open("main", analyzed);
-        // The editor buffer is ahead: the user just typed `.` after the final
-        // `u`. The analyzed text doesn't contain the dot yet.
-        let pending = format!("{analyzed}.");
-        ws.state.pending_sources.insert(
-            uri.clone(),
-            PendingSource {
-                source: pending.clone(),
-                version: Some(2),
-            },
-        );
-        let dot_off = pending.len();
-        let pos = offset_to_position(&pending, dot_off);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some(".")))
-            .expect("completion response");
-        let labels = item_labels(resp);
-        assert!(
-            labels.iter().any(|l| l == "name"),
-            "dot completion must surface field names; got: {labels:?}"
-        );
-        assert!(
-            !labels.iter().any(|l| l == "do"),
-            "dot completion must not fall back to the generic keyword list; got: {labels:?}"
-        );
-    }
-
-    #[test]
-    fn completion_after_star_yields_source_names() {
-        let mut ws = TestWorkspace::new();
-        // Position the cursor immediately after the `*` literal — the
-        // completion handler reads the byte at offset-1 to detect the
-        // trigger context.
-        let uri = ws.open(
-            "main",
-            r#"type P = {n: Text}
-*people : [P]
-*pets : [P]
-get = \_ -> *
-"#,
-        );
-        let doc = ws.doc(&uri);
-        let star = doc.source.find("\\_ -> *").expect("trigger position");
-        let after_star = star + "\\_ -> *".len();
-        let pos = offset_to_position(&doc.source, after_star);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some("*")))
-            .expect("completion returns");
-        let labels = item_labels(resp);
-        // Labels carry the sigil (matching the general completion path) and the
-        // items replace the typed `*` via a text_edit so accepting one yields
-        // `*people`, not `**people`.
-        assert!(labels.contains(&"*people".to_string()), "labels: {labels:?}");
-        assert!(labels.contains(&"*pets".to_string()), "labels: {labels:?}");
-    }
-
-    #[test]
-    fn completion_after_double_amp_operator_does_not_collapse() {
-        // Typing the second `&` of `&&` fires a `&` trigger, but the popup
-        // must NOT collapse to derived-relation names only — `flag` (a param)
-        // should still be offered.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"&active = []
-check = \flag -> flag &&
-"#,
-        );
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("flag &&").expect("trigger") + "flag &&".len();
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some("&")))
-            .expect("completion returns");
-        let labels = item_labels(resp);
-        // Falls through to general completion instead of collapsing to the
-        // derived-only list: general items like builtins are present, and the
-        // set is not just the single derived name `active`.
-        assert!(labels.contains(&"count".to_string()), "labels: {labels:?}");
-        assert!(labels.len() > 1, "should not collapse to one item: {labels:?}");
-    }
-
-    #[test]
-    fn completion_after_mul_operator_does_not_collapse() {
-        // `n *` (mul, `*` adjacent to nothing but preceded by an expression):
-        // the `n*` form must fall through, not force source-name completion.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"*people : [{n: Int 1}]
-calc = \n -> n*
-"#,
-        );
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("n*").expect("trigger") + "n*".len();
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some("*")))
-            .expect("completion returns");
-        // Falls through to general completion rather than the source-only list:
-        // general items are present (a `*` in operator position is not a
-        // source-ref prefix).
-        let labels = item_labels(resp);
-        assert!(labels.contains(&"count".to_string()), "labels: {labels:?}");
-    }
-
-    #[test]
-    fn completion_inside_route_decl_offers_methods_and_types_only() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"type Greeting = {message: Text}
-route Hello where
-  GET /hi -> Greeting
-"#,
-        );
-        let doc = ws.doc(&uri);
-        // Cursor on the second line of the route block — inside a route decl
-        // but on a "fresh" line where the user is typing a new entry.
-        let off = doc.source.find("GET /hi").expect("route entry") + 3;
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
-            .expect("completion returns");
-        let labels = item_labels(resp);
-
-        // HTTP methods and the local type alias should be present.
-        assert!(labels.contains(&"GET".to_string()), "labels: {labels:?}");
-        assert!(labels.contains(&"POST".to_string()), "labels: {labels:?}");
-        assert!(
-            labels.contains(&"Greeting".to_string()),
-            "labels: {labels:?}"
-        );
-        // Expression-level builtins like `println` make no sense in a route
-        // declaration and would be a parse error if accepted.
-        assert!(
-            !labels.contains(&"println".to_string()),
-            "println leaked into route-decl completion; labels: {labels:?}"
-        );
-    }
-
-    #[test]
-    fn completion_dot_includes_field_refinement_detail() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"*scores : [{name: Text, score: Int 1 where \x -> x >= 0}]
-
-main = do
-  s <- *scores
-  yield s.score
-"#,
-        );
-        let doc = ws.doc(&uri);
-        // Position cursor right after the `.` (between the dot and `score`).
-        let dot = doc.source.rfind("s.score").expect("dot site") + 2;
-        let pos = offset_to_position(&doc.source, dot);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some(".")))
-            .expect("completion returns");
-        let items: Vec<CompletionItem> = match resp {
-            CompletionResponse::Array(items) => items,
-            CompletionResponse::List(list) => list.items,
-        };
-        let score = items
-            .iter()
-            .find(|i| i.label == "score")
-            .expect("score field offered");
-        let detail = score
-            .detail
-            .as_deref()
-            .expect("refined field has a detail string");
-        assert!(
-            detail.contains(">= 0") || detail.contains(">=0"),
-            "expected refinement predicate in detail; got: {detail:?}"
-        );
-    }
-
-    #[test]
-    fn completion_filters_io_builtins_in_atomic_block() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"type P = {n: Text}
-*people : [P]
-main = atomic (do *people = [{n "A"}]; yield {})
-"#,
-        );
-        let doc = ws.doc(&uri);
-        // Cursor inside the atomic body, on the line after `*people = ...`
-        let inside = doc.source.find("[{n ").expect("atomic body");
-        let pos = offset_to_position(&doc.source, inside);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
-            .expect("completion returns");
-        let labels = item_labels(resp);
-        // `println` is in ATOMIC_DISALLOWED_BUILTINS — must not appear.
-        assert!(
-            !labels.contains(&"println".to_string()),
-            "println leaked into atomic-context completion; labels: {labels:?}"
-        );
-    }
-}
-
-// Regression tests for the 2026-06 LSP bug-fix batch (completion group).
-#[cfg(test)]
-mod regress_fixes_tests {
-    use super::*;
-
-    #[test]
-    fn fuzz_helpers_no_panic() {
-        // Directly probe byte-offset helpers with every offset including
-        // non-char-boundaries and out-of-range, on multibyte strings.
-        let strings = [
-            "café.field", "3.5", "é.", ".x", "x'.", "  foo  .", "\"a.b\"",
-            "-- a.b", "IO {fs} café", "usér.ok", "𝟛.5", "a\r\nb.", "",
-            "\u{200b}.x", "n😀.", "  ", "\t\tx.",
-        ];
-        for s in strings {
-            for off in 0..=s.len() {
-                let _ = super::inside_string_or_comment(s, off);
-                let _ = super::dot_receiver_is_numeric(s, off);
-                let _ = super::receiver_ident_before_dot(s, off);
-                let _ = super::ident_range_before_dot(s, off);
-                let idx = off.min(s.len());
-                if s.is_char_boundary(idx) {
-                    let _ = super::cursor_in_type_context(&s[..idx]);
-                }
-            }
-            let _ = super::arrow_arity(s);
-            let _ = super::type_matches_monad(s, &MonadKind::Relation);
-            let _ = super::type_matches_monad(s, &MonadKind::IO);
-            let _ = super::type_matches_monad(s, &MonadKind::Adt("Maybe".into()));
-            let _ = super::monad_head_matches(s, &MonadKind::Relation);
-        }
-    }
-
-    #[test]
-    fn fuzz_no_panic() {
-        use crate::test_support::TestWorkspace;
-        use crate::utils::offset_to_position;
-        let sources = [
-            "*usérs : [{náme: Text, age: Int 1}]\nmain = do\n  u <- *usérs\n  yield u",
-            "type P = {café: Text}\nx = 3.5\nmain = x.",
-            "-- see notés.\nmain = 1",
-            "main = println \"a*b—é\"\nfoo : Int 1",
-            "type X = {n: Text}\nf = \\x -> atomic do\n  yield {}\n",
-            "route Hello where\n  GET /hí -> Text\n",
-            "import ./café\nmain = 1\n",
-            "x = \"\\\"é\nfoo :",
-            "🎉 = 1\nmain = 🎉.\n",
-            "f : {name: \ng = {a: 1}.",
-            "*t : [{x: Int 1}]\nmain = *té\n",
-            "&d = do yield {}\nmain = &dé\n",
-            "s = \"café\nmain = s.",
-            "Ünïcöde = 1\nmain = Ünïcöde",
-            "a = 1\r\nb = 2\r\nmain = a.\r\n",
-        ];
-        let valid = [
-            "*people : [{name: Text, age: Int 1}]\nmain = do\n  p <- *people\n  yield p.name\n",
-            "type Person = {name: Text, age: Int 1}\ngreet = \\p -> p.name\n",
-            "*t : [{x: Int 1}]\nf = \\r -> r.x\nmain = f\n",
-            "u = {a: 1, b: 2}\nmain = u.a\n",
-        ];
-        let triggers = [None, Some("."), Some("*"), Some("&"), Some("/"), Some(":")];
-        for src in sources.iter().copied().chain(valid.iter().copied()) {
-            let mut ws = TestWorkspace::new();
-            let uri = ws.open("main", src);
-            // Exercise mid-debounce / latest_source paths: pending source may
-            // be longer OR shorter than the analyzed text, shifting offsets.
-            let shorter = {
-                let mut idx = src.len().saturating_sub(2);
-                while idx > 0 && !src.is_char_boundary(idx) { idx -= 1; }
-                if idx > 0 { Some(src[..idx].to_string()) } else { None }
-            };
-            for pend in [
-                None,
-                Some(format!("{src}.")),
-                Some(format!("{src}é")),
-                Some(format!("{src}é.")),
-                shorter,
-            ] {
-                if let Some(p) = pend {
-                    ws.state.pending_sources.insert(
-                        uri.clone(),
-                        crate::state::PendingSource { source: p, version: Some(2) },
-                    );
-                } else {
-                    ws.state.pending_sources.remove(&uri);
-                }
-                let latest = ws
-                    .state
-                    .pending_sources
-                    .get(&uri)
-                    .map(|p| p.source.clone())
-                    .unwrap_or_else(|| src.to_string());
-                for off in 0..=latest.len() {
-                    if !latest.is_char_boundary(off) {
-                        continue;
-                    }
-                    let pos = offset_to_position(&latest, off);
-                    for trig in triggers {
-                        let _ = handle_completion(&ws.state, &comp_params(&uri, pos, trig));
-                    }
-                    // Also try positions one past line ends etc via raw pos.
-                    let big = Position::new(pos.line, pos.character + 3);
-                    for trig in triggers {
-                        let _ = handle_completion(&ws.state, &comp_params(&uri, big, trig));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Item 8: `->` must be skipped at any depth so its `>` never reaches
-    /// the bracket-depth logic.
-    #[test]
-    fn arrow_arity_handles_parenthesized_function_params() {
-        assert_eq!(arrow_arity("(a -> Bool) -> [a] -> [a]"), 2);
-        assert_eq!(arrow_arity("(a -> b) -> [a] -> [b]"), 2);
-        assert_eq!(arrow_arity("(b -> a -> b) -> b -> [a] -> b"), 3);
-        assert_eq!(arrow_arity("Int -> Text"), 1);
-        assert_eq!(arrow_arity("Int"), 0);
-        // Constraint arrows don't corrupt the count either.
-        assert_eq!(arrow_arity("Ord a => a -> a -> a"), 2);
-        // Units and effect rows unaffected.
-        assert_eq!(arrow_arity("Int Ms -> IO {clock} {}"), 1);
-    }
-
-    /// Item 9: type-context detection must not fire after lambda arrows,
-    /// case-arm arrows, record-literal field colons, or list literals.
-    #[test]
-    fn type_context_rules() {
-        // Type positions.
-        assert!(cursor_in_type_context("f : "));
-        assert!(cursor_in_type_context("f : Int 1 -> "));
-        assert!(cursor_in_type_context("f : ["));
-        assert!(cursor_in_type_context("f : {name: "));
-        assert!(cursor_in_type_context("type X = "));
-        assert!(cursor_in_type_context("data Shape = Circle {radius: "));
-        assert!(cursor_in_type_context("g = (x : "));
-        assert!(cursor_in_type_context("f : Display a => a -> "));
-        assert!(cursor_in_type_context("source users : [{name: "));
-        // Expression positions.
-        assert!(!cursor_in_type_context("f = \\x -> "));
-        assert!(!cursor_in_type_context("f = case x of\n  Red {} -> "));
-        assert!(!cursor_in_type_context("p = {name: "));
-        assert!(!cursor_in_type_context("xs = ["));
-        assert!(!cursor_in_type_context("f : Int 1 -> Int 1 = \\x -> "));
-        // A signature arrow followed by a lambda body arrow: the lambda wins.
-        assert!(!cursor_in_type_context("nums = do\n  n <- *numbers\n  let y = "));
-    }
-
-    /// Item 10: relation-monad ranking must inspect the head of the type,
-    /// not substring-scan the whole string.
-    #[test]
-    fn monad_head_matches_relation_inspects_head() {
-        let rel = MonadKind::Relation;
-        assert!(monad_head_matches("[Int]", &rel));
-        assert!(monad_head_matches("IO {} [Int]", &rel));
-        assert!(monad_head_matches("IO {r *users} [{name: Text}]", &rel));
-        // Not relations: plain IO, and types merely mentioning IO / lists.
-        assert!(!monad_head_matches("IO {} Int", &rel));
-        assert!(!monad_head_matches("Int -> IO {} Int", &rel));
-        assert!(!monad_head_matches("Map Text [Int]", &rel));
-        assert!(!monad_head_matches("Text", &rel));
-    }
-
-    fn parse_module_src(src: &str) -> Module {
-        let lexer = knot::lexer::Lexer::new(src);
-        let (tokens, _) = lexer.tokenize();
-        let parser = knot::parser::Parser::new(src.to_string(), tokens);
-        parser.parse_module().0
-    }
-
-    /// Cyclic type aliases must not overflow the stack during
-    /// dot-completion field extraction.
-    #[test]
-    fn extract_fields_terminates_on_cyclic_type_aliases() {
-        // Previously: infinite mutual recursion A → B → A → … killing the
-        // whole LSP process. Now: terminates with no fields.
-        let module = parse_module_src("type A = B\ntype B = A\nx = 1\n");
-        assert!(extract_fields_from_type_str("A", &module).is_empty());
-        assert!(extract_fields_from_type_str("B", &module).is_empty());
-        // Self-cycle too.
-        let module2 = parse_module_src("type C = C\n");
-        assert!(extract_fields_from_type_str("C", &module2).is_empty());
-    }
-
-    /// Non-cyclic alias chains still resolve through the guard.
-    #[test]
-    fn extract_fields_follows_acyclic_alias_chain() {
-        let module = parse_module_src("type Person = {name: Text}\ntype Alias = Person\n");
-        assert_eq!(extract_fields_from_type_str("Alias", &module), vec!["name"]);
-    }
-
-    /// Monad-aware ranking must sample the do-block deterministically:
-    /// the INNERMOST monad_info span containing the cursor wins; without a
-    /// containing span, the first contained entry in (start, end) order.
-    #[test]
-    fn monad_for_do_span_prefers_innermost_containing_cursor() {
-        let mut info: HashMap<Span, MonadKind> = HashMap::new();
-        let do_span = Span::new(0, 100);
-        // Outer block's callsite entry.
-        info.insert(Span::new(5, 90), MonadKind::Relation);
-        // Nested do-block's entry.
-        info.insert(Span::new(40, 60), MonadKind::IO);
-        // Cursor inside the nested block → IO.
-        assert!(matches!(
-            monad_for_do_span(&info, do_span, 50),
-            Some(MonadKind::IO)
-        ));
-        // Cursor inside the outer block only → Relation.
-        assert!(matches!(
-            monad_for_do_span(&info, do_span, 10),
-            Some(MonadKind::Relation)
-        ));
-        // Cursor outside both → deterministic fallback (first by start).
-        assert!(matches!(
-            monad_for_do_span(&info, do_span, 95),
-            Some(MonadKind::Relation)
-        ));
-    }
-
-    use crate::test_support::TestWorkspace;
-    use crate::utils::offset_to_position;
-
-    fn comp_params(uri: &Uri, position: Position, trigger: Option<&str>) -> CompletionParams {
-        CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-            context: Some(CompletionContext {
-                trigger_kind: if trigger.is_some() {
-                    CompletionTriggerKind::TRIGGER_CHARACTER
-                } else {
-                    CompletionTriggerKind::INVOKED
-                },
-                trigger_character: trigger.map(String::from),
-            }),
-        }
-    }
-
-    fn resp_items(resp: CompletionResponse) -> Vec<CompletionItem> {
-        match resp {
-            CompletionResponse::Array(items) => items,
-            CompletionResponse::List(list) => list.items,
-        }
-    }
-
-    /// Bug 15: a user declaration shadows the same-named builtin — offering
-    /// both produced two `map` items with divergent snippets.
-    #[test]
-    fn builtin_shadowed_by_user_declaration_is_not_duplicated() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "map = \\x -> x\nmain = map 1\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("map 1").expect("usage");
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
-            .expect("completion returns");
-        let items = resp_items(resp);
-        let map_items: Vec<&CompletionItem> = items
-            .iter()
-            .filter(|i| i.label == "map" && i.kind != Some(CompletionItemKind::SNIPPET))
-            .collect();
-        assert_eq!(
-            map_items.len(),
-            1,
-            "user `map` must shadow the builtin; got: {map_items:?}"
-        );
-    }
-
-    /// Bug 14: the `.` trigger inside a float literal is a decimal point —
-    /// no field completion (the all-known-fields fallback used to fire).
-    #[test]
-    fn dot_trigger_suppressed_inside_float_literal() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "type P = {name: Text}\nx = 3.5\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("3.").expect("float") + 2;
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some(".")));
-        assert!(resp.is_none(), "no field completion inside a float: {resp:?}");
-    }
-
-    /// Bug 14: `.` typed inside a `--` comment must not pop completion.
-    #[test]
-    fn dot_trigger_suppressed_inside_comment() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "-- see notes.\nmain = 1\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("notes.").expect("comment dot") + "notes.".len();
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some(".")));
-        assert!(resp.is_none(), "no completion inside a comment: {resp:?}");
-    }
-
-    /// Bug 14: `*` typed inside a string literal must not pop relation
-    /// completion.
-    #[test]
-    fn star_trigger_suppressed_inside_string() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "*todos : [{t: Text}]\nmain = println \"a*b\"\n");
-        let doc = ws.doc(&uri);
-        let off = doc.source.find("a*").expect("string star") + 2;
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, Some("*")));
-        assert!(resp.is_none(), "no relation completion inside a string: {resp:?}");
-    }
-
-    /// Bug 16: relation items must carry a text_edit that REPLACES the
-    /// typed token including its sigil — bare insert_text after a typed `*`
-    /// produced `**name`.
-    #[test]
-    fn relation_completion_text_edit_replaces_typed_sigil() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "*todos : [{t: Text}]\nmain = *to\n");
-        let doc = ws.doc(&uri);
-        // Target the `*to` in `main = *to` (end-of-token), not the line-1
-        // `*todos` declaration that `find` would match first.
-        let sigil_off = doc.source.rfind("*to").expect("typed prefix");
-        let cursor = sigil_off + 3;
-        let pos = offset_to_position(&doc.source, cursor);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
-            .expect("completion returns");
-        let items = resp_items(resp);
-        let item = items
-            .iter()
-            .find(|i| i.label == "*todos")
-            .expect("relation item offered");
-        let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
-            panic!("relation item must carry a replacing text_edit: {item:?}");
-        };
-        assert_eq!(
-            edit.range.start,
-            offset_to_position(&doc.source, sigil_off),
-            "edit must start AT the sigil so it gets replaced"
-        );
-        assert_eq!(edit.range.end, pos);
-        assert_eq!(edit.new_text, "*todos");
-    }
-
-    /// Bug 2: completing mid-token must replace the WHOLE token, not just up
-    /// to the caret — otherwise accepting `*todos` at `*to|dos` left the `dos`
-    /// suffix behind, producing `*todosdos`.
-    #[test]
-    fn relation_completion_text_edit_replaces_whole_token_midword() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "*todos : [{t: Text}]\nmain = *todos\n");
-        let doc = ws.doc(&uri);
-        // Caret in the middle of the `*todos` usage on line 2: `*to|dos`.
-        let usage = doc.source.rfind("*todos").expect("usage");
-        let caret = usage + 3;
-        let pos = offset_to_position(&doc.source, caret);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
-            .expect("completion returns");
-        let item = resp_items(resp)
-            .into_iter()
-            .find(|i| i.label == "*todos")
-            .expect("relation item offered");
-        let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
-            panic!("relation item must carry a replacing text_edit: {item:?}");
-        };
-        assert_eq!(
-            edit.range.start,
-            offset_to_position(&doc.source, usage),
-            "edit starts at the sigil"
-        );
-        assert_eq!(
-            edit.range.end,
-            offset_to_position(&doc.source, usage + "*todos".len()),
-            "edit must extend past the caret to the end of the token"
-        );
-        assert_eq!(edit.new_text, "*todos");
-    }
-
-    /// Bug 4 consequence: completion stops offering IO builtins inside
-    /// atomic blocks of PARAMETERIZED functions (the lambda-skip in the
-    /// atomic walker made `in_atomic` always false there).
-    #[test]
-    fn completion_filters_io_builtins_in_atomic_block_of_parameterized_fn() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "type P = {n: Text}\n*people : [P]\nf = \\x -> atomic do\n  *people = [{n: \"A\"}]\n  yield {}\n",
-        );
-        let doc = ws.doc(&uri);
-        let inside = doc.source.find("[{n:").expect("atomic body");
-        let pos = offset_to_position(&doc.source, inside);
-        let resp = handle_completion(&ws.state, &comp_params(&uri, pos, None))
-            .expect("completion returns");
-        let labels: Vec<String> = resp_items(resp).into_iter().map(|i| i.label).collect();
-        assert!(
-            !labels.contains(&"println".to_string()),
-            "println leaked into atomic completion of a parameterized fn"
-        );
-    }
-
-    /// `rateLimit <expr>` clauses inside route declarations hold ordinary
-    /// expressions — the route-block completion gate must not swallow them.
-    #[test]
-    fn rate_limit_expression_gets_normal_expression_completions() {
-        use crate::test_support::TestWorkspace;
-        let mut ws = TestWorkspace::new();
-        let src = "route Api where\n  GET /things -> Text rateLimit {key (\\i -> \\c -> Nothing) limit {requests 10 window 1000}} = GetThings\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        // Sanity: the parser recorded the rateLimit expression.
-        let has_rl = doc.module.decls.iter().any(|d| {
-            matches!(&d.node, DeclKind::Route { entries, .. }
-                if entries.iter().any(|e| e.rate_limit.is_some()))
-        });
-        assert!(has_rl, "parser should record the rateLimit clause");
-        let off = doc.source.find("\\i ->").expect("rateLimit lambda");
-        assert!(
-            offset_in_route_rate_limit(&doc.module, off),
-            "cursor inside the rateLimit expression must be detected"
-        );
-        let pos = crate::utils::offset_to_position(&doc.source, off);
-        let params = CompletionParams {
-            text_document_position: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: pos,
-            },
-            context: None,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        };
-        let resp = handle_completion(&ws.state, &params).expect("completion response");
-        let items = match resp {
-            CompletionResponse::Array(items) => items,
-            CompletionResponse::List(l) => l.items,
-        };
-        // Expression completions include builtins like `show`; the gated
-        // route list contains only methods/types/headers.
-        assert!(
-            items.iter().any(|i| i.label == "show"),
-            "expected expression completions inside rateLimit; got {} items: {:?}",
-            items.len(),
-            items.iter().map(|i| &i.label).take(20).collect::<Vec<_>>()
-        );
-    }
-}

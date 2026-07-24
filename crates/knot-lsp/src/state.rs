@@ -11,7 +11,7 @@ use crossbeam_channel::Sender;
 use lsp_server::Connection;
 use lsp_types::{Diagnostic, SemanticToken, Uri};
 
-use knot::ast::{self, Module, Span};
+use knot::ast::{self, Expr, Span};
 use knot::diagnostic;
 use knot_compiler::effects::EffectSet;
 use knot_compiler::infer::MonadKind;
@@ -76,7 +76,7 @@ pub type InferenceCache = HashMap<(PathBuf, u64), InferenceSnapshot>;
 #[derive(Clone)]
 pub struct ImportCacheEntry {
     pub content_hash: u64,
-    pub module: Module,
+    pub module: Expr,
     pub source: String,
     /// Bumped on every cache hit and insert. The eviction policy drops the
     /// entry with the lowest counter when the cache is at its cap, so files
@@ -159,7 +159,7 @@ pub fn enforce_uri_cache_cap<V, OV>(
 
 pub struct DocumentState {
     pub source: String,
-    pub module: Module,
+    pub module: Expr,
     /// Span-based references: (usage_span → definition_span).
     pub references: Vec<(Span, Span)>,
     /// Fallback name-based definitions for names not covered by AST walk.

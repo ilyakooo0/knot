@@ -39,3 +39,7 @@ examples/for_each
 examples/stm_row_filter
 examples/uuid
 examples/race
+examples/builtins
+examples/implicit_dictionaries
+examples/ord
+examples/trait_replacement

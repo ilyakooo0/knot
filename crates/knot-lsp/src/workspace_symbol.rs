@@ -6,12 +6,12 @@ use std::path::PathBuf;
 
 use lsp_types::*;
 
-use knot::ast::{DeclKind, Module};
+use knot::ast::{Expr, ExprKind};
 
 use crate::analysis::get_or_parse_file_shared;
 use crate::shared::scan_knot_files_in_roots;
 use crate::state::{content_hash, ServerState, WorkspaceSymbolEntry};
-use crate::utils::{path_to_uri, span_to_range, uri_to_path};
+use crate::utils::{path_to_uri, span_to_range, top_fields, uri_to_path};
 
 // ── Workspace Symbols ───────────────────────────────────────────────
 
@@ -19,15 +19,15 @@ use crate::utils::{path_to_uri, span_to_range, uri_to_path};
 /// so the same vector can be reused across queries until the file's content
 /// hash changes. Returns entries with absolute file URIs already resolved.
 pub(crate) fn build_workspace_symbol_entries(
-    module: &Module,
+    program: &Expr,
     source: &str,
     uri: &Uri,
 ) -> Vec<WorkspaceSymbolEntry> {
     let mut out = Vec::new();
-    for decl in &module.decls {
-        let (name, kind, container) = match &decl.node {
-            DeclKind::Data { name, .. } => (name.clone(), SymbolKind::STRUCT, None),
-            DeclKind::TypeAlias { name, ty, .. } => {
+    for decl in top_fields(program) {
+        let (name, kind, container) = match &decl.value.node {
+            ExprKind::DataCtor { name, .. } => (name.clone(), SymbolKind::STRUCT, None),
+            ExprKind::TypeCtor { name, ty, .. } => {
                 // Refined types: surface `where` predicate in the container so
                 // the workspace symbol picker shows it inline.
                 let container = match &ty.node {
@@ -38,20 +38,20 @@ pub(crate) fn build_workspace_symbol_entries(
                 };
                 (name.clone(), SymbolKind::TYPE_PARAMETER, container)
             }
-            DeclKind::Source { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
-            DeclKind::View { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
-            DeclKind::Derived { name, .. } => (format!("&{name}"), SymbolKind::VARIABLE, None),
-            DeclKind::Fun { name, .. } => (name.clone(), SymbolKind::FUNCTION, None),
-            DeclKind::Route { name, .. } | DeclKind::RouteComposite { name, .. } => {
+            ExprKind::SourceDecl { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
+            ExprKind::ViewDecl { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
+            ExprKind::DerivedDecl { name, .. } => (format!("&{name}"), SymbolKind::VARIABLE, None),
+            ExprKind::RouteDecl { name, .. } | ExprKind::RouteCompositeDecl { name, .. } => {
                 (format!("route {name}"), SymbolKind::MODULE, None)
             }
-            _ => continue,
+            ExprKind::SubsetConstraint { .. } => continue,
+            _ => (decl.name.clone(), SymbolKind::FUNCTION, None),
         };
         out.push(WorkspaceSymbolEntry {
             name,
             kind,
             uri: uri.clone(),
-            range: span_to_range(decl.span, source),
+            range: span_to_range(decl.value.span, source),
             container,
         });
     }

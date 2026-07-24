@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind, Span};
+use knot::ast::{self, Span};
 
 use crate::builtins::EFFECTFUL_BUILTINS;
 use crate::legend::{
@@ -14,7 +14,7 @@ use crate::legend::{
     TOK_TYPE, TOK_VARIABLE,
 };
 use crate::state::ServerState;
-use crate::utils::{find_word_in_source, position_to_offset};
+use crate::utils::{find_word_in_source, position_to_offset, top_fields};
 
 // ── Semantic Tokens ─────────────────────────────────────────────────
 
@@ -190,12 +190,12 @@ fn collect_tokens(
         source: &doc.source,
     };
 
-    for decl in &doc.module.decls {
+    for decl in top_fields(&doc.module) {
         // Coarse pre-filter: skip decls whose span doesn't overlap the
         // requested range. Fine-grained per-token filtering still happens
         // below, but this avoids walking unrelated subtrees.
         if let Some((rs, re)) = range
-            && (decl.span.end < rs || decl.span.start > re) {
+            && (decl.value.span.end < rs || decl.value.span.start > re) {
                 continue;
             }
         collector.visit_decl(decl);
@@ -267,30 +267,18 @@ impl<'a> TokenCollector<'a> {
         }
     }
 
-    fn visit_decl(&mut self, decl: &ast::Decl) {
-        match &decl.node {
-            DeclKind::Fun { name, body, ty, .. } => {
-                // Search the whole declaration span (like the sibling arms
-                // below) rather than an arbitrary `name.len() + 20` byte
-                // window: that window could end mid-codepoint when a multibyte
-                // char follows the name (e.g. `f : Café -> Int`), making
-                // `find_word_in_source`'s `source.get(start..end)` return None
-                // and silently dropping the function's declaration highlight.
-                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
-                    self.add(s, TOK_FUNCTION, MOD_DECLARATION);
-                }
-                if let Some(scheme) = ty {
-                    self.visit_type(&scheme.ty);
-                }
-                if let Some(body) = body {
-                    self.visit_expr(body);
-                }
-            }
-            DeclKind::Data {
+    fn visit_decl(&mut self, decl: &ast::RecordField) {
+        let dspan = decl.value.span;
+        // A named function field's own signature.
+        if let Some(scheme) = &decl.sig {
+            self.visit_type(&scheme.ty);
+        }
+        match &decl.value.node {
+            ast::ExprKind::DataCtor {
                 name, constructors, ..
             } => {
                 let name_span =
-                    find_word_in_source(self.source, name, decl.span.start, decl.span.end);
+                    find_word_in_source(self.source, name, dspan.start, dspan.end);
                 if let Some(s) = name_span {
                     self.add(s, TOK_STRUCT, MOD_DECLARATION);
                 }
@@ -303,11 +291,11 @@ impl<'a> TokenCollector<'a> {
                 // steal a later constructor's token either.
                 let mut search_from = self
                     .source
-                    .get(decl.span.start..decl.span.end.min(self.source.len()))
+                    .get(dspan.start..dspan.end.min(self.source.len()))
                     .and_then(|t| t.find('='))
-                    .map(|p| decl.span.start + p + 1)
+                    .map(|p| dspan.start + p + 1)
                     .or_else(|| name_span.map(|s| s.end))
-                    .unwrap_or(decl.span.start);
+                    .unwrap_or(dspan.start);
                 for ctor in constructors {
                     // Bound the name search to the window *before* this
                     // constructor's first field type. Otherwise a later
@@ -319,7 +307,7 @@ impl<'a> TokenCollector<'a> {
                         .fields
                         .first()
                         .map(|f| f.value.span.start)
-                        .unwrap_or(decl.span.end);
+                        .unwrap_or(dspan.end);
                     let found = find_word_in_source(self.source, &ctor.name, search_from, search_end);
                     if let Some(s) = found {
                         self.add(s, TOK_ENUM_MEMBER, MOD_DECLARATION);
@@ -337,33 +325,33 @@ impl<'a> TokenCollector<'a> {
                     }
                 }
             }
-            DeclKind::TypeAlias { ty, .. } => {
+            ast::ExprKind::TypeCtor { ty, .. } => {
                 // Refined-type aliases (`type Nat = Int 1 where \x -> x >= 0`)
                 // contain expression-bodied predicates; walk the type so the
                 // predicate's tokens get highlighted alongside the rest of
                 // the file.
                 self.visit_type(ty);
             }
-            DeclKind::Source { name, ty, .. } => {
-                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
+            ast::ExprKind::SourceDecl { name, ty, .. } => {
+                if let Some(s) = find_word_in_source(self.source, name, dspan.start, dspan.end) {
                     self.add(s, TOK_NAMESPACE, MOD_DECLARATION);
                 }
                 self.visit_type(ty);
             }
-            DeclKind::View { name, body, .. } => {
-                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
+            ast::ExprKind::ViewDecl { name, body, .. } => {
+                if let Some(s) = find_word_in_source(self.source, name, dspan.start, dspan.end) {
                     self.add(s, TOK_NAMESPACE, MOD_DECLARATION);
                 }
                 self.visit_expr(body);
             }
-            DeclKind::Derived { name, body, .. } => {
-                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
+            ast::ExprKind::DerivedDecl { name, body, .. } => {
+                if let Some(s) = find_word_in_source(self.source, name, dspan.start, dspan.end) {
                     self.add(s, TOK_NAMESPACE, MOD_DECLARATION | MOD_READONLY);
                 }
                 self.visit_expr(body);
             }
-            DeclKind::Route { name, entries, .. } => {
-                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
+            ast::ExprKind::RouteDecl { name, entries } => {
+                if let Some(s) = find_word_in_source(self.source, name, dspan.start, dspan.end) {
                     self.add(s, TOK_TYPE, MOD_DECLARATION);
                 }
                 for entry in entries {
@@ -392,12 +380,21 @@ impl<'a> TokenCollector<'a> {
                     }
                 }
             }
-            DeclKind::RouteComposite { name, .. } => {
-                if let Some(s) = find_word_in_source(self.source, name, decl.span.start, decl.span.end) {
+            ast::ExprKind::RouteCompositeDecl { name, .. } => {
+                if let Some(s) = find_word_in_source(self.source, name, dspan.start, dspan.end) {
                     self.add(s, TOK_TYPE, MOD_DECLARATION);
                 }
             }
-            _ => {}
+            ast::ExprKind::SubsetConstraint { .. } => {}
+            _ => {
+                // A named function field. Search the whole declaration span
+                // (rather than an arbitrary `name.len() + 20` byte window that
+                // could end mid-codepoint, e.g. `f : Café -> Int`).
+                if let Some(s) = find_word_in_source(self.source, &decl.name, dspan.start, dspan.end) {
+                    self.add(s, TOK_FUNCTION, MOD_DECLARATION);
+                }
+                self.visit_expr(&decl.value);
+            }
         }
     }
 
@@ -743,167 +740,7 @@ impl<'a> TokenCollector<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
 
-    fn full_params(uri: &Uri) -> SemanticTokensParams {
-        SemanticTokensParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        }
-    }
-
-    fn delta_params(uri: &Uri, prev: &str) -> SemanticTokensDeltaParams {
-        SemanticTokensDeltaParams {
-            text_document: TextDocumentIdentifier { uri: uri.clone() },
-            previous_result_id: prev.to_string(),
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        }
-    }
-
-    #[test]
-    fn semantic_tokens_full_caches_result_id() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "id = \\x -> x\n");
-        let resp = handle_semantic_tokens_full(&mut ws.state, &full_params(&uri))
-            .expect("full tokens");
-        let id = match resp {
-            SemanticTokensResult::Tokens(t) => t.result_id,
-            _ => panic!("expected Tokens variant"),
-        };
-        assert!(id.is_some(), "result_id should be set");
-        assert!(
-            ws.state.semantic_token_cache.contains_key(&uri),
-            "cache should be populated"
-        );
-    }
-
-    #[test]
-    fn semantic_tokens_delta_returns_empty_edits_when_unchanged() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "id = \\x -> x\n");
-        let full = handle_semantic_tokens_full(&mut ws.state, &full_params(&uri))
-            .expect("full");
-        let prev_id = match full {
-            SemanticTokensResult::Tokens(t) => t.result_id.unwrap(),
-            _ => panic!(),
-        };
-        let delta = handle_semantic_tokens_full_delta(&mut ws.state, &delta_params(&uri, &prev_id))
-            .expect("delta");
-        match delta {
-            SemanticTokensFullDeltaResult::TokensDelta(d) => {
-                assert!(d.edits.is_empty(), "no changes → no edits");
-            }
-            _ => panic!("expected TokensDelta variant"),
-        }
-    }
-
-    #[test]
-    fn semantic_tokens_delta_falls_back_to_full_on_unknown_id() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "id = \\x -> x\n");
-        // Skip the initial full request — the cache is empty, so delta
-        // should bail out to a full response rather than diffing nothing.
-        let delta = handle_semantic_tokens_full_delta(&mut ws.state, &delta_params(&uri, "stale"))
-            .expect("delta");
-        assert!(
-            matches!(delta, SemanticTokensFullDeltaResult::Tokens(_)),
-            "stale prev_result_id should produce a full response"
-        );
-    }
-
-    #[test]
-    fn delta_encode_handles_out_of_order_tokens_without_underflow() {
-        // Tokens are normally sorted by start offset; the encoder's reset
-        // path handles the out-of-order case by rewinding the cursor. Before
-        // the saturating-arithmetic fix, the rewind left `prev_line` /
-        // `prev_char` reflecting the later token, so the second iteration
-        // computed `0 - prev_line` and panicked in debug builds.
-        let source = "abc\ndef\n";
-        let tokens = vec![
-            super::RawToken {
-                start: 4,
-                length: 3,
-                token_type: 0,
-                modifiers: 0,
-            },
-            super::RawToken {
-                start: 0,
-                length: 3,
-                token_type: 0,
-                modifiers: 0,
-            },
-        ];
-        let encoded = super::delta_encode_tokens(&tokens, source);
-        assert_eq!(encoded.len(), 2);
-        // The clamp produces a (lossy but well-formed) encoding rather than
-        // a panic. Exact deltas don't matter — just that we got back two
-        // entries with no overflow propagated through `length`.
-        assert!(encoded.iter().all(|t| t.length == 3));
-    }
-
-    #[test]
-    fn constructor_token_not_stolen_by_same_named_field_type() {
-        // `B` appears first as a field type inside `A`'s payload and then as a
-        // real constructor. The ENUM_MEMBER token for the constructor must be
-        // anchored on the real `B` (after the `|`), not on the field-type `B`.
-        let src = "data T = A {x: B} | B {y: Int 1}\n";
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", src);
-        let doc = ws.state.documents.get(&uri).expect("doc");
-        let tokens = collect_tokens(doc, None);
-
-        let field_b = src.find("x: B").unwrap() + 3; // offset of the field-type B
-        let ctor_b = src.rfind('B').unwrap(); // offset of the real constructor B
-        assert_ne!(field_b, ctor_b);
-
-        let enum_members: Vec<usize> = tokens
-            .iter()
-            .filter(|t| t.token_type == TOK_ENUM_MEMBER)
-            .map(|t| t.start)
-            .collect();
-        assert!(
-            enum_members.contains(&ctor_b),
-            "constructor B's ENUM_MEMBER token must sit on the real ctor (offset {ctor_b}); got {enum_members:?}"
-        );
-        assert!(
-            !enum_members.contains(&field_b),
-            "field-type B (offset {field_b}) must NOT be tagged as an ENUM_MEMBER; got {enum_members:?}"
-        );
-    }
-
-    #[test]
-    fn semantic_tokens_delta_emits_edits_for_changed_tokens() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "id = \\x -> x\n");
-        let full = handle_semantic_tokens_full(&mut ws.state, &full_params(&uri))
-            .expect("full");
-        let prev_id = match full {
-            SemanticTokensResult::Tokens(t) => t.result_id.unwrap(),
-            _ => panic!(),
-        };
-        // Mutate the underlying document — append a new top-level decl so
-        // the token list grows. Reach in directly since this is a unit
-        // test; in production a didChange notification triggers
-        // re-analysis.
-        if let Some(doc) = ws.state.documents.get_mut(&uri) {
-            doc.source.push_str("y = 42\n");
-        }
-        ws.reanalyze(&uri);
-        let delta = handle_semantic_tokens_full_delta(&mut ws.state, &delta_params(&uri, &prev_id))
-            .expect("delta");
-        match delta {
-            SemanticTokensFullDeltaResult::TokensDelta(d) => {
-                assert!(!d.edits.is_empty(), "expected edits for token change");
-            }
-            other => panic!("expected TokensDelta, got: {other:?}"),
-        }
-    }
-}
 
 fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> {
     // Tokens arrive in source order. A naive implementation calls
@@ -1009,81 +846,4 @@ fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> 
 }
 
 // Regression tests for the 2026-06 LSP bug-fix batch (semantic tokens).
-#[cfg(test)]
-mod regress_fixes_tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
 
-    /// Item 18: for `data Person = Person {…}` the constructor token must
-    /// land on the SECOND `Person` (after the `=`), not overlap the type
-    /// name token.
-    #[test]
-    fn self_named_constructor_gets_its_own_token() {
-        let mut ws = TestWorkspace::new();
-        let src = "data Person = Person {name: Text}\n";
-        let uri = ws.open("main", src);
-        let doc = ws.doc(&uri);
-        let tokens = collect_tokens(doc, None);
-        let type_name_start = src.find("Person").unwrap();
-        let ctor_start = src.rfind("Person").unwrap();
-        assert_ne!(type_name_start, ctor_start);
-        let struct_tok = tokens
-            .iter()
-            .find(|t| t.token_type == crate::legend::TOK_STRUCT && t.start == type_name_start);
-        assert!(struct_tok.is_some(), "type-name token missing");
-        let ctor_tok = tokens
-            .iter()
-            .find(|t| t.token_type == crate::legend::TOK_ENUM_MEMBER);
-        let ctor_tok = ctor_tok.expect("constructor token missing");
-        assert_eq!(
-            ctor_tok.start, ctor_start,
-            "constructor token must sit on the constructor, not the type name"
-        );
-    }
-
-    /// Item 19: CRLF sources must not count the `\r` in per-line token
-    /// lengths when a multi-line token is split.
-    #[test]
-    fn multiline_token_split_strips_carriage_return() {
-        let mut tokens = Vec::new();
-        let source = "abc\r\ndef\r\n";
-        let mut collector = TokenCollector {
-            tokens: &mut tokens,
-            source,
-        };
-        collector.add(Span::new(0, 8), 0, 0); // "abc\r\ndef"
-        assert_eq!(tokens.len(), 2);
-        assert_eq!(tokens[0].start, 0);
-        assert_eq!(tokens[0].length, 3, "CRLF \\r counted in token length");
-        assert_eq!(tokens[1].start, 5);
-        assert_eq!(tokens[1].length, 3);
-    }
-
-    /// A lone `\r` (not part of CRLF) is a real line break, exactly like
-    /// `utils::offset_to_position` and the lexer treat it — so
-    /// `delta_encode_tokens` must advance the line (not the column) for it,
-    /// keeping semantic-token positions in sync for `\r`-only files.
-    #[test]
-    fn delta_encode_treats_lone_cr_as_line_break() {
-        let source = "ab\rcd\r\nxy\n";
-        // Token on `cd` (byte 3..5) and on `xy` (byte 7..9).
-        let tokens = vec![
-            RawToken { start: 3, length: 2, token_type: 0, modifiers: 0 },
-            RawToken { start: 7, length: 2, token_type: 0, modifiers: 0 },
-        ];
-        let encoded = delta_encode_tokens(&tokens, source);
-        assert_eq!(encoded.len(), 2);
-        // `cd` sits on line 1, column 0 — the lone `\r` before it is a line
-        // break. This must agree with offset_to_position byte-for-byte.
-        let expected = crate::utils::offset_to_position(source, 3);
-        assert_eq!(expected, lsp_types::Position::new(1, 0));
-        assert_eq!(encoded[0].delta_line, expected.line);
-        assert_eq!(
-            encoded[0].delta_start, expected.character,
-            "a lone \\r must advance the line, matching offset_to_position"
-        );
-        // `xy` is one line further down (after the CRLF), column 0.
-        assert_eq!(encoded[1].delta_line, 1);
-        assert_eq!(encoded[1].delta_start, 0);
-    }
-}

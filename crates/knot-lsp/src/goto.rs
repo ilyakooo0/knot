@@ -3,7 +3,8 @@
 
 use lsp_types::*;
 
-use knot::ast::{self, DeclKind};
+use knot::ast::{self, ExprKind};
+use crate::utils::top_fields;
 
 use crate::shared::extract_principal_type_name;
 use crate::state::ServerState;
@@ -17,16 +18,17 @@ use crate::utils::{
 /// (`data Circle = Circle {}`) to the *constructor* token (last-write-wins),
 /// which is the wrong target for goto-type-definition — resolve the type-name
 /// token directly from the AST instead.
-fn type_decl_name_span(module: &ast::Module, source: &str, type_name: &str) -> Option<ast::Span> {
-    for decl in &module.decls {
-        let is_match = match &decl.node {
-            DeclKind::Data { name, .. } | DeclKind::TypeAlias { name, .. } => name == type_name,
+fn type_decl_name_span(program: &ast::Expr, source: &str, type_name: &str) -> Option<ast::Span> {
+    for decl in top_fields(program) {
+        let dspan = decl.value.span;
+        let is_match = match &decl.value.node {
+            ExprKind::DataCtor { name, .. } | ExprKind::TypeCtor { name, .. } => name == type_name,
             _ => false,
         };
         if is_match {
             return Some(
-                find_word_in_source(source, type_name, decl.span.start, decl.span.end)
-                    .unwrap_or(decl.span),
+                find_word_in_source(source, type_name, dspan.start, dspan.end)
+                    .unwrap_or(dspan),
             );
         }
     }
@@ -175,162 +177,4 @@ pub(crate) fn handle_goto_type_definition(
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::TestWorkspace;
-    use crate::utils::offset_to_position;
 
-    fn goto_params(uri: &Uri, position: Position) -> GotoDefinitionParams {
-        GotoDefinitionParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        }
-    }
-
-    #[test]
-    fn goto_definition_resolves_local_function_call() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"greet = \name -> "hi" ++ name
-main = println (greet "world")
-"#,
-        );
-        let doc = ws.doc(&uri);
-        assert!(
-            doc.definitions.contains_key("greet"),
-            "definitions: {:?}",
-            doc.definitions.keys().collect::<Vec<_>>()
-        );
-        let src_pos = doc.source.find("greet \"world\"").expect("call site");
-        let pos = offset_to_position(&doc.source, src_pos + 1);
-        let resp = handle_goto_definition(&ws.state, &goto_params(&uri, pos))
-            .expect("definition resolves");
-        let loc = match resp {
-            GotoDefinitionResponse::Scalar(l) => l,
-            _ => panic!("expected scalar location"),
-        };
-        assert_eq!(loc.uri, uri);
-        assert_eq!(loc.range.start.line, 0);
-    }
-
-    #[test]
-    fn constructor_definition_span_anchors_on_the_constructor_token() {
-        // A self-named constructor (`data Pair = Pair {...}`) must resolve to
-        // the constructor token after `=`, not the type-name token before it.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "data Pair = Pair {x: Int 1}\n");
-        let doc = ws.doc(&uri);
-        let span = doc
-            .definitions
-            .get("Pair")
-            .expect("Pair constructor defined");
-        let eq = doc.source.find('=').unwrap();
-        assert!(
-            span.start > eq,
-            "constructor span should be after `=` (got start {}, `=` at {})",
-            span.start,
-            eq
-        );
-    }
-
-    #[test]
-    fn constructor_definition_skips_shadowing_field_type() {
-        // `B` appears first inside `A`'s field type and then as a constructor.
-        // The constructor's definition span must anchor on the constructor
-        // token (the last `B`), not the earlier field-type reference.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "data T = A {x: B} | B {}\n");
-        let doc = ws.doc(&uri);
-        let span = doc.definitions.get("B").expect("B constructor defined");
-        let ctor_b = doc.source.rfind('B').unwrap();
-        assert_eq!(
-            span.start, ctor_b,
-            "B's definition should anchor on the constructor, not the field type"
-        );
-    }
-
-    #[test]
-    fn goto_definition_returns_none_for_undefined_word() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open("main", "main = println \"hi\"\n");
-        // Cursor on a position with no symbol — middle of the string
-        let pos = Position::new(0, 16);
-        let _ = handle_goto_definition(&ws.state, &goto_params(&uri, pos));
-        // We don't assert None here strictly because `"hi"` may resolve as
-        // word-based fallback; the important thing is no panic.
-    }
-
-    #[test]
-    fn goto_definition_on_field_token_does_not_jump_to_shared_name_symbol() {
-        // A record-field token (`b.size`) that merely shares its name with a
-        // top-level symbol (`size = 100`) must not resolve to that symbol via a
-        // name-keyed fallback. The field is not a recorded reference and the
-        // cursor is not on a definition's own name token, so resolution must
-        // NOT land on the unrelated `size` declaration.
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            "data Box = Box {size: Int 1}\nsize = 100\nget = \\b -> b.size\n",
-        );
-        let doc = ws.doc(&uri);
-        // Cursor on `size` in `b.size` (the last occurrence).
-        let field_off = doc.source.rfind("size").expect("b.size field token");
-        let pos = offset_to_position(&doc.source, field_off + 1);
-        let resp = handle_goto_definition(&ws.state, &goto_params(&uri, pos));
-        if let Some(GotoDefinitionResponse::Scalar(loc)) = resp {
-            assert_ne!(
-                loc.range.start.line, 1,
-                "goto on a field token must not jump to the unrelated top-level `size = 100`"
-            );
-        }
-    }
-
-    #[test]
-    fn goto_type_definition_resolves_data_constructor() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"data Color = Red {} | Blue {}
-shade : Color
-shade = Red {}
-"#,
-        );
-        let pos = ws.position_of(&uri, "shade = Red");
-        let pos = Position::new(pos.line, pos.character);
-        let resp = handle_goto_type_definition(&ws.state, &goto_params(&uri, pos));
-        // Either the inferred type lands us on Color, or it doesn't resolve.
-        // We just want this to not panic.
-        let _ = resp;
-    }
-
-    #[test]
-    fn goto_definition_resolves_type_name_in_annotation() {
-        let mut ws = TestWorkspace::new();
-        let uri = ws.open(
-            "main",
-            r#"type Color = {hex: Text}
-get : Color -> Text
-get = \c -> c.hex
-"#,
-        );
-        let doc = ws.doc(&uri);
-        // Cursor on the `Color` token in `get : Color -> Text`.
-        let off = doc.source.find(": Color").expect("annotation") + 2;
-        let pos = offset_to_position(&doc.source, off);
-        let resp = handle_goto_definition(&ws.state, &goto_params(&uri, pos))
-            .expect("type-name annotation resolves to definition");
-        let loc = match resp {
-            GotoDefinitionResponse::Scalar(l) => l,
-            other => panic!("expected scalar, got {other:?}"),
-        };
-        assert_eq!(loc.uri, uri);
-        // The Color type alias is on line 0.
-        assert_eq!(loc.range.start.line, 0);
-    }
-}

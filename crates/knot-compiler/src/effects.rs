@@ -430,25 +430,6 @@ impl EffectChecker {
             }
         }
 
-        // Collect trait-method bodies: impl methods and trait default
-        // bodies, grouped by method name. A trait-method call dispatches on
-        // the runtime type tag, so the only sound static approximation for
-        // a call site is the UNION of effects across every known impl
-        // (plus defaults). The union is stored in `decl_effects` under the
-        // method name so Var/callee lookups see it. (Names that collide
-        // with a top-level function are skipped — the function wins, which
-        // matches name-resolution order.) BTreeMap keeps diagnostic order
-        // deterministic.
-        let fun_names: HashSet<&str> = module
-            .decls
-            .iter()
-            .filter_map(|d| match &d.node {
-                ast::DeclKind::Fun { name, .. }
-                | ast::DeclKind::View { name, .. }
-                | ast::DeclKind::Derived { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect();
         // Group declarations so the final diagnostic pass keeps a stable
         // order (derived, then views, then funs).
         let mut derived = Vec::new();

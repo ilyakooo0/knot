@@ -830,7 +830,7 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
                     .collect();
                 format!("{{{}}}", inner.join(", "))
             }
-            ast::PatKind::Constructor { name, payload } => {
+            ast::PatKind::Constructor { name, payload, .. } => {
                 format!("{name} {}", pat(payload))
             }
             ast::PatKind::List(pats) => {
@@ -1059,7 +1059,7 @@ pub(crate) fn pat_to_simple_name(pat: &ast::PatKind) -> String {
                 .collect();
             format!("{{{}}}", parts.join(", "))
         }
-        ast::PatKind::Constructor { name, payload } => match &payload.node {
+        ast::PatKind::Constructor { name, payload, .. } => match &payload.node {
             ast::PatKind::Record(fields) if fields.is_empty() => name.clone(),
             other => format!("{name} {}", pat_to_simple_name(other)),
         },

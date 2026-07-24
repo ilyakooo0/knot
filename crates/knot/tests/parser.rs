@@ -673,7 +673,7 @@ fn case_with_constructor_patterns() {
         ExprKind::Case { arms, .. } => {
             assert_eq!(arms.len(), 2);
             match &arms[0].pat.node {
-                PatKind::Constructor { name, payload } => {
+                PatKind::Constructor { name, payload, .. } => {
                     assert_eq!(name, "Circle");
                     assert!(matches!(&payload.node, PatKind::Record(_)));
                 }
@@ -1411,7 +1411,7 @@ fn constructor_with_record_pattern() {
     match fun_body(src) {
         ExprKind::Case { arms, .. } => {
             match &arms[0].pat.node {
-                PatKind::Constructor { name, payload } => {
+                PatKind::Constructor { name, payload, .. } => {
                     assert_eq!(name, "Circle");
                     match &payload.node {
                         PatKind::Record(fields) => {
@@ -1440,7 +1440,7 @@ fn constructor_with_var_pattern() {
     match fun_body(src) {
         ExprKind::Case { arms, .. } => {
             match &arms[0].pat.node {
-                PatKind::Constructor { name, payload } => {
+                PatKind::Constructor { name, payload, .. } => {
                     assert_eq!(name, "Circle");
                     assert!(matches!(&payload.node, PatKind::Var(n) if n == "c"));
                 }
@@ -1457,7 +1457,7 @@ fn empty_constructor_pattern() {
     match fun_body(src) {
         ExprKind::Case { arms, .. } => {
             match &arms[0].pat.node {
-                PatKind::Constructor { name, payload } => {
+                PatKind::Constructor { name, payload, .. } => {
                     assert_eq!(name, "Open");
                     assert!(matches!(&payload.node, PatKind::Record(fields) if fields.is_empty()));
                 }
@@ -3259,7 +3259,7 @@ fn constructor_without_explicit_payload() {
     match fun_body(src) {
         ExprKind::Case { arms, .. } => {
             match &arms[0].pat.node {
-                PatKind::Constructor { name, payload } => {
+                PatKind::Constructor { name, payload, .. } => {
                     assert_eq!(name, "Nothing");
                     // No explicit payload — parser uses empty record
                     assert!(matches!(&payload.node, PatKind::Record(fs) if fs.is_empty()));
@@ -3267,7 +3267,7 @@ fn constructor_without_explicit_payload() {
                 other => panic!("expected Constructor, got {:?}", other),
             }
             match &arms[1].pat.node {
-                PatKind::Constructor { name, payload } => {
+                PatKind::Constructor { name, payload, .. } => {
                     assert_eq!(name, "Just");
                     assert!(matches!(&payload.node, PatKind::Var(n) if n == "v"));
                 }

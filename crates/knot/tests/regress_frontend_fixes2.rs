@@ -510,7 +510,7 @@ fn bare_cons_pattern_round_trips() {
         panic!("expected Case, got {:?}", body);
     };
     match &arms[0].pat.node {
-        PatKind::Constructor { name, payload } => {
+        PatKind::Constructor { name, payload, .. } => {
             assert_eq!(name, "Cons");
             assert!(
                 matches!(&payload.node, PatKind::Record(fs) if fs.is_empty()),

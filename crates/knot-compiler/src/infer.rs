@@ -7905,14 +7905,36 @@ impl Infer {
                 self.binding_types.push((pat.span, expected.clone()));
             }
             ast::PatKind::Wildcard => {}
-            ast::PatKind::Constructor { name, payload } => {
-                if let Some((_data_ty, record_ty)) =
+            ast::PatKind::Constructor {
+                name,
+                payload,
+                qualifier,
+            } => {
+                if let Some(q) = qualifier {
+                    // Qualified pattern `Color.Red`: resolve `Red` within the
+                    // nominal data type `Color` and unify the scrutinee with
+                    // `Color` directly — NO row-polymorphic open variant.
+                    match self.instantiate_qualified_ctor(q, name) {
+                        Some((data_ty, record_ty)) => {
+                            self.unify(&data_ty, expected, pat.span);
+                            self.check_pattern(payload, &record_ty);
+                        }
+                        None => {
+                            self.error(
+                                format!(
+                                    "data type '{}' has no constructor '{}' in pattern",
+                                    q, name
+                                ),
+                                pat.span,
+                            );
+                        }
+                    }
+                } else if let Some((_data_ty, record_ty)) =
                     self.instantiate_ctor(name, pat.span)
                 {
-                    // Create an open variant with just this constructor.
-                    // This enables row-polymorphic variant matching: the
-                    // scrutinee only needs to *contain* this constructor,
-                    // not be the exact nominal ADT that defines it.
+                    // Unqualified constructor (legacy): row-polymorphic open
+                    // variant. Slated for removal — constructors are meant to
+                    // be qualified.
                     let row_var = self.fresh_var();
                     let mut ctors = BTreeMap::new();
                     ctors.insert(name.clone(), record_ty.clone());
@@ -8045,7 +8067,7 @@ impl Infer {
         let mut partial: HashSet<&str> = HashSet::new();
         for arm in arms {
             match &arm.pat.node {
-                ast::PatKind::Constructor { name, payload } => {
+                ast::PatKind::Constructor { name, payload, .. } => {
                     if Self::pattern_is_irrefutable(payload) {
                         covered.insert(name.as_str());
                     } else {

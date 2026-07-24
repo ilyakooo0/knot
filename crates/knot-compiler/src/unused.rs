@@ -352,7 +352,7 @@ fn walk_stmt(s: &Stmt, r: &mut Refs) {
 fn walk_pat(p: &Pat, r: &mut Refs) {
     match &p.node {
         PatKind::Var(_) | PatKind::Wildcard | PatKind::Lit(_) => {}
-        PatKind::Constructor { name, payload } => {
+        PatKind::Constructor { name, payload, .. } => {
             r.ctors.insert(name.clone());
             walk_pat(payload, r);
         }

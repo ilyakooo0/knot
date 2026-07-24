@@ -3893,17 +3893,21 @@ impl Parser {
             TokenKind::Upper(_) => {
                 let tok = self.advance();
                 let TokenKind::Upper(mut name) = tok.kind else { unreachable!() };
-                // Qualified constructor: `Type.Ctor`. Consume `.` + the ctor
-                // segment; matching is by the ctor tag (`Ctor`), with `Type`
-                // providing resolution/confinement context (dropped here —
-                // the type checker validates membership). Loops to allow
-                // deeper qualification (`a.b.Ctor`).
+                // Qualified constructor: `Type.Ctor`. The leading `Type`
+                // segment(s) form the qualifier (resolution/confinement
+                // context); `name` is the final ctor tag. Loops to allow
+                // deeper qualification (`a.b.Ctor` → qualifier `a.b`).
+                let mut qualifier: Option<Name> = None;
                 while self.at(&TokenKind::Dot)
                     && matches!(self.peek_ahead(1), TokenKind::Upper(_))
                 {
                     self.advance(); // consume `.`
                     let ctor_tok = self.advance();
                     let TokenKind::Upper(seg) = ctor_tok.kind else { unreachable!() };
+                    qualifier = Some(match qualifier {
+                        None => name.clone(),
+                        Some(q) => format!("{q}.{name}"),
+                    });
                     name = seg;
                 }
                 // `Cons head tail` — non-empty relation pattern (reserved name).
@@ -3913,7 +3917,7 @@ impl Parser {
                 // payload, so fall through to a normal constructor pattern
                 // instead of erroring — otherwise a `data … = … | Cons {…}` type
                 // is constructable but impossible to pattern-match.
-                if name == "Cons" && self.can_start_pat_atom() {
+                if name == "Cons" && qualifier.is_none() && self.can_start_pat_atom() {
                     let head = self.parse_pat_atom()?;
                     if self.can_start_pat_atom() {
                         let tail = self.parse_pat_atom()?;
@@ -3931,6 +3935,7 @@ impl Parser {
                         PatKind::Constructor {
                             name,
                             payload: Box::new(head),
+                            qualifier,
                         },
                         span,
                     ));
@@ -3948,6 +3953,7 @@ impl Parser {
                     PatKind::Constructor {
                         name,
                         payload: Box::new(payload),
+                        qualifier,
                     },
                     span,
                 ))
@@ -4079,13 +4085,28 @@ impl Parser {
                 // A bare constructor used as a payload: `Just True`, `Ok Nothing`.
                 // Treat it as a nullary constructor (empty record payload) — do
                 // NOT consume a further payload atom here, so a constructor with
-                // arguments still requires parentheses.
+                // arguments still requires parentheses. May be qualified
+                // (`Just Color.Red`): capture the qualifier as above.
                 let tok = self.advance();
-                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(mut name) = tok.kind else { unreachable!() };
+                let mut qualifier: Option<Name> = None;
+                while self.at(&TokenKind::Dot)
+                    && matches!(self.peek_ahead(1), TokenKind::Upper(_))
+                {
+                    self.advance();
+                    let ctor_tok = self.advance();
+                    let TokenKind::Upper(seg) = ctor_tok.kind else { unreachable!() };
+                    qualifier = Some(match qualifier {
+                        None => name.clone(),
+                        Some(q) => format!("{q}.{name}"),
+                    });
+                    name = seg;
+                }
                 Some(Spanned::new(
                     PatKind::Constructor {
                         name,
                         payload: Box::new(Spanned::new(PatKind::Record(vec![]), tok.span)),
+                        qualifier,
                     },
                     tok.span,
                 ))

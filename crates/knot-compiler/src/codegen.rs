@@ -7199,6 +7199,7 @@ impl Codegen {
                     ast::PatKind::Constructor {
                         name: h.endpoint.clone(),
                         payload: Box::new(payload_pat),
+                        qualifier: None,
                     },
                     h.endpoint_span,
                 );
@@ -7695,7 +7696,7 @@ impl Codegen {
         match &pat.node {
             ast::PatKind::Var(name) => env.set(name, val),
             ast::PatKind::Wildcard => {}
-            ast::PatKind::Constructor { name, payload } => {
+            ast::PatKind::Constructor { name, payload, .. } => {
                 if name == "True" || name == "False" {
                     // Bool is represented as Value::Bool, not Value::Constructor —
                     // calling knot_constructor_payload would panic. The payload is
@@ -7795,7 +7796,7 @@ impl Codegen {
             ast::PatKind::Wildcard => {}
             // Top-level literal equality was tested by compile_case.
             ast::PatKind::Lit(_) => {}
-            ast::PatKind::Constructor { name, payload } => {
+            ast::PatKind::Constructor { name, payload, .. } => {
                 // Tag already tested at top level — test+bind the payload.
                 let inner = self.case_ctor_payload(builder, name, val);
                 self.test_and_bind_case_subpattern(builder, payload, inner, env, fail_block);
@@ -7872,7 +7873,7 @@ impl Codegen {
                 let is_eq = builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
                 branch_on(builder, is_eq);
             }
-            ast::PatKind::Constructor { name, payload } => {
+            ast::PatKind::Constructor { name, payload, .. } => {
                 let is_match = if name == "True" || name == "False" {
                     let bool_val = self.call_rt_typed(
                         builder,
@@ -9313,7 +9314,7 @@ impl Codegen {
                     }
                 }
             }
-            ast::PatKind::Constructor { name, payload } => {
+            ast::PatKind::Constructor { name, payload, .. } => {
                 let is_match = if name == "True" || name == "False" {
                     // Bool is represented as Value::Bool, not Value::Constructor —
                     // knot_constructor_matches would always return 0. Test the
@@ -15712,7 +15713,7 @@ fn bind_do_pattern(
                 }
             }
         }
-        ast::PatKind::Constructor { name, payload } => {
+        ast::PatKind::Constructor { name, payload, .. } => {
             // Pattern match bind: `Circle c <- *shapes`
             // Filter: only rows matching the constructor tag continue
             let is_match = if name == "True" || name == "False" {
@@ -16736,7 +16737,7 @@ fn pretty_pat(pat: &ast::Pat) -> String {
     match &pat.node {
         ast::PatKind::Var(name) => name.clone(),
         ast::PatKind::Wildcard => "_".to_string(),
-        ast::PatKind::Constructor { name, payload } => {
+        ast::PatKind::Constructor { name, payload, .. } => {
             format!("{} {}", name, pretty_pat(payload))
         }
         ast::PatKind::Record(fields) => {

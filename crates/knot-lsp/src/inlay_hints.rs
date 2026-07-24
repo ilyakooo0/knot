@@ -521,7 +521,7 @@ fn add_record_pattern_field_hints(
                     }
                 }
             }
-            ast::PatKind::Constructor { name, payload } => {
+            ast::PatKind::Constructor { name, payload, .. } => {
                 // A constructor-record pattern is collected ONCE, as the
                 // constructor entry; recursing into the payload Record would
                 // push the same record again and duplicate every per-field

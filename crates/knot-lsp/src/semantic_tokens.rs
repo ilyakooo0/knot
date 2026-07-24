@@ -704,7 +704,7 @@ impl<'a> TokenCollector<'a> {
                 let tok = if is_param { TOK_PARAMETER } else { TOK_VARIABLE };
                 self.add(pat.span, tok, MOD_DECLARATION);
             }
-            ast::PatKind::Constructor { name, payload } => {
+            ast::PatKind::Constructor { name, payload, .. } => {
                 // Emit an ENUM_MEMBER token for the constructor name itself,
                 // mirroring the expression-side `ExprKind::Constructor` arm so
                 // `Circle c` in a pattern highlights like `Circle {..}` in

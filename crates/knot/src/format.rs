@@ -2272,7 +2272,16 @@ fn render_pat(p: &Pat) -> String {
     match &p.node {
         PatKind::Var(n) => n.clone(),
         PatKind::Wildcard => "_".into(),
-        PatKind::Constructor { name, payload } => {
+        PatKind::Constructor {
+            name,
+            payload,
+            qualifier,
+        } => {
+            // Re-emit the qualifier for a qualified pattern (`Color.Red`).
+            let head = match qualifier {
+                Some(q) => format!("{q}.{name}"),
+                None => name.clone(),
+            };
             // `Ctor {}` for empty record; otherwise `Ctor {fields}` or `Ctor pat`.
             match &payload.node {
                 // A constructor named `Cons` must print WITHOUT a payload
@@ -2280,9 +2289,9 @@ fn render_pat(p: &Pat) -> String {
                 // `Cons head tail` path ('{}' becomes the head pattern and
                 // the parse fails on a missing tail). A bare `Cons` reparses
                 // to Constructor("Cons", Record([])) — exactly this AST.
-                PatKind::Record(fields) if fields.is_empty() && name == "Cons" => name.clone(),
-                PatKind::Record(fields) if fields.is_empty() => format!("{} {{}}", name),
-                _ => format!("{} {}", name, render_pat_atom(payload)),
+                PatKind::Record(fields) if fields.is_empty() && name == "Cons" => head,
+                PatKind::Record(fields) if fields.is_empty() => format!("{} {{}}", head),
+                _ => format!("{} {}", head, render_pat_atom(payload)),
             }
         }
         PatKind::Record(fields) => {

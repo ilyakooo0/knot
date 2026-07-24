@@ -263,7 +263,7 @@ fn format_pat_brief_d(pat: &ast::PatKind, depth: usize) -> String {
         ast::PatKind::Lit(ast::Literal::Text(s)) => format!("\"{s}\""),
         ast::PatKind::Lit(ast::Literal::Bool(b)) => if *b { "true" } else { "false" }.into(),
         ast::PatKind::Lit(ast::Literal::Bytes(_)) => "<bytes>".into(),
-        ast::PatKind::Constructor { name, payload } => match &payload.node {
+        ast::PatKind::Constructor { name, payload, .. } => match &payload.node {
             // `Open {}` — nullary constructor; drop the empty payload to keep
             // the brief rendering tight.
             ast::PatKind::Record(fields) if fields.is_empty() => name.clone(),

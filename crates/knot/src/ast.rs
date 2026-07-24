@@ -436,7 +436,13 @@ pub enum PatKind {
     Wildcard,
 
     /// `Circle {radius}`, `Open {}`, `Circle c` — constructor + payload.
-    Constructor { name: Name, payload: Box<Pat> },
+    /// `qualifier` is the data-type path in a qualified pattern `Color.Red`
+    /// (`Some("Color")`); `name` is always the bare constructor tag (`Red`).
+    Constructor {
+        name: Name,
+        payload: Box<Pat>,
+        qualifier: Option<Name>,
+    },
 
     /// `{name: n, age}` — record destructure.
     Record(Vec<FieldPat>),

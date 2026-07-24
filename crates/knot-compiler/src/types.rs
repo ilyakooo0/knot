@@ -1117,6 +1117,7 @@ fn synth_ctor_field_case(ctor: &str, field: &str, pred: Expr, span: Span) -> Exp
         PatKind::Constructor {
             name: ctor.into(),
             payload: Box::new(rec_pat),
+            qualifier: None,
         },
         span,
     );

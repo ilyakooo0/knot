@@ -438,7 +438,7 @@ impl<'a> DefResolver<'a> {
                 // — local binders have no entry in the top-level name map.
                 self.refs.push((pat.span, pat.span));
             }
-            ast::PatKind::Constructor { name, payload } => {
+            ast::PatKind::Constructor { name, payload, .. } => {
                 // The reference must cover only the constructor name, not the
                 // payload — rename replaces usage spans verbatim, so a
                 // whole-pattern span would delete the payload binder. The name

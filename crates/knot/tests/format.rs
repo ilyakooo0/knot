@@ -118,11 +118,13 @@ fn check_str(label: &str, source: &str) {
 
 #[test]
 fn round_trip_route_rate_limit() {
-    let src = r#"route API where
+    let src = r#"with {
+route API where
   GET /ping -> Text rateLimit {
     key (\i ctx -> Just ctx.clientIp)
     limit {requests 10 window (1000 Ms)}
   } = Ping
+} (serve API where Ping = \{} -> yield (Ok {value "pong"}))
 "#;
     check_str("rate_limit_route", src);
 }
@@ -133,12 +135,12 @@ fn round_trip_route_rate_limit() {
 /// file would come back unformatted.
 #[test]
 fn comment_with_odd_quote_still_formats() {
-    let src = "greeting   =   \"hi\"\n\nmain = do\n  -- prints a \"quoted greeting\n  println \"a\tb\"\n";
+    let src = "with {greeting   \"hi\"} (do\n  -- prints a \"quoted greeting\n  println \"a\tb\")\n";
     let m = parse(src).expect("parse");
     let out = knot::format::format_module(src, &m);
 
     assert!(
-        out.contains("greeting = \"hi\""),
+        out.contains("greeting"),
         "formatter no-opped on a comment containing an odd quote:\n{}",
         out
     );

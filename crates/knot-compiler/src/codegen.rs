@@ -3312,7 +3312,30 @@ impl Codegen {
             .unwrap();
 
         let decls = decl_views(program);
-        let user_main = self.user_fns.get("main").copied();
+        // The program's body — the expression the file *is* (`with {…} (body)`
+        // → `body`; any other file → the whole expression) — is the program's
+        // `main` computation. Register it as `knot_user_main` so the entry
+        // point below actually runs it. A field literally named `main` (if the
+        // user wrote one) is a plain decl, not the entry point.
+        let file_body = file_main_body(program);
+        let user_main = file_body.map(|body| {
+            let mut msig = self.module.make_signature();
+            msig.params.push(AbiParam::new(self.ptr_type)); // db
+            msig.returns.push(AbiParam::new(self.ptr_type));
+            let fid = self
+                .module
+                .declare_function("knot_user_main", Linkage::Local, &msig)
+                .unwrap();
+            self.user_fns.insert("main".to_string(), (fid, 0));
+            // Compile the body into `knot_user_main`.
+            self.build_function(fid, msig, |cg, builder, entry| {
+                let db = builder.block_params(entry)[0];
+                let mut env = Env::new();
+                let result = cg.compile_expr(builder, body, &mut env, db);
+                builder.ins().return_(&[result]);
+            });
+            (fid, 0)
+        });
         let all_routes: Vec<(String, Vec<ast::RouteEntry>)> =
             self.route_entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let alias_ast = self.alias_ast.clone();
@@ -15831,6 +15854,17 @@ fn uncurry_app(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
             (f, args)
         }
         _ => (expr, Vec::new()),
+    }
+}
+
+/// The program's entry-point expression. A `.knot` file IS a single
+/// expression, so the whole program is compiled as `main` — its value is the
+/// program's result. `None` only for a bare record with no body (a pure
+/// declaration file, e.g. a lockfile).
+fn file_main_body(program: &ast::Expr) -> Option<&ast::Expr> {
+    match &program.node {
+        ast::ExprKind::Record(_) => None,
+        _ => Some(program),
     }
 }
 

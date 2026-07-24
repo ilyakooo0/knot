@@ -69,12 +69,18 @@ pub fn inject_prelude(expr: &mut ast::Expr) {
         expr,
         ast::Spanned::new(ast::ExprKind::Record(Vec::new()), span),
     );
+    // The wrapping `with`'s own span must NOT alias the original program's
+    // span: when the program is itself a `with`, sharing the span would make
+    // `with_fields` (keyed by span) collide and the inner with's field
+    // bindings (the user's `with {x …}` fields) would be overwritten by the
+    // prelude's. Use the (shifted) prelude record's span — guaranteed unique.
+    let with_span = record.span;
     *expr = ast::Spanned::new(
         ast::ExprKind::With {
             record: Box::new(record),
             body: Box::new(body),
         },
-        span,
+        with_span,
     );
 }
 

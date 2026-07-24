@@ -85,7 +85,30 @@ impl<'a> DeclView<'a> {
 /// Collect every declaration in the program.
 pub fn decl_views(program: &ast::Expr) -> Vec<DeclView<'_>> {
     let mut out = Vec::new();
-    collect(program, &mut out);
+    // The user's declaration record is the record of the INNERMOST `with` in
+    // the `with {prelude} <user program>` chain (the user's own `with`, when
+    // theirs is one). Only TOP-LEVEL fields are declarations — nested record
+    // literals are plain values, not decls (recursing into a field's value
+    // would turn `{name "Alice"}` into a spurious `name` decl and collide
+    // nested `rec {max …}` field-functions).
+    let mut cur = program;
+    loop {
+        match &cur.node {
+            ast::ExprKind::With { record, body }
+                if matches!(body.node, ast::ExprKind::With { .. }) =>
+            {
+                cur = body;
+            }
+            ast::ExprKind::With { record, .. } => {
+                collect(record, &mut out);
+                break;
+            }
+            _ => {
+                collect(cur, &mut out);
+                break;
+            }
+        }
+    }
     out
 }
 
@@ -145,30 +168,25 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
                         kind: DeclViewKind::Subset { sub, sup },
                     }),
                     _ => {
-                        // A named function: a record field with a lambda body
-                        // and/or a signature.
-                        let is_lambda = matches!(fl.value.node, Lambda { .. });
-                        if is_lambda || fl.sig.is_some() {
-                            out.push(DeclView {
-                                name: fl.name.as_str(),
-                                span: fl.value.span,
-                                kind: DeclViewKind::Fun {
-                                    ty: fl.sig.as_ref(),
-                                    body: Some(&fl.value),
-                                },
-                            });
-                        }
+                        // A named value/function: any record field whose value
+                        // is not a declaration marker. This covers lambdas
+                        // (functions), signatures, AND plain value bindings
+                        // like `nums [1, 2, 3]` — all become top-level named
+                        // declarations, exactly as the Phase-1 lowering turned
+                        // `with {f v} body` fields into decls.
+                        out.push(DeclView {
+                            name: fl.name.as_str(),
+                            span: fl.value.span,
+                            kind: DeclViewKind::Fun {
+                                ty: fl.sig.as_ref(),
+                                body: Some(&fl.value),
+                            },
+                        });
                     }
                 }
-                // Recurse into every field value to find nested records.
-                collect(&fl.value, out);
             }
         }
-        With { record, body } => {
-            collect(record, out);
-            collect(body, out);
-        }
-        _ => recurse(e, out),
+        _ => {}
     }
 }
 

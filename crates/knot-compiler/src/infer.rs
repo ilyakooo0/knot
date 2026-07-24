@@ -12143,6 +12143,42 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
     // Phase 4: Infer all declaration bodies
     infer.infer_declarations(program);
 
+    // Phase 4z: Infer the program's body so nested expressions get
+    // `with_fields` entries and do-block monad resolution, and record the
+    // user's top-level `with` fields. The program root is not a declaration,
+    // so `infer_declarations` never visits it — without this a top-level
+    // `with {x …} (…x…)` or a nested `with` inside the body compiles to
+    // "undefined variable". After prelude injection the program is
+    // `with {prelude} <user program>`; the user's `with` (when theirs is one)
+    // is the prelude-with's body. We infer the user's BODY (not the record,
+    // whose fields are already decls), and register the with's field names.
+    {
+        let mut cur: &ast::Expr = program;
+        loop {
+            match &cur.node {
+                ast::ExprKind::With { body, .. }
+                    if matches!(body.node, ast::ExprKind::With { .. }) =>
+                {
+                    cur = body;
+                }
+                ast::ExprKind::With { record, body } => {
+                    if let ast::ExprKind::Record(fields) = &record.node {
+                        infer.with_fields.push((
+                            cur.span,
+                            fields.iter().map(|f| f.name.clone()).collect(),
+                        ));
+                    }
+                    let _ = infer.infer_expr(body);
+                    break;
+                }
+                _ => {
+                    let _ = infer.infer_expr(cur);
+                    break;
+                }
+            }
+        }
+    }
+
     // Phase 4a: Resolve any remaining effect-union (`r1 \/ r2`) constraints
     // so their result rows get bound to the union of their sources' effects.
     infer.resolve_pending_effect_unions();
@@ -12860,16 +12896,47 @@ fn for_each_named_fn<'a>(
     program: &'a ast::Expr,
     f: &mut impl FnMut(&'a str, Option<&'a ast::TypeScheme>, Option<&'a ast::Expr>),
 ) {
-    walk_exprs_read(program, &mut |e| {
-        if let ast::ExprKind::Record(fields) = &e.node {
-            for fl in fields {
-                let is_lambda = matches!(fl.value.node, ast::ExprKind::Lambda { .. });
-                if is_lambda || fl.sig.is_some() {
-                    f(&fl.name, fl.sig.as_ref(), Some(&fl.value));
+    // The user's declaration record is the record of the INNERMOST `with` in
+    // the `with {r1} (with {r2} (…))` chain — after prelude injection the
+    // program is `with {prelude} <user program>`, so when the user's program
+    // is itself a `with`, its record holds the declarations. When the user
+    // program is a bare record or a non-`with` expression, that's the record
+    // (or there are no decls). Nested record *values* (a record literal in a
+    // field) are NOT declarations.
+    fn decl_record(e: &ast::Expr) -> Option<&ast::Expr> {
+        match &e.node {
+            ast::ExprKind::With { record, body } => {
+                // The user's program is this `with`'s body. If that body is
+                // itself a `with`, the user's decls live in ITS record.
+                if matches!(body.node, ast::ExprKind::With { .. }) {
+                    decl_record(body)
+                } else {
+                    Some(record)
                 }
             }
+            ast::ExprKind::Record(_) => Some(e),
+            _ => None,
         }
-    });
+    }
+    if let Some(record) = decl_record(program)
+        && let ast::ExprKind::Record(fields) = &record.node
+    {
+        for fl in fields {
+            if !matches!(
+                fl.value.node,
+                ast::ExprKind::DataCtor { .. }
+                    | ast::ExprKind::TypeCtor { .. }
+                    | ast::ExprKind::SourceDecl { .. }
+                    | ast::ExprKind::ViewDecl { .. }
+                    | ast::ExprKind::DerivedDecl { .. }
+                    | ast::ExprKind::RouteDecl { .. }
+                    | ast::ExprKind::RouteCompositeDecl { .. }
+                    | ast::ExprKind::SubsetConstraint { .. }
+            ) {
+                f(&fl.name, fl.sig.as_ref(), Some(&fl.value));
+            }
+        }
+    }
 }
 
 /// Visit every route marker: `route Name = …` (with entries) and route

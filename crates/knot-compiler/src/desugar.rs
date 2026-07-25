@@ -454,9 +454,17 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
         // they don't produce IO even if they contain IO values as
         // subexpressions. Must match codegen's expr_contains_io to avoid
         // incorrectly preventing desugaring of pure comprehension do-blocks.
+        //
+        // Exception: `base.<io-builtin>` is the namespaced form of an
+        // IO-producing builtin (`base.sleep`, `base.println`, …). Even though
+        // it is syntactically a FieldAccess, it CALLS an IO builtin, so it
+        // must mark the do-block as IO (mirrors the `Var` arm above).
+        ExprKind::FieldAccess { expr, field } => {
+            matches!(&expr.node, ExprKind::Var(n) if n == "base")
+                && builtins.contains(field.as_str())
+        }
         ExprKind::Record(_)
         | ExprKind::RecordUpdate { .. }
-        | ExprKind::FieldAccess { .. }
         | ExprKind::List(_) => false,
         _ => {
             if let Some(inner) = expr.node.as_yield_arg() {
@@ -1239,6 +1247,16 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
         // they don't produce IO even if they contain IO values as
         // subexpressions. Only direct IO-producing expressions (calls to
         // IO functions, relation ops, etc.) should flag a do-block as IO.
+        //
+        // Exception: `base.<io-builtin>` is the namespaced form of an
+        // IO-producing builtin (`base.sleep`, `base.println`, …). Syntactically
+        // a FieldAccess, but it CALLS an IO builtin — flag it so the do-block
+        // routes to the dedicated IO codegen path (mirrors the `Var` arm).
+        ExprKind::FieldAccess { expr, field } => {
+            matches!(&expr.node, ExprKind::Var(n) if n == "base")
+                && crate::builtins::EFFECTFUL_BUILTINS.contains(&field.as_str())
+                && field.as_str() != "retry"
+        }
         _ => false,
     }
 }

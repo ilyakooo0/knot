@@ -8260,9 +8260,16 @@ impl Codegen {
             ast::ExprKind::TimeUnitLit { value, .. } => Self::expr_contains_io(value, builtins, io_fns),
             ast::ExprKind::Annot { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
             ast::ExprKind::Refine(inner) => Self::expr_contains_io(inner, builtins, io_fns),
+            // `base.<io-builtin>` — the namespaced form of an IO-producing
+            // builtin. Syntactically a FieldAccess, but it CALLS an IO
+            // builtin, so it marks the do-block as IO (mirrors the `Var` arm
+            // and the desugarer's `expr_contains_io`).
+            ast::ExprKind::FieldAccess { expr, field } => {
+                matches!(&expr.node, ast::ExprKind::Var(n) if n == "base")
+                    && builtins.contains(field.as_str())
+            }
             ast::ExprKind::Record(_)
             | ast::ExprKind::RecordUpdate { .. }
-            | ast::ExprKind::FieldAccess { .. }
             | ast::ExprKind::List(_) => false,
             _ => false,
         }

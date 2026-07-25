@@ -9546,17 +9546,20 @@ impl Infer {
         // The ToJSON/FromJSON traits register these methods with constraints,
         // but we want calling them to work on all types without explicit impls
         // (the runtime provides generic JSON encoding/decoding for all types).
+        // These are stdlib value fns: they go into `stdlib_schemes` (never
+        // `scopes`) like every other stdlib name — this runs outside the
+        // `register_builtins` window, so bind the registry directly.
         let a = self.fresh_var();
-        self.bind_top(
-            "toJson",
+        self.stdlib_schemes.insert(
+            "toJson".to_string(),
             Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text))),
         );
         // `parseJson : Text -> Maybe a` — a failure channel for malformed
         // input. The runtime decoder returns `Nothing` on parse error and
         // `Just decoded` on success, rather than aborting the program.
         let a = self.fresh_var();
-        self.bind_top(
-            "parseJson",
+        self.stdlib_schemes.insert(
+            "parseJson".to_string(),
             Scheme::poly(
                 vec![a],
                 Ty::Fun(
@@ -9567,7 +9570,7 @@ impl Infer {
         );
 
         // Bind the global `base` record's type LAST, once every stdlib name
-        // (including `toJson`/`parseJson` above) is in `scopes[0]`.
+        // (including `toJson`/`parseJson` above) is in `stdlib_schemes`.
         self.bind_base_record();
     }
 

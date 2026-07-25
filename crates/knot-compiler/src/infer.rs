@@ -9169,6 +9169,26 @@ impl Infer {
         }
         self.enforce_units = saved_enforce;
 
+        // Same-scope duplicate type declarations: two `data` decls with the
+        // same name at the SAME `with` nesting depth are a compile error.
+        // Without this they silently clobber each other in the global type env
+        // (last-write-wins), producing "no constructor" errors far from the
+        // real mistake. Nested scopes (different depths) may reuse a name —
+        // those are distinct types. Builtin data types are exempt (they are
+        // not user `data` decls and never appear here).
+        {
+            let mut seen: HashMap<(String, usize), Span> = HashMap::new();
+            for_each_data_ctor_scoped(program, &mut |name, _params, _ctors, span, depth| {
+                let key = (name.to_string(), depth);
+                if seen.insert(key, span).is_some() {
+                    self.error(
+                        format!("duplicate type declaration '{name}' in the same scope"),
+                        span,
+                    );
+                }
+            });
+        }
+
         // Second pass: data types and constructors
         for_each_data_ctor(program, &mut |name, params, ctors, span| {
             {
@@ -13161,6 +13181,101 @@ fn for_each_data_ctor<'a>(
             f(name, params, constructors, e.span);
         }
     });
+}
+
+/// Visit every `DataCtor` (`data`) marker, additionally yielding the `with`
+/// nesting depth at which it is declared (0 = top level, +1 per enclosing
+/// `with`). Used to detect SAME-SCOPE duplicate type declarations: two `data`
+/// decls with the same name at the SAME depth are a compile error (they would
+/// otherwise silently clobber each other in the global type env). Nested
+/// scopes (different depths) may reuse a name — those are distinct types.
+fn for_each_data_ctor_scoped<'a>(
+    program: &'a ast::Expr,
+    f: &mut impl FnMut(&'a str, &'a [ast::Name], &'a [ast::ConstructorDef], Span, usize),
+) {
+    fn walk<'a>(
+        e: &'a ast::Expr,
+        depth: usize,
+        f: &mut impl FnMut(&'a str, &'a [ast::Name], &'a [ast::ConstructorDef], Span, usize),
+    ) {
+        use ast::ExprKind::*;
+        if let DataCtor { name, params, constructors } = &e.node {
+            f(name, params, constructors, e.span, depth);
+            return; // do not descend into the decl's own subexpressions
+        }
+        let d = match &e.node {
+            With { .. } => depth + 1,
+            _ => depth,
+        };
+        match &e.node {
+            App { func, arg } => {
+                walk(func, d, f);
+                walk(arg, d, f);
+            }
+            With { record, body } => {
+                walk(record, d, f);
+                walk(body, d, f);
+            }
+            Lambda { body, .. } => walk(body, d, f),
+            BinOp { lhs, rhs, .. } => {
+                walk(lhs, d, f);
+                walk(rhs, d, f);
+            }
+            UnaryOp { operand, .. } => walk(operand, d, f),
+            If { cond, then_branch, else_branch } => {
+                walk(cond, d, f);
+                walk(then_branch, d, f);
+                walk(else_branch, d, f);
+            }
+            Case { scrutinee, arms } => {
+                walk(scrutinee, d, f);
+                for arm in arms {
+                    walk(&arm.body, d, f);
+                }
+            }
+            Do(stmts) => {
+                for s in stmts {
+                    match &s.node {
+                        ast::StmtKind::Bind { expr, .. } => walk(expr, d, f),
+                        ast::StmtKind::Where { cond } => walk(cond, d, f),
+                        ast::StmtKind::GroupBy { key } => walk(key, d, f),
+                        ast::StmtKind::Expr(x) => walk(x, d, f),
+                    }
+                }
+            }
+            Set { target, value } | ReplaceSet { target, value } => {
+                walk(target, d, f);
+                walk(value, d, f);
+            }
+            Atomic(x) | Refine(x) => walk(x, d, f),
+            TimeUnitLit { value, .. } => walk(value, d, f),
+            Record(fields) => {
+                for fl in fields {
+                    walk(&fl.value, d, f);
+                }
+            }
+            RecordUpdate { base, fields } => {
+                walk(base, d, f);
+                for fl in fields {
+                    walk(&fl.value, d, f);
+                }
+            }
+            List(items) => {
+                for it in items {
+                    walk(it, d, f);
+                }
+            }
+            FieldAccess { expr, .. } | Annot { expr, .. } => walk(expr, d, f),
+            Serve { handlers, .. } => {
+                for h in handlers {
+                    walk(&h.body, d, f);
+                }
+            }
+            ViewDecl { body, .. } | DerivedDecl { body, .. } => walk(body, d, f),
+            _ => {}
+        }
+    }
+    walk(program, 0, f);
 }
 
 /// Visit every relation marker (`*source` / view / `&derived`).

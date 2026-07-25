@@ -465,19 +465,8 @@ pub enum TypeKind {
         rest: Option<Name>,
     },
 
-    /// `{rw *people} Text -> {}` — effectful type.
-    Effectful {
-        effects: Vec<Effect>,
-        ty: Box<Type>,
-    },
-
-    /// `IO {effects} a` or `IO {effects | r} a` — IO monad type with effect set.
-    /// `rest` is the row-variable tail. Empty Vec = closed row. One element =
-    /// single row variable. Multiple elements = `r1 \/ r2 \/ ...` row-union —
-    /// the tail row is the union of each named row variable's effects.
+    /// `IO a` — IO monad type. Effects are untracked.
     IO {
-        effects: Vec<Effect>,
-        rest: Vec<Name>,
         ty: Box<Type>,
     },
 
@@ -545,19 +534,6 @@ impl Constraint {
             Constraint::ImplicitField { ty, .. } => vec![ty],
         }
     }
-}
-
-// ── Effects ────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub enum Effect {
-    Reads(Name),
-    Writes(Name),
-    Console,
-    Network,
-    Fs,
-    Clock,
-    Random,
 }
 
 // ── Shared structures ──────────────────────────────────────────────

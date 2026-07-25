@@ -1,14 +1,12 @@
-//! `textDocument/codeLens` handler. Surfaces reference counts, lineage info,
-//! route URLs, and impl counts.
-
-use std::collections::HashMap;
+//! `textDocument/codeLens` handler. Surfaces reference counts, route URLs, and
+//! impl counts.
 
 use lsp_types::*;
 
 use knot::ast::ExprKind;
 use crate::utils::top_fields;
 
-use crate::shared::{format_route_path, http_method_str, plural, route_is_listened};
+use crate::shared::{format_route_path, http_method_str, route_is_listened};
 use crate::state::ServerState;
 use crate::utils::span_to_range;
 
@@ -21,32 +19,6 @@ pub(crate) fn handle_code_lens(
     let uri = &params.text_document.uri;
     let doc = state.documents.get(uri)?;
     let mut lenses = Vec::new();
-
-    // Lineage: for each relation (source/view/derived), find the consumers and
-    // producers using the per-decl effect sets.
-    //   readers[name] → list of (consumer_name, consumer_kind)
-    //   writers[name] → list of writer decl names
-    // Built once per request; small enough that O(n × m) is fine.
-    let mut readers: HashMap<&str, Vec<(&str, &str)>> = HashMap::new();
-    let mut writers: HashMap<&str, Vec<&str>> = HashMap::new();
-    for d in top_fields(&doc.module) {
-        let (name, kind) = match &d.value.node {
-            ExprKind::ViewDecl { name, .. } => (name.as_str(), "view"),
-            ExprKind::DerivedDecl { name, .. } => (name.as_str(), "derived"),
-            ExprKind::SourceDecl { .. } | ExprKind::DataCtor { .. }
-            | ExprKind::TypeCtor { .. } | ExprKind::RouteDecl { .. }
-            | ExprKind::RouteCompositeDecl { .. } | ExprKind::SubsetConstraint { .. } => continue,
-            _ => (d.name.as_str(), "fn"),
-        };
-        if let Some(eff) = doc.effect_sets.get(name) {
-            for r in &eff.reads {
-                readers.entry(r.as_str()).or_default().push((name, kind));
-            }
-            for w in &eff.writes {
-                writers.entry(w.as_str()).or_default().push(name);
-            }
-        }
-    }
 
     for decl in top_fields(&doc.module) {
         let dspan = decl.value.span;
@@ -116,112 +88,8 @@ pub(crate) fn handle_code_lens(
             data: None,
         });
 
-        // Effect summary lens: surface inferred IO/relation effects inline so
-        // the user sees at a glance whether a function reads/writes relations
-        // or performs IO. Effects are central to knot's semantics — a `set`
-        // hidden behind two helper layers is easy to miss without this.
-        // Suppress the lens for pure-by-construction decl kinds (sources,
-        // data, traits) where the effect summary would be noise.
-        let eff_name = match &decl.value.node {
-            ExprKind::ViewDecl { name, .. } | ExprKind::DerivedDecl { name, .. } => Some(name.as_str()),
-            ExprKind::SourceDecl { .. } | ExprKind::DataCtor { .. }
-            | ExprKind::TypeCtor { .. } | ExprKind::RouteDecl { .. }
-            | ExprKind::RouteCompositeDecl { .. } | ExprKind::SubsetConstraint { .. } => None,
-            _ => Some(decl.name.as_str()),
-        };
-        if let Some(name) = eff_name {
-            if let Some(effects) = doc.effect_info.get(name) {
-                lenses.push(CodeLens {
-                    range: Range {
-                        start: range.start,
-                        end: range.start,
-                    },
-                    command: Some(Command {
-                        title: format!("effects: {effects}"),
-                        command: String::new(),
-                        arguments: None,
-                    }),
-                    data: None,
-                });
-            }
-        }
-
-        // Lineage lens: source declarations show their consumers; views/derived
-        // show their producers. The lens command is informational (no nav target),
-        // so we use a no-op command name and put the summary in the title.
+        // Route URL preview + dead-route lint lens.
         match &decl.value.node {
-            ExprKind::SourceDecl { name, .. } => {
-                let mut view_count = 0;
-                let mut derived_count = 0;
-                let mut fn_count = 0;
-                if let Some(consumers) = readers.get(name.as_str()) {
-                    for (_, kind) in consumers {
-                        match *kind {
-                            "view" => view_count += 1,
-                            "derived" => derived_count += 1,
-                            "fn" => fn_count += 1,
-                            _ => {}
-                        }
-                    }
-                }
-                let writer_count = writers.get(name.as_str()).map_or(0, |v| v.len());
-                let mut parts = Vec::new();
-                if view_count > 0 {
-                    parts.push(format!("{view_count} view{}", plural(view_count)));
-                }
-                if derived_count > 0 {
-                    parts.push(format!(
-                        "{derived_count} derived"
-                    ));
-                }
-                if fn_count > 0 {
-                    parts.push(format!("{fn_count} fn{}", plural(fn_count)));
-                }
-                if writer_count > 0 {
-                    parts.push(format!(
-                        "written by {writer_count} decl{}",
-                        plural(writer_count)
-                    ));
-                }
-                if !parts.is_empty() {
-                    let title = format!("feeds: {}", parts.join(", "));
-                    lenses.push(CodeLens {
-                        range: Range {
-                            start: range.start,
-                            end: range.start,
-                        },
-                        command: Some(Command {
-                            title,
-                            command: String::new(),
-                            arguments: None,
-                        }),
-                        data: None,
-                    });
-                }
-            }
-            ExprKind::DerivedDecl { name, .. } | ExprKind::ViewDecl { name, .. } => {
-                if let Some(eff) = doc.effect_sets.get(name) {
-                    let mut deps: Vec<String> = Vec::new();
-                    for r in &eff.reads {
-                        deps.push(format!("*{r}"));
-                    }
-                    if !deps.is_empty() {
-                        let title = format!("depends on: {}", deps.join(", "));
-                        lenses.push(CodeLens {
-                            range: Range {
-                                start: range.start,
-                                end: range.start,
-                            },
-                            command: Some(Command {
-                                title,
-                                command: String::new(),
-                                arguments: None,
-                            }),
-                            data: None,
-                        });
-                    }
-                }
-            }
             ExprKind::RouteDecl { name, entries } => {
                 // Per-entry URL preview lens, anchored at the route header. Each
                 // entry's constructor is also separately hoverable for the same

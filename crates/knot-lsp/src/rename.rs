@@ -1138,8 +1138,7 @@ fn field_sites_in_type<F: FnMut(&str, Span)>(ty: &ast::Type, source: &str, f: &m
             field_sites_in_type(param, source, f);
             field_sites_in_type(result, source, f);
         }
-        ast::TypeKind::Effectful { ty: inner, .. }
-        | ast::TypeKind::IO { ty: inner, .. } => field_sites_in_type(inner, source, f),
+        ast::TypeKind::IO { ty: inner, .. } => field_sites_in_type(inner, source, f),
         ast::TypeKind::UnitAnnotated { base, .. } => field_sites_in_type(base, source, f),
         ast::TypeKind::Refined { base, .. } => field_sites_in_type(base, source, f),
         ast::TypeKind::Forall { ty: inner, .. } => field_sites_in_type(inner, source, f),

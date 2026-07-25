@@ -159,9 +159,6 @@ pub(crate) fn handle_signature_help(
     if let Some(comment) = doc.doc_comments.get(&func_name) {
         doc_parts.push(comment.clone());
     }
-    if let Some(effects) = doc.effect_info.get(&func_name) {
-        doc_parts.push(format!("**Effects:** `{effects}`"));
-    }
     let doc_value = if doc_parts.is_empty() {
         None
     } else {

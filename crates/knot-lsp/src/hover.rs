@@ -128,19 +128,11 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         } else {
             d.clone()
         };
-        Some(if let Some(effects) = doc.effect_info.get(word) {
-            format!("{base}\n{effects}")
-        } else {
-            base
-        })
+        Some(base)
     } else if let Some(inferred) = doc.type_info.get(word) {
         type_for_refinement_scan = Some(inferred.clone());
         let base = format!("{word} : {inferred}");
-        Some(if let Some(effects) = doc.effect_info.get(word) {
-            format!("{base}\n{effects}")
-        } else {
-            base
-        })
+        Some(base)
     } else {
         None
     };

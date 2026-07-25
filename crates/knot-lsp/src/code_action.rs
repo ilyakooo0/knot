@@ -8,7 +8,7 @@ use lsp_types::*;
 use knot::ast::{self, Span, TypeKind};
 
 use crate::shared::{
-    extract_principal_type_name, find_enclosing_atomic_expr, render_signature_with_effects,
+    extract_principal_type_name, find_enclosing_atomic_expr,
 };
 use crate::state::{builtins as state_builtins, DocumentState, ServerState};
 use crate::utils::{
@@ -53,11 +53,8 @@ pub(crate) fn handle_code_action(
             continue;
         }
 
-        // Action: Add type annotation to unannotated functions. Effects belong
-        // inside the IO row of the rendered type — `render_signature_with_effects`
-        // merges any per-decl effect-checker findings into that row when HM
-        // inference dropped them (e.g., forward references through annotated
-        // callers can collapse the row to `{}`).
+        // Action: Add type annotation to unannotated functions, using the
+        // inferred type as the suggested signature.
         let is_unannotated_fn = decl.sig.is_none()
             && !matches!(decl.value.node,
                 ast::ExprKind::ViewDecl { .. } | ast::ExprKind::DerivedDecl { .. }
@@ -66,11 +63,7 @@ pub(crate) fn handle_code_action(
                 | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. });
         if is_unannotated_fn
             && let Some(inferred) = doc.type_info.get(&decl.name) {
-                let name = &decl.name;
-                let signature = match doc.effect_sets.get(name) {
-                    Some(eff) => render_signature_with_effects(inferred, eff),
-                    None => inferred.clone(),
-                };
+                let signature = inferred.clone();
                 // Insert the annotation inline on the definition
                 // (`name : Sig = body`), mirroring the View/Derived branch
                 // below — not as a separate standalone signature line.
@@ -108,10 +101,7 @@ pub(crate) fn handle_code_action(
         match &decl.value.node {
             ast::ExprKind::ViewDecl { name, ty: None, .. } | ast::ExprKind::DerivedDecl { name, ty: None, .. } => {
                 if let Some(inferred) = doc.type_info.get(name) {
-                    let signature = match doc.effect_sets.get(name) {
-                        Some(eff) => render_signature_with_effects(inferred, eff),
-                        None => inferred.clone(),
-                    };
+                    let signature = inferred.clone();
                     let decl_text = safe_slice(&doc.source, decl.value.span);
                     if let Some(eq_pos) = decl_text.find('=') {
                         let insert_offset = decl.value.span.start + eq_pos;
@@ -188,45 +178,6 @@ pub(crate) fn handle_code_action(
             // span, nesting `fork (fork (…))` forever. A quickfix that doesn't
             // fix is worse than none, so it was removed; "Remove `atomic`
             // wrapper" above remains the effective fix.
-        }
-
-        // Quick fix for "inferred effects exceed declared effects"
-        if msg.contains("inferred effects exceed declared effects") {
-            // Extract the inferred-effects line from the diagnostic message
-            if let Some(inferred) = extract_effect_set_from_message(msg, "inferred effects:") {
-                // Find the declaration whose span overlaps this diagnostic
-                if let Some((decl, fun_name)) = top_fields(&doc.module)
-                    .into_iter()
-                    .find_map(|d| {
-                        let in_span = d.value.span.start <= diag_offset && diag_offset < d.value.span.end;
-                        if d.sig.is_some() && in_span && !matches!(d.value.node,
-                            ast::ExprKind::ViewDecl { .. } | ast::ExprKind::DerivedDecl { .. }
-                            | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-                            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-                            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. })
-                        {
-                            Some((d, d.name.clone()))
-                        } else {
-                            None
-                        }
-                    })
-                    && let Some(edit) = build_effect_widen_edit(decl, &doc.source, &inferred) {
-                        let mut changes = HashMap::new();
-                        changes.insert(uri.clone(), vec![edit]);
-                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!("Widen declared effects to: {inferred}"),
-                            kind: Some(CodeActionKind::QUICKFIX),
-                            diagnostics: Some(vec![diag.clone()]),
-                            edit: Some(WorkspaceEdit {
-                                changes: Some(changes),
-                                ..Default::default()
-                            }),
-                            is_preferred: Some(true),
-                            ..Default::default()
-                        }));
-                        let _ = fun_name; // for diagnostics in future
-                    }
-            }
         }
 
         // Wrap-in-constructor quick fixes: when a type mismatch shows that an
@@ -1031,15 +982,6 @@ fn find_if_negate_at(
     None
 }
 
-/// Byte offset just past the last non-whitespace character of a declaration.
-/// Decl spans include the trailing newline run the parser consumed, so
-/// "insert at the end of the decl" anchors must trim that whitespace first —
-/// otherwise inserted text glues onto the start of the next declaration.
-fn decl_text_end(source: &str, span: Span) -> usize {
-    let text = safe_slice(source, span);
-    span.start.min(source.len()) + text.trim_end().len()
-}
-
 /// Wrap the cursor's enclosing expression in `Err {error: ...}` if it sits at
 /// an expression position. Best-effort: skips when the cursor isn't on a
 /// well-formed expression span.
@@ -1355,66 +1297,6 @@ fn find_case_actions(
     crate::utils::recurse_expr(expr, |e| {
         find_case_actions(e, doc, uri, range_start, range_end, actions);
     });
-}
-
-/// Pull a `{...}` block out of an effects diagnostic note like
-/// `inferred effects: {console, r *foo}`.
-fn extract_effect_set_from_message(msg: &str, prefix: &str) -> Option<String> {
-    let start = msg.find(prefix)? + prefix.len();
-    let rest = msg[start..].trim_start();
-    let open = rest.find('{')?;
-    let close = rest[open..].find('}')?;
-    Some(rest[open..=open + close].to_string())
-}
-
-/// Build a TextEdit that widens a function's declared effects to a target set.
-/// Looks for the `: ... -> ...` signature in the source and rewrites the head.
-fn build_effect_widen_edit(decl: &ast::RecordField, source: &str, target_effects: &str) -> Option<TextEdit> {
-    // The strategy: find the type annotation signature line that looks like
-    // `name : ...` within the declaration span and replace the existing IO
-    // effect set or insert one if none exists. We do a minimal textual rewrite
-    // rather than re-rendering the whole type, to preserve user formatting.
-    let decl_text = source.get(decl.value.span.start..decl.value.span.end.min(source.len()))?;
-    // Find `: ` after the function name to locate the start of the type signature
-    let colon = decl_text.find(": ")?;
-    let after_colon_off = colon + 2;
-    // Bound the search to the SIGNATURE text: the signature ends where the
-    // next column-0 line begins (the body line `name = …`). Continuation
-    // lines of a multi-line signature are indented and stay included.
-    let sig_end = {
-        let bytes = decl_text.as_bytes();
-        let mut end = decl_text.len();
-        let mut i = after_colon_off;
-        while i < bytes.len() {
-            if bytes[i] == b'\n'
-                && bytes
-                    .get(i + 1)
-                    .is_none_or(|b| *b != b' ' && *b != b'\t' && *b != b'\r')
-            {
-                end = i;
-                break;
-            }
-            i += 1;
-        }
-        end
-    };
-    let sig = &decl_text[after_colon_off..sig_end];
-    // The declared row to widen is the RESULT row — the outermost top-level
-    // `IO { … }` along the arrow spine. Taking the first textual `IO {`
-    // would mutate a callback parameter's row in signatures like
-    // `(Int -> IO {} {}) -> IO {} {}`. `find_outermost_io_row` already
-    // implements the depth-aware spine walk.
-    let (row_start, row_end) = crate::shared::find_outermost_io_row(sig)?;
-    // Replace the row INCLUDING braces (target_effects carries its own).
-    let abs_open = decl.value.span.start + after_colon_off + row_start - 1;
-    let abs_close = decl.value.span.start + after_colon_off + row_end + 1;
-    Some(TextEdit {
-        range: Range {
-            start: offset_to_position(source, abs_open),
-            end: offset_to_position(source, abs_close),
-        },
-        new_text: target_effects.to_string(),
-    })
 }
 
 /// A wrap-in-constructor suggestion derived from a type mismatch.

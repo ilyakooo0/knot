@@ -293,41 +293,8 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             s.push('>');
             s
         }
-        TypeKind::Effectful { effects, ty } => {
-            let mut s = String::from("{");
-            let parts = render_effects_coalesced(effects);
-            s.push_str(&parts.join(", "));
-            s.push_str("} ");
-            s.push_str(&render_type(ty));
-            if ctx > TyPrec::Function {
-                format!("({})", s)
-            } else {
-                s
-            }
-        }
-        TypeKind::IO { effects, rest, ty } => {
-            // `rest` joins one or more row-variable names with ` \/ `; an empty
-            // list means a closed row. `IO {| r \/ s} T` collapses to the
-            // shorthand `IO r \/ s T`.
-            let rest_joined = rest.join(" \\/ ");
-            let s = if effects.is_empty() {
-                if rest.is_empty() {
-                    format!("IO {{}} {}", render_type_atom(ty))
-                } else {
-                    format!("IO {} {}", rest_joined, render_type_atom(ty))
-                }
-            } else {
-                let mut s = String::from("IO {");
-                let parts = render_effects_coalesced(effects);
-                s.push_str(&parts.join(", "));
-                if !rest.is_empty() {
-                    s.push_str(" | ");
-                    s.push_str(&rest_joined);
-                }
-                s.push_str("} ");
-                s.push_str(&render_type_atom(ty));
-                s
-            };
+        TypeKind::IO { ty } => {
+            let s = format!("IO {}", render_type_atom(ty));
             if ctx > TyPrec::App {
                 format!("({})", s)
             } else {
@@ -367,40 +334,6 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             }
         }
     }
-}
-
-fn render_effect(e: &Effect) -> String {
-    match e {
-        Effect::Reads(n) => format!("r *{}", n),
-        Effect::Writes(n) => format!("w *{}", n),
-        Effect::Console => "console".into(),
-        Effect::Network => "network".into(),
-        Effect::Fs => "fs".into(),
-        Effect::Clock => "clock".into(),
-        Effect::Random => "random".into(),
-    }
-}
-
-/// Render an effect list, coalescing an *adjacent* `r *x` followed by `w *x`
-/// into `rw *x`. The parser expands `rw *x` to exactly `[Reads(x), Writes(x)]`
-/// in place, so only that pattern may be coalesced — anything looser (e.g.
-/// merging `w *x, r *x` or a non-adjacent pair) would reorder the effect list
-/// on reparse and break the formatter's AST round-trip invariant. Pairs in
-/// any other order or position are printed uncoalesced.
-fn render_effects_coalesced(effects: &[Effect]) -> Vec<String> {
-    let mut out = Vec::with_capacity(effects.len());
-    let mut i = 0;
-    while i < effects.len() {
-        if let Effect::Reads(n) = &effects[i]
-            && matches!(effects.get(i + 1), Some(Effect::Writes(m)) if m == n) {
-                out.push(format!("rw *{}", n));
-                i += 2;
-                continue;
-            }
-        out.push(render_effect(&effects[i]));
-        i += 1;
-    }
-    out
 }
 
 fn render_type_scheme(ts: &TypeScheme) -> String {

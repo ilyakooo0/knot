@@ -641,7 +641,7 @@ fn collect_named_alias_refs(
                 }
             }
         }
-        TypeKind::Effectful { ty, .. } | TypeKind::IO { ty, .. } => {
+        TypeKind::IO { ty } => {
             collect_named_alias_refs(ty, alias_names, out);
         }
         TypeKind::UnitAnnotated { base, .. } | TypeKind::Refined { base, .. } => {
@@ -766,7 +766,7 @@ impl<'a> ReservedFieldWalker<'a> {
                 self.walk(base, seen)
             }
             TypeKind::Unit(_) => {}
-            TypeKind::Effectful { ty, .. } | TypeKind::IO { ty, .. } | TypeKind::Forall { ty, .. } => {
+            TypeKind::IO { ty } | TypeKind::Forall { ty, .. } => {
                 self.walk(ty, seen)
             }
             // A function can never be stored in a column, so nothing below one
@@ -1489,10 +1489,7 @@ fn resolve_type(
                     .collect();
             ResolvedType::Adt(ctors)
         }
-        TypeKind::Effectful { ty, .. } => {
-            resolve_type(ty, aliases, assoc_types, single_variant_params, multi_variant_params)
-        }
-        TypeKind::IO { ty, .. } => {
+        TypeKind::IO { ty } => {
             // IO values aren't persisted — resolve inner type for diagnostics
             resolve_type(ty, aliases, assoc_types, single_variant_params, multi_variant_params)
         }
@@ -1594,9 +1591,9 @@ fn schema_for_source(
     single_variant_params: &HashMap<String, (Vec<String>, Vec<(String, Type)>)>,
     multi_variant_params: &HashMap<String, (Vec<String>, Vec<(String, Vec<(String, Type)>)>)>,
 ) -> String {
-    // Unwrap Effectful/Refined wrappers to find the underlying type
+    // Unwrap Refined wrappers to find the underlying type
     let unwrapped = match &ty.node {
-        TypeKind::Effectful { ty: inner, .. } | TypeKind::Refined { base: inner, .. } => inner.as_ref(),
+        TypeKind::Refined { base: inner, .. } => inner.as_ref(),
         _ => ty,
     };
     match &unwrapped.node {
@@ -1883,13 +1880,7 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
                 }
             }),
         },
-        TypeKind::Effectful { effects, ty: inner } => TypeKind::Effectful {
-            effects: effects.clone(),
-            ty: Box::new(apply_type_subst(inner, subst)),
-        },
-        TypeKind::IO { effects, rest, ty: inner } => TypeKind::IO {
-            effects: effects.clone(),
-            rest: rest.clone(),
+        TypeKind::IO { ty: inner } => TypeKind::IO {
             ty: Box::new(apply_type_subst(inner, subst)),
         },
         TypeKind::Hole => TypeKind::Hole,

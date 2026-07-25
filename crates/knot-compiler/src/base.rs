@@ -37,10 +37,10 @@ min (\a b -> if a < b then a else b)
 max : a -> a -> a
 max (\a b -> if a > b then a else b)
 
-when : Bool -> IO {| e} {} -> IO {| e} {}
+when : Bool -> IO {} -> IO {}
 when (\cond action -> if cond then action else yield {})
 
-unless : Bool -> IO {| e} {} -> IO {| e} {}
+unless : Bool -> IO {} -> IO {}
 unless (\cond action -> if cond then yield {} else action)
 }
 }

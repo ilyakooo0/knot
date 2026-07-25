@@ -57,7 +57,6 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
                 TypeKind::App { .. }
                     | TypeKind::Function { .. }
                     | TypeKind::IO { .. }
-                    | TypeKind::Effectful { .. }
                     | TypeKind::Refined { .. }
                     | TypeKind::Forall { .. }
                     | TypeKind::Unit(_)
@@ -109,22 +108,8 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
                 None => format!("<{}>", cs.join(" | ")),
             }
         }
-        TypeKind::Effectful { effects, ty } => {
-            let effs: Vec<String> = effects.iter().map(format_effect).collect();
-            format!("{{{}}} {}", effs.join(", "), format_type_kind_d(&ty.node, d))
-        }
-        TypeKind::IO { effects, rest, ty } => {
-            // Open rows render `{fs | r}` / `{| r}` — the row tail is
-            // separated by `|`, never preceded by a comma.
-            let effs: Vec<String> = effects.iter().map(format_effect).collect();
-            let row = if rest.is_empty() {
-                effs.join(", ")
-            } else if effs.is_empty() {
-                format!("| {}", rest.join(" \\/ "))
-            } else {
-                format!("{} | {}", effs.join(", "), rest.join(" \\/ "))
-            };
-            format!("IO {{{row}}} {}", format_type_kind_d(&ty.node, d))
+        TypeKind::IO { ty } => {
+            format!("IO {}", format_type_kind_d(&ty.node, d))
         }
         TypeKind::Hole => "_".into(),
         TypeKind::UnitAnnotated { base, unit } => {
@@ -310,18 +295,6 @@ fn format_unit_expr_d(u: &ast::UnitExpr, depth: usize) -> String {
         }
         ast::UnitExpr::Pow(base, exp) => format!("{}^{}", format_unit_expr_d(base, d), exp),
         ast::UnitExpr::Hole => "_".into(),
-    }
-}
-
-pub fn format_effect(eff: &ast::Effect) -> String {
-    match eff {
-        ast::Effect::Reads(name) => format!("r *{name}"),
-        ast::Effect::Writes(name) => format!("w *{name}"),
-        ast::Effect::Console => "console".into(),
-        ast::Effect::Network => "network".into(),
-        ast::Effect::Fs => "fs".into(),
-        ast::Effect::Clock => "clock".into(),
-        ast::Effect::Random => "random".into(),
     }
 }
 

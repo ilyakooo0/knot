@@ -13,7 +13,6 @@ use lsp_types::Uri;
 
 use knot::ast::{self, Span};
 use knot::diagnostic::{self, Diagnostic};
-use knot_compiler::effects::EffectSet;
 use knot_compiler::infer::MonadKind;
 
 use crate::defs::{build_details, resolve_definitions};
@@ -323,8 +322,6 @@ fn panic_recovery_state(source: &str, message: &str) -> DocumentState {
         local_type_info: HashMap::new(),
         local_type_info_sorted: Vec::new(),
         literal_types: Vec::new(),
-        effect_info: HashMap::new(),
-        effect_sets: HashMap::new(),
         knot_diagnostics: vec![diag],
         doc_comments: HashMap::new(),
         keyword_tokens: Vec::new(),
@@ -349,8 +346,6 @@ pub fn analyze_document(
     let mut all_diags = Vec::new();
     let mut type_info = HashMap::new();
     let mut local_type_info = HashMap::new();
-    let mut effect_info = HashMap::new();
-    let mut effect_sets: HashMap<String, EffectSet> = HashMap::new();
     let mut refined_types: HashMap<String, ast::Expr> = HashMap::new();
     let mut refine_targets: HashMap<Span, String> = HashMap::new();
     let mut source_refinements: HashMap<String, Vec<(Option<String>, String, ast::Expr)>> =
@@ -575,16 +570,6 @@ pub fn analyze_document(
             }
         }
 
-        let (effect_diags, effects) =
-            knot_compiler::effects::check_with_effects(&analysis_module);
-        all_diags.extend(effect_diags.into_iter().filter(anchored_in_user));
-        for (name, eff) in &effects {
-            if !eff.is_pure() {
-                effect_info.insert(name.clone(), format!("{eff}"));
-            }
-            effect_sets.insert(name.clone(), eff.clone());
-        }
-
         all_diags.extend(
             knot_compiler::stratify::check(&analysis_module)
                 .into_iter()
@@ -631,8 +616,6 @@ pub fn analyze_document(
                 diagnostics: all_diags[pre_inference_len..].to_vec(),
                 type_info: type_info.clone(),
                 local_type_info: local_type_info.clone(),
-                effect_info: effect_info.clone(),
-                effect_sets: effect_sets.clone(),
                 refined_types: refined_types.clone(),
                 refine_targets: refine_targets.clone(),
                 source_refinements: source_refinements.clone(),
@@ -656,8 +639,6 @@ pub fn analyze_document(
         local_type_info,
         local_type_info_sorted,
         literal_types,
-        effect_info,
-        effect_sets,
         knot_diagnostics: all_diags,
         doc_comments,
         keyword_tokens,
@@ -719,8 +700,6 @@ fn reuse_snapshot(
         local_type_info: snap.local_type_info.clone(),
         local_type_info_sorted,
         literal_types,
-        effect_info: snap.effect_info.clone(),
-        effect_sets: snap.effect_sets.clone(),
         knot_diagnostics: all_diags,
         doc_comments,
         keyword_tokens,

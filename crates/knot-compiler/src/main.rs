@@ -2,7 +2,7 @@
 //!
 //! Usage: knot build <file.knot>
 
-use knot_compiler::{codegen, desugar, effects, infer, linker, lockfile, stratify, types};
+use knot_compiler::{codegen, desugar, infer, linker, lockfile, stratify, types};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -374,20 +374,6 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
             eprintln!("{}", diag.render(&source, &filename));
         }
         if infer_diags
-            .iter()
-            .any(|d| d.severity == knot::diagnostic::Severity::Error)
-        {
-            process::exit(1);
-        }
-    }
-
-    // Effect inference
-    let effect_diags = effects::check(&program);
-    if !effect_diags.is_empty() {
-        for diag in &effect_diags {
-            eprintln!("{}", diag.render(&source, &filename));
-        }
-        if effect_diags
             .iter()
             .any(|d| d.severity == knot::diagnostic::Severity::Error)
         {

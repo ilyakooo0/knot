@@ -285,7 +285,7 @@ fn collect_type_field_name_spans(
             collect_type_field_name_spans(param, field_name, source, ranges);
             collect_type_field_name_spans(result, field_name, source, ranges);
         }
-        ast::TypeKind::Effectful { ty: inner, .. } | ast::TypeKind::IO { ty: inner, .. } => {
+        ast::TypeKind::IO { ty: inner, .. } => {
             collect_type_field_name_spans(inner, field_name, source, ranges)
         }
         ast::TypeKind::UnitAnnotated { base, .. } => {

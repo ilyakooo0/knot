@@ -711,9 +711,6 @@ fn analyze_unopened_file_inner(
         let (infer_diags, ..) = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_importer));
 
-        let (effect_diags, _) = knot_compiler::effects::check_with_effects(&analysis_module);
-        all_diags.extend(effect_diags.into_iter().filter(anchored_in_importer));
-
         all_diags.extend(
             knot_compiler::stratify::check(&analysis_module)
                 .into_iter()

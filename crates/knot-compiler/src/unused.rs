@@ -16,7 +16,7 @@
 //! scope. Imports and prelude can never reference user-defined names anyway.
 
 use crate::decl_view::{decl_views, DeclView, DeclViewKind};
-use knot::ast::{CaseArm, ConstructorDef, Constraint, Effect, Expr, ExprKind, Pat, PatKind, PathSegment, RouteEntry, Stmt, StmtKind, Type, TypeKind, TypeScheme};
+use knot::ast::{CaseArm, ConstructorDef, Constraint, Expr, ExprKind, Pat, PatKind, PathSegment, RouteEntry, Stmt, StmtKind, Type, TypeKind, TypeScheme};
 use knot::diagnostic::Diagnostic;
 use std::collections::HashSet;
 
@@ -418,16 +418,7 @@ fn walk_type(t: &Type, r: &mut Refs) {
                 walk_ctor_def(c, r);
             }
         }
-        TypeKind::Effectful { effects, ty } => {
-            for e in effects {
-                walk_effect(e, r);
-            }
-            walk_type(ty, r);
-        }
-        TypeKind::IO { effects, ty, .. } => {
-            for e in effects {
-                walk_effect(e, r);
-            }
+        TypeKind::IO { ty } => {
             walk_type(ty, r);
         }
         TypeKind::UnitAnnotated { base, .. } => walk_type(base, r),
@@ -437,15 +428,6 @@ fn walk_type(t: &Type, r: &mut Refs) {
             walk_expr(predicate, r);
         }
         TypeKind::Forall { ty, .. } => walk_type(ty, r),
-    }
-}
-
-fn walk_effect(e: &Effect, r: &mut Refs) {
-    match e {
-        Effect::Reads(name) | Effect::Writes(name) => {
-            r.sources.insert(name.clone());
-        }
-        Effect::Console | Effect::Network | Effect::Fs | Effect::Clock | Effect::Random => {}
     }
 }
 

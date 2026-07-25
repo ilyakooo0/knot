@@ -21,23 +21,10 @@ pub(crate) fn handle_document_symbol(
     Some(DocumentSymbolResponse::Nested(symbols))
 }
 
-/// Build a hint string combining declared/inferred type and effects.
-/// Falls back to declared type, then inferred type, then effect string alone.
+/// Build a hint string from the declared/inferred type.
+/// Falls back to declared type, then inferred type.
 fn detail_for(doc: &DocumentState, name: &str, declared: Option<String>) -> Option<String> {
-    let mut parts = Vec::new();
-    let ty = declared.or_else(|| doc.type_info.get(name).cloned());
-    if let Some(t) = ty {
-        parts.push(t);
-    }
-    if let Some(eff) = doc.effect_info.get(name)
-        && !eff.trim_start_matches('{').trim_end_matches('}').trim().is_empty() {
-            parts.push(eff.clone());
-        }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" "))
-    }
+    declared.or_else(|| doc.type_info.get(name).cloned())
 }
 
 #[allow(deprecated)]

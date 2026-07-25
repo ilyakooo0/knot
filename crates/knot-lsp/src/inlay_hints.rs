@@ -105,12 +105,7 @@ pub(crate) fn handle_inlay_hint(
                     // Text edit emits the signature as a separate statement above the
                     // function, so anchor it at the declaration start, not at the hint.
                     let edit_pos = offset_to_position(&doc.source, dspan.start);
-                    // Merge per-decl effect-checker findings into the IO row of
-                    // the rendered type, in case HM inference dropped them.
-                    let full_sig = match doc.effect_sets.get(name) {
-                        Some(eff) => crate::shared::render_signature_with_effects(inferred, eff),
-                        None => inferred.clone(),
-                    };
+                    let full_sig = inferred.clone();
                     hints.push(InlayHint {
                         position: hint_pos,
                         label: InlayHintLabel::String(format!(": {full_sig}")),
@@ -119,53 +114,11 @@ pub(crate) fn handle_inlay_hint(
                             range: Range { start: edit_pos, end: edit_pos },
                             new_text: format!("{name} : {full_sig}\n"),
                         }]),
-                        tooltip: doc.effect_info.get(name).map(|effects| {
-                            InlayHintTooltip::String(format!("Effects: {effects}"))
-                        }),
+                        tooltip: None,
                         padding_left: Some(true),
                         padding_right: Some(true),
                         data: None,
                     });
-                }
-            }
-            (name, Some(scheme), false) => {
-                // Annotated function: show the inferred *effects* as a hint at
-                // the function body's start, only when the type doesn't already
-                // declare them. Helps with effect-row polymorphism debugging.
-                if let Some(effects) = doc.effect_info.get(name) {
-                    let inferred_ty = doc.type_info.get(name);
-                    let needs_hint = inferred_ty
-                        .map(|ty| !type_str_mentions_effects(ty, effects))
-                        .unwrap_or(true);
-                    if needs_hint {
-                        // Anchor at the END of the signature line. Anchoring
-                        // right after the name would visually split `name`
-                        // and `:` on annotated declarations. Use the end of the
-                        // *type signature* line, not the first `\n` in the whole
-                        // declaration — on a multi-line signature the latter
-                        // lands mid-type, where the `--` hint reads as commenting
-                        // out the continuation.
-                        let span_end = dspan.end.min(doc.source.len());
-                        let sig_end = scheme.ty.span.end.min(span_end);
-                        // `sig_end`/`span_end` are clamped to `len` but a stale
-                        // or mid-token span endpoint can land mid-multibyte-char;
-                        // a direct slice would panic, so use `get` and fall back.
-                        let hint_offset = doc.source
-                            .get(sig_end..span_end)
-                            .and_then(|s| s.find('\n').map(|p| sig_end + p))
-                            .unwrap_or(span_end);
-                        let hint_pos = offset_to_position(&doc.source, hint_offset);
-                        hints.push(InlayHint {
-                            position: hint_pos,
-                            label: InlayHintLabel::String(format!("-- effects: {effects}")),
-                            kind: None,
-                            text_edits: None,
-                            tooltip: None,
-                            padding_left: Some(true),
-                            padding_right: None,
-                            data: None,
-                        });
-                    }
                 }
             }
             _ => {}
@@ -839,18 +792,6 @@ fn add_unit_literal_hints(
             data: None,
         });
     }
-}
-
-/// Heuristic: does the rendered type string already mention all of the given
-/// effects? Used to suppress redundant effect inlay hints.
-fn type_str_mentions_effects(ty: &str, effects: &str) -> bool {
-    // The effects string looks like `{console, r *foo}` — pull the inner
-    // tokens and check that each appears in the type string.
-    let inner = effects.trim_start_matches('{').trim_end_matches('}');
-    if inner.is_empty() {
-        return true;
-    }
-    inner.split(',').all(|tok| ty.contains(tok.trim()))
 }
 
 /// Walk the AST looking for App expressions whose callee resolves to a named

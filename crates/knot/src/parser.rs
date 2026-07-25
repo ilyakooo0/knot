@@ -3977,76 +3977,26 @@ impl Parser {
             TokenKind::Upper(_) => {
                 let tok = self.advance();
                 let TokenKind::Upper(name) = tok.kind else { unreachable!() };
-                if name == "IO" && matches!(self.peek(), TokenKind::LBrace) {
-                    // Parse `IO {effects} Type`, `IO {effects | r} Type`,
-                    // `IO {| r} Type`, or `IO {effects | r1 \/ r2} Type`.
-                    // After `|`, accept one row-variable name (or `_`),
-                    // optionally chained with `\/` to form a row union.
-                    self.advance(); // consume '{'
-                    self.skip_newlines();
-                    let effects = if matches!(self.peek(), TokenKind::RBrace | TokenKind::Pipe) {
-                        Vec::new()
-                    } else {
-                        self.try_parse_effects().unwrap_or_default()
-                    };
-                    self.skip_newlines();
-                    let rest: Vec<Name> = if self.eat(&TokenKind::Pipe) {
-                        self.parse_effect_row_tail()
-                    } else {
-                        Vec::new()
-                    };
-                    self.skip_newlines();
-                    self.expect(&TokenKind::RBrace, "expected '}' to close IO effect set")
-                        .ok()?;
+                if name == "IO" && matches!(self.peek(), TokenKind::LBrace | TokenKind::Lower(_) | TokenKind::Underscore)
+                    // `IO {}` is IO of the unit record type `{}`, not an
+                    // effect row — only reject when the brace has contents.
+                    && !(matches!(self.peek(), TokenKind::LBrace)
+                        && matches!(self.peek_ahead(1), TokenKind::RBrace))
+                {
+                    // Legacy effect-row syntax (`IO {effects} T`, `IO r T`) is
+                    // no longer valid — effects are untracked. Reject so the
+                    // user gets a clear error rather than a misparsed type.
+                    self.error("effect rows are no longer supported: use `IO T`");
+                    return None;
+                }
+                if name == "IO" {
+                    // `IO a` — plain IO monad type, effects untracked.
                     if !self.enter_recursion() { return None; }
                     let inner = self.parse_type_atom();
                     self.recursion_depth -= 1;
                     let inner = inner?;
                     let span = Span::new(tok.span.start, inner.span.end);
-                    Some(Spanned::new(TypeKind::IO { effects, rest, ty: Box::new(inner) }, span))
-                } else if name == "IO" && matches!(self.peek(), TokenKind::Lower(_) | TokenKind::Underscore) {
-                    // Shorthand: `IO e Type` desugars to `IO {| e} Type`.
-                    // `IO _ Type` is the wildcard form — effects are inferred.
-                    // Also support `IO r1 \/ r2 Type` as shorthand for
-                    // `IO {| r1 \/ r2} Type`.
-                    let row_tok = self.advance();
-                    let first_name = match row_tok.kind {
-                        TokenKind::Lower(n) => n,
-                        TokenKind::Underscore => "_".to_string(),
-                        _ => unreachable!(),
-                    };
-                    let mut rest: Vec<Name> = vec![first_name];
-                    while self.eat(&TokenKind::BackslashSlash) {
-                        self.skip_newlines();
-                        match self.peek() {
-                            TokenKind::Lower(_) => {
-                                let tok = self.advance();
-                                let TokenKind::Lower(n) = tok.kind else { unreachable!() };
-                                rest.push(n);
-                            }
-                            TokenKind::Underscore => {
-                                self.advance();
-                                rest.push("_".to_string());
-                            }
-                            _ => {
-                                self.error("expected effect row variable name or '_' after '\\/'");
-                                break;
-                            }
-                        }
-                    }
-                    if !self.enter_recursion() { return None; }
-                    let inner = self.parse_type_atom();
-                    self.recursion_depth -= 1;
-                    let inner = inner?;
-                    let span = Span::new(tok.span.start, inner.span.end);
-                    Some(Spanned::new(
-                        TypeKind::IO {
-                            effects: Vec::new(),
-                            rest,
-                            ty: Box::new(inner),
-                        },
-                        span,
-                    ))
+                    Some(Spanned::new(TypeKind::IO { ty: Box::new(inner) }, span))
                 } else if (name == "Float" || name == "Int")
                     && self.can_start_unit_type_arg()
                 {
@@ -4146,42 +4096,6 @@ impl Parser {
         // Already consumed `{`.
         self.skip_newlines();
 
-        // Check for effectful type: {r *rel, w *rel, ...} Type
-        // Effects have special keyword-like identifiers.
-        let saved = self.save();
-        let diag_count = self.diagnostics.len();
-        if let Some(effects) = self.try_parse_effects() {
-            let close = self
-                .expect(&TokenKind::RBrace, "expected '}' to close effect set")
-                .ok()?;
-            // If a type atom follows, parse it as the effectful body (e.g.
-            // `{console} Int`). Otherwise `{effects}` is terminal — before a
-            // closing paren, `->`, end of type, or newline — so treat it as a
-            // complete effectful type with an empty (Unit) body. This is the
-            // form written in `Server Api {console}` type annotations.
-            let ty = if self.can_start_type_atom() {
-                self.parse_type()?
-            } else {
-                Spanned::new(
-                    TypeKind::Record {
-                        fields: vec![],
-                        rest: None,
-                    },
-                    close.span,
-                )
-            };
-            let span = Span::new(start.start, ty.span.end);
-            return Some(Spanned::new(
-                TypeKind::Effectful {
-                    effects,
-                    ty: Box::new(ty),
-                },
-                span,
-            ));
-        }
-        self.restore(saved);
-        self.diagnostics.truncate(diag_count);
-
         // Empty record type `{}`
         if self.eat(&TokenKind::RBrace) {
             return Some(Spanned::new(
@@ -4252,146 +4166,6 @@ impl Parser {
 
     /// Parse the row-variable tail of an IO type after `|`:
     /// `r1`, `_`, or `r1 \/ r2 \/ r3`. Returns an empty Vec on parse error.
-    fn parse_effect_row_tail(&mut self) -> Vec<Name> {
-        let mut rest: Vec<Name> = Vec::new();
-        self.skip_newlines();
-        match self.peek() {
-            TokenKind::Lower(_) => {
-                let tok = self.advance();
-                let TokenKind::Lower(n) = tok.kind else { unreachable!() };
-                rest.push(n);
-            }
-            TokenKind::Underscore => {
-                self.advance();
-                rest.push("_".to_string());
-            }
-            _ => {
-                self.error("expected effect row variable name or '_' after '|'");
-                return rest;
-            }
-        }
-        while self.eat(&TokenKind::BackslashSlash) {
-            self.skip_newlines();
-            match self.peek() {
-                TokenKind::Lower(_) => {
-                    let tok = self.advance();
-                    let TokenKind::Lower(n) = tok.kind else { unreachable!() };
-                    rest.push(n);
-                }
-                TokenKind::Underscore => {
-                    self.advance();
-                    rest.push("_".to_string());
-                }
-                _ => {
-                    self.error("expected effect row variable name or '_' after '\\/'");
-                    break;
-                }
-            }
-        }
-        rest
-    }
-
-    /// Parse the relation name in an effect row after `r`/`w`/`rw`. Accepts a
-    /// single `StarIdent` token (`r *name`) or the legacy `Star` + `Lower`
-    /// form. Returns the bare relation name (no `*`).
-    fn parse_effect_relation_name(&mut self, kw: &str) -> Option<Name> {
-        match self.peek() {
-            TokenKind::StarIdent(_) => {
-                let tok = self.advance();
-                let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
-                Some(n.trim_start_matches('*').to_string())
-            }
-            TokenKind::Star => {
-                if self.expect(&TokenKind::Star, "expected '*' after effect keyword").is_err() {
-                    return None;
-                }
-                let (n, _) = self
-                    .expect_lower(&format!("expected relation name after '{} *'", kw))
-                    .ok()?;
-                Some(n)
-            }
-            _ => {
-                self.error(&format!("expected '*' after '{}'", kw));
-                None
-            }
-        }
-    }
-
-    fn try_parse_effects(&mut self) -> Option<Vec<Effect>> {
-        let mut effects = Vec::new();
-        loop {
-            match self.peek() {
-                // For the `r`/`w`/`rw` forms, once the keyword is consumed we are
-                // committed. If the following `*`/name is malformed, `expect`
-                // already emits a diagnostic — `break` out (keeping any effects
-                // parsed so far) rather than `?`-propagating `None`, which would
-                // discard the partial parse AND leave the caller unable to tell a
-                // parse error from a legitimately empty effect set, desyncing the
-                // surrounding type-row parse.
-                TokenKind::Lower(s) if s == "r" => {
-                    self.advance();
-                    match self.parse_effect_relation_name("r") {
-                        Some(name) => effects.push(Effect::Reads(name)),
-                        None => break,
-                    }
-                }
-                TokenKind::Lower(s) if s == "w" => {
-                    self.advance();
-                    match self.parse_effect_relation_name("w") {
-                        Some(name) => effects.push(Effect::Writes(name)),
-                        None => break,
-                    }
-                }
-                TokenKind::Lower(s) if s == "rw" => {
-                    self.advance();
-                    match self.parse_effect_relation_name("rw") {
-                        Some(name) => {
-                            effects.push(Effect::Reads(name.clone()));
-                            effects.push(Effect::Writes(name));
-                        }
-                        None => break,
-                    }
-                }
-                // Bare effect keywords must not be a record field name: if the
-                // next token is `:`, this is `{console: Type}` (a record), not an
-                // effect set, so we bail and let `parse_record_type` fall back.
-                TokenKind::Lower(s)
-                    if s == "console" && self.peek_ahead(1) != &TokenKind::Colon =>
-                {
-                    self.advance();
-                    effects.push(Effect::Console);
-                }
-                TokenKind::Lower(s)
-                    if s == "network" && self.peek_ahead(1) != &TokenKind::Colon =>
-                {
-                    self.advance();
-                    effects.push(Effect::Network);
-                }
-                TokenKind::Lower(s) if s == "fs" && self.peek_ahead(1) != &TokenKind::Colon => {
-                    self.advance();
-                    effects.push(Effect::Fs);
-                }
-                TokenKind::Lower(s) if s == "clock" && self.peek_ahead(1) != &TokenKind::Colon => {
-                    self.advance();
-                    effects.push(Effect::Clock);
-                }
-                TokenKind::Lower(s) if s == "random" && self.peek_ahead(1) != &TokenKind::Colon => {
-                    self.advance();
-                    effects.push(Effect::Random);
-                }
-                _ => break,
-            }
-            if !self.eat(&TokenKind::Comma) {
-                break;
-            }
-        }
-        if effects.is_empty() {
-            None
-        } else {
-            Some(effects)
-        }
-    }
-
     fn parse_relation_type(&mut self, start: Span) -> Option<Type> {
         // Already consumed `[`.
         self.skip_newlines();

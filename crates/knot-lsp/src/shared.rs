@@ -5,169 +5,9 @@
 use std::path::{Path, PathBuf};
 
 use knot::ast::{self, Expr, ExprKind, Span};
-use knot_compiler::effects::EffectSet;
 
 use crate::type_format::format_type_kind;
 use crate::utils::{find_word_in_source, recurse_expr, safe_slice, top_fields};
-
-// ── Signature rendering ─────────────────────────────────────────────
-
-/// Render a type signature for "Add type annotation" suggestions, using the
-/// per-decl `effect_sets` analysis to populate the IO effect row when the
-/// inferred type has one. Effects belong inside the `IO { … }` row, not as a
-/// prefix on the function — this helper only adjusts the row's contents.
-///
-/// HM inference and the effect-checker are separate passes. In some cases
-/// (forward references through annotated callers), HM closes a function's IO
-/// row to `{}` and silently drops body-side effects. The effect-checker is
-/// precise per declaration, so when it disagrees with the rendered type's IO
-/// row, prefer the effect-checker's view.
-///
-/// Falls back to `inferred` unchanged when:
-/// - the type contains no `IO { … }` row (the function isn't IO),
-/// - the effect set is pure (nothing to add),
-/// - the rendered IO row already contains every effect the set knows about.
-pub(crate) fn render_signature_with_effects(inferred: &str, effects: &EffectSet) -> String {
-    if effects.is_pure() {
-        return inferred.to_string();
-    }
-    let Some((row_start, row_end)) = find_outermost_io_row(inferred) else {
-        return inferred.to_string();
-    };
-    let existing_row = &inferred[row_start..row_end];
-    let merged = merge_effects_into_row(existing_row, effects);
-    if merged == existing_row {
-        return inferred.to_string();
-    }
-    format!("{}{}{}", &inferred[..row_start], merged, &inferred[row_end..])
-}
-
-/// Find the byte range of the contents (between `{` and `}`) of the
-/// *outermost* (top-level result position) `IO { … }` row in the rendered
-/// type. Only `IO {` occurrences at nesting depth 0 count — taking the
-/// textually-last row regardless of nesting picks the wrong one for curried
-/// IO-returning results (`Int -> IO {} (Int -> IO {fs} Text)`, where the
-/// outermost row is the FIRST). Among depth-0 rows, the last along the arrow
-/// spine (`IO {a} Int -> IO {b} Text`) is the result row. Returns `None`
-/// when no top-level IO row is present.
-pub(crate) fn find_outermost_io_row(ty: &str) -> Option<(usize, usize)> {
-    let bytes = ty.as_bytes();
-    let mut last: Option<(usize, usize)> = None;
-    let mut depth: i32 = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b'I' if depth == 0 && ty[i..].starts_with("IO {") => {
-                // Whole-word check: don't match the tail of an identifier.
-                let left_ok = i == 0
-                    || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
-                if left_ok {
-                    let row_start = i + 4;
-                    let mut row_depth: i32 = 1;
-                    let mut j = row_start;
-                    while j < bytes.len() {
-                        match bytes[j] {
-                            b'{' => row_depth += 1,
-                            b'}' => {
-                                row_depth -= 1;
-                                if row_depth == 0 {
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                        j += 1;
-                    }
-                    if row_depth != 0 {
-                        return None;
-                    }
-                    last = Some((row_start, j));
-                    i = j + 1;
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    last
-}
-
-/// Merge any effects from `effects` that aren't already named in
-/// `existing_row` into the row, preserving the row's existing tokens (and any
-/// trailing row variable like `| r`). Returns the new row contents (no braces).
-fn merge_effects_into_row(existing_row: &str, effects: &EffectSet) -> String {
-    let trimmed = existing_row.trim();
-    let (effects_part, row_var): (&str, Option<String>) = match trimmed.split_once('|') {
-        Some((before, tail)) => (before, Some(format!("| {}", tail.trim()))),
-        None => (trimmed, None),
-    };
-    let existing_effects: Vec<String> = effects_part
-        .split(',')
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .map(String::from)
-        .collect();
-
-    let mut have: std::collections::BTreeSet<String> =
-        existing_effects.iter().cloned().collect();
-    let mut additions: Vec<String> = Vec::new();
-    let read_write: std::collections::BTreeSet<&String> =
-        effects.reads.intersection(&effects.writes).collect();
-    for name in &effects.reads {
-        if read_write.contains(name) {
-            continue;
-        }
-        let s = format!("r *{name}");
-        if have.insert(s.clone()) {
-            additions.push(s);
-        }
-    }
-    for name in &effects.writes {
-        if read_write.contains(name) {
-            continue;
-        }
-        let s = format!("w *{name}");
-        if have.insert(s.clone()) {
-            additions.push(s);
-        }
-    }
-    for name in &read_write {
-        let s = format!("rw *{name}");
-        if have.insert(s.clone()) {
-            additions.push(s);
-        }
-    }
-    for (flag, name) in [
-        (effects.console, "console"),
-        (effects.network, "network"),
-        (effects.fs, "fs"),
-        (effects.clock, "clock"),
-        (effects.random, "random"),
-    ] {
-        if flag {
-            let s = name.to_string();
-            if have.insert(s.clone()) {
-                additions.push(s);
-            }
-        }
-    }
-
-    if additions.is_empty() {
-        return existing_row.to_string();
-    }
-
-    let mut parts = existing_effects;
-    parts.extend(additions);
-    let body = parts.join(", ");
-    match row_var {
-        Some(rv) => format!("{body} {rv}"),
-        None => body,
-    }
-}
-
 
 
 // ── Type-string parsing ─────────────────────────────────────────────
@@ -344,11 +184,6 @@ pub(crate) fn scan_knot_files_recursive(
 pub(crate) const MAX_WALK_DEPTH: usize = 10_000;
 
 // ── Route formatting ────────────────────────────────────────────────
-
-/// English plural suffix for counts. `1 view`, `2 views`.
-pub(crate) fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
-}
 
 /// Format a Knot HTTP method as the literal HTTP verb.
 pub(crate) fn http_method_str(m: ast::HttpMethod) -> &'static str {
@@ -1259,7 +1094,6 @@ fn type_contains_offset(ty: &ast::Type, offset: usize) -> bool {
         ast::TypeKind::Variant { constructors, .. } => constructors
             .iter()
             .any(|c| c.fields.iter().any(|f| type_contains_offset(&f.value, offset))),
-        ast::TypeKind::Effectful { ty, .. } => type_contains_offset(ty, offset),
         ast::TypeKind::IO { ty, .. } => type_contains_offset(ty, offset),
         ast::TypeKind::UnitAnnotated { base, .. } => type_contains_offset(base, offset),
         ast::TypeKind::Refined { base, .. } => type_contains_offset(base, offset),
@@ -1343,8 +1177,7 @@ fn type_mentions_var(ty: &ast::Type, var: &str) -> bool {
         ast::TypeKind::Variant { constructors, .. } => constructors
             .iter()
             .any(|c| c.fields.iter().any(|f| type_mentions_var(&f.value, var))),
-        ast::TypeKind::Effectful { ty, .. }
-        | ast::TypeKind::IO { ty, .. }
+        ast::TypeKind::IO { ty, .. }
         | ast::TypeKind::UnitAnnotated { base: ty, .. }
         | ast::TypeKind::Refined { base: ty, .. } => type_mentions_var(ty, var),
         ast::TypeKind::Unit(_) => false,

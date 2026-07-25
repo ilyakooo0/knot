@@ -13,7 +13,6 @@ use lsp_types::{Diagnostic, SemanticToken, Uri};
 
 use knot::ast::{self, Expr, Span};
 use knot::diagnostic;
-use knot_compiler::effects::EffectSet;
 use knot_compiler::infer::MonadKind;
 
 use crate::incremental::ModuleFingerprint;
@@ -35,8 +34,6 @@ pub struct InferenceSnapshot {
     pub diagnostics: Vec<diagnostic::Diagnostic>,
     pub type_info: HashMap<String, String>,
     pub local_type_info: HashMap<Span, String>,
-    pub effect_info: HashMap<String, String>,
-    pub effect_sets: HashMap<String, EffectSet>,
     pub refined_types: HashMap<String, ast::Expr>,
     pub refine_targets: HashMap<Span, String>,
     pub source_refinements: HashMap<String, Vec<(Option<String>, String, ast::Expr)>>,
@@ -179,12 +176,6 @@ pub struct DocumentState {
     pub local_type_info_sorted: Vec<(Span, String)>,
     /// Span-based type info for literal expressions.
     pub literal_types: Vec<(Span, String)>,
-    /// Per-declaration effect info (formatted strings).
-    pub effect_info: HashMap<String, String>,
-    /// Per-declaration effect sets (structured form). Keys mirror `effect_info`
-    /// but the value is the underlying `EffectSet` so callers can do set
-    /// operations (e.g. atomic-context filtering).
-    pub effect_sets: HashMap<String, EffectSet>,
     pub knot_diagnostics: Vec<diagnostic::Diagnostic>,
     /// Doc comments for declarations: name → comment text.
     pub doc_comments: HashMap<String, String>,

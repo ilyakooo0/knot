@@ -805,31 +805,12 @@ fn apply_default_category_ranking(items: &mut [CompletionItem], doc: &DocumentSt
     }
 }
 
-/// True if a completion candidate would be rejected by the effect checker
-/// inside an `atomic` block. Mirrors the rule in `effects.rs`: any builtin
-/// from `ATOMIC_DISALLOWED_BUILTINS`, plus any user function whose inferred
-/// effect set contains console/network/fs/clock/random — including imported
-/// functions that show up in the *current* doc (effect_sets is populated
-/// after import resolution) and auto-import candidates that show up in any
-/// open document's effect_sets.
-fn is_disallowed_in_atomic(label: &str, doc: &DocumentState, state: &ServerState) -> bool {
+/// True if a completion candidate would be rejected inside an `atomic` block.
+/// With the effect system removed, only the builtin set is statically known to
+/// be disallowed; user-defined functions can no longer be classified here.
+fn is_disallowed_in_atomic(label: &str, _doc: &DocumentState, _state: &ServerState) -> bool {
     let bare = label.trim_start_matches(['*', '&']);
-    if ATOMIC_DISALLOWED_BUILTINS.contains(&bare) {
-        return true;
-    }
-    if let Some(eff) = doc.effect_sets.get(bare) {
-        return eff.has_io();
-    }
-    // Auto-import items don't have entries in this doc's effect_sets yet
-    // (the import isn't applied), but if any open doc declares the same
-    // name with IO effects, it's almost certainly the same definition.
-    for other in state.documents.values() {
-        if let Some(eff) = other.effect_sets.get(bare)
-            && eff.has_io() {
-                return true;
-            }
-    }
-    false
+    ATOMIC_DISALLOWED_BUILTINS.contains(&bare)
 }
 
 /// Return the span of a `route` or `route Foo = ...` declaration that
@@ -1539,9 +1520,6 @@ pub(crate) fn handle_resolve_completion_item(
             && let Some(d) = doc.doc_comments.get(label.as_str()) {
                 doc_md = Some(d.clone());
             }
-        if let Some(eff) = doc.effect_info.get(label.as_str()) {
-            push_unique(&mut sections, format!("*Effects:* `{eff}`"));
-        }
         if let Some(predicate) = doc.refined_types.get(label.as_str()) {
             let pred_src = predicate_to_source(predicate, &doc.source);
             push_unique(

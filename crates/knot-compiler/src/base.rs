@@ -19,12 +19,18 @@ use knot::ast;
 /// the synthesized monad-span range.
 pub(crate) const PRELUDE_SPAN_OFFSET: usize = 1 << 40;
 
-/// Knot source for the standard prelude: a bare record literal whose fields
-/// are the prelude's bindings.
+/// Knot source for the standard prelude. The ONLY binding the prelude splices
+/// into scope is `base` — a record holding every standard-library function.
+/// User code refers to `base.println`, `base.map`, etc.; nothing else enters
+/// the environment by default.
+///
+/// The prelude's own polymorphic helpers (`min`/`max`/`when`/`unless`) are
+/// defined as nested lambdas inside the `base` record. The data declaration
+/// `Ordering` is hoisted out (a `data` decl cannot be a record *field value*),
+/// then re-exposed as `base.Ordering` by the compiler's ctor routing.
 const PRELUDE_SOURCE: &str = r#"
 {
-data Ordering = LT {} | EQ {} | GT {}
-
+base {
 min : a -> a -> a
 min (\a b -> if a < b then a else b)
 
@@ -37,7 +43,36 @@ when (\cond action -> if cond then action else yield {})
 unless : Bool -> IO {| e} {} -> IO {| e} {}
 unless (\cond action -> if cond then yield {} else action)
 }
+}
 "#;
+
+/// Stdlib builtins exposed as fields of `base` (`base.map`, `base.filter`, …).
+/// Each is registered by codegen as a curried function value in `user_fns`;
+/// the prelude record references them as `name: Var(name)` so the `base`
+/// record assembles to real function values. Dispatch-only builtins
+/// (`println`, `show`, `now`, …) and intrinsic constructors
+/// (`Just`/`Nothing`/`Ok`/`Err`/`True`/`False`) are routed separately by the
+/// compiler, not via this record.
+const BASE_STDLIB_FNS: &[&str] = &[
+    "all", "any", "appendFile", "avg", "bytesConcat", "bytesFromHex",
+    "bytesGet", "bytesLength", "bytesSlice", "bytesToHex", "bytesToText",
+    "chars", "contains", "countWhere", "decrypt", "diff", "dress", "drop",
+    "elem", "encrypt", "fileExists", "filter", "findFirst", "fold", "forEach",
+    "fork", "hash", "head", "hexDecode", "id", "inter", "length", "listDir",
+    "map", "match", "maxOn", "minOn", "not", "parseJson", "race", "randomInt",
+    "readFile", "removeFile", "reverse", "sign", "single", "sleep", "sortBy",
+    "strip", "stripFloatUnit", "stripUnit", "take", "textToBytes", "toJson",
+    "toLower", "toUpper", "traverse", "trim", "upsertBy", "verify",
+    "withFloatUnit", "withUnit", "writeFile",
+    // Console IO builtins (registered as stdlib function values in codegen).
+    "println", "print", "putLine", "logInfo", "logWarn", "logError", "logDebug",
+    "show",
+    // 0-arg IO builtins. Each is a re-runnable IO thunk (`Value::IO(thunk, _)`)
+    // produced fresh by the bare-`Var` dispatch, so holding the action as a
+    // record field is safe — forcing `base.now` twice runs `knot_now` twice.
+    "now", "readLine", "randomFloat", "randomUuid",
+    "generateKeyPair", "generateSigningKeyPair",
+];
 
 /// Parse the prelude record and wrap the program's expression in
 /// `with {prelude} expr`, so prelude names are in scope throughout.
@@ -52,7 +87,7 @@ pub fn inject_prelude(expr: &mut ast::Expr) {
         lex_diags
     );
     let parser = knot::parser::Parser::new(PRELUDE_SOURCE.to_string(), tokens);
-    let (prelude_record, parse_diags) = parser.parse_file_expr();
+    let (mut prelude_record, parse_diags) = parser.parse_file_expr();
     assert!(
         !parse_diags
             .iter()
@@ -60,6 +95,25 @@ pub fn inject_prelude(expr: &mut ast::Expr) {
         "prelude failed to parse: {:?}",
         parse_diags
     );
+
+    // Inject the stdlib builtins as fields of the nested `base` record.
+    let dummy_span = ast::Span::new(0, 0);
+    if let ast::ExprKind::Record(outer) = &mut prelude_record.node {
+        if let Some(base_field) = outer.iter_mut().find(|f| f.name == "base") {
+            if let ast::ExprKind::Record(base_fields) = &mut base_field.value.node {
+                for name in BASE_STDLIB_FNS {
+                    base_fields.push(ast::RecordField {
+                        name: (*name).to_string(),
+                        value: ast::Spanned::new(
+                            ast::ExprKind::Var((*name).to_string()),
+                            dummy_span,
+                        ),
+                        sig: None,
+                    });
+                }
+            }
+        }
+    }
 
     let mut record = prelude_record;
     shift_expr_spans(&mut record, PRELUDE_SPAN_OFFSET);

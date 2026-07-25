@@ -1829,6 +1829,11 @@ impl Codegen {
             "randomInt", "sleep", "fork", "race",
             "encrypt", "decrypt", "sign", "verify",
             "upsertBy",
+            // Console IO builtins, registered so they become first-class
+            // function values living as fields of the `base` record.
+            "println", "print", "putLine",
+            "logInfo", "logWarn", "logError", "logDebug",
+            "show",
         ];
         for name in &stdlib_names {
             self.register_stdlib_fn(name);
@@ -2566,6 +2571,18 @@ impl Codegen {
         self.define_stdlib_fn_1("strip", "knot_value_id");
         self.define_stdlib_fn_1("dress", "knot_value_id");
 
+        // Console IO builtins as first-class function values, so they can live
+        // as fields of the `base` record (`base.println`, …). These mirror the
+        // applied-call dispatch in `compile_app` (`println x → knot_println_io
+        // x`) but as a curried 1-param function value the record can hold.
+        self.define_stdlib_fn_1("println", "knot_println_io");
+        self.define_stdlib_fn_1("print", "knot_print_io");
+        self.define_stdlib_fn_1("putLine", "knot_println_io");
+        self.define_stdlib_fn_1("logInfo", "knot_log_info_io");
+        self.define_stdlib_fn_1("logWarn", "knot_log_warn_io");
+        self.define_stdlib_fn_1("logError", "knot_log_error_io");
+        self.define_stdlib_fn_1("logDebug", "knot_log_debug_io");
+
         // 2-param: curried (outer captures arg1, inner calls runtime)
         self.define_stdlib_fn_2("filter", "knot_relation_filter", true);
         self.define_stdlib_fn_2("map", "knot_relation_map", true);
@@ -2610,6 +2627,12 @@ impl Codegen {
 
         // Random: 1-param (IO-returning)
         self.define_stdlib_fn_1("randomInt", "knot_random_int_io");
+
+        // Show: 1-param. The `base.show` record-field path uses the plain
+        // runtime `knot_value_show`; the unit-annotating variant
+        // (`knot_value_show_unit`) is only reachable via the applied-call
+        // special case, which `base.show` (a first-class value) does not hit.
+        self.define_stdlib_fn_1("show", "knot_value_show");
 
         // Sleep: 1-param (IO-returning)
         self.define_stdlib_fn_1("sleep", "knot_sleep_io");
@@ -4044,6 +4067,22 @@ impl Codegen {
             }
 
             ast::ExprKind::FieldAccess { expr, field } => {
+                // `base.Ctor` — a built-in constructor reached through the
+                // `base` namespace (`base.Just`, `base.Ok`, `base.True`, …).
+                // Inference typed this as the intrinsic ctor (payload → ADT);
+                // the `base` record itself has no ctor fields, so emit the
+                // constructor as a first-class function value rather than a
+                // runtime `knot_record_field` read.
+                if let ast::ExprKind::Var(base_name) = &expr.node
+                    && base_name == "base"
+                    && matches!(
+                        field.as_str(),
+                        "True" | "False" | "Just" | "Nothing" | "Ok" | "Err"
+                            | "LT" | "EQ" | "GT"
+                    )
+                {
+                    return self.emit_ctor_as_function_value(builder, field);
+                }
                 // `rec.Name.Ctor` where `Ctor` comes from an embedded `data`
                 // decl: the data field is erased to unit, so emit the
                 // constructor value directly rather than a runtime
@@ -8534,6 +8573,15 @@ impl Codegen {
                     ast::StmtKind::Where { cond } => self.expr_is_io_scoped(cond, scopes),
                     ast::StmtKind::GroupBy { key } => self.expr_is_io_scoped(key, scopes),
                 })
+            }
+            // `base.<io-builtin>` — with the standard library namespaced under
+            // the `base` record, an IO-producing call is a FieldAccess on
+            // `base` rather than a bare `Var`. Recognize it here (mirroring
+            // the bare-builtin `Var` arm) so a do-block whose only IO step is
+            // `base.println …` compiles as an IO block, not a relational one.
+            ast::ExprKind::FieldAccess { expr, field } => {
+                matches!(&expr.node, ast::ExprKind::Var(n) if n == "base")
+                    && crate::builtins::is_io_builtin(field)
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io_scoped(body, scopes),
             ast::ExprKind::With { record, body } => {

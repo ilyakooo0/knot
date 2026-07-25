@@ -5871,6 +5871,22 @@ impl Infer {
                     );
                     return Ty::Error;
                 }
+                // `base.Ctor` — a built-in constructor reached through the
+                // `base` namespace (`base.Just`, `base.Ok`, `base.True`, …).
+                // Resolve it as the intrinsic constructor (payload-record →
+                // ADT), exactly like the bare-constructor path, instead of a
+                // record-field read on `base` (which has no constructor
+                // fields). Codegen recognizes the same shape and emits the
+                // constructor as a first-class function value.
+                if let ast::ExprKind::Var(n) = &e.node
+                    && n == "base"
+                    && self.is_builtin_ctor(field)
+                    && let Some((data_ty, record_ty)) = self.instantiate_ctor(field, expr.span)
+                {
+                    let ty = Ty::Fun(Box::new(record_ty), Box::new(data_ty));
+                    self.field_accesses.push((expr.span, ty.clone()));
+                    return ty;
+                }
                 let expr_ty = self.infer_expr(e);
                 let resolved = self.apply(&expr_ty);
                 // If the expression is a relation (e.g., after groupBy), unwrap
@@ -8452,6 +8468,15 @@ impl Infer {
                     ast::StmtKind::Where { cond } => self.expr_is_io_prescan(cond),
                     ast::StmtKind::GroupBy { key } => self.expr_is_io_prescan(key),
                 })
+            }
+            // `base.<io-builtin>` — the standard library now lives under the
+            // `base` record, so an IO-producing call reaches us as a
+            // FieldAccess on `base` rather than a bare `Var`. Treat it exactly
+            // like the bare-builtin case above so a do-block whose only IO
+            // step is `base.println …` is still classified as an IO block.
+            ast::ExprKind::FieldAccess { expr, field } => {
+                matches!(&expr.node, ast::ExprKind::Var(n) if n == "base")
+                    && crate::builtins::is_io_builtin(field)
             }
             ast::ExprKind::With { record, body } => {
                 self.expr_is_io_prescan(record) || self.expr_is_io_prescan(body)

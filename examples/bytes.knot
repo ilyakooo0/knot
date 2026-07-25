@@ -2,55 +2,55 @@
 
 with { raw (b"hello") } (do
   -- Byte string literals
-  println (bytesLength raw)        -- 5
+  base.println (base.bytesLength raw)        -- 5
 
   -- Convert text -> bytes (always succeeds)
-  with { encoded (textToBytes "world") } (do
-    println (bytesLength encoded)    -- 5
+  with { encoded (base.textToBytes "world") } (do
+    base.println (base.bytesLength encoded)    -- 5
 
     -- Convert bytes -> text — Maybe, returns Nothing on invalid UTF-8
-    case bytesToText encoded of
-      Just { value t } -> println t   -- world
-      Nothing {} -> println "<invalid utf-8>"
+    case base.bytesToText encoded of
+      base.Just { value t } -> base.println t   -- world
+      base.Nothing {} -> base.println "<invalid utf-8>"
 
     -- Hex encoding always succeeds
-    with { hex (bytesToHex raw) } (do
-      println hex                      -- 68656c6c6f
+    with { hex (base.bytesToHex raw) } (do
+      base.println hex                      -- 68656c6c6f
 
       -- Hex decoding is Maybe — returns Nothing on odd-length / non-hex input
-      case bytesFromHex hex of
-        Just { value decoded } -> case bytesToText decoded of
-          Just { value t } -> println t -- hello
-          Nothing {} -> println "<invalid utf-8>"
-        Nothing {} -> println "<invalid hex>"
+      case base.bytesFromHex hex of
+        base.Just { value decoded } -> case base.bytesToText decoded of
+          base.Just { value t } -> base.println t -- hello
+          base.Nothing {} -> base.println "<invalid utf-8>"
+        base.Nothing {} -> base.println "<invalid hex>"
 
       -- Concatenation
-      with { combined (bytesConcat raw encoded) } (do
-        println (bytesLength combined)   -- 10
+      with { combined (base.bytesConcat raw encoded) } (do
+        base.println (base.bytesLength combined)   -- 10
 
         -- Slicing
-        with { slice (bytesSlice 0 5 combined) } (do
-          case bytesToText slice of
-            Just { value t } -> println t   -- hello
-            Nothing {} -> println "<invalid utf-8>"
+        with { slice (base.bytesSlice 0 5 combined) } (do
+          case base.bytesToText slice of
+            base.Just { value t } -> base.println t   -- hello
+            base.Nothing {} -> base.println "<invalid utf-8>"
 
           -- Byte access is Maybe — Nothing when the index is out of bounds
-          case bytesGet 0 raw of
-            Just { value byte } -> println byte  -- 104 (ascii 'h')
-            Nothing {} -> println "<out of bounds>"
+          case base.bytesGet 0 raw of
+            base.Just { value byte } -> base.println byte  -- 104 (ascii 'h')
+            base.Nothing {} -> base.println "<out of bounds>"
 
-          case bytesGet 10 raw of
-            Just { value byte } -> println byte
-            Nothing {} -> println "<out of bounds>"  -- raw has only 5 bytes
+          case base.bytesGet 10 raw of
+            base.Just { value byte } -> base.println byte
+            base.Nothing {} -> base.println "<out of bounds>"  -- raw has only 5 bytes
 
           -- Hex escapes in literals
           with { withHex (b"\x48\x49") } (do
-            case bytesToText withHex of
-              Just { value t } -> println t   -- HI
-              Nothing {} -> println "<invalid utf-8>"
+            case base.bytesToText withHex of
+              base.Just { value t } -> base.println t   -- HI
+              base.Nothing {} -> base.println "<invalid utf-8>"
 
             -- JSON encoding wraps bytes so they round-trip through parseJson.
-            println (toJson raw)             -- {"__knot_bytes":"aGVsbG8="}
-            println (toJson { payload raw })  -- {"payload":{"__knot_bytes":"aGVsbG8="}}
+            base.println (base.toJson raw)             -- {"__knot_bytes":"aGVsbG8="}
+            base.println (base.toJson { payload raw })  -- {"payload":{"__knot_bytes":"aGVsbG8="}}
 
             yield {}))))))

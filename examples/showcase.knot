@@ -453,6 +453,6 @@ seedMetrics (do
   seedTeams
   seedLogs
   seedMetrics
-  yield (show (count *employees) ++ " employees, " ++ show (count *projects) ++ " projects, " ++ show (count *tickets) ++ " tickets, " ++ show (count *customers) ++ " customers, " ++ show (count *products) ++ " products, " ++ show (count *orders) ++ " orders, " ++ show (count *teams) ++ " teams, " ++ show (count *logs) ++ " logs, " ++ show (count *metrics) ++ " metrics")
+  yield (base.show (base.count *employees) ++ " employees, " ++ base.show (base.count *projects) ++ " projects, " ++ base.show (base.count *tickets) ++ " tickets, " ++ base.show (base.count *customers) ++ " customers, " ++ base.show (base.count *products) ++ " products, " ++ base.show (base.count *orders) ++ " orders, " ++ base.show (base.count *teams) ++ " teams, " ++ base.show (base.count *logs) ++ " logs, " ++ base.show (base.count *metrics) ++ " metrics")
 
 )

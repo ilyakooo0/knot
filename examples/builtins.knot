@@ -1,12 +1,12 @@
 with {
 safeDiv : Int 1 -> Int 1 -> Maybe (Int 1)
-safeDiv (\x y -> if y == 0 then Nothing {} else Just {value (x / y)})
+safeDiv (\x y -> if y == 0 then base.Nothing {} else base.Just {value (x / y)})
 
 nums [1, 2, 3, 4, 5]
 
-doubled (map (\n -> n * 2) nums)
-total (fold (\acc n -> acc + n) 0 nums)
-evens (filter (\n -> n % 2 == 0) nums)
+doubled (base.map (\n -> n * 2) nums)
+total (base.fold (\acc n -> acc + n) 0 nums)
+evens (base.filter (\n -> n % 2 == 0) nums)
 
 divChain (do
   a <- safeDiv 20 4
@@ -19,14 +19,14 @@ divOk (do
   yield b)
 }
 (do
-  println ("doubled: " ++ show doubled)
-  println ("total:   " ++ show total)
-  println ("evens:   " ++ show evens)
-  println ("first2:  " ++ show (take 2 nums))
-  println ("drop2:   " ++ show (drop 2 nums))
-  println ("head:    " ++ show (head nums))
-  println ("find>3:  " ++ show (findFirst nums (\n -> n > 3)))
-  forEach nums (\n -> println ("  item " ++ show n))
-  println ("divChain (hits Nothing): " ++ show divChain)
-  println ("divOk:                   " ++ show divOk)
+  base.println ("doubled: " ++ base.show doubled)
+  base.println ("total:   " ++ base.show total)
+  base.println ("evens:   " ++ base.show evens)
+  base.println ("first2:  " ++ base.show (base.take 2 nums))
+  base.println ("drop2:   " ++ base.show (base.drop 2 nums))
+  base.println ("head:    " ++ base.show (base.head nums))
+  base.println ("find>3:  " ++ base.show (base.findFirst nums (\n -> n > 3)))
+  base.forEach nums (\n -> base.println ("  item " ++ base.show n))
+  base.println ("divChain (hits Nothing): " ++ base.show divChain)
+  base.println ("divOk:                   " ++ base.show divOk)
   yield {})

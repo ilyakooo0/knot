@@ -9,20 +9,20 @@ type Department = {name: Text, budget: Int 1}
 -- 1. Count pushdown: count *rel → SQL COUNT(*)
 countDemo (do
   employees <- *employees
-  println ("Employee count: " ++ show (count employees)))
+  base.println ("Employee count: " ++ base.show (base.count employees)))
 
 -- 2. Filter pushdown: where clause → SQL WHERE
 filterDemo (do
   employees <- *employees
-  println "High earners (salary > 75):"
-  with {filtered (do e <- employees; where e.salary > 75; yield ("  " ++ e.name ++ " ($" ++ show e.salary ++ ")"))} (do r <- filtered; println r; yield {}))
+  base.println "High earners (salary > 75):"
+  with {filtered (do e <- employees; where e.salary > 75; yield ("  " ++ e.name ++ " ($" ++ base.show e.salary ++ ")"))} (do r <- filtered; base.println r; yield {}))
 
 -- 3. Hash join: equi-join via hash index
 joinDemo (do
   employees <- *employees
   departments <- *departments
-  println "Employee departments:"
-  with {joined (do e <- employees; d <- departments; where e.dept == d.name; yield ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget: $" ++ show d.budget ++ ")"))} (do r <- joined; println r; yield {}))
+  base.println "Employee departments:"
+  with {joined (do e <- employees; d <- departments; where e.dept == d.name; yield ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget: $" ++ base.show d.budget ++ ")"))} (do r <- joined; base.println r; yield {}))
 
 -- 4. Full SQL: single-table filter → one SQL SELECT
 filterQuery (do
@@ -41,53 +41,53 @@ allEmployees (do
   with {result (do e <- employees; yield e)} yield result)
 
 printQuery (\label results -> do
-  println (label ++ ":")
+  base.println (label ++ ":")
   r <- results
-  println ("  " ++ show r)
+  base.println ("  " ++ base.show r)
   yield {})
 
 -- 7. Pipe: filter → SQL WHERE
 pipeFilter (do
   employees <- *employees
-  yield (employees |> filter (\e -> e.salary > 75)))
+  yield (employees |> base.filter (\e -> e.salary > 75)))
 
 -- 8. Pipe: filter + map → SQL WHERE + SELECT
 pipeFilterMap (do
   employees <- *employees
-  yield (employees |> filter (\e -> e.salary > 75) |> map (\e -> {name e.name salary e.salary})))
+  yield (employees |> base.filter (\e -> e.salary > 75) |> base.map (\e -> {name e.name salary e.salary})))
 
 -- 9. Pipe: filter + count
 pipeFilterCount (do
   employees <- *employees
-  with {filtered (employees |> filter (\e -> e.salary > 75))} yield (count filtered))
+  with {filtered (employees |> base.filter (\e -> e.salary > 75))} yield (base.count filtered))
 
 -- 10. Pipe: map only → SQL SELECT
 pipeMap (do
   employees <- *employees
-  yield (employees |> map (\e -> {name e.name dept e.dept})))
+  yield (employees |> base.map (\e -> {name e.name dept e.dept})))
 
 -- 11. minOn/maxOn projection → SQL MIN/MAX
 minMaxDemo (do
   employees <- *employees
-  with {lo (minOn (\e -> e.salary) employees)} with {hi (maxOn (\e -> e.salary) employees)} println ("min salary: " ++ show lo ++ ", max salary: " ++ show hi))
+  with {lo (base.minOn (\e -> e.salary) employees)} with {hi (base.maxOn (\e -> e.salary) employees)} base.println ("min salary: " ++ base.show lo ++ ", max salary: " ++ base.show hi))
 
 -- 12. countWhere predicate → SQL COUNT(*) WHERE
 countWhereDemo (do
   employees <- *employees
-  with {n (countWhere (\e -> e.dept == "Eng") employees)} println ("eng headcount: " ++ show n))
+  with {n (base.countWhere (\e -> e.dept == "Eng") employees)} base.println ("eng headcount: " ++ base.show n))
 
 -- 13. Pipe: filter + minOn/maxOn → SQL aggregate with WHERE
 pipeFilterMin (do
   employees <- *employees
-  yield (employees |> filter (\e -> e.dept == "Eng") |> minOn (\e -> e.salary)))
+  yield (employees |> base.filter (\e -> e.dept == "Eng") |> base.minOn (\e -> e.salary)))
 
 pipeFilterMax (do
   employees <- *employees
-  yield (employees |> filter (\e -> e.dept == "Eng") |> maxOn (\e -> e.salary)))
+  yield (employees |> base.filter (\e -> e.dept == "Eng") |> base.maxOn (\e -> e.salary)))
 
 pipeCountWhere (do
   employees <- *employees
-  yield (employees |> countWhere (\e -> e.dept == "Sales")))
+  yield (employees |> base.countWhere (\e -> e.dept == "Sales")))
 }
 (do
   replace *employees = [
@@ -112,15 +112,15 @@ pipeCountWhere (do
   pfm <- pipeFilterMap
   printQuery "Pipe filter+map (salary > 75)" pfm
   pfc <- pipeFilterCount
-  println ("Pipe filter+count (salary > 75): " ++ show pfc)
+  base.println ("Pipe filter+count (salary > 75): " ++ base.show pfc)
   pm <- pipeMap
   printQuery "Pipe map (name, dept)" pm
   minMaxDemo
   countWhereDemo
   pmin <- pipeFilterMin
-  println ("Pipe Eng min salary: " ++ show pmin)
+  base.println ("Pipe Eng min salary: " ++ base.show pmin)
   pmax <- pipeFilterMax
-  println ("Pipe Eng max salary: " ++ show pmax)
+  base.println ("Pipe Eng max salary: " ++ base.show pmax)
   pcw <- pipeCountWhere
-  println ("Pipe count dept=Sales: " ++ show pcw)
+  base.println ("Pipe count dept=Sales: " ++ base.show pcw)
   yield {})

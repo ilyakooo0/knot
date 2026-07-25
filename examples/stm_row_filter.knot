@@ -12,7 +12,7 @@ type Account = {id: Int 1, balance: Int 1}
 -- The `single (filter (\a -> a.id == ?) rows)` pattern is what the codegen
 -- recognizes as a `"id" = ?` simple equality; inside an atomic block the
 -- runtime tracks this as a `Cols([(id, Eq, ?)])` read filter on accounts.
-findById (\aid rows -> single (filter (\a -> a.id == aid) rows))
+findById (\aid rows -> base.single (base.filter (\a -> a.id == aid) rows))
 
 setBalance (\aid newBalance rows -> do
   r <- rows
@@ -32,5 +32,5 @@ credit (\aid amount -> atomic do
   credit 2 50
   credit 3 25
   rows <- *accounts
-  println ("final: " ++ show rows)
+  base.println ("final: " ++ base.show rows)
   yield {})

@@ -2,52 +2,52 @@
 
 (do
   -- Key pair generation for encryption (X25519)
-  keys <- generateKeyPair
-  println "Encryption key pair generated"
-  println ("  Public key: " ++ bytesToHex keys.publicKey)
+  keys <- base.generateKeyPair
+  base.println "Encryption key pair generated"
+  base.println ("  Public key: " ++ base.bytesToHex keys.publicKey)
 
   -- Encrypt is Maybe — Nothing if the public key is unusable (wrong length or
   -- a low-order point). Keys often come from a peer, so this is a value to
   -- handle, not a crash.
-  with { message (textToBytes "Hello, cryptography!") } (do
-    encrypted <- encrypt keys.publicKey message
+  with { message (base.textToBytes "Hello, cryptography!") } (do
+    encrypted <- base.encrypt keys.publicKey message
     case encrypted of
-      Nothing {} -> println "  Encryption failed: bad public key"
-      Just { value ciphertext } -> do
-        println ("  Ciphertext: " ++ bytesToHex ciphertext)
+      base.Nothing {} -> base.println "  Encryption failed: bad public key"
+      base.Just { value ciphertext } -> do
+        base.println ("  Ciphertext: " ++ base.bytesToHex ciphertext)
 
         -- Decrypt is Maybe too — Nothing on a wrong key or tampered ciphertext.
-        case decrypt keys.privateKey ciphertext of
-          Nothing {} -> println "  Decryption failed: wrong key or tampered ciphertext"
-          Just { value decrypted } -> case bytesToText decrypted of
-            Just t -> println ("  Decrypted: " ++ t.value)
-            Nothing -> println "  Decrypted: <invalid utf-8>"
+        case base.decrypt keys.privateKey ciphertext of
+          base.Nothing {} -> base.println "  Decryption failed: wrong key or tampered ciphertext"
+          base.Just { value decrypted } -> case base.bytesToText decrypted of
+            base.Just t -> base.println ("  Decrypted: " ++ t.value)
+            base.Nothing -> base.println "  Decrypted: <invalid utf-8>"
 
         -- Tampering with the ciphertext is caught by the authentication tag.
-        with { tampered (bytesConcat (bytesSlice 0 40 ciphertext) (textToBytes "XXXX")) } (do
-          case decrypt keys.privateKey tampered of
-            Nothing {} -> println "  Tampered ciphertext rejected"
-            Just { value _ } -> println "  BUG: tampered ciphertext decrypted"
+        with { tampered (base.bytesConcat (base.bytesSlice 0 40 ciphertext) (base.textToBytes "XXXX")) } (do
+          case base.decrypt keys.privateKey tampered of
+            base.Nothing {} -> base.println "  Tampered ciphertext rejected"
+            base.Just { value _ } -> base.println "  BUG: tampered ciphertext decrypted"
           yield {})
 
     -- Signing key pair generation (Ed25519)
-    sigKeys <- generateSigningKeyPair
-    println "Signing key pair generated"
-    println ("  Public key: " ++ bytesToHex sigKeys.publicKey)
+    sigKeys <- base.generateSigningKeyPair
+    base.println "Signing key pair generated"
+    base.println ("  Public key: " ++ base.bytesToHex sigKeys.publicKey)
 
     -- Sign is Maybe — Nothing if the private key is not 32 bytes.
-    case sign sigKeys.privateKey message of
-      Nothing {} -> println "  Signing failed: bad private key"
-      Just { value sig } -> do
-        println ("  Signature: " ++ bytesToHex sig)
+    case base.sign sigKeys.privateKey message of
+      base.Nothing {} -> base.println "  Signing failed: bad private key"
+      base.Just { value sig } -> do
+        base.println ("  Signature: " ++ base.bytesToHex sig)
 
-        with { valid (verify sigKeys.publicKey message sig) } (do
-          println ("  Valid: " ++ show valid)
+        with { valid (base.verify sigKeys.publicKey message sig) } (do
+          base.println ("  Valid: " ++ base.show valid)
 
           -- Verify with wrong message should fail
-          with { wrongMsg (textToBytes "Wrong message") } (do
-            with { invalid (verify sigKeys.publicKey wrongMsg sig) } (do
-              println ("  Invalid (wrong msg): " ++ show invalid)
+          with { wrongMsg (base.textToBytes "Wrong message") } (do
+            with { invalid (base.verify sigKeys.publicKey wrongMsg sig) } (do
+              base.println ("  Invalid (wrong msg): " ++ base.show invalid)
               yield {})))
 
     yield {})

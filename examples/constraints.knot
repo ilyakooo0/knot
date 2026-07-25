@@ -19,8 +19,8 @@ type Person = {name: Text, age: Int 1, email: Text}
   replace *orders = [{ customer "Alice" amount 100 }]
 
   -- Print current state
-  println "People:"
-  println (show *people)
-  println "Orders:"
-  println (show *orders)
+  base.println "People:"
+  base.println (base.show *people)
+  base.println "Orders:"
+  base.println (base.show *orders)
   yield {})

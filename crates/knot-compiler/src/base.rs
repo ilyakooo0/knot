@@ -53,7 +53,7 @@ unless (\cond action -> if cond then yield {} else action)
 /// (`println`, `show`, `now`, …) and intrinsic constructors
 /// (`Just`/`Nothing`/`Ok`/`Err`/`True`/`False`) are routed separately by the
 /// compiler, not via this record.
-const BASE_STDLIB_FNS: &[&str] = &[
+pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     "all", "any", "appendFile", "avg", "bytesConcat", "bytesFromHex",
     "bytesGet", "bytesLength", "bytesSlice", "bytesToHex", "bytesToText",
     "chars", "contains", "countWhere", "decrypt", "diff", "dress", "drop",
@@ -64,6 +64,12 @@ const BASE_STDLIB_FNS: &[&str] = &[
     "strip", "stripFloatUnit", "stripUnit", "take", "textToBytes", "toJson",
     "toLower", "toUpper", "traverse", "trim", "upsertBy", "verify",
     "withFloatUnit", "withUnit", "writeFile",
+    // Relation query forms as first-class function values (`base.count`,
+    // `base.union`, `base.sum`, `base.bind`). Each is registered as a curried
+    // function value in codegen; the call-site SQL-pushdown optimization
+    // recognizes both the bare (`count rel`) and namespaced (`base.count rel`)
+    // application head. `bind` here is relation flatMap (`knot_relation_bind`).
+    "count", "union", "sum", "bind",
     // Console IO builtins (registered as stdlib function values in codegen).
     "println", "print", "putLine", "logInfo", "logWarn", "logError", "logDebug",
     "show",
@@ -74,9 +80,35 @@ const BASE_STDLIB_FNS: &[&str] = &[
     "generateKeyPair", "generateSigningKeyPair",
 ];
 
-/// Parse the prelude record and wrap the program's expression in
-/// `with {prelude} expr`, so prelude names are in scope throughout.
-pub fn inject_prelude(expr: &mut ast::Expr) {
+/// Names a bare user-span `Var` may NOT reference directly; the hard gate
+/// (option A) requires `base.<name>` instead. This is every stdlib builtin
+/// plus the prelude's polymorphic helpers. Constructors
+/// (`Just`/`Nothing`/`Ok`/`Err`/`True`/`False`) are deliberately NOT here —
+/// they route through the dedicated `base.Ctor` arms, which gate separately.
+pub(crate) fn is_gated_stdlib(name: &str) -> bool {
+    BASE_STDLIB_FNS.contains(&name) || matches!(name, "min" | "max" | "when" | "unless")
+}
+
+/// Server special forms (`fetch`/`fetchWith`/`listen`/`listenOn`) and the STM
+/// primitive `retry`. These are compile-time macros, NOT `base` record fields,
+/// but the bare form is still gated for consistency — the user must write
+/// `base.fetch`, `base.listen`, `base.retry`. Codegen routes the namespaced
+/// head through the same macro dispatch (`server_form_name`); `retry` keeps its
+/// own "only inside `atomic`" check, which fires first.
+pub(crate) fn is_gated_special_form(name: &str) -> bool {
+    matches!(
+        name,
+        "fetch" | "fetchWith" | "listen" | "listenOn" | "retry"
+    )
+}
+
+/// Parse the prelude source and return the fully-assembled `base` record
+/// expression (the prelude helpers `min`/`max`/`when`/`unless` plus every
+/// stdlib builtin as a `name: Var(name)` field), with all spans shifted by
+/// `PRELUDE_SPAN_OFFSET`. This is the single source of truth for the `base`
+/// record's VALUE; both the injected prelude `with` and the global
+/// `define_base_record` compile it.
+pub(crate) fn prelude_base_record() -> ast::Expr {
     let lexer = knot::lexer::Lexer::new(PRELUDE_SOURCE);
     let (tokens, lex_diags) = lexer.tokenize();
     assert!(
@@ -98,6 +130,7 @@ pub fn inject_prelude(expr: &mut ast::Expr) {
 
     // Inject the stdlib builtins as fields of the nested `base` record.
     let dummy_span = ast::Span::new(0, 0);
+    let mut base_record = None;
     if let ast::ExprKind::Record(outer) = &mut prelude_record.node {
         if let Some(base_field) = outer.iter_mut().find(|f| f.name == "base") {
             if let ast::ExprKind::Record(base_fields) = &mut base_field.value.node {
@@ -112,12 +145,28 @@ pub fn inject_prelude(expr: &mut ast::Expr) {
                     });
                 }
             }
+            base_record = Some(base_field.value.clone());
         }
     }
-
-    let mut record = prelude_record;
+    let mut record = base_record.expect("prelude source has no `base` field");
     shift_expr_spans(&mut record, PRELUDE_SPAN_OFFSET);
+    record
+}
 
+/// Parse the prelude record and wrap the program's expression in
+/// `with {base: <base record>} expr`, so `base` is in scope throughout.
+pub fn inject_prelude(expr: &mut ast::Expr) {
+    let base_record = prelude_base_record();
+    // Wrap the inner `base` record as the single field of the outer record
+    // `{base: …}` that the `with` binds.
+    let record = ast::Spanned::new(
+        ast::ExprKind::Record(vec![ast::RecordField {
+            name: "base".to_string(),
+            value: base_record,
+            sig: None,
+        }]),
+        ast::Span::new(PRELUDE_SPAN_OFFSET, PRELUDE_SPAN_OFFSET),
+    );
     let span = expr.span;
     let body = std::mem::replace(
         expr,

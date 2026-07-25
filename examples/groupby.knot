@@ -17,9 +17,9 @@ type Todo = {title: Text, owner: Text, done: Int 1}
     t <- *todos
     where t.done == 0
     groupBy { owner t.owner }
-    yield { owner t.owner count (count t) }) } (do
+    yield { owner t.owner count (base.count t) }) } (do
 
-    println "Pending work per person:"
+    base.println "Pending work per person:"
     w <- workload
-    println (w.owner ++ ": " ++ show w.count)
+    base.println (w.owner ++ ": " ++ base.show w.count)
     yield {}))

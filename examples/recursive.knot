@@ -15,8 +15,8 @@ with {
     {manager "Alice" report "Carol"},
     {manager "Bob" report "Dave"}
   ]
-  println "Direct reports:"
+  base.println "Direct reports:"
   rows <- &directReports
-  println (show rows)
-  println ("Total: " ++ show (count rows))
+  base.println (base.show rows)
+  base.println ("Total: " ++ base.show (base.count rows))
   yield {})

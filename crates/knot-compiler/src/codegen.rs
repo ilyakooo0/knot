@@ -1614,6 +1614,84 @@ impl Codegen {
         });
     }
 
+    /// Define `count : [a] -> Int u` as a first-class function value (for the
+    /// `base.count` record field and bare-`count`-as-value). `knot_relation_len`
+    /// returns a raw `usize`; wrap it in `knot_value_int` to produce a knot Int.
+    /// The unit annotation `u` is statically inferred and erased at runtime, so
+    /// the value carries a plain dimensionless Int here.
+    fn define_stdlib_count(&mut self) {
+        if self.user_shadowed_stdlib.contains("count") {
+            return;
+        }
+        let (func_id, _) = self.user_fns["count"];
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.params.push(AbiParam::new(self.ptr_type)); // rel
+        sig.returns.push(AbiParam::new(self.ptr_type));
+
+        self.build_function(func_id, sig, |cg, builder, entry| {
+            let rel = builder.block_params(entry)[1];
+            let len = cg.call_rt(builder, "knot_relation_len", &[rel]);
+            let result = cg.call_rt(builder, "knot_value_int", &[len]);
+            builder.ins().return_(&[result]);
+        });
+    }
+
+    /// Define the global `base` record as a 0-param function returning a record
+    /// of every stdlib function value plus the prelude's polymorphic helpers.
+    /// Binding `base` as a 0-param `user_fns` entry makes the bare-`Var` path
+    /// resolve it everywhere — including decl bodies and nested `with` field
+    /// values, which compile in fresh envs that never see the injected prelude
+    /// `with`. This is what makes the hard gate (option A) viable: `base.X`
+    /// works everywhere bare names used to.
+    ///
+    /// Field values: stdlib functions become trampoline function values (the
+    /// same shape the bare-`Var` path emits); the 0-arg IO builtins (`now`,
+    /// `readLine`, `randomFloat`, `randomUuid`, `generateKeyPair`,
+    /// `generateSigningKeyPair`) become their re-runnable `knot_*_io` thunks;
+    /// the prelude helpers (`min`/`max`/`when`/`unless`) become 1-param
+    /// closures over compiler-synthesized bodies. Constructors and the server
+    /// special forms are NOT record fields — dedicated `base.Ctor` /
+    /// `base.<form>` FieldAccess arms route them.
+    fn define_base_record(&mut self) {
+        if self.user_shadowed_stdlib.contains("base") {
+            return;
+        }
+        // `base` was registered as a 0-param function during the registration
+        // phase (so decl bodies see it); reuse that FuncId. If for some reason
+        // it wasn't registered, declare it now.
+        let func_id = match self.user_fns.get("base") {
+            Some(&(fid, 0)) => fid,
+            _ => {
+                let mut sig = self.module.make_signature();
+                sig.params.push(AbiParam::new(self.ptr_type)); // db
+                sig.returns.push(AbiParam::new(self.ptr_type));
+                let fid = self
+                    .module
+                    .declare_function("knot_user_base", Linkage::Local, &sig)
+                    .unwrap();
+                self.user_fns.insert("base".to_string(), (fid, 0));
+                fid
+            }
+        };
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.returns.push(AbiParam::new(self.ptr_type));
+
+        // Compile the prelude's fully-assembled `base` record (helpers
+        // `min`/`max`/`when`/`unless` as closures + every stdlib `Var(name)`
+        // field resolved via `user_fns`). This is the same AST the injected
+        // prelude `with` compiles, so the global record and the `with` field
+        // have identical values.
+        let base_record = crate::base::prelude_base_record();
+        self.build_function(func_id, sig, |cg, builder, entry| {
+            let db = builder.block_params(entry)[0];
+            let mut env = Env::new();
+            let record = cg.compile_expr(builder, &base_record, &mut env, db);
+            builder.ins().return_(&[record]);
+        });
+    }
+
     /// Define a 2-param stdlib function using currying:
     /// outer(db, arg1) -> Function(inner, arg1, name)  — arg1 passed directly as env
     /// inner(db, env=arg1, arg2) -> rt_fn(db, arg1, arg2)
@@ -1815,6 +1893,10 @@ impl Codegen {
         let stdlib_names = [
             "filter", "map", "fold", "forEach", "match", "single", "any", "all", "diff", "inter", "sum", "avg",
             "minOn", "maxOn", "countWhere", "head", "findFirst",
+            // Relation query forms, registered as first-class function values
+            // so they can live as fields of the `base` record (`base.count`,
+            // `base.union`, `base.bind`). `sum` is already registered above.
+            "count", "union", "bind",
             "toUpper", "toLower", "sortBy",
             "length", "trim", "contains", "elem", "reverse",
             "chars", "id", "not", "toJson", "parseJson",
@@ -1837,6 +1919,22 @@ impl Codegen {
         ];
         for name in &stdlib_names {
             self.register_stdlib_fn(name);
+        }
+
+        // Register the global `base` record as a 0-param function NOW (during
+        // the registration phase) so decl bodies — compiled later in
+        // `define_functions` — already see `user_fns["base"]` when they
+        // reference it. The body is defined by `define_base_record` (called in
+        // `define_functions` after every stdlib fn is defined).
+        if !self.user_shadowed_stdlib.contains("base") && !self.user_fns.contains_key("base") {
+            let mut sig = self.module.make_signature();
+            sig.params.push(AbiParam::new(self.ptr_type)); // db
+            sig.returns.push(AbiParam::new(self.ptr_type));
+            let func_id = self
+                .module
+                .declare_function("knot_user_base", Linkage::Local, &sig)
+                .unwrap();
+            self.user_fns.insert("base".to_string(), (func_id, 0));
         }
 
         // Composite route declarations (`route Name = A | B`), resolved to a
@@ -2599,6 +2697,9 @@ impl Codegen {
         self.define_stdlib_fn_2("diff", "knot_relation_diff", true);
         self.define_stdlib_fn_2("inter", "knot_relation_inter", true);
         self.define_stdlib_sum();
+        self.define_stdlib_count();
+        self.define_stdlib_fn_2("union", "knot_relation_union", true);
+        self.define_stdlib_fn_2("bind", "knot_relation_bind", true);
         self.define_stdlib_fn_2("avg", "knot_relation_avg", true);
         self.define_stdlib_fn_2("minOn", "knot_relation_min", true);
         self.define_stdlib_fn_2("maxOn", "knot_relation_max", true);
@@ -2701,6 +2802,15 @@ impl Codegen {
                 _ => {}
             }
         }
+
+        // The global `base` record: a 0-param function returning a record of
+        // every stdlib function value, so `base` resolves as a global (not
+        // just a `with` field) inside decl bodies and nested `with` field
+        // values, which compile in fresh envs without the prelude `with`.
+        // Defined BEFORE the pending-lambda/trampoline compile loop below so
+        // any trampolines it creates (for stdlib fns never referenced bare)
+        // are picked up by that loop.
+        self.define_base_record();
 
         // Compile any pending lambdas and IO thunks (may generate more)
         while !self.pending_lambdas.is_empty() || !self.pending_io_thunks.is_empty() || !self.pending_trampolines.is_empty() {
@@ -3845,38 +3955,7 @@ impl Codegen {
                     return self.call_rt(builder, "knot_read_line_io", &[]);
                 }
                 if name == "retry" {
-                    if let Some(retry_block) = self.atomic_retry_block {
-                        // Pop any arena frames opened since the atomic loop
-                        // head (nested do-block frames, bind-expression
-                        // isolation frames). retry_block only pops the
-                        // atomic's own frame — skipping these pops would
-                        // leak one frame per retry iteration.
-                        for _ in 0..self.atomic_arena_frames {
-                            self.call_rt_void(builder, "knot_arena_pop_frame", &[]);
-                        }
-                        // Free every live pre-built hash-join index. These are
-                        // heap `Box<HashIndex>` allocations (not arena-managed),
-                        // so the arena-pop above does not reclaim them, and the
-                        // normal-exit free loop in `compile_do` is unreachable
-                        // from here. Without this each retry iteration leaks one
-                        // box per active join. The stack is left untouched (it
-                        // is balanced by `compile_do`'s own push/pop) — we only
-                        // read it to know which SSA values are live at this site.
-                        let live_indices = self.pending_index_frees.clone();
-                        for idx in live_indices {
-                            self.call_rt_void(builder, "knot_relation_index_free", &[idx]);
-                        }
-                        // Jump directly to the retry path, short-circuiting
-                        // all subsequent code in the atomic body.
-                        builder.ins().jump(retry_block, &[]);
-                        // Create an unreachable block so subsequent codegen
-                        // has somewhere to emit instructions (dead code).
-                        let dead = builder.create_block();
-                        builder.switch_to_block(dead);
-                        builder.seal_block(dead);
-                        return self.call_rt(builder, "knot_value_unit", &[]);
-                    }
-                    return self.call_rt(builder, "knot_stm_retry", &[]);
+                    return self.emit_retry(builder);
                 }
                 // `env` and `user_fns` were both consulted above; anything
                 // reaching here is a genuinely undefined variable.
@@ -4082,6 +4161,15 @@ impl Codegen {
                     )
                 {
                     return self.emit_ctor_as_function_value(builder, field);
+                }
+                // `base.retry` — the STM primitive reached through the `base`
+                // namespace. It has no `base` record field, so emit the retry
+                // logic directly (identical to the bare `retry` Var arm).
+                if let ast::ExprKind::Var(base_name) = &expr.node
+                    && base_name == "base"
+                    && field == "retry"
+                {
+                    return self.emit_retry(builder);
                 }
                 // `rec.Name.Ctor` where `Ctor` comes from an embedded `data`
                 // decl: the data field is erased to unit, so emit the
@@ -5718,6 +5806,64 @@ impl Codegen {
         }
     }
 
+    /// Emit the STM `retry` primitive. Shared by the bare `retry` Var arm and
+    /// the namespaced `base.retry` FieldAccess arm so both produce identical
+    /// code: inside `atomic`, short-circuit to the retry block (popping arena
+    /// frames and freeing live join indices); otherwise fall back to the
+    /// standalone `knot_stm_retry`.
+    fn emit_retry(
+        &mut self,
+        builder: &mut cranelift_frontend::FunctionBuilder,
+    ) -> cranelift_codegen::ir::Value {
+        if let Some(retry_block) = self.atomic_retry_block {
+            // Pop any arena frames opened since the atomic loop head (nested
+            // do-block frames, bind-expression isolation frames). retry_block
+            // only pops the atomic's own frame — skipping these pops would
+            // leak one frame per retry iteration.
+            for _ in 0..self.atomic_arena_frames {
+                self.call_rt_void(builder, "knot_arena_pop_frame", &[]);
+            }
+            // Free every live pre-built hash-join index. These are heap
+            // `Box<HashIndex>` allocations (not arena-managed), so the
+            // arena-pop above does not reclaim them, and the normal-exit free
+            // loop in `compile_do` is unreachable from here. Without this each
+            // retry iteration leaks one box per active join. The stack is left
+            // untouched (it is balanced by `compile_do`'s own push/pop) — we
+            // only read it to know which SSA values are live at this site.
+            let live_indices = self.pending_index_frees.clone();
+            for idx in live_indices {
+                self.call_rt_void(builder, "knot_relation_index_free", &[idx]);
+            }
+            // Jump directly to the retry path, short-circuiting all subsequent
+            // code in the atomic body.
+            builder.ins().jump(retry_block, &[]);
+            // Create an unreachable block so subsequent codegen has somewhere
+            // to emit instructions (dead code).
+            let dead = builder.create_block();
+            builder.switch_to_block(dead);
+            builder.seal_block(dead);
+            return self.call_rt(builder, "knot_value_unit", &[]);
+        }
+        self.call_rt(builder, "knot_stm_retry", &[])
+    }
+
+    /// Relation query forms (`count`/`union`/`sum`/`bind`) reached either bare
+    /// (`count rel`) or namespaced (`base.count rel`). Like `server_form_name`,
+    /// this lets the SQL-pushdown optimization recognize the `base.X` head so a
+    /// namespaced query form pushes down to SQL exactly like the bare form.
+    /// Returns `Some(name)` for either shape, `None` otherwise.
+    fn query_form_name(func_expr: &ast::Expr) -> Option<&str> {
+        match &func_expr.node {
+            ast::ExprKind::Var(name) => Some(name.as_str()),
+            ast::ExprKind::FieldAccess { expr, field }
+                if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") =>
+            {
+                Some(field.as_str())
+            }
+            _ => None,
+        }
+    }
+
     fn compile_app(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -5785,9 +5931,9 @@ impl Codegen {
                 return result;
             }
 
-        // Special case: count *rel → SQL COUNT(*)
-        if let ast::ExprKind::Var(name) = &func_expr.node
-            && name == "count" && args.len() == 1 && !user_shadows_special {
+        // Special case: count *rel → SQL COUNT(*)  (bare `count` or `base.count`)
+        if Self::query_form_name(func_expr) == Some("count")
+            && args.len() == 1 && !user_shadows_special {
                 if let Some(source_name) = self.resolve_source(args[0]) {
                     // Only for actual sources, not views
                     if !self.views.contains_key(&source_name)
@@ -6664,8 +6810,7 @@ impl Codegen {
         // (the SQL pushdown paths pass the same `is_float` flag, derived from
         // the column type). Inference records the span only when the result is
         // a Float; a user-defined `sum` skips this and dispatches normally.
-        if let ast::ExprKind::Var(name) = &func_expr.node
-            && name == "sum"
+        if Self::query_form_name(func_expr) == Some("sum")
                 && args.len() == 1
                 && !user_shadows_special {
                     let rel_val = self.compile_expr(builder, args[0], env, db);
@@ -11260,8 +11405,7 @@ impl Codegen {
                 func: inner_func,
                 arg: arg1,
             } = &func.node
-                && let ast::ExprKind::Var(fn_name) = &inner_func.node
-                    && fn_name == "union" {
+                && Self::query_form_name(inner_func) == Some("union") {
                         // union *rel <new_rows>
                         if Self::expr_is_source(&arg1.node, source_name, &self.source_var_binds) {
                             return Some(arg2);
@@ -14404,6 +14548,21 @@ fn flatten_pipe_chain<'a>(
     Some((current, ops))
 }
 
+/// Recognize a query-form head (`count`/`sum`/`union`/`bind`) reached bare
+/// (`count`) or namespaced (`base.count`). Free-function mirror of
+/// `Codegen::query_form_name` for use outside the impl.
+fn query_form_head(expr: &ast::Expr) -> Option<&str> {
+    match &expr.node {
+        ast::ExprKind::Var(name) => Some(name.as_str()),
+        ast::ExprKind::FieldAccess { expr, field }
+            if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") =>
+        {
+            Some(field.as_str())
+        }
+        _ => None,
+    }
+}
+
 /// Recognize a pipe RHS as a SQL-compilable operation.
 fn analyze_pipe_op(
     expr: &ast::Expr,
@@ -14411,11 +14570,12 @@ fn analyze_pipe_op(
     let_bindings: &HashMap<String, ast::Expr>,
 ) -> Option<PipeOp> {
     match &expr.node {
-        ast::ExprKind::Var(name) if name == "count" => Some(PipeOp::Count),
-        // `rel |> sum` — direct aggregation over a numeric relation, no
-        // projection. The PipeOp::Sum fields are unused for this form (the
-        // relation's own element is the summand); reuse the identity shape.
-        ast::ExprKind::Var(name) if name == "sum" => Some(PipeOp::SumDirect),
+        // `rel |> count` / `rel |> base.count` — bare or namespaced query form.
+        _ if query_form_head(expr) == Some("count") => Some(PipeOp::Count),
+        // `rel |> sum` / `rel |> base.sum` — direct aggregation over a numeric
+        // relation, no projection. The PipeOp::Sum fields are unused for this
+        // form (the relation's own element is the summand); reuse the identity shape.
+        _ if query_form_head(expr) == Some("sum") => Some(PipeOp::SumDirect),
         ast::ExprKind::App { func, arg } => {
             if let ast::ExprKind::Var(name) = &func.node {
                 match name.as_str() {

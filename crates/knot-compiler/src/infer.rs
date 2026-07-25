@@ -1046,6 +1046,13 @@ struct Infer {
     /// `unify_dir`.
     suppress_refine_intro: Option<HashSet<String>>,
 
+    /// Names of USER top-level declarations (the `with`-record fields that act
+    /// as named functions/values). These live in `scopes[0]` alongside the
+    /// builtins via `bind_top`, so `bound_in_user_scope` can't tell them apart
+    /// by scope index alone — it consults this set so a user decl named e.g.
+    /// `map` shadows the gated builtin rather than triggering the gate.
+    user_top_level_names: HashSet<String>,
+
     /// Unit-composition checks for `*`/`/` deferred because one operand was
     /// still an unresolved type variable when the binop was inferred. When the
     /// enclosing binding is generalized, `generalize` moves the relevant
@@ -1124,6 +1131,7 @@ impl Infer {
             with_scope_stack: vec![None],
             implicit_refs: HashMap::new(),
             suppress_refine_intro: None,
+            user_top_level_names: HashSet::new(),
             deferred_unit_binops: Vec::new(),
             elem_pushdown_ok: ElemPushdownOk::default(),
         }
@@ -4323,6 +4331,22 @@ impl Infer {
         None
     }
 
+    /// True when `name` is bound by a USER scope (any scope above the bottom
+    /// builtin scope `scopes[0]`): a local lambda param, a do-block binder, a
+    /// `with` field, a user top-level decl. The hard gate exempts such names —
+    /// a user `map`/`println` binding shadows the gated builtin.
+    fn bound_in_user_scope(&self, name: &str) -> bool {
+        // A user top-level decl lives in `scopes[0]` alongside builtins, so it
+        // won't be found by the scope-index scan below — check the set first.
+        if self.user_top_level_names.contains(name) {
+            return true;
+        }
+        self.scopes
+            .iter()
+            .skip(1)
+            .any(|scope| scope.contains_key(name))
+    }
+
     fn lookup_instantiate_at(
         &mut self,
         name: &str,
@@ -5597,6 +5621,22 @@ impl Infer {
                         expr.span,
                     );
                 }
+                // Hard gate (option A): a bare user-code reference to a stdlib
+                // builtin or prelude helper must be qualified as `base.<name>`.
+                // Fires only when the Var is user code (span below the prelude
+                // offset) and the name isn't shadowed by a user binding (a
+                // lambda param / with field / user decl of the same name).
+                if expr.span.start < crate::base::PRELUDE_SPAN_OFFSET
+                    && (crate::base::is_gated_stdlib(name)
+                        || crate::base::is_gated_special_form(name))
+                    && !self.bound_in_user_scope(name)
+                {
+                    self.error(
+                        format!("undefined variable '{name}' (did you mean `base.{name}`?)"),
+                        expr.span,
+                    );
+                    return Ty::Error;
+                }
                 if let Some(ty) = self.lookup_instantiate_at(name, expr.span) {
                     // If this Var resolved to a field of a `with` that codegen
                     // binds in the CURRENT env frame, redirect codegen's `Var`
@@ -5672,7 +5712,22 @@ impl Infer {
             }
 
             ast::ExprKind::Constructor(name) => {
-                if !self.is_builtin_ctor(name) && self.constructors.contains_key(name) {
+                // Hard gate (option A): a bare BUILT-IN constructor in user
+                // code must be qualified as `base.<Ctor>` (`base.Just`,
+                // `base.Ok`, …). Prelude-internal uses (shifted spans) and
+                // pattern positions (which go through a different arm) are
+                // exempt.
+                if self.is_builtin_ctor(name)
+                    && expr.span.start < crate::base::PRELUDE_SPAN_OFFSET
+                {
+                    self.error(
+                        format!(
+                            "constructor '{name}' must be qualified as `base.{name}`"
+                        ),
+                        expr.span,
+                    );
+                    Ty::Error
+                } else if !self.is_builtin_ctor(name) && self.constructors.contains_key(name) {
                     // A USER-defined constructor referenced bare. Constructors
                     // are always qualified — require `Type.Ctor`. Built-ins
                     // (`True`, `Just`) fall through to the bare path below.
@@ -5894,9 +5949,43 @@ impl Infer {
                 // builtin's scheme; codegen dispatches the same name through
                 // `server_form_name`. (`retry` is deliberately excluded: it is
                 // the STM primitive, only valid inside `atomic`, never a value.)
+                //
+                // `base.<query-form>` — `count`/`union`/`sum`/`bind` ARE real
+                // record fields (codegen registers curried values for them),
+                // but their schemes carry `unit_vars` (`count : [a] -> Int u`)
+                // or higher-rank shapes that the infer-from-prelude record type
+                // in `bind_base_record` mangles during generalize. Resolve them
+                // by instantiating the field's OWN scheme from scope, exactly
+                // like the server forms — the runtime value is the same, only
+                // the typing path differs.
+                // `base.retry` — the STM primitive reached through `base`. It
+                // has no record field; instantiate its polymorphic scheme, but
+                // keep the same "only inside `atomic`" constraint as the bare
+                // form (the bare `Var` arm checks this at its own site).
                 if let ast::ExprKind::Var(n) = &e.node
                     && n == "base"
-                    && matches!(field.as_str(), "fetch" | "fetchWith" | "listen" | "listenOn")
+                    && field == "retry"
+                {
+                    if !self.in_atomic {
+                        self.error(
+                            "'retry' can only be used inside an 'atomic' block".to_string(),
+                            expr.span,
+                        );
+                    }
+                    if let Some(scheme) = self.lookup(field).cloned() {
+                        let ty = self.instantiate_at(&scheme, expr.span);
+                        self.field_accesses.push((expr.span, ty.clone()));
+                        return ty;
+                    }
+                    return Ty::Error;
+                }
+                if let ast::ExprKind::Var(n) = &e.node
+                    && n == "base"
+                    && matches!(
+                        field.as_str(),
+                        "fetch" | "fetchWith" | "listen" | "listenOn"
+                            | "count" | "union" | "sum" | "bind"
+                    )
                     && let Some(scheme) = self.lookup(field).cloned()
                 {
                     let ty = self.instantiate_at(&scheme, expr.span);
@@ -6217,6 +6306,19 @@ impl Infer {
                 // always qualified (`Color.Red {…}`); only built-ins
                 // (`Just {…}`, `Nothing {}`) apply bare.
                 if let ast::ExprKind::Constructor(name) = &func.node {
+                    // Hard gate (option A): an applied BUILT-IN constructor in
+                    // user code must be qualified as `base.<Ctor> {…}`.
+                    if self.is_builtin_ctor(name)
+                        && func.span.start < crate::base::PRELUDE_SPAN_OFFSET
+                    {
+                        self.error(
+                            format!(
+                                "constructor '{name}' must be qualified as `base.{name}`"
+                            ),
+                            func.span,
+                        );
+                        return Ty::Error;
+                    }
                     if !self.is_builtin_ctor(name) && self.constructors.contains_key(name) {
                         self.error(
                             format!(
@@ -6274,6 +6376,11 @@ impl Infer {
                 let lambda_last = if let ast::ExprKind::App { func: head, arg: lam } = &func.node
                     && matches!(&lam.node, ast::ExprKind::Lambda { .. })
                     && let ast::ExprKind::Var(head_name) = &head.node
+                    // Skip a bare gated builtin: the gate already rejected it,
+                    // so it isn't a usable two-arg stdlib head here.
+                    && !(head.span.start < crate::base::PRELUDE_SPAN_OFFSET
+                        && crate::base::is_gated_stdlib(head_name)
+                        && !self.bound_in_user_scope(head_name))
                 {
                     self.lookup(head_name)
                         .is_some_and(|s| takes_two_args(&s.ty))
@@ -7983,6 +8090,24 @@ impl Infer {
                 qualifier,
             } => {
                 if let Some(q) = qualifier {
+                    if q == "base" {
+                        // `base.Ctor` pattern: resolve the BUILT-IN constructor
+                        // nominally (same as the unqualified builtin path, but
+                        // explicitly qualified under the hard gate).
+                        if self.is_builtin_ctor(name) {
+                            if let Some((data_ty, record_ty)) =
+                                self.instantiate_ctor(name, pat.span)
+                            {
+                                self.unify(&data_ty, expected, pat.span);
+                                self.check_pattern(payload, &record_ty);
+                            }
+                        } else {
+                            self.error(
+                                format!("`base` has no constructor '{name}'"),
+                                pat.span,
+                            );
+                        }
+                    } else {
                     // Qualified pattern `Color.Red`: resolve `Red` within the
                     // nominal data type `Color` and unify the scrutinee with
                     // `Color` directly — NO row-polymorphic open variant.
@@ -8001,10 +8126,19 @@ impl Infer {
                             );
                         }
                     }
+                    }
                 } else if self.is_builtin_ctor(name) {
-                    // Unqualified BUILT-IN constructor (`True`, `Just`): stays
-                    // bare. Resolve nominally within its (single) built-in ADT.
-                    if let Some((data_ty, record_ty)) =
+                    // Unqualified BUILT-IN constructor in a PATTERN. Under the
+                    // hard gate (option A) user code must write `base.Ctor`;
+                    // prelude-internal patterns (shifted spans) stay bare.
+                    if pat.span.start < crate::base::PRELUDE_SPAN_OFFSET {
+                        self.error(
+                            format!(
+                                "constructor '{name}' must be qualified as `base.{name}`"
+                            ),
+                            pat.span,
+                        );
+                    } else if let Some((data_ty, record_ty)) =
                         self.instantiate_ctor(name, pat.span)
                     {
                         self.unify(&data_ty, expected, pat.span);
@@ -9207,6 +9341,7 @@ impl Infer {
         // Named functions are `with`-record fields with a signature and/or a
         // lambda value. Pre-register their schemes by name.
         for_each_named_fn(program, &mut |name, sig, _value| {
+            self.user_top_level_names.insert(name.to_string());
             if let Some(scheme) = sig {
                 self.annotation_vars.clear();
                 self.annotation_unit_vars.clear();
@@ -9382,6 +9517,10 @@ impl Infer {
                 ),
             ),
         );
+
+        // Bind the global `base` record's type LAST, once every stdlib name
+        // (including `toJson`/`parseJson` above) is in `scopes[0]`.
+        self.bind_base_record();
     }
 
     fn register_builtins(&mut self) {
@@ -10826,6 +10965,41 @@ impl Infer {
                 )),
             )),
         );
+    }
+
+    /// Bind the global `base` record's TYPE. Its field types come from the
+    /// stdlib schemes bound during `pre_register` (`map`, `filter`, `toJson`,
+    /// …) plus the prelude's own polymorphic helpers (`min`/`max`/`when`/
+    /// `unless`). Binding `base` as a top-level global — rather than only as a
+    /// `with` field — makes `base.X` resolve inside nested `with` field-values
+    /// and decl bodies, which compile in fresh envs that never see the
+    /// injected prelude `with`. Constructors (`Just`/…) and the server forms
+    /// are NOT fields here; dedicated `base.Ctor` / `base.<form>` arms route
+    /// them.
+    ///
+    /// The record's scheme is generalized over every free type variable in the
+    /// field types, so each field access re-instantiates them (a field like
+    /// `map : (a -> b) -> [a] -> [b]` stays polymorphic per use, just as the
+    /// bare stdlib binding is).
+    ///
+    /// Must run AFTER every stdlib `bind_top` in `pre_register` — including
+    /// the `toJson`/`parseJson` re-bind at the end — or those names are absent
+    /// from the record type.
+    fn bind_base_record(&mut self) {
+        // Infer the prelude `base` record's type directly from its source.
+        // The stdlib `Var(name)` fields resolve against `scopes[0]` (bound
+        // during `pre_register`), and the polymorphic helper lambdas
+        // (`min`/`max`/`when`/`unless`) infer with CORRECT effect-row
+        // generalization — hand-building their schemes gets the `IO {| e}`
+        // rows wrong (rigid instead of unifiable). Generalize the inferred
+        // record type so each `base.X` access re-instantiates every field.
+        let base_record = crate::base::prelude_base_record();
+        self.push_scope();
+        let inferred = self.infer_expr(&base_record);
+        let resolved = self.apply(&inferred);
+        self.pop_scope();
+        let scheme = self.generalize(&resolved);
+        self.bind_top("base", scheme);
     }
 
 

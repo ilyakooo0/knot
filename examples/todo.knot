@@ -5,7 +5,7 @@ type Todo = {title: Text, owner: Text, done: Int 1}
 
 add (\title owner -> do
   todos <- *todos
-  *todos = union todos [{title title owner owner done 0}])
+  *todos = base.union todos [{title title owner owner done 0}])
 
 complete (\title -> do
   todos <- *todos
@@ -23,4 +23,4 @@ pending (\owner -> do
   add "Write runtime" "Bob"
   complete "Write parser"
   result <- pending "Alice"
-  println result)
+  base.println result)

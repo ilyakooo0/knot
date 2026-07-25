@@ -6,25 +6,25 @@
 -- No trait decl, no impl, no constraint — the dictionary is just a value.
 with {
 -- Two "Show dictionaries", one per type.
-intShow {show (\n -> "int:" ++ show n)}
+intShow {show (\n -> "int:" ++ base.show n)}
 textShow {show (\s -> "text:" ++ s)}
 
 -- "Multiple constraints" is just a record with several fields.
-greeter {greet (\n -> "hi " ++ show n) farewell (\n -> "bye " ++ show n)}
+greeter {greet (\n -> "hi " ++ base.show n) farewell (\n -> "bye " ++ base.show n)}
 }
 (do
   -- `^show` resolves to whichever dictionary is lexically in scope.
-  with intShow (println ((^show) 41))         -- intShow's show
-  with textShow (println ((^show) "hello"))   -- textShow's show
+  with intShow (base.println ((^show) 41))         -- intShow's show
+  with textShow (base.println ((^show) "hello"))   -- textShow's show
 
   -- Project different fields from one dictionary.
-  with greeter (println ((^greet) 7))
-  with greeter (println ((^farewell) 7))
+  with greeter (base.println ((^greet) 7))
+  with greeter (base.println ((^farewell) 7))
 
   -- Nesting `with` shadows lexically: the inner dictionary wins inside its
   -- own body, and the outer one is unaffected afterwards.
   with intShow (
-    with {show (\n -> "INNER:" ++ show n)} (println ((^show) 1))
+    with {show (\n -> "INNER:" ++ base.show n)} (base.println ((^show) 1))
   )
-  with intShow (println ((^show) 2))
+  with intShow (base.println ((^show) 2))
   yield {})

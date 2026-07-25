@@ -1,33 +1,33 @@
 (do
   -- Encode values to JSON
-  println (toJson 42)
-  println (toJson 3.14)
-  println (toJson "hello")
-  println (toJson {})
+  base.println (base.toJson 42)
+  base.println (base.toJson 3.14)
+  base.println (base.toJson "hello")
+  base.println (base.toJson {})
 
   -- Encode a record
-  println (toJson { name "Alice" age 30 })
+  base.println (base.toJson { name "Alice" age 30 })
 
   -- Encode a relation (becomes JSON array)
   with { nums [{ x 1 }, { x 2 }, { x 3 }] } (do
-    println (toJson nums)
+    base.println (base.toJson nums)
 
     -- Round-trip: encode then decode. parseJson returns `Maybe a` so malformed
     -- input is recoverable rather than fatal — match on the result.
-    with { json (toJson { x 10 y 20 }) } (do
-      println json
-      case parseJson json : Maybe {x: Int 1, y: Int 1} of
-        Just { value value } -> println (show value)
-        Nothing {} -> println "parse failed"
+    with { json (base.toJson { x 10 y 20 }) } (do
+      base.println json
+      case base.parseJson json : Maybe {x: Int 1, y: Int 1} of
+        base.Just { value value } -> base.println (base.show value)
+        base.Nothing {} -> base.println "parse failed"
 
       -- Parse a JSON array
-      case parseJson "[1, 2, 3]" : Maybe [Int 1] of
-        Just { value value } -> println (show value)
-        Nothing {} -> println "parse failed"
+      case base.parseJson "[1, 2, 3]" : Maybe [Int 1] of
+        base.Just { value value } -> base.println (base.show value)
+        base.Nothing {} -> base.println "parse failed"
 
       -- Malformed input decodes to Nothing instead of crashing the program
-      case parseJson "not valid json" : Maybe [Int 1] of
-        Just { value value } -> println (show value)
-        Nothing {} -> println "parse failed (as expected)"
+      case base.parseJson "not valid json" : Maybe [Int 1] of
+        base.Just { value value } -> base.println (base.show value)
+        base.Nothing {} -> base.println "parse failed (as expected)"
 
       yield {})))

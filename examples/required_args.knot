@@ -6,4 +6,4 @@ host : Text
 greeting : Text
 }
 (do
-  println (greeting ++ " from " ++ host ++ " on port " ++ show port))
+  base.println (greeting ++ " from " ++ host ++ " on port " ++ base.show port))

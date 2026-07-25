@@ -11,6 +11,6 @@ clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
 clamp (\lo hi x -> if ((^compare) x lo) < 0 then lo else if ((^compare) x hi) > 0 then hi else x)
 }
 (do
-    println (show (with intOrd (clamp 0 10 42)))
-    println (show (with textOrd (clamp "a" "m" "z")))
-    println (show (with intOrdDesc (clamp 0 10 42))))
+    base.println (base.show (with intOrd (clamp 0 10 42)))
+    base.println (base.show (with textOrd (clamp "a" "m" "z")))
+    base.println (base.show (with intOrdDesc (clamp 0 10 42))))

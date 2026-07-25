@@ -30,12 +30,12 @@ clamp (\lo hi ord x ->
 }
 (do
   -- Same function, different types — just different dictionaries.
-  println (show (clamp 0 10 intOrd 42))          -- 10  (Int, clamped high)
-  println (show (clamp 0 10 intOrd 3))           -- 3   (Int, in range)
-  println (clamp "a" "m" textOrd "zebra")        -- "m" (Text, clamped high)
+  base.println (base.show (clamp 0 10 intOrd 42))          -- 10  (Int, clamped high)
+  base.println (base.show (clamp 0 10 intOrd 3))           -- 3   (Int, in range)
+  base.println (clamp "a" "m" textOrd "zebra")        -- "m" (Text, clamped high)
 
   -- Swap the dictionary to change the ordering: descending "max" is the min.
-  println (show (clamp 0 10 intOrdDesc 42))      -- 0
-  println (show ((intOrd.max) 3 7))              -- 7  (ascending max)
-  println (show ((intOrdDesc.max) 3 7))          -- 3  (descending "max")
+  base.println (base.show (clamp 0 10 intOrdDesc 42))      -- 0
+  base.println (base.show ((intOrd.max) 3 7))              -- 7  (ascending max)
+  base.println (base.show ((intOrdDesc.max) 3 7))          -- 3  (descending "max")
   yield {})

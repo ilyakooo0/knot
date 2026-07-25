@@ -3368,6 +3368,31 @@ impl Parser {
             TokenKind::Lower(_) => {
                 let tok = self.advance();
                 let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                // `base.Ctor` pattern (hard gate): lowercase `base` qualifier
+                // before a dotted Upper constructor. Reuses the qualified-ctor
+                // machinery with qualifier `base`.
+                if name == "base"
+                    && self.at(&TokenKind::Dot)
+                    && matches!(self.peek_ahead(1), TokenKind::Upper(_))
+                {
+                    self.advance(); // consume `.`
+                    let ctor_tok = self.advance();
+                    let TokenKind::Upper(ctor) = ctor_tok.kind else { unreachable!() };
+                    let payload = if self.can_start_pat_atom() {
+                        self.parse_pat_atom()?
+                    } else {
+                        Spanned::new(PatKind::Record(vec![]), ctor_tok.span)
+                    };
+                    let span = Span::new(start.start, payload.span.end);
+                    return Some(Spanned::new(
+                        PatKind::Constructor {
+                            name: ctor,
+                            payload: Box::new(payload),
+                            qualifier: Some("base".to_string()),
+                        },
+                        span,
+                    ));
+                }
                 Some(Spanned::new(PatKind::Var(name), tok.span))
             }
             TokenKind::Upper(_) => {

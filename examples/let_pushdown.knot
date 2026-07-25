@@ -9,7 +9,7 @@ type Item = {name: Text, price: Int 1}
 -- Append: `union items new` hidden behind a with.
 appendDemo (do
   items <- *items
-  with {extra [{name "Charlie" price 30}]} with {merged (union items extra)} *items = merged)
+  with {extra [{name "Charlie" price 30}]} with {merged (base.union items extra)} *items = merged)
 
 -- Conditional update: do-block update body bound to a with.
 discountDemo (do
@@ -25,11 +25,11 @@ pruneDemo (do
   replace *items = [{name "Alice" price 10}, {name "Bob" price 25}]
   appendDemo
   rows1 <- *items
-  println ("after append: " ++ show rows1)
+  base.println ("after append: " ++ base.show rows1)
   discountDemo
   rows2 <- *items
-  println ("after discount: " ++ show rows2)
+  base.println ("after discount: " ++ base.show rows2)
   pruneDemo
   rows3 <- *items
-  println ("after prune: " ++ show rows3)
+  base.println ("after prune: " ++ base.show rows3)
   yield {})

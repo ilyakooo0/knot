@@ -12,27 +12,27 @@ inDept (\name e -> e.dept == name)
 -- 1. filter where the predicate body calls a helper function.
 case1 (do
   emps <- *employees
-  yield (emps |> filter (\e -> isHighEarner e)))
+  yield (emps |> base.filter (\e -> isHighEarner e)))
 
 -- 2. minOn where the projection lambda body calls a helper.
 case2 (do
   emps <- *employees
-  yield (emps |> minOn (\e -> salaryOf e)))
+  yield (emps |> base.minOn (\e -> salaryOf e)))
 
 -- 3. filter then count, with predicate via helper.
 case3 (do
   emps <- *employees
-  with {filtered (emps |> filter (\e -> isHighEarner e))} yield (count filtered))
+  with {filtered (emps |> base.filter (\e -> isHighEarner e))} yield (base.count filtered))
 
 -- 4. filter using a curried helper.
 case4 (do
   emps <- *employees
-  yield (filter (inDept "Eng") emps))
+  yield (base.filter (inDept "Eng") emps))
 
 -- 5. countWhere with helper-built predicate.
 case5 (do
   emps <- *employees
-  yield (countWhere (\e -> isHighEarner e) emps))
+  yield (base.countWhere (\e -> isHighEarner e) emps))
 }
 (do
   replace *employees = [
@@ -43,13 +43,13 @@ case5 (do
     {name "Eve" dept "Eng" salary 100}
   ]
   c1 <- case1
-  println ("case1: " ++ show c1)
+  base.println ("case1: " ++ base.show c1)
   c2 <- case2
-  println ("case2: " ++ show c2)
+  base.println ("case2: " ++ base.show c2)
   c3 <- case3
-  println ("case3: " ++ show c3)
+  base.println ("case3: " ++ base.show c3)
   c4 <- case4
-  println ("case4: " ++ show c4)
+  base.println ("case4: " ++ base.show c4)
   c5 <- case5
-  println ("case5: " ++ show c5)
+  base.println ("case5: " ++ base.show c5)
   yield {})

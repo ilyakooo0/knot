@@ -12,10 +12,10 @@ type Person = {name: Text, age: Int 1}
   ]
 
   -- Read nested members: bind the team, then bind its members field.
-  println "Before:"
+  base.println "Before:"
   teams <- *teams
-  forEach teams (\t -> do
-    forEach t.members (\m -> println ("  " ++ t.name ++ ": " ++ m.name)))
+  base.forEach teams (\t -> do
+    base.forEach t.members (\m -> base.println ("  " ++ t.name ++ ": " ++ m.name)))
 
   -- Remove Eve from every team: rewrite each team's members list.
   *teams = do
@@ -25,9 +25,9 @@ type Person = {name: Text, age: Int 1}
       where m.name != "Eve"
       yield m) }
 
-  println "After:"
+  base.println "After:"
   teams2 <- *teams
-  forEach teams2 (\t -> do
-    forEach t.members (\m -> println ("  " ++ t.name ++ ": " ++ m.name)))
+  base.forEach teams2 (\t -> do
+    base.forEach t.members (\m -> base.println ("  " ++ t.name ++ ": " ++ m.name)))
 
   yield {})

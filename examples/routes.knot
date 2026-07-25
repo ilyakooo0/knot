@@ -25,17 +25,17 @@ getTodos (\owner -> do
 api (serve Api where
   GetTodos = \{owner owner xForwardedFor xForwardedFor} -> do
     case xForwardedFor of
-      base.Just {value ip} -> base.logInfo ("GetTodos from " ++ ip)
-      base.Nothing {} -> base.logInfo "GetTodos (no proxy header)"
+      Maybe.Just {value ip} -> base.logInfo ("GetTodos from " ++ ip)
+      Maybe.Nothing {} -> base.logInfo "GetTodos (no proxy header)"
     todos <- getTodos owner
     if base.count todos == 0
-      then yield (base.Err {error {status 404 message "no todos found for owner"}})
-      else yield (base.Ok {value todos})
+      then yield (Result.Err {error {status 404 message "no todos found for owner"}})
+      else yield (Result.Ok {value todos})
   CreateTodo = \{title title owner owner priority priority} -> do
     addTodo title owner priority
-    yield (base.Ok {value {title title owner owner priority (Priority.Low {})}})
+    yield (Result.Ok {value {title title owner owner priority (Priority.Low {})}})
   GetCount = \{} -> do
     todos <- *todos
-    yield (base.Ok {value (base.count todos)}))
+    yield (Result.Ok {value (base.count todos)}))
 }
 (listen 8080 api)

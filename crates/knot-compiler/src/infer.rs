@@ -771,6 +771,21 @@ struct Infer {
     /// Scoped variable environment (functions, let-bindings, params).
     scopes: Vec<HashMap<String, Scheme>>,
 
+    /// Compiler-internal registry of stdlib schemes (`map`, `println`,
+    /// `count`, …). These NEVER enter `scopes` — user code cannot name them
+    /// bare (they are naturally undefined). `base`'s record type and the
+    /// `base.<special-form>`/`base.<query-form>` arms instantiate from here,
+    /// mirroring how codegen keeps stdlib closures in its internal `user_fns`
+    /// registry rather than any source-level scope.
+    stdlib_schemes: HashMap<String, Scheme>,
+
+    /// True only while `register_builtins` runs. During that window, `bind_top`
+    /// routes stdlib value-fn names into `stdlib_schemes` instead of `scopes`.
+    /// User named fns are bound later (in `infer_declarations`), after the flag
+    /// is cleared, so a user fn named `map` still lands in `scopes` and shadows
+    /// correctly via the scopes-only `lookup`.
+    in_register_builtins: bool,
+
     /// Constructor metadata: ctor_name → one entry per ADT that declares it.
     /// Distinct ADTs may legally share a constructor name; keeping all
     /// candidates (rather than last-write-wins) lets `instantiate_ctor`
@@ -1047,10 +1062,10 @@ struct Infer {
     suppress_refine_intro: Option<HashSet<String>>,
 
     /// Names of USER top-level declarations (the `with`-record fields that act
-    /// as named functions/values). These live in `scopes[0]` alongside the
-    /// builtins via `bind_top`, so `bound_in_user_scope` can't tell them apart
-    /// by scope index alone — it consults this set so a user decl named e.g.
-    /// `map` shadows the gated builtin rather than triggering the gate.
+    /// as named functions/values). These live in `scopes[0]`, which no longer
+    /// contains stdlib value fns (those are in `stdlib_schemes`), but DOES
+    /// still hold ctor/effect bindings — so `bound_in_user_scope` consults this
+    /// set to tell a user decl named e.g. `map` apart from a builtin binding.
     user_top_level_names: HashSet<String>,
 
     /// Unit-composition checks for `*`/`/` deferred because one operand was
@@ -1077,6 +1092,8 @@ impl Infer {
             alias_free_vars: HashSet::new(),
             scopes: vec![HashMap::new()],
             // One `None` per starting scope (the global scope is not a `with`).
+            stdlib_schemes: HashMap::new(),
+            in_register_builtins: false,
             constructors: HashMap::new(),
             data_types: HashMap::new(),
             builtin_data_types: std::collections::HashSet::new(),
@@ -4317,9 +4334,31 @@ impl Infer {
     }
 
     fn bind_top(&mut self, name: &str, scheme: Scheme) {
+        // While `register_builtins` runs, stdlib value functions (`map`,
+        // `println`, `count`, the server/query forms, …) go into the
+        // compiler-internal `stdlib_schemes` registry, NOT `scopes` — so user
+        // code cannot name them bare (they are naturally undefined, no gate
+        // needed). `base`'s record type and the `base.<form>` arms instantiate
+        // from the registry. The flag is cleared before `infer_declarations`,
+        // so a USER fn named `map` binds into `scopes` here and shadows
+        // correctly via the scopes-only `lookup`.
+        if self.in_register_builtins
+            && (crate::base::is_gated_stdlib(name)
+                || crate::base::is_gated_special_form(name))
+        {
+            self.stdlib_schemes.insert(name.to_string(), scheme);
+            return;
+        }
         if let Some(scope) = self.scopes.first_mut() {
             scope.insert(name.to_string(), scheme);
         }
+    }
+
+    /// Instantiate a stdlib scheme from the internal registry. Used by
+    /// `bind_base_record` and the `base.<form>` arms, which must resolve a
+    /// stdlib name that is deliberately absent from `scopes`.
+    fn lookup_stdlib(&self, name: &str) -> Option<&Scheme> {
+        self.stdlib_schemes.get(name)
     }
 
     fn lookup(&self, name: &str) -> Option<&Scheme> {
@@ -4341,10 +4380,24 @@ impl Infer {
         if self.user_top_level_names.contains(name) {
             return true;
         }
-        self.scopes
+        if self
+            .scopes
             .iter()
             .skip(1)
             .any(|scope| scope.contains_key(name))
+        {
+            return true;
+        }
+        // A `with`-opened field (`with base (map …)`, `with {show …} (…)`) is
+        // a user binding too. It normally lands in `scopes[1..]` (caught
+        // above), but the Phase-4z program-body re-inference runs with a
+        // collapsed scope stack while the `with` frames still record the
+        // opened fields — consult them so `with base`'s `map`/`show` aren't
+        // misread as the gated builtin.
+        self.with_scope_stack
+            .iter()
+            .flatten()
+            .any(|(_, fields)| fields.contains_key(name))
     }
 
     fn lookup_instantiate_at(
@@ -5621,22 +5674,15 @@ impl Infer {
                         expr.span,
                     );
                 }
-                // Hard gate (option A): a bare user-code reference to a stdlib
-                // builtin or prelude helper must be qualified as `base.<name>`.
-                // Fires only when the Var is user code (span below the prelude
-                // offset) and the name isn't shadowed by a user binding (a
-                // lambda param / with field / user decl of the same name).
-                if expr.span.start < crate::base::PRELUDE_SPAN_OFFSET
-                    && (crate::base::is_gated_stdlib(name)
-                        || crate::base::is_gated_special_form(name))
-                    && !self.bound_in_user_scope(name)
-                {
-                    self.error(
-                        format!("undefined variable '{name}' (did you mean `base.{name}`?)"),
-                        expr.span,
-                    );
-                    return Ty::Error;
-                }
+                // `base` is the ONLY stdlib value in scope. Bare stdlib
+                // value-function names (`map`, `println`, …) are NOT bound in
+                // `scopes` at all (they live in the internal `stdlib_schemes`
+                // registry), so a bare reference falls through to the natural
+                // "undefined variable" path below — no masking gate needed.
+                // A user binding that shadows the name (a local `map`, …) IS
+                // in `scopes` and resolves normally. Prelude-internal uses
+                // resolve via the temporary stdlib scope `bind_base_record`
+                // pushes. `retry` is handled by its own `atomic` check above.
                 if let Some(ty) = self.lookup_instantiate_at(name, expr.span) {
                     // If this Var resolved to a field of a `with` that codegen
                     // binds in the CURRENT env frame, redirect codegen's `Var`
@@ -5712,17 +5758,23 @@ impl Infer {
             }
 
             ast::ExprKind::Constructor(name) => {
-                // Hard gate (option A): a bare BUILT-IN constructor in user
-                // code must be qualified as `base.<Ctor>` (`base.Just`,
-                // `base.Ok`, …). Prelude-internal uses (shifted spans) and
-                // pattern positions (which go through a different arm) are
-                // exempt.
+                // A bare BUILT-IN constructor in user code must be qualified
+                // by its data type, exactly like a user constructor
+                // (`Maybe.Just`, `Result.Ok`, `Bool.True`, …). Prelude-internal
+                // uses (shifted spans) and pattern positions (which go through
+                // a different arm) are exempt.
                 if self.is_builtin_ctor(name)
                     && expr.span.start < crate::base::PRELUDE_SPAN_OFFSET
                 {
+                    let ty = self
+                        .constructors
+                        .get(name)
+                        .and_then(|i| i.first())
+                        .map(|i| i.data_type.as_str())
+                        .unwrap_or("Type");
                     self.error(
                         format!(
-                            "constructor '{name}' must be qualified as `base.{name}`"
+                            "constructor '{name}' must be qualified (e.g. `{ty}.{name}`)"
                         ),
                         expr.span,
                     );
@@ -5926,22 +5978,6 @@ impl Infer {
                     );
                     return Ty::Error;
                 }
-                // `base.Ctor` — a built-in constructor reached through the
-                // `base` namespace (`base.Just`, `base.Ok`, `base.True`, …).
-                // Resolve it as the intrinsic constructor (payload-record →
-                // ADT), exactly like the bare-constructor path, instead of a
-                // record-field read on `base` (which has no constructor
-                // fields). Codegen recognizes the same shape and emits the
-                // constructor as a first-class function value.
-                if let ast::ExprKind::Var(n) = &e.node
-                    && n == "base"
-                    && self.is_builtin_ctor(field)
-                    && let Some((data_ty, record_ty)) = self.instantiate_ctor(field, expr.span)
-                {
-                    let ty = Ty::Fun(Box::new(record_ty), Box::new(data_ty));
-                    self.field_accesses.push((expr.span, ty.clone()));
-                    return ty;
-                }
                 // `base.<server-form>` — `fetch`/`fetchWith`/`listen`/`listenOn`
                 // are compile-time special forms (route-table / HTTP macros),
                 // not `base` record fields, so the generic record-read below
@@ -5972,7 +6008,7 @@ impl Infer {
                             expr.span,
                         );
                     }
-                    if let Some(scheme) = self.lookup(field).cloned() {
+                    if let Some(scheme) = self.lookup_stdlib(field).cloned() {
                         let ty = self.instantiate_at(&scheme, expr.span);
                         self.field_accesses.push((expr.span, ty.clone()));
                         return ty;
@@ -5986,7 +6022,7 @@ impl Infer {
                         "fetch" | "fetchWith" | "listen" | "listenOn"
                             | "count" | "union" | "sum" | "bind"
                     )
-                    && let Some(scheme) = self.lookup(field).cloned()
+                    && let Some(scheme) = self.lookup_stdlib(field).cloned()
                 {
                     let ty = self.instantiate_at(&scheme, expr.span);
                     self.field_accesses.push((expr.span, ty.clone()));
@@ -6306,14 +6342,20 @@ impl Infer {
                 // always qualified (`Color.Red {…}`); only built-ins
                 // (`Just {…}`, `Nothing {}`) apply bare.
                 if let ast::ExprKind::Constructor(name) = &func.node {
-                    // Hard gate (option A): an applied BUILT-IN constructor in
-                    // user code must be qualified as `base.<Ctor> {…}`.
+                    // An applied BUILT-IN constructor in user code must be
+                    // qualified by its data type (`Maybe.Just {…}`).
                     if self.is_builtin_ctor(name)
                         && func.span.start < crate::base::PRELUDE_SPAN_OFFSET
                     {
+                        let ty = self
+                            .constructors
+                            .get(name)
+                            .and_then(|i| i.first())
+                            .map(|i| i.data_type.as_str())
+                            .unwrap_or("Type");
                         self.error(
                             format!(
-                                "constructor '{name}' must be qualified as `base.{name}`"
+                                "constructor '{name}' must be qualified (e.g. `{ty}.{name} {{…}}`)"
                             ),
                             func.span,
                         );
@@ -6376,15 +6418,22 @@ impl Infer {
                 let lambda_last = if let ast::ExprKind::App { func: head, arg: lam } = &func.node
                     && matches!(&lam.node, ast::ExprKind::Lambda { .. })
                     && let ast::ExprKind::Var(head_name) = &head.node
-                    // Skip a bare gated builtin: the gate already rejected it,
-                    // so it isn't a usable two-arg stdlib head here.
-                    && !(head.span.start < crate::base::PRELUDE_SPAN_OFFSET
-                        && crate::base::is_gated_stdlib(head_name)
-                        && !self.bound_in_user_scope(head_name))
                 {
-                    self.lookup(head_name)
-                        .is_some_and(|s| takes_two_args(&s.ty))
-                        .then(|| ((**head).clone(), (**lam).clone()))
+                    // Respect the `base`-only gate: a bare stdlib head at a
+                    // user span is undefined (the Var arm reports it), so don't
+                    // pre-compute the lambda-last shape for it — `infer_expr`
+                    // on the head would yield `Ty::Error` and trip the
+                    // `unreachable!` arity assumption below.
+                    let gated = head.span.start < crate::base::PRELUDE_SPAN_OFFSET
+                        && crate::base::is_gated_stdlib(head_name)
+                        && !self.bound_in_user_scope(head_name);
+                    if gated {
+                        None
+                    } else {
+                        self.lookup(head_name)
+                            .is_some_and(|s| takes_two_args(&s.ty))
+                            .then(|| ((**head).clone(), (**lam).clone()))
+                    }
                 } else {
                     None
                 };
@@ -8091,22 +8140,15 @@ impl Infer {
             } => {
                 if let Some(q) = qualifier {
                     if q == "base" {
-                        // `base.Ctor` pattern: resolve the BUILT-IN constructor
-                        // nominally (same as the unqualified builtin path, but
-                        // explicitly qualified under the hard gate).
-                        if self.is_builtin_ctor(name) {
-                            if let Some((data_ty, record_ty)) =
-                                self.instantiate_ctor(name, pat.span)
-                            {
-                                self.unify(&data_ty, expected, pat.span);
-                                self.check_pattern(payload, &record_ty);
-                            }
-                        } else {
-                            self.error(
-                                format!("`base` has no constructor '{name}'"),
-                                pat.span,
-                            );
-                        }
+                        // `base.Ctor` is no longer a thing — constructors are
+                        // qualified by their DATA TYPE (`Maybe.Just`), not the
+                        // `base` namespace, matching user-defined ctors.
+                        self.error(
+                            format!(
+                                "constructors are qualified by their data type, not `base` — write `{name}`'s type (e.g. `Maybe.Just`, `Result.Ok`)"
+                            ),
+                            pat.span,
+                        );
                     } else {
                     // Qualified pattern `Color.Red`: resolve `Red` within the
                     // nominal data type `Color` and unify the scrutinee with
@@ -8128,13 +8170,19 @@ impl Infer {
                     }
                     }
                 } else if self.is_builtin_ctor(name) {
-                    // Unqualified BUILT-IN constructor in a PATTERN. Under the
-                    // hard gate (option A) user code must write `base.Ctor`;
-                    // prelude-internal patterns (shifted spans) stay bare.
+                    // Unqualified BUILT-IN constructor in a PATTERN. User code
+                    // must qualify by data type (`Maybe.Just`); prelude-internal
+                    // patterns (shifted spans) stay bare.
                     if pat.span.start < crate::base::PRELUDE_SPAN_OFFSET {
+                        let ty = self
+                            .constructors
+                            .get(name)
+                            .and_then(|i| i.first())
+                            .map(|i| i.data_type.as_str())
+                            .unwrap_or("Type");
                         self.error(
                             format!(
-                                "constructor '{name}' must be qualified as `base.{name}`"
+                                "constructor '{name}' must be qualified (e.g. `{ty}.{name}`)"
                             ),
                             pat.span,
                         );
@@ -9524,6 +9572,20 @@ impl Infer {
     }
 
     fn register_builtins(&mut self) {
+        // Route stdlib value-fn `bind_top` calls into `stdlib_schemes` (not
+        // `scopes`) for the duration of this function. Cleared on exit, before
+        // user named fns are bound in `infer_declarations`.
+        self.in_register_builtins = true;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.register_builtins_inner();
+        }));
+        self.in_register_builtins = false;
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    fn register_builtins_inner(&mut self) {
         // Built-in ADTs whose constructors stay referenceable bare.
         for n in ["Maybe", "Bool", "Result"] {
             self.builtin_data_types.insert(n.to_string());
@@ -10987,17 +11049,22 @@ impl Infer {
     /// from the record type.
     fn bind_base_record(&mut self) {
         // Infer the prelude `base` record's type directly from its source.
-        // The stdlib `Var(name)` fields resolve against `scopes[0]` (bound
-        // during `pre_register`), and the polymorphic helper lambdas
+        // The stdlib `Var(name)` fields must resolve, but stdlib names are
+        // deliberately absent from `scopes` (they live in `stdlib_schemes`).
+        // Push a temporary scope holding the stdlib schemes so the record's
+        // `map: Var(map)` fields resolve; the polymorphic helper lambdas
         // (`min`/`max`/`when`/`unless`) infer with CORRECT effect-row
         // generalization — hand-building their schemes gets the `IO {| e}`
-        // rows wrong (rigid instead of unifiable). Generalize the inferred
-        // record type so each `base.X` access re-instantiates every field.
+        // rows wrong (rigid instead of unifiable). The scope is popped before
+        // returning, so user code never sees these names. Generalize the
+        // inferred record type so each `base.X` access re-instantiates.
         let base_record = crate::base::prelude_base_record();
+        self.scopes.push(self.stdlib_schemes.clone());
         self.push_scope();
         let inferred = self.infer_expr(&base_record);
         let resolved = self.apply(&inferred);
         self.pop_scope();
+        self.scopes.pop(); // the temporary stdlib scope
         let scheme = self.generalize(&resolved);
         self.bind_top("base", scheme);
     }
@@ -12378,12 +12445,24 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
                 }
                 ast::ExprKind::With { record, body } => {
                     if let ast::ExprKind::Record(fields) = &record.node {
+                        // Literal-record `with`: the fields are decls already
+                        // inferred by `infer_declarations`, so infer only the
+                        // body (its field references resolve via the alias
+                        // mechanism) and record the field names.
                         infer.with_fields.push((
                             cur.span,
                             fields.iter().map(|f| f.name.clone()).collect(),
                         ));
+                        let _ = infer.infer_expr(body);
+                    } else {
+                        // Non-literal operand (`with base …`, `with someRecord …`):
+                        // the fields are NOT decls, so there is nothing to skip
+                        // — infer the whole `with` so its arm pushes the field
+                        // scope and the body's bare field references (`map`,
+                        // `show`) resolve. Inferring only `body` would leave
+                        // them unbound in this pass.
+                        let _ = infer.infer_expr(cur);
                     }
-                    let _ = infer.infer_expr(body);
                     break;
                 }
                 _ => {

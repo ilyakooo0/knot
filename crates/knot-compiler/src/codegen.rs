@@ -4146,22 +4146,6 @@ impl Codegen {
             }
 
             ast::ExprKind::FieldAccess { expr, field } => {
-                // `base.Ctor` — a built-in constructor reached through the
-                // `base` namespace (`base.Just`, `base.Ok`, `base.True`, …).
-                // Inference typed this as the intrinsic ctor (payload → ADT);
-                // the `base` record itself has no ctor fields, so emit the
-                // constructor as a first-class function value rather than a
-                // runtime `knot_record_field` read.
-                if let ast::ExprKind::Var(base_name) = &expr.node
-                    && base_name == "base"
-                    && matches!(
-                        field.as_str(),
-                        "True" | "False" | "Just" | "Nothing" | "Ok" | "Err"
-                            | "LT" | "EQ" | "GT"
-                    )
-                {
-                    return self.emit_ctor_as_function_value(builder, field);
-                }
                 // `base.retry` — the STM primitive reached through the `base`
                 // namespace. It has no `base` record field, so emit the retry
                 // logic directly (identical to the bare `retry` Var arm).
@@ -4183,6 +4167,24 @@ impl Codegen {
                         "knot_value_constructor",
                         &[tag_ptr, tag_len, unit],
                     );
+                }
+                // `Type.Ctor` for a BUILT-IN data type (`Maybe.Just`,
+                // `Bool.True`, `Result.Ok`, …). The type is erased (no runtime
+                // `Maybe` record), so a generic `knot_record_field` would
+                // panic on a non-record. Emit the constructor as a first-class
+                // function value; `emit_ctor_as_function_value` eta-expands to
+                // the correct arity (nullary `True` vs payload `Just`).
+                // Inference resolved this via `instantiate_qualified_ctor`.
+                // User ctors are handled by `embedded_ctors` above; this case
+                // only fires for the built-in types (never in `embedded_ctors`).
+                if let ast::ExprKind::Constructor(type_name) = &expr.node
+                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Bool" | "Ordering")
+                    && self
+                        .data_constructors
+                        .get(type_name.as_str())
+                        .is_some_and(|ctors| ctors.iter().any(|c| c == field))
+                {
+                    return self.emit_ctor_as_function_value(builder, field);
                 }
                 // `db.*name` — a source-relation field (the field name starts
                 // with `*`) on a record that declares it via `SourceDecl`. The

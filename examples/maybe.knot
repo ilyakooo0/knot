@@ -5,30 +5,30 @@
 -- dispatch structurally to the intrinsic Maybe bind/yield/empty.
 with {
 -- Test: a simple do-block that uses Maybe as the monad
-safeDivide (\x y -> if y == 0 then base.Nothing {} else base.Just {value (x / y)})
+safeDivide (\x y -> if y == 0 then Maybe.Nothing {} else Maybe.Just {value (x / y)})
 
 result1 (do
-  a <- base.Just {value 10}
-  b <- base.Just {value 2}
+  a <- Maybe.Just {value 10}
+  b <- Maybe.Just {value 2}
   c <- safeDivide a b
   yield c)
 
 result2 (do
-  a <- base.Just {value 10}
-  b <- base.Just {value 0}
+  a <- Maybe.Just {value 10}
+  b <- Maybe.Just {value 0}
   c <- safeDivide a b
   yield c)
 
 -- Test where clause (uses empty for filtering)
 result3 (do
-  a <- base.Just {value 10}
-  b <- base.Just {value 3}
+  a <- Maybe.Just {value 10}
+  b <- Maybe.Just {value 3}
   where b > 2
   yield (a + b))
 
 result4 (do
-  a <- base.Just {value 10}
-  b <- base.Just {value 1}
+  a <- Maybe.Just {value 10}
+  b <- Maybe.Just {value 1}
   where b > 2
   yield (a + b))
 }

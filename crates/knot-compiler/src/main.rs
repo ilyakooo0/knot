@@ -2,7 +2,7 @@
 //!
 //! Usage: knot build <file.knot>
 
-use knot_compiler::{base, codegen, desugar, effects, infer, linker, lockfile, stratify, types};
+use knot_compiler::{codegen, desugar, effects, infer, linker, lockfile, stratify, types};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -336,8 +336,8 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         process::exit(1);
     }
 
-    // Inject the standard prelude: wraps the program in `with {prelude} …`.
-    base::inject_prelude(&mut program);
+    // The `base` record is bound globally by infer (`bind_base_record`) and
+    // codegen (`define_base_record`) — no `with` wrapper is injected.
 
     // Desugar monadic do blocks into trait method calls
     desugar::desugar(&mut program);

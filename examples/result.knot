@@ -6,24 +6,24 @@
 -- system). Errors short-circuit through bind.
 with {
 -- Test: basic do-block chaining with Result
-safeDivide (\x y -> if y == 0 then base.Err {error "division by zero"} else base.Ok {value (x / y)})
+safeDivide (\x y -> if y == 0 then Result.Err {error "division by zero"} else Result.Ok {value (x / y)})
 
 result1 (do
-  a <- base.Ok {value 10}
-  b <- base.Ok {value 2}
+  a <- Result.Ok {value 10}
+  b <- Result.Ok {value 2}
   c <- safeDivide a b
   yield c)
 
 result2 (do
-  a <- base.Ok {value 10}
-  b <- base.Ok {value 0}
+  a <- Result.Ok {value 10}
+  b <- Result.Ok {value 0}
   c <- safeDivide a b
   yield c)
 
 -- Test: error propagation — first Err short-circuits the rest
 result3 (do
-  a <- base.Err {error "no input"}
-  b <- base.Ok {value 42}
+  a <- Result.Err {error "no input"}
+  b <- Result.Ok {value 42}
   yield (a + b))
 }
 (do

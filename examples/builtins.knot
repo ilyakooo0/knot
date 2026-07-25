@@ -1,6 +1,6 @@
 with {
 safeDiv : Int 1 -> Int 1 -> Maybe (Int 1)
-safeDiv (\x y -> if y == 0 then base.Nothing {} else base.Just {value (x / y)})
+safeDiv (\x y -> if y == 0 then Maybe.Nothing {} else Maybe.Just {value (x / y)})
 
 nums [1, 2, 3, 4, 5]
 

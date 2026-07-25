@@ -106,8 +106,9 @@ pub(crate) fn is_gated_special_form(name: &str) -> bool {
 /// expression (the prelude helpers `min`/`max`/`when`/`unless` plus every
 /// stdlib builtin as a `name: Var(name)` field), with all spans shifted by
 /// `PRELUDE_SPAN_OFFSET`. This is the single source of truth for the `base`
-/// record's VALUE; both the injected prelude `with` and the global
-/// `define_base_record` compile it.
+/// record's VALUE; infer (`bind_base_record`) and codegen
+/// (`define_base_record`) each compile it to bind `base` globally — there is
+/// no `with` wrapper around the program.
 pub(crate) fn prelude_base_record() -> ast::Expr {
     let lexer = knot::lexer::Lexer::new(PRELUDE_SOURCE);
     let (tokens, lex_diags) = lexer.tokenize();
@@ -151,40 +152,6 @@ pub(crate) fn prelude_base_record() -> ast::Expr {
     let mut record = base_record.expect("prelude source has no `base` field");
     shift_expr_spans(&mut record, PRELUDE_SPAN_OFFSET);
     record
-}
-
-/// Parse the prelude record and wrap the program's expression in
-/// `with {base: <base record>} expr`, so `base` is in scope throughout.
-pub fn inject_prelude(expr: &mut ast::Expr) {
-    let base_record = prelude_base_record();
-    // Wrap the inner `base` record as the single field of the outer record
-    // `{base: …}` that the `with` binds.
-    let record = ast::Spanned::new(
-        ast::ExprKind::Record(vec![ast::RecordField {
-            name: "base".to_string(),
-            value: base_record,
-            sig: None,
-        }]),
-        ast::Span::new(PRELUDE_SPAN_OFFSET, PRELUDE_SPAN_OFFSET),
-    );
-    let span = expr.span;
-    let body = std::mem::replace(
-        expr,
-        ast::Spanned::new(ast::ExprKind::Record(Vec::new()), span),
-    );
-    // The wrapping `with`'s own span must NOT alias the original program's
-    // span: when the program is itself a `with`, sharing the span would make
-    // `with_fields` (keyed by span) collide and the inner with's field
-    // bindings (the user's `with {x …}` fields) would be overwritten by the
-    // prelude's. Use the (shifted) prelude record's span — guaranteed unique.
-    let with_span = record.span;
-    *expr = ast::Spanned::new(
-        ast::ExprKind::With {
-            record: Box::new(record),
-            body: Box::new(body),
-        },
-        with_span,
-    );
 }
 
 // ── Prelude span shifting (bug B39) ──────────────────────────────────

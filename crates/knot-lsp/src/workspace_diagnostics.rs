@@ -706,7 +706,6 @@ fn analyze_unopened_file_inner(
             })
         };
 
-        knot_compiler::base::inject_prelude(&mut analysis_module);
         knot_compiler::desugar::desugar(&mut analysis_module);
 
         let (infer_diags, ..) = knot_compiler::infer::check(&mut analysis_module);

@@ -511,7 +511,6 @@ pub fn analyze_document(
 
         let mut analysis_module = module.clone();
 
-        knot_compiler::base::inject_prelude(&mut analysis_module);
         knot_compiler::desugar::desugar(&mut analysis_module);
 
         // Capture the start of inference diagnostics so the cached snapshot

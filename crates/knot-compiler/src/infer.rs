@@ -5887,6 +5887,22 @@ impl Infer {
                     self.field_accesses.push((expr.span, ty.clone()));
                     return ty;
                 }
+                // `base.<server-form>` — `fetch`/`fetchWith`/`listen`/`listenOn`
+                // are compile-time special forms (route-table / HTTP macros),
+                // not `base` record fields, so the generic record-read below
+                // would fail. Type the access by instantiating the bare
+                // builtin's scheme; codegen dispatches the same name through
+                // `server_form_name`. (`retry` is deliberately excluded: it is
+                // the STM primitive, only valid inside `atomic`, never a value.)
+                if let ast::ExprKind::Var(n) = &e.node
+                    && n == "base"
+                    && matches!(field.as_str(), "fetch" | "fetchWith" | "listen" | "listenOn")
+                    && let Some(scheme) = self.lookup(field).cloned()
+                {
+                    let ty = self.instantiate_at(&scheme, expr.span);
+                    self.field_accesses.push((expr.span, ty.clone()));
+                    return ty;
+                }
                 let expr_ty = self.infer_expr(e);
                 let resolved = self.apply(&expr_ty);
                 // If the expression is a relation (e.g., after groupBy), unwrap

@@ -5699,6 +5699,25 @@ impl Codegen {
         val
     }
 
+    /// Resolve the dispatch name of an applied function head for the
+    /// server/network special forms (`fetch`, `fetchWith`, `listen`,
+    /// `listenOn`). These are compile-time macros (they build route tables /
+    /// HTTP calls from `serve` declarations), not first-class functions, so
+    /// they have no `base` record field. Both the legacy bare form (`fetch …`)
+    /// and the namespaced form (`base.fetch …`) name the same special form;
+    /// this returns `Some(name)` for either, `None` otherwise.
+    fn server_form_name(func_expr: &ast::Expr) -> Option<&str> {
+        match &func_expr.node {
+            ast::ExprKind::Var(name) => Some(name.as_str()),
+            ast::ExprKind::FieldAccess { expr, field }
+                if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") =>
+            {
+                Some(field.as_str())
+            }
+            _ => None,
+        }
+    }
+
     fn compile_app(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -6602,7 +6621,7 @@ impl Codegen {
         }
 
         // Special case: fetch/fetchWith
-        if let ast::ExprKind::Var(name) = &func_expr.node
+        if let Some(name) = Self::server_form_name(func_expr)
             && ((name == "fetch" && args.len() == 2)
                 || (name == "fetchWith" && args.len() == 3))
             {
@@ -6857,8 +6876,15 @@ impl Codegen {
                     self.call_rt(builder, "knot_value_unit", &[])
                 }
             }
-            ast::ExprKind::Var(name) if name == "listen" || name == "listenOn" => {
-                let is_listen_on = name == "listenOn";
+            // listen/listenOn — reached either bare (`listen port api`) or
+            // namespaced (`base.listen port api`). Both name the same server
+            // special form (a compile-time macro building the route table), so
+            // match on the resolved dispatch name rather than the syntactic
+            // `Var`/`FieldAccess` shape.
+            _ if Self::server_form_name(func_expr)
+                .is_some_and(|n| n == "listen" || n == "listenOn") =>
+            {
+                let is_listen_on = Self::server_form_name(func_expr) == Some("listenOn");
                 let expected_arity = if is_listen_on { 3 } else { 2 };
                 if compiled_args.len() == expected_arity {
                     // listen port handler  /  listenOn host port handler

@@ -1245,7 +1245,7 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             s.push('}');
             s
         }
-        TypeKind::Relation(inner) => format!("[|{}|]", render_type(inner)),
+        TypeKind::Relation(inner) => format!("[{}]", render_type(inner)),
         TypeKind::Function { param, result } => {
             let s = format!("{} -> {}", render_type_prec(param, TyPrec::App), render_type_prec(result, TyPrec::Function));
             if ctx > TyPrec::Function {
@@ -1651,14 +1651,14 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             paren_if(parent > Prec::Lowest, s)
         }
         ExprKind::List(items) => {
-            let mut s = String::from("[|");
+            let mut s = String::from("[");
             for (i, it) in items.iter().enumerate() {
                 if i > 0 {
                     s.push_str(", ");
                 }
                 s.push_str(&render_expr_inline(it, Prec::Lowest));
             }
-            s.push_str("|]");
+            s.push(']');
             s
         }
         ExprKind::Lambda { params, body } => {
@@ -2148,10 +2148,10 @@ fn render_case_block(p: &mut Printer, scrut: &Expr, arms: &[CaseArm], parent: Pr
 
 fn render_list_block(p: &mut Printer, items: &[Expr]) {
     if items.is_empty() {
-        p.write("[| |]");
+        p.write("[]");
         return;
     }
-    p.write("[|");
+    p.write("[");
     p.newline();
     p.with_indent(|p| {
         for (i, it) in items.iter().enumerate() {
@@ -2162,7 +2162,7 @@ fn render_list_block(p: &mut Printer, items: &[Expr]) {
             p.newline();
         }
     });
-    p.write("|]");
+    p.write("]");
 }
 
 fn render_record_block(p: &mut Printer, fields: &[Field<Expr>]) {
@@ -2306,14 +2306,14 @@ fn render_pat(p: &Pat) -> String {
         }
         PatKind::Lit(l) => render_literal(l),
         PatKind::List(items) => {
-            let mut s = String::from("[|");
+            let mut s = String::from("[");
             for (i, it) in items.iter().enumerate() {
                 if i > 0 {
                     s.push_str(", ");
                 }
                 s.push_str(&render_pat(it));
             }
-            s.push_str("|]");
+            s.push(']');
             s
         }
         PatKind::Cons { head, tail } => {
@@ -2462,7 +2462,7 @@ mod tests {
 
     #[test]
     fn source_decl() {
-        assert_fmt("*people:[|Person|]", "*people : [|Person|]\n");
+        assert_fmt("*people:[Person]", "*people : [Person]\n");
     }
 
     #[test]

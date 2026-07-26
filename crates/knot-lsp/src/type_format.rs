@@ -77,7 +77,7 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
                 None => format!("{{{}}}", fs.join(", ")),
             }
         }
-        TypeKind::Relation(inner) => format!("[|{}|]", format_type_kind_d(&inner.node, d)),
+        TypeKind::Relation(inner) => format!("[{}]", format_type_kind_d(&inner.node, d)),
         TypeKind::Function { param, result } => {
             let p = format_type_kind_d(&param.node, d);
             let r = format_type_kind_d(&result.node, d);
@@ -266,7 +266,7 @@ fn format_pat_brief_d(pat: &ast::PatKind, depth: usize) -> String {
         }
         ast::PatKind::List(pats) => {
             let parts: Vec<String> = pats.iter().map(|p| format_pat_brief_d(&p.node, d)).collect();
-            format!("[|{}|]", parts.join(", "))
+            format!("[{}]", parts.join(", "))
         }
         ast::PatKind::Cons { head, tail } => {
             format!(

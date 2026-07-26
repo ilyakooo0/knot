@@ -52,8 +52,6 @@ pub enum TokenKind {
     RBrace,
     LBracket,
     RBracket,
-    LBracketPipe,
-    PipeRBracket,
 
     // Operators
     Eq,
@@ -139,8 +137,6 @@ impl TokenKind {
             TokenKind::RBrace => "'}'",
             TokenKind::LBracket => "'['",
             TokenKind::RBracket => "']'",
-            TokenKind::LBracketPipe => "'[|'",
-            TokenKind::PipeRBracket => "'|]'",
             TokenKind::Eq => "'='",
             TokenKind::EqEq => "'=='",
             TokenKind::BangEq => "'!='",
@@ -237,7 +233,6 @@ fn follows_prefix_minus(prev: &[Token]) -> bool {
                 | TokenKind::Upper(_)
                 | TokenKind::RParen
                 | TokenKind::RBracket
-                | TokenKind::PipeRBracket
                 | TokenKind::RBrace
         )
     )
@@ -995,9 +990,7 @@ impl<'src> Lexer<'src> {
                 }
             }
             b'|' => {
-                if self.eat(b']') {
-                    TokenKind::PipeRBracket
-                } else if self.eat(b'|') {
+                if self.eat(b'|') {
                     TokenKind::OrOr
                 } else if self.eat(b'>') {
                     TokenKind::PipeGt
@@ -1023,13 +1016,7 @@ impl<'src> Lexer<'src> {
             b')' => TokenKind::RParen,
             b'{' => TokenKind::LBrace,
             b'}' => TokenKind::RBrace,
-            b'[' => {
-                if self.eat(b'|') {
-                    TokenKind::LBracketPipe
-                } else {
-                    TokenKind::LBracket
-                }
-            }
+            b'[' => TokenKind::LBracket,
             b']' => TokenKind::RBracket,
             _ => {
                 let char_start = self.pos - 1;

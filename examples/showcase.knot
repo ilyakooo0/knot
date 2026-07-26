@@ -29,7 +29,7 @@ type Product = {name: Text, price: Float 1, category: Category, inStock: Active}
 
 data Category = Electronics {} | Books {} | Clothing {} | Food {} | Software {}
 
-type Team = {name: Text, members: [|{name: Text, role: Text}|]}
+type Team = {name: Text, members: [{name: Text, role: Text}]}
 
 type LogEntry = {timestamp: Int 1, level: Level, message: Text, source: Text}
 
@@ -39,20 +39,20 @@ type Metric = {name: Text, value: Float 1, tags: Text}
 
 -- ── Sources ──────────────────────────────────────────────────────
 
-*employees : [|Employee|]
-*projects : [|Project|]
-*tickets : [|Ticket|]
-*customers : [|Customer|]
-*orders : [|Order|]
-*products : [|Product|]
-*teams : [|Team|]
-*logs : [|LogEntry|]
-*metrics : [|Metric|]
+*employees : [Employee]
+*projects : [Project]
+*tickets : [Ticket]
+*customers : [Customer]
+*orders : [Order]
+*products : [Product]
+*teams : [Team]
+*logs : [LogEntry]
+*metrics : [Metric]
 
 -- ── Seed data ────────────────────────────────────────────────────
 
 seedEmployees (do
-  replace *employees = [|
+  replace *employees = [
     {name "Alice Chen" age 34 salary 142000.0 dept (Department.Engineering {}) active (Active.Yes {})},
     {name "Bob Martinez" age 28 salary 95000.0 dept (Department.Engineering {}) active (Active.Yes {})},
     {name "Carol Davis" age 41 salary 155000.0 dept (Department.Engineering {}) active (Active.Yes {})},
@@ -73,11 +73,11 @@ seedEmployees (do
     {name "Rita Baker" age 39 salary 145000.0 dept (Department.Engineering {}) active (Active.Yes {})},
     {name "Sam Torres" age 42 salary 158000.0 dept (Department.Marketing {}) active (Active.No {})},
     {name "Tina Flores" age 35 salary 132000.0 dept (Department.Sales {}) active (Active.Yes {})}
-  |]
+  ]
   yield {})
 
 seedProjects (do
-  replace *projects = [|
+  replace *projects = [
     {name "Phoenix" lead "Alice Chen" budget 500000.0 priority (Priority.Critical {})},
     {name "Atlas" lead "Carol Davis" budget 350000.0 priority (Priority.High {})},
     {name "Meridian" lead "Frank Lee" budget 200000.0 priority (Priority.Medium {})},
@@ -86,11 +86,11 @@ seedProjects (do
     {name "Vanguard" lead "Rita Baker" budget 420000.0 priority (Priority.High {})},
     {name "Echo" lead "Bob Martinez" budget 180000.0 priority (Priority.Medium {})},
     {name "Nimbus" lead "Kate White" budget 280000.0 priority (Priority.High {})}
-  |]
+  ]
   yield {})
 
 seedTickets (do
-  replace *tickets = [|
+  replace *tickets = [
     {
       title "Fix auth timeout"
       project "Phoenix"
@@ -182,11 +182,11 @@ seedTickets (do
     {title "Performance benchmarks" project "Phoenix" status (Status.Open {}) priority (Priority.High {}) points 5},
     {title "Implement SSO" project "Phoenix" status (Status.Open {}) priority (Priority.Critical {}) points 13},
     {title "Add telemetry" project "Atlas" status (Status.Open {}) priority (Priority.Medium {}) points 5}
-  |]
+  ]
   yield {})
 
 seedCustomers (do
-  replace *customers = [|
+  replace *customers = [
     {name "Acme Corp" email "admin@acme.com" tier (Tier.Enterprise {})},
     {name "Widgets Inc" email "hello@widgets.io" tier (Tier.Pro {})},
     {name "Startup Labs" email "team@startuplabs.dev" tier (Tier.Free {})},
@@ -199,11 +199,11 @@ seedCustomers (do
     {name "TechVista" email "info@techvista.com" tier (Tier.Free {})},
     {name "Alpine Digital" email "hello@alpine.digital" tier (Tier.Pro {})},
     {name "CoreStack" email "admin@corestack.io" tier (Tier.Enterprise {})}
-  |]
+  ]
   yield {})
 
 seedProducts (do
-  replace *products = [|
+  replace *products = [
     {name "Laptop Pro 16" price 2499.99 category (Category.Electronics {}) inStock (Active.Yes {})},
     {name "Wireless Mouse" price 49.99 category (Category.Electronics {}) inStock (Active.Yes {})},
     {name "USB-C Hub" price 79.99 category (Category.Electronics {}) inStock (Active.No {})},
@@ -219,11 +219,11 @@ seedProducts (do
     {name "IDE License" price 199.99 category (Category.Software {}) inStock (Active.Yes {})},
     {name "CI/CD Platform" price 499.99 category (Category.Software {}) inStock (Active.Yes {})},
     {name "Monitoring Suite" price 299.99 category (Category.Software {}) inStock (Active.Yes {})}
-  |]
+  ]
   yield {})
 
 seedOrders (do
-  replace *orders = [|
+  replace *orders = [
     {customer "Acme Corp" product "Laptop Pro 16" quantity 50 total 124999.5},
     {customer "Acme Corp" product "4K Monitor" quantity 50 total 29999.5},
     {customer "Acme Corp" product "IDE License" quantity 100 total 19999.0},
@@ -249,55 +249,55 @@ seedOrders (do
     {customer "CoreStack" product "Laptop Pro 16" quantity 75 total 187499.25},
     {customer "CoreStack" product "IDE License" quantity 75 total 14999.25},
     {customer "CoreStack" product "CI/CD Platform" quantity 2 total 999.98}
-  |]
+  ]
   yield {})
 
 seedTeams (do
-  replace *teams = [|
+  replace *teams = [
     {
       name "Platform"
-      members [|
+      members [
         {name "Alice Chen" role "Lead"},
         {name "Bob Martinez" role "Senior"},
         {name "Dan Wilson" role "Junior"},
         {name "Leo Garcia" role "Junior"}
-      |]
+      ]
     },
     {
       name "Frontend"
-      members [|
+      members [
         {name "Eve Johnson" role "Lead"},
         {name "Kate White" role "Senior"},
         {name "Quinn Adams" role "Junior"}
-      |]
+      ]
     },
     {
       name "Infrastructure"
-      members [|
+      members [
         {name "Carol Davis" role "Lead"},
         {name "Frank Lee" role "Senior"},
         {name "Rita Baker" role "Senior"}
-      |]
+      ]
     },
     {
       name "Growth"
-      members [|
+      members [
         {name "Grace Kim" role "Lead"},
         {name "Noah Clark" role "Senior"},
         {name "Jack Thompson" role "Senior"},
         {name "Olivia Hall" role "Senior"},
         {name "Tina Flores" role "Senior"}
-      |]
+      ]
     },
     {
       name "Customer Success"
-      members [|{name "Iris Patel" role "Lead"}, {name "Pat Young" role "Senior"}|]
+      members [{name "Iris Patel" role "Lead"}, {name "Pat Young" role "Senior"}]
     }
-  |]
+  ]
   yield {})
 
 seedLogs (do
-  replace *logs = [|
+  replace *logs = [
     {timestamp 1710900000 level (Level.Info {}) message "Server started on port 8080" source "main"},
     {
       timestamp 1710900001
@@ -403,11 +403,11 @@ seedLogs (do
       message "Rate limit applied: 10.0.5.23 (429)"
       source "http"
     }
-  |]
+  ]
   yield {})
 
 seedMetrics (do
-  replace *metrics = [|
+  replace *metrics = [
     {name "http_requests_total" value 48291.0 tags "method=GET,status=200"},
     {name "http_requests_total" value 12847.0 tags "method=POST,status=201"},
     {name "http_requests_total" value 342.0 tags "method=POST,status=400"},
@@ -438,7 +438,7 @@ seedMetrics (do
     {name "queue_depth" value 0.0 tags "queue=analytics"},
     {name "disk_usage_percent" value 82.3 tags "mount=/data"},
     {name "disk_usage_percent" value 45.1 tags "mount=/logs"}
-  |]
+  ]
   yield {})
 -- ── Main ─────────────────────────────────────────────────────────
 

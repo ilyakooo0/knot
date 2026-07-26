@@ -3,10 +3,10 @@ data Priority = Low {} | Medium {} | High {} | Critical {}
 
 type Todo = {title: Text, owner: Text, priority: Priority}
 
-*todos : [|Todo|]
+*todos : [Todo]
 
 route TodoApi where
-  GET /todos/{owner: Text} headers {xForwardedFor: Maybe Text} -> [|Todo|] = GetTodos
+  GET /todos/{owner: Text} headers {xForwardedFor: Maybe Text} -> [Todo] = GetTodos
   POST {title: Text, owner: Text, priority: Text} /todos -> Todo = CreateTodo
 
 route AdminApi where
@@ -16,7 +16,7 @@ route Api = TodoApi | AdminApi
 
 addTodo (\title owner priority -> do
   todos <- *todos
-  *todos = base.union todos [|{title title owner owner priority (Priority.Low {})}|])
+  *todos = base.union todos [{title title owner owner priority (Priority.Low {})}])
 
 getTodos (\owner -> do
   todos <- *todos

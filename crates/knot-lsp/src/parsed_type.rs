@@ -157,7 +157,7 @@ impl ParsedType {
                     None => format!("<{}>", cs.join(" | ")),
                 }
             }
-            ParsedType::Relation(t) => format!("[|{}|]", t.render()),
+            ParsedType::Relation(t) => format!("[{}]", t.render()),
             ParsedType::Io { effects, rest, ty } => {
                 // Open rows render `{fs | r}` / `{| r}` — the row variable is
                 // separated by `|`, never preceded by a comma.
@@ -434,18 +434,15 @@ impl<'a> Parser<'a> {
 
     fn parse_relation(&mut self) -> Option<ParsedType> {
         self.eat_char('[');
-        self.eat_char('|');
         self.skip_ws();
-        if self.peek() == Some('|') {
-            self.eat_char('|');
+        if self.peek() == Some(']') {
             self.eat_char(']');
-            // Bare `[| |]` is the empty relation type constructor at value level;
+            // Bare `[]` is the empty list type constructor at value level;
             // not common as a type, but represent it as a variable.
             return Some(ParsedType::Named("[]".into(), Vec::new()));
         }
         let inner = self.parse_function()?;
         self.skip_ws();
-        self.eat_char('|');
         self.eat_char(']');
         Some(ParsedType::Relation(Box::new(inner)))
     }

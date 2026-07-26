@@ -13,18 +13,18 @@ data Tier = Free {} | Pro {} | Enterprise {}
 type Order = {customer: Text, product: Text, quantity: Int 1, total: Float 1}
 type Product = {name: Text, price: Float 1, category: Category, inStock: Active}
 data Category = Electronics {} | Books {} | Clothing {} | Food {} | Software {}
-type Team = {name: Text, members: [|{name: Text, role: Text}|]}
+type Team = {name: Text, members: [{name: Text, role: Text}]}
 type LogEntry = {timestamp: Int 1, level: Level, message: Text, source: Text}
 data Level = Debug {} | Info {} | Warn {} | Error {}
 type Metric = {name: Text, value: Float 1, tags: Text}
-*employees : [|Employee|]
-*projects : [|Project|]
-*tickets : [|Ticket|]
-*customers : [|Customer|]
-*orders : [|Order|]
-*products : [|Product|]
-*teams : [|Team|]
-*logs : [|LogEntry|]
-*metrics : [|Metric|]
+*employees : [Employee]
+*projects : [Project]
+*tickets : [Ticket]
+*customers : [Customer]
+*orders : [Order]
+*products : [Product]
+*teams : [Team]
+*logs : [LogEntry]
+*metrics : [Metric]
 }
 (main)

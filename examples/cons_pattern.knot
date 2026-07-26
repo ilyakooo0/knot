@@ -1,16 +1,16 @@
 -- Pattern-matching on relations with `[]` and `Cons head tail`.
 with {
 sumList (\xs -> case xs of
-  [||] -> 0
+  [] -> 0
   Cons h t -> h + sumList t)
 
 firstOr (\xs default -> case xs of
-  [||] -> default
+  [] -> default
   Cons h _ -> h)
 }
 (do
-  base.println (base.show (sumList [|1, 2, 3, 4|]))
-  base.println (base.show (sumList [||]))
-  base.println (base.show (firstOr [|10, 20, 30|] 0))
-  base.println (base.show (firstOr [||] 99))
+  base.println (base.show (sumList [1, 2, 3, 4]))
+  base.println (base.show (sumList []))
+  base.println (base.show (firstOr [10, 20, 30] 0))
+  base.println (base.show (firstOr [] 99))
   yield {})

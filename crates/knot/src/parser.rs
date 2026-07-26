@@ -635,7 +635,6 @@ impl Parser {
                     self.peek(),
                     TokenKind::RParen
                         | TokenKind::RBracket
-                        | TokenKind::PipeRBracket
                         | TokenKind::RBrace
                         | TokenKind::Comma
                 )
@@ -660,7 +659,6 @@ impl Parser {
                         self.peek(),
                         TokenKind::RParen
                             | TokenKind::RBracket
-                            | TokenKind::PipeRBracket
                             | TokenKind::RBrace
                             | TokenKind::Comma
                     ))
@@ -1777,7 +1775,7 @@ impl Parser {
             | TokenKind::Upper(_)
             | TokenKind::LParen
             | TokenKind::LBrace
-            | TokenKind::LBracketPipe
+            | TokenKind::LBracket
             | TokenKind::Replace
             | TokenKind::Do => true,
             // `yield` is not a keyword but should not start application atoms
@@ -2204,7 +2202,7 @@ impl Parser {
                 self.delimiter_depth -= 1;
                 result
             }
-            TokenKind::LBracketPipe => {
+            TokenKind::LBracket => {
                 self.advance();
                 self.delimiter_depth += 1;
                 let result = self.parse_list_expr(start);
@@ -2853,10 +2851,10 @@ impl Parser {
     }
 
     fn parse_list_expr(&mut self, start: Span) -> Option<Expr> {
-        // Already consumed `[|`.
+        // Already consumed `[`.
         self.skip_newlines();
         let mut elems = Vec::new();
-        if !self.at(&TokenKind::PipeRBracket) {
+        if !self.at(&TokenKind::RBracket) {
             loop {
                 self.skip_newlines();
                 let e = self.parse_expr()?;
@@ -2866,14 +2864,14 @@ impl Parser {
                     break;
                 }
                 self.skip_newlines();
-                if self.at(&TokenKind::PipeRBracket) {
+                if self.at(&TokenKind::RBracket) {
                     break; // trailing comma
                 }
             }
         }
         self.skip_newlines();
         let end_tok = self
-            .expect(&TokenKind::PipeRBracket, "expected '|]' to close relation")
+            .expect(&TokenKind::RBracket, "expected ']' to close list")
             .ok()?;
         Some(Spanned::new(
             ExprKind::List(elems),
@@ -3192,7 +3190,7 @@ impl Parser {
         // without an error (e.g. `(do ... )` or `[do ... ]`).
         if matches!(
             self.peek(),
-            TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket | TokenKind::PipeRBracket
+            TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket
         ) {
             return None;
         }
@@ -3278,7 +3276,7 @@ impl Parser {
                 | TokenKind::Upper(_)
                 | TokenKind::Underscore
                 | TokenKind::LBrace
-                | TokenKind::LBracketPipe
+                | TokenKind::LBracket
                 | TokenKind::LParen
                 | TokenKind::Int(_)
                 | TokenKind::Float(_)
@@ -3426,7 +3424,7 @@ impl Parser {
                 self.advance();
                 self.parse_record_pat(start)
             }
-            TokenKind::LBracketPipe => {
+            TokenKind::LBracket => {
                 self.advance();
                 self.parse_list_pat(start)
             }
@@ -3521,7 +3519,7 @@ impl Parser {
                 | TokenKind::Upper(_)
                 | TokenKind::Underscore
                 | TokenKind::LBrace
-                | TokenKind::LBracketPipe
+                | TokenKind::LBracket
                 | TokenKind::LParen
                 | TokenKind::Minus
                 | TokenKind::Int(_)
@@ -3579,7 +3577,7 @@ impl Parser {
                 self.advance();
                 self.parse_record_pat(start)
             }
-            TokenKind::LBracketPipe => {
+            TokenKind::LBracket => {
                 self.advance();
                 self.parse_list_pat(start)
             }
@@ -3700,10 +3698,10 @@ impl Parser {
     }
 
     fn parse_list_pat(&mut self, start: Span) -> Option<Pat> {
-        // Already consumed `[|`.
+        // Already consumed `[`.
         self.skip_newlines();
         let mut pats = Vec::new();
-        if !self.at(&TokenKind::PipeRBracket) {
+        if !self.at(&TokenKind::RBracket) {
             loop {
                 self.skip_newlines();
                 let p = self.parse_pat()?;
@@ -3713,14 +3711,14 @@ impl Parser {
                     break;
                 }
                 self.skip_newlines();
-                if self.at(&TokenKind::PipeRBracket) {
+                if self.at(&TokenKind::RBracket) {
                     break; // trailing comma
                 }
             }
         }
         self.skip_newlines();
         let end_tok = self
-            .expect(&TokenKind::PipeRBracket, "expected '|]' to close relation pattern")
+            .expect(&TokenKind::RBracket, "expected ']' to close list pattern")
             .ok()?;
         Some(Spanned::new(
             PatKind::List(pats),
@@ -3912,7 +3910,7 @@ impl Parser {
                 | TokenKind::Lower(_)
                 | TokenKind::Underscore
                 | TokenKind::LBrace
-                | TokenKind::LBracketPipe
+                | TokenKind::LBracket
                 | TokenKind::LParen
         )
     }
@@ -3994,7 +3992,7 @@ impl Parser {
                 self.advance();
                 self.parse_record_type(start)
             }
-            TokenKind::LBracketPipe => {
+            TokenKind::LBracket => {
                 self.advance();
                 self.parse_relation_type(start)
             }
@@ -4126,10 +4124,10 @@ impl Parser {
     /// Parse the row-variable tail of an IO type after `|`:
     /// `r1`, `_`, or `r1 \/ r2 \/ r3`. Returns an empty Vec on parse error.
     fn parse_relation_type(&mut self, start: Span) -> Option<Type> {
-        // Already consumed `[|`.
+        // Already consumed `[`.
         self.skip_newlines();
-        if self.eat(&TokenKind::PipeRBracket) {
-            // `[| |]` as a type — the relation type constructor with no argument.
+        if self.eat(&TokenKind::RBracket) {
+            // `[]` as a type — the list/relation type constructor with no argument.
             // This represents the `[]` type constructor used in `impl Functor []`.
             return Some(Spanned::new(
                 TypeKind::Named("[]".into()),
@@ -4140,7 +4138,7 @@ impl Parser {
         let inner = self.parse_type()?;
         self.skip_newlines();
         let end_tok = self
-            .expect(&TokenKind::PipeRBracket, "expected '|]' to close relation type")
+            .expect(&TokenKind::RBracket, "expected ']' to close relation type")
             .ok()?;
         Some(Spanned::new(
             TypeKind::Relation(Box::new(inner)),

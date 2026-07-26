@@ -1,3 +1,3 @@
 -- Test findFirst builtin.
 
-with {r1 (base.findFirst [|1, 2, 3, 4, 5|] (\x -> x > 3))} (do with {r2 (base.findFirst [|1, 2, 3|] (\x -> x > 10))} (do with {r3 (base.findFirst [||] (\x -> x > 0))} (do base.println (base.show r1); base.println (base.show r2); base.println (base.show r3); yield {})))
+with {r1 (base.findFirst [1, 2, 3, 4, 5] (\x -> x > 3))} (do with {r2 (base.findFirst [1, 2, 3] (\x -> x > 10))} (do with {r3 (base.findFirst [] (\x -> x > 0))} (do base.println (base.show r1); base.println (base.show r2); base.println (base.show r3); yield {})))

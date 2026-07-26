@@ -4089,7 +4089,7 @@ impl Infer {
                 format!("{{{}}}", parts.join(", "))
             }
             Ty::Relation(inner) => {
-                format!("[|{}|]", self.display_ty(inner))
+                format!("[{}]", self.display_ty(inner))
             }
             Ty::Con(name, args) => {
                 // Unit-bearing Int/Float: `Con("Int", [Unit(u)])` → `Int u`,
@@ -10701,7 +10701,7 @@ fn display_ty_clean_inner(
             }
             format!("{{{}}}", parts.join(", "))
         }
-        Ty::Relation(inner) => format!("[|{}|]", display_ty_clean(inner, names, unit_names)),
+        Ty::Relation(inner) => format!("[{}]", display_ty_clean(inner, names, unit_names)),
         Ty::Con(name, args) => {
             // Unit-bearing Int/Float → `Int u`/`Float u`, collapsing to
             // `Int`/`Float` when dimensionless.

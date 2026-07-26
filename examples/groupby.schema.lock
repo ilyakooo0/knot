@@ -2,6 +2,6 @@
 -- Commit to source control.
 with {
 type Todo = {title: Text, owner: Text, done: Int 1}
-*todos : [|Todo|]
+*todos : [Todo]
 }
 (main)

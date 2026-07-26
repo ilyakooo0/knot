@@ -2,6 +2,6 @@
 -- Commit to source control.
 with {
 type Item = {name: Text, price: Int 1}
-*items : [|Item|]
+*items : [Item]
 }
 (main)

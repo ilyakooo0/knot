@@ -16913,6 +16913,19 @@ fn eval_expr_bool(expr: &ast::Expr, lit: &CompileLit, param_name: &str) -> Optio
     match &expr.node {
         ast::ExprKind::Lit(ast::Literal::Bool(b)) => Some(*b),
         ast::ExprKind::BinOp { op, lhs, rhs, .. } => {
+            // Boolean connectives operate on booleans, not numbers — handle
+            // them before the numeric comparison path so `x >= 0 && x <= 10`
+            // (operands are comparisons, not numbers) isn't short-circuited
+            // to None by `eval_expr_num`.
+            match op {
+                ast::BinOp::And => {
+                    return Some(eval_expr_bool(lhs, lit, param_name)? && eval_expr_bool(rhs, lit, param_name)?);
+                }
+                ast::BinOp::Or => {
+                    return Some(eval_expr_bool(lhs, lit, param_name)? || eval_expr_bool(rhs, lit, param_name)?);
+                }
+                _ => {}
+            }
             let lv = eval_expr_num(lhs, lit, param_name)?;
             let rv = eval_expr_num(rhs, lit, param_name)?;
             match op {
@@ -16922,12 +16935,6 @@ fn eval_expr_bool(expr: &ast::Expr, lit: &CompileLit, param_name: &str) -> Optio
                 ast::BinOp::Ge => Some(lv >= rv),
                 ast::BinOp::Eq => Some(lv == rv),
                 ast::BinOp::Neq => Some(lv != rv),
-                ast::BinOp::And => {
-                    Some(eval_expr_bool(lhs, lit, param_name)? && eval_expr_bool(rhs, lit, param_name)?)
-                }
-                ast::BinOp::Or => {
-                    Some(eval_expr_bool(lhs, lit, param_name)? || eval_expr_bool(rhs, lit, param_name)?)
-                }
                 _ => None,
             }
         }

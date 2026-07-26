@@ -139,6 +139,43 @@ Lambdas are `\x y -> body`. Functions are values; `add 2 3` is just
 application. There are no named `def`s with bodies — a "named function" is a
 plain binding whose value happens to be a lambda.
 
+### Refined types
+
+A refined type is a base type plus a predicate — `T where \x -> ...`. The
+predicate is an ordinary pure function. `Refined(T) <: T`, so a refined value
+flows anywhere its base type is expected (no check). Going the other way
+(base → refined) is where the check happens:
+
+```knot
+with {
+type Nat = Int 1 where \x -> x >= 0
+-- stacking: Age is Nat further restricted — predicates conjoin (>= 0 && <= 150)
+type Age = Nat where \x -> x <= 150
+
+greet : Age -> Text
+greet (\a -> "age " ++ base.show a)
+
+double (\x -> x + x)
+}
+(do
+  base.println (greet 30)                 -- OK: 30 is a compile-time constant,
+                                          -- the compiler checks it satisfies
+                                          -- 0 <= 30 <= 150 and lets it through.
+  case refine (double 21) of              -- a runtime value needs `refine`
+    Result.Ok {value a} -> base.println (greet a)   -- "age 42"
+    Result.Err {error e} -> base.println "not a valid age"
+  yield {})
+```
+
+- A **compile-time constant** (`greet 30`, or a `with`-bound literal like
+  `drinkingAge 21`) is checked against the predicate *at compile time* — no
+  `refine` needed, and a constant that fails the predicate is a **build
+  error** naming the value.
+- A **runtime value** must go through `refine`, which returns
+  `Result RefinementError T` — handle the `Err` case.
+- Refinements on **source-relation fields** are checked row-by-row on every
+  write, and route bodies are validated on decode (HTTP 400 on violation).
+
 ### Conditionals are `case` on a Bool
 
 There is **no `if`**. Pattern matching with `case ... of` is the only

@@ -2,6 +2,6 @@
 -- Commit to source control.
 with {
 type Person = {name: Text, age: Int 1}
-*teams : [{name: Text, members: [Person]}]
+*teams : [|{name: Text, members: [|Person|]}|]
 }
 (main)

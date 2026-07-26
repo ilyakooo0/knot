@@ -2,6 +2,6 @@
 -- Commit to source control.
 with {
 type Employee = {name: Text, dept: Text, salary: Int 1}
-*employees : [Employee]
+*employees : [|Employee|]
 }
 (main)

@@ -3,13 +3,13 @@
 with {
 type Person = {name: Text, age: Int 1}
 
-*teams : [{name: Text, members: [Person]}]
+*teams : [|{name: Text, members: [|Person|]}|]
 }
 (do
-  replace *teams = [
-    { name "Engineering" members [{ name "Alice" age 30 }, { name "Bob" age 25 }, { name "Eve" age 22 }] },
-    { name "Design" members [{ name "Carol" age 35 }, { name "Eve" age 22 }] }
-  ]
+  replace *teams = [|
+    { name "Engineering" members [|{ name "Alice" age 30 }, { name "Bob" age 25 }, { name "Eve" age 22 }|] },
+    { name "Design" members [|{ name "Carol" age 35 }, { name "Eve" age 22 }|] }
+  |]
 
   -- Read nested members: bind the team, then bind its members field.
   base.println "Before:"

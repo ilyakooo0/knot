@@ -9,7 +9,7 @@
   base.println (base.toJson { name "Alice" age 30 })
 
   -- Encode a relation (becomes JSON array)
-  with { nums [{ x 1 }, { x 2 }, { x 3 }] } (do
+  with { nums [|{ x 1 }, { x 2 }, { x 3 }|] } (do
     base.println (base.toJson nums)
 
     -- Round-trip: encode then decode. parseJson returns `Maybe a` so malformed
@@ -21,12 +21,12 @@
         Maybe.Nothing {} -> base.println "parse failed"
 
       -- Parse a JSON array
-      case base.parseJson "[1, 2, 3]" : Maybe [Int 1] of
+      case base.parseJson "[|1, 2, 3|]" : Maybe [|Int 1|] of
         Maybe.Just { value value } -> base.println (base.show value)
         Maybe.Nothing {} -> base.println "parse failed"
 
       -- Malformed input decodes to Nothing instead of crashing the program
-      case base.parseJson "not valid json" : Maybe [Int 1] of
+      case base.parseJson "not valid json" : Maybe [|Int 1|] of
         Maybe.Just { value value } -> base.println (base.show value)
         Maybe.Nothing {} -> base.println "parse failed (as expected)"
 

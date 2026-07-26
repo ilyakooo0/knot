@@ -660,7 +660,7 @@ pub const SNIPPETS: &[(&str, &str, &str, SnippetContext)] = &[
     (
         "source",
         "source declaration",
-        "*${1:name} : [${2:Type}]",
+        "*${1:name} : [|${2:Type}|]",
         SnippetContext::TopLevel,
     ),
     (

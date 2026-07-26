@@ -20,6 +20,6 @@
   -- Numbers, booleans, lists also work
   base.println (base.bytesToHex (base.hash 42))
   base.println (base.bytesToHex (base.hash true))
-  base.println (base.bytesToHex (base.hash [1, 2, 3]))
+  base.println (base.bytesToHex (base.hash [|1, 2, 3|]))
 
   yield {})

@@ -7,7 +7,7 @@
 -- as an end-to-end compile/run check on the codegen specialization path.
 with {
 type Account = {id: Int 1, balance: Int 1}
-*accounts : [Account]
+*accounts : [|Account|]
 
 -- The `single (filter (\a -> a.id == ?) rows)` pattern is what the codegen
 -- recognizes as a `"id" = ?` simple equality; inside an atomic block the
@@ -27,7 +27,7 @@ credit (\aid amount -> atomic do
     (*accounts = setBalance aid amount rows))
 }
 (do
-  replace *accounts = [{id 1 balance 0}, {id 2 balance 0}, {id 3 balance 0}]
+  replace *accounts = [|{id 1 balance 0}, {id 2 balance 0}, {id 3 balance 0}|]
   credit 1 100
   credit 2 50
   credit 3 25

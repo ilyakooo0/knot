@@ -146,6 +146,70 @@ struct ResultMarker {
 /// Maps `refine` expression spans to their resolved refined type name.
 pub type RefineTargets = HashMap<Span, String>;
 
+/// A stdlib function that codegen may special-case (SQL pushdown, query
+/// forms, …). Identified by RESOLUTION, not by name string, so user code that
+/// shadows the name is never confused with the builtin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum StdlibFn {
+    Sum,
+    Avg,
+    MinOn,
+    MaxOn,
+    Count,
+    CountWhere,
+    Filter,
+    Map,
+    SortBy,
+    Take,
+    Drop,
+    FindFirst,
+    Any,
+    All,
+}
+
+impl StdlibFn {
+    /// Map a stdlib name to its identity; `None` for names codegen does not
+    /// special-case.
+    pub fn from_name(name: &str) -> Option<StdlibFn> {
+        Some(match name {
+            "sum" => StdlibFn::Sum,
+            "avg" => StdlibFn::Avg,
+            "minOn" => StdlibFn::MinOn,
+            "maxOn" => StdlibFn::MaxOn,
+            "count" => StdlibFn::Count,
+            "countWhere" => StdlibFn::CountWhere,
+            "filter" => StdlibFn::Filter,
+            "map" => StdlibFn::Map,
+            "sortBy" => StdlibFn::SortBy,
+            "take" => StdlibFn::Take,
+            "drop" => StdlibFn::Drop,
+            "findFirst" => StdlibFn::FindFirst,
+            "any" => StdlibFn::Any,
+            "all" => StdlibFn::All,
+            _ => return None,
+        })
+    }
+}
+
+/// Which function a call-site head actually resolved to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FnIdentity {
+    /// The compiler's own stdlib value-fn — safe to pattern-match for
+    /// pushdown regardless of what else in the program shares its name.
+    Stdlib(StdlibFn),
+    /// Anything the user bound (top-level fn, `let`, lambda param, `with`
+    /// field). Never eligible for pushdown.
+    User,
+}
+
+/// Maps a call-site head span to the identity it resolved to during
+/// inference. Codegen consults this to decide — positively, by resolution
+/// rather than by name + shadowing guards — whether a call is the stdlib
+/// function it can push down. A span with no entry fell through a path
+/// inference did not classify; codegen treats that as "not provably stdlib"
+/// and keeps the conservative (non-pushdown or name+guard) behaviour.
+pub type ResolvedCalls = HashMap<Span, FnIdentity>;
+
 /// Refined type info exported for codegen: type_name → predicate expression.
 pub type RefinedTypeInfoMap = HashMap<String, knot::ast::Expr>;
 
@@ -977,6 +1041,10 @@ struct Infer {
     /// field path). Populated when an `ImplicitRef` is resolved; handed to
     /// codegen via `ImplicitRefs` so it can emit the projection chain.
     implicit_refs: ImplicitRefs,
+    /// Call-site head spans mapped to the function identity they resolved to
+    /// (stdlib vs user). Handed to codegen via `ResolvedCalls` so pushdown
+    /// dispatch is by resolution, not name string.
+    resolved_calls: ResolvedCalls,
     /// Refined-type names for which the directional refined-type check (which
     /// otherwise rejects implicitly introducing a refinement, e.g. a raw `Int`
     /// flowing where a `Nat` is required) is suppressed. `None` = suppress
@@ -1082,6 +1150,7 @@ impl Infer {
             with_fields: Vec::new(),
             with_scope_stack: vec![None],
             implicit_refs: HashMap::new(),
+            resolved_calls: HashMap::new(),
             suppress_refine_intro: None,
             user_top_level_names: HashSet::new(),
             deferred_unit_binops: Vec::new(),
@@ -4921,6 +4990,15 @@ impl Infer {
                 // resolve via the temporary stdlib scope `bind_base_record`
                 // pushes. `retry` is handled by its own `atomic` check above.
                 if let Some(ty) = self.lookup_instantiate_at(name, expr.span) {
+                    // This bare Var resolved through `scopes` — i.e. to a user
+                    // binding (top-level fn, `let`, lambda param, or `with`
+                    // field), never to a stdlib value-fn (those live only in
+                    // `stdlib_schemes`, absent from `scopes`). Record the
+                    // identity so codegen knows this call head is NOT the
+                    // builtin even though the name may collide with one.
+                    if StdlibFn::from_name(name).is_some() {
+                        self.resolved_calls.insert(expr.span, FnIdentity::User);
+                    }
                     // If this Var resolved to a field of a `with` that codegen
                     // binds in the CURRENT env frame, redirect codegen's `Var`
                     // lookup to that `with` site's unique alias slot. Codegen's
@@ -5259,6 +5337,9 @@ impl Infer {
                     )
                     && let Some(scheme) = self.lookup_stdlib(field).cloned()
                 {
+                    if let Some(sf) = StdlibFn::from_name(field) {
+                        self.resolved_calls.insert(expr.span, FnIdentity::Stdlib(sf));
+                    }
                     let ty = self.instantiate_at(&scheme, expr.span);
                     self.field_accesses.push((expr.span, ty.clone()));
                     return ty;
@@ -5273,6 +5354,17 @@ impl Infer {
                 } else {
                     resolved
                 };
+                // `base.<field>` where `field` is a stdlib value-fn codegen
+                // special-cases: `base` is always the compiler's own record
+                // (user code cannot rebind it), so the field unambiguously
+                // names the builtin. Record the identity by resolution so
+                // codegen's pushdown dispatch need not re-derive it by name.
+                if let ast::ExprKind::Var(n) = &e.node
+                    && n == "base"
+                    && let Some(sf) = StdlibFn::from_name(field)
+                {
+                    self.resolved_calls.insert(expr.span, FnIdentity::Stdlib(sf));
+                }
                 let field_ty = self.fresh();
                 let rv = self.fresh_var();
                 let constraint = Ty::Record(
@@ -11128,6 +11220,7 @@ pub type CheckOutput = (
     TypeArgSpans,
     ImplicitRefs,
     ImplicitDictArgs,
+    ResolvedCalls,
 );
 
 /// Run type inference on a parsed module. Returns diagnostics,
@@ -11578,7 +11671,7 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
     let implicit_refs: ImplicitRefs = infer.implicit_refs.clone();
     let implicit_dict_args: ImplicitDictArgs = infer.implicit_dict_args.clone();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, infer.resolved_calls.clone())
 }
 
 

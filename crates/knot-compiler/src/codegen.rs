@@ -314,6 +314,10 @@ pub struct Codegen {
     source_refinements: HashMap<String, Vec<(Option<String>, String, knot::ast::Expr)>>,
     // Refine expression targets: expr_span -> refined type name
     refine_targets: HashMap<knot::ast::Span, String>,
+    // Call-site head spans -> resolved function identity (stdlib vs user),
+    // from inference. Pushdown dispatch consults this to identify stdlib
+    // functions by resolution rather than by name + shadowing guards.
+    resolved_calls: crate::infer::ResolvedCalls,
     // Compiled predicate function values: type_name -> func_id
     #[allow(dead_code)]
     refined_predicate_fns: HashMap<String, FuncId>,
@@ -686,6 +690,7 @@ pub fn compile(
     implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
     implicit_dict_args: &crate::infer::ImplicitDictArgs,
+    resolved_calls: &crate::infer::ResolvedCalls,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     crate::stack::grow(|| {
@@ -706,6 +711,7 @@ pub fn compile(
             implicit_refs,
             type_arg_spans,
             implicit_dict_args,
+            resolved_calls,
             compile_time_overrides,
         )
     })
@@ -729,6 +735,7 @@ fn compile_inner(
     implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
     implicit_dict_args: &crate::infer::ImplicitDictArgs,
+    resolved_calls: &crate::infer::ResolvedCalls,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
@@ -765,6 +772,7 @@ fn compile_inner(
     cg.subset_constraints = type_env.subset_constraints.clone();
     cg.monad_info = monad_info.clone();
     cg.refine_targets = refine_targets.clone();
+    cg.resolved_calls = resolved_calls.clone();
     cg.refined_types = refined_types.clone();
     cg.alias_ast = decl_views(program)
         .iter()
@@ -1045,6 +1053,7 @@ impl Codegen {
             refined_types: HashMap::new(),
             alias_ast: HashMap::new(),
             refine_targets: HashMap::new(),
+            resolved_calls: HashMap::new(),
             refined_predicate_fns: HashMap::new(),
             source_refinements: HashMap::new(),
             from_json_targets: HashMap::new(),
@@ -5746,6 +5755,24 @@ impl Codegen {
         }
     }
 
+    /// Did inference resolve this call-site head to the given stdlib function?
+    /// Positive identification by RESOLUTION (span-keyed), not by name string,
+    /// so a user function that shadows the name is never mistaken for the
+    /// builtin. `false` when the span was not classified (a form inference did
+    /// not visit) — callers must then fall back to conservative behaviour.
+    fn resolves_to_stdlib(&self, func_expr: &ast::Expr, f: crate::infer::StdlibFn) -> bool {
+        self.resolved_calls.get(&func_expr.span)
+            == Some(&crate::infer::FnIdentity::Stdlib(f))
+    }
+
+    /// Did inference resolve this call-site head to a USER binding (top-level
+    /// fn, `let`, lambda param, `with` field) whose name collides with a
+    /// stdlib function codegen special-cases? When true, pushdown for that
+    /// name must NOT fire even if the name matches. `false` when unclassified.
+    fn resolves_to_user(&self, func_expr: &ast::Expr) -> bool {
+        self.resolved_calls.get(&func_expr.span) == Some(&crate::infer::FnIdentity::User)
+    }
+
     fn compile_app(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -6126,9 +6153,33 @@ impl Codegen {
                     );
                 }
 
-        // Special case: filter/sum/avg with lambda on source → SQL
-        if let ast::ExprKind::Var(name) = &func_expr.node
-            && args.len() == 2 && !user_shadows_special {
+        // Special case: filter/sum/avg with lambda on source → SQL.
+        //
+        // The head is eligible when it is EITHER the bare builtin name
+        // (guarded against user shadowing by name) OR the namespaced `base.X`
+        // form, which inference resolved unambiguously to the stdlib function
+        // (`base` is always the compiler's record). The resolution table gives
+        // the positive identity for both, and positively vetoes any head that
+        // resolved to a USER binding even when its name collides.
+        let aggregate_pushdown_name: Option<&str> = match &func_expr.node {
+            ast::ExprKind::Var(name)
+                if args.len() == 2
+                    && !user_shadows_special
+                    && !self.resolves_to_user(func_expr) =>
+            {
+                Some(name.as_str())
+            }
+            ast::ExprKind::FieldAccess { expr, field }
+                if args.len() == 2
+                    && matches!(&expr.node, ast::ExprKind::Var(n) if n == "base")
+                    && crate::infer::StdlibFn::from_name(field)
+                        .is_some_and(|sf| self.resolves_to_stdlib(func_expr, sf)) =>
+            {
+                Some(field.as_str())
+            }
+            _ => None,
+        };
+        if let Some(name) = aggregate_pushdown_name {
                 if let Some(source_name) = self.resolve_source(args[1])
                     && !self.views.contains_key(&source_name)
                         && let Some(schema) = self.source_schemas.get(&source_name).cloned()
@@ -6153,11 +6204,11 @@ impl Codegen {
                                         let agg_body: &ast::Expr = &agg_body;
                                         // MIN/MAX over non-numeric columns must
                                         // stay in memory (see minmax_pushdown_type_ok).
-                                        let minmax_ok = !matches!(name.as_str(), "minOn" | "maxOn")
+                                        let minmax_ok = !matches!(name, "minOn" | "maxOn")
                                             || minmax_pushdown_type_ok(&agg_bind, agg_body, &schema);
                                         if let (true, Some(col_sql)) = (minmax_ok, extract_sql_field_access(&agg_bind, agg_body, "", &schema))
                                             && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
-                                                let arg_sql = if matches!(name.as_str(), "minOn" | "maxOn") {
+                                                let arg_sql = if matches!(name, "minOn" | "maxOn") {
                                                     col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
                                                 } else {
                                                     col_sql
@@ -6220,7 +6271,7 @@ impl Codegen {
                                         // MIN/MAX diverges from total_cmp —
                                         // keep both in memory (see
                                         // minmax_pushdown_type_ok).
-                                        let case_ok = !matches!(name.as_str(), "minOn" | "maxOn")
+                                        let case_ok = !matches!(name, "minOn" | "maxOn")
                                             || minmax_pushdown_type_ok(&agg_bind, agg_body, &schema);
                                         if case_ok {
                                             extract_sql_field_access(&agg_bind, agg_body, alias, &schema)
@@ -6244,13 +6295,13 @@ impl Codegen {
                                     // Int and Text push down — the runtime's
                                     // `is_text` flag keeps Text results from being
                                     // re-parsed as Int.
-                                    !matches!(name.as_str(), "minOn" | "maxOn")
+                                    !matches!(name, "minOn" | "maxOn")
                                         || col_ty == "int"
                                         || col_ty == "text"
                                 });
                                 if let Some((col_sql, col_ty)) = col_info {
                                     let col_is_text = col_ty == "text";
-                                    let arg_sql = if matches!(name.as_str(), "minOn" | "maxOn")
+                                    let arg_sql = if matches!(name, "minOn" | "maxOn")
                                         && col_ty == "int"
                                     {
                                         format!("{} COLLATE KNOT_INT", col_sql)
@@ -6371,12 +6422,12 @@ impl Codegen {
                 // field references are rewritten through the yield
                 // projection before being compiled against the base table;
                 // computed projections fall back to in-memory evaluation.
-                if matches!(name.as_str(), "filter" | "sortBy")
+                if matches!(name, "filter" | "sortBy")
                     && let ast::ExprKind::Do(stmts) = &args[1].node
                         && let Some(mut plan) = self.analyze_sql_plan(stmts, env)
                             && let Some((bind_var, body)) = extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings) {
                                 let body: &ast::Expr = &body;
-                                match name.as_str() {
+                                match name {
                                     "filter" => {
                                         // For single-table plans, the bind var maps to the table alias
                                         if plan.tables.len() == 1

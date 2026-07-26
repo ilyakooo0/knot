@@ -548,6 +548,7 @@ pub fn analyze_document(
             _type_args,
             _implicit_refs,
             _implicit_dict_args,
+            _resolved_calls,
         ) = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_user));
         type_info = inferred_types;

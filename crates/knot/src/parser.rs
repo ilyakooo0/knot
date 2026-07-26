@@ -484,9 +484,6 @@ impl Parser {
             }
             TokenKind::Where
             | TokenKind::Do
-            | TokenKind::If
-            | TokenKind::Then
-            | TokenKind::Else
             | TokenKind::Case
             | TokenKind::Of
             | TokenKind::Not
@@ -646,7 +643,7 @@ impl Parser {
                 break;
             }
             // Keywords that cannot start a new block item terminate the block.
-            if matches!(self.peek(), TokenKind::Then | TokenKind::Else | TokenKind::Of) {
+            if matches!(self.peek(), TokenKind::Of) {
                 break;
             }
             // Peek past newlines to check if the next item is still in
@@ -1356,7 +1353,6 @@ impl Parser {
         }
         match self.peek() {
             TokenKind::Backslash => self.parse_lambda(),
-            TokenKind::If => self.parse_if(),
             TokenKind::Case => self.parse_case(),
             TokenKind::Do => self.parse_do_expr(),
             TokenKind::Serve => self.parse_serve_expr(),
@@ -1595,8 +1591,7 @@ impl Parser {
             if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
             let rhs = if matches!(
                 self.peek(),
-                TokenKind::If
-                    | TokenKind::Case
+                TokenKind::Case
                     | TokenKind::Do
                     | TokenKind::Backslash
                     | TokenKind::Atomic
@@ -2926,7 +2921,7 @@ impl Parser {
         // is dispatched from `parse_expr_head`, NOT `parse_atom`, so it never
         // gets the delimiter charge that guards `((((…))))`. Charge the budget
         // here so pathological nesting diagnoses instead of overflowing.
-        // (Mirrors `parse_do_expr`. Same applies to `parse_if`/`parse_case`.)
+        // (Mirrors `parse_do_expr`. Same applies to `parse_case`.)
         if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
             return None;
         }
@@ -2971,44 +2966,6 @@ impl Parser {
                     params,
                     ty_params,
                     body: Box::new(body),
-                },
-                Span::new(start.start, end_sp.end),
-            ))
-        });
-        self.recursion_depth -= DELIMITER_RECURSION_COST;
-        result
-    }
-
-    fn parse_if(&mut self) -> Option<Expr> {
-        let start = self.span();
-        if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
-            return None;
-        }
-        let result = self.in_context("if expression", |this| {
-            this.advance(); // consume `if`
-
-            let cond = this.parse_expr()?;
-            this.skip_newlines();
-            this.expect(
-                &TokenKind::Then,
-                "expected 'then' after condition in 'if' expression",
-            )
-            .ok()?;
-            let then_branch = this.parse_expr()?;
-            this.skip_newlines();
-            this.expect(
-                &TokenKind::Else,
-                "expected 'else' after 'then' branch in 'if' expression",
-            )
-            .ok()?;
-            let else_branch = this.parse_expr()?;
-
-            let end_sp = else_branch.span;
-            Some(Spanned::new(
-                ExprKind::If {
-                    cond: Box::new(cond),
-                    then_branch: Box::new(then_branch),
-                    else_branch: Box::new(else_branch),
                 },
                 Span::new(start.start, end_sp.end),
             ))

@@ -580,9 +580,6 @@ impl Parser {
             }
             TokenKind::Where
             | TokenKind::Do
-            | TokenKind::If
-            | TokenKind::Then
-            | TokenKind::Else
             | TokenKind::Case
             | TokenKind::Of
             | TokenKind::Let
@@ -903,7 +900,7 @@ impl Parser {
             // Keywords that cannot start a new block item terminate the block.
             // For example, `in` after `let active = do ...; yield x in ...`
             // belongs to the enclosing `let...in`, not to the do block.
-            if matches!(self.peek(), TokenKind::In | TokenKind::Then | TokenKind::Else | TokenKind::Of) {
+            if matches!(self.peek(), TokenKind::In | TokenKind::Of) {
                 break;
             }
             // Peek past newlines to check if the next item is still in
@@ -2287,7 +2284,6 @@ impl Parser {
         }
         match self.peek() {
             TokenKind::Backslash => self.parse_lambda(),
-            TokenKind::If => self.parse_if(),
             TokenKind::Case => self.parse_case(),
             TokenKind::Do => self.parse_do_expr(),
             TokenKind::Serve => self.parse_serve_expr(),
@@ -2504,7 +2500,6 @@ impl Parser {
             let rhs = if matches!(
                 self.peek(),
                 TokenKind::Let
-                    | TokenKind::If
                     | TokenKind::Case
                     | TokenKind::Do
                     | TokenKind::Backslash
@@ -3311,7 +3306,7 @@ impl Parser {
         // is dispatched from `parse_expr_head`, NOT `parse_atom`, so it never
         // gets the delimiter charge that guards `((((…))))`. Charge the budget
         // here so pathological nesting diagnoses instead of overflowing.
-        // (Mirrors `parse_do_expr`. Same applies to `parse_if`/`parse_case`/
+        // (Mirrors `parse_do_expr`. Same applies to `parse_case`/
         // `parse_let_in_expr` below.)
         if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
             return None;
@@ -3348,44 +3343,6 @@ impl Parser {
                 ExprKind::Lambda {
                     params,
                     body: Box::new(body),
-                },
-                Span::new(start.start, end_sp.end),
-            ))
-        });
-        self.recursion_depth -= DELIMITER_RECURSION_COST;
-        result
-    }
-
-    fn parse_if(&mut self) -> Option<Expr> {
-        let start = self.span();
-        if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
-            return None;
-        }
-        let result = self.in_context("if expression", |this| {
-            this.advance(); // consume `if`
-
-            let cond = this.parse_expr()?;
-            this.skip_newlines();
-            this.expect(
-                &TokenKind::Then,
-                "expected 'then' after condition in 'if' expression",
-            )
-            .ok()?;
-            let then_branch = this.parse_expr()?;
-            this.skip_newlines();
-            this.expect(
-                &TokenKind::Else,
-                "expected 'else' after 'then' branch in 'if' expression",
-            )
-            .ok()?;
-            let else_branch = this.parse_expr()?;
-
-            let end_sp = else_branch.span;
-            Some(Spanned::new(
-                ExprKind::If {
-                    cond: Box::new(cond),
-                    then_branch: Box::new(then_branch),
-                    else_branch: Box::new(else_branch),
                 },
                 Span::new(start.start, end_sp.end),
             ))
@@ -4816,34 +4773,6 @@ mod tests {
                 }
                 other => panic!("expected BinOp Add, got {:?}", other),
             },
-            other => panic!("expected Fun, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn parse_if_expr() {
-        // f = \x -> if x then 1 else 2
-        let source = r"f = \x -> if x then 1 else 2".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Lower("f".into()), 0, 1),
-            (TokenKind::Eq, 2, 3),
-            (TokenKind::Backslash, 4, 5),
-            (TokenKind::Lower("x".into()), 5, 6),
-            (TokenKind::Arrow, 7, 9),
-            (TokenKind::If, 10, 12),
-            (TokenKind::Lower("x".into()), 13, 14),
-            (TokenKind::Then, 15, 19),
-            (TokenKind::Int("1".into()), 20, 21),
-            (TokenKind::Else, 22, 26),
-            (TokenKind::Int("2".into()), 27, 28),
-            (TokenKind::Eof, 28, 28),
-        ]);
-        let (module, diags) = Parser::new(source, tokens).parse_module();
-        assert!(diags.is_empty(), "diags: {:?}", diags);
-        match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
-                assert!(matches!(&body.node, ExprKind::Lambda { .. }));
-            }
             other => panic!("expected Fun, got {:?}", other),
         }
     }

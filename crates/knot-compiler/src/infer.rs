@@ -5739,35 +5739,6 @@ impl Infer {
                 }
             }
 
-            ast::ExprKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                let cond_ty = self.infer_expr(cond);
-                self.unify(&cond_ty, &Ty::Bool, cond.span);
-                // Unify each branch against a fresh result var (the same
-                // shape `case` uses) rather than unifying the branches
-                // directly: when both branches are *concrete* `Ty::IO`s
-                // with different closed effect sets (e.g. `*a` vs `*b`),
-                // Both branches unify into the fresh result var.
-                let result_ty = self.fresh();
-                let then_ty = self.infer_expr(then_branch);
-                self.unify(&then_ty, &result_ty, then_branch.span);
-                let else_ty = self.infer_expr(else_branch);
-                self.unify(&else_ty, &result_ty, else_branch.span);
-                // When one branch is IO and the other Relation, prefer IO.
-                // This handles functions whose IO nature wasn't detected
-                // due to declaration ordering (callee inferred after caller).
-                let applied_then = self.apply(&then_ty);
-                let applied_else = self.apply(&else_ty);
-                match (&applied_then, &applied_else) {
-                    (Ty::IO(inner), _) => Ty::IO(inner.clone()),
-                    (_, Ty::IO(inner)) => Ty::IO(inner.clone()),
-                    _ => result_ty,
-                }
-            }
-
             ast::ExprKind::Case { scrutinee, arms } => {
                 let scrut_ty = self.infer_expr(scrutinee);
                 let result_ty = self.fresh();
@@ -6323,16 +6294,6 @@ impl Infer {
                     // t1_provided=false for correct Forall polarity.
                     self.unify_dir(expected, &inferred, expr.span, false);
                 }
-            }
-            ast::ExprKind::If { cond, then_branch, else_branch } => {
-                // Push expected into both branches so a mismatch lights up
-                // just the offending branch instead of the whole if.
-                let cond_ty = self.infer_expr(cond);
-                self.unify(&cond_ty, &Ty::Bool, cond.span);
-                let then_ty = self.infer_expr(then_branch);
-                self.unify_dir(expected, &then_ty, then_branch.span, false);
-                let else_ty = self.infer_expr(else_branch);
-                self.unify_dir(expected, &else_ty, else_branch.span, false);
             }
             ast::ExprKind::Case { scrutinee, arms } => {
                 // Push expected into each arm body so a mismatch lights up
@@ -7604,11 +7565,6 @@ impl Infer {
                 self.expr_is_io_prescan(lhs) || self.expr_is_io_prescan(rhs)
             }
             ast::ExprKind::UnaryOp { operand, .. } => self.expr_is_io_prescan(operand),
-            ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
-                self.expr_is_io_prescan(cond)
-                    || self.expr_is_io_prescan(then_branch)
-                    || self.expr_is_io_prescan(else_branch)
-            }
             ast::ExprKind::Case { scrutinee, arms, .. } => {
                 self.expr_is_io_prescan(scrutinee)
                     || arms.iter().any(|arm| self.expr_is_io_prescan(&arm.body))
@@ -10911,19 +10867,6 @@ fn value_references_source_inner(
         ast::ExprKind::UnaryOp { operand, .. } => value_references_source_inner(
             operand, source_name, aliases, let_bindings, visited,
         ),
-        ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            value_references_source_inner(
-                cond, source_name, aliases, let_bindings, visited,
-            ) || value_references_source_inner(
-                then_branch, source_name, aliases, let_bindings, visited,
-            ) || value_references_source_inner(
-                else_branch, source_name, aliases, let_bindings, visited,
-            )
-        }
         ast::ExprKind::Case { scrutinee, arms } => {
             value_references_source_inner(
                 scrutinee, source_name, aliases, let_bindings, visited,
@@ -11656,11 +11599,6 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
             f(rhs);
         }
         UnaryOp { operand, .. } => f(operand),
-        If { cond, then_branch, else_branch } => {
-            f(cond);
-            f(then_branch);
-            f(else_branch);
-        }
         Case { scrutinee, arms } => {
             f(scrutinee);
             for arm in arms {
@@ -11732,11 +11670,6 @@ fn walk_exprs_read<'a>(e: &'a ast::Expr, f: &mut impl FnMut(&'a ast::Expr)) {
             walk_exprs_read(rhs, f);
         }
         UnaryOp { operand, .. } => walk_exprs_read(operand, f),
-        If { cond, then_branch, else_branch } => {
-            walk_exprs_read(cond, f);
-            walk_exprs_read(then_branch, f);
-            walk_exprs_read(else_branch, f);
-        }
         Case { scrutinee, arms } => {
             walk_exprs_read(scrutinee, f);
             for arm in arms {
@@ -11849,11 +11782,6 @@ fn for_each_data_ctor_scoped<'a>(
                 walk(rhs, d, f);
             }
             UnaryOp { operand, .. } => walk(operand, d, f),
-            If { cond, then_branch, else_branch } => {
-                walk(cond, d, f);
-                walk(then_branch, d, f);
-                walk(else_branch, d, f);
-            }
             Case { scrutinee, arms } => {
                 walk(scrutinee, d, f);
                 for arm in arms {

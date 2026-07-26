@@ -502,15 +502,6 @@ impl<'a> TokenCollector<'a> {
                 self.visit_expr(rhs);
             }
             ast::ExprKind::UnaryOp { operand, .. } => self.visit_expr(operand),
-            ast::ExprKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                self.visit_expr(cond);
-                self.visit_expr(then_branch);
-                self.visit_expr(else_branch);
-            }
             ast::ExprKind::Case { scrutinee, arms } => {
                 self.visit_expr(scrutinee);
                 for arm in arms {

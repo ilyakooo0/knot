@@ -533,15 +533,6 @@ impl<'a> DefResolver<'a> {
                 self.resolve_expr(rhs);
             }
             ast::ExprKind::UnaryOp { operand, .. } => self.resolve_expr(operand),
-            ast::ExprKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                self.resolve_expr(cond);
-                self.resolve_expr(then_branch);
-                self.resolve_expr(else_branch);
-            }
             ast::ExprKind::Atomic(e) => self.resolve_expr(e),
             ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
                 self.resolve_expr(target);

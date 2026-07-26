@@ -32,9 +32,6 @@ pub enum TokenKind {
     Migrate,
     Where,
     Do,
-    If,
-    Then,
-    Else,
     Case,
     Of,
     Let,
@@ -124,9 +121,6 @@ impl TokenKind {
             TokenKind::Migrate => "'migrate'",
             TokenKind::Where => "'where'",
             TokenKind::Do => "'do'",
-            TokenKind::If => "'if'",
-            TokenKind::Then => "'then'",
-            TokenKind::Else => "'else'",
             TokenKind::Case => "'case'",
             TokenKind::Of => "'of'",
             TokenKind::Let => "'let'",
@@ -196,9 +190,6 @@ impl TokenKind {
             TokenKind::Migrate => Some("migrate"),
             TokenKind::Where => Some("where"),
             TokenKind::Do => Some("do"),
-            TokenKind::If => Some("if"),
-            TokenKind::Then => Some("then"),
-            TokenKind::Else => Some("else"),
             TokenKind::Case => Some("case"),
             TokenKind::Of => Some("of"),
             TokenKind::Let => Some("let"),
@@ -477,9 +468,6 @@ impl<'src> Lexer<'src> {
                 "migrate" => return TokenKind::Migrate,
                 "where" => return TokenKind::Where,
                 "do" => return TokenKind::Do,
-                "if" => return TokenKind::If,
-                "then" => return TokenKind::Then,
-                "else" => return TokenKind::Else,
                 "case" => return TokenKind::Case,
                 "of" => return TokenKind::Of,
                 "let" => return TokenKind::Let,
@@ -1157,12 +1145,13 @@ mod tests {
 
     #[test]
     fn keywords() {
+        // `if`/`then`/`else` are no longer keywords — they lex as identifiers.
         assert_eq!(
             kinds("if then else let in"),
             vec![
-                TokenKind::If,
-                TokenKind::Then,
-                TokenKind::Else,
+                TokenKind::Lower("if".into()),
+                TokenKind::Lower("then".into()),
+                TokenKind::Lower("else".into()),
                 TokenKind::Let,
                 TokenKind::In,
                 TokenKind::Eof,
@@ -1289,6 +1278,6 @@ mod tests {
         assert_eq!(TokenKind::Int("0".into()).display_name(), "integer literal");
         assert_eq!(TokenKind::Eof.display_name(), "end of file");
         assert_eq!(TokenKind::Plus.display_name(), "'+'");
-        assert_eq!(TokenKind::If.display_name(), "'if'");
+        assert_eq!(TokenKind::Case.display_name(), "'case'");
     }
 }

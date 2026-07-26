@@ -82,34 +82,6 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
                     ..Default::default()
                 });
             }
-        ast::ExprKind::If {
-            then_branch,
-            else_branch,
-            ..
-        } => {
-            let then_range = span_to_range(then_branch.span, source);
-            if then_range.end.line > then_range.start.line {
-                ranges.push(FoldingRange {
-                    start_line: then_range.start.line,
-                    start_character: Some(then_range.start.character),
-                    end_line: then_range.end.line,
-                    end_character: Some(then_range.end.character),
-                    kind: Some(FoldingRangeKind::Region),
-                    ..Default::default()
-                });
-            }
-            let else_range = span_to_range(else_branch.span, source);
-            if else_range.end.line > else_range.start.line {
-                ranges.push(FoldingRange {
-                    start_line: else_range.start.line,
-                    start_character: Some(else_range.start.character),
-                    end_line: else_range.end.line,
-                    end_character: Some(else_range.end.character),
-                    kind: Some(FoldingRangeKind::Region),
-                    ..Default::default()
-                });
-            }
-        }
         _ => {}
     }
 
@@ -141,15 +113,6 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
         }
         ast::ExprKind::Lambda { body, .. } => {
             collect_folding_ranges_expr(body, source, ranges);
-        }
-        ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            collect_folding_ranges_expr(cond, source, ranges);
-            collect_folding_ranges_expr(then_branch, source, ranges);
-            collect_folding_ranges_expr(else_branch, source, ranges);
         }
         ast::ExprKind::App { func, arg } => {
             collect_folding_ranges_expr(func, source, ranges);

@@ -204,15 +204,6 @@ fn recurse<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
             collect(rhs, out);
         }
         UnaryOp { operand, .. } => collect(operand, out),
-        If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            collect(cond, out);
-            collect(then_branch, out);
-            collect(else_branch, out);
-        }
         Case { scrutinee, arms } => {
             collect(scrutinee, out);
             for arm in arms {

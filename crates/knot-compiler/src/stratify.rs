@@ -419,11 +419,6 @@ fn collect_edges(
             };
             collect_edges(operand, child_polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
-        ast::ExprKind::If { cond, then_branch, else_branch } => {
-            collect_edges(cond, polarity, node_names, env, partial_diffs, diff_wrappers, out);
-            collect_edges(then_branch, polarity, node_names, env, partial_diffs, diff_wrappers, out);
-            collect_edges(else_branch, polarity, node_names, env, partial_diffs, diff_wrappers, out);
-        }
         ast::ExprKind::Case { scrutinee, arms } => {
             collect_edges(scrutinee, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             for arm in arms {

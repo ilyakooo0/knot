@@ -673,23 +673,6 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
                 ast::UnaryOp::Neg => format!("-{}", go(operand, true)?),
                 ast::UnaryOp::Not => format!("not {}", go(operand, true)?),
             },
-            ast::ExprKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                let rendered = format!(
-                    "if {} then {} else {}",
-                    go(cond, false)?,
-                    go(then_branch, false)?,
-                    go(else_branch, false)?
-                );
-                return Some(if nested {
-                    format!("({rendered})")
-                } else {
-                    rendered
-                });
-            }
             _ => return None,
         };
         Some(s)

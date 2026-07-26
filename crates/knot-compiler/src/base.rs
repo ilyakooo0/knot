@@ -32,16 +32,24 @@ const PRELUDE_SOURCE: &str = r#"
 {
 base {
 min : a -> a -> a
-min (\a b -> if a < b then a else b)
+min (\a b -> case a < b of
+  true -> a
+  false -> b)
 
 max : a -> a -> a
-max (\a b -> if a > b then a else b)
+max (\a b -> case a > b of
+  true -> a
+  false -> b)
 
 when : Bool -> IO {} -> IO {}
-when (\cond action -> if cond then action else yield {})
+when (\cond action -> case cond of
+  true -> action
+  false -> yield {})
 
 unless : Bool -> IO {} -> IO {}
-unless (\cond action -> if cond then yield {} else action)
+unless (\cond action -> case cond of
+  true -> yield {}
+  false -> action)
 }
 }
 "#;
@@ -193,11 +201,6 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
             shift_expr_spans(rhs, offset);
         }
         UnaryOp { operand, .. } => shift_expr_spans(operand, offset),
-        If { cond, then_branch, else_branch } => {
-            shift_expr_spans(cond, offset);
-            shift_expr_spans(then_branch, offset);
-            shift_expr_spans(else_branch, offset);
-        }
         Case { scrutinee, arms } => {
             shift_expr_spans(scrutinee, offset);
             for arm in arms {

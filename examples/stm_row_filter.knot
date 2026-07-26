@@ -16,7 +16,9 @@ findById (\aid rows -> base.single (base.filter (\a -> a.id == aid) rows))
 
 setBalance (\aid newBalance rows -> do
   r <- rows
-  yield (if r.id == aid then {r | balance newBalance} else r))
+  yield (case r.id == aid of
+    true -> {r | balance newBalance}
+    false -> r))
 
 credit (\aid amount -> atomic do
   rows <- *accounts

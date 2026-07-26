@@ -1704,15 +1704,6 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             };
             paren_if(parent > Prec::Unary, s)
         }
-        ExprKind::If { cond, then_branch, else_branch } => {
-            let s = format!(
-                "if {} then {} else {}",
-                render_expr_inline(cond, Prec::Lowest),
-                render_expr_inline(then_branch, Prec::Lowest),
-                render_expr_inline(else_branch, Prec::Lowest),
-            );
-            paren_if(parent > Prec::Lowest, s)
-        }
         ExprKind::Case { scrutinee, arms } => {
             let mut s = format!("case {} of", render_expr_inline(scrutinee, Prec::Lowest));
             // The first arm follows `of` directly; `;` only separates arms.
@@ -1934,10 +1925,9 @@ fn annot_inner_needs_parens(e: &Expr, inline: bool) -> bool {
         return true;
     }
     match &e.node {
-        // Tail is `parse_expr`: lambda body, else-branch, atomic/refine
+        // Tail is `parse_expr`: lambda body, atomic/refine
         // operand, set/replace value.
         ExprKind::Lambda { .. }
-        | ExprKind::If { .. }
         | ExprKind::Atomic(_)
         | ExprKind::Refine(_)
         | ExprKind::Set { .. }
@@ -1979,9 +1969,6 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
     match &e.node {
         ExprKind::Do(stmts) => render_do_block(p, stmts, parent),
         ExprKind::Case { scrutinee, arms } => render_case_block(p, scrutinee, arms, parent),
-        ExprKind::If { cond, then_branch, else_branch } => {
-            render_if_block(p, cond, then_branch, else_branch, parent)
-        }
         ExprKind::Lambda { params, body } => {
             // `\x y -> body` where body is multiline
             let need_parens = parent > Prec::Lowest;
@@ -2153,29 +2140,6 @@ fn render_case_block(p: &mut Printer, scrut: &Expr, arms: &[CaseArm], parent: Pr
                 p.newline();
             }
         }
-    });
-    if need_parens {
-        p.write(")");
-    }
-}
-
-fn render_if_block(p: &mut Printer, cond: &Expr, then_branch: &Expr, else_branch: &Expr, parent: Prec) {
-    let need_parens = parent > Prec::Lowest;
-    if need_parens {
-        p.write("(");
-    }
-    p.write("if ");
-    render_expr(p, cond, Prec::Lowest);
-    // Indent `then`/`else` relative to the `if` (mirrors how `case` indents
-    // its arms): the newline must precede the writes inside `with_indent` so
-    // the branch keywords are padded with the deeper indent.
-    p.with_indent(|p| {
-        p.newline();
-        p.write("then ");
-        render_expr(p, then_branch, Prec::Lowest);
-        p.newline();
-        p.write("else ");
-        render_expr(p, else_branch, Prec::Lowest);
     });
     if need_parens {
         p.write(")");

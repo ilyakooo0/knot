@@ -11,8 +11,7 @@ use knot::diagnostic::Diagnostic;
 
 use crate::codegen::{
     beta_reduce, divisor_is_nonzero_int_literal, divisor_is_nonzero_literal, expr_has_tag_column,
-    expr_refs_var, infer_sql_expr_type,
-    lookup_col_type_from_schema,
+    expr_refs_var, lookup_col_type_from_schema,
     minmax_pushdown_type_ok, sortby_projection_pushable, sql_comparison_cast_mode,
     SqlCastMode,
 };
@@ -137,15 +136,6 @@ fn lint_expr(
         ExprKind::With { record, body } => {
             lint_expr(record, source_schemas, views, fun_bodies, diags);
             lint_expr(body, source_schemas, views, fun_bodies, diags);
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            lint_expr(cond, source_schemas, views, fun_bodies, diags);
-            lint_expr(then_branch, source_schemas, views, fun_bodies, diags);
-            lint_expr(else_branch, source_schemas, views, fun_bodies, diags);
         }
         ExprKind::Lambda { body, .. } => {
             lint_expr(body, source_schemas, views, fun_bodies, diags);
@@ -321,43 +311,6 @@ fn lint_set_expr(
     // Check if value references the source (self-referential update)
     if !references_source(value, source_name) {
         return; // Full replace — no SQL optimization needed
-    }
-
-    // Try conditional update pattern:
-    //   do { t <- *rel; yield (if cond then {t | ...} else t) }
-    if let Some((bind_var, cond, update_fields)) =
-        match_conditional_update(source_name, value)
-    {
-        let where_ok = try_compile_sql_expr(&bind_var, cond, schema).is_some();
-        let set_ok = where_ok
-            && update_fields.iter().all(|(_, val)| {
-                matches!(val.node, ExprKind::Lit(_) | ExprKind::Var(_))
-                    || try_sql_atom(&bind_var, val).is_some()
-            });
-
-        if !where_ok {
-            diags.push(
-                Diagnostic::info(
-                    "conditional update will use full table rewrite instead of SQL UPDATE",
-                )
-                .label(cond.span, "condition cannot be compiled to SQL WHERE")
-                .note(
-                    "only simple comparisons on source fields against literals \
-                     or variables can be compiled to SQL",
-                ),
-            );
-        } else if !set_ok {
-            diags.push(
-                Diagnostic::info(
-                    "conditional update will use full table rewrite instead of SQL UPDATE",
-                )
-                .label(
-                    value.span,
-                    "update values must be literals or variables for SQL SET",
-                ),
-            );
-        }
-        return;
     }
 
     // Try filter-only pattern:
@@ -944,61 +897,6 @@ fn lookup_col_type(schema: &str, col_name: &str) -> Option<String> {
 
 // ── Pattern matchers (mirror codegen.rs) ───────────────────────────
 
-/// Matched conditional-update shape: the condition expression, the update
-/// value expression, and the `(column, value-expr)` field assignments.
-type ConditionalUpdate<'a> = (String, &'a Expr, Vec<(&'a str, &'a Expr)>);
-
-fn match_conditional_update<'a>(
-    source_name: &str,
-    value: &'a Expr,
-) -> Option<ConditionalUpdate<'a>> {
-    let stmts = match &value.node {
-        ExprKind::Do(stmts) => stmts,
-        _ => return None,
-    };
-    if stmts.len() != 2 {
-        return None;
-    }
-
-    let bind_var = match &stmts[0].node {
-        StmtKind::Bind { pat, expr } => match (&pat.node, &expr.node) {
-            (PatKind::Var(v), ExprKind::SourceRef(name)) if name == source_name => v.clone(),
-            _ => return None,
-        },
-        _ => return None,
-    };
-
-    if let StmtKind::Expr(e) = &stmts[1].node
-        && let Some(yield_inner) = e.node.as_yield_arg()
-            && let ExprKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } = &yield_inner.node
-            {
-                if let ExprKind::Var(v) = &else_branch.node {
-                    if v != &bind_var {
-                        return None;
-                    }
-                } else {
-                    return None;
-                }
-                if let ExprKind::RecordUpdate { base, fields } = &then_branch.node {
-                    if let ExprKind::Var(v) = &base.node {
-                        if v != &bind_var {
-                            return None;
-                        }
-                    } else {
-                        return None;
-                    }
-                    let update_fields: Vec<(&str, &Expr)> =
-                        fields.iter().map(|f| (f.name.as_str(), &f.value)).collect();
-                    return Some((bind_var, cond, update_fields));
-                }
-            }
-    None
-}
-
 fn match_filter_only<'a>(
     source_name: &str,
     value: &'a Expr,
@@ -1076,15 +974,6 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         }
         ExprKind::With { record, body } => {
             references_source(record, source_name) || references_source(body, source_name)
-        }
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            references_source(cond, source_name)
-                || references_source(then_branch, source_name)
-                || references_source(else_branch, source_name)
         }
         ExprKind::Lambda { body, .. } => references_source(body, source_name),
         ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
@@ -1272,9 +1161,7 @@ fn extract_single_param_lambda(expr: &Expr) -> Option<(String, &Expr)> {
 /// (Float MIN/MAX diverges from `total_cmp`, so it stays in memory). The
 /// MIN/MAX runtime is told whether the result column is textual (`is_text`)
 /// so Text results are returned verbatim instead of being re-parsed as Int.
-/// Int-typed if/then/else projections are also rejected (MIN/MAX over CASE
-/// loses the KNOT_INT collation) — that check lives in
-/// `minmax_pushdown_type_ok`.
+/// Type-dependent rejections live in `minmax_pushdown_type_ok`.
 fn try_sql_minmax_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> {
     try_sql_column_expr(bind_var, body, schema)?;
     if minmax_pushdown_type_ok(bind_var, body, schema) {
@@ -1285,12 +1172,11 @@ fn try_sql_minmax_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> 
 }
 
 /// Mirror of codegen's sortBy pushdown approval: the lambda body must
-/// compile to a SQL column expression, Int-typed if/then/else projections
-/// are rejected (ORDER BY CASE loses the KNOT_INT collation), and float-typed
-/// projections are rejected (SQLite REAL ordering diverges from Knot's
-/// `total_cmp`). Uses `sortby_projection_pushable` — the same predicate codegen
+/// compile to a SQL column expression, and float-typed projections are
+/// rejected (SQLite REAL ordering diverges from Knot's `total_cmp`).
+/// Uses `sortby_projection_pushable` — the same predicate codegen
 /// applies — so this lint's "evaluated at runtime" info matches what actually
-/// happens (previously it used `int_case_projection_pushable`, missing the
+/// happens (previously it used a CASE-based predicate, missing the
 /// float rejection and falsely believing float sorts pushed down).
 fn try_sql_sortby_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> {
     try_sql_column_expr(bind_var, body, schema)?;
@@ -1303,7 +1189,7 @@ fn try_sql_sortby_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> 
 
 /// Check if a lambda body can be compiled to a SQL expression.
 /// Mirrors codegen's `extract_sql_field_access` which handles simple field access,
-/// arithmetic expressions (including ++), CASE WHEN, and built-in functions.
+/// arithmetic expressions (including ++), and built-in functions.
 fn try_sql_column_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> {
     match &body.node {
         ExprKind::FieldAccess { expr, .. } => {
@@ -1333,11 +1219,6 @@ fn try_sql_column_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> 
                 }
                 _ => None,
             }
-        }
-        ExprKind::If { cond, then_branch, else_branch } => {
-            try_sql_inline_cond(bind_var, cond, schema)?;
-            try_sql_column_expr(bind_var, then_branch, schema)?;
-            try_sql_column_expr(bind_var, else_branch, schema)
         }
         // toUpper/toLower are NOT pushed down (ASCII-only in SQLite);
         // trim likewise (SQLite TRIM strips ASCII spaces only, the
@@ -1395,82 +1276,6 @@ fn lint_pipe_order_pushable(ops: &[LintPipeOp]) -> bool {
         last_stage = st;
     }
     true
-}
-
-/// Check if a condition can be compiled to an inline SQL condition (for CASE WHEN).
-fn try_sql_inline_cond(bind_var: &str, expr: &Expr, schema: &str) -> Option<()> {
-    match &expr.node {
-        ExprKind::BinOp { op, lhs, rhs } => match op {
-            BinOp::And | BinOp::Or => {
-                try_sql_inline_cond(bind_var, lhs, schema)?;
-                try_sql_inline_cond(bind_var, rhs, schema)
-            }
-            BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
-                // Mirror codegen's inline-condition gates: float
-                // comparisons stay in memory (total_cmp vs SQL
-                // -0.0/NaN-as-NULL); ordered comparisons on tag columns
-                // ignore the type's Ord.
-                let lt = infer_sql_expr_type(bind_var, lhs, schema);
-                let rt = infer_sql_expr_type(bind_var, rhs, schema);
-                if lt.as_deref() == Some("float") || rt.as_deref() == Some("float") {
-                    return None;
-                }
-                // json-stored columns (ADT payloads / nested records) compare
-                // as raw JSON text in SQL, which can diverge from Knot's
-                // structural equality. Codegen's `try_sql_inline_condition`
-                // refuses to push these; mirror that here so the lint doesn't
-                // claim a query is pushed down when codegen keeps it in memory.
-                if lt.as_deref() == Some("json") || rt.as_deref() == Some("json") {
-                    return None;
-                }
-                if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
-                    && (lt.as_deref() == Some("tag") || rt.as_deref() == Some("tag"))
-                {
-                    return None;
-                }
-                try_sql_column_expr(bind_var, lhs, schema)?;
-                try_sql_column_expr(bind_var, rhs, schema)
-            }
-            _ => None,
-        },
-        ExprKind::UnaryOp { op: UnaryOp::Not, operand } => {
-            try_sql_inline_cond(bind_var, operand, schema)
-        }
-        ExprKind::App { func, arg } => {
-            if let ExprKind::App { func: inner_func, arg: first_arg } = &func.node
-                && let ExprKind::Var(name) = &inner_func.node {
-                    if name == "contains" {
-                        try_sql_column_expr(bind_var, first_arg, schema)?;
-                        return try_sql_column_expr(bind_var, arg, schema);
-                    }
-                    if name == "elem" {
-                        // Mirror codegen: float `IN` equality stays in memory.
-                        if infer_sql_expr_type(bind_var, first_arg, schema).as_deref()
-                            == Some("float")
-                        {
-                            return None;
-                        }
-                        try_sql_column_expr(bind_var, first_arg, schema)?;
-                        // The list arg must be a literal list of scalar literals.
-                        if let ExprKind::List(elems) = &arg.node {
-                            for e in elems {
-                                match &e.node {
-                                    ExprKind::Lit(Literal::Int(_))
-                                    | ExprKind::Lit(Literal::Float(_))
-                                    | ExprKind::Lit(Literal::Text(_))
-                                    | ExprKind::Lit(Literal::Bool(_)) => {}
-                                    _ => return None,
-                                }
-                            }
-                            return Some(());
-                        }
-                        return None;
-                    }
-                }
-            None
-        }
-        _ => None,
-    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────

@@ -14,7 +14,11 @@ appendDemo (do
 -- Conditional update: do-block update body bound to a with.
 discountDemo (do
   items <- *items
-  with {discounted (do i <- items; yield (if i.price > 20 then {i | price (i.price - 5)} else i))} *items = discounted)
+  with {discounted (do
+    i <- items
+    yield (case i.price > 20 of
+      true -> {i | price (i.price - 5)}
+      false -> i))} *items = discounted)
 
 -- Filter only: do-block filter body bound to a with.
 pruneDemo (do

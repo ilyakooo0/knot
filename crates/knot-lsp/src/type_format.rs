@@ -225,7 +225,7 @@ fn format_binop_operand(expr: &ast::ExprKind, depth: usize, parent_prec: u8, is_
             let child_prec = bin_op_prec(*op);
             child_prec < parent_prec || (child_prec == parent_prec && is_rhs)
         }
-        ast::ExprKind::Lambda { .. } | ast::ExprKind::If { .. } => true,
+        ast::ExprKind::Lambda { .. } => true,
         _ => false,
     };
     if needs_parens {

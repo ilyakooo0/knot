@@ -428,9 +428,6 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
             | TokenKind::Migrate
             | TokenKind::Where
             | TokenKind::Do
-            | TokenKind::If
-            | TokenKind::Then
-            | TokenKind::Else
             | TokenKind::Case
             | TokenKind::Of
             | TokenKind::Not
@@ -503,15 +500,6 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
             f(rhs);
         }
         ast::ExprKind::UnaryOp { operand, .. } => f(operand),
-        ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            f(cond);
-            f(then_branch);
-            f(else_branch);
-        }
         ast::ExprKind::Case { scrutinee, arms } => {
             f(scrutinee);
             for arm in arms {

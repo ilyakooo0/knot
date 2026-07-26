@@ -124,11 +124,6 @@ fn walk_expr_children_read(expr: &Expr, f: &mut impl FnMut(&Expr)) {
             f(rhs);
         }
         ExprKind::UnaryOp { operand, .. } => f(operand),
-        ExprKind::If { cond, then_branch, else_branch } => {
-            f(cond);
-            f(then_branch);
-            f(else_branch);
-        }
         ExprKind::Case { scrutinee, arms } => {
             f(scrutinee);
             for arm in arms {
@@ -277,11 +272,6 @@ fn collect_fun_bodies<'a>(
         }
         ExprKind::UnaryOp { operand, .. } => {
             collect_fun_bodies(operand, fun_bodies, fun_sig_io)
-        }
-        ExprKind::If { cond, then_branch, else_branch } => {
-            collect_fun_bodies(cond, fun_bodies, fun_sig_io);
-            collect_fun_bodies(then_branch, fun_bodies, fun_sig_io);
-            collect_fun_bodies(else_branch, fun_bodies, fun_sig_io);
         }
         ExprKind::Case { scrutinee, arms } => {
             collect_fun_bodies(scrutinee, fun_bodies, fun_sig_io);
@@ -441,11 +431,6 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
             })
         }
         ExprKind::Lambda { body, .. } => expr_contains_io(body, builtins, io_fns),
-        ExprKind::If { cond, then_branch, else_branch, .. } => {
-            expr_contains_io(cond, builtins, io_fns)
-                || expr_contains_io(then_branch, builtins, io_fns)
-                || expr_contains_io(else_branch, builtins, io_fns)
-        }
         ExprKind::Case { scrutinee, arms, .. } => {
             expr_contains_io(scrutinee, builtins, io_fns)
                 || arms.iter().any(|arm| expr_contains_io(&arm.body, builtins, io_fns))
@@ -607,11 +592,6 @@ fn walk_expr_children(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
             f(rhs);
         }
         ExprKind::UnaryOp { operand, .. } => f(operand),
-        ExprKind::If { cond, then_branch, else_branch } => {
-            f(cond);
-            f(then_branch);
-            f(else_branch);
-        }
         ExprKind::Case { scrutinee, arms } => {
             f(scrutinee);
             for arm in arms {
@@ -775,15 +755,6 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
             desugar_expr(rhs, io_fns, source_vars);
         }
         ExprKind::UnaryOp { operand, .. } => desugar_expr(operand, io_fns, source_vars),
-        ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            desugar_expr(cond, io_fns, source_vars);
-            desugar_expr(then_branch, io_fns, source_vars);
-            desugar_expr(else_branch, io_fns, source_vars);
-        }
         ExprKind::Case { scrutinee, arms } => {
             desugar_expr(scrutinee, io_fns, source_vars);
             for arm in arms {
@@ -1217,11 +1188,6 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
         ExprKind::TimeUnitLit { value, .. } => expr_is_io(value, io_fns),
         ExprKind::Annot { expr, .. } => expr_is_io(expr, io_fns),
         ExprKind::Refine(inner) => expr_is_io(inner, io_fns),
-        ExprKind::If { cond, then_branch, else_branch, .. } => {
-            expr_is_io(cond, io_fns)
-                || expr_is_io(then_branch, io_fns)
-                || expr_is_io(else_branch, io_fns)
-        }
         ExprKind::Case { scrutinee, arms, .. } => {
             expr_is_io(scrutinee, io_fns)
                 || arms.iter().any(|arm| expr_is_io(&arm.body, io_fns))
@@ -1430,15 +1396,20 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
         }
 
         StmtKind::Where { cond } => {
-            // App(App(__bind, \_ -> rest), if cond then __yield({}) else __empty)
+            // App(App(__bind, \_ -> rest), case cond of true -> __yield({}); false -> __empty)
             let guard = spanned(
-                ExprKind::If {
-                    cond: Box::new(cond.clone()),
-                    then_branch: Box::new(mk_yield(
-                        spanned(ExprKind::Record(vec![]), span),
-                        span,
-                    )),
-                    else_branch: Box::new(mk_empty(span)),
+                ExprKind::Case {
+                    scrutinee: Box::new(cond.clone()),
+                    arms: vec![
+                        CaseArm {
+                            pat: spanned(PatKind::Lit(Literal::Bool(true)), span),
+                            body: mk_yield(spanned(ExprKind::Record(vec![]), span), span),
+                        },
+                        CaseArm {
+                            pat: spanned(PatKind::Lit(Literal::Bool(false)), span),
+                            body: mk_empty(span),
+                        },
+                    ],
                 },
                 span,
             );

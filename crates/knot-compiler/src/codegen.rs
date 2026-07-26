@@ -504,10 +504,6 @@ struct LoopInfo {
     arena_mark: Value,
 }
 
-/// Matched conditional-update shape:
-/// `(bind var, condition expr, `(field, value-expr)` update assignments)`.
-type ConditionalUpdateMatch<'a> = (String, &'a ast::Expr, Vec<(&'a str, &'a ast::Expr)>);
-
 /// Resolve a constant's inferred type, as rendered by inference, to the scalar
 /// type the runtime knows how to parse from argv. Returns one of the eight
 /// strings `define_user_function` maps to a type tag, or `None` when the
@@ -4599,41 +4595,6 @@ impl Codegen {
                 }
             }
 
-            ast::ExprKind::If {
-                cond,
-                then_branch,
-                else_branch,
-            } => {
-                let cond_i32 = self.compile_condition(builder, cond, env, db);
-                let is_true =
-                    builder.ins().icmp_imm(IntCC::NotEqual, cond_i32, 0);
-
-                let then_block = builder.create_block();
-                let else_block = builder.create_block();
-                let merge_block = builder.create_block();
-                merge_block_param(builder, merge_block, self.ptr_type);
-
-                builder
-                    .ins()
-                    .brif(is_true, then_block, &[], else_block, &[]);
-
-                builder.switch_to_block(then_block);
-                builder.seal_block(then_block);
-                let then_val =
-                    self.compile_expr(builder, then_branch, &mut env.clone(), db);
-                builder.ins().jump(merge_block, &[then_val.into()]);
-
-                builder.switch_to_block(else_block);
-                builder.seal_block(else_block);
-                let else_val =
-                    self.compile_expr(builder, else_branch, &mut env.clone(), db);
-                builder.ins().jump(merge_block, &[else_val.into()]);
-
-                builder.switch_to_block(merge_block);
-                builder.seal_block(merge_block);
-                builder.block_params(merge_block)[0]
-            }
-
             ast::ExprKind::Lambda { params, body, .. } => {
                 self.compile_lambda(builder, params, body, env, db)
             }
@@ -4754,82 +4715,6 @@ impl Codegen {
                             "knot_source_write",
                             &[db, name_ptr, name_len, schema_ptr, schema_len, val],
                         );
-                    } else if !schema.contains('[')
-                        && !self.source_refinements.contains_key(name)
-                        && let Some((bind_var, cond, update_fields)) =
-                            Self::match_conditional_update(name, match_value)
-                    {
-                        // 3. Conditional update: do { t <- *rel; yield (if cond then {t | ...} else t) }
-                        //    Try SQL UPDATE WHERE (skip for nested relations — child tables need full rewrite)
-                        //    Skip when source has refinements — SQL bypasses Knot-level validation
-                        let where_frag = self.try_compile_sql_expr(&bind_var, cond, &schema);
-                        let set_frag = where_frag.as_ref().and_then(|_| {
-                            let mut parts = Vec::new();
-                            let mut params = Vec::new();
-                            for (field_name, field_val) in &update_fields {
-                                match &field_val.node {
-                                    ast::ExprKind::Lit(lit) => {
-                                        parts.push(format!("{} = ?", quote_sql_ident(field_name)));
-                                        params.push(SqlParamSource::Literal(lit.clone()));
-                                    }
-                                    ast::ExprKind::Var(name) => {
-                                        parts.push(format!("{} = ?", quote_sql_ident(field_name)));
-                                        params.push(SqlParamSource::Var(name.clone()));
-                                    }
-                                    _ => {
-                                        // Try computed expression (e.g., p.price * 0.9)
-                                        let atom = Self::try_compile_single_table_atom(
-                                            &bind_var, field_val,
-                                        )?;
-                                        parts.push(format!(
-                                            "{} = {}",
-                                            quote_sql_ident(field_name),
-                                            atom.sql
-                                        ));
-                                        params.extend(atom.params);
-                                    }
-                                }
-                            }
-                            Some(SqlFragment {
-                                sql: parts.join(", "),
-                                params,
-                            })
-                        });
-
-                        if let (Some(wf), Some(sf)) = (where_frag, set_frag) {
-                            // SQL compilation succeeded → UPDATE WHERE
-                            let mut all_params = sf.params;
-                            all_params.extend(wf.params);
-                            let params_rel =
-                                self.compile_sql_params(builder, &all_params, env, db);
-                            let (name_ptr, name_len) = self.string_ptr(builder, name);
-                            let set_sql = sf.sql;
-                            let where_sql = wf.sql;
-                            let (set_ptr, set_len) =
-                                self.string_ptr(builder, &set_sql);
-                            let (where_ptr, where_len) =
-                                self.string_ptr(builder, &where_sql);
-                            self.call_rt_void(
-                                builder,
-                                "knot_source_update_where",
-                                &[
-                                    db, name_ptr, name_len, set_ptr, set_len,
-                                    where_ptr, where_len, params_rel,
-                                ],
-                            );
-                        } else {
-                            // SQL compilation failed → map with no filter → full write
-                            let val = self.compile_set_value_expr(builder, value, env, db);
-                            self.emit_refinement_checks(builder, name, val, env, db);
-                            let (name_ptr, name_len) = self.string_ptr(builder, name);
-                            let (schema_ptr, schema_len) =
-                                self.string_ptr(builder, &schema);
-                            self.call_rt_void(
-                                builder,
-                                "knot_source_write",
-                                &[db, name_ptr, name_len, schema_ptr, schema_len, val],
-                            );
-                        }
                     } else if !schema.contains('[')
                         && let Some((bind_var, conditions)) =
                             Self::match_filter_only(name, match_value)
@@ -5617,11 +5502,6 @@ impl Codegen {
             BinOp { lhs, rhs, .. } => {
                 self.collect_direct_write_targets(lhs, out)
                     && self.collect_direct_write_targets(rhs, out)
-            }
-            If { cond, then_branch, else_branch } => {
-                self.collect_direct_write_targets(cond, out)
-                    && self.collect_direct_write_targets(then_branch, out)
-                    && self.collect_direct_write_targets(else_branch, out)
             }
             Case { scrutinee, arms } => {
                 self.collect_direct_write_targets(scrutinee, out)
@@ -8279,7 +8159,7 @@ impl Codegen {
             // comprehension too. The branches are compiled by the generic
             // `compile_expr` path, so record their do-block spans first and
             // let the `Do` arm of `compile_expr` consult the set.
-            ast::ExprKind::If { .. } | ast::ExprKind::Case { .. } => {
+            ast::ExprKind::Case { .. } => {
                 Self::collect_relational_do_spans(value, &mut self.relational_do_spans);
                 self.compile_expr(builder, value, env, db)
             }
@@ -8289,7 +8169,7 @@ impl Codegen {
 
     /// Record the spans of do-blocks that a set/replace value produces its
     /// relation from. Result position extends through type/unit wrappers and
-    /// through `if`/`case` branches (which may nest arbitrarily), so the walk
+    /// through `case` branches (which may nest arbitrarily), so the walk
     /// mirrors `compile_set_value_expr`'s own recursion.
     fn collect_relational_do_spans(value: &ast::Expr, spans: &mut HashSet<ast::Span>) {
         match &value.node {
@@ -8299,14 +8179,6 @@ impl Codegen {
             ast::ExprKind::TimeUnitLit { value: inner, .. }
             | ast::ExprKind::Annot { expr: inner, .. }
             | ast::ExprKind::Refine(inner) => Self::collect_relational_do_spans(inner, spans),
-            ast::ExprKind::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                Self::collect_relational_do_spans(then_branch, spans);
-                Self::collect_relational_do_spans(else_branch, spans);
-            }
             ast::ExprKind::Case { arms, .. } => {
                 for arm in arms {
                     Self::collect_relational_do_spans(&arm.body, spans);
@@ -8417,11 +8289,6 @@ impl Codegen {
             }
             ast::ExprKind::Lambda { body, .. } => Self::expr_contains_io(body, builtins, io_fns),
             ast::ExprKind::With { body, .. } => Self::expr_contains_io(body, builtins, io_fns),
-            ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
-                Self::expr_contains_io(cond, builtins, io_fns)
-                    || Self::expr_contains_io(then_branch, builtins, io_fns)
-                    || Self::expr_contains_io(else_branch, builtins, io_fns)
-            }
             ast::ExprKind::Case { scrutinee, arms, .. } => {
                 Self::expr_contains_io(scrutinee, builtins, io_fns)
                     || arms.iter().any(|arm| Self::expr_contains_io(&arm.body, builtins, io_fns))
@@ -8505,10 +8372,6 @@ impl Codegen {
     ) -> bool {
         match &strip_expr_wrappers(expr).node {
             ast::ExprKind::Var(name) => params.contains(name),
-            ast::ExprKind::If { then_branch, else_branch, .. } => {
-                Self::tail_returns_param(then_branch, params, passthrough_fns)
-                    || Self::tail_returns_param(else_branch, params, passthrough_fns)
-            }
             ast::ExprKind::Case { arms, .. } => arms
                 .iter()
                 .any(|arm| Self::tail_returns_param(&arm.body, params, passthrough_fns)),
@@ -8640,11 +8503,6 @@ impl Codegen {
                 ast::StmtKind::GroupBy { key } => Self::expr_contains_writes(key, write_fns, known_fns, passthrough_fns),
             }),
             ast::ExprKind::Lambda { body, .. } => Self::expr_contains_writes(body, write_fns, known_fns, passthrough_fns),
-            ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
-                Self::expr_contains_writes(cond, write_fns, known_fns, passthrough_fns)
-                    || Self::expr_contains_writes(then_branch, write_fns, known_fns, passthrough_fns)
-                    || Self::expr_contains_writes(else_branch, write_fns, known_fns, passthrough_fns)
-            }
             ast::ExprKind::Case { scrutinee, arms, .. } => {
                 Self::expr_contains_writes(scrutinee, write_fns, known_fns, passthrough_fns)
                     || arms.iter().any(|arm| Self::expr_contains_writes(&arm.body, write_fns, known_fns, passthrough_fns))
@@ -8737,11 +8595,6 @@ impl Codegen {
                 self.expr_is_io_scoped(lhs, scopes) || self.expr_is_io_scoped(rhs, scopes)
             }
             ast::ExprKind::UnaryOp { operand, .. } => self.expr_is_io_scoped(operand, scopes),
-            ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
-                self.expr_is_io_scoped(cond, scopes)
-                    || self.expr_is_io_scoped(then_branch, scopes)
-                    || self.expr_is_io_scoped(else_branch, scopes)
-            }
             ast::ExprKind::Case { scrutinee, arms, .. } => {
                 self.expr_is_io_scoped(scrutinee, scopes)
                     || arms.iter().any(|arm| self.expr_is_io_scoped(&arm.body, scopes))
@@ -8881,11 +8734,6 @@ impl Codegen {
                 self.expr_has_external_io(lhs) || self.expr_has_external_io(rhs)
             }
             ast::ExprKind::UnaryOp { operand, .. } => self.expr_has_external_io(operand),
-            ast::ExprKind::If { cond, then_branch, else_branch, .. } => {
-                self.expr_has_external_io(cond)
-                    || self.expr_has_external_io(then_branch)
-                    || self.expr_has_external_io(else_branch)
-            }
             ast::ExprKind::Case { scrutinee, arms, .. } => {
                 self.expr_has_external_io(scrutinee)
                     || arms.iter().any(|arm| self.expr_has_external_io(&arm.body))
@@ -9471,47 +9319,6 @@ impl Codegen {
     ) -> Value {
         if let Some(inner) = expr.node.as_yield_arg() {
             return self.compile_expr(builder, inner, env, db);
-        }
-        if let ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } = &expr.node
-        {
-            let cond_i32 = self.compile_condition(builder, cond, env, db);
-            let is_true =
-                builder.ins().icmp_imm(IntCC::NotEqual, cond_i32, 0);
-            let then_block = builder.create_block();
-            let else_block = builder.create_block();
-            let merge_block = builder.create_block();
-            builder.append_block_param(merge_block, self.ptr_type);
-            builder
-                .ins()
-                .brif(is_true, then_block, &[], else_block, &[]);
-
-            builder.switch_to_block(then_block);
-            builder.seal_block(then_block);
-            let then_val = self.compile_io_expr_eager(
-                builder,
-                then_branch,
-                &mut env.clone(),
-                db,
-            );
-            builder.ins().jump(merge_block, &[then_val.into()]);
-
-            builder.switch_to_block(else_block);
-            builder.seal_block(else_block);
-            let else_val = self.compile_io_expr_eager(
-                builder,
-                else_branch,
-                &mut env.clone(),
-                db,
-            );
-            builder.ins().jump(merge_block, &[else_val.into()]);
-
-            builder.switch_to_block(merge_block);
-            builder.seal_block(merge_block);
-            return builder.block_params(merge_block)[0];
         }
         if let ast::ExprKind::Do(stmts) = &expr.node
             && self.is_io_do_block(stmts) {
@@ -11363,11 +11170,6 @@ impl Codegen {
             ast::ExprKind::UnaryOp { operand, .. } => {
                 Self::references_source(operand, source_name)
             }
-            ast::ExprKind::If { cond, then_branch, else_branch } => {
-                Self::references_source(cond, source_name)
-                    || Self::references_source(then_branch, source_name)
-                    || Self::references_source(else_branch, source_name)
-            }
             ast::ExprKind::Case { scrutinee, arms } => {
                 Self::references_source(scrutinee, source_name)
                     || arms.iter().any(|a| Self::references_source(&a.body, source_name))
@@ -12939,74 +12741,6 @@ impl Codegen {
         Some((bind_var, conditions))
     }
 
-    /// Detect `do { t <- *rel; yield (if cond then {t | fields} else t) }`.
-    /// Returns (bind_var, condition, update_fields) for SQL UPDATE WHERE.
-    fn match_conditional_update<'a>(
-        source_name: &str,
-        value: &'a ast::Expr,
-    ) -> Option<ConditionalUpdateMatch<'a>> {
-        let stmts = if let ast::ExprKind::Do(stmts) = &value.node {
-            stmts
-        } else {
-            return None;
-        };
-        if stmts.len() != 2 {
-            return None;
-        }
-
-        // First: t <- *rel
-        let bind_var = if let ast::StmtKind::Bind { pat, expr } = &stmts[0].node {
-            if let ast::ExprKind::SourceRef(name) = &expr.node {
-                if name == source_name {
-                    if let ast::PatKind::Var(v) = &pat.node {
-                        v.clone()
-                    } else {
-                        return None;
-                    }
-                } else {
-                    return None;
-                }
-            } else {
-                return None;
-            }
-        } else {
-            return None;
-        };
-
-        // Second: yield (if cond then {t | ...} else t)
-        if let ast::StmtKind::Expr(e) = &stmts[1].node
-            && let Some(yield_inner) = e.node.as_yield_arg()
-                && let ast::ExprKind::If {
-                    cond,
-                    then_branch,
-                    else_branch,
-                } = &yield_inner.node
-                {
-                    // else must be just the bind var
-                    if let ast::ExprKind::Var(v) = &else_branch.node {
-                        if v != &bind_var {
-                            return None;
-                        }
-                    } else {
-                        return None;
-                    }
-                    // then must be {t | field: val, ...}
-                    if let ast::ExprKind::RecordUpdate { base, fields } = &then_branch.node {
-                        if let ast::ExprKind::Var(v) = &base.node {
-                            if v != &bind_var {
-                                return None;
-                            }
-                        } else {
-                            return None;
-                        }
-                        let update_fields: Vec<(&str, &ast::Expr)> =
-                            fields.iter().map(|f| (f.name.as_str(), &f.value)).collect();
-                        return Some((bind_var, cond, update_fields));
-                    }
-                }
-        None
-    }
-
     /// Compile SQL bind parameters into a runtime Relation value.
     fn compile_sql_params(
         &mut self,
@@ -13640,13 +13374,6 @@ fn expr_is_promote_safe(expr: &ast::Expr) -> bool {
         ast::ExprKind::Constructor(name) => {
             matches!(name.as_str(), "True" | "False")
         }
-        // `if cond then t else e` produces whichever branch ran.  If
-        // both branches are promote-safe, the result is too.  Note we
-        // don't inspect `cond` — it's evaluated but its result doesn't
-        // reach the yield position; only the selected branch does.
-        ast::ExprKind::If { then_branch, else_branch, .. } => {
-            expr_is_promote_safe(then_branch) && expr_is_promote_safe(else_branch)
-        }
         // Case dispatch: if every arm's body is promote-safe, so is
         // the result.  An empty arm list shouldn't occur (ill-typed),
         // but we conservatively return false to avoid false positives.
@@ -13677,11 +13404,6 @@ fn expr_has_user_calls(expr: &ast::Expr, user_fns: &HashMap<String, (FuncId, usi
             expr_has_user_calls(lhs, user_fns) || expr_has_user_calls(rhs, user_fns)
         }
         ast::ExprKind::UnaryOp { operand, .. } => expr_has_user_calls(operand, user_fns),
-        ast::ExprKind::If { cond, then_branch, else_branch } => {
-            expr_has_user_calls(cond, user_fns)
-                || expr_has_user_calls(then_branch, user_fns)
-                || expr_has_user_calls(else_branch, user_fns)
-        }
         ast::ExprKind::Case { scrutinee, arms } => {
             expr_has_user_calls(scrutinee, user_fns)
                 || arms.iter().any(|a| expr_has_user_calls(&a.body, user_fns))
@@ -13788,7 +13510,7 @@ pub(crate) fn minmax_pushdown_type_ok(
     matches!(
         infer_sql_expr_type(bind_var, body, schema).as_deref(),
         Some("int") | Some("text")
-    ) && int_case_projection_pushable(bind_var, body, schema)
+    )
 }
 
 /// Whether the result of a `minOn`/`maxOn` pushdown over `body` is a genuine
@@ -13835,46 +13557,10 @@ pub(crate) fn sortby_projection_pushable(
     body: &ast::Expr,
     schema: &str,
 ) -> bool {
-    int_case_projection_pushable(bind_var, body, schema)
-        && !matches!(
-            infer_sql_expr_type(bind_var, body, schema).as_deref(),
-            Some("float") | Some("tag") | Some("bool")
-        )
-}
-
-/// True when an expression tree contains an if/then/else node (which
-/// compiles to a SQL CASE WHEN when pushed down).
-fn expr_contains_if(expr: &ast::Expr) -> bool {
-    match &expr.node {
-        ast::ExprKind::If { .. } => true,
-        ast::ExprKind::BinOp { lhs, rhs, .. } => {
-            expr_contains_if(lhs) || expr_contains_if(rhs)
-        }
-        ast::ExprKind::UnaryOp { operand, .. } => expr_contains_if(operand),
-        ast::ExprKind::App { func, arg } => {
-            expr_contains_if(func) || expr_contains_if(arg)
-        }
-        ast::ExprKind::FieldAccess { expr: inner, .. } => expr_contains_if(inner),
-        ast::ExprKind::Annot { expr: inner, .. } => expr_contains_if(inner),
-        ast::ExprKind::TimeUnitLit { value, .. } => expr_contains_if(value),
-        _ => false,
-    }
-}
-
-/// MIN/MAX and ORDER BY over a CASE expression must not push down for
-/// Int-typed projections: SQLite does not propagate the KNOT_INT column
-/// collation through CASE (so values compare byte-wise as TEXT), and CASE
-/// branches mixing TEXT-stored Int columns with INTEGER literals compare
-/// by storage class rather than value. In-memory evaluation is the
-/// faithful fallback. Float (REAL storage) and Text projections are typed
-/// out elsewhere or compare consistently.
-pub(crate) fn int_case_projection_pushable(
-    bind_var: &str,
-    body: &ast::Expr,
-    schema: &str,
-) -> bool {
-    !(expr_contains_if(body)
-        && infer_sql_expr_type(bind_var, body, schema).as_deref() == Some("int"))
+    !matches!(
+        infer_sql_expr_type(bind_var, body, schema).as_deref(),
+        Some("float") | Some("tag") | Some("bool")
+    )
 }
 
 /// Wrap a column SQL expression for use inside MIN/MAX so integer-typed
@@ -14342,13 +14028,6 @@ fn rewrite_body_through_projection(
                 func: Box::new(rewrite(plan, bind_var, func)?),
                 arg: Box::new(rewrite(plan, bind_var, arg)?),
             })),
-            ast::ExprKind::If { cond, then_branch, else_branch } => {
-                Some(mk(ast::ExprKind::If {
-                    cond: Box::new(rewrite(plan, bind_var, cond)?),
-                    then_branch: Box::new(rewrite(plan, bind_var, then_branch)?),
-                    else_branch: Box::new(rewrite(plan, bind_var, else_branch)?),
-                }))
-            }
             ast::ExprKind::List(elems) => {
                 let new_elems = elems
                     .iter()
@@ -14910,23 +14589,6 @@ fn beta_reduce_inner(
                 .map(|e| beta_reduce_inner(e, fun_bodies, let_bindings, visited, fuel))
                 .collect(),
         ),
-        If { cond, then_branch, else_branch } => If {
-            cond: Box::new(beta_reduce_inner(cond, fun_bodies, let_bindings, visited, fuel)),
-            then_branch: Box::new(beta_reduce_inner(
-                then_branch,
-                fun_bodies,
-                let_bindings,
-                visited,
-                fuel,
-            )),
-            else_branch: Box::new(beta_reduce_inner(
-                else_branch,
-                fun_bodies,
-                let_bindings,
-                visited,
-                fuel,
-            )),
-        },
         // For constructs that bind names (Case arms, Do statements, Set, etc.)
         // we keep them unchanged: SQL pushdown never sees these inside the
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
@@ -15034,11 +14696,6 @@ fn substitute_inner(
                 .map(|e| substitute_inner(e, var, value, value_fv))
                 .collect::<Option<Vec<_>>>()?,
         ),
-        If { cond, then_branch, else_branch } => If {
-            cond: Box::new(substitute_inner(cond, var, value, value_fv)?),
-            then_branch: Box::new(substitute_inner(then_branch, var, value, value_fv)?),
-            else_branch: Box::new(substitute_inner(else_branch, var, value, value_fv)?),
-        },
         TimeUnitLit { value: v, unit_name } => TimeUnitLit {
             value: Box::new(substitute_inner(v, var, value, value_fv)?),
             unit_name: unit_name.clone(),
@@ -15105,11 +14762,6 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
             expr_mentions_var(lhs, var) || expr_mentions_var(rhs, var)
         }
         UnaryOp { operand, .. } => expr_mentions_var(operand, var),
-        If { cond, then_branch, else_branch } => {
-            expr_mentions_var(cond, var)
-                || expr_mentions_var(then_branch, var)
-                || expr_mentions_var(else_branch, var)
-        }
         Case { scrutinee, arms } => {
             expr_mentions_var(scrutinee, var)
                 || arms.iter().any(|a| expr_mentions_var(&a.body, var))
@@ -15181,11 +14833,6 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             for e in items {
                 collect_free_vars_set(e, bound, free);
             }
-        }
-        If { cond, then_branch, else_branch } => {
-            collect_free_vars_set(cond, bound, free);
-            collect_free_vars_set(then_branch, bound, free);
-            collect_free_vars_set(else_branch, bound, free);
         }
         TimeUnitLit { value: v, .. } => collect_free_vars_set(v, bound, free),
         Annot { expr: e, .. } => collect_free_vars_set(e, bound, free),
@@ -15365,129 +15012,8 @@ fn sql_col_ref(alias: &str, col_name: &str) -> String {
     }
 }
 
-/// Try to compile a condition expression to an inline SQL condition (no params).
-/// Used inside CASE WHEN expressions where everything must be inlined.
-/// Handles: comparisons (==, !=, <, >, <=, >=), AND, OR, NOT.
-fn try_sql_inline_condition(
-    bind_var: &str,
-    expr: &ast::Expr,
-    alias: &str,
-    schema: &str,
-) -> Option<String> {
-    match &expr.node {
-        ast::ExprKind::BinOp { op, lhs, rhs } => match op {
-            ast::BinOp::And => {
-                let l = try_sql_inline_condition(bind_var, lhs, alias, schema)?;
-                let r = try_sql_inline_condition(bind_var, rhs, alias, schema)?;
-                Some(format!("({}) AND ({})", l, r))
-            }
-            ast::BinOp::Or => {
-                let l = try_sql_inline_condition(bind_var, lhs, alias, schema)?;
-                let r = try_sql_inline_condition(bind_var, rhs, alias, schema)?;
-                Some(format!("({}) OR ({})", l, r))
-            }
-            ast::BinOp::Eq | ast::BinOp::Neq | ast::BinOp::Lt
-            | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge => {
-                let sql_op = match op {
-                    ast::BinOp::Eq => "=",
-                    ast::BinOp::Neq => "!=",
-                    ast::BinOp::Lt => "<",
-                    ast::BinOp::Gt => ">",
-                    ast::BinOp::Le => "<=",
-                    ast::BinOp::Ge => ">=",
-                    _ => unreachable!(),
-                };
-                // Mirror the WHERE-pushdown gates: float comparisons stay
-                // in memory (total_cmp vs SQL -0.0/NaN-as-NULL semantics);
-                // ordered comparisons on tag columns ignore the type's Ord.
-                let lt = infer_sql_expr_type(bind_var, lhs, schema);
-                let rt = infer_sql_expr_type(bind_var, rhs, schema);
-                if lt.as_deref() == Some("float") || rt.as_deref() == Some("float") {
-                    return None;
-                }
-                // json-stored columns (ADT payloads / nested records) compare
-                // as raw JSON text in SQL, which can diverge from Knot's
-                // structural equality. The WHERE-pushdown path rejects these
-                // (sql_scalar_kind returns Err for "json"); mirror that here.
-                if lt.as_deref() == Some("json") || rt.as_deref() == Some("json") {
-                    return None;
-                }
-                if matches!(sql_op, "<" | ">" | "<=" | ">=")
-                    && (lt.as_deref() == Some("tag") || rt.as_deref() == Some("tag"))
-                {
-                    return None;
-                }
-                let l = try_sql_arithmetic_expr(bind_var, lhs, alias, schema)?;
-                let r = try_sql_arithmetic_expr(bind_var, rhs, alias, schema)?;
-                Some(format!("{} {} {}", l, sql_op, r))
-            }
-            _ => None,
-        },
-        ast::ExprKind::UnaryOp {
-            op: ast::UnaryOp::Not,
-            operand,
-        } => {
-            let inner = try_sql_inline_condition(bind_var, operand, alias, schema)?;
-            Some(format!("NOT ({})", inner))
-        }
-        // `not expr` function application form → NOT (...)
-        // `contains needle haystack` → INSTR(haystack, needle) > 0
-        ast::ExprKind::App { func, arg } => {
-            if let ast::ExprKind::Var(name) = &func.node
-                && name == "not" {
-                    let inner = try_sql_inline_condition(bind_var, arg, alias, schema)?;
-                    return Some(format!("NOT ({})", inner));
-                }
-            if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node
-                && let ast::ExprKind::Var(name) = &inner_func.node {
-                    if name == "contains" {
-                        let needle = try_sql_arithmetic_expr(bind_var, first_arg, alias, schema)?;
-                        let haystack = try_sql_arithmetic_expr(bind_var, arg, alias, schema)?;
-                        return Some(format!("INSTR({}, {}) > 0", haystack, needle));
-                    }
-                    if name == "elem" {
-                        // elem (bind_var.field) [lit, lit, ...] → field IN (lit, lit, ...)
-                        // Empty list → always-false (`0`).
-                        // Float `IN` equality stays in memory (see the
-                        // float comparison gates above).
-                        if infer_sql_expr_type(bind_var, first_arg, schema).as_deref()
-                            == Some("float")
-                        {
-                            return None;
-                        }
-                        let col = try_sql_arithmetic_expr(bind_var, first_arg, alias, schema)?;
-                        let elems = match &arg.node {
-                            ast::ExprKind::List(es) => es,
-                            _ => return None,
-                        };
-                        if elems.is_empty() {
-                            return Some("0".to_string());
-                        }
-                        let mut parts = Vec::with_capacity(elems.len());
-                        for e in elems {
-                            match &e.node {
-                                ast::ExprKind::Lit(ast::Literal::Int(n)) => parts.push(n.to_string()),
-                                ast::ExprKind::Lit(ast::Literal::Float(f)) => parts.push(f.to_string()),
-                                ast::ExprKind::Lit(ast::Literal::Text(s)) => {
-                                    parts.push(format!("'{}'", s.replace('\'', "''")))
-                                }
-                                ast::ExprKind::Lit(ast::Literal::Bool(b)) => {
-                                    parts.push(if *b { "1" } else { "0" }.to_string())
-                                }
-                                _ => return None,
-                            }
-                        }
-                        return Some(format!("{} IN ({})", col, parts.join(", ")));
-                    }
-                }
-            None
-        }
-        _ => None,
-    }
-}
-
 /// Try to compile an arithmetic expression to a SQL fragment.
-/// Handles: field access, literals, +, -, *, / binary ops, and if/then/else → CASE WHEN.
+/// Handles: field access, literals, +, -, *, / binary ops.
 fn try_sql_arithmetic_expr(
     bind_var: &str,
     expr: &ast::Expr,
@@ -15526,12 +15052,6 @@ fn try_sql_arithmetic_expr(
             let l = try_sql_arithmetic_expr(bind_var, lhs, alias, schema)?;
             let r = try_sql_arithmetic_expr(bind_var, rhs, alias, schema)?;
             Some(format!("({} {} {})", l, sql_op, r))
-        }
-        ast::ExprKind::If { cond, then_branch, else_branch } => {
-            let cond_sql = try_sql_inline_condition(bind_var, cond, alias, schema)?;
-            let then_sql = try_sql_arithmetic_expr(bind_var, then_branch, alias, schema)?;
-            let else_sql = try_sql_arithmetic_expr(bind_var, else_branch, alias, schema)?;
-            Some(format!("CASE WHEN {} THEN {} ELSE {} END", cond_sql, then_sql, else_sql))
         }
         // Built-in functions: toUpper, toLower, trim, length
         ast::ExprKind::App { func, .. } => {
@@ -15642,10 +15162,6 @@ pub(crate) fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str
                 }
             }
         }
-        ast::ExprKind::If { then_branch, else_branch, .. } => {
-            infer_sql_expr_type(bind_var, then_branch, schema)
-                .or_else(|| infer_sql_expr_type(bind_var, else_branch, schema))
-        }
         // Built-in functions
         ast::ExprKind::App { func, .. } => {
             if let ast::ExprKind::Var(name) = &func.node {
@@ -15663,92 +15179,8 @@ pub(crate) fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str
 
 // ── Multi-table SQL expression helpers ───────────────────────────
 
-/// Try to compile a condition expression to inline SQL for multi-table contexts.
-/// Used inside CASE WHEN in multi-table yield expressions.
-fn try_multi_table_inline_condition(
-    bind_to_alias: &HashMap<String, String>,
-    bind_to_schema: &HashMap<String, String>,
-    expr: &ast::Expr,
-) -> Option<String> {
-    match &expr.node {
-        ast::ExprKind::BinOp { op, lhs, rhs } => match op {
-            ast::BinOp::And => {
-                let l = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, lhs)?;
-                let r = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, rhs)?;
-                Some(format!("({}) AND ({})", l, r))
-            }
-            ast::BinOp::Or => {
-                let l = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, lhs)?;
-                let r = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, rhs)?;
-                Some(format!("({}) OR ({})", l, r))
-            }
-            ast::BinOp::Eq | ast::BinOp::Neq | ast::BinOp::Lt
-            | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge => {
-                let sql_op = match op {
-                    ast::BinOp::Eq => "=",
-                    ast::BinOp::Neq => "!=",
-                    ast::BinOp::Lt => "<",
-                    ast::BinOp::Gt => ">",
-                    ast::BinOp::Le => "<=",
-                    ast::BinOp::Ge => ">=",
-                    _ => unreachable!(),
-                };
-                // Mirror the WHERE-pushdown gates: float comparisons stay
-                // in memory (total_cmp vs SQL -0.0/NaN-as-NULL semantics);
-                // ordered comparisons on tag columns ignore the type's Ord.
-                let lt = infer_multi_table_sql_expr_type(bind_to_schema, lhs);
-                let rt = infer_multi_table_sql_expr_type(bind_to_schema, rhs);
-                if lt.as_deref() == Some("float") || rt.as_deref() == Some("float") {
-                    return None;
-                }
-                // json-stored columns (ADT payloads / nested records) compare
-                // as raw JSON text in SQL, which can diverge from Knot's
-                // structural equality. The WHERE-pushdown path rejects these
-                // (sql_scalar_kind returns Err for "json"); mirror that here.
-                if lt.as_deref() == Some("json") || rt.as_deref() == Some("json") {
-                    return None;
-                }
-                if matches!(sql_op, "<" | ">" | "<=" | ">=")
-                    && (lt.as_deref() == Some("tag") || rt.as_deref() == Some("tag"))
-                {
-                    return None;
-                }
-                let l = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, lhs)?;
-                let r = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, rhs)?;
-                Some(format!("{} {} {}", l, sql_op, r))
-            }
-            _ => None,
-        },
-        ast::ExprKind::UnaryOp {
-            op: ast::UnaryOp::Not,
-            operand,
-        } => {
-            let inner = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, operand)?;
-            Some(format!("NOT ({})", inner))
-        }
-        // `not expr` function application form → NOT (...)
-        // `contains needle haystack` → INSTR(haystack, needle) > 0
-        ast::ExprKind::App { func, arg } => {
-            if let ast::ExprKind::Var(name) = &func.node
-                && name == "not" {
-                    let inner = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, arg)?;
-                    return Some(format!("NOT ({})", inner));
-                }
-            if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node
-                && let ast::ExprKind::Var(name) = &inner_func.node
-                    && name == "contains" {
-                        let needle = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, first_arg)?;
-                        let haystack = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, arg)?;
-                        return Some(format!("INSTR({}, {}) > 0", haystack, needle));
-                    }
-            None
-        }
-        _ => None,
-    }
-}
-
 /// Try to compile an expression to an inline SQL string for multi-table yield contexts.
-/// Handles: field access on any bound table, literals, arithmetic, CASE WHEN.
+/// Handles: field access on any bound table, literals, arithmetic.
 fn try_multi_table_arithmetic_expr(
     bind_to_alias: &HashMap<String, String>,
     bind_to_schema: &HashMap<String, String>,
@@ -15785,12 +15217,6 @@ fn try_multi_table_arithmetic_expr(
             let l = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, lhs)?;
             let r = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, rhs)?;
             Some(format!("({} {} {})", l, sql_op, r))
-        }
-        ast::ExprKind::If { cond, then_branch, else_branch } => {
-            let cond_sql = try_multi_table_inline_condition(bind_to_alias, bind_to_schema, cond)?;
-            let then_sql = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, then_branch)?;
-            let else_sql = try_multi_table_arithmetic_expr(bind_to_alias, bind_to_schema, else_branch)?;
-            Some(format!("CASE WHEN {} THEN {} ELSE {} END", cond_sql, then_sql, else_sql))
         }
         // Built-in functions: toUpper, toLower, trim, length
         ast::ExprKind::App { func, .. } => {
@@ -15849,10 +15275,6 @@ fn infer_multi_table_sql_expr_type(
                     }
                 }
             }
-        }
-        ast::ExprKind::If { then_branch, else_branch, .. } => {
-            infer_multi_table_sql_expr_type(bind_to_schema, then_branch)
-                .or_else(|| infer_multi_table_sql_expr_type(bind_to_schema, else_branch))
         }
         // Built-in functions
         ast::ExprKind::App { func, .. } => {
@@ -16195,11 +15617,6 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
             expr_contains_derived_ref(lhs, name) || expr_contains_derived_ref(rhs, name)
         }
         ast::ExprKind::UnaryOp { operand, .. } => expr_contains_derived_ref(operand, name),
-        ast::ExprKind::If { cond, then_branch, else_branch } => {
-            expr_contains_derived_ref(cond, name)
-                || expr_contains_derived_ref(then_branch, name)
-                || expr_contains_derived_ref(else_branch, name)
-        }
         ast::ExprKind::Case { scrutinee, arms } => {
             expr_contains_derived_ref(scrutinee, name)
                 || arms.iter().any(|a| expr_contains_derived_ref(&a.body, name))
@@ -16332,15 +15749,6 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::UnaryOp { operand, .. } => {
             collect_free_vars(operand, bound, free);
         }
-        ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            collect_free_vars(cond, bound, free);
-            collect_free_vars(then_branch, bound, free);
-            collect_free_vars(else_branch, bound, free);
-        }
         ast::ExprKind::Case { scrutinee, arms } => {
             collect_free_vars(scrutinee, bound, free);
             for arm in arms {
@@ -16458,11 +15866,6 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         }
         ast::ExprKind::BinOp { lhs, rhs, .. } => expr_refs_var(lhs, var) || expr_refs_var(rhs, var),
         ast::ExprKind::UnaryOp { operand, .. } => expr_refs_var(operand, var),
-        ast::ExprKind::If { cond, then_branch, else_branch } => {
-            expr_refs_var(cond, var)
-                || expr_refs_var(then_branch, var)
-                || expr_refs_var(else_branch, var)
-        }
         ast::ExprKind::Lambda { params, body, .. } => {
             if params.iter().any(pat_binds_var) {
                 false // shadowed
@@ -16569,11 +15972,6 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
             expr_uses_var_as_value(lhs, var) || expr_uses_var_as_value(rhs, var)
         }
         ast::ExprKind::UnaryOp { operand, .. } => expr_uses_var_as_value(operand, var),
-        ast::ExprKind::If { cond, then_branch, else_branch } => {
-            expr_uses_var_as_value(cond, var)
-                || expr_uses_var_as_value(then_branch, var)
-                || expr_uses_var_as_value(else_branch, var)
-        }
         ast::ExprKind::Lambda { params, body, .. } => {
             if params.iter().any(pat_binds_var) {
                 false // shadowed
@@ -16869,10 +16267,6 @@ pub(crate) fn expr_has_tag_column(
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
             expr_has_tag_column(lhs, col_ty) || expr_has_tag_column(rhs, col_ty)
         }
-        ast::ExprKind::If { then_branch, else_branch, .. } => {
-            expr_has_tag_column(then_branch, col_ty)
-                || expr_has_tag_column(else_branch, col_ty)
-        }
         _ => false,
     }
 }
@@ -16957,16 +16351,6 @@ fn pretty_expr(expr: &ast::Expr) -> String {
             ast::UnaryOp::Neg => format!("-{}", pretty_expr(operand)),
             ast::UnaryOp::Not => format!("not {}", pretty_expr(operand)),
         },
-        ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => format!(
-            "if {} then {} else {}",
-            pretty_expr(cond),
-            pretty_expr(then_branch),
-            pretty_expr(else_branch)
-        ),
         ast::ExprKind::Case { scrutinee, arms } => {
             let arm_strs: Vec<String> = arms
                 .iter()

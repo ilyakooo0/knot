@@ -591,12 +591,6 @@ pub const SNIPPETS: &[(&str, &str, &str, SnippetContext)] = &[
         SnippetContext::Expression,
     ),
     (
-        "if",
-        "if expression",
-        "if ${1:cond}\n  then ${2:a}\n  else ${3:b}",
-        SnippetContext::Expression,
-    ),
-    (
         "atomic",
         "atomic block",
         "atomic do\n  ${1:x} <- *${2:source}\n  ${3:body}",

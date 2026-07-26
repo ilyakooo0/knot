@@ -129,13 +129,6 @@ pub enum ExprKind {
     /// `-x`, `not cond`
     UnaryOp { op: UnaryOp, operand: Box<Expr> },
 
-    /// `if cond then a else b`
-    If {
-        cond: Box<Expr>,
-        then_branch: Box<Expr>,
-        else_branch: Box<Expr>,
-    },
-
     /// `case expr of { Pat -> Expr, ... }`
     Case {
         scrutinee: Box<Expr>,

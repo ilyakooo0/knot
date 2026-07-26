@@ -11,7 +11,9 @@ complete (\title -> do
   todos <- *todos
   *todos = do
     t <- todos
-    yield (if t.title == title then {t | done 1} else t))
+    yield (case t.title == title of
+      true -> {t | done 1}
+      false -> t))
 
 pending (\owner -> do
   todos <- *todos

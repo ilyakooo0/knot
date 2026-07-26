@@ -267,7 +267,7 @@ trait Sequence s where
 
 - `x <- expr` desugars to `bind (\x -> ...) expr`
 - `yield x` is `Applicative.yield`
-- `where cond` desugars to `if cond then yield {} else empty` (requires `Alternative`)
+- `where cond` desugars to `case cond of true -> yield {}; false -> empty` (requires `Alternative`)
 
 IO do blocks (those containing IO-returning expressions like `*rel`, `println`, `readFile`, `now`) are not desugared — they use a dedicated compilation path that sequences IO actions directly.
 
@@ -286,7 +286,7 @@ richOnes = \employees departments -> do
   yield (richOnes employees departments)
 
 -- do with Maybe
-safeDivide = \a b -> if b == 0 then Nothing {} else Just {value: a / b}
+safeDivide = \a b -> case b == 0 of true -> Nothing {}; false -> Just {value: a / b}
 
 tryCompute = do
   x <- safeDivide 10 2
@@ -294,7 +294,7 @@ tryCompute = do
   yield (x + y)
 
 -- do with Result
-safeDivideR = \a b -> if b == 0 then Err {error: "div by zero"} else Ok {value: a / b}
+safeDivideR = \a b -> case b == 0 of true -> Err {error: "div by zero"}; false -> Ok {value: a / b}
 
 computeR = do
   x <- safeDivideR 10 2
@@ -348,7 +348,7 @@ Everything else is built from trait methods plus the `*rel = expr` write. The co
 **`where`** — conditional empty (requires `Alternative`):
 
 ```knot
-where = \cond -> if cond then yield {} else empty
+where = \cond -> case cond of true -> yield {}; false -> empty
 ```
 
 **`filter`** — filter rows:
@@ -405,7 +405,7 @@ inter = \a b -> do
 **update** — transform matching rows. Recognized as an UPDATE:
 
 ```knot
-*rel = map (\x -> if p x then f x else x) *rel
+*rel = map (\x -> case p x of true -> f x; false -> x) *rel
 ```
 
 **`count`**, **`sum`**, **`avg`** — folds:
@@ -616,7 +616,7 @@ The pattern for querying relations is: IO-bind to get the value, then pure compr
     yield result)
 ```
 
-The compiler detects whether a do-block is IO or relational based on the types of bound expressions. IO do-blocks work correctly in all positions, including as branches of `if`/`then`/`else`.
+The compiler detects whether a do-block is IO or relational based on the types of bound expressions. IO do-blocks work correctly in all positions, including as arms of a `case`.
 
 ### DB Effect Inference
 
@@ -636,7 +636,7 @@ birthday = \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (if p.name == name then {p | age: p.age + 1} else p)
+    yield (case p.name == name of true -> {p | age: p.age + 1}; false -> p)
 ```
 
 ### Effect Annotations
@@ -649,7 +649,7 @@ birthday = \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (if p.name == name then {p | age: p.age + 1} else p)
+    yield (case p.name == name of true -> {p | age: p.age + 1}; false -> p)
 ```
 
 If the body uses a capability not listed in the signature, the compiler rejects it.
@@ -907,13 +907,13 @@ api = serve Api where
       [| |] -> yield Err {error: {status: 404, message: "user not found"}}
       Cons u _ -> yield Ok {value: u}
   CreateUser = \{name, email} -> do
-    if length name == 0 then
-      yield Err {error: {status: 400, message: "name required"}}
-    else do
-      atomic do
-        users <- *people
+    case length name == 0 of
+      true -> yield Err {error: {status: 400, message: "name required"}}
+      false -> do
+        atomic do
+          users <- *people
         *people = union users [|{name: name, email: email}|]
-      yield Ok {value: {name: name, email: email}}
+        yield Ok {value: {name: name, email: email}}
 ```
 
 Status codes are clamped to the range `100..=599`. Common codes: `400` (bad request), `401` (unauthorized), `403` (forbidden), `404` (not found), `409` (conflict), `500` (internal error). The runtime emits `400` automatically for path/query/body/header parsing failures and refinement violations, and `404` for unmatched routes — handlers only need to return `Err` for application-level errors.
@@ -1134,7 +1134,7 @@ birthday = \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (if p.name == "Alice" then {p | age: p.age + 1} else p)
+    yield (case p.name == "Alice" of true -> {p | age: p.age + 1}; false -> p)
 
 -- Delete: filter to keep the rest
 removePerson = \name -> do
@@ -1925,7 +1925,7 @@ declares that the function needs a dictionary record providing `field` at type
 
 ```knot
 clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
-clamp = \lo hi x -> if ((^compare) x lo) < 0 then lo else if ((^compare) x hi) > 0 then hi else x
+clamp = \lo hi x -> case ((^compare) x lo) < 0 of true -> lo; false -> case ((^compare) x hi) > 0 of true -> hi; false -> x
 ```
 
 `clamp` is elaborated to take a hidden leading dictionary parameter (a record
@@ -1935,9 +1935,9 @@ searches the lexical scope for a record supplying `compare` at the required
 type and splices it in as the leading argument:
 
 ```knot
-intOrd     = {compare (\a b -> if a > b then 1 else if a < b then (0 - 1) else 0)}
-textOrd    = {compare (\a b -> if a > b then 1 else if a < b then (0 - 1) else 0)}
-intOrdDesc = {compare (\a b -> if a < b then 1 else if a > b then (0 - 1) else 0)}
+intOrd     = {compare (\a b -> case a > b of true -> 1; false -> case a < b of true -> (0 - 1); false -> 0)}
+textOrd    = {compare (\a b -> case a > b of true -> 1; false -> case a < b of true -> (0 - 1); false -> 0)}
+intOrdDesc = {compare (\a b -> case a < b of true -> 1; false -> case a > b of true -> (0 - 1); false -> 0)}
 
 clamp 0 10 42                     -- resolves to intOrd     → 10
 clamp "a" "m" "z"                 -- resolves to textOrd    → "m"

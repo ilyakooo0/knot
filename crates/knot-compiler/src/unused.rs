@@ -306,11 +306,6 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
             walk_expr(rhs, r);
         }
         ExprKind::UnaryOp { operand, .. } => walk_expr(operand, r),
-        ExprKind::If { cond, then_branch, else_branch } => {
-            walk_expr(cond, r);
-            walk_expr(then_branch, r);
-            walk_expr(else_branch, r);
-        }
         ExprKind::Case { scrutinee, arms } => {
             walk_expr(scrutinee, r);
             for arm in arms {

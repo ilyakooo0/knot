@@ -549,34 +549,9 @@ pub(crate) fn handle_code_action(
         }
     }
 
-    // Action: convert `if cond then a else b` to `case cond of True -> a | False -> b`.
-    // Useful when the user wants to extend the conditional with additional
-    // arms (e.g. matching on the cond's variant) without re-typing the body.
-    if let Some((if_span, replacement)) =
-        find_if_to_case_at(&doc.module, &doc.source, range_start)
-    {
-        let mut changes = HashMap::new();
-        changes.insert(
-            uri.clone(),
-            vec![TextEdit {
-                range: span_to_range(if_span, &doc.source),
-                new_text: replacement,
-            }],
-        );
-        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: "Convert `if` to `case`".to_string(),
-            kind: Some(CodeActionKind::REFACTOR_REWRITE),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }));
-    }
-
     // Action: flip a commutative binary operator's operands (e.g. `a == b` → `b == a`).
     // Helpful when a comparison reads more naturally with the other operand
-    // first, especially in `if` conditions or `where` filters.
+    // first, especially in `where` filters.
     if let Some((bin_span, replacement)) =
         find_flip_binary_at(&doc.module, &doc.source, range_start)
     {
@@ -642,30 +617,6 @@ pub(crate) fn handle_code_action(
         );
         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
             title: format!("Match `Result RefinementError {target_name}`"),
-            kind: Some(CodeActionKind::REFACTOR_REWRITE),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }));
-    }
-
-    // Action: negate `if` condition and swap branches. Useful when the
-    // positive case is rare and the user wants to lead with the common path.
-    if let Some((if_span, replacement)) =
-        find_if_negate_at(&doc.module, &doc.source, range_start)
-    {
-        let mut changes = HashMap::new();
-        changes.insert(
-            uri.clone(),
-            vec![TextEdit {
-                range: span_to_range(if_span, &doc.source),
-                new_text: replacement,
-            }],
-        );
-        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-            title: "Negate condition (swap branches)".to_string(),
             kind: Some(CodeActionKind::REFACTOR_REWRITE),
             edit: Some(WorkspaceEdit {
                 changes: Some(changes),
@@ -886,102 +837,6 @@ fn find_alias_to_refine_at(
     None
 }
 
-/// Find an `if cond then a else b` at `offset` and produce
-/// `if not cond then b else a` as the rewritten text.
-fn find_if_negate_at(
-    module: &ast::Expr,
-    source: &str,
-    offset: usize,
-) -> Option<(Span, String)> {
-    fn walk(expr: &ast::Expr, source: &str, offset: usize) -> Option<(Span, String)> {
-        if expr.span.start > offset || expr.span.end < offset {
-            return None;
-        }
-        if let ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } = &expr.node
-        {
-            // Recurse first — prefer the innermost match.
-            if let Some(inner) = walk(cond, source, offset) {
-                return Some(inner);
-            }
-            if let Some(inner) = walk(then_branch, source, offset) {
-                return Some(inner);
-            }
-            if let Some(inner) = walk(else_branch, source, offset) {
-                return Some(inner);
-            }
-            let cond_text = source.get(cond.span.start..cond.span.end)?;
-            let then_text = source.get(then_branch.span.start..then_branch.span.end)?;
-            let else_text = source.get(else_branch.span.start..else_branch.span.end)?;
-            // Multi-line branches carry indentation tied to their original
-            // position; swapping them onto one line (or into each other's
-            // columns) breaks the layout-sensitive parse. Only offer the
-            // action when the whole rewrite stays on a single line.
-            if cond_text.contains('\n') || then_text.contains('\n') || else_text.contains('\n') {
-                return None;
-            }
-            // Strip the `not` only when the condition's AST ROOT is the
-            // negation — a textual prefix check is wrong for `not a && b`,
-            // which parses as `(not a) && b`: stripping the prefix would
-            // negate only the first conjunct. Otherwise wrap the whole
-            // condition in `not (…)`.
-            let new_cond = if let ast::ExprKind::UnaryOp {
-                op: ast::UnaryOp::Not,
-                operand,
-            } = &cond.node
-            {
-                source.get(operand.span.start..operand.span.end)?.to_string()
-            } else {
-                format!("not ({cond_text})")
-            };
-            let rewrite = format!("if {new_cond} then {else_text} else {then_text}");
-            // When the `if` sits in operand position it's parenthesized, and
-            // the parser folds those parens into this expr's span while keeping
-            // the bare `If` node (see parse_atom's `LParen` arm). Replacing the
-            // whole `(if …)` span with an unparenthesized rewrite would let a
-            // trailing operator bind into the else branch —
-            // `(if c then a else b) * 2` → `if not c then b else a * 2`. Re-wrap
-            // to keep the operand outside the conditional.
-            let expr_text = source.get(expr.span.start..expr.span.end)?;
-            let rewrite = if is_already_parenthesized(expr_text) {
-                format!("({rewrite})")
-            } else {
-                rewrite
-            };
-            return Some((expr.span, rewrite));
-        }
-        let mut found = None;
-        crate::utils::recurse_expr(expr, |child| {
-            if found.is_none()
-                && let Some(hit) = walk(child, source, offset) {
-                    found = Some(hit);
-                }
-        });
-        found
-    }
-    for decl in top_fields(module) {
-        match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
-                if let Some(hit) = walk(body, source, offset) {
-                    return Some(hit);
-                }
-            }
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
-            _ => {
-                if let Some(hit) = walk(&decl.value, source, offset) {
-                    return Some(hit);
-                }
-            }
-        }
-    }
-    None
-}
-
 /// Wrap the cursor's enclosing expression in `Err {error: ...}` if it sits at
 /// an expression position. Best-effort: skips when the cursor isn't on a
 /// well-formed expression span.
@@ -1014,8 +869,7 @@ fn find_wrap_in_err_at(
         match &expr.node {
             ast::ExprKind::Lambda { .. }
             | ast::ExprKind::Do(_)
-            | ast::ExprKind::Case { .. }
-            | ast::ExprKind::If { .. } => None,
+            | ast::ExprKind::Case { .. } => None,
             _ => Some(expr.span),
         }
     }
@@ -1828,81 +1682,6 @@ pub(crate) fn enclosing_do_stmt_range(
     best
 }
 
-/// Locate the smallest `if cond then a else b` expression containing the
-/// cursor, and return its span plus the equivalent `case` rewrite. Returns
-/// `None` if the cursor isn't inside an if-expression.
-fn find_if_to_case_at(
-    module: &ast::Expr,
-    source: &str,
-    offset: usize,
-) -> Option<(Span, String)> {
-    fn walk(
-        expr: &ast::Expr,
-        source: &str,
-        offset: usize,
-        best: &mut Option<(Span, String)>,
-    ) {
-        if expr.span.start > offset || offset >= expr.span.end {
-            return;
-        }
-        if let ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } = &expr.node
-        {
-            let size = expr.span.end - expr.span.start;
-            if best.as_ref().is_none_or(|b| size < b.0.end - b.0.start) {
-                let cond_text = safe_slice(source, cond.span);
-                let then_text = safe_slice(source, then_branch.span);
-                let else_text = safe_slice(source, else_branch.span);
-                // Multi-line branch/condition text carries indentation tied
-                // to its original column; splicing it after a case arm's
-                // `->` at a new column breaks the layout-sensitive parse.
-                // Same guard as `find_if_negate_at`. (Recursion below may
-                // still find a single-line inner `if`.)
-                let multi_line = cond_text.contains('\n')
-                    || then_text.contains('\n')
-                    || else_text.contains('\n');
-                if !multi_line {
-                    let indent = indent_for_expr_start(source, expr.span.start);
-                    let replacement = format!(
-                        "case {cond_text} of{indent}True {{}} -> {then_text}{indent}False {{}} -> {else_text}"
-                    );
-                    // A parenthesized `if` in operand position folds its parens
-                    // into `expr.span` (parse_atom keeps the bare node), so
-                    // replacing the whole `(if …)` span with a bare `case …`
-                    // would let a trailing operator bind into the last arm —
-                    // `(if c then a else b) * 2` → `case … False {} -> b * 2`.
-                    // Re-wrap in parens; inside delimiters the `)` terminates
-                    // the arm block, so the multi-line layout still parses.
-                    let expr_text = safe_slice(source, expr.span);
-                    let replacement = if is_already_parenthesized(expr_text) {
-                        format!("({replacement})")
-                    } else {
-                        replacement
-                    };
-                    *best = Some((expr.span, replacement));
-                }
-            }
-        }
-        crate::utils::recurse_expr(expr, |e| walk(e, source, offset, best));
-    }
-    let mut best = None;
-    for decl in top_fields(module) {
-        match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
-                walk(body, source, offset, &mut best)
-            }
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
-            _ => walk(&decl.value, source, offset, &mut best),
-        }
-    }
-    best
-}
-
 /// Locate the smallest commutative binary expression containing the cursor,
 /// returning the span and the operand-flipped source text. Limited to ops
 /// where flipping preserves semantics — `+`, `*`, `==`, `!=`, `&&`, `||`.
@@ -1959,8 +1738,7 @@ fn find_flip_binary_at(
                         let text = safe_slice(source, e.span);
                         let needs_parens = matches!(
                             &e.node,
-                            ast::ExprKind::If { .. }
-                                | ast::ExprKind::Case { .. }
+                            ast::ExprKind::Case { .. }
                                 | ast::ExprKind::Lambda { .. }
                                 | ast::ExprKind::Do(_)
                                 | ast::ExprKind::BinOp { .. }

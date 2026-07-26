@@ -344,11 +344,6 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
             walk_exprs(rhs, f);
         }
         ExprKind::UnaryOp { operand, .. } => walk_exprs(operand, f),
-        ExprKind::If { cond, then_branch, else_branch } => {
-            walk_exprs(cond, f);
-            walk_exprs(then_branch, f);
-            walk_exprs(else_branch, f);
-        }
         ExprKind::Case { scrutinee, arms } => {
             walk_exprs(scrutinee, f);
             for arm in arms {
@@ -483,11 +478,6 @@ fn collect_type_and_data_refs<'a>(
         }
         ExprKind::UnaryOp { operand, .. } => {
             collect_type_and_data_refs(operand, aliases, data_decls)
-        }
-        ExprKind::If { cond, then_branch, else_branch } => {
-            collect_type_and_data_refs(cond, aliases, data_decls);
-            collect_type_and_data_refs(then_branch, aliases, data_decls);
-            collect_type_and_data_refs(else_branch, aliases, data_decls);
         }
         ExprKind::Case { scrutinee, arms } => {
             collect_type_and_data_refs(scrutinee, aliases, data_decls);

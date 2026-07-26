@@ -127,15 +127,6 @@ fn collect_containing_spans(expr: &ast::Expr, offset: usize, spans: &mut Vec<Spa
         ast::ExprKind::UnaryOp { operand, .. } => {
             collect_containing_spans(operand, offset, spans);
         }
-        ast::ExprKind::If {
-            cond,
-            then_branch,
-            else_branch,
-        } => {
-            collect_containing_spans(cond, offset, spans);
-            collect_containing_spans(then_branch, offset, spans);
-            collect_containing_spans(else_branch, offset, spans);
-        }
         ast::ExprKind::Case { scrutinee, arms } => {
             collect_containing_spans(scrutinee, offset, spans);
             for arm in arms {

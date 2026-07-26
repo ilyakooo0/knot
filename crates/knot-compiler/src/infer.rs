@@ -952,6 +952,11 @@ struct Infer {
     refined_types: HashMap<String, (Ty, knot::ast::Expr)>,
     /// Refine expression type vars: (span, alpha_var, inner_ty) for post-inference resolution.
     refine_vars: Vec<(Span, TyVar, Ty)>,
+    /// Top-level constant literals from the `with` declaration record
+    /// (`five 5`), so a constant used where a refined type is required can be
+    /// checked against the predicate at compile time (allowing the implicit
+    /// base→refined use, or failing the build when the predicate is violated).
+    const_literals: HashMap<String, crate::codegen::CompileLit>,
 
     /// Field-access expressions: (span, field type). The field's type is often
     /// still an unsolved variable when the access is inferred, so the relation-
@@ -1072,6 +1077,7 @@ impl Infer {
             enforce_units: false,
             refined_types: HashMap::new(),
             refine_vars: Vec::new(),
+            const_literals: HashMap::new(),
             field_accesses: Vec::new(),
             with_fields: Vec::new(),
             with_scope_stack: vec![None],
@@ -1163,6 +1169,60 @@ impl Infer {
     /// the first cycle so the caller can stop unifying without overflowing
     /// the stack. The returned `Ty` is guaranteed not to be a refined alias
     /// (or another nullary `Con` whose name is in `refined_types`).
+    /// Attempt to type an application `f <constant>` where `f`'s parameter is
+    /// a refined type. When the argument is a compile-time constant we can
+    /// check it against the predicate now: allow the implicit base→refined use
+    /// if it holds, or fail the build if it's violated. Returns `Some((arg_ty,
+    /// result_ty))` when handled, `None` to fall through to the normal path.
+    fn try_const_refined_app(
+        &mut self,
+        func_ty: &Ty,
+        arg: &ast::Expr,
+        span: Span,
+    ) -> Option<(Ty, Ty)> {
+        // Only applies to a direct function `param -> ret`.
+        let func_applied = self.apply(func_ty);
+        let (param, ret) = match &func_applied {
+            Ty::Fun(p, r) => (self.apply(p), self.apply(r)),
+            _ => return None,
+        };
+        // The parameter must be a (non-generic) refined type.
+        let refined_name = match &param {
+            Ty::Con(name, args) if args.is_empty() && self.refined_types.contains_key(name) => {
+                name.clone()
+            }
+            _ => return None,
+        };
+        // The argument must be a compile-time constant (literal or named const).
+        let lit = crate::codegen::extract_literal_with_consts(arg, &self.const_literals)?;
+        let pred = self.refined_types.get(&refined_name)?.1.clone();
+        match crate::codegen::eval_refine_predicate_pub(&pred, &lit) {
+            Some(true) => {
+                // Predicate holds — allow the implicit use. Type the argument
+                // against the *base* type (bypassing the introduction guard)
+                // and return the function's result type.
+                let base = self.resolve_refined_base(&refined_name, span)?;
+                let arg_ty = self.infer_expr(arg);
+                self.unify(&base, &arg_ty, arg.span);
+                Some((self.apply(&param), ret))
+            }
+            Some(false) => {
+                self.error(
+                    format!(
+                        "constant {} does not satisfy the predicate for refined type `{}`",
+                        lit.display(),
+                        refined_name
+                    ),
+                    arg.span,
+                );
+                Some((Ty::Error, Ty::Error))
+            }
+            // Not statically evaluable — leave it to the normal path, which
+            // will require `refine`.
+            None => None,
+        }
+    }
+
     fn resolve_refined_base(&mut self, name: &str, span: Span) -> Option<Ty> {
         let mut visited: Vec<String> = vec![name.to_string()];
         let mut current = self.refined_types.get(name)?.0.clone();
@@ -5651,14 +5711,25 @@ impl Infer {
                         }
                     }
 
-                    let arg_ty = self.infer_expr(arg);
-                    let result_ty = self.fresh();
-                    let expected = Ty::Fun(
-                        Box::new(arg_ty.clone()),
-                        Box::new(result_ty.clone()),
-                    );
-                    self.unify(&func_ty, &expected, arg.span);
-                    (arg_ty, result_ty)
+                    // Constant into a refined parameter: `f 5` / `f five`
+                    // where `f : Nat -> …`. If the argument is a compile-time
+                    // constant, check it against the predicate now — allow the
+                    // implicit use when it holds (no `refine`, no runtime
+                    // check), fail the build when it's violated. Anything not
+                    // statically determinable falls through to the normal path
+                    // (which still requires `refine`).
+                    if let Some(pair) = self.try_const_refined_app(&func_ty, arg, expr.span) {
+                        pair
+                    } else {
+                        let arg_ty = self.infer_expr(arg);
+                        let result_ty = self.fresh();
+                        let expected = Ty::Fun(
+                            Box::new(arg_ty.clone()),
+                            Box::new(result_ty.clone()),
+                        );
+                        self.unify(&func_ty, &expected, arg.span);
+                        (arg_ty, result_ty)
+                    }
                 };
                 // Track parseJson calls for compile-time FromJSON dispatch
                 if let ast::ExprKind::Var(name) = &func.node
@@ -9807,7 +9878,40 @@ impl Infer {
 
     // ── Declaration inference (phase 4) ──────────────────────────
 
+    /// Walk the declaration record and record each `name <literal>` field as a
+    /// compile-time constant, for constant-checking at refined-type boundaries.
+    /// Only plain literal values are collected (`five 5`, `name "Ada"`); lambdas,
+    /// relations, ADTs, and decl forms are ignored.
+    fn collect_const_literals(&mut self, program: &ast::Expr) {
+        fn decl_record(e: &ast::Expr) -> Option<&ast::Expr> {
+            match &e.node {
+                ast::ExprKind::With { record, body } => {
+                    if matches!(body.node, ast::ExprKind::With { .. }) {
+                        decl_record(body)
+                    } else {
+                        Some(record)
+                    }
+                }
+                ast::ExprKind::Record(_) => Some(e),
+                _ => None,
+            }
+        }
+        if let Some(record) = decl_record(program)
+            && let ast::ExprKind::Record(fields) = &record.node
+        {
+            for fl in fields {
+                if let Some(lit) = crate::codegen::extract_literal(&fl.value) {
+                    self.const_literals.insert(fl.name.clone(), lit);
+                }
+            }
+        }
+    }
+
     fn infer_declarations(&mut self, program: &ast::Expr) {
+        // Collect top-level constant literals (`five 5`) from the declaration
+        // record so a constant flowing into a refined type can be checked
+        // against the predicate at compile time.
+        self.collect_const_literals(program);
         // Named functions: `with`-record fields with a lambda body.
         for_each_named_fn(program, &mut |name, ty, body| {
             let body = match body {

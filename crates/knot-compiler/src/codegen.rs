@@ -16832,7 +16832,8 @@ fn resolved_type_to_descriptor(ty: &ResolvedType) -> String {
 
 /// A literal value extracted from an AST expression, for compile-time
 /// refinement checking.
-enum CompileLit {
+#[derive(Clone, Debug)]
+pub(crate) enum CompileLit {
     Int(i64),
     Float(f64),
     Text(String),
@@ -16840,7 +16841,7 @@ enum CompileLit {
 }
 
 impl CompileLit {
-    fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         match self {
             CompileLit::Int(n) => n.to_string(),
             CompileLit::Float(f) => f.to_string(),
@@ -16851,7 +16852,7 @@ impl CompileLit {
 }
 
 /// Extract a literal from an AST expression (peeling annotations).
-fn extract_literal(expr: &ast::Expr) -> Option<CompileLit> {
+pub(crate) fn extract_literal(expr: &ast::Expr) -> Option<CompileLit> {
     match &expr.node {
         ast::ExprKind::Lit(ast::Literal::Int(s)) => s.parse::<i64>().ok().map(CompileLit::Int),
         ast::ExprKind::Lit(ast::Literal::Float(f)) => Some(CompileLit::Float(*f)),
@@ -16859,6 +16860,20 @@ fn extract_literal(expr: &ast::Expr) -> Option<CompileLit> {
         ast::ExprKind::Lit(ast::Literal::Bool(b)) => Some(CompileLit::Bool(*b)),
         ast::ExprKind::Annot { expr, .. } => extract_literal(expr),
         _ => None,
+    }
+}
+
+/// Extract a compile-time literal from an expression, additionally resolving
+/// a variable that names a top-level constant (a `with`-bound literal such as
+/// `five 5`) via `consts`.
+pub(crate) fn extract_literal_with_consts(
+    expr: &ast::Expr,
+    consts: &std::collections::HashMap<String, CompileLit>,
+) -> Option<CompileLit> {
+    match &expr.node {
+        ast::ExprKind::Var(name) => consts.get(name).cloned(),
+        ast::ExprKind::Annot { expr, .. } => extract_literal_with_consts(expr, consts),
+        _ => extract_literal(expr),
     }
 }
 
@@ -16883,6 +16898,12 @@ fn eval_refine_predicate(pred: &ast::Expr, lit: &CompileLit) -> Option<bool> {
     };
     // Evaluate the body with the parameter bound to the literal.
     eval_expr_bool(body, lit, &param_name)
+}
+
+/// Public wrapper so inference can const-check a refinement predicate against
+/// a compile-time literal at a refined-type introduction boundary.
+pub(crate) fn eval_refine_predicate_pub(pred: &ast::Expr, lit: &CompileLit) -> Option<bool> {
+    eval_refine_predicate(pred, lit)
 }
 
 /// Evaluate an expression to a boolean, with the refinement variable

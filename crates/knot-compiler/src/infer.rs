@@ -1244,6 +1244,63 @@ impl Infer {
         }
     }
 
+    /// Collect the predicate of a refined type *and every link in its declared
+    /// chain*, outermost first. `Age = Nat where \x -> x <= 150` yields
+    /// `[x <= 150, x >= 0]` — the effective predicate is their conjunction.
+    /// Returns `None` on a cyclic definition (already diagnosed elsewhere).
+    fn refined_chain_predicates(&self, name: &str) -> Option<Vec<ast::Expr>> {
+        let mut preds = Vec::new();
+        let mut visited: Vec<String> = vec![name.to_string()];
+        let (mut base, pred) = self.refined_types.get(name)?.clone();
+        preds.push(pred);
+        loop {
+            match &base {
+                Ty::Con(n, args) if args.is_empty() && self.refined_types.contains_key(n) => {
+                    if visited.iter().any(|v| v == n) {
+                        return None;
+                    }
+                    visited.push(n.clone());
+                    let (b, p) = self.refined_types[n].clone();
+                    preds.push(p);
+                    base = b;
+                }
+                _ => return Some(preds),
+            }
+        }
+    }
+
+    /// Is `src` a subtype of `dst` — may a `src` value be used where `dst` is
+    /// required with no `refine`? True when both are refined types over the
+    /// same numeric base and Z3 proves the source's (conjoined) predicate
+    /// implies the destination's. Anything unprovable returns false.
+    fn refined_subtype(&mut self, src: &str, dst: &str, span: Span) -> bool {
+        // Resolve each to its non-refined base and require the same numeric kind.
+        let src_base = match self.resolve_refined_base(src, span) {
+            Some(b) => self.apply(&b),
+            None => return false,
+        };
+        let dst_base = match self.resolve_refined_base(dst, span) {
+            Some(b) => self.apply(&b),
+            None => return false,
+        };
+        let kind = match (&src_base, &dst_base) {
+            (a, b) if a == b => match base_kind(a) {
+                Some(k) => k,
+                None => return false, // non-numeric base: not SMT-encodable
+            },
+            _ => return false, // different bases: no widening
+        };
+        let src_preds = match self.refined_chain_predicates(src) {
+            Some(p) => p,
+            None => return false,
+        };
+        let dst_preds = match self.refined_chain_predicates(dst) {
+            Some(p) => p,
+            None => return false,
+        };
+        crate::refine_smt::implies(&src_preds, &dst_preds, kind)
+    }
+
     /// True when `ty` resolves to a concrete type that can serve as a
     /// refinement base. Used to distinguish "a real base value is being
     /// supplied" (reject the implicit introduction of a refinement) from
@@ -2117,6 +2174,34 @@ impl Infer {
             }
             (Ty::Relation(a), Ty::Relation(b)) => {
                 self.unify_dir(a, b, span, t1_provided);
+            }
+            // ── Refined-type SMT subsumption ─────────────────────────────
+            // A value of refined type `S` flows where a *different*, looser
+            // refined type `T` is required — with no `refine` — when Z3 proves
+            // `S`'s predicate implies `T`'s predicate over a shared numeric
+            // base. Anything unprovable (not a subtype, an un-encodable
+            // predicate, a timeout) falls through to the mismatch arm, so the
+            // user keeps the explicit-`refine` requirement. Same-name Cons are
+            // the arm below; base-type flows are the refined/Con arms later.
+            (Ty::Con(n1, a1), Ty::Con(n2, a2))
+                if a1.is_empty()
+                    && a2.is_empty()
+                    && n1 != n2
+                    && self.refined_types.contains_key(n1)
+                    && self.refined_types.contains_key(n2) =>
+            {
+                // Provided vs required from polarity. `t1_provided` means t1
+                // is the value being supplied and t2 the requirement.
+                let (src, dst) = if t1_provided { (n1, n2) } else { (n2, n1) };
+                if !self.refined_subtype(src, dst, span) {
+                    let d1 = self.display_ty(&t1);
+                    let d2 = self.display_ty(&t2);
+                    let (exp, fnd) = if t1_provided { (d2, d1) } else { (d1, d2) };
+                    self.error(
+                        format!("type mismatch: expected {}, found {}", exp, fnd),
+                        span,
+                    );
+                }
             }
             (Ty::Con(n1, a1), Ty::Con(n2, a2))
                 if n1 == n2 && a1.len() == a2.len() =>
@@ -11959,6 +12044,21 @@ fn for_each_relation_marker<'a>(program: &'a ast::Expr, f: &mut impl FnMut(RelMa
         }
         _ => {}
     });
+}
+
+/// Classify a resolved, non-refined base type as integer or real for the SMT
+/// encoding; `None` for non-numeric bases (Text, Bool, records, ADTs), which
+/// Z3's arithmetic fragment can't reason about. Unit-bearing numerics count —
+/// but only when dimensionless, since `Nat M` and `Nat s` must not widen into
+/// each other (unit mismatch is caught by the earlier `==` on the base `Ty`).
+fn base_kind(ty: &Ty) -> Option<crate::refine_smt::BaseKind> {
+    match ty {
+        Ty::Float => Some(crate::refine_smt::BaseKind::Real),
+        Ty::Int => Some(crate::refine_smt::BaseKind::Int),
+        Ty::Con(name, _) if name == "Float" => Some(crate::refine_smt::BaseKind::Real),
+        Ty::Con(name, _) if name == "Int" => Some(crate::refine_smt::BaseKind::Int),
+        _ => None,
+    }
 }
 
 /// Visit every named function binding: a record field whose value is a lambda

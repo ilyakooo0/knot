@@ -24,3 +24,7 @@ target-lexicon = { workspace = true }
 # pinned to what cranelift 0.131 itself uses.
 gimli = { version = "0.33", default-features = false, features = ["write"] }
 object = { version = "0.39", default-features = false, features = ["write"] }
+# Z3 for compile-time refinement-predicate implication (SMT subtyping between
+# refined types). `gh-release` statically links a prebuilt libz3 (downloaded at
+# build time), so the compiler binary is self-contained — no runtime Z3 dep.
+z3 = { version = "0.20", default-features = false, features = ["gh-release"] }

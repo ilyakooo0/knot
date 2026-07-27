@@ -5869,39 +5869,42 @@ impl Codegen {
                         && let Some(schema) = self.source_schemas.get(source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[')
                                 && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
-                                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                    let sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table, frag.sql);
-                                    self.emit_stm_track_read(builder, source_name);
-                                    let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
-                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                    return self.call_rt(
-                                        builder,
-                                        "knot_source_query_count",
-                                        &[db, sql_ptr, sql_len, params_rel],
-                                    );
+                                    let query = Query {
+                                        plan: SqlQueryPlan {
+                                            tables: vec![SqlTable {
+                                                source_name: source_name.to_string(),
+                                                alias: String::new(),
+                                            }],
+                                            conditions: vec![frag.sql],
+                                            params: frag.params,
+                                            select_columns: Vec::new(),
+                                            order_by: Vec::new(),
+                                            limit: None,
+                                            offset: None,
+                                        },
+                                        terminal: QueryTerminal::Count,
+                                    };
+                                    return self.emit_query(builder, &query, &schema, env, db, None);
                                 }
                 }
 
                 // count (do { x <- *source; where ...; yield x }) → SELECT COUNT(*) FROM ... WHERE ...
                 if let ast::ExprKind::Do(stmts) = &args[0].node
                     && let Some(plan) = self.analyze_sql_plan(stmts, env) {
-                        let tables_sql: Vec<String> = plan.tables.iter().map(|t| {
-                            format!("{} AS {}", quote_sql_ident(&format!("_knot_{}", t.source_name)), t.alias)
-                        }).collect();
-                        let from = tables_sql.join(", ");
-                        let sql = if plan.conditions.is_empty() {
-                            format!("SELECT COUNT(*) FROM {}", from)
-                        } else {
-                            format!("SELECT COUNT(*) FROM {} WHERE {}", from, join_sql_conditions(&plan.conditions))
+                        let result_schema = plan.build_result_schema();
+                        let query = Query {
+                            plan: SqlQueryPlan {
+                                tables: plan.tables,
+                                conditions: plan.conditions,
+                                params: plan.params,
+                                select_columns: Vec::new(),
+                                order_by: Vec::new(),
+                                limit: None,
+                                offset: None,
+                            },
+                            terminal: QueryTerminal::Count,
                         };
-                        self.emit_stm_track_reads_for_plan(builder, &plan);
-                        let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
-                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                        return self.call_rt(
-                            builder,
-                            "knot_source_query_count",
-                            &[db, sql_ptr, sql_len, params_rel],
-                        );
+                        return self.emit_query(builder, &query, &result_schema, env, db, None);
                     }
             }
 
@@ -6191,7 +6194,7 @@ impl Codegen {
                                 }
 
                 // sum/avg/min/max lambda (filter f *source) → SQL aggregate with WHERE
-                if let Some((sql_func, rt_fn)) = aggregate_sql_func_runtime(name) {
+                if let Some((sql_func, _)) = aggregate_sql_func_runtime(name) {
                     if let Some((source_name, filter_bind, filter_body)) =
                         extract_filter_on_source(args[1], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
                     {
@@ -6213,26 +6216,31 @@ impl Codegen {
                                                 } else {
                                                     col_sql
                                                 };
-                                                let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                                let sql = format!("SELECT {}({}) FROM {} WHERE {}", sql_func, arg_sql, table, frag.sql);
-                                                self.emit_stm_track_read(builder, source_name);
-                                                let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
-                                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                                if rt_fn == "knot_source_query_value" {
-                                                    let is_text = builder.ins().iconst(
-                                                        types::I64,
-                                                        minmax_result_is_text(&agg_bind, agg_body, &schema) as i64,
-                                                    );
-                                                    return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_text]);
-                                                }
-                                                if rt_fn == "knot_source_query_sum" {
-                                                    let is_float = builder.ins().iconst(
-                                                        types::I64,
-                                                        sum_result_is_float(&agg_bind, agg_body, &schema) as i64,
-                                                    );
-                                                    return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_float]);
-                                                }
-                                                return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
+                                                let result_flag = if matches!(name, "minOn" | "maxOn") {
+                                                    minmax_result_is_text(&agg_bind, agg_body, &schema)
+                                                } else {
+                                                    sum_result_is_float(&agg_bind, agg_body, &schema)
+                                                };
+                                                let query = Query {
+                                                    plan: SqlQueryPlan {
+                                                        tables: vec![SqlTable {
+                                                            source_name: source_name.to_string(),
+                                                            alias: String::new(),
+                                                        }],
+                                                        conditions: vec![frag.sql],
+                                                        params: frag.params,
+                                                        select_columns: Vec::new(),
+                                                        order_by: Vec::new(),
+                                                        limit: None,
+                                                        offset: None,
+                                                    },
+                                                    terminal: QueryTerminal::Aggregate {
+                                                        func: sql_func,
+                                                        col_sql: arg_sql,
+                                                        result_flag,
+                                                    },
+                                                };
+                                                return self.emit_query(builder, &query, &schema, env, db, None);
                                             }
                                     }
                     }
@@ -6308,27 +6316,29 @@ impl Codegen {
                                     } else {
                                         col_sql
                                     };
-                                    let tables_sql: Vec<String> = plan.tables.iter().map(|t| {
-                                        format!("{} AS {}", quote_sql_ident(&format!("_knot_{}", t.source_name)), t.alias)
-                                    }).collect();
-                                    let from = tables_sql.join(", ");
-                                    let sql = if plan.conditions.is_empty() {
-                                        format!("SELECT {}({}) FROM {}", sql_func, arg_sql, from)
+                                    let result_flag = if matches!(name, "minOn" | "maxOn") {
+                                        col_is_text
                                     } else {
-                                        format!("SELECT {}({}) FROM {} WHERE {}", sql_func, arg_sql, from, join_sql_conditions(&plan.conditions))
+                                        col_ty == "float"
                                     };
-                                    self.emit_stm_track_reads_for_plan(builder, &plan);
-                                    let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
-                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                    if rt_fn == "knot_source_query_value" {
-                                        let is_text = builder.ins().iconst(types::I64, col_is_text as i64);
-                                        return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_text]);
-                                    }
-                                    if rt_fn == "knot_source_query_sum" {
-                                        let is_float = builder.ins().iconst(types::I64, (col_ty == "float") as i64);
-                                        return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_float]);
-                                    }
-                                    return self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]);
+                                    let result_schema = plan.build_result_schema();
+                                    let query = Query {
+                                        plan: SqlQueryPlan {
+                                            tables: plan.tables,
+                                            conditions: plan.conditions,
+                                            params: plan.params,
+                                            select_columns: Vec::new(),
+                                            order_by: Vec::new(),
+                                            limit: None,
+                                            offset: None,
+                                        },
+                                        terminal: QueryTerminal::Aggregate {
+                                            func: sql_func,
+                                            col_sql: arg_sql,
+                                            result_flag,
+                                        },
+                                    };
+                                    return self.emit_query(builder, &query, &result_schema, env, db, None);
                                 }
                             }
                 }
@@ -6518,23 +6528,24 @@ impl Codegen {
                                                     // divergence) — fall back to in-memory otherwise.
                                                     if sortby_projection_pushable(&sort_bind, sort_body, &schema)
                                                     && let Some(col_sql) = extract_sql_field_access(&sort_bind, sort_body, "", &schema) {
-                                                        let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                                        let cols = parse_schema_columns(&schema).iter()
-                                                            .map(|(n, _)| quote_sql_ident(n))
-                                                            .collect::<Vec<_>>()
-                                                            .join(", ");
-                                                        let sql = format!("SELECT {} FROM {} ORDER BY {} LIMIT MAX(CAST(? AS INTEGER), 0)", cols, table, col_sql);
                                                         let source_name = source_name.clone();
-                                                        self.emit_stm_track_read(builder, &source_name);
                                                         let n_val = self.compile_expr(builder, args[0], env, db);
-                                                        let params_rel = self.call_rt(builder, "knot_relation_singleton", &[n_val]);
-                                                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                                        let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                                                        return self.call_rt(
-                                                            builder,
-                                                            "knot_source_query",
-                                                            &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                                        );
+                                                        let query = Query {
+                                                            plan: SqlQueryPlan {
+                                                                tables: vec![SqlTable {
+                                                                    source_name,
+                                                                    alias: String::new(),
+                                                                }],
+                                                                conditions: Vec::new(),
+                                                                params: Vec::new(),
+                                                                select_columns: schema_select_columns(&schema, ""),
+                                                                order_by: vec![col_sql],
+                                                                limit: Some(SqlParamSource::Var("__limit__".into())),
+                                                                offset: None,
+                                                            },
+                                                            terminal: QueryTerminal::Rows,
+                                                        };
+                                                        return self.emit_query(builder, &query, &schema, env, db, Some(n_val));
                                                     }
                                                 }
                                     // Case 2: sortBy f (do { m <- *source; where ...; yield m })
@@ -6594,22 +6605,23 @@ impl Codegen {
                     && !self.views.contains_key(&source_name)
                         && let Some(schema) = self.source_schemas.get(&source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[') {
-                                self.emit_stm_track_read(builder, &source_name);
-                                let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                let cols = parse_schema_columns(&schema).iter()
-                                    .map(|(n, _)| quote_sql_ident(n))
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                let sql = format!("SELECT {} FROM {} LIMIT MAX(CAST(? AS INTEGER), 0)", cols, table);
                                 let n_val = self.compile_expr(builder, args[0], env, db);
-                                let params_rel = self.call_rt(builder, "knot_relation_singleton", &[n_val]);
-                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                                return self.call_rt(
-                                    builder,
-                                    "knot_source_query",
-                                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                );
+                                let query = Query {
+                                    plan: SqlQueryPlan {
+                                        tables: vec![SqlTable {
+                                            source_name: source_name.clone(),
+                                            alias: String::new(),
+                                        }],
+                                        conditions: Vec::new(),
+                                        params: Vec::new(),
+                                        select_columns: schema_select_columns(&schema, ""),
+                                        order_by: Vec::new(),
+                                        limit: Some(SqlParamSource::Var("__limit__".into())),
+                                        offset: None,
+                                    },
+                                    terminal: QueryTerminal::Rows,
+                                };
+                                return self.emit_query(builder, &query, &schema, env, db, Some(n_val));
                             }
 
                 // takeRelation N (filter f *source) → SQL WHERE + LIMIT
@@ -6622,23 +6634,23 @@ impl Codegen {
                         && let Some(schema) = self.source_schemas.get(source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[')
                                 && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
-                                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                    let cols = parse_schema_columns(&schema).iter()
-                                        .map(|(n, _)| quote_sql_ident(n))
-                                        .collect::<Vec<_>>()
-                                        .join(", ");
-                                    let sql = format!("SELECT {} FROM {} WHERE {} LIMIT MAX(CAST(? AS INTEGER), 0)", cols, table, frag.sql);
-                                    self.emit_stm_track_read(builder, source_name);
                                     let n_val = self.compile_expr(builder, args[0], env, db);
-                                    let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
-                                    self.call_rt_void(builder, "knot_relation_push", &[params_rel, n_val]);
-                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                                    return self.call_rt(
-                                        builder,
-                                        "knot_source_query",
-                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                    );
+                                    let query = Query {
+                                        plan: SqlQueryPlan {
+                                            tables: vec![SqlTable {
+                                                source_name: source_name.to_string(),
+                                                alias: String::new(),
+                                            }],
+                                            conditions: vec![frag.sql],
+                                            params: frag.params,
+                                            select_columns: schema_select_columns(&schema, ""),
+                                            order_by: Vec::new(),
+                                            limit: Some(SqlParamSource::Var("__limit__".into())),
+                                            offset: None,
+                                        },
+                                        terminal: QueryTerminal::Rows,
+                                    };
+                                    return self.emit_query(builder, &query, &schema, env, db, Some(n_val));
                                 }
                 }
             }
@@ -6659,42 +6671,28 @@ impl Codegen {
                         self.try_set_op_subquery(args[0], env),
                         self.try_set_op_subquery(args[1], env),
                     ) {
-                        // SQLite's EXCEPT/INTERSECT/UNION match columns
-                        // POSITIONALLY. The two sides can have different SELECT
-                        // column orders (a bare/filtered source uses schema
-                        // order, a do-block uses yield-record field order), so
-                        // align sub_b to sub_a's schema column order by name
-                        // before combining — otherwise the set op compares
-                        // mismatched columns and silently returns wrong rows.
-                        // Output columns are aliased to their field names in
-                        // both subquery forms, so a name-based reprojection is
-                        // safe. The result is read positionally as sub_a.schema.
-                        let b_sql = if sub_b.schema == sub_a.schema {
-                            sub_b.sql
-                        } else {
-                            let order_cols = parse_schema_columns(&sub_a.schema)
-                                .iter()
-                                .map(|(n, _)| quote_sql_ident(n))
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            format!("SELECT {} FROM ({})", order_cols, sub_b.sql)
+                        let result_schema = sub_a.schema.clone();
+                        let query = Query {
+                            // The plan is a sentinel — each SetOpSubquery side
+                            // carries its own sql/params/tables (a do-block
+                            // subquery's build_sql output isn't reconstructible
+                            // from a single SqlQueryPlan).
+                            plan: SqlQueryPlan {
+                                tables: Vec::new(),
+                                conditions: Vec::new(),
+                                params: Vec::new(),
+                                select_columns: Vec::new(),
+                                order_by: Vec::new(),
+                                limit: None,
+                                offset: None,
+                            },
+                            terminal: QueryTerminal::SetOp {
+                                op: sql_op,
+                                left: sub_a,
+                                right: sub_b,
+                            },
                         };
-                        let sql = format!("{} {} {}", sub_a.sql, sql_op, b_sql);
-                        let result_schema = sub_a.schema;
-                        for table in sub_a.tables.iter().chain(sub_b.tables.iter()) {
-                            let table = table.clone();
-                            self.emit_stm_track_read(builder, &table);
-                        }
-                        let mut all_params = sub_a.params;
-                        all_params.extend(sub_b.params);
-                        let params_rel = self.compile_sql_params(builder, &all_params, env, db);
-                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                        let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-                        return self.call_rt(
-                            builder,
-                            "knot_source_query",
-                            &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                        );
+                        return self.emit_query(builder, &query, &result_schema, env, db, None);
                     }
                 }
         }
@@ -11321,7 +11319,6 @@ impl Codegen {
         }
         let (bind_var, body) = extract_single_param_lambda(lambda_arg, &self.fun_bodies, &self.let_bindings)?;
         let body: &ast::Expr = &body;
-        let table = quote_sql_ident(&format!("_knot_{}", source_name));
 
         match fn_name {
             "filter" => {
@@ -11347,43 +11344,57 @@ impl Codegen {
                 }
                 // Use unqualified column names for direct SQL aggregate
                 let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
-                let (func, rt_fn) = aggregate_sql_func_runtime(fn_name)?;
+                let (func, _rt_fn) = aggregate_sql_func_runtime(fn_name)?;
                 let arg_sql = if matches!(fn_name, "minOn" | "maxOn") {
                     col_sql_for_minmax(&col_sql, &bind_var, body, schema)
                 } else {
                     col_sql
                 };
-                let sql = format!("SELECT {}({}) FROM {}", func, arg_sql, table);
-                self.emit_stm_track_read(builder, source_name);
-                let params_rel = self.compile_sql_params(builder, &[], env, db);
-                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                if rt_fn == "knot_source_query_value" {
-                    let is_text = builder.ins().iconst(
-                        types::I64,
-                        minmax_result_is_text(&bind_var, body, schema) as i64,
-                    );
-                    Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_text]))
-                } else if rt_fn == "knot_source_query_sum" {
-                    let is_float = builder.ins().iconst(
-                        types::I64,
-                        sum_result_is_float(&bind_var, body, schema) as i64,
-                    );
-                    Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, is_float]))
+                let result_flag = if matches!(fn_name, "minOn" | "maxOn") {
+                    minmax_result_is_text(&bind_var, body, schema)
                 } else {
-                    Some(self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel]))
-                }
+                    // SUM → is_float; AVG ignores the flag (always float).
+                    sum_result_is_float(&bind_var, body, schema)
+                };
+                let query = Query {
+                    plan: SqlQueryPlan {
+                        tables: vec![SqlTable {
+                            source_name: source_name.to_string(),
+                            alias: String::new(), // bare FROM, unqualified cols
+                        }],
+                        conditions: Vec::new(),
+                        params: Vec::new(),
+                        select_columns: Vec::new(),
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                    },
+                    terminal: QueryTerminal::Aggregate {
+                        func,
+                        col_sql: arg_sql,
+                        result_flag,
+                    },
+                };
+                Some(self.emit_query(builder, &query, schema, env, db, None))
             }
             "countWhere" => {
                 let frag = self.try_compile_sql_expr(&bind_var, body, schema)?;
-                let sql = format!("SELECT COUNT(*) FROM {} WHERE {}", table, frag.sql);
-                self.emit_stm_track_read(builder, source_name);
-                let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
-                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                Some(self.call_rt(
-                    builder,
-                    "knot_source_query_count",
-                    &[db, sql_ptr, sql_len, params_rel],
-                ))
+                let query = Query {
+                    plan: SqlQueryPlan {
+                        tables: vec![SqlTable {
+                            source_name: source_name.to_string(),
+                            alias: String::new(),
+                        }],
+                        conditions: vec![frag.sql],
+                        params: frag.params,
+                        select_columns: Vec::new(),
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                    },
+                    terminal: QueryTerminal::Count,
+                };
+                Some(self.emit_query(builder, &query, schema, env, db, None))
             }
             "sortBy" => {
                 // sortBy (\m -> m.field) *source → SELECT * FROM source ORDER BY field
@@ -11394,20 +11405,22 @@ impl Codegen {
                     return None;
                 }
                 let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
-                let cols = parse_schema_columns(schema).iter()
-                    .map(|(name, _)| quote_sql_ident(name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let sql = format!("SELECT {} FROM {} ORDER BY {}", cols, table, col_sql);
-                self.emit_stm_track_read(builder, source_name);
-                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                let (schema_ptr, schema_len) = self.string_ptr(builder, schema);
-                let params_rel = self.compile_sql_params(builder, &[], env, db);
-                Some(self.call_rt(
-                    builder,
-                    "knot_source_query",
-                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                ))
+                let query = Query {
+                    plan: SqlQueryPlan {
+                        tables: vec![SqlTable {
+                            source_name: source_name.to_string(),
+                            alias: String::new(),
+                        }],
+                        conditions: Vec::new(),
+                        params: Vec::new(),
+                        select_columns: schema_select_columns(schema, ""),
+                        order_by: vec![col_sql],
+                        limit: None,
+                        offset: None,
+                    },
+                    terminal: QueryTerminal::Rows,
+                };
+                Some(self.emit_query(builder, &query, schema, env, db, None))
             }
             _ => None,
         }
@@ -11618,69 +11631,41 @@ impl Codegen {
             if limit.is_some() || offset.is_some() {
                 return None;
             }
-            let table = quote_sql_ident(&format!("_knot_{}", source_name));
-            let sql = if conditions.is_empty() {
-                format!("SELECT {}({}) FROM {} AS {}", func, col_sql, table, alias)
-            } else {
-                format!(
-                    "SELECT {}({}) FROM {} AS {} WHERE {}",
-                    func, col_sql, table, alias, join_sql_conditions(&conditions)
-                )
+            let query = Query {
+                plan: SqlQueryPlan {
+                    tables: vec![SqlTable { source_name, alias }],
+                    conditions,
+                    params,
+                    select_columns: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                },
+                terminal: QueryTerminal::Aggregate { func, col_sql, result_flag },
             };
-            self.emit_stm_track_read(builder, &source_name);
-            let params_rel = self.compile_sql_params(builder, &params, env, db);
-            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-            let rt_fn = match func {
-                "SUM" => "knot_source_query_sum",
-                "AVG" => "knot_source_query_float",
-                "MIN" | "MAX" => "knot_source_query_value",
-                _ => "knot_source_query_count",
-            };
-            if rt_fn == "knot_source_query_value" {
-                let is_text = builder.ins().iconst(types::I64, result_flag as i64);
-                Some(self.call_rt(
-                    builder,
-                    rt_fn,
-                    &[db, sql_ptr, sql_len, params_rel, is_text],
-                ))
-            } else if rt_fn == "knot_source_query_sum" {
-                // For SUM `result_flag` carries `is_float` (see PipeOp::Sum).
-                let is_float = builder.ins().iconst(types::I64, result_flag as i64);
-                Some(self.call_rt(
-                    builder,
-                    rt_fn,
-                    &[db, sql_ptr, sql_len, params_rel, is_float],
-                ))
-            } else {
-                Some(self.call_rt(
-                    builder,
-                    rt_fn,
-                    &[db, sql_ptr, sql_len, params_rel],
-                ))
-            }
+            Some(self.emit_query(builder, &query, &schema, env, db, None))
         } else if is_count {
             // COUNT(*) ignores LIMIT/OFFSET — a count after take/drop must
             // fall back. (Also rejected by the order check.)
             if limit.is_some() || offset.is_some() {
                 return None;
             }
-            let table = quote_sql_ident(&format!("_knot_{}", source_name));
-            let sql = if conditions.is_empty() {
-                format!("SELECT COUNT(*) FROM {}", table)
-            } else {
-                format!(
-                    "SELECT COUNT(*) FROM {} AS {} WHERE {}",
-                    table, alias, join_sql_conditions(&conditions)
-                )
+            // Quirk preserved: bare `FROM t` when no conditions (no qualified
+            // column refs), `FROM t AS alias` when conditions reference t0.*.
+            let alias = if conditions.is_empty() { String::new() } else { alias };
+            let query = Query {
+                plan: SqlQueryPlan {
+                    tables: vec![SqlTable { source_name, alias }],
+                    conditions,
+                    params,
+                    select_columns: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                },
+                terminal: QueryTerminal::Count,
             };
-            self.emit_stm_track_read(builder, &source_name);
-            let params_rel = self.compile_sql_params(builder, &params, env, db);
-            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-            Some(self.call_rt(
-                builder,
-                "knot_source_query_count",
-                &[db, sql_ptr, sql_len, params_rel],
-            ))
+            Some(self.emit_query(builder, &query, &schema, env, db, None))
         } else {
             let select_columns = if let Some(cols) = select_override {
                 cols
@@ -12883,6 +12868,92 @@ impl Codegen {
         }
     }
 
+    /// Unified emit for the `Query` IR: render the SQL, track STM reads,
+    /// bind params, and dispatch to the terminal's runtime function with the
+    /// exact argument list that function expects. Replaces the per-entry-point
+    /// `format!("SELECT …")` + `call_rt` sequences. `result_schema` is only
+    /// used by the `Rows` terminal (positional reconstruction needs it);
+    /// aggregate/count terminals return scalars and ignore it.
+    ///
+    /// `limit_val`: a runtime-compiled `Value` for the LIMIT placeholder of a
+    /// `take`/`drop` query (N can be an arbitrary expression, not a static
+    /// `SqlParamSource`). When `Some`, it is pushed onto the params relation
+    /// after the static WHERE params — matching the `?` the plan's
+    /// `limit_offset_suffix` emits. `None` for queries with no runtime limit.
+    fn emit_query(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        query: &Query,
+        result_schema: &str,
+        env: &mut Env,
+        db: Value,
+        limit_val: Option<Value>,
+    ) -> Value {
+        let sql = query.build_sql();
+        // STM read-tracking + param sources differ by terminal: single-plan
+        // terminals read the plan's tables/params; a SetOp reads and binds
+        // across BOTH lowered subqueries.
+        let mut all_params: Vec<SqlParamSource> = Vec::new();
+        match &query.terminal {
+            QueryTerminal::SetOp { left, right, .. } => {
+                for table in left.tables.iter().chain(right.tables.iter()) {
+                    self.emit_stm_track_read(builder, table);
+                }
+                all_params.extend(left.params.iter().cloned());
+                all_params.extend(right.params.iter().cloned());
+            }
+            _ => {
+                self.emit_stm_track_reads_for_plan(builder, &query.plan);
+                all_params.extend(query.plan.params.iter().cloned());
+                // The Rows terminal may carry LIMIT/OFFSET params (take/drop):
+                // append after the WHERE params, LIMIT-then-OFFSET, matching
+                // the placeholders `limit_offset_suffix` emits.
+                if matches!(query.terminal, QueryTerminal::Rows) {
+                    if let Some(lim) = &query.plan.limit {
+                        all_params.push(lim.clone());
+                    }
+                    if let Some(off) = &query.plan.offset {
+                        all_params.push(off.clone());
+                    }
+                }
+            }
+        }
+        let params_rel = self.compile_sql_params(builder, &all_params, env, db);
+        // A runtime-compiled limit value rides as the final `?` param. (When
+        // it's the ONLY param this is equivalent to `knot_relation_singleton`.)
+        if let Some(n) = limit_val {
+            self.call_rt_void(builder, "knot_relation_push", &[params_rel, n]);
+        }
+        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+        match &query.terminal {
+            QueryTerminal::Rows | QueryTerminal::SetOp { .. } => {
+                // Both read positionally into a Relation (SetOp as left.schema).
+                let (schema_ptr, schema_len) = self.string_ptr(builder, result_schema);
+                self.call_rt(
+                    builder,
+                    "knot_source_query",
+                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                )
+            }
+            QueryTerminal::Count => self.call_rt(
+                builder,
+                "knot_source_query_count",
+                &[db, sql_ptr, sql_len, params_rel],
+            ),
+            QueryTerminal::Aggregate { result_flag, .. } => {
+                let rt_fn = query.runtime_fn();
+                // SUM and MIN/MAX take an extra I64 flag (is_float / is_text);
+                // AVG (`knot_source_query_float`) takes none.
+                if matches!(rt_fn, "knot_source_query_sum" | "knot_source_query_value") {
+                    let flag = builder.ins().iconst(types::I64, *result_flag as i64);
+                    self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel, flag])
+                } else {
+                    self.call_rt(builder, rt_fn, &[db, sql_ptr, sql_len, params_rel])
+                }
+            }
+        }
+    }
+
     fn emit_stm_track_pred(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -13877,6 +13948,7 @@ struct SqlFragment {
 }
 
 /// A SQL subquery for one side of a set operation (diff/inter/union).
+#[derive(Clone)]
 struct SetOpSubquery {
     sql: String,
     schema: String,
@@ -13970,21 +14042,28 @@ impl SqlQueryPlan {
             sql.push_str(&format!(" ORDER BY {}", self.order_by.join(", ")));
         }
 
-        if self.limit.is_some() || self.offset.is_some() {
-            // Clamp a negative limit to 0 (empty) so the SQL `take` matches the
-            // in-memory `knot_relation_take`, which clamps negatives to 0.
-            // SQLite otherwise reads a negative LIMIT as "no limit" (all rows).
-            // The bound param is TEXT (Ints store as TEXT), so CAST first.
-            sql.push_str(&format!(
-                " LIMIT {}",
-                if self.limit.is_some() { "MAX(CAST(? AS INTEGER), 0)" } else { "-1" }
-            ));
-            if self.offset.is_some() {
-                sql.push_str(" OFFSET ?");
-            }
-        }
+        sql.push_str(&self.limit_offset_suffix());
 
         sql
+    }
+
+    /// The `LIMIT …/OFFSET …` clause (empty when neither is set). A param
+    /// limit renders as `MAX(CAST(? AS INTEGER), 0)` so a negative `take`
+    /// clamps to 0 like `knot_relation_take` (SQLite reads negative LIMIT as
+    /// "no limit"); the bound param is TEXT (Ints store as TEXT) so CAST first.
+    /// Shared by `build_sql` and the Query IR's bare-Rows flavor.
+    fn limit_offset_suffix(&self) -> String {
+        if self.limit.is_none() && self.offset.is_none() {
+            return String::new();
+        }
+        let mut s = format!(
+            " LIMIT {}",
+            if self.limit.is_some() { "MAX(CAST(? AS INTEGER), 0)" } else { "-1" }
+        );
+        if self.offset.is_some() {
+            s.push_str(" OFFSET ?");
+        }
+        s
     }
 
     fn build_result_schema(&self) -> String {
@@ -14003,6 +14082,202 @@ fn plan_projection_is_identity(plan: &SqlQueryPlan) -> bool {
     plan.select_columns
         .iter()
         .all(|c| c.sql_expr.is_none() && c.result_field == c.source_col)
+}
+
+// ── Unified Query IR ────────────────────────────────────────────
+//
+// Every SELECT-producing pushdown entry point (do-block filter, pipe-chain,
+// single-aggregate) lowers to ONE `Query`: a relational spine (`SqlQueryPlan`)
+// plus a `QueryTerminal` saying what the query produces. A single
+// `Codegen::emit_query` then renders the SQL and dispatches to the matching
+// runtime function, replacing the per-site `format!("SELECT …")` + `call_rt`
+// duplication. Set operations (union/diff/inter) and groupBy are COMBINATORS
+// over `Query`s (union) or a streaming fold (groupBy), not SELECT terminals,
+// so they consume lowered `Query`s rather than being terminals themselves.
+
+/// What a lowered `Query` produces — determines both the SQL shape and which
+/// `knot_source_query*` runtime function `emit_query` calls.
+enum QueryTerminal {
+    /// Plain rows: `SELECT <cols> …` read positionally into a `Value::Relation`.
+    /// Runtime: `knot_source_query` (needs the result schema for reconstruction).
+    Rows,
+    /// `SELECT COUNT(*) …` → int. Runtime: `knot_source_query_count`.
+    Count,
+    /// `SELECT <FUNC>(<col>) …` → scalar. `result_flag` is type-dependent:
+    /// MIN/MAX → is_text, SUM → is_float, AVG → unused (always float).
+    /// Runtime: `knot_source_query_sum` / `_float` / `_value` (per `func`).
+    Aggregate {
+        /// SQL aggregate name: "SUM" | "AVG" | "MIN" | "MAX".
+        func: &'static str,
+        /// Column/expression SQL inside the aggregate.
+        col_sql: String,
+        /// Extra I64 flag the runtime fn takes (is_text for MIN/MAX,
+        /// is_float for SUM). Ignored for AVG.
+        result_flag: bool,
+    },
+    /// A set operation over two lowered `Rows` subqueries:
+    /// `<left.sql> <op> <right.sql>`, where `right` is reprojected to `left`'s
+    /// column order (SQLite's EXCEPT/INTERSECT/UNION match columns
+    /// POSITIONALLY and the two sides can list columns in different orders).
+    /// The enclosing `Query.plan` is a sentinel (unused) — each side carries
+    /// its own sql/params/tables because a do-block subquery's `build_sql`
+    /// output isn't reconstructible from a single `SqlQueryPlan`. Runtime:
+    /// `knot_source_query` (read positionally as `left.schema`).
+    SetOp {
+        /// "UNION" | "EXCEPT" | "INTERSECT".
+        op: &'static str,
+        left: SetOpSubquery,
+        right: SetOpSubquery,
+    },
+}
+
+/// A fully-lowered SELECT query: the relational spine plus its terminal.
+struct Query {
+    plan: SqlQueryPlan,
+    terminal: QueryTerminal,
+}
+
+/// Bare `SqlSelectColumn`s for every column of a single-source schema (used by
+/// the unqualified Rows flavor): result field == source column, the given
+/// (usually empty) alias, no computed expr.
+fn schema_select_columns(schema: &str, alias: &str) -> Vec<SqlSelectColumn> {
+    parse_schema_columns(schema)
+        .iter()
+        .map(|(name, ty)| SqlSelectColumn {
+            result_field: name.clone(),
+            alias: alias.to_string(),
+            source_col: name.clone(),
+            type_str: ty.clone(),
+            sql_expr: None,
+        })
+        .collect()
+}
+
+impl Query {
+    /// Render the SQL string. Aggregates reshape the SELECT list around the
+    /// terminal; `Rows`/`Count` reuse the plan's SELECT/FROM/WHERE/ORDER/LIMIT
+    /// machinery (Count overrides the select list with `COUNT(*)`).
+    fn build_sql(&self) -> String {
+        match &self.terminal {
+            QueryTerminal::Aggregate { func, col_sql, .. } => {
+                let from = self.from_clause();
+                if self.plan.conditions.is_empty() {
+                    format!("SELECT {}({}) FROM {}", func, col_sql, from)
+                } else {
+                    format!(
+                        "SELECT {}({}) FROM {} WHERE {}",
+                        func,
+                        col_sql,
+                        from,
+                        join_sql_conditions(&self.plan.conditions)
+                    )
+                }
+            }
+            QueryTerminal::Count => {
+                let from = self.from_clause();
+                if self.plan.conditions.is_empty() {
+                    format!("SELECT COUNT(*) FROM {}", from)
+                } else {
+                    format!(
+                        "SELECT COUNT(*) FROM {} WHERE {}",
+                        from,
+                        join_sql_conditions(&self.plan.conditions)
+                    )
+                }
+            }
+            QueryTerminal::SetOp { op, left, right } => {
+                // Reproject `right` to `left`'s column order (positional match
+                // — the two sides can list columns differently). Identity when
+                // the schemas already agree.
+                let right_sql = if right.schema == left.schema {
+                    right.sql.clone()
+                } else {
+                    let order_cols = parse_schema_columns(&left.schema)
+                        .iter()
+                        .map(|(n, _)| quote_sql_ident(n))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("SELECT {} FROM ({})", order_cols, right.sql)
+                };
+                format!("{} {} {}", left.sql, op, right_sql)
+            }
+            QueryTerminal::Rows => {
+                // Two Rows flavors. The single-source paths (sortBy / take /
+                // single / fold) use BARE unqualified columns and no table
+                // alias: `SELECT "a","b" FROM "_knot_x" …`. The do-block
+                // multi-table path aliases every column (`t0."a" AS "a"`) via
+                // the plan's own emitter. Pick by whether the table is aliased.
+                let bare = self.plan.tables.iter().all(|t| t.alias.is_empty());
+                if bare {
+                    let cols = self
+                        .plan
+                        .select_columns
+                        .iter()
+                        .map(|c| match &c.sql_expr {
+                            Some(e) => e.clone(),
+                            None => quote_sql_ident(&c.source_col),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let from = self.from_clause();
+                    let mut sql = if self.plan.conditions.is_empty() {
+                        format!("SELECT {} FROM {}", cols, from)
+                    } else {
+                        format!(
+                            "SELECT {} FROM {} WHERE {}",
+                            cols,
+                            from,
+                            join_sql_conditions(&self.plan.conditions)
+                        )
+                    };
+                    if !self.plan.order_by.is_empty() {
+                        sql.push_str(&format!(" ORDER BY {}", self.plan.order_by.join(", ")));
+                    }
+                    sql.push_str(&self.plan.limit_offset_suffix());
+                    sql
+                } else {
+                    self.plan.build_sql()
+                }
+            }
+        }
+    }
+
+    /// `"_knot_<src>" AS <alias>` joined over the plan's tables — the FROM
+    /// clause shared by the Count and Aggregate terminals (Rows uses the
+    /// plan's own emitter). A table with an EMPTY alias renders bare
+    /// (`"_knot_<src>"`, no `AS`) — the single-aggregate path uses unqualified
+    /// columns and must not gain an alias (byte-identical SQL).
+    fn from_clause(&self) -> String {
+        self.plan
+            .tables
+            .iter()
+            .map(|t| {
+                let tbl = quote_sql_ident(&format!("_knot_{}", t.source_name));
+                if t.alias.is_empty() {
+                    tbl
+                } else {
+                    format!("{} AS {}", tbl, t.alias)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The runtime function `emit_query` dispatches to for this terminal.
+    fn runtime_fn(&self) -> &'static str {
+        match &self.terminal {
+            QueryTerminal::Rows => "knot_source_query",
+            QueryTerminal::Count => "knot_source_query_count",
+            QueryTerminal::Aggregate { func, .. } => match *func {
+                "SUM" => "knot_source_query_sum",
+                "AVG" => "knot_source_query_float",
+                // MIN/MAX
+                _ => "knot_source_query_value",
+            },
+            // Set-ops read positionally into a Relation, like Rows.
+            QueryTerminal::SetOp { .. } => "knot_source_query",
+        }
+    }
 }
 
 /// Look up `field` in the plan's yield projection. Returns the qualified

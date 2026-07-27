@@ -3719,12 +3719,19 @@ impl Infer {
     }
 
     /// Bind `name` in the current scope, rejecting any binding that would
-    /// SHADOW a name already visible — either in an enclosing lexical scope or
-    /// in the stdlib value-fn registry. Knot forbids shadowing outright: a name
-    /// means exactly one thing for the whole region it is in scope, so a call
-    /// head / var reference can never silently change which definition it
-    /// resolves to (this is what makes SQL pushdown's name→SQL mapping sound
-    /// without any shadowing guard).
+    /// SHADOW a name already visible in an enclosing lexical scope. Knot
+    /// forbids shadowing outright: a name means exactly one thing for the
+    /// whole region it is in scope, so a call head / var reference can never
+    /// silently change which definition it resolves to (this is what makes
+    /// SQL pushdown's name→SQL mapping sound without any shadowing guard).
+    ///
+    /// The check is purely lexical — only `scopes` matters. The stdlib names
+    /// are NOT special: they live in `base` (an ordinary record) and in the
+    /// compiler-internal `stdlib_schemes` registry, never in `scopes`, so they
+    /// are simply not "in scope" until some `with` (e.g. `with base`) brings
+    /// them in — at which point a later conflicting binding errors like any
+    /// other. `with base` itself binds `base`'s fields exactly as `with` on
+    /// any other record would.
     ///
     /// `span` is the new binding site, used for the error. Internal
     /// compiler-generated names (the `\0with:` alias prefix and friends) are
@@ -3733,15 +3740,7 @@ impl Infer {
         if !name.starts_with('\0') {
             let shadows_enclosing =
                 self.scopes.iter().rev().skip(1).any(|s| s.contains_key(name));
-            let shadows_stdlib = self.stdlib_schemes.contains_key(name);
-            if shadows_stdlib {
-                self.error(
-                    format!(
-                        "`{name}` cannot be defined here: it is the name of a standard-library function, and shadowing is not allowed"
-                    ),
-                    span,
-                );
-            } else if shadows_enclosing {
+            if shadows_enclosing {
                 self.error(
                     format!(
                         "`{name}` is already defined in an enclosing scope, and shadowing is not allowed"
@@ -5437,19 +5436,18 @@ impl Infer {
                     let mut field_tys: Vec<(String, Ty)> =
                         Vec::with_capacity(field_exprs.len());
                     for f in field_exprs {
-                        // A `with` field named `base` shadows the compiler-owned
-                        // stdlib record — forbidden (knot has no shadowing).
-                        // `base` is bound via `bind_top` (not `stdlib_schemes`),
-                        // so it escapes the `bind_at` stdlib-shadow check that
-                        // catches the other stdlib names below. Reject here and
-                        // skip the field entirely: the error is the clean
-                        // shadowing message, and omitting the field keeps the
-                        // `with` record from unifying `base`'s value against the
-                        // global record type (which would add a redundant,
-                        // unreadable type-mismatch error on top).
+                        // A `with` field named `base` collides with the
+                        // compiler-owned stdlib record, which is bound in
+                        // `scopes[0]` — a genuine lexical conflict (knot has
+                        // no shadowing). Reject here and skip the field
+                        // entirely: the error is the clean shadowing message,
+                        // and omitting the field keeps the `with` record from
+                        // unifying `base`'s value against the global record
+                        // type (which would add a redundant, unreadable
+                        // type-mismatch error on top).
                         if f.name == "base" {
                             self.error(
-                                "`base` cannot be defined here: it is the name of a standard-library function, and shadowing is not allowed".to_string(),
+                                "`base` is already defined in an enclosing scope, and shadowing is not allowed".to_string(),
                                 f.value.span,
                             );
                             continue;
@@ -8505,19 +8503,23 @@ impl Infer {
         // Named functions are `with`-record fields with a signature and/or a
         // lambda value. Pre-register their schemes by name.
         for_each_named_fn(program, &mut |name, sig, value| {
-            // A declaration record field named after a stdlib value-fn shadows
-            // the builtin — forbidden (knot has no shadowing). Decl fields bind
-            // through `bind_top` (pre-registration into `scopes[0]`), bypassing
-            // the `bind_at` check, so reject the collision here at the source.
-            // `base` is the compiler-owned stdlib record, bound globally via
-            // `bind_top` (not `stdlib_schemes`, which holds its field names), so
-            // it needs an explicit check to get the clean shadowing error
+            // A declaration record field named `base` collides with the
+            // compiler-owned stdlib record, which IS bound in `scopes[0]`
+            // (via `bind_top`) — a genuine lexical conflict, so reject it.
+            // Decl fields bind through `bind_top` (pre-registration into
+            // `scopes[0]`), bypassing the `bind_at` check, so reject the
+            // collision here at the source to get the clean shadowing error
             // instead of a type mismatch against the full `base` record type.
-            if self.stdlib_schemes.contains_key(name) || name == "base" {
+            //
+            // stdlib value-fn names (`map`, `count`, …) are NOT in `scopes` —
+            // they live in `base` / the `stdlib_schemes` registry — so a decl
+            // field named after one is NOT a lexical conflict and is allowed
+            // (pure-lexical scoping: `base` is an ordinary record).
+            if name == "base" {
                 let span = value.map(|v| v.span).unwrap_or(Span { start: 0, end: 0 });
                 self.error(
                     format!(
-                        "`{name}` cannot be defined here: it is the name of a standard-library function, and shadowing is not allowed"
+                        "`{name}` is already defined in an enclosing scope, and shadowing is not allowed"
                     ),
                     span,
                 );

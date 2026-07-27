@@ -2,7 +2,7 @@
 //!
 //! Usage: knot build <file.knot>
 
-use knot_compiler::{codegen, desugar, infer, linker, lockfile, stratify, types};
+use knot_compiler::{codegen, desugar, infer, linker, lockfile, nonterm, stratify, types};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -388,6 +388,21 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
             eprintln!("{}", diag.render(&source, &filename));
         }
         if strat_diags
+            .iter()
+            .any(|d| d.severity == knot::diagnostic::Severity::Error)
+        {
+            process::exit(1);
+        }
+    }
+
+    // Non-termination check: reject definitions that provably recurse forever
+    // (unguarded self-calls with no base case).
+    let nonterm_diags = nonterm::check(&program);
+    if !nonterm_diags.is_empty() {
+        for diag in &nonterm_diags {
+            eprintln!("{}", diag.render(&source, &filename));
+        }
+        if nonterm_diags
             .iter()
             .any(|d| d.severity == knot::diagnostic::Severity::Error)
         {

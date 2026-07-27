@@ -6,6 +6,7 @@ pub mod desugar;
 pub mod infer;
 pub mod linker;
 pub mod lockfile;
+pub mod nonterm;
 pub mod refine_smt;
 pub mod sql_lint;
 pub mod stack;

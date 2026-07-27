@@ -4247,24 +4247,6 @@ impl Codegen {
             }
 
             ast::ExprKind::With { record, body } => {
-                // Reject `with {base ...}` — the `base` record is compiler-owned
-                // and rebinding it would shadow the global stdlib record, causing
-                // codegen to emit a self-referential call to `knot_user_base`
-                // (the global `base` record function) with no body, crashing at
-                // runtime. This is a compile error, not a silent shadow.
-                if let ast::ExprKind::Record(field_exprs) = &record.node {
-                    for f in field_exprs {
-                        if f.name == "base" {
-                            self.push_codegen_error(
-                                builder,
-                                record.span,
-                                "`base` cannot be redefined: it is the compiler-owned standard-library record".to_string(),
-                            );
-                            // Return a dummy value to continue compilation without crashing
-                            return builder.ins().iconst(self.ptr_type, 0);
-                        }
-                    }
-                }
                 // Evaluate the record, then bind each of its fields (from
                 // inference's `with_fields`) as a local for the body. A cloned
                 // env gives lexical scoping: field bindings shadow outer ones

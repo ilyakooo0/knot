@@ -364,6 +364,16 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         process::exit(1);
     }
 
+    // Reject `with`-chain shadowing: a field name bound by two layers of the
+    // top-level `with {…} (with {…} …)` chain silently shadows the outer one.
+    let with_shadow_diags = types::check_with_chain_shadowing(&program);
+    if !with_shadow_diags.is_empty() {
+        for diag in &with_shadow_diags {
+            eprintln!("{}", diag.render(&source, &filename));
+        }
+        process::exit(1);
+    }
+
     // Resolve types
     let type_env = types::TypeEnv::from_program(&program);
 

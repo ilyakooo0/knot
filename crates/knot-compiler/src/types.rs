@@ -595,6 +595,63 @@ pub fn check_alias_cycles(program: &Expr) -> Vec<knot::diagnostic::Diagnostic> {
     diags
 }
 
+/// Reject `with`-chain shadowing: in the top-level `with {r1} (with {r2} (…
+/// body))` chain, each layer scopes its record's fields over the layers and
+/// body beneath it, so a field name bound by two layers silently shadows the
+/// outer one. knot has no shadowing — report every name bound by more than
+/// one layer. This catches what the per-scope `bind_at` check cannot: the
+/// declaration record is the INNERMOST `with`'s record, so an outer layer's
+/// same-named field is a separate binding that no enclosing-scope check sees.
+pub fn check_with_chain_shadowing(program: &Expr) -> Vec<knot::diagnostic::Diagnostic> {
+    use knot::ast::ExprKind;
+    let mut diags = Vec::new();
+    // (name, span) of every field bound by an OUTER layer, in chain order.
+    let mut outer: HashMap<String, Span> = HashMap::new();
+    let mut cur = program;
+    loop {
+        match &cur.node {
+            ExprKind::With { record, body } if matches!(body.node, ExprKind::With { .. }) => {
+                // An outer layer: collect its field names, then descend. A name
+                // repeated across two outer layers shadows within the chain.
+                if let ExprKind::Record(fields) = &record.node {
+                    for f in fields {
+                        if outer.insert(f.name.clone(), f.value.span).is_some() {
+                            diags.push(
+                                knot::diagnostic::Diagnostic::error(format!(
+                                    "`{}` is already defined in an enclosing scope, and shadowing is not allowed",
+                                    f.name
+                                ))
+                                .label(f.value.span, "shadows an earlier `with` binding of this name"),
+                            );
+                        }
+                    }
+                }
+                cur = body;
+            }
+            ExprKind::With { record, .. } => {
+                // The innermost `with`: its record is the declaration record.
+                // Its fields must not repeat any outer layer's name.
+                if let ExprKind::Record(fields) = &record.node {
+                    for f in fields {
+                        if outer.contains_key(&f.name) {
+                            diags.push(
+                                knot::diagnostic::Diagnostic::error(format!(
+                                    "`{}` is already defined in an enclosing scope, and shadowing is not allowed",
+                                    f.name
+                                ))
+                                .label(f.value.span, "shadows an earlier `with` binding of this name"),
+                            );
+                        }
+                    }
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    diags
+}
+
 /// Collect the alias names referenced anywhere inside a type AST.
 fn collect_named_alias_refs(
     ty: &Type,

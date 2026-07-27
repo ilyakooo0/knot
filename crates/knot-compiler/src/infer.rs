@@ -5437,6 +5437,23 @@ impl Infer {
                     let mut field_tys: Vec<(String, Ty)> =
                         Vec::with_capacity(field_exprs.len());
                     for f in field_exprs {
+                        // A `with` field named `base` shadows the compiler-owned
+                        // stdlib record — forbidden (knot has no shadowing).
+                        // `base` is bound via `bind_top` (not `stdlib_schemes`),
+                        // so it escapes the `bind_at` stdlib-shadow check that
+                        // catches the other stdlib names below. Reject here and
+                        // skip the field entirely: the error is the clean
+                        // shadowing message, and omitting the field keeps the
+                        // `with` record from unifying `base`'s value against the
+                        // global record type (which would add a redundant,
+                        // unreadable type-mismatch error on top).
+                        if f.name == "base" {
+                            self.error(
+                                "`base` cannot be defined here: it is the name of a standard-library function, and shadowing is not allowed".to_string(),
+                                f.value.span,
+                            );
+                            continue;
+                        }
                         // Save any enclosing `with` frame that binds this
                         // field's name (innermost-to-outermost), masking it
                         // only while THIS field's value is inferred.
@@ -8492,7 +8509,11 @@ impl Infer {
             // the builtin — forbidden (knot has no shadowing). Decl fields bind
             // through `bind_top` (pre-registration into `scopes[0]`), bypassing
             // the `bind_at` check, so reject the collision here at the source.
-            if self.stdlib_schemes.contains_key(name) {
+            // `base` is the compiler-owned stdlib record, bound globally via
+            // `bind_top` (not `stdlib_schemes`, which holds its field names), so
+            // it needs an explicit check to get the clean shadowing error
+            // instead of a type mismatch against the full `base` record type.
+            if self.stdlib_schemes.contains_key(name) || name == "base" {
                 let span = value.map(|v| v.span).unwrap_or(Span { start: 0, end: 0 });
                 self.error(
                     format!(

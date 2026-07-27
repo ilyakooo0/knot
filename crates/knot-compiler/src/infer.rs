@@ -3718,6 +3718,43 @@ impl Infer {
         }
     }
 
+    /// Bind `name` in the current scope, rejecting any binding that would
+    /// SHADOW a name already visible — either in an enclosing lexical scope or
+    /// in the stdlib value-fn registry. Knot forbids shadowing outright: a name
+    /// means exactly one thing for the whole region it is in scope, so a call
+    /// head / var reference can never silently change which definition it
+    /// resolves to (this is what makes SQL pushdown's name→SQL mapping sound
+    /// without any shadowing guard).
+    ///
+    /// `span` is the new binding site, used for the error. Internal
+    /// compiler-generated names (the `\0with:` alias prefix and friends) are
+    /// exempt — they are not user-visible and are free to collide.
+    fn bind_at(&mut self, name: &str, scheme: Scheme, span: Span) {
+        if !name.starts_with('\0') {
+            let shadows_enclosing =
+                self.scopes.iter().rev().skip(1).any(|s| s.contains_key(name));
+            let shadows_stdlib = self.stdlib_schemes.contains_key(name);
+            if shadows_stdlib {
+                self.error(
+                    format!(
+                        "`{name}` cannot be defined here: it is the name of a standard-library function, and shadowing is not allowed"
+                    ),
+                    span,
+                );
+            } else if shadows_enclosing {
+                self.error(
+                    format!(
+                        "`{name}` is already defined in an enclosing scope, and shadowing is not allowed"
+                    ),
+                    span,
+                );
+            }
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name.to_string(), scheme);
+        }
+    }
+
     fn bind_top(&mut self, name: &str, scheme: Scheme) {
         // While `register_builtins` runs, stdlib value functions (`map`,
         // `println`, `count`, the server/query forms, …) go into the
@@ -5449,7 +5486,9 @@ impl Infer {
                 };
                 self.push_scope();
                 for (name, ty) in &fields {
-                    self.bind(name, Scheme::mono(ty.clone()));
+                    // `fields` comes from the resolved record TYPE (no per-field
+                    // span), so point the shadow error at the whole `with` record.
+                    self.bind_at(name, Scheme::mono(ty.clone()), record.span);
                 }
                 // Mark this scope as a `with` frame (span + field schemes) so
                 // the `Var` arm can redirect a `with`-field reference to the
@@ -5720,7 +5759,7 @@ impl Infer {
                             let applied = self.apply(&arg_ty);
                             let scheme = self.generalize(&applied);
                             self.push_scope();
-                            self.bind(name, scheme);
+                            self.bind_at(name, scheme, params[0].span);
                             self.binding_types.push((params[0].span, applied));
                             let body_ty = self.infer_expr(body);
                             self.pop_scope();
@@ -7292,7 +7331,7 @@ impl Infer {
                     }
                     _ => Scheme::mono(expected.clone()),
                 };
-                self.bind(name, scheme);
+                self.bind_at(name, scheme, pat.span);
                 self.binding_types.push((pat.span, expected.clone()));
             }
             ast::PatKind::Wildcard => {}
@@ -7386,7 +7425,7 @@ impl Infer {
                         // span (not the whole record pattern's), so hover on one
                         // punned field resolves to that field's type instead of
                         // colliding with its siblings (smallest-span-wins).
-                        self.bind(&fp.name, Scheme::mono(ft.clone()));
+                        self.bind_at(&fp.name, Scheme::mono(ft.clone()), fp.name_span);
                         self.binding_types.push((fp.name_span, ft));
                     }
                 }
@@ -8448,7 +8487,20 @@ impl Infer {
 
         // Named functions are `with`-record fields with a signature and/or a
         // lambda value. Pre-register their schemes by name.
-        for_each_named_fn(program, &mut |name, sig, _value| {
+        for_each_named_fn(program, &mut |name, sig, value| {
+            // A declaration record field named after a stdlib value-fn shadows
+            // the builtin — forbidden (knot has no shadowing). Decl fields bind
+            // through `bind_top` (pre-registration into `scopes[0]`), bypassing
+            // the `bind_at` check, so reject the collision here at the source.
+            if self.stdlib_schemes.contains_key(name) {
+                let span = value.map(|v| v.span).unwrap_or(Span { start: 0, end: 0 });
+                self.error(
+                    format!(
+                        "`{name}` cannot be defined here: it is the name of a standard-library function, and shadowing is not allowed"
+                    ),
+                    span,
+                );
+            }
             self.user_top_level_names.insert(name.to_string());
             if let Some(scheme) = sig {
                 self.annotation_vars.clear();

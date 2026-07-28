@@ -408,6 +408,23 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         }
     }
 
+    // Warn about every `trace` probe left in the codebase: it compiles, runs,
+    // and returns its value unchanged, but prints a report every time it fires —
+    // a debugging aid, not shipping behaviour. One warning per probe, with a
+    // caret at the site. Unlike errors this does not stop the build.
+    if !trace_types.is_empty() {
+        let mut spans: Vec<_> = trace_types.keys().copied().collect();
+        spans.sort_by_key(|s| s.start);
+        for span in spans {
+            let diag = knot::diagnostic::Diagnostic::warning(
+                "`trace` probe left in — prints a report at runtime every time it fires",
+            )
+            .label(span, "debug probe")
+            .note("remove `base.trace` before shipping");
+            eprintln!("{}", diag.render(&source, &filename));
+        }
+    }
+
     // Stratification check for recursive derived relations
     let strat_diags = stratify::check(&program);
     if !strat_diags.is_empty() {

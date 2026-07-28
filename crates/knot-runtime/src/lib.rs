@@ -20414,6 +20414,18 @@ mod index_extraction_tests {
         assert_eq!(cols, vec!["age"]);
     }
 
+    #[test]
+    fn where_columns_alias_qualified_join() {
+        // Regression (JOIN pushdown): a multi-table WHERE emits alias-qualified
+        // columns — `t0."dname" = t1."dname"`. The aliases are unquoted, so only
+        // the quoted column names are extracted (deduped); the caller indexes
+        // each against its own source table.
+        let cols = extract_where_columns(
+            r#"(t0."dname" = t1."dname") AND (t0."budget" > ?) AND (t1."salary" > ?)"#,
+        );
+        assert_eq!(cols, vec!["dname", "budget", "salary"]);
+    }
+
     // ── extract_aggregate_columns ───────────────────────────────────
 
     #[test]

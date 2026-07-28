@@ -9170,6 +9170,19 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Value {
+        // A read-only relational comprehension (binds + wheres + yield, no
+        // writes) is classified as IO only because reading a `*source` counts
+        // as an effect — but it has no side effect worth deferring. Try the
+        // single-SQL-query path first: multi-table joins and filters become
+        // one SELECT … WHERE …, which is both faster and lets the runtime
+        // auto-index the join/filter columns. `knot_io_run` (the consumer of
+        // every IO value) returns non-IO values unchanged, so handing back an
+        // eager relation instead of a thunk is transparent to callers.
+        if Self::do_block_is_comprehension(stmts)
+            && let Some(val) = self.try_compile_full_sql(builder, stmts, env, db)
+        {
+            return val;
+        }
         // Build the entire do-block as an IO thunk using a helper function.
         // The helper function, when called, runs each IO action with knot_io_run.
         self.compile_io_do_as_thunk(builder, stmts, env, db)

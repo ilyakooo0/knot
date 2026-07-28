@@ -5,10 +5,10 @@ type Sale = {item: Text, qty: Int 1, price: Int 1}
 }
 (do
   replace *sales = [
-    { item "apple" qty 3 price 50 },
-    { item "banana" qty 7 price 20 },
-    { item "cherry" qty 2 price 120 },
-    { item "date" qty 5 price 80 },
+    { item "apple" qty 3 price 50 } 
+    { item "banana" qty 7 price 20 } 
+    { item "cherry" qty 2 price 120 } 
+    { item "date" qty 5 price 80 } 
     { item "fig" qty 4 price 30 }
   ]
 

@@ -138,7 +138,7 @@ Extract the single element of a relation. Returns `Just {value: x}` for a single
 ```knot
 single [{name "Alice"}]    -- Just {value {name "Alice"}}
 single []                   -- Nothing {}
-single [1, 2]               -- Nothing {}
+single [1 2]               -- Nothing {}
 ```
 
 ### `count`
@@ -178,7 +178,7 @@ sum : [a] -> a
 Sum of a numeric relation. Takes the relation directly — there is no projection argument. To sum a field of a record relation, project first with `map`. Works with `Int 1`, `Float 1`, and unit-annotated types — units are preserved.
 
 ```knot
-total = sum [10, 20, 30]                          -- 60
+total = sum [10 20 30]                          -- 60
 
 -- Sum a record field by projecting first:
 totalAge = sum (map (\p -> p.age) *people)
@@ -293,7 +293,7 @@ findFirst : [a] -> (a -> Bool) -> Maybe a
 First row matching the predicate (left-to-right), or `Nothing {}` when no row matches. Stops at the first hit.
 
 ```knot
-findFirst [1, 2, 3, 4, 5] (\x -> x > 3)   -- Just {value 4}
+findFirst [1 2 3 4 5] (\x -> x > 3)   -- Just {value 4}
 ```
 
 ### `any` / `all`
@@ -534,9 +534,9 @@ drop : Int 1 -> [a]  -> [a]
 
 ```knot
 take 3 "hello"        -- "hel"
-take 2 [10, 20, 30]   -- [10, 20]
+take 2 [10 20 30]   -- [10, 20]
 drop 3 "hello"        -- "lo"
-drop 1 [10, 20, 30]   -- [20, 30]
+drop 1 [10 20 30]   -- [20, 30]
 ```
 
 ### `contains`
@@ -639,7 +639,7 @@ forEach : [a] -> (a -> IO r {}) -> IO r {}
 Sequence an IO action over each row of a relation. Iteration follows the relation's deterministic order (after any `sortBy`).
 
 ```knot
-forEach ["a", "b", "c"] (\s -> println s)
+forEach ["a" "b" "c"] (\s -> println s)
 ```
 
 ---

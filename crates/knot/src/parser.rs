@@ -1857,7 +1857,36 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> Option<Expr> {
         let expr = self.parse_constructor_or_atom()?;
-        self.parse_postfix_from(expr)
+        let expr = self.parse_postfix_from(expr)?;
+        // A QUALIFIED constructor (`Maybe.Just`) parses as a `FieldAccess`, so
+        // the bare-ctor arg consumption in `parse_constructor_or_atom` never
+        // fires for it. Every constructor carries a record payload, so when a
+        // postfix chain ends in an uppercase field (`Type.Ctor`) and a record
+        // literal `{…}` follows, that record is the ctor's payload — consume it
+        // as the application argument here. This lets `Maybe.Just {value 1}`
+        // appear unparenthesized as a list element or record field value, just
+        // like the bare `Just {value 1}` form.
+        if let ExprKind::FieldAccess { field, .. } = &expr.node {
+            if field.chars().next().is_some_and(|c| c.is_uppercase())
+                && self.at(&TokenKind::LBrace)
+            {
+                if !self.enter_recursion() {
+                    return None;
+                }
+                let arg = self.parse_postfix();
+                self.recursion_depth -= 1;
+                let arg = arg?;
+                let span = Span::new(expr.span.start, arg.span.end);
+                return Some(Spanned::new(
+                    ExprKind::App {
+                        func: Box::new(expr),
+                        arg: Box::new(arg),
+                    },
+                    span,
+                ));
+            }
+        }
+        Some(expr)
     }
 
     /// Continue a field-access chain from an already-parsed head expression.
@@ -2875,25 +2904,23 @@ impl Parser {
     }
 
     fn parse_list_expr(&mut self, start: Span) -> Option<Expr> {
-        // Already consumed `[`.
+        // Already consumed `[`. Elements are SPACE-separated (no commas), so
+        // each is parsed with `parse_postfix` — the same non-greedy parse used
+        // for record field values — so one element can't absorb the next as a
+        // function application. `[1 2 3]`, `[{x 1} {x 2}]`, and
+        // `[Just {value 1} Nothing {}]` all work; anything needing a binop or
+        // application must be parenthesized: `[(1 + 2) (f x)]`.
         self.skip_newlines();
         let mut elems = Vec::new();
-        if !self.at(&TokenKind::RBracket) {
-            loop {
-                self.skip_newlines();
-                let e = self.parse_expr()?;
-                elems.push(e);
-                self.skip_newlines();
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-                self.skip_newlines();
-                if self.at(&TokenKind::RBracket) {
-                    break; // trailing comma
-                }
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBracket) {
+                break;
             }
+            let e = self.parse_postfix()?;
+            elems.push(e);
+            self.skip_newlines();
         }
-        self.skip_newlines();
         let end_tok = self
             .expect(&TokenKind::RBracket, "expected ']' to close list")
             .ok()?;
@@ -3762,25 +3789,21 @@ impl Parser {
     }
 
     fn parse_list_pat(&mut self, start: Span) -> Option<Pat> {
-        // Already consumed `[`.
+        // Already consumed `[`. Elements are SPACE-separated (no commas), like
+        // relation-literal expressions. `parse_pat` is non-greedy (patterns
+        // have no application), so `[p1 p2]` is two var patterns and
+        // `[Cons h t]` stays one constructor pattern.
         self.skip_newlines();
         let mut pats = Vec::new();
-        if !self.at(&TokenKind::RBracket) {
-            loop {
-                self.skip_newlines();
-                let p = self.parse_pat()?;
-                pats.push(p);
-                self.skip_newlines();
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-                self.skip_newlines();
-                if self.at(&TokenKind::RBracket) {
-                    break; // trailing comma
-                }
+        loop {
+            self.skip_newlines();
+            if self.at(&TokenKind::RBracket) {
+                break;
             }
+            let p = self.parse_pat()?;
+            pats.push(p);
+            self.skip_newlines();
         }
-        self.skip_newlines();
         let end_tok = self
             .expect(&TokenKind::RBracket, "expected ']' to close list pattern")
             .ok()?;

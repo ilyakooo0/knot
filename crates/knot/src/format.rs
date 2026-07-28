@@ -629,7 +629,7 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             let mut s = String::from("[");
             for (i, it) in items.iter().enumerate() {
                 if i > 0 {
-                    s.push_str(", ");
+                    s.push(' ');
                 }
                 s.push_str(&render_expr_inline(it, Prec::Lowest));
             }
@@ -1255,11 +1255,8 @@ fn render_list_block(p: &mut Printer, items: &[Expr]) {
     p.write("[");
     p.newline();
     p.with_indent(|p| {
-        for (i, it) in items.iter().enumerate() {
+        for it in items.iter() {
             render_expr(p, it, Prec::Lowest);
-            if i + 1 < items.len() {
-                p.write(",");
-            }
             p.newline();
         }
     });
@@ -1435,7 +1432,7 @@ fn render_pat(p: &Pat) -> String {
             let mut s = String::from("[");
             for (i, it) in items.iter().enumerate() {
                 if i > 0 {
-                    s.push_str(", ");
+                    s.push(' ');
                 }
                 s.push_str(&render_pat(it));
             }

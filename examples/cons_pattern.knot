@@ -9,8 +9,8 @@ firstOr (\xs default -> case xs of
   Cons h _ -> h)
 }
 (do
-  base.println (base.show (sumList [1, 2, 3, 4]))
+  base.println (base.show (sumList [1 2 3 4]))
   base.println (base.show (sumList []))
-  base.println (base.show (firstOr [10, 20, 30] 0))
+  base.println (base.show (firstOr [10 20 30] 0))
   base.println (base.show (firstOr [] 99))
   yield {})

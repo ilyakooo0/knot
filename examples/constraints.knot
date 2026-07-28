@@ -13,7 +13,7 @@ type Person = {name: Text, age: Int 1, email: Text}
 }
 (do
   -- Insert some people
-  replace *people = [{ name "Alice" age 30 email "alice@example.com" }, { name "Bob" age 25 email "bob@example.com" }]
+  replace *people = [{ name "Alice" age 30 email "alice@example.com" } { name "Bob" age 25 email "bob@example.com" }]
 
   -- Insert a valid order (Alice exists in people)
   replace *orders = [{ customer "Alice" amount 100 }]

@@ -10,7 +10,7 @@ type Person = {name: Text, age: Int 1}
 *people : [Person]
 
 main = do
-  *people = [{name "Alice" age 30}, {name "Bob" age 25}]
+  *people = [{name "Alice" age 30} {name "Bob" age 25}]
   people <- *people
   with {result do
     p <- people
@@ -95,7 +95,7 @@ Note the two syntaxes differ: **values** are `{name "Alice" age 30}` (space-sepa
 A relation `[T]` is a typed **set** of `T` values. No duplicates. No ordering guarantees.
 
 ```knot
-names = ["Alice", "Bob", "Carol"]     -- [Text]
+names = ["Alice" "Bob" "Carol"]     -- [Text]
 empty = []                             -- [a]
 people = [{name "Alice" age 30}]   -- [{name: Text, age: Int 1}]
 ```
@@ -457,7 +457,7 @@ describe = \rel -> case rel of
 | Pattern | Matches |
 |---------|---------|
 | `[]` | empty relation |
-| `[p1, p2, ...]` | relation with exactly that many rows |
+| `[p1 p2 ...]` | relation with exactly that many rows |
 | `Cons head tail` | non-empty relation, `head` is one row, `tail` is the rest |
 
 `Cons` is also useful in recursive functions:

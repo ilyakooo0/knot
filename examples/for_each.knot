@@ -2,11 +2,11 @@
 
 (do
   -- Basic case: print each integer
-  base.forEach [1, 2, 3] (\x -> base.println (base.show x))
+  base.forEach [1 2 3] (\x -> base.println (base.show x))
   -- Empty list: action shouldn't run
   base.forEach [] (\x -> base.println (base.show x))
   -- Strings
-  base.forEach ["a", "b", "c"] (\s -> base.println s)
+  base.forEach ["a" "b" "c"] (\s -> base.println s)
   -- After forEach: subsequent actions still run
   base.println "done"
   yield {})

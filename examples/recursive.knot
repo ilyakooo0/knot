@@ -11,8 +11,8 @@ with {
 }
 (do
   replace *manages = [
-    {manager "Alice" report "Bob"},
-    {manager "Alice" report "Carol"},
+    {manager "Alice" report "Bob"} 
+    {manager "Alice" report "Carol"} 
     {manager "Bob" report "Dave"}
   ]
   base.println "Direct reports:"

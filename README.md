@@ -45,7 +45,7 @@ type Person = {name: Text, age: Int 1}
 *people : [Person]
 }
 (do
-  replace *people = [{name "Alice" age 30}, {name "Bob" age 25}, {name "Carol" age 35}]
+  replace *people = [{name "Alice" age 30} {name "Bob" age 25} {name "Carol" age 35}]
   seniors <- (do
     p <- *people
     where p.age > 27
@@ -160,9 +160,9 @@ the role other languages give to lists/arrays.
 
 ```knot
 with {
-nums   [1, 2, 3, 4]
+nums   [1 2 3 4]
 empty  []                       -- the empty relation
-people [{name "Ada" age 36}, {name "Grace" age 17}]
+people [{name "Ada" age 36} {name "Grace" age 17}]
 }
 (do
   base.println (base.show (base.count nums))        -- "4"
@@ -279,7 +279,7 @@ sumList (\xs -> case xs of
   []        -> 0
   Cons h t  -> h + sumList t)
 }
-(base.println (base.show (sumList [1, 2, 3, 4])))   -- "10"
+(base.println (base.show (sumList [1 2 3 4])))   -- "10"
 ```
 
 `[]` matches the empty relation and `Cons h t` splits off one element `h`
@@ -322,7 +322,7 @@ type Todo = {title: Text, done: Int 1}
 *todos : [Todo]
 }
 (do
-  replace *todos = [{title "write guide" done 0}, {title "ship it" done 0}]
+  replace *todos = [{title "write guide" done 0} {title "ship it" done 0}]
 
   -- a query comprehension: binds each row, filters, yields results
   open <- (do
@@ -368,8 +368,8 @@ with {
 }
 (do
   replace *manages = [
-    {manager "Alice" report "Bob"},
-    {manager "Alice" report "Carol"},
+    {manager "Alice" report "Bob"}
+    {manager "Alice" report "Carol"}
     {manager "Bob" report "Dave"}
   ]
   rows <- &directReports
@@ -491,8 +491,8 @@ annotations — they're inferred.
 (do
   base.println (base.toUpper "knot")            -- "KNOT"
   base.println (base.show (base.length "hi"))   -- "2"
-  base.println (base.show (base.take 2 [9, 8, 7]))  -- "[9, 8]"
-  base.println (base.show (base.sum [1, 2, 3]))     -- "6"
+  base.println (base.show (base.take 2 [9 8 7]))  -- "[9, 8]"
+  base.println (base.show (base.sum [1 2 3]))     -- "6"
   base.println (base.show (base.min 3 7))           -- "3"
   base.println (base.show (base.max 3 7))           -- "7"
   yield {})

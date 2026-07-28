@@ -26,7 +26,7 @@ pruneDemo (do
   with {kept (do i <- items; where i.price > 0; yield i)} *items = kept)
 }
 (do
-  replace *items = [{name "Alice" price 10}, {name "Bob" price 25}]
+  replace *items = [{name "Alice" price 10} {name "Bob" price 25}]
   appendDemo
   rows1 <- *items
   base.println ("after append: " ++ base.show rows1)

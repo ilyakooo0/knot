@@ -17,7 +17,7 @@ avgDemo (do
 }
 
 do
-  replace *lines = [{product "widget" price 5 qty 2}, {product "gadget" price 9 qty 1}, {product "gizmo" price 5 qty 3}]
+  replace *lines = [{product "widget" price 5 qty 2} {product "gadget" price 9 qty 1} {product "gizmo" price 5 qty 3}]
   totalDemo
   avgDemo
   yield {}

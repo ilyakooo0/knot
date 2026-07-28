@@ -78,9 +78,17 @@ answer 42
 (base.println (base.show answer))   -- prints "42"
 ```
 
-There are no statements, only expressions. `with { ... } body` brings the
-declarations into scope for `body`. Indentation is significant (layout), and
-application is by juxtaposition: `f x y`, with parens to group.
+There are no statements, only expressions. **Everything is an expression** — a
+`case` arm, a `do` block, a function body, a whole program — and every
+expression evaluates to a value. A Knot *file* is one big expression whose
+value is what the program produces. `with { ... } body` is itself an
+expression: it brings the declarations into scope for `body` and its value is
+`body`'s value. Indentation is significant (layout), and application is by
+juxtaposition: `f x y`, with parens to group.
+
+Because everything is an expression, you can nest any of these wherever a value
+is expected — a `do` block inside a `with` field, a `case` inside an argument,
+a `with` inside another `with`.
 
 ### Values and primitive types
 
@@ -90,14 +98,60 @@ anInt    42               -- Int 1  (unit is mandatory; `1` = dimensionless)
 aFloat   3.14             -- Float 1
 aText    "hello"          -- Text
 aBool    true             -- Bool (also `false`)
-aRecord  {name "Ada" age 36}          -- records: space-separated fields
-aUnit    {}               -- the empty record / unit value
 }
 (base.println aText)
 ```
 
 Numbers carry **units of measure**. `Int 1` is dimensionless; you can declare
-`unit Ms` and write `250 Ms`. Field access uses a dot: `aRecord.name`.
+`unit Ms` and write `250 Ms`.
+
+### Records
+
+A **record** groups named values into one value. Fields are space-separated —
+no `:` and no `,` — and each field pairs a name with a value:
+
+```knot
+with {
+point   {x 3 y 4}                  -- two Int fields
+person  {name "Ada" age 36}        -- mixed field types
+empty   {}                          -- the empty record (the unit value)
+}
+(base.println (base.show point))    -- "{x: 3, y: 4}"
+```
+
+You always *write* a record with spaces — `{x 3 y 4}`. The `{x: 3, y: 4}` above
+is just how `show` *prints* a record (with `:` and `,`); that printed form is
+not valid input syntax.
+
+Read a field with a dot. Records nest, and access chains left to right:
+
+```knot
+with {
+pt     {x 3 y 4}
+person {name "Ada" addr {city "London" zip "E1"}}
+}
+(do
+  base.println (base.show pt.x)              -- "3"
+  base.println (base.show person.addr.city)  -- "London"
+  yield {})
+```
+
+Records are immutable, but a **record update** builds a new record from an old
+one with some fields replaced — `{base | field newValue ...}` (spaces again, no
+commas):
+
+```knot
+with {
+pt    {x 3 y 4}
+moved ({pt | x 10})               -- like pt, but x is 10
+}
+(base.println (base.show moved))  -- "{x: 10, y: 4}"
+```
+
+The empty record `{}` is the **unit** value — the "nothing interesting here"
+result. A `do` block that only performs effects ends in `yield {}` to produce
+it. Records are how `with` declarations, constructor payloads, and function
+dictionaries are all shaped, so you'll see them everywhere.
 
 ### Relations — the core data structure
 

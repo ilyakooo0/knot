@@ -174,12 +174,26 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
                         // like `nums [1, 2, 3]` — all become top-level named
                         // declarations, exactly as the Phase-1 lowering turned
                         // `with {f v} body` fields into decls.
+                        //
+                        // A signature-only field (`name : Type` with no `=`)
+                        // is emitted by the parser as `sig: Some` + an
+                        // empty-record placeholder value. That is a required
+                        // CLI constant, NOT a `{}` binding: surface it as
+                        // `Fun { body: None }` so codegen registers a startup
+                        // `--name=value` lookup instead of checking the empty
+                        // record against the sig (which fails to type-check).
+                        let is_required_const = fl.sig.is_some()
+                            && matches!(&fl.value.node, Record(fs) if fs.is_empty());
                         out.push(DeclView {
                             name: fl.name.as_str(),
                             span: fl.value.span,
                             kind: DeclViewKind::Fun {
                                 ty: fl.sig.as_ref(),
-                                body: Some(&fl.value),
+                                body: if is_required_const {
+                                    None
+                                } else {
+                                    Some(&fl.value)
+                                },
                             },
                         });
                     }

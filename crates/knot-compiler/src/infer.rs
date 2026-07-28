@@ -5289,6 +5289,23 @@ impl Infer {
                 let field_tys: BTreeMap<String, Ty> = fields
                     .iter()
                     .map(|f| {
+                        // A signature-only field (`name : Type`, no `=`) is a
+                        // required CLI constant: the parser gave it an
+                        // empty-record placeholder value that must NOT be
+                        // checked against the sig (it would fail). Take the
+                        // sig type as the field type and skip the value.
+                        let is_required_const = f.sig.is_some()
+                            && matches!(&f.value.node, ast::ExprKind::Record(fs) if fs.is_empty());
+                        if is_required_const {
+                            let sig = f.sig.as_ref().unwrap();
+                            let saved_flag = self.in_type_annotation;
+                            let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
+                            self.in_type_annotation = true;
+                            let sig_ty = self.ast_type_to_ty(&sig.ty);
+                            self.in_type_annotation = saved_flag;
+                            self.annotation_unit_vars = saved_unit_vars;
+                            return (f.name.clone(), sig_ty);
+                        }
                         let val_ty = self.infer_expr(&f.value);
                         // A field with a standalone sig line (`name : Type`)
                         // must have a value whose type matches the sig —
@@ -5535,6 +5552,23 @@ impl Infer {
                     let mut field_tys: Vec<(String, Ty)> =
                         Vec::with_capacity(field_exprs.len());
                     for f in field_exprs {
+                        // Required CLI constant (sig-only field, empty-record
+                        // placeholder value): take the sig type as the field
+                        // type and skip the placeholder value entirely.
+                        if f.sig.is_some()
+                            && matches!(&f.value.node, ast::ExprKind::Record(fs) if fs.is_empty())
+                        {
+                            let sig = f.sig.as_ref().unwrap();
+                            let saved_flag = self.in_type_annotation;
+                            let saved_unit_vars =
+                                std::mem::take(&mut self.annotation_unit_vars);
+                            self.in_type_annotation = true;
+                            let sig_ty = self.ast_type_to_ty(&sig.ty);
+                            self.in_type_annotation = saved_flag;
+                            self.annotation_unit_vars = saved_unit_vars;
+                            field_tys.push((f.name.clone(), sig_ty));
+                            continue;
+                        }
                         // A `with` field named `base` collides with the
                         // compiler-owned stdlib record, which is bound in
                         // `scopes[0]` — a genuine lexical conflict (knot has
@@ -6668,6 +6702,22 @@ impl Infer {
                     let expected_fields = expected_fields.clone();
                     let mut field_tys = BTreeMap::new();
                     for f in fields {
+                        // Required CLI constant (sig-only field, empty-record
+                        // placeholder value): take the sig type, skip the value.
+                        let is_required_const = f.sig.is_some()
+                            && matches!(&f.value.node, ast::ExprKind::Record(fs) if fs.is_empty());
+                        if is_required_const {
+                            let sig = f.sig.as_ref().unwrap();
+                            let saved_flag = self.in_type_annotation;
+                            let saved_unit_vars =
+                                std::mem::take(&mut self.annotation_unit_vars);
+                            self.in_type_annotation = true;
+                            let sig_ty = self.ast_type_to_ty(&sig.ty);
+                            self.in_type_annotation = saved_flag;
+                            self.annotation_unit_vars = saved_unit_vars;
+                            field_tys.insert(f.name.clone(), sig_ty);
+                            continue;
+                        }
                         // A field with a sig line is checked against its sig
                         // first; the sig type then stands as the field's type.
                         if let Some(sig) = &f.sig {
@@ -10293,6 +10343,15 @@ impl Infer {
                 Some(b) => b,
                 None => return,
             };
+            // Required CLI constant (sig-only field, empty-record placeholder
+            // body): there is no value to check against the sig. Skip — codegen
+            // registers the startup `--name=value` lookup and the field's type
+            // is the sig (set during pre-registration).
+            if ty.is_some()
+                && matches!(&body.node, ast::ExprKind::Record(fs) if fs.is_empty())
+            {
+                return;
+            }
             {
                 let scheme = self.lookup(name).cloned();
                 let (expected, fresh_skolems, fresh_unit_skolems) = match scheme {

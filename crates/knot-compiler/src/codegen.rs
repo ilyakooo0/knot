@@ -2037,6 +2037,14 @@ impl Codegen {
                     }
                 }
                 DeclViewKind::Derived { body: Some(body), .. } => {
+                    // `decl_views` yields the field name WITH the `&` marker
+                    // (`&directReports`), but `DerivedRef` (desugar) and the
+                    // `DerivedRef` codegen arm use the BARE name. Strip the
+                    // marker once here so registration, self-reference
+                    // detection, and the fixpoint keys all agree with the
+                    // reference site — otherwise the lookup in the `DerivedRef`
+                    // arm misses ("undefined derived relation").
+                    let name = name.strip_prefix('&').unwrap_or(name);
                     // Derived relations are 0-param functions (only db param)
                     let mut sig = self.module.make_signature();
                     sig.params.push(AbiParam::new(self.ptr_type)); // db
@@ -2859,6 +2867,9 @@ impl Codegen {
                     }
                 }
                 DeclViewKind::Derived { body: Some(body), .. } => {
+                    // Same `&`-strip as the registration pass above: keys are
+                    // the BARE name (matching `DerivedRef`).
+                    let name = name.strip_prefix('&').unwrap_or(name);
                     if self.recursive_derived.contains(name) {
                         self.define_recursive_derived(name, body);
                     } else {
@@ -4355,6 +4366,28 @@ impl Codegen {
                     let mut compiled_fields: Vec<(&String, Value)> =
                         Vec::with_capacity(field_exprs.len());
                     for f in field_exprs {
+                        // Required CLI constant (sig-only field, empty-record
+                        // placeholder value): bind the field to a call of the
+                        // registered required-const function (which reads
+                        // `--name=value` at startup), NOT the placeholder
+                        // record — the placeholder is a parser artifact, never
+                        // a real value.
+                        if f.sig.is_some()
+                            && matches!(&f.value.node, ast::ExprKind::Record(fs) if fs.is_empty())
+                        {
+                            let v = if let Some((func_id, 0)) =
+                                self.user_fns.get(f.name.as_str()).copied()
+                            {
+                                let func_ref =
+                                    self.module.declare_func_in_func(func_id, builder.func);
+                                let call = builder.ins().call(func_ref, &[db]);
+                                builder.inst_results(call)[0]
+                            } else {
+                                self.compile_expr(builder, &f.value, &mut env.clone(), db)
+                            };
+                            compiled_fields.push((&f.name, v));
+                            continue;
+                        }
                         let mut field_env = env.clone();
                         // Self-reference masking (mirror of inference): this
                         // field's value must not capture an enclosing `with`'s
@@ -6134,10 +6167,22 @@ impl Codegen {
         // global instead of the local value.
         if let ast::ExprKind::Var(name) = &func_expr.node
             && env.bindings.contains_key(name) {
-                let compiled_args: Vec<Value> = args
-                    .iter()
-                    .map(|a| self.compile_arg_expr(builder, a, env, db))
-                    .collect();
+                // Implicit dictionary: a `with`-field function with a
+                // `(^field : T) =>` constraint is called through the local
+                // env binding (the `with` frame binds it). Inference recorded
+                // the dictionary splice keyed by this callsite's span; prepend
+                // the resolved dictionary record as the leading argument (the
+                // elaborated function takes it first), exactly like the
+                // top-level call path below.
+                let mut compiled_args: Vec<Value> = Vec::new();
+                if let Some((root, path)) = self.implicit_dict_args.get(&expr.span).cloned() {
+                    let dict_val =
+                        self.compile_root_path(builder, &root, &path, expr.span, env, db);
+                    compiled_args.push(dict_val);
+                }
+                compiled_args.extend(
+                    args.iter().map(|a| self.compile_arg_expr(builder, a, env, db)),
+                );
                 let func_val = self.compile_expr(builder, func_expr, env, db);
                 let mut result = func_val;
                 for arg in &compiled_args {
@@ -15482,7 +15527,20 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
         }
         With { record, body } => {
             collect_free_vars_set(record, bound, free);
-            collect_free_vars_set(body, bound, free);
+            // The record's fields are bound within the body (`with {r v} …
+            // … r …` uses `r` without capturing it). Without this, a `with`
+            // field referenced in the body is reported free, and an enclosing
+            // lambda tries to capture it from an outer scope where it does
+            // not exist ("undefined captured variable"). Only record-literal
+            // operands expose static field names; a computed record binds
+            // nothing statically knowable, matching the type checker.
+            let mut new_bound = bound.clone();
+            if let Record(fields) = &record.node {
+                for f in fields {
+                    new_bound.insert(f.name.clone());
+                }
+            }
+            collect_free_vars_set(body, &new_bound, free);
         }
         BinOp { lhs, rhs, .. } => {
             collect_free_vars_set(lhs, bound, free);
@@ -16412,7 +16470,17 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         }
         ast::ExprKind::With { record, body } => {
             collect_free_vars(record, bound, free);
-            collect_free_vars(body, bound, free);
+            // The record's fields are bound within the body, so a `with`
+            // field referenced there is NOT a free variable of an enclosing
+            // lambda — otherwise the lambda tries to capture it from an outer
+            // scope where it does not exist ("undefined captured variable").
+            let mut new_bound = bound.clone();
+            if let ast::ExprKind::Record(fields) = &record.node {
+                for f in fields {
+                    new_bound.insert(f.name.as_str());
+                }
+            }
+            collect_free_vars(body, &new_bound, free);
         }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
             collect_free_vars(lhs, bound, free);

@@ -28,7 +28,10 @@ migration tracking.
 ## Documentation
 
 - [Language Design](DESIGN.md) — full language specification
-- [Standard Library](stdlib.md) — built-in functions, traits, and types
+- [The `base` Namespace](base.md) — every standard-library function with its
+  full path, type, and description
+- [Standard Library](stdlib.md) — operators, built-in types, and units of
+  measure
 
 ## A Taste
 
@@ -119,7 +122,7 @@ people [{name "Ada" age 36}, {name "Grace" age 17}]
 
 ```knot
 with {
--- name (\\arg1 arg2 -> body)
+-- name (\arg1 arg2 -> body)
 add (\a b -> a + b)
 
 -- optional type signature on the line above
@@ -290,6 +293,136 @@ Comprehensions over a source push down to SQL (`WHERE`, joins, aggregates
 like `count`/`sum`/`avg`, `sortBy`). A `<name>.schema.lock` file tracks the
 schema across runs for automatic migration.
 
+### Derived relations — `&name`
+
+Prefix a name with `&` to declare a **derived relation**: a read-only,
+computed view over one or more source relations. Unlike a source relation it
+is never persisted — its body is re-evaluated on each access, so it always
+reflects the current state of its inputs. Recursive and mutually-recursive
+derived relations are supported (transitive closures, etc.).
+
+```knot
+with {
+*manages : [{manager: Text, report: Text}]
+
+-- recomputed on every read; rows are projected from *manages
+&directReports = (do
+  manages <- *manages
+  yield (do
+    m <- manages
+    yield {manager m.manager report m.report}))
+}
+(do
+  replace *manages = [
+    {manager "Alice" report "Bob"},
+    {manager "Alice" report "Carol"},
+    {manager "Bob" report "Dave"}
+  ]
+  rows <- &directReports
+  base.println (base.show rows)
+  base.println ("Total: " ++ base.show (base.count rows))   -- "Total: 3"
+  yield {})
+```
+
+See `examples/recursive.knot`.
+
+### Required CLI arguments — signature-only constants
+
+A `with`-level binding with a type signature but **no value** is a *required
+command-line argument*. The compiled program reads `--name=value` at startup;
+the value is parsed and checked against the declared type (including any
+refinement predicate), and a missing or invalid argument aborts with a clear
+error and `--help` output listing every required flag.
+
+```knot
+with {
+type Port = Int 1 where \p -> p > 0 && p < 65536
+
+-- no value on the right — these are required CLI args
+port     : Port
+host     : Text
+greeting : Text
+}
+(do
+  base.println (greeting ++ " from " ++ host ++ " on port " ++ base.show port))
+```
+
+```sh
+$ ./program
+Error: missing required argument --port
+  pass --port=<value> on the command line, or run --help for usage
+
+$ ./program --port=8080 --host=localhost --greeting=Hello
+"Hello from localhost on port 8080"
+
+$ ./program --port=99999 --host=x --greeting=y
+Error: value supplied for --port does not satisfy 'Port' predicate
+```
+
+Only scalar-ish types (integers, floats, text, bools, and refinements of
+those) can be CLI-overridden. See `examples/required_args.knot`.
+
+### Implicit field projection — `^field` and dictionary constraints
+
+`^field` is an *implicit reference*: it resolves to some field named `field`
+found in an in-scope record, with the **expected type** disambiguating which
+one. You don't name the record — the compiler searches lexical scope and picks
+the field whose type unifies with what the context needs.
+
+The canonical use is lightweight ad-hoc polymorphism: bundle functions in a
+record (a "dictionary"), bring it into scope with `with`, and project
+operations out with `(^field)`:
+
+```knot
+with {
+intRender  {render (\n -> "int: " ++ base.show n)}
+textRender {render (\s -> "text: " ++ s)}
+}
+(do
+  with intRender  (base.println ((^render) 41))        -- "int: 41"
+  with textRender (base.println ((^render) "hello"))   -- "text: hello"
+  yield {})
+```
+
+`(^render)` resolves to whichever `render` field is lexically in scope and
+type-compatible — `Int -> Text` at the first site, `Text -> Text` at the
+second. If no in-scope field matches the expected type, you get a compile
+error listing what was searched. See `examples/trait_replacement.knot` and
+`examples/ord.knot`.
+
+#### Dictionary constraints — `(^field : T) =>`
+
+A function can *declare* that it needs a dictionary without naming it, using a
+signature constraint `(^field : T) =>`. The compiler then resolves the
+dictionary from lexical scope at each full-arity callsite and splices it in as
+a hidden leading argument:
+
+```knot
+with {
+intOrd     {compare (\a b -> case a > b of true -> 1 false -> case a < b of true -> (0 - 1) false -> 0)}
+textOrd    {compare (\a b -> case a > b of true -> 1 false -> case a < b of true -> (0 - 1) false -> 0)}
+intOrdDesc {compare (\a b -> case a < b of true -> 1 false -> case a > b of true -> (0 - 1) false -> 0)}
+
+-- clamp needs a `compare` dictionary but doesn't name it
+clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
+clamp (\lo hi x -> case ((^compare) x lo) < 0 of
+  true -> lo
+  false -> case ((^compare) x hi) > 0 of
+    true -> hi
+    false -> x)
+}
+(do
+  base.println (base.show (with intOrd     (clamp 0 10 42)))   -- "10"
+  base.println (base.show (with textOrd    (clamp "a" "m" "z"))) -- "m"
+  base.println (base.show (with intOrdDesc (clamp 0 10 42)))   -- "0"
+  yield {})
+```
+
+At each `clamp ...` callsite, the enclosing `with <dict>` supplies the record
+whose `compare` field satisfies the constraint. This is the post-trait idiom
+for overloading: an "instance" is an ordinary record passed implicitly. See
+`examples/implicit_dictionaries.knot`.
+
 ### Effects are tracked
 
 Every function's type records what it can do. `base.println` returns
@@ -317,10 +450,86 @@ Also: `map`, `filter`, `fold`, `count`, `countWhere`, `avg`, `minOn`,
 hashing, UUIDs, file I/O, crypto, and leveled logging. See
 [stdlib.md](stdlib.md) for the full list.
 
+### Debugging with `base.todo` and `base.trace`
+
+Two primitives for development-time debugging. Both are gated special forms
+reached through the `base` record, and both print a rich report showing the
+relevant type, the source location (file:line:col with a caret), and every
+in-scope local binding with its type and runtime value.
+
+```knot
+with {
+greet (\name -> "hello " ++ name)
+
+-- `base.todo : ∀a. a` is an unimplemented hole. It type-checks as ANY type,
+-- so you can stub out a definition and fill it in later. The program
+-- COMPILES, but when evaluation reaches the hole it aborts (exit 1) with the
+-- report:
+--   Error: reached a `todo` hole — this code path is not implemented yet
+--     expected to produce a value of type: Text
+--     local bindings in scope: ...
+--     values in scope: ...
+tagline base.todo          -- stub: "I'll write the tagline later"
+}
+(do
+  base.println (greet "world")
+  base.println tagline           -- a top-level hole is forced when the program
+  yield {})                      -- starts, so this aborts with the report above
+```
+
+Every surviving `base.todo` also emits a **compile-time warning** (one per
+site), so holes can't slip into a build unnoticed:
+
+```
+Warning: `todo` hole used — this code path is a debug placeholder, not implemented
+```
+
+`base.trace : ∀a. a -> a` is the non-crashing sibling — a transparent probe.
+It prints the same report *plus* the traced value, then returns the value
+unchanged, so you can drop it into the middle of an expression without
+changing its meaning:
+
+```knot
+(do
+  base.println (base.toUpper (base.trace "hello"))   -- prints the report +
+                                                     -- traced value, then "HELLO"
+  base.println (base.show (base.trace 21))           -- report + 21, then "21"
+  yield {})
+```
+
+Like `todo`, a surviving `base.trace` emits a compile-time warning so you
+don't ship a stray probe. The difference: `todo` is a placeholder to *replace*
+before shipping (it aborts); `trace` is a *temporary observation point* (it
+returns its argument, so the program keeps running).
+
+### Compile-time termination checking
+
+The compiler rejects definitions it can prove never terminate — a function
+that unconditionally calls itself with no base case that could ever bottom
+out, and certain non-productive recursive bindings. This is a *conservative*
+check: it only fires on definite non-termination, so ordinary recursion
+(`sumList`, folds, etc.) is unaffected.
+
+### Refined-type constant checking and SMT subtyping
+
+Two refinements to the refined-type machinery beyond the basics above:
+
+- **Compile-time constants are checked against the predicate at build time.**
+  `greet 30` needs no `refine` — the compiler evaluates the constant against
+  `0 <= 30 <= 150` and either accepts it or fails the build naming the value.
+  `&&`/`||` in predicates are const-folded so compound predicates check
+  statically.
+- **SMT-based subtyping.** The compiler can *prove* one refined type is a
+  subtype of another when the predicates allow it — e.g. `Int 1 where \x ->
+  x >= 10` is accepted where `Int 1 where \x -> x >= 0` is expected, because
+  `x >= 10` implies `x >= 0`. This uses an SMT solver (Z3) to discharge the
+  implication, so you can pass a *more* refined value where a *less* refined
+  one is required without an explicit `refine`.
+
 ### Where to go next
 
 - [DESIGN.md](DESIGN.md) — the full language specification (routes/HTTP,
-  refined types, units, concurrency with `fork`/`race`/`atomic`, modules,
+  refined types, units, concurrency with `fork`/`race`/`atomic`, traits,
   schema migration, subset constraints).
 - [stdlib.md](stdlib.md) — every builtin with its type.
 - [examples/](examples/) — runnable programs for each feature.
@@ -335,9 +544,13 @@ under [examples/](examples/):
 expression-bindings, and derived relations (`&name = ...`) compose through
 `do`-notation. Comprehension queries push down to SQL when they can —
 `filter`, `map`, `count`, `countWhere`, `sum`, `avg`, `minOn`, `maxOn`,
-multi-table joins, and `sortBy` all become SELECT statements with
-auto-indexed WHERE/ORDER BY columns. See `examples/query_opt.knot`,
-`examples/inline_pushdown.knot`, `examples/let_pushdown.knot`.
+multi-table joins, `groupBy`, and `sortBy` all become SELECT statements with
+auto-indexed WHERE/ORDER BY columns. Pushdown goes through a unified Query IR,
+matches stdlib functions by *resolution* (not bare name, so a same-named user
+function can't be mistaken for a builtin), and *inlines pure helper functions*
+in predicates so `where (salaryOf e) > 75` becomes `WHERE salary > 75`.
+See `examples/query_opt.knot`, `examples/inline_pushdown.knot`,
+`examples/let_pushdown.knot`, `examples/groupby.knot`, `examples/recursive.knot`.
 
 **ADTs and pattern matching.** Sum types are first-class — `[Shape]` holds
 circles and rects in one table. Constructor patterns work in `case` and in
@@ -345,11 +558,14 @@ circles and rects in one table. Constructor patterns work in `case` and in
 include `Bool`, `Maybe`, and `Result`. See `examples/maybe.knot`,
 `examples/result.knot`, `examples/cons_pattern.knot`.
 
-**Traits and HKT.** Single-dispatch traits with default methods, deriving,
-and supertraits. Higher-kinded type parameters let you write `Functor`,
-`Applicative`, `Monad`, `Alternative` once and instantiate per type.
-Associated types are supported. See `examples/traits.knot`,
-`examples/associated_types.knot`.
+**Traits and ad-hoc polymorphism.** Single-dispatch traits with default
+methods, deriving, supertraits, and associated types; built-in `Eq`, `Ord`,
+and `Num` back the comparison and arithmetic operators. Alongside traits, the
+**record-dictionary idiom** — bundling operations in a record and passing it
+implicitly via `^field` projection or a `(^field : T) =>` constraint — gives
+lightweight, first-class overloading without a separate instance mechanism.
+See `examples/ord.knot`, `examples/trait_replacement.knot`,
+`examples/implicit_dictionaries.knot`.
 
 **Type inference.** Hindley-Milner with row-polymorphic records and
 variants, let-generalization, trait-bound checking, and unit polymorphism.
@@ -367,15 +583,36 @@ isn't woken by writes to `id = 2`. See `examples/race.knot`,
 **HTTP routes and serving.** `route Api where ... = Endpoint` declarations
 define endpoints by ADT constructor. `serve Api where E = handler`
 type-checks every handler against the declared method/path/body/query/
-headers/response, and `listen 8080 api` runs a `tiny_http` server.
-`fetch url (Endpoint {...})` is a type-safe client that reuses route
-declarations. Per-route rate limiting is built in. See
-`examples/routes.knot`.
+headers/response, and `base.listen 8080 api` runs the server. Route
+composition (`route Api = TodoApi | AdminApi`) merges sub-APIs. Per-route
+rate limiting is built in. See `examples/routes.knot`.
 
-**Refined types.** `type Port = Int where \p -> p > 0 && p < 65536` is a
+**Refined types.** `type Port = Int 1 where \p -> p > 0 && p < 65536` is a
 nominal type whose predicate is checked at boundaries — relation writes,
-HTTP body decoding, and explicit `refine expr`. Route handlers auto-return
-HTTP 400 on validation failure. See `examples/required_args.knot`.
+HTTP body decoding, explicit `refine expr`, and CLI-argument parsing. Route
+handlers auto-return HTTP 400 on validation failure. Compile-time constants
+are checked against the predicate at build time (no `refine` needed), and an
+SMT solver (Z3) proves subtyping between refined types, so a *more* refined
+value is accepted where a *less* refined one is required. See
+`examples/required_args.knot`.
+
+**Required CLI arguments.** A `with`-level binding with a signature but no
+value becomes a required `--name=value` flag on the compiled binary, parsed
+and checked against its declared (possibly refined) type at startup. Missing
+or invalid arguments abort with a clear error and a `--help` listing. See
+`examples/required_args.knot`.
+
+**Debugging primitives.** `base.todo` (an `∀a. a` unimplemented hole that
+aborts with a full context report) and `base.trace` (an `∀a. a -> a`
+transparent probe that prints a value and returns it) both show the relevant
+type, source location, and in-scope bindings with values — and both emit a
+compile-time warning so they don't get shipped accidentally.
+
+**Lexical scoping.** `with { ... }` bindings are ordinary record fields with
+purely lexical shadowing: an inner `with` shadows an outer one, siblings don't
+collide, and a direct binding shadows an outer `with` field. Shadowing across
+the top-level `with` chain (or of the `base` record itself) is rejected with a
+clean error rather than silently changing meaning.
 
 **Units of measure.** `unit Ms`, `unit Usd`, `unit N = Kg * M / S^2`.
 Numeric literals carry units via `42.0 M` and `(expr : Int Ms)`. The
@@ -385,35 +622,33 @@ functions are unit-polymorphic — `sleep` takes `Int Ms`, `now` returns
 
 **Schema evolution.** A `<name>.schema.lock` file records the persisted
 schema. Adding nullable fields or ADT variants auto-updates; breaking
-changes require a `migrate` block.
+changes require a `migrate` block (see [DESIGN.md](DESIGN.md)).
 
 **Constraints.** Subset constraints (`*orders.customer <= *people.name`)
 enforce referential integrity and uniqueness at write time. See
 `examples/constraints.knot`.
 
-**Modules.** `import ./types` brings in another file's `export`ed
-declarations. See `examples/modules/`.
-
 **Other goodies.** Bytes and hex encoding, BLAKE3 hashing, UUIDv7,
 JSON encode/decode, file I/O, leveled logging (`logInfo`/`logWarn`/...),
-crypto (`generateKeyPair`/`encrypt`/`sign`/`verify`).
+crypto (`generateKeyPair`/`encrypt`/`sign`/`verify`). See
+`examples/bytes.knot`, `examples/hash.knot`, `examples/uuid.knot`,
+`examples/json.knot`, `examples/crypto.knot`, `examples/log_test.knot`.
 
-**Runtime CLI.** Every compiled program accepts a common set of flags and
-subcommands for free:
+**Runtime CLI.** Every compiled program accepts a common set of flags, plus
+any required-argument constants declared in the source:
 
 ```sh
 ./my_program                     # run main
 ./my_program --debug             # turn on logDebug output
-./my_program --help              # print usage + any compile-time overrides
-./my_program --http-max-body-bytes=32M
-./my_program db                  # browse the .db file in a TUI
-./my_program api MyRouteName     # print OpenAPI 3.0 spec for a `route`
-./my_program --my-flag=value     # override a compile-time constant
+./my_program --help              # print usage + any required CLI arguments
+./my_program --http-max-body-bytes=32M   # cap HTTP body size (K/M/G suffixes)
+./my_program --port=8080         # supply a required CLI argument
 ```
 
-Constant overrides can also be supplied at build time
-(`knot build foo.knot --my-flag=value`). The compiler also ships with
-`knot fmt [--check] [--stdout] <file.knot>` for in-place formatting.
+Required-argument constants can also be supplied at build time
+(`knot build foo.knot --port=8080`). The compiler ships with
+`knot fmt [--check] [--stdout] <file.knot>` for in-place formatting and
+`knot build <file.knot> [-o <path>]` for compilation.
 
 ## Project Structure
 

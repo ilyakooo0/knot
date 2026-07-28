@@ -43,7 +43,39 @@ fn desugar_inner(expr: &mut Expr) {
     // `SourceRef` — routing through them unchanged is far less invasive than
     // teaching each to recognise `FieldAccess` on a source-record.
     rewrite_record_source_refs(expr);
+    // Elaborate `(^field : T) =>` implicit-dictionary constraints on
+    // record-field functions into hidden leading `{field : T} ->` dictionary
+    // parameters (and rewrite the body's `^field` to `__dict_<field>.field`).
+    // Without this the constrained function's registered scheme lacks the
+    // dict param, so full-arity callsites can't splice the in-scope
+    // dictionary (they see only the explicit params).
+    elaborate_all_implicit_dicts(expr);
     desugar_expr(expr, &io_fns, &no_source_vars);
+}
+
+/// Walk the program and apply `elaborate_implicit_dicts` to every record
+/// field whose signature carries `(^field : T) =>` constraints and whose
+/// value is a lambda (a record-field function). Recurses so nested `with`
+/// records are covered.
+fn elaborate_all_implicit_dicts(expr: &mut Expr) {
+    // Recurse first (bottom-up) so inner records are elaborated before the
+    // outer record's fields are inspected.
+    walk_expr_children(expr, &mut |child| elaborate_all_implicit_dicts(child));
+    if let ExprKind::Record(fields) = &mut expr.node {
+        for field in fields {
+            let has_implicit = field
+                .sig
+                .as_ref()
+                .is_some_and(|ts| {
+                    ts.constraints
+                        .iter()
+                        .any(|c| matches!(c, Constraint::ImplicitField { .. }))
+                });
+            if has_implicit && matches!(field.value.node, ExprKind::Lambda { .. }) {
+                elaborate_implicit_dicts(&mut field.value, &mut field.sig);
+            }
+        }
+    }
 }
 
 /// Map a `with`-bound record-variable name to the relations its record

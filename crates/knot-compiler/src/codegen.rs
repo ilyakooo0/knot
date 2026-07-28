@@ -12152,6 +12152,16 @@ impl Codegen {
                     });
                 }
                 ast::StmtKind::Where { cond } => {
+                    // Inline pure user-defined helpers so their bodies can be
+                    // translated to SQL: `where (salaryOf e) > 75` becomes
+                    // `where e.salary > 75`, which the translator recognizes.
+                    // Only PURE definitions are inlined (those not in
+                    // `io_functions`) — inlining an effectful call into a WHERE
+                    // clause would silently drop its effect. The translator's
+                    // maps are static, so this rewrite happens here, where
+                    // `self` is available; on no change the condition is used
+                    // as-is.
+                    let cond = &self.inline_pure_sql_helpers(cond);
                     let frag = Self::try_compile_multi_table_sql_expr(
                         &bind_to_alias, &bind_to_schema, cond, env, &let_binds,
                     )?;
@@ -12241,6 +12251,32 @@ impl Codegen {
             limit: None,
             offset: None,
         })
+    }
+
+    /// Inline pure user-defined helpers in a `where` condition so their bodies
+    /// become visible to the SQL translator: `where (salaryOf e) > 75` →
+    /// `where e.salary > 75`.
+    ///
+    /// Only PURE definitions are inlined. `fun_bodies` registers every user
+    /// function without a purity gate, so we filter it through `io_functions`
+    /// (the transitive effect set) before handing it to `beta_reduce` —
+    /// otherwise an effectful helper (`saveEmployee`, a `println` wrapper, …)
+    /// would be inlined into a WHERE clause and its effect silently dropped.
+    /// `let_bindings` is already purity-gated at registration, so it is used
+    /// as-is. Recursion and expansion blow-up are handled inside `beta_reduce`
+    /// (recursive names are left unexpanded; fuel bounds the work); when no
+    /// reduction applies the condition is returned unchanged, which is sound.
+    fn inline_pure_sql_helpers(&self, cond: &ast::Expr) -> ast::Expr {
+        let pure_fun_bodies: HashMap<String, ast::Expr> = self
+            .fun_bodies
+            .iter()
+            .filter(|(name, _)| !self.io_functions.contains(*name))
+            .map(|(name, body)| (name.clone(), body.clone()))
+            .collect();
+        if pure_fun_bodies.is_empty() && self.let_bindings.is_empty() {
+            return cond.clone();
+        }
+        beta_reduce(cond, &pure_fun_bodies, &self.let_bindings)
     }
 
     /// Compile a multi-table Where condition to a SQL fragment.

@@ -4,6 +4,7 @@ Complete reference for all built-in functions, traits, and types.
 
 ## Table of Contents
 
+- [Query Pushdown & Auto-Indexing](#query-pushdown--auto-indexing)
 - [Relation Operations](#relation-operations)
 - [Concurrency](#concurrency)
 - [Text Operations](#text-operations)
@@ -20,6 +21,56 @@ Complete reference for all built-in functions, traits, and types.
 - [Built-in Traits](#built-in-traits)
 - [Built-in Types](#built-in-types)
 - [Operators](#operators)
+
+---
+
+## Query Pushdown & Auto-Indexing
+
+Many relation operations over a **source relation** (`*name : [T]`) don't load
+rows into memory and process them in Knot — the compiler pushes them down to a
+single SQL query against the underlying SQLite table, and the runtime
+auto-indexes the columns involved.
+
+**What pushes down:**
+
+- **Filters** — `where` clauses and `filter (\r -> r.f OP x) rows` become
+  `WHERE`.
+- **Joins** — a read-only comprehension binding two or more sources and
+  relating them with an equi-join predicate plus single-table predicates
+  compiles to one multi-table `SELECT`:
+  ```knot
+  with {result (do
+    e <- *employees
+    d <- *departments
+    where e.dept == d.name
+    where e.salary > 75
+    yield {name e.name dept d.name})}
+  yield result
+  ```
+  →
+  ```sql
+  SELECT t0."name", t1."name"
+  FROM "_knot_employees" AS t0, "_knot_departments" AS t1
+  WHERE (t0."dept" = t1."name") AND (t0."salary" > ?)
+  ```
+- **Aggregates** — `count`, `countWhere`, `sum`, `avg`, `minOn`, `maxOn`
+  become `SELECT COUNT(*)`/`SUM(...)`/`MIN(...)`/`MAX(...) ...`.
+- **`sortBy`** — becomes `ORDER BY`.
+- **Pure helper functions** used in a predicate are inlined, so
+  `where (salaryOf e) > 75` still becomes `WHERE salary > 75`.
+
+**Auto-indexing.** Columns referenced in a pushed-down `WHERE` or `ORDER BY`
+clause — including both join columns of a multi-table join (`employees.dept`
+*and* `departments.name`) — get a `CREATE INDEX IF NOT EXISTS` on first use.
+ADT tables also index the `_tag` discriminator at creation. There is no
+`CREATE INDEX` syntax and nothing to declare; the runtime observes the queries
+and indexes accordingly.
+
+**Fallback.** Any comprehension or operation the planner cannot translate
+falls back to reading the relation(s) and computing in memory (hash-join /
+nested-loop for joins). The *results are identical* — only the execution
+strategy differs — so you can write the natural comprehension and not worry
+about whether it pushed down.
 
 ---
 

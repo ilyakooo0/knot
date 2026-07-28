@@ -34,8 +34,13 @@ noted in prose rather than as a type constraint.
 ## Relation operations
 
 Relations are the core data structure. Comprehensions over a **source**
-relation (`*name`) push down to SQL; the same functions over an in-memory
-relation run natively.
+relation (`*name`) push down to SQL — filters become `WHERE`, aggregates
+become `SELECT COUNT/SUM/MIN/MAX`, `sortBy` becomes `ORDER BY`, and a
+read-only comprehension binding two or more sources with an equi-join
+predicate (`where e.dept == d.name`) becomes a single multi-table `SELECT`
+with both join columns auto-indexed. The same functions over an in-memory
+relation run natively. See [stdlib.md — Query Pushdown &
+Auto-Indexing](stdlib.md#query-pushdown--auto-indexing) for the full picture.
 
 ### `base.filter`
 

@@ -10,7 +10,7 @@ type Person = {name: Text, age: Int 1}
 *people : [Person]
 
 main = do
-  *people = [{name: "Alice", age: 30}, {name: "Bob", age: 25}]
+  *people = [{name "Alice" age 30}, {name "Bob" age 25}]
   people <- *people
   with {result: do
     p <- people
@@ -77,18 +77,18 @@ Unit-preserving stdlib: `sum` (over a numeric relation) and `avg` (via its proje
 ### Records
 
 ```knot
--- Anonymous record
-{name: "Alice", age: 30}
+-- Anonymous record VALUE: space-separated `name value` pairs, no colons/commas
+{name "Alice" age 30}
 
--- Type alias
+-- Record TYPE: colon after each field name, comma-separated
 type Person = {name: Text, age: Int 1}
 ```
 
 Field access: `person.name`
 
-Record update: `{person | age: person.age + 1}`
+Record update: `{person | age (person.age + 1)}`
 
-Shorthand field pun: `yield {name: t.name, age: t.age}` can be written `yield {t.name, t.age}` when field name matches.
+Note the two syntaxes differ: **values** are `{name "Alice" age 30}` (space-separated, no `:` or `,`); **types** are `{name: Text, age: Int 1}` (`:` after each field name, `,` between fields). There is no field-name punning — a record value always pairs an explicit field name with its value (`{name t.name age t.age}`).
 
 ### Relations
 
@@ -97,7 +97,7 @@ A relation `[T]` is a typed **set** of `T` values. No duplicates. No ordering gu
 ```knot
 names = ["Alice", "Bob", "Carol"]     -- [Text]
 empty = []                             -- [a]
-people = [{name: "Alice", age: 30}]   -- [{name: Text, age: Int 1}]
+people = [{name "Alice" age 30}]   -- [{name: Text, age: Int 1}]
 ```
 
 ### ADTs (Algebraic Data Types)
@@ -147,7 +147,7 @@ There are five kinds of top-level declarations:
   todos <- *todos
   with {result: do
     t <- todos
-    yield {title: t.title, owner: t.owner, status: Open {}}}
+    yield {title t.title owner t.owner status Open {}}}
   (do
     yield result)
 
@@ -312,7 +312,7 @@ main = do
 -- IO do block with DB operations
 addPerson = \name age -> do
   people <- *people                  -- IO {} [Person]
-  *people = union people [{name: name, age: age}]
+  *people = union people [{name name age age}]
 ```
 
 The compiler detects whether a do block is relational or IO from the types. Relation operations (`*rel`, `&rel`, and writes `*rel = expr`) all return `IO {} value` — the empty effect set `{}` distinguishes DB operations from external effects like `{console}` or `{fs}`.
@@ -350,7 +350,7 @@ Mutation is written `*rel = expr`, which makes the source relation equal to `exp
 -- Insert (union with singleton)
 addPerson = do
   people <- *people
-  *people = union people [{name: "Alice", age: 30}]
+  *people = union people [{name "Alice" age 30}]
 
 -- Update (map with conditional)
 birthday = \name -> do
@@ -387,7 +387,7 @@ result = if x > 0 then "positive" else "non-positive"
 `with {name: value, ...} body` evaluates `body` with each record field bound as a variable in scope. The whole expression's value is `body`'s value:
 
 ```knot
-with {x: 2, y: 3} (x + y)            -- 5
+with {x 2 y 3} (x + y)            -- 5
 
 -- The bound value can be any expression, including a do block:
 with {result: do
@@ -451,7 +451,7 @@ sumList = \xs -> case xs of
     t <- todos
     where t.done == 0
     groupBy {t.owner}
-    yield {owner: t.owner, count: count t}}
+    yield {owner t.owner count count t}}
   (do
     yield result)
 ```
@@ -478,7 +478,7 @@ Fields can hold `[T]` — sets nested inside rows:
   with {result: do
     t <- teams
     m <- t.members
-    yield {team: t.name, member: m.name}}
+    yield {team t.name member m.name}}
   (do
     yield result)
 
@@ -504,7 +504,7 @@ A `*`-prefixed declaration with a body is a view — reads compute the query, wr
   todos <- *todos
   with {result: do
     t <- todos
-    yield {title: t.title, owner: t.owner, priority: t.priority, status: Open {}}}
+    yield {title t.title owner t.owner priority t.priority status Open {}}}
   (do
     yield result)
 ```
@@ -518,7 +518,7 @@ Constant columns (like `status: Open {}`) are:
 -- Insert through view — status auto-filled
 addOpenTodo = do
   openTodos <- *openTodos
-  *openTodos = union openTodos [{title: "New task", owner: "Alice", priority: High {}}]
+  *openTodos = union openTodos [{title "New task" owner "Alice" priority High {}}]
 ```
 
 ---
@@ -537,7 +537,7 @@ Read-only computed relations, prefixed with `&`:
   with {result: do
     t <- todos
     groupBy {t.owner}
-    yield {owner: t.owner, total: count t}}
+    yield {owner t.owner total count t}}
   (do
     yield result)
 ```
@@ -555,7 +555,7 @@ Datalog-style fixpoint iteration for transitive closure:
     r <- reportsTo
     m <- manages
     where r.descendant == m.manager
-    yield {ancestor: r.ancestor, descendant: m.report}}
+    yield {ancestor r.ancestor descendant m.report}}
   (do
     yield (union base step))
 ```
@@ -696,7 +696,7 @@ birthday = \name -> do
 handleOrder = \item -> do
   orderId <- atomic do
     orders <- *orders
-    *orders = union orders [{item: item, qty: 1}]
+    *orders = union orders [{item item qty 1}]
     newOrders <- *orders
     yield (count newOrders)
   println ("Order #" ++ show orderId)
@@ -965,13 +965,13 @@ route Api = TodoApi | AdminApi
 api = serve Api where
   GetTodos = \{owner} -> do
     todos <- getTodos owner
-    yield Ok {value: todos}
+    yield Ok {value todos}
   CreateTodo = \{title, owner} -> do
     todo <- addTodo title owner
-    yield Ok {value: todo}
+    yield Ok {value todo}
   GetCount = \{} -> do
     todos <- *todos
-    yield Ok {value: count todos}
+    yield Ok {value count todos}
 
 main = listen 8080 api
 ```
@@ -987,7 +987,7 @@ api = serve Api where
   GetUser = \{id} -> do
     users <- *people
     case filter (\u -> u.id == id) users of
-      [] -> yield Err {error: {status: 404, message: "user not found"}}
+      [] -> yield Err {error {status 404 message "user not found"}}
       Cons u _ -> yield Ok {value: u}
 ```
 
@@ -1014,11 +1014,11 @@ Request headers become constructor fields. When response headers are declared, t
 ```knot
 api = serve Api where
   GetTodos = \{authorization} ->
-    with {todos: allTodos}
+    with {todos allTodos}
     (do
-      yield Ok {value: {body: todos, headers: {xTotalCount: length todos}}})
+      yield Ok {value {body todos headers {xTotalCount length todos}}})
   CreateTodo = \{title, authorization} ->
-    yield Ok {value: {body: addTodo title, headers: {}}}
+    yield Ok {value {body addTodo title headers {}}}
 ```
 
 Optional headers use `Maybe`:
@@ -1033,7 +1033,7 @@ Server gets `Nothing {}` if absent, `Just {value: "..."}` if present. In `fetch`
 On the `fetch` side, header fields are sent automatically. When response headers are declared, the result wraps as `{body: T, headers: H}`:
 
 ```knot
-result <- fetch "https://api.example.com" (GetTodos {authorization: "Bearer tok"})
+result <- fetch "https://api.example.com" (GetTodos {authorization "Bearer tok"})
 -- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int 1}})
 ```
 
@@ -1048,26 +1048,24 @@ type RequestCtx = {
   header: Text -> Maybe Text       -- case-insensitive lookup
 }
 
-type RateLimit input a = {
-  key: input -> RequestCtx -> Maybe a,    -- Ord a; Nothing exempts the request
-  limit: {requests: Int 1, window: Int Ms}
-}
+type RateLimit input a = {key input -> RequestCtx -> Maybe a -- Ord a; Nothing exempts the request
+  limit: {requests: Int 1, window: Int Ms}}
 ```
 
 `key` receives the same input record the handler does (path/query/body/header fields, combined) plus the runtime-supplied `RequestCtx`, so you can key on any field of either:
 
 ```knot
-byClientIp = \input ctx -> Just {value: ctx.clientIp}
+byClientIp = \input ctx -> Just {value ctx.clientIp}
 
-byOwner = \{owner} ctx -> Just {value: owner}             -- key on a path/body field
+byOwner = \{owner} ctx -> Just {value owner}             -- key on a path/body field
 
 route Api where
   GET /hello -> {message: Text}
-    rateLimit {key: byClientIp, limit: {requests: 100, window: 60000 Ms}}
+    rateLimit {key byClientIp limit {requests 100 window 60000 Ms}}
     = Hello
 
   GET /user/{owner: Text} -> {message: Text}
-    rateLimit {key: byOwner, limit: {requests: 10, window: 60000 Ms}}
+    rateLimit {key byOwner limit {requests 10 window 60000 Ms}}
     = User
 
   GET /open -> {message: Text} = Open                  -- no clause = unlimited
@@ -1080,8 +1078,7 @@ On rejection the runtime responds `429 Too Many Requests` with body `{"error":"R
 Common keying strategies are regular expressions, so extract them once and reuse:
 
 ```knot
-serverLimit = {key: \input ctx -> Just {value: ctx.clientIp},
-               limit: {requests: 1000, window: 60000 Ms}}
+serverLimit = {key \input ctx -> Just {value ctx.clientIp} limit {requests 1000 window 60000 Ms}}
 
 route Api where
   POST {events: [Event]} /federation/gossip -> {} rateLimit serverLimit = RecvGossip
@@ -1171,7 +1168,7 @@ validated = do
 *people : [{name: Text, age: Nat}]
 
 -- This panics if any age is negative:
-*people = [{name: "Alice", age: -1}]
+*people = [{name "Alice" age -1}]
 ```
 
 **Route handlers**: refined body fields are auto-validated after JSON decoding. Returns HTTP 400 on failure.
@@ -1198,16 +1195,16 @@ do-blocks directly with them:
 ```knot
 -- Maybe — short-circuits on Nothing
 result = do
-  a <- Just {value: 10}
-  b <- Just {value: 2}
+  a <- Just {value 10}
+  b <- Just {value 2}
   where b != 0
   yield (a / b)
 
 -- Result — short-circuits on Err
-safeDivide = \x y -> if y == 0 then Err {error: "div by zero"} else Ok {value: x / y}
+safeDivide = \x y -> if y == 0 then Err {error "div by zero"} else Ok {value: x / y}
 
 compute = do
-  a <- Ok {value: 10}
+  a <- Ok {value 10}
   b <- safeDivide a 2
   yield (a + b)
 ```
@@ -1245,14 +1242,14 @@ type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
 
 add = \title owner priority -> do
   todos <- *todos
-  *todos = union todos [{title: title, owner: owner, priority: priority, status: Open {}}]
+  *todos = union todos [{title title owner owner priority priority status Open {}}]
 
 complete = \title -> do
   todos <- *todos
   *todos = do
     t <- todos
     yield (if t.title == title
-      then {t | status: Resolved {resolution: "done"}}
+      then {t | status: Resolved {resolution "done"}}
       else t)
 
 assign = \title person -> do
@@ -1260,7 +1257,7 @@ assign = \title person -> do
   *todos = do
     t <- todos
     yield (if t.title == title
-      then {t | status: InProgress {assignee: person}}
+      then {t | status: InProgress {assignee person}}
       else t)
 
 pending = \owner -> do
@@ -1279,7 +1276,7 @@ pending = \owner -> do
     t <- todos
     Open {} <- t.status
     groupBy {t.owner}
-    yield {owner: t.owner, count: count t}}
+    yield {owner t.owner count count t}}
   (do
     yield result)
 

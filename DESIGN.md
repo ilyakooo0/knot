@@ -36,12 +36,12 @@ There are five kinds of top-level declarations:
 -- View: defined by a query over source relations, settable (writes propagate back)
 *openTodos = do
   t <- *todos
-  yield {title: t.title, owner: t.owner, priority: t.priority, status: Open {}}
+  yield {title t.title owner t.owner priority t.priority status Open {}}
 
 -- Constant: a pure expression with no DB references (zero-argument function)
 maxRetries = 3
 defaultPriority = Low {}
-httpCodes = [{code: 200, name: "OK"}, {code: 404, name: "Not Found"}]
+httpCodes = [{code 200 name "OK"}, {code 404 name "Not Found"}]
 
 -- Derived: references source relations, recomputed on access (read-only)
 &seniors = do
@@ -130,7 +130,7 @@ Bind through multiple levels with `<-`:
   with {result: do
     t <- teams
     m <- t.members
-    yield {team: t.name, member: m.name}}
+    yield {team t.name member m.name}}
   (do
     yield result)
 
@@ -142,7 +142,7 @@ Bind through multiple levels with `<-`:
     where (count t.members) > 10
     m <- t.members
     where m.role == "engineer"
-    yield {team: t.name, name: m.name}}
+    yield {team t.name name m.name}}
   (do
     yield result)
 ```
@@ -189,7 +189,7 @@ type FlatMembership = {team: Text, member: Text, age: Int 1}
     yield {name: t, members: do
       m <- memberships
       where m.team == t
-      yield {name: m.member, age: m.age}}}
+      yield {name m.member age m.age}}}
   (do
     yield result)
 
@@ -199,7 +199,7 @@ type FlatMembership = {team: Text, member: Text, age: Int 1}
   with {result: do
     t <- teams
     m <- t.members
-    yield {team: t.name, member: m.name, age: m.age}}
+    yield {team t.name member m.name age m.age}}
   (do
     yield result)
 ```
@@ -222,7 +222,7 @@ type Course = {name: Text, students: [{name: Text, grades: [{subject: Text, scor
     s <- c.students
     g <- s.grades
     where g.score < 50
-    yield {dept: d.name, course: c.name, student: s.name, subject: g.subject, score: g.score}}
+    yield {dept d.name course c.name student s.name subject g.subject score g.score}}
   (do
     yield result)
 ```
@@ -294,7 +294,7 @@ tryCompute = do
   yield (x + y)
 
 -- do with Result
-safeDivideR = \a b -> case b == 0 of true -> Err {error: "div by zero"}; false -> Ok {value: a / b}
+safeDivideR = \a b -> case b == 0 of true -> Err {error "div by zero"}; false -> Ok {value: a / b}
 
 computeR = do
   x <- safeDivideR 10 2
@@ -427,23 +427,21 @@ match = \Circle shapes -> do
 
 ### Comprehensions
 
-Relation comprehensions use `do` syntax with `yield` to produce rows. Since relation references (`*rel`, `&rel`) return `IO {} value`, you IO-bind to get the value, then use a pure comprehension on the plain value:
+Relation comprehensions use `do` syntax with `yield` to produce rows. A read-only comprehension binds each row of a source with `<-` (like `FROM`), filters with `where` (like `WHERE`), and emits rows with `yield`:
 
 ```knot
-&richEmployees = do
-  employees <- *employees
-  departments <- *departments
-  with {result: do
-    e <- employees
-    d <- departments
-    where e.dept == d.name
-    where d.budget > 1_000_000
-    yield {e.name, e.salary, d.budget}}
-  (do
-    yield result)
+with {result (do
+  e <- *employees
+  d <- *departments
+  where e.dept == d.name          -- the join condition
+  where d.budget > 1000000        -- extra filter
+  yield {name e.ename salary e.salary budget d.budget})}
+yield result
 ```
 
-The outer do-block is an IO do-block that binds from `*employees` (type `IO {} [Employee]`) and `*departments` (type `IO {} [Department]`). The inner `with {result: do ...} ...` binds a pure comprehension over plain relation values to `result`. `<-` draws from a relation (like a `FROM` clause). `where` filters (like a `WHERE` clause). `yield` emits a row into the result relation.
+Binding two sources and relating them with an equi-join predicate (`e.dept == d.name`) is a **join**. A read-only join/filter comprehension like this compiles to a single multi-table SQL `SELECT ... FROM "_knot_employees" AS t0, "_knot_departments" AS t1 WHERE t0."dept" = t1."name" AND t1."budget" > ?`, with the join and filter columns auto-indexed; anything the planner can't translate falls back to an in-memory join with identical results.
+
+Record fields in the `yield` need explicit names — `{name e.ename}`, not `{e.ename}` (there is no field-name shorthand). Relation references (`*rel`, `&rel`) return `IO {} value`; binding them inside a read-only comprehension is handled directly by the compiler, which reads the sources as part of the query.
 
 ### Pipe-Forward Composition
 
@@ -454,7 +452,7 @@ Derived combinators like `filter` compose with `|>`:
   employees <- *employees
   yield (employees
     |> filter (\e -> e.salary > 150000)
-    |> map (\e -> {name: e.name, salary: e.salary}))
+    |> map (\e -> {name e.name salary e.salary}))
 ```
 
 ### Querying by Variant: `match`
@@ -485,7 +483,7 @@ Pattern matching on `<-` filters and binds in one step:
   with {result: do
     Circle c <- shapes
     where c.radius > 10
-    yield {area: pi * c.radius * c.radius}}
+    yield {area pi * c.radius * c.radius}}
   (do
     yield result)
 
@@ -510,8 +508,8 @@ scale = \factor -> do
   *shapes = do
     s <- shapes
     yield (case s of
-      Circle {radius}       -> Circle {radius: radius * factor}
-      Rect {width, height}  -> Rect {width: width * factor, height: height * factor})
+      Circle {radius}       -> Circle {radius radius * factor}
+      Rect {width, height}  -> Rect {width width * factor height height * factor})
 ```
 
 ### Pattern Matching on Relations
@@ -536,7 +534,7 @@ describe = \rel -> case rel of
     t <- todos
     where t.done == 0
     groupBy {t.owner}
-    yield {owner: t.owner, count: count t}}
+    yield {owner t.owner count count t}}
   (do
     yield result)
 ```
@@ -551,7 +549,7 @@ Multiple key fields group by their combination:
   with {result: do
     o <- orders
     groupBy {o.region, o.status}
-    yield {region: o.region, status: o.status, total: count o}}
+    yield {region o.region status o.status total count o}}
   (do
     yield result)
 ```
@@ -667,7 +665,7 @@ atomic : IO {} a -> IO {} a
 handleOrder = \req -> do
   orderId <- atomic do
     orders <- *orders
-    *orders = union orders [{item: req.body.item, qty: 1}]
+    *orders = union orders [{item req.body.item qty 1}]
     newOrders <- *orders
     yield (count newOrders)
   println ("New order #" ++ show orderId)
@@ -768,10 +766,10 @@ The spawned action's effect row `r` propagates through `fork` to the caller — 
 
 increment = do
   c <- *counter
-  *counter = [{n: (fold (\_ x -> x.n) 0 c) + 1}]
+  *counter = [{n (fold (\_ x -> x.n) 0 c) + 1}]
 
 main = do
-  *counter = [{n: 0}]
+  *counter = [{n 0}]
   fork do
     increment
     increment
@@ -801,11 +799,11 @@ waitForCompletion = \id -> atomic do
     yield task)
 
 main = do
-  *tasks = [{id: 1, status: "pending"}]
+  *tasks = [{id 1 status "pending"}]
   fork do
     -- simulate work
     atomic do
-      *tasks = [{id: 1, status: "done"}]
+      *tasks = [{id 1 status "done"}]
   result <- waitForCompletion 1
   println result
 ```
@@ -879,13 +877,13 @@ Handlers are bound per-endpoint with `serve API where` — the compiler ensures 
 api = serve Api where
   GetTodos = \{user, page, limit} -> do
     todos <- pendingFor user page limit
-    yield Ok {value: todos}
+    yield Ok {value todos}
   AddTodo = \{title, owner, priority} -> do
     atomic (add title owner priority)
-    yield Ok {value: {ok: True {}}}
+    yield Ok {value {ok True {}}}
   AssignTodo = \{title, owner, person} -> do
     atomic (assign title owner person)
-    yield Ok {value: {ok: True {}}}
+    yield Ok {value {ok True {}}}
   GetWorkload = \{} -> do
     w <- &workload
     yield Ok {value: w}
@@ -904,16 +902,16 @@ api = serve Api where
   GetUser = \{id} -> do
     users <- *people
     case filter (\u -> u.id == id) users of
-      [ ] -> yield Err {error: {status: 404, message: "user not found"}}
+      [ ] -> yield Err {error {status 404 message "user not found"}}
       Cons u _ -> yield Ok {value: u}
   CreateUser = \{name, email} -> do
     case length name == 0 of
-      true -> yield Err {error: {status: 400, message: "name required"}}
+      true -> yield Err {error {status 400 message "name required"}}
       false -> do
         atomic do
           users <- *people
-        *people = union users [{name: name, email: email}]
-        yield Ok {value: {name: name, email: email}}
+        *people = union users [{name name email email}]
+        yield Ok {value {name name email email}}
 ```
 
 Status codes are clamped to the range `100..=599`. Common codes: `400` (bad request), `401` (unauthorized), `403` (forbidden), `404` (not found), `409` (conflict), `500` (internal error). The runtime emits `400` automatically for path/query/body/header parsing failures and refinement violations, and `404` for unmatched routes — handlers only need to return `Err` for application-level errors.
@@ -947,14 +945,14 @@ Request headers become constructor fields, just like body/query/path params. The
 ```knot
 api = serve Api where
   GetTodos = \{authorization} ->
-    with {todos: allTodos}
+    with {todos allTodos}
     (do
-      yield Ok {value: {body: todos, headers: {xTotalCount: length todos, xPage: 1}}})
+      yield Ok {value {body todos headers {xTotalCount length todos xPage 1}}})
   CreateTodo = \{title, authorization, xIdempotencyKey} ->
-    with {id: addTodo title}
+    with {id addTodo title}
     (do
-      yield Ok {value: {body: {id: id}, headers: {}}})
-  HealthCheck = \{} -> yield Ok {value: {status: "ok"}}
+      yield Ok {value {body {id id} headers {}}})
+  HealthCheck = \{} -> yield Ok {value {status "ok"}}
 ```
 
 When response headers are declared, the success branch wraps a `{body: ..., headers: ...}` record inside `Ok {value: ...}`. Without response headers, `Ok` carries the body directly. Error responses (`Err {error: {status, message}}`) never include custom headers — only the status code and JSON error body.
@@ -971,7 +969,7 @@ The server gets `Nothing {}` if the header is absent, `Just {value: "..."}` if p
 On the fetch side, request headers are sent automatically from constructor fields. When response headers are declared, the result wraps as `{body: ResponseType, headers: {h: T}}`:
 
 ```knot
-result <- fetch "https://api.example.com" (GetTodos {authorization: "Bearer tok"})
+result <- fetch "https://api.example.com" (GetTodos {authorization "Bearer tok"})
 -- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int 1, xPage: Int 1}})
 ```
 
@@ -986,34 +984,32 @@ type RequestCtx = {
   header: Text -> Maybe Text       -- case-insensitive lookup
 }
 
-type RateLimit input a = {
-  key: input -> RequestCtx -> Maybe a,    -- Ord a; Nothing exempts this request
-  limit: {requests: Int 1, window: Int Ms}
-}
+type RateLimit input a = {key input -> RequestCtx -> Maybe a -- Ord a; Nothing exempts this request
+  limit: {requests: Int 1, window: Int Ms}}
 ```
 
 The `key` function receives the same input record the handler does (path params, query params, body fields, request headers — combined into one record), plus the runtime-supplied `RequestCtx`. Returning `Nothing` exempts the request from rate limiting; returning `Just k` puts the request into the bucket named by `k`. The key type `a` only has to satisfy `Ord` — the runtime serializes it (via `show`) for the SQLite bucket key, so any `Ord` value works (text, int, tuples, records, ADTs).
 
 ```knot
-byClientIp = \input ctx -> Just {value: ctx.clientIp}
+byClientIp = \input ctx -> Just {value ctx.clientIp}
 
-byOwner = \{owner} ctx -> Just {value: owner}              -- key by path/query/body field
+byOwner = \{owner} ctx -> Just {value owner}              -- key by path/query/body field
 
 byApiKey = \input ctx -> case ctx.header "Authorization" of
   Just {value: k} -> Just {value: k}
-  Nothing {} -> Just {value: ctx.clientIp}                  -- fall back to IP
+  Nothing {} -> Just {value ctx.clientIp}                  -- fall back to IP
 
 route Api where
   GET /hello -> {message: Text}
-    rateLimit {key: byClientIp, limit: {requests: 100, window: 60000 Ms}}
+    rateLimit {key byClientIp limit {requests 100 window 60000 Ms}}
     = Hello
 
   GET /user/{owner: Text} -> {message: Text}
-    rateLimit {key: byOwner, limit: {requests: 10, window: 60000 Ms}}
+    rateLimit {key byOwner limit {requests 10 window 60000 Ms}}
     = User
 
   POST {body: Text} /upload -> {ok: Bool}
-    rateLimit {key: byApiKey, limit: {requests: 10, window: 60000 Ms}}
+    rateLimit {key byApiKey limit {requests 10 window 60000 Ms}}
     = Upload
 
   GET /open -> {message: Text} = Open       -- no clause = unlimited
@@ -1022,8 +1018,7 @@ route Api where
 The clause accepts any expression of type `RateLimit input a`, so common keying strategies and limits can be extracted into top-level bindings and reused:
 
 ```knot
-serverLimit = {key: \input ctx -> Just {value: ctx.clientIp},
-               limit: {requests: 1000, window: 60000 Ms}}
+serverLimit = {key \input ctx -> Just {value ctx.clientIp} limit {requests 1000 window 60000 Ms}}
 
 route Api where
   POST {events: [Event]} /federation/gossip -> {} rateLimit serverLimit = RecvGossip
@@ -1103,11 +1098,11 @@ api = serve Api where
   CreateOrder = \{item, qty} -> do
     orderId <- atomic do
       orders <- *orders
-      *orders = union orders [{item: item, qty: qty}]
+      *orders = union orders [{item item qty qty}]
       newOrders <- *orders
       yield (count newOrders)
     println ("New order #" ++ show orderId)
-    yield Ok {value: {orderId: orderId}}
+    yield Ok {value {orderId orderId}}
 ```
 
 For sub-transaction boundaries:
@@ -1127,7 +1122,7 @@ All mutation is done through the `*rel = expr` write, which makes a persistent r
 -- Insert: union with a singleton
 addPerson = do
   people <- *people
-  *people = union people [{name: "Alice", age: 30}]
+  *people = union people [{name "Alice" age 30}]
 
 -- Update: map with a conditional
 birthday = \name -> do
@@ -1151,8 +1146,8 @@ Relations are sets. Two rows are the same row iff all their fields are equal. Se
 
 ```knot
 -- Adding an already-existing row changes nothing
-*people = union *people [{name: "Alice", age: 30}]
-*people = union *people [{name: "Alice", age: 30}]  -- no change
+*people = union *people [{name "Alice" age 30}]
+*people = union *people [{name "Alice" age 30}]  -- no change
 ```
 
 No surrogate IDs, no key declarations. Data identifies itself.
@@ -1176,7 +1171,7 @@ A `*`-prefixed relation with a body is a **view** — a bidirectional query over
 
 *openTodos = do                                              -- settable (* prefix)
   t <- *todos
-  yield {title: t.title, owner: t.owner, priority: t.priority, status: Open {}}
+  yield {title t.title owner t.owner priority t.priority status Open {}}
 ```
 
 ### Column Provenance
@@ -1210,9 +1205,9 @@ Writing through a view auto-fills constants and propagates source columns:
 -- Insert through view — status auto-filled as Open {}
 addOpenTodo = do
   openTodos <- *openTodos
-  *openTodos = union openTodos [{title: "New task", owner: "Alice", priority: High {}}]
+  *openTodos = union openTodos [{title "New task" owner "Alice" priority High {}}]
 -- Compiler rewrites →
--- *todos = union *todos [{title: "New task", owner: "Alice", priority: High {}, status: Open {}}]
+-- *todos = union *todos [{title "New task" owner "Alice" priority High {} status Open {}}]
 
 -- Delete through view — only affects rows matching the constant
 removeAliceTodos = do
@@ -1229,7 +1224,7 @@ Multiple constants create narrow slices:
 ```knot
 *criticalOpen = do
   t <- *todos
-  yield {title: t.title, owner: t.owner, status: Open {}, priority: Critical {}}
+  yield {title t.title owner t.owner status Open {} priority Critical {}}
 
 -- Type: [{title: Text, owner: Text}]
 -- Reads: only critical open todos
@@ -1320,7 +1315,7 @@ migrate *todos
   from {title: Text, owner: Text, priority: Priority, status: <Open {} | InProgress {assignee: Text} | Resolved {resolution: Text}>}
   to   {title: Text, owner: Text, priority: Priority, status: Status}
   using (\old -> {old | status: case old.status of
-    InProgress {assignee} -> Resolved {resolution: "closed by " ++ assignee}
+    InProgress {assignee} -> Resolved {resolution "closed by " ++ assignee}
     other                 -> other})
 ```
 
@@ -1368,7 +1363,7 @@ Functions can be generic over any ADT that has a particular variant:
 countOpen = \rel ->
   rel |> filter (\r -> case r.status of Open {} -> True {}; _ -> False {}) |> count
 
--- Inferred: [{status: <Open {} | r> | s}] -> Int 1
+-- Inferred: [{status <Open {} | r> | s}] -> Int 1
 -- Works on tickets, issues, orders — anything with an Open status variant
 ```
 
@@ -1537,7 +1532,7 @@ type Measurement = {distance: Float M, time: Float S}
   measurements <- *measurements
   with {result: do
     m <- measurements
-    yield {speed: m.distance / m.time}}   -- Float (M/S)
+    yield {speed m.distance / m.time}}   -- Float (M/S)
   (do
     yield result)
 ```
@@ -1686,10 +1681,10 @@ x + y    -- Int 1, not Nat (no attempt to prove result satisfies predicate)
 ```knot
 -- Target type Nat inferred from binding annotation
 let r : Result RefinementError Nat = refine 42
--- r = Ok {value: 42}
+-- r = Ok {value 42}
 
 let r : Result RefinementError Nat = refine (-1)
--- r = Err {error: {typeName: "Nat", violations: [{field: Nothing {}, message: "expected x >= 0, got -1"}]}}
+-- r = Err {error {typeName: "Nat", violations: [{field Nothing {} message "expected x >= 0 got -1"}]}}
 ```
 
 The error type:
@@ -1784,15 +1779,15 @@ route Api where
 api = serve Api where
   CreateUser = \{name, age, email} ->
     case refine {name, age, email} of    -- Person inferred from *people
-      Ok {value: person} -> do
+      Ok {value person} -> do
         atomic do
           people <- *people
           *people = union people [person]
-        yield Ok {value: {ok: true, error: Nothing {}}}
+        yield Ok {value {ok true error Nothing {}}}
       Err {error} ->
-        with {msg: fold (\acc v -> acc ++ v.message ++ "; ") "" error.violations}
+        with {msg fold (\acc v -> acc ++ v.message ++ "; ") "" error.violations}
         (do
-          yield Ok {value: {ok: false, error: Just {value: msg}}})
+          yield Ok {value {ok false error Just {value msg}}})
 ```
 
 ### Traits
@@ -1891,7 +1886,7 @@ Traits compose naturally with relational queries:
 -- Works on any relation whose rows are displayable
 report = \rel -> do
   r <- rel
-  yield {summary: display r}
+  yield {summary display r}
 
 -- Works on any relation with a numeric column named `amount`
 totalAmount : Num n => [{amount: n | r}] -> n
@@ -1993,14 +1988,14 @@ pendingFor = \user -> do
 
 add = \title owner priority -> do
   todos <- *todos
-  *todos = union todos [{title: formatTitle title, owner: owner, priority: priority, status: Open {}}]
+  *todos = union todos [{title formatTitle title owner owner priority priority status Open {}}]
 
 assign = \title owner person -> do
   todos <- *todos
   *todos = do
     t <- todos
     yield (if t.title == title && t.owner == owner
-      then {t | status: InProgress {assignee: person}}
+      then {t | status: InProgress {assignee person}}
       else t)
 
 resolve = \title owner msg -> do
@@ -2008,7 +2003,7 @@ resolve = \title owner msg -> do
   *todos = do
     t <- todos
     yield (if t.title == title && t.owner == owner
-      then {t | status: Resolved {resolution: msg}}
+      then {t | status: Resolved {resolution msg}}
       else t)
 
 &workload = do
@@ -2017,23 +2012,23 @@ resolve = \title owner msg -> do
     t <- todos
     Open {} <- t.status
     groupBy {t.owner}
-    yield {owner: t.owner, count: count t}}
+    yield {owner t.owner count count t}}
   (do
     yield result)
 
 api = serve Api where
   GetTodos = \{user} -> do
     todos <- pendingFor user
-    yield Ok {value: todos}
+    yield Ok {value todos}
   AddTodo = \{title, owner, priority} -> do
     atomic (add title owner priority)
-    yield Ok {value: {ok: True {}}}
+    yield Ok {value {ok True {}}}
   AssignTodo = \{title, owner, person} -> do
     atomic (assign title owner person)
-    yield Ok {value: {ok: True {}}}
+    yield Ok {value {ok True {}}}
   ResolveTodo = \{title, owner, msg} -> do
     atomic (resolve title owner msg)
-    yield Ok {value: {ok: True {}}}
+    yield Ok {value {ok True {}}}
   GetWorkload = \{} -> do
     w <- &workload
     yield Ok {value: w}

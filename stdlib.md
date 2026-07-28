@@ -97,7 +97,7 @@ map : (a -> b) -> [a] -> [b]
 Apply a function to each row. Results are deduplicated (relations are sets).
 
 ```knot
-&names = *people |> map (\p -> {name: p.name})
+&names = *people |> map (\p -> {name p.name})
 ```
 
 `map` is the `Functor` trait method for `[]`.
@@ -136,7 +136,7 @@ single : [a] -> Maybe a
 Extract the single element of a relation. Returns `Just {value: x}` for a singleton, `Nothing {}` for empty or multi-element relations.
 
 ```knot
-single [{name: "Alice"}]    -- Just {value: {name: "Alice"}}
+single [{name "Alice"}]    -- Just {value {name "Alice"}}
 single []                   -- Nothing {}
 single [1, 2]               -- Nothing {}
 ```
@@ -293,7 +293,7 @@ findFirst : [a] -> (a -> Bool) -> Maybe a
 First row matching the predicate (left-to-right), or `Nothing {}` when no row matches. Stops at the first hit.
 
 ```knot
-findFirst [1, 2, 3, 4, 5] (\x -> x > 3)   -- Just {value: 4}
+findFirst [1, 2, 3, 4, 5] (\x -> x > 3)   -- Just {value 4}
 ```
 
 ### `any` / `all`
@@ -352,7 +352,7 @@ source relations.
 ```knot
 -- Bump or insert a per-user counter
 bump = \user counters -> upsertBy (\c -> c.user == user)
-                                   {user: user, count: lookup user counters + 1}
+                                   {user user count lookup user counters + 1}
                                    counters
 ```
 
@@ -590,7 +590,7 @@ compiled Knot program accepts `--debug` automatically; see
 ```knot
 main = do
   logInfo "starting"
-  logWarn {event: "low memory", availableMb: 64}
+  logWarn {event "low memory" availableMb 64}
   yield {}
 ```
 

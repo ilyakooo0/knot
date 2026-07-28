@@ -133,7 +133,7 @@ safeDiv (\x y -> case y == 0 of
 }
 (do
   base.println (base.show (add 2 3))         -- "5"
-  base.println (base.show (safeDiv 10 2))    -- "Just {value: 5}"
+  base.println (base.show (safeDiv 10 2))    -- "Just {value 5}"
   base.println (base.show (safeDiv 10 0))    -- "Nothing {}"
   yield {})
 ```
@@ -246,7 +246,7 @@ compute (do
   a <- safeDiv 20 4     -- a = 5
   b <- safeDiv a 5      -- b = 1
   where b > 0           -- guard; Nothing if false
-  yield (a + b))        -- Just {value: 6}
+  yield (a + b))        -- Just {value 6}
 }
 (base.println (base.show compute))
 ```

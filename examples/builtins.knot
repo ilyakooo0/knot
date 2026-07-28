@@ -1,8 +1,8 @@
 with {
 safeDiv : Int 1 -> Int 1 -> Maybe (Int 1)
 safeDiv (\x y -> case y == 0 of
-  true -> Maybe.Nothing {}
-  false -> Maybe.Just {value (x / y)})
+  Bool.True {} -> Maybe.Nothing {}
+  Bool.False {} -> Maybe.Just {value (x / y)})
 
 nums [1, 2, 3, 4, 5]
 

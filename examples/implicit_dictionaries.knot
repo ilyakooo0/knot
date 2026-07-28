@@ -4,27 +4,27 @@
 -- resolves the dictionary from lexical scope at each full-arity callsite.
 with {
 intOrd {compare (\a b -> case a > b of
-  true -> 1
-  false -> case a < b of
-    true -> (0 - 1)
-    false -> 0)}
+  Bool.True {} -> 1
+  Bool.False {} -> case a < b of
+    Bool.True {} -> (0 - 1)
+    Bool.False {} -> 0)}
 textOrd {compare (\a b -> case a > b of
-  true -> 1
-  false -> case a < b of
-    true -> (0 - 1)
-    false -> 0)}
+  Bool.True {} -> 1
+  Bool.False {} -> case a < b of
+    Bool.True {} -> (0 - 1)
+    Bool.False {} -> 0)}
 intOrdDesc {compare (\a b -> case a < b of
-  true -> 1
-  false -> case a > b of
-    true -> (0 - 1)
-    false -> 0)}
+  Bool.True {} -> 1
+  Bool.False {} -> case a > b of
+    Bool.True {} -> (0 - 1)
+    Bool.False {} -> 0)}
 
 clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
 clamp (\lo hi x -> case ((^compare) x lo) < 0 of
-  true -> lo
-  false -> case ((^compare) x hi) > 0 of
-    true -> hi
-    false -> x)
+  Bool.True {} -> lo
+  Bool.False {} -> case ((^compare) x hi) > 0 of
+    Bool.True {} -> hi
+    Bool.False {} -> x)
 }
 (do
     base.println (base.show (with intOrd (clamp 0 10 42)))

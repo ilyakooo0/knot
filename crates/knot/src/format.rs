@@ -909,7 +909,7 @@ fn render_literal(l: &Literal) -> String {
         }
         Literal::Text(s) => format!("\"{}\"", escape_text(s)),
         Literal::Bytes(bytes) => format!("b\"{}\"", escape_bytes(bytes)),
-        Literal::Bool(b) => if *b { "true".into() } else { "false".into() },
+        Literal::Bool(b) => if *b { "Bool.True {}".into() } else { "Bool.False {}".into() },
     }
 }
 

@@ -33,23 +33,23 @@ const PRELUDE_SOURCE: &str = r#"
 base {
 min : a -> a -> a
 min (\a b -> case a < b of
-  true -> a
-  false -> b)
+  Bool.True {} -> a
+  Bool.False {} -> b)
 
 max : a -> a -> a
 max (\a b -> case a > b of
-  true -> a
-  false -> b)
+  Bool.True {} -> a
+  Bool.False {} -> b)
 
 when : Bool -> IO {} -> IO {}
 when (\cond action -> case cond of
-  true -> action
-  false -> yield {})
+  Bool.True {} -> action
+  Bool.False {} -> yield {})
 
 unless : Bool -> IO {} -> IO {}
 unless (\cond action -> case cond of
-  true -> yield {}
-  false -> action)
+  Bool.True {} -> yield {}
+  Bool.False {} -> action)
 }
 }
 "#;

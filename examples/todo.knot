@@ -12,8 +12,8 @@ complete (\title -> do
   *todos = do
     t <- todos
     yield (case t.title == title of
-      true -> {t | done 1}
-      false -> t))
+      Bool.True {} -> {t | done 1}
+      Bool.False {} -> t))
 
 pending (\owner -> do
   todos <- *todos

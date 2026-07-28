@@ -358,8 +358,8 @@ birthday = \name -> do
   *people = do
     p <- people
     yield (case p.name == name of
-      true  -> {p | age (p.age + 1)}
-      false -> p)
+      Bool.True {}  -> {p | age (p.age + 1)}
+      Bool.False {} -> p)
 
 -- Delete (filter to keep)
 removePerson = \name -> do
@@ -383,8 +383,8 @@ There is **no `if`/`then`/`else`**. The only branch is pattern matching with
 
 ```knot
 result = case x > 0 of
-  true  -> "positive"
-  false -> "non-positive"
+  Bool.True {}  -> "positive"
+  Bool.False {} -> "non-positive"
 ```
 
 Both arms must have the same type, and matching must be exhaustive (the
@@ -640,8 +640,8 @@ birthday = \name -> do
   *people = do               -- IO {} {}
     p <- people
     yield (case p.name == name of
-      true  -> {p | age (p.age + 1)}
-      false -> p)
+      Bool.True {}  -> {p | age (p.age + 1)}
+      Bool.False {} -> p)
 -- Inferred effects: {rw *people}
 -- Type: Text -> IO {} {}
 ```
@@ -1163,8 +1163,8 @@ result = do
 
 -- Result — short-circuits on Err
 safeDivide = \x y -> case y == 0 of
-  true  -> Err {error "div by zero"}
-  false -> Ok {value (x / y)}
+  Bool.True {}  -> Err {error "div by zero"}
+  Bool.False {} -> Ok {value (x / y)}
 
 compute = do
   a <- Ok {value 10}
@@ -1278,8 +1278,8 @@ updateWhere = \target newValue -> do
   *rel = do
     r <- rel
     yield (case r.id == target of
-      true  -> {r | field newValue}
-      false -> r)
+      Bool.True {}  -> {r | field newValue}
+      Bool.False {} -> r)
 ```
 
 ### Join two relations

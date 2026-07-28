@@ -17,8 +17,8 @@ discountDemo (do
   with {discounted (do
     i <- items
     yield (case i.price > 20 of
-      true -> {i | price (i.price - 5)}
-      false -> i))} *items = discounted)
+      Bool.True {} -> {i | price (i.price - 5)}
+      Bool.False {} -> i))} *items = discounted)
 
 -- Filter only: do-block filter body bound to a with.
 pruneDemo (do

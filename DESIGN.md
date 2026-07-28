@@ -276,7 +276,7 @@ richOnes = \employees departments -> do
   yield (richOnes employees departments)
 
 -- do with Maybe
-safeDivide = \a b -> case b == 0 of true -> Nothing {}; false -> Just {value: a / b}
+safeDivide = \a b -> case b == 0 of Bool.True {} -> Nothing {}; Bool.False {} -> Just {value: a / b}
 
 tryCompute = do
   x <- safeDivide 10 2
@@ -284,7 +284,7 @@ tryCompute = do
   yield (x + y)
 
 -- do with Result
-safeDivideR = \a b -> case b == 0 of true -> Err {error "div by zero"}; false -> Ok {value: a / b}
+safeDivideR = \a b -> case b == 0 of Bool.True {} -> Err {error "div by zero"}; Bool.False {} -> Ok {value: a / b}
 
 computeR = do
   x <- safeDivideR 10 2
@@ -318,7 +318,7 @@ These are built-in functions over relations plus the `*rel = expr` write. The co
 **`where`** — keep matching rows (in a comprehension, or via `base.filter`):
 
 ```knot
-where = \cond -> case cond of true -> yield {}; false -> empty
+where = \cond -> case cond of Bool.True {} -> yield {}; Bool.False {} -> empty
 ```
 
 **`filter`** — filter rows:
@@ -375,7 +375,7 @@ inter = \a b -> do
 **update** — transform matching rows. Recognized as an UPDATE:
 
 ```knot
-*rel = map (\x -> case p x of true -> f x; false -> x) *rel
+*rel = map (\x -> case p x of Bool.True {} -> f x; Bool.False {} -> x) *rel
 ```
 
 **`count`**, **`sum`**, **`avg`** — folds:
@@ -602,7 +602,7 @@ birthday = \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (case p.name == name of true -> {p | age p.age + 1}; false -> p)
+    yield (case p.name == name of Bool.True {} -> {p | age p.age + 1}; Bool.False {} -> p)
 ```
 
 ### Effect Annotations
@@ -615,7 +615,7 @@ birthday = \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (case p.name == name of true -> {p | age p.age + 1}; false -> p)
+    yield (case p.name == name of Bool.True {} -> {p | age p.age + 1}; Bool.False {} -> p)
 ```
 
 If the body uses a capability not listed in the signature, the compiler rejects it.
@@ -874,8 +874,8 @@ api = serve Api where
       Cons u _ -> yield Ok {value: u}
   CreateUser = \{name, email} -> do
     case length name == 0 of
-      true -> yield Err {error {status 400 message "name required"}}
-      false -> do
+      Bool.True {} -> yield Err {error {status 400 message "name required"}}
+      Bool.False {} -> do
         atomic do
           users <- *people
         *people = union users [{name name email email}]
@@ -1097,7 +1097,7 @@ birthday = \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (case p.name == "Alice" of true -> {p | age p.age + 1}; false -> p)
+    yield (case p.name == "Alice" of Bool.True {} -> {p | age p.age + 1}; Bool.False {} -> p)
 
 -- Delete: filter to keep the rest
 removePerson = \name -> do
@@ -1755,11 +1755,11 @@ api = serve Api where
         atomic do
           people <- *people
           *people = union people [person]
-        yield Ok {value {ok true error Nothing {}}}
+        yield Ok {value {ok (Bool.True {}) error Nothing {}}}
       Err {error} ->
         with {msg fold (\acc v -> acc ++ v.message ++ "; ") "" error.violations}
         (do
-          yield Ok {value {ok false error Just {value msg}}})
+          yield Ok {value {ok (Bool.False {}) error Just {value msg}}})
 ```
 
 ### No User-Facing Traits
@@ -1800,7 +1800,7 @@ declares that the function needs a dictionary record providing `field` at type
 
 ```knot
 clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
-clamp = \lo hi x -> case ((^compare) x lo) < 0 of true -> lo; false -> case ((^compare) x hi) > 0 of true -> hi; false -> x
+clamp = \lo hi x -> case ((^compare) x lo) < 0 of Bool.True {} -> lo; Bool.False {} -> case ((^compare) x hi) > 0 of Bool.True {} -> hi; Bool.False {} -> x
 ```
 
 `clamp` is elaborated to take a hidden leading dictionary parameter (a record
@@ -1810,9 +1810,9 @@ searches the lexical scope for a record supplying `compare` at the required
 type and splices it in as the leading argument:
 
 ```knot
-intOrd     = {compare (\a b -> case a > b of true -> 1; false -> case a < b of true -> (0 - 1); false -> 0)}
-textOrd    = {compare (\a b -> case a > b of true -> 1; false -> case a < b of true -> (0 - 1); false -> 0)}
-intOrdDesc = {compare (\a b -> case a < b of true -> 1; false -> case a > b of true -> (0 - 1); false -> 0)}
+intOrd     = {compare (\a b -> case a > b of Bool.True {} -> 1; Bool.False {} -> case a < b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)}
+textOrd    = {compare (\a b -> case a > b of Bool.True {} -> 1; Bool.False {} -> case a < b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)}
+intOrdDesc = {compare (\a b -> case a < b of Bool.True {} -> 1; Bool.False {} -> case a > b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)}
 
 clamp 0 10 42                     -- resolves to intOrd     → 10
 clamp "a" "m" "z"                 -- resolves to textOrd    → "m"

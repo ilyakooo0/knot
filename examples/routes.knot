@@ -29,8 +29,8 @@ api (serve Api where
       Maybe.Nothing {} -> base.logInfo "GetTodos (no proxy header)"
     todos <- getTodos owner
     case base.count todos == 0 of
-      true -> yield (Result.Err {error {status 404 message "no todos found for owner"}})
-      false -> yield (Result.Ok {value todos})
+      Bool.True {} -> yield (Result.Err {error {status 404 message "no todos found for owner"}})
+      Bool.False {} -> yield (Result.Ok {value todos})
   CreateTodo = \{title title owner owner priority priority} -> do
     addTodo title owner priority
     yield (Result.Ok {value {title title owner owner priority (Priority.Low {})}})

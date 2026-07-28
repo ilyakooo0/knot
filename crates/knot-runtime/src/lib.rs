@@ -4035,8 +4035,17 @@ impl KnotDb {
             quote_ident(column)
         );
         debug_sql(&sql);
-        if self.conn.execute_batch(&sql).is_ok() {
-            self.indexed.borrow_mut().insert(key);
+        match self.conn.execute_batch(&sql) {
+            Ok(()) => {
+                self.indexed.borrow_mut().insert(key);
+            }
+            Err(e) => {
+                // Index creation is best-effort, but a failure is invisible
+                // without this — surface it under --debug so a bogus column
+                // (e.g. a subquery over-match) or a real SQLite error shows
+                // up alongside the [SQL] trace instead of being swallowed.
+                log_debug!("[SQL] index creation failed for {}.{}: {}", table, column, e);
+            }
         }
     }
 
@@ -4053,42 +4062,209 @@ impl KnotDb {
     /// `<alias>."col"` qualified refs to their underlying table. Unqualified
     /// `"col"` refs are only indexed when the query references exactly one
     /// `_knot_` table — otherwise their table is ambiguous and we skip them.
+    ///
+    /// Also indexes the target column of a bare `MIN`/`MAX`/`SUM`/`AVG("col"…)`
+    /// aggregate: such a query has no WHERE/ORDER BY, so the clause scan finds
+    /// nothing, but an index lets SQLite satisfy `MIN`/`MAX` with a single
+    /// B-tree seek instead of a full scan.
     fn ensure_indexes_for_sql(&self, sql: &str) {
         for (table, column) in extract_sql_indexable_columns(sql) {
+            self.ensure_index(&table, &column);
+        }
+        for (table, column) in extract_aggregate_columns(sql) {
             self.ensure_index(&table, &column);
         }
     }
 }
 
-/// Extract column names from a generated SQL WHERE clause.
-/// Columns are always double-quoted identifiers (e.g. `"age"`, `"name"`).
-fn extract_where_columns(sql: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut columns = Vec::new();
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '"' {
-            let mut col = String::new();
-            loop {
-                match chars.next() {
-                    Some('"') => {
-                        if chars.peek() == Some(&'"') {
-                            col.push('"');
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    Some(ch) => col.push(ch),
-                    None => break,
-                }
+/// Extract `(table, column)` pairs for the argument of a top-level
+/// `MIN`/`MAX`/`SUM`/`AVG("col" …)` aggregate. The aggregate's table is
+/// resolved through the same `FROM`-clause alias map as
+/// [`extract_sql_indexable_columns`]; when the query touches several `_knot_`
+/// tables the column is only indexed if it is alias-qualified.
+fn extract_aggregate_columns(sql: &str) -> Vec<(String, String)> {
+    let aliases = parse_table_aliases(sql);
+    if aliases.is_empty() {
+        return Vec::new();
+    }
+    let unique_tables: HashSet<&String> = aliases.values().collect();
+    let single_table: Option<String> = if unique_tables.len() == 1 {
+        unique_tables.into_iter().next().cloned()
+    } else {
+        None
+    };
+
+    let bytes = sql.as_bytes();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Match an aggregate keyword at a word boundary.
+        let kw = [b"MIN" as &[u8], b"MAX", b"SUM", b"AVG"]
+            .iter()
+            .find(|kw| {
+                let end = i + kw.len();
+                end < bytes.len()
+                    && bytes[i..end].eq_ignore_ascii_case(kw)
+                    && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+                    && bytes[end] == b'('
+            })
+            .map(|kw| kw.len());
+        let Some(klen) = kw else {
+            i += 1;
+            continue;
+        };
+        // Skip whitespace between `(` and the opening quote.
+        let mut j = i + klen + 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        i += 1;
+        if j >= bytes.len() || bytes[j] != b'"' {
+            continue; // MIN(DISTINCT …), MIN(expr), MIN(*) — not a bare column.
+        }
+        let open = j;
+        let mut close = open + 1;
+        while close < bytes.len() && bytes[close] != b'"' {
+            close += 1;
+        }
+        if close >= bytes.len() {
+            break;
+        }
+        let raw = &sql[open + 1..close];
+        if raw.starts_with("_knot_") || raw.is_empty() {
+            continue;
+        }
+        // Resolve an optional `<alias>.` qualifier before the opening quote.
+        let table = if open > 0 && bytes[open - 1] == b'.' {
+            let mut k = open - 1;
+            while k > 0 && (bytes[k - 1].is_ascii_alphanumeric() || bytes[k - 1] == b'_') {
+                k -= 1;
             }
-            if seen.insert(col.clone()) {
-                columns.push(col);
+            if k == open - 1 {
+                None
+            } else {
+                aliases.get(&sql[k..open - 1]).cloned()
+            }
+        } else {
+            single_table.clone()
+        };
+        if let Some(table) = table {
+            let key = (table, raw.to_string());
+            if seen.insert(key.clone()) {
+                out.push(key);
             }
         }
     }
+    out
+}
+
+/// Extract column names from a generated SQL WHERE clause.
+/// Columns are always double-quoted identifiers (e.g. `"age"`, `"name"`).
+///
+/// Columns inside a subquery are *not* returned: `"dept_id" IN (SELECT "id"
+/// FROM "_knot_depts" WHERE "budget" > ?)` references columns of a *different*
+/// table, and `ensure_indexes_for_where` attributes every returned name to the
+/// outer table. A parenthesised group is treated as a subquery iff it contains
+/// a `SELECT` keyword or another `_knot_` table reference; plain parenthesised
+/// expressions like `("age" + ?) > ?` keep their columns. `_knot_`-prefixed
+/// identifiers are table names, never columns, so they're skipped as well.
+fn extract_where_columns(sql: &str) -> Vec<String> {
+    // First, mark the byte ranges of every parenthesised subquery so their
+    // columns can be excluded. A group is a subquery iff its body contains a
+    // `SELECT` keyword or a `_knot_` table reference.
+    let bytes = sql.as_bytes();
+    let mut subquery_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new(); // byte offsets of open parens
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => stack.push(i),
+            b')' => {
+                if let Some(open) = stack.pop() {
+                    let body = &sql[open + 1..i];
+                    if contains_subquery_marker(body) {
+                        subquery_ranges.push((open, i));
+                    }
+                }
+            }
+            b'"' => {} // quoted identifiers are handled in the main scan below
+            _ => {}
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut columns = Vec::new();
+    let mut chars = sql.char_indices().peekable();
+    while let Some((pos, c)) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        // Inside a subquery range? Then this identifier belongs to another
+        // table — skip it.
+        if subquery_ranges.iter().any(|&(s, e)| pos > s && pos < e) {
+            // Still consume the quoted body so we don't re-read its quotes.
+            consume_quoted(&mut chars);
+            continue;
+        }
+        let mut col = String::new();
+        loop {
+            match chars.next() {
+                Some((_, '"')) => {
+                    if chars.peek().map(|&(_, p)| p) == Some('"') {
+                        col.push('"');
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                Some((_, ch)) => col.push(ch),
+                None => break,
+            }
+        }
+        if !col.starts_with("_knot_") && seen.insert(col.clone()) {
+            columns.push(col);
+        }
+    }
     columns
+}
+
+/// Consume a double-quoted identifier body from `chars` (the opening quote has
+/// already been read), honoring `""` as an embedded quote.
+fn consume_quoted(chars: &mut std::iter::Peekable<std::str::CharIndices>) {
+    loop {
+        match chars.next() {
+            Some((_, '"')) => {
+                if chars.peek().map(|&(_, p)| p) == Some('"') {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+}
+
+/// Does a parenthesised body introduce another table? True when it contains a
+/// `SELECT` keyword or a `_knot_` table reference — i.e. it's a subquery whose
+/// columns belong to a different table than the outer query.
+fn contains_subquery_marker(body: &str) -> bool {
+    if body.contains("\"_knot_") {
+        return true;
+    }
+    let b = body.as_bytes();
+    let mut i = 0;
+    while i + 6 <= b.len() {
+        if b[i..i + 6].eq_ignore_ascii_case(b"SELECT")
+            && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+            && (i + 6 == b.len() || !(b[i + 6].is_ascii_alphanumeric() || b[i + 6] == b'_'))
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Walk a generated SQL query and return `(table_with_prefix, column)` pairs
@@ -20196,6 +20372,145 @@ pub extern "C-unwind" fn knot_crypto_encrypt_io(public_key: *mut Value, plaintex
 // nothing at all — not even `Nothing` for a `Maybe`. Every column type now reads
 // back as its default value, and the rows are backfilled in SQLite so the
 // pushed-down SQL sees the same value the in-memory read does.
+
+#[cfg(test)]
+mod index_extraction_tests {
+    use super::*;
+
+    // ── extract_where_columns ───────────────────────────────────────
+
+    #[test]
+    fn where_columns_simple() {
+        let cols = extract_where_columns(r#""age" > ? AND "name" = ?"#);
+        assert_eq!(cols, vec!["age", "name"]);
+    }
+
+    #[test]
+    fn where_columns_dedupes() {
+        let cols = extract_where_columns(r#""age" > ? OR "age" < ?"#);
+        assert_eq!(cols, vec!["age"]);
+    }
+
+    #[test]
+    fn where_columns_skips_subquery_body_and_inner_table() {
+        // Regression: a subquery's inner columns and its `_knot_` table name
+        // must not be attributed to the outer table.
+        let cols = extract_where_columns(
+            r#""dept_id" IN (SELECT "id" FROM "_knot_depts" WHERE "budget" > ?)"#,
+        );
+        assert_eq!(cols, vec!["dept_id"]);
+    }
+
+    #[test]
+    fn where_columns_skips_table_name_prefix() {
+        let cols = extract_where_columns(r#""_knot_emps" = ? AND "age" > ?"#);
+        assert_eq!(cols, vec!["age"]);
+    }
+
+    #[test]
+    fn where_columns_top_level_parens_kept() {
+        // A parenthesised *expression* on the outer table still indexes it.
+        let cols = extract_where_columns(r#"("age" + ?) > ?"#);
+        assert_eq!(cols, vec!["age"]);
+    }
+
+    // ── extract_aggregate_columns ───────────────────────────────────
+
+    #[test]
+    fn aggregate_min_single_table() {
+        let sql = r#"SELECT MIN("salary" COLLATE KNOT_INT) FROM "_knot_emps""#;
+        let cols = extract_aggregate_columns(sql);
+        assert_eq!(cols, vec![("_knot_emps".to_string(), "salary".to_string())]);
+    }
+
+    #[test]
+    fn aggregate_max_and_sum() {
+        let sql = r#"SELECT MAX("age"), SUM("salary") FROM "_knot_emps""#;
+        let cols = extract_aggregate_columns(sql);
+        assert!(cols.contains(&("_knot_emps".to_string(), "age".to_string())));
+        assert!(cols.contains(&("_knot_emps".to_string(), "salary".to_string())));
+    }
+
+    #[test]
+    fn aggregate_ignores_non_column_args() {
+        // MIN(DISTINCT …), COUNT(*), expressions — none are bare columns.
+        let sql = r#"SELECT COUNT(*) FROM "_knot_emps""#;
+        assert!(extract_aggregate_columns(sql).is_empty());
+    }
+
+    #[test]
+    fn aggregate_does_not_match_column_named_like_keyword() {
+        // A column literally named "minimum" must not be read as MIN(.
+        let sql = r#"SELECT "minimum" FROM "_knot_emps""#;
+        assert!(extract_aggregate_columns(sql).is_empty());
+    }
+
+    // ── extract_sql_indexable_columns ───────────────────────────────
+
+    #[test]
+    fn sql_indexable_where_single_table() {
+        let sql = r#"SELECT "name", "salary" FROM "_knot_emps" WHERE "salary" > ?"#;
+        let cols = extract_sql_indexable_columns(sql);
+        assert_eq!(cols, vec![("_knot_emps".to_string(), "salary".to_string())]);
+    }
+
+    #[test]
+    fn sql_indexable_order_by_only() {
+        let sql = r#"SELECT "name" FROM "_knot_emps" ORDER BY "salary""#;
+        let cols = extract_sql_indexable_columns(sql);
+        assert_eq!(cols, vec![("_knot_emps".to_string(), "salary".to_string())]);
+    }
+
+    #[test]
+    fn sql_indexable_no_where_no_order_by() {
+        // Bare SELECT — nothing indexable.
+        let sql = r#"SELECT "name", "salary" FROM "_knot_emps""#;
+        assert!(extract_sql_indexable_columns(sql).is_empty());
+    }
+
+    // ── parse_table_aliases ─────────────────────────────────────────
+
+    #[test]
+    fn aliases_bare_and_as() {
+        let sql = r#"SELECT * FROM "_knot_emps" AS e JOIN "_knot_depts" d ON e."did" = d."id""#;
+        let aliases = parse_table_aliases(sql);
+        assert_eq!(aliases.get("e"), Some(&"_knot_emps".to_string()));
+        assert_eq!(aliases.get("d"), Some(&"_knot_depts".to_string()));
+    }
+
+    #[test]
+    fn aliases_no_alias_maps_table_to_itself() {
+        let sql = r#"SELECT "name" FROM "_knot_emps" WHERE "salary" > ?"#;
+        let aliases = parse_table_aliases(sql);
+        assert_eq!(aliases.get("_knot_emps"), Some(&"_knot_emps".to_string()));
+    }
+
+    #[test]
+    fn aliases_clause_keyword_not_treated_as_alias() {
+        // `WHERE` right after the table must not become an alias.
+        let sql = r#"SELECT "name" FROM "_knot_emps" WHERE "salary" > ?"#;
+        let aliases = parse_table_aliases(sql);
+        assert!(!aliases.contains_key("WHERE"));
+        assert!(!aliases.contains_key("where"));
+    }
+
+    // ── find_indexable_region_start ─────────────────────────────────
+
+    #[test]
+    fn region_start_prefers_where_over_order_by() {
+        let sql = r#"SELECT "a" FROM "_knot_t" WHERE "b" > ? ORDER BY "c""#;
+        let start = find_indexable_region_start(sql).unwrap();
+        // Points just after WHERE, so the region covers both WHERE and ORDER BY.
+        assert!(sql[start..].contains("\"b\""));
+        assert!(sql[start..].contains("\"c\""));
+    }
+
+    #[test]
+    fn region_start_none_when_no_clauses() {
+        let sql = r#"SELECT "a" FROM "_knot_t""#;
+        assert!(find_indexable_region_start(sql).is_none());
+    }
+}
 
 
 

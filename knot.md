@@ -250,20 +250,43 @@ argument. To share a type between positions, use an explicit type variable
 
 ### Relation Comprehensions
 
+A comprehension over one source filters and projects its rows:
+
 ```knot
-&results = do
-  employees <- *employees       -- IO bind: get [Employee]
-  departments <- *departments   -- IO bind: get [Department]
-  with {joined: do              -- pure comprehension
-    e <- employees
-    d <- departments
-    where e.dept == d.name
-    with {bonus: e.salary * 0.1}
-    (do
-      yield {e.name, bonus, d.budget})}
-  (do
-    yield joined)
+with {result (do
+  e <- *employees
+  where e.salary > 75
+  yield {name e.name salary e.salary})}
+yield result
 ```
+
+**Joins.** Bind two (or more) relations in the same comprehension and relate
+them with a `where` clause — an equi-join predicate (`a.f == b.g`) plus any
+single-table predicates:
+
+```knot
+with {result (do
+  e <- *employees
+  d <- *departments
+  where e.dept == d.name        -- the join condition
+  where e.salary > 75           -- extra single-table filter
+  yield {name e.name dept d.name budget d.budget})}
+yield result
+```
+
+A read-only comprehension like this compiles to a **single multi-table SQL
+query**:
+
+```sql
+SELECT t0."name", t1."name", t1."budget"
+FROM "_knot_employees" AS t0, "_knot_departments" AS t1
+WHERE (t0."dept" = t1."name") AND (t0."salary" > ?)
+```
+
+The join columns (`employees.dept`, `departments.name`) and filter columns
+(`employees.salary`) are auto-indexed on first use. A comprehension the
+planner cannot translate falls back to reading the sources and joining in
+memory — results are identical either way, only the strategy differs.
 
 Statements in a `do` block:
 

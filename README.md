@@ -660,15 +660,25 @@ crates/
   knot-compiler/     Cranelift compiler producing native executables;
                      CLI binary is `knot`
   knot-lsp/          Language server for editor integration (binary `knot-lsp`)
+tools/
+  migrate/           Schema-migration library (knot-migrate) used by the
+                     compiler's migration path
 examples/            Example .knot programs
 DESIGN.md            Language specification
-stdlib.md            Standard library reference
+knot.md              Language reference (syntax, types, semantics)
+stdlib.md            Standard library reference (operators, types, units)
+base.md              `base` namespace reference (every builtin function)
+AGENTS.md            Contributor/agent guide (build, test, architecture)
 ```
 
 ## Tests
 
 ```sh
-cargo test                   # All tests
-cargo test -p knot           # Frontend (parser/lexer) only
-cargo test -p knot-compiler  # Inference, codegen, etc.
+cargo test                       # All tests (57 migrate + 18 runtime = 75)
+cargo test -p knot-runtime       # Runtime: SQLite, indexing, value repr
+cargo test -p knot-migrate       # Schema-migration logic
 ```
+
+Unit tests currently live in `knot-migrate` and `knot-runtime`; the
+frontend/compiler/LSP are exercised end-to-end by building and running the
+programs under [examples/](examples/).

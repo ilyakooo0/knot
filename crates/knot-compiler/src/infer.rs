@@ -226,6 +226,24 @@ pub type TypeInfo = HashMap<String, String>;
 /// Maps binding spans (local variables, params, patterns) to their inferred type strings.
 pub type LocalTypeInfo = HashMap<Span, String>;
 
+/// Maps each `base.todo` / bare-`todo` reference span to the display string of
+/// the type it was inferred to produce. Baked into the runtime hole report.
+pub type TodoTypes = HashMap<Span, String>;
+
+/// Maps each `base.todo` reference span to the local bindings visible at that
+/// site — `(name, type-display-string)` pairs, innermost-first with shadowed
+/// duplicates removed. Baked into the runtime hole report.
+pub type TodoBindings = HashMap<Span, Vec<(String, String)>>;
+
+/// Maps each `base.trace` reference span to the display string of the traced
+/// value's type. Baked into the runtime trace report.
+pub type TraceTypes = HashMap<Span, String>;
+
+/// Maps each `base.trace` reference span to the local bindings visible at that
+/// site — `(name, type-display-string)` pairs, innermost-first with shadowed
+/// duplicates removed. Baked into the runtime trace report.
+pub type TraceBindings = HashMap<Span, Vec<(String, String)>>;
+
 /// Resolved parseJson call-site info: the simple type name (for compile-time
 /// FromJSON impl dispatch) and a wire type descriptor (for Maybe
 /// normalization in the generic decoder — `null`/absent → Nothing, present
@@ -946,6 +964,28 @@ struct Infer {
     /// Spans of local variable bindings and their types (for LSP hover).
     binding_types: Vec<(Span, Ty)>,
 
+    /// Spans of `base.todo` (or `with base` → bare `todo`) references and the
+    /// type each was inferred at. Recorded as raw `(Span, Ty)` pairs and
+    /// applied/displayed at extraction time, mirroring `binding_types`, so the
+    /// runtime `todo` hole can report the exact type it was expected to
+    /// produce.
+    todo_types: Vec<(Span, Ty)>,
+
+    /// Spans of `base.todo` references and a snapshot of the local bindings
+    /// visible at each site — `(name, Scheme)` pairs, innermost scope first,
+    /// shadowed names already deduplicated. Resolved/displayed at extraction
+    /// time so the runtime hole report can list every in-scope local binding.
+    todo_scopes: Vec<(Span, Vec<(String, Scheme)>)>,
+
+    /// Spans of `base.trace` references and the type each was inferred at,
+    /// mirroring `todo_types` — the traced value's type, reported at runtime.
+    trace_types: Vec<(Span, Ty)>,
+
+    /// Spans of `base.trace` references and a snapshot of the local bindings
+    /// visible at each site, mirroring `todo_scopes` — so the runtime trace
+    /// report can list every in-scope local binding, like `todo` does.
+    trace_scopes: Vec<(Span, Vec<(String, Scheme)>)>,
+
     /// Route constructor → response type mapping (for `fetch` return type resolution).
     fetch_response_types: HashMap<String, ast::Type>,
 
@@ -1128,6 +1168,10 @@ impl Infer {
             deferred_constraints: Vec::new(),
             next_constraint_seq: 0,
             binding_types: Vec::new(),
+            todo_types: Vec::new(),
+            todo_scopes: Vec::new(),
+            trace_types: Vec::new(),
+            trace_scopes: Vec::new(),
             fetch_response_types: HashMap::new(),
             route_entries_by_api: HashMap::new(),
             fetch_response_headers: HashMap::new(),
@@ -4956,6 +5000,27 @@ impl Infer {
     }
 
     fn infer_expr(&mut self, expr: &ast::Expr) -> Ty {
+        let ty = self.infer_expr_inner(expr);
+        // Record the inferred type of every `base.todo` (or `with base` → bare
+        // `todo`) hole so codegen can report the exact type it was expected to
+        // produce at runtime. Detection is purely syntactic on the reference
+        // shape; the recorded `Ty` is applied/displayed at extraction time.
+        if expr_is_todo_ref(expr) {
+            self.todo_types.push((expr.span, ty.clone()));
+            self.todo_scopes
+                .push((expr.span, self.visible_bindings()));
+        }
+        // Same capture for `base.trace`: the traced value's type and the local
+        // bindings in scope, so the runtime trace report mirrors `todo`'s.
+        if expr_is_trace_ref(expr) {
+            self.trace_types.push((expr.span, ty.clone()));
+            self.trace_scopes
+                .push((expr.span, self.visible_bindings()));
+        }
+        ty
+    }
+
+    fn infer_expr_inner(&mut self, expr: &ast::Expr) -> Ty {
         match &expr.node {
             ast::ExprKind::Lit(lit) => self.literal_type(lit),
 
@@ -5357,6 +5422,40 @@ impl Infer {
                             expr.span,
                         );
                     }
+                    if let Some(scheme) = self.lookup_stdlib(field).cloned() {
+                        let ty = self.instantiate_at(&scheme, expr.span);
+                        self.field_accesses.push((expr.span, ty.clone()));
+                        return ty;
+                    }
+                    return Ty::Error;
+                }
+                // `base.todo` — the unimplemented hole. Dispatch-only (no
+                // `base` record field holds it, since `todo : ∀a. a` can never
+                // produce a value eagerly), so the generic record-read below
+                // would report "unexpected field `todo`". Instantiate its
+                // polymorphic scheme like `base.retry`; the expected type it
+                // unifies with is captured for the runtime report via
+                // `todo_types` (recorded in `record_expr_types`).
+                if let ast::ExprKind::Var(n) = &e.node
+                    && n == "base"
+                    && field == "todo"
+                {
+                    if let Some(scheme) = self.lookup_stdlib(field).cloned() {
+                        let ty = self.instantiate_at(&scheme, expr.span);
+                        self.field_accesses.push((expr.span, ty.clone()));
+                        return ty;
+                    }
+                    return Ty::Error;
+                }
+                // `base.trace` — the tracer. Also dispatch-only in the `base`
+                // namespace: it compiles to a closure-creating call, not a
+                // record read. Type it as `∀a. a -> a`; the traced value's type
+                // and the in-scope bindings are captured for the runtime report
+                // via `trace_types` (recorded in `record_expr_types`).
+                if let ast::ExprKind::Var(n) = &e.node
+                    && n == "base"
+                    && field == "trace"
+                {
                     if let Some(scheme) = self.lookup_stdlib(field).cloned() {
                         let ty = self.instantiate_at(&scheme, expr.span);
                         self.field_accesses.push((expr.span, ty.clone()));
@@ -9015,6 +9114,30 @@ impl Infer {
             )),
         );
 
+        // todo : a  — the unimplemented hole. Fully polymorphic so it unifies
+        // with whatever type its position expects (including `IO _`); the
+        // expected type is recorded per reference (see `todo_types`) and the
+        // runtime aborts with that context. Never produces a value.
+        {
+            let a = self.fresh_var();
+            self.bind_top("todo", Scheme::poly(vec![a], Ty::Var(a)));
+        }
+
+        // trace : ∀a. a -> a  — print the traced value (with source context and
+        // in-scope bindings, like `todo`) and return it unchanged. Fully
+        // polymorphic on the value type; the per-reference type is recorded in
+        // `trace_types` for the runtime report.
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "trace",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(a))),
+                ),
+            );
+        }
+
         // now : IO {clock} Int Ms
         {
             let int_ms = Ty::int_with_unit(UnitTy::named("Ms"));
@@ -10671,6 +10794,84 @@ impl Infer {
         info
     }
 
+    fn extract_todo_types(&self) -> TodoTypes {
+        let mut info = TodoTypes::new();
+        for (span, ty) in &self.todo_types {
+            let applied = self.apply(ty);
+            let applied = default_free_unit_vars(&applied);
+            let var_map = var_map_for(&applied);
+            let unit_var_map = unit_var_map_for(&applied);
+            info.insert(*span, display_ty_clean(&applied, &var_map, &unit_var_map));
+        }
+        info
+    }
+
+    /// Snapshot the local bindings visible at the current point, innermost
+    /// scope first. `scopes` is a stack of per-frame `HashMap`s; walking it in
+    /// reverse and skipping names already seen yields each binding under its
+    /// innermost (shadowing) definition, deduplicated. Stdlib value-fns are
+    /// not in `scopes` (they live in `stdlib_schemes`), so this captures only
+    /// genuine user/lambda/`with`/do-block bindings.
+    fn visible_bindings(&self) -> Vec<(String, Scheme)> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            for (name, scheme) in scope {
+                // `base` is the namespaced stdlib prelude record — dumping its
+                // full type into every report is noise. It's always reachable
+                // via `base.` anyway, so it's not a genuine local.
+                if name == "base" {
+                    continue;
+                }
+                if seen.insert(name.clone()) {
+                    out.push((name.clone(), scheme.clone()));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    fn extract_todo_bindings(&self) -> TodoBindings {
+        let mut out = TodoBindings::new();
+        for (span, bindings) in &self.todo_scopes {
+            let rendered = bindings
+                .iter()
+                .map(|(name, scheme)| (name.clone(), self.display_scheme(scheme)))
+                .collect();
+            out.insert(*span, rendered);
+        }
+        out
+    }
+
+    /// Extract `base.trace` spans → traced value type display strings, mirroring
+    /// `extract_todo_types`.
+    fn extract_trace_types(&self) -> TraceTypes {
+        let mut info = TraceTypes::new();
+        for (span, ty) in &self.trace_types {
+            let applied = self.apply(ty);
+            let applied = default_free_unit_vars(&applied);
+            let var_map = var_map_for(&applied);
+            let unit_var_map = unit_var_map_for(&applied);
+            info.insert(*span, display_ty_clean(&applied, &var_map, &unit_var_map));
+        }
+        info
+    }
+
+    /// Extract `base.trace` spans → in-scope local bindings, mirroring
+    /// `extract_todo_bindings`.
+    fn extract_trace_bindings(&self) -> TraceBindings {
+        let mut out = TraceBindings::new();
+        for (span, bindings) in &self.trace_scopes {
+            let rendered = bindings
+                .iter()
+                .map(|(name, scheme)| (name.clone(), self.display_scheme(scheme)))
+                .collect();
+            out.insert(*span, rendered);
+        }
+        out
+    }
+
     fn display_scheme(&self, scheme: &Scheme) -> String {
         let applied = self.apply(&scheme.ty);
         let var_map = var_map_for(&applied);
@@ -11296,6 +11497,10 @@ pub type CheckOutput = (
     ImplicitRefs,
     ImplicitDictArgs,
     ResolvedCalls,
+    TodoTypes,
+    TodoBindings,
+    TraceTypes,
+    TraceBindings,
 );
 
 /// Run type inference on a parsed module. Returns diagnostics,
@@ -11312,6 +11517,29 @@ pub type CheckOutput = (
 /// statement, and `infer_expr` recurses through every level.
 pub fn check(program: &mut ast::Expr) -> CheckOutput {
     crate::stack::grow(|| check_inner(program))
+}
+
+/// Is this expression a reference to the `todo` hole, `base.todo`? Purely
+/// syntactic on the reference shape; the type checker has already resolved
+/// that the field means the builtin. (Bare `todo` is not a `base` record
+/// field, so it is never in scope — only the namespaced form exists.)
+fn expr_is_todo_ref(expr: &ast::Expr) -> bool {
+    matches!(
+        &expr.node,
+        ast::ExprKind::FieldAccess { expr: base, field }
+            if field == "todo" && matches!(&base.node, ast::ExprKind::Var(n) if n == "base")
+    )
+}
+
+/// Is this expression a reference to the tracer, `base.trace`? Same purely
+/// syntactic shape check as `expr_is_todo_ref`. (Bare `trace` is not a `base`
+/// record field, so only the namespaced form exists.)
+fn expr_is_trace_ref(expr: &ast::Expr) -> bool {
+    matches!(
+        &expr.node,
+        ast::ExprKind::FieldAccess { expr: base, field }
+            if field == "trace" && matches!(&base.node, ast::ExprKind::Var(n) if n == "base")
+    )
 }
 
 fn check_inner(program: &mut ast::Expr) -> CheckOutput {
@@ -11745,8 +11973,12 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
     let type_arg_spans: TypeArgSpans = infer.type_arg_spans.clone();
     let implicit_refs: ImplicitRefs = infer.implicit_refs.clone();
     let implicit_dict_args: ImplicitDictArgs = infer.implicit_dict_args.clone();
+    let todo_types = infer.extract_todo_types();
+    let todo_bindings = infer.extract_todo_bindings();
+    let trace_types = infer.extract_trace_types();
+    let trace_bindings = infer.extract_trace_bindings();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, infer.resolved_calls.clone())
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, infer.resolved_calls.clone(), todo_types, todo_bindings, trace_types, trace_bindings)
 }
 
 

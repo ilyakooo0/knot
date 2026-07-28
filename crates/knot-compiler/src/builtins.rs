@@ -50,6 +50,14 @@ pub const PURE_BUILTINS: &[&str] = &[
     "countWhere", "minOn", "maxOn", "sortBy",
     "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
     "strip", "dress",
+    // The unimplemented hole: polymorphic `∀a. a`, aborts at runtime with a
+    // full source-context report. Effect-free in the type system (like
+    // `retry`); dispatch-only at codegen, never a real `base` record field.
+    "todo",
+    // The tracer: polymorphic `∀a. a -> a`, prints the traced value (with the
+    // same source-context + in-scope-bindings report as `todo`) and returns it
+    // unchanged. Dispatch-only at codegen, never a real `base` record field.
+    "trace",
 ];
 
 /// Set of builtin function names that perform some IO effect. Used by the LSP

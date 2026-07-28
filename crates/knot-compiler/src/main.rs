@@ -378,7 +378,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     let type_env = types::TypeEnv::from_program(&program);
 
     // Type inference
-    let (infer_diags, monad_info, type_info, _local_types, refine_targets, refined_types, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, resolved_calls) = infer::check(&mut program);
+    let (infer_diags, monad_info, type_info, _local_types, refine_targets, refined_types, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, resolved_calls, todo_types, todo_bindings, trace_types, trace_bindings) = infer::check(&mut program);
     if !infer_diags.is_empty() {
         for diag in &infer_diags {
             eprintln!("{}", diag.render(&source, &filename));
@@ -388,6 +388,23 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
             .any(|d| d.severity == knot::diagnostic::Severity::Error)
         {
             process::exit(1);
+        }
+    }
+
+    // Warn about every `todo` hole left in the codebase: it compiles and runs
+    // (aborting with a report only if reached), but is a debug placeholder, not
+    // a real implementation. One warning per hole, with a caret at the site.
+    // Unlike errors this does not stop the build.
+    if !todo_types.is_empty() {
+        let mut spans: Vec<_> = todo_types.keys().copied().collect();
+        spans.sort_by_key(|s| s.start);
+        for span in spans {
+            let diag = knot::diagnostic::Diagnostic::warning(
+                "`todo` hole used — this code path is a debug placeholder, not implemented",
+            )
+            .label(span, "debug placeholder")
+            .note("replace `base.todo` with an implementation before shipping");
+            eprintln!("{}", diag.render(&source, &filename));
         }
     }
 
@@ -435,7 +452,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     }
 
     // Code generation
-    let obj_bytes = match codegen::compile(&program, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, &elem_pushdown_ok, &show_unit_strings, &sum_float_spans, &relation_fields, &with_fields, &implicit_refs, &type_arg_spans, &implicit_dict_args, &resolved_calls, overrides) {
+    let obj_bytes = match codegen::compile(&program, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, &elem_pushdown_ok, &show_unit_strings, &sum_float_spans, &relation_fields, &with_fields, &implicit_refs, &type_arg_spans, &implicit_dict_args, &resolved_calls, &todo_types, &todo_bindings, &trace_types, &trace_bindings, &source, overrides) {
         Ok(bytes) => bytes,
         Err(diags) => {
             for diag in &diags {

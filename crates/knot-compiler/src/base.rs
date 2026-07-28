@@ -106,7 +106,7 @@ pub(crate) fn is_gated_stdlib(name: &str) -> bool {
 pub(crate) fn is_gated_special_form(name: &str) -> bool {
     matches!(
         name,
-        "fetch" | "fetchWith" | "listen" | "listenOn" | "retry"
+        "fetch" | "fetchWith" | "listen" | "listenOn" | "retry" | "todo" | "trace"
     )
 }
 

@@ -338,6 +338,24 @@ pub struct Codegen {
     // splices the projected record as the leading argument at that application.
     implicit_dict_args: crate::infer::ImplicitDictArgs,
 
+    /// `base.todo` / bare-`todo` reference span → the type it was expected to
+    /// produce. Rendered into the runtime hole report at codegen time.
+    todo_types: crate::infer::TodoTypes,
+    /// `base.todo` reference span → the local bindings visible at that site
+    /// (`(name, type)` display pairs). Rendered into the runtime hole report.
+    todo_bindings: crate::infer::TodoBindings,
+    /// `base.trace` reference span → the traced value's type. Rendered into the
+    /// runtime trace report at codegen time.
+    trace_types: crate::infer::TraceTypes,
+    /// `base.trace` reference span → the local bindings visible at that site
+    /// (`(name, type)` display pairs). Rendered into the runtime trace report.
+    trace_bindings: crate::infer::TraceBindings,
+    /// Full program source text, used to render the pretty source-context
+    /// snippet (line + caret) for each `todo` hole report.
+    source_text: String,
+    /// Program filename, shown in the hole report header.
+    source_name: String,
+
     // Names of `with`-bound locals and whether each one's bound value is
     // IO-producing (`self.expr_is_io(value)`). Such a name used inside the
     // body (e.g. `f 1` where `f` was bound to `\y -> println (show y)`)
@@ -691,6 +709,11 @@ pub fn compile(
     type_arg_spans: &crate::infer::TypeArgSpans,
     implicit_dict_args: &crate::infer::ImplicitDictArgs,
     resolved_calls: &crate::infer::ResolvedCalls,
+    todo_types: &crate::infer::TodoTypes,
+    todo_bindings: &crate::infer::TodoBindings,
+    trace_types: &crate::infer::TraceTypes,
+    trace_bindings: &crate::infer::TraceBindings,
+    source: &str,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     crate::stack::grow(|| {
@@ -712,6 +735,11 @@ pub fn compile(
             type_arg_spans,
             implicit_dict_args,
             resolved_calls,
+            todo_types,
+            todo_bindings,
+            trace_types,
+            trace_bindings,
+            source,
             compile_time_overrides,
         )
     })
@@ -736,9 +764,20 @@ fn compile_inner(
     type_arg_spans: &crate::infer::TypeArgSpans,
     implicit_dict_args: &crate::infer::ImplicitDictArgs,
     resolved_calls: &crate::infer::ResolvedCalls,
+    todo_types: &crate::infer::TodoTypes,
+    todo_bindings: &crate::infer::TodoBindings,
+    trace_types: &crate::infer::TraceTypes,
+    trace_bindings: &crate::infer::TraceBindings,
+    source: &str,
     compile_time_overrides: &HashMap<String, String>,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
+    cg.todo_types = todo_types.clone();
+    cg.todo_bindings = todo_bindings.clone();
+    cg.trace_types = trace_types.clone();
+    cg.trace_bindings = trace_bindings.clone();
+    cg.source_text = source.to_string();
+    cg.source_name = source_file.to_string();
     // Seed the relation-typed top-level constant set from inference's type
     // strings (`[T]` / `[T; units]` display forms). Used by
     // `expr_is_relation_var` so `x <- some_global` binds in IO do-blocks
@@ -1060,6 +1099,12 @@ impl Codegen {
             with_fields: HashMap::new(),
             implicit_refs: HashMap::new(),
             implicit_dict_args: HashMap::new(),
+            todo_types: HashMap::new(),
+            todo_bindings: HashMap::new(),
+            trace_types: HashMap::new(),
+            trace_bindings: HashMap::new(),
+            source_text: String::new(),
+            source_name: String::new(),
             with_io_locals: Vec::new(),
             elem_pushdown_ok: crate::infer::ElemPushdownOk::default(),
             show_unit_strings: HashMap::new(),
@@ -1383,6 +1428,22 @@ impl Codegen {
         self.declare_rt("knot_random_int_io", &[p], &[p]);
         self.declare_rt("knot_random_float_io", &[], &[p]);
         self.declare_rt("knot_random_uuid_io", &[], &[p]);
+
+        // The `todo` hole: takes a baked context string (ptr, len), reports it,
+        // and exits. The plain form is for value positions; the `_io` form wraps
+        // the report in an IO thunk for `IO a` positions. Both return `*mut
+        // Value` nominally, but never actually return (they `process::exit`).
+        self.declare_rt("knot_todo", &[p, p], &[p]);
+        self.declare_rt("knot_todo_io", &[p, p], &[p]);
+        // Value-carrying variants: also take a `names` array (count × [ptr,len]
+        // pairs), a `vals` array (count × *mut Value), and the count, so the
+        // report can print each in-scope binding's runtime value.
+        self.declare_rt("knot_todo_vals", &[p, p, p, p, p], &[p]);
+        self.declare_rt("knot_todo_vals_io", &[p, p, p, p, p], &[p]);
+        // `base.trace` — same capture shape as `knot_todo_vals` (baked context +
+        // name/value arrays), but returns an `a -> a` closure value that prints
+        // the report + traced value when applied and yields its argument.
+        self.declare_rt("knot_trace", &[p, p, p, p, p], &[p]);
 
         // Spawn / threading
         self.declare_rt("knot_fork_io", &[p], &[p]);
@@ -3881,6 +3942,12 @@ impl Codegen {
         env: &mut Env,
         db: Value,
     ) -> Value {
+        // The span of THIS expression, captured before the match below
+        // destructures `expr.node` (arms like `FieldAccess { expr, .. }`
+        // shadow the `expr` binding with a sub-expression, losing the outer
+        // span). `base.todo` needs the outer FieldAccess span to key the
+        // `todo_types` map (which infer records at the whole-`base.todo` span).
+        let outer_span = expr.span;
         match &expr.node {
             ast::ExprKind::Lit(lit) => self.compile_lit(builder, lit),
 
@@ -4151,6 +4218,26 @@ impl Codegen {
             }
 
             ast::ExprKind::FieldAccess { expr, field } => {
+                // `base.todo` — the unimplemented hole, reached through the
+                // `base` namespace. Dispatch-only (no `base` record field holds
+                // it, since `todo : a` can never produce a value eagerly); emit
+                // the report-and-exit call directly.
+                if let ast::ExprKind::Var(base_name) = &expr.node
+                    && base_name == "base"
+                    && field == "todo"
+                {
+                    return self.emit_todo(builder, outer_span, env);
+                }
+                // `base.trace` — the debug probe, reached through the `base`
+                // namespace. Dispatch-only (it compiles to a closure-creating
+                // call, not a record read); the returned closure prints the
+                // report + traced value when applied and yields its argument.
+                if let ast::ExprKind::Var(base_name) = &expr.node
+                    && base_name == "base"
+                    && field == "trace"
+                {
+                    return self.emit_trace(builder, outer_span, env);
+                }
                 // `base.retry` — the STM primitive reached through the `base`
                 // namespace. It has no `base` record field, so emit the retry
                 // logic directly (identical to the bare `retry` Var arm).
@@ -5695,6 +5782,229 @@ impl Codegen {
             }
             _ => None,
         }
+    }
+
+    /// Emit the `todo` hole report-and-exit. Shared by the bare `todo` Var arm
+    /// and the namespaced `base.todo` FieldAccess arm. Renders the source
+    /// context (file:line:col, caret under `todo`, expected type) into a string
+    /// baked into the binary, gathers the runtime values of every local binding
+    /// in scope from `env`, and calls `knot_todo_vals` — or `knot_todo_vals_io`
+    /// when the expected type is `IO _`, so the report (with values) fires when
+    /// the action is forced, not when the thunk is created. Never returns.
+    fn emit_todo(
+        &mut self,
+        builder: &mut cranelift_frontend::FunctionBuilder,
+        span: ast::Span,
+        env: &mut Env,
+    ) -> cranelift_codegen::ir::Value {
+        let ty_str = self.todo_types.get(&span).cloned();
+        let rendered = self.render_todo_context(span, ty_str.as_deref());
+        let (ctx_ptr, ctx_len) = self.string_ptr(builder, &rendered);
+
+        // Gather the in-scope binding names (from infer's capture) paired with
+        // their runtime values (from the codegen env). Names infer recorded but
+        // codegen has no value for (e.g. a top-level fn not passed as a local)
+        // are skipped — only genuine locals with a live value are reported.
+        let names: Vec<String> = self
+            .todo_bindings
+            .get(&span)
+            .map(|bs| bs.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default();
+        let mut pairs: Vec<(String, cranelift_codegen::ir::Value)> = Vec::new();
+        for name in &names {
+            if let Some(v) = env.get(name) {
+                pairs.push((name.clone(), v));
+            }
+        }
+
+        let ptr_bytes = self.ptr_type.bytes() as i32;
+        let count = pairs.len();
+        // names array: count × [ptr, len]; vals array: count × [*mut Value].
+        let names_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (2 * count as u32) * ptr_bytes as u32,
+            3,
+        ));
+        let vals_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (count as u32) * ptr_bytes as u32,
+            3,
+        ));
+        for (i, (name, val)) in pairs.iter().enumerate() {
+            let (nptr, nlen) = self.string_ptr(builder, name);
+            let noff = (i as i32) * (2 * ptr_bytes);
+            builder.ins().stack_store(nptr, names_slot, noff);
+            builder.ins().stack_store(nlen, names_slot, noff + ptr_bytes);
+            builder
+                .ins()
+                .stack_store(*val, vals_slot, (i as i32) * ptr_bytes);
+        }
+        let names_ptr = builder.ins().stack_addr(self.ptr_type, names_slot, 0);
+        let vals_ptr = builder.ins().stack_addr(self.ptr_type, vals_slot, 0);
+        let count_v = builder.ins().iconst(self.ptr_type, count as i64);
+
+        let is_io = ty_str
+            .as_deref()
+            .map(|t| t.trim_start().starts_with("IO"))
+            .unwrap_or(false);
+        if is_io {
+            self.call_rt(
+                builder,
+                "knot_todo_vals_io",
+                &[ctx_ptr, ctx_len, names_ptr, vals_ptr, count_v],
+            )
+        } else {
+            self.call_rt(
+                builder,
+                "knot_todo_vals",
+                &[ctx_ptr, ctx_len, names_ptr, vals_ptr, count_v],
+            )
+        }
+    }
+
+    /// Render the pretty source context for a `todo` hole at `span`, matching
+    /// the compiler's own diagnostic style. Reuses `knot::diagnostic`'s ariadne
+    /// rendering so the runtime report looks identical to a compile error.
+    /// Appends the expected type and the names/types of every local binding in
+    /// scope; the runtime appends their values (unknown at compile time).
+    fn render_todo_context(&self, span: ast::Span, ty_str: Option<&str>) -> String {
+        let mut msg =
+            String::from("reached a `todo` hole — this code path is not implemented yet");
+        if let Some(t) = ty_str {
+            msg.push_str(&format!("\n  expected to produce a value of type: {t}"));
+        }
+        if let Some(bindings) = self.todo_bindings.get(&span)
+            && !bindings.is_empty()
+        {
+            msg.push_str("\n  local bindings in scope:");
+            for (name, ty) in bindings {
+                msg.push_str(&format!("\n    {name} : {ty}"));
+            }
+        }
+        let (line, col) = knot::diagnostic::line_col(&self.source_text, span.start);
+        knot::diagnostic::Diagnostic::error(msg)
+            .label(span, "not implemented")
+            .note(format!(
+                "replace `base.todo` at {}:{}:{} with an implementation",
+                self.source_name,
+                line,
+                col + 1,
+            ))
+            .render(&self.source_text, &self.source_name)
+    }
+
+    /// Gather the in-scope binding names infer recorded for `span` (from
+    /// `bindings_map`) paired with their live runtime values from `env`, and
+    /// spill them into two stack arrays: `names` (count × [ptr,len] pairs) and
+    /// `vals` (count × *mut Value). Returns the call arguments
+    /// `[names_ptr, vals_ptr, count]` to append after a baked-context
+    /// `(ptr, len)` pair. Shared by `emit_todo` and `emit_trace` — the report
+    /// differs, the capture is identical.
+    fn spill_binding_arrays(
+        &mut self,
+        builder: &mut cranelift_frontend::FunctionBuilder,
+        bindings_map: &crate::infer::TodoBindings,
+        span: ast::Span,
+        env: &mut Env,
+    ) -> [cranelift_codegen::ir::Value; 3] {
+        let names: Vec<String> = bindings_map
+            .get(&span)
+            .map(|bs| bs.iter().map(|(n, _)| n.clone()).collect())
+            .unwrap_or_default();
+        let mut pairs: Vec<(String, cranelift_codegen::ir::Value)> = Vec::new();
+        for name in &names {
+            if let Some(v) = env.get(name) {
+                pairs.push((name.clone(), v));
+            }
+        }
+
+        let ptr_bytes = self.ptr_type.bytes() as i32;
+        let count = pairs.len();
+        // names array: count × [ptr, len]; vals array: count × [*mut Value].
+        let names_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (2 * count as u32) * ptr_bytes as u32,
+            3,
+        ));
+        let vals_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            (count as u32) * ptr_bytes as u32,
+            3,
+        ));
+        for (i, (name, val)) in pairs.iter().enumerate() {
+            let (nptr, nlen) = self.string_ptr(builder, name);
+            let noff = (i as i32) * (2 * ptr_bytes);
+            builder.ins().stack_store(nptr, names_slot, noff);
+            builder.ins().stack_store(nlen, names_slot, noff + ptr_bytes);
+            builder
+                .ins()
+                .stack_store(*val, vals_slot, (i as i32) * ptr_bytes);
+        }
+        let names_ptr = builder.ins().stack_addr(self.ptr_type, names_slot, 0);
+        let vals_ptr = builder.ins().stack_addr(self.ptr_type, vals_slot, 0);
+        let count_v = builder.ins().iconst(self.ptr_type, count as i64);
+        [names_ptr, vals_ptr, count_v]
+    }
+
+    /// Emit the `trace` debug probe. Shared by the namespaced `base.trace`
+    /// FieldAccess arm. Renders the source context (file:line:col, caret under
+    /// `trace`, traced-value type, in-scope bindings) into a string baked into
+    /// the binary, spills the live binding values via `spill_binding_arrays`,
+    /// and calls `knot_trace`, which returns an `a -> a` closure value. The
+    /// closure prints the report + the traced value when applied and yields its
+    /// argument — a transparent probe, not a hole, so it always has a value and
+    /// never needs an IO-deferred variant.
+    fn emit_trace(
+        &mut self,
+        builder: &mut cranelift_frontend::FunctionBuilder,
+        span: ast::Span,
+        env: &mut Env,
+    ) -> cranelift_codegen::ir::Value {
+        let ty_str = self.trace_types.get(&span).cloned();
+        let rendered = self.render_trace_context(span, ty_str.as_deref());
+        let (ctx_ptr, ctx_len) = self.string_ptr(builder, &rendered);
+        let trace_bindings = self.trace_bindings.clone();
+        let [names_ptr, vals_ptr, count_v] =
+            self.spill_binding_arrays(builder, &trace_bindings, span, env);
+        self.call_rt(
+            builder,
+            "knot_trace",
+            &[ctx_ptr, ctx_len, names_ptr, vals_ptr, count_v],
+        )
+    }
+
+    /// Render the pretty source context for a `trace` probe at `span`, matching
+    /// `render_todo_context` but framed as a debug trace rather than an
+    /// unimplemented hole: header names the traced value's type, the caret is
+    /// labelled "traced here", and the note points at the call site. The runtime
+    /// appends the binding values and the traced value itself.
+    fn render_trace_context(&self, span: ast::Span, ty_str: Option<&str>) -> String {
+        let mut msg = String::from("`trace` probe — value passed through here");
+        // `trace : ∀a. a -> a` records the whole function type; the traced
+        // *value* is the argument, whose type is the domain. Display that
+        // (strip the leading `T ->`) so the report names what flows through.
+        if let Some(t) = ty_str {
+            let arg_ty = t.split_once(" -> ").map(|(dom, _)| dom).unwrap_or(t);
+            msg.push_str(&format!("\n  traced value has type: {arg_ty}"));
+        }
+        if let Some(bindings) = self.trace_bindings.get(&span)
+            && !bindings.is_empty()
+        {
+            msg.push_str("\n  local bindings in scope:");
+            for (name, ty) in bindings {
+                msg.push_str(&format!("\n    {name} : {ty}"));
+            }
+        }
+        let (line, col) = knot::diagnostic::line_col(&self.source_text, span.start);
+        knot::diagnostic::Diagnostic::error(msg)
+            .label(span, "traced here")
+            .note(format!(
+                "`base.trace` at {}:{}:{} — remove it when done debugging",
+                self.source_name,
+                line,
+                col + 1,
+            ))
+            .render(&self.source_text, &self.source_name)
     }
 
     /// Emit the STM `retry` primitive. Shared by the bare `retry` Var arm and

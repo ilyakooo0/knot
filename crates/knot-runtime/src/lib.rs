@@ -9230,6 +9230,171 @@ pub extern "C-unwind" fn knot_random_int_io(bound: *mut Value) -> *mut Value {
     alloc(Value::IO(thunk as *const u8, env))
 }
 
+/// `base.todo` — an unimplemented hole. The compiler bakes the full pretty
+/// source context (file:line:col, caret-underlined source line, enclosing
+/// definition, inferred expected type) into a single rendered string and
+/// passes it here; we print it to stderr and abort. Never returns, so the
+/// `*mut Value` it nominally yields is never observed — it can stand in for
+/// any type `a`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_todo(ctx_ptr: *const u8, ctx_len: usize) -> *mut Value {
+    let ctx = unsafe {
+        let bytes = std::slice::from_raw_parts(ctx_ptr, ctx_len);
+        String::from_utf8_lossy(bytes)
+    };
+    eprintln!("{ctx}");
+    std::process::exit(1);
+}
+
+/// IO-position `base.todo` (used as `IO a`): defer the abort until the thunk
+/// is forced, mirroring `knot_now_io`. The context string is bound as the env.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_todo_io(ctx_ptr: *const u8, ctx_len: usize) -> *mut Value {
+    let ctx = unsafe {
+        let bytes = std::slice::from_raw_parts(ctx_ptr, ctx_len);
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        if let Value::Text(s) = unsafe { as_ref(env) } {
+            eprintln!("{s}");
+        }
+        std::process::exit(1);
+    }
+    let env = alloc(Value::Text(Arc::from(ctx.as_str())));
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+/// Read a C-style `(ptr, len)` string slice baked into the binary.
+///
+/// # Safety
+/// `ptr..ptr+len` must be a valid UTF-8 string constant in the data section.
+unsafe fn baked_str<'a>(ptr: *const u8, len: usize) -> std::borrow::Cow<'a, str> {
+    unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)) }
+}
+
+/// Render the report body shared by `knot_todo_vals` / `knot_todo_vals_io`:
+/// the baked context string followed by the runtime value of every local
+/// binding in scope at the hole, one `name = value` per line. `names` /
+/// `vals` are parallel arrays of length `count`; each `names[i]` is a
+/// `(ptr, len)` pair back-to-back. Bindings whose value is a function or IO
+/// action are shown as such rather than forced.
+fn render_todo_with_vals(
+    ctx_ptr: *const u8,
+    ctx_len: usize,
+    names: *const u8,
+    vals: *const *mut Value,
+    count: usize,
+) -> String {
+    let mut out = unsafe { baked_str(ctx_ptr, ctx_len) }.into_owned();
+    if count == 0 || names.is_null() {
+        return out;
+    }
+    // Each name entry is two pointer-sized slots: [ptr, len].
+    let name_slots =
+        unsafe { std::slice::from_raw_parts(names as *const usize, count * 2) };
+    let val_slots = unsafe { std::slice::from_raw_parts(vals, count) };
+    out.push_str("\n  values in scope:");
+    for i in 0..count {
+        let (nptr, nlen) = (name_slots[i * 2], name_slots[i * 2 + 1]);
+        let name = unsafe { baked_str(nptr as *const u8, nlen) };
+        let v = val_slots[i];
+        let shown = if v.is_null() {
+            String::from("<unavailable>")
+        } else {
+            match unsafe { as_ref(v) } {
+                Value::Function(_) => String::from("<function>"),
+                Value::IO(..) => String::from("<IO action>"),
+                _ => format_value(v),
+            }
+        };
+        out.push_str(&format!("\n    {name} = {shown}"));
+    }
+    out
+}
+
+/// Value-position `base.todo` carrying the runtime values of the local
+/// bindings in scope at the hole. Prints the baked context, then each
+/// binding's value, and exits. Never returns.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_todo_vals(
+    ctx_ptr: *const u8,
+    ctx_len: usize,
+    names: *const u8,
+    vals: *const *mut Value,
+    count: usize,
+) -> *mut Value {
+    let report = render_todo_with_vals(ctx_ptr, ctx_len, names, vals, count);
+    eprintln!("{report}");
+    std::process::exit(1);
+}
+
+/// IO-position variant: defer the report (with binding values) until the IO
+/// thunk is forced. The captured `*const *mut Value` array is stack-allocated
+/// at the todo site, so it must be copied into an owned Vec bound as the env.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_todo_vals_io(
+    ctx_ptr: *const u8,
+    ctx_len: usize,
+    names: *const u8,
+    vals: *const *mut Value,
+    count: usize,
+) -> *mut Value {
+    let report = render_todo_with_vals(ctx_ptr, ctx_len, names, vals, count);
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        if let Value::Text(s) = unsafe { as_ref(env) } {
+            eprintln!("{s}");
+        }
+        std::process::exit(1);
+    }
+    let env = alloc(Value::Text(Arc::from(report.as_str())));
+    alloc(Value::IO(thunk as *const u8, env))
+}
+
+/// Value-position `base.trace`. Mirrors `knot_todo_vals` in capture (baked
+/// context + parallel name/value arrays for the in-scope bindings), but instead
+/// of aborting it returns a one-argument closure value. When that closure is
+/// applied to the traced value `x`, it prints the report followed by `x`'s own
+/// value and returns `x` unchanged — so `base.trace x` is a transparent `a -> a`
+/// debug probe, not a hole. The binding arrays are stack-allocated at the trace
+/// site, so (like `knot_todo_vals_io`) the report is rendered eagerly and bound
+/// as the closure env.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_trace(
+    ctx_ptr: *const u8,
+    ctx_len: usize,
+    names: *const u8,
+    vals: *const *mut Value,
+    count: usize,
+) -> *mut Value {
+    let report = render_todo_with_vals(ctx_ptr, ctx_len, names, vals, count);
+    // Closure body: print the report, then the traced value, then return it.
+    // Signature matches `knot_value_call`'s transmuted call convention.
+    extern "C-unwind" fn apply(_db: *mut c_void, env: *mut Value, arg: *mut Value) -> *mut Value {
+        if let Value::Text(s) = unsafe { as_ref(env) } {
+            eprintln!("{s}");
+        }
+        let shown = if arg.is_null() {
+            String::from("<unavailable>")
+        } else {
+            match unsafe { as_ref(arg) } {
+                Value::Function(_) => String::from("<function>"),
+                Value::IO(..) => String::from("<IO action>"),
+                _ => format_value(arg),
+            }
+        };
+        eprintln!("  traced value = {shown}");
+        arg
+    }
+    let env = alloc(Value::Text(Arc::from(report.as_str())));
+    alloc(Value::Function(Box::new(FunctionInner {
+        fn_ptr: apply as *const u8,
+        env,
+        source: Arc::from("trace"),
+    })))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_random_float_io() -> *mut Value {
     extern "C-unwind" fn thunk(db: *mut c_void, _env: *mut Value) -> *mut Value {

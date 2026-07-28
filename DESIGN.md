@@ -158,7 +158,7 @@ addMember = \teamName person -> do
   *teams = do
     t <- teams
     yield (if t.name == teamName
-      then {t | members: union t.members [person]}
+      then {t | members union t.members [person]}
       else t)
 
 -- Remove a member from all teams
@@ -166,7 +166,7 @@ removePerson = \personName -> do
   teams <- *teams
   *teams = do
     t <- teams
-    yield {t | members: do
+    yield {t | members do
       m <- t.members
       where m.name != personName
       yield m}
@@ -634,7 +634,7 @@ birthday = \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (case p.name == name of true -> {p | age: p.age + 1}; false -> p)
+    yield (case p.name == name of true -> {p | age p.age + 1}; false -> p)
 ```
 
 ### Effect Annotations
@@ -647,7 +647,7 @@ birthday = \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (case p.name == name of true -> {p | age: p.age + 1}; false -> p)
+    yield (case p.name == name of true -> {p | age p.age + 1}; false -> p)
 ```
 
 If the body uses a capability not listed in the signature, the compiler rejects it.
@@ -1129,7 +1129,7 @@ birthday = \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (case p.name == "Alice" of true -> {p | age: p.age + 1}; false -> p)
+    yield (case p.name == "Alice" of true -> {p | age p.age + 1}; false -> p)
 
 -- Delete: filter to keep the rest
 removePerson = \name -> do
@@ -1276,7 +1276,7 @@ data Status
 migrate *people
   from {name: Text, age: Int 1}
   to   {name: Text, age: Int 1, email: Text}
-  using (\old -> {old | email: old.name ++ "@unknown.com"})
+  using (\old -> {old | email old.name ++ "@unknown.com"})
 ```
 
 Since it's valid Knot, it can be parsed by the same compiler frontend — no separate schema format. Migrations are recorded in the lockfile so the compiler can detect if a migration is accidentally removed from source.
@@ -1305,7 +1305,7 @@ Breaking changes require a `migrate` block:
 migrate *people
   from {name: Text, age: Int 1}
   to   {name: Text, age: Int 1, email: Text}
-  using (\old -> {old | email: old.name ++ "@unknown.com"})
+  using (\old -> {old | email old.name ++ "@unknown.com"})
 ```
 
 ADT migrations use pattern matching:
@@ -1314,7 +1314,7 @@ ADT migrations use pattern matching:
 migrate *todos
   from {title: Text, owner: Text, priority: Priority, status: <Open {} | InProgress {assignee: Text} | Resolved {resolution: Text}>}
   to   {title: Text, owner: Text, priority: Priority, status: Status}
-  using (\old -> {old | status: case old.status of
+  using (\old -> {old | status case old.status of
     InProgress {assignee} -> Resolved {resolution "closed by " ++ assignee}
     other                 -> other})
 ```
@@ -1995,7 +1995,7 @@ assign = \title owner person -> do
   *todos = do
     t <- todos
     yield (if t.title == title && t.owner == owner
-      then {t | status: InProgress {assignee person}}
+      then {t | status (InProgress {assignee person})}
       else t)
 
 resolve = \title owner msg -> do
@@ -2003,7 +2003,7 @@ resolve = \title owner msg -> do
   *todos = do
     t <- todos
     yield (if t.title == title && t.owner == owner
-      then {t | status: Resolved {resolution msg}}
+      then {t | status (Resolved {resolution msg})}
       else t)
 
 &workload = do

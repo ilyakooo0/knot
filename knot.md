@@ -357,7 +357,9 @@ birthday = \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (if p.name == name then {p | age: p.age + 1} else p)
+    yield (case p.name == name of
+      true  -> {p | age (p.age + 1)}
+      false -> p)
 
 -- Delete (filter to keep)
 removePerson = \name -> do
@@ -374,13 +376,19 @@ Relations are sets — inserting a duplicate row is a no-op.
 
 ## Control Flow
 
-### If/Else
+### Conditionals — `case` on a Bool
+
+There is **no `if`/`then`/`else`**. The only branch is pattern matching with
+`case ... of`; a Bool scrutinee gives you if/else:
 
 ```knot
-result = if x > 0 then "positive" else "non-positive"
+result = case x > 0 of
+  true  -> "positive"
+  false -> "non-positive"
 ```
 
-`if` is an expression — both branches must have the same type.
+Both arms must have the same type, and matching must be exhaustive (the
+compiler enforces covering every constructor).
 
 ### `with` Expressions
 
@@ -487,7 +495,7 @@ updateTeams = do
   teams <- *teams
   *teams = do
     t <- teams
-    yield {t | members: do
+    yield {t | members do
       m <- t.members
       where m.name != "Eve"
       yield m}
@@ -682,7 +690,9 @@ birthday = \name -> do
   people <- *people              -- IO {} [Person]
   *people = do               -- IO {} {}
     p <- people
-    yield (if p.name == name then {p | age: p.age + 1} else p)
+    yield (case p.name == name of
+      true  -> {p | age (p.age + 1)}
+      false -> p)
 -- Inferred effects: {rw *people}
 -- Type: Text -> IO {} {}
 ```
@@ -1101,7 +1111,7 @@ The compiler maintains a lockfile (`<name>.schema.lock`) tracking persisted sche
 migrate *people
   from {name: Text, age: Int 1}
   to   {name: Text, age: Int 1, email: Text}
-  using (\old -> {old | email: old.name ++ "@unknown.com"})
+  using (\old -> {old | email old.name ++ "@unknown.com"})
 ```
 
 ---
@@ -1201,7 +1211,9 @@ result = do
   yield (a / b)
 
 -- Result — short-circuits on Err
-safeDivide = \x y -> if y == 0 then Err {error "div by zero"} else Ok {value: x / y}
+safeDivide = \x y -> case y == 0 of
+  true  -> Err {error "div by zero"}
+  false -> Ok {value (x / y)}
 
 compute = do
   a <- Ok {value 10}
@@ -1249,7 +1261,7 @@ complete = \title -> do
   *todos = do
     t <- todos
     yield (if t.title == title
-      then {t | status: Resolved {resolution "done"}}
+      then {t | status (Resolved {resolution "done"})}
       else t)
 
 assign = \title person -> do
@@ -1257,7 +1269,7 @@ assign = \title person -> do
   *todos = do
     t <- todos
     yield (if t.title == title
-      then {t | status: InProgress {assignee person}}
+      then {t | status (InProgress {assignee person})}
       else t)
 
 pending = \owner -> do
@@ -1325,7 +1337,9 @@ updateWhere = \target newValue -> do
   rel <- *rel
   *rel = do
     r <- rel
-    yield (if r.id == target then {r | field: newValue} else r)
+    yield (case r.id == target of
+      true  -> {r | field newValue}
+      false -> r)
 ```
 
 ### Join two relations

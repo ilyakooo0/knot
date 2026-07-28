@@ -430,8 +430,8 @@ transfer = \from to amount -> atomic do
   accounts <- *accounts
   *accounts = do
     a <- accounts
-    yield (if a.name == from then {a | balance: a.balance - amount}
-           else if a.name == to then {a | balance: a.balance + amount}
+    yield (if a.name == from then {a | balance a.balance - amount}
+           else if a.name == to then {a | balance a.balance + amount}
            else a)
 ```
 

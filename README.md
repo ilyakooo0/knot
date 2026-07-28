@@ -558,17 +558,18 @@ circles and rects in one table. Constructor patterns work in `case` and in
 include `Bool`, `Maybe`, and `Result`. See `examples/maybe.knot`,
 `examples/result.knot`, `examples/cons_pattern.knot`.
 
-**Traits and ad-hoc polymorphism.** Single-dispatch traits with default
-methods, deriving, supertraits, and associated types; built-in `Eq`, `Ord`,
-and `Num` back the comparison and arithmetic operators. Alongside traits, the
-**record-dictionary idiom** — bundling operations in a record and passing it
-implicitly via `^field` projection or a `(^field : T) =>` constraint — gives
-lightweight, first-class overloading without a separate instance mechanism.
-See `examples/ord.knot`, `examples/trait_replacement.knot`,
-`examples/implicit_dictionaries.knot`.
+**Ad-hoc polymorphism via record dictionaries.** There is no user-facing
+`trait`/`impl` mechanism — the comparison and arithmetic operators are
+intrinsic, and equality/ordering/`show` work structurally on any value. For
+overloading you control, the **record-dictionary idiom** — bundling operations
+in a record and passing it implicitly via `^field` projection or a
+`(^field : T) =>` constraint — gives lightweight, first-class overloading
+without a separate instance mechanism. See `examples/ord.knot`,
+`examples/trait_replacement.knot`, `examples/implicit_dictionaries.knot`.
 
 **Type inference.** Hindley-Milner with row-polymorphic records and
-variants, let-generalization, trait-bound checking, and unit polymorphism.
+variants, let-generalization, implicit-dictionary constraints, and unit
+polymorphism.
 
 **IO effects.** Every function carries an effect row in its type:
 `IO {console, fs} Text`, `IO {network | r} {}`, etc. Atomic blocks are

@@ -246,7 +246,7 @@ argument. To share a type between positions, use an explicit type variable
 
 ## Do Blocks
 
-`do` blocks are the primary syntax for comprehensions and sequencing. They work with any type implementing the `Monad` trait — not just relations.
+`do` blocks are the primary syntax for comprehensions and sequencing. They work on four types — relations `[a]`, `IO`, `Maybe`, and `Result` — compiled structurally, not via a `Monad` trait.
 
 ### Relation Comprehensions
 
@@ -292,7 +292,7 @@ Statements in a `do` block:
 
 | Statement | Meaning |
 |-----------|---------|
-| `x <- expr` | Bind: iterate over relation / unwrap monad |
+| `x <- expr` | Bind: iterate a relation / sequence IO / unwrap `Maybe`/`Result` |
 | `where cond` | Filter: skip when condition is false |
 | `yield expr` | Emit a value into the result |
 | `groupBy {fields}` | Group by key fields (see Grouping) |
@@ -748,16 +748,18 @@ and the loser unwinds at its next safe point.
 
 ## Operators
 
-| Operator | Meaning | Trait |
-|----------|---------|-------|
-| `+` `-` `*` `/` | Arithmetic | `Num` |
-| `%` | Modulo (remainder) | `Num` |
-| unary `-` | Negation | `Num` |
-| `==` `!=` | Equality | `Eq` |
-| `<` `>` `<=` `>=` | Comparison | `Ord` |
-| `++` | Concatenation | `Semigroup` |
-| `&&` `\|\|` | Boolean logic | (direct) |
+| Operator | Meaning | Works on |
+|----------|---------|----------|
+| `+` `-` `*` `/` | Arithmetic | `Int 1`, `Float 1`, unit-annotated |
+| `%` | Modulo (remainder) | `Int 1`, `Float 1` |
+| unary `-` | Negation | numerics |
+| `==` `!=` | Equality | `Int 1`, `Float 1`, `Text`, `Bool` |
+| `<` `>` `<=` `>=` | Comparison | `Int 1`, `Float 1`, `Text` |
+| `++` | Concatenation | `Text`, `[a]` |
+| `&&` `\|\|` | Boolean logic | `Bool` (direct) |
 | `\|>` | Pipe forward | `x \|> f` = `f x` |
+
+All intrinsic — no trait mechanism.
 
 ---
 
@@ -768,9 +770,9 @@ and the loser unwinds at its next safe point.
 | Function | Type | Description |
 |----------|------|-------------|
 | `filter` | `(a -> Bool) -> [a] -> [a]` | Keep matching rows |
-| `map` | `(a -> b) -> [a] -> [b]` | Transform each row (`Functor.map`) |
+| `map` | `(a -> b) -> [a] -> [b]` | Transform each row |
 | `match` | `Constructor -> [ADT] -> [Payload]` | Filter by variant |
-| `fold` | `(b -> a -> b) -> b -> [a] -> b` | Left fold (`Foldable.fold`) |
+| `fold` | `(b -> a -> b) -> b -> [a] -> b` | Left fold |
 | `count` | `[a] -> Int u` | Number of rows |
 | `countWhere` | `(a -> Bool) -> [a] -> Int u` | Filtered count (SQL-pushed when possible) |
 | `sum` | `(a -> b) -> [a] -> b` | Sum projected field (preserves units) |
@@ -1145,11 +1147,11 @@ Refined types are subtypes of their base type. `Nat` is compatible with `Int 1` 
 
 ---
 
-## Custom Monads
+## `do` on `Maybe` and `Result`
 
-Any type implementing `Monad` gets `do`/`<-`/`yield` syntax. The prelude ships
-with built-in monad instances for `[]`, `Maybe`, and `Result`, so you can use
-do-blocks directly with them:
+Besides relations and `IO`, `do`/`<-`/`yield` works on `Maybe` and `Result` via
+the compiler's built-in structural support — short-circuiting on `Nothing` /
+`Err`:
 
 ```knot
 -- Maybe — short-circuits on Nothing
@@ -1170,20 +1172,9 @@ compute = do
   yield (a + b)
 ```
 
-To add `do` support to a user-defined type, provide its `Functor`,
-`Applicative`, `Monad`, and (optionally) `Alternative` impls:
-
-```knot
-data Tree a = Leaf {} | Node {left: Tree a, value: a, right: Tree a}
-
-impl Functor Tree where
-  map f t = case t of
-    Leaf {} -> Leaf {}
-    Node {left, value, right} ->
-      Node {left: map f left, value: f value, right: map f right}
-
--- (Applicative, Monad, Alternative omitted for brevity)
-```
+`do` support is **fixed to these four types** (`[a]`, `IO`, `Maybe`, `Result`)
+— there is no way to make a user-defined type work with `do`, because that
+would require a `Monad` instance and there is no trait system to write one in.
 
 ---
 

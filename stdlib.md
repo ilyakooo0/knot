@@ -337,7 +337,7 @@ take : Int 1 -> [a] -> [a]      -- Sequence.take
 drop : Int 1 -> [a] -> [a]      -- Sequence.drop
 ```
 
-First / drop *n* rows. Both come from the `Sequence` trait, which also has a `Text` impl that operates on characters.
+First / drop *n* rows. `take`/`drop` are built-in polymorphic functions that work on both `[a]` (rows) and `Text` (characters).
 
 ### `upsertBy`
 
@@ -1069,8 +1069,8 @@ variables and no bounds.
 | `[a]` | Relation (set of values of type `a`) |
 | `IO {effects} a` | IO action with tracked effects |
 | `Ordering` | `LT {}`, `EQ {}`, or `GT {}` |
-| `Maybe a` | `Nothing {}` or `Just {value: a}` (built-in monad) |
-| `Result e a` | `Err {error: e}` or `Ok {value: a}` (built-in monad) |
+| `Maybe a` | `Nothing {}` or `Just {value: a}` (supports `do`/`<-`) |
+| `Result e a` | `Err {error: e}` or `Ok {value: a}` (supports `do`/`<-`) |
 
 ### Units of Measure
 

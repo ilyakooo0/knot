@@ -269,7 +269,7 @@ it if none match — the "insert or update" pattern.
 base.traverse : (a -> f b) -> [a] -> f [b]
 ```
 
-Walk a relation left-to-right, sequencing through an applicative `f`
+Walk a relation left-to-right, sequencing through an effectful or short-circuiting step
 (typically `Maybe` — validate every row and collect, or get the first
 `Nothing`).
 

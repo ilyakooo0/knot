@@ -86,7 +86,7 @@ Constructors are the interface for building values, inserting, and querying. The
 
 Every constructor requires `{}` — even those with no fields. This keeps the syntax uniform: a constructor is always `Name {fields}`, whether it has fields or not. There is no distinction between "a constructor" and "a constructor applied to a record."
 
-`Bool`, `Maybe`, and `Result` are built-in — their constructors (`True`/`False`, `Nothing`/`Just`, `Ok`/`Err`) are always available without a `data` declaration. `True {}` and `False {}` are interchangeable with the `true`/`false` literals and can be used in `case` patterns. `Maybe` gets `Functor`, `Applicative`, `Monad`, and `Alternative` from prelude impls; `Result` gets the same hierarchy via built-in compiler support, so `do`-notation works on both out of the box.
+`Bool`, `Maybe`, and `Result` are built-in — their constructors (`True`/`False`, `Nothing`/`Just`, `Ok`/`Err`) are always available without a `data` declaration. `True {}` and `False {}` are interchangeable with the `true`/`false` literals and can be used in `case` patterns. `do`-notation works on `Maybe` and `Result` out of the box via the compiler's structural support (short-circuiting on `Nothing`/`Err`), with no instances to write.
 
 ```knot
 data Maybe a = Nothing {} | Just {value: a}
@@ -229,47 +229,37 @@ type Course = {name: Text, students: [{name: Text, grades: [{subject: Text, scor
 
 ## Primitives
 
-### Trait Hierarchy
+### `do` Works on Four Types, Structurally
 
-`do` syntax is not hardcoded to `[]`. It desugars to trait methods, so any type implementing `Monad` gets `do`/`yield`/`<-` for free. This requires higher-kinded types in the type system.
+`do` syntax is not trait-polymorphic — there is no `Monad` trait a user type can
+implement. Instead the compiler recognizes `do` blocks over exactly four types
+and compiles each by a dedicated path:
 
-```knot
-trait Functor (f : Type -> Type) where
-  map : (a -> b) -> f a -> f b
+- **`[a]`** (relation comprehension): `<-` iterates rows, `where` filters,
+  `yield` emits a row. Compiled to SQL when over source relations (see
+  [Querying](#querying)), otherwise to an in-memory loop.
+- **`IO {e} a`**: `<-` sequences effects, `yield` returns a pure value. IO do
+  blocks (those containing IO-returning expressions like `*rel`, `println`,
+  `readFile`, `now`) use a dedicated IO compilation path that sequences actions
+  directly.
+- **`Maybe a`**: `<-` unwraps `Just`, short-circuits on `Nothing`.
+- **`Result e a`**: `<-` unwraps `Ok`, short-circuits on `Err`.
 
-trait Functor f => Applicative (f : Type -> Type) where
-  yield : a -> f a
-  ap    : f (a -> b) -> f a -> f b
-
-trait Applicative m => Monad (m : Type -> Type) where
-  bind : (a -> m b) -> m a -> m b
-
-trait Applicative f => Alternative (f : Type -> Type) where
-  empty : f a
-  alt   : f a -> f a -> f a
-
-trait Foldable (t : Type -> Type) where
-  fold : (b -> a -> b) -> b -> t a -> b
-
-trait Foldable t => Traversable (t : Type -> Type) where
-  traverse : (a -> f b) -> t a -> f (t b)
-
-trait Sequence s where
-  take : Int 1 -> s -> s
-  drop : Int 1 -> s -> s
-```
-
-`Sequence` has built-in impls for both `Text` (character take/drop) and relations (row take/drop), so the same `take 5 x` works on a string or a relation.
+Higher-order operations (`map`, `fold`, `traverse`, `bind`, …) are ordinary
+polymorphic functions over these concrete types — there are no instances to
+write, no dictionaries, and no higher-kinded trait bounds. `take`/`drop` work on
+both `Text` (characters) and `[a]` (rows) as built-in polymorphic functions, so
+the same `take 5 x` works on a string or a relation.
 
 ### `do` Desugaring
 
-`do` syntax works for any `Monad`. Do blocks can appear anywhere an expression is expected, including as function arguments: `f do ...` or `f (do ...)`.
+Do blocks can appear anywhere an expression is expected, including as function arguments: `f do ...` or `f (do ...)`.
 
-- `x <- expr` desugars to `bind (\x -> ...) expr`
-- `yield x` is `Applicative.yield`
-- `where cond` desugars to `case cond of true -> yield {}; false -> empty` (requires `Alternative`)
+- `x <- expr` sequences/binds, according to which of the four types `expr` has
+- `yield x` produces a result in that type
+- `where cond` filters (relation comprehension) or guards (`Maybe`/`Result`)
 
-IO do blocks (those containing IO-returning expressions like `*rel`, `println`, `readFile`, `now`) are not desugared — they use a dedicated compilation path that sequences IO actions directly.
+IO do blocks (those containing IO-returning expressions like `*rel`, `println`, `readFile`, `now`) are not desugared to a generic bind — they use a dedicated compilation path that sequences IO actions directly.
 
 ```knot
 -- do with [] (pure relation comprehension over plain values)
@@ -301,51 +291,31 @@ computeR = do
   yield (x + 1)
 ```
 
-### `[]` Trait Implementations
+### The `[]` Primitives
 
-`[]` implements the full hierarchy:
-
-```knot
-impl Functor [] where
-  map f rel = do x <- rel; yield (f x)
-
-impl Applicative [] where
-  yield x = [x]
-  ap fs xs = do f <- fs; x <- xs; yield (f x)
-
-impl Monad [] where
-  bind = ...  -- built-in
-
-impl Alternative [] where
-  empty = [ ]
-  alt = union
-
-impl Foldable [] where
-  fold = ...  -- built-in
-```
-
-### The Only `[]`-Specific Primitive
+The only `[]`-specific primitive is the relation write; everything else is a
+built-in function over relations:
 
 | Primitive | Form | Description |
 |-----------|------|-------------|
 | relation write | `*rel = expr  :  IO {} {}` | Make a persistent relation equal to `expr` (use `replace *rel = expr` to force a full overwrite) |
 
-Everything else comes from traits:
+The relation operations are built-in functions, not trait methods:
 
-| Operation | Trait method |
-|-----------|-------------|
-| `empty` | `Alternative.empty` |
-| `yield` | `Applicative.yield` |
-| `<-` (bind) | `Monad.bind` |
-| `union` | `Alternative.alt` |
-| `fold` | `Foldable.fold` |
-| `map` | `Functor.map` |
+| Operation | Built-in |
+|-----------|----------|
+| empty relation | `[]` literal |
+| `yield` (singleton) | comprehension `yield` |
+| `<-` (iterate) | comprehension `<-` |
+| `union` | `base.union` |
+| `fold` | `base.fold` |
+| `map` | `base.map` |
 
 ### Derived Operations
 
-Everything else is built from trait methods plus the `*rel = expr` write. The compiler recognizes these patterns and executes them as efficient set operations (hash joins, indexed lookups, etc.) — the traits define semantics, the runtime chooses the strategy.
+These are built-in functions over relations plus the `*rel = expr` write. The compiler recognizes these patterns and executes them as efficient set operations (hash joins, indexed lookups, SQL pushdown, etc.) — the operations define semantics, the runtime chooses the strategy.
 
-**`where`** — conditional empty (requires `Alternative`):
+**`where`** — keep matching rows (in a comprehension, or via `base.filter`):
 
 ```knot
 where = \cond -> case cond of true -> yield {}; false -> empty
@@ -556,7 +526,7 @@ Multiple key fields group by their combination:
 
 Grouping is executed via SQLite — key columns are inserted into a temp table and sorted with `ORDER BY`, then consecutive rows with matching keys are collected into groups.
 
-## Effects and the IO Monad
+## Effects and IO
 
 ### Unified Effect Model
 
@@ -1486,12 +1456,12 @@ total = (acc + delta) : Float M  -- parenthesized form
 `sum`, `avg`, `minOn`, `maxOn`, and binary `min`/`max` preserve units:
 
 ```knot
-sum   : Num a => [a] -> a                  -- direct; use `map` to project first
+sum   : [a] -> a                        -- direct; use `map` to project first
 avg   : (a -> Float u) -> [a] -> Float u
 minOn : (a -> b) -> [a] -> b           -- units flow through via b
 maxOn : (a -> b) -> [a] -> b
-min   : Ord a => a -> a -> a            -- binary
-max   : Ord a => a -> a -> a            -- binary
+min   : a -> a -> a                     -- binary
+max   : a -> a -> a                     -- binary
 ```
 
 `sum` takes the relation directly — there is no projection argument. To sum a
@@ -1537,9 +1507,13 @@ type Measurement = {distance: Float M, time: Float S}
     yield result)
 ```
 
-#### Interaction with Traits
+#### Units and Arithmetic
 
-Units live outside the trait system as a compile-time overlay. The `Num` trait handles runtime dispatch for arithmetic; the compiler applies unit algebra rules as an additional layer. No changes to trait definitions are needed — `+` on `Float M` dispatches through `Num.add` at runtime while the compiler separately verifies that both operands share the unit `M` and propagates `M` to the result.
+Units live outside the value level as a compile-time overlay. Arithmetic is
+intrinsic (checked/panicking on `Int 1`); the compiler applies unit algebra
+rules as an additional layer on top. `+` on `Float M` evaluates directly while
+the compiler separately verifies that both operands share the unit `M` and
+propagates `M` to the result.
 
 ### Refined Types
 
@@ -1790,123 +1764,31 @@ api = serve Api where
           yield Ok {value {ok false error Just {value msg}}})
 ```
 
-### Traits
+### No User-Facing Traits
 
-Traits define shared behavior that types can implement. Syntax follows Rust: `trait` for definition, `impl` for implementation.
+Knot has **no trait system you can use**. The parser rejects `trait`
+declarations, `impl` blocks, `deriving`, associated types, and `Num a =>`-style
+bounds — writing any of them is a syntax error. (Earlier drafts of this design
+had a Rust-style trait system; it was removed. The mechanism that replaced it
+for *ad-hoc* polymorphism is [Implicit Dictionaries](#implicit-dictionaries-field--t-), below.)
 
-```knot
-trait Display a where
-  display : a -> Text
+What remains:
 
-impl Display Int where
-  display n = showInt n
+- **Operators** (`==` `<` `+` `++` `%` …) are **intrinsic** — the compiler
+  evaluates them directly on the supported types (`Int 1`, `Float 1`, `Text`,
+  `Bool` for equality; numerics for arithmetic/ordering; `Text` and `[a]` for
+  `++`). No type class, no instance, no dictionary.
+- **Higher-order functions** (`base.map`, `base.fold`, `base.traverse`,
+  `base.bind`, `base.display`, `base.show`, …) are ordinary polymorphic
+  functions over concrete types (`[a]`, `Maybe a`, `Result e a`, `IO`, and any
+  `a` for `display`/`show`, which work structurally via the runtime). They have
+  no bounds.
+- **Equality, ordering, and `show`/`display`** work structurally on any value —
+  there is nothing to derive.
 
-impl Display Text where
-  display t = t
-```
-
-#### Trait Bounds
-
-Trait bounds constrain type variables. They are inferred but can be written explicitly:
-
-```knot
--- Bounds are inferred from usage
-printAll = \rel -> do
-  r <- rel
-  yield (display r)
-
--- Inferred: Display a => [a] -> [Text]
-
--- Explicit bound (optional)
-printAll : Display a => [a] -> [Text]
-```
-
-#### Multiple Bounds
-
-```knot
-sortAndShow : Ord a => Display a => [a] -> [Text]
-```
-
-#### Associated Types
-
-Traits can have associated types:
-
-```knot
-trait Container c where
-  type Elem c
-  size : c -> Int 1
-  toList : c -> [Elem c]
-
-impl Container [a] where
-  type Elem [a] = a
-  size xs = count xs
-  toList xs = xs
-```
-
-(Method names must not collide with prelude trait methods like `empty`/`yield`,
-since trait method names share one global namespace.)
-
-#### Deriving
-
-`deriving (TraitName)` auto-generates an impl from the trait's **default method
-bodies**, so it only does useful work for traits that provide defaults (see
-[Default Implementations](#default-implementations) below):
-
-```knot
-data Priority = Low {} | Medium {} | High {} | Critical {}
-  deriving (Describe)   -- Describe must supply default method bodies
-```
-
-Equality, ordering, and `show` do **not** need deriving — `==`/`!=`, the
-comparison operators, and `show` work structurally on any value via the runtime,
-regardless of whether `Eq`/`Ord`/`Display` are derived (those built-in traits
-declare no default bodies, so `deriving (Eq, Ord, Display)` would generate
-nothing).
-
-#### Relation-Specific Traits
-
-The standard library defines traits that interact with the relational model:
-
-```knot
--- Types that can be used in where clauses and joins
--- (method names are plain identifiers; the `==` operator dispatches to `eq`)
-trait Eq a where
-  eq : a -> a -> Bool
-
--- Types that support ordering
-trait Ord a where
-  compare : a -> a -> Ordering
-```
-
-#### Trait-Polymorphic Queries
-
-Traits compose naturally with relational queries:
-
-```knot
--- Works on any relation whose rows are displayable
-report = \rel -> do
-  r <- rel
-  yield {summary display r}
-
--- Works on any relation with a numeric column named `amount`
-totalAmount : Num n => [{amount: n | r}] -> n
-totalAmount = \rel -> fold (\acc r -> acc + r.amount) 0 rel
-```
-
-#### Default Implementations
-
-```knot
-trait Summarize a where
-  summary : a -> Text
-  detailed : a -> Text
-  detailed x = summary x  -- default: same as summary
-
-impl Summarize Shape where
-  summary s = case s of
-    Circle {radius} -> "circle r=" ++ display radius
-    Rect {width, height} -> display width ++ "x" ++ display height
-  -- detailed uses the default
-```
+For polymorphism the *user* controls, see the next section: implicit record
+dictionaries, where the operations travel as fields of an ordinary record
+resolved from lexical scope.
 
 ### Implicit Dictionaries: `(^field : T) =>`
 
@@ -1952,7 +1834,7 @@ once.
 
 ### Type Inference
 
-Full Hindley-Milner style inference extended with row polymorphism and trait bounds. Type signatures are always optional — the compiler infers trait bounds from usage just like it infers everything else.
+Full Hindley-Milner style inference extended with row polymorphism (record fields, effect rows, and unit variables) and implicit-dictionary constraints. Type signatures are always optional — the compiler infers everything from usage.
 
 ## Full Example
 

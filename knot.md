@@ -325,7 +325,7 @@ Filter and destructure in one step:
 &circles = do
   shapes <- *shapes
   with {result do
-    Circle c <- shapes
+    Shape.Circle c <- shapes
     yield c}
   (do
     yield result)
@@ -334,8 +334,8 @@ Filter and destructure in one step:
   tickets <- *tickets
   with {result do
     t <- tickets
-    InProgress ip <- t.status
-    yield {t.title, ip.assignee}}
+    Status.InProgress ip <- t.status
+    yield {title t.title assignee ip.assignee}}
   (do
     yield result)
 ```
@@ -1321,7 +1321,7 @@ getCount = do
 &circles = do
   shapes <- *shapes
   with {result do
-    Circle c <- shapes
+    Shape.Circle c <- shapes
     yield c}
   (do
     yield result)

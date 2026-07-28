@@ -385,12 +385,10 @@ count = \rel -> fold (\n _ -> n + 1) 0 rel
 sum = \f rel -> fold (\acc x -> acc + f x) 0 rel
 ```
 
-**`match`** — filter to one variant:
+**`match`** — filter a relation of ADT values to one variant, extracting the payload (built-in `base.match`):
 
 ```knot
-match = \Circle shapes -> do
-  Circle c <- shapes
-  yield c
+circles = base.match Shape.Circle shapes   -- [Shape] -> [{radius: Float 1}]
 ```
 
 ## Querying
@@ -451,7 +449,7 @@ Pattern matching on `<-` filters and binds in one step:
 &bigCircleAreas = do
   shapes <- *shapes
   with {result do
-    Circle c <- shapes
+    Shape.Circle c <- shapes
     where c.radius > 10
     yield {area pi * c.radius * c.radius}}
   (do

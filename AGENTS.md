@@ -6,7 +6,7 @@ See `DESIGN.md` for the full language specification.
 
 ## Project Structure
 
-Cargo workspace with four crates:
+Cargo workspace (members: `crates/*` and `tools/migrate`):
 
 ```
 crates/
@@ -14,6 +14,8 @@ crates/
   knot-runtime/      Rust staticlib linked into compiled programs (value representation, SQLite persistence)
   knot-compiler/     Cranelift-based compiler producing native executables (CLI binary: knot)
   knot-lsp/          Language server for editor integration (binary: knot-lsp)
+tools/
+  migrate/           Schema-migration tool/library (knot-migrate) used by the compiler's migration path
 examples/            Example .knot programs
 ```
 
@@ -21,9 +23,11 @@ examples/            Example .knot programs
 
 ```sh
 cargo build                  # Build all crates
-cargo test                   # Run all tests (450 frontend + 518 compiler + 82 runtime + 295 lsp)
-cargo test -p knot           # Run only frontend tests
+cargo test                   # Run all tests (57 migrate + 18 runtime = 75 total)
+cargo test -p knot-runtime   # Run only runtime tests
 ```
+
+Note: unit tests currently live only in `knot-migrate` (57) and `knot-runtime` (18, the index-extraction suite). The `knot`, `knot-compiler`, and `knot-lsp` crates have no `#[test]` functions; their correctness is exercised end-to-end by building and running the programs under `examples/`.
 
 ## Compiling Knot Programs
 
@@ -111,7 +115,7 @@ Key codegen patterns:
 - Standard library functions are registered as 1-param user_fns with currying: 1-param functions delegate directly to runtime; 2-param functions (filter, match, map, take, drop, contains) curry via `define_stdlib_fn_2` — outer function captures first arg in a closure env, inner closure extracts it and calls the runtime; 3-param functions (fold) use double currying via `define_stdlib_fn_3`
 - Recursive derived relations: detected via `expr_contains_derived_ref` AST walk; compile to a body function `knot_user_<name>_body(db, self_val)` where self-references read from `self_val` param (via `__derived_self_<name>` env key), plus a wrapper that calls `knot_relation_fixpoint(db, body_fn_ptr, empty)` for fixed-point iteration
 - Bool constructors: `True` and `False` are special-cased in codegen — bare `True`/`False` and applied `True {}`/`False {}` compile to `knot_value_bool(1)`/`knot_value_bool(0)` (not `knot_value_constructor`); pattern matching on `True`/`False` in `case` uses `knot_value_get_bool` instead of tag string comparison
-- IO do-blocks: detected via `is_io_do_block` (checks if any statement binds from or is a bare IO-returning expression — includes both external IO builtins and relation operations like SourceRef/DerivedRef/Set/ReplaceSet/At); compiled by `compile_io_do_as_thunk` which runs each IO action inline with `knot_io_run(db, io)` and wraps the final result in `knot_io_pure`; `compile_main` calls `knot_io_run(db, result)` on the main function's return value so IO main functions execute their effects; after IO run, `knot_threads_join()` is called to wait for all spawned threads before db close
+- IO do-blocks: detected via `is_io_do_block` (checks if any statement binds from or is a bare IO-returning expression — includes both external IO builtins and relation operations like SourceRef/DerivedRef/Set/ReplaceSet/At). Before building a thunk, `compile_io_do` first tries `try_compile_full_sql` for comprehension-shaped blocks (`do_block_is_comprehension`: binds/wheres + a final yield): a read-only relational comprehension that binds one or more sources and filters with `where` (including cross-source equi-joins like `where (d.dname == e.dname)`) compiles to a single multi-table `SELECT ... FROM "_knot_a" AS t0, "_knot_b" AS t1 WHERE t0."f" = t1."g" AND ...` via `analyze_sql_plan`, with join keys and filter columns auto-indexed by `ensure_indexes_for_sql`. This is transparent because a pure read comprehension has no side effect to defer and `knot_io_run` returns non-IO values unchanged. Blocks the planner can't translate fall through to the default: `compile_io_do_as_thunk`, which runs each IO action inline with `knot_io_run(db, io)` and wraps the final result in `knot_io_pure`; `compile_main` calls `knot_io_run(db, result)` on the main function's return value so IO main functions execute their effects; after IO run, `knot_threads_join()` is called to wait for all spawned threads before db close
 - Concurrency codegen: `fork` registered as 1-param stdlib function via `define_stdlib_fn_1("fork", "knot_fork_io")`; `Atomic(inner)` compiles to a retry loop with three Cranelift blocks (loop_block, retry_block, done_block) — loop_block snapshots the change counter via `knot_stm_snapshot`, begins savepoint, runs body, checks `knot_stm_check_and_clear` retry flag with `brif`; retry_block calls `knot_atomic_rollback` then `knot_stm_wait(snapshot)` then jumps back to loop_block; done_block commits and continues; `Var("retry")` compiles to `knot_stm_retry()` call; all blocks explicitly sealed after predecessors are emitted
 - IO runtime representation: `Value::IO(fn_ptr, env)` where fn_ptr has signature `extern "C" fn(db, env) -> *mut Value`; `knot_io_pure` wraps a value in a trivial IO (null fn_ptr, value as env); `knot_io_run` executes thunks or returns non-IO values as-is; `knot_io_bind` and `knot_io_then` compose IO actions via nested thunks with captured environments
 - Effectful builtins (`println`, `readFile`, `now`, etc.) compile to `_io` wrapper functions (e.g. `knot_println_io`) that capture arguments and return `Value::IO` thunks instead of executing immediately

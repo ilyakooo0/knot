@@ -2049,6 +2049,14 @@ impl Parser {
             TokenKind::Bool(_) => {
                 let tok = self.advance();
                 let TokenKind::Bool(b) = tok.kind else { unreachable!() };
+                self.error_at(
+                    tok.span,
+                    format!(
+                        "`{}` is not allowed; use the constructor `{}`",
+                        if b { "true" } else { "false" },
+                        if b { "Bool.True {}" } else { "Bool.False {}" }
+                    ),
+                );
                 Some(Spanned::new(ExprKind::Lit(Literal::Bool(b)), tok.span))
             }
             TokenKind::Lower(_) => {
@@ -3502,6 +3510,14 @@ impl Parser {
             TokenKind::Bool(_) => {
                 let tok = self.advance();
                 let TokenKind::Bool(b) = tok.kind else { unreachable!() };
+                self.error_at(
+                    tok.span,
+                    format!(
+                        "`{}` is not allowed; use the constructor `{}`",
+                        if b { "true" } else { "false" },
+                        if b { "Bool.True {}" } else { "Bool.False {}" }
+                    ),
+                );
                 Some(Spanned::new(PatKind::Lit(Literal::Bool(b)), tok.span))
             }
             _ => {
@@ -3655,6 +3671,14 @@ impl Parser {
             TokenKind::Bool(_) => {
                 let tok = self.advance();
                 let TokenKind::Bool(b) = tok.kind else { unreachable!() };
+                self.error_at(
+                    tok.span,
+                    format!(
+                        "`{}` is not allowed; use the constructor `{}`",
+                        if b { "true" } else { "false" },
+                        if b { "Bool.True {}" } else { "Bool.False {}" }
+                    ),
+                );
                 Some(Spanned::new(PatKind::Lit(Literal::Bool(b)), tok.span))
             }
             _ => {

@@ -209,7 +209,7 @@ fn collect_unguarded_calls<'a>(
                 collect_unguarded_calls(it, defs, caller_name, caller, out);
             }
         }
-        With { record, body } => {
+        With { record, body, .. } => {
             collect_unguarded_calls(record, defs, caller_name, caller, out);
             collect_unguarded_calls(body, defs, caller_name, caller, out);
         }

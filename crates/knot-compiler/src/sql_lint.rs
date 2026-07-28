@@ -133,7 +133,7 @@ fn lint_expr(
             lint_expr(func, source_schemas, views, fun_bodies, diags);
             lint_expr(arg, source_schemas, views, fun_bodies, diags);
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, .. } => {
             lint_expr(record, source_schemas, views, fun_bodies, diags);
             lint_expr(body, source_schemas, views, fun_bodies, diags);
         }
@@ -972,7 +972,7 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         ExprKind::App { func, arg } => {
             references_source(func, source_name) || references_source(arg, source_name)
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, .. } => {
             references_source(record, source_name) || references_source(body, source_name)
         }
         ExprKind::Lambda { body, .. } => references_source(body, source_name),

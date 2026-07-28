@@ -4344,7 +4344,7 @@ impl Codegen {
                 val
             }
 
-            ast::ExprKind::With { record, body } => {
+            ast::ExprKind::With { record, body, .. } => {
                 // Evaluate the record, then bind each of its fields (from
                 // inference's `with_fields`) as a local for the body. A cloned
                 // env gives lexical scoping: field bindings shadow outer ones
@@ -5609,7 +5609,7 @@ impl Codegen {
             TimeUnitLit { value, .. } => self.collect_direct_write_targets(value, out),
             Annot { expr: e, .. } => self.collect_direct_write_targets(e, out),
             FieldAccess { expr: e, .. } => self.collect_direct_write_targets(e, out),
-            With { record, body } => {
+            With { record, body, .. } => {
                 self.collect_direct_write_targets(record, out)
                     && self.collect_direct_write_targets(body, out)
             }
@@ -6331,7 +6331,7 @@ impl Codegen {
                 let (plan_stmts, with_overlay): (&[ast::Stmt], Vec<(String, ast::Expr)>) =
                     match &single_arg.node {
                         ast::ExprKind::Do(stmts) => (stmts, Vec::new()),
-                        ast::ExprKind::With { record, body }
+                        ast::ExprKind::With { record, body, .. }
                             if matches!(&body.node, ast::ExprKind::Do(_)) =>
                         {
                             let overlay = if let ast::ExprKind::Record(fes) = &record.node {
@@ -9023,7 +9023,7 @@ impl Codegen {
                     && crate::builtins::is_io_builtin(field)
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io_scoped(body, scopes),
-            ast::ExprKind::With { record, body } => {
+            ast::ExprKind::With { record, body, .. } => {
                 let sc = self.with_io_scope_for(expr.span, record);
                 if let Some(scope) = sc {
                     scopes.push(scope);
@@ -11578,7 +11578,7 @@ impl Codegen {
                 Self::references_source(func, source_name)
                     || Self::references_source(arg, source_name)
             }
-            ast::ExprKind::With { record, body } => {
+            ast::ExprKind::With { record, body, .. } => {
                 Self::references_source(record, source_name)
                     || Self::references_source(body, source_name)
             }
@@ -15228,10 +15228,10 @@ fn beta_reduce_inner(
         ImplicitRef(_) => expr.node.clone(),
         SubsetConstraint { .. } => expr.node.clone(),
         RouteDecl { .. } | RouteCompositeDecl { .. } => expr.node.clone(),
-        With { record, body } => {
+        With { record, body, types } => {
             let r = beta_reduce_inner(record, fun_bodies, let_bindings, visited, fuel);
             let b = beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel);
-            With { record: Box::new(r), body: Box::new(b) }
+            With { record: Box::new(r), body: Box::new(b), types: types.clone() }
         }
         App { func, arg } => {
             let f = beta_reduce_inner(func, fun_bodies, let_bindings, visited, fuel);
@@ -15384,9 +15384,10 @@ fn substitute_inner(
                 body: Box::new(substitute_inner(body, var, value, value_fv)?),
             }
         }
-        With { record, body } => With {
+        With { record, body, types } => With {
             record: Box::new(substitute_inner(record, var, value, value_fv)?),
             body: Box::new(substitute_inner(body, var, value, value_fv)?),
+            types: types.clone(),
         },
         ViewDecl { name, ty, body } => ViewDecl {
             name: name.clone(),
@@ -15504,7 +15505,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
         App { func, arg } => {
             expr_mentions_var(func, var) || expr_mentions_var(arg, var)
         }
-        With { record, body } => {
+        With { record, body, .. } => {
             expr_mentions_var(record, var) || expr_mentions_var(body, var)
         }
         BinOp { lhs, rhs, .. } => {
@@ -15557,7 +15558,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             collect_free_vars_set(func, bound, free);
             collect_free_vars_set(arg, bound, free);
         }
-        With { record, body } => {
+        With { record, body, .. } => {
             collect_free_vars_set(record, bound, free);
             // The record's fields are bound within the body (`with {r v} …
             // … r …` uses `r` without capturing it). Without this, a `with`
@@ -16400,7 +16401,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::App { func, arg } => {
             expr_contains_derived_ref(func, name) || expr_contains_derived_ref(arg, name)
         }
-        ast::ExprKind::With { record, body } => {
+        ast::ExprKind::With { record, body, .. } => {
             expr_contains_derived_ref(record, name) || expr_contains_derived_ref(body, name)
         }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
@@ -16528,7 +16529,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
             collect_free_vars(func, bound, free);
             collect_free_vars(arg, bound, free);
         }
-        ast::ExprKind::With { record, body } => {
+        ast::ExprKind::With { record, body, .. } => {
             collect_free_vars(record, bound, free);
             // The record's fields are bound within the body, so a `with`
             // field referenced there is NOT a free variable of an enclosing
@@ -16661,7 +16662,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_refs_var(body, var),
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
-        ast::ExprKind::With { record, body } => {
+        ast::ExprKind::With { record, body, .. } => {
             expr_refs_var(record, var) || expr_refs_var(body, var)
         }
         ast::ExprKind::BinOp { lhs, rhs, .. } => expr_refs_var(lhs, var) || expr_refs_var(rhs, var),
@@ -16765,7 +16766,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         ast::ExprKind::App { func, arg } => {
             expr_uses_var_as_value(func, var) || expr_uses_var_as_value(arg, var)
         }
-        ast::ExprKind::With { record, body } => {
+        ast::ExprKind::With { record, body, .. } => {
             expr_uses_var_as_value(record, var) || expr_uses_var_as_value(body, var)
         }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
@@ -17113,7 +17114,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::FieldAccess { expr, field } => {
             format!("{}.{}", pretty_expr(expr), field)
         }
-        ast::ExprKind::With { record, body } => {
+        ast::ExprKind::With { record, body, .. } => {
             format!("with {} {}", pretty_expr(record), pretty_expr(body))
         }
         ast::ExprKind::List(elems) => {

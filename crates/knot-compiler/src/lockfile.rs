@@ -616,7 +616,7 @@ fn collect_record_sources(e: &Expr, out: &mut Vec<(String, Type, Span)>) {
                 collect_record_sources(&f.value, out);
             }
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, .. } => {
             collect_record_sources(record, out);
             collect_record_sources(body, out);
         }
@@ -704,7 +704,7 @@ fn collect_record_migrations(e: &Expr, out: &mut String) {
                 collect_record_migrations(&f.value, out);
             }
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, .. } => {
             collect_record_migrations(record, out);
             collect_record_migrations(body, out);
         }

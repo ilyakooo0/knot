@@ -297,7 +297,7 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
             walk_expr(func, r);
             walk_expr(arg, r);
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, .. } => {
             walk_expr(record, r);
             walk_expr(body, r);
         }

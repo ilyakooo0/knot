@@ -409,6 +409,28 @@ with {result do
 
 Use `with` wherever you would otherwise introduce a local name — inside do blocks, in function bodies, or nested in other expressions.
 
+#### Importing a type's constructors
+
+Naming a **data type** (uppercase) as a `with` field brings that type's constructors into scope **unqualified** for the body — you can write `Just {value v}` instead of `Maybe.Just {value v}`:
+
+```knot
+with {Maybe} (case (Just {value 5}) of
+  Just {value v} -> v
+  Nothing {} -> 0)              -- 5
+
+-- Types and value bindings mix freely:
+with {Maybe five 5} (case (Just {value five}) of
+  Just {value v} -> v
+  Nothing {} -> 0)              -- 5
+
+-- Import several types at once:
+with {Maybe Result} (case (Ok {value 3}) of
+  Ok {value v} -> v
+  Err {error e} -> 0)           -- 3
+```
+
+The unqualified constructors are confined to the `with` body — the qualified form (`Maybe.Just {…}`) still works everywhere, including inside the body. A name that isn't a known data type is an error, and if two imported types share a constructor name you must use that one qualified. This also works for your own ADTs once their `data` declaration is in scope.
+
 ### Case Expressions
 
 ```knot

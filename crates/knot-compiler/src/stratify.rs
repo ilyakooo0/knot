@@ -249,7 +249,7 @@ fn collect_edges(
         // same call shape `App(App(Var("minus"), a), b)` — detect it via
         // `diff_wrappers` and treat identically to a direct `diff` call
         // (B31: negation laundered through a user wrapper).
-        ast::ExprKind::With { record, body } => {
+        ast::ExprKind::With { record, body, .. } => {
             collect_edges(record, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             // A record-literal `with {name: value, ...} body` binds each field
             // name to the field's value inside `body` — exactly like the old

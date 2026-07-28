@@ -2698,6 +2698,22 @@ impl Parser {
                 pending_sigs.push((sname, sty));
                 continue;
             }
+            // Type-import marker: a bare uppercase name (`Maybe` in
+            // `with {Maybe} body`) brings that data type's constructors into
+            // scope unqualified inside the body. Parsed as a field whose value
+            // is a `Constructor` marker; `parse_with_expr` lifts it out of the
+            // record into `With.types`. Outside `with`, the marker field is a
+            // hard error (a record field must be lowercase).
+            if let TokenKind::Upper(tname) = self.peek().clone() {
+                let tspan = self.span();
+                self.advance();
+                fields.push(RecordField {
+                    name: tname.clone(),
+                    value: Spanned::new(ExprKind::Constructor(tname), tspan),
+                    sig: None,
+                });
+                continue;
+            }
             let field_col = self.cur_column();
             let (fname, _) = self
                 .expect_lower("expected field name in record")
@@ -3157,6 +3173,29 @@ impl Parser {
         let result = self.in_context("with expression", |this| {
             this.advance(); // consume `with`
             let record = this.parse_postfix()?;
+            // Lift type-import markers (`Maybe` in `with {Maybe}`) out of the
+            // record into `types`; the remaining value fields form the `with`
+            // record. A marker is a field whose value is `Constructor(name)`.
+            let mut types: Vec<String> = Vec::new();
+            let record = if let ExprKind::Record(fields) = &record.node {
+                let mut value_fields: Vec<RecordField> = Vec::new();
+                for f in fields {
+                    if let ExprKind::Constructor(tname) = &f.value.node {
+                        if tname == &f.name {
+                            types.push(tname.clone());
+                            continue;
+                        }
+                    }
+                    value_fields.push(f.clone());
+                }
+                if types.is_empty() {
+                    record.clone()
+                } else {
+                    Spanned::new(ExprKind::Record(value_fields), record.span)
+                }
+            } else {
+                record.clone()
+            };
             // Bind the record's field names for the body so `maybe_time_unit`
             // suppresses unit sugar on collisions (`with {ms: 5} g 2 ms`
             // applies `g` to `2` and `ms`, not `g (2 ms)`).
@@ -3176,6 +3215,7 @@ impl Parser {
                 ExprKind::With {
                     record: Box::new(record),
                     body: Box::new(body),
+                    types,
                 },
                 Span::new(start.start, end_sp.end),
             ))

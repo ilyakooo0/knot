@@ -1534,7 +1534,7 @@ fn find_inline_actions(
         return;
     }
 
-    if let ast::ExprKind::With { record, body } = &expr.node
+    if let ast::ExprKind::With { record, body, .. } = &expr.node
         && let ast::ExprKind::Record(fields) = &record.node
         && fields.len() == 1
     {

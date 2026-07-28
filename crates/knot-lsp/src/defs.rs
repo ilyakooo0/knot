@@ -493,7 +493,7 @@ impl<'a> DefResolver<'a> {
                 self.pop_scope();
             }
 
-            ast::ExprKind::With { record, body } => {
+            ast::ExprKind::With { record, body, .. } => {
                 self.resolve_expr(record);
                 self.resolve_expr(body);
             }

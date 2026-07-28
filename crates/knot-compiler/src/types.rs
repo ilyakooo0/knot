@@ -334,7 +334,7 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
             walk_exprs(func, f);
             walk_exprs(arg, f);
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, .. } => {
             walk_exprs(record, f);
             walk_exprs(body, f);
         }
@@ -467,7 +467,7 @@ fn collect_type_and_data_refs<'a>(
             collect_type_and_data_refs(func, aliases, data_decls);
             collect_type_and_data_refs(arg, aliases, data_decls);
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, .. } => {
             collect_type_and_data_refs(record, aliases, data_decls);
             collect_type_and_data_refs(body, aliases, data_decls);
         }
@@ -610,7 +610,7 @@ pub fn check_with_chain_shadowing(program: &Expr) -> Vec<knot::diagnostic::Diagn
     let mut cur = program;
     loop {
         match &cur.node {
-            ExprKind::With { record, body } if matches!(body.node, ExprKind::With { .. }) => {
+            ExprKind::With { record, body, .. } if matches!(body.node, ExprKind::With { .. }) => {
                 // An outer layer: collect its field names, then descend. A name
                 // repeated across two outer layers shadows within the chain.
                 if let ExprKind::Record(fields) = &record.node {

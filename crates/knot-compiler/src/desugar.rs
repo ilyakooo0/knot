@@ -92,7 +92,7 @@ fn collect_source_fields_in_expr(
     expr: &Expr,
     out: &mut std::collections::HashMap<String, Vec<(String, RecordRelKind)>>,
 ) {
-    if let ExprKind::With { record, body } = &expr.node
+    if let ExprKind::With { record, body, .. } = &expr.node
         && let ExprKind::Record(fields) = &record.node
     {
         let names: Vec<(String, RecordRelKind)> = fields
@@ -147,7 +147,7 @@ fn walk_expr_children_read(expr: &Expr, f: &mut impl FnMut(&Expr)) {
                 f(e);
             }
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, .. } => {
             f(record);
             f(body);
         }
@@ -270,7 +270,7 @@ fn collect_fun_bodies<'a>(
     fun_bodies: &mut Vec<(&'a str, &'a Expr)>,
     fun_sig_io: &mut HashSet<String>,
 ) {
-    if let ExprKind::With { record, body } = &expr.node {
+    if let ExprKind::With { record, body, .. } = &expr.node {
         if let ExprKind::Record(fields) = &record.node {
             for f in fields {
                 if matches!(f.value.node, ExprKind::Lambda { .. }) {
@@ -443,7 +443,7 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
             expr_contains_io(func, builtins, io_fns)
                 || expr_contains_io(arg, builtins, io_fns)
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, .. } => {
             expr_contains_io(record, builtins, io_fns)
                 || expr_contains_io(body, builtins, io_fns)
         }
@@ -615,7 +615,7 @@ fn walk_expr_children(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
                 f(e);
             }
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, .. } => {
             f(record);
             f(body);
         }
@@ -759,7 +759,7 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
                 desugar_expr(body, io_fns, source_vars);
             }
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, .. } => {
             desugar_expr(record, io_fns, source_vars);
             desugar_expr(body, io_fns, source_vars);
         }

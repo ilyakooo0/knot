@@ -1077,6 +1077,12 @@ struct Infer {
     /// and `WITH_FIELD_ALIAS_PREFIX`). A `None` scope entry keeps the two stacks
     /// aligned when a non-`with` construct pushes a scope.
     with_scope_stack: Vec<Option<(Span, HashMap<String, Scheme>)>>,
+    /// Stack of per-`with` constructor-import scopes (one frame per enclosing
+    /// `with {Type …}` that names types). Each frame maps a constructor NAME to
+    /// the data type it belongs to, so a bare `Just {value v}` inside the body
+    /// resolves to `Maybe.Just`. Pushed before the body is inferred, popped
+    /// after — the unqualified ctors are confined to the `with` body.
+    with_ctor_imports: Vec<HashMap<String, String>>,
     /// Resolved `^name` implicit-field projections: span → (root binding,
     /// field path). Populated when an `ImplicitRef` is resolved; handed to
     /// codegen via `ImplicitRefs` so it can emit the projection chain.
@@ -1193,6 +1199,7 @@ impl Infer {
             field_accesses: Vec::new(),
             with_fields: Vec::new(),
             with_scope_stack: vec![None],
+            with_ctor_imports: Vec::new(),
             implicit_refs: HashMap::new(),
             resolved_calls: HashMap::new(),
             suppress_refine_intro: None,
@@ -4495,6 +4502,54 @@ impl Infer {
         }
     }
 
+    /// Resolve a bare constructor name against the active `with {Type …}`
+    /// constructor-import scopes (innermost-first). Returns the data type that
+    /// owns it, so the bare `Just` can be instantiated as `Maybe.Just`. `None`
+    /// when no enclosing `with` imports a type providing `name`.
+    fn resolve_with_imported_ctor(&self, name: &str) -> Option<String> {
+        for frame in self.with_ctor_imports.iter().rev() {
+            if let Some(ty) = frame.get(name) {
+                return Some(ty.clone());
+            }
+        }
+        None
+    }
+
+    /// Push a `with {Type …}` constructor-import frame for `types`, validating
+    /// each is a known data type and that no two imported ctors collide.
+    /// Returns true when a frame was pushed (caller pops after the body). Used
+    /// both by the `With` inference arm and by the top-level Phase-4z path,
+    /// which infers a literal-record `with`'s body without visiting the arm.
+    fn push_with_ctor_imports(&mut self, types: &[String], span: Span) -> bool {
+        if types.is_empty() {
+            return false;
+        }
+        let mut frame: HashMap<String, String> = HashMap::new();
+        for tname in types {
+            let Some(info) = self.data_types.get(tname).cloned() else {
+                self.error(
+                    format!("`with` type import `{tname}` is not a known data type"),
+                    span,
+                );
+                continue;
+            };
+            for (ctor, _) in &info.ctors {
+                if let Some(prev_ty) = frame.get(ctor) {
+                    self.error(
+                        format!(
+                            "`with` type import `{tname}`: constructor `{ctor}` is also a constructor of `{prev_ty}` — use it qualified"
+                        ),
+                        span,
+                    );
+                    continue;
+                }
+                frame.insert(ctor.clone(), tname.clone());
+            }
+        }
+        self.with_ctor_imports.push(frame);
+        true
+    }
+
     fn instantiate_ctor(
         &mut self,
         name: &str,
@@ -5174,6 +5229,17 @@ impl Infer {
             }
 
             ast::ExprKind::Constructor(name) => {
+                // A constructor named by an enclosing `with {Type …}` import is
+                // in scope UNQUALIFIED: resolve `Just` to `Maybe.Just` and
+                // instantiate it via the confined qualified path, yielding the
+                // same `record -> data` function type as a normal ctor.
+                if let Some(data_name) = self.resolve_with_imported_ctor(name) {
+                    if let Some((data_ty, record_ty)) =
+                        self.instantiate_qualified_ctor(&data_name, name)
+                    {
+                        return Ty::Fun(Box::new(record_ty), Box::new(data_ty));
+                    }
+                }
                 // A bare BUILT-IN constructor in user code must be qualified
                 // by its data type, exactly like a user constructor
                 // (`Maybe.Just`, `Result.Ok`, `Bool.True`, …). Prelude-internal
@@ -5528,7 +5594,7 @@ impl Infer {
                 field_ty
             }
 
-            ast::ExprKind::With { record, body } => {
+            ast::ExprKind::With { record, body, types } => {
                 // Infer the record, then resolve its type to a concrete record
                 // so the field names are known. Each field is bound as a local
                 // variable for the body; the result is the body's type.
@@ -5706,7 +5772,14 @@ impl Infer {
                             .insert(f.name.clone(), f.value.clone());
                     }
                 }
+                // Type imports (`with {Maybe …} body`): bring each named data
+                // type's constructors into scope UNQUALIFIED for the body,
+                // confined to the body (see push_with_ctor_imports).
+                let pushed_ctor_imports = self.push_with_ctor_imports(types, record.span);
                 let body_ty = self.infer_expr(body);
+                if pushed_ctor_imports {
+                    self.with_ctor_imports.pop();
+                }
                 self.let_bindings = prev_let_bindings;
                 if let ast::ExprKind::Record(_) = &record.node {
                     self.record_type_scopes.pop();
@@ -5855,6 +5928,18 @@ impl Infer {
                 // always qualified (`Color.Red {…}`); only built-ins
                 // (`Just {…}`, `Nothing {}`) apply bare.
                 if let ast::ExprKind::Constructor(name) = &func.node {
+                    // A constructor named by an enclosing `with {Type …}`
+                    // import applies UNQUALIFIED: `Just {value 5}` resolves to
+                    // `Maybe.Just`. Check the payload against the qualified
+                    // record type and return the data type.
+                    if let Some(data_name) = self.resolve_with_imported_ctor(name) {
+                        if let Some((data_ty, record_ty)) =
+                            self.instantiate_qualified_ctor(&data_name, name)
+                        {
+                            self.check_expr(arg, &record_ty);
+                            return data_ty;
+                        }
+                    }
                     // An applied BUILT-IN constructor in user code must be
                     // qualified by its data type (`Maybe.Just {…}`).
                     if self.is_builtin_ctor(name)
@@ -7504,6 +7589,29 @@ impl Infer {
                 payload,
                 qualifier,
             } => {
+                // A constructor named by an enclosing `with {Type …}` import is
+                // in scope UNQUALIFIED in patterns too: `Just {value v}`
+                // resolves to `Maybe.Just`. Takes precedence over the
+                // must-qualify errors below.
+                if qualifier.is_none()
+                    && let Some(data_name) = self.resolve_with_imported_ctor(name)
+                {
+                    match self.instantiate_qualified_ctor(&data_name, name) {
+                        Some((data_ty, record_ty)) => {
+                            self.unify(&data_ty, expected, pat.span);
+                            self.check_pattern(payload, &record_ty);
+                        }
+                        None => {
+                            self.error(
+                                format!(
+                                    "data type '{data_name}' has no constructor '{name}' in pattern"
+                                ),
+                                pat.span,
+                            );
+                        }
+                    }
+                    return;
+                }
                 if let Some(q) = qualifier {
                     if q == "base" {
                         // `base.Ctor` is no longer a thing — constructors are
@@ -8037,7 +8145,7 @@ impl Infer {
                 matches!(&expr.node, ast::ExprKind::Var(n) if n == "base")
                     && crate::builtins::is_io_builtin(field)
             }
-            ast::ExprKind::With { record, body } => {
+            ast::ExprKind::With { record, body, .. } => {
                 self.expr_is_io_prescan(record) || self.expr_is_io_prescan(body)
             }
             ast::ExprKind::Lambda { body, .. } => self.expr_is_io_prescan(body),
@@ -10310,7 +10418,7 @@ impl Infer {
     fn collect_const_literals(&mut self, program: &ast::Expr) {
         fn decl_record(e: &ast::Expr) -> Option<&ast::Expr> {
             match &e.node {
-                ast::ExprKind::With { record, body } => {
+                ast::ExprKind::With { record, body, .. } => {
                     if matches!(body.node, ast::ExprKind::With { .. }) {
                         decl_record(body)
                     } else {
@@ -11468,7 +11576,7 @@ fn value_references_source_inner(
                     arg, source_name, aliases, let_bindings, visited,
                 )
         }
-        ast::ExprKind::With { record, body } => {
+        ast::ExprKind::With { record, body, .. } => {
             value_references_source_inner(record, source_name, aliases, let_bindings, visited)
                 || value_references_source_inner(
                     body, source_name, aliases, let_bindings, visited,
@@ -11690,7 +11798,7 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
                 {
                     cur = body;
                 }
-                ast::ExprKind::With { record, body } => {
+                ast::ExprKind::With { record, body, types } => {
                     if let ast::ExprKind::Record(fields) = &record.node {
                         // Literal-record `with`: the fields are decls already
                         // inferred by `infer_declarations`, so infer only the
@@ -11700,7 +11808,14 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
                             cur.span,
                             fields.iter().map(|f| f.name.clone()).collect(),
                         ));
+                        // The `With` inference arm is skipped here, so push its
+                        // type-import scope (`with {Maybe …}`) around the body
+                        // inference ourselves — else bare ctors never resolve.
+                        let pushed = infer.push_with_ctor_imports(types, record.span);
                         let _ = infer.infer_expr(body);
+                        if pushed {
+                            infer.with_ctor_imports.pop();
+                        }
                     } else {
                         // Non-literal operand (`with base …`, `with someRecord …`):
                         // the fields are NOT decls, so there is nothing to skip
@@ -12238,7 +12353,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
             f(func);
             f(arg);
         }
-        With { record, body } => {
+        With { record, body, .. } => {
             f(record);
             f(body);
         }
@@ -12308,7 +12423,7 @@ fn walk_exprs_read<'a>(e: &'a ast::Expr, f: &mut impl FnMut(&'a ast::Expr)) {
             walk_exprs_read(func, f);
             walk_exprs_read(arg, f);
         }
-        With { record, body } => {
+        With { record, body, .. } => {
             walk_exprs_read(record, f);
             walk_exprs_read(body, f);
         }
@@ -12420,7 +12535,7 @@ fn for_each_data_ctor_scoped<'a>(
                 walk(func, d, f);
                 walk(arg, d, f);
             }
-            With { record, body } => {
+            With { record, body, .. } => {
                 walk(record, d, f);
                 walk(body, d, f);
             }
@@ -12535,7 +12650,7 @@ fn for_each_named_fn<'a>(
     // field) are NOT declarations.
     fn decl_record(e: &ast::Expr) -> Option<&ast::Expr> {
         match &e.node {
-            ast::ExprKind::With { record, body } => {
+            ast::ExprKind::With { record, body, .. } => {
                 // The user's program is this `with`'s body. If that body is
                 // itself a `with`, the user's decls live in ITS record.
                 if matches!(body.node, ast::ExprKind::With { .. }) {

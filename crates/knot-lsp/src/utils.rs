@@ -490,7 +490,7 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
             f(func);
             f(arg);
         }
-        ast::ExprKind::With { record, body } => {
+        ast::ExprKind::With { record, body, .. } => {
             f(record);
             f(body);
         }

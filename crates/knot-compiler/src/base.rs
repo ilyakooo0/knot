@@ -186,7 +186,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
             shift_expr_spans(func, offset);
             shift_expr_spans(arg, offset);
         }
-        With { record, body } => {
+        With { record, body, .. } => {
             shift_expr_spans(record, offset);
             shift_expr_spans(body, offset);
         }

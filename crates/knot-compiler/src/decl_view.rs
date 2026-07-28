@@ -94,7 +94,7 @@ pub fn decl_views(program: &ast::Expr) -> Vec<DeclView<'_>> {
     let mut cur = program;
     loop {
         match &cur.node {
-            ast::ExprKind::With { record, body }
+            ast::ExprKind::With { record, body, .. }
                 if matches!(body.node, ast::ExprKind::With { .. }) =>
             {
                 cur = body;

@@ -117,7 +117,12 @@ pub enum ExprKind {
     /// `with record body` — every field of `record` (which must have a known
     /// record type) is in scope as a variable inside `body`. The result is
     /// `body`. Generalizes `let … in` for record-shaped bindings.
-    With { record: Box<Expr>, body: Box<Expr> },
+    ///
+    /// `types` lists the data types named as uppercase "fields" in the `with`
+    /// record (`with {Maybe} body`). Their constructors are in scope
+    /// UNQUALIFIED inside `body` (`Just {value v}` instead of `Maybe.Just
+    /// {value v}`). Empty for an ordinary value-only `with`.
+    With { record: Box<Expr>, body: Box<Expr>, types: Vec<String> },
 
     /// `a + b`, `x == y`, `xs |> filter f`
     BinOp {

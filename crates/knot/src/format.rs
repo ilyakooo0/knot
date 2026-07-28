@@ -601,10 +601,24 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         ExprKind::FieldAccess { expr, field } => {
             format!("{}.{}", render_expr_inline(expr, Prec::Atom), field)
         }
-        ExprKind::With { record, body } => {
+        ExprKind::With { record, body, types } => {
             // Never pun the `with` record: its field NAMES are the bindings,
             // so `{lo: p.lo}` must stay explicit — `{p.lo}` would bind nothing.
+            // Type imports (`with {Maybe}`) are re-emitted as bare type names
+            // ahead of the value fields.
             let rec_s = match &record.node {
+                ExprKind::Record(fields) if !types.is_empty() => {
+                    let mut s = types.join(" ");
+                    let fs = render_record_inline_no_pun(fields);
+                    let fs = fs.trim_start_matches('{').trim_end_matches('}').trim();
+                    if !fs.is_empty() {
+                        if !s.is_empty() {
+                            s.push(' ');
+                        }
+                        s.push_str(fs);
+                    }
+                    format!("{{ {} }}", s)
+                }
                 ExprKind::Record(fields) => render_record_inline_no_pun(fields),
                 _ => render_expr_inline(record, Prec::Atom),
             };

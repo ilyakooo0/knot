@@ -548,7 +548,7 @@ Multiple key fields group by their combination:
   orders <- *orders
   with {result: do
     o <- orders
-    groupBy {o.region, o.status}
+    groupBy {region o.region status o.status}
     yield {region o.region status o.status total count o}}
   (do
     yield result)

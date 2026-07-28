@@ -464,7 +464,7 @@ sumList = \xs -> case xs of
     yield result)
 ```
 
-Multiple keys: `groupBy {o.region, o.status}`
+Multiple keys: `groupBy {region o.region status o.status}`
 
 After `groupBy {t.owner}`:
 - `t.owner` returns the shared key value
@@ -570,77 +570,26 @@ Datalog-style fixpoint iteration for transitive closure:
 
 ---
 
-## Traits
+## No User-Facing Traits
 
-```knot
-trait Describe a where
-  describe : a -> Text
-  describe x = show x       -- default implementation
-  detailed : a -> Text
-  detailed x = describe x   -- default using another method
+Knot has **no trait system you can use**. The parser rejects `trait`
+declarations, `impl` blocks, `deriving`, and `Num a =>`-style bounds — writing
+any of them is a syntax error.
 
-impl Describe Shape where
-  describe s = case s of
-    Circle {radius} -> "a circle"
-    Rect {width, height} -> "a rectangle"
+The operators and higher-order functions are still there, but they are
+**intrinsic / ordinary polymorphic functions**, not trait methods:
 
--- Auto-derive from defaults
-data Color = Red {} | Green {} | Blue {}
-  deriving (Describe)
-```
+- `==` `!=` `<` `>` `<=` `>=` work on `Int 1`, `Float 1`, `Text` (equality also
+  on `Bool`); `+` `-` `*` `/` `%` and unary `-` on numerics; `++` on `Text`
+  and `[a]`. No type class is involved — the compiler evaluates them directly.
+- `base.map`, `base.fold`, `base.traverse`, `base.bind`, etc. are plain
+  polymorphic functions over the concrete types `[a]`, `Maybe a`,
+  `Result e a`, and `IO`, with no bounds. Do-notation with `<-` works on
+  `[a]`, `IO`, `Maybe`, and `Result` because the compiler knows how to sequence
+  each of them — not because of a `Monad` instance you could write.
 
-### Higher-Kinded Traits
-
-```knot
-trait Functor (f : Type -> Type) where
-  map : (a -> b) -> f a -> f b
-
-impl Functor Maybe where
-  map f m = case m of
-    Nothing {} -> Nothing {}
-    Just {value} -> Just {value: f value}
-```
-
-### Trait Bounds
-
-```knot
-printAll : Display a => [a] -> [Text]
-printAll = \rel -> do
-  r <- rel
-  yield (display r)
-
--- Multiple bounds
-sortAndShow : Ord a => Display a => [a] -> [Text]
-```
-
-### Built-in Trait Hierarchy
-
-```
-Eq          -- ==, !=
-├── Ord     -- <, >, <=, >= (returns Ordering: LT {} | EQ {} | GT {})
-└── Num     -- +, -, *, /, %, unary -
-
-Semigroup   -- ++ (text concat, relation concat)
-Display     -- display : a -> Text
-ToJSON      -- toJson : a -> Text
-FromJSON    -- parseJson : Text -> Maybe a
-Sequence    -- take, drop (impls for Text and [a])
-
-Functor (f : Type -> Type)        -- map
-└── Applicative (f : Type -> Type) -- yield, ap
-    ├── Monad (m : Type -> Type)   -- bind (enables do/<-)
-    └── Alternative (f : Type -> Type) -- empty, alt (enables where)
-
-Foldable (t : Type -> Type)       -- fold
-└── Traversable (t : Type -> Type) -- traverse
-```
-
-Built-in impls of the Functor/Applicative/Monad hierarchy ship for `[]`,
-`Maybe`, `Result`, and `IO`, so do-notation works on all of them; `[]`,
-`Maybe`, and `Result` additionally have `Alternative` (`IO` does not), so
-`where`-guards work in their do-blocks.
-`Sequence` ships with impls for `Text` and `[]`, so `take 5 x` works on a
-string or a relation.
+Because there are no instances to define, there is also nothing to derive and
+no way to make your own type work with an operator beyond the built-in cases.
 
 ---
 
@@ -828,8 +777,8 @@ and the loser unwinds at its next safe point.
 | `avg` | `(a -> Float u) -> [a] -> Float u` | Average projected field (preserves units) |
 | `minOn` | `(a -> b) -> [a] -> b` | Min of projected field (panics on empty) |
 | `maxOn` | `(a -> b) -> [a] -> b` | Max of projected field (panics on empty) |
-| `min` | `Ord a => a -> a -> a` | Binary min of two values |
-| `max` | `Ord a => a -> a -> a` | Binary max of two values |
+| `min` | `a -> a -> a` | Binary min of two orderable values |
+| `max` | `a -> a -> a` | Binary max of two orderable values |
 | `head` | `[a] -> Maybe a` | First row, or `Nothing` if empty |
 | `findFirst` | `[a] -> (a -> Bool) -> Maybe a` | First row matching predicate |
 | `single` | `[a] -> Maybe a` | `Just x` for a singleton, `Nothing` otherwise |
@@ -867,7 +816,7 @@ and the loser unwinds at its next safe point.
 | `show` | `a -> Text` | Any value to text |
 | `toJson` | `a -> Text` | Encode as JSON (`ToJSON.toJson`) |
 | `parseJson` | `Text -> Maybe a` | Decode JSON (`FromJSON.parseJson`) |
-| `display` | `Display a => a -> Text` | Render a value via `Display` |
+| `display` | `a -> Text` | Render a value as human-readable text |
 | `stripUnit` | `Int u -> Int 1` | Drop unit tag from `Int 1` |
 | `withUnit` | `Int 1 -> Int u` | Attach unit tag to `Int 1` |
 | `stripFloatUnit` | `Float u -> Float 1` | Drop unit tag from `Float 1` |

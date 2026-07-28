@@ -18,7 +18,7 @@ Complete reference for all built-in functions, traits, and types.
 - [HTTP](#http)
 - [Cryptography](#cryptography)
 - [Utility Functions](#utility-functions)
-- [Built-in Traits](#built-in-traits)
+- [Operator Behavior (Intrinsic)](#operator-behavior-intrinsic)
 - [Built-in Types](#built-in-types)
 - [Operators](#operators)
 
@@ -172,7 +172,7 @@ engHeadcount = do
 ### `sum`
 
 ```
-sum : Num a => [a] -> a
+sum : [a] -> a
 ```
 
 Sum of a numeric relation. Takes the relation directly — there is no projection argument. To sum a field of a record relation, project first with `map`. Works with `Int 1`, `Float 1`, and unit-annotated types — units are preserved.
@@ -232,8 +232,8 @@ highestSalary = do
 ### `min` / `max`
 
 ```
-min : Ord a => a -> a -> a
-max : Ord a => a -> a -> a
+min : a -> a -> a
+max : a -> a -> a
 ```
 
 Binary minimum and maximum of two values. Use `minOn`/`maxOn` to aggregate
@@ -1000,134 +1000,57 @@ cannot rebrand a value already pinned to `1`.
 
 ---
 
-## Built-in Traits
+## Operator Behavior (Intrinsic)
 
-### `Eq`
+There is **no user-facing trait system**. You cannot declare a `trait`, write an
+`impl`, or put a `Num a =>` bound on a function — the parser rejects all of it.
+The operators below are **intrinsic**: the compiler knows how to evaluate them
+directly on the supported types, with no trait dictionary involved. This table
+describes what each operator does and which types it works on.
 
-```knot
-trait Eq a where
-  eq : a -> a -> Bool
-```
+### `==` / `!=` — equality
 
-Equality comparison. Built-in implementations for `Int 1`, `Float 1`, `Text`, `Bool`. Used by the `==` and `!=` operators.
+Works on `Int 1`, `Float 1`, `Text`, `Bool`, and unit-annotated numerics.
+Pushes down to `=` in SQL when used in a SQL-compilable comprehension.
 
-### `Ord`
+### `<` / `>` / `<=` / `>=` — ordering
 
-```knot
-trait Eq a => Ord a where
-  compare : a -> a -> Ordering
-```
+Works on `Int 1`, `Float 1`, `Text`, and unit-annotated numerics. `Ordering` is
+the `LT {}` / `EQ {}` / `GT {}` ADT (see `base.compare`). Pushes down to SQL
+comparison operators.
 
-Ordering comparison. Returns `LT {}`, `EQ {}`, or `GT {}`. Built-in implementations for `Int 1`, `Float 1`, `Text`. Used by `<`, `>`, `<=`, `>=` operators.
+### `+` / `-` / `*` / `/` and unary `-` — arithmetic
 
-### `Num`
+Works on `Int 1`, `Float 1`, and unit-annotated numerics. `Int 1` arithmetic is
+checked and panics on overflow. Units compose algebraically (see [Units of
+Measure](#units-of-measure)). `+`/`-` require matching units; `*`/`/` combine
+units. Pushes down to SQL arithmetic.
 
-```knot
-trait Eq a => Num a where
-  add : a -> a -> a
-  sub : a -> a -> a
-  mul : a -> a -> a
-  div : a -> a -> a
-  negate : a -> a
-```
+### `%` — modulo
 
-Numeric operations. Built-in implementations for `Int 1`, `Float 1`. Used by `+`, `-`, `*`, `/` operators and unary negation. The `%` (modulo) operator is **not** a `Num` trait method — it is handled by intrinsic codegen for `Int 1`/`Float 1` (a user `impl Num` cannot supply it). Modulo on `Int 1` is the remainder (sign follows the dividend); on `Float 1` it is `fmod`. Modulo by zero panics. The `%` operator pushes down into SQLite as `%` when used inside a SQL-compilable comprehension.
+`Int 1` remainder (sign follows the dividend) and `Float 1` `fmod`. Modulo by
+zero panics. Handled by intrinsic codegen — there is no user-overridable
+operation. Pushes down to SQLite `%` in a SQL-compilable comprehension.
 
-### `Semigroup`
+### `++` — concatenation
 
-```knot
-trait Semigroup a where
-  append : a -> a -> a
-```
+Works on `Text` (string append) and `[a]` (relation union). Pushes down to SQL
+`||` for text.
 
-Associative append. Built-in implementations for `Text` and `[]`. Used by the `++` operator.
+### `&&` / `||` — boolean logic
 
-### `Display`
+Short-circuiting AND/OR on `Bool`. Pushes down to SQL `AND`/`OR`.
 
-```knot
-trait Display a where
-  display : a -> Text
-```
+### `|>` — pipe forward
 
-Convert a value to a human-readable text representation. Built-in implementations for `Int 1`, `Float 1`, `Text`, `Bool`.
+`x |> f` is `f x`. Purely syntactic.
 
-### `Sequence`
+### Higher-order functions without traits
 
-```knot
-trait Sequence s where
-  take : Int 1 -> s -> s
-  drop : Int 1 -> s -> s
-```
-
-`take`/`drop` work on any sequenceable type. Built-in implementations for `Text` (characters) and `[]` (rows).
-
-### `ToJSON` / `FromJSON`
-
-```knot
-trait ToJSON a where
-  toJson : a -> Text
-
-trait FromJSON a where
-  parseJson : Text -> Maybe a
-```
-
-JSON encode/decode as trait methods. Built-in instances cover records, relations, primitives, ADTs, and `Maybe`/`Result`/`Bool`.
-
-### `Functor`
-
-```knot
-trait Functor (f : Type -> Type) where
-  map : (a -> b) -> f a -> f b
-```
-
-Higher-kinded functor. Built-in implementations for `[]`, `Maybe`, `Result`, `IO`.
-
-### `Applicative`
-
-```knot
-trait Functor f => Applicative (f : Type -> Type) where
-  yield : a -> f a
-  ap : f (a -> b) -> f a -> f b
-```
-
-Higher-kinded applicative functor. `yield` wraps a value; `ap` applies a wrapped function. Built-in implementations for `[]`, `Maybe`, `Result`, `IO`.
-
-### `Monad`
-
-```knot
-trait Applicative m => Monad (m : Type -> Type) where
-  bind : (a -> m b) -> m a -> m b
-```
-
-Higher-kinded monad. Enables `do` notation with `<-`. Built-in implementations for `[]`, `IO`, `Maybe`, and `Result`.
-
-### `Alternative`
-
-```knot
-trait Applicative f => Alternative (f : Type -> Type) where
-  empty : f a
-  alt : f a -> f a -> f a
-```
-
-Higher-kinded alternative. `empty` is the identity; `alt` combines alternatives. Built-in implementations for `[]` (where `empty = []` and `alt = union`) and `Maybe` (where `empty = Nothing {}` and `alt` takes the first `Just`).
-
-### `Foldable`
-
-```knot
-trait Foldable (t : Type -> Type) where
-  fold : (b -> a -> b) -> b -> t a -> b
-```
-
-Higher-kinded foldable. Built-in implementation for `[]`.
-
-### `Traversable`
-
-```knot
-trait Foldable t => Traversable (t : Type -> Type) where
-  traverse : (a -> f b) -> t a -> f (t b)
-```
-
-Walk a structure left-to-right and sequence through any `Applicative` `f`. Built-in impl for `[]` over `Maybe` — useful for validating every row and collecting the result or the first `Nothing`.
+Functions like `base.map`, `base.fold`, `base.traverse` are ordinary
+polymorphic functions over concrete types (`[a]`, `Maybe a`, `Result e a`) —
+not trait methods. They appear in this reference with plain `a`/`b` type
+variables and no bounds.
 
 ---
 
@@ -1206,21 +1129,19 @@ maxOn (\t -> t.distance) *trips   -- Float M if distance : Float M
 
 ## Operators
 
-| Operator | Trait | Method |
-|----------|-------|--------|
-| `+` | `Num` | `add` |
-| `-` | `Num` | `sub` |
-| `*` | `Num` | `mul` |
-| `/` | `Num` | `div` |
-| `%` | `Num` | `mod` |
-| unary `-` | `Num` | `negate` |
-| `==` | `Eq` | `eq` |
-| `!=` | `Eq` | `eq` (negated) |
-| `<` `>` `<=` `>=` | `Ord` | `compare` |
-| `++` | `Semigroup` | `append` |
-| `&&` | — | Boolean AND (direct) |
-| `\|\|` | — | Boolean OR (direct) |
-| `\|>` | — | Pipe-forward (`x \|> f` = `f x`) |
+| Operator | Works on | Behavior |
+|----------|----------|----------|
+| `+` `-` `*` `/` | `Int 1`, `Float 1`, unit-annotated | Arithmetic (checked on `Int 1`) |
+| `%` | `Int 1`, `Float 1` | Modulo / `fmod` |
+| unary `-` | `Int 1`, `Float 1`, unit-annotated | Negation |
+| `==` `!=` | `Int 1`, `Float 1`, `Text`, `Bool` | Equality |
+| `<` `>` `<=` `>=` | `Int 1`, `Float 1`, `Text` | Ordering |
+| `++` | `Text`, `[a]` | Concatenation / union |
+| `&&` `\|\|` | `Bool` | Short-circuiting logic |
+| `\|>` | any | Pipe forward (`x \|> f` = `f x`) |
+
+All are intrinsic (no trait mechanism); see [Operator Behavior
+(Intrinsic)](#operator-behavior-intrinsic).
 
 ---
 

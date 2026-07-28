@@ -93,8 +93,8 @@ impl Parser {
 
     /// Compute the display column of every token in one pass over the source.
     /// A column is the number of Unicode scalar values between the start of the
-    /// token's line and the token. Line boundaries are any of `\n`/`\r`/`\r\n`,
-    /// matching the lexer's layout-newline handling and the legacy `column_of`.
+    /// token's line and the token. Line boundaries are any of `\\n`/`\\r`/`\\r\\n`,
+    /// matching the lexer's layout-newline handling.
     fn precompute_columns(source: &str, tokens: &[Token]) -> (Vec<usize>, usize) {
         let mut cols = Vec::with_capacity(tokens.len());
         let mut chars = source.char_indices();

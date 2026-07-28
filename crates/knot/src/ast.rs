@@ -503,7 +503,7 @@ pub struct TypeScheme {
 /// implicit-field constraint (`^compare : a -> a -> Ordering`).
 #[derive(Debug, Clone)]
 pub enum Constraint {
-    /// `Display a`, `Num n` — a trait constraint (legacy; traits removed).
+    /// `Display a`, `Num n` — a trait constraint.
     Trait { trait_name: Name, args: Vec<Type> },
     /// `(^field : Type)` — an implicit-field constraint. The function takes a
     /// hidden dictionary argument; callsites resolve it by searching scope for

@@ -101,8 +101,8 @@ impl Parser {
 
     /// Compute the display column of every token in one pass over the source.
     /// A column is the number of Unicode scalar values between the start of the
-    /// token's line and the token. Line boundaries are any of `\n`/`\r`/`\r\n`,
-    /// matching the lexer's layout-newline handling and the legacy `column_of`.
+    /// token's line and the token. Line boundaries are any of `\\n`/`\\r`/`\\r\\n`,
+    /// matching the lexer's layout-newline handling.
     fn precompute_columns(source: &str, tokens: &[Token]) -> (Vec<usize>, usize) {
         let mut cols = Vec::with_capacity(tokens.len());
         let mut chars = source.char_indices();
@@ -2075,7 +2075,7 @@ impl Parser {
                 ))
             }
             TokenKind::Star => {
-                // *name — source reference (legacy Star + Lower form)
+                // *name — source reference
                 self.advance();
                 match self.peek() {
                     TokenKind::Lower(_) => {
@@ -3940,10 +3940,10 @@ impl Parser {
                     && !(matches!(self.peek(), TokenKind::LBrace)
                         && matches!(self.peek_ahead(1), TokenKind::RBrace))
                 {
-                    // Legacy effect-row syntax (`IO {effects} T`, `IO r T`) is
-                    // no longer valid — effects are untracked. Reject so the
-                    // user gets a clear error rather than a misparsed type.
-                    self.error("effect rows are no longer supported: use `IO T`");
+                    // Effect-row syntax (`IO {effects} T`, `IO r T`) is not
+                    // valid — effects are untracked. Reject so the user gets a
+                    // clear error rather than a misparsed type.
+                    self.error("effect rows are not supported: use `IO T`");
                     return None;
                 }
                 if name == "IO" {

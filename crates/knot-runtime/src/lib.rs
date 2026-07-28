@@ -10946,7 +10946,7 @@ fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
 /// enum-like ADT strings); unknown descriptors leave the value unchanged.
 fn apply_wire_type(v: *mut Value, desc: &str) -> *mut Value {
     // Infallible wrapper: on a shape / required-`null` mismatch, leave the
-    // value unchanged (legacy lenient behavior). Callers that have a failure
+    // value unchanged (lenient behavior). Callers that have a failure
     // channel (`parseJson : Maybe a`, `fetch`, route body decoding) use
     // `apply_wire_type_checked` directly and turn the mismatch into
     // `Nothing` / an error / a 400 instead.
@@ -10980,7 +10980,7 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
             Value::Unit => make_nothing(),
             Value::Constructor(tag, payload) if is_nothing_ctor(tag, *payload) => v,
             Value::Constructor(tag, payload) => match just_ctor_value(tag, *payload) {
-                // Already Just-wrapped (legacy `__knot_ctor` encoding):
+                // Already Just-wrapped (`__knot_ctor` encoding):
                 // keep the wrapper, normalize the payload.
                 Some(jv) => make_just(apply_wire_type_checked(jv, inner)?),
                 None => make_just(apply_wire_type_checked(v, inner)?),
@@ -13048,11 +13048,10 @@ pub extern "C-unwind" fn knot_source_query_value(
                     } else {
                         // Int columns are stored as TEXT COLLATE KNOT_INT, so a
                         // MIN/MAX over an Int column comes back as Text. Parse
-                        // it back to an Int. A value that doesn't fit i64 is a
-                        // legacy BigInt-era value the runtime's i64 ints cannot
-                        // represent — panic with the same clear migration
-                        // message as `read_sql_column` rather than silently
-                        // degrading to a lossy Float.
+                        // it back to an Int. A value that doesn't fit i64 cannot
+                        // be represented by the runtime's i64 ints — panic with
+                        // the same clear migration message as `read_sql_column`
+                        // rather than silently degrading to a lossy Float.
                         if let Ok(n) = s.parse::<i64>() {
                             Ok(alloc_int(n))
                         } else {
@@ -16027,24 +16026,10 @@ pub extern "C-unwind" fn knot_constraint_register(
                 sub_rel, sf, sup_rel, spf
             ).replace('\'', "''");
 
-            // Trigger names must encode BOTH endpoints of the constraint.
-            // Legacy names encoded only one side, so two constraints sharing
-            // a sub field (ins/upd) or a superset field (del) collided on
-            // the trigger name and the second was silently skipped by
-            // CREATE TRIGGER IF NOT EXISTS — dropping its enforcement.
+            // Trigger names encode BOTH endpoints of the constraint, so two
+            // constraints sharing a sub field (ins/upd) or a superset field
+            // (del) never collide on the trigger name.
             let trg_suffix = format!("{}_{}__{}_{}", sub_rel, sf, sup_rel, spf);
-            // Drop stale legacy-format triggers from databases created by
-            // older builds so they don't linger alongside the new ones with
-            // potentially wrong bodies.
-            for legacy in [
-                format!("_knot_fk_{}_{}_ins", sub_rel, sf),
-                format!("_knot_fk_{}_{}_upd", sub_rel, sf),
-                format!("_knot_fk_{}_{}_del", sup_rel, spf),
-            ] {
-                let drop_sql = format!("DROP TRIGGER IF EXISTS {};", quote_ident(&legacy));
-                debug_sql(&drop_sql);
-                let _ = db_ref.conn.execute_batch(&drop_sql);
-            }
 
             // Trigger: reject INSERT into sub if value doesn't exist in sup
             let insert_trigger = format!(

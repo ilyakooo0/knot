@@ -5802,9 +5802,11 @@ impl Codegen {
     /// server/network special forms (`fetch`, `fetchWith`, `listen`,
     /// `listenOn`). These are compile-time macros (they build route tables /
     /// HTTP calls from `serve` declarations), not first-class functions, so
-    /// they have no `base` record field. Both the legacy bare form (`fetch …`)
-    /// and the namespaced form (`base.fetch …`) name the same special form;
-    /// this returns `Some(name)` for either, `None` otherwise.
+    /// they have no `base` record field. The namespaced form (`base.fetch …`)
+    /// names the special form; the bare `Var` arm below is unreachable for
+    /// gated names (inference rejects the un-namespaced form first), but the
+    /// match is kept simple by accepting either shape here. Returns
+    /// `Some(name)` for either, `None` otherwise.
     fn server_form_name(func_expr: &ast::Expr) -> Option<&str> {
         match &func_expr.node {
             ast::ExprKind::Var(name) => Some(name.as_str()),
@@ -12595,8 +12597,7 @@ impl Codegen {
         // faithful SQL behavior — unlike the previous CAST-to-TEXT, the
         // overflow text can no longer satisfy arbitrary KNOT_INT filters).
         // Without arithmetic, the plain TEXT comparison stays under the
-        // columns' KNOT_INT collation (exact, including legacy
-        // BigInt-as-TEXT rows).
+        // columns' KNOT_INT collation (exact, including BigInt-as-TEXT rows).
         let (l_sql, r_sql) = match mode {
             SqlCastMode::CastInt => {
                 if cast_arithmetic_for_where(&l.sql) != l.sql

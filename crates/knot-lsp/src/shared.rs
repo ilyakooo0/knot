@@ -83,16 +83,16 @@ pub(crate) fn scan_knot_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// Recursively find all .knot files under any of the given roots. Used by
 /// workspace-wide handlers (auto-import, workspace symbol, workspace
 /// diagnostics) that should see every folder the editor surfaced, not just
-/// the first. Falls back to `legacy_root` when `roots` is empty so single-root
-/// callers stay correct.
+/// the first. Falls back to `fallback_root` when `roots` is empty so
+/// single-root callers stay correct.
 pub(crate) fn scan_knot_files_in_roots(
     roots: &[PathBuf],
-    legacy_root: Option<&Path>,
+    fallback_root: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let dirs: Vec<&Path> = if roots.is_empty() {
-        legacy_root.into_iter().collect()
+        fallback_root.into_iter().collect()
     } else {
         roots.iter().map(|p| p.as_path()).collect()
     };

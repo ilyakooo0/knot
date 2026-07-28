@@ -291,7 +291,7 @@ fn main() {
         let cache_handle = Arc::clone(&state.workspace_symbol_cache);
         let import_cache_handle = Arc::clone(&state.import_cache);
         let roots = state.workspace_roots.clone();
-        let legacy_root = state.workspace_root.clone();
+        let fallback_root = state.workspace_root.clone();
         // Spawn failures are rare (resource exhaustion) but worth logging:
         // without the prewarm thread, the first `workspace/symbol` query
         // walks the workspace from cold instead of finding a populated
@@ -304,7 +304,7 @@ fn main() {
                         cache_handle,
                         import_cache_handle,
                         &roots,
-                        legacy_root.as_deref(),
+                        fallback_root.as_deref(),
                     );
                 }));
                 if let Err(payload) = result {
@@ -434,14 +434,14 @@ fn prewarm_workspace_symbol_cache(
     cache: Arc<Mutex<WorkspaceSymbolCache>>,
     import_cache: Arc<Mutex<crate::state::ImportCache>>,
     roots: &[PathBuf],
-    legacy_root: Option<&Path>,
+    fallback_root: Option<&Path>,
 ) {
     use crate::shared::scan_knot_files_in_roots;
     use crate::state::content_hash;
     use crate::utils::path_to_uri;
     use crate::workspace_symbol::build_workspace_symbol_entries;
 
-    for path in scan_knot_files_in_roots(roots, legacy_root) {
+    for path in scan_knot_files_in_roots(roots, fallback_root) {
         let canonical = match path.canonicalize() {
             Ok(p) => p,
             Err(_) => continue,

@@ -11851,6 +11851,12 @@ impl Codegen {
         let mut offset: Option<SqlParamSource> = None;
         let mut order_by_cols: Vec<String> = Vec::new();
         let mut aggregate: Option<(&str, String, bool)> = None; // (func, column_sql, result_is_text)
+        // True when the map projection is a bare scalar (`\p -> p.dept`) or
+        // computed expr (`\p -> p.price * p.qty`) rather than a record. Such a
+        // map yields a relation of bare values (dedup'd, set semantics), which
+        // the record-reconstructing Rows path CANNOT reproduce — so it may only
+        // push down when a terminal aggregate consumes the column (`|> sum`).
+        let mut map_is_scalar = false;
 
         for op in ops {
             match &op {
@@ -11873,6 +11879,8 @@ impl Codegen {
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let cols =
                         analyze_map_select(bind_var, body, &alias, &schema)?;
+                    // A non-record body yields bare values, not records.
+                    map_is_scalar = !matches!(&body.node, ast::ExprKind::Record(_));
                     select_override = Some(cols);
                 }
                 PipeOp::Count => {
@@ -12037,6 +12045,13 @@ impl Codegen {
             };
             Some(self.emit_query(builder, &query, &schema, env, db, None))
         } else {
+            // A scalar (non-record) map yields a relation of bare values
+            // (dedup'd, set semantics). The record-reconstructing Rows path
+            // cannot reproduce that shape, so unless a terminal aggregate
+            // consumed the column above, fall back to in-memory evaluation.
+            if map_is_scalar {
+                return None;
+            }
             let select_columns = if let Some(cols) = select_override {
                 cols
             } else {
@@ -14989,8 +15004,11 @@ fn analyze_pipe_op(
         // form (the relation's own element is the summand); reuse the identity shape.
         _ if query_form_head(expr) == Some("sum") => Some(PipeOp::SumDirect),
         ast::ExprKind::App { func, arg } => {
-            if let ast::ExprKind::Var(name) = &func.node {
-                match name.as_str() {
+            // Bare (`map f`) and namespaced (`base.map f`) heads both resolve
+            // via `query_form_head` — previously only the bare `Var` matched,
+            // so `rel |> base.map f` never pushed down.
+            if let Some(name) = query_form_head(func) {
+                match name {
                     "filter" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
                         PipeOp::Filter { bind_var, body }
                     }),
@@ -15861,6 +15879,34 @@ fn analyze_map_select(
         }
         Some(cols)
     } else {
+        // Non-record body: a bare projection `\p -> p.field` or an arithmetic
+        // expression `\p -> p.price * p.qty` produces a single output column
+        // named after the field (or a fixed `_val` for computed exprs). This
+        // lets `rel |> map (\p -> p.x) |> sum` and `rel |> map (\p -> p.dept)`
+        // push down instead of shipping every row.
+        if let ast::ExprKind::FieldAccess { expr, field: col_name } = &body.node
+            && let ast::ExprKind::Var(name) = &expr.node
+                && name == bind_var {
+                    let type_str = lookup_col_type_from_schema(schema, col_name)?;
+                    return Some(vec![SqlSelectColumn {
+                        result_field: col_name.clone(),
+                        alias: alias.to_string(),
+                        source_col: col_name.clone(),
+                        type_str,
+                        sql_expr: None,
+                    }]);
+                }
+        if let Some(sql_expr) = try_sql_arithmetic_expr(bind_var, body, alias, schema) {
+            let type_str = infer_sql_expr_type(bind_var, body, schema)
+                .unwrap_or_else(|| "float".to_string());
+            return Some(vec![SqlSelectColumn {
+                result_field: "_val".to_string(),
+                alias: alias.to_string(),
+                source_col: "_val".to_string(),
+                type_str,
+                sql_expr: Some(sql_expr),
+            }]);
+        }
         None
     }
 }

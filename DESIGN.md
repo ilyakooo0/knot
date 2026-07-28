@@ -127,7 +127,7 @@ Bind through multiple levels with `<-`:
 -- All people across all teams
 &allMembers = do
   teams <- *teams
-  with {result: do
+  with {result do
     t <- teams
     m <- t.members
     yield {team t.name member m.name}}
@@ -137,7 +137,7 @@ Bind through multiple levels with `<-`:
 -- Engineers on large teams
 &engineers = do
   teams <- *teams
-  with {result: do
+  with {result do
     t <- teams
     where (count t.members) > 10
     m <- t.members
@@ -184,19 +184,19 @@ type FlatMembership = {team: Text, member: Text, age: Int 1}
 -- Nest: group a flat relation into nested structure
 &nested = do
   memberships <- *memberships
-  with {result: do
+  with {result do
     t <- do m <- memberships; yield m.team
-    yield {name: t, members: do
+    yield {name t members (do
       m <- memberships
       where m.team == t
-      yield {name m.member age m.age}}}
+      yield {name m.member age m.age})}}
   (do
     yield result)
 
 -- Flatten: expand nested relation into flat rows
 &flat = do
   teams <- *teams
-  with {result: do
+  with {result do
     t <- teams
     m <- t.members
     yield {team t.name member m.name age m.age}}
@@ -216,7 +216,7 @@ type Course = {name: Text, students: [{name: Text, grades: [{subject: Text, scor
 -- Find all failing grades across all departments
 &failing = do
   departments <- *departments
-  with {result: do
+  with {result do
     d <- departments
     c <- d.courses
     s <- c.students
@@ -450,7 +450,7 @@ Pattern matching on `<-` filters and binds in one step:
 ```knot
 &bigCircleAreas = do
   shapes <- *shapes
-  with {result: do
+  with {result do
     Circle c <- shapes
     where c.radius > 10
     yield {area pi * c.radius * c.radius}}
@@ -459,7 +459,7 @@ Pattern matching on `<-` filters and binds in one step:
 
 &blockedDetails = do
   tickets <- *tickets
-  with {result: do
+  with {result do
     t <- tickets
     Blocked {dependencies} <- t.status
     dep <- dependencies
@@ -500,7 +500,7 @@ describe = \rel -> case rel of
 ```knot
 &workload = do
   todos <- *todos
-  with {result: do
+  with {result do
     t <- todos
     where t.done == 0
     groupBy {t.owner}
@@ -516,7 +516,7 @@ Multiple key fields group by their combination:
 ```knot
 &summary = do
   orders <- *orders
-  with {result: do
+  with {result do
     o <- orders
     groupBy {region o.region status o.status}
     yield {region o.region status o.status total count o}}
@@ -576,7 +576,7 @@ The pattern for querying relations is: IO-bind to get the value, then pure compr
 ```knot
 &richEmployees = do
   employees <- *employees       -- IO bind: [Employee] from IO {} [Employee]
-  with {result: do              -- pure comprehension on the value
+  with {result do              -- pure comprehension on the value
     e <- employees
     where e.salary > 100000
     yield e}
@@ -758,7 +758,7 @@ The combination of `fork`, `atomic`, and `retry` enables STM-style concurrent co
 
 waitForCompletion = \id -> atomic do
   tasks <- *tasks
-  with {task: do
+  with {task do
     t <- tasks
     where t.id == id
     where t.status == "done"
@@ -1500,7 +1500,7 @@ type Measurement = {distance: Float M, time: Float S}
 -- Units flow through queries
 &speeds = do
   measurements <- *measurements
-  with {result: do
+  with {result do
     m <- measurements
     yield {speed m.distance / m.time}}   -- Float (M/S)
   (do
@@ -1860,7 +1860,7 @@ formatTitle = \title -> toUpper (take 1 title) ++ drop 1 title
 
 pendingFor = \user -> do
   todos <- *todos
-  with {result: do
+  with {result do
     t <- todos
     where t.owner == user
     Open {} <- t.status
@@ -1890,7 +1890,7 @@ resolve = \title owner msg -> do
 
 &workload = do
   todos <- *todos
-  with {result: do
+  with {result do
     t <- todos
     Open {} <- t.status
     groupBy {t.owner}

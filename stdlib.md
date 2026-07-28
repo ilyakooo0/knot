@@ -446,7 +446,7 @@ Used inside `atomic` blocks only. Causes the transaction to rollback and wait un
 ```knot
 waitForTask = \id -> atomic do
   tasks <- *tasks
-  with {done: do
+  with {done do
     t <- tasks
     where t.id == id
     where t.status == "done"

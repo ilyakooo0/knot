@@ -12,7 +12,7 @@ type Person = {name: Text, age: Int 1}
 main = do
   *people = [{name "Alice" age 30}, {name "Bob" age 25}]
   people <- *people
-  with {result: do
+  with {result do
     p <- people
     where p.age > 27
     yield p.name}
@@ -145,7 +145,7 @@ There are five kinds of top-level declarations:
 -- View: settable query over a source
 *openTodos = do
   todos <- *todos
-  with {result: do
+  with {result do
     t <- todos
     yield {title t.title owner t.owner status Open {}}}
   (do
@@ -324,7 +324,7 @@ Filter and destructure in one step:
 ```knot
 &circles = do
   shapes <- *shapes
-  with {result: do
+  with {result do
     Circle c <- shapes
     yield c}
   (do
@@ -332,7 +332,7 @@ Filter and destructure in one step:
 
 &inProgress = do
   tickets <- *tickets
-  with {result: do
+  with {result do
     t <- tickets
     InProgress ip <- t.status
     yield {t.title, ip.assignee}}
@@ -392,13 +392,13 @@ compiler enforces covering every constructor).
 
 ### `with` Expressions
 
-`with {name: value, ...} body` evaluates `body` with each record field bound as a variable in scope. The whole expression's value is `body`'s value:
+`with {name value, ...} body` evaluates `body` with each record field bound as a variable in scope. The whole expression's value is `body`'s value:
 
 ```knot
 with {x 2 y 3} (x + y)            -- 5
 
 -- The bound value can be any expression, including a do block:
-with {result: do
+with {result do
   p <- people
   where p.age > 27
   yield p.name}
@@ -455,7 +455,7 @@ sumList = \xs -> case xs of
 ```knot
 &workload = do
   todos <- *todos
-  with {result: do
+  with {result do
     t <- todos
     where t.done == 0
     groupBy {t.owner}
@@ -483,7 +483,7 @@ Fields can hold `[T]` — sets nested inside rows:
 -- Query into nested relations
 &allMembers = do
   teams <- *teams
-  with {result: do
+  with {result do
     t <- teams
     m <- t.members
     yield {team t.name member m.name}}
@@ -510,7 +510,7 @@ A `*`-prefixed declaration with a body is a view — reads compute the query, wr
 ```knot
 *openTodos = do
   todos <- *todos
-  with {result: do
+  with {result do
     t <- todos
     yield {title t.title owner t.owner priority t.priority status Open {}}}
   (do
@@ -542,7 +542,7 @@ Read-only computed relations, prefixed with `&`:
 
 &stats = do
   todos <- *todos
-  with {result: do
+  with {result do
     t <- todos
     groupBy {t.owner}
     yield {owner t.owner total count t}}
@@ -559,7 +559,7 @@ Datalog-style fixpoint iteration for transitive closure:
   reportsTo <- &reportsTo     -- self-reference (IO bind)
   manages <- *manages
   base <- &base
-  with {step: do
+  with {step do
     r <- reportsTo
     m <- manages
     where r.descendant == m.manager
@@ -1214,7 +1214,7 @@ assign = \title person -> do
 
 pending = \owner -> do
   todos <- *todos
-  with {result: do
+  with {result do
     t <- todos
     where t.owner == owner
     Open {} <- t.status
@@ -1224,7 +1224,7 @@ pending = \owner -> do
 
 &workload = do
   todos <- *todos
-  with {result: do
+  with {result do
     t <- todos
     Open {} <- t.status
     groupBy {t.owner}
@@ -1288,7 +1288,7 @@ updateWhere = \target newValue -> do
 &joined = do
   employees <- *employees
   departments <- *departments
-  with {result: do
+  with {result do
     e <- employees
     d <- departments
     where e.dept == d.name
@@ -1320,7 +1320,7 @@ getCount = do
 -- Using pattern bind in do
 &circles = do
   shapes <- *shapes
-  with {result: do
+  with {result do
     Circle c <- shapes
     yield c}
   (do

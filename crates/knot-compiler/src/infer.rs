@@ -4741,6 +4741,61 @@ impl Infer {
         Some(result)
     }
 
+    /// Type an application spine whose head is an `ImplicitRef` (`^name`) by
+    /// its ARGUMENT types, so the candidate search in `resolve_implicit_ref`
+    /// can discriminate between same-named fields of different structures
+    /// (`base.list.map` vs `base.text.map`).
+    ///
+    /// `(^map) f xs` is `App(App(^map, f), xs)`. Inferring each argument and
+    /// assembling the expected curried type `f_ty -> xs_ty -> ret` gives the
+    /// resolver real type information to unify each candidate field against;
+    /// the field whose type matches the arguments wins. Returns `None` when
+    /// the head is not an `ImplicitRef` or the spine has no arguments (a bare
+    /// `^name` falls through to the generic `ImplicitRef` arm, which keeps
+    /// its fresh-var — first-in-scope — behavior).
+    fn try_infer_implicit_ref_app(&mut self, expr: &ast::Expr) -> Option<Ty> {
+        // Peel the spine into (head, args in application order).
+        let mut args: Vec<&ast::Expr> = Vec::new();
+        let mut head = expr;
+        while let ast::ExprKind::App { func, arg } = &head.node {
+            args.push(arg);
+            head = func;
+        }
+        args.reverse();
+        let ast::ExprKind::ImplicitRef(name) = &head.node else {
+            return None;
+        };
+        if args.is_empty() {
+            return None;
+        }
+
+        // Infer each argument, building the expected curried function type
+        // `arg1 -> … -> argN -> ret` with a fresh result variable.
+        let mut expected = self.fresh();
+        for a in args.iter().rev() {
+            let arg_ty = self.infer_expr(a);
+            expected = Ty::Fun(Box::new(arg_ty), Box::new(expected));
+        }
+
+        // Resolve `^name` against the argument-shaped type. The candidate
+        // whose field type unifies wins; on success the resolver records the
+        // (root, path) projection for codegen keyed by the `^name` span.
+        let field_ty = self.resolve_implicit_ref(name, &expected, head.span);
+        // Bind the result variable: the resolved field type must equal the
+        // whole curried application type, pinning `ret` for the caller.
+        self.unify(&field_ty, &expected, expr.span);
+        // The overall application type is the result variable (the tail of
+        // the curried chain after all args are applied).
+        let mut result = self.apply(&expected);
+        for _ in &args {
+            let Ty::Fun(_, rest) = result else {
+                return Some(Ty::Error);
+            };
+            result = self.apply(&rest);
+        }
+        Some(result)
+    }
+
     /// Find an in-scope RECORD supplying `field` at `field_ty`, for splicing
     /// as an implicit dictionary. Unlike `resolve_implicit_ref` (which returns
     /// the *field value* projection for `^field`), this returns the *record*
@@ -4954,13 +5009,20 @@ impl Infer {
             }
         }
 
-        // Speculatively unify each candidate against `expected` in order.
-        // The speculative substitution CLONES the real one but points every
+        // Speculatively unify EACH candidate against `expected`. The
+        // speculative substitution CLONES the real one but points every
         // variable straight at its fully-resolved type, so bindings made
-        // during the trial are all at fresh or resolved-root variables and
-        // never reach a shared deeper chain — applying the winner's diff to
-        // the real substitution is then a faithful replay.
+        // during a trial are all at fresh or resolved-root variables and
+        // never reach a shared deeper chain — applying a winner's diff to
+        // the real substitution is then a faithful replay. Collect every
+        // candidate that unifies: exactly one means a clean resolution;
+        // more than one means the projection is genuinely ambiguous (two
+        // in-scope fields of the same name and compatible type), which is a
+        // hard error rather than a silent first-wins pick.
         let mut searched: Vec<String> = Vec::new();
+        // (root binding, field path, field type, post-unify speculative subst)
+        type Winner = (String, Vec<String>, Ty, HashMap<TyVar, Ty>);
+        let mut winners: Vec<Winner> = Vec::new();
         for (root, path, field_ty) in &candidates {
             let mut trial: HashMap<TyVar, Ty> = HashMap::with_capacity(self.subst.len());
             for v in self.subst.keys() {
@@ -4975,14 +5037,37 @@ impl Infer {
             std::mem::swap(&mut self.errors, &mut trial_errors);
             // `trial` now holds the post-unify speculative substitution.
             if trial_errors.is_empty() {
+                winners.push((root.clone(), path.clone(), field_ty.clone(), trial));
+            }
+            searched.push(format!("{}.{} : {}", root, path.join("."), self.display_ty(field_ty)));
+        }
+
+        match winners.len() {
+            1 => {
+                let (root, path, field_ty, trial) = winners.pop().expect("one winner");
                 for (v, t) in trial {
                     self.subst.insert(v, t);
                 }
-                self.implicit_refs
-                    .insert(span, (root.clone(), path.clone()));
-                return field_ty.clone();
+                self.implicit_refs.insert(span, (root, path));
+                return field_ty;
             }
-            searched.push(format!("{}.{} : {}", root, path.join("."), self.display_ty(field_ty)));
+            n if n > 1 => {
+                let options = winners
+                    .iter()
+                    .map(|(root, path, field_ty, _)| {
+                        format!("{}.{} : {}", root, path.join("."), self.display_ty(field_ty))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.error(
+                    format!(
+                        "ambiguous projection '^{name}': {n} in-scope record fields match the expected type ({options}); qualify one explicitly"
+                    ),
+                    span,
+                );
+                return Ty::Error;
+            }
+            _ => {}
         }
 
         let detail = if searched.is_empty() {
@@ -5827,6 +5912,21 @@ impl Infer {
                 // it for codegen to splice as the leading argument, and type
                 // the application with the dictionary parameter consumed.
                 if let Some(result) = self.try_infer_implicit_dict_app(expr) {
+                    return result;
+                }
+
+                // Type-directed `^name` projection. A bare `^name` resolves
+                // against a FRESH expected var (see the `ImplicitRef` arm),
+                // so the candidate search's backtracking has nothing to
+                // discriminate on and the shallowest/first field always wins.
+                // When `^name` heads an application spine (`(^map) f xs`),
+                // the argument types ARE the discriminating information:
+                // infer them first, build the expected curried function type
+                // `arg1 -> … -> argN -> ret`, and resolve `^name` against it —
+                // the candidate whose field type unifies (e.g. `list.map` for
+                // a list argument, `text.map` for a text argument) wins, and
+                // genuinely ambiguous overlaps are reported by the resolver.
+                if let Some(result) = self.try_infer_implicit_ref_app(expr) {
                     return result;
                 }
 

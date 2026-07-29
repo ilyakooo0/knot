@@ -4968,21 +4968,38 @@ impl Infer {
         let mut candidates: Vec<(String, Vec<String>, Ty)> =
             with_candidate.into_iter().collect();
         'scopes: for scope in self.scopes.iter().rev() {
+            // Level-synchronized BFS across ALL record bindings in this
+            // scope. Every binding's frontier advances one depth level per
+            // round; we only stop descending once a given LEVEL (across all
+            // bindings) has produced at least one candidate. This is the
+            // "shallowest depth wins" rule — but a *shared* depth, so two
+            // sibling records that both carry the field at the same nesting
+            // (e.g. `int.morph.into` and `text.morph.into`) are BOTH
+            // collected, letting the type-directed disambiguation below pick
+            // between them. (The previous per-binding loop broke out of the
+            // depth search as soon as the FIRST binding found a match at a
+            // deeper level, so a later sibling's same-depth field was never
+            // reached.)
+            let mut frontiers: Vec<(String, Vec<(Vec<String>, Ty)>)> = Vec::new();
             for (bind_name, scheme) in scope {
-                // A `with` field's binding scheme is the field's own type —
-                // no quantified vars to instantiate, so `scheme.ty` is the
-                // binding's type as-is.
                 let root_ty = self.apply(&scheme.ty);
-                let mut frontier: Vec<(Vec<String>, Ty)> = match root_ty.peel_alias() {
+                let frontier: Vec<(Vec<String>, Ty)> = match root_ty.peel_alias() {
                     Ty::Record(fields, _) => fields
                         .iter()
                         .map(|(f, t)| (vec![f.clone()], t.clone()))
                         .collect(),
                     _ => Vec::new(),
                 };
-                while !frontier.is_empty() {
+                if !frontier.is_empty() {
+                    frontiers.push((bind_name.clone(), frontier));
+                }
+            }
+            'depth: while frontiers.iter().any(|(_, f)| !f.is_empty()) {
+                let found_before = candidates.len();
+                // Advance every binding's frontier by one level.
+                for (bind_name, frontier) in frontiers.iter_mut() {
                     let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
-                    for (path, field_ty) in frontier {
+                    for (path, field_ty) in frontier.drain(..) {
                         if *path.last().expect("non-empty path") == name {
                             candidates.push((bind_name.clone(), path.clone(), field_ty.clone()));
                         }
@@ -4996,12 +5013,12 @@ impl Infer {
                             }
                         }
                     }
-                    // Shallowest depth wins: if this depth produced any
-                    // candidate, deeper nesting is never considered.
-                    if !candidates.is_empty() {
-                        break;
-                    }
-                    frontier = next;
+                    *frontier = next;
+                }
+                // Shallowest depth wins: if this LEVEL produced any candidate,
+                // stop descending (deeper nesting is never considered).
+                if candidates.len() > found_before {
+                    break 'depth;
                 }
             }
             if !candidates.is_empty() {

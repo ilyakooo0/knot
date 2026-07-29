@@ -1,0 +1,31 @@
+-- Type-directed conversion via record dictionaries + `^into` projection.
+--
+-- A "morph dictionary" for a target type T is a record `{ into : S -> T }`
+-- holding conversions INTO T. The convention is to nest them under a type
+-- name: `<type>.morph.into`. With several in scope at once, `(^into) x`
+-- resolves TYPE-DIRECTEDLY: it picks the dictionary whose `into` field's
+-- parameter type matches x's type. (This exercises the level-synchronized
+-- candidate search in `resolve_implicit_ref`: both `int.morph.into` and
+-- `text.morph.into` live at the same nesting depth, and the resolver must
+-- collect BOTH, then disambiguate by argument type.)
+with {
+-- Conversions INTO Int 1 and INTO Text, each with a concrete input type.
+intMorph  { into : Text -> Int 1
+            into (\s -> base.length s) }
+textMorph { into : Int 1 -> Text
+            into (\n -> base.show n) }
+
+-- The ambient conversion scope: one record nesting both morphs at the same
+-- depth, mirroring the `base.<type>.morph` convention.
+conv { int { morph intMorph } text { morph textMorph } }
+}
+(do
+  -- `(^into) "hi"` : the argument is Text, so the resolver picks
+  -- `conv.int.morph.into : Text -> Int 1` (the length of "hi").
+  base.println (base.show (with conv ((^into) "hi")))   -- "2"
+
+  -- `(^into) 41` : the argument is Int 1, so it picks
+  -- `conv.text.morph.into : Int 1 -> Text`.
+  base.println (with conv ((^into) 41))                 -- "41"
+
+  yield {})

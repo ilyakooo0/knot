@@ -917,19 +917,14 @@ fn match_filter_only<'a>(
         _ => return None,
     };
 
-    if let StmtKind::Expr(e) = &stmts.last()?.node {
-        if let Some(inner) = e.node.as_yield_arg() {
-            if let ExprKind::Var(v) = &inner.node {
-                if v != &bind_var {
-                    return None;
-                }
-            } else {
-                return None;
-            }
-        } else {
-            return None;
-        }
-    } else {
+    let StmtKind::Expr(e) = &stmts.last()?.node else {
+        return None;
+    };
+    let inner = e.node.as_yield_arg()?;
+    let ExprKind::Var(v) = &inner.node else {
+        return None;
+    };
+    if v != &bind_var {
         return None;
     }
 
@@ -1074,11 +1069,8 @@ fn flatten_pipe_chain(expr: &Expr) -> Option<(&Expr, Vec<LintPipeOp<'_>>)> {
         rhs,
     } = &current.node
     {
-        if let Some(pipe_op) = analyze_pipe_op(rhs) {
-            ops.push(pipe_op);
-        } else {
-            return None;
-        }
+        let pipe_op = analyze_pipe_op(rhs)?;
+        ops.push(pipe_op);
         current = lhs;
     }
 

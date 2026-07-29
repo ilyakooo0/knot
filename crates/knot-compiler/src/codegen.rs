@@ -12277,22 +12277,19 @@ impl Codegen {
                                         continue;
                                     }
                     // Fallback: try computed expression (arithmetic, CASE WHEN)
-                    if let Some(sql_expr) = try_multi_table_arithmetic_expr(
+                    let sql_expr = try_multi_table_arithmetic_expr(
                         &bind_to_alias, &bind_to_schema, &field.value,
-                    ) {
-                        let type_str = infer_multi_table_sql_expr_type(
-                            &bind_to_schema, &field.value,
-                        ).unwrap_or_else(|| "float".to_string());
-                        select_columns.push(SqlSelectColumn {
-                            result_field: field.name.clone(),
-                            alias: String::new(),
-                            source_col: field.name.clone(),
-                            type_str,
-                            sql_expr: Some(sql_expr),
-                        });
-                    } else {
-                        return None;
-                    }
+                    )?;
+                    let type_str = infer_multi_table_sql_expr_type(
+                        &bind_to_schema, &field.value,
+                    ).unwrap_or_else(|| "float".to_string());
+                    select_columns.push(SqlSelectColumn {
+                        result_field: field.name.clone(),
+                        alias: String::new(),
+                        source_col: field.name.clone(),
+                        type_str,
+                        sql_expr: Some(sql_expr),
+                    });
                 }
             }
             ast::ExprKind::Var(var_name) => {
@@ -13162,19 +13159,14 @@ impl Codegen {
         };
 
         // Last: yield t
-        if let ast::StmtKind::Expr(e) = &stmts.last()?.node {
-            if let Some(inner) = e.node.as_yield_arg() {
-                if let ast::ExprKind::Var(v) = &inner.node {
-                    if v != &bind_var {
-                        return None;
-                    }
-                } else {
-                    return None;
-                }
-            } else {
-                return None;
-            }
-        } else {
+        let ast::StmtKind::Expr(e) = &stmts.last()?.node else {
+            return None;
+        };
+        let inner = e.node.as_yield_arg()?;
+        let ast::ExprKind::Var(v) = &inner.node else {
+            return None;
+        };
+        if v != &bind_var {
             return None;
         }
 
@@ -15853,20 +15845,17 @@ fn analyze_map_select(
                         continue;
                     }
             // Try arithmetic expression
-            if let Some(sql_expr) = try_sql_arithmetic_expr(bind_var, &field.value, alias, schema) {
-                // Infer result type from the expression (default to float for arithmetic)
-                let type_str = infer_sql_expr_type(bind_var, &field.value, schema)
-                    .unwrap_or_else(|| "float".to_string());
-                cols.push(SqlSelectColumn {
-                    result_field: field.name.clone(),
-                    alias: alias.to_string(),
-                    source_col: field.name.clone(),
-                    type_str,
-                    sql_expr: Some(sql_expr),
-                });
-            } else {
-                return None;
-            }
+            let sql_expr = try_sql_arithmetic_expr(bind_var, &field.value, alias, schema)?;
+            // Infer result type from the expression (default to float for arithmetic)
+            let type_str = infer_sql_expr_type(bind_var, &field.value, schema)
+                .unwrap_or_else(|| "float".to_string());
+            cols.push(SqlSelectColumn {
+                result_field: field.name.clone(),
+                alias: alias.to_string(),
+                source_col: field.name.clone(),
+                type_str,
+                sql_expr: Some(sql_expr),
+            });
         }
         Some(cols)
     } else {

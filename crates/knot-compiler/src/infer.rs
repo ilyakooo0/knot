@@ -38,57 +38,6 @@ fn collect_pat_bound_names(pat: &ast::Pat, out: &mut Vec<String>) {
     }
 }
 
-/// Reinterpret an argument *expression* as a *type* AST. Used for Π-lite
-/// explicit type arguments: when a function's next parameter is a type-witness
-/// (kind `Type`), the argument expression is a type written in value syntax —
-/// a bare name `Int` / `T` (`Constructor`/`Var`) or an application `Maybe Int`.
-/// Returns `None` for expressions that can't denote a type (then the argument
-/// is treated as an ordinary value).
-fn expr_to_type(expr: &ast::Expr) -> Option<ast::Type> {
-    use knot::ast::{ExprKind, TypeKind};
-    let span = expr.span;
-    let node = match &expr.node {
-        // Bare numeric base as a type argument means dimensionless (`Int 1`).
-        // `ast_type_to_ty` rejects a bare `Int`/`Float` (unit enforcement), so
-        // elaborate it to the dimensionless form here.
-        ExprKind::Constructor(name)
-            if name == "Int" || name == "Float" =>
-        {
-            TypeKind::UnitAnnotated {
-                base: Box::new(knot::ast::Spanned {
-                    node: TypeKind::Named(name.clone()),
-                    span,
-                }),
-                unit: knot::ast::UnitExpr::Dimensionless,
-            }
-        }
-        // Type heads are uppercase (`Constructor`); lowercase `Var` is always
-        // a value (e.g. `f x`), never a type argument.
-        ExprKind::Constructor(name) => TypeKind::Named(name.clone()),
-        // `Int 1` — a numeric base applied to a dimensionless unit literal.
-        ExprKind::App { func, arg }
-            if matches!(&arg.node, ExprKind::Lit(knot::ast::Literal::Int(n)) if n == "1") =>
-        {
-            let base = expr_to_type(func)?;
-            TypeKind::UnitAnnotated {
-                base: Box::new(base),
-                unit: knot::ast::UnitExpr::Dimensionless,
-            }
-        }
-        ExprKind::App { func, arg } => {
-            let f = expr_to_type(func)?;
-            let a = expr_to_type(arg)?;
-            TypeKind::App {
-                func: Box::new(f),
-                arg: Box::new(a),
-            }
-        }
-        ExprKind::Annot { expr: inner, .. } => return expr_to_type(inner),
-        _ => return None,
-    };
-    Some(knot::ast::Spanned { node, span })
-}
-
 /// Flatten an application spine `f a b …` into `[f, a, b, …]` (head-first).
 /// A non-application expression yields a single-element vector.
 fn flatten_spine(expr: &ast::Expr) -> Vec<&ast::Expr> {
@@ -534,6 +483,7 @@ enum Ty {
     /// definition. While `arg` is still a variable the projection is rigid: it
     /// only unifies with an identical projection (or a variable), which keeps
     /// the result from being silently equated with an arbitrary type.
+    #[allow(dead_code)] // associated-type projection not yet constructed
     Assoc(String, Box<Ty>),
     /// Error sentinel — suppresses cascading errors.
     Error,
@@ -726,6 +676,7 @@ struct DeferredConstraint {
     /// this — not a positional index into `deferred_constraints` — to identify
     /// "constraints this body added", because `generalize_with_constraints`
     /// *removes* entries mid-body, which would invalidate any length snapshot.
+    #[allow(dead_code)] // reserved for constraint ordering
     seq: u64,
 }
 
@@ -1824,8 +1775,8 @@ impl Infer {
                 // for the inner `Ty::Unit(u)`, so by the time we get here the
                 // arg may already be a substituted `Unit(u)` — but if the arg
                 // was something exotic we must not pretend it's a unit.
-                if (name == "Int" || name == "Float") && applied_args.len() == 1 {
-                    if let Ty::Unit(u) = &applied_args[0] {
+                if (name == "Int" || name == "Float") && applied_args.len() == 1
+                    && let Ty::Unit(u) = &applied_args[0] {
                         let u = self.apply_unit(u);
                         if u.is_dimensionless() {
                             return if name == "Int" { Ty::Int } else { Ty::Float };
@@ -1836,7 +1787,6 @@ impl Infer {
                             Ty::float_with_unit(u)
                         };
                     }
-                }
                 Ty::Con(name.clone(), applied_args)
             }
             Ty::TyCon(_) => ty.clone(),
@@ -1890,9 +1840,10 @@ impl Infer {
 
     // ── Effect-row helpers ───────────────────────────────────────
 
-    /// Walk an effect-row tail through the substitution, merging any
-    /// effects that have been bound to the chain. Returns the fully
-    /// resolved (effects, tail) pair.
+    // Walk an effect-row tail through the substitution, merging any
+    // effects that have been bound to the chain. Returns the fully
+    // resolved (effects, tail) pair.
+
     // ── Occurs check ─────────────────────────────────────────────
 
     fn occurs_in(&self, var: TyVar, ty: &Ty) -> bool {
@@ -3968,7 +3919,7 @@ impl Infer {
     /// next `n` spine elements (each recursively a complete type). Returns the
     /// type AST and the number of spine elements consumed. `None` if the head
     /// is not a type.
-    fn consume_type_arg<'a>(&self, spine: &[&'a ast::Expr]) -> Option<(ast::Type, usize)> {
+    fn consume_type_arg(&self, spine: &[&ast::Expr]) -> Option<(ast::Type, usize)> {
         use knot::ast::TypeKind;
         let head = spine.first()?;
         let mut head_expr = *head;
@@ -4079,11 +4030,10 @@ impl Infer {
                         }
                     }
                     // Parameterized alias referenced bare (`Pair` with 0 args).
-                    if self.param_aliases.contains_key(name) {
-                        if let Some(t) = self.expand_param_alias(ty) {
+                    if self.param_aliases.contains_key(name)
+                        && let Some(t) = self.expand_param_alias(ty) {
                             return t;
                         }
-                    }
                     if let Some(aliased) = self.aliases.get(name).cloned() {
                         // Freshen any free type variables in the alias body
                         // (e.g. the `a` in `type Box = {val: a}`): the body
@@ -4395,15 +4345,14 @@ impl Infer {
             Ty::Con(name, args) => {
                 // Unit-bearing Int/Float: `Con("Int", [Unit(u)])` → `Int u`,
                 // collapsing to `Int`/`Float` when the unit is dimensionless.
-                if (name == "Int" || name == "Float") && args.len() == 1 {
-                    if let Ty::Unit(u) = args[0].peel_alias() {
+                if (name == "Int" || name == "Float") && args.len() == 1
+                    && let Ty::Unit(u) = args[0].peel_alias() {
                         let u = self.apply_unit(u);
                         if u.is_dimensionless() {
                             return name.clone();
                         }
                         return format!("{} {}", name, u.display());
                     }
-                }
                 if args.is_empty() {
                     name.clone()
                 } else {
@@ -4699,18 +4648,14 @@ impl Infer {
             // A record-field fun with a `^`-field constraint is called through
             // a field path (`fns.greet`). Register/look up its dictionaries
             // under the dotted path so scope resolution works the same way.
-            let Some(path) = implicit_dict_head_path(head) else {
-                return None;
-            };
+            let path = implicit_dict_head_path(head)?;
             let dicts = self.implicit_dict_fns.get(&path)?.clone();
             let n_dicts = dicts.len();
             // Resolve the field's type structurally from the record root's
             // scheme (walking the path), so the leading dictionary params the
             // desugarer prepended are visible. `infer_expr(head)` would return
             // a fresh unification var, not the function type.
-            let Some(head_ty) = self.resolve_field_path_ty(head) else {
-                return None;
-            };
+            let head_ty = self.resolve_field_path_ty(head)?;
             let arity = curry_arity(&head_ty);
             let explicit_arity = arity - n_dicts;
             if args.len() != explicit_arity {
@@ -5233,13 +5178,12 @@ impl Infer {
                 // in scope UNQUALIFIED: resolve `Just` to `Maybe.Just` and
                 // instantiate it via the confined qualified path, yielding the
                 // same `record -> data` function type as a normal ctor.
-                if let Some(data_name) = self.resolve_with_imported_ctor(name) {
-                    if let Some((data_ty, record_ty)) =
+                if let Some(data_name) = self.resolve_with_imported_ctor(name)
+                    && let Some((data_ty, record_ty)) =
                         self.instantiate_qualified_ctor(&data_name, name)
                     {
                         return Ty::Fun(Box::new(record_ty), Box::new(data_ty));
                     }
-                }
                 // A bare BUILT-IN constructor in user code must be qualified
                 // by its data type, exactly like a user constructor
                 // (`Maybe.Just`, `Result.Ok`, `Bool.True`, …). Prelude-internal
@@ -5621,10 +5565,9 @@ impl Infer {
                         // Required CLI constant (sig-only field, empty-record
                         // placeholder value): take the sig type as the field
                         // type and skip the placeholder value entirely.
-                        if f.sig.is_some()
+                        if let Some(sig) = &f.sig
                             && matches!(&f.value.node, ast::ExprKind::Record(fs) if fs.is_empty())
                         {
-                            let sig = f.sig.as_ref().unwrap();
                             let saved_flag = self.in_type_annotation;
                             let saved_unit_vars =
                                 std::mem::take(&mut self.annotation_unit_vars);
@@ -5932,14 +5875,13 @@ impl Infer {
                     // import applies UNQUALIFIED: `Just {value 5}` resolves to
                     // `Maybe.Just`. Check the payload against the qualified
                     // record type and return the data type.
-                    if let Some(data_name) = self.resolve_with_imported_ctor(name) {
-                        if let Some((data_ty, record_ty)) =
+                    if let Some(data_name) = self.resolve_with_imported_ctor(name)
+                        && let Some((data_ty, record_ty)) =
                             self.instantiate_qualified_ctor(&data_name, name)
                         {
                             self.check_expr(arg, &record_ty);
                             return data_ty;
                         }
-                    }
                     // An applied BUILT-IN constructor in user code must be
                     // qualified by its data type (`Maybe.Just {…}`).
                     if self.is_builtin_ctor(name)
@@ -6503,14 +6445,13 @@ impl Infer {
                 // map. The alias name is reachable only via the record value
                 // (`rec.Name`) or a `with` peel (scoped type env), so it never
                 // leaks into the enclosing type namespace.
-                let kind_type =
-                    (0..params.len()).fold(Ty::Con("Type".into(), vec![]), |acc, _| {
+                
+                (0..params.len()).fold(Ty::Con("Type".into(), vec![]), |acc, _| {
                         Ty::Fun(
                             Box::new(Ty::Con("Type".into(), vec![])),
                             Box::new(acc),
                         )
-                    });
-                kind_type
+                    })
             }
 
             ast::ExprKind::DataCtor { name, params, constructors } => {
@@ -6720,7 +6661,7 @@ impl Infer {
                     // (provided side) and strip the quantifier, losing the
                     // witness binding the caller needs to supply the type arg.
                     if let Ty::Var(v) = self.apply(expected)
-                        && self.subst.get(&v).is_none()
+                        && !self.subst.contains_key(&v)
                     {
                         self.subst.insert(v, inferred);
                         return;
@@ -7344,8 +7285,8 @@ impl Infer {
         let same_numeric_class =
             |a: &Ty, b: &Ty| (a.is_int_like() && b.is_int_like()) || (a.is_float_like() && b.is_float_like());
         // Both operands have a unit and are the same numeric class → compose.
-        if let (Some(u1), Some(u2)) = (lhs_applied.unit_of(), rhs_applied.unit_of()) {
-            if same_numeric_class(lhs_applied, rhs_applied) {
+        if let (Some(u1), Some(u2)) = (lhs_applied.unit_of(), rhs_applied.unit_of())
+            && same_numeric_class(lhs_applied, rhs_applied) {
                 let u1 = self.apply_unit(u1);
                 let u2 = self.apply_unit(u2);
                 let result_unit = if op == ast::BinOp::Mul {
@@ -7362,7 +7303,6 @@ impl Infer {
                     Ty::float_with_unit(result_unit)
                 };
             }
-        }
         // One side carries a unit, the other is the plain form of the same
         // numeric class → preserve (and on `/`, invert the unit when the
         // *denominator* is the unit side).
@@ -7747,11 +7687,10 @@ impl Infer {
                 // *required* Forall and skolemised (rank-N soundness) — a
                 // monomorphic `Int->Int` is then rejected. (Unifying instead
                 // would solve the skolems away and accept anything.)
-                if let Ty::Var(v) = self.apply(expected) {
-                    if !self.skolems.contains(&v) {
+                if let Ty::Var(v) = self.apply(expected)
+                    && !self.skolems.contains(&v) {
                         self.bind_var(v, annot_ty.clone(), ty.span);
                     }
-                }
                 self.check_pattern(inner, &annot_ty);
             }
         }
@@ -10487,7 +10426,7 @@ impl Infer {
                                         .iter()
                                         .filter_map(|c| match c {
                                             ast::Constraint::ImplicitField { field, ty } => {
-                                                Some((field.clone(), self.ast_type_to_ty(&ty)))
+                                                Some((field.clone(), self.ast_type_to_ty(ty)))
                                             }
                                             _ => None,
                                         })
@@ -10564,7 +10503,7 @@ impl Infer {
                                 .iter()
                                 .filter_map(|c| match c {
                                     ast::Constraint::ImplicitField { field, ty } => {
-                                        Some((field.clone(), self.ast_type_to_ty(&ty)))
+                                        Some((field.clone(), self.ast_type_to_ty(ty)))
                                     }
                                     _ => None,
                                 })
@@ -11429,14 +11368,13 @@ fn display_ty_clean_inner(
         Ty::Con(name, args) => {
             // Unit-bearing Int/Float → `Int u`/`Float u`, collapsing to
             // `Int`/`Float` when dimensionless.
-            if (name == "Int" || name == "Float") && args.len() == 1 {
-                if let Ty::Unit(u) = args[0].peel_alias() {
+            if (name == "Int" || name == "Float") && args.len() == 1
+                && let Ty::Unit(u) = args[0].peel_alias() {
                     if u.is_dimensionless() {
                         return name.clone();
                     }
                     return format!("{} {}", name, display_unit_clean(u, unit_names));
                 }
-            }
             if args.is_empty() {
                 name.clone()
             } else {
@@ -12219,7 +12157,7 @@ fn action_monad_of(ty: &Ty) -> Option<MonadKind> {
         // }`) would misclassify the number as an `Adt("Int")` action and
         // try to treat it as the block's monad instead of wrapping in `pure`.
         Ty::Con(name, args)
-            if !args.is_empty() && !(name == "Int" || name == "Float") =>
+            if !(args.is_empty() || name == "Int" || name == "Float") =>
         {
             Some(MonadKind::Adt(name.clone()))
         }

@@ -839,11 +839,10 @@ impl Parser {
 
     // ── subset constraint ────────────────────────────────────────────
 
-    /// Parse the rest of a subset constraint after `*name` has been consumed.
-    /// Handles: `*name.field <= *other.field` and `*name <= *other.field`.
+    // Parse the rest of a subset constraint after `*name` has been consumed.
+    // Handles: `*name.field <= *other.field` and `*name <= *other.field`.
 
     // ── derived ──────────────────────────────────────────────────────
-
 
     // ── function / constant ──────────────────────────────────────────
 
@@ -851,21 +850,6 @@ impl Parser {
     // ── route ────────────────────────────────────────────────────────
 
 
-    /// Parse a route reference: a bare route name (`Api`) or a dotted field
-    /// path to a record-embedded route (`rec.Api`, `a.b.TodoApi`). Used by
-    /// composite components (`route X = A | rec.B`) and by `serve`'s API head.
-
-    /// Parse route entries, supporting path prefix nesting.
-    /// A line starting with `/` (no HTTP method) introduces a prefix group;
-    /// nested entries under it have the prefix prepended to their paths.
-    ///
-    /// Each `/`-prefixed group recurses, so a long run of `/...` lines would
-    /// otherwise grow the native call stack without bound and abort the
-    /// process. Charge the shared recursion budget so pathological input
-    /// surfaces a "nesting depth limit exceeded" diagnostic instead.
-    /// `floor` is the column of the `/prefix` line that introduced this group
-    /// (0 at the top level). Nested entries must be strictly more indented than
-    /// it, so a same-indent sibling is not absorbed into the group.
     /// Parse a possibly-dotted route component path: a bare route name or a
     /// path to a record-embedded route (`rec.Api`, `a.b.TodoApi`). Used by
     /// composite components (`route X = A | rec.B`) and by `serve`'s API head.
@@ -1866,25 +1850,24 @@ impl Parser {
         // as the application argument here. This lets `Maybe.Just {value 1}`
         // appear unparenthesized as a list element or record field value, just
         // like the bare `Just {value 1}` form.
-        if let ExprKind::FieldAccess { field, .. } = &expr.node {
-            if field.chars().next().is_some_and(|c| c.is_uppercase())
-                && self.at(&TokenKind::LBrace)
-            {
-                if !self.enter_recursion() {
-                    return None;
-                }
-                let arg = self.parse_postfix();
-                self.recursion_depth -= 1;
-                let arg = arg?;
-                let span = Span::new(expr.span.start, arg.span.end);
-                return Some(Spanned::new(
-                    ExprKind::App {
-                        func: Box::new(expr),
-                        arg: Box::new(arg),
-                    },
-                    span,
-                ));
+        if let ExprKind::FieldAccess { field, .. } = &expr.node
+            && field.chars().next().is_some_and(|c| c.is_uppercase())
+            && self.at(&TokenKind::LBrace)
+        {
+            if !self.enter_recursion() {
+                return None;
             }
+            let arg = self.parse_postfix();
+            self.recursion_depth -= 1;
+            let arg = arg?;
+            let span = Span::new(expr.span.start, arg.span.end);
+            return Some(Spanned::new(
+                ExprKind::App {
+                    func: Box::new(expr),
+                    arg: Box::new(arg),
+                },
+                span,
+            ));
         }
         Some(expr)
     }
@@ -3207,11 +3190,11 @@ impl Parser {
             let record = if let ExprKind::Record(fields) = &record.node {
                 let mut value_fields: Vec<RecordField> = Vec::new();
                 for f in fields {
-                    if let ExprKind::Constructor(tname) = &f.value.node {
-                        if tname == &f.name {
-                            types.push(tname.clone());
-                            continue;
-                        }
+                    if let ExprKind::Constructor(tname) = &f.value.node
+                        && tname == &f.name
+                    {
+                        types.push(tname.clone());
+                        continue;
                     }
                     value_fields.push(f.clone());
                 }

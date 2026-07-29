@@ -540,7 +540,7 @@ impl<'a> TokenCollector<'a> {
                     // appears in source before the `:` that separates it from
                     // the value, so search backwards from the value's span start.
                     let val_start = self.strip_parens(f.value.span).start;
-                    if val_start >= f.name.len() + 1 {
+                    if val_start > f.name.len() {
                         // Look for `name:` before the value — find the last
                         // occurrence of the field name before the value start.
                         let search_end = val_start;

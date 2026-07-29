@@ -816,7 +816,7 @@ fn compile_inner(
     cg.alias_ast = decl_views(program)
         .iter()
         .filter_map(|d| match d.kind {
-            DeclViewKind::TypeAlias { params, ty } if params.is_empty() => {
+            DeclViewKind::TypeAlias { params: [], ty } => {
                 Some((d.name.to_string(), ty.clone()))
             }
             _ => None,
@@ -9107,10 +9107,10 @@ impl Codegen {
         false
     }
 
-    /// Like `do_block_is_comprehension`, but also admits `groupBy`
-    /// statements: a do-block ending in `yield` whose other statements are
-    /// all Bind/Where/Let/GroupBy compiles through the relational loop
-    /// paths and therefore produces a relation value.
+    // Like `do_block_is_comprehension`, but also admits `groupBy`
+    // statements: a do-block ending in `yield` whose other statements are
+    // all Bind/Where/Let/GroupBy compiles through the relational loop
+    // paths and therefore produces a relation value.
 
     /// Check whether an expression's IO-ness involves *external* effects
     /// (console/fs/network/clock/random builtins, fork/race, atomic blocks,
@@ -9984,16 +9984,13 @@ impl Codegen {
         let mut primary: Option<String> = None;
         let mut loop_local: HashSet<String> = HashSet::new();
         for stmt in &stmts[..group_pos] {
-            match &stmt.node {
-                ast::StmtKind::Bind { pat, .. } => {
-                    let mut names = HashSet::new();
-                    collect_pat_binds(pat, &mut names);
-                    loop_local.extend(names);
-                    if let Some(p) = pat_primary_var(&pat.node) {
-                        primary = Some(p);
-                    }
+            if let ast::StmtKind::Bind { pat, .. } = &stmt.node {
+                let mut names = HashSet::new();
+                collect_pat_binds(pat, &mut names);
+                loop_local.extend(names);
+                if let Some(p) = pat_primary_var(&pat.node) {
+                    primary = Some(p);
                 }
-                _ => {}
             }
         }
         if let Some(p) = &primary {
@@ -13508,15 +13505,6 @@ impl Codegen {
         false
     }
 
-    /// Check if a trait method has a non-builtin implementation on a
-    /// primitive type (Int/Float/Text/Bool/…). When true, tag-based operator
-    /// fast paths must be skipped entirely — a primitive value would
-    /// otherwise bypass the user's impl.
-    fn has_user_primitive_impl(&self, _method: &str) -> bool {
-        // User trait impls are gone with trait dispatch.
-        false
-    }
-
     /// SQL pushdown executes comparisons and arithmetic as native SQLite
     /// operations, bypassing operator trait dispatch entirely. When the
     /// user overrides `eq`/`compare` or a `Num` method on a PRIMITIVE type
@@ -14667,6 +14655,7 @@ impl Query {
     /// plan's own emitter). A table with an EMPTY alias renders bare
     /// (`"_knot_<src>"`, no `AS`) — the single-aggregate path uses unqualified
     /// columns and must not gain an alias (byte-identical SQL).
+    #[allow(clippy::wrong_self_convention)] // SQL FROM clause; reads self.plan
     fn from_clause(&self) -> String {
         self.plan
             .tables
@@ -14938,6 +14927,7 @@ enum PipeOp {
     CountWhere { bind_var: String, body: ast::Expr },
     Take { n: ast::Expr },
     Drop { n: ast::Expr },
+    #[allow(dead_code)] // sum-pipe not yet wired
     Sum { bind_var: String, body: ast::Expr },
     /// Direct `sum rel` (no projection): the relation's own elements are the
     /// summands. Distinguished from `Sum` so the SQL lowering aggregates the
@@ -17270,15 +17260,6 @@ fn pretty_stmt(stmt: &ast::Stmt) -> String {
         ast::StmtKind::Where { cond } => format!("where {}", pretty_expr(cond)),
         ast::StmtKind::GroupBy { key } => format!("groupBy {}", pretty_expr(key)),
         ast::StmtKind::Expr(e) => pretty_expr(e),
-    }
-}
-
-/// Count the number of function parameters from a type annotation.
-/// `a -> b -> c` has 2 parameters.
-fn count_fn_params(ty: &ast::Type) -> usize {
-    match &ty.node {
-        ast::TypeKind::Function { result, .. } => 1 + count_fn_params(result),
-        _ => 0,
     }
 }
 

@@ -1484,8 +1484,8 @@ fn resolve_type(
                     // arguments into constructor field types (mirrors the
                     // single-variant path above) so schema-dependent logic
                     // sees the actual type arguments, not `Named("unknown")`.
-                    if let ResolvedType::Adt(_) = resolved {
-                        if let Some((params, raw_ctors)) = multi_variant_params.get(name)
+                    if let ResolvedType::Adt(_) = resolved
+                        && let Some((params, raw_ctors)) = multi_variant_params.get(name)
                             && params.len() == spine_args.len()
                         {
                             let subst: HashMap<String, Type> =
@@ -1507,7 +1507,6 @@ fn resolve_type(
                                 .collect();
                             return ResolvedType::Adt(substituted);
                         }
-                    }
                     return resolved.clone();
                 }
             ResolvedType::Named("unknown".into())

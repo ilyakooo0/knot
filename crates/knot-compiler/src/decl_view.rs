@@ -114,150 +114,89 @@ pub fn decl_views(program: &ast::Expr) -> Vec<DeclView<'_>> {
 
 fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
     use ast::ExprKind::*;
-    match &e.node {
-        Record(fields) => {
-            for fl in fields {
-                match &fl.value.node {
-                    DataCtor { params, constructors, .. } => out.push(DeclView {
+    if let Record(fields) = &e.node {
+        for fl in fields {
+            match &fl.value.node {
+                DataCtor { params, constructors, .. } => out.push(DeclView {
+                    name: fl.name.as_str(),
+                    span: fl.value.span,
+                    kind: DeclViewKind::Data {
+                        params,
+                        ctors: constructors,
+                    },
+                }),
+                TypeCtor { params, ty, .. } => out.push(DeclView {
+                    name: fl.name.as_str(),
+                    span: fl.value.span,
+                    kind: DeclViewKind::TypeAlias { params, ty },
+                }),
+                SourceDecl { ty, .. } => out.push(DeclView {
+                    name: fl.name.as_str(),
+                    span: fl.value.span,
+                    kind: DeclViewKind::Source { ty },
+                }),
+                ViewDecl { ty, body, .. } => out.push(DeclView {
+                    name: fl.name.as_str(),
+                    span: fl.value.span,
+                    kind: DeclViewKind::View {
+                        ty: ty.as_ref(),
+                        body: Some(body),
+                    },
+                }),
+                DerivedDecl { ty, body, .. } => out.push(DeclView {
+                    name: fl.name.as_str(),
+                    span: fl.value.span,
+                    kind: DeclViewKind::Derived {
+                        ty: ty.as_ref(),
+                        body: Some(body),
+                    },
+                }),
+                RouteDecl { entries, .. } => out.push(DeclView {
+                    name: fl.name.as_str(),
+                    span: fl.value.span,
+                    kind: DeclViewKind::Route { entries },
+                }),
+                RouteCompositeDecl { components, .. } => out.push(DeclView {
+                    name: fl.name.as_str(),
+                    span: fl.value.span,
+                    kind: DeclViewKind::RouteComposite { components },
+                }),
+                SubsetConstraint { sub, sup } => out.push(DeclView {
+                    name: fl.name.as_str(),
+                    span: fl.value.span,
+                    kind: DeclViewKind::Subset { sub, sup },
+                }),
+                _ => {
+                    // A named value/function: any record field whose value
+                    // is not a declaration marker. This covers lambdas
+                    // (functions), signatures, AND plain value bindings
+                    // like `nums [1, 2, 3]` — all become top-level named
+                    // declarations, exactly as the Phase-1 lowering turned
+                    // `with {f v} body` fields into decls.
+                    //
+                    // A signature-only field (`name : Type` with no `=`)
+                    // is emitted by the parser as `sig: Some` + an
+                    // empty-record placeholder value. That is a required
+                    // CLI constant, NOT a `{}` binding: surface it as
+                    // `Fun { body: None }` so codegen registers a startup
+                    // `--name=value` lookup instead of checking the empty
+                    // record against the sig (which fails to type-check).
+                    let is_required_const = fl.sig.is_some()
+                        && matches!(&fl.value.node, Record(fs) if fs.is_empty());
+                    out.push(DeclView {
                         name: fl.name.as_str(),
                         span: fl.value.span,
-                        kind: DeclViewKind::Data {
-                            params,
-                            ctors: constructors,
-                        },
-                    }),
-                    TypeCtor { params, ty, .. } => out.push(DeclView {
-                        name: fl.name.as_str(),
-                        span: fl.value.span,
-                        kind: DeclViewKind::TypeAlias { params, ty },
-                    }),
-                    SourceDecl { ty, .. } => out.push(DeclView {
-                        name: fl.name.as_str(),
-                        span: fl.value.span,
-                        kind: DeclViewKind::Source { ty },
-                    }),
-                    ViewDecl { ty, body, .. } => out.push(DeclView {
-                        name: fl.name.as_str(),
-                        span: fl.value.span,
-                        kind: DeclViewKind::View {
-                            ty: ty.as_ref(),
-                            body: Some(body),
-                        },
-                    }),
-                    DerivedDecl { ty, body, .. } => out.push(DeclView {
-                        name: fl.name.as_str(),
-                        span: fl.value.span,
-                        kind: DeclViewKind::Derived {
-                            ty: ty.as_ref(),
-                            body: Some(body),
-                        },
-                    }),
-                    RouteDecl { entries, .. } => out.push(DeclView {
-                        name: fl.name.as_str(),
-                        span: fl.value.span,
-                        kind: DeclViewKind::Route { entries },
-                    }),
-                    RouteCompositeDecl { components, .. } => out.push(DeclView {
-                        name: fl.name.as_str(),
-                        span: fl.value.span,
-                        kind: DeclViewKind::RouteComposite { components },
-                    }),
-                    SubsetConstraint { sub, sup } => out.push(DeclView {
-                        name: fl.name.as_str(),
-                        span: fl.value.span,
-                        kind: DeclViewKind::Subset { sub, sup },
-                    }),
-                    _ => {
-                        // A named value/function: any record field whose value
-                        // is not a declaration marker. This covers lambdas
-                        // (functions), signatures, AND plain value bindings
-                        // like `nums [1, 2, 3]` — all become top-level named
-                        // declarations, exactly as the Phase-1 lowering turned
-                        // `with {f v} body` fields into decls.
-                        //
-                        // A signature-only field (`name : Type` with no `=`)
-                        // is emitted by the parser as `sig: Some` + an
-                        // empty-record placeholder value. That is a required
-                        // CLI constant, NOT a `{}` binding: surface it as
-                        // `Fun { body: None }` so codegen registers a startup
-                        // `--name=value` lookup instead of checking the empty
-                        // record against the sig (which fails to type-check).
-                        let is_required_const = fl.sig.is_some()
-                            && matches!(&fl.value.node, Record(fs) if fs.is_empty());
-                        out.push(DeclView {
-                            name: fl.name.as_str(),
-                            span: fl.value.span,
-                            kind: DeclViewKind::Fun {
-                                ty: fl.sig.as_ref(),
-                                body: if is_required_const {
-                                    None
-                                } else {
-                                    Some(&fl.value)
-                                },
+                        kind: DeclViewKind::Fun {
+                            ty: fl.sig.as_ref(),
+                            body: if is_required_const {
+                                None
+                            } else {
+                                Some(&fl.value)
                             },
-                        });
-                    }
+                        },
+                    });
                 }
             }
         }
-        _ => {}
-    }
-}
-
-/// Read-only recursion into all sub-expressions for non-record nodes.
-fn recurse<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
-    use ast::ExprKind::*;
-    match &e.node {
-        App { func, arg } => {
-            collect(func, out);
-            collect(arg, out);
-        }
-        Lambda { body, .. } => collect(body, out),
-        BinOp { lhs, rhs, .. } => {
-            collect(lhs, out);
-            collect(rhs, out);
-        }
-        UnaryOp { operand, .. } => collect(operand, out),
-        Case { scrutinee, arms } => {
-            collect(scrutinee, out);
-            for arm in arms {
-                collect(&arm.body, out);
-            }
-        }
-        Do(stmts) => {
-            for s in stmts {
-                match &s.node {
-                    ast::StmtKind::Bind { expr, .. } => collect(expr, out),
-                    ast::StmtKind::Where { cond } => collect(cond, out),
-                    ast::StmtKind::GroupBy { key } => collect(key, out),
-                    ast::StmtKind::Expr(x) => collect(x, out),
-                }
-            }
-        }
-        Set { target, value } | ReplaceSet { target, value } => {
-            collect(target, out);
-            collect(value, out);
-        }
-        Atomic(x) | Refine(x) => collect(x, out),
-        TimeUnitLit { value, .. } => collect(value, out),
-        RecordUpdate { base, fields } => {
-            collect(base, out);
-            for fl in fields {
-                collect(&fl.value, out);
-            }
-        }
-        List(items) => {
-            for it in items {
-                collect(it, out);
-            }
-        }
-        FieldAccess { expr, .. } | Annot { expr, .. } => collect(expr, out),
-        Serve { handlers, .. } => {
-            for h in handlers {
-                collect(&h.body, out);
-            }
-        }
-        ViewDecl { body, .. } | DerivedDecl { body, .. } => collect(body, out),
-        _ => {}
     }
 }

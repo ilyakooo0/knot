@@ -89,46 +89,43 @@ pub(crate) fn handle_code_lens(
         });
 
         // Route URL preview + dead-route lint lens.
-        match &decl.value.node {
-            ExprKind::RouteDecl { name, entries } => {
-                // Per-entry URL preview lens, anchored at the route header. Each
-                // entry's constructor is also separately hoverable for the same
-                // info; this lens makes the URL space visible at a glance.
-                for entry in entries {
-                    let method = http_method_str(entry.method);
-                    let path = format_route_path(entry);
-                    lenses.push(CodeLens {
-                        range: Range {
-                            start: range.start,
-                            end: range.start,
-                        },
-                        command: Some(Command {
-                            title: format!("{method} {path} → {}", entry.constructor),
-                            command: String::new(),
-                            arguments: None,
-                        }),
-                        data: None,
-                    });
-                }
-                // Dead-route lint: this route is never composed into a `listen`
-                // call within the current document. Surface it as a lens so the
-                // user can see at a glance.
-                if !route_is_listened(&doc.module, name) {
-                    lenses.push(CodeLens {
-                        range: Range {
-                            start: range.start,
-                            end: range.start,
-                        },
-                        command: Some(Command {
-                            title: "⚠ no `listen` handler references this route".to_string(),
-                            command: String::new(),
-                            arguments: None,
-                        }),
-                        data: None,
-                    });
-                }
+        if let ExprKind::RouteDecl { name, entries } = &decl.value.node {
+            // Per-entry URL preview lens, anchored at the route header. Each
+            // entry's constructor is also separately hoverable for the same
+            // info; this lens makes the URL space visible at a glance.
+            for entry in entries {
+                let method = http_method_str(entry.method);
+                let path = format_route_path(entry);
+                lenses.push(CodeLens {
+                    range: Range {
+                        start: range.start,
+                        end: range.start,
+                    },
+                    command: Some(Command {
+                        title: format!("{method} {path} → {}", entry.constructor),
+                        command: String::new(),
+                        arguments: None,
+                    }),
+                    data: None,
+                });
             }
-            _ => {}
+            // Dead-route lint: this route is never composed into a `listen`
+            // call within the current document. Surface it as a lens so the
+            // user can see at a glance.
+            if !route_is_listened(&doc.module, name) {
+                lenses.push(CodeLens {
+                    range: Range {
+                        start: range.start,
+                        end: range.start,
+                    },
+                    command: Some(Command {
+                        title: "⚠ no `listen` handler references this route".to_string(),
+                        command: String::new(),
+                        arguments: None,
+                    }),
+                    data: None,
+                });
+            }
         }
     }
 

@@ -694,7 +694,7 @@ fn analyze_unopened_file_inner(
         // 0:0). We keep only diagnostics anchored within this file's own
         // declarations.
         let own_ranges: Vec<(usize, usize)> =
-            crate::utils::top_fields(&module).iter().map(|d| (d.value.span.start, d.value.span.end)).collect();
+            crate::utils::top_fields(module).iter().map(|d| (d.value.span.start, d.value.span.end)).collect();
 
         let mut analysis_module = module.clone();
 
@@ -719,7 +719,7 @@ fn analyze_unopened_file_inner(
 
         // Unused-definition warnings: use pre-prelude decls so prelude/imported
         // names are not flagged.
-        all_diags.extend(knot_compiler::unused::check(&module));
+        all_diags.extend(knot_compiler::unused::check(module));
 
         let type_env = knot_compiler::types::TypeEnv::from_program(&analysis_module);
         all_diags.extend(

@@ -599,7 +599,7 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
                 format!("{name} {}", pat(payload))
             }
             ast::PatKind::List(pats) => {
-                format!("[{}]", pats.iter().map(|p| pat(p)).collect::<Vec<_>>().join(", "))
+                format!("[{}]", pats.iter().map(pat).collect::<Vec<_>>().join(", "))
             }
             ast::PatKind::Cons { head, tail } => {
                 format!("Cons {} {}", pat(head), pat(tail))

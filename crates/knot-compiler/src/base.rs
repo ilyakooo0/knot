@@ -140,8 +140,8 @@ pub(crate) fn prelude_base_record() -> ast::Expr {
     // Inject the stdlib builtins as fields of the nested `base` record.
     let dummy_span = ast::Span::new(0, 0);
     let mut base_record = None;
-    if let ast::ExprKind::Record(outer) = &mut prelude_record.node {
-        if let Some(base_field) = outer.iter_mut().find(|f| f.name == "base") {
+    if let ast::ExprKind::Record(outer) = &mut prelude_record.node
+        && let Some(base_field) = outer.iter_mut().find(|f| f.name == "base") {
             if let ast::ExprKind::Record(base_fields) = &mut base_field.value.node {
                 for name in BASE_STDLIB_FNS {
                     base_fields.push(ast::RecordField {
@@ -156,7 +156,6 @@ pub(crate) fn prelude_base_record() -> ast::Expr {
             }
             base_record = Some(base_field.value.clone());
         }
-    }
     let mut record = base_record.expect("prelude source has no `base` field");
     shift_expr_spans(&mut record, PRELUDE_SPAN_OFFSET);
     record

@@ -145,11 +145,8 @@ fn collect_field_name_spans(
         }
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
-                match &stmt.node {
-                    ast::StmtKind::Bind { pat, .. } => {
-                        collect_pat_field_spans(pat, field_name, source, ranges, pun_seen);
-                    }
-                    _ => {}
+                if let ast::StmtKind::Bind { pat, .. } = &stmt.node {
+                    collect_pat_field_spans(pat, field_name, source, ranges, pun_seen);
                 }
             }
         }

@@ -88,6 +88,7 @@ fn collect_record_source_fields(
     out
 }
 
+#[allow(clippy::only_used_in_recursion)] // `out` is the accumulator
 fn collect_source_fields_in_expr(
     expr: &Expr,
     out: &mut std::collections::HashMap<String, Vec<(String, RecordRelKind)>>,
@@ -863,20 +864,17 @@ fn desugar_do_stmts(stmts: &mut [Stmt], io_fns: &IoFns, source_vars: &HashSet<St
     let mut local = source_vars.clone();
     for stmt in stmts.iter_mut() {
         desugar_stmt(stmt, io_fns, &local);
-        match &stmt.node {
-            StmtKind::Bind { pat, expr } => {
-                let mut bound: Vec<String> = Vec::new();
-                pat_bound_names(pat, &mut bound);
-                let is_source_read = matches!(&expr.node, ExprKind::SourceRef(_));
-                if let (PatKind::Var(name), true) = (&pat.node, is_source_read) {
-                    local.insert(name.clone());
-                } else {
-                    for n in &bound {
-                        local.remove(n);
-                    }
+        if let StmtKind::Bind { pat, expr } = &stmt.node {
+            let mut bound: Vec<String> = Vec::new();
+            pat_bound_names(pat, &mut bound);
+            let is_source_read = matches!(&expr.node, ExprKind::SourceRef(_));
+            if let (PatKind::Var(name), true) = (&pat.node, is_source_read) {
+                local.insert(name.clone());
+            } else {
+                for n in &bound {
+                    local.remove(n);
                 }
             }
-            _ => {}
         }
     }
 }

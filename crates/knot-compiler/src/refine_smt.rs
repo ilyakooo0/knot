@@ -57,7 +57,7 @@ pub fn implies(source_preds: &[ast::Expr], target_preds: &[ast::Expr], base: Bas
     // ∧P_S ∧ ¬(∧P_T) unsat  ⟺  ∧P_S ⟹ ∧P_T valid.  ¬(∧P_T) = ∨(¬P_T_i).
     let neg_tgt: Vec<Bool> = tgt.iter().map(|f| f.not()).collect();
     let neg_tgt_refs: Vec<&Bool> = neg_tgt.iter().collect();
-    solver.assert(&Bool::or(&neg_tgt_refs));
+    solver.assert(Bool::or(&neg_tgt_refs));
     solver.check() == SatResult::Unsat
 }
 

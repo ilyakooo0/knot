@@ -47,6 +47,7 @@ pub struct ModuleFingerprint {
     /// upstream decl's *externally-visible* type/shape changed, not when a
     /// signed body got rewritten internally. Reduces cascade re-analysis on
     /// the common "edit a function body" workflow.
+    #[allow(dead_code)] // signature-hash invalidation not yet wired
     pub decl_signature_hashes: HashMap<String, u64>,
     /// Dependency graph: `decl_name → set of top-level names it references`.
     /// References include calls to other functions, type uses, and
@@ -98,6 +99,7 @@ impl ModuleFingerprint {
     /// `changed_decls` but NOT here. Drives the cross-file dependent
     /// re-queue: dependents of `f` only need re-analysis when `f`'s
     /// outward-facing type or shape moves.
+    #[allow(dead_code)] // signature-hash invalidation not yet wired
     pub fn signature_changed_decls(&self, prev: &ModuleFingerprint) -> HashSet<String> {
         let mut changed: HashSet<String> = HashSet::new();
         for (k, h) in &self.decl_signature_hashes {

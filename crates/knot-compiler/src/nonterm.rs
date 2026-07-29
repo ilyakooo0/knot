@@ -148,8 +148,8 @@ fn collect_unguarded_calls<'a>(
         App { .. } => {
             // Peel the application spine to find the head and its arguments.
             let (head, args) = peel_app(expr);
-            if let Var(name) = &head.node {
-                if let Some(callee) = defs.get(name.as_str()) {
+            if let Var(name) = &head.node
+                && let Some(callee) = defs.get(name.as_str()) {
                     // A param'd self-application that passes the caller's own
                     // parameters unchanged makes no progress toward a base
                     // case — it loops forever. Only such edges prove
@@ -161,7 +161,6 @@ fn collect_unguarded_calls<'a>(
                         out.push(name.clone());
                     }
                 }
-            }
             // The head and every argument are still evaluated unconditionally.
             collect_unguarded_calls(head, defs, caller_name, caller, out);
             for a in args {

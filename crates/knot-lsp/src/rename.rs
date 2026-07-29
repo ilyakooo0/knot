@@ -967,7 +967,7 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::RecordField, source: &s
                 }
             }
         }
-        ast::ExprKind::SourceDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. }
+        ast::ExprKind::RouteCompositeDecl { .. }
         | ast::ExprKind::SubsetConstraint { .. } => {}
         _ => {
             // A named function field: walk its body.
@@ -1023,11 +1023,8 @@ fn field_sites_in_expr<F: FnMut(&str, Span)>(expr: &ast::Expr, source: &str, f: 
         }
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
-                match &stmt.node {
-                    ast::StmtKind::Bind { pat, .. } => {
-                        field_sites_in_pat(pat, source, f);
-                    }
-                    _ => {}
+                if let ast::StmtKind::Bind { pat, .. } = &stmt.node {
+                    field_sites_in_pat(pat, source, f);
                 }
             }
         }

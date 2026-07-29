@@ -47,9 +47,7 @@ pub(crate) fn handle_document_highlight(
                 .copied()
         });
 
-    let Some(def_span) = def_span else {
-        return None;
-    };
+    let def_span = def_span?;
 
     let mut highlights = Vec::new();
 

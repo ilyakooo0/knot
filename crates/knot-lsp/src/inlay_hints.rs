@@ -77,52 +77,48 @@ pub(crate) fn handle_inlay_hint(
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => continue,
             _ => (decl.name.as_str(), decl.sig.as_ref(), false),
         };
-        match (fname, fsig, is_relation_marker) {
-            (name, None, marker) => {
-                if let Some(inferred) = doc.type_info.get(name) {
-                    let decl_text = safe_slice(&doc.source, dspan);
-                    // View/derived markers begin with a `*`/`&` sigil that
-                    // `dspan.start` points at; skip it before scanning for the
-                    // end of the name so the hint doesn't land on the sigil.
-                    let sigil_len = if marker {
-                        decl_text
-                            .chars()
-                            .next()
-                            .filter(|c| *c == '*' || *c == '&')
-                            .map_or(0, char::len_utf8)
-                    } else {
-                        0
-                    };
-                    // `'` continues identifiers in the lexer (`x'` is one
-                    // token), so the hint anchor must skip it too — otherwise
-                    // `x' = 1` renders as `x : Int' = 1`.
-                    let name_end = decl_text[sigil_len..]
-                        .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
-                        .map(|p| sigil_len + p)
-                        .unwrap_or(decl_text.len());
-                    let hint_offset = dspan.start + name_end;
-                    let hint_pos = offset_to_position(&doc.source, hint_offset);
-                    // Text edit emits the signature as a separate statement above the
-                    // function, so anchor it at the declaration start, not at the hint.
-                    let edit_pos = offset_to_position(&doc.source, dspan.start);
-                    let full_sig = inferred.clone();
-                    hints.push(InlayHint {
-                        position: hint_pos,
-                        label: InlayHintLabel::String(format!(": {full_sig}")),
-                        kind: Some(InlayHintKind::TYPE),
-                        text_edits: Some(vec![TextEdit {
-                            range: Range { start: edit_pos, end: edit_pos },
-                            new_text: format!("{name} : {full_sig}\n"),
-                        }]),
-                        tooltip: None,
-                        padding_left: Some(true),
-                        padding_right: Some(true),
-                        data: None,
-                    });
-                }
+        if let (name, None, marker) = (fname, fsig, is_relation_marker)
+            && let Some(inferred) = doc.type_info.get(name) {
+                let decl_text = safe_slice(&doc.source, dspan);
+                // View/derived markers begin with a `*`/`&` sigil that
+                // `dspan.start` points at; skip it before scanning for the
+                // end of the name so the hint doesn't land on the sigil.
+                let sigil_len = if marker {
+                    decl_text
+                        .chars()
+                        .next()
+                        .filter(|c| *c == '*' || *c == '&')
+                        .map_or(0, char::len_utf8)
+                } else {
+                    0
+                };
+                // `'` continues identifiers in the lexer (`x'` is one
+                // token), so the hint anchor must skip it too — otherwise
+                // `x' = 1` renders as `x : Int' = 1`.
+                let name_end = decl_text[sigil_len..]
+                    .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
+                    .map(|p| sigil_len + p)
+                    .unwrap_or(decl_text.len());
+                let hint_offset = dspan.start + name_end;
+                let hint_pos = offset_to_position(&doc.source, hint_offset);
+                // Text edit emits the signature as a separate statement above the
+                // function, so anchor it at the declaration start, not at the hint.
+                let edit_pos = offset_to_position(&doc.source, dspan.start);
+                let full_sig = inferred.clone();
+                hints.push(InlayHint {
+                    position: hint_pos,
+                    label: InlayHintLabel::String(format!(": {full_sig}")),
+                    kind: Some(InlayHintKind::TYPE),
+                    text_edits: Some(vec![TextEdit {
+                        range: Range { start: edit_pos, end: edit_pos },
+                        new_text: format!("{name} : {full_sig}\n"),
+                    }]),
+                    tooltip: None,
+                    padding_left: Some(true),
+                    padding_right: Some(true),
+                    data: None,
+                });
             }
-            _ => {}
-        }
     }
 
     // Show inferred types for local bindings (let/bind in do blocks). Reads

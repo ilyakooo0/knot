@@ -1034,6 +1034,7 @@ enum LintPipeOp<'a> {
         body: &'a Expr,
         span: Span,
     },
+    #[allow(dead_code)] // sum-pipe not yet wired
     Sum {
         bind_var: String,
         body: &'a Expr,
@@ -1190,6 +1191,7 @@ fn try_sql_sortby_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> 
 /// Check if a lambda body can be compiled to a SQL expression.
 /// Mirrors codegen's `extract_sql_field_access` which handles simple field access,
 /// arithmetic expressions (including ++), and built-in functions.
+#[allow(clippy::only_used_in_recursion)] // `schema` is threaded context
 fn try_sql_column_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> {
     match &body.node {
         ExprKind::FieldAccess { expr, .. } => {

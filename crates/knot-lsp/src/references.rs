@@ -95,9 +95,7 @@ pub(crate) fn handle_references(
         });
 
     // Nothing resolved: not a definition and not a local usage.
-    let Some(def_span) = local_def else {
-        return None;
-    };
+    let def_span = local_def?;
 
     let mut locations = Vec::new();
 

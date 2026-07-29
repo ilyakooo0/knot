@@ -406,7 +406,7 @@ impl<'a> Parser<'a> {
                 // Postfix unit argument: `Float M`, `Float (M / S^2)`.
                 // Only applies to numeric primitives (Int/Float).
                 self.skip_ws();
-                if type_takes_unit(&node) && self.peek().map_or(false, |c| c.is_alphabetic() || c == '(') {
+                if type_takes_unit(&node) && self.peek().is_some_and(|c| c.is_alphabetic() || c == '(') {
                     let saved = self.pos;
                     if let Some(unit) = self.parse_unit_arg() {
                         node = ParsedType::UnitAnnotated {

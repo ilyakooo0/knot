@@ -224,9 +224,7 @@ fn main() {
                         // need raw delimiter that doesn't clash: content may
                         // contain `"#`? use r##"..."## if content has "#
                         let delim = if new.contains("\"#") { "##" } else { "#" };
-                        let closing: String = std::iter::repeat('#')
-                            .take(delim.len())
-                            .collect();
+                        let closing = "#".repeat(delim.len());
                         format!("r{delim}\"{new}\"{closing}")
                     } else {
                         format!("\"{}\"", escape_for_rust(&new))

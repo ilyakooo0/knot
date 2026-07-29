@@ -50,6 +50,28 @@ unless : Bool -> IO {} -> IO {}
 unless (\cond action -> case cond of
   Bool.True {} -> yield {}
   Bool.False {} -> action)
+
+-- List ADT namespace (`base.list.*`). Each field is a codegen builtin
+-- (`Var(listX)` resolves to the registered knot_list_* function value), so
+-- the prelude record needs no self-reference for recursion. `nil` is the
+-- `listNil` builtin (a 1-arg fn that ignores its argument and returns the
+-- empty list); call it as `base.list.nil {}` so the element type stays
+-- polymorphic per call site. The rest are the function values themselves.
+list {
+nil listNil
+cons listCons
+isNil listIsNil
+head listHead
+tail listTail
+length listLength
+map listMap
+filter listFilter
+fold listFold
+reverse listReverse
+append listAppend
+fromRelation listFromRelation
+toRelation listToRelation
+}
 }
 }
 "#;

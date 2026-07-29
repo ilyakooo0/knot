@@ -1346,6 +1346,21 @@ impl Codegen {
         self.declare_rt("knot_relation_count_where", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_upsert_by", &[p, p, p, p], &[p]);
 
+        // Standard library: List ADT operations (`base.list.*`)
+        self.declare_rt("knot_list_nil", &[p], &[p]);
+        self.declare_rt("knot_list_cons", &[p, p], &[p]);
+        self.declare_rt("knot_list_is_nil", &[p], &[p]);
+        self.declare_rt("knot_list_head", &[p], &[p]);
+        self.declare_rt("knot_list_tail", &[p], &[p]);
+        self.declare_rt("knot_list_length", &[p], &[p]);
+        self.declare_rt("knot_list_map", &[p, p, p], &[p]);
+        self.declare_rt("knot_list_filter", &[p, p, p], &[p]);
+        self.declare_rt("knot_list_fold", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_list_reverse", &[p], &[p]);
+        self.declare_rt("knot_list_append", &[p, p], &[p]);
+        self.declare_rt("knot_list_from_relation", &[p], &[p]);
+        self.declare_rt("knot_list_to_relation", &[p], &[p]);
+
         // Standard library: text operations
         self.declare_rt("knot_text_to_upper", &[p], &[p]);
         self.declare_rt("knot_text_to_lower", &[p], &[p]);
@@ -1931,6 +1946,10 @@ impl Codegen {
             "Bool".into(),
             vec!["True".into(), "False".into()],
         );
+        self.data_constructors.insert(
+            "List".into(),
+            vec!["Nil".into(), "Cons".into()],
+        );
 
         // __bind/__yield/__empty are desugared do-block operations that dispatch
         // through Monad/Applicative/Alternative trait impls (see compile_app,
@@ -1982,6 +2001,12 @@ impl Codegen {
             "println", "print", "putLine",
             "logInfo", "logWarn", "logError", "logDebug",
             "show",
+            // List ADT builtins (`base.list.*`), exposed nested under the
+            // `list` namespace in the prelude record. Runtime-implemented
+            // (knot_list_*) since the prelude record can't self-reference.
+            "listNil", "listCons", "listIsNil", "listHead", "listTail",
+            "listLength", "listMap", "listFilter", "listFold", "listReverse",
+            "listAppend", "listFromRelation", "listToRelation",
         ];
         for name in &stdlib_names {
             self.register_stdlib_fn(name);
@@ -2780,6 +2805,24 @@ impl Codegen {
         self.define_stdlib_fn_2("countWhere", "knot_relation_count_where", true);
         self.define_stdlib_fn_2("any", "knot_relation_any", true);
         self.define_stdlib_fn_2("all", "knot_relation_all", true);
+
+        // List ADT builtins (`base.list.*`). Order-preserving sequence ops,
+        // runtime-implemented (knot_list_*). Higher-order ones (map/filter/
+        // fold) need `db` for `knot_value_call`; the pure constructors/
+        // accessors/structural ones do not.
+        self.define_stdlib_fn_1("listNil", "knot_list_nil");
+        self.define_stdlib_fn_2("listCons", "knot_list_cons", false);
+        self.define_stdlib_fn_1("listIsNil", "knot_list_is_nil");
+        self.define_stdlib_fn_1("listHead", "knot_list_head");
+        self.define_stdlib_fn_1("listTail", "knot_list_tail");
+        self.define_stdlib_fn_1("listLength", "knot_list_length");
+        self.define_stdlib_fn_2("listMap", "knot_list_map", true);
+        self.define_stdlib_fn_2("listFilter", "knot_list_filter", true);
+        self.define_stdlib_fn_3("listFold", "knot_list_fold");
+        self.define_stdlib_fn_1("listReverse", "knot_list_reverse");
+        self.define_stdlib_fn_2("listAppend", "knot_list_append", false);
+        self.define_stdlib_fn_1("listFromRelation", "knot_list_from_relation");
+        self.define_stdlib_fn_1("listToRelation", "knot_list_to_relation");
 
         // Bytes: 1-param
         self.define_stdlib_fn_1("bytesLength", "knot_bytes_length");
@@ -4281,7 +4324,7 @@ impl Codegen {
                 // User ctors are handled by `embedded_ctors` above; this case
                 // only fires for the built-in types (never in `embedded_ctors`).
                 if let ast::ExprKind::Constructor(type_name) = &expr.node
-                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Bool" | "Ordering")
+                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Bool" | "Ordering" | "List")
                     && self
                         .data_constructors
                         .get(type_name.as_str())

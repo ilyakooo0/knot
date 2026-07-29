@@ -9105,6 +9105,47 @@ impl Infer {
             },
         );
 
+        // Built-in ADT: data List a = Nil {} | Cons {head: a, tail: List a}
+        // A singly-linked list. `tail` is self-referential (`List a`), so the
+        // recursion lives in the type, not in codegen. Registered as an
+        // intrinsic (like `Maybe`/`Result`) because the prelude's `base` record
+        // bypasses the desugar hoist that would otherwise lift a user
+        // `with`-record's embedded `data` into the global type env.
+        let list_a_ty = || ast::Type::new(
+            ast::TypeKind::App {
+                func: Box::new(ast::Type::new(ast::TypeKind::Named("List".into()), dummy_span)),
+                arg: Box::new(ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span)),
+            },
+            dummy_span,
+        );
+        let a_var = || ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span);
+        self.constructors.insert(
+            "Nil".into(),
+            vec![CtorInfo {
+                data_type: "List".into(),
+                data_params: vec!["a".into()],
+                fields: vec![],
+            }],
+        );
+        self.constructors.insert(
+            "Cons".into(),
+            vec![CtorInfo {
+                data_type: "List".into(),
+                data_params: vec!["a".into()],
+                fields: vec![("head".into(), a_var()), ("tail".into(), list_a_ty())],
+            }],
+        );
+        self.data_types.insert(
+            "List".into(),
+            DataInfo {
+                params: vec!["a".into()],
+                ctors: vec![
+                    ("Nil".into(), vec![]),
+                    ("Cons".into(), vec![("head".into(), a_var()), ("tail".into(), list_a_ty())]),
+                ],
+            },
+        );
+
         // Built-in type: RefinementError = {typeName: Text, violations: [{field: Maybe Text, message: Text}]}
         // Register as a type alias so field access (e.typeName) works.
         self.aliases.insert(
@@ -9932,6 +9973,216 @@ impl Infer {
                             Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
                             Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(a)])),
                         )),
+                    ),
+                ),
+            );
+        }
+
+        // ── List ADT builtins (`base.list.*`) ─────────────────────────────
+        // Runtime-implemented (knot_list_*); the prelude record can't
+        // self-reference for recursion, so these are codegen builtins. Names
+        // are `list`-prefixed to avoid clashing with the flat relation
+        // builtins (`map`/`length`/`head`/`reverse` operate on `[a]`).
+        // List is a sequence: order-preserving, duplicates allowed.
+        {
+            // listCons : ∀a. a -> List a -> List a
+            let a = self.fresh_var();
+            let list_a = || Ty::Con("List".into(), vec![Ty::Var(a)]);
+            self.bind_top(
+                "listCons",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Var(a)),
+                        Box::new(Ty::Fun(Box::new(list_a()), Box::new(list_a()))),
+                    ),
+                ),
+            );
+        }
+        // listNil : ∀a b. b -> List a   (exposed as a 1-arg builtin that
+        // ignores its argument, so the bare function value has the standard
+        // 1-param shape. The param type `b` is independent of the element
+        // type `a`, so applying it to any value — e.g. `nil {}` — leaves `a`
+        // free to unify per call site, keeping `nil` polymorphic.)
+        {
+            let a = self.fresh_var();
+            let b = self.fresh_var();
+            self.bind_top(
+                "listNil",
+                Scheme::poly(
+                    vec![a, b],
+                    Ty::Fun(
+                        Box::new(Ty::Var(b)),
+                        Box::new(Ty::Con("List".into(), vec![Ty::Var(a)])),
+                    ),
+                ),
+            );
+        }
+        // listIsNil : ∀a. List a -> Bool
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "listIsNil",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Con("List".into(), vec![Ty::Var(a)])),
+                        Box::new(Ty::Bool),
+                    ),
+                ),
+            );
+        }
+        // listHead : ∀a. List a -> Maybe a
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "listHead",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Con("List".into(), vec![Ty::Var(a)])),
+                        Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(a)])),
+                    ),
+                ),
+            );
+        }
+        // listTail : ∀a. List a -> Maybe (List a)
+        {
+            let a = self.fresh_var();
+            let list_a = || Ty::Con("List".into(), vec![Ty::Var(a)]);
+            self.bind_top(
+                "listTail",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(list_a()),
+                        Box::new(Ty::Con("Maybe".into(), vec![list_a()])),
+                    ),
+                ),
+            );
+        }
+        // listLength : ∀a. List a -> Int  (dimensionless)
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "listLength",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Con("List".into(), vec![Ty::Var(a)])),
+                        Box::new(Ty::int_with_unit(UnitTy::dimensionless())),
+                    ),
+                ),
+            );
+        }
+        // listMap : ∀a b. (a -> b) -> List a -> List b
+        {
+            let a = self.fresh_var();
+            let b = self.fresh_var();
+            self.bind_top(
+                "listMap",
+                Scheme::poly(
+                    vec![a, b],
+                    Ty::Fun(
+                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Con("List".into(), vec![Ty::Var(a)])),
+                            Box::new(Ty::Con("List".into(), vec![Ty::Var(b)])),
+                        )),
+                    ),
+                ),
+            );
+        }
+        // listFilter : ∀a. (a -> Bool) -> List a -> List a
+        {
+            let a = self.fresh_var();
+            let list_a = || Ty::Con("List".into(), vec![Ty::Var(a)]);
+            self.bind_top(
+                "listFilter",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Bool))),
+                        Box::new(Ty::Fun(Box::new(list_a()), Box::new(list_a()))),
+                    ),
+                ),
+            );
+        }
+        // listFold : ∀a b. (b -> a -> b) -> b -> List a -> b
+        {
+            let a = self.fresh_var();
+            let b = self.fresh_var();
+            self.bind_top(
+                "listFold",
+                Scheme::poly(
+                    vec![a, b],
+                    Ty::Fun(
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Var(b)),
+                            Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                        )),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Var(b)),
+                            Box::new(Ty::Fun(
+                                Box::new(Ty::Con("List".into(), vec![Ty::Var(a)])),
+                                Box::new(Ty::Var(b)),
+                            )),
+                        )),
+                    ),
+                ),
+            );
+        }
+        // listReverse : ∀a. List a -> List a
+        {
+            let a = self.fresh_var();
+            let list_a = || Ty::Con("List".into(), vec![Ty::Var(a)]);
+            self.bind_top(
+                "listReverse",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(Box::new(list_a()), Box::new(list_a())),
+                ),
+            );
+        }
+        // listAppend : ∀a. List a -> List a -> List a
+        {
+            let a = self.fresh_var();
+            let list_a = || Ty::Con("List".into(), vec![Ty::Var(a)]);
+            self.bind_top(
+                "listAppend",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(list_a()),
+                        Box::new(Ty::Fun(Box::new(list_a()), Box::new(list_a()))),
+                    ),
+                ),
+            );
+        }
+        // listFromRelation : ∀a. [a] -> List a
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "listFromRelation",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Con("List".into(), vec![Ty::Var(a)])),
+                    ),
+                ),
+            );
+        }
+        // listToRelation : ∀a. List a -> [a]
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "listToRelation",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Con("List".into(), vec![Ty::Var(a)])),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                     ),
                 ),
             );

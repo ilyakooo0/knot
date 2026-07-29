@@ -10255,6 +10255,228 @@ pub extern "C-unwind" fn knot_relation_single(rel: *mut Value) -> *mut Value {
     }
 }
 
+// ── Standard library: List ADT operations (`base.list.*`) ────────────────
+//
+// The `List a` ADT is `Constructor("Nil", unit)` | `Constructor("Cons",
+// record{head, tail})`. These mirror the relation builtins but preserve
+// order and allow duplicates (List is a sequence, not a set). Implemented
+// as runtime builtins (not knot source) because the prelude `base` record
+// cannot self-reference for recursion.
+
+/// Build `Cons {head, tail}`. Record fields are kept sorted ("head" < "tail").
+fn list_cons(head: *mut Value, tail: *mut Value) -> *mut Value {
+    let record = alloc(Value::Record(vec![
+        RecordField { name: intern_str("head"), value: head },
+        RecordField { name: intern_str("tail"), value: tail },
+    ]));
+    alloc(Value::Constructor(intern_str("Cons"), record))
+}
+
+/// Build the `Nil` constructor.
+fn list_nil() -> *mut Value {
+    alloc(Value::Constructor(intern_str("Nil"), encode_unit()))
+}
+
+/// Destructure a `List` value into `Some((head, tail))` for `Cons`, `None` for `Nil`.
+fn list_uncons(v: *mut Value) -> Option<(*mut Value, *mut Value)> {
+    match unsafe { as_ref(v) } {
+        Value::Constructor(tag, payload) if &**tag == "Nil" => None,
+        Value::Constructor(tag, payload) if &**tag == "Cons" => {
+            let head = knot_record_field(*payload, b"head".as_ptr(), 4);
+            let tail = knot_record_field(*payload, b"tail".as_ptr(), 4);
+            Some((head, tail))
+        }
+        _ => panic!("knot runtime: expected List (Nil/Cons), got {}", type_name(v)),
+    }
+}
+
+/// Wrap a value in `Just {value}`.
+fn maybe_just(v: *mut Value) -> *mut Value {
+    let record = alloc(Value::Record(vec![RecordField { name: intern_str("value"), value: v }]));
+    alloc(Value::Constructor(intern_str("Just"), record))
+}
+
+/// The `Nothing` constructor.
+fn maybe_nothing() -> *mut Value {
+    alloc(Value::Constructor(intern_str("Nothing"), encode_unit()))
+}
+
+/// nil — the empty List (1-arg builtin that ignores its argument, so the
+/// bare `base.list.nil` function value has the standard 1-param shape).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_nil(_ignored: *mut Value) -> *mut Value {
+    list_nil()
+}
+
+/// cons(head, tail) — prepend an element.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_cons(head: *mut Value, tail: *mut Value) -> *mut Value {
+    list_cons(head, tail)
+}
+
+/// isNil(xs) — is the list empty?
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_is_nil(xs: *mut Value) -> *mut Value {
+    encode_bool(list_uncons(xs).is_none())
+}
+
+/// head(xs) — first element as a Maybe.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_head(xs: *mut Value) -> *mut Value {
+    match list_uncons(xs) {
+        Some((h, _)) => maybe_just(h),
+        None => maybe_nothing(),
+    }
+}
+
+/// tail(xs) — all but the first element as a Maybe.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_tail(xs: *mut Value) -> *mut Value {
+    match list_uncons(xs) {
+        Some((_, t)) => maybe_just(t),
+        None => maybe_nothing(),
+    }
+}
+
+/// length(xs) — number of elements.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_length(xs: *mut Value) -> *mut Value {
+    let mut n: i64 = 0;
+    let mut cur = xs;
+    while let Some((_, tail)) = list_uncons(cur) {
+        n += 1;
+        cur = tail;
+    }
+    knot_value_int(n)
+}
+
+/// map(f, xs) — apply f to each element, preserving order.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_map(
+    db: *mut c_void,
+    f: *mut Value,
+    xs: *mut Value,
+) -> *mut Value {
+    // Collect mapped elements, then rebuild front-to-back (avoids O(n^2)
+    // append and keeps the recursion iterative in Rust).
+    let mut elems: Vec<*mut Value> = Vec::new();
+    let mut cur = xs;
+    while let Some((h, tail)) = list_uncons(cur) {
+        elems.push(knot_value_call(db, f, h));
+        cur = tail;
+    }
+    let mut out = list_nil();
+    for &e in elems.iter().rev() {
+        out = list_cons(e, out);
+    }
+    out
+}
+
+/// filter(p, xs) — keep elements where p holds, preserving order.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_filter(
+    db: *mut c_void,
+    p: *mut Value,
+    xs: *mut Value,
+) -> *mut Value {
+    let mut elems: Vec<*mut Value> = Vec::new();
+    let mut cur = xs;
+    while let Some((h, tail)) = list_uncons(cur) {
+        let keep = match unsafe { as_ref(knot_value_call(db, p, h)) } {
+            Value::Bool(b) => *b,
+            other => panic!(
+                "knot runtime: listFilter predicate must return Bool, got {}",
+                type_name(other as *const Value as *mut Value)
+            ),
+        };
+        if keep {
+            elems.push(h);
+        }
+        cur = tail;
+    }
+    let mut out = list_nil();
+    for &e in elems.iter().rev() {
+        out = list_cons(e, out);
+    }
+    out
+}
+
+/// fold(f, acc, xs) — left fold. f is 2-arg curried: f acc x.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_fold(
+    db: *mut c_void,
+    f: *mut Value,
+    acc: *mut Value,
+    xs: *mut Value,
+) -> *mut Value {
+    let mut acc = acc;
+    let mut cur = xs;
+    while let Some((h, tail)) = list_uncons(cur) {
+        acc = knot_value_call(db, knot_value_call(db, f, acc), h);
+        cur = tail;
+    }
+    acc
+}
+
+/// reverse(xs) — reverse the list.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_reverse(xs: *mut Value) -> *mut Value {
+    let mut out = list_nil();
+    let mut cur = xs;
+    while let Some((h, tail)) = list_uncons(cur) {
+        out = list_cons(h, out);
+        cur = tail;
+    }
+    out
+}
+
+/// append(xs, ys) — concatenate two lists.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_append(xs: *mut Value, ys: *mut Value) -> *mut Value {
+    // Collect xs front-to-back, then rebuild onto ys.
+    let mut elems: Vec<*mut Value> = Vec::new();
+    let mut cur = xs;
+    while let Some((h, tail)) = list_uncons(cur) {
+        elems.push(h);
+        cur = tail;
+    }
+    let mut out = ys;
+    for &e in elems.iter().rev() {
+        out = list_cons(e, out);
+    }
+    out
+}
+
+/// fromRelation([a]) — build a List from a relation's rows (order preserved).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_from_relation(rel: *mut Value) -> *mut Value {
+    let rows = match unsafe { as_ref(rel) } {
+        Value::Relation(rows) => rows,
+        Value::Unit => return list_nil(),
+        _ => panic!(
+            "knot runtime: listFromRelation expected Relation, got {}",
+            type_name(rel)
+        ),
+    };
+    let mut out = list_nil();
+    for &r in rows.iter().rev() {
+        out = list_cons(r, out);
+    }
+    out
+}
+
+/// toRelation(List) — collect the list's elements into a relation.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_list_to_relation(xs: *mut Value) -> *mut Value {
+    let mut rows: Vec<*mut Value> = Vec::new();
+    let mut cur = xs;
+    while let Some((h, tail)) = list_uncons(cur) {
+        rows.push(h);
+        cur = tail;
+    }
+    alloc(Value::Relation(rows))
+}
+
 // ── Standard library: derived relation operations ────────────────
 
 /// diff(a, b) — rows in a but not in b

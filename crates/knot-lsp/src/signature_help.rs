@@ -58,15 +58,11 @@ pub(crate) fn handle_signature_help(
         .map(|d| d.value.span)
         .find(|s| s.start <= offset && offset < s.end);
     let local = lookup_local_binding_type(doc, &func_name, offset, enclosing);
-    let type_str_owned: String;
-    let type_str: &str = if let Some(local) = local {
-        type_str_owned = local;
-        type_str_owned.as_str()
-    } else if let Some(global) = doc.type_info.get(func_name.as_str()) {
-        global.as_str()
-    } else {
-        return None;
+    let type_str_owned: String = match local {
+        Some(local) => local,
+        None => doc.type_info.get(func_name.as_str())?.clone(),
     };
+    let type_str: &str = type_str_owned.as_str();
 
     // Parse arrow-separated parameters from the type string
     let param_types = parse_function_params(type_str);

@@ -369,11 +369,9 @@ fork : IO a -> IO {}
 ```
 
 Run an IO action on a new OS thread (fire-and-forget). The spawned action can
-return any value `a` (it is discarded) and may have any effect row `r`. That
-effect row propagates through `fork` to the caller, so a program that forks an
-IO performing `println` is visibly typed with `{console}` in its IO row. Each
-thread gets its own SQLite connection via WAL mode for safe concurrent access.
-The main thread waits for all spawned threads before exiting.
+return any value `a` (it is discarded). Each thread gets its own SQLite
+connection via WAL mode for safe concurrent access. The main thread waits for
+all spawned threads before exiting.
 
 ```knot
 main do
@@ -392,9 +390,7 @@ Do blocks can be passed directly as arguments without parentheses.
 race : IO a -> IO b -> IO (Result a b)
 ```
 
-Run two IO actions concurrently and return the winner. Each argument carries
-its own effect row; the result IO's row is the union of both (written
-`r1 \/ r2`). Effects required by either side flow into the result IO.
+Run two IO actions concurrently and return the winner.
 
 The winner is reported via the built-in `Result a b` ADT — `Err {error: a}` when the left action wins, `Ok {value: b}` when the right action wins.
 
@@ -619,11 +615,11 @@ Read a line of input from stdin.
 ### `when` / `unless`
 
 ```
-when   : Bool -> IO r {} -> IO r {}
-unless : Bool -> IO r {} -> IO r {}
+when   : Bool -> IO {} -> IO {}
+unless : Bool -> IO {} -> IO {}
 ```
 
-Run an IO action conditionally. `when cond a` runs `a` if `cond` is `True {}`; `unless cond a` runs `a` if `cond` is `False {}`. The skipped branch becomes `yield {}`. The action's effect row `r` propagates to the result.
+Run an IO action conditionally. `when cond a` runs `a` if `cond` is `True {}`; `unless cond a` runs `a` if `cond` is `False {}`. The skipped branch becomes `yield {}`.
 
 ```knot
 when (n > 0) (println "positive")
@@ -635,7 +631,7 @@ unless verbose do
 ### `forEach`
 
 ```
-forEach : [a] -> (a -> IO r {}) -> IO r {}
+forEach : [a] -> (a -> IO {}) -> IO {}
 ```
 
 Sequence an IO action over each row of a relation. Iteration follows the relation's deterministic order (after any `sortBy`).
@@ -946,11 +942,11 @@ The HTTP types and primitives are defined in the language spec (`DESIGN.md`). Th
 ### `listen` / `listenOn`
 
 ```
-listen   : Int u -> Server a r -> IO {}
-listenOn : Text   -> Int u -> Server a r -> IO {}
+listen   : Int u -> Server a -> IO {}
+listenOn : Text   -> Int u -> Server a -> IO {}
 ```
 
-Start an HTTP server built with `serve API where ...`. `listen` binds to all interfaces; `listenOn` takes an explicit bind address. The `r` row variable unifies with the server's effect row, so handler effects (e.g. `console` from a handler that calls `println`) flow into the program's IO type.
+Start an HTTP server built with `serve API where ...`. `listen` binds to all interfaces; `listenOn` takes an explicit bind address.
 
 ### `fetch` / `fetchWith`
 

@@ -16,10 +16,9 @@ This file is the complete reference for every field of `base`, grouped by
 purpose, with the full path, type, and a description. Types are written in
 Knot's own notation:
 
-- `a`, `b`, `r`, `u`, … are type / effect / unit variables (universally
-  quantified).
+- `a`, `b`, `u`, … are type / unit variables (universally quantified).
 - `[a]` is a relation (a set) of `a`.
-- `IO a` is an IO action carrying an effect row.
+- `IO a` is an IO action producing an `a`.
 - `Maybe a` is `Nothing {}` or `Just {value: a}`; `Result e a` is
   `Err {error: e}` or `Ok {value: a}`.
 
@@ -352,11 +351,10 @@ base.when (n > 0) (base.println "positive")
 ### `base.forEach`
 
 ```
-base.forEach : [a] -> (a -> IO r {}) -> IO r {}
+base.forEach : [a] -> (a -> IO {}) -> IO {}
 ```
 
-Sequence an IO action over each row (in iteration order). The effect row `r`
-propagates.
+Sequence an IO action over each row (in iteration order).
 
 ### `base.not`
 
@@ -778,12 +776,12 @@ Verify a signature. Args: public key, message, signature.
 ### `base.fork`
 
 ```
-base.fork : IO r a -> IO r {}
+base.fork : IO a -> IO {}
 ```
 
 Run an IO action on a new OS thread (fire-and-forget; the result is
-discarded). The effect row propagates. Each thread gets its own SQLite
-connection (WAL). The main thread joins all spawned threads before exit.
+discarded). Each thread gets its own SQLite connection (WAL). The main thread
+joins all spawned threads before exit.
 
 ### `base.race`
 

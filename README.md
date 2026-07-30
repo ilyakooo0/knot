@@ -625,10 +625,9 @@ without a separate instance mechanism. See `examples/ord.knot`,
 variants, let-generalization, implicit-dictionary constraints, and unit
 polymorphism.
 
-**IO effects.** Every function carries an effect row in its type:
-`IO Text`, `IO {}`, etc. Atomic blocks are
-typed `IO {} a -> IO {} a` so the compiler rejects `println` inside a
-transaction. See `examples/log_test.knot`.
+**IO.** Effectful functions return `IO a` — a description of an effectful
+computation producing an `a`. `atomic do ...` runs a block in a transaction.
+See `examples/log_test.knot`.
 
 **Concurrency.** `fork`, `race`, and STM-style `atomic` blocks with
 `retry`. Row-level read-filter wakeups mean a watcher on `WHERE id = 1`

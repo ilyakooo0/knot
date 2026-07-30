@@ -526,12 +526,17 @@ Grouping is executed via SQLite — key columns are inserted into a temp table a
 
 ## Effects and IO
 
-### Unified Effect Model
+### Unified IO Model
 
-All state operations in Knot return IO values. The IO type carries an effect set that distinguishes DB operations from external effects:
+All state operations in Knot return IO values. `IO a` is a single type
+constructor taking one argument — the result type — with no effect-row
+parameter:
 
-- **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), and relation writes (`*rel = expr`, `replace *rel = expr`) all return `IO {} value`.
-- **External effects** carry specific tags: `IO {}`, `IO Text`, `IO Result`, `IO Int Ms`, `IO Float 1`.
+- **DB operations** return `IO value`. Source refs (`*rel`), derived refs
+  (`&rel`), and relation writes (`*rel = expr`, `replace *rel = expr`) all
+  return `IO value`.
+- **External effects** are also plain `IO`: `IO {}`, `IO Text`, `IO Result`,
+  `IO (Int Ms)`, `IO Float 1`.
 
 This unified model means all stateful code lives in IO do-blocks, while pure comprehensions over plain values remain non-IO.
 
@@ -540,18 +545,15 @@ This unified model means all stateful code lives in IO do-blocks, while pure com
 Effectful functions return descriptions of effects (`IO a`) rather than performing them. IO values are thunks that execute when run.
 
 ```knot
--- DB operations return IO with empty effects
+-- DB operations return IO
 *people : [Person]
--- *people : IO {} [Person]
+-- a read of *people yields IO [Person]
 
--- println returns an IO action with console effect
 println : a -> IO {}
 
--- readFile returns an IO action with fs effect
 readFile : Text -> IO Text
 
--- now returns an IO action with clock effect, tagged with the built-in Ms unit
-now : IO Int Ms
+now : IO (Int Ms)
 ```
 
 ### IO Do-Blocks
@@ -622,11 +624,8 @@ If the body uses a capability not listed in the signature, the compiler rejects 
 
 ### IO and Transactions
 
-`atomic` takes an IO body and runs it in a transaction. The body must only contain DB interactions (empty effect set) — no external IO (console, fs, etc.) is allowed inside `atomic`.
-
-```knot
-atomic : IO {} a -> IO {} a
-```
+`atomic` takes an IO body and runs it in a transaction. `atomic do ...` is a
+keyword form (not a `base.` function); the block is an `IO a`.
 
 ```knot
 -- DB writes go in `atomic`, IO happens after commit
@@ -727,7 +726,7 @@ loadConfig \path -> do
 fork : IO a -> IO {}
 ```
 
-The spawned action's effect row `r` propagates through `fork` to the caller — a program that forks an IO that calls `println` is visibly typed with `{console}` in its IO row, so the effect system still reflects what the program can do. Do blocks can be passed as arguments without parentheses: `fork do ...`.
+`fork` spawns an IO action on a new OS thread and returns `IO {}`. Do blocks can be passed as arguments without parentheses: `fork do ...`.
 
 ```knot
 *counter : [{n: Int 1}]
@@ -780,10 +779,8 @@ SQLite WAL mode ensures that concurrent readers and writers do not block each ot
 
 #### `race`
 
-`race` runs two IO actions concurrently and returns as soon as one wins. Each
-argument carries its own effect row; the result IO's row is the union of both,
-written `r1 \/ r2`. Any effects required by either side propagate into the
-result IO. The winner is reported via the built-in `Result a b` ADT —
+`race` runs two IO actions concurrently and returns as soon as one wins. The
+winner is reported via the built-in `Result a b` ADT —
 `Err {error: a}` when the left action wins, `Ok {value: b}` when the right
 action wins.
 
@@ -859,7 +856,7 @@ api (serve Api where)
 main (listen 8080 api)
 ```
 
-`serve API where` produces a value of type `Server API _` (a polymorphic row variable when handlers have no concrete effects) or `Server API {effects}` when handlers carry concrete effects — e.g. `Server API {console}` if a handler calls `println`. Each handler receives the request record (path/query/body/header fields) and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. Handler effects propagate through `listen` into the program's IO type. No string routes, no untyped params, no missing handlers.
+`serve API where` produces a value of type `Server API`. Each handler receives the request record (path/query/body/header fields) and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. `listen : Int u -> Server a -> IO {}` binds the server to a port. No string routes, no untyped params, no missing handlers.
 
 #### HTTP Status Codes
 
@@ -1008,7 +1005,7 @@ CREATE TABLE _knot_rate_limits (
 
 The check runs in a `BEGIN IMMEDIATE` transaction so concurrent requests for the same client serialize correctly; different keys do not contend.
 
-**Effects.** Rate limiting reads and writes a hidden table; these effects are internal and not surfaced in user-visible effect rows.
+**Effects.** Rate limiting reads and writes a hidden internal table.
 
 #### Path Prefixes
 
@@ -1853,7 +1850,7 @@ type-directedly and would silently match the wrong conversion. See
 
 ### Type Inference
 
-Full Hindley-Milner style inference extended with row polymorphism (record fields, effect rows, and unit variables) and implicit-dictionary constraints. Type signatures are always optional — the compiler infers everything from usage.
+Full Hindley-Milner style inference extended with row polymorphism (record fields and unit variables) and implicit-dictionary constraints. Type signatures are always optional — the compiler infers everything from usage.
 
 ## Full Example
 

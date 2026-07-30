@@ -1,31 +1,52 @@
 -- Type-directed conversion via record dictionaries + `^into` projection.
 --
--- A "morph dictionary" for a target type T is a record `{ into : S -> T }`
--- holding conversions INTO T. The convention is to nest them under a type
--- name: `<type>.morph.into`. With several in scope at once, `(^into) x`
--- resolves TYPE-DIRECTEDLY: it picks the dictionary whose `into` field's
--- parameter type matches x's type. (This exercises the level-synchronized
--- candidate search in `resolve_implicit_ref`: both `int.morph.into` and
--- `text.morph.into` live at the same nesting depth, and the resolver must
--- collect BOTH, then disambiguate by argument type.)
+-- Conversions live under a single `morph` namespace, keyed by source then
+-- target type: `morph.<from-type>.<to-type>.into` holds a function `S -> T`.
+-- `(^into) x` resolves TYPE-DIRECTEDLY against the in-scope `into` fields:
+--
+--   * by the ARGUMENT type — when only one morph's `into` accepts x's type
+--     (the resolver collects every same-depth `into`, then keeps the one
+--     whose parameter type matches x);
+--
+--   * by the EXPECTED RESULT type — when the surrounding context demands a
+--     concrete type (e.g. an annotation `v : Float 1 = (^into) x`), so two
+--     morphs sharing x's source type (`text.int` vs `text.float`) are
+--     disambiguated by which one produces the required target. This is the
+--     bidirectional (check-mode) path: the contextual expected type threads
+--     through the enclosing `with` into the application's result.
 with {
--- Conversions INTO Int 1 and INTO Text, each with a concrete input type.
-intMorph  { into : Text -> Int 1
+textToInt { into : Text -> Int 1
             into (\s -> base.length s) }
-textMorph { into : Int 1 -> Text
+intToText { into : Int 1 -> Text
             into (\n -> base.show n) }
+textToFloat { into : Text -> Float 1
+              into (\s -> 2.5) }
 
--- The ambient conversion scope: one record nesting both morphs at the same
--- depth, mirroring the `base.<type>.morph` convention.
-conv { int { morph intMorph } text { morph textMorph } }
+-- The ambient conversion scope: base.morph.<from-type>.<to-type>.into
+conv { morph {
+  text { int  { into textToInt.into }
+         float { into textToFloat.into } }
+  int  { text { into intToText.into } }
+} }
+
+-- Argument-type-directed: distinct source types. (These are annotated too,
+-- because `text.int` and `text.float` below share the Text source — an
+-- un-annotated Text `into` would be ambiguous. The annotation is what lets
+-- the result type pick.)
+argInt  : Int 1
+argInt  (with conv ((^into) "hi"))   -- Text arg, wants Int 1
+argText : Text
+argText (with conv ((^into) 41))     -- Int arg,  wants Text
+
+-- Result-type-directed: same source (Text), annotation picks the target.
+asInt   : Int 1
+asInt   (with conv ((^into) "hi"))   -- wants Int 1   -> morph.text.int.into
+asFloat : Float 1
+asFloat (with conv ((^into) "hi"))   -- wants Float 1 -> morph.text.float.into
 }
 (do
-  -- `(^into) "hi"` : the argument is Text, so the resolver picks
-  -- `conv.int.morph.into : Text -> Int 1` (the length of "hi").
-  base.println (base.show (with conv ((^into) "hi")))   -- "2"
-
-  -- `(^into) 41` : the argument is Int 1, so it picks
-  -- `conv.text.morph.into : Int 1 -> Text`.
-  base.println (with conv ((^into) 41))                 -- "41"
-
+  base.println (base.show argInt)    -- "2"   (length of "hi")
+  base.println (base.show argText)   -- "41"
+  base.println (base.show asInt)     -- "2"
+  base.println (base.show asFloat)   -- "2.5"
   yield {})

@@ -1062,6 +1062,14 @@ struct Infer {
     /// `unify_dir`.
     suppress_refine_intro: Option<HashSet<String>>,
 
+    /// Expected type pushed by `check_expr` when it falls through to
+    /// infer-mode for a `with` expression. The infer `With` arm pops this and
+    /// CHECKS its body against it (rather than inferring), so the contextual
+    /// type flows through the `with` to a `(^name) arg` application inside —
+    /// letting the expected RESULT type disambiguate same-source-type morphs.
+    /// A stack: nested checked `with` bodies push/pop in order.
+    with_body_expected: Vec<Ty>,
+
     /// Names of USER top-level declarations (the `with`-record fields that act
     /// as named functions/values). These live in `scopes[0]`, which no longer
     /// contains stdlib value fns (those are in `stdlib_schemes`), but DOES
@@ -1149,6 +1157,7 @@ impl Infer {
             const_literals: HashMap::new(),
             field_accesses: Vec::new(),
             with_fields: Vec::new(),
+            with_body_expected: Vec::new(),
             with_scope_stack: vec![None],
             with_ctor_imports: Vec::new(),
             implicit_refs: HashMap::new(),
@@ -4753,8 +4762,12 @@ impl Infer {
     /// the head is not an `ImplicitRef` or the spine has no arguments (a bare
     /// `^name` falls through to the generic `ImplicitRef` arm, which keeps
     /// its fresh-var — first-in-scope — behavior).
-    fn try_infer_implicit_ref_app(&mut self, expr: &ast::Expr) -> Option<Ty> {
-        // Peel the spine into (head, args in application order).
+    /// Peel an application spine whose head is `^name` into (name, args in
+    /// application order, head span). Returns `None` when the expression is
+    /// not a `^name` applied to at least one argument.
+    fn peel_implicit_ref_app<'a>(
+        expr: &'a ast::Expr,
+    ) -> Option<(&'a str, Vec<&'a ast::Expr>, Span)> {
         let mut args: Vec<&ast::Expr> = Vec::new();
         let mut head = expr;
         while let ast::ExprKind::App { func, arg } = &head.node {
@@ -4768,32 +4781,46 @@ impl Infer {
         if args.is_empty() {
             return None;
         }
+        Some((name.as_str(), args, head.span))
+    }
 
-        // Infer each argument, building the expected curried function type
-        // `arg1 -> … -> argN -> ret` with a fresh result variable.
-        let mut expected = self.fresh();
+    /// Resolve a `^name` application against a curried function type
+    /// `arg1 -> … -> argN -> ret`, where `ret` is the caller-supplied result
+    /// type. In infer mode `ret` is a fresh variable (argument types drive
+    /// disambiguation); in check mode it is the CONTEXTUAL expected type, so
+    /// the surrounding context's required result type also constrains which
+    /// `^name` field is picked. Records the winning projection for codegen.
+    fn resolve_implicit_ref_app(
+        &mut self,
+        name: &str,
+        args: &[&ast::Expr],
+        head_span: Span,
+        app_span: Span,
+        ret: Ty,
+    ) -> Ty {
+        let mut expected = ret;
         for a in args.iter().rev() {
             let arg_ty = self.infer_expr(a);
             expected = Ty::Fun(Box::new(arg_ty), Box::new(expected));
         }
-
-        // Resolve `^name` against the argument-shaped type. The candidate
-        // whose field type unifies wins; on success the resolver records the
-        // (root, path) projection for codegen keyed by the `^name` span.
-        let field_ty = self.resolve_implicit_ref(name, &expected, head.span);
-        // Bind the result variable: the resolved field type must equal the
-        // whole curried application type, pinning `ret` for the caller.
-        self.unify(&field_ty, &expected, expr.span);
-        // The overall application type is the result variable (the tail of
-        // the curried chain after all args are applied).
+        let field_ty = self.resolve_implicit_ref(name, &expected, head_span);
+        self.unify(&field_ty, &expected, app_span);
         let mut result = self.apply(&expected);
-        for _ in &args {
+        for _ in args {
             let Ty::Fun(_, rest) = result else {
-                return Some(Ty::Error);
+                return Ty::Error;
             };
             result = self.apply(&rest);
         }
-        Some(result)
+        result
+    }
+
+    fn try_infer_implicit_ref_app(&mut self, expr: &ast::Expr) -> Option<Ty> {
+        let (name, args, head_span) = Self::peel_implicit_ref_app(expr)?;
+        // Infer mode: the result type is a FRESH variable, so only the
+        // argument types constrain which `^name` field is picked.
+        let ret = self.fresh();
+        Some(self.resolve_implicit_ref_app(name, &args, head_span, expr.span, ret))
     }
 
     /// Find an in-scope RECORD supplying `field` at `field_ty`, for splicing
@@ -5821,7 +5848,17 @@ impl Infer {
                 // type's constructors into scope UNQUALIFIED for the body,
                 // confined to the body (see push_with_ctor_imports).
                 let pushed_ctor_imports = self.push_with_ctor_imports(types, record.span);
-                let body_ty = self.infer_expr(body);
+                // If `check_expr` fell through to us on this `with` with a
+                // pending contextual expected type, CHECK the body against it
+                // (rather than inferring) so the expected type flows to a
+                // `(^name) arg` application inside — letting the required
+                // RESULT type disambiguate same-source-type morphs.
+                let body_ty = if let Some(expected) = self.with_body_expected.pop() {
+                    self.check_expr(body, &expected);
+                    expected
+                } else {
+                    self.infer_expr(body)
+                };
                 if pushed_ctor_imports {
                     self.with_ctor_imports.pop();
                 }
@@ -6751,6 +6788,30 @@ impl Infer {
                 let name = name.clone();
                 self.resolve_implicit_ref(&name, expected, expr.span);
             }
+            ast::ExprKind::App { .. }
+                if matches!(
+                    Self::peel_implicit_ref_app(expr),
+                    Some((_, args, _)) if !args.is_empty()
+                ) =>
+            {
+                // `(^name) arg…` in a CHECKING context: thread the contextual
+                // expected type in as the application's RESULT type, so the
+                // surrounding context's required type participates in
+                // disambiguation (e.g. `x : Float 1 = (^into) "hi"` picks the
+                // `Text -> Float 1` morph, not any other `Text -> _` one).
+                // Without this the result var is fresh and only the argument
+                // types constrain the pick, leaving same-source-type morphs
+                // ambiguous.
+                let (name, args, head_span) =
+                    Self::peel_implicit_ref_app(expr).expect("matched above");
+                self.resolve_implicit_ref_app(
+                    name,
+                    &args,
+                    head_span,
+                    expr.span,
+                    expected.clone(),
+                );
+            }
             ast::ExprKind::Annot { expr: inner, ty } => {
                 // See the infer-mode `Annot` arm: lowercase units in an inline
                 // ascription must be polymorphic unit variables, not concrete.
@@ -6918,6 +6979,19 @@ impl Infer {
                     // t1_provided=false for correct Forall polarity.
                     self.unify_dir(expected, &inferred, expr.span, false);
                 }
+            }
+            ast::ExprKind::With { .. } => {
+                // Propagate the contextual expected type INTO the `with` body:
+                // push it so the infer `With` arm CHECKS its body against it
+                // (see `with_body_expected`), letting a `(^name) arg` inside
+                // resolve by the required RESULT type. `infer_expr` returns
+                // that same expected type, so the final unify is a no-op.
+                self.with_body_expected.push(expected.clone());
+                let inferred = self.infer_expr(expr);
+                // Defensive: if the infer path didn't consume it (e.g. an
+                // error bailed early), don't leak the pending expected.
+                self.with_body_expected.retain(|e| e != expected);
+                self.unify_dir(expected, &inferred, expr.span, false);
             }
             _ => {
                 let inferred = self.infer_expr(expr);

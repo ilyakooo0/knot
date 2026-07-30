@@ -1396,6 +1396,10 @@ impl Codegen {
         self.declare_rt("knot_bytes_to_text", &[p], &[p]);
         self.declare_rt("knot_bytes_to_hex", &[p], &[p]);
         self.declare_rt("knot_bytes_from_hex", &[p], &[p]);
+        self.declare_rt("knot_floor", &[p], &[p]);
+        self.declare_rt("knot_int_to_float", &[p], &[p]);
+        self.declare_rt("knot_text_to_int", &[p], &[p]);
+        self.declare_rt("knot_text_to_float", &[p], &[p]);
         self.declare_rt("knot_bytes_get", &[p, p], &[p]);
         self.declare_rt("knot_hash", &[p], &[p]);
 
@@ -1991,6 +1995,7 @@ impl Codegen {
             "bytesLength", "bytesSlice", "bytesConcat",
             "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex", "hexDecode",
             "bytesGet", "hash",
+            "floor", "intToFloat", "textToInt", "textToFloat",
             "readFile", "writeFile", "appendFile",
             "fileExists", "removeFile", "listDir",
             "randomInt", "sleep", "fork", "race",
@@ -2831,6 +2836,10 @@ impl Codegen {
         self.define_stdlib_fn_1("bytesToHex", "knot_bytes_to_hex");
         self.define_stdlib_fn_1("bytesFromHex", "knot_bytes_from_hex");
         self.define_stdlib_fn_1("hexDecode", "knot_bytes_from_hex");
+        self.define_stdlib_fn_1("floor", "knot_floor");
+        self.define_stdlib_fn_1("intToFloat", "knot_int_to_float");
+        self.define_stdlib_fn_1("textToInt", "knot_text_to_int");
+        self.define_stdlib_fn_1("textToFloat", "knot_text_to_float");
         self.define_stdlib_fn_1("hash", "knot_hash");
 
         // Bytes: 2-param (curried)

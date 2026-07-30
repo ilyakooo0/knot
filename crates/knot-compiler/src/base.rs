@@ -72,6 +72,36 @@ append listAppend
 fromRelation listFromRelation
 toRelation listToRelation
 }
+
+-- Morph namespace (`base.morph.*`): type-directed conversions resolved by the
+-- `^into` projection. Each `<from>To<to>` record holds an `into : S -> T`
+-- function with an EXPLICIT concrete signature (an un-annotated body could
+-- infer a polymorphic type and silently mis-dispatch — see the `^into`
+-- resolver's unify-based candidate match). Fallible conversions return
+-- `Maybe`. Conversions needing a primitive not exposed as a base builtin are
+-- written as lambdas over the existing builtins.
+morph {
+textToBytes { into : Text -> Bytes
+              into textToBytes }
+bytesToText { into : Bytes -> Maybe Text
+              into bytesToText }
+bytesToHex  { into : Bytes -> Text
+              into bytesToHex }
+textToBytesFromHex { into : Text -> Maybe Bytes
+                     into bytesFromHex }
+intToFloat  { into : Int 1 -> Float 1
+              into intToFloat }
+textToInt   { into : Text -> Maybe Int 1
+              into textToInt }
+textToFloat { into : Text -> Maybe Float 1
+              into textToFloat }
+intToText   { into : Int 1 -> Text
+              into (\n -> show n) }
+floatToText { into : Float 1 -> Text
+              into (\f -> show f) }
+boolToText  { into : Bool -> Text
+              into (\b -> show b) }
+}
 }
 }
 "#;
@@ -94,6 +124,8 @@ pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     "strip", "stripFloatUnit", "stripUnit", "take", "textToBytes", "toJson",
     "toLower", "toUpper", "traverse", "trim", "upsertBy", "verify",
     "withFloatUnit", "withUnit", "writeFile",
+    // Numeric/text conversions.
+    "floor", "intToFloat", "textToInt", "textToFloat",
     // Relation query forms as first-class function values (`base.count`,
     // `base.union`, `base.sum`, `base.bind`). Each is registered as a curried
     // function value in codegen; the call-site SQL-pushdown optimization

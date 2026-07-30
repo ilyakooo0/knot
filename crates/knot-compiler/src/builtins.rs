@@ -48,6 +48,7 @@ pub const PURE_BUILTINS: &[&str] = &[
     "decrypt", "sign", "verify",
     "upsertBy",
     "countWhere", "minOn", "maxOn", "sortBy",
+    "floor", "intToFloat", "textToInt", "textToFloat",
     "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
     "strip", "dress",
     // The unimplemented hole: polymorphic `∀a. a`, aborts at runtime with a

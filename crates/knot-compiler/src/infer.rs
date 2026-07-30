@@ -10645,6 +10645,36 @@ impl Infer {
             Scheme::mono(Ty::Fun(Box::new(Ty::Bytes), Box::new(Ty::Text))),
         );
 
+        // floor : Float -> Int  (round toward negative infinity)
+        self.bind_top(
+            "floor",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Float), Box::new(Ty::Int))),
+        );
+
+        // intToFloat : Int -> Float  (lossy past 2^53)
+        self.bind_top(
+            "intToFloat",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Float))),
+        );
+
+        // textToInt : Text -> Maybe Int  (Nothing on malformed input)
+        self.bind_top(
+            "textToInt",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::Con("Maybe".into(), vec![Ty::Int])),
+            )),
+        );
+
+        // textToFloat : Text -> Maybe Float  (Nothing on malformed input)
+        self.bind_top(
+            "textToFloat",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::Con("Maybe".into(), vec![Ty::Float])),
+            )),
+        );
+
         // hash : ∀a. a -> Bytes  (BLAKE3, returns 32 bytes; Bytes/Text hash
         // their raw contents, structured values hash a canonical serialization)
         {

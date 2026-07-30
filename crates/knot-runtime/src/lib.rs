@@ -11007,6 +11007,48 @@ pub extern "C-unwind" fn knot_text_to_bytes(v: *mut Value) -> *mut Value {
     }
 }
 
+/// floor(float) — round toward negative infinity, yielding an Int
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_floor(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Float(f) => alloc(Value::Int(f.floor() as i64)),
+        _ => panic!("knot runtime: floor expected Float, got {}", type_name(v)),
+    }
+}
+
+/// intToFloat(int) — widen an Int to a Float (lossy past 2^53)
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_int_to_float(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Int(n) => alloc(Value::Float(*n as f64)),
+        _ => panic!("knot runtime: intToFloat expected Int, got {}", type_name(v)),
+    }
+}
+
+/// textToInt(text) — parse an integer; Nothing on malformed input
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_text_to_int(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => match s.trim().parse::<i64>() {
+            Ok(n) => make_just(alloc(Value::Int(n))),
+            Err(_) => make_nothing(),
+        },
+        _ => panic!("knot runtime: textToInt expected Text, got {}", type_name(v)),
+    }
+}
+
+/// textToFloat(text) — parse a float; Nothing on malformed input
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_text_to_float(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => match s.trim().parse::<f64>() {
+            Ok(f) => make_just(alloc(Value::Float(f))),
+            Err(_) => make_nothing(),
+        },
+        _ => panic!("knot runtime: textToFloat expected Text, got {}", type_name(v)),
+    }
+}
+
 /// Build `Just {value: payload}` for the built-in `Maybe a` ADT.
 fn make_just(payload: *mut Value) -> *mut Value {
     let tag = intern_str("Just");

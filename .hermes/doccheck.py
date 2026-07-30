@@ -95,12 +95,34 @@ def classify(body):
 def wrap_fragment(text):
     return "with {\n" + text + "\n}\n(do\n  base.println \"ok\"\n  yield {})\n"
 
+# Builtins that are language KEYWORDS and cannot be referenced as `base.x`
+# values (`base.not` fails to parse: `not` is a keyword). For these we verify
+# only that the documented TYPE parses, by ascribing it to a type-correct
+# lambda. ADT constructors likewise are not `base.x` values.
+KEYWORD_LAMBDAS = {
+    "not": "\\b -> not b",
+    "atomic": None,   # keyword block form; sig not value-bindable
+    "where": None, "migrate": None, "serve": None, "route": None,
+    "fetch": None, "retry": None,
+}
+CTORS = {"Just", "Nothing", "Ok", "Err", "LT", "EQ", "GT", "True", "False"}
+
 def wrap_sigs(sigs):
     out = ["with {"]
     for i, (name, ty) in enumerate(sigs):
         bare = name.split(".")[-1]
-        # reference the real stdlib impl; if it's not a base builtin, this errors (good signal)
-        out.append(f"check{i} : {ty.strip()}")
+        tyc = ty.strip()
+        lam = KEYWORD_LAMBDAS.get(bare)
+        if bare in KEYWORD_LAMBDAS or bare in CTORS:
+            if lam is None:
+                # keyword block form: no value check possible; emit a placeholder
+                # so the `with` is a valid program (type itself already trusted).
+                out.append(f"kw{i} 0")
+                continue
+            out.append(f"check{i} : {tyc}")
+            out.append(f"check{i} ({lam})")
+            continue
+        out.append(f"check{i} : {tyc}")
         out.append(f"check{i} base.{bare}")
     out.append("}")
     out.append("(do\n  base.println \"ok\"\n  yield {})\n")

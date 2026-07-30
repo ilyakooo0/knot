@@ -417,11 +417,7 @@ Cancellation is cooperative but aggressive: the loser's `knot_io_run` checks its
 
 ### `atomic`
 
-```
-atomic : IO {} a -> IO {} a
-```
-
-Run an IO body in a database transaction. The body must contain only DB operations — no external effects (console, fs, etc.) are allowed. If the body calls `retry`, the transaction rolls back and waits for a relation change before re-executing.
+`atomic do ...` is a keyword form (not a `base.` function). It runs an IO body in a database transaction; the block is an `IO a` where `a` is the body's `yield` type. If the body calls `retry`, the transaction rolls back and waits for a relation change before re-executing.
 
 ```knot
 transfer \from to amount -> atomic do

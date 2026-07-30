@@ -797,14 +797,9 @@ be used inside `atomic`.
 ### `atomic` and `retry` (language keywords, not `base` fields)
 
 `atomic` is a **keyword**, not a `base` field — you write `atomic do ...`,
-never `base.atomic`. It runs an IO body as a database transaction:
-
-```
-atomic : IO {} a -> IO {} a
-```
-
-The body must be DB-only (no console/fs/network) — the compiler rejects other
-effects inside. With `base.retry` it implements STM.
+never `base.atomic`. It runs an IO body as a database transaction; the block is
+an `IO a` where `a` is the body's `yield` type. With `base.retry` it implements
+STM.
 
 `base.retry` (below) is the one STM primitive that *is* gated to the `base.`
 prefix, even though it's a compile-time macro rather than a record field.

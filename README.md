@@ -97,7 +97,7 @@ with {
 anInt    42               -- Int 1  (unit is mandatory; `1` = dimensionless)
 aFloat   3.14             -- Float 1
 aText    "hello"          -- Text
-aBool    true             -- Bool (also `false`)
+aBool    (Bool.True {})     -- Bool (also `Bool.False {}`)
 }
 (base.println aText)
 ```
@@ -182,8 +182,8 @@ add (\a b -> a + b)
 -- optional type signature on the line above
 safeDiv : Int 1 -> Int 1 -> Maybe (Int 1)
 safeDiv (\x y -> case y == 0 of
-  true  -> Maybe.Nothing {}
-  false -> Maybe.Just {value (x / y)})
+  Bool.True {} -> Maybe.Nothing {}
+  Bool.False {} -> Maybe.Just {value (x / y)})
 }
 (do
   base.println (base.show (add 2 3))         -- "5"
@@ -241,10 +241,10 @@ branch, and a Bool scrutinee gives you if/else:
 ```knot
 with {
 sign (\n -> case n < 0 of
-  true  -> (0 - 1)
-  false -> case n > 0 of
-    true  -> 1
-    false -> 0)
+  Bool.True {} -> (0 - 1)
+  Bool.False {} -> case n > 0 of
+    Bool.True {} -> 1
+    Bool.False {} -> 0)
 }
 (base.println (base.show (sign (0 - 5))))   -- "-1"
 ```
@@ -293,8 +293,8 @@ and the rest `t` — this is how you iterate structurally.
 ```knot
 with {
 safeDiv (\x y -> case y == 0 of
-  true  -> Maybe.Nothing {}
-  false -> Maybe.Just {value (x / y)})
+  Bool.True {} -> Maybe.Nothing {}
+  Bool.False {} -> Maybe.Just {value (x / y)})
 
 compute (do
   a <- safeDiv 20 4     -- a = 5
@@ -337,8 +337,8 @@ type Todo = {title: Text, done: Int 1}
   *todos = (do
     t <- todos
     yield (case t.title == "write guide" of
-      true  -> {t | done 1}
-      false -> t))
+      Bool.True {} -> {t | done 1}
+      Bool.False {} -> t))
   yield {})
 ```
 
@@ -453,17 +453,17 @@ a hidden leading argument:
 
 ```knot
 with {
-intOrd     {compare (\a b -> case a > b of true -> 1 false -> case a < b of true -> (0 - 1) false -> 0)}
-textOrd    {compare (\a b -> case a > b of true -> 1 false -> case a < b of true -> (0 - 1) false -> 0)}
-intOrdDesc {compare (\a b -> case a < b of true -> 1 false -> case a > b of true -> (0 - 1) false -> 0)}
+intOrd     {compare (\a b -> case a > b of Bool.True {} -> 1; Bool.False {} -> case a < b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)}
+textOrd    {compare (\a b -> case a > b of Bool.True {} -> 1; Bool.False {} -> case a < b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)}
+intOrdDesc {compare (\a b -> case a < b of Bool.True {} -> 1; Bool.False {} -> case a > b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)}
 
 -- clamp needs a `compare` dictionary but doesn't name it
 clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
 clamp (\lo hi x -> case ((^compare) x lo) < 0 of
-  true -> lo
-  false -> case ((^compare) x hi) > 0 of
-    true -> hi
-    false -> x)
+  Bool.True {} -> lo
+  Bool.False {} -> case ((^compare) x hi) > 0 of
+    Bool.True {} -> hi
+    Bool.False {} -> x)
 }
 (do
   base.println (base.show (with intOrd     (clamp 0 10 42)))   -- "10"
@@ -480,7 +480,7 @@ for overloading: an "instance" is an ordinary record passed implicitly. See
 ### Effects are tracked
 
 Every function's type records what it can do. `base.println` returns
-`IO {console} {}`; reading a file is `IO {fs} Text`; the DB operations are
+`IO {}`; reading a file is `IO Text`; the DB operations are
 `IO {} ...`. An `atomic` block (a transaction) is typed `IO {} a -> IO {} a`,
 so the compiler *rejects* a `println` inside it. You don't write these
 annotations — they're inferred.
@@ -626,7 +626,7 @@ variants, let-generalization, implicit-dictionary constraints, and unit
 polymorphism.
 
 **IO effects.** Every function carries an effect row in its type:
-`IO {console, fs} Text`, `IO {network | r} {}`, etc. Atomic blocks are
+`IO Text`, `IO {}`, etc. Atomic blocks are
 typed `IO {} a -> IO {} a` so the compiler rejects `println` inside a
 transaction. See `examples/log_test.knot`.
 

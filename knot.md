@@ -305,8 +305,8 @@ When bound expressions are `IO` values, the do block sequences IO actions:
 ```knot
 -- IO do block with console effects
 main do
-  content <- readFile "input.txt"    -- IO {fs} Text
-  println content                     -- IO {console} {}
+  content <- readFile "input.txt"    -- IO Text
+  println content                     -- IO {}
   yield {}
 
 -- IO do block with DB operations
@@ -315,7 +315,7 @@ addPerson \name age -> do
   *people = union people [{name name age age}]
 ```
 
-The compiler detects whether a do block is relational or IO from the types. Relation operations (`*rel`, `&rel`, and writes `*rel = expr`) all return `IO {} value` — the empty effect set `{}` distinguishes DB operations from external effects like `{console}` or `{fs}`.
+The compiler detects whether a do block is relational or IO from the types. Relation operations (`*rel`, `&rel`, and writes `*rel = expr`) all return `IO value`.
 
 ### Pattern Matching in Bind
 
@@ -619,28 +619,17 @@ no way to make your own type work with an operator beyond the built-in cases.
 
 ### IO Type
 
-Effectful functions return `IO {effects} a` — descriptions of effects, not immediate execution:
+Effectful functions return `IO a` — a description of an effectful computation
+producing an `a`, not immediate execution. `IO` takes a single type argument
+(the result type); there is no effect-row parameter:
 
 ```knot
--- External effects
-println : a -> IO {console} {}
-readFile : Text -> IO {fs} Text
-now : IO {clock} Int Ms
-
--- DB operations (empty effect set)
--- *rel : IO {} [T]
--- *rel = val : IO {} {}
+println : a -> IO {}
+readFile : Text -> IO Text
+now : IO (Int Ms)
 ```
 
-### Effect Kinds
-
-| Effect | Functions |
-|--------|-----------|
-| `console` | `println`, `print`, `readLine`, `logInfo`, `logWarn`, `logError`, `logDebug` |
-| `fs` | `readFile`, `writeFile`, `appendFile`, `fileExists`, `removeFile`, `listDir` |
-| `clock` | `now`, `sleep` |
-| `random` | `randomInt`, `randomFloat`, `randomUuid`, `generateKeyPair`, `generateSigningKeyPair`, `encrypt` |
-| `network` | `listen`, `fetch`, `fetchWith` |
+A `do` block sequences `IO` actions; the whole block is itself an `IO`.
 
 ### IO Do Blocks
 
@@ -653,13 +642,13 @@ main do
 
 ### DB Effects
 
-All relation operations are IO-wrapped with an empty effect set:
+Relation operations are also `IO`-wrapped:
 
 ```knot
 -- All relation operations are IO:
 birthday \name -> do
-  people <- *people              -- IO {} [Person]
-  *people = do               -- IO {} {}
+  people <- *people              -- IO [Person]
+  *people = do               -- IO {}
     p <- people
     yield (case p.name == name of
       Bool.True {}  -> {p | age (p.age + 1)}
@@ -693,7 +682,7 @@ The body of `atomic` must be an IO expression containing only DB operations. Ext
 Fire-and-forget: runs an IO action on a new OS thread. Each thread gets its own SQLite connection (WAL mode).
 
 ```knot
-fork : IO {| r} a -> IO {| r} {}
+fork : IO a -> IO {}
 
 main do
   fork do
@@ -704,10 +693,8 @@ main do
   -- main waits for all spawned threads before exiting
 ```
 
-The spawned action's effect row `r` propagates through `fork` to the caller, so
-forking an IO that calls `println` is visibly typed with `{console}` in the
-result's IO row. Do blocks can be passed directly as arguments: `fork do ...`
-(no parentheses needed).
+`fork` spawns an `IO` action concurrently and returns `IO {}`. Do blocks can be
+passed directly as arguments: `fork do ...` (no parentheses needed).
 
 #### `retry`
 
@@ -733,13 +720,12 @@ conservatively.
 #### `race`
 
 ```knot
-race : IO {| r1} a -> IO {| r2} b -> IO {| r1 \/ r2} (Result a b)
+race : IO a -> IO b -> IO (Result a b)
 ```
 
-Run two IO actions concurrently and return the winner. Both arguments share a
-single effect row, so any effects required by either side flow into the result
-IO. The winner is reported using the built-in `Result` ADT — `Err {error: a}`
-when the left action wins, `Ok {value: b}` when the right action wins.
+Run two IO actions concurrently and return the winner. The winner is reported
+using the built-in `Result` ADT — `Err {error: a}` when the left action wins,
+`Ok {value: b}` when the right action wins.
 
 ```knot
 slow do
@@ -861,38 +847,36 @@ result type (see [base.md](base.md#morphs-basemorph)).
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `println` | `a -> IO {console} {}` | Print with newline |
-| `print` | `a -> IO {console} {}` | Print without newline |
-| `readLine` | `IO {console} Text` | Read stdin line |
-| `logInfo` | `a -> IO {console} {}` | Leveled log to stderr (INFO) |
-| `logWarn` | `a -> IO {console} {}` | Leveled log to stderr (WARN) |
-| `logError` | `a -> IO {console} {}` | Leveled log to stderr (ERROR) |
-| `logDebug` | `a -> IO {console} {}` | DEBUG; only emits when run with `--debug` |
-| `readFile` | `Text -> IO {fs} Text` | Read file |
-| `writeFile` | `Text -> Text -> IO {fs} {}` | Write file (path, content) |
-| `appendFile` | `Text -> Text -> IO {fs} {}` | Append to file |
-| `fileExists` | `Text -> IO {fs} Bool` | Check file exists |
-| `removeFile` | `Text -> IO {fs} {}` | Delete file |
-| `listDir` | `Text -> IO {fs} [Text]` | List directory |
-| `now` | `IO {clock} Int Ms` | Unix timestamp (milliseconds) |
-| `sleep` | `Int Ms -> IO {clock} {}` | Pause the current thread |
-| `randomInt` | `Int u -> IO {random} Int u` | Random int `[0, bound)`, preserves unit |
-| `randomFloat` | `IO {random} Float u` | Random float `[0.0, 1.0)`, unit-polymorphic |
-| `randomUuid` | `IO {random} Uuid` | Generate a RFC 9562 UUIDv7 |
+| `println` | `a -> IO {}` | Print with newline |
+| `print` | `a -> IO {}` | Print without newline |
+| `readLine` | `IO Text` | Read stdin line |
+| `logInfo` | `a -> IO {}` | Leveled log to stderr (INFO) |
+| `logWarn` | `a -> IO {}` | Leveled log to stderr (WARN) |
+| `logError` | `a -> IO {}` | Leveled log to stderr (ERROR) |
+| `logDebug` | `a -> IO {}` | DEBUG; only emits when run with `--debug` |
+| `readFile` | `Text -> IO Text` | Read file |
+| `writeFile` | `Text -> Text -> IO {}` | Write file (path, content) |
+| `appendFile` | `Text -> Text -> IO {}` | Append to file |
+| `fileExists` | `Text -> IO Bool` | Check file exists |
+| `removeFile` | `Text -> IO {}` | Delete file |
+| `listDir` | `Text -> IO [Text]` | List directory |
+| `now` | `IO Int Ms` | Unix timestamp (milliseconds) |
+| `sleep` | `Int Ms -> IO {}` | Pause the current thread |
+| `randomInt` | `Int u -> IO Int u` | Random int `[0, bound)`, preserves unit |
+| `randomFloat` | `IO Float u` | Random float `[0.0, 1.0)`, unit-polymorphic |
+| `randomUuid` | `IO Uuid` | Generate a RFC 9562 UUIDv7 |
 | `atomic` | `IO {} a -> IO {} a` | Run DB operations in a transaction |
-| `fork` | `IO {\| r} a -> IO {\| r} {}` | Fire-and-forget on new OS thread; effects propagate |
-| `race` | `IO {\| r1} a -> IO {\| r2} b -> IO {\| r1 \/ r2} (Result a b)` | Run two IO actions, return the winner; effect rows union |
+| `fork` | `IO a -> IO {}` | Fire-and-forget on new OS thread |
+| `race` | `IO a -> IO b -> IO (Result a b)` | Run two IO actions, return the winner |
 | `retry` | `a` | Rollback and wait (inside `atomic` only) |
-| `when` | `Bool -> IO r {} -> IO r {}` | Run action when condition is true |
-| `unless` | `Bool -> IO r {} -> IO r {}` | Run action when condition is false |
-| `forEach` | `[a] -> (a -> IO r {}) -> IO r {}` | Sequence an action over each row |
-| `listen` | `Int u -> Server a r -> IO {network \| r} {}` | Start an HTTP server |
-| `fetch` | `Text -> Endpoint -> IO {network} (Result HttpError T)` | Type-safe HTTP client |
-| `fetchWith` | `Text -> {headers: [..]} -> Endpoint -> IO {network} (Result HttpError T)` | `fetch` with ad-hoc headers |
+| `when` | `Bool -> IO {} -> IO {}` | Run action when condition is true |
+| `unless` | `Bool -> IO {} -> IO {}` | Run action when condition is false |
+| `forEach` | `[a] -> (a -> IO {}) -> IO {}` | Sequence an action over each row |
+| `listen` | `Int u -> Server a -> IO {}` | Start an HTTP server |
+| `fetch` | `Text -> Endpoint -> IO (Result HttpError T)` | Type-safe HTTP client |
+| `fetchWith` | `Text -> {headers: [..]} -> Endpoint -> IO (Result HttpError T)` | `fetch` with ad-hoc headers |
 
-`listen`'s effect row unifies with the `Server`'s, so handler effects (e.g.
-`console` from a handler that calls `println`) flow into the IO type of the
-program.
+`listen` takes a `Server` built by `serve API where` and binds the HTTP port.
 
 ### Bytes
 
@@ -912,9 +896,9 @@ program.
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `generateKeyPair` | `IO {random} {privateKey: Bytes, publicKey: Bytes}` | X25519 keypair |
-| `generateSigningKeyPair` | `IO {random} {privateKey: Bytes, publicKey: Bytes}` | Ed25519 keypair |
-| `encrypt` | `Bytes -> Bytes -> IO {random} Bytes` | Sealed-box (public key, plaintext) |
+| `generateKeyPair` | `IO {privateKey: Bytes, publicKey: Bytes}` | X25519 keypair |
+| `generateSigningKeyPair` | `IO {privateKey: Bytes, publicKey: Bytes}` | Ed25519 keypair |
+| `encrypt` | `Bytes -> Bytes -> IO Bytes` | Sealed-box (public key, plaintext) |
 | `decrypt` | `Bytes -> Bytes -> Bytes` | Open sealed-box (private key, ciphertext) |
 | `sign` | `Bytes -> Bytes -> Bytes` | Ed25519 sign (private key, message) |
 | `verify` | `Bytes -> Bytes -> Bytes -> Bool` | Verify (public key, message, signature) |
@@ -968,7 +952,7 @@ api (serve Api where)
 main (listen 8080 api)
 ```
 
-`serve API where` produces a value of type `Server API r`, where `r` is the effect row of the handlers (rendered `_` when handlers are pure, or e.g. `{console}` when a handler logs). Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. The row `r` flows into `listen`'s IO type: `listen : Int u -> Server a r -> IO {network | r} {}`.
+`serve API where` produces a value of type `Server API`. Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. `listen : Int u -> Server a -> IO {}` binds the server to a port.
 
 ### HTTP Status Codes
 
@@ -1026,7 +1010,7 @@ On the `fetch` side, header fields are sent automatically. When response headers
 
 ```knot
 result <- fetch "https://api.example.com" (GetTodos {authorization "Bearer tok"})
--- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int 1}})
+-- result : IO (Result ... {body: [Todo], headers: {xTotalCount: Int 1}})
 ```
 
 ### Rate Limiting

@@ -238,7 +238,7 @@ and compiles each by a dedicated path:
 - **`[a]`** (relation comprehension): `<-` iterates rows, `where` filters,
   `yield` emits a row. Compiled to SQL when over source relations (see
   [Querying](#querying)), otherwise to an in-memory loop.
-- **`IO {e} a`**: `<-` sequences effects, `yield` returns a pure value. IO do
+- **`IO a`**: `<-` sequences effects, `yield` returns a pure value. IO do
   blocks (those containing IO-returning expressions like `*rel`, `println`,
   `readFile`, `now`) use a dedicated IO compilation path that sequences actions
   directly.
@@ -531,13 +531,13 @@ Grouping is executed via SQLite — key columns are inserted into a temp table a
 All state operations in Knot return IO values. The IO type carries an effect set that distinguishes DB operations from external effects:
 
 - **DB operations** return `IO {} value` — the empty effect set `{}` indicates pure database interaction with no external side effects. Source refs (`*rel`), derived refs (`&rel`), and relation writes (`*rel = expr`, `replace *rel = expr`) all return `IO {} value`.
-- **External effects** carry specific tags: `IO {console} {}`, `IO {fs} Text`, `IO {network} Result`, `IO {clock} Int Ms`, `IO {random} Float 1`.
+- **External effects** carry specific tags: `IO {}`, `IO Text`, `IO Result`, `IO Int Ms`, `IO Float 1`.
 
 This unified model means all stateful code lives in IO do-blocks, while pure comprehensions over plain values remain non-IO.
 
 ### The IO Type
 
-Effectful functions return descriptions of effects (`IO {effects} a`) rather than performing them. IO values are thunks that execute when run.
+Effectful functions return descriptions of effects (`IO a`) rather than performing them. IO values are thunks that execute when run.
 
 ```knot
 -- DB operations return IO with empty effects
@@ -545,13 +545,13 @@ Effectful functions return descriptions of effects (`IO {effects} a`) rather tha
 -- *people : IO {} [Person]
 
 -- println returns an IO action with console effect
-println : a -> IO {console} {}
+println : a -> IO {}
 
 -- readFile returns an IO action with fs effect
-readFile : Text -> IO {fs} Text
+readFile : Text -> IO Text
 
 -- now returns an IO action with clock effect, tagged with the built-in Ms unit
-now : IO {clock} Int Ms
+now : IO Int Ms
 ```
 
 ### IO Do-Blocks
@@ -561,12 +561,12 @@ IO do-blocks sequence effects. The `<-` operator runs an IO action and binds its
 ```knot
 main do
   people <- *people                  -- IO {} [Person] → binds [Person]
-  content <- readFile "input.txt"    -- IO {fs} Text → binds Text
-  println content                     -- IO {console} {}
-  t <- now                            -- IO {clock} Int Ms → binds Int Ms
+  content <- readFile "input.txt"    -- IO Text → binds Text
+  println content                     -- IO {}
+  t <- now                            -- IO Int Ms → binds Int Ms
   println ("time: " ++ show t)
   yield {}
--- overall type: IO {fs, console, clock} {}
+-- overall type: IO {}
 ```
 
 The pattern for querying relations is: IO-bind to get the value, then pure comprehension on the plain value:
@@ -684,16 +684,16 @@ ordinary functional code.
 
 ### File System
 
-Built-in functions for file I/O. All return `IO {fs}` values.
+Built-in functions for file I/O. All return `IO ` values.
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `readFile` | `Text -> IO {fs} Text` | Read entire file contents as text |
-| `writeFile` | `Text -> Text -> IO {fs} {}` | Write text to a file (creates or overwrites) |
-| `appendFile` | `Text -> Text -> IO {fs} {}` | Append text to a file |
-| `fileExists` | `Text -> IO {fs} Bool` | Check whether a path exists |
-| `removeFile` | `Text -> IO {fs} {}` | Delete a file |
-| `listDir` | `Text -> IO {fs} [Text]` | List directory entries as a relation of filenames |
+| `readFile` | `Text -> IO Text` | Read entire file contents as text |
+| `writeFile` | `Text -> Text -> IO {}` | Write text to a file (creates or overwrites) |
+| `appendFile` | `Text -> Text -> IO {}` | Append text to a file |
+| `fileExists` | `Text -> IO Bool` | Check whether a path exists |
+| `removeFile` | `Text -> IO {}` | Delete a file |
+| `listDir` | `Text -> IO [Text]` | List directory entries as a relation of filenames |
 
 ```knot
 -- Copy a file (IO do-block)
@@ -724,7 +724,7 @@ loadConfig \path -> do
 `fork` runs an IO action on a new OS thread. It is fire-and-forget — the forked action runs independently, but its effects are still visible in the caller's IO type. The spawned action can return any value (the result is discarded). Each spawned thread gets its own SQLite connection (WAL mode enables concurrent access). The main thread waits for all spawned threads before exiting.
 
 ```knot
-fork : IO {| r} a -> IO {| r} {}
+fork : IO a -> IO {}
 ```
 
 The spawned action's effect row `r` propagates through `fork` to the caller — a program that forks an IO that calls `println` is visibly typed with `{console}` in its IO row, so the effect system still reflects what the program can do. Do blocks can be passed as arguments without parentheses: `fork do ...`.
@@ -788,7 +788,7 @@ result IO. The winner is reported via the built-in `Result a b` ADT —
 action wins.
 
 ```knot
-race : IO {| r1} a -> IO {| r2} b -> IO {| r1 \/ r2} (Result a b)
+race : IO a -> IO b -> IO (Result a b)
 ```
 
 ```knot
@@ -938,7 +938,7 @@ On the fetch side, request headers are sent automatically from constructor field
 
 ```knot
 result <- fetch "https://api.example.com" (GetTodos {authorization "Bearer tok"})
--- result : IO {network} (Result ... {body: [Todo], headers: {xTotalCount: Int 1, xPage: Int 1}})
+-- result : IO (Result ... {body: [Todo], headers: {xTotalCount: Int 1, xPage: Int 1}})
 ```
 
 #### Rate Limiting
@@ -1480,7 +1480,7 @@ show (42.0 : Float M)         -- "42.0 M"
 show 3.14                     -- "3.14"
 ```
 
-`Int 1` units are appended the same way, including the built-in `Ms` that clock operations carry — `now : IO {clock} Int Ms`, so `show` on a timestamp reads `"1783814121719 Ms"`. Use `stripUnit` to print the bare number.
+`Int 1` units are appended the same way, including the built-in `Ms` that clock operations carry — `now : IO Int Ms`, so `show` on a timestamp reads `"1783814121719 Ms"`. Use `stripUnit` to print the bare number.
 
 When the unit is polymorphic (inside a unit-generic function), `show` prints just the number: the function body is compiled once, for every unit its caller may instantiate.
 

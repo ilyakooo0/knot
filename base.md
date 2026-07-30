@@ -19,7 +19,7 @@ Knot's own notation:
 - `a`, `b`, `r`, `u`, … are type / effect / unit variables (universally
   quantified).
 - `[a]` is a relation (a set) of `a`.
-- `IO {effects} a` is an IO action carrying an effect row.
+- `IO a` is an IO action carrying an effect row.
 - `Maybe a` is `Nothing {}` or `Just {value: a}`; `Result e a` is
   `Err {error: e}` or `Ok {value: a}`.
 
@@ -280,7 +280,7 @@ Walk a relation left-to-right, sequencing through an effectful or short-circuiti
 ### `base.println`
 
 ```
-base.println : a -> IO {console} {}
+base.println : a -> IO {}
 ```
 
 Print any value to stdout followed by a newline (uses `base.show`
@@ -289,7 +289,7 @@ formatting). `base.putLine` is an alias.
 ### `base.putLine`
 
 ```
-base.putLine : a -> IO {console} {}
+base.putLine : a -> IO {}
 ```
 
 Alias for `base.println`.
@@ -297,7 +297,7 @@ Alias for `base.println`.
 ### `base.print`
 
 ```
-base.print : a -> IO {console} {}
+base.print : a -> IO {}
 ```
 
 Print without a trailing newline.
@@ -305,7 +305,7 @@ Print without a trailing newline.
 ### `base.readLine`
 
 ```
-base.readLine : IO {console} Text
+base.readLine : IO Text
 ```
 
 Read a line from stdin.
@@ -378,12 +378,12 @@ Identity function.
 
 ## File system
 
-All return `IO {fs}` values.
+All return `IO ` values.
 
 ### `base.readFile`
 
 ```
-base.readFile : Text -> IO {fs} Text
+base.readFile : Text -> IO Text
 ```
 
 Read an entire file as text.
@@ -391,7 +391,7 @@ Read an entire file as text.
 ### `base.writeFile`
 
 ```
-base.writeFile : Text -> Text -> IO {fs} {}
+base.writeFile : Text -> Text -> IO {}
 ```
 
 Write text to a file (path, then contents); creates or overwrites.
@@ -399,7 +399,7 @@ Write text to a file (path, then contents); creates or overwrites.
 ### `base.appendFile`
 
 ```
-base.appendFile : Text -> Text -> IO {fs} {}
+base.appendFile : Text -> Text -> IO {}
 ```
 
 Append text to a file.
@@ -407,7 +407,7 @@ Append text to a file.
 ### `base.fileExists`
 
 ```
-base.fileExists : Text -> IO {fs} Bool
+base.fileExists : Text -> IO Bool
 ```
 
 Whether a file exists at the path.
@@ -415,7 +415,7 @@ Whether a file exists at the path.
 ### `base.removeFile`
 
 ```
-base.removeFile : Text -> IO {fs} {}
+base.removeFile : Text -> IO {}
 ```
 
 Delete a file.
@@ -423,7 +423,7 @@ Delete a file.
 ### `base.listDir`
 
 ```
-base.listDir : Text -> IO {fs} [Text]
+base.listDir : Text -> IO [Text]
 ```
 
 List directory entries as a relation of filenames.
@@ -435,7 +435,7 @@ List directory entries as a relation of filenames.
 ### `base.now`
 
 ```
-base.now : IO {clock} Int Ms
+base.now : IO Int Ms
 ```
 
 Current Unix timestamp in **milliseconds** (`Int Ms`). `base.now` is a
@@ -445,7 +445,7 @@ for a plain `Int 1`.
 ### `base.sleep`
 
 ```
-base.sleep : Int Ms -> IO {clock} {}
+base.sleep : Int Ms -> IO {}
 ```
 
 Pause the current thread for the given milliseconds. Inside `base.race` a
@@ -458,7 +458,7 @@ sleeping loser wakes immediately when the peer wins.
 ### `base.randomInt`
 
 ```
-base.randomInt : Int u -> IO {random} Int u
+base.randomInt : Int u -> IO Int u
 ```
 
 Random integer in `[0, bound)`. Unit-polymorphic — `base.randomInt 100 Usd`
@@ -467,7 +467,7 @@ returns `Int Usd`.
 ### `base.randomFloat`
 
 ```
-base.randomFloat : IO {random} Float u
+base.randomFloat : IO Float u
 ```
 
 Random float in `[0.0, 1.0)`. The unit is inferred from context.
@@ -475,7 +475,7 @@ Random float in `[0.0, 1.0)`. The unit is inferred from context.
 ### `base.randomUuid`
 
 ```
-base.randomUuid : IO {random} Uuid
+base.randomUuid : IO Uuid
 ```
 
 A fresh RFC 9562 **UUIDv7** — time-ordered, so values sort chronologically
@@ -722,7 +722,7 @@ X25519 (encryption) and Ed25519 (signing).
 ### `base.generateKeyPair`
 
 ```
-base.generateKeyPair : IO {random} {privateKey: Bytes, publicKey: Bytes}
+base.generateKeyPair : IO {privateKey: Bytes, publicKey: Bytes}
 ```
 
 X25519 key pair for encryption/decryption.
@@ -730,7 +730,7 @@ X25519 key pair for encryption/decryption.
 ### `base.generateSigningKeyPair`
 
 ```
-base.generateSigningKeyPair : IO {random} {privateKey: Bytes, publicKey: Bytes}
+base.generateSigningKeyPair : IO {privateKey: Bytes, publicKey: Bytes}
 ```
 
 Ed25519 key pair for signing/verification.
@@ -738,7 +738,7 @@ Ed25519 key pair for signing/verification.
 ### `base.encrypt`
 
 ```
-base.encrypt : Bytes -> Bytes -> IO {random} (Maybe Bytes)
+base.encrypt : Bytes -> Bytes -> IO (Maybe Bytes)
 ```
 
 Encrypt plaintext with a public key (sealed box: X25519 ECDH +
@@ -849,8 +849,8 @@ flow into the program's IO type.
 ### `base.fetch` / `base.fetchWith`
 
 ```
-base.fetch     : Text -> a -> IO {network} (Result {status: Int 1, message: Text} b)
-base.fetchWith : Text -> c -> a -> IO {network} (Result {status: Int 1, message: Text} b)
+base.fetch     : Text -> a -> IO (Result {status: Int 1, message: Text} b)
+base.fetchWith : Text -> c -> a -> IO (Result {status: Int 1, message: Text} b)
 ```
 
 Type-safe HTTP client from a route declaration. The first argument is the base

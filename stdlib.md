@@ -365,7 +365,7 @@ bump = \user counters -> upsertBy (\c -> c.user == user)
 ### `fork`
 
 ```
-fork : IO {| r} a -> IO {| r} {}
+fork : IO a -> IO {}
 ```
 
 Run an IO action on a new OS thread (fire-and-forget). The spawned action can
@@ -389,7 +389,7 @@ Do blocks can be passed directly as arguments without parentheses.
 ### `race`
 
 ```
-race : IO {| r1} a -> IO {| r2} b -> IO {| r1 \/ r2} (Result a b)
+race : IO a -> IO b -> IO (Result a b)
 ```
 
 Run two IO actions concurrently and return the winner. Each argument carries
@@ -560,7 +560,7 @@ has (contains "ell" "hello") -- True
 ### `println`
 
 ```
-println : a -> IO {console} {}
+println : a -> IO {}
 ```
 
 Print a value to stdout followed by a newline. `putLine` is an alias.
@@ -568,7 +568,7 @@ Print a value to stdout followed by a newline. `putLine` is an alias.
 ### `print`
 
 ```
-print : a -> IO {console} {}
+print : a -> IO {}
 ```
 
 Print a value to stdout without a trailing newline.
@@ -576,10 +576,10 @@ Print a value to stdout without a trailing newline.
 ### `logInfo` / `logWarn` / `logError` / `logDebug`
 
 ```
-logInfo  : a -> IO {console} {}
-logWarn  : a -> IO {console} {}
-logError : a -> IO {console} {}
-logDebug : a -> IO {console} {}
+logInfo  : a -> IO {}
+logWarn  : a -> IO {}
+logError : a -> IO {}
+logDebug : a -> IO {}
 ```
 
 Leveled logging to stderr (so output does not mix with `println` on stdout).
@@ -607,7 +607,7 @@ Convert any value to its text representation. This is a pure function (no IO).
 ### `readLine`
 
 ```
-readLine : IO {console} Text
+readLine : IO Text
 ```
 
 Read a line of input from stdin.
@@ -648,12 +648,12 @@ forEach ["a" "b" "c"] (\s -> println s)
 
 ## File System
 
-All file system functions return `IO {fs}` values.
+All file system functions return `IO ` values.
 
 ### `readFile`
 
 ```
-readFile : Text -> IO {fs} Text
+readFile : Text -> IO Text
 ```
 
 Read an entire file's contents as text.
@@ -661,7 +661,7 @@ Read an entire file's contents as text.
 ### `writeFile`
 
 ```
-writeFile : Text -> Text -> IO {fs} {}
+writeFile : Text -> Text -> IO {}
 ```
 
 Write text to a file (creates or overwrites). First argument is the path, second is the content.
@@ -669,7 +669,7 @@ Write text to a file (creates or overwrites). First argument is the path, second
 ### `appendFile`
 
 ```
-appendFile : Text -> Text -> IO {fs} {}
+appendFile : Text -> Text -> IO {}
 ```
 
 Append text to a file.
@@ -677,7 +677,7 @@ Append text to a file.
 ### `fileExists`
 
 ```
-fileExists : Text -> IO {fs} Bool
+fileExists : Text -> IO Bool
 ```
 
 Check whether a file exists at the given path.
@@ -685,7 +685,7 @@ Check whether a file exists at the given path.
 ### `removeFile`
 
 ```
-removeFile : Text -> IO {fs} {}
+removeFile : Text -> IO {}
 ```
 
 Delete a file.
@@ -693,7 +693,7 @@ Delete a file.
 ### `listDir`
 
 ```
-listDir : Text -> IO {fs} [Text]
+listDir : Text -> IO [Text]
 ```
 
 List directory entries as a relation of filenames.
@@ -711,7 +711,7 @@ main do
 ### `now`
 
 ```
-now : IO {clock} Int Ms
+now : IO Int Ms
 ```
 
 Return the current Unix timestamp in milliseconds. The result is tagged with the built-in `Ms` unit; use `stripUnit` if you need a plain `Int 1`.
@@ -719,7 +719,7 @@ Return the current Unix timestamp in milliseconds. The result is tagged with the
 ### `sleep`
 
 ```
-sleep : Int Ms -> IO {clock} {}
+sleep : Int Ms -> IO {}
 ```
 
 Pause the current thread for the given number of milliseconds. Inside a `race` worker, `sleep` parks on the worker's cancel condvar and wakes immediately if the peer wins.
@@ -731,7 +731,7 @@ Pause the current thread for the given number of milliseconds. Inside a `race` w
 ### `randomInt`
 
 ```
-randomInt : Int u -> IO {random} Int u
+randomInt : Int u -> IO Int u
 ```
 
 Generate a random integer in the range `[0, bound)`. Unit-polymorphic — the bound's unit is preserved in the result, so `randomInt 100 Usd` returns `Int Usd`.
@@ -739,7 +739,7 @@ Generate a random integer in the range `[0, bound)`. Unit-polymorphic — the bo
 ### `randomFloat`
 
 ```
-randomFloat : IO {random} Float u
+randomFloat : IO Float u
 ```
 
 Generate a random float in the range `[0.0, 1.0)`. Unit-polymorphic — the unit is inferred from context.
@@ -747,7 +747,7 @@ Generate a random float in the range `[0.0, 1.0)`. Unit-polymorphic — the unit
 ### `randomUuid`
 
 ```
-randomUuid : IO {random} Uuid
+randomUuid : IO Uuid
 ```
 
 Generate a fresh UUID. The output is a RFC 9562 UUIDv7 — time-ordered, so values sort chronologically and are well-suited as primary keys.
@@ -946,8 +946,8 @@ The HTTP types and primitives are defined in the language spec (`DESIGN.md`). Th
 ### `listen` / `listenOn`
 
 ```
-listen   : Int u -> Server a r -> IO {network | r} {}
-listenOn : Text   -> Int u -> Server a r -> IO {network | r} {}
+listen   : Int u -> Server a r -> IO {}
+listenOn : Text   -> Int u -> Server a r -> IO {}
 ```
 
 Start an HTTP server built with `serve API where ...`. `listen` binds to all interfaces; `listenOn` takes an explicit bind address. The `r` row variable unifies with the server's effect row, so handler effects (e.g. `console` from a handler that calls `println`) flow into the program's IO type.
@@ -955,9 +955,9 @@ Start an HTTP server built with `serve API where ...`. `listen` binds to all int
 ### `fetch` / `fetchWith`
 
 ```
-fetch     : Text -> Endpoint -> IO {network} (Result HttpError T)
+fetch     : Text -> Endpoint -> IO (Result HttpError T)
 fetchWith : Text -> {headers: [{name: Text, value: Text}]}
-                -> Endpoint -> IO {network} (Result HttpError T)
+                -> Endpoint -> IO (Result HttpError T)
 ```
 
 Type-safe HTTP client built from route declarations. `Endpoint` is a route constructor; the response type `T` is inferred from the route. `fetchWith` lets you add ad-hoc headers on top of the route's declared ones. When the route declares response headers, the success body wraps as `{body: T, headers: H}` inside `Ok`.
@@ -971,7 +971,7 @@ Knot provides elliptic-curve cryptography built-ins using X25519 (encryption) an
 ### `generateKeyPair`
 
 ```
-generateKeyPair : IO {random} {privateKey: Bytes, publicKey: Bytes}
+generateKeyPair : IO {privateKey: Bytes, publicKey: Bytes}
 ```
 
 Generate an X25519 key pair for encryption/decryption. Inside a `do` block, bind with `keys <- generateKeyPair`.
@@ -979,7 +979,7 @@ Generate an X25519 key pair for encryption/decryption. Inside a `do` block, bind
 ### `generateSigningKeyPair`
 
 ```
-generateSigningKeyPair : IO {random} {privateKey: Bytes, publicKey: Bytes}
+generateSigningKeyPair : IO {privateKey: Bytes, publicKey: Bytes}
 ```
 
 Generate an Ed25519 key pair for signing/verification. Inside a `do` block, bind with `keys <- generateSigningKeyPair`.
@@ -987,7 +987,7 @@ Generate an Ed25519 key pair for signing/verification. Inside a `do` block, bind
 ### `encrypt`
 
 ```
-encrypt : Bytes -> Bytes -> IO {random} Bytes
+encrypt : Bytes -> Bytes -> IO Bytes
 ```
 
 Encrypt plaintext bytes with a public key (sealed-box: X25519 ECDH + ChaCha20-Poly1305). First argument is the public key, second is the plaintext. Returns IO because a fresh ephemeral key pair and nonce are generated per call.
@@ -1143,7 +1143,7 @@ variables and no bounds.
 | `Bytes` | Byte string |
 | `Uuid` | RFC 9562 UUIDv7 identifier (TEXT in SQLite) |
 | `[a]` | Relation (set of values of type `a`) |
-| `IO {effects} a` | IO action with tracked effects |
+| `IO a` | IO action with tracked effects |
 | `Ordering` | `LT {}`, `EQ {}`, or `GT {}` |
 | `Maybe a` | `Nothing {}` or `Just {value: a}` (supports `do`/`<-`) |
 | `Result e a` | `Err {error: e}` or `Ok {value: a}` (supports `do`/`<-`) |

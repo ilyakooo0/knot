@@ -847,6 +847,15 @@ All intrinsic — no trait mechanism.
 | `withFloatUnit` | `Float 1 -> Float u` | Attach unit tag to `Float 1` |
 | `strip` | `a u -> a 1` | Drop unit tag (any unit-carrying numeric) |
 | `dress` | `a 1 -> a u` | Attach unit tag (any unit-carrying numeric) |
+| `floor` | `Float u -> Int 1` | Round toward negative infinity |
+| `intToFloat` | `Int u -> Float 1` | Widen `Int` to `Float` (lossy past 2⁵³) |
+| `textToInt` | `Text -> Maybe (Int 1)` | Parse integer (`Nothing` on bad input) |
+| `textToFloat` | `Text -> Maybe (Float 1)` | Parse float (`Nothing` on bad input) |
+
+Type-directed conversions also live in the nested **`base.morph`** record,
+consumed by the `^into` implicit-field projection: `(^into) x` resolves the
+matching `base.morph.<from>To<to>.into` by both the argument and expected
+result type (see [base.md](base.md#morphs-basemorph)).
 
 ### IO
 

@@ -640,6 +640,81 @@ digests.
 
 ---
 
+## Numeric conversion
+
+### `base.floor`
+
+```
+base.floor : Float u -> Int 1
+```
+
+Round toward negative infinity (`base.floor (-2.3)` is `-3`). The result is
+dimensionless; attach a unit with `base.withUnit` if needed.
+
+### `base.intToFloat`
+
+```
+base.intToFloat : Int u -> Float 1
+```
+
+Widen an `Int` to a `Float` (lossy past 2⁵³). The result is dimensionless.
+
+### `base.textToInt`
+
+```
+base.textToInt : Text -> Maybe (Int 1)
+```
+
+Parse an integer; `Nothing {}` on malformed input.
+
+### `base.textToFloat`
+
+```
+base.textToFloat : Text -> Maybe (Float 1)
+```
+
+Parse a float; `Nothing {}` on malformed input.
+
+---
+
+## Morphs (`base.morph`)
+
+`base.morph` is a nested record of type-directed conversions, consumed by the
+`^into` implicit-field projection. Each `<from>To<to>` field holds an
+`into : S -> T` function:
+
+```
+base.morph.textToBytes.into       : Text -> Bytes
+base.morph.bytesToText.into       : Bytes -> Maybe Text
+base.morph.bytesToHex.into        : Bytes -> Text
+base.morph.textToBytesFromHex.into : Text -> Maybe Bytes
+base.morph.intToFloat.into        : Int 1 -> Float 1
+base.morph.textToInt.into         : Text -> Maybe (Int 1)
+base.morph.textToFloat.into       : Text -> Maybe (Float 1)
+base.morph.intToText.into         : Int 1 -> Text
+base.morph.floatToText.into       : Float 1 -> Text
+base.morph.boolToText.into        : Bool -> Text
+```
+
+You rarely project these directly. Instead write `(^into) x` where the target
+type is known from context, and the compiler picks the matching morph:
+
+```knot
+asInt : Text -> Maybe (Int 1)
+asInt (\s -> (^into) s)     -- resolves base.morph.textToInt.into
+
+asText : Int 1 -> Text
+asText (\n -> (^into) n)    -- resolves base.morph.intToText.into
+```
+
+The conversion is chosen by **both** the argument type and the expected result
+type. `(^into) "42"` with no result annotation is ambiguous (several morphs
+accept `Text`) and is a compile error — pin the result type. See
+[DESIGN.md](DESIGN.md#implicit-dictionaries-field--t-) for the `^field`
+mechanism.
+
+---
+
 ## Cryptography
 
 X25519 (encryption) and Ed25519 (signing).

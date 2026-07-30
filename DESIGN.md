@@ -1830,6 +1830,27 @@ a constrained function partially applied (e.g. `map (clamp lo hi) xs`) does not
 yet thread the dictionary — it must be applied to all its explicit arguments at
 once.
 
+#### The seeded conversion dictionary: `base.morph`
+
+The prelude ships one implicit dictionary for the common case: **`base.morph`**,
+a nested record of type-directed conversions. Each `<from>To<to>` field holds an
+`into : S -> T` (e.g. `base.morph.textToInt.into : Text -> Maybe (Int 1)`).
+Because `base` is bound in every program's top scope, the `^into` projection
+resolves these conversions with no explicit dictionary:
+
+```knot
+asInt : Text -> Maybe (Int 1)
+asInt (\s -> (^into) s)     -- resolves base.morph.textToInt.into
+```
+
+The conversion is chosen by **both** the argument type and the expected result
+type, so the result must be pinned (an annotation, or use at a concrete type) —
+`(^into) "42"` alone is ambiguous and a compile error. Each morph field carries
+an explicit concrete signature: an un-annotated body whose type would stay
+polymorphic (e.g. `\n -> show n`, inferring `a -> Text`) cannot be dispatched
+type-directedly and would silently match the wrong conversion. See
+[base.md](base.md#morphs-basemorph) for the full conversion table.
+
 ### Type Inference
 
 Full Hindley-Milner style inference extended with row polymorphism (record fields, effect rows, and unit variables) and implicit-dictionary constraints. Type signatures are always optional — the compiler infers everything from usage.

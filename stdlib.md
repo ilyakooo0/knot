@@ -15,6 +15,8 @@ Complete reference for all built-in functions, traits, and types.
 - [Random](#random)
 - [JSON](#json)
 - [Bytes](#bytes)
+- [Numeric Conversion](#numeric-conversion)
+- [Morphs (`base.morph`)](#morphs-basemorph)
 - [HTTP](#http)
 - [Cryptography](#cryptography)
 - [Utility Functions](#utility-functions)
@@ -860,6 +862,80 @@ canonical serialisation, so equal logical values always produce equal digests.
 ```knot
 bytesToHex (hash "hello")    -- "ea8f163..."
 ```
+
+---
+
+## Numeric Conversion
+
+### `floor`
+
+```
+floor : Float u -> Int 1
+```
+
+Round toward negative infinity (`floor (-2.3)` is `-3`). The result is dimensionless.
+
+### `intToFloat`
+
+```
+intToFloat : Int u -> Float 1
+```
+
+Widen an `Int` to a `Float` (lossy past 2⁵³). The result is dimensionless.
+
+### `textToInt`
+
+```
+textToInt : Text -> Maybe (Int 1)
+```
+
+Parse an integer. Returns `Nothing {}` on malformed input.
+
+### `textToFloat`
+
+```
+textToFloat : Text -> Maybe (Float 1)
+```
+
+Parse a float. Returns `Nothing {}` on malformed input.
+
+---
+
+## Morphs (`base.morph`)
+
+`base.morph` is a nested record of type-directed conversions consumed by the
+`^into` implicit-field projection. Each `<from>To<to>` field holds an
+`into : S -> T` function:
+
+```
+base.morph.textToBytes.into        : Text -> Bytes
+base.morph.bytesToText.into        : Bytes -> Maybe Text
+base.morph.bytesToHex.into         : Bytes -> Text
+base.morph.textToBytesFromHex.into : Text -> Maybe Bytes
+base.morph.intToFloat.into         : Int 1 -> Float 1
+base.morph.textToInt.into          : Text -> Maybe (Int 1)
+base.morph.textToFloat.into        : Text -> Maybe (Float 1)
+base.morph.intToText.into          : Int 1 -> Text
+base.morph.floatToText.into        : Float 1 -> Text
+base.morph.boolToText.into         : Bool -> Text
+```
+
+Rather than projecting these directly, write `(^into) x` where the target type
+is known from context; the compiler selects the matching morph by **both** the
+argument and the expected result type:
+
+```knot
+asInt : Text -> Maybe (Int 1)
+asInt (\s -> (^into) s)     -- resolves base.morph.textToInt.into
+
+asText : Int 1 -> Text
+asText (\n -> (^into) n)    -- resolves base.morph.intToText.into
+```
+
+`(^into) "42"` with no result annotation is ambiguous (several morphs accept
+`Text`) and is a compile error — pin the result type. See
+[DESIGN.md](DESIGN.md#implicit-dictionaries-field--t-) for the `^field`
+mechanism.
 
 ---
 

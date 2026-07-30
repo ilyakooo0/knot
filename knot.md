@@ -619,7 +619,7 @@ no way to make your own type work with an operator beyond the built-in cases.
 
 ### IO Type
 
-Effectful functions return `IO a` — a description of an effectful computation
+Effectful functions return `IO (a)` — a description of an effectful computation
 producing an `a`, not immediate execution. `IO` takes a single type argument
 (the result type); there is no effect-row parameter:
 
@@ -682,14 +682,14 @@ The body of `atomic` must be an IO expression containing only DB operations. Ext
 Fire-and-forget: runs an IO action on a new OS thread. Each thread gets its own SQLite connection (WAL mode).
 
 ```knot
-fork : IO a -> IO {}
-
-main do
-  fork do
-    println "hello from thread 1"
-  fork do
-    println "hello from thread 2"
-  println "hello from main"
+-- base.fork : IO (a) -> IO {}
+(do
+  base.fork do
+    base.println "hello from thread 1"
+  base.fork do
+    base.println "hello from thread 2"
+  base.println "hello from main"
+  yield {})
   -- main waits for all spawned threads before exiting
 ```
 
@@ -720,7 +720,7 @@ conservatively.
 #### `race`
 
 ```knot
-race : IO a -> IO b -> IO (Result a b)
+race : IO (a) -> IO (b) -> IO (Result a b)
 ```
 
 Run two IO actions concurrently and return the winner. The winner is reported
@@ -866,8 +866,8 @@ result type (see [base.md](base.md#morphs-basemorph)).
 | `randomFloat` | `IO Float u` | Random float `[0.0, 1.0)`, unit-polymorphic |
 | `randomUuid` | `IO Uuid` | Generate a RFC 9562 UUIDv7 |
 | `atomic` | `IO {} a -> IO {} a` | Run DB operations in a transaction |
-| `fork` | `IO a -> IO {}` | Fire-and-forget on new OS thread |
-| `race` | `IO a -> IO b -> IO (Result a b)` | Run two IO actions, return the winner |
+| `fork` | `IO (a) -> IO {}` | Fire-and-forget on new OS thread |
+| `race` | `IO (a) -> IO (b) -> IO (Result a b)` | Run two IO actions, return the winner |
 | `retry` | `a` | Rollback and wait (inside `atomic` only) |
 | `when` | `Bool -> IO {} -> IO {}` | Run action when condition is true |
 | `unless` | `Bool -> IO {} -> IO {}` | Run action when condition is false |

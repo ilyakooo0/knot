@@ -365,7 +365,7 @@ bump = \user counters -> upsertBy (\c -> c.user == user)
 ### `fork`
 
 ```
-fork : IO a -> IO {}
+fork : IO (a) -> IO {}
 ```
 
 Run an IO action on a new OS thread (fire-and-forget). The spawned action can
@@ -387,7 +387,7 @@ Do blocks can be passed directly as arguments without parentheses.
 ### `race`
 
 ```
-race : IO a -> IO b -> IO (Result a b)
+race : IO (a) -> IO (b) -> IO (Result a b)
 ```
 
 Run two IO actions concurrently and return the winner.
@@ -1139,7 +1139,7 @@ variables and no bounds.
 | `Bytes` | Byte string |
 | `Uuid` | RFC 9562 UUIDv7 identifier (TEXT in SQLite) |
 | `[a]` | Relation (set of values of type `a`) |
-| `IO a` | IO action with tracked effects |
+| `IO (a)` | IO action producing a value of type `a` |
 | `Ordering` | `LT {}`, `EQ {}`, or `GT {}` |
 | `Maybe a` | `Nothing {}` or `Just {value: a}` (supports `do`/`<-`) |
 | `Result e a` | `Err {error: e}` or `Ok {value: a}` (supports `do`/`<-`) |

@@ -238,7 +238,7 @@ and compiles each by a dedicated path:
 - **`[a]`** (relation comprehension): `<-` iterates rows, `where` filters,
   `yield` emits a row. Compiled to SQL when over source relations (see
   [Querying](#querying)), otherwise to an in-memory loop.
-- **`IO a`**: `<-` sequences effects, `yield` returns a pure value. IO do
+- **`IO (a)`**: `<-` sequences effects, `yield` returns a pure value. IO do
   blocks (those containing IO-returning expressions like `*rel`, `println`,
   `readFile`, `now`) use a dedicated IO compilation path that sequences actions
   directly.
@@ -528,7 +528,7 @@ Grouping is executed via SQLite — key columns are inserted into a temp table a
 
 ### Unified IO Model
 
-All state operations in Knot return IO values. `IO a` is a single type
+All state operations in Knot return IO values. `IO (a)` is a single type
 constructor taking one argument — the result type — with no effect-row
 parameter:
 
@@ -542,7 +542,7 @@ This unified model means all stateful code lives in IO do-blocks, while pure com
 
 ### The IO Type
 
-Effectful functions return descriptions of effects (`IO a`) rather than performing them. IO values are thunks that execute when run.
+Effectful functions return descriptions of effects (`IO (a)`) rather than performing them. IO values are thunks that execute when run.
 
 ```knot
 -- DB operations return IO
@@ -625,7 +625,7 @@ If the body uses a capability not listed in the signature, the compiler rejects 
 ### IO and Transactions
 
 `atomic` takes an IO body and runs it in a transaction. `atomic do ...` is a
-keyword form (not a `base.` function); the block is an `IO a`.
+keyword form (not a `base.` function); the block is an `IO (a)`.
 
 ```knot
 -- DB writes go in `atomic`, IO happens after commit
@@ -720,10 +720,10 @@ loadConfig \path -> do
 
 #### `fork`
 
-`fork` runs an IO action on a new OS thread. It is fire-and-forget — the forked action runs independently, but its effects are still visible in the caller's IO type. The spawned action can return any value (the result is discarded). Each spawned thread gets its own SQLite connection (WAL mode enables concurrent access). The main thread waits for all spawned threads before exiting.
+`fork` runs an IO action on a new OS thread. It is fire-and-forget — the forked action runs independently and its result is discarded. Each spawned thread gets its own SQLite connection (WAL mode enables concurrent access). The main thread waits for all spawned threads before exiting.
 
 ```knot
-fork : IO a -> IO {}
+fork : IO (a) -> IO {}
 ```
 
 `fork` spawns an IO action on a new OS thread and returns `IO {}`. Do blocks can be passed as arguments without parentheses: `fork do ...`.
@@ -785,7 +785,7 @@ winner is reported via the built-in `Result a b` ADT —
 action wins.
 
 ```knot
-race : IO a -> IO b -> IO (Result a b)
+race : IO (a) -> IO (b) -> IO (Result a b)
 ```
 
 ```knot

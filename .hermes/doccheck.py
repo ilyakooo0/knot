@@ -132,13 +132,10 @@ def compile_src(src, tag):
 def main():
     doc = sys.argv[1]
     blocks = extract_blocks(doc)
-    results = []
+    # Build work items first, then compile in parallel (each block spawns the
+    # compiler; serial is ~5s/block which times out on the big docs).
+    work_items = []
     for idx, b in enumerate(blocks):
-        # Compile `knot`-tagged blocks. Untagged blocks are usually prose/output,
-        # but MANY reference signature blocks (stdlib.md/base.md) are untagged
-        # and ARE knot type signatures that must be verified. Compile an untagged
-        # block only if it looks like knot (every non-comment line parses as a
-        # sig/binding/expr); skip obvious non-knot (paths, backticks, diagrams).
         if b["lang"] not in ("knot", ""):
             continue
         if b["lang"] == "" and not looks_like_knot(b["body"]):
@@ -154,9 +151,19 @@ def main():
             src = wrap_sigs(payload)
         else:
             continue
-        ok, err = compile_src(src, f"{os.path.basename(doc)}-{idx}")
-        results.append({"idx": idx, "line": b["line"], "kind": kind, "ok": ok, "err": err,
-                        "preview": next((l for l in b["body"] if not is_comment_or_blank(l)), "")[:60]})
+        work_items.append({"idx": idx, "line": b["line"], "kind": kind, "src": src,
+                           "preview": next((l for l in b["body"] if not is_comment_or_blank(l)), "")[:60]})
+
+    from concurrent.futures import ThreadPoolExecutor
+    def run(item):
+        ok, err = compile_src(item["src"], f"{os.path.basename(doc)}-{item['idx']}")
+        item["ok"] = ok; item["err"] = err
+        return item
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for item in ex.map(run, work_items):
+            results.append(item)
+    results.sort(key=lambda r: r["line"])
     npass = sum(1 for r in results if r["ok"])
     print(f"\n==== {doc}: {npass}/{len(results)} blocks compile ====")
     for r in results:

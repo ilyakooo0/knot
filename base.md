@@ -72,7 +72,7 @@ base.fold : (b -> a -> b) -> b -> [a] -> b
 Left fold over a relation: combine every row into an accumulator.
 
 ```knot
-totalAmount = \rel -> base.fold (\acc r -> acc + r.amount) 0 rel
+totalAmount \rel -> base.fold (\acc r -> acc + r.amount) 0 rel
 ```
 
 ### `base.count`
@@ -105,7 +105,7 @@ Sum a numeric relation. Project a record field first with `base.map`. Units
 are preserved: summing `[Float M]` gives `Float M`.
 
 ```knot
-totalDist = base.sum (base.map (\t -> t.distance) *trips)
+totalDist (base.sum (base.map (\t -> t.distance) *trips))
 ```
 
 ### `base.avg`
@@ -925,7 +925,7 @@ context/annotation).
 
 ```knot
 toS : Int Ms -> Int S
-toS = \ms -> base.dress (base.strip ms / 1000)
+toS \ms -> base.dress (base.strip ms / 1000)
 ```
 
 ---

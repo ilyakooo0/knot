@@ -9,7 +9,7 @@ type Person = {name: Text, age: Int 1}
 
 *people : [Person]
 
-main = do
+main do
   *people = [{name "Alice" age 30} {name "Bob" age 25}]
   people <- *people
   with {result do
@@ -49,7 +49,7 @@ cargo run -p knot-compiler -- build file.knot
 Compile-time units on `Int` and `Float`. Units are fully erased at runtime — no performance cost. Units are not declared: any name used in a unit position is a unit, and compound units are written inline.
 
 ```knot
-distance = (42.0 : Float M)  -- Float M
+distance ((42.0 : Float M)) -- Float M
 speed : Float (M / S)
 force : Float (Kg * M / S^2)
 cents : Int Usd
@@ -69,7 +69,7 @@ Unit polymorphism — concrete units are uppercase, lowercase names are unit var
 
 ```knot
 double : Float u -> Float u
-double = \x -> x + x
+double \x -> x + x
 ```
 
 Unit-preserving stdlib: `sum` (over a numeric relation) and `avg` (via its projection) propagate units.
@@ -95,9 +95,9 @@ Note the two syntaxes differ: **values** are `{name "Alice" age 30}` (space-sepa
 A relation `[T]` is a typed **set** of `T` values. No duplicates. No ordering guarantees.
 
 ```knot
-names = ["Alice" "Bob" "Carol"]     -- [Text]
-empty = []                             -- [a]
-people = [{name "Alice" age 30}]   -- [{name: Text, age: Int 1}]
+names (["Alice" "Bob" "Carol"]) -- [Text]
+empty ([]) -- [a]
+people ([{name "Alice" age 30}]) -- [{name: Text, age: Int 1}]
 ```
 
 ### ADTs (Algebraic Data Types)
@@ -157,10 +157,10 @@ There are five kinds of top-level declarations:
   yield (filter (\p -> p.age > 65) people)
 
 -- Constant
-maxRetries = 3
+maxRetries (3)
 
 -- Function (constants bound to lambdas)
-double = \x -> x * 2
+double \x -> x * 2
 ```
 
 ---
@@ -171,14 +171,14 @@ Functions are constants bound to lambdas:
 
 ```knot
 -- Single parameter
-greet = \name -> "Hello, " ++ name
+greet \name -> "Hello, " ++ name
 
 -- Multiple parameters
-add = \x y -> x + y
+add \x y -> x + y
 
 -- With type signature (optional — types are inferred)
 formatName : Text -> Text
-formatName = \n -> toUpper (take 1 n) ++ drop 1 n
+formatName \n -> toUpper (take 1 n) ++ drop 1 n
 ```
 
 Function application is juxtaposition:
@@ -203,9 +203,9 @@ Any expression can carry a postfix type annotation, both with and without
 surrounding parens:
 
 ```knot
-n = 0 : Int Usd                -- bare postfix annotation
-m = (x + y) : Float M          -- parenthesized
-distance = 42.0 : Float (M / S)  -- units on a literal
+n (0 : Int Usd) -- bare postfix annotation
+m ((x + y) : Float M) -- parenthesized
+distance (42.0 : Float (M / S)) -- units on a literal
 ```
 
 Annotations are common with units of measure where the literal alone is
@@ -219,7 +219,7 @@ whatever the surrounding code requires and is generalized like a type variable:
 
 ```knot
 id : _ -> _
-id = \x -> x
+id \x -> x
 id 42          -- 42 : Int 1
 id "hello"     -- "hello" : Text
 
@@ -234,7 +234,7 @@ unit variable:
 
 ```knot
 double : Float _ -> Float _
-double = \x -> x + x
+double \x -> x + x
 double (5.0 : Float M)     -- 10.0 M — the unit flows through the hole
 ```
 
@@ -304,13 +304,13 @@ When bound expressions are `IO` values, the do block sequences IO actions:
 
 ```knot
 -- IO do block with console effects
-main = do
+main do
   content <- readFile "input.txt"    -- IO {fs} Text
   println content                     -- IO {console} {}
   yield {}
 
 -- IO do block with DB operations
-addPerson = \name age -> do
+addPerson \name age -> do
   people <- *people                  -- IO {} [Person]
   *people = union people [{name name age age}]
 ```
@@ -348,12 +348,12 @@ Mutation is written `*rel = expr`, which makes the source relation equal to `exp
 
 ```knot
 -- Insert (union with singleton)
-addPerson = do
+addPerson do
   people <- *people
   *people = union people [{name "Alice" age 30}]
 
 -- Update (map with conditional)
-birthday = \name -> do
+birthday \name -> do
   people <- *people
   *people = do
     p <- people
@@ -362,7 +362,7 @@ birthday = \name -> do
       Bool.False {} -> p)
 
 -- Delete (filter to keep)
-removePerson = \name -> do
+removePerson \name -> do
   people <- *people
   *people = do
     p <- people
@@ -382,7 +382,7 @@ There is **no `if`/`then`/`else`**. The only branch is pattern matching with
 `case ... of`; a Bool scrutinee gives you if/else:
 
 ```knot
-result = case x > 0 of
+result (case x > 0 of)
   Bool.True {}  -> "positive"
   Bool.False {} -> "non-positive"
 ```
@@ -434,12 +434,12 @@ The unqualified constructors are confined to the `with` body — the qualified f
 ### Case Expressions
 
 ```knot
-describe = \s -> case s of
+describe \s -> case s of
   Circle {radius} -> "circle r=" ++ show radius
   Rect {width, height} -> show width ++ "x" ++ show height
 
 -- With wildcard
-priority = \p -> case p of
+priority \p -> case p of
   Critical {} -> 1
   High {} -> 2
   _ -> 3
@@ -448,7 +448,7 @@ priority = \p -> case p of
 ### Pattern Matching on Relations
 
 ```knot
-describe = \rel -> case rel of
+describe \rel -> case rel of
   [] -> "empty"
   [{name: n}] -> "just " ++ n
   Cons h _ -> "first of many: " ++ show h
@@ -463,7 +463,7 @@ describe = \rel -> case rel of
 `Cons` is also useful in recursive functions:
 
 ```knot
-sumList = \xs -> case xs of
+sumList \xs -> case xs of
   [] -> 0
   Cons h t -> h + sumList t
 ```
@@ -513,7 +513,7 @@ Fields can hold `[T]` — sets nested inside rows:
     yield result)
 
 -- Update nested relations
-updateTeams = do
+updateTeams do
   teams <- *teams
   *teams = do
     t <- teams
@@ -546,7 +546,7 @@ Constant columns (like `status: Open {}`) are:
 
 ```knot
 -- Insert through view — status auto-filled
-addOpenTodo = do
+addOpenTodo do
   openTodos <- *openTodos
   *openTodos = union openTodos [{title "New task" owner "Alice" priority High {}}]
 ```
@@ -645,7 +645,7 @@ now : IO {clock} Int Ms
 ### IO Do Blocks
 
 ```knot
-main = do
+main do
   content <- readFile "data.txt"
   println ("Read " ++ show (length content) ++ " chars")
   yield {}
@@ -657,7 +657,7 @@ All relation operations are IO-wrapped with an empty effect set:
 
 ```knot
 -- All relation operations are IO:
-birthday = \name -> do
+birthday \name -> do
   people <- *people              -- IO {} [Person]
   *people = do               -- IO {} {}
     p <- people
@@ -674,7 +674,7 @@ birthday = \name -> do
 
 ```knot
 -- atomic : IO {} a -> IO {} a
-handleOrder = \item -> do
+handleOrder \item -> do
   orderId <- atomic do
     orders <- *orders
     *orders = union orders [{item item qty 1}]
@@ -695,7 +695,7 @@ Fire-and-forget: runs an IO action on a new OS thread. Each thread gets its own 
 ```knot
 fork : IO {| r} a -> IO {| r} {}
 
-main = do
+main do
   fork do
     println "hello from thread 1"
   fork do
@@ -714,7 +714,7 @@ result's IO row. Do blocks can be passed directly as arguments: `fork do ...`
 Used inside `atomic` blocks for STM-style waiting. Causes the transaction to rollback and wait until some relation changes, then re-executes the atomic block.
 
 ```knot
-waitFor = \condition -> atomic do
+waitFor \condition -> atomic do
   cond <- condition
   where (not cond)
   retry
@@ -742,15 +742,15 @@ IO. The winner is reported using the built-in `Result` ADT — `Err {error: a}`
 when the left action wins, `Ok {value: b}` when the right action wins.
 
 ```knot
-slow = do
+slow do
   sleep 1000 Ms
   yield "slow"
 
-fast = do
+fast do
   sleep 50 Ms
   yield "fast"
 
-main = do
+main do
   r <- race slow fast
   case r of
     Err {error: a} -> println ("left won: " ++ a)
@@ -954,7 +954,7 @@ route AdminApi where
 route Api = TodoApi | AdminApi
 
 -- Handler
-api = serve Api where
+api (serve Api where)
   GetTodos = \{owner} -> do
     todos <- getTodos owner
     yield Ok {value todos}
@@ -965,7 +965,7 @@ api = serve Api where
     todos <- *todos
     yield Ok {value count todos}
 
-main = listen 8080 api
+main (listen 8080 api)
 ```
 
 `serve API where` produces a value of type `Server API r`, where `r` is the effect row of the handlers (rendered `_` when handlers are pure, or e.g. `{console}` when a handler logs). Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. The row `r` flows into `listen`'s IO type: `listen : Int u -> Server a r -> IO {network | r} {}`.
@@ -975,7 +975,7 @@ main = listen 8080 api
 `Ok {value: v}` responds 200 with `v` as JSON. `Err {error: {status, message}}` responds with the given status code and a JSON error body:
 
 ```knot
-api = serve Api where
+api (serve Api where)
   GetUser = \{id} -> do
     users <- *people
     case filter (\u -> u.id == id) users of
@@ -1004,7 +1004,7 @@ Field names use camelCase, auto-converted to HTTP-Header-Case: `authorization` �
 Request headers become constructor fields. When response headers are declared, the handler returns a `{body: ..., headers: ...}` record:
 
 ```knot
-api = serve Api where
+api (serve Api where)
   GetTodos = \{authorization} ->
     with {todos allTodos}
     (do
@@ -1047,9 +1047,9 @@ type RateLimit input a = {key input -> RequestCtx -> Maybe a -- Ord a; Nothing e
 `key` receives the same input record the handler does (path/query/body/header fields, combined) plus the runtime-supplied `RequestCtx`, so you can key on any field of either:
 
 ```knot
-byClientIp = \input ctx -> Just {value ctx.clientIp}
+byClientIp \input ctx -> Just {value ctx.clientIp}
 
-byOwner = \{owner} ctx -> Just {value owner}             -- key on a path/body field
+byOwner \{owner} ctx -> Just {value owner}             -- key on a path/body field
 
 route Api where
   GET /hello -> {message: Text}
@@ -1070,7 +1070,7 @@ On rejection the runtime responds `429 Too Many Requests` with body `{"error":"R
 Common keying strategies are regular expressions, so extract them once and reuse:
 
 ```knot
-serverLimit = {key \input ctx -> Just {value ctx.clientIp} limit {requests 1000 window 60000 Ms}}
+serverLimit ({key \input ctx -> Just {value ctx.clientIp} limit {requests 1000 window 60000 Ms}})
 
 route Api where
   POST {events: [Event]} /federation/gossip -> {} rateLimit serverLimit = RecvGossip
@@ -1138,12 +1138,12 @@ data Shape
 
 ```knot
 -- Use with case
-result = case refine someInt of
+result (case refine someInt of)
   Ok {value: n} -> println ("Valid: " ++ show n)
   Err {error: e} -> println ("Invalid: " ++ show e)
 
 -- Use in Result do-block
-validated = do
+validated do
   n <- refine someInt        -- binds n : Nat on success, short-circuits on failure
   m <- refine otherInt
   yield (n + m)
@@ -1186,7 +1186,7 @@ the compiler's built-in structural support — short-circuiting on `Nothing` /
 
 ```knot
 -- Maybe — short-circuits on Nothing
-result = do
+result do
   a <- Just {value 10}
   b <- Just {value 2}
   where b != 0
@@ -1197,7 +1197,7 @@ safeDivide = \x y -> case y == 0 of
   Bool.True {}  -> Err {error "div by zero"}
   Bool.False {} -> Ok {value (x / y)}
 
-compute = do
+compute do
   a <- Ok {value 10}
   b <- safeDivide a 2
   yield (a + b)
@@ -1223,11 +1223,11 @@ type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
 
 *todos : [Todo]
 
-add = \title owner priority -> do
+add \title owner priority -> do
   todos <- *todos
   *todos = union todos [{title title owner owner priority priority status Open {}}]
 
-complete = \title -> do
+complete \title -> do
   todos <- *todos
   *todos = do
     t <- todos
@@ -1235,7 +1235,7 @@ complete = \title -> do
       then {t | status (Resolved {resolution "done"})}
       else t)
 
-assign = \title person -> do
+assign \title person -> do
   todos <- *todos
   *todos = do
     t <- todos
@@ -1243,7 +1243,7 @@ assign = \title person -> do
       then {t | status (InProgress {assignee person})}
       else t)
 
-pending = \owner -> do
+pending \owner -> do
   todos <- *todos
   with {result do
     t <- todos
@@ -1263,7 +1263,7 @@ pending = \owner -> do
   (do
     yield result)
 
-main = do
+main do
   add "Write parser" "Alice" High {}
   add "Write codegen" "Alice" Critical {}
   add "Write runtime" "Bob" Medium {}
@@ -1285,7 +1285,7 @@ main = do
 ### Insert
 
 ```knot
-addRow = \newRow -> do
+addRow \newRow -> do
   rel <- *rel
   *rel = union rel [newRow]
 ```
@@ -1293,7 +1293,7 @@ addRow = \newRow -> do
 ### Delete by condition
 
 ```knot
-deleteWhere = \valueToDelete -> do
+deleteWhere \valueToDelete -> do
   rel <- *rel
   *rel = do
     r <- rel
@@ -1304,7 +1304,7 @@ deleteWhere = \valueToDelete -> do
 ### Update by condition
 
 ```knot
-updateWhere = \target newValue -> do
+updateWhere \target newValue -> do
   rel <- *rel
   *rel = do
     r <- rel
@@ -1331,11 +1331,11 @@ updateWhere = \target newValue -> do
 ### Aggregate
 
 ```knot
-getTotal = do
+getTotal do
   orders <- *orders
   yield (fold (\acc x -> acc + x.amount) 0 orders)
 
-getCount = do
+getCount do
   people <- *people
   yield (count people)
 ```

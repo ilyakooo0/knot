@@ -126,7 +126,7 @@ fold : (b -> a -> b) -> b -> [a] -> b
 Left fold over a relation. `fold` is the `Foldable` trait method for `[]`.
 
 ```knot
-totalAmount = \rel -> fold (\acc r -> acc + r.amount) 0 rel
+totalAmount \rel -> fold (\acc r -> acc + r.amount) 0 rel
 ```
 
 ### `single`
@@ -152,7 +152,7 @@ count : [a] -> Int u
 Return the number of rows in a relation.
 
 ```knot
-numPeople = count *people
+numPeople (count *people)
 ```
 
 When the argument is a source relation (or its bound alias), the compiler emits a single `SELECT COUNT(*)` query. Pipe forms like `*people |> filter (\p -> p.age > 30) |> count` collapse into one `SELECT COUNT(*) FROM ... WHERE ...`.
@@ -166,7 +166,7 @@ countWhere : (a -> Bool) -> [a] -> Int u
 Count rows that satisfy a predicate. Equivalent to `count . filter`, but pushes down to a single `SELECT COUNT(*) FROM ... WHERE pred` when the predicate is SQL-compilable.
 
 ```knot
-engHeadcount = do
+engHeadcount do
   employees <- *employees
   yield (countWhere (\e -> e.dept == "Eng") employees)
 ```
@@ -180,13 +180,13 @@ sum : [a] -> a
 Sum of a numeric relation. Takes the relation directly — there is no projection argument. To sum a field of a record relation, project first with `map`. Works with `Int 1`, `Float 1`, and unit-annotated types — units are preserved.
 
 ```knot
-total = sum [10 20 30]                          -- 60
+total (sum [10 20 30]) -- 60
 
 -- Sum a record field by projecting first:
-totalAge = sum (map (\p -> p.age) *people)
+totalAge (sum (map (\p -> p.age) *people))
 
 -- Unit-preserving:
-totalDistance = sum (map (\t -> t.distance) *trips)   -- Float M if distance : Float M
+totalDistance (sum (map (\t -> t.distance) *trips)) -- Float M if distance : Float M
 ```
 
 ### `avg`
@@ -206,11 +206,11 @@ minOn : (a -> b) -> [a] -> b
 Minimum of a projected field over a relation. The projection can return any orderable type — `Int 1`, `Float 1`, or `Text` (lexicographic ordering). Panics if the relation is empty.
 
 ```knot
-lowestSalary = do
+lowestSalary do
   employees <- *employees
   yield (minOn (\e -> e.salary) employees)
 
-firstName = do
+firstName do
   employees <- *employees
   yield (minOn (\e -> e.name) employees)
 ```
@@ -226,7 +226,7 @@ maxOn : (a -> b) -> [a] -> b
 Maximum of a projected field over a relation. Like `minOn`, works with any orderable type. Panics if the relation is empty. Pushes down to `SELECT MAX(col) FROM ...`.
 
 ```knot
-highestSalary = do
+highestSalary do
   employees <- *employees
   yield (maxOn (\e -> e.salary) employees)
 ```
@@ -376,7 +376,7 @@ thread gets its own SQLite connection via WAL mode for safe concurrent access.
 The main thread waits for all spawned threads before exiting.
 
 ```knot
-main = do
+main do
   fork do
     println "hello from thread 1"
   fork do
@@ -399,15 +399,15 @@ its own effect row; the result IO's row is the union of both (written
 The winner is reported via the built-in `Result a b` ADT — `Err {error: a}` when the left action wins, `Ok {value: b}` when the right action wins.
 
 ```knot
-slow = do
+slow do
   sleep (1000 : Int Ms)
   yield "slow"
 
-fast = do
+fast do
   sleep (50 : Int Ms)
   yield "fast"
 
-main = do
+main do
   r <- race slow fast
   case r of
     Err {error: a} -> println ("left won: " ++ a)
@@ -428,7 +428,7 @@ atomic : IO {} a -> IO {} a
 Run an IO body in a database transaction. The body must contain only DB operations — no external effects (console, fs, etc.) are allowed. If the body calls `retry`, the transaction rolls back and waits for a relation change before re-executing.
 
 ```knot
-transfer = \from to amount -> atomic do
+transfer \from to amount -> atomic do
   accounts <- *accounts
   *accounts = do
     a <- accounts
@@ -446,7 +446,7 @@ retry : a
 Used inside `atomic` blocks only. Causes the transaction to rollback and wait until some relation changes, then re-executes the atomic block. Implements STM (Software Transactional Memory) style concurrency.
 
 ```knot
-waitForTask = \id -> atomic do
+waitForTask \id -> atomic do
   tasks <- *tasks
   with {done do
     t <- tasks
@@ -550,7 +550,7 @@ contains : Text -> Text -> Bool
 Check if the second argument contains the first as a substring.
 
 ```knot
-has = contains "ell" "hello"   -- True
+has (contains "ell" "hello") -- True
 ```
 
 ---
@@ -590,7 +590,7 @@ compiled Knot program accepts `--debug` automatically; see
 [Runtime CLI](#runtime-cli).)
 
 ```knot
-main = do
+main do
   logInfo "starting"
   logWarn {event "low memory" availableMb 64}
   yield {}
@@ -699,7 +699,7 @@ listDir : Text -> IO {fs} [Text]
 List directory entries as a relation of filenames.
 
 ```knot
-main = do
+main do
   files <- listDir "."
   yield (filter (\f -> contains ".knot" f) files)
 ```
@@ -753,7 +753,7 @@ randomUuid : IO {random} Uuid
 Generate a fresh UUID. The output is a RFC 9562 UUIDv7 — time-ordered, so values sort chronologically and are well-suited as primary keys.
 
 ```knot
-main = do
+main do
   u <- randomUuid
   println u
   yield {}
@@ -1064,10 +1064,10 @@ at runtime:
 
 ```knot
 toS : Int Ms -> Int S
-toS = \ms -> dress (strip ms / 1000)
+toS \ms -> dress (strip ms / 1000)
 
 toMiles : Float M -> Float Mi
-toMiles = \d -> dress (strip d * 0.000621371)
+toMiles \d -> dress (strip d * 0.000621371)
 ```
 
 A dimensionless `Int 1`/`Float 1` does **not** unify with a concrete unit, so
@@ -1159,7 +1159,7 @@ Units are not declared. Any name used in a unit position is a unit — there is 
 #### Literals and Type Annotations
 
 ```knot
-distance = (42.0 : Float M)   -- Float M
+distance ((42.0 : Float M)) -- Float M
 speed : Float (M / S)
 force : Float (Kg * M / S^2)
 cents : Int Usd
@@ -1187,7 +1187,7 @@ Concrete units are uppercase; lowercase names are unit variables:
 
 ```knot
 double : Float u -> Float u
-double = \x -> x + x
+double \x -> x + x
 ```
 
 #### Unit-Preserving Functions

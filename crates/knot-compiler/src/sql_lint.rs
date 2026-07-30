@@ -191,6 +191,7 @@ fn lint_expr(
         | ExprKind::Constructor(_)
         | ExprKind::SourceRef(_)
         | ExprKind::ImplicitRef(_)
+        | ExprKind::TypeHole
         | ExprKind::DerivedRef(_) => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
     }
@@ -950,7 +951,8 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         | ExprKind::Var(_)
         | ExprKind::Constructor(_)
         | ExprKind::ImplicitRef(_)
-        | ExprKind::DerivedRef(_) => false,
+        | ExprKind::DerivedRef(_)
+        | ExprKind::TypeHole => false,
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => false,
         ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => references_source(body, source_name),
         ExprKind::Record(fields) => fields.iter().any(|f| references_source(&f.value, source_name)),

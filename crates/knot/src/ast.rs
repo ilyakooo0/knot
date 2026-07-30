@@ -84,6 +84,13 @@ pub enum ExprKind {
     /// field named `name` whose type unifies with the expected type.
     ImplicitRef(Name),
 
+    /// `_` in expression position — a HOLE. In a type-argument slot (consumed
+    /// by `consume_type_arg`) it is an inferrable type hole (`TypeKind::Hole`
+    /// → a fresh unification variable). In any other (value) position it
+    /// behaves like `base.todo`: a polymorphic `∀a. a` placeholder that warns
+    /// at compile time and errors at runtime with the expected type + scope.
+    TypeHole,
+
     /// `{name: "Alice", age: 30}`
     Record(Vec<RecordField>),
 

@@ -3935,6 +3935,17 @@ impl Infer {
         while let ast::ExprKind::Annot { expr: inner, .. } = &head_expr.node {
             head_expr = inner;
         }
+        // `_` as a type argument: an inferrable hole. Maps to `TypeKind::Hole`
+        // (→ a fresh unification variable), consumed as a single spine element.
+        if matches!(&head_expr.node, ast::ExprKind::TypeHole) {
+            return Some((
+                knot::ast::Spanned {
+                    node: TypeKind::Hole,
+                    span: head.span,
+                },
+                1,
+            ));
+        }
         let ast::ExprKind::Constructor(name) = &head_expr.node else {
             return None;
         };
@@ -5381,6 +5392,15 @@ impl Infer {
                 // recorded for codegen (see `resolve_implicit_ref`).
                 let expected = self.fresh();
                 self.resolve_implicit_ref(name, &expected, expr.span)
+            }
+
+            ast::ExprKind::TypeHole => {
+                // `_` in VALUE position (a TypeHole that reached general
+                // inference rather than being consumed as a type argument):
+                // behaves like `base.todo` — a polymorphic `∀a. a` placeholder.
+                // The `infer_expr` wrapper records the expected type + scope
+                // (via `expr_is_todo_ref`) for the runtime hole report.
+                self.fresh()
             }
 
             ast::ExprKind::SourceRef(name) => {
@@ -11901,6 +11921,8 @@ fn value_references_source_inner(
         ast::ExprKind::SourceRef(name) => name == source_name,
         // `^x` reads a record field, never a source relation directly.
         ast::ExprKind::ImplicitRef(_) => false,
+        // `_` hole reads nothing.
+        ast::ExprKind::TypeHole => false,
         ast::ExprKind::Var(name) => {
             if aliases.get(name).map(|s| s.as_str()) == Some(source_name) {
                 return true;
@@ -12071,6 +12093,12 @@ pub fn check(program: &mut ast::Expr) -> CheckOutput {
 /// that the field means the builtin. (Bare `todo` is not a `base` record
 /// field, so it is never in scope — only the namespaced form exists.)
 fn expr_is_todo_ref(expr: &ast::Expr) -> bool {
+    // `_` in value position is a TypeHole: it behaves exactly like `base.todo`
+    // (polymorphic placeholder that warns at compile time, errors at runtime),
+    // so it is detected here too and shares the whole todo pipeline.
+    if matches!(&expr.node, ast::ExprKind::TypeHole) {
+        return true;
+    }
     matches!(
         &expr.node,
         ast::ExprKind::FieldAccess { expr: base, field }
@@ -12708,6 +12736,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
     use ast::ExprKind::*;
     match &mut expr.node {
         Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
+        TypeHole => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         RouteDecl { .. } | RouteCompositeDecl { .. } => {}
         ViewDecl { body, .. } | DerivedDecl { body, .. } => f(body),

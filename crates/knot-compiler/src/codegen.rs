@@ -4005,6 +4005,10 @@ impl Codegen {
         match &expr.node {
             ast::ExprKind::Lit(lit) => self.compile_lit(builder, lit),
 
+            // `_` in value position: a TypeHole behaves exactly like
+            // `base.todo` — report the expected type + scope and exit.
+            ast::ExprKind::TypeHole => self.emit_todo(builder, expr.span, env),
+
             ast::ExprKind::Var(name) if name == "__empty" => {
                 self.compile_monadic_empty(builder, expr.span, db)
             }
@@ -5643,6 +5647,7 @@ impl Codegen {
             Var(name) => !self.write_functions.contains(name),
             // `^x` reads a record field; it never writes to a source.
             ImplicitRef(_) => true,
+            TypeHole => true,
             // A route declaration marker carries no value and never writes.
             RouteDecl { .. } | RouteCompositeDecl { .. } => true,
             Atomic(inner) | Refine(inner) => {
@@ -5768,6 +5773,11 @@ impl Codegen {
                 ast::ExprKind::Constructor(_) => {
                     return self.type_arg_spans.contains(&cur.span);
                 }
+                // `_` consumed as a type argument (erased): its span is also
+                // recorded in `type_arg_spans`.
+                ast::ExprKind::TypeHole => {
+                    return self.type_arg_spans.contains(&cur.span);
+                }
                 _ => return false,
             }
         }
@@ -5796,11 +5806,12 @@ impl Codegen {
         }
         let mut flat: Vec<&ast::Expr> = Vec::new();
         flatten(arg, &mut flat);
-        // Drop leading erased type-argument constructors; keep the rest.
+        // Drop leading erased type-argument constructors (and `_` type holes,
+        // which are likewise erased type arguments); keep the rest.
         let mut i = 0;
         while i < flat.len() {
             let e = flat[i];
-            if matches!(&e.node, ast::ExprKind::Constructor(_))
+            if matches!(&e.node, ast::ExprKind::Constructor(_) | ast::ExprKind::TypeHole)
                 && self.type_arg_spans.contains(&e.span)
             {
                 i += 1;
@@ -11595,6 +11606,7 @@ impl Codegen {
         match &expr.node {
             ast::ExprKind::SourceRef(name) => name == source_name,
             ast::ExprKind::ImplicitRef(_) => false,
+            ast::ExprKind::TypeHole => false,
             ast::ExprKind::Lit(_)
             | ast::ExprKind::Var(_)
             | ast::ExprKind::Constructor(_)
@@ -15250,7 +15262,7 @@ fn beta_reduce_inner(
             }
             Var(name.clone())
         }
-        ImplicitRef(_) => expr.node.clone(),
+        ImplicitRef(_) | TypeHole => expr.node.clone(),
         SubsetConstraint { .. } => expr.node.clone(),
         RouteDecl { .. } | RouteCompositeDecl { .. } => expr.node.clone(),
         With { record, body, types } => {
@@ -15392,7 +15404,7 @@ fn substitute_inner(
     let span = expr.span;
     let new_node = match &expr.node {
         Var(name) if name == var => return Some(value.clone()),
-        Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
+        Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {
             return Some(expr.clone())
         }
@@ -15516,7 +15528,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     };
     match &expr.node {
         Var(name) => name == var,
-        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
+        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => false,
         ViewDecl { body, .. } | DerivedDecl { body, .. } => expr_mentions_var(body, var),
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
@@ -15569,7 +15581,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
                 free.insert(name.clone());
             }
         }
-        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeCtor { .. }
+        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {}
         ViewDecl { body, .. } | DerivedDecl { body, .. } => collect_free_vars_set(body, bound, free),
         Lambda { params, body, .. } => {
@@ -16406,7 +16418,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
     match &expr.node {
         ast::ExprKind::DerivedRef(n) => n == name,
         ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef(_) | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::TypeCtor { .. }
+        | ast::ExprKind::SourceRef(_) | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::TypeHole | ast::ExprKind::TypeCtor { .. }
         | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_contains_derived_ref(body, name),
@@ -16509,6 +16521,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => collect_free_vars(body, bound, free),
         ast::ExprKind::ImplicitRef(_) => {}
+        ast::ExprKind::TypeHole => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
         ast::ExprKind::DerivedRef(name) => {
             // A recursive derived relation passes its in-progress accumulator
@@ -16678,6 +16691,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::ImplicitRef(_)
+        | ast::ExprKind::TypeHole
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
@@ -16770,6 +16784,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef(_)
         | ast::ExprKind::ImplicitRef(_)
+        | ast::ExprKind::TypeHole
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
@@ -17101,6 +17116,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::Lit(lit) => pretty_lit(lit),
         ast::ExprKind::Var(name) => name.clone(),
         ast::ExprKind::ImplicitRef(name) => format!("^{name}"),
+        ast::ExprKind::TypeHole => "_".to_string(),
         ast::ExprKind::Constructor(name) => name.clone(),
         ast::ExprKind::TypeCtor { name, .. } => name.clone(),
         ast::ExprKind::DataCtor { name, .. } => name.clone(),

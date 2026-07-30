@@ -1806,6 +1806,9 @@ impl Parser {
                     false
                 }
             }
+            // `_` — a hole. Valid as an application argument: as a type
+            // argument it is inferred; as a value it behaves like `base.todo`.
+            TokenKind::Underscore => true,
             _ => false,
         }
     }
@@ -2230,9 +2233,10 @@ impl Parser {
                 result
             }
             TokenKind::Underscore => {
-                self.error("unexpected '_' in expression — wildcards are only for patterns");
+                // `_` in expression position: a hole. As a type argument it is
+                // inferred; as a value it behaves like `base.todo`.
                 self.advance();
-                None
+                Some(Spanned::new(ExprKind::TypeHole, start))
             }
             _ => {
                 self.error("expected expression");

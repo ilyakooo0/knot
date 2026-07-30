@@ -1,0 +1,35 @@
+-- The `_` hole, in its two positions.
+--
+-- `_` is a HOLE. Its meaning depends on where it appears:
+--
+--   * TYPE position — an inferrable type. As a type argument to a
+--     type-witness function it is consumed and erased (no runtime
+--     representation), and unification fills it in from the value argument
+--     or the surrounding context. (`_` in a plain type annotation, e.g.
+--     `f : _ -> Text`, already works the same way.)
+--
+--   * VALUE position — behaves exactly like `base.todo`: a polymorphic
+--     `∀a. a` placeholder that warns at compile time and, if reached at
+--     runtime, reports the type it was expected to produce plus the local
+--     bindings in scope.
+with {
+-- A type-witness function: `\(From : Type)` binds a type argument, which the
+-- caller supplies positionally. `showInto From x` shows x at type From.
+showInto (\(From : Type) -> \x -> base.show x)
+}
+(do
+  -- `_` as a TYPE ARGUMENT: inferred (here, from nothing constraining it to a
+  -- concrete type, it stays polymorphic — same as passing an explicit type).
+  -- The `_` is erased at runtime, exactly like an explicit `Int`/`Text`.
+  base.println (showInto _ 41)          -- the witness is erased; prints the lambda's result
+
+  -- `_` in a type annotation: inferred from the call.
+  base.println (base.show 99)
+  yield {})
+
+-- `_` as a VALUE (uncomment to see the hole report):
+-- (do
+--   base.println (base.show _)
+--   yield {})
+-- compiles with a "`todo` hole used" warning, and running it reports:
+--   reached a `todo` hole — expected to produce a value of type: a

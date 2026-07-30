@@ -4008,15 +4008,17 @@ impl Parser {
             TokenKind::Upper(_) => {
                 let tok = self.advance();
                 let TokenKind::Upper(name) = tok.kind else { unreachable!() };
-                if name == "IO" && matches!(self.peek(), TokenKind::LBrace | TokenKind::Lower(_) | TokenKind::Underscore)
+                if name == "IO" && matches!(self.peek(), TokenKind::LBrace | TokenKind::Underscore)
                     // `IO {}` is IO of the unit record type `{}`, not an
                     // effect row — only reject when the brace has contents.
                     && !(matches!(self.peek(), TokenKind::LBrace)
                         && matches!(self.peek_ahead(1), TokenKind::RBrace))
                 {
-                    // Effect-row syntax (`IO {effects} T`, `IO r T`) is not
-                    // valid — effects are untracked. Reject so the user gets a
-                    // clear error rather than a misparsed type.
+                    // Effect-row brace syntax (`IO {effects} T`) and the
+                    // wildcard (`IO _ T`) are not valid — effects are
+                    // untracked. Reject so the user gets a clear error rather
+                    // than a misparsed type. A lowercase type variable
+                    // (`IO a`) is fine: IO of a type variable.
                     self.error("effect rows are not supported: use `IO T`");
                     return None;
                 }

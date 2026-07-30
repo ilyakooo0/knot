@@ -18,7 +18,7 @@ Knot's own notation:
 
 - `a`, `b`, `u`, … are type / unit variables (universally quantified).
 - `[a]` is a relation (a set) of `a`.
-- `IO (a)` is an IO action producing an `a`.
+- `IO a` is an IO action producing an `a`.
 - `Maybe a` is `Nothing {}` or `Just {value: a}`; `Result e a` is
   `Err {error: e}` or `Ok {value: a}`.
 
@@ -776,7 +776,7 @@ Verify a signature. Args: public key, message, signature.
 ### `base.fork`
 
 ```
-base.fork : IO (a) -> IO {}
+base.fork : IO a -> IO {}
 ```
 
 Run an IO action on a new OS thread (fire-and-forget; the result is
@@ -786,7 +786,7 @@ joins all spawned threads before exit.
 ### `base.race`
 
 ```
-base.race : IO (a) -> IO (b) -> IO (Result a b)
+base.race : IO a -> IO b -> IO (Result a b)
 ```
 
 Run two IO actions concurrently, return the winner:

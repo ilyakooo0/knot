@@ -1430,7 +1430,7 @@ Literals are unit-polymorphic and pick up their unit from an annotation:
 distance ((42.0 : Float M))
 duration ((3.5 : Float S))
 price ((999 : Int Usd))
-pi (3.14159) -- dimensionless (Float 1)
+piVal (3.14159) -- dimensionless (Float 1)
 ```
 
 #### Arithmetic
@@ -1438,21 +1438,20 @@ pi (3.14159) -- dimensionless (Float 1)
 `+`/`-` require matching units. `*`/`/` compose units. The compiler normalizes unit expressions algebraically (`M * S / S` → `M`, `M / M` → `1`).
 
 ```knot
--- Same-unit addition/subtraction
-(10.0 : Float M) + (5.0 : Float M)      -- Float M
-(10.0 : Float M) + (5.0 : Float S)      -- type error
+-- Same-unit addition/subtraction (mismatched units are a type error)
+addSame ((10.0 : Float M) + (5.0 : Float M))      -- Float M
 
 -- Unit composition
-(10.0 : Float M) * (5.0 : Float M)      -- Float (M^2)
-(100.0 : Float M) / (10.0 : Float S)    -- Float (M/S)
-(2.0 : Float Kg) * (9.8 : Float (M / S^2))  -- Float (Kg * M / S^2)
+mulSq ((10.0 : Float M) * (5.0 : Float M))        -- Float (M^2)
+divSpeed ((100.0 : Float M) / (10.0 : Float S))   -- Float (M/S)
+force ((2.0 : Float Kg) * (9.8 : Float (M / S^2)))  -- Float (Kg * M / S^2)
 
 -- Dimensionless scalars
-2.0 * (5.0 : Float M)                    -- Float M
-(5.0 : Float M) / 2.0                    -- Float M
+scaledL (2.0 * (5.0 : Float M))                   -- Float M
+scaledR ((5.0 : Float M) / 2.0)                   -- Float M
 
 -- Negation preserves units
--((5.0 : Float M))                       -- Float M
+negated (-((5.0 : Float M)))                      -- Float M
 ```
 
 Arbitrary integer powers arise naturally from multiplication: `M * M` = `M^2`, `S * S * S` = `S^3`. Powers can also be written directly in type annotations: `Float (M^2)`, `Float (S^-1)`.
@@ -1481,16 +1480,16 @@ double \x -> x + x
 `stripUnit` / `withUnit` (Int 1) and `stripFloatUnit` / `withFloatUnit` (Float 1) are identity functions that exist only for the type checker. Use them to drop a unit tag and re-attach a different one. The result of `withUnit`/`withFloatUnit` carries a free unit variable, so the caller pins the target unit via the surrounding type context (e.g. the function's return signature) or an explicit annotation:
 
 ```knot
-stripUnit       : Int u -> Int 1           -- drop unit from Int 1
-withUnit        : Int 1 -> Int u           -- attach unit to Int 1
-stripFloatUnit  : Float u -> Float 1
-withFloatUnit   : Float 1 -> Float u
+base.stripUnit       : Int u -> Int 1           -- drop unit from Int 1
+base.withUnit        : Int 1 -> Int u           -- attach unit to Int 1
+base.stripFloatUnit  : Float u -> Float 1
+base.withFloatUnit   : Float 1 -> Float u
 
 toS : Int Ms -> Int S
-toS \ms -> withUnit (stripUnit ms / 1000)
+toS \ms -> base.withUnit (base.stripUnit ms / 1000)
 
 toMiles : Float Km -> Float Mi
-toMiles \d -> withFloatUnit (stripFloatUnit d * 0.621371)
+toMiles \d -> base.withFloatUnit (base.stripFloatUnit d * 0.621371)
 ```
 
 The generalized top-level pair `strip : a u -> a 1` and `dress : a 1 -> a u` performs the same rebranding across both numeric types with one call. The `u` is a unit variable of kind `Unit`, so in practice `a` is a unit-carrying numeric (`Int` or `Float`); these are registered directly in the compiler because the surface syntax cannot write `a 1` (`1` is not a type). Both are identity at runtime:
@@ -1675,25 +1674,33 @@ Age <: Nat <: Int 1
 Upcasting (refined → base) is implicit, no check:
 
 ```knot
-f : Int 1 -> Int 1
-f (x : Nat)         -- fine: Nat <: Int 1
+type Nat = Int 1 where \x -> x >= 0
+doubleIt : Int 1 -> Int 1
+doubleIt \x -> x + x
+-- A Nat argument upcasts implicitly to the Int 1 parameter (Nat <: Int 1)
 ```
 
 Downcasting (base → refined) requires `refine`. `refine expr` has type `Result RefinementError T` where `T` is the target refined type, inferred from context. If context doesn't determine `T`, it's a type error.
 
 ```knot
-f : Nat -> Text
-
--- In a Result do-block (bind unwraps the Result):
-do
-  n <- refine someInt        -- n : Nat (inferred from f's parameter type)
-  yield (f n)
--- : Result RefinementError Text
-
--- With case:
-case refine someInt of
-  Ok {value: n} -> f n       -- Nat inferred from f's parameter
-  Err {error}   -> "invalid"
+type Nat = Int 1 where \x -> x >= 0
+showNat : Nat -> Text
+showNat \n -> base.show n
+someInt (5 : Int 1)
+```
+```knot
+with {
+type Nat = Int 1 where \x -> x >= 0
+showNat : Nat -> Text
+showNat \n -> base.show n
+someInt (5 : Int 1)
+}
+(do
+  -- With case (Nat inferred from showNat's parameter):
+  case refine someInt of
+    Result.Ok {value n} -> base.println (showNat n)
+    Result.Err {error e} -> base.println "invalid"
+  yield {})
 ```
 
 Two refined types with the same base but different predicates are unrelated — no subtyping between `Nat` and `Percentage`. Stacked refinements are the exception: `Age <: Nat` because `Age` was defined as `Nat where ...`.

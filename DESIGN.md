@@ -274,12 +274,15 @@ Do blocks can appear anywhere an expression is expected, including as function a
 IO do blocks (those containing IO-returning expressions like `*rel`, `println`, `readFile`, `now`) are not desugared to a generic bind — they use a dedicated compilation path that sequences IO actions directly.
 
 ```knot
+*employees : [{name: Text, dept: Text, salary: Int 1}]
+*departments : [{name: Text, budget: Int 1}]
+
 -- do with [] (pure relation comprehension over plain values)
 richOnes \employees departments -> do
   e <- employees
   d <- departments
   where e.dept == d.name
-  yield {e.name, e.salary, d.budget}
+  yield {name e.name salary e.salary budget d.budget}
 
 -- IO do block (binds from *rel, which returns IO)
 &richEmployees = do
@@ -288,7 +291,7 @@ richOnes \employees departments -> do
   yield (richOnes employees departments)
 
 -- do with Maybe
-safeDivide = \a b -> case b == 0 of Bool.True {} -> Nothing {}; Bool.False {} -> Just {value: a / b}
+safeDivide \a b -> case b == 0 of Bool.True {} -> Maybe.Nothing {}; Bool.False {} -> Maybe.Just {value (a / b)}
 
 tryCompute do
   x <- safeDivide 10 2
@@ -296,7 +299,7 @@ tryCompute do
   yield (x + y)
 
 -- do with Result
-safeDivideR = \a b -> case b == 0 of Bool.True {} -> Err {error "div by zero"}; Bool.False {} -> Ok {value: a / b}
+safeDivideR \a b -> case b == 0 of Bool.True {} -> Result.Err {error "div by zero"}; Bool.False {} -> Result.Ok {value (a / b)}
 
 computeR do
   x <- safeDivideR 10 2
@@ -427,13 +430,17 @@ circles (base.match Shape.Circle shapes) -- [Shape] -> [{radius: Float 1}]
 Relation comprehensions use `do` syntax with `yield` to produce rows. A read-only comprehension binds each row of a source with `<-` (like `FROM`), filters with `where` (like `WHERE`), and emits rows with `yield`:
 
 ```knot
-with {result (do
+with {
+*employees : [{ename: Text, dept: Text, salary: Int 1}]
+*departments : [{name: Text, budget: Int 1}]
+}
+(with {result (do
   e <- *employees
   d <- *departments
   where e.dept == d.name          -- the join condition
   where d.budget > 1000000        -- extra filter
   yield {name e.ename salary e.salary budget d.budget})}
-yield result
+yield result)
 ```
 
 Binding two sources and relating them with an equi-join predicate (`e.dept == d.name`) is a **join**. A read-only join/filter comprehension like this compiles to a single multi-table SQL `SELECT ... FROM "_knot_employees" AS t0, "_knot_departments" AS t1 WHERE t0."dept" = t1."name" AND t1."budget" > ?`, with the join and filter columns auto-indexed; anything the planner can't translate falls back to an in-memory join with identical results.
@@ -585,15 +592,13 @@ This unified model means all stateful code lives in IO do-blocks, while pure com
 Effectful functions return descriptions of effects (`IO a`) rather than performing them. IO values are thunks that execute when run.
 
 ```knot
--- DB operations return IO
-*people : [Person]
--- a read of *people yields IO [Person]
+-- DB operations return IO — a read of *people yields IO [Person].
+-- External effects are also plain IO:
+base.println : a -> IO {}
 
-println : a -> IO {}
+base.readFile : Text -> IO Text
 
-readFile : Text -> IO Text
-
-now : IO (Int Ms)
+base.now : IO (Int Ms)
 ```
 
 ### IO Do-Blocks
@@ -601,14 +606,17 @@ now : IO (Int Ms)
 IO do-blocks sequence effects. The `<-` operator runs an IO action and binds its result. Since relation references return IO, you bind to get the plain value, then use pure comprehensions:
 
 ```knot
-do
-  people <- *people                  -- IO {} [Person] → binds [Person]
+with {
+type Person = {name: Text, age: Int 1}
+*people : [Person]
+}
+(do
+  people <- *people                       -- IO [Person] → binds [Person]
   content <- base.readFile "input.txt"    -- IO Text → binds Text
   base.println content                     -- IO {}
-  t <- base.now                            -- IO Int Ms → binds Int Ms
+  t <- base.now                            -- IO (Int Ms) → binds Int Ms
   base.println ("time: " ++ base.show t)
-  yield {}
--- overall type: IO {}
+  yield {})
 ```
 
 The pattern for querying relations is: IO-bind to get the value, then pure comprehension on the plain value:

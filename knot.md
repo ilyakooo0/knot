@@ -253,11 +253,14 @@ argument. To share a type between positions, use an explicit type variable
 A comprehension over one source filters and projects its rows:
 
 ```knot
-with {result (do
+with {
+*employees : [{name: Text, salary: Int 1}]
+}
+(with {result (do
   e <- *employees
   where e.salary > 75
   yield {name e.name salary e.salary})}
-yield result
+yield result)
 ```
 
 **Joins.** Bind two (or more) relations in the same comprehension and relate
@@ -265,13 +268,17 @@ them with a `where` clause — an equi-join predicate (`a.f == b.g`) plus any
 single-table predicates:
 
 ```knot
-with {result (do
+with {
+*employees : [{name: Text, dept: Text, salary: Int 1}]
+*departments : [{name: Text, budget: Int 1}]
+}
+(with {result (do
   e <- *employees
   d <- *departments
   where e.dept == d.name        -- the join condition
   where e.salary > 75           -- extra single-table filter
   yield {name e.name dept d.name budget d.budget})}
-yield result
+yield result)
 ```
 
 A read-only comprehension like this compiles to a **single multi-table SQL
@@ -388,9 +395,11 @@ There is **no `if`/`then`/`else`**. The only branch is pattern matching with
 `case ... of`; a Bool scrutinee gives you if/else:
 
 ```knot
-result (case x > 0 of)
+with {x 5}
+(with {result (case x > 0 of
   Bool.True {}  -> "positive"
-  Bool.False {} -> "non-positive"
+  Bool.False {} -> "non-positive")}
+result)
 ```
 
 Both arms must have the same type, and matching must be exhaustive (the
@@ -402,15 +411,21 @@ compiler enforces covering every constructor).
 
 ```knot
 with {x 2 y 3} (x + y)            -- 5
+```
 
--- The bound value can be any expression, including a do block:
-with {result do
+The bound value can be any expression, including a do block:
+
+```knot
+with {
+people [{name "Al" age 30} {name "Bo" age 20}]
+}
+(with {result do
   p <- people
   where p.age > 27
   yield p.name}
 (do
   base.println (base.show result)
-  yield {})
+  yield {}))
 ```
 
 Use `with` wherever you would otherwise introduce a local name — inside do blocks, in function bodies, or nested in other expressions.
@@ -423,13 +438,19 @@ Naming a **data type** (uppercase) as a `with` field brings that type's construc
 with {Maybe} (case (Just {value 5}) of
   Just {value v} -> v
   Nothing {} -> 0)              -- 5
+```
 
--- Types and value bindings mix freely:
+Types and value bindings mix freely:
+
+```knot
 with {Maybe five 5} (case (Just {value five}) of
   Just {value v} -> v
   Nothing {} -> 0)              -- 5
+```
 
--- Import several types at once:
+Import several types at once:
+
+```knot
 with {Maybe Result} (case (Ok {value 3}) of
   Ok {value v} -> v
   Err {error e} -> 0)           -- 3

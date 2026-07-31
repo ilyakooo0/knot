@@ -62,9 +62,19 @@ def classify(body):
     nonempty = [b for b in body if not is_comment_or_blank(b)]
     if not nonempty:
         return "empty", None
-    # complete program: an OUTER record-open `with {` at col 0 (not an inner
-    # comprehension `with {name do ...`), possibly followed by a body.
-    outer_with = re.search(r'^with \{\s*$', text, re.M)
+    # complete program: an OUTER record-open `with {` at col 0. This is NOT an
+    # inner comprehension (`with {name do ...`) — a comprehension binds a single
+    # name to a do-block and appears inside another do. A program's record-open
+    # has record fields (name value / name : T / name \a -> ...) or closes with
+    # a body expression.
+    outer_with = None
+    for m in re.finditer(r'^with \{(.*)$', text, re.M):
+        rest = m.group(1).strip()
+        # `with {name do` / `with {name (do` => inner comprehension, skip
+        if re.match(r'^[a-zA-Z_]\w*\s+\(?do\b', rest):
+            continue
+        outer_with = m
+        break
     if outer_with:
         # is there a body after the last closing brace at col 0?
         # crude: last non-comment line that's not part of the with-record

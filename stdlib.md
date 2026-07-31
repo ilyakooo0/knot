@@ -87,7 +87,7 @@ filter : (a -> Bool) -> [a] -> [a]
 Keep rows where the predicate returns `True`.
 
 ```knot
-&seniors = *people |> filter (\p -> p.age > 65)
+&seniors = *people |> base.filter (\p -> p.age > 65)
 ```
 
 ### `map`
@@ -99,7 +99,7 @@ map : (a -> b) -> [a] -> [b]
 Apply a function to each row. Results are deduplicated (relations are sets).
 
 ```knot
-&names = *people |> map (\p -> {name p.name})
+&names = *people |> base.map (\p -> {name p.name})
 ```
 
 `map` is the `Functor` trait method for `[]`.
@@ -126,7 +126,7 @@ fold : (b -> a -> b) -> b -> [a] -> b
 Left fold over a relation. `fold` is the `Foldable` trait method for `[]`.
 
 ```knot
-totalAmount \rel -> fold (\acc r -> acc + r.amount) 0 rel
+totalAmount \rel -> base.fold (\acc r -> acc + r.amount) 0 rel
 ```
 
 ### `single`
@@ -152,7 +152,7 @@ count : [a] -> Int u
 Return the number of rows in a relation.
 
 ```knot
-numPeople (count *people)
+numPeople (base.count *people)
 ```
 
 When the argument is a source relation (or its bound alias), the compiler emits a single `SELECT COUNT(*)` query. Pipe forms like `*people |> filter (\p -> p.age > 30) |> count` collapse into one `SELECT COUNT(*) FROM ... WHERE ...`.
@@ -168,7 +168,7 @@ Count rows that satisfy a predicate. Equivalent to `count . filter`, but pushes 
 ```knot
 engHeadcount do
   employees <- *employees
-  yield (countWhere (\e -> e.dept == "Eng") employees)
+  yield (base.countWhere (\e -> e.dept == "Eng") employees)
 ```
 
 ### `sum`
@@ -180,13 +180,13 @@ sum : [a] -> a
 Sum of a numeric relation. Takes the relation directly — there is no projection argument. To sum a field of a record relation, project first with `map`. Works with `Int 1`, `Float 1`, and unit-annotated types — units are preserved.
 
 ```knot
-total (sum [10 20 30]) -- 60
+total (base.sum [10 20 30]) -- 60
 
 -- Sum a record field by projecting first:
-totalAge (sum (map (\p -> p.age) *people))
+totalAge (base.sum (base.map (\p -> p.age) *people))
 
 -- Unit-preserving:
-totalDistance (sum (map (\t -> t.distance) *trips)) -- Float M if distance : Float M
+totalDistance (base.sum (base.map (\t -> t.distance) *trips)) -- Float M if distance : Float M
 ```
 
 ### `avg`
@@ -208,11 +208,11 @@ Minimum of a projected field over a relation. The projection can return any orde
 ```knot
 lowestSalary do
   employees <- *employees
-  yield (minOn (\e -> e.salary) employees)
+  yield (base.minOn (\e -> e.salary) employees)
 
 firstName do
   employees <- *employees
-  yield (minOn (\e -> e.name) employees)
+  yield (base.minOn (\e -> e.name) employees)
 ```
 
 When applied to a source (or bound source variable), it pushes down to `SELECT MIN(col) FROM ...`. Combined with `filter` it becomes `SELECT MIN(col) FROM ... WHERE ...`.
@@ -228,7 +228,7 @@ Maximum of a projected field over a relation. Like `minOn`, works with any order
 ```knot
 highestSalary do
   employees <- *employees
-  yield (maxOn (\e -> e.salary) employees)
+  yield (base.maxOn (\e -> e.salary) employees)
 ```
 
 ### `min` / `max`
@@ -242,8 +242,8 @@ Binary minimum and maximum of two values. Use `minOn`/`maxOn` to aggregate
 over a relation; `min`/`max` operate on two single values.
 
 ```knot
-min 3 7         -- 3
-max "a" "b"     -- "b"
+base.min 3 7         -- 3
+base.max "a" "b"     -- "b"
 ```
 
 ### `union`
@@ -255,7 +255,7 @@ union : [a] -> [a] -> [a]
 Set union of two relations.
 
 ```knot
-&all = union *employees *contractors
+&all = base.union *employees *contractors
 ```
 
 ### `diff`
@@ -267,7 +267,7 @@ diff : [a] -> [a] -> [a]
 Set difference — rows in the first relation but not the second.
 
 ```knot
-&nonManagers = diff *employees *managers
+&nonManagers = base.diff *employees *managers
 ```
 
 ### `inter`
@@ -295,7 +295,7 @@ findFirst : [a] -> (a -> Bool) -> Maybe a
 First row matching the predicate (left-to-right), or `Nothing {}` when no row matches. Stops at the first hit.
 
 ```knot
-findFirst [1 2 3 4 5] (\x -> x > 3)   -- Just {value 4}
+base.findFirst [1 2 3 4 5] (\x -> x > 3)   -- Just {value 4}
 ```
 
 ### `any` / `all`
@@ -328,7 +328,7 @@ Pushes down to SQL `ORDER BY` when applied to a source relation. Combined with `
 ```knot
 &topFive = do
   employees <- *employees
-  yield (employees |> sortBy (\e -> -e.salary) |> take 5)
+  yield (employees |> base.sortBy (\e -> -e.salary) |> base.take 5)
 -- SQL: SELECT ... FROM _knot_employees ORDER BY -salary LIMIT 5
 ```
 
@@ -354,7 +354,7 @@ source relations.
 ```knot
 -- Bump or insert a per-user counter
 bump = \user counters -> upsertBy (\c -> c.user == user)
-                                   {user user count lookup user counters + 1}
+                                   {user user base.count lookup user counters + 1}
                                    counters
 ```
 
@@ -376,10 +376,10 @@ all spawned threads before exiting.
 ```knot
 main do
   fork do
-    println "hello from thread 1"
+    base.println "hello from thread 1"
   fork do
-    println "hello from thread 2"
-  println "hello from main"
+    base.println "hello from thread 2"
+  base.println "hello from main"
 ```
 
 Do blocks can be passed directly as arguments without parentheses.
@@ -406,8 +406,8 @@ fast do
 main do
   r <- race slow fast
   case r of
-    Err {error: a} -> println ("left won: " ++ a)
-    Ok {value: b}  -> println ("right won: " ++ b)
+    Err {error: a} -> base.println ("left won: " ++ a)
+    Ok {value: b}  -> base.println ("right won: " ++ b)
   yield {}
 ```
 
@@ -446,8 +446,8 @@ waitForTask \id -> atomic do
     where t.status == "done"
     yield t}
   (do
-    where (count done) == 0
-    retry
+    where (base.count done) == 0
+    base.retry
     yield done)
 ```
 
@@ -527,10 +527,10 @@ drop : Int 1 -> [a]  -> [a]
 ```
 
 ```knot
-take 3 "hello"        -- "hel"
-take 2 [10 20 30]   -- [10, 20]
-drop 3 "hello"        -- "lo"
-drop 1 [10 20 30]   -- [20, 30]
+base.take 3 "hello"        -- "hel"
+base.take 2 [10 20 30]   -- [10, 20]
+base.drop 3 "hello"        -- "lo"
+base.drop 1 [10 20 30]   -- [20, 30]
 ```
 
 ### `contains`
@@ -542,7 +542,7 @@ contains : Text -> Text -> Bool
 Check if the second argument contains the first as a substring.
 
 ```knot
-has (contains "ell" "hello") -- True
+has (base.contains "ell" "hello") -- True
 ```
 
 ---
@@ -618,10 +618,10 @@ unless : Bool -> IO {} -> IO {}
 Run an IO action conditionally. `when cond a` runs `a` if `cond` is `True {}`; `unless cond a` runs `a` if `cond` is `False {}`. The skipped branch becomes `yield {}`.
 
 ```knot
-when (n > 0) (println "positive")
+when (n > 0) (base.println "positive")
 
-unless verbose do
-  println "(quiet mode)"
+base.unless verbose do
+  base.println "(quiet mode)"
 ```
 
 ### `forEach`
@@ -633,7 +633,7 @@ forEach : [a] -> (a -> IO {}) -> IO {}
 Sequence an IO action over each row of a relation. Iteration follows the relation's deterministic order (after any `sortBy`).
 
 ```knot
-forEach ["a" "b" "c"] (\s -> println s)
+base.forEach ["a" "b" "c"] (\s -> base.println s)
 ```
 
 ---
@@ -693,7 +693,7 @@ List directory entries as a relation of filenames.
 ```knot
 main do
   files <- listDir "."
-  yield (filter (\f -> contains ".knot" f) files)
+  yield (base.filter (\f -> base.contains ".knot" f) files)
 ```
 
 ---
@@ -747,7 +747,7 @@ Generate a fresh UUID. The output is a RFC 9562 UUIDv7 — time-ordered, so valu
 ```knot
 main do
   u <- randomUuid
-  println u
+  base.println u
   yield {}
 ```
 
@@ -852,7 +852,7 @@ raw contents; structured values (records, relations, constructors) hash a
 canonical serialisation, so equal logical values always produce equal digests.
 
 ```knot
-bytesToHex (hash "hello")    -- "ea8f163..."
+base.bytesToHex (base.hash "hello")    -- "ea8f163..."
 ```
 
 ---
@@ -1187,10 +1187,10 @@ double \x -> x + x
 `avg`, `minOn`, and `maxOn` preserve units from their projection function; `sum` preserves the units of the numeric relation it sums:
 
 ```knot
-avg   (\t -> t.distance) *trips   -- Float M if distance : Float M
-sum   (map (\t -> t.distance) *trips)   -- Float M if distance : Float M
-minOn (\t -> t.distance) *trips   -- Float M if distance : Float M
-maxOn (\t -> t.distance) *trips   -- Float M if distance : Float M
+base.avg   (\t -> t.distance) *trips   -- Float M if distance : Float M
+base.sum   (base.map (\t -> t.distance) *trips)   -- Float M if distance : Float M
+base.minOn (\t -> t.distance) *trips   -- Float M if distance : Float M
+base.maxOn (\t -> t.distance) *trips   -- Float M if distance : Float M
 ```
 
 ---

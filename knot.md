@@ -17,7 +17,7 @@ main do
     where p.age > 27
     yield p.name}
   (do
-    println (show result)
+    base.println (show result)
     yield {})
 ```
 
@@ -154,7 +154,7 @@ There are five kinds of top-level declarations:
 -- Derived: read-only computed relation
 &seniors = do
   people <- *people
-  yield (filter (\p -> p.age > 65) people)
+  yield (base.filter (\p -> p.age > 65) people)
 
 -- Constant
 maxRetries (3)
@@ -178,7 +178,7 @@ add \x y -> x + y
 
 -- With type signature (optional — types are inferred)
 formatName : Text -> Text
-formatName \n -> toUpper (take 1 n) ++ drop 1 n
+formatName \n -> base.toUpper (base.take 1 n) ++ base.drop 1 n
 ```
 
 Function application is juxtaposition:
@@ -186,15 +186,15 @@ Function application is juxtaposition:
 ```knot
 greet "Alice"           -- "Hello, Alice"
 add 2 3                 -- 5
-filter (\p -> p.age > 30) people
+base.filter (\p -> p.age > 30) people
 ```
 
 Pipe-forward operator:
 
 ```knot
 people
-  |> filter (\p -> p.age > 30)
-  |> map (\p -> p.name)
+  |> base.filter (\p -> p.age > 30)
+  |> base.map (\p -> p.name)
 ```
 
 ### Inline Type Annotations
@@ -306,13 +306,13 @@ When bound expressions are `IO` values, the do block sequences IO actions:
 -- IO do block with console effects
 main do
   content <- readFile "input.txt"    -- IO Text
-  println content                     -- IO {}
+  base.println content                     -- IO {}
   yield {}
 
 -- IO do block with DB operations
 addPerson \name age -> do
   people <- *people                  -- IO {} [Person]
-  *people = union people [{name name age age}]
+  *people = base.union people [{name name age age}]
 ```
 
 The compiler detects whether a do block is relational or IO from the types. Relation operations (`*rel`, `&rel`, and writes `*rel = expr`) all return `IO value`.
@@ -350,7 +350,7 @@ Mutation is written `*rel = expr`, which makes the source relation equal to `exp
 -- Insert (union with singleton)
 addPerson do
   people <- *people
-  *people = union people [{name "Alice" age 30}]
+  *people = base.union people [{name "Alice" age 30}]
 
 -- Update (map with conditional)
 birthday \name -> do
@@ -403,7 +403,7 @@ with {result do
   where p.age > 27
   yield p.name}
 (do
-  println (show result)
+  base.println (show result)
   yield {})
 ```
 
@@ -476,19 +476,18 @@ sumList \xs -> case xs of
 
 ```knot
 &workload = do
-  todos <- *todos
   with {result do
-    t <- todos
+    t <- *todos
     where t.done == 0
-    groupBy {t.owner}
-    yield {owner t.owner count count t}}
+    groupBy {owner t.owner}
+    yield {owner t.owner count (base.count t)}}
   (do
     yield result)
 ```
 
 Multiple keys: `groupBy {region o.region status o.status}`
 
-After `groupBy {t.owner}`:
+After `groupBy {owner t.owner}`:
 - `t.owner` returns the shared key value
 - `count t` counts rows in the group
 - `sum (map (\x -> x.points) t)` aggregates over the group
@@ -548,7 +547,7 @@ Constant columns (like `status: Open {}`) are:
 -- Insert through view — status auto-filled
 addOpenTodo do
   openTodos <- *openTodos
-  *openTodos = union openTodos [{title "New task" owner "Alice" priority High {}}]
+  *openTodos = base.union openTodos [{title "New task" owner "Alice" priority High {}}]
 ```
 
 ---
@@ -560,14 +559,13 @@ Read-only computed relations, prefixed with `&`:
 ```knot
 &seniors = do
   people <- *people
-  yield (filter (\p -> p.age > 65) people)
+  yield (base.filter (\p -> p.age > 65) people)
 
 &stats = do
-  todos <- *todos
   with {result do
-    t <- todos
-    groupBy {t.owner}
-    yield {owner t.owner total count t}}
+    t <- *todos
+    groupBy {owner t.owner}
+    yield {owner t.owner total (base.count t)}}
   (do
     yield result)
 ```
@@ -587,7 +585,7 @@ Datalog-style fixpoint iteration for transitive closure:
     where r.descendant == m.manager
     yield {ancestor r.ancestor descendant m.report}}
   (do
-    yield (union base step))
+    yield (base.union base step))
 ```
 
 ---
@@ -636,7 +634,7 @@ A `do` block sequences `IO` actions; the whole block is itself an `IO`.
 ```knot
 main do
   content <- readFile "data.txt"
-  println ("Read " ++ show (length content) ++ " chars")
+  base.println ("Read " ++ show (base.length content) ++ " chars")
   yield {}
 ```
 
@@ -666,10 +664,10 @@ birthday \name -> do
 handleOrder \item -> do
   orderId <- atomic do
     orders <- *orders
-    *orders = union orders [{item item qty 1}]
+    *orders = base.union orders [{item item qty 1}]
     newOrders <- *orders
-    yield (count newOrders)
-  println ("Order #" ++ show orderId)
+    yield (base.count newOrders)
+  base.println ("Order #" ++ show orderId)
   yield {orderId}
 ```
 
@@ -704,7 +702,7 @@ Used inside `atomic` blocks for STM-style waiting. Causes the transaction to rol
 waitFor \condition -> atomic do
   cond <- condition
   where (not cond)
-  retry
+  base.retry
 ```
 
 The compiler enforces that `retry` is only used inside `atomic`.
@@ -739,8 +737,8 @@ fast do
 main do
   r <- race slow fast
   case r of
-    Err {error: a} -> println ("left won: " ++ a)
-    Ok {value: b}  -> println ("right won: " ++ b)
+    Err {error: a} -> base.println ("left won: " ++ a)
+    Ok {value: b}  -> base.println ("right won: " ++ b)
   yield {}
 ```
 
@@ -932,7 +930,7 @@ route TodoApi where
 
 route AdminApi where
   /admin
-    GET /count -> Int 1 = GetCount
+    GET /base.count -> Int 1 = GetCount
 
 -- Compose routes
 route Api = TodoApi | AdminApi
@@ -947,7 +945,7 @@ api (serve Api where)
     yield Ok {value todo}
   GetCount = \{} -> do
     todos <- *todos
-    yield Ok {value count todos}
+    yield Ok {value base.count todos}
 
 main (listen 8080 api)
 ```
@@ -962,7 +960,7 @@ main (listen 8080 api)
 api (serve Api where)
   GetUser = \{id} -> do
     users <- *people
-    case filter (\u -> u.id == id) users of
+    case base.filter (\u -> u.id == id) users of
       [] -> yield Err {error {status 404 message "user not found"}}
       Cons u _ -> yield Ok {value: u}
 ```
@@ -992,7 +990,7 @@ api (serve Api where)
   GetTodos = \{authorization} ->
     with {todos allTodos}
     (do
-      yield Ok {value {body todos headers {xTotalCount length todos}}})
+      yield Ok {value {body todos headers {xTotalCount base.length todos}}})
   CreateTodo = \{title, authorization} ->
     yield Ok {value {body addTodo title headers {}}}
 ```
@@ -1009,7 +1007,7 @@ Server gets `Nothing {}` if absent, `Just {value: "..."}` if present. In `fetch`
 On the `fetch` side, header fields are sent automatically. When response headers are declared, the result wraps as `{body: T, headers: H}`:
 
 ```knot
-result <- fetch "https://api.example.com" (GetTodos {authorization "Bearer tok"})
+result <- base.fetch "https://api.example.com" (GetTodos {authorization "Bearer tok"})
 -- result : IO (Result ... {body: [Todo], headers: {xTotalCount: Int 1}})
 ```
 
@@ -1123,8 +1121,8 @@ data Shape
 ```knot
 -- Use with case
 result (case refine someInt of)
-  Ok {value: n} -> println ("Valid: " ++ show n)
-  Err {error: e} -> println ("Invalid: " ++ show e)
+  Ok {value: n} -> base.println ("Valid: " ++ show n)
+  Err {error: e} -> base.println ("Invalid: " ++ show e)
 
 -- Use in Result do-block
 validated do
@@ -1209,7 +1207,7 @@ type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
 
 add \title owner priority -> do
   todos <- *todos
-  *todos = union todos [{title title owner owner priority priority status Open {}}]
+  *todos = base.union todos [{title title owner owner priority priority status Open {}}]
 
 complete \title -> do
   todos <- *todos
@@ -1242,8 +1240,8 @@ pending \owner -> do
   with {result do
     t <- todos
     Open {} <- t.status
-    groupBy {t.owner}
-    yield {owner t.owner count count t}}
+    groupBy {owner t.owner}
+    yield {owner t.owner count (base.count t)}}
   (do
     yield result)
 
@@ -1254,11 +1252,11 @@ main do
   assign "Write parser" "Carol"
   complete "Write runtime"
   p <- pending "Alice"
-  println "Alice's pending:"
-  println (show p)
+  base.println "Alice's pending:"
+  base.println (show p)
   w <- &workload
-  println "Workload:"
-  println (show w)
+  base.println "Workload:"
+  base.println (show w)
   yield {}
 ```
 
@@ -1271,7 +1269,7 @@ main do
 ```knot
 addRow \newRow -> do
   rel <- *rel
-  *rel = union rel [newRow]
+  *rel = base.union rel [newRow]
 ```
 
 ### Delete by condition
@@ -1317,11 +1315,11 @@ updateWhere \target newValue -> do
 ```knot
 getTotal do
   orders <- *orders
-  yield (fold (\acc x -> acc + x.amount) 0 orders)
+  yield (base.fold (\acc x -> acc + x.amount) 0 orders)
 
 getCount do
   people <- *people
-  yield (count people)
+  yield (base.count people)
 ```
 
 ### Filter by variant

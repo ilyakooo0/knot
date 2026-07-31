@@ -9,7 +9,7 @@ type Person = {name: Text, age: Int 1}
 
 *people : [Person]
 
-main do
+do
   *people = [{name "Alice" age 30} {name "Bob" age 25}]
   people <- *people
   with {result do
@@ -304,7 +304,7 @@ When bound expressions are `IO` values, the do block sequences IO actions:
 
 ```knot
 -- IO do block with console effects
-main do
+do
   content <- base.readFile "input.txt"    -- IO Text
   base.println content                     -- IO {}
   yield {}
@@ -322,6 +322,10 @@ The compiler detects whether a do block is relational or IO from the types. Rela
 Filter and destructure in one step:
 
 ```knot
+data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
+data Status = InProgress {assignee: Text} | Done {}
+*shapes : [Shape]
+*tickets : [{title: Text, status: Status}]
 &circles = do
   shapes <- *shapes
   with {result do
@@ -347,6 +351,8 @@ Filter and destructure in one step:
 Mutation is written `*rel = expr`, which makes the source relation equal to `expr`. There is no `set` keyword — the assignment is the bare `*rel = ...` form. The compiler recognizes common shapes (`*rel = union *rel [...]` → INSERT, conditional `map` → UPDATE, `filter` → DELETE) and emits minimal SQL; otherwise it rewrites the whole relation. Use `replace *rel = expr` to force a full overwrite.
 
 ```knot
+*people : [{name: Text, age: Int 1}]
+
 -- Insert (union with singleton)
 addPerson do
   people <- *people
@@ -475,6 +481,7 @@ sumList \xs -> case xs of
 `groupBy` partitions a relation by key fields. After `groupBy`, the bound variable becomes a sub-relation:
 
 ```knot
+*todos : [{title: Text, owner: Text, done: Int 1}]
 &workload = do
   with {result do
     t <- *todos
@@ -529,11 +536,14 @@ updateTeams do
 A `*`-prefixed declaration with a body is a view — reads compute the query, writes propagate back:
 
 ```knot
+data Priority = Low {} | High {}
+data Status = Open {} | Closed {}
+*todos : [{title: Text, owner: Text, priority: Priority}]
 *openTodos = do
   todos <- *todos
   with {result do
     t <- todos
-    yield {title t.title owner t.owner priority t.priority status Open {}}}
+    yield {title t.title owner t.owner priority t.priority status Status.Open {}}}
   (do
     yield result)
 ```
@@ -544,10 +554,22 @@ Constant columns (like `status: Open {}`) are:
 - **Hidden from the type**: the view's type omits constant columns
 
 ```knot
+data Priority = Low {} | High {}
+data Status = Open {} | Closed {}
+*todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
+*openTodos = do
+  todos <- *todos
+  with {result do
+    t <- todos
+    where t.status == Status.Open {}
+    yield {title t.title owner t.owner priority t.priority}}
+  (do
+    yield result)
+
 -- Insert through view — status auto-filled
 addOpenTodo do
   openTodos <- *openTodos
-  *openTodos = base.union openTodos [{title "New task" owner "Alice" priority High {}}]
+  *openTodos = base.union openTodos [{title "New task" owner "Alice" priority Priority.High {}}]
 ```
 
 ---
@@ -557,6 +579,8 @@ addOpenTodo do
 Read-only computed relations, prefixed with `&`:
 
 ```knot
+*people : [{name: Text, age: Int 1}]
+*todos : [{title: Text, owner: Text, done: Int 1}]
 &seniors = do
   people <- *people
   yield (base.filter (\p -> p.age > 65) people)
@@ -575,17 +599,27 @@ Read-only computed relations, prefixed with `&`:
 Datalog-style fixpoint iteration for transitive closure:
 
 ```knot
+*manages : [{manager: Text, report: Text}]
+
+-- Base case: direct management edges, renamed to ancestor/descendant
+&direct = (do
+  manages <- *manages
+  yield (do
+    m <- manages
+    yield {ancestor m.manager descendant m.report}))
+
+-- Recursive: ancestor/descendant via fixpoint over the base case
 &reportsTo = do
   reportsTo <- &reportsTo     -- self-reference (IO bind)
   manages <- *manages
-  base <- &base
+  direct <- &direct
   with {step do
     r <- reportsTo
     m <- manages
     where r.descendant == m.manager
     yield {ancestor r.ancestor descendant m.report}}
   (do
-    yield (base.union base step))
+    yield (base.union direct step))
 ```
 
 ---
@@ -632,7 +666,7 @@ A `do` block sequences `IO` actions; the whole block is itself an `IO`.
 ### IO Do Blocks
 
 ```knot
-main do
+do
   content <- base.readFile "data.txt"
   base.println ("Read " ++ base.show (base.length content) ++ " chars")
   yield {}
@@ -643,6 +677,9 @@ main do
 Relation operations are also `IO`-wrapped:
 
 ```knot
+type Person = {name: Text, age: Int 1}
+*people : [Person]
+
 -- All relation operations are IO:
 birthday \name -> do
   people <- *people              -- IO [Person]
@@ -734,7 +771,7 @@ fast do
   base.sleep 50 Ms
   yield "fast"
 
-main do
+do
   r <- base.race slow fast
   case r of
     Err {error: a} -> base.println ("left won: " ++ a)
@@ -1245,7 +1282,7 @@ pending \owner -> do
   (do
     yield result)
 
-main do
+do
   add "Write parser" "Alice" High {}
   add "Write codegen" "Alice" Critical {}
   add "Write runtime" "Bob" Medium {}
@@ -1267,6 +1304,7 @@ main do
 ### Insert
 
 ```knot
+*rel : [{value: Int 1}]
 addRow \newRow -> do
   rel <- *rel
   *rel = base.union rel [newRow]
@@ -1275,6 +1313,7 @@ addRow \newRow -> do
 ### Delete by condition
 
 ```knot
+*rel : [{id: Int 1, field: Int 1}]
 deleteWhere \valueToDelete -> do
   rel <- *rel
   *rel = do
@@ -1286,6 +1325,7 @@ deleteWhere \valueToDelete -> do
 ### Update by condition
 
 ```knot
+*rel : [{id: Int 1, field: Int 1}]
 updateWhere \target newValue -> do
   rel <- *rel
   *rel = do
@@ -1298,6 +1338,8 @@ updateWhere \target newValue -> do
 ### Join two relations
 
 ```knot
+*employees : [{name: Text, dept: Text}]
+*departments : [{name: Text, budget: Int 1}]
 &joined = do
   employees <- *employees
   departments <- *departments
@@ -1305,7 +1347,7 @@ updateWhere \target newValue -> do
     e <- employees
     d <- departments
     where e.dept == d.name
-    yield {e.name, d.budget}}
+    yield {name e.name budget d.budget}}
   (do
     yield result)
 ```
@@ -1313,6 +1355,8 @@ updateWhere \target newValue -> do
 ### Aggregate
 
 ```knot
+*orders : [{amount: Int 1}]
+*people : [{name: Text, age: Int 1}]
 getTotal do
   orders <- *orders
   yield (base.fold (\acc x -> acc + x.amount) 0 orders)
@@ -1325,13 +1369,16 @@ getCount do
 ### Filter by variant
 
 ```knot
+data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
+*shapes : [Shape]
+
 -- Using match
 &circles = do
   shapes <- *shapes
-  yield (shapes |> match Circle)
+  yield (base.match Shape.Circle shapes)
 
 -- Using pattern bind in do
-&circles = do
+&circles2 = do
   shapes <- *shapes
   with {result do
     Shape.Circle c <- shapes

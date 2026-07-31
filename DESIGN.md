@@ -676,6 +676,7 @@ birthday \name -> do
 keyword form (not a `base.` function); the block is an `IO a`.
 
 ```knot
+*orders : [{item: Text, qty: Int 1}]
 -- DB writes go in `atomic`, IO happens after commit
 handleOrder \req -> do
   orderId <- atomic do
@@ -684,7 +685,7 @@ handleOrder \req -> do
     newOrders <- *orders
     yield (base.count newOrders)
   base.println ("New order #" ++ base.show orderId)
-  yield {orderId}
+  yield {orderId orderId}
 ```
 
 #### `retry`
@@ -781,10 +782,10 @@ fork : IO a -> IO {}
 
 increment do
   c <- *counter
-  *counter = [{n (base.fold (\_ x -> x.n) 0 c) + 1}]
+  *counter = [{n ((base.fold (\_ x -> x.n) 0 c) + 1)}]
 
 do
-  *counter = [{n 0}]
+  replace *counter = [{n 0}]
   base.fork do
     increment
     increment
@@ -809,18 +810,18 @@ waitForCompletion \id -> atomic do
     where t.status == "done"
     yield t}
   (do
-    where (base.count task) == 0
-    base.retry
+    base.when ((base.count task) == 0) base.retry
     yield task)
 
 do
-  *tasks = [{id 1 status "pending"}]
+  replace *tasks = [{id 1 status "pending"}]
   base.fork do
     -- simulate work
     atomic do
-      *tasks = [{id 1 status "done"}]
+      replace *tasks = [{id 1 status "done"}]
   result <- waitForCompletion 1
-  base.println result
+  base.println (base.show result)
+  yield {}
 ```
 
 SQLite WAL mode ensures that concurrent readers and writers do not block each other. Each thread operates on its own connection, and `atomic` provides transaction isolation within a thread.

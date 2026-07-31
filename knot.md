@@ -151,12 +151,8 @@ data Status = Open {} | Closed {}
 
 -- View: settable query over a source
 *openTodos = do
-  todos <- *todos
-  with {result do
-    t <- todos
-    yield {title t.title owner t.owner status Status.Open {}}}
-  (do
-    yield result)
+  t <- *todos
+  yield {title t.title owner t.owner status Status.Open {}}
 
 -- Derived: read-only computed relation
 &seniors = do
@@ -587,12 +583,8 @@ data Priority = Low {} | High {}
 data Status = Open {} | Closed {}
 *todos : [{title: Text, owner: Text, priority: Priority}]
 *openTodos = do
-  todos <- *todos
-  with {result do
-    t <- todos
-    yield {title t.title owner t.owner priority t.priority status Status.Open {}}}
-  (do
-    yield result)
+  t <- *todos
+  yield {title t.title owner t.owner priority t.priority status Status.Open {}}
 ```
 
 Constant columns (like `status: Open {}`) are:
@@ -605,13 +597,9 @@ data Priority = Low {} | High {}
 data Status = Open {} | Closed {}
 *todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
 *openTodos = do
-  todos <- *todos
-  with {result do
-    t <- todos
-    where t.status == Status.Open {}
-    yield {title t.title owner t.owner priority t.priority}}
-  (do
-    yield result)
+  t <- *todos
+  where t.status == Status.Open {}
+  yield {title t.title owner t.owner priority t.priority}
 
 -- Insert through view — status auto-filled
 addOpenTodo do

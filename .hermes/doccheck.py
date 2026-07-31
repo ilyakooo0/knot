@@ -62,19 +62,11 @@ def classify(body):
     nonempty = [b for b in body if not is_comment_or_blank(b)]
     if not nonempty:
         return "empty", None
-    # complete program: an OUTER record-open `with {` at col 0. This is NOT an
-    # inner comprehension (`with {name do ...`) — a comprehension binds a single
-    # name to a do-block and appears inside another do. A program's record-open
-    # has record fields (name value / name : T / name \a -> ...) or closes with
-    # a body expression.
-    outer_with = None
-    for m in re.finditer(r'^with \{(.*)$', text, re.M):
-        rest = m.group(1).strip()
-        # `with {name do` / `with {name (do` => inner comprehension, skip
-        if re.match(r'^[a-zA-Z_]\w*\s+\(?do\b', rest):
-            continue
-        outer_with = m
-        break
+    # complete program: an OUTER record-open `with {` at col 0 followed by a
+    # top-level body. Both `with {name value ...} body` and the comprehension
+    # form `with {name do ...} (do ...)` are programs when they start at col 0
+    # (an *inner* comprehension would be indented inside an enclosing do).
+    outer_with = re.search(r'^with \{', text, re.M)
     if outer_with:
         # is there a body after the last closing brace at col 0?
         # crude: last non-comment line that's not part of the with-record
@@ -146,8 +138,9 @@ def split_decls_exprs(lines):
     cur = None        # accumulating a multi-line declaration
     cur_indent = 0    # indent of the declaration's opening line
     def opens_block(s):
-        # `... do` or `... ->` or `... =` at end of line opens an indented body
-        return bool(re.search(r'(\bdo\b|->|=)\s*$', s))
+        # `... do`, `... ->`, `... =` at end of line opens an indented body, as
+        # does `... -> case ... of` / `... case ... of` (arms follow indented).
+        return bool(re.search(r'(\bdo\b|->|=|\bof)\s*$', s))
     for raw in lines:
         if is_comment_or_blank(raw):
             if cur is not None:

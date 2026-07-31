@@ -218,7 +218,7 @@ Any expression can carry a postfix type annotation, both with and without
 surrounding parens:
 
 ```knot
-n (0 : Int Usd)                -- bare postfix annotation
+cents (0 : Int Usd)             -- bare postfix annotation
 m ((2.0 + 3.0) : Float M)      -- parenthesized
 distance (42.0 : Float (M / S)) -- units on a literal
 ```
@@ -483,14 +483,17 @@ The unqualified constructors are confined to the `with` body — the qualified f
 ### Case Expressions
 
 ```knot
+data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
+data Priority = Critical {} | High {} | Low {}
+
 describe \s -> case s of
-  Circle {radius} -> "circle r=" ++ base.show radius
-  Rect {width, height} -> base.show width ++ "x" ++ base.show height
+  Shape.Circle {radius r} -> "circle r=" ++ base.show r
+  Shape.Rect {width w height h} -> base.show w ++ "x" ++ base.show h
 
 -- With wildcard
 priority \p -> case p of
-  Critical {} -> 1
-  High {} -> 2
+  Priority.Critical {} -> 1
+  Priority.High {} -> 2
   _ -> 3
 ```
 
@@ -499,8 +502,8 @@ priority \p -> case p of
 ```knot
 describe \rel -> case rel of
   [] -> "empty"
-  [{name: n}] -> "just " ++ n
-  Cons h _ -> "first of many: " ++ base.show h
+  [{name n}] -> "just " ++ n
+  Cons h t -> "first of many: " ++ base.show h.name
 ```
 
 | Pattern | Matches |

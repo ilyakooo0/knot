@@ -305,7 +305,7 @@ When bound expressions are `IO` values, the do block sequences IO actions:
 ```knot
 -- IO do block with console effects
 main do
-  content <- readFile "input.txt"    -- IO Text
+  content <- base.readFile "input.txt"    -- IO Text
   base.println content                     -- IO {}
   yield {}
 
@@ -633,7 +633,7 @@ A `do` block sequences `IO` actions; the whole block is itself an `IO`.
 
 ```knot
 main do
-  content <- readFile "data.txt"
+  content <- base.readFile "data.txt"
   base.println ("Read " ++ base.show (base.length content) ++ " chars")
   yield {}
 ```
@@ -727,15 +727,15 @@ using the built-in `Result` ADT — `Err {error: a}` when the left action wins,
 
 ```knot
 slow do
-  sleep 1000 Ms
+  base.sleep 1000 Ms
   yield "slow"
 
 fast do
-  sleep 50 Ms
+  base.sleep 50 Ms
   yield "fast"
 
 main do
-  r <- race slow fast
+  r <- base.race slow fast
   case r of
     Err {error: a} -> base.println ("left won: " ++ a)
     Ok {value: b}  -> base.println ("right won: " ++ b)

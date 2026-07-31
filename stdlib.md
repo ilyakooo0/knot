@@ -183,6 +183,7 @@ countWhere : (a -> Bool) -> [a] -> Int u
 Count rows that satisfy a predicate. Equivalent to `count . filter`, but pushes down to a single `SELECT COUNT(*) FROM ... WHERE pred` when the predicate is SQL-compilable.
 
 ```knot
+*employees : [{name: Text, dept: Text, salary: Int 1}]
 engHeadcount do
   employees <- *employees
   yield (base.countWhere (\e -> e.dept == "Eng") employees)
@@ -229,6 +230,7 @@ minOn : (a -> b) -> [a] -> b
 Minimum of a projected field over a relation. The projection can return any orderable type — `Int 1`, `Float 1`, or `Text` (lexicographic ordering). Panics if the relation is empty.
 
 ```knot
+*employees : [{name: Text, salary: Int 1}]
 lowestSalary do
   employees <- *employees
   yield (base.minOn (\e -> e.salary) employees)
@@ -249,6 +251,7 @@ maxOn : (a -> b) -> [a] -> b
 Maximum of a projected field over a relation. Like `minOn`, works with any orderable type. Panics if the relation is empty. Pushes down to `SELECT MAX(col) FROM ...`.
 
 ```knot
+*employees : [{name: Text, salary: Int 1}]
 highestSalary do
   employees <- *employees
   yield (base.maxOn (\e -> e.salary) employees)
@@ -359,6 +362,7 @@ Reorder rows by a projected key. The key type `b` must be `Ord`. Returns a new r
 Pushes down to SQL `ORDER BY` when applied to a source relation. Combined with `take` it becomes `ORDER BY ... LIMIT`:
 
 ```knot
+*employees : [{name: Text, salary: Int 1}]
 &topFive = do
   employees <- *employees
   yield (employees |> base.sortBy (\e -> -e.salary) |> base.take 5)
@@ -386,9 +390,9 @@ source relations.
 
 ```knot
 -- Bump or insert a per-user counter
-bump = \user counters -> base.upsertBy (\c -> c.user == user)
-                                   {user user base.count lookup user counters + 1}
-                                   counters
+bump \user counters -> base.upsertBy (\c -> c.user == user)
+                                     {user user n 1}
+                                     counters
 ```
 
 ---
@@ -407,10 +411,10 @@ connection via WAL mode for safe concurrent access. The main thread waits for
 all spawned threads before exiting.
 
 ```knot
-main do
-  fork do
+do
+  base.fork do
     base.println "hello from thread 1"
-  fork do
+  base.fork do
     base.println "hello from thread 2"
   base.println "hello from main"
 ```
@@ -429,18 +433,18 @@ The winner is reported via the built-in `Result a b` ADT — `Err {error: a}` wh
 
 ```knot
 slow do
-  sleep (1000 : Int Ms)
+  base.sleep (1000 : Int Ms)
   yield "slow"
 
 fast do
-  sleep (50 : Int Ms)
+  base.sleep (50 : Int Ms)
   yield "fast"
 
-main do
-  r <- race slow fast
+do
+  r <- base.race slow fast
   case r of
-    Err {error: a} -> base.println ("left won: " ++ a)
-    Ok {value: b}  -> base.println ("right won: " ++ b)
+    Result.Err {error a} -> base.println ("left won: " ++ a)
+    Result.Ok {value b}  -> base.println ("right won: " ++ b)
   yield {}
 ```
 
@@ -453,13 +457,16 @@ Cancellation is cooperative but aggressive: the loser's `knot_io_run` checks its
 `atomic do ...` is a keyword form (not a `base.` function). It runs an IO body in a database transaction; the block is an `IO a` where `a` is the body's `yield` type. If the body calls `retry`, the transaction rolls back and waits for a relation change before re-executing.
 
 ```knot
+*accounts : [{name: Text, balance: Int 1}]
 transfer \from to amount -> atomic do
   accounts <- *accounts
   *accounts = do
     a <- accounts
-    yield (if a.name == from then {a | balance a.balance - amount}
-           else if a.name == to then {a | balance a.balance + amount}
-           else a)
+    yield (case a.name == from of
+      Bool.True {} -> {a | balance (a.balance - amount)}
+      Bool.False {} -> (case a.name == to of
+        Bool.True {} -> {a | balance (a.balance + amount)}
+        Bool.False {} -> a))
 ```
 
 ### `retry`
@@ -471,6 +478,7 @@ retry : a
 Used inside `atomic` blocks only. Causes the transaction to rollback and wait until some relation changes, then re-executes the atomic block. Implements STM (Software Transactional Memory) style concurrency.
 
 ```knot
+*tasks : [{id: Int 1, status: Text}]
 waitForTask \id -> atomic do
   tasks <- *tasks
   with {done do
@@ -575,7 +583,7 @@ contains : Text -> Text -> Bool
 Check if the second argument contains the first as a substring.
 
 ```knot
-base.has (base.contains "ell" "hello") -- True
+base.contains "ell" "hello" -- True
 ```
 
 ---
@@ -615,9 +623,9 @@ compiled Knot program accepts `--debug` automatically; see
 [Runtime CLI](#runtime-cli).)
 
 ```knot
-main do
-  logInfo "starting"
-  logWarn {event "low memory" availableMb 64}
+do
+  base.logInfo "starting"
+  base.logWarn {event "low memory" availableMb 64}
   yield {}
 ```
 
@@ -651,10 +659,10 @@ unless : Bool -> IO {} -> IO {}
 Run an IO action conditionally. `when cond a` runs `a` if `cond` is `True {}`; `unless cond a` runs `a` if `cond` is `False {}`. The skipped branch becomes `yield {}`.
 
 ```knot
-base.when (n > 0) (base.println "positive")
-
-base.unless verbose do
-  base.println "(quiet mode)"
+(do
+  base.when (5 > 0) (base.println "positive")
+  base.unless (1 > 2) (base.println "(quiet mode)")
+  yield {})
 ```
 
 ### `forEach`
@@ -724,8 +732,8 @@ listDir : Text -> IO [Text]
 List directory entries as a relation of filenames.
 
 ```knot
-main do
-  files <- listDir "."
+do
+  files <- base.listDir "."
   yield (base.filter (\f -> base.contains ".knot" f) files)
 ```
 
@@ -778,8 +786,8 @@ randomUuid : IO Uuid
 Generate a fresh UUID. The output is a RFC 9562 UUIDv7 — time-ordered, so values sort chronologically and are well-suited as primary keys.
 
 ```knot
-main do
-  u <- randomUuid
+do
+  u <- base.randomUuid
   base.println u
   yield {}
 ```
@@ -1185,10 +1193,14 @@ Units are not declared. Any name used in a unit position is a unit — there is 
 #### Literals and Type Annotations
 
 ```knot
-distance ((42.0 : Float M)) -- Float M
+distance : Float M
+distance 42.0
 speed : Float (M / S)
+speed 10.0
 force : Float (Kg * M / S^2)
+force 9.8
 cents : Int Usd
+cents 100
 ```
 
 #### Arithmetic Rules
@@ -1198,7 +1210,7 @@ cents : Int Usd
 - Unary negation preserves units
 - Scalar (dimensionless) multiplication preserves the other operand's unit
 
-```knot
+```
 (10.0 : Float M) + (5.0 : Float M)   -- Float M
 (10.0 : Float M) + (5.0 : Float S)   -- type error
 (10.0 : Float M) * (5.0 : Float M)   -- Float (M^2)

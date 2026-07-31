@@ -563,9 +563,9 @@ IO do-blocks sequence effects. The `<-` operator runs an IO action and binds its
 ```knot
 main do
   people <- *people                  -- IO {} [Person] → binds [Person]
-  content <- readFile "input.txt"    -- IO Text → binds Text
+  content <- base.readFile "input.txt"    -- IO Text → binds Text
   base.println content                     -- IO {}
-  t <- now                            -- IO Int Ms → binds Int Ms
+  t <- base.now                            -- IO Int Ms → binds Int Ms
   base.println ("time: " ++ base.show t)
   yield {}
 -- overall type: IO {}
@@ -697,22 +697,22 @@ Built-in functions for file I/O. All return `IO ` values.
 ```knot
 -- Copy a file (IO do-block)
 copyFile \src dst -> do
-  content <- readFile src
-  writeFile dst content
+  content <- base.readFile src
+  base.writeFile dst content
 
 -- Append a log line
-log \msg -> appendFile "app.log" (msg ++ "\n")
+log \msg -> base.appendFile "app.log" (msg ++ "\n")
 
 -- List .knot files
 knotFiles do
-  files <- listDir "."
+  files <- base.listDir "."
   yield (base.filter (\f -> base.contains ".knot" f) files)
 
 -- Conditional read
 loadConfig \path -> do
-  exists <- fileExists path
+  exists <- base.fileExists path
   if exists
-    then readFile path
+    then base.readFile path
     else yield "{}"
 ```
 
@@ -737,10 +737,10 @@ increment do
 
 main do
   *counter = [{n 0}]
-  fork do
+  base.fork do
     increment
     increment
-  fork do
+  base.fork do
     increment
     increment
   -- main waits for all threads before exiting
@@ -767,7 +767,7 @@ waitForCompletion \id -> atomic do
 
 main do
   *tasks = [{id 1 status "pending"}]
-  fork do
+  base.fork do
     -- simulate work
     atomic do
       *tasks = [{id 1 status "done"}]
@@ -790,15 +790,15 @@ race : IO a -> IO b -> IO (Result a b)
 
 ```knot
 slow do
-  sleep 1000 Ms
+  base.sleep 1000 Ms
   yield "slow"
 
 fast do
-  sleep 50 Ms
+  base.sleep 50 Ms
   yield "fast"
 
 main do
-  r <- race slow fast
+  r <- base.race slow fast
   case r of
     Err {error: a} -> base.println ("left won: " ++ a)
     Ok {value: b}  -> base.println ("right won: " ++ b)

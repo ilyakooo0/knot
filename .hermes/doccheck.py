@@ -81,6 +81,10 @@ def classify(body):
     # possibly with a trailing body expression: wrap decls in `with { }`.
     if re.search(r'^(route|data|type|serve)\b', text, re.M):
         return "program_decls", body
+    # Declaration(s) followed by a top-level `(do ...)` body (e.g. `*src : T`
+    # then a `(do ...)` program body): also program_decls.
+    if re.search(r'^\(do\b', text, re.M) and re.search(r'^[*&]?[a-zA-Z_]\w*\s*[:=]', text, re.M):
+        return "program_decls", body
     # pure signature(s)?
     sigs = []
     allsig = True

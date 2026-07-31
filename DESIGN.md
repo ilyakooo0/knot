@@ -415,6 +415,8 @@ base.sum \f rel -> base.fold (\acc x -> acc + f x) 0 rel
 **`match`** — filter a relation of ADT values to one variant, extracting the payload (built-in `base.match`):
 
 ```knot
+data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
+shapes [(Shape.Circle {radius 1.0}) (Shape.Rect {width 2.0 height 3.0})]
 circles (base.match Shape.Circle shapes) -- [Shape] -> [{radius: Float 1}]
 ```
 
@@ -456,17 +458,20 @@ Derived combinators like `filter` compose with `|>`:
 `match` filters to one variant and exposes its fields:
 
 ```knot
-&circles = do                              -- : IO {} [{radius: Float 1}]
-  shapes <- *shapes
-  yield (shapes |> match Circle)
+data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
+*shapes : [Shape]
 
-&rects = do                                -- : IO {} [{width: Float 1, height: Float 1}]
+&circles = do                              -- : IO [{radius: Float 1}]
   shapes <- *shapes
-  yield (shapes |> match Rect)
+  yield (base.match Shape.Circle shapes)
+
+&rects = do                                -- : IO [{width: Float 1, height: Float 1}]
+  shapes <- *shapes
+  yield (base.match Shape.Rect shapes)
 
 &bigCircles = do
   circles <- &circles
-  yield (base.filter (\c -> c.radius > 10) circles)
+  yield (base.filter (\c -> c.radius > 10.0) circles)
 ```
 
 ### Pattern Matching in Comprehensions
@@ -474,12 +479,17 @@ Derived combinators like `filter` compose with `|>`:
 Pattern matching on `<-` filters and binds in one step:
 
 ```knot
+data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
+*shapes : [Shape]
+data Status = Blocked {dependencies: [Text]} | Open {}
+*tickets : [{title: Text, status: Status}]
+
 &bigCircleAreas = do
   shapes <- *shapes
   with {result do
     Shape.Circle c <- shapes
-    where c.radius > 10
-    yield {area pi * c.radius * c.radius}}
+    where c.radius > 10.0
+    yield {area (3.14159 * c.radius * c.radius)}}
   (do
     yield result)
 
@@ -487,9 +497,9 @@ Pattern matching on `<-` filters and binds in one step:
   tickets <- *tickets
   with {result do
     t <- tickets
-    Blocked {dependencies} <- t.status
-    dep <- dependencies
-    yield {t.title, dep}}
+    Status.Blocked {dependencies deps} <- t.status
+    dep <- deps
+    yield {title t.title dep dep}}
   (do
     yield result)
 ```
@@ -499,22 +509,24 @@ Pattern matching on `<-` filters and binds in one step:
 Operate on the whole relation with `case`:
 
 ```knot
+data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
+*shapes : [Shape]
 scale \factor -> do
   shapes <- *shapes
   *shapes = do
     s <- shapes
     yield (case s of
-      Circle {radius}       -> Circle {radius radius * factor}
-      Rect {width, height}  -> Rect {width width * factor height height * factor})
+      Shape.Circle {radius r}       -> Shape.Circle {radius (r * factor)}
+      Shape.Rect {width w height h}  -> Shape.Rect {width (w * factor) height (h * factor)})
 ```
 
 ### Pattern Matching on Relations
 
 ```knot
 describe \rel -> case rel of
-  [ ]           -> "empty"
-  [{name: n}]  -> "just " ++ n
-  Cons h _     -> "first of many: " ++ base.show h
+  [ ]          -> "empty"
+  [{name n}]   -> "just " ++ n
+  Cons h t     -> "first of many: " ++ base.show h.name
 ```
 
 `[ ]` matches an empty relation. `[p1, p2, ...]` matches a relation with exactly that many rows in any iteration order. `Cons head tail` matches a non-empty relation, binding `head` to the first row and `tail` to the rest (the relation has no inherent order; `Cons` chooses a deterministic iteration order for the match).

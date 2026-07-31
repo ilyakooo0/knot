@@ -735,7 +735,7 @@ birthday \name -> do
 `atomic` takes an IO expression containing only DB operations and runs it in a transaction:
 
 ```knot
--- atomic : IO {} a -> IO {} a
+*orders : [{item: Text, qty: Int 1}]
 handleOrder \item -> do
   orderId <- atomic do
     orders <- *orders
@@ -743,7 +743,7 @@ handleOrder \item -> do
     newOrders <- *orders
     yield (base.count newOrders)
   base.println ("Order #" ++ base.show orderId)
-  yield {orderId}
+  yield {orderId orderId}
 ```
 
 The body of `atomic` must be an IO expression containing only DB operations. External effects (console, fs, etc.) are not allowed inside `atomic`.
@@ -776,8 +776,8 @@ Used inside `atomic` blocks for STM-style waiting. Causes the transaction to rol
 ```knot
 waitFor \condition -> atomic do
   cond <- condition
-  where (not cond)
-  base.retry
+  base.when (not cond) base.retry
+  yield cond
 ```
 
 The compiler enforces that `retry` is only used inside `atomic`.
@@ -998,31 +998,39 @@ result type (see [base.md](base.md#morphs-basemorph)).
 HTTP routing with typed paths, query params, bodies, and headers:
 
 ```knot
+data Priority = Low {} | Medium {} | High {} | Critical {}
+type Todo = {title: Text, owner: Text, priority: Priority}
+*todos : [Todo]
+
 route TodoApi where
-  /todos
-    GET /{owner: Text} -> [Todo] = GetTodos
-    POST {title: Text, owner: Text} / -> Todo = CreateTodo
+  GET /todos/{owner: Text} -> [Todo] = GetTodos
+  POST {title: Text, owner: Text} /todos -> Todo = CreateTodo
 
 route AdminApi where
-  /admin
-    GET /base.count -> Int 1 = GetCount
+  GET /admin/count -> Int 1 = GetCount
 
 -- Compose routes
 route Api = TodoApi | AdminApi
 
+addTodo (\title owner -> do
+  todos <- *todos
+  *todos = base.union todos [{title title owner owner priority (Priority.Low {})}])
+
+getTodos (\owner -> do
+  todos <- *todos
+  with {result (do t <- todos; where t.owner == owner; yield t)} yield result)
+
 -- Handler
-api (serve Api where)
-  GetTodos = \{owner} -> do
+api (serve Api where
+  GetTodos = \{owner owner} -> do
     todos <- getTodos owner
-    yield Ok {value todos}
-  CreateTodo = \{title, owner} -> do
-    todo <- addTodo title owner
-    yield Ok {value todo}
+    yield (Result.Ok {value todos})
+  CreateTodo = \{title title owner owner} -> do
+    addTodo title owner
+    yield (Result.Ok {value {title title owner owner priority (Priority.Low {})}})
   GetCount = \{} -> do
     todos <- *todos
-    yield Ok {value base.count todos}
-
-main (listen 8080 api)
+    yield (Result.Ok {value (base.count todos)}))
 ```
 
 `serve API where` produces a value of type `Server API`. Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. `listen : Int u -> Server a -> IO {}` binds the server to a port.
@@ -1032,12 +1040,15 @@ main (listen 8080 api)
 `Ok {value: v}` responds 200 with `v` as JSON. `Err {error: {status, message}}` responds with the given status code and a JSON error body:
 
 ```knot
-api (serve Api where)
-  GetUser = \{id} -> do
+*people : [{id: Int 1, name: Text}]
+route Api where
+  GET /users/{id: Int 1} -> {id: Int 1, name: Text} = GetUser
+api (serve Api where
+  GetUser = \{id id} -> do
     users <- *people
     case base.filter (\u -> u.id == id) users of
-      [] -> yield Err {error {status 404 message "user not found"}}
-      Cons u _ -> yield Ok {value: u}
+      [] -> yield (Result.Err {error {status 404 message "user not found"}})
+      Cons u rest -> yield (Result.Ok {value u}))
 ```
 
 Status is clamped to `100..=599`. The runtime emits `400` for path/query/body parsing failures and refinement violations, and `404` for unmatched routes — only return `Err` for application-level errors.
@@ -1049,7 +1060,7 @@ Request and response headers use the `headers` keyword:
 ```knot
 route Api where
   GET /todos headers {authorization: Text}
-    -> [Todo] headers {xTotalCount: Int 1}
+    -> [{title: Text}] headers {xTotalCount: Int 1}
     = GetTodos
   POST {title: Text} /todos headers {authorization: Text}
     -> {id: Int 1}
@@ -1147,10 +1158,10 @@ The compiler maintains a lockfile (`<name>.schema.lock`) tracking persisted sche
 ### Migrations
 
 ```knot
-migrate *people
-  from {name: Text, age: Int 1}
-  to   {name: Text, age: Int 1, email: Text}
-  using (\old -> {old | email old.name ++ "@unknown.com"})
+*people : [{name: Text, age: Int 1}]
+  migrate from {name: Text, age: Int 1}
+  to {name: Text, age: Int 1, email: Text}
+  using (\old -> {old | email (old.name ++ "@unknown.com")})
 ```
 
 ---
@@ -1158,6 +1169,10 @@ migrate *people
 ## Subset Constraints
 
 ```knot
+*people : [{name: Text, age: Int 1}]
+*orders : [{customer: Text, amount: Int 1}]
+*users : [{name: Text, email: Text}]
+
 -- Referential integrity
 *orders.customer <= *people.name
 
@@ -1175,18 +1190,18 @@ Types restricted by predicate functions, checked at runtime boundaries.
 
 ```knot
 -- Simple refined type alias
-type Nat = Int where \x -> x >= 0
+type Nat = Int 1 where \x -> x >= 0
 
 -- Per-field refinements
-type ValidPerson = {name: Text, age: Int where \x -> x >= 0 && x <= 150}
+type ValidPerson = {name: Text, age: Int 1 where \x -> x >= 0 && x <= 150}
 
 -- Cross-field refinements
 type Range = {lo: Int 1, hi: Int 1} where \r -> r.lo <= r.hi
 
 -- ADT constructor refinements
 data Shape
-  = Circle {radius: Float where \r -> r > 0.0}
-  | Rect {width: Float where \w -> w > 0.0, height: Float where \h -> h > 0.0}
+  = Circle {radius: Float 1 where \r -> r > 0.0}
+  | Rect {width: Float 1 where \w -> w > 0.0, height: Float 1 where \h -> h > 0.0}
 ```
 
 ### Checking with `refine`
@@ -1194,17 +1209,26 @@ data Shape
 `refine expr` validates a value against a refined type inferred from context. Returns `Result RefinementError T`:
 
 ```knot
--- Use with case
-result (case refine someInt of)
-  Ok {value: n} -> base.println ("Valid: " ++ base.show n)
-  Err {error: e} -> base.println ("Invalid: " ++ base.show e)
-
--- Use in Result do-block
-validated do
-  n <- refine someInt        -- binds n : Nat on success, short-circuits on failure
-  m <- refine otherInt
-  yield (n + m)
--- validated : Result RefinementError Int 1
+type Nat = Int 1 where \x -> x >= 0
+```
+```knot
+with {
+type Nat = Int 1 where \x -> x >= 0
+}
+(do
+  -- Use with case
+  case refine (5 : Int 1) of
+    Result.Ok {value n} -> base.println ("Valid: " ++ base.show n)
+    Result.Err {error e} -> base.println ("Invalid: " ++ base.show e)
+  -- Use in Result do-block
+  with {validated do
+    n <- refine (3 : Int 1)     -- binds n : Nat on success, short-circuits on failure
+    m <- refine (4 : Int 1)
+    yield (n + m)}
+  (do
+    base.println (base.show validated)   -- validated : Result RefinementError (Int 1)
+    yield {})
+  yield {})
 ```
 
 `RefinementError = {typeName: Text, violations: [{field: Maybe Text, message: Text}]}`
@@ -1214,10 +1238,13 @@ validated do
 **Write validation**: refined fields on source relations are checked before each write (`*rel = ...`). Panics on violation.
 
 ```knot
+type Nat = Int 1 where \x -> x >= 0
 *people : [{name: Text, age: Nat}]
 
 -- This panics if any age is negative:
-*people = [{name "Alice" age -1}]
+do
+  replace *people = [{name "Alice" age (0 - 1)}]
+  yield {}
 ```
 
 **Route handlers**: refined body fields are auto-validated after JSON decoding. Returns HTTP 400 on failure.

@@ -862,7 +862,7 @@ bytesToHex (hash "hello")    -- "ea8f163..."
 ### `floor`
 
 ```
-floor : Float u -> Int 1
+floor : Float 1 -> Int 1
 ```
 
 Round toward negative infinity (`floor (-2.3)` is `-3`). The result is dimensionless.
@@ -870,7 +870,7 @@ Round toward negative infinity (`floor (-2.3)` is `-3`). The result is dimension
 ### `intToFloat`
 
 ```
-intToFloat : Int u -> Float 1
+intToFloat : Int 1 -> Float 1
 ```
 
 Widen an `Int` to a `Float` (lossy past 2⁵³). The result is dimensionless.
@@ -963,7 +963,7 @@ Knot provides elliptic-curve cryptography built-ins using X25519 (encryption) an
 ### `generateKeyPair`
 
 ```
-generateKeyPair : IO {privateKey: Bytes, publicKey: Bytes}
+generateKeyPair : IO ({privateKey: Bytes, publicKey: Bytes})
 ```
 
 Generate an X25519 key pair for encryption/decryption. Inside a `do` block, bind with `keys <- generateKeyPair`.
@@ -971,7 +971,7 @@ Generate an X25519 key pair for encryption/decryption. Inside a `do` block, bind
 ### `generateSigningKeyPair`
 
 ```
-generateSigningKeyPair : IO {privateKey: Bytes, publicKey: Bytes}
+generateSigningKeyPair : IO ({privateKey: Bytes, publicKey: Bytes})
 ```
 
 Generate an Ed25519 key pair for signing/verification. Inside a `do` block, bind with `keys <- generateSigningKeyPair`.

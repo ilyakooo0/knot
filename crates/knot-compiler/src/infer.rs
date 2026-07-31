@@ -9792,7 +9792,7 @@ impl Infer {
             ),
         );
 
-        // bind : ∀a b. (a -> Maybe b) -> Maybe a -> Maybe b  (builtin → knot_relation_bind)
+        // bind : ∀a b. (a -> [b]) -> [a] -> [b]  (builtin → knot_relation_bind)
         let a = self.fresh_var();
         let b = self.fresh_var();
         self.bind_top(

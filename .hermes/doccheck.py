@@ -123,7 +123,9 @@ def wrap_sigs(sigs):
             out.append(f"check{i} ({lam})")
             continue
         out.append(f"check{i} : {tyc}")
-        out.append(f"check{i} base.{bare}")
+        # SIG_RE strips any leading `base.`; `name` is the path WITHOUT it
+        # (e.g. `morph.textToBytes.into` or `sum`). Reference the full path.
+        out.append(f"check{i} base.{name}")
     out.append("}")
     out.append("(do\n  base.println \"ok\"\n  yield {})\n")
     return "\n".join(out)

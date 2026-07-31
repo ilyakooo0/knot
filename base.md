@@ -169,13 +169,12 @@ Set intersection — rows present in both.
 ### `base.bind`
 
 ```
-base.bind : (a -> Maybe b) -> Maybe a -> Maybe b
+base.bind : (a -> [b]) -> [a] -> [b]
 ```
 
-Monadic bind. Over relations it is `flatMap`
-(`(a -> [b]) -> [a] -> [b]`, compiled to `knot_relation_bind`); over `Maybe`
-it threads a `Just` or short-circuits a `Nothing`. This is the function `<-`
-desugars to in `do` notation.
+Monadic bind over relations — `flatMap` (compiled to `knot_relation_bind`).
+This is the function `<-` desugars to in a relation comprehension. (`Maybe`
+`<-` is handled by do-desugaring, not by `base.bind`.)
 
 ### `base.head`
 
@@ -237,8 +236,8 @@ Reorder rows by a projected key (ascending). Pushes down to `ORDER BY`; with
 ### `base.take` / `base.drop`
 
 ```
-base.take : Int -> s -> s
-base.drop : Int -> s -> s
+base.take : Int 1 -> s -> s
+base.drop : Int 1 -> s -> s
 ```
 
 First / skip *n* items. Polymorphic over the sequence type `s` — works on
@@ -643,7 +642,7 @@ digests.
 ### `base.floor`
 
 ```
-base.floor : Float u -> Int 1
+base.floor : Float 1 -> Int 1
 ```
 
 Round toward negative infinity (`base.floor (-2.3)` is `-3`). The result is
@@ -652,7 +651,7 @@ dimensionless; attach a unit with `base.withUnit` if needed.
 ### `base.intToFloat`
 
 ```
-base.intToFloat : Int u -> Float 1
+base.intToFloat : Int 1 -> Float 1
 ```
 
 Widen an `Int` to a `Float` (lossy past 2⁵³). The result is dimensionless.
@@ -720,7 +719,7 @@ X25519 (encryption) and Ed25519 (signing).
 ### `base.generateKeyPair`
 
 ```
-base.generateKeyPair : IO {privateKey: Bytes, publicKey: Bytes}
+base.generateKeyPair : IO ({privateKey: Bytes, publicKey: Bytes})
 ```
 
 X25519 key pair for encryption/decryption.
@@ -728,7 +727,7 @@ X25519 key pair for encryption/decryption.
 ### `base.generateSigningKeyPair`
 
 ```
-base.generateSigningKeyPair : IO {privateKey: Bytes, publicKey: Bytes}
+base.generateSigningKeyPair : IO ({privateKey: Bytes, publicKey: Bytes})
 ```
 
 Ed25519 key pair for signing/verification.
@@ -908,11 +907,13 @@ Drop / attach a unit on a `Float`.
 ### `base.strip` / `base.dress`
 
 ```
-base.strip : a u -> a 1
-base.dress : a 1 -> a u
+base.strip : Int u -> Int 1
+base.dress : Int 1 -> Int u
 ```
 
-Generalized unit rebranding across both `Int` and `Float`. `base.strip` drops
+Generalized unit rebranding across both `Int` and `Float` (the same shapes hold
+with `Float` for `Int` — the polymorphic `a u -> a 1` form is not writable
+surface syntax, but `base.strip`/`base.dress` work on both). `base.strip` drops
 a unit; `base.dress` attaches one to a dimensionless value (target pinned by
 context/annotation).
 

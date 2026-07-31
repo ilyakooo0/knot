@@ -896,8 +896,8 @@ result type (see [base.md](base.md#morphs-basemorph)).
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `generateKeyPair` | `IO {privateKey: Bytes, publicKey: Bytes}` | X25519 keypair |
-| `generateSigningKeyPair` | `IO {privateKey: Bytes, publicKey: Bytes}` | Ed25519 keypair |
+| `generateKeyPair` | `IO ({privateKey: Bytes, publicKey: Bytes})` | X25519 keypair |
+| `generateSigningKeyPair` | `IO ({privateKey: Bytes, publicKey: Bytes})` | Ed25519 keypair |
 | `encrypt` | `Bytes -> Bytes -> IO Bytes` | Sealed-box (public key, plaintext) |
 | `decrypt` | `Bytes -> Bytes -> Bytes` | Open sealed-box (private key, ciphertext) |
 | `sign` | `Bytes -> Bytes -> Bytes` | Ed25519 sign (private key, message) |

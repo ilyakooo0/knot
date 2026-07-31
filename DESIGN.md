@@ -591,39 +591,39 @@ The compiler detects whether a do-block is IO or relational based on the types o
 
 ### DB Effect Inference
 
-DB effects are still inferred as fine-grained capabilities (`{r *rel}`, `{w *rel}`), but all relation access returns IO values:
+All relation access returns `IO` values. The compiler tracks which functions touch the DB through the `IO` type — no separate effect annotations to write:
 
 ```knot
--- Pure (inferred: no effects)
+*people : [{name: Text, age: Int 1}]
+
+-- Pure (no DB access)
 formatName \n -> base.toUpper (base.take 1 n) ++ base.drop 1 n
 
--- DB read (inferred: {r *people})
+-- DB read
 &seniors = do
   people <- *people
   yield (base.filter (\p -> p.age > 65) people)
 
--- DB write (inferred: {rw *people})
+-- DB write
 birthday \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (case p.name == name of Bool.True {} -> {p | age p.age + 1}; Bool.False {} -> p)
+    yield (case p.name == name of Bool.True {} -> {p | age (p.age + 1)}; Bool.False {} -> p)
 ```
 
 ### Effect Annotations
 
-Effect signatures are inferred but can be written explicitly:
+Effect signatures are inferred; you do not write them. A function that touches the DB returns an `IO` value:
 
 ```knot
-birthday : {rw *people} Text -> IO {} {}
+*people : [{name: Text, age: Int 1}]
 birthday \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (case p.name == name of Bool.True {} -> {p | age p.age + 1}; Bool.False {} -> p)
+    yield (case p.name == name of Bool.True {} -> {p | age (p.age + 1)}; Bool.False {} -> p)
 ```
-
-If the body uses a capability not listed in the signature, the compiler rejects it.
 
 ### IO and Transactions
 
@@ -1521,14 +1521,14 @@ A refined type is a base type restricted by a predicate. The predicate is an ord
 
 ```knot
 -- Standalone refined type
-type Nat = Int where \x -> x >= 0
-type Percentage = Float where \x -> x >= 0.0 && x <= 100.0
+type Nat = Int 1 where \x -> x >= 0
+type Percentage = Float 1 where \x -> x >= 0.0 && x <= 100.0
 type NonEmptyText = Text where \s -> base.length s > 0
 type Email = Text where \s -> base.contains "@" s && base.length s >= 3
 
 -- Stacking: inner refinement inherited, predicates conjoin
 type Age = Nat where \x -> x <= 150
--- equivalent to: Int where \x -> x >= 0 && x <= 150
+-- equivalent to: Int 1 where \x -> x >= 0 && x <= 150
 ```
 
 #### Per-Field Refinements
@@ -1538,7 +1538,7 @@ Refinements attach to individual record fields:
 ```knot
 type Person = {
   name: Text where \s -> length s > 0,
-  age: Int where \x -> x >= 0 && x <= 150,
+  age: Int 1 where \x -> x >= 0 && x <= 150,
   email: Text
 }
 ```
@@ -1554,8 +1554,8 @@ type DateRange = {
 } where \r -> r.start <= r.end
 
 type Discount = {
-  percent: Float where \x -> x >= 0.0 && x <= 1.0,
-  minQty: Int where \x -> x >= 0
+  percent: Float 1 where \x -> x >= 0.0 && x <= 1.0,
+  minQty: Int 1 where \x -> x >= 0
 } where \d -> d.percent < 0.5 || d.minQty >= 10
 ```
 
@@ -1565,8 +1565,8 @@ Refinements can appear on constructor fields:
 
 ```knot
 data Shape
-  = Circle {radius: Float where \r -> r > 0.0}
-  | Rect {width: Float where \w -> w > 0.0, height: Float where \h -> h > 0.0}
+  = Circle {radius: Float 1 where \r -> r > 0.0}
+  | Rect {width: Float 1 where \w -> w > 0.0, height: Float 1 where \h -> h > 0.0}
 ```
 
 #### Relation Constraints
@@ -1578,11 +1578,11 @@ constraints (referential integrity, uniqueness) are written as top-level
 ```knot
 *people : [{
   name: Text where \s -> length s > 0,
-  age: Int where \x -> x >= 0,
+  age: Int 1 where \x -> x >= 0,
   email: Text where \s -> contains "@" s
 }]
 
-*orders : [{customer: Text, amount: Int where \x -> x > 0}]
+*orders : [{customer: Text, amount: Int 1 where \x -> x > 0}]
 
 -- Referential integrity: every orders.customer must appear in people.email
 *orders.customer <= *people.email
@@ -1724,7 +1724,7 @@ Adding a refinement to an existing relation requires a validation migration to e
 #### Full Example
 
 ```knot
-type Nat = Int where \x -> x >= 0
+type Nat = Int 1 where \x -> x >= 0
 type NonEmptyText = Text where \s -> base.length s > 0
 type Email = Text where \s -> base.contains "@" s && base.length s >= 3
 

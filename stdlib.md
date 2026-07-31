@@ -283,7 +283,7 @@ Set union of two relations.
 ```knot
 *employees : [{name: Text}]
 *contractors : [{name: Text}]
-&all = (do
+&everyone = (do
   employees <- *employees
   contractors <- *contractors
   yield (base.union employees contractors))
@@ -390,9 +390,7 @@ source relations.
 
 ```knot
 -- Bump or insert a per-user counter
-bump \user counters -> base.upsertBy (\c -> c.user == user)
-                                     {user user n 1}
-                                     counters
+bump \user counters -> base.upsertBy (\c -> c.user == user) {user user n 1} counters
 ```
 
 ---
@@ -487,8 +485,7 @@ waitForTask \id -> atomic do
     where t.status == "done"
     yield t}
   (do
-    where (base.count done) == 0
-    base.retry
+    base.when (base.count done == 0) base.retry
     yield done)
 ```
 

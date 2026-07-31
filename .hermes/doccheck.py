@@ -62,8 +62,10 @@ def classify(body):
     nonempty = [b for b in body if not is_comment_or_blank(b)]
     if not nonempty:
         return "empty", None
-    # complete program: has `with {` and a non-} trailing expression, OR starts with (do / do
-    if "with {" in text:
+    # complete program: an OUTER record-open `with {` at col 0 (not an inner
+    # comprehension `with {name do ...`), possibly followed by a body.
+    outer_with = re.search(r'^with \{\s*$', text, re.M)
+    if outer_with:
         # is there a body after the last closing brace at col 0?
         # crude: last non-comment line that's not part of the with-record
         tail = [b for b in reversed(body) if not is_comment_or_blank(b)]
@@ -81,10 +83,12 @@ def classify(body):
     # possibly with a trailing body expression: wrap decls in `with { }`.
     if re.search(r'^(route|data|type|serve)\b', text, re.M):
         return "program_decls", body
-    # Declaration(s) followed by a top-level `(do ...)` body (e.g. `*src : T`
-    # then a `(do ...)` program body): also program_decls.
-    if re.search(r'^\(do\b', text, re.M) and re.search(r'^[*&]?[a-zA-Z_]\w*\s*[:=]', text, re.M):
-        return "program_decls", body
+    # Declaration(s) followed by a top-level `(do ...)` or `do ...` program body
+    # (e.g. `*src : T` / `f \\x -> ...` fields then a `do` body): program_decls.
+    if re.search(r'^\(?do\s*$', text, re.M) or (re.search(r'^\(do\b', text, re.M) and re.search(r'^[*&]?[a-zA-Z_]\w*\s*[:=]', text, re.M)):
+        # only when there is at least one field-like declaration line above it
+        if re.search(r'^[*&]?[a-zA-Z_]\w*\s*[:=\\]|^[*&]?[a-zA-Z_]\w*\s+do\b', text, re.M):
+            return "program_decls", body
     # pure signature(s)?
     sigs = []
     allsig = True
@@ -100,7 +104,10 @@ def classify(body):
     # otherwise: declaration/expr fragment
     return "fragment", text
 
-DECL_START = re.compile(r'^\s*(?:[*&]?[a-zA-Z_]\w*|route\b|serve\b)\s*(?::|=|\bwhere\b|\\|\()', )
+DECL_START = re.compile(r'^\s*(?:[*&]?[a-zA-Z_]\w*|route\b|serve\b)\s*(?::|=|\bwhere\b|\\|\(|\bdo\b)', )
+# A `name <value>` with-field line (constant/function/derived with a body). The
+# value may be a literal, record, lambda, `do` block, source read, or call.
+FIELD_WITH_BODY = re.compile(r'^\s*[*&]?[a-zA-Z_]\w*\s+\S')
 EXPR_START = re.compile(r'^\s*[\(]?\s*(?:base\.|do\b|\(do\b|[a-zA-Z_][\w.]*\s*\()', )
 
 def _paren_balanced(s):
@@ -121,31 +128,42 @@ def split_decls_exprs(lines):
     """Group a fragment's lines into declarations vs trailing bare expressions.
 
     A declaration starts at a DECL_START line and continues while its parens are
-    unbalanced OR the following non-blank line is more indented. Lines that don't
-    belong to any declaration and aren't declarations themselves are expressions.
+    unbalanced OR it opens an indented body block (`name do`, `name \\args ->`)
+    whose following lines are more indented. Lines that don't belong to any
+    declaration and aren't declarations themselves are expressions.
     """
     decls, exprs = [], []
-    cur = None  # accumulating a multi-line declaration
+    cur = None        # accumulating a multi-line declaration
+    cur_indent = 0    # indent of the declaration's opening line
+    def opens_block(s):
+        # `... do` or `... ->` or `... =` at end of line opens an indented body
+        return bool(re.search(r'(\bdo\b|->|=)\s*$', s))
     for raw in lines:
         if is_comment_or_blank(raw):
             if cur is not None:
                 cur.append(raw)
             continue
         s = raw.strip()
-        starts_decl = bool(DECL_START.match(raw)) and not s.startswith("(")
+        indent = len(raw) - len(raw.lstrip())
+        # a with-field: `name : T`, `name = v`, `name do ...`, `name \a -> ...`,
+        # or `name <value>` (constant with a body). Dotted names (base.x) are not fields.
+        starts_decl = (bool(DECL_START.match(raw)) or bool(FIELD_WITH_BODY.match(raw))) \
+                      and not s.startswith("(") and "." not in s.split(None, 1)[0]
         if cur is not None:
-            # continue an open multi-line declaration
-            cur.append(raw)
             joined = "\n".join(cur)
-            if _paren_balanced(joined):
-                decls.append("\n".join(cur))
-                cur = None
-            continue
+            # continue if parens unbalanced OR this line is a more-indented body line
+            if not _paren_balanced(joined) or indent > cur_indent:
+                cur.append(raw)
+                if _paren_balanced("\n".join(cur)) and indent <= cur_indent:
+                    decls.append("\n".join(cur)); cur = None
+                continue
+            # a same-or-less-indented balanced line closes the declaration
+            decls.append(joined); cur = None
         if starts_decl:
-            if _paren_balanced(raw):
+            if _paren_balanced(raw) and not opens_block(s):
                 decls.append(raw)
             else:
-                cur = [raw]
+                cur = [raw]; cur_indent = indent
         else:
             exprs.append(raw)
     if cur is not None:

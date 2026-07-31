@@ -127,6 +127,9 @@ type Person = {name: Text, age: Int 1}
 Bind through multiple levels with `<-`:
 
 ```knot
+type Person = {name: Text, role: Text}
+*teams : [{name: Text, members: [Person]}]
+
 -- All people across all teams
 &allMembers = do
   teams <- *teams
@@ -155,14 +158,17 @@ Bind through multiple levels with `<-`:
 Write `*rel = ...` with a `map` over the outer relation that transforms the nested relation:
 
 ```knot
+type Person = {name: Text, role: Text}
+*teams : [{name: Text, members: [Person]}]
+
 -- Add a member to a team
 addMember \teamName person -> do
   teams <- *teams
   *teams = do
     t <- teams
-    yield (if t.name == teamName
-      then {t | members base.union t.members [person]}
-      else t)
+    yield (case t.name == teamName of
+      Bool.True {} -> {t | members (base.union t.members [person])}
+      Bool.False {} -> t)
 
 -- Remove a member from all teams
 removePerson \personName -> do
@@ -180,6 +186,9 @@ removePerson \personName -> do
 Convert between flat and nested representations:
 
 ```knot
+type Person = {name: Text, role: Text, age: Int 1}
+*teams : [{name: Text, members: [Person]}]
+
 -- Flat relation
 type FlatMembership = {team: Text, member: Text, age: Int 1}
 *memberships : [FlatMembership]

@@ -226,7 +226,7 @@ pub struct Codegen {
     io_functions: HashSet<String>,
 
     // User-defined functions whose bodies (transitively) perform a relation
-    // write (Set/ReplaceSet or a nested call to another writing function).
+    // write (Set/FullSet or a nested call to another writing function).
     // Used to skip the SAVEPOINT in read-only `atomic` blocks — the version-
     // snapshot retry machinery doesn't need transactional rollback when no
     // SQL writes can happen.
@@ -4997,7 +4997,7 @@ impl Codegen {
                 }
             }
 
-            ast::ExprKind::ReplaceSet { target, value } => {
+            ast::ExprKind::FullSet { target, value } => {
                 if let ast::ExprKind::SourceRef(name) = &target.node {
                     // Check if target is a view
                     let view_info = self.views.get(name).cloned();
@@ -5052,7 +5052,7 @@ impl Codegen {
 
             ast::ExprKind::Atomic(inner) => {
                 let is_nested = self.atomic_retry_block.is_some();
-                // Whether the body might issue a SQL write (Set/ReplaceSet,
+                // Whether the body might issue a SQL write (Set/FullSet,
                 // direct or via a user fn). If not, the SAVEPOINT can be
                 // skipped — the version-snapshot retry machinery already
                 // provides the consistency guarantees we need for a
@@ -5626,7 +5626,7 @@ impl Codegen {
     /// function, or a call through an unknown callee. The conservatism
     /// mirrors `expr_contains_writes` exactly: whenever that function
     /// reports "may write" for a reason other than a direct
-    /// `Set`/`ReplaceSet`, this returns `false` so the caller invalidates
+    /// `Set`/`FullSet`, this returns `false` so the caller invalidates
     /// every source binding.
     fn collect_direct_write_targets(
         &self,
@@ -5641,7 +5641,7 @@ impl Codegen {
                     || matches!(name, "yield" | "__bind" | "__yield" | "__empty"))
         };
         match &expr.node {
-            Set { target, value } | ReplaceSet { target, value } => {
+            Set { target, value } | FullSet { target, value } => {
                 let target_ok = match &target.node {
                     SourceRef(name) if !self.views.contains_key(name) => {
                         out.push(name.clone());
@@ -8735,7 +8735,7 @@ impl Codegen {
         match &expr.node {
             ast::ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name),
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
-            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
+            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::App { func, arg } => {
                 Self::expr_contains_io(func, builtins, io_fns)
@@ -8924,7 +8924,7 @@ impl Codegen {
             }
         };
         match &expr.node {
-            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
+            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(inner) => Self::expr_contains_writes(inner, write_fns, known_fns, passthrough_fns),
             ast::ExprKind::Var(name) => write_fns.contains(name),
             ast::ExprKind::App { func, arg } => {
@@ -9058,7 +9058,7 @@ impl Codegen {
                 || Self::io_scopes_lookup(scopes, name)
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
-            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
+            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_is_io_scoped(lhs, scopes) || self.expr_is_io_scoped(rhs, scopes)
@@ -9197,7 +9197,7 @@ impl Codegen {
             // as the relation value itself.
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => false,
             // Writes and atomic blocks must not run at `let` time.
-            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
+            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_has_external_io(lhs) || self.expr_has_external_io(rhs)
@@ -9361,7 +9361,7 @@ impl Codegen {
     /// Compile an expression in *argument* position, where the value is handed
     /// to a callee instead of being executed here.
     ///
-    /// `Set`/`ReplaceSet` are typed `IO {} {}`, but their `compile_expr` arms
+    /// `Set`/`FullSet` are typed `IO {} {}`, but their `compile_expr` arms
     /// emit the write inline. That is correct for a do-block *statement* (the
     /// write is meant to run at that point) and wrong for an argument: in
     /// `when False (*rel = …)` the argument is compiled while building the call,
@@ -9383,7 +9383,7 @@ impl Codegen {
     ) -> Value {
         if matches!(
             &expr.node,
-            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. }
+            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. }
         ) {
             let do_stmts = vec![ast::Spanned::new(
                 ast::StmtKind::Expr(expr.clone()),
@@ -9474,7 +9474,7 @@ impl Codegen {
                     );
                     // A comprehension TAIL inside a sequential IO block:
                     //
-                    //   replace *people = [...]      -- IO statement
+                    //   full *people = [...]      -- IO statement
                     //   p <- *people                 -- ← this bind
                     //   where p.age > 27
                     //   yield p.name
@@ -10566,7 +10566,7 @@ impl Codegen {
                                 | ast::ExprKind::List(_)
                                 | ast::ExprKind::Do(_)
                                 | ast::ExprKind::Set { .. }
-                                | ast::ExprKind::ReplaceSet { .. }
+                                | ast::ExprKind::FullSet { .. }
                         ) || self.expr_is_known_relation(expr);
                         if is_known_relation {
                             val
@@ -11034,7 +11034,7 @@ impl Codegen {
                             "knot_relation_push",
                             &[result, val],
                         );
-                    } else if matches!(&expr.node, ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. }) {
+                    } else if matches!(&expr.node, ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. }) {
                         // Compile set inside do block
                         let _ = self.compile_expr(builder, expr, env, db);
                         // Variables bound from the written source are stale now.
@@ -11661,7 +11661,7 @@ impl Codegen {
                 ast::StmtKind::Expr(e) => Self::references_source(e, source_name),
             }),
             ast::ExprKind::Set { target, value }
-            | ast::ExprKind::ReplaceSet { target, value } => {
+            | ast::ExprKind::FullSet { target, value } => {
                 Self::references_source(target, source_name)
                     || Self::references_source(value, source_name)
             }
@@ -15388,7 +15388,7 @@ fn beta_reduce_inner(
         // we keep them unchanged: SQL pushdown never sees these inside the
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
         Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | Case { .. } | Do(_)
-        | Set { .. } | ReplaceSet { .. } | Atomic(_) | TimeUnitLit { .. }
+        | Set { .. } | FullSet { .. } | Atomic(_) | TimeUnitLit { .. }
         | Annot { .. } | Refine(_) | Serve { .. } | TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. }
         | ViewDecl { .. } | DerivedDecl { .. } => return expr.clone(),
     };
@@ -15510,7 +15510,7 @@ fn substitute_inner(
         // matchers then compiled the broken AST, panicking with
         // "codegen: undefined variable" or silently capturing a same-named
         // in-scope variable.
-        Case { .. } | Do(_) | Set { .. } | ReplaceSet { .. } | Atomic(_)
+        Case { .. } | Do(_) | Set { .. } | FullSet { .. } | Atomic(_)
         | Serve { .. } => {
             if expr_mentions_var(expr, var) {
                 return None;
@@ -15563,7 +15563,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
                 || arms.iter().any(|a| expr_mentions_var(&a.body, var))
         }
         Do(stmts) => in_stmts(stmts),
-        Set { target, value } | ReplaceSet { target, value } => {
+        Set { target, value } | FullSet { target, value } => {
             expr_mentions_var(target, var) || expr_mentions_var(value, var)
         }
         Atomic(inner) | Refine(inner) => expr_mentions_var(inner, var),
@@ -15682,7 +15682,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
                 }
             }
         }
-        Set { target, value } | ReplaceSet { target, value } => {
+        Set { target, value } | FullSet { target, value } => {
             collect_free_vars_set(target, bound, free);
             collect_free_vars_set(value, bound, free);
         }
@@ -16464,7 +16464,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::Atomic(inner) => {
             expr_contains_derived_ref(inner, name)
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
             expr_contains_derived_ref(target, name) || expr_contains_derived_ref(value, name)
         }
         ast::ExprKind::TimeUnitLit { value, .. } => expr_contains_derived_ref(value, name),
@@ -16623,7 +16623,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
             }
         }
         ast::ExprKind::Set { target, value }
-        | ast::ExprKind::ReplaceSet { target, value } => {
+        | ast::ExprKind::FullSet { target, value } => {
             collect_free_vars(target, bound, free);
             collect_free_vars(value, bound, free);
         }
@@ -16760,7 +16760,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
             }
             false
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
             expr_refs_var(target, var) || expr_refs_var(value, var)
         }
         ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => expr_refs_var(inner, var),
@@ -16874,7 +16874,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
             }
             false
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
             expr_uses_var_as_value(target, var) || expr_uses_var_as_value(value, var)
         }
         ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => {
@@ -17217,9 +17217,9 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::Set { target, value } => {
             format!("{} = {}", pretty_expr(target), pretty_expr(value))
         }
-        ast::ExprKind::ReplaceSet { target, value } => {
+        ast::ExprKind::FullSet { target, value } => {
             format!(
-                "replace {} = {}",
+                "full {} = {}",
                 pretty_expr(target),
                 pretty_expr(value)
             )

@@ -313,7 +313,7 @@ built-in function over relations:
 
 | Primitive | Form | Description |
 |-----------|------|-------------|
-| relation write | `*rel = expr  :  IO {} {}` | Make a persistent relation equal to `expr` (use `replace *rel = expr` to force a full overwrite) |
+| relation write | `*rel = expr  :  IO {} {}` | Make a persistent relation equal to `expr` (use `full *rel = expr` to force a full overwrite) |
 
 The relation operations are built-in functions, not trait methods:
 
@@ -580,7 +580,7 @@ constructor taking one argument — the result type — with no effect-row
 parameter:
 
 - **DB operations** return `IO value`. Source refs (`*rel`), derived refs
-  (`&rel`), and relation writes (`*rel = expr`, `replace *rel = expr`) all
+  (`&rel`), and relation writes (`*rel = expr`, `full *rel = expr`) all
   return `IO value`.
 - **External effects** are also plain `IO`: `IO {}`, `IO Text`, `IO Result`,
   `IO (Int Ms)`, `IO Float 1`.
@@ -787,7 +787,7 @@ increment do
   *counter = [{n ((base.fold (\_ x -> x.n) 0 c) + 1)}]
 
 do
-  replace *counter = [{n 0}]
+  full *counter = [{n 0}]
   base.fork do
     increment
     increment
@@ -816,11 +816,11 @@ waitForCompletion \id -> atomic do
     yield task)
 
 do
-  replace *tasks = [{id 1 status "pending"}]
+  full *tasks = [{id 1 status "pending"}]
   base.fork do
     -- simulate work
     atomic do
-      replace *tasks = [{id 1 status "done"}]
+      full *tasks = [{id 1 status "done"}]
   result <- waitForCompletion 1
   base.println (base.show result)
   yield {}
@@ -1184,7 +1184,7 @@ batchTransfer \transfers ->
 
 ### Mutation
 
-All mutation is done through the `*rel = expr` write, which makes a persistent relation equal to `expr` (there is no `set` keyword — the bare assignment is the write). The compiler recognizes common shapes (`union *rel [...]` → INSERT, conditional `map` → UPDATE, `filter` → DELETE) and emits minimal SQL; otherwise it rewrites the whole relation. `replace *rel = expr` forces a full overwrite. Since relation references return IO, you bind to get the current value first:
+All mutation is done through the `*rel = expr` write, which makes a persistent relation equal to `expr` (there is no `set` keyword — the bare assignment is the write). The compiler recognizes common shapes (`union *rel [...]` → INSERT, conditional `map` → UPDATE, `filter` → DELETE) and emits minimal SQL; otherwise it rewrites the whole relation. `full *rel = expr` forces a full overwrite. Since relation references return IO, you bind to get the current value first:
 
 ```knot
 *people : [{name: Text, age: Int 1}]

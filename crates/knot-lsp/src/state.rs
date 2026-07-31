@@ -501,7 +501,7 @@ impl ServerConfig {
 /// symbol *to* them would re-lex as a literal.
 pub const KEYWORDS: &[&str] = &[
     "data", "type", "route", "serve", "migrate", "where", "do",
-    "yield", "if", "then", "else", "case", "of", "not", "replace", "atomic",
+    "yield", "if", "then", "else", "case", "of", "not", "full", "atomic",
     "deriving", "with", "unit", "refine", "forall", "true", "false",
 ];
 

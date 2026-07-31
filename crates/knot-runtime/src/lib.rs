@@ -14483,7 +14483,7 @@ fn restore_del_triggers(conn: &Connection, sup_table: &str, suspended: &[Suspend
             };
             let field = |s: &str| s.trim_matches('"').to_string();
             panic!(
-                "knot runtime: subset constraint violated: cannot replace *{sup} while *{sub}.{sf} references a removed *{sup}.{spf} value",
+                "knot runtime: subset constraint violated: cannot full-replace *{sup} while *{sub}.{sf} references a removed *{sup}.{spf} value",
                 sup = rel(sup_table),
                 sub = rel(&t.sub_table),
                 sf = field(&t.sub_col),

@@ -230,7 +230,7 @@ fn collect_unguarded_calls<'a>(
                 }
             }
         }
-        Set { target, value } | ReplaceSet { target, value } => {
+        Set { target, value } | FullSet { target, value } => {
             collect_unguarded_calls(target, defs, caller_name, caller, out);
             collect_unguarded_calls(value, defs, caller_name, caller, out);
         }

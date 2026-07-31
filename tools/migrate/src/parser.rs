@@ -585,7 +585,7 @@ impl Parser {
             | TokenKind::Let
             | TokenKind::In
             | TokenKind::Not
-            | TokenKind::Replace
+            | TokenKind::Full
             | TokenKind::Atomic
             | TokenKind::Deriving
             | TokenKind::With
@@ -2304,8 +2304,8 @@ impl Parser {
                     Some(target)
                 }
             }
-            TokenKind::Replace => {
-                // `replace *rel = expr` is a replace-set expression. Otherwise
+            TokenKind::Full => {
+                // `full *rel = expr` is a replace-set expression. Otherwise
                 // `replace` is treated as a regular identifier.
                 let mut offset = 1;
                 while self.peek_ahead(offset) == &TokenKind::Newline {
@@ -2685,7 +2685,7 @@ impl Parser {
             | TokenKind::LParen
             | TokenKind::LBrace
             | TokenKind::LBracket
-            | TokenKind::Replace
+            | TokenKind::Full
             | TokenKind::Do => true,
             // `yield` is not a keyword but should not start application atoms
             // (like keywords), to prevent `f; yield x` from parsing as `f yield x`
@@ -2925,9 +2925,9 @@ impl Parser {
                 let TokenKind::Upper(name) = tok.kind else { unreachable!() };
                 Some(Spanned::new(ExprKind::Constructor(name), tok.span))
             }
-            TokenKind::Replace => {
+            TokenKind::Full => {
                 let tok = self.advance();
-                Some(Spanned::new(ExprKind::Var("replace".into()), tok.span))
+                Some(Spanned::new(ExprKind::Var("full".into()), tok.span))
             }
             TokenKind::Star => {
                 // *name — source reference
@@ -3490,7 +3490,7 @@ impl Parser {
 
             let end_sp = value.span;
             let kind = if replace {
-                ExprKind::ReplaceSet {
+                ExprKind::FullSet {
                     target: Box::new(target),
                     value: Box::new(value),
                 }

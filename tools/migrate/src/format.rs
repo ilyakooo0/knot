@@ -1588,7 +1588,7 @@ fn forces_multiline(e: &Expr) -> bool {
         ExprKind::Do(_) | ExprKind::Case { .. } => true,
         ExprKind::Lambda { body, .. } => forces_multiline(body),
         ExprKind::App { func, arg } => forces_multiline(func) || forces_multiline(arg),
-        ExprKind::Set { value, .. } | ExprKind::ReplaceSet { value, .. } => forces_multiline(value),
+        ExprKind::Set { value, .. } | ExprKind::FullSet { value, .. } => forces_multiline(value),
         _ => false,
     }
 }
@@ -1745,9 +1745,9 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             );
             paren_if(parent > Prec::Lowest, s)
         }
-        ExprKind::ReplaceSet { target, value } => {
+        ExprKind::FullSet { target, value } => {
             let s = format!(
-                "replace {} = {}",
+                "full {} = {}",
                 render_expr_inline(target, Prec::App),
                 render_expr_inline(value, Prec::Lowest)
             );
@@ -1931,7 +1931,7 @@ fn annot_inner_needs_parens(e: &Expr, inline: bool) -> bool {
         | ExprKind::Atomic(_)
         | ExprKind::Refine(_)
         | ExprKind::Set { .. }
-        | ExprKind::ReplaceSet { .. } => true,
+        | ExprKind::FullSet { .. } => true,
         // Last case arm body / do statement / serve handler is also parsed
         // with `parse_expr`, but the inline renderers already wrap these in
         // parens unconditionally.
@@ -2007,12 +2007,12 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
                 p.write(")");
             }
         }
-        ExprKind::ReplaceSet { target, value } => {
+        ExprKind::FullSet { target, value } => {
             let need_parens = parent > Prec::Lowest;
             if need_parens {
                 p.write("(");
             }
-            p.write("replace ");
+            p.write("full ");
             render_expr(p, target, Prec::App);
             p.write(" = ");
             render_expr(p, value, Prec::Lowest);

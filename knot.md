@@ -10,7 +10,7 @@ type Person = {name: Text, age: Int 1}
 *people : [Person]
 
 do
-  replace *people = [{name "Alice" age 30} {name "Bob" age 25}]
+  full *people = [{name "Alice" age 30} {name "Bob" age 25}]
   people <- *people
   with {result do
     p <- people
@@ -384,7 +384,7 @@ data Status = InProgress {assignee: Text} | Done {}
 
 ## Mutation
 
-Mutation is written `*rel = expr`, which makes the source relation equal to `expr`. There is no `set` keyword — the assignment is the bare `*rel = ...` form. The compiler recognizes common shapes (`*rel = union *rel [...]` → INSERT, conditional `map` → UPDATE, `filter` → DELETE) and emits minimal SQL; otherwise it rewrites the whole relation. Use `replace *rel = expr` to force a full overwrite.
+Mutation is written `*rel = expr`, which makes the source relation equal to `expr`. There is no `set` keyword — the assignment is the bare `*rel = ...` form. The compiler recognizes common shapes (`*rel = union *rel [...]` → INSERT, conditional `map` → UPDATE, `filter` → DELETE) and emits minimal SQL; otherwise it rewrites the whole relation. Use `full *rel = expr` to force a full overwrite.
 
 ```knot
 *people : [{name: Text, age: Int 1}]
@@ -1251,7 +1251,7 @@ type Nat = Int 1 where \x -> x >= 0
 
 -- This panics if any age is negative:
 do
-  replace *people = [{name "Alice" age (0 - 1)}]
+  full *people = [{name "Alice" age (0 - 1)}]
   yield {}
 ```
 

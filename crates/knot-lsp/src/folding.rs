@@ -144,7 +144,7 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
         ast::ExprKind::UnaryOp { operand, .. } => {
             collect_folding_ranges_expr(operand, source, ranges);
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
             collect_folding_ranges_expr(target, source, ranges);
             collect_folding_ranges_expr(value, source, ranges);
         }

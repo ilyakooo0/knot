@@ -88,7 +88,7 @@ fn lint_expr(
                 lint_expr(value, source_schemas, views, fun_bodies, diags);
             }
         }
-        ExprKind::ReplaceSet { target, value } => {
+        ExprKind::FullSet { target, value } => {
             lint_expr(target, source_schemas, views, fun_bodies, diags);
             lint_expr(value, source_schemas, views, fun_bodies, diags);
         }
@@ -983,7 +983,7 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
             references_source(scrutinee, source_name)
                 || arms.iter().any(|a| references_source(&a.body, source_name))
         }
-        ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
+        ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
             references_source(target, source_name) || references_source(value, source_name)
         }
         ExprKind::Annot { expr, .. } => references_source(expr, source_name),

@@ -10,7 +10,7 @@ with {
     yield {manager m.manager report m.report}))
 }
 (do
-  replace *manages = [
+  full *manages = [
     {manager "Alice" report "Bob"} 
     {manager "Alice" report "Carol"} 
     {manager "Bob" report "Dave"}

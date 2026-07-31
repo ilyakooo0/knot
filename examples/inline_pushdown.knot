@@ -35,7 +35,7 @@ case5 (do
   yield (base.countWhere (\e -> isHighEarner e) emps))
 }
 (do
-  replace *employees = [
+  full *employees = [
     {name "Alice" dept "Eng" salary 90} 
     {name "Bob" dept "Eng" salary 80} 
     {name "Carol" dept "Sales" salary 70} 

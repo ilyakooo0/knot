@@ -452,7 +452,7 @@ fn collect_edges(
         ast::ExprKind::Atomic(inner) => {
             collect_edges(inner, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::ReplaceSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
             collect_edges(target, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             collect_edges(value, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }

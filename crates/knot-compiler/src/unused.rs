@@ -29,7 +29,7 @@ struct Refs {
     types: HashSet<String>,
     /// Constructor references (`ExprKind::Constructor` or `PatKind::Constructor`).
     ctors: HashSet<String>,
-    /// `*name` references: `SourceRef`, `Set` targets, `ReplaceSet` targets,
+    /// `*name` references: `SourceRef`, `Set` targets, `FullSet` targets,
     /// `At` relations, effect-row `r`/`w`, and subset relation paths.
     sources: HashSet<String>,
     /// `&name` references.
@@ -322,7 +322,7 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
             walk_expr(target, r);
             walk_expr(value, r);
         }
-        ExprKind::ReplaceSet { target, value } => {
+        ExprKind::FullSet { target, value } => {
             walk_expr(target, r);
             walk_expr(value, r);
         }

@@ -360,7 +360,7 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 }
             }
         }
-        ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
+        ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
             walk_exprs(target, f);
             walk_exprs(value, f);
         }
@@ -502,7 +502,7 @@ fn collect_type_and_data_refs<'a>(
                 }
             }
         }
-        ExprKind::Set { target, value } | ExprKind::ReplaceSet { target, value } => {
+        ExprKind::Set { target, value } | ExprKind::FullSet { target, value } => {
             collect_type_and_data_refs(target, aliases, data_decls);
             collect_type_and_data_refs(value, aliases, data_decls);
         }

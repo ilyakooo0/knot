@@ -14,7 +14,7 @@ Prints per-block PASS/FAIL with the first error line for failures.
 """
 import re, os, subprocess, sys, tempfile
 
-WORK = "/tmp/knot-todo"
+WORK = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KNOT = os.path.join(WORK, "target/debug/knot")
 
 def extract_blocks(path):

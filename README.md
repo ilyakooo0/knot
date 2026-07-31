@@ -45,7 +45,7 @@ type Person = {name: Text, age: Int 1}
 *people : [Person]
 }
 (do
-  replace *people = [{name "Alice" age 30} {name "Bob" age 25} {name "Carol" age 35}]
+  full *people = [{name "Alice" age 30} {name "Bob" age 25} {name "Carol" age 35}]
   seniors <- (do
     p <- *people
     where p.age > 27
@@ -322,7 +322,7 @@ type Todo = {title: Text, done: Int 1}
 *todos : [Todo]
 }
 (do
-  replace *todos = [{title "write guide" done 0} {title "ship it" done 0}]
+  full *todos = [{title "write guide" done 0} {title "ship it" done 0}]
 
   -- a query comprehension: binds each row, filters, yields results
   open <- (do
@@ -342,7 +342,7 @@ type Todo = {title: Text, done: Int 1}
   yield {})
 ```
 
-`replace *todos = ...` overwrites; `*todos = ...` assigns a computed value.
+`full *todos = ...` overwrites; `*todos = ...` assigns a computed value.
 Comprehensions over a source push down to SQL (`WHERE`, joins, aggregates
 like `count`/`sum`/`avg`, `sortBy`). A `<name>.schema.lock` file tracks the
 schema across runs for automatic migration.
@@ -367,7 +367,7 @@ with {
     yield {manager m.manager report m.report}))
 }
 (do
-  replace *manages = [
+  full *manages = [
     {manager "Alice" report "Bob"}
     {manager "Alice" report "Carol"}
     {manager "Bob" report "Dave"}

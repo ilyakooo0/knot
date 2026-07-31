@@ -1,7 +1,0 @@
--- schema.lock (auto-generated, do not edit)
--- Commit to source control.
-with {
-type Item = {name: Text, price: Int 1}
-*items : [Item]
-}
-(main)

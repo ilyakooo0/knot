@@ -6428,7 +6428,7 @@ impl Infer {
                         &self.source_var_binds,
                         &self.let_bindings,
                     );
-                    // Require `replace *rel = ...` when the value is a full
+                    // Require `full *rel = ...` when the value is a full
                     // replacement (doesn't reference *rel directly or via a
                     // local alias `xs <- *rel`). Skip views and scalar
                     // sources where the distinction is meaningless.
@@ -6442,7 +6442,7 @@ impl Infer {
                             format!(
                                 "`*{name} = ...` must reference `*{name}` \
                                  (directly or via a `<- *{name}` bind); \
-                                 use `replace *{name} = ...` for a full replacement"
+                                 use `full *{name} = ...` for a full replacement"
                             ),
                             expr.span,
                         );
@@ -6451,7 +6451,7 @@ impl Infer {
                 Ty::IO(Box::new(Ty::unit()))
             }
 
-            ast::ExprKind::ReplaceSet { target, value } => {
+            ast::ExprKind::FullSet { target, value } => {
                 let target_ty = self.infer_expr(target);
                 let target_applied = self.apply(&target_ty);
                 let unwrap_io = |ty: &Ty| match ty {
@@ -6469,7 +6469,7 @@ impl Infer {
                 self.check_expr(value, &target_inner);
                 self.suppress_refine_intro = prev_suppress;
                 if let ast::ExprKind::SourceRef(name) = &target.node {
-                    // Reject `replace *rel = ...` when the value references
+                    // Reject `full *rel = ...` when the value references
                     // `*rel` (directly, via a `<- *rel` bind, or via a let
                     // binding that ultimately reads from `*rel`) — `set`
                     // would produce the same final state more efficiently.
@@ -6491,7 +6491,7 @@ impl Infer {
                     {
                         self.error(
                             format!(
-                                "`replace *{name} = ...` is unnecessary when \
+                                "`full *{name} = ...` is unnecessary when \
                                  the value references `*{name}` \
                                  (directly or via a `<- *{name}` bind); \
                                  use `*{name} = ...` instead"
@@ -8268,7 +8268,7 @@ impl Infer {
                 })
             }
             ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
-            ast::ExprKind::Set { .. } | ast::ExprKind::ReplaceSet { .. } => true,
+            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
                 self.expr_is_io_prescan(lhs) || self.expr_is_io_prescan(rhs)
@@ -11929,7 +11929,7 @@ fn display_ty_clean_inner(
 /// (e.g. `xs <- *foo`, then `xs` counts as a reference), or via a
 /// `let`-bound expression that itself references the source. Used
 /// to distinguish incremental `set` (must reference the source)
-/// from full replacement (which requires `replace *rel = ...`).
+/// from full replacement (which requires `full *rel = ...`).
 fn value_references_source(
     expr: &ast::Expr,
     source_name: &str,
@@ -12047,7 +12047,7 @@ fn value_references_source_inner(
             ),
         }),
         ast::ExprKind::Set { target, value }
-        | ast::ExprKind::ReplaceSet { target, value } => {
+        | ast::ExprKind::FullSet { target, value } => {
             value_references_source_inner(
                 target, source_name, aliases, let_bindings, visited,
             ) || value_references_source_inner(
@@ -12817,7 +12817,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
                 }
             }
         }
-        Set { target, value } | ReplaceSet { target, value } => {
+        Set { target, value } | FullSet { target, value } => {
             f(target);
             f(value);
         }
@@ -12888,7 +12888,7 @@ fn walk_exprs_read<'a>(e: &'a ast::Expr, f: &mut impl FnMut(&'a ast::Expr)) {
                 }
             }
         }
-        Set { target, value } | ReplaceSet { target, value } => {
+        Set { target, value } | FullSet { target, value } => {
             walk_exprs_read(target, f);
             walk_exprs_read(value, f);
         }
@@ -13000,7 +13000,7 @@ fn for_each_data_ctor_scoped<'a>(
                     }
                 }
             }
-            Set { target, value } | ReplaceSet { target, value } => {
+            Set { target, value } | FullSet { target, value } => {
                 walk(target, d, f);
                 walk(value, d, f);
             }

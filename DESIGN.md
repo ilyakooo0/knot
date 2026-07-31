@@ -18,7 +18,7 @@ A relation is a typed set of values. Duplicate values cannot exist — it's a se
 
 ```knot
 -- Literal relation (constant — pure, no DB references)
-names (["Alice", "Bob", "Carol"])
+names (["Alice" "Bob" "Carol"])
 
 -- Empty relation
 none ([ ])
@@ -29,27 +29,30 @@ none ([ ])
 There are five kinds of top-level declarations:
 
 ```knot
+-- Type alias: just a name for a type
+type Person = {name: Text, age: Int 1}
+data Priority = Low {} | High {}
+data Status = Open {} | Closed {}
+
 -- Source: stored in DB, mutable via `*people = ...`
 *people : [Person]
 *orders : [{customer: Text, amount: Int 1}]
+*todos : [{title: Text, owner: Text, priority: Priority}]
 
 -- View: defined by a query over source relations, settable (writes propagate back)
 *openTodos = do
   t <- *todos
-  yield {title t.title owner t.owner priority t.priority status Open {}}
+  yield {title t.title owner t.owner priority t.priority status (Status.Open {})}
 
 -- Constant: a pure expression with no DB references (zero-argument function)
 maxRetries (3)
-defaultPriority (Low {})
-httpCodes ([{code 200 name "OK"}, {code 404 name "Not Found"}])
+defaultPriority (Priority.Low {})
+httpCodes ([{code 200 name "OK"} {code 404 name "Not Found"}])
 
 -- Derived: references source relations, recomputed on access (read-only)
 &seniors = do
   people <- *people
   yield (base.filter (\p -> p.age > 65) people)
-
--- Type alias: just a name for a type
-type Person = {name: Text, age: Int 1}
 ```
 
 The prefix determines mutability, the presence of a body determines whether it's stored or computed:
@@ -90,7 +93,7 @@ Every constructor requires `{}` — even those with no fields. This keeps the sy
 
 ```knot
 data Maybe a = Nothing {} | Just {value: a}
-data List a = Nil {} | Cons {base.head: a, base.tail: List a}
+data List a = Nil {} | Cons {head: a, tail: List a}
 ```
 
 ### ADTs, Records, and Relations Compose Freely
@@ -561,7 +564,7 @@ now : IO (Int Ms)
 IO do-blocks sequence effects. The `<-` operator runs an IO action and binds its result. Since relation references return IO, you bind to get the plain value, then use pure comprehensions:
 
 ```knot
-main do
+do
   people <- *people                  -- IO {} [Person] → binds [Person]
   content <- base.readFile "input.txt"    -- IO Text → binds Text
   base.println content                     -- IO {}
@@ -735,7 +738,7 @@ increment do
   c <- *counter
   *counter = [{n (base.fold (\_ x -> x.n) 0 c) + 1}]
 
-main do
+do
   *counter = [{n 0}]
   base.fork do
     increment
@@ -765,7 +768,7 @@ waitForCompletion \id -> atomic do
     base.retry
     yield task)
 
-main do
+do
   *tasks = [{id 1 status "pending"}]
   base.fork do
     -- simulate work
@@ -797,7 +800,7 @@ fast do
   base.sleep 50 Ms
   yield "fast"
 
-main do
+do
   r <- base.race slow fast
   case r of
     Err {error: a} -> base.println ("left won: " ++ a)

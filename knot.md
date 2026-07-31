@@ -10,7 +10,7 @@ type Person = {name: Text, age: Int 1}
 *people : [Person]
 
 do
-  *people = [{name "Alice" age 30} {name "Bob" age 25}]
+  replace *people = [{name "Alice" age 30} {name "Bob" age 25}]
   people <- *people
   with {result do
     p <- people
@@ -49,10 +49,14 @@ cargo run -p knot-compiler -- build file.knot
 Compile-time units on `Int` and `Float`. Units are fully erased at runtime — no performance cost. Units are not declared: any name used in a unit position is a unit, and compound units are written inline.
 
 ```knot
-distance ((42.0 : Float M)) -- Float M
+distance : Float M
+distance 42.0
 speed : Float (M / S)
+speed 10.0
 force : Float (Kg * M / S^2)
+force 9.8
 cents : Int Usd
+cents 100
 ```
 
 Arithmetic rules: `+`/`-` require matching units, `*`/`/` compose units, negation preserves units.
@@ -78,7 +82,7 @@ Unit-preserving stdlib: `sum` (over a numeric relation) and `avg` (via its proje
 
 ```knot
 -- Anonymous record VALUE: space-separated `name value` pairs, no colons/commas
-{name "Alice" age 30}
+alice {name "Alice" age 30}
 
 -- Record TYPE: colon after each field name, comma-separated
 type Person = {name: Text, age: Int 1}
@@ -139,15 +143,18 @@ There are five kinds of top-level declarations:
 | `type Foo = T` | Type alias | Name for a type |
 
 ```knot
+data Status = Open {} | Closed {}
+
 -- Source: stored in DB
 *people : [{name: Text, age: Int 1}]
+*todos : [{title: Text, owner: Text}]
 
 -- View: settable query over a source
 *openTodos = do
   todos <- *todos
   with {result do
     t <- todos
-    yield {title t.title owner t.owner status Open {}}}
+    yield {title t.title owner t.owner status Status.Open {}}}
   (do
     yield result)
 
@@ -184,17 +191,29 @@ formatName \n -> base.toUpper (base.take 1 n) ++ base.drop 1 n
 Function application is juxtaposition:
 
 ```knot
-greet "Alice"           -- "Hello, Alice"
-add 2 3                 -- 5
-base.filter (\p -> p.age > 30) people
+with {
+greet \name -> "Hello, " ++ name
+add \x y -> x + y
+people [{name "Al" age 30} {name "Bo" age 20}]
+}
+(do
+  base.println (greet "Alice")                          -- "Hello, Alice"
+  base.println (base.show (add 2 3))                    -- 5
+  base.println (base.show (base.filter (\p -> p.age > 30) people))
+  yield {})
 ```
 
 Pipe-forward operator:
 
 ```knot
-people
-  |> base.filter (\p -> p.age > 30)
-  |> base.map (\p -> p.name)
+with {
+people [{name "Al" age 30} {name "Bo" age 20}]
+}
+(do
+  base.println (base.show (people
+    |> base.filter (\p -> p.age > 30)
+    |> base.map (\p -> p.name)))
+  yield {})
 ```
 
 ### Inline Type Annotations
@@ -203,8 +222,8 @@ Any expression can carry a postfix type annotation, both with and without
 surrounding parens:
 
 ```knot
-n (0 : Int Usd) -- bare postfix annotation
-m ((x + y) : Float M) -- parenthesized
+n (0 : Int Usd)                -- bare postfix annotation
+m ((2.0 + 3.0) : Float M)      -- parenthesized
 distance (42.0 : Float (M / S)) -- units on a literal
 ```
 
@@ -218,13 +237,20 @@ compiler infers it. Each `_` is an independent placeholder — it unifies with
 whatever the surrounding code requires and is generalized like a type variable:
 
 ```knot
+with {
 id : _ -> _
 id \x -> x
-id 42          -- 42 : Int 1
-id "hello"     -- "hello" : Text
-
-first : [_] -> _          -- element type inferred
-const : _ -> _ -> _       -- three independent holes
+first : [_] -> _
+first \xs -> base.head xs
+const : _ -> _ -> _
+const \x y -> x
+}
+(do
+  base.println (base.show (id 42))        -- 42 : Int 1
+  base.println (id "hello")               -- "hello" : Text
+  base.println (base.show (first [10 20]))  -- element type inferred
+  base.println (base.show (const 1 "two"))  -- three independent holes
+  yield {})
 ```
 
 Holes work anywhere a type can appear: function arrows, records, relation
@@ -233,9 +259,13 @@ type, `_` is a unit hole — it binds the unit by unification, like a lowercase
 unit variable:
 
 ```knot
+with {
 double : Float _ -> Float _
 double \x -> x + x
-double (5.0 : Float M)     -- 10.0 M — the unit flows through the hole
+}
+(do
+  base.println (base.show (double (5.0 : Float M)))   -- 10.0 M — the unit flows through the hole
+  yield {})
 ```
 
 Each occurrence is fresh: `f : _ -> _` does not force the result to equal the
@@ -395,11 +425,10 @@ There is **no `if`/`then`/`else`**. The only branch is pattern matching with
 `case ... of`; a Bool scrutinee gives you if/else:
 
 ```knot
-with {x 5}
-(with {result (case x > 0 of
+with {result (case 5 > 0 of
   Bool.True {}  -> "positive"
   Bool.False {} -> "non-positive")}
-result)
+result
 ```
 
 Both arms must have the same type, and matching must be exhaustive (the
@@ -416,16 +445,13 @@ with {x 2 y 3} (x + y)            -- 5
 The bound value can be any expression, including a do block:
 
 ```knot
-with {
-people [{name "Al" age 30} {name "Bo" age 20}]
-}
-(with {result do
-  p <- people
+with {result do
+  p <- [{name "Al" age 30} {name "Bo" age 20}]
   where p.age > 27
   yield p.name}
 (do
   base.println (base.show result)
-  yield {}))
+  yield {})
 ```
 
 Use `with` wherever you would otherwise introduce a local name — inside do blocks, in function bodies, or nested in other expressions.

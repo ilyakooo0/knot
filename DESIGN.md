@@ -699,11 +699,12 @@ retry : forall a. a  -- bottom type, never returns
 The compiler enforces that `retry` is only used inside `atomic`. This enables blocking waits on relation state without busy-polling:
 
 ```knot
+*status : [{ready: Int 1}]
 -- Wait until a condition is met
-waitForReady atomic do
+waitForReady (atomic do
   status <- *status
-  where (base.count (base.filter (\s -> s.ready) status)) == 0
-  base.retry
+  base.when (base.count (base.filter (\s -> s.ready == 1) status) == 0) base.retry
+  yield status)
 ```
 
 ##### Row-Level Invalidation
@@ -760,9 +761,9 @@ knotFiles do
 -- Conditional read
 loadConfig \path -> do
   exists <- base.fileExists path
-  if exists
-    then base.readFile path
-    else yield "{}"
+  case exists of
+    Bool.True {} -> base.readFile path
+    Bool.False {} -> yield "{}"
 ```
 
 ### Concurrency
@@ -839,18 +840,18 @@ race : IO a -> IO b -> IO (Result a b)
 
 ```knot
 slow do
-  base.sleep 1000 Ms
+  base.sleep (1000 : Int Ms)
   yield "slow"
 
 fast do
-  base.sleep 50 Ms
+  base.sleep (50 : Int Ms)
   yield "fast"
 
 do
   r <- base.race slow fast
   case r of
-    Err {error: a} -> base.println ("left won: " ++ a)
-    Ok {value: b}  -> base.println ("right won: " ++ b)
+    Result.Err {error a} -> base.println ("left won: " ++ a)
+    Result.Ok {value b}  -> base.println ("right won: " ++ b)
   yield {}
 ```
 
@@ -1122,6 +1123,17 @@ api (serve Api where)
 For sub-transaction boundaries:
 
 ```knot
+*accounts : [{name: Text, balance: Int 1}]
+transfer \from to amount -> do
+  accounts <- *accounts
+  *accounts = do
+    a <- accounts
+    yield (case a.name == from of
+      Bool.True {} -> {a | balance (a.balance - amount)}
+      Bool.False {} -> (case a.name == to of
+        Bool.True {} -> {a | balance (a.balance + amount)}
+        Bool.False {} -> a))
+
 batchTransfer \transfers ->
   base.map (\t -> atomic (transfer t.from t.to t.amount)) transfers
 ```
@@ -1133,6 +1145,8 @@ batchTransfer \transfers ->
 All mutation is done through the `*rel = expr` write, which makes a persistent relation equal to `expr` (there is no `set` keyword — the bare assignment is the write). The compiler recognizes common shapes (`union *rel [...]` → INSERT, conditional `map` → UPDATE, `filter` → DELETE) and emits minimal SQL; otherwise it rewrites the whole relation. `replace *rel = expr` forces a full overwrite. Since relation references return IO, you bind to get the current value first:
 
 ```knot
+*people : [{name: Text, age: Int 1}]
+
 -- Insert: union with a singleton
 addPerson do
   people <- *people
@@ -1143,7 +1157,7 @@ birthday \name -> do
   people <- *people
   *people = do
     p <- people
-    yield (case p.name == "Alice" of Bool.True {} -> {p | age p.age + 1}; Bool.False {} -> p)
+    yield (case p.name == "Alice" of Bool.True {} -> {p | age (p.age + 1)}; Bool.False {} -> p)
 
 -- Delete: filter to keep the rest
 removePerson \name -> do

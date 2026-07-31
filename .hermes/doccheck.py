@@ -77,6 +77,10 @@ def classify(body):
     stripped0 = nonempty[0].strip()
     if stripped0.startswith("(do") or stripped0 == "do" or stripped0.startswith("do "):
         return "program", text
+    # Program-level declaration sequence (route/data/type/serve at top level),
+    # possibly with a trailing body expression: wrap decls in `with { }`.
+    if re.search(r'^(route|data|type|serve)\b', text, re.M):
+        return "program_decls", body
     # pure signature(s)?
     sigs = []
     allsig = True
@@ -92,8 +96,90 @@ def classify(body):
     # otherwise: declaration/expr fragment
     return "fragment", text
 
+DECL_START = re.compile(r'^\s*(?:[*&]?[a-zA-Z_]\w*|route\b|serve\b)\s*(?::|=|\bwhere\b|\\|\()', )
+EXPR_START = re.compile(r'^\s*[\(]?\s*(?:base\.|do\b|\(do\b|[a-zA-Z_][\w.]*\s*\()', )
+
+def _paren_balanced(s):
+    depth = 0
+    in_str = False
+    for ch in s:
+        if ch == '"':
+            in_str = not in_str
+        if in_str:
+            continue
+        if ch in '([{':
+            depth += 1
+        elif ch in ')]}':
+            depth -= 1
+    return depth <= 0
+
+def split_decls_exprs(lines):
+    """Group a fragment's lines into declarations vs trailing bare expressions.
+
+    A declaration starts at a DECL_START line and continues while its parens are
+    unbalanced OR the following non-blank line is more indented. Lines that don't
+    belong to any declaration and aren't declarations themselves are expressions.
+    """
+    decls, exprs = [], []
+    cur = None  # accumulating a multi-line declaration
+    for raw in lines:
+        if is_comment_or_blank(raw):
+            if cur is not None:
+                cur.append(raw)
+            continue
+        s = raw.strip()
+        starts_decl = bool(DECL_START.match(raw)) and not s.startswith("(")
+        if cur is not None:
+            # continue an open multi-line declaration
+            cur.append(raw)
+            joined = "\n".join(cur)
+            if _paren_balanced(joined):
+                decls.append("\n".join(cur))
+                cur = None
+            continue
+        if starts_decl:
+            if _paren_balanced(raw):
+                decls.append(raw)
+            else:
+                cur = [raw]
+        else:
+            exprs.append(raw)
+    if cur is not None:
+        decls.append("\n".join(cur))
+    return decls, exprs
+
 def wrap_fragment(text):
-    return "with {\n" + text + "\n}\n(do\n  base.println \"ok\"\n  yield {})\n"
+    lines = text.splitlines()
+    decls, exprs = split_decls_exprs(lines)
+    out = ["with {"]
+    out.extend(decls)
+    out.append("}")
+    if exprs:
+        body = "\n".join(re.sub(r'\s+--.*$', '', e) for e in exprs)
+        out.append(f"(do\n  base.println (base.show ({body}))\n  yield {{}})\n")
+    else:
+        out.append("(do\n  base.println \"ok\"\n  yield {})\n")
+    return "\n".join(out)
+
+def wrap_program_decls(lines):
+    """Wrap a program-level declaration sequence in `with { }`. The trailing
+    top-level expression (a line at col 0 starting with `(` or `do`) becomes the
+    body; everything else goes inside the record."""
+    body_idx = None
+    for i, raw in enumerate(lines):
+        if re.match(r'^(\(|do\b)', raw) and not raw.startswith(' '):
+            body_idx = i
+            break
+    decls = lines if body_idx is None else lines[:body_idx]
+    body = [] if body_idx is None else lines[body_idx:]
+    out = ["with {"]
+    out.extend(decls)
+    out.append("}")
+    if body:
+        out.extend(body)
+    else:
+        out.append("(do\n  base.println \"ok\"\n  yield {})\n")
+    return "\n".join(out)
 
 # Builtins that are language KEYWORDS and cannot be referenced as `base.x`
 # values (`base.not` fails to parse: `not` is a keyword). For these we verify
@@ -169,6 +255,8 @@ def main():
             continue
         if kind == "program":
             src = payload
+        elif kind == "program_decls":
+            src = wrap_program_decls(payload)
         elif kind == "fragment":
             src = wrap_fragment(payload)
         elif kind == "sigs":

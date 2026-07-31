@@ -51,7 +51,10 @@ Keep the rows where the predicate returns `True`. Pushes down to `WHERE` over
 a source.
 
 ```knot
-&seniors = *people |> base.filter (\p -> p.age > 65)
+*people : [{name: Text, age: Int 1}]
+&seniors = (do
+  people <- *people
+  yield (people |> base.filter (\p -> p.age > 65)))
 ```
 
 ### `base.map`
@@ -104,7 +107,10 @@ Sum a numeric relation. Project a record field first with `base.map`. Units
 are preserved: summing `[Float M]` gives `Float M`.
 
 ```knot
-totalDist (base.sum (base.map (\t -> t.distance) *trips))
+*trips : [{distance: Float Km}]
+&totalDist = (do
+  trips <- *trips
+  yield (base.sum (base.map (\t -> t.distance) trips)))
 ```
 
 ### `base.avg`
@@ -138,8 +144,10 @@ Binary minimum / maximum of **two values** (not a relation). Use
 `base.minOn` / `base.maxOn` to aggregate over a relation.
 
 ```knot
-base.min 3 7      -- 3
-base.max "a" "b"  -- "b"
+(do
+  base.println (base.show (base.min 3 7))
+  base.println (base.show (base.max "a" "b"))
+  yield {})
 ```
 
 ### `base.union`
@@ -230,7 +238,10 @@ Reorder rows by a projected key (ascending). Pushes down to `ORDER BY`; with
 `base.take` it becomes `ORDER BY ... LIMIT`.
 
 ```knot
-&top5 = *people |> base.sortBy (\p -> (0 - p.age)) |> base.take 5
+*people : [{name: Text, age: Int 1}]
+&top5 = (do
+  people <- *people
+  yield (people |> base.sortBy (\p -> (0 - p.age)) |> base.take 5))
 ```
 
 ### `base.take` / `base.drop`
@@ -344,7 +355,7 @@ Run an IO action conditionally — `base.when` when the condition is `True`,
 `base.unless` when `False`. The skipped branch yields `{}`.
 
 ```knot
-base.when (n > 0) (base.println "positive")
+base.when (1 > 0) (base.println "positive")
 ```
 
 ### `base.forEach`
@@ -831,10 +842,15 @@ base.listenOn : Text -> Int u -> Server a -> IO {}
 ```
 
 Start an HTTP server built with `serve Api where ...`. `base.listen` binds all
-interfaces; `base.listenOn` takes an explicit bind address. Handler effects
-flow into the program's IO type.
+interfaces; `base.listenOn` takes an explicit bind address.
 
 ```knot
+route Api where
+  GET /hello -> Text = Hello
+
+api (serve Api where
+  Hello = \{} -> yield (Result.Ok {value "hi"}))
+
 (base.listen 8080 api)
 ```
 

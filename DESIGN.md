@@ -1568,7 +1568,7 @@ The generalized top-level pair `strip : a u -> a 1` and `dress : a 1 -> a u` per
 
 ```knot
 toS : Int Ms -> Int S
-toS \ms -> dress (strip ms / 1000)
+toS \ms -> base.dress (base.strip ms / 1000)
 ```
 
 Every numeric type carries a unit — a bare `Int` or `Float` is a **compile error**; you must write a unit. Use `Int 1` / `Float 1` for the dimensionless case (e.g. counts, indices). A value of a concrete unit does **not** implicitly convert to the dimensionless form — `x : Float 1; x = (1.5 : Float M)` is a type error (`expected Float 1, found Float M`). Numeric **literals** are unit-polymorphic: `1.5` has type `Float u` for a fresh unit variable, so it flows into whatever unit the context demands (`(1.5 : Float M)`, `sum` over `[Float M]`, or a `Float 1` field) and defaults to dimensionless when unconstrained. These helpers are only needed when you must rebrand a value with a *different* concrete unit.
@@ -1576,8 +1576,8 @@ Every numeric type carries a unit — a bare `Int` or `Float` is a **compile err
 For explicit unit ascription you can put a type annotation on any expression, either inside parens or as a bare postfix:
 
 ```knot
-base.count (0 : Int Usd) -- bare postfix annotation
-total ((acc + delta) : Float M) -- parenthesized form
+cents ((0 : Int Usd))          -- bare postfix annotation
+total ((2.0 + 3.0) : Float M)  -- parenthesized form
 ```
 
 #### Unit-Preserving Stdlib
@@ -1597,8 +1597,9 @@ max   : a -> a -> a                     -- binary
 field of a record relation, project first with `map`:
 
 ```knot
-base.sum (base.map (\r -> r.price) rows)
-rows |> base.map (\r -> r.price) |> base.sum
+rows [{price (10.0 : Float Usd)} {price (20.0 : Float Usd)}]
+totalPrice (base.sum (base.map (\r -> r.price) rows))
+totalPrice2 (rows |> base.map (\r -> r.price) |> base.sum)
 ```
 
 #### `show` and Units
@@ -1631,7 +1632,7 @@ type Measurement = {distance: Float M, time: Float S}
   measurements <- *measurements
   with {result do
     m <- measurements
-    yield {speed m.distance / m.time}}   -- Float (M/S)
+    yield {speed (m.distance / m.time)}}   -- Float (M/S)
   (do
     yield result)
 ```
@@ -1780,9 +1781,13 @@ Two refined types with the same base but different predicates are unrelated — 
 Arithmetic on refined types returns the base type:
 
 ```knot
-x : Nat = ...
-y : Nat = ...
-x + y    -- Int 1, not Nat (no attempt to prove result satisfies predicate)
+type Nat = Int 1 where \x -> x >= 0
+
+-- x + y : Int 1, not Nat (the compiler does not try to prove the result satisfies the predicate)
+sumN do
+  x <- refine (3 : Int 1)
+  y <- refine (4 : Int 1)
+  yield (x + y)
 ```
 
 #### The `refine` Expression
@@ -1790,12 +1795,16 @@ x + y    -- Int 1, not Nat (no attempt to prove result satisfies predicate)
 `refine expr` checks the refinement predicate at runtime. It returns `Result RefinementError T` where `T` is the target refined type, inferred from context:
 
 ```knot
--- Target type Nat inferred from binding annotation
-let r : Result RefinementError Nat = refine 42
--- r = Ok {value 42}
+type Nat = Int 1 where \x -> x >= 0
 
-let r : Result RefinementError Nat = refine (-1)
--- r = Err {error {typeName: "Nat", violations: [{field Nothing {} message "expected x >= 0 got -1"}]}}
+-- Target type Nat inferred from the binding annotation
+r : Result RefinementError Nat
+r (refine 42)
+-- r = Result.Ok {value 42}
+
+r2 : Result RefinementError Nat
+r2 (refine (0 - 1))
+-- r2 = Result.Err {error {typeName "Nat" violations [{field (Maybe.Nothing {}) message "value does not satisfy 'Nat' predicate"}]}}
 ```
 
 The error type:
@@ -1815,11 +1824,14 @@ type RefinementError = {
 In do-blocks over `Result`, `<-` unwraps on `Ok` and short-circuits on `Err`:
 
 ```knot
+type Nat = Int 1 where \x -> x >= 0
+type NonEmptyText = Text where \s -> base.length s > 0
+
 validateOrder : {customer: Text, amount: Int 1} -> Result RefinementError {customer: NonEmptyText, amount: Nat}
 validateOrder \raw -> do
   customer <- refine raw.customer    -- NonEmptyText inferred from return type
   amount   <- refine raw.amount      -- Nat inferred from return type
-  yield {customer, amount}
+  yield {customer customer amount amount}
 ```
 
 #### Boundary Checking
@@ -1871,7 +1883,7 @@ type Person = {
   name: NonEmptyText,
   age: Nat where \x -> x <= 150,
   email: Email
-} where \p -> p.age >= 13
+}
 
 *people : [Person]
 
@@ -1885,20 +1897,28 @@ type Person = {
 *orders.customer <= *people.email
 
 route Api where
-  POST {name: Text, age: Int 1, email: Text}  /users -> {ok: Bool, error: Maybe Text}  = CreateUser
+  POST {name: Text, age: Int 1, email: Text} /users -> {ok: Bool, error: Maybe Text} = CreateUser
 
-api (serve Api where)
-  CreateUser = \{name, age, email} ->
-    case refine {name, age, email} of    -- Person inferred from *people
-      Ok {value person} -> do
+-- Refine each field; the Person return type pins each refine's target.
+mkPerson : Text -> Int 1 -> Text -> Result RefinementError Person
+mkPerson \n a e -> do
+  name <- refine (n : Text)
+  age <- refine (a : Int 1)
+  email <- refine (e : Text)
+  yield {name name age age email email}
+
+api (serve Api where
+  CreateUser = \{name name age age email email} ->
+    case mkPerson name age email of
+      Result.Ok {value person} -> do
         atomic do
           people <- *people
           *people = base.union people [person]
-        yield Ok {value {ok (Bool.True {}) error Nothing {}}}
-      Err {error} ->
-        with {msg base.fold (\acc v -> acc ++ v.message ++ "; ") "" error.violations}
+        yield (Result.Ok {value {ok (Bool.True {}) error (Maybe.Nothing {})}})
+      Result.Err {error e} ->
+        with {msg (base.fold (\acc v -> acc ++ v.message ++ "; ") "" e.violations)}
         (do
-          yield Ok {value {ok (Bool.False {}) error Just {value msg}}})
+          yield (Result.Ok {value {ok (Bool.False {}) error (Maybe.Just {value msg})}})))
 ```
 
 ### No User-Facing Traits
@@ -1949,13 +1969,19 @@ searches the lexical scope for a record supplying `compare` at the required
 type and splices it in as the leading argument:
 
 ```knot
+with {
+clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
+clamp \lo hi x -> case ((^compare) x lo) < 0 of Bool.True {} -> lo; Bool.False {} -> case ((^compare) x hi) > 0 of Bool.True {} -> hi; Bool.False {} -> x
+
 intOrd ({compare (\a b -> case a > b of Bool.True {} -> 1; Bool.False {} -> case a < b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)})
 textOrd ({compare (\a b -> case a > b of Bool.True {} -> 1; Bool.False {} -> case a < b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)})
 intOrdDesc ({compare (\a b -> case a < b of Bool.True {} -> 1; Bool.False {} -> case a > b of Bool.True {} -> (0 - 1); Bool.False {} -> 0)})
-
-clamp 0 10 42                     -- resolves to intOrd     → 10
-clamp "a" "m" "z"                 -- resolves to textOrd    → "m"
-with intOrdDesc (clamp 0 10 42)   -- `with` shadows outer  → 0
+}
+(do
+  base.println (base.show (clamp 0 10 42))           -- resolves to intOrd     → 10
+  base.println (clamp "a" "m" "z")                   -- resolves to textOrd    → "m"
+  base.println (base.show (with intOrdDesc (clamp 0 10 42)))  -- `with` shadows outer → 0
+  yield {})
 ```
 
 Resolution is **per-callsite** (the dictionary is chosen by the instantiation —
@@ -2004,15 +2030,14 @@ data Status
   | InProgress {assignee: Text}
   | Resolved {resolution: Text}
 
-*todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
+type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
+*todos : [Todo]
 
 route Api where
-  GET                                /todos/{user: Text}           -> [{title: Text, priority: Priority}]  = GetTodos
-  POST {title: Text, owner: Text, priority: Priority}
-                                     /todos                        -> {ok: Bool}                             = AddTodo
-  PUT  {owner: Text, person: Text}   /todos/{title: Text}/assign   -> {ok: Bool}                             = AssignTodo
-  PUT  {owner: Text, msg: Text}      /todos/{title: Text}/resolve  -> {ok: Bool}                             = ResolveTodo
-  GET                                /workload                     -> [{owner: Text, base.count: Int 1}]          = GetWorkload
+  GET /todos/{user: Text} -> [Todo] = GetTodos
+  POST {title: Text, owner: Text, priority: Priority} /todos -> {ok: Bool} = AddTodo
+  PUT {owner: Text, person: Text} /todos/{title: Text}/assign -> {ok: Bool} = AssignTodo
+  PUT {owner: Text, msg: Text} /todos/{title: Text}/resolve -> {ok: Bool} = ResolveTodo
 
 formatTitle \title -> base.toUpper (base.take 1 title) ++ base.drop 1 title
 
@@ -2021,57 +2046,42 @@ pendingFor \user -> do
   with {result do
     t <- todos
     where t.owner == user
-    Open {} <- t.status
-    yield {t.title, t.priority}}
+    Status.Open {} <- t.status
+    yield t}
   (do
     yield result)
 
 add \title owner priority -> do
   todos <- *todos
-  *todos = base.union todos [{title formatTitle title owner owner priority priority status Open {}}]
+  *todos = base.union todos [{title (formatTitle title) owner owner priority priority status (Status.Open {})}]
 
 assign \title owner person -> do
   todos <- *todos
   *todos = do
     t <- todos
-    yield (if t.title == title && t.owner == owner
-      then {t | status (InProgress {assignee person})}
-      else t)
+    yield (case t.title == title && t.owner == owner of
+      Bool.True {} -> {t | status (Status.InProgress {assignee person})}
+      Bool.False {} -> t)
 
 resolve \title owner msg -> do
   todos <- *todos
   *todos = do
     t <- todos
-    yield (if t.title == title && t.owner == owner
-      then {t | status (Resolved {resolution msg})}
-      else t)
+    yield (case t.title == title && t.owner == owner of
+      Bool.True {} -> {t | status (Status.Resolved {resolution msg})}
+      Bool.False {} -> t)
 
-&workload = do
-  todos <- *todos
-  with {result do
-    t <- todos
-    Open {} <- t.status
-    groupBy {owner t.owner}
-    yield {owner t.owner count (base.count t)}}
-  (do
-    yield result)
-
-api (serve Api where)
-  GetTodos = \{user} -> do
+api (serve Api where
+  GetTodos = \{user user} -> do
     todos <- pendingFor user
-    yield Ok {value todos}
-  AddTodo = \{title, owner, priority} -> do
+    yield (Result.Ok {value todos})
+  AddTodo = \{title title owner owner priority priority} -> do
     atomic (add title owner priority)
-    yield Ok {value {ok True {}}}
-  AssignTodo = \{title, owner, person} -> do
+    yield (Result.Ok {value {ok (Bool.True {})}})
+  AssignTodo = \{title title owner owner person person} -> do
     atomic (assign title owner person)
-    yield Ok {value {ok True {}}}
-  ResolveTodo = \{title, owner, msg} -> do
+    yield (Result.Ok {value {ok (Bool.True {})}})
+  ResolveTodo = \{title title owner owner msg msg} -> do
     atomic (resolve title owner msg)
-    yield Ok {value {ok True {}}}
-  GetWorkload = \{} -> do
-    w <- &workload
-    yield Ok {value: w}
-
-main (listen 8080 api)
+    yield (Result.Ok {value {ok (Bool.True {})}}))
 ```

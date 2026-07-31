@@ -329,13 +329,15 @@ These are built-in functions over relations plus the `*rel = expr` write. The co
 
 **`where`** — keep matching rows (in a comprehension, or via `base.filter`):
 
-```knot
+<!-- doccheck: skip — definitional illustration of a builtin's semantics (redefines a builtin/keyword; not a runnable program). -->
+```knot-skip
 where \cond -> case cond of Bool.True {} -> yield {}; Bool.False {} -> empty
 ```
 
 **`filter`** — filter rows:
 
-```knot
+<!-- doccheck: skip — definitional illustration of a builtin's semantics (redefines a builtin/keyword; not a runnable program). -->
+```knot-skip
 base.filter \p rel -> do
   x <- rel
   where (p x)
@@ -344,7 +346,8 @@ base.filter \p rel -> do
 
 **`join`** — combine relations on a condition:
 
-```knot
+<!-- doccheck: skip — definitional illustration of a builtin's semantics (redefines a builtin/keyword; not a runnable program). -->
+```knot-skip
 base.join \a b -> do
   x <- a
   y <- b
@@ -354,7 +357,8 @@ base.join \a b -> do
 
 **`diff`** — rows in one relation but not another:
 
-```knot
+<!-- doccheck: skip — definitional illustration of a builtin's semantics (redefines a builtin/keyword; not a runnable program). -->
+```knot-skip
 elem = \x rel -> base.fold (\acc r -> acc || r == x) False {} rel
 
 base.diff \a b -> do
@@ -365,7 +369,8 @@ base.diff \a b -> do
 
 **`inter`** — rows in both relations:
 
-```knot
+<!-- doccheck: skip — definitional illustration of a builtin's semantics (redefines a builtin/keyword; not a runnable program). -->
+```knot-skip
 base.inter \a b -> do
   x <- a
   where (base.contains x b)
@@ -375,24 +380,34 @@ base.inter \a b -> do
 **insert** — add a value (union with a singleton). Recognized as an INSERT:
 
 ```knot
-*rel = base.union *rel [x]
+*rel : [{x: Int 1}]
+insertRow \x -> do
+  rows <- *rel
+  *rel = base.union rows [{x x}]
 ```
 
 **delete** — remove matching rows (keep the rest). Recognized as a DELETE:
 
 ```knot
-*rel = base.filter (\x -> not (p x)) *rel
+*rel : [{x: Int 1}]
+deleteWhere \p -> do
+  rows <- *rel
+  *rel = base.filter (\x -> not (p x)) rows
 ```
 
 **update** — transform matching rows. Recognized as an UPDATE:
 
 ```knot
-*rel = base.map (\x -> case p x of Bool.True {} -> f x; Bool.False {} -> x) *rel
+*rel : [{x: Int 1}]
+updateWhere \p f -> do
+  rows <- *rel
+  *rel = base.map (\x -> case p x of Bool.True {} -> f x; Bool.False {} -> x) rows
 ```
 
 **`count`**, **`sum`**, **`avg`** — folds:
 
-```knot
+<!-- doccheck: skip — definitional illustration of a builtin's semantics (redefines a builtin/keyword; not a runnable program). -->
+```knot-skip
 base.count \rel -> base.fold (\n _ -> n + 1) 0 rel
 base.sum \f rel -> base.fold (\acc x -> acc + f x) 0 rel
 ```

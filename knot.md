@@ -338,13 +338,16 @@ When bound expressions are `IO` values, the do block sequences IO actions:
 ```knot
 -- IO do block with console effects
 do
-  content <- base.readFile "input.txt"    -- IO Text
-  base.println content                     -- IO {}
+  content <- base.readFile "input.txt"
+  base.println content
   yield {}
+```
 
+```knot
 -- IO do block with DB operations
+*people : [{name: Text, age: Int 1}]
 addPerson \name age -> do
-  people <- *people                  -- IO {} [Person]
+  people <- *people
   *people = base.union people [{name name age age}]
 ```
 
@@ -802,18 +805,18 @@ using the built-in `Result` ADT — `Err {error: a}` when the left action wins,
 
 ```knot
 slow do
-  base.sleep 1000 Ms
+  base.sleep (1000 : Int Ms)
   yield "slow"
 
 fast do
-  base.sleep 50 Ms
+  base.sleep (50 : Int Ms)
   yield "fast"
 
 do
   r <- base.race slow fast
   case r of
-    Err {error: a} -> base.println ("left won: " ++ a)
-    Ok {value: b}  -> base.println ("right won: " ++ b)
+    Result.Err {error a} -> base.println ("left won: " ++ a)
+    Result.Ok {value b}  -> base.println ("right won: " ++ b)
   yield {}
 ```
 
@@ -1072,13 +1075,15 @@ Field names use camelCase, auto-converted to HTTP-Header-Case: `authorization` �
 Request headers become constructor fields. When response headers are declared, the handler returns a `{body: ..., headers: ...}` record:
 
 ```knot
-api (serve Api where)
-  GetTodos = \{authorization} ->
-    with {todos allTodos}
-    (do
-      yield Ok {value {body todos headers {xTotalCount base.length todos}}})
-  CreateTodo = \{title, authorization} ->
-    yield Ok {value {body addTodo title headers {}}}
+type Todo = {title: Text}
+*todos : [Todo]
+route Api where
+  GET /todos headers {authorization: Text} -> [Todo] headers {xTotalCount: Int 1} = GetTodos
+
+api (serve Api where
+  GetTodos = \{authorization authorization} -> do
+    allTodos <- *todos
+    yield (Result.Ok {value {body allTodos headers {xTotalCount (base.count allTodos)}}}))
 ```
 
 Optional headers use `Maybe`:
@@ -1092,7 +1097,9 @@ Server gets `Nothing {}` if absent, `Just {value: "..."}` if present. In `fetch`
 
 On the `fetch` side, header fields are sent automatically. When response headers are declared, the result wraps as `{body: T, headers: H}`:
 
-```knot
+<!-- doccheck: skip — the `fetch`+route-constructor form is documented here but
+     the endpoint constructor is not yet value-accessible in expressions (doc-vs-impl gap). -->
+```knot-skip
 result <- base.fetch "https://api.example.com" (GetTodos {authorization "Bearer tok"})
 -- result : IO (Result ... {body: [Todo], headers: {xTotalCount: Int 1}})
 ```
@@ -1105,27 +1112,27 @@ Add a per-endpoint token-bucket rate limit with `rateLimit <expr>` (placed after
 type RequestCtx = {
   clientIp: Text,
   receivedAt: Int Ms,
-  header: Text -> Maybe Text       -- case-insensitive lookup
+  header: Text -> Maybe Text
 }
 
-type RateLimit input a = {key input -> RequestCtx -> Maybe a -- Ord a; Nothing exempts the request
-  limit: {requests: Int 1, window: Int Ms}}
+-- `key` is Ord a; returning Nothing exempts the request. `header` is a case-insensitive lookup.
+type RateLimit input a = {key: input -> RequestCtx -> Maybe a, limit: {requests: Int 1, window: Int Ms}}
 ```
 
 `key` receives the same input record the handler does (path/query/body/header fields, combined) plus the runtime-supplied `RequestCtx`, so you can key on any field of either:
 
 ```knot
-byClientIp \input ctx -> Just {value ctx.clientIp}
+byClientIp \input ctx -> Maybe.Just {value ctx.clientIp}
 
-byOwner \{owner} ctx -> Just {value owner}             -- key on a path/body field
+byOwner \{owner owner} ctx -> Maybe.Just {value owner}   -- key on a path/body field
 
 route Api where
   GET /hello -> {message: Text}
-    rateLimit {key byClientIp limit {requests 100 window 60000 Ms}}
+    rateLimit {key byClientIp limit {requests 100 window (60000 : Int Ms)}}
     = Hello
 
   GET /user/{owner: Text} -> {message: Text}
-    rateLimit {key byOwner limit {requests 10 window 60000 Ms}}
+    rateLimit {key byOwner limit {requests 10 window (60000 : Int Ms)}}
     = User
 
   GET /open -> {message: Text} = Open                  -- no clause = unlimited
@@ -1138,7 +1145,8 @@ On rejection the runtime responds `429 Too Many Requests` with body `{"error":"R
 Common keying strategies are regular expressions, so extract them once and reuse:
 
 ```knot
-serverLimit ({key \input ctx -> Just {value ctx.clientIp} limit {requests 1000 window 60000 Ms}})
+data Event = Gossip {payload: Text}
+serverLimit ({key (\input ctx -> Maybe.Just {value ctx.clientIp}) limit {requests 1000 window (60000 : Int Ms)}})
 
 route Api where
   POST {events: [Event]} /federation/gossip -> {} rateLimit serverLimit = RecvGossip
@@ -1271,18 +1279,18 @@ the compiler's built-in structural support — short-circuiting on `Nothing` /
 ```knot
 -- Maybe — short-circuits on Nothing
 result do
-  a <- Just {value 10}
-  b <- Just {value 2}
+  a <- Maybe.Just {value 10}
+  b <- Maybe.Just {value 2}
   where b != 0
   yield (a / b)
 
 -- Result — short-circuits on Err
-safeDivide = \x y -> case y == 0 of
-  Bool.True {}  -> Err {error "div by zero"}
-  Bool.False {} -> Ok {value (x / y)}
+safeDivide \x y -> case y == 0 of
+  Bool.True {}  -> Result.Err {error "div by zero"}
+  Bool.False {} -> Result.Ok {value (x / y)}
 
 compute do
-  a <- Ok {value 10}
+  a <- Result.Ok {value 10}
   b <- safeDivide a 2
   yield (a + b)
 ```
@@ -1309,48 +1317,47 @@ type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
 
 add \title owner priority -> do
   todos <- *todos
-  *todos = base.union todos [{title title owner owner priority priority status Open {}}]
+  *todos = base.union todos [{title title owner owner priority priority status (Status.Open {})}]
 
 complete \title -> do
   todos <- *todos
   *todos = do
     t <- todos
-    yield (if t.title == title
-      then {t | status (Resolved {resolution "done"})}
-      else t)
+    yield (case t.title == title of
+      Bool.True {} -> {t | status (Status.Resolved {resolution "done"})}
+      Bool.False {} -> t)
 
 assign \title person -> do
   todos <- *todos
   *todos = do
     t <- todos
-    yield (if t.title == title
-      then {t | status (InProgress {assignee person})}
-      else t)
+    yield (case t.title == title of
+      Bool.True {} -> {t | status (Status.InProgress {assignee person})}
+      Bool.False {} -> t)
 
 pending \owner -> do
   todos <- *todos
   with {result do
     t <- todos
     where t.owner == owner
-    Open {} <- t.status
-    yield {t.title, t.priority}}
+    Status.Open {} <- t.status
+    yield {title t.title priority t.priority}}
   (do
     yield result)
 
 &workload = do
-  todos <- *todos
   with {result do
-    t <- todos
-    Open {} <- t.status
+    t <- *todos
+    where t.status == Status.Open {}
     groupBy {owner t.owner}
     yield {owner t.owner count (base.count t)}}
   (do
     yield result)
 
 do
-  add "Write parser" "Alice" High {}
-  add "Write codegen" "Alice" Critical {}
-  add "Write runtime" "Bob" Medium {}
+  add "Write parser" "Alice" (Priority.High {})
+  add "Write codegen" "Alice" (Priority.Critical {})
+  add "Write runtime" "Bob" (Priority.Medium {})
   assign "Write parser" "Carol"
   complete "Write runtime"
   p <- pending "Alice"

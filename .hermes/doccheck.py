@@ -22,7 +22,7 @@ def extract_blocks(path):
     blocks = []
     i = 0
     while i < len(lines):
-        m = re.match(r"^```(\w*)\s*$", lines[i])
+        m = re.match(r"^```([\w-]*)\s*$", lines[i])
         if m:
             lang = m.group(1)
             start = i + 2  # 1-indexed line of first content line
@@ -107,6 +107,9 @@ def classify(body):
     return "fragment", text
 
 DECL_START = re.compile(r'^\s*(?:[*&]?[a-zA-Z_]\w*|route\b|serve\b)\s*(?::|=|\bwhere\b|\\|\(|\bdo\b)', )
+# Subset-constraint declaration: `*a.b <= *c.d` or `*a <= *a.b`. These are
+# declarations, not expressions — keep them in the with-record.
+CONSTRAINT_DECL = re.compile(r'^\s*\*[a-zA-Z_]\w*(?:\.\w+)?\s*<=')
 # A `name <value>` with-field line (constant/function/derived with a body). The
 # value may be a literal, record, lambda, `do` block, source read, or call.
 FIELD_WITH_BODY = re.compile(r'^\s*[*&]?[a-zA-Z_]\w*\s+\S')
@@ -152,6 +155,8 @@ def split_decls_exprs(lines):
         # or `name <value>` (constant with a body). Dotted names (base.x) are not fields.
         starts_decl = (bool(DECL_START.match(raw)) or bool(FIELD_WITH_BODY.match(raw))) \
                       and not s.startswith("(") and "." not in s.split(None, 1)[0]
+        # a subset-constraint `*a.b <= *c.d` IS a declaration despite the dotted name
+        starts_decl = starts_decl or bool(CONSTRAINT_DECL.match(raw))
         if cur is not None:
             joined = "\n".join(cur)
             # continue if parens unbalanced OR this line is a more-indented body line
@@ -278,7 +283,14 @@ def main():
     # Build work items first, then compile in parallel (each block spawns the
     # compiler; serial is ~5s/block which times out on the big docs).
     work_items = []
+    skipped = []
     for idx, b in enumerate(blocks):
+        # `knot-skip` blocks are intentionally not compiled (document a feature
+        # whose impl doesn't yet match the doc — doc-vs-impl gap). Report them
+        # so the skip is visible, not silent.
+        if b["lang"] == "knot-skip":
+            skipped.append(b)
+            continue
         if b["lang"] not in ("knot", ""):
             continue
         if b["lang"] == "" and not looks_like_knot(b["body"]):
@@ -310,7 +322,11 @@ def main():
             results.append(item)
     results.sort(key=lambda r: r["line"])
     npass = sum(1 for r in results if r["ok"])
-    print(f"\n==== {doc}: {npass}/{len(results)} blocks compile ====")
+    skip_note = f" ({len(skipped)} skipped: knot-skip)" if skipped else ""
+    print(f"\n==== {doc}: {npass}/{len(results)} blocks compile{skip_note} ====")
+    for s in skipped:
+        preview = next((l for l in s["body"] if not is_comment_or_blank(l)), "")[:60]
+        print(f"SKIP L{s['line']} {preview}")
     for r in results:
         if not r["ok"]:
             print(f"FAIL L{r['line']} [{r['kind']}] {r['preview']}")

@@ -880,30 +880,50 @@ Constructors are bare names — their fields are automatically the union of path
 
 ```knot
 route Api where
-  GET                                          /todos/{user: Text}?{page: Int 1, limit: Int 1}  = GetTodos
-  POST {title: Text, owner: Text, priority: Priority}  /todos                               = AddTodo
-  PUT  {owner: Text, person: Text}             /todos/{title: Text}/assign                   = AssignTodo
-  GET                                          /workload                                     = GetWorkload
+  GET /todos/{user: Text}?{page: Int 1, limit: Int 1} -> [Todo] = GetTodos
+  POST {title: Text, owner: Text, priority: Priority} /todos -> {ok: Bool} = AddTodo
+  PUT {owner: Text, person: Text} /todos/{title: Text}/assign -> {ok: Bool} = AssignTodo
 ```
 
 Handlers are bound per-endpoint with `serve API where` — the compiler ensures every endpoint has exactly one handler:
 
 ```knot
-api (serve Api where)
-  GetTodos = \{user, page, limit} -> do
-    todos <- pendingFor user page limit
-    yield Ok {value todos}
-  AddTodo = \{title, owner, priority} -> do
-    atomic (add title owner priority)
-    yield Ok {value {ok True {}}}
-  AssignTodo = \{title, owner, person} -> do
-    atomic (assign title owner person)
-    yield Ok {value {ok True {}}}
-  GetWorkload = \{} -> do
-    w <- &workload
-    yield Ok {value: w}
+data Priority = Low {} | High {}
+data Status = Open {} | Done {}
+type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
+*todos : [Todo]
 
-main (listen 8080 api)
+route Api where
+  GET /todos/{user: Text}?{page: Int 1, limit: Int 1} -> [Todo] = GetTodos
+  POST {title: Text, owner: Text, priority: Priority} /todos -> {ok: Bool} = AddTodo
+  PUT {owner: Text, person: Text} /todos/{title: Text}/assign -> {ok: Bool} = AssignTodo
+
+add \title owner priority -> do
+  todos <- *todos
+  *todos = base.union todos [{title title owner owner priority priority status (Status.Open {})}]
+
+assign \title owner person -> do
+  todos <- *todos
+  *todos = do
+    t <- todos
+    yield (case t.title == title of
+      Bool.True {} -> {t | owner person}
+      Bool.False {} -> t)
+
+pendingFor \user page limit -> do
+  todos <- *todos
+  with {result (do t <- todos; where t.owner == user; yield t)} yield result
+
+api (serve Api where
+  GetTodos = \{user user page page limit limit} -> do
+    todos <- pendingFor user page limit
+    yield (Result.Ok {value todos})
+  AddTodo = \{title title owner owner priority priority} -> do
+    atomic (add title owner priority)
+    yield (Result.Ok {value {ok (Bool.True {})}})
+  AssignTodo = \{title title owner owner person person} -> do
+    atomic (assign title owner person)
+    yield (Result.Ok {value {ok (Bool.True {})}}))
 ```
 
 `serve API where` produces a value of type `Server API`. Each handler receives the request record (path/query/body/header fields) and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. `listen : Int u -> Server a -> IO {}` binds the server to a port. No string routes, no untyped params, no missing handlers.
@@ -913,20 +933,26 @@ main (listen 8080 api)
 Handlers return `Result HttpError T`. `Ok {value: v}` responds with HTTP 200 and serializes `v` as JSON. `Err {error: {status, message}}` responds with the given status code and a JSON error body:
 
 ```knot
-api (serve Api where)
-  GetUser = \{id} -> do
+type Person = {id: Int 1, name: Text, email: Text}
+*people : [Person]
+route Api where
+  GET /users/{id: Int 1} -> Person = GetUser
+  POST {name: Text, email: Text} /users -> {name: Text, email: Text} = CreateUser
+
+api (serve Api where
+  GetUser = \{id id} -> do
     users <- *people
     case base.filter (\u -> u.id == id) users of
-      [ ] -> yield Err {error {status 404 message "user not found"}}
-      Cons u _ -> yield Ok {value: u}
-  CreateUser = \{name, email} -> do
+      [ ] -> yield (Result.Err {error {status 404 message "user not found"}})
+      Cons u rest -> yield (Result.Ok {value u})
+  CreateUser = \{name name email email} -> do
     case base.length name == 0 of
-      Bool.True {} -> yield Err {error {status 400 message "name required"}}
+      Bool.True {} -> yield (Result.Err {error {status 400 message "name required"}})
       Bool.False {} -> do
         atomic do
           users <- *people
-        *people = base.union users [{name name email email}]
-        yield Ok {value {name name email email}}
+          *people = base.union users [{id 0 name name email email}]
+        yield (Result.Ok {value {name name email email}}))
 ```
 
 Status codes are clamped to the range `100..=599`. Common codes: `400` (bad request), `401` (unauthorized), `403` (forbidden), `404` (not found), `409` (conflict), `500` (internal error). The runtime emits `400` automatically for path/query/body/header parsing failures and refinement violations, and `404` for unmatched routes — handlers only need to return `Err` for application-level errors.

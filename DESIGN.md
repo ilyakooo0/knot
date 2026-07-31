@@ -443,6 +443,7 @@ Record fields in the `yield` need explicit names — `{name e.ename}`, not `{e.e
 Derived combinators like `filter` compose with `|>`:
 
 ```knot
+*employees : [{name: Text, salary: Int 1}]
 &highEarners = do
   employees <- *employees
   yield (employees
@@ -523,10 +524,10 @@ describe \rel -> case rel of
 `groupBy` partitions a relation by key fields, like SQL's `GROUP BY`. After `groupBy`, the bound variable becomes a sub-relation (the group), enabling aggregation:
 
 ```knot
+*todos : [{title: Text, owner: Text, done: Int 1}]
 &workload = do
-  todos <- *todos
   with {result do
-    t <- todos
+    t <- *todos
     where t.done == 0
     groupBy {owner t.owner}
     yield {owner t.owner count (base.count t)}}
@@ -539,12 +540,12 @@ The key expression is a record literal whose fields select the grouping columns.
 Multiple key fields group by their combination:
 
 ```knot
+*orders : [{region: Text, status: Text, amount: Int 1}]
 &summary = do
-  orders <- *orders
   with {result do
-    o <- orders
+    o <- *orders
     groupBy {region o.region status o.status}
-    yield {region o.region status o.status total base.count o}}
+    yield {region o.region status o.status total (base.count o)}}
   (do
     yield result)
 ```

@@ -1147,15 +1147,19 @@ route Api = TodoApi | AdminApi
 DB writes within handlers must use `atomic`. IO happens outside `atomic`:
 
 ```knot
-api (serve Api where)
-  CreateOrder = \{item, qty} -> do
+*orders : [{item: Text, qty: Int 1}]
+route Api where
+  POST {item: Text, qty: Int 1} /orders -> {orderId: Int 1} = CreateOrder
+
+api (serve Api where
+  CreateOrder = \{item item qty qty} -> do
     orderId <- atomic do
       orders <- *orders
       *orders = base.union orders [{item item qty qty}]
       newOrders <- *orders
       yield (base.count newOrders)
     base.println ("New order #" ++ base.show orderId)
-    yield Ok {value {orderId orderId}}
+    yield (Result.Ok {value {orderId orderId}}))
 ```
 
 For sub-transaction boundaries:
@@ -1356,14 +1360,12 @@ data Status
   | InProgress {assignee: Text}
   | Resolved {resolution: Text}
 
-*people : [{name: Text, age: Int 1, email: Text}]
+*people : [{name: Text, age: Int 1}]
+  migrate from {name: Text, age: Int 1}
+  to {name: Text, age: Int 1, email: Text}
+  using (\old -> {old | email (old.name ++ "@unknown.com")})
 
 *todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
-
-migrate *people
-  from {name: Text, age: Int 1}
-  to   {name: Text, age: Int 1, email: Text}
-  using (\old -> {old | email old.name ++ "@unknown.com"})
 ```
 
 Since it's valid Knot, it can be parsed by the same compiler frontend — no separate schema format. Migrations are recorded in the lockfile so the compiler can detect if a migration is accidentally removed from source.
@@ -1389,21 +1391,23 @@ On each compile, the compiler diffs the source types against `schema.lock`:
 Breaking changes require a `migrate` block:
 
 ```knot
-migrate *people
-  from {name: Text, age: Int 1}
-  to   {name: Text, age: Int 1, email: Text}
-  using (\old -> {old | email old.name ++ "@unknown.com"})
+*people : [{name: Text, age: Int 1}]
+  migrate from {name: Text, age: Int 1}
+  to {name: Text, age: Int 1, email: Text}
+  using (\old -> {old | email (old.name ++ "@unknown.com")})
 ```
 
 ADT migrations use pattern matching:
 
 ```knot
-migrate *todos
-  from {title: Text, owner: Text, priority: Priority, status: <Open {} | InProgress {assignee: Text} | Resolved {resolution: Text}>}
-  to   {title: Text, owner: Text, priority: Priority, status: Status}
-  using (\old -> {old | status case old.status of
-    InProgress {assignee} -> Resolved {resolution "closed by " ++ assignee}
-    other                 -> other})
+data Priority = Low {} | High {}
+data Status = Open {} | InProgress {assignee: Text} | Resolved {resolution: Text}
+*todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
+  migrate from {title: Text, owner: Text, priority: Priority, status: Status}
+  to {title: Text, owner: Text, priority: Priority, status: Status}
+  using (\old -> {old | status (case old.status of
+    Status.InProgress {assignee a} -> Status.Resolved {resolution ("closed by " ++ a)}
+    other -> other)})
 ```
 
 After a successful compile, `schema.lock` is updated.
@@ -1447,11 +1451,11 @@ getName \r -> r.name
 Functions can be generic over any ADT that has a particular variant:
 
 ```knot
+data Status = Open {} | Closed {}
 countOpen \rel ->
-  rel |> base.filter (\r -> case r.status of Open {} -> True {}; _ -> False {}) |> base.count
+  rel |> base.filter (\r -> case r.status of Status.Open {} -> Bool.True {}; other -> Bool.False {}) |> base.count
 
--- Inferred: [{status <Open {} | r> | s}] -> Int 1
--- Works on tickets, issues, orders — anything with an Open status variant
+-- Inferred: works on tickets, issues, orders — anything with an Open status variant
 ```
 
 ### Units of Measure
@@ -1464,8 +1468,11 @@ Units are not declared. Any name used in a unit position is a unit — the compi
 
 ```knot
 height : Float M
+height 5.0
 force : Float (Kg * M / S^2)
+force 9.8
 frequency : Float (1 / S)
+frequency 60.0
 ```
 
 #### Type Syntax
@@ -1474,11 +1481,17 @@ Postfix unit argument on numeric types only. Concrete units are uppercase; lower
 
 ```knot
 height : Float M
+height 5.0
 mass : Float Kg
+mass 70.0
 speed : Float (M / S)
+speed 10.0
 force : Float (Kg * M / S^2)
+force 9.8
 acceleration : Float (M / S^2)
+acceleration 3.0
 cents : Int Usd
+cents 100
 ```
 
 #### Literal Syntax

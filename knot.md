@@ -17,7 +17,7 @@ main do
     where p.age > 27
     yield p.name}
   (do
-    base.println (show result)
+    base.println (base.show result)
     yield {})
 ```
 
@@ -403,7 +403,7 @@ with {result do
   where p.age > 27
   yield p.name}
 (do
-  base.println (show result)
+  base.println (base.show result)
   yield {})
 ```
 
@@ -435,8 +435,8 @@ The unqualified constructors are confined to the `with` body — the qualified f
 
 ```knot
 describe \s -> case s of
-  Circle {radius} -> "circle r=" ++ show radius
-  Rect {width, height} -> show width ++ "x" ++ show height
+  Circle {radius} -> "circle r=" ++ base.show radius
+  Rect {width, height} -> base.show width ++ "x" ++ base.show height
 
 -- With wildcard
 priority \p -> case p of
@@ -451,7 +451,7 @@ priority \p -> case p of
 describe \rel -> case rel of
   [] -> "empty"
   [{name: n}] -> "just " ++ n
-  Cons h _ -> "first of many: " ++ show h
+  Cons h _ -> "first of many: " ++ base.show h
 ```
 
 | Pattern | Matches |
@@ -634,7 +634,7 @@ A `do` block sequences `IO` actions; the whole block is itself an `IO`.
 ```knot
 main do
   content <- readFile "data.txt"
-  base.println ("Read " ++ show (base.length content) ++ " chars")
+  base.println ("Read " ++ base.show (base.length content) ++ " chars")
   yield {}
 ```
 
@@ -667,7 +667,7 @@ handleOrder \item -> do
     *orders = base.union orders [{item item qty 1}]
     newOrders <- *orders
     yield (base.count newOrders)
-  base.println ("Order #" ++ show orderId)
+  base.println ("Order #" ++ base.show orderId)
   yield {orderId}
 ```
 
@@ -1121,8 +1121,8 @@ data Shape
 ```knot
 -- Use with case
 result (case refine someInt of)
-  Ok {value: n} -> base.println ("Valid: " ++ show n)
-  Err {error: e} -> base.println ("Invalid: " ++ show e)
+  Ok {value: n} -> base.println ("Valid: " ++ base.show n)
+  Err {error: e} -> base.println ("Invalid: " ++ base.show e)
 
 -- Use in Result do-block
 validated do
@@ -1253,10 +1253,10 @@ main do
   complete "Write runtime"
   p <- pending "Alice"
   base.println "Alice's pending:"
-  base.println (show p)
+  base.println (base.show p)
   w <- &workload
   base.println "Workload:"
-  base.println (show w)
+  base.println (base.show w)
   yield {}
 ```
 

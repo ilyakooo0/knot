@@ -347,7 +347,7 @@ elem = \x rel -> base.fold (\acc r -> acc || r == x) False {} rel
 
 base.diff \a b -> do
   x <- a
-  where (not (elem x b))
+  where (not (base.elem x b))
   yield x
 ```
 
@@ -486,7 +486,7 @@ scale \factor -> do
 describe \rel -> case rel of
   [ ]           -> "empty"
   [{name: n}]  -> "just " ++ n
-  Cons h _     -> "first of many: " ++ show h
+  Cons h _     -> "first of many: " ++ base.show h
 ```
 
 `[ ]` matches an empty relation. `[p1, p2, ...]` matches a relation with exactly that many rows in any iteration order. `Cons head tail` matches a non-empty relation, binding `head` to the first row and `tail` to the rest (the relation has no inherent order; `Cons` chooses a deterministic iteration order for the match).
@@ -566,7 +566,7 @@ main do
   content <- readFile "input.txt"    -- IO Text → binds Text
   base.println content                     -- IO {}
   t <- now                            -- IO Int Ms → binds Int Ms
-  base.println ("time: " ++ show t)
+  base.println ("time: " ++ base.show t)
   yield {}
 -- overall type: IO {}
 ```
@@ -635,7 +635,7 @@ handleOrder \req -> do
     *orders = base.union orders [{item req.body.item qty 1}]
     newOrders <- *orders
     yield (base.count newOrders)
-  base.println ("New order #" ++ show orderId)
+  base.println ("New order #" ++ base.show orderId)
   yield {orderId}
 ```
 
@@ -1066,7 +1066,7 @@ api (serve Api where)
       *orders = base.union orders [{item item qty qty}]
       newOrders <- *orders
       yield (base.count newOrders)
-    base.println ("New order #" ++ show orderId)
+    base.println ("New order #" ++ base.show orderId)
     yield Ok {value {orderId orderId}}
 ```
 
@@ -1472,9 +1472,9 @@ rows |> base.map (\r -> r.price) |> base.sum
 `show` on a value with a concrete unit appends the unit string. The compiler knows the unit statically and emits the string as a constant:
 
 ```knot
-show (9.8 : Float (M / S^2))  -- "9.8 M/S^2"
-show (42.0 : Float M)         -- "42.0 M"
-show 3.14                     -- "3.14"
+base.show (9.8 : Float (M / S^2))  -- "9.8 M/S^2"
+base.show (42.0 : Float M)         -- "42.0 M"
+base.show 3.14                     -- "3.14"
 ```
 
 `Int 1` units are appended the same way, including the built-in `Ms` that clock operations carry — `now : IO Int Ms`, so `show` on a timestamp reads `"1783814121719 Ms"`. Use `stripUnit` to print the bare number.

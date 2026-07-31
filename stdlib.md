@@ -87,7 +87,10 @@ filter : (a -> Bool) -> [a] -> [a]
 Keep rows where the predicate returns `True`.
 
 ```knot
-&seniors = *people |> base.filter (\p -> p.age > 65)
+*people : [{name: Text, age: Int 1}]
+&seniors = (do
+  people <- *people
+  yield (base.filter (\p -> p.age > 65) people))
 ```
 
 ### `map`
@@ -99,7 +102,10 @@ map : (a -> b) -> [a] -> [b]
 Apply a function to each row. Results are deduplicated (relations are sets).
 
 ```knot
-&names = *people |> base.map (\p -> {name p.name})
+*people : [{name: Text, age: Int 1}]
+&names = (do
+  people <- *people
+  yield (base.map (\p -> {name p.name}) people))
 ```
 
 `map` is the `Functor` trait method for `[]`.
@@ -107,14 +113,22 @@ Apply a function to each row. Results are deduplicated (relations are sets).
 ### `match`
 
 ```
-match : Constructor -> [Constructor] -> [Payload]
+match : (a -> b) -> [b] -> [a]
 ```
 
 Filter a relation to rows matching a constructor tag, extracting the payload.
 
 ```knot
-&circles = *shapes |> match Circle    -- : [{radius: Float 1}]
-&rects   = *shapes |> match Rect      -- : [{width: Float 1, height: Float 1}]
+data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
+
+*shapes : [Shape]
+
+&circles = (do
+  shapes <- *shapes
+  yield (base.match Shape.Circle shapes))    -- : [{radius: Float 1}]
+&rects = (do
+  shapes <- *shapes
+  yield (base.match Shape.Rect shapes))      -- : [{width: Float 1, height: Float 1}]
 ```
 
 ### `fold`
@@ -138,9 +152,9 @@ single : [a] -> Maybe a
 Extract the single element of a relation. Returns `Just {value: x}` for a singleton, `Nothing {}` for empty or multi-element relations.
 
 ```knot
-single [{name "Alice"}]    -- Just {value {name "Alice"}}
-single []                   -- Nothing {}
-single [1 2]               -- Nothing {}
+base.single [{name "Alice"}]    -- Just {value {name "Alice"}}
+base.single []                   -- Nothing {}
+base.single [1 2]               -- Nothing {}
 ```
 
 ### `count`
@@ -152,7 +166,10 @@ count : [a] -> Int u
 Return the number of rows in a relation.
 
 ```knot
-numPeople (base.count *people)
+*people : [{name: Text, age: Int 1}]
+&numPeople = (do
+  people <- *people
+  yield (base.count people))
 ```
 
 When the argument is a source relation (or its bound alias), the compiler emits a single `SELECT COUNT(*)` query. Pipe forms like `*people |> filter (\p -> p.age > 30) |> count` collapse into one `SELECT COUNT(*) FROM ... WHERE ...`.
@@ -182,11 +199,17 @@ Sum of a numeric relation. Takes the relation directly — there is no projectio
 ```knot
 total (base.sum [10 20 30]) -- 60
 
--- Sum a record field by projecting first:
-totalAge (base.sum (base.map (\p -> p.age) *people))
+-- Sum a record field by projecting first (source read is IO, so bind first):
+*people : [{name: Text, age: Int 1}]
+&totalAge = (do
+  people <- *people
+  yield (base.sum (base.map (\p -> p.age) people)))
 
 -- Unit-preserving:
-totalDistance (base.sum (base.map (\t -> t.distance) *trips)) -- Float M if distance : Float M
+*trips : [{distance: Float M}]
+&totalDistance = (do
+  trips <- *trips
+  yield (base.sum (base.map (\t -> t.distance) trips))) -- Float M if distance : Float M
 ```
 
 ### `avg`
@@ -255,7 +278,12 @@ union : [a] -> [a] -> [a]
 Set union of two relations.
 
 ```knot
-&all = base.union *employees *contractors
+*employees : [{name: Text}]
+*contractors : [{name: Text}]
+&all = (do
+  employees <- *employees
+  contractors <- *contractors
+  yield (base.union employees contractors))
 ```
 
 ### `diff`
@@ -267,7 +295,12 @@ diff : [a] -> [a] -> [a]
 Set difference — rows in the first relation but not the second.
 
 ```knot
-&nonManagers = base.diff *employees *managers
+*employees : [{name: Text}]
+*managers : [{name: Text}]
+&nonManagers = (do
+  employees <- *employees
+  managers <- *managers
+  yield (base.diff employees managers))
 ```
 
 ### `inter`
@@ -353,7 +386,7 @@ source relations.
 
 ```knot
 -- Bump or insert a per-user counter
-bump = \user counters -> upsertBy (\c -> c.user == user)
+bump = \user counters -> base.upsertBy (\c -> c.user == user)
                                    {user user base.count lookup user counters + 1}
                                    counters
 ```
@@ -542,7 +575,7 @@ contains : Text -> Text -> Bool
 Check if the second argument contains the first as a substring.
 
 ```knot
-has (base.contains "ell" "hello") -- True
+base.has (base.contains "ell" "hello") -- True
 ```
 
 ---
@@ -618,7 +651,7 @@ unless : Bool -> IO {} -> IO {}
 Run an IO action conditionally. `when cond a` runs `a` if `cond` is `True {}`; `unless cond a` runs `a` if `cond` is `False {}`. The skipped branch becomes `yield {}`.
 
 ```knot
-when (n > 0) (base.println "positive")
+base.when (n > 0) (base.println "positive")
 
 base.unless verbose do
   base.println "(quiet mode)"
@@ -828,7 +861,7 @@ Concatenate two byte strings.
 ### `bytesGet`
 
 ```
-bytesGet : Int u1 -> Bytes -> Int u2
+bytesGet : Int 1 -> Bytes -> Maybe (Int 1)
 ```
 
 Get the byte value (0–255) at the given index.
@@ -979,7 +1012,7 @@ Generate an Ed25519 key pair for signing/verification. Inside a `do` block, bind
 ### `encrypt`
 
 ```
-encrypt : Bytes -> Bytes -> IO Bytes
+encrypt : Bytes -> Bytes -> IO (Maybe Bytes)
 ```
 
 Encrypt plaintext bytes with a public key (sealed-box: X25519 ECDH + ChaCha20-Poly1305). First argument is the public key, second is the plaintext. Returns IO because a fresh ephemeral key pair and nonce are generated per call.
@@ -987,7 +1020,7 @@ Encrypt plaintext bytes with a public key (sealed-box: X25519 ECDH + ChaCha20-Po
 ### `decrypt`
 
 ```
-decrypt : Bytes -> Bytes -> Bytes
+decrypt : Bytes -> Bytes -> Maybe Bytes
 ```
 
 Decrypt ciphertext bytes with a private key. First argument is the private key, second is the ciphertext.
@@ -995,7 +1028,7 @@ Decrypt ciphertext bytes with a private key. First argument is the private key, 
 ### `sign`
 
 ```
-sign : Bytes -> Bytes -> Bytes
+sign : Bytes -> Bytes -> Maybe Bytes
 ```
 
 Sign a message with a private key (Ed25519). First argument is the private key, second is the message. Returns a 64-byte signature.
@@ -1044,22 +1077,23 @@ concrete unit (e.g. `Ms` → `S`).
 ### `strip` / `dress`
 
 ```
-strip : a u -> a 1
-dress : a 1 -> a u
+strip : Int u -> Int 1
+dress : Int 1 -> Int u
 ```
 
-Generalized unit rebranding that works across both `Int` and `Float` with a
-single call. `strip` drops a value's unit; `dress` attaches one to a
-dimensionless value, the target pinned by context or annotation. The `u` is a
+Generalized unit rebranding that works across both `Int` and `Float` (the same
+shapes hold with `Float` for `Int`; the polymorphic `a u -> a 1` form is not
+writable surface syntax). `strip` drops a value's unit; `dress` attaches one to
+a dimensionless value, the target pinned by context or annotation. The `u` is a
 unit variable (kind `Unit`), so only unit-carrying numerics qualify. Identity
 at runtime:
 
 ```knot
 toS : Int Ms -> Int S
-toS \ms -> dress (strip ms / 1000)
+toS \ms -> base.dress (base.strip ms / 1000)
 
 toMiles : Float M -> Float Mi
-toMiles \d -> dress (strip d * 0.000621371)
+toMiles \d -> base.dress (base.strip d * 0.000621371)
 ```
 
 A dimensionless `Int 1`/`Float 1` does **not** unify with a concrete unit, so
@@ -1187,10 +1221,14 @@ double \x -> x + x
 `avg`, `minOn`, and `maxOn` preserve units from their projection function; `sum` preserves the units of the numeric relation it sums:
 
 ```knot
-base.avg   (\t -> t.distance) *trips   -- Float M if distance : Float M
-base.sum   (base.map (\t -> t.distance) *trips)   -- Float M if distance : Float M
-base.minOn (\t -> t.distance) *trips   -- Float M if distance : Float M
-base.maxOn (\t -> t.distance) *trips   -- Float M if distance : Float M
+*trips : [{distance: Float M}]
+
+(do
+  base.println (base.show (base.avg   (\t -> t.distance) *trips))
+  base.println (base.show (base.sum   (base.map (\t -> t.distance) *trips)))
+  base.println (base.show (base.minOn (\t -> t.distance) *trips))
+  base.println (base.show (base.maxOn (\t -> t.distance) *trips))
+  yield {})
 ```
 
 ---

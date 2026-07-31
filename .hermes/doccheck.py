@@ -155,8 +155,16 @@ def wrap_fragment(text):
     out.extend(decls)
     out.append("}")
     if exprs:
-        body = "\n".join(re.sub(r'\s+--.*$', '', e) for e in exprs)
-        out.append(f"(do\n  base.println (base.show ({body}))\n  yield {{}})\n")
+        # Each bare expression line is an independent example (e.g. a reference
+        # table of `single [...]` / `single []` cases). Emit one println per
+        # expression so multi-expression blocks compile.
+        body_lines = ["(do"]
+        for e in exprs:
+            e2 = re.sub(r'\s+--.*$', '', e).strip()
+            if e2:
+                body_lines.append(f"  base.println (base.show ({e2}))")
+        body_lines.append("  yield {})\n")
+        out.extend(body_lines)
     else:
         out.append("(do\n  base.println \"ok\"\n  yield {})\n")
     return "\n".join(out)

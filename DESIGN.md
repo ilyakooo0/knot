@@ -622,8 +622,9 @@ type Person = {name: Text, age: Int 1}
 The pattern for querying relations is: IO-bind to get the value, then pure comprehension on the plain value:
 
 ```knot
+*employees : [{name: Text, salary: Int 1}]
 &richEmployees = do
-  employees <- *employees       -- IO bind: [Employee] from IO {} [Employee]
+  employees <- *employees       -- IO bind: [Employee] from IO [Employee]
   with {result do              -- pure comprehension on the value
     e <- employees
     where e.salary > 100000
@@ -1210,9 +1211,14 @@ removePerson \name -> do
 Relations are sets. Two rows are the same row iff all their fields are equal. Setting a relation to a value that includes a duplicate is a no-op for that row.
 
 ```knot
+*people : [{name: Text, age: Int 1}]
+
 -- Adding an already-existing row changes nothing
-*people = base.union *people [{name "Alice" age 30}]
-*people = base.union *people [{name "Alice" age 30}]  -- no change
+addAliceTwice do
+  people <- *people
+  *people = base.union people [{name "Alice" age 30}]
+  people2 <- *people
+  *people = base.union people2 [{name "Alice" age 30}]  -- no change
 ```
 
 No surrogate IDs, no key declarations. Data identifies itself.
@@ -1230,13 +1236,18 @@ For UUIDv7 primary keys, time-ordered values mean inserts append to the right ed
 A `*`-prefixed relation with a body is a **view** — a bidirectional query over source relations. Reads compute the query; writes propagate back to the underlying sources.
 
 ```knot
+data Priority = Low {} | High {}
+data Status = Open {} | Closed {}
+*employees : [{name: Text, salary: Int 1}]
+*todos : [{title: Text, owner: Text, priority: Priority}]
+
 &seniorStaff = do                                            -- read-only (& prefix)
   employees <- *employees
   yield (base.filter (\e -> e.salary > 100000) employees)
 
 *openTodos = do                                              -- settable (* prefix)
   t <- *todos
-  yield {title t.title owner t.owner priority t.priority status Open {}}
+  yield {title t.title owner t.owner priority t.priority status (Status.Open {})}
 ```
 
 ### Column Provenance
@@ -1261,18 +1272,28 @@ For `*openTodos` above:
 The constant column is hidden from the type — its value is fixed by definition:
 
 ```knot
-*openTodos : [{title: Text, owner: Text, priority: Priority}]
+data Priority = Low {} | High {}
+data Status = Open {} | Closed {}
+*todos : [{title: Text, owner: Text, priority: Priority}]
+*openTodos = do
+  t <- *todos
+  yield {title t.title owner t.owner priority t.priority status (Status.Open {})}
 ```
 
 Writing through a view auto-fills constants and propagates source columns:
 
 ```knot
--- Insert through view — status auto-filled as Open {}
+data Priority = Low {} | High {}
+data Status = Open {} | Closed {}
+*todos : [{title: Text, owner: Text, priority: Priority}]
+*openTodos = do
+  t <- *todos
+  yield {title t.title owner t.owner priority t.priority status (Status.Open {})}
+
+-- Insert through view — the compiler constrains status to Open {}
 addOpenTodo do
   openTodos <- *openTodos
-  *openTodos = base.union openTodos [{title "New task" owner "Alice" priority High {}}]
--- Compiler rewrites →
--- *todos = union *todos [{title "New task" owner "Alice" priority High {} status Open {}}]
+  *openTodos = base.union openTodos [{title "New task" owner "Alice" priority (Priority.High {}) status (Status.Open {})}]
 
 -- Delete through view — only affects rows matching the constant
 removeAliceTodos do
@@ -1287,13 +1308,14 @@ removeAliceTodos do
 Multiple constants create narrow slices:
 
 ```knot
+data Priority = Low {} | Critical {}
+data Status = Open {} | Closed {}
+*todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
 *criticalOpen = do
   t <- *todos
-  yield {title t.title owner t.owner status Open {} priority Critical {}}
+  yield {title t.title owner t.owner status (Status.Open {}) priority (Priority.Critical {})}
 
--- Type: [{title: Text, owner: Text}]
--- Reads: only critical open todos
--- Writes: auto-fills status=Open, priority=Critical
+-- Reads: only critical open todos. Writes: the compiler constrains status=Open, priority=Critical.
 ```
 
 ### Recursive Derived Relations
@@ -1308,11 +1330,11 @@ Datalog-style transitive closure:
   reportsTo <- &reportsTo
   yield (base.union
     (do m <- manages
-        yield {m.manager, m.report})
+        yield {ancestor m.manager descendant m.report})
     (do r <- reportsTo
         m <- manages
         where r.descendant == m.manager
-        yield {r.ancestor, m.report}))
+        yield {ancestor r.ancestor descendant m.report}))
 ```
 
 The compiler checks stratification.

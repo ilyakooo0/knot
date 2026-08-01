@@ -5823,10 +5823,13 @@ impl Codegen {
         }
     }
 
-    /// Peel `map (\r -> r.<field>) *source` into `(source_name, field)`.
-    /// Used by the `elem` pushdown, where the relation is a single-column
-    /// projection. Accepts both `map` and `base.map` heads. Returns None for
-    /// any other shape (falls back in-memory).
+    /// Peel `map (\r -> r.<field>) <source>` into `(source_name, field)`,
+    /// where `<source>` is a bare `*src`, a `filter f *src`, or the pipe form
+    /// `*src |> map (\r -> r.<field>)` / `*src |> filter f |> map (\r -> ...)`.
+    /// Used by the `elem` and aggregate pushdowns, where the relation is a
+    /// single-column projection. Accepts both `map`/`filter` and their
+    /// `base.`-qualified heads. Returns None for any other shape (falls back
+    /// in-memory).
     fn peel_map_projection(&self, expr: &ast::Expr) -> Option<(String, String)> {
         let reduced = beta_reduce(expr, &self.fun_bodies, &self.let_bindings);
         if let ast::ExprKind::App { func, arg: source_expr } = &reduced.node
@@ -5841,6 +5844,9 @@ impl Codegen {
                                     return Some((source_name, field.clone()));
                                 }
                     }
+        // Pipe form: `source |> map (\r -> r.<field>)` — beta_reduce leaves the
+        // pipe as `map (\r -> ...) source`, which the arm above already
+        // handles. No extra case needed.
         None
     }
 
@@ -5910,12 +5916,33 @@ impl Codegen {
                     };
                 let reduced_base =
                     beta_reduce(&base, &self.fun_bodies, &self.let_bindings);
+                // Peel a leading take/drop around the source. `head (drop N …)`
+                // becomes `LIMIT 1 OFFSET N`. `head (take N …)` must keep the
+                // take's bound as the LIMIT: `take 0`/negative yields an empty
+                // page (so head → Nothing), and a positive take keeps at least
+                // the first row — head then reads the first of the ≤N rows.
+                let (offset, take, base_no_take): (Option<ast::Expr>, Option<ast::Expr>, ast::Expr) =
+                    match peel_take_drop(&reduced_base, &self.fun_bodies, &self.let_bindings) {
+                        Some((true, n, inner)) => (Some(n), None, inner),
+                        Some((false, n, inner)) => (None, Some(n), inner),
+                        None => (None, None, reduced_base.clone()),
+                    };
+                let offset_param = match &offset {
+                    Some(n) => Some(expr_to_sql_param(n)?),
+                    None => None,
+                };
+                let take_param = match &take {
+                    Some(n) => Some(expr_to_sql_param(n)?),
+                    None => None,
+                };
+                let base_reduced =
+                    beta_reduce(&base_no_take, &self.fun_bodies, &self.let_bindings);
                 let (source_name, filter): (String, Option<(String, ast::Expr)>) =
                     match extract_filter_on_source(
-                        &reduced_base, &self.source_var_binds, &self.fun_bodies, &self.let_bindings,
+                        &base_reduced, &self.source_var_binds, &self.fun_bodies, &self.let_bindings,
                     ) {
                         Some((src, bind, body)) => (src, Some((bind, body))),
-                        None => (self.resolve_source(&reduced_base)?, None),
+                        None => (self.resolve_source(&base_reduced)?, None),
                     };
                 if self.views.contains_key(&source_name) {
                     return None;
@@ -5940,8 +5967,10 @@ impl Codegen {
                         params,
                         select_columns: schema_select_columns(&schema, ""),
                         order_by,
-                        limit: None,
-                        offset: None,
+                        // A peeled `take N` sets the page bound (`take 0` →
+                        // empty → Nothing); otherwise head uses LIMIT 1 below.
+                        limit: take_param,
+                        offset: offset_param,
                         distinct: false,
                     },
                     schema,
@@ -5958,8 +5987,12 @@ impl Codegen {
             plan.params.extend(frag.params);
         }
 
-        // LIMIT 1 as a literal — no runtime param needed.
-        plan.limit = Some(SqlParamSource::Literal(ast::Literal::Int("1".to_string())));
+        // LIMIT 1 as a literal — no runtime param needed. A peeled `take N`
+        // already set the bound above (`take 0` → empty → Nothing); only the
+        // bare case needs the explicit 1.
+        if plan.limit.is_none() {
+            plan.limit = Some(SqlParamSource::Literal(ast::Literal::Int("1".to_string())));
+        }
         let query = Query { plan, terminal: QueryTerminal::Rows };
         Some(self.emit_query(builder, &query, &schema, env, db, None))
     }
@@ -6503,6 +6536,78 @@ impl Codegen {
                                     };
                                     return self.emit_query(builder, &query, &schema, env, db, None);
                                 }
+                }
+
+                // count (take N *source) / count (drop N *source) →
+                // SELECT COUNT(*) over a LIMIT/OFFSET subquery. `take`
+                // bounds the page (LIMIT MAX(CAST(? AS INTEGER),0)); `drop`
+                // skips N rows (LIMIT -1 OFFSET ?). Both are exact for any N.
+                if let Some((is_drop, n, inner)) =
+                    peel_take_drop(&beta_reduce(args[0], &self.fun_bodies, &self.let_bindings),
+                                   &self.fun_bodies, &self.let_bindings)
+                    && let Some(source_name) = self.resolve_source(&inner)
+                    && !self.views.contains_key(&source_name)
+                    && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                    && !schema.starts_with('#') && !schema.contains('[')
+                    && let Some(n_param) = expr_to_sql_param(&n) {
+                        self.emit_stm_track_read(builder, &source_name);
+                        let page = if is_drop {
+                            "LIMIT -1 OFFSET ?".to_string()
+                        } else {
+                            "LIMIT MAX(CAST(? AS INTEGER), 0)".to_string()
+                        };
+                        let sql = format!(
+                            "SELECT COUNT(*) FROM (SELECT 1 FROM {} {})",
+                            quote_sql_ident(&format!("_knot_{}", source_name)),
+                            page
+                        );
+                        let params_rel = self.compile_sql_params(builder, &[n_param], env, db);
+                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                        return self.call_rt(
+                            builder,
+                            "knot_source_query_count",
+                            &[db, sql_ptr, sql_len, params_rel],
+                        );
+                    }
+
+                // count (map (\r -> r.<field>) *source) → SELECT COUNT(*) —
+                // the projection is irrelevant to COUNT(*), so strip it and
+                // count the underlying source. Also covers the pipe form
+                // `*source |> map ...` (beta_reduce collapses the pipe to
+                // `map ... source`).
+                if let Some((source_name, _field)) = self.peel_map_projection(args[0])
+                    && !self.views.contains_key(&source_name)
+                        && self.source_schemas.contains_key(&source_name) {
+                            self.emit_stm_track_read(builder, &source_name);
+                            let (name_ptr, name_len) =
+                                self.string_ptr(builder, &source_name);
+                            return self.call_rt(
+                                builder,
+                                "knot_source_count",
+                                &[db, name_ptr, name_len],
+                            );
+                        }
+
+                // count (*source |> ops) → delegate to the pipe-chain
+                // pushdown with an appended terminal `count`. Synthesizes
+                // `(*source |> ops) |> count` and runs the same plan builder
+                // that handles `*source |> ops |> count` directly.
+                if matches!(&args[0].node, ast::ExprKind::BinOp { op: ast::BinOp::Pipe, .. }) {
+                    let count_rhs = ast::Expr {
+                        node: ast::ExprKind::Var("count".to_string()),
+                        span: args[0].span,
+                    };
+                    let piped = ast::Expr {
+                        node: ast::ExprKind::BinOp {
+                            op: ast::BinOp::Pipe,
+                            lhs: Box::new(args[0].clone()),
+                            rhs: Box::new(count_rhs),
+                        },
+                        span: args[0].span,
+                    };
+                    if let Some(v) = self.try_compile_pipe_sql(builder, &piped, env, db) {
+                        return v;
+                    }
                 }
 
                 // count (do { x <- *source; where ...; yield x }) → SELECT COUNT(*) FROM ... WHERE ...
@@ -7516,6 +7621,53 @@ impl Codegen {
         if Self::query_form_name(func_expr) == Some("sum")
                 && args.len() == 1
                 && !user_shadows_special {
+                    // sum (map (\r -> r.<numCol>) *source) → SELECT SUM(col):
+                    // fuse the projection into the aggregate instead of
+                    // materializing the projected column. Also covers the pipe
+                    // form `*source |> map ...` (beta_reduce collapses it).
+                    if let Some((source_name, field)) = self.peel_map_projection(args[0])
+                        && !self.views.contains_key(&source_name)
+                            && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                                && !schema.starts_with('#') && !schema.contains('[') {
+                                    let bind_var = "x".to_string();
+                                    let body = ast::Expr {
+                                        node: ast::ExprKind::FieldAccess {
+                                            expr: Box::new(ast::Expr {
+                                                node: ast::ExprKind::Var(bind_var.clone()),
+                                                span: args[0].span,
+                                            }),
+                                            field: field.clone(),
+                                        },
+                                        span: args[0].span,
+                                    };
+                                    if let Some(col_sql) =
+                                        extract_sql_field_access(&bind_var, &body, "", &schema)
+                                        && let Some((func, _rt)) = aggregate_sql_func_runtime("sum") {
+                                        let result_flag = sum_result_is_float(&bind_var, &body, &schema);
+                                        let query = Query {
+                                            plan: SqlQueryPlan {
+                                                tables: vec![SqlTable {
+                                                    source_name: source_name.to_string(),
+                                                    alias: String::new(),
+                                                }],
+                                                conditions: Vec::new(),
+                                                params: Vec::new(),
+                                                select_columns: Vec::new(),
+                                                order_by: Vec::new(),
+                                                limit: None,
+                                                offset: None,
+                                                distinct: false,
+                                            },
+                                            terminal: QueryTerminal::Aggregate {
+                                                func,
+                                                col_sql,
+                                                result_flag,
+                                            },
+                                        };
+                                        return self.emit_query(builder, &query, &schema, env, db, None);
+                                    }
+                                }
+
                     let rel_val = self.compile_expr(builder, args[0], env, db);
                     let is_float = builder.ins().iconst(
                         types::I64,
@@ -15510,6 +15662,50 @@ fn extract_single_param_lambda(
         && params.len() == 1
             && let ast::PatKind::Var(name) = &params[0].node {
                 return Some((name.clone(), *body));
+            }
+    None
+}
+
+/// Peel `take N source` / `drop N source` (bare, `base.`-qualified, or the
+/// pipe form `source |> take N` / `source |> drop N`) into
+/// `(is_drop, n_expr, source)`, after full inlining. Returns None for any
+/// other shape. Owned because inlining may synthesize new sub-expressions.
+/// Used by the `head` pushdown: `head (take N src)` = `head src` (a take of
+/// ≥1 keeps the first row; ≤0 is empty, and head of empty is Nothing either
+/// way), and `head (drop N src)` = `LIMIT 1 OFFSET N`.
+fn peel_take_drop(
+    expr: &ast::Expr,
+    fun_bodies: &HashMap<String, ast::Expr>,
+    let_bindings: &HashMap<String, ast::Expr>,
+) -> Option<(bool, ast::Expr, ast::Expr)> {
+    let reduced = beta_reduce(expr, fun_bodies, let_bindings);
+    let is_take_drop = |e: &ast::Expr| -> Option<bool> {
+        match &e.node {
+            ast::ExprKind::Var(n) if n == "take" => Some(false),
+            ast::ExprKind::Var(n) if n == "drop" => Some(true),
+            ast::ExprKind::FieldAccess { expr, field }
+                if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") =>
+            {
+                match field.as_str() {
+                    "take" => Some(false),
+                    "drop" => Some(true),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
+    // Call form: `take N source` → App { App { take, N }, source }.
+    if let ast::ExprKind::App { func, arg: source } = &reduced.node
+        && let ast::ExprKind::App { func: name_expr, arg: n } = &func.node
+            && let Some(is_drop) = is_take_drop(name_expr) {
+                return Some((is_drop, (**n).clone(), (**source).clone()));
+            }
+    // Pipe form: `source |> take N` → BinOp::Pipe { source, App { take, N } }.
+    if let ast::ExprKind::BinOp { op: ast::BinOp::Pipe, lhs, rhs } = &reduced.node
+        && let ast::ExprKind::App { func: name_expr, arg: n } = &rhs.node
+            && let Some(is_drop) = is_take_drop(name_expr) {
+                return Some((is_drop, (**n).clone(), (**lhs).clone()));
             }
     None
 }

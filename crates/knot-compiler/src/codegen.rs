@@ -5844,6 +5844,126 @@ impl Codegen {
         None
     }
 
+    /// Build a `SELECT … LIMIT 1` query reading the first row of a source
+    /// relation, for the `head`/`findFirst` pushdowns. Returns the 1-row
+    /// `Value::Relation` (which `knot_relation_head` then unwraps to a Maybe),
+    /// or None to fall back to in-memory. `pred_lambda` is findFirst's
+    /// predicate (None for head); it is AND-ed into the WHERE clause.
+    /// Handles bare `*src`, `filter p *src`, and do-block sources. Bails on
+    /// views, ADT/nested schemas, multi-table plans, and untranslatable exprs.
+    fn build_first_row_query(
+        &mut self,
+        rel_expr: &ast::Expr,
+        pred_lambda: Option<&ast::Expr>,
+        env: &mut Env,
+        builder: &mut FunctionBuilder,
+        db: Value,
+    ) -> Option<Value> {
+        // Resolve the source to (plan, schema). Two shapes: a bare/`filter`
+        // source (single table, optional WHERE) or a do-block plan.
+        let (mut plan, schema): (SqlQueryPlan, String) =
+            if let ast::ExprKind::Do(stmts) = &rel_expr.node {
+                let plan = self.analyze_sql_plan(stmts, env)?;
+                if plan.tables.len() != 1 || plan.limit.is_some() || plan.offset.is_some() {
+                    return None;
+                }
+                let schema =
+                    self.source_schemas.get(&plan.tables[0].source_name)?.clone();
+                (plan, schema)
+            } else {
+                // Bare `*src`, `filter p *src`, or `sortBy k *src`. Peel a
+                // leading `sortBy` into ORDER BY (the key must be a single
+                // column access, matching the standalone sortBy pushdown's
+                // pushability rule), then treat the remainder as a bare or
+                // filtered source.
+                let reduced = beta_reduce(rel_expr, &self.fun_bodies, &self.let_bindings);
+                let (order_by, base): (Vec<String>, ast::Expr) =
+                    match peel_sort_by(&reduced, &self.fun_bodies, &self.let_bindings) {
+                        Some((key_lam, inner)) => {
+                            let (key_bind, key_body) = extract_single_param_lambda(
+                                &key_lam, &self.fun_bodies, &self.let_bindings,
+                            )?;
+                            let key_body: &ast::Expr = &key_body;
+                            // Resolve the inner source's schema for the key
+                            // column; sortBy over a filter keeps the filter's
+                            // source. Use the inner source's own schema.
+                            let inner_src = match extract_filter_on_source(
+                                &inner, &self.source_var_binds, &self.fun_bodies,
+                                &self.let_bindings,
+                            ) {
+                                Some((s, _, _)) => s,
+                                None => self.resolve_source(&inner)?,
+                            };
+                            if self.views.contains_key(&inner_src) {
+                                return None;
+                            }
+                            let inner_schema =
+                                self.source_schemas.get(&inner_src)?.clone();
+                            if !sortby_projection_pushable(&key_bind, key_body, &inner_schema) {
+                                return None;
+                            }
+                            let col_sql =
+                                extract_sql_field_access(&key_bind, key_body, "", &inner_schema)?;
+                            (vec![col_sql], inner)
+                        }
+                        None => (Vec::new(), rel_expr.clone()),
+                    };
+                let reduced_base =
+                    beta_reduce(&base, &self.fun_bodies, &self.let_bindings);
+                let (source_name, filter): (String, Option<(String, ast::Expr)>) =
+                    match extract_filter_on_source(
+                        &reduced_base, &self.source_var_binds, &self.fun_bodies, &self.let_bindings,
+                    ) {
+                        Some((src, bind, body)) => (src, Some((bind, body))),
+                        None => (self.resolve_source(&reduced_base)?, None),
+                    };
+                if self.views.contains_key(&source_name) {
+                    return None;
+                }
+                let schema = self.source_schemas.get(&source_name)?.clone();
+                if schema.starts_with('#') || schema.contains('[') {
+                    return None;
+                }
+                let alias = String::new(); // bare FROM, unqualified cols
+                let mut conditions = Vec::new();
+                let mut params = Vec::new();
+                if let Some((bind, body)) = filter {
+                    let body: &ast::Expr = &body;
+                    let frag = self.try_compile_sql_expr(&bind, body, &schema)?;
+                    conditions.push(frag.sql);
+                    params.extend(frag.params);
+                }
+                (
+                    SqlQueryPlan {
+                        tables: vec![SqlTable { source_name, alias }],
+                        conditions,
+                        params,
+                        select_columns: schema_select_columns(&schema, ""),
+                        order_by,
+                        limit: None,
+                        offset: None,
+                        distinct: false,
+                    },
+                    schema,
+                )
+            };
+
+        // AND findFirst's predicate into the WHERE (single table → alias t0).
+        if let Some(lam) = pred_lambda {
+            let (bind, body) =
+                extract_single_param_lambda(lam, &self.fun_bodies, &self.let_bindings)?;
+            let body: &ast::Expr = &body;
+            let frag = self.try_compile_sql_expr(&bind, body, &schema)?;
+            plan.conditions.push(frag.sql);
+            plan.params.extend(frag.params);
+        }
+
+        // LIMIT 1 as a literal — no runtime param needed.
+        plan.limit = Some(SqlParamSource::Literal(ast::Literal::Int("1".to_string())));
+        let query = Query { plan, terminal: QueryTerminal::Rows };
+        Some(self.emit_query(builder, &query, &schema, env, db, None))
+    }
+
     /// Does this argument expression have a Π-lite type-argument head? Only the
     /// LEFTMOST head of the arg's application spine counts: `App(Int, x)` has
     /// type head `Int`, but `App(f, App(Int, x))` (a complete call passed as an
@@ -6533,6 +6653,52 @@ impl Codegen {
                     }
                 for n in &overlay_added {
                     self.let_bindings.remove(n);
+                }
+            }
+
+        // head / findFirst over a source relation → SELECT … LIMIT 1, then take
+        // the first row as a `Maybe`. Without this the whole relation is
+        // materialized just to read one row. Mirrors the `single` pushdown
+        // (which uses LIMIT 2 to distinguish singleton from multi); head only
+        // needs LIMIT 1.
+        //   head *src                    → SELECT cols FROM t LIMIT 1
+        //   head (filter p *src)         → SELECT cols FROM t WHERE p LIMIT 1
+        //   findFirst *src p             → same as head (filter p *src)
+        //   head/findFirst (do/sortBy …) → plan + ORDER BY/WHERE … LIMIT 1
+        // Match both bare `head`/`findFirst` and the `base.`-qualified forms,
+        // positively identified via the resolution table (no false positive
+        // when a user binding shadows the name).
+        let head_pushdown_name: Option<&str> = match &func_expr.node {
+            ast::ExprKind::Var(name)
+                if (name == "head" || name == "findFirst")
+                    && !user_shadows_special
+                    && !self.resolves_to_user(func_expr) =>
+            {
+                Some(name.as_str())
+            }
+            ast::ExprKind::FieldAccess { expr, field }
+                if (field == "head" || field == "findFirst")
+                    && matches!(&expr.node, ast::ExprKind::Var(n) if n == "base")
+                    && crate::infer::StdlibFn::from_name(field)
+                        .is_some_and(|sf| self.resolves_to_stdlib(func_expr, sf)) =>
+            {
+                Some(field.as_str())
+            }
+            _ => None,
+        };
+        if let Some(name) = head_pushdown_name {
+                // Normalize to (source_expr, Option<predicate_lambda>). head has
+                // no predicate; findFirst's second arg is the predicate.
+                let normalized: Option<(&ast::Expr, Option<&ast::Expr>)> = match name {
+                    "head" if args.len() == 1 => Some((args[0], None)),
+                    "findFirst" if args.len() == 2 => Some((args[0], Some(args[1]))),
+                    _ => None, // arity mismatch: fall through to the generic call path
+                };
+                if let Some((rel_expr, pred_lambda)) = normalized
+                    && let Some(query) =
+                        self.build_first_row_query(rel_expr, pred_lambda, env, builder, db)
+                {
+                    return self.call_rt(builder, "knot_relation_head", &[query]);
                 }
             }
 
@@ -15345,6 +15511,34 @@ fn extract_single_param_lambda(
             && let ast::PatKind::Var(name) = &params[0].node {
                 return Some((name.clone(), *body));
             }
+    None
+}
+
+/// Peel `sortBy key_lambda source` (bare or `base.sortBy`) into
+/// `(key_lambda, source)`, after full inlining. Returns None for any other
+/// shape. Owned because inlining may synthesize new sub-expressions. Used by
+/// pushdowns that turn a leading `sortBy` into an ORDER BY without
+/// materializing the whole relation.
+fn peel_sort_by(
+    expr: &ast::Expr,
+    fun_bodies: &HashMap<String, ast::Expr>,
+    let_bindings: &HashMap<String, ast::Expr>,
+) -> Option<(ast::Expr, ast::Expr)> {
+    let reduced = beta_reduce(expr, fun_bodies, let_bindings);
+    if let ast::ExprKind::App { func, arg: source } = reduced.node
+        && let ast::ExprKind::App { func: name_expr, arg: key_lambda } = func.node
+    {
+        let is_sort_by = match &name_expr.node {
+            ast::ExprKind::Var(n) => n == "sortBy",
+            ast::ExprKind::FieldAccess { expr, field } => {
+                field == "sortBy" && matches!(&expr.node, ast::ExprKind::Var(n) if n == "base")
+            }
+            _ => false,
+        };
+        if is_sort_by {
+            return Some((*key_lambda, *source));
+        }
+    }
     None
 }
 

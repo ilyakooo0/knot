@@ -115,6 +115,7 @@ pub enum StdlibFn {
     Any,
     All,
     Elem,
+    Head,
 }
 
 impl StdlibFn {
@@ -137,6 +138,7 @@ impl StdlibFn {
             "any" => StdlibFn::Any,
             "all" => StdlibFn::All,
             "elem" => StdlibFn::Elem,
+            "head" => StdlibFn::Head,
             _ => return None,
         })
     }

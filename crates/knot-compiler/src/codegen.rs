@@ -4117,7 +4117,20 @@ impl Codegen {
                 self.emit_ctor_as_function_value(builder, &name)
             }
 
-            ast::ExprKind::SourceRef(name) => {
+            ast::ExprKind::SourceRef { name, full } => {
+                // A bare `*rel` read that reaches here was not consumed by any
+                // SQL-pushdown matcher — it loads the whole relation into
+                // memory via `knot_source_read`. Require the user to opt in
+                // with `full *rel`.
+                if !full {
+                    return self.push_codegen_error(
+                        builder,
+                        expr.span,
+                        format!(
+                            "reading `*{name}` loads the whole relation into memory (no SQL pushdown); write `full *{name}` to allow this",
+                        ),
+                    );
+                }
                 // Check if this is a view reference
                 let view_info = self.views.get(name).cloned();
                 if let Some(view) = view_info {
@@ -4672,7 +4685,7 @@ impl Codegen {
                             && fn_name == "match"
                             && !env.bindings.contains_key(fn_name)
                             && !(self.top_fn_names.contains(fn_name) && self.user_fns.contains_key(fn_name)) {
-                                if let ast::ExprKind::SourceRef(source_name) = &lhs.node
+                                if let ast::ExprKind::SourceRef { name: source_name, .. } = &lhs.node
                                     && let Some(schema) = self.source_schemas.get(source_name).cloned() {
                                         let (name_ptr, name_len) =
                                             self.string_ptr(builder, source_name);
@@ -4821,7 +4834,7 @@ impl Codegen {
 
             ast::ExprKind::Set { target, value } => {
                 // target should be a SourceRef (source or view)
-                if let ast::ExprKind::SourceRef(name) = &target.node {
+                if let ast::ExprKind::SourceRef { name, .. } = &target.node {
                     // Check if target is a view
                     let view_info = self.views.get(name).cloned();
                     if let Some(view) = view_info {
@@ -4998,7 +5011,7 @@ impl Codegen {
             }
 
             ast::ExprKind::FullSet { target, value } => {
-                if let ast::ExprKind::SourceRef(name) = &target.node {
+                if let ast::ExprKind::SourceRef { name, .. } = &target.node {
                     // Check if target is a view
                     let view_info = self.views.get(name).cloned();
                     if let Some(view) = view_info {
@@ -5643,7 +5656,7 @@ impl Codegen {
         match &expr.node {
             Set { target, value } | FullSet { target, value } => {
                 let target_ok = match &target.node {
-                    SourceRef(name) if !self.views.contains_key(name) => {
+                    SourceRef { name, .. } if !self.views.contains_key(name) => {
                         out.push(name.clone());
                         true
                     }
@@ -5729,7 +5742,7 @@ impl Codegen {
             Serve { handlers, .. } => handlers
                 .iter()
                 .all(|h| self.collect_direct_write_targets(&h.body, out)),
-            Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) => true,
+            Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) => true,
             TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => true,
             ViewDecl { body, .. } | DerivedDecl { body, .. } => self.collect_direct_write_targets(body, out),
         }
@@ -5762,7 +5775,7 @@ impl Codegen {
     /// Handles both `*source` (SourceRef) and bound variables from `x <- *source`.
     fn resolve_source(&self, expr: &ast::Expr) -> Option<String> {
         match &expr.node {
-            ast::ExprKind::SourceRef(name) => Some(name.clone()),
+            ast::ExprKind::SourceRef { name, .. } => Some(name.clone()),
             ast::ExprKind::Var(name) => self.source_var_binds.get(name).cloned(),
             _ => None,
         }
@@ -6469,7 +6482,7 @@ impl Codegen {
         if let ast::ExprKind::Var(name) = &func_expr.node
             && name == "fold" && args.len() == 3 && !user_shadows_special {
                 // fold f init *source → SELECT cols FROM table; stream
-                if let ast::ExprKind::SourceRef(source_name) = &args[2].node
+                if let ast::ExprKind::SourceRef { name: source_name, .. } = &args[2].node
                     && !self.views.contains_key(source_name)
                         && let Some(schema) = self.source_schemas.get(source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[') {
@@ -6547,7 +6560,7 @@ impl Codegen {
         if let ast::ExprKind::Var(name) = &func_expr.node
             && name == "match" && args.len() == 2 && !user_shadows_special
                 && let ast::ExprKind::Constructor(ctor_name) = &args[0].node {
-                    if let ast::ExprKind::SourceRef(source_name) = &args[1].node
+                    if let ast::ExprKind::SourceRef { name: source_name, .. } = &args[1].node
                         && let Some(schema) = self.source_schemas.get(source_name).cloned() {
                             let source_name = source_name.clone();
                             self.emit_stm_track_read(builder, &source_name);
@@ -6939,7 +6952,7 @@ impl Codegen {
                                 && let Some((sort_bind, sort_body)) = extract_single_param_lambda(sort_lambda, &self.fun_bodies, &self.let_bindings) {
                                     let sort_body: &ast::Expr = &sort_body;
                                     // Case 1: sortBy f *source → SQL ORDER BY + LIMIT
-                                    if let ast::ExprKind::SourceRef(source_name) = &sort_source.node
+                                    if let ast::ExprKind::SourceRef { name: source_name, .. } = &sort_source.node
                                         && !self.views.contains_key(source_name)
                                             && let Some(schema) = self.source_schemas.get(source_name).cloned()
                                                 && !schema.starts_with('#') && !schema.contains('[') {
@@ -8734,7 +8747,7 @@ impl Codegen {
     fn expr_contains_io(expr: &ast::Expr, builtins: &HashSet<&str>, io_fns: &HashSet<String>) -> bool {
         match &expr.node {
             ast::ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name),
-            ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
+            ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::App { func, arg } => {
@@ -9057,7 +9070,7 @@ impl Codegen {
                 ) || self.io_functions.contains(name)
                 || Self::io_scopes_lookup(scopes, name)
             }
-            ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
+            ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
@@ -9195,7 +9208,7 @@ impl Codegen {
             }
             // Relation reads are the "pure DB" IO that inference lets flow
             // as the relation value itself.
-            ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => false,
+            ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_) => false,
             // Writes and atomic blocks must not run at `let` time.
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
@@ -9470,7 +9483,7 @@ impl Codegen {
                     );
                     let rhs_is_io_relation_source = matches!(
                         &expr.node,
-                        ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_)
+                        ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_)
                     );
                     // A comprehension TAIL inside a sequential IO block:
                     //
@@ -9569,7 +9582,7 @@ impl Codegen {
                     // `x <- *source` records x → source so inner do-blocks
                     // like `do { m <- x; where ...; yield m }` can compile to SQL.
                     if let ast::PatKind::Var(var_name) = &pat.node
-                        && let ast::ExprKind::SourceRef(source_name) = &expr.node {
+                        && let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node {
                             self.source_var_binds.insert(var_name.clone(), source_name.clone());
                         }
                     // A comprehension over relation sources (`xs <- do { r <-
@@ -10251,7 +10264,7 @@ impl Codegen {
                 }
                 // Inner expr must be hoistable (source, derived, var, or list).
                 let hoistable = match &inner_expr.node {
-                    ast::ExprKind::SourceRef(_)
+                    ast::ExprKind::SourceRef { .. }
                     | ast::ExprKind::DerivedRef(_)
                     | ast::ExprKind::List(_) => true,
                     // A `Var` is only hoistable when it resolves OUTSIDE this
@@ -10390,7 +10403,7 @@ impl Codegen {
                             }
                             primary_row_val = Some(row);
                             match &expr.node {
-                                ast::ExprKind::SourceRef(name)
+                                ast::ExprKind::SourceRef { name, .. }
                                 | ast::ExprKind::DerivedRef(name) => {
                                     primary_source = Some(name.clone());
                                     primary_schema = self.source_schemas.get(name).cloned();
@@ -10433,7 +10446,7 @@ impl Codegen {
 
                     // ── Filter pushdown: try to push Where clauses into SQL ──
                     let use_filter_pushdown = if let ast::PatKind::Var(bind_var) = &pat.node {
-                        if let ast::ExprKind::SourceRef(source_name) = &expr.node {
+                        if let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node {
                             if !self.views.contains_key(source_name)
                                 && self.source_schemas.contains_key(source_name)
                             {
@@ -10561,7 +10574,7 @@ impl Codegen {
                     let rel = if matches!(&pat.node, ast::PatKind::Constructor { .. }) {
                         let is_known_relation = matches!(
                             &expr.node,
-                            ast::ExprKind::SourceRef(_)
+                            ast::ExprKind::SourceRef { .. }
                                 | ast::ExprKind::DerivedRef(_)
                                 | ast::ExprKind::List(_)
                                 | ast::ExprKind::Do(_)
@@ -10613,7 +10626,7 @@ impl Codegen {
                         }
                         primary_row_val = Some(row);
                         match &expr.node {
-                            ast::ExprKind::SourceRef(name)
+                            ast::ExprKind::SourceRef { name, .. }
                             | ast::ExprKind::DerivedRef(name) => {
                                 primary_source = Some(name.clone());
                                 primary_schema = self.source_schemas.get(name).cloned();
@@ -11613,7 +11626,7 @@ impl Codegen {
     /// Check whether an expression references `*<source_name>` anywhere.
     fn references_source(expr: &ast::Expr, source_name: &str) -> bool {
         match &expr.node {
-            ast::ExprKind::SourceRef(name) => name == source_name,
+            ast::ExprKind::SourceRef { name, .. } => name == source_name,
             ast::ExprKind::ImplicitRef(_) => false,
             ast::ExprKind::TypeHole => false,
             ast::ExprKind::Lit(_)
@@ -11877,7 +11890,7 @@ impl Codegen {
 
         // Source must be a SourceRef or a variable bound from a source read
         let source_name = match &source.node {
-            ast::ExprKind::SourceRef(name) => name.clone(),
+            ast::ExprKind::SourceRef { name, .. } => name.clone(),
             ast::ExprKind::Var(name) => self.source_var_binds.get(name)?.clone(),
             _ => return None,
         };
@@ -12262,7 +12275,7 @@ impl Codegen {
                     } else {
                         return None;
                     };
-                    let source_name = if let ast::ExprKind::SourceRef(name) = &expr.node {
+                    let source_name = if let ast::ExprKind::SourceRef { name, .. } = &expr.node {
                         name.clone()
                     } else if let ast::ExprKind::Var(var_name) = &expr.node {
                         // Variable bound from a source read (e.g. `allMessages <- *messages`)
@@ -13124,7 +13137,7 @@ impl Codegen {
     /// Check if an expression refers to a specific source (directly or via a bound variable).
     fn expr_is_source(node: &ast::ExprKind, source_name: &str, var_binds: &HashMap<String, String>) -> bool {
         match node {
-            ast::ExprKind::SourceRef(name) => name == source_name,
+            ast::ExprKind::SourceRef { name, .. } => name == source_name,
             ast::ExprKind::Var(name) => var_binds.get(name).is_some_and(|s| s == source_name),
             _ => false,
         }
@@ -13180,7 +13193,7 @@ impl Codegen {
         if let ast::ExprKind::Do(stmts) = &value.node
             && stmts.len() == 2
                 && let ast::StmtKind::Bind { expr, .. } = &stmts[0].node
-                    && let ast::ExprKind::SourceRef(name) = &expr.node
+                    && let ast::ExprKind::SourceRef { name, .. } = &expr.node
                         && name == source_name
                             && let ast::StmtKind::Expr(e) = &stmts[1].node {
                                 return e.node.as_yield_arg().is_some();
@@ -13205,7 +13218,7 @@ impl Codegen {
 
         // First: t <- *rel
         let bind_var = if let ast::StmtKind::Bind { pat, expr } = &stmts[0].node {
-            if let ast::ExprKind::SourceRef(name) = &expr.node {
+            if let ast::ExprKind::SourceRef { name, .. } = &expr.node {
                 if name == source_name {
                     if let ast::PatKind::Var(v) = &pat.node {
                         v.clone()
@@ -13787,7 +13800,7 @@ impl Codegen {
 /// write rows that violate the filter), and we must not panic on valid input.
 fn analyze_view(body: &ast::Expr) -> Result<Option<ViewInfo>, (ast::Span, String)> {
     // Case 1: simple alias — *view = *source
-    if let ast::ExprKind::SourceRef(source_name) = &body.node {
+    if let ast::ExprKind::SourceRef { name: source_name, .. } = &body.node {
         return Ok(Some(ViewInfo {
             source_name: source_name.clone(),
             source_columns: vec![],
@@ -13801,7 +13814,7 @@ fn analyze_view(body: &ast::Expr) -> Result<Option<ViewInfo>, (ast::Span, String
         // Find the bind statement: t <- *source
         let bind_info = stmts.iter().find_map(|s| {
             if let ast::StmtKind::Bind { pat, expr } = &s.node
-                && let ast::ExprKind::SourceRef(source_name) = &expr.node
+                && let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node
                     && let ast::PatKind::Var(var_name) = &pat.node {
                         return Some((var_name.clone(), source_name.clone()));
                     }
@@ -14016,7 +14029,7 @@ fn expr_has_user_calls(expr: &ast::Expr, user_fns: &HashMap<String, (FuncId, usi
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Var(_)
         | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::DerivedRef(_)
         | ast::ExprKind::List(_) => false,
         // Conservative: treat complex nodes as potentially having user calls
@@ -14029,7 +14042,7 @@ fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
         ast::ExprKind::Var(name) => name == var_name,
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::Record(fields) => fields
             .iter()
@@ -15119,7 +15132,7 @@ fn extract_filter_on_source(
     if let ast::ExprKind::App { func, arg: source_expr } = &reduced.node {
         let resolve_source = |se: &ast::Expr| -> Option<String> {
             match &se.node {
-                ast::ExprKind::SourceRef(name) => Some(name.clone()),
+                ast::ExprKind::SourceRef { name, .. } => Some(name.clone()),
                 ast::ExprKind::Var(name) => source_var_binds.get(name).cloned(),
                 _ => None,
             }
@@ -15387,7 +15400,7 @@ fn beta_reduce_inner(
         // For constructs that bind names (Case arms, Do statements, Set, etc.)
         // we keep them unchanged: SQL pushdown never sees these inside the
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
-        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | Case { .. } | Do(_)
+        Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | Case { .. } | Do(_)
         | Set { .. } | FullSet { .. } | Atomic(_) | TimeUnitLit { .. }
         | Annot { .. } | Refine(_) | Serve { .. } | TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. }
         | ViewDecl { .. } | DerivedDecl { .. } => return expr.clone(),
@@ -15413,7 +15426,7 @@ fn substitute_inner(
     let span = expr.span;
     let new_node = match &expr.node {
         Var(name) if name == var => return Some(value.clone()),
-        Var(_) | Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
+        Var(_) | Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {
             return Some(expr.clone())
         }
@@ -15537,7 +15550,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     };
     match &expr.node {
         Var(name) => name == var,
-        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
+        Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => false,
         ViewDecl { body, .. } | DerivedDecl { body, .. } => expr_mentions_var(body, var),
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
@@ -15590,7 +15603,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
                 free.insert(name.clone());
             }
         }
-        Lit(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
+        Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {}
         ViewDecl { body, .. } | DerivedDecl { body, .. } => collect_free_vars_set(body, bound, free),
         Lambda { params, body, .. } => {
@@ -16427,7 +16440,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
     match &expr.node {
         ast::ExprKind::DerivedRef(n) => n == name,
         ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef(_) | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::TypeHole | ast::ExprKind::TypeCtor { .. }
+        | ast::ExprKind::SourceRef { .. } | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::TypeHole | ast::ExprKind::TypeCtor { .. }
         | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_contains_derived_ref(body, name),
@@ -16524,7 +16537,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
             }
         }
         ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => {}
-        ast::ExprKind::SourceRef(_) => {}
+        ast::ExprKind::SourceRef { .. } => {}
         ast::ExprKind::SourceDecl { .. } => {}
         ast::ExprKind::SubsetConstraint { .. } => {}
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
@@ -16698,7 +16711,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         ast::ExprKind::Var(name) => name == var,
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::TypeHole
         | ast::ExprKind::DerivedRef(_) => false,
@@ -16791,7 +16804,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         ast::ExprKind::Var(name) => name == var,
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::TypeHole
         | ast::ExprKind::DerivedRef(_) => false,
@@ -17142,7 +17155,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::RouteDecl { name, .. } | ast::ExprKind::RouteCompositeDecl { name, .. } => {
             format!("route {}", name)
         }
-        ast::ExprKind::SourceRef(name) => format!("*{}", name),
+        ast::ExprKind::SourceRef { name, .. } => format!("*{}", name),
         ast::ExprKind::DerivedRef(name) => format!("&{}", name),
         ast::ExprKind::Record(fields) => {
             let fs: Vec<String> = fields

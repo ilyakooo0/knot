@@ -5403,7 +5403,7 @@ impl Infer {
                 self.fresh()
             }
 
-            ast::ExprKind::SourceRef(name) => {
+            ast::ExprKind::SourceRef { name, .. } => {
                 if let Some(ty) = self.source_types.get(name).cloned() {
                     Ty::IO(Box::new(ty))
                 } else {
@@ -6416,7 +6416,7 @@ impl Infer {
                     self.suppress_refine_intro.replace(source_refined);
                 self.check_expr(value, &target_inner);
                 self.suppress_refine_intro = prev_suppress;
-                if let ast::ExprKind::SourceRef(name) = &target.node {
+                if let ast::ExprKind::SourceRef { name, .. } = &target.node {
                     // `set` is a read-modify-write only when the value actually
                     // reads the source. Relations require that reference (it's
                     // enforced below), so a valid relation `set` genuinely
@@ -6468,7 +6468,7 @@ impl Infer {
                     self.suppress_refine_intro.replace(source_refined);
                 self.check_expr(value, &target_inner);
                 self.suppress_refine_intro = prev_suppress;
-                if let ast::ExprKind::SourceRef(name) = &target.node {
+                if let ast::ExprKind::SourceRef { name, .. } = &target.node {
                     // Reject `full *rel = ...` when the value references
                     // `*rel` (directly, via a `<- *rel` bind, or via a let
                     // binding that ultimately reads from `*rel`) — `set`
@@ -8267,7 +8267,7 @@ impl Infer {
                     returns_io(&resolved)
                 })
             }
-            ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) => true,
+            ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_) => true,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
@@ -8404,7 +8404,7 @@ impl Infer {
 
                     // Track `x <- *foo` for `set` full-replacement detection.
                     if let ast::PatKind::Var(var_name) = &pat.node
-                        && let ast::ExprKind::SourceRef(source_name) = &expr.node {
+                        && let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node {
                             self.source_var_binds
                                 .insert(var_name.clone(), source_name.clone());
                         }
@@ -11948,7 +11948,7 @@ fn value_references_source_inner(
     visited: &mut HashSet<String>,
 ) -> bool {
     match &expr.node {
-        ast::ExprKind::SourceRef(name) => name == source_name,
+        ast::ExprKind::SourceRef { name, .. } => name == source_name,
         // `^x` reads a record field, never a source relation directly.
         ast::ExprKind::ImplicitRef(_) => false,
         // `_` hole reads nothing.
@@ -12765,7 +12765,7 @@ fn rewrite_result_markers(expr: &mut ast::Expr, pure_spans: &HashSet<Span>) {
 fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Expr)) {
     use ast::ExprKind::*;
     match &mut expr.node {
-        Lit(_) | Var(_) | Constructor(_) | SourceRef(_) | DerivedRef(_) | ImplicitRef(_) => {}
+        Lit(_) | Var(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) => {}
         TypeHole => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         RouteDecl { .. } | RouteCompositeDecl { .. } => {}

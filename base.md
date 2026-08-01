@@ -53,7 +53,7 @@ a source.
 ```knot
 *people : [{name: Text, age: Int 1}]
 &seniors = (do
-  people <- *people
+  people <- full *people
   yield (people |> base.filter (\p -> p.age > 65)))
 ```
 
@@ -109,7 +109,7 @@ are preserved: summing `[Float M]` gives `Float M`.
 ```knot
 *trips : [{distance: Float Km}]
 &totalDist = (do
-  trips <- *trips
+  trips <- full *trips
   yield (base.sum (base.map (\t -> t.distance) trips)))
 ```
 
@@ -240,7 +240,7 @@ Reorder rows by a projected key (ascending). Pushes down to `ORDER BY`; with
 ```knot
 *people : [{name: Text, age: Int 1}]
 &top5 = (do
-  people <- *people
+  people <- full *people
   yield (people |> base.sortBy (\p -> (0 - p.age)) |> base.take 5))
 ```
 

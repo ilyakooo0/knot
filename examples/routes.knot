@@ -15,11 +15,11 @@ route AdminApi where
 route Api = TodoApi | AdminApi
 
 addTodo (\title owner priority -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = base.union todos [{title title owner owner priority (Priority.Low {})}])
 
 getTodos (\owner -> do
-  todos <- *todos
+  todos <- full *todos
   with {result (do t <- todos; where t.owner == owner; yield t)} yield result)
 
 api (serve Api where
@@ -35,7 +35,7 @@ api (serve Api where
     addTodo title owner priority
     yield (Result.Ok {value {title title owner owner priority (Priority.Low {})}})
   GetCount = \{} -> do
-    todos <- *todos
+    todos <- full *todos
     yield (Result.Ok {value (base.count todos)}))
 }
 (base.listen 8080 api)

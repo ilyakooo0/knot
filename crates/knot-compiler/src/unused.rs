@@ -256,7 +256,7 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         ExprKind::Constructor(name) => {
             r.ctors.insert(name.clone());
         }
-        ExprKind::SourceRef(name) => {
+        ExprKind::SourceRef { name, .. } => {
             r.sources.insert(name.clone());
         }
         ExprKind::DerivedRef(name) => {

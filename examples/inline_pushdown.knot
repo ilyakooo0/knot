@@ -11,27 +11,27 @@ inDept (\name e -> e.dept == name)
 
 -- 1. filter where the predicate body calls a helper function.
 case1 (do
-  emps <- *employees
+  emps <- full *employees
   yield (emps |> base.filter (\e -> isHighEarner e)))
 
 -- 2. minOn where the projection lambda body calls a helper.
 case2 (do
-  emps <- *employees
+  emps <- full *employees
   yield (emps |> base.minOn (\e -> salaryOf e)))
 
 -- 3. filter then count, with predicate via helper.
 case3 (do
-  emps <- *employees
+  emps <- full *employees
   with {filtered (emps |> base.filter (\e -> isHighEarner e))} yield (base.count filtered))
 
 -- 4. filter using a curried helper.
 case4 (do
-  emps <- *employees
+  emps <- full *employees
   yield (base.filter (inDept "Eng") emps))
 
 -- 5. countWhere with helper-built predicate.
 case5 (do
-  emps <- *employees
+  emps <- full *employees
   yield (base.countWhere (\e -> isHighEarner e) emps))
 }
 (do

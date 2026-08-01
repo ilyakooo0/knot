@@ -638,7 +638,7 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
                 ast::Literal::Bytes(_) => return None,
             },
             ast::ExprKind::Var(n) | ast::ExprKind::Constructor(n) => n.clone(),
-            ast::ExprKind::SourceRef(n) => format!("*{n}"),
+            ast::ExprKind::SourceRef { name: n, .. } => format!("*{n}"),
             ast::ExprKind::DerivedRef(n) => format!("&{n}"),
             ast::ExprKind::FieldAccess { expr: recv, field } => {
                 format!("{}.{field}", go(recv, true)?)
@@ -872,7 +872,7 @@ pub(crate) fn find_field_access_at_offset(
     fn classify_receiver(expr: &ast::Expr) -> ReceiverKind {
         match &expr.node {
             ast::ExprKind::Var(n) => ReceiverKind::Var(n.clone()),
-            ast::ExprKind::SourceRef(n) => ReceiverKind::SourceRef(n.clone()),
+            ast::ExprKind::SourceRef { name: n, .. } => ReceiverKind::SourceRef(n.clone()),
             ast::ExprKind::DerivedRef(n) => ReceiverKind::DerivedRef(n.clone()),
             _ => ReceiverKind::Other,
         }
@@ -963,7 +963,7 @@ pub(crate) fn resolve_var_to_source(
 
     fn rhs_source_name(rhs: &ast::Expr) -> Option<String> {
         match &rhs.node {
-            ast::ExprKind::SourceRef(n) | ast::ExprKind::DerivedRef(n) => Some(n.clone()),
+            ast::ExprKind::SourceRef { name: n, .. } | ast::ExprKind::DerivedRef(n) => Some(n.clone()),
             // `filter f *src`, `take n *src`, etc. — peel App chains to find
             // an underlying source ref.
             ast::ExprKind::App { func, arg } => {

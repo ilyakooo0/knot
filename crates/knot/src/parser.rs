@@ -1379,25 +1379,67 @@ impl Parser {
             TokenKind::Full => {
                 // `full *rel = expr` is a replace-set expression. So is
                 // `full db.*rel = expr` (a source-field on a record-var:
-                // `Lower` `.` `StarIdent`). Otherwise `replace` is treated as
-                // a regular identifier.
+                // `Lower` `.` `StarIdent`). A bare `full *rel` (no `=`) is a
+                // full-read marker: the user acknowledges the read loads the
+                // whole relation into memory. Otherwise `full` is a regular
+                // identifier.
                 let mut offset = 1;
                 while self.peek_ahead(offset) == &TokenKind::Newline {
                     offset += 1;
                 }
                 let next = self.peek_ahead(offset);
-                let is_source_target = next == &TokenKind::Star || matches!(next, TokenKind::StarIdent(_));
                 // `db.*rel` — a record-var target whose field is a source.
                 let is_record_source_target = matches!(next, TokenKind::Lower(_))
                     && self.peek_ahead(offset + 1) == &TokenKind::Dot
                     && matches!(self.peek_ahead(offset + 2), TokenKind::StarIdent(_));
-                if is_source_target || is_record_source_target {
+                if is_record_source_target {
                     let replace_start = self.span();
-                    self.advance(); // consume `replace`
+                    self.advance(); // consume `full`
                     self.skip_newlines();
                     self.parse_set_with_start(true, replace_start)
+                } else if next == &TokenKind::Star || matches!(next, TokenKind::StarIdent(_)) {
+                    // Bare `*rel` target: read vs write decided by a following `=`.
+                    // Find the token just past the source reference.
+                    let past = if matches!(next, TokenKind::StarIdent(_)) {
+                        offset + 1 // `*rel` is one token
+                    } else {
+                        offset + 2 // `*` then `rel`
+                    };
+                    let after = self.peek_ahead(past);
+                    if after == &TokenKind::Eq {
+                        // Write: `full *rel = expr`.
+                        let replace_start = self.span();
+                        self.advance(); // consume `full`
+                        self.skip_newlines();
+                        self.parse_set_with_start(true, replace_start)
+                    } else {
+                        // Read: `full *rel` — mark the SourceRef as full.
+                        let start = self.span();
+                        self.advance(); // consume `full`
+                        self.skip_newlines();
+                        let tok = self.advance();
+                        let name = match tok.kind {
+                            TokenKind::StarIdent(n) => n.trim_start_matches('*').to_string(),
+                            TokenKind::Star => {
+                                let id = self.advance();
+                                match id.kind {
+                                    TokenKind::Lower(n) => n,
+                                    _ => {
+                                        self.error("expected identifier after '*' for source reference");
+                                        return None;
+                                    }
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                        let end = self.prev_span();
+                        Some(Spanned::new(
+                            ExprKind::SourceRef { name, full: true },
+                            Span::new(start.start, end.end),
+                        ))
+                    }
                 } else {
-                    // `replace` used as a regular identifier — fall through to
+                    // `full` used as a regular identifier — fall through to
                     // Pratt parsing so binary operators and application work.
                     self.parse_expr_bp(0)
                 }
@@ -2093,7 +2135,7 @@ impl Parser {
                 let tok = self.advance();
                 let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
                 Some(Spanned::new(
-                    ExprKind::SourceRef(n.trim_start_matches('*').to_string()),
+                    ExprKind::SourceRef { name: n.trim_start_matches('*').to_string(), full: false },
                     Span::new(start.start, tok.span.end),
                 ))
             }
@@ -2105,7 +2147,7 @@ impl Parser {
                         let tok = self.advance();
                         let TokenKind::Lower(name) = tok.kind else { unreachable!() };
                         Some(Spanned::new(
-                            ExprKind::SourceRef(name),
+                            ExprKind::SourceRef { name, full: false },
                             Span::new(start.start, tok.span.end),
                         ))
                     }

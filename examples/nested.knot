@@ -13,7 +13,7 @@ type Person = {name: Text, age: Int 1}
 
   -- Read nested members: bind the team, then bind its members field.
   base.println "Before:"
-  teams <- *teams
+  teams <- full *teams
   base.forEach teams (\t -> do
     base.forEach t.members (\m -> base.println ("  " ++ t.name ++ ": " ++ m.name)))
 
@@ -26,7 +26,7 @@ type Person = {name: Text, age: Int 1}
       yield m) }
 
   base.println "After:"
-  teams2 <- *teams
+  teams2 <- full *teams
   base.forEach teams2 (\t -> do
     base.forEach t.members (\m -> base.println ("  " ++ t.name ++ ": " ++ m.name)))
 

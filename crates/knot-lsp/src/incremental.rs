@@ -558,7 +558,7 @@ fn collect_expr_names(expr: &ast::Expr, out: &mut HashSet<String>) {
         ast::ExprKind::Var(name) => {
             out.insert(name.clone());
         }
-        ast::ExprKind::SourceRef(name) | ast::ExprKind::DerivedRef(name) => {
+        ast::ExprKind::SourceRef { name, .. } | ast::ExprKind::DerivedRef(name) => {
             out.insert(name.clone());
         }
         ast::ExprKind::Constructor(name) => {

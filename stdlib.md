@@ -89,7 +89,7 @@ Keep rows where the predicate returns `True`.
 ```knot
 *people : [{name: Text, age: Int 1}]
 &seniors = (do
-  people <- *people
+  people <- full *people
   yield (base.filter (\p -> p.age > 65) people))
 ```
 
@@ -104,7 +104,7 @@ Apply a function to each row. Results are deduplicated (relations are sets).
 ```knot
 *people : [{name: Text, age: Int 1}]
 &names = (do
-  people <- *people
+  people <- full *people
   yield (base.map (\p -> {name p.name}) people))
 ```
 
@@ -124,10 +124,10 @@ data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 *shapes : [Shape]
 
 &circles = (do
-  shapes <- *shapes
+  shapes <- full *shapes
   yield (base.match Shape.Circle shapes))    -- : [{radius: Float 1}]
 &rects = (do
-  shapes <- *shapes
+  shapes <- full *shapes
   yield (base.match Shape.Rect shapes))      -- : [{width: Float 1, height: Float 1}]
 ```
 
@@ -168,7 +168,7 @@ Return the number of rows in a relation.
 ```knot
 *people : [{name: Text, age: Int 1}]
 &numPeople = (do
-  people <- *people
+  people <- full *people
   yield (base.count people))
 ```
 
@@ -185,7 +185,7 @@ Count rows that satisfy a predicate. Equivalent to `count . filter`, but pushes 
 ```knot
 *employees : [{name: Text, dept: Text, salary: Int 1}]
 engHeadcount do
-  employees <- *employees
+  employees <- full *employees
   yield (base.countWhere (\e -> e.dept == "Eng") employees)
 ```
 
@@ -203,13 +203,13 @@ total (base.sum [10 20 30]) -- 60
 -- Sum a record field by projecting first (source read is IO, so bind first):
 *people : [{name: Text, age: Int 1}]
 &totalAge = (do
-  people <- *people
+  people <- full *people
   yield (base.sum (base.map (\p -> p.age) people)))
 
 -- Unit-preserving:
 *trips : [{distance: Float M}]
 &totalDistance = (do
-  trips <- *trips
+  trips <- full *trips
   yield (base.sum (base.map (\t -> t.distance) trips))) -- Float M if distance : Float M
 ```
 
@@ -232,11 +232,11 @@ Minimum of a projected field over a relation. The projection can return any orde
 ```knot
 *employees : [{name: Text, salary: Int 1}]
 lowestSalary do
-  employees <- *employees
+  employees <- full *employees
   yield (base.minOn (\e -> e.salary) employees)
 
 firstName do
-  employees <- *employees
+  employees <- full *employees
   yield (base.minOn (\e -> e.name) employees)
 ```
 
@@ -253,7 +253,7 @@ Maximum of a projected field over a relation. Like `minOn`, works with any order
 ```knot
 *employees : [{name: Text, salary: Int 1}]
 highestSalary do
-  employees <- *employees
+  employees <- full *employees
   yield (base.maxOn (\e -> e.salary) employees)
 ```
 
@@ -284,8 +284,8 @@ Set union of two relations.
 *employees : [{name: Text}]
 *contractors : [{name: Text}]
 &everyone = (do
-  employees <- *employees
-  contractors <- *contractors
+  employees <- full *employees
+  contractors <- full *contractors
   yield (base.union employees contractors))
 ```
 
@@ -301,8 +301,8 @@ Set difference — rows in the first relation but not the second.
 *employees : [{name: Text}]
 *managers : [{name: Text}]
 &nonManagers = (do
-  employees <- *employees
-  managers <- *managers
+  employees <- full *employees
+  managers <- full *managers
   yield (base.diff employees managers))
 ```
 
@@ -364,7 +364,7 @@ Pushes down to SQL `ORDER BY` when applied to a source relation. Combined with `
 ```knot
 *employees : [{name: Text, salary: Int 1}]
 &topFive = do
-  employees <- *employees
+  employees <- full *employees
   yield (employees |> base.sortBy (\e -> -e.salary) |> base.take 5)
 -- SQL: SELECT ... FROM _knot_employees ORDER BY -salary LIMIT 5
 ```
@@ -457,7 +457,7 @@ Cancellation is cooperative but aggressive: the loser's `knot_io_run` checks its
 ```knot
 *accounts : [{name: Text, balance: Int 1}]
 transfer \from to amount -> atomic do
-  accounts <- *accounts
+  accounts <- full *accounts
   *accounts = do
     a <- accounts
     yield (case a.name == from of
@@ -478,7 +478,7 @@ Used inside `atomic` blocks only. Causes the transaction to rollback and wait un
 ```knot
 *tasks : [{id: Int 1, status: Text}]
 waitForTask \id -> atomic do
-  tasks <- *tasks
+  tasks <- full *tasks
   with {done do
     t <- tasks
     where t.id == id
@@ -1234,9 +1234,9 @@ double \x -> x + x
 
 (do
   base.println (base.show (base.avg   (\t -> t.distance) *trips))
-  base.println (base.show (base.sum   (base.map (\t -> t.distance) *trips)))
-  base.println (base.show (base.minOn (\t -> t.distance) *trips))
-  base.println (base.show (base.maxOn (\t -> t.distance) *trips))
+  base.println (base.show (base.sum   (base.map (\t -> t.distance) (full *trips))))
+  base.println (base.show (base.minOn (\t -> t.distance) (full *trips)))
+  base.println (base.show (base.maxOn (\t -> t.distance) (full *trips)))
   yield {})
 ```
 

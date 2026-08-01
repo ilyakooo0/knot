@@ -37,7 +37,7 @@ fn desugar_inner(expr: &mut Expr) {
     let io_fns = detect_io_functions(expr);
     let no_source_vars = HashSet::new();
     // Rewrite `rec.*name` field access on a static source-record
-    // (`db = { *todos : [Todo], … }`) to a plain `SourceRef(name)`. The record
+    // (`db = { *todos : [Todo], … }`) to a plain `SourceRef { name, .. }`. The record
     // value is erased to unit at runtime and every downstream source-read
     // path (do-block binds, `count`, SQL pushdown, STM tracking) keys on
     // `SourceRef` — routing through them unchanged is far less invasive than
@@ -198,7 +198,7 @@ enum RecordRelKind {
     Derived,
 }
 
-/// Rewrite `rec.*name` → `SourceRef(name)` / `rec.&name` → `DerivedRef(name)`
+/// Rewrite `rec.*name` → `SourceRef { name, .. }` / `rec.&name` → `DerivedRef(name)`
 /// when `rec` is a static source-record that declares that relation.
 fn rewrite_record_source_refs(expr: &mut Expr) {
     let map = collect_record_source_fields(expr);
@@ -225,7 +225,7 @@ fn rewrite_source_refs_in_expr(
             && names.iter().any(|(n, k)| n == bare && *k == kind)
         {
             expr.node = match kind {
-                RecordRelKind::Source => ExprKind::SourceRef(bare.to_string()),
+                RecordRelKind::Source => ExprKind::SourceRef { name: bare.to_string(), full: false },
                 RecordRelKind::Derived => ExprKind::DerivedRef(bare.to_string()),
             };
             return;
@@ -434,7 +434,7 @@ fn type_returns_io(ty: &Type) -> bool {
 fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<String>) -> bool {
     match &expr.node {
         ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name.as_str()),
-        ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
+        ExprKind::SourceRef { .. } | ExprKind::DerivedRef(_) => true,
         ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
         ExprKind::Atomic(_) => true,
         ExprKind::TimeUnitLit { value, .. } => expr_contains_io(value, builtins, io_fns),
@@ -718,7 +718,7 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
 fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) {
     match &mut expr.node {
         ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Constructor(_)
-        | ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) | ExprKind::ImplicitRef(_) | ExprKind::TypeHole => {}
+        | ExprKind::SourceRef { .. } | ExprKind::DerivedRef(_) | ExprKind::ImplicitRef(_) | ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
         ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
@@ -867,7 +867,7 @@ fn desugar_do_stmts(stmts: &mut [Stmt], io_fns: &IoFns, source_vars: &HashSet<St
         if let StmtKind::Bind { pat, expr } = &stmt.node {
             let mut bound: Vec<String> = Vec::new();
             pat_bound_names(pat, &mut bound);
-            let is_source_read = matches!(&expr.node, ExprKind::SourceRef(_));
+            let is_source_read = matches!(&expr.node, ExprKind::SourceRef { .. });
             if let (PatKind::Var(name), true) = (&pat.node, is_source_read) {
                 local.insert(name.clone());
             } else {
@@ -942,7 +942,7 @@ fn is_sql_compilable(stmts: &[Stmt], source_vars: &HashSet<String>) -> bool {
                     // provably a source-bound variable from an enclosing
                     // do-block (codegen resolves these via source_var_binds).
                     let ok = match &expr.node {
-                        ExprKind::SourceRef(_) => true,
+                        ExprKind::SourceRef { .. } => true,
                         ExprKind::Var(v) => source_vars.contains(v),
                         _ => false,
                     };
@@ -1208,7 +1208,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
                 && name.as_str() != "retry")
                 || io_fns.contains(name.as_str())
         }
-        ExprKind::SourceRef(_) | ExprKind::DerivedRef(_) => true,
+        ExprKind::SourceRef { .. } | ExprKind::DerivedRef(_) => true,
         ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
         ExprKind::Atomic(_) => true,
         ExprKind::BinOp { lhs, rhs, .. } => {

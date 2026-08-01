@@ -4,11 +4,11 @@ type Todo = {title: Text, owner: Text, done: Int 1}
 *todos : [Todo]
 
 add (\title owner -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = base.union todos [{title title owner owner done 0}])
 
 complete (\title -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = do
     t <- todos
     yield (case t.title == title of
@@ -16,7 +16,7 @@ complete (\title -> do
       Bool.False {} -> t))
 
 pending (\owner -> do
-  todos <- *todos
+  todos <- full *todos
   with {result (do t <- todos; where t.done == 0; where t.owner == owner; yield t.title)} yield result)
 }
 (do

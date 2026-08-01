@@ -216,7 +216,7 @@ fn collect_edges(
         // (their bodies can in turn reference derived relations, forming
         // cycles); ordinary user sources are not nodes, so non-view
         // SourceRefs fall through and contribute no edge.
-        ast::ExprKind::SourceRef(name) if node_names.contains(name) => {
+        ast::ExprKind::SourceRef { name, .. } if node_names.contains(name) => {
             out.push(Edge { target: name.clone(), polarity, span: expr.span });
         }
         // A variable aliasing a node carries that node's dependency at the
@@ -235,7 +235,7 @@ fn collect_edges(
         | ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::ImplicitRef(_)
-        | ast::ExprKind::SourceRef(_)
+        | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::TypeHole => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {

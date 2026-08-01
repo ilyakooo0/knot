@@ -4,7 +4,7 @@ with {
 *manages : [{manager: Text, report: Text}]
 
 &directReports = (do
-  manages <- *manages
+  manages <- full *manages
   yield (do
     m <- manages
     yield {manager m.manager report m.report}))

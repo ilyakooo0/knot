@@ -21,7 +21,7 @@ setBalance (\aid newBalance rows -> do
     Bool.False {} -> r))
 
 credit (\aid amount -> atomic do
-  rows <- *accounts
+  rows <- full *accounts
   -- The `single (filter ...)` lookup is what the runtime SQL pushdown turns
   -- into a `WHERE "id" = ?` query — codegen extracts the predicate and the
   -- runtime calls `knot_stm_track_read_pred` to register a row-level filter.
@@ -33,6 +33,6 @@ credit (\aid amount -> atomic do
   credit 1 100
   credit 2 50
   credit 3 25
-  rows <- *accounts
+  rows <- full *accounts
   base.println ("final: " ++ base.show rows)
   yield {})

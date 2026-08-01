@@ -51,7 +51,7 @@ httpCodes ([{code 200 name "OK"} {code 404 name "Not Found"}])
 
 -- Derived: references source relations, recomputed on access (read-only)
 &seniors = do
-  people <- *people
+  people <- full *people
   yield (base.filter (\p -> p.age > 65) people)
 ```
 
@@ -132,7 +132,7 @@ type Person = {name: Text, role: Text}
 
 -- All people across all teams
 &allMembers = do
-  teams <- *teams
+  teams <- full *teams
   with {result do
     t <- teams
     m <- t.members
@@ -142,7 +142,7 @@ type Person = {name: Text, role: Text}
 
 -- Engineers on large teams
 &engineers = do
-  teams <- *teams
+  teams <- full *teams
   with {result do
     t <- teams
     where (base.count t.members) > 10
@@ -163,7 +163,7 @@ type Person = {name: Text, role: Text}
 
 -- Add a member to a team
 addMember \teamName person -> do
-  teams <- *teams
+  teams <- full *teams
   *teams = do
     t <- teams
     yield (case t.name == teamName of
@@ -172,7 +172,7 @@ addMember \teamName person -> do
 
 -- Remove a member from all teams
 removePerson \personName -> do
-  teams <- *teams
+  teams <- full *teams
   *teams = do
     t <- teams
     yield {t | members do
@@ -195,7 +195,7 @@ type FlatMembership = {team: Text, member: Text, age: Int 1}
 
 -- Nest: group a flat relation into nested structure
 &nested = do
-  memberships <- *memberships
+  memberships <- full *memberships
   with {result do
     t <- do m <- memberships; yield m.team
     yield {name t members (do
@@ -207,7 +207,7 @@ type FlatMembership = {team: Text, member: Text, age: Int 1}
 
 -- Flatten: expand nested relation into flat rows
 &flat = do
-  teams <- *teams
+  teams <- full *teams
   with {result do
     t <- teams
     m <- t.members
@@ -227,7 +227,7 @@ type Course = {name: Text, students: [{name: Text, grades: [{subject: Text, scor
 
 -- Find all failing grades across all departments
 &failing = do
-  departments <- *departments
+  departments <- full *departments
   with {result do
     d <- departments
     c <- d.courses
@@ -286,8 +286,8 @@ richOnes \employees departments -> do
 
 -- IO do block (binds from *rel, which returns IO)
 &richEmployees = do
-  employees <- *employees
-  departments <- *departments
+  employees <- full *employees
+  departments <- full *departments
   yield (richOnes employees departments)
 
 -- do with Maybe
@@ -385,7 +385,7 @@ base.inter \a b -> do
 ```knot
 *rel : [{x: Int 1}]
 insertRow \x -> do
-  rows <- *rel
+  rows <- full *rel
   *rel = base.union rows [{x x}]
 ```
 
@@ -394,7 +394,7 @@ insertRow \x -> do
 ```knot
 *rel : [{x: Int 1}]
 deleteWhere \p -> do
-  rows <- *rel
+  rows <- full *rel
   *rel = base.filter (\x -> not (p x)) rows
 ```
 
@@ -403,7 +403,7 @@ deleteWhere \p -> do
 ```knot
 *rel : [{x: Int 1}]
 updateWhere \p f -> do
-  rows <- *rel
+  rows <- full *rel
   *rel = base.map (\x -> case p x of Bool.True {} -> f x; Bool.False {} -> x) rows
 ```
 
@@ -447,6 +447,8 @@ Binding two sources and relating them with an equi-join predicate (`e.dept == d.
 
 Record fields in the `yield` need explicit names — `{name e.ename}`, not `{e.ename}` (there is no field-name shorthand). Relation references (`*rel`, `&rel`) return `IO {} value`; binding them inside a read-only comprehension is handled directly by the compiler, which reads the sources as part of the query.
 
+**`full` reads.** When a relation read is not pushed down to SQL, the whole relation is loaded into memory, and the read must be marked with `full` before the relation name (`rows <- full *rel`). Pushed-down reads — a translatable comprehension, or a recognized aggregate such as `base.count *rel` — need no marker; the compiler reports an error at any read it cannot push down, so a full table load is always explicit in the source. Writing `full` on a read that is actually pushed down is allowed and has no effect.
+
 ### Pipe-Forward Composition
 
 Derived combinators like `filter` compose with `|>`:
@@ -454,7 +456,7 @@ Derived combinators like `filter` compose with `|>`:
 ```knot
 *employees : [{name: Text, salary: Int 1}]
 &highEarners = do
-  employees <- *employees
+  employees <- full *employees
   yield (employees
     |> base.filter (\e -> e.salary > 150000)
     |> base.map (\e -> {name e.name salary e.salary}))
@@ -469,11 +471,11 @@ data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 *shapes : [Shape]
 
 &circles = do                              -- : IO [{radius: Float 1}]
-  shapes <- *shapes
+  shapes <- full *shapes
   yield (base.match Shape.Circle shapes)
 
 &rects = do                                -- : IO [{width: Float 1, height: Float 1}]
-  shapes <- *shapes
+  shapes <- full *shapes
   yield (base.match Shape.Rect shapes)
 
 &bigCircles = do
@@ -492,7 +494,7 @@ data Status = Blocked {dependencies: [Text]} | Open {}
 *tickets : [{title: Text, status: Status}]
 
 &bigCircleAreas = do
-  shapes <- *shapes
+  shapes <- full *shapes
   with {result do
     Shape.Circle c <- shapes
     where c.radius > 10.0
@@ -501,7 +503,7 @@ data Status = Blocked {dependencies: [Text]} | Open {}
     yield result)
 
 &blockedDetails = do
-  tickets <- *tickets
+  tickets <- full *tickets
   with {result do
     t <- tickets
     Status.Blocked {dependencies deps} <- t.status
@@ -519,7 +521,7 @@ Operate on the whole relation with `case`:
 data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 *shapes : [Shape]
 scale \factor -> do
-  shapes <- *shapes
+  shapes <- full *shapes
   *shapes = do
     s <- shapes
     yield (case s of
@@ -562,7 +564,7 @@ Multiple key fields group by their combination:
 *orders : [{region: Text, status: Text, amount: Int 1}]
 &summary = do
   with {result do
-    o <- *orders
+    o <- full *orders
     groupBy {region o.region status o.status}
     yield {region o.region status o.status total (base.count o)}}
   (do
@@ -611,7 +613,7 @@ type Person = {name: Text, age: Int 1}
 *people : [Person]
 }
 (do
-  people <- *people                       -- IO [Person] → binds [Person]
+  people <- full *people                       -- IO [Person] → binds [Person]
   content <- base.readFile "input.txt"    -- IO Text → binds Text
   base.println content                     -- IO {}
   t <- base.now                            -- IO (Int Ms) → binds Int Ms
@@ -624,7 +626,7 @@ The pattern for querying relations is: IO-bind to get the value, then pure compr
 ```knot
 *employees : [{name: Text, salary: Int 1}]
 &richEmployees = do
-  employees <- *employees       -- IO bind: [Employee] from IO [Employee]
+  employees <- full *employees       -- IO bind: [Employee] from IO [Employee]
   with {result do              -- pure comprehension on the value
     e <- employees
     where e.salary > 100000
@@ -647,12 +649,12 @@ formatName \n -> base.toUpper (base.take 1 n) ++ base.drop 1 n
 
 -- DB read
 &seniors = do
-  people <- *people
+  people <- full *people
   yield (base.filter (\p -> p.age > 65) people)
 
 -- DB write
 birthday \name -> do
-  people <- *people
+  people <- full *people
   *people = do
     p <- people
     yield (case p.name == name of Bool.True {} -> {p | age (p.age + 1)}; Bool.False {} -> p)
@@ -665,7 +667,7 @@ Effect signatures are inferred; you do not write them. A function that touches t
 ```knot
 *people : [{name: Text, age: Int 1}]
 birthday \name -> do
-  people <- *people
+  people <- full *people
   *people = do
     p <- people
     yield (case p.name == name of Bool.True {} -> {p | age (p.age + 1)}; Bool.False {} -> p)
@@ -681,9 +683,9 @@ keyword form (not a `base.` function); the block is an `IO a`.
 -- DB writes go in `atomic`, IO happens after commit
 handleOrder \req -> do
   orderId <- atomic do
-    orders <- *orders
+    orders <- full *orders
     *orders = base.union orders [{item req.body.item qty 1}]
-    newOrders <- *orders
+    newOrders <- full *orders
     yield (base.count newOrders)
   base.println ("New order #" ++ base.show orderId)
   yield {orderId orderId}
@@ -703,7 +705,7 @@ The compiler enforces that `retry` is only used inside `atomic`. This enables bl
 *status : [{ready: Int 1}]
 -- Wait until a condition is met
 waitForReady (atomic do
-  status <- *status
+  status <- full *status
   base.when (base.count (base.filter (\s -> s.ready == 1) status) == 0) base.retry
   yield status)
 ```
@@ -783,7 +785,7 @@ fork : IO a -> IO {}
 *counter : [{n: Int 1}]
 
 increment do
-  c <- *counter
+  c <- full *counter
   *counter = [{n ((base.fold (\_ x -> x.n) 0 c) + 1)}]
 
 do
@@ -805,7 +807,7 @@ The combination of `fork`, `atomic`, and `retry` enables STM-style concurrent co
 *tasks : [{id: Int 1, status: Text}]
 
 waitForCompletion \id -> atomic do
-  tasks <- *tasks
+  tasks <- full *tasks
   with {task do
     t <- tasks
     where t.id == id
@@ -900,11 +902,11 @@ route Api where
   PUT {owner: Text, person: Text} /todos/{title: Text}/assign -> {ok: Bool} = AssignTodo
 
 add \title owner priority -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = base.union todos [{title title owner owner priority priority status (Status.Open {})}]
 
 assign \title owner person -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = do
     t <- todos
     yield (case t.title == title of
@@ -912,7 +914,7 @@ assign \title owner person -> do
       Bool.False {} -> t)
 
 pendingFor \user page limit -> do
-  todos <- *todos
+  todos <- full *todos
   with {result (do t <- todos; where t.owner == user; yield t)} yield result
 
 api (serve Api where
@@ -942,7 +944,7 @@ route Api where
 
 api (serve Api where
   GetUser = \{id id} -> do
-    users <- *people
+    users <- full *people
     case base.filter (\u -> u.id == id) users of
       [ ] -> yield (Result.Err {error {status 404 message "user not found"}})
       Cons u rest -> yield (Result.Ok {value u})
@@ -951,7 +953,7 @@ api (serve Api where
       Bool.True {} -> yield (Result.Err {error {status 400 message "name required"}})
       Bool.False {} -> do
         atomic do
-          users <- *people
+          users <- full *people
           *people = base.union users [{id 0 name name email email}]
         yield (Result.Ok {value {name name email email}}))
 ```
@@ -992,13 +994,13 @@ route Api where
   GET /health -> {status: Text} = HealthCheck
 
 addTodo \title -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = base.union todos [{title title}]
   yield {id 1}
 
 api (serve Api where
   GetTodos = \{authorization authorization} -> do
-    todos <- *todos
+    todos <- full *todos
     yield (Result.Ok {value {body todos headers {xTotalCount (base.count todos) xPage 1}}})
   CreateTodo = \{title title authorization authorization xIdempotencyKey xIdempotencyKey} -> do
     r <- addTodo title
@@ -1154,9 +1156,9 @@ route Api where
 api (serve Api where
   CreateOrder = \{item item qty qty} -> do
     orderId <- atomic do
-      orders <- *orders
+      orders <- full *orders
       *orders = base.union orders [{item item qty qty}]
-      newOrders <- *orders
+      newOrders <- full *orders
       yield (base.count newOrders)
     base.println ("New order #" ++ base.show orderId)
     yield (Result.Ok {value {orderId orderId}}))
@@ -1167,7 +1169,7 @@ For sub-transaction boundaries:
 ```knot
 *accounts : [{name: Text, balance: Int 1}]
 transfer \from to amount -> do
-  accounts <- *accounts
+  accounts <- full *accounts
   *accounts = do
     a <- accounts
     yield (case a.name == from of
@@ -1191,19 +1193,19 @@ All mutation is done through the `*rel = expr` write, which makes a persistent r
 
 -- Insert: union with a singleton
 addPerson do
-  people <- *people
+  people <- full *people
   *people = base.union people [{name "Alice" age 30}]
 
 -- Update: map with a conditional
 birthday \name -> do
-  people <- *people
+  people <- full *people
   *people = do
     p <- people
     yield (case p.name == "Alice" of Bool.True {} -> {p | age (p.age + 1)}; Bool.False {} -> p)
 
 -- Delete: filter to keep the rest
 removePerson \name -> do
-  people <- *people
+  people <- full *people
   *people = do
     p <- people
     where p.name != name
@@ -1219,9 +1221,9 @@ Relations are sets. Two rows are the same row iff all their fields are equal. Se
 
 -- Adding an already-existing row changes nothing
 addAliceTwice do
-  people <- *people
+  people <- full *people
   *people = base.union people [{name "Alice" age 30}]
-  people2 <- *people
+  people2 <- full *people
   *people = base.union people2 [{name "Alice" age 30}]  -- no change
 ```
 
@@ -1246,7 +1248,7 @@ data Status = Open {} | Closed {}
 *todos : [{title: Text, owner: Text, priority: Priority}]
 
 &seniorStaff = do                                            -- read-only (& prefix)
-  employees <- *employees
+  employees <- full *employees
   yield (base.filter (\e -> e.salary > 100000) employees)
 
 *openTodos = do                                              -- settable (* prefix)
@@ -1296,12 +1298,12 @@ data Status = Open {} | Closed {}
 
 -- Insert through view — the compiler constrains status to Open {}
 addOpenTodo do
-  openTodos <- *openTodos
+  openTodos <- full *openTodos
   *openTodos = base.union openTodos [{title "New task" owner "Alice" priority (Priority.High {}) status (Status.Open {})}]
 
 -- Delete through view — only affects rows matching the constant
 removeAliceTodos do
-  openTodos <- *openTodos
+  openTodos <- full *openTodos
   *openTodos = do
     t <- openTodos
     where t.owner != "Alice"
@@ -1330,7 +1332,7 @@ Datalog-style transitive closure:
 *manages : [{manager: Text, report: Text}]
 
 &reportsTo : [{ancestor: Text, descendant: Text}] = do
-  manages <- *manages
+  manages <- full *manages
   reportsTo <- &reportsTo
   yield (base.union
     (do m <- manages
@@ -1629,7 +1631,7 @@ type Measurement = {distance: Float M, time: Float S}
 
 -- Units flow through queries
 &speeds = do
-  measurements <- *measurements
+  measurements <- full *measurements
   with {result do
     m <- measurements
     yield {speed (m.distance / m.time)}}   -- Float (M/S)
@@ -1912,7 +1914,7 @@ api (serve Api where
     case mkPerson name age email of
       Result.Ok {value person} -> do
         atomic do
-          people <- *people
+          people <- full *people
           *people = base.union people [person]
         yield (Result.Ok {value {ok (Bool.True {}) error (Maybe.Nothing {})}})
       Result.Err {error e} ->
@@ -2042,7 +2044,7 @@ route Api where
 formatTitle \title -> base.toUpper (base.take 1 title) ++ base.drop 1 title
 
 pendingFor \user -> do
-  todos <- *todos
+  todos <- full *todos
   with {result do
     t <- todos
     where t.owner == user
@@ -2052,11 +2054,11 @@ pendingFor \user -> do
     yield result)
 
 add \title owner priority -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = base.union todos [{title (formatTitle title) owner owner priority priority status (Status.Open {})}]
 
 assign \title owner person -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = do
     t <- todos
     yield (case t.title == title && t.owner == owner of
@@ -2064,7 +2066,7 @@ assign \title owner person -> do
       Bool.False {} -> t)
 
 resolve \title owner msg -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = do
     t <- todos
     yield (case t.title == title && t.owner == owner of

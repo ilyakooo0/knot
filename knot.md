@@ -11,7 +11,7 @@ type Person = {name: Text, age: Int 1}
 
 do
   full *people = [{name "Alice" age 30} {name "Bob" age 25}]
-  people <- *people
+  people <- full *people
   with {result do
     p <- people
     where p.age > 27
@@ -156,7 +156,7 @@ data Status = Open {} | Closed {}
 
 -- Derived: read-only computed relation
 &seniors = do
-  people <- *people
+  people <- full *people
   yield (base.filter (\p -> p.age > 65) people)
 
 -- Constant
@@ -321,6 +321,27 @@ The join columns (`employees.dept`, `departments.name`) and filter columns
 planner cannot translate falls back to reading the sources and joining in
 memory — results are identical either way, only the strategy differs.
 
+### `full` reads
+
+When a relation read is **not** pushed down to SQL, the whole relation is
+loaded into memory. Knot requires you to mark such a read with `full` before
+the relation name, so the cost is explicit:
+
+```knot
+*people : [{name: Text, age: Int 1}]
+(do
+  people <- full *people            -- whole relation loaded into memory
+  base.println (base.show (base.count people))
+  yield {})
+```
+
+A read that *is* pushed down — a comprehension the planner translates, or a
+recognized aggregate such as `base.count *people` — needs no marker. The
+compiler reports an error (`reading `*rel` loads the whole relation into
+memory … write `full *rel``) at any read it cannot push down, so you always
+know where a full table load happens. Writing `full` on a read that turns out
+to be pushed down is allowed and has no effect.
+
 Statements in a `do` block:
 
 | Statement | Meaning |
@@ -347,7 +368,7 @@ do
 -- IO do block with DB operations
 *people : [{name: Text, age: Int 1}]
 addPerson \name age -> do
-  people <- *people
+  people <- full *people
   *people = base.union people [{name name age age}]
 ```
 
@@ -363,7 +384,7 @@ data Status = InProgress {assignee: Text} | Done {}
 *shapes : [Shape]
 *tickets : [{title: Text, status: Status}]
 &circles = do
-  shapes <- *shapes
+  shapes <- full *shapes
   with {result do
     Shape.Circle c <- shapes
     yield c}
@@ -371,7 +392,7 @@ data Status = InProgress {assignee: Text} | Done {}
     yield result)
 
 &inProgress = do
-  tickets <- *tickets
+  tickets <- full *tickets
   with {result do
     t <- tickets
     Status.InProgress ip <- t.status
@@ -391,12 +412,12 @@ Mutation is written `*rel = expr`, which makes the source relation equal to `exp
 
 -- Insert (union with singleton)
 addPerson do
-  people <- *people
+  people <- full *people
   *people = base.union people [{name "Alice" age 30}]
 
 -- Update (map with conditional)
 birthday \name -> do
-  people <- *people
+  people <- full *people
   *people = do
     p <- people
     yield (case p.name == name of
@@ -405,7 +426,7 @@ birthday \name -> do
 
 -- Delete (filter to keep)
 removePerson \name -> do
-  people <- *people
+  people <- full *people
   *people = do
     p <- people
     where p.name != name
@@ -559,7 +580,7 @@ Fields can hold `[T]` — sets nested inside rows:
 
 -- Query into nested relations
 &allMembers = do
-  teams <- *teams
+  teams <- full *teams
   with {result do
     t <- teams
     m <- t.members
@@ -569,7 +590,7 @@ Fields can hold `[T]` — sets nested inside rows:
 
 -- Update nested relations
 updateTeams do
-  teams <- *teams
+  teams <- full *teams
   *teams = do
     t <- teams
     yield {t | members do
@@ -609,7 +630,7 @@ data Status = Open {} | Closed {}
 
 -- Insert through view — status auto-filled
 addOpenTodo do
-  openTodos <- *openTodos
+  openTodos <- full *openTodos
   *openTodos = base.union openTodos [{title "New task" owner "Alice" priority Priority.High {}}]
 ```
 
@@ -623,12 +644,12 @@ Read-only computed relations, prefixed with `&`:
 *people : [{name: Text, age: Int 1}]
 *todos : [{title: Text, owner: Text, done: Int 1}]
 &seniors = do
-  people <- *people
+  people <- full *people
   yield (base.filter (\p -> p.age > 65) people)
 
 &stats = do
   with {result do
-    t <- *todos
+    t <- full *todos
     groupBy {owner t.owner}
     yield {owner t.owner total (base.count t)}}
   (do
@@ -644,7 +665,7 @@ Datalog-style fixpoint iteration for transitive closure:
 
 -- Base case: direct management edges, renamed to ancestor/descendant
 &direct = (do
-  manages <- *manages
+  manages <- full *manages
   yield (do
     m <- manages
     yield {ancestor m.manager descendant m.report}))
@@ -652,7 +673,7 @@ Datalog-style fixpoint iteration for transitive closure:
 -- Recursive: ancestor/descendant via fixpoint over the base case
 &reportsTo = do
   reportsTo <- &reportsTo     -- self-reference (IO bind)
-  manages <- *manages
+  manages <- full *manages
   direct <- &direct
   with {step do
     r <- reportsTo
@@ -723,7 +744,7 @@ type Person = {name: Text, age: Int 1}
 
 -- All relation operations are IO:
 birthday \name -> do
-  people <- *people              -- IO [Person]
+  people <- full *people              -- IO [Person]
   *people = do               -- IO {}
     p <- people
     yield (case p.name == name of
@@ -741,9 +762,9 @@ birthday \name -> do
 *orders : [{item: Text, qty: Int 1}]
 handleOrder \item -> do
   orderId <- atomic do
-    orders <- *orders
+    orders <- full *orders
     *orders = base.union orders [{item item qty 1}]
-    newOrders <- *orders
+    newOrders <- full *orders
     yield (base.count newOrders)
   base.println ("Order #" ++ base.show orderId)
   yield {orderId orderId}
@@ -1016,11 +1037,11 @@ route AdminApi where
 route Api = TodoApi | AdminApi
 
 addTodo (\title owner -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = base.union todos [{title title owner owner priority (Priority.Low {})}])
 
 getTodos (\owner -> do
-  todos <- *todos
+  todos <- full *todos
   with {result (do t <- todos; where t.owner == owner; yield t)} yield result)
 
 -- Handler
@@ -1032,7 +1053,7 @@ api (serve Api where
     addTodo title owner
     yield (Result.Ok {value {title title owner owner priority (Priority.Low {})}})
   GetCount = \{} -> do
-    todos <- *todos
+    todos <- full *todos
     yield (Result.Ok {value (base.count todos)}))
 ```
 
@@ -1048,7 +1069,7 @@ route Api where
   GET /users/{id: Int 1} -> {id: Int 1, name: Text} = GetUser
 api (serve Api where
   GetUser = \{id id} -> do
-    users <- *people
+    users <- full *people
     case base.filter (\u -> u.id == id) users of
       [] -> yield (Result.Err {error {status 404 message "user not found"}})
       Cons u rest -> yield (Result.Ok {value u}))
@@ -1082,7 +1103,7 @@ route Api where
 
 api (serve Api where
   GetTodos = \{authorization authorization} -> do
-    allTodos <- *todos
+    allTodos <- full *todos
     yield (Result.Ok {value {body allTodos headers {xTotalCount (base.count allTodos)}}}))
 ```
 
@@ -1316,11 +1337,11 @@ type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
 *todos : [Todo]
 
 add \title owner priority -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = base.union todos [{title title owner owner priority priority status (Status.Open {})}]
 
 complete \title -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = do
     t <- todos
     yield (case t.title == title of
@@ -1328,7 +1349,7 @@ complete \title -> do
       Bool.False {} -> t)
 
 assign \title person -> do
-  todos <- *todos
+  todos <- full *todos
   *todos = do
     t <- todos
     yield (case t.title == title of
@@ -1336,7 +1357,7 @@ assign \title person -> do
       Bool.False {} -> t)
 
 pending \owner -> do
-  todos <- *todos
+  todos <- full *todos
   with {result do
     t <- todos
     where t.owner == owner
@@ -1347,7 +1368,7 @@ pending \owner -> do
 
 &workload = do
   with {result do
-    t <- *todos
+    t <- full *todos
     where t.status == Status.Open {}
     groupBy {owner t.owner}
     yield {owner t.owner count (base.count t)}}
@@ -1378,7 +1399,7 @@ do
 ```knot
 *rel : [{value: Int 1}]
 addRow \newRow -> do
-  rel <- *rel
+  rel <- full *rel
   *rel = base.union rel [newRow]
 ```
 
@@ -1387,7 +1408,7 @@ addRow \newRow -> do
 ```knot
 *rel : [{id: Int 1, field: Int 1}]
 deleteWhere \valueToDelete -> do
-  rel <- *rel
+  rel <- full *rel
   *rel = do
     r <- rel
     where r.field != valueToDelete
@@ -1399,7 +1420,7 @@ deleteWhere \valueToDelete -> do
 ```knot
 *rel : [{id: Int 1, field: Int 1}]
 updateWhere \target newValue -> do
-  rel <- *rel
+  rel <- full *rel
   *rel = do
     r <- rel
     yield (case r.id == target of
@@ -1413,8 +1434,8 @@ updateWhere \target newValue -> do
 *employees : [{name: Text, dept: Text}]
 *departments : [{name: Text, budget: Int 1}]
 &joined = do
-  employees <- *employees
-  departments <- *departments
+  employees <- full *employees
+  departments <- full *departments
   with {result do
     e <- employees
     d <- departments
@@ -1430,11 +1451,11 @@ updateWhere \target newValue -> do
 *orders : [{amount: Int 1}]
 *people : [{name: Text, age: Int 1}]
 getTotal do
-  orders <- *orders
+  orders <- full *orders
   yield (base.fold (\acc x -> acc + x.amount) 0 orders)
 
 getCount do
-  people <- *people
+  people <- full *people
   yield (base.count people)
 ```
 
@@ -1446,12 +1467,12 @@ data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 
 -- Using match
 &circles = do
-  shapes <- *shapes
+  shapes <- full *shapes
   yield (base.match Shape.Circle shapes)
 
 -- Using pattern bind in do
 &circles2 = do
-  shapes <- *shapes
+  shapes <- full *shapes
   with {result do
     Shape.Circle c <- shapes
     yield c}

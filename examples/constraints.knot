@@ -20,7 +20,7 @@ type Person = {name: Text, age: Int 1, email: Text}
 
   -- Print current state
   base.println "People:"
-  base.println (base.show *people)
+  base.println (base.show (full *people))
   base.println "Orders:"
-  base.println (base.show *orders)
+  base.println (base.show (full *orders))
   yield {})

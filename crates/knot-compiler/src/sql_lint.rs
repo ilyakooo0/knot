@@ -61,7 +61,7 @@ fn lint_expr(
 ) {
     match &expr.node {
         ExprKind::Set { target, value } => {
-            if let ExprKind::SourceRef(name) = &target.node {
+            if let ExprKind::SourceRef { name, .. } = &target.node {
                 if let Some(schema) = source_schemas.get(name) {
                     lint_set_expr(name, schema, value, source_schemas, views, diags);
                 }
@@ -189,7 +189,7 @@ fn lint_expr(
         ExprKind::Lit(_)
         | ExprKind::Var(_)
         | ExprKind::Constructor(_)
-        | ExprKind::SourceRef(_)
+        | ExprKind::SourceRef { .. }
         | ExprKind::ImplicitRef(_)
         | ExprKind::TypeHole
         | ExprKind::DerivedRef(_) => {}
@@ -244,7 +244,7 @@ fn lint_do_block_skipping(
                 _ => continue,
             };
             let source_name = match &expr.node {
-                ExprKind::SourceRef(name) => name,
+                ExprKind::SourceRef { name, .. } => name,
                 _ => continue,
             };
             if skip_source == Some(source_name.as_str()) {
@@ -365,7 +365,7 @@ fn lint_pipe_chain(
     }
 
     let source_name = match &source.node {
-        ExprKind::SourceRef(name) => name,
+        ExprKind::SourceRef { name, .. } => name,
         _ => return false,
     };
     if views.contains(source_name.as_str()) {
@@ -524,7 +524,7 @@ fn lint_app_form(
             _ => return,
         };
         let source_name = match &arg.node {
-            ExprKind::SourceRef(name) => name,
+            ExprKind::SourceRef { name, .. } => name,
             _ => return,
         };
         if views.contains(source_name.as_str()) {
@@ -912,7 +912,7 @@ fn match_filter_only<'a>(
 
     let bind_var = match &stmts[0].node {
         StmtKind::Bind { pat, expr } => match (&pat.node, &expr.node) {
-            (PatKind::Var(v), ExprKind::SourceRef(name)) if name == source_name => v.clone(),
+            (PatKind::Var(v), ExprKind::SourceRef { name, .. }) if name == source_name => v.clone(),
             _ => return None,
         },
         _ => return None,
@@ -946,7 +946,7 @@ fn match_filter_only<'a>(
 
 fn references_source(expr: &Expr, source_name: &str) -> bool {
     match &expr.node {
-        ExprKind::SourceRef(name) => name == source_name,
+        ExprKind::SourceRef { name, .. } => name == source_name,
         ExprKind::Lit(_)
         | ExprKind::Var(_)
         | ExprKind::Constructor(_)

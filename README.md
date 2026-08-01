@@ -333,7 +333,7 @@ type Todo = {title: Text, done: Int 1}
 
   -- update: bind the rows to a local, then map, marking one done
   -- ({t | done 1} is a record update)
-  todos <- *todos
+  todos <- full *todos
   *todos = (do
     t <- todos
     yield (case t.title == "write guide" of
@@ -361,7 +361,7 @@ with {
 
 -- recomputed on every read; rows are projected from *manages
 &directReports = (do
-  manages <- *manages
+  manages <- full *manages
   yield (do
     m <- manages
     yield {manager m.manager report m.report}))

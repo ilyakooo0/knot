@@ -442,7 +442,7 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::Constructor(_) => {
                 self.add(self.strip_parens(expr.span), TOK_ENUM_MEMBER, 0);
             }
-            ast::ExprKind::SourceRef(_) => {
+            ast::ExprKind::SourceRef { .. } => {
                 self.add(self.strip_parens(expr.span), TOK_NAMESPACE, 0);
             }
             ast::ExprKind::DerivedRef(_) => {
@@ -530,7 +530,7 @@ impl<'a> TokenCollector<'a> {
                 // Highlight mutation targets distinctly. We re-emit the target
                 // span with a MUTATION modifier overlaying whatever inner type
                 // visit_expr would assign.
-                if let ast::ExprKind::SourceRef(_) | ast::ExprKind::DerivedRef(_) = &target.node {
+                if let ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_) = &target.node {
                     self.add(target.span, TOK_NAMESPACE, MOD_MUTATION);
                 } else {
                     self.visit_expr(target);

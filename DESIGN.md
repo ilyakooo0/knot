@@ -447,7 +447,7 @@ Binding two sources and relating them with an equi-join predicate (`e.dept == d.
 
 Record fields in the `yield` need explicit names — `{name e.ename}`, not `{e.ename}` (there is no field-name shorthand). Relation references (`*rel`, `&rel`) return `IO {} value`; binding them inside a read-only comprehension is handled directly by the compiler, which reads the sources as part of the query.
 
-**`full` reads.** When a relation read is not pushed down to SQL, the whole relation is loaded into memory, and the read must be marked with `full` before the relation name (`rows <- full *rel`). Pushed-down reads — a translatable comprehension, or a recognized aggregate such as `base.count *rel` — need no marker; the compiler reports an error at any read it cannot push down, so a full table load is always explicit in the source. Writing `full` on a read that is actually pushed down is allowed and has no effect.
+**`full` reads.** When a relation read is not pushed down to SQL, the whole relation is loaded into memory, and the read must be marked with `full` before the relation name (`rows <- full *rel`). Pushed-down reads — a translatable comprehension, or a recognized aggregate such as `base.count *rel` — need no marker; the compiler reports an error at any read it cannot push down, so a full table load is always explicit in the source. The requirement is exact in both directions: a `full` marker on a read that *is* pushed down is reported as an error (`unnecessary `full``), so the marker appears precisely where a whole-relation load happens.
 
 ### Pipe-Forward Composition
 

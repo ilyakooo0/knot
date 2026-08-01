@@ -12854,7 +12854,7 @@ enum RelMarker<'a> {
 }
 
 /// Read-only recursion over every sub-expression.
-fn walk_exprs_read<'a>(e: &'a ast::Expr, f: &mut impl FnMut(&'a ast::Expr)) {
+pub(crate) fn walk_exprs_read<'a>(e: &'a ast::Expr, f: &mut impl FnMut(&'a ast::Expr)) {
     f(e);
     use ast::ExprKind::*;
     match &e.node {

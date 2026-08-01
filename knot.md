@@ -340,7 +340,8 @@ recognized aggregate such as `base.count *people` — needs no marker. The
 compiler reports an error (`reading `*rel` loads the whole relation into
 memory … write `full *rel``) at any read it cannot push down, so you always
 know where a full table load happens. Writing `full` on a read that turns out
-to be pushed down is allowed and has no effect.
+to be pushed down is itself an error (`unnecessary `full``), so the marker is
+present exactly where a full load occurs — no more, no less.
 
 Statements in a `do` block:
 

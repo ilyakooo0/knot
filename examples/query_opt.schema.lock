@@ -1,0 +1,9 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+with {
+type Employee = {name: Text, dept: Text, salary: Int 1}
+type Department = {name: Text, budget: Int 1}
+*employees : [Employee]
+*departments : [Department]
+}
+(main)

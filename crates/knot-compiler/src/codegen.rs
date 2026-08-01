@@ -1254,6 +1254,7 @@ impl Codegen {
         self.declare_rt("knot_source_read", &[p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_count", &[p, p, p], &[p]);
         self.declare_rt("knot_source_query_count", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_source_query_exists", &[p, p, p, p], &[p]);
         self.declare_rt("knot_source_read_where", &[p, p, p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_query", &[p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_source_query_float", &[p, p, p, p], &[p]);
@@ -5822,6 +5823,27 @@ impl Codegen {
         }
     }
 
+    /// Peel `map (\r -> r.<field>) *source` into `(source_name, field)`.
+    /// Used by the `elem` pushdown, where the relation is a single-column
+    /// projection. Accepts both `map` and `base.map` heads. Returns None for
+    /// any other shape (falls back in-memory).
+    fn peel_map_projection(&self, expr: &ast::Expr) -> Option<(String, String)> {
+        let reduced = beta_reduce(expr, &self.fun_bodies, &self.let_bindings);
+        if let ast::ExprKind::App { func, arg: source_expr } = &reduced.node
+            && let ast::ExprKind::App { func: inner_func, arg: map_lambda } = &func.node
+                && Self::query_form_name(inner_func) == Some("map") {
+                        let source_name = self.resolve_source(source_expr)?;
+                        let (bind_var, body) = extract_single_param_lambda(map_lambda, &self.fun_bodies, &self.let_bindings)?;
+                        let body: &ast::Expr = &body;
+                        if let ast::ExprKind::FieldAccess { expr: rec, field } = &body.node
+                            && let ast::ExprKind::Var(v) = &rec.node
+                                && v == &bind_var {
+                                    return Some((source_name, field.clone()));
+                                }
+                    }
+        None
+    }
+
     /// Does this argument expression have a Π-lite type-argument head? Only the
     /// LEFTMOST head of the arg's application spine counts: `App(Int, x)` has
     /// type head `Int`, but `App(f, App(Int, x))` (a complete call passed as an
@@ -6355,6 +6377,7 @@ impl Codegen {
                                             order_by: Vec::new(),
                                             limit: None,
                                             offset: None,
+                                            distinct: false,
                                         },
                                         terminal: QueryTerminal::Count,
                                     };
@@ -6375,6 +6398,7 @@ impl Codegen {
                                 order_by: Vec::new(),
                                 limit: None,
                                 offset: None,
+                                distinct: false,
                             },
                             terminal: QueryTerminal::Count,
                         };
@@ -6707,6 +6731,7 @@ impl Codegen {
                                                         order_by: Vec::new(),
                                                         limit: None,
                                                         offset: None,
+                                                        distinct: false,
                                                     },
                                                     terminal: QueryTerminal::Aggregate {
                                                         func: sql_func,
@@ -6805,6 +6830,7 @@ impl Codegen {
                                             order_by: Vec::new(),
                                             limit: None,
                                             offset: None,
+                                            distinct: false,
                                         },
                                         terminal: QueryTerminal::Aggregate {
                                             func: sql_func,
@@ -6899,6 +6925,79 @@ impl Codegen {
                                         }
                                     }
                                 }
+                }
+
+                // any/all/elem over a source relation → SELECT EXISTS(…).
+                // Only existence is needed, so the relation never leaves
+                // SQLite. `any pred rel` → EXISTS(… WHERE pred);
+                // `all pred rel` → NOT EXISTS(… WHERE NOT pred);
+                // `elem val rel`  → EXISTS(… WHERE <sole col> = val).
+                // Any shape we can't translate falls through to in-memory.
+                if matches!(name, "any" | "all" | "elem") && args.len() == 2 {
+                    // (WHERE conditions, params, negated, source_name, schema)
+                    type ExistsParts = (Vec<String>, Vec<SqlParamSource>, bool, String, String);
+                    let built: Option<ExistsParts> = (|| {
+                        // Resolve the table + (for `elem`) the projected column.
+                        // `elem val (map (\r -> r.f) *src)` peels the map; the other
+                        // ops take a bare `*src`.
+                        let (source_name, map_col): (String, Option<String>) = if name == "elem" {
+                            match self.peel_map_projection(args[1]) {
+                                Some((src, col)) => (src, Some(col)),
+                                None => (self.resolve_source(args[1])?, None),
+                            }
+                        } else {
+                            (self.resolve_source(args[1])?, None)
+                        };
+                        if self.views.contains_key(&source_name) { return None; }
+                        let schema = self.source_schemas.get(&source_name)?.clone();
+                        if schema.starts_with('#') || schema.contains('[') { return None; }
+                        let (conditions, params, negated) = match name {
+                            "any" | "all" => {
+                                let (pb, pbody) = extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings)?;
+                                let pbody: &ast::Expr = &pbody;
+                                let frag = self.try_compile_sql_expr(&pb, pbody, &schema)?;
+                                if name == "all" {
+                                    // all pred rel  ⇔  no row *fails* pred.
+                                    (vec![format!("NOT ({})", frag.sql)], frag.params, true)
+                                } else {
+                                    (vec![frag.sql], frag.params, false)
+                                }
+                            }
+                            _ => {
+                                let needle = expr_to_sql_param(args[0])?;
+                                let col_sql = match map_col {
+                                    Some(c) => quote_sql_ident(&c),
+                                    None => {
+                                        // Bare source: only valid when it has one column.
+                                        let cols = schema_select_columns(&schema, "");
+                                        if cols.len() != 1 { return None; }
+                                        quote_sql_ident(&cols[0].result_field)
+                                    }
+                                };
+                                (vec![format!("{} = ?", col_sql)], vec![needle], false)
+                            }
+                        };
+                        Some((conditions, params, negated, source_name, schema))
+                    })();
+                    if let Some((conditions, params, negated, source_name, schema)) = built {
+                        let query = Query {
+                            plan: SqlQueryPlan {
+                                tables: vec![SqlTable {
+                                    source_name: source_name.clone(),
+                                    alias: String::new(),
+                                }],
+                                conditions,
+                                params,
+                                select_columns: Vec::new(),
+                                order_by: Vec::new(),
+                                limit: None,
+                                offset: None,
+                                distinct: false,
+                            },
+                            terminal: QueryTerminal::Exists { negated },
+                        };
+                        return self.emit_query(builder, &query, &schema, env, db, None);
+                    }
                 }
 
                 // filter/sortBy lambda (do { ... }) → merge into SQL plan.
@@ -7016,6 +7115,7 @@ impl Codegen {
                                                                 order_by: vec![col_sql],
                                                                 limit: Some(SqlParamSource::Var("__limit__".into())),
                                                                 offset: None,
+                                                                distinct: false,
                                                             },
                                                             terminal: QueryTerminal::Rows,
                                                         };
@@ -7092,6 +7192,7 @@ impl Codegen {
                                         order_by: Vec::new(),
                                         limit: Some(SqlParamSource::Var("__limit__".into())),
                                         offset: None,
+                                        distinct: false,
                                     },
                                     terminal: QueryTerminal::Rows,
                                 };
@@ -7121,6 +7222,7 @@ impl Codegen {
                                             order_by: Vec::new(),
                                             limit: Some(SqlParamSource::Var("__limit__".into())),
                                             offset: None,
+                                            distinct: false,
                                         },
                                         terminal: QueryTerminal::Rows,
                                     };
@@ -7128,6 +7230,35 @@ impl Codegen {
                                 }
                 }
             }
+
+        // Special case: dropRelation N *source → SQL OFFSET (no ORDER BY).
+        // Mirrors the bare-`take` LIMIT path: the row set is the same as
+        // in-memory `drop` (unordered), just computed in SQL.
+        if let ast::ExprKind::Var(name) = &func_expr.node
+            && (name == "dropRelation" || name == "drop") && args.len() == 2 && !user_shadows_special
+                && let Some(source_name) = self.resolve_source(args[1])
+                    && !self.views.contains_key(&source_name)
+                        && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                            && !schema.starts_with('#') && !schema.contains('[') {
+                                let query = Query {
+                                    plan: SqlQueryPlan {
+                                        tables: vec![SqlTable {
+                                            source_name: source_name.clone(),
+                                            alias: String::new(),
+                                        }],
+                                        conditions: Vec::new(),
+                                        params: Vec::new(),
+                                        select_columns: schema_select_columns(&schema, ""),
+                                        order_by: Vec::new(),
+                                        limit: None,
+                                        offset: Some(SqlParamSource::Var("__offset__".into())),
+                                        distinct: false,
+                                    },
+                                    terminal: QueryTerminal::Rows,
+                                };
+                                let n_val = self.compile_expr(builder, args[0], env, db);
+                                return self.emit_query(builder, &query, &schema, env, db, Some(n_val));
+                            }
 
         // SQL set operations: diff/inter/union on two source relations
         if let ast::ExprKind::Var(name) = &func_expr.node
@@ -7159,6 +7290,7 @@ impl Codegen {
                                 order_by: Vec::new(),
                                 limit: None,
                                 offset: None,
+                                distinct: false,
                             },
                             terminal: QueryTerminal::SetOp {
                                 op: sql_op,
@@ -11853,6 +11985,7 @@ impl Codegen {
                         order_by: Vec::new(),
                         limit: None,
                         offset: None,
+                        distinct: false,
                     },
                     terminal: QueryTerminal::Aggregate {
                         func,
@@ -11876,6 +12009,7 @@ impl Codegen {
                         order_by: Vec::new(),
                         limit: None,
                         offset: None,
+                        distinct: false,
                     },
                     terminal: QueryTerminal::Count,
                 };
@@ -11902,6 +12036,7 @@ impl Codegen {
                         order_by: vec![col_sql],
                         limit: None,
                         offset: None,
+                        distinct: false,
                     },
                     terminal: QueryTerminal::Rows,
                 };
@@ -12133,6 +12268,7 @@ impl Codegen {
                     order_by: Vec::new(),
                     limit: None,
                     offset: None,
+                    distinct: false,
                 },
                 terminal: QueryTerminal::Aggregate { func, col_sql, result_flag },
             };
@@ -12155,6 +12291,7 @@ impl Codegen {
                     order_by: Vec::new(),
                     limit: None,
                     offset: None,
+                    distinct: false,
                 },
                 terminal: QueryTerminal::Count,
             };
@@ -12167,7 +12304,17 @@ impl Codegen {
             if map_is_scalar {
                 return None;
             }
+            // DISTINCT is needed when a `map` projection can collapse distinct
+            // source rows into identical result rows: a strict subset of the
+            // source's columns, or any computed (non-identity) column. Knot
+            // relations are sets; SQL is a bag, so dedup at the SQL level.
+            // Identity projections (all columns, no computed exprs) keep
+            // `distinct: false` — their rows are already unique.
+            let full_col_count = parse_schema_columns(&schema).len();
+            let mut distinct = false;
             let select_columns = if let Some(cols) = select_override {
+                distinct = cols.len() < full_col_count
+                    || cols.iter().any(|c| c.sql_expr.is_some());
                 cols
             } else {
                 // SELECT * — all columns from schema
@@ -12194,6 +12341,7 @@ impl Codegen {
                 order_by: order_by_cols,
                 limit,
                 offset,
+                distinct,
             };
 
             let sql = plan.build_sql();
@@ -12437,6 +12585,7 @@ impl Codegen {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            distinct: false,
         })
     }
 
@@ -12575,10 +12724,10 @@ impl Codegen {
                             params: inner.params,
                         });
                     }
-                // Two-arg builtins: App(App(Var(name), arg1), arg2)
+                // Two-arg builtins: App(App(<head>, arg1), arg2). Accept both
+                // `contains` and the `base.`-qualified form.
                 if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node
-                    && let ast::ExprKind::Var(name) = &inner_func.node
-                        && name == "contains" {
+                    && Self::query_form_name(inner_func) == Some("contains") {
                             // contains needle haystack → INSTR(haystack, needle) > 0
                             let needle = Self::try_compile_sql_atom(bind_aliases, first_arg, env, let_binds)?;
                             let haystack = Self::try_compile_sql_atom(bind_aliases, arg, env, let_binds)?;
@@ -12916,9 +13065,10 @@ impl Codegen {
                             params: inner.params,
                         });
                     }
-                // Two-arg builtins: App(App(Var(name), arg1), arg2)
+                // Two-arg builtins: App(App(<head>, arg1), arg2). Accept both
+                // `contains`/`elem` and the `base.`-qualified forms.
                 if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node
-                    && let ast::ExprKind::Var(name) = &inner_func.node {
+                    && let Some(name) = Self::query_form_name(inner_func) {
                         if name == "contains" {
                             let needle = Self::try_compile_single_table_atom(bind_var, first_arg)?;
                             let haystack = Self::try_compile_single_table_atom(bind_var, arg)?;
@@ -13465,6 +13615,11 @@ impl Codegen {
             QueryTerminal::Count => self.call_rt(
                 builder,
                 "knot_source_query_count",
+                &[db, sql_ptr, sql_len, params_rel],
+            ),
+            QueryTerminal::Exists { .. } => self.call_rt(
+                builder,
+                "knot_source_query_exists",
                 &[db, sql_ptr, sql_len, params_rel],
             ),
             QueryTerminal::Aggregate { result_flag, .. } => {
@@ -14495,6 +14650,14 @@ struct SqlQueryPlan {
     order_by: Vec<String>,
     limit: Option<SqlParamSource>,
     offset: Option<SqlParamSource>,
+    /// Emit `SELECT DISTINCT`. Set for single-table projections (a `map`
+    /// that selects a strict subset of columns or computes expressions):
+    /// SQL is a bag, but a Knot relation is a set, so a projection that
+    /// collapses distinct source rows into identical result rows must dedup
+    /// at the SQL level (runtime dedup would come *after* LIMIT/OFFSET and
+    /// could shrink a `take`/`drop` window). Never set for identity
+    /// (`SELECT *`) single-table reads, whose rows are already unique.
+    distinct: bool,
 }
 
 struct SqlTable {
@@ -14549,11 +14712,15 @@ impl SqlQueryPlan {
             .collect::<Vec<_>>()
             .join(", ");
 
+        let distinct_kw = if self.distinct { "DISTINCT " } else { "" };
         let mut sql = if self.conditions.is_empty() {
-            format!("SELECT {} FROM {}", select, from)
+            format!("SELECT {}{} FROM {}", distinct_kw, select, from)
         } else {
             let where_clause = join_sql_conditions(&self.conditions);
-            format!("SELECT {} FROM {} WHERE {}", select, from, where_clause)
+            format!(
+                "SELECT {}{} FROM {} WHERE {}",
+                distinct_kw, select, from, where_clause
+            )
         };
 
         if !self.order_by.is_empty() {
@@ -14621,6 +14788,11 @@ enum QueryTerminal {
     Rows,
     /// `SELECT COUNT(*) …` → int. Runtime: `knot_source_query_count`.
     Count,
+    /// `SELECT [NOT] EXISTS(SELECT 1 FROM … WHERE …)` → bool. Runtime:
+    /// `knot_source_query_exists`. Used by the any/all/elem pushdowns; the
+    /// plan's conditions hold the inner WHERE. `negated` emits `NOT EXISTS`
+    /// (for `all`: no row *fails* the predicate ⇔ NOT EXISTS counterexample).
+    Exists { negated: bool },
     /// `SELECT <FUNC>(<col>) …` → scalar. `result_flag` is type-dependent:
     /// MIN/MAX → is_text, SUM → is_float, AVG → unused (always float).
     /// Runtime: `knot_source_query_sum` / `_float` / `_value` (per `func`).
@@ -14698,6 +14870,20 @@ impl Query {
                 } else {
                     format!(
                         "SELECT COUNT(*) FROM {} WHERE {}",
+                        from,
+                        join_sql_conditions(&self.plan.conditions)
+                    )
+                }
+            }
+            QueryTerminal::Exists { negated } => {
+                let from = self.from_clause();
+                let not_kw = if *negated { "NOT " } else { "" };
+                if self.plan.conditions.is_empty() {
+                    format!("SELECT {}EXISTS(SELECT 1 FROM {})", not_kw, from)
+                } else {
+                    format!(
+                        "SELECT {}EXISTS(SELECT 1 FROM {} WHERE {})",
+                        not_kw,
                         from,
                         join_sql_conditions(&self.plan.conditions)
                     )
@@ -14787,6 +14973,7 @@ impl Query {
         match &self.terminal {
             QueryTerminal::Rows => "knot_source_query",
             QueryTerminal::Count => "knot_source_query_count",
+            QueryTerminal::Exists { .. } => "knot_source_query_exists",
             QueryTerminal::Aggregate { func, .. } => match *func {
                 "SUM" => "knot_source_query_sum",
                 "AVG" => "knot_source_query_float",

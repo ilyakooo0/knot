@@ -114,6 +114,7 @@ pub enum StdlibFn {
     FindFirst,
     Any,
     All,
+    Elem,
 }
 
 impl StdlibFn {
@@ -135,6 +136,7 @@ impl StdlibFn {
             "findFirst" => StdlibFn::FindFirst,
             "any" => StdlibFn::Any,
             "all" => StdlibFn::All,
+            "elem" => StdlibFn::Elem,
             _ => return None,
         })
     }

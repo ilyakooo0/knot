@@ -43,3 +43,6 @@ examples/builtins
 examples/implicit_dictionaries
 examples/ord
 examples/trait_replacement
+
+# Schema lockfiles (regenerated on each build)
+*.schema.lock

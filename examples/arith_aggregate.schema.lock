@@ -1,0 +1,7 @@
+-- schema.lock (auto-generated, do not edit)
+-- Commit to source control.
+with {
+type Line = {product: Text, price: Int 1, qty: Int 1}
+*lines : [Line]
+}
+(main)

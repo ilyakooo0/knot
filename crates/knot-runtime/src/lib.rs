@@ -13315,6 +13315,42 @@ pub extern "C-unwind" fn knot_source_query_count(
     alloc_int(count)
 }
 
+/// Execute a SQL existence query (`SELECT EXISTS(SELECT 1 …)`), returning a
+/// boxed Knot Bool. Used by the `any` / `all` / `elem` pushdowns, which only
+/// need to know whether *some* row matches — not the rows themselves — so the
+/// whole relation never leaves SQLite.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_source_query_exists(
+    db: *mut c_void,
+    sql_ptr: *const u8,
+    sql_len: usize,
+    params: *mut Value,
+) -> *mut Value {
+    let db_ref = unsafe { &*(db as *mut KnotDb) };
+    let sql = unsafe { str_from_raw(sql_ptr, sql_len) };
+
+    let param_values = match unsafe { as_ref(params) } {
+        Value::Relation(rows) => rows,
+        _ => panic!(
+            "knot runtime: query_exists params must be a Relation, got {}",
+            type_name(params)
+        ),
+    };
+    let sql_params: Vec<rusqlite::types::Value> =
+        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+
+    debug_sql_params(sql, &sql_params);
+    db_ref.ensure_indexes_for_sql(sql);
+
+    let exists: i64 = db_ref
+        .conn
+        .query_row(sql, param_refs.as_slice(), |row| row.get(0))
+        .unwrap_or_else(|e| panic!("knot runtime: query_exists error: {}\n  SQL: {}", e, sql));
+    alloc_bool(exists != 0)
+}
+
 /// Execute a SQL aggregate query returning a float (e.g. AVG).
 /// Returns a boxed Float value. Returns 0.0 when the result is NULL
 /// (e.g. AVG on an empty table).

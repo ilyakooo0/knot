@@ -14404,6 +14404,41 @@ impl Codegen {
                                     params,
                                 });
                             }
+                            // (c) Relation-derived haystack: `elem x (*src |>
+                            //     map (\u -> u.col))` (or the un-piped
+                            //     `map (\u -> u.col) *src`). Emit a real
+                            //     sub-select `x IN (SELECT col FROM src)`. The
+                            //     column keeps its own affinity/collation, so
+                            //     this is byte-identical for Text/Bool/Uuid
+                            //     columns (the same scalars the dynamic set
+                            //     allows). Int/Float stay in memory: an Int
+                            //     column is TEXT-stored, and a sub-select
+                            //     comparing it to an INTEGER-affinity needle
+                            //     hits the same storage-class mismatch as
+                            //     json_each. Runs before the dynamic branch
+                            //     since a real sub-select is strictly better
+                            //     (no JSON round-trip) when it applies. Gated
+                            //     on the projected column's own schema type,
+                            //     NOT the `dynamic` span set (which is for the
+                            //     json_each form and doesn't cover relation
+                            //     projections).
+                            if !Self::expr_refs_var(arg, bind_var)
+                                && let Some((sub_src, sub_col)) = self.peel_map_projection(arg)
+                                && let Some(sub_schema) = self.source_schemas.get(&sub_src).cloned()
+                                && let Some(sub_ty) = lookup_col_type_from_schema(&sub_schema, &sub_col)
+                                && matches!(sub_ty.as_str(), "text" | "bool" | "uuid")
+                            {
+                                let sub_sql = format!(
+                                    "SELECT {} FROM {}",
+                                    quote_sql_ident(&sub_col),
+                                    quote_sql_ident(&format!("_knot_{}", sub_src)),
+                                );
+                                let params = needle.params;
+                                return Some(SqlFragment {
+                                    sql: format!("{} IN ({})", needle.sql, sub_sql),
+                                    params,
+                                });
+                            }
                             // (b) Dynamic haystack: bind the whole list as a
                             //     single JSON-encoded param (value_to_sql_param
                             //     auto-encodes Relations) and expand via

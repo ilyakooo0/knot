@@ -5823,6 +5823,57 @@ impl Codegen {
         }
     }
 
+    /// Rewrite a call-form query chain `opk … (op1 … *src)` into the
+    /// equivalent left-leaning pipe `*src |> op1 … |> … |> opk …`, which the
+    /// pipe-chain pushdown (`try_compile_pipe_sql`) already fuses into one SQL
+    /// query. Lets the call-form spellings of composable ops share that one
+    /// analyzer instead of re-deriving a plan per (outer, inner) pair.
+    ///
+    /// Each link is `App(partial_op, relation)` where `partial_op` is a query
+    /// form (filter/map/sortBy/take/drop/count/sum) applied to all but its last
+    /// argument; the recursion bottoms out at a bare `*src` (or source-bound
+    /// var), an existing `|>` chain, or a `do` block — any of which the pipe
+    /// analyzer accepts as the chain source. Returns None if a link isn't a
+    /// recognized single-relation query op (caller falls back in-memory).
+    fn call_chain_to_pipe(&self, expr: &ast::Expr) -> Option<ast::Expr> {
+        match &expr.node {
+            // Bottom: a source, an existing pipe, or a do-block — used as-is.
+            ast::ExprKind::SourceRef { .. }
+            | ast::ExprKind::BinOp { op: ast::BinOp::Pipe, .. }
+            | ast::ExprKind::Do(_) => Some(expr.clone()),
+            ast::ExprKind::Var(name) if self.source_var_binds.contains_key(name) => {
+                Some(expr.clone())
+            }
+            // Link: `partial_op relation` — convert the relation, pipe on the op.
+            ast::ExprKind::App { func, arg } => {
+                // The op head is the leftmost symbol of `func`'s spine; it must
+                // be a query form the pipe analyzer recognizes.
+                let mut head = func;
+                while let ast::ExprKind::App { func: f, .. } = &head.node {
+                    head = f;
+                }
+                let op_name = Self::query_form_name(head)?;
+                if !matches!(
+                    op_name,
+                    "filter" | "map" | "sortBy" | "take" | "takeRelation" | "drop"
+                        | "dropRelation" | "count" | "sum"
+                ) {
+                    return None;
+                }
+                let inner = self.call_chain_to_pipe(arg)?;
+                Some(ast::Expr {
+                    node: ast::ExprKind::BinOp {
+                        op: ast::BinOp::Pipe,
+                        lhs: Box::new(inner),
+                        rhs: func.clone(),
+                    },
+                    span: expr.span,
+                })
+            }
+            _ => None,
+        }
+    }
+
     /// Peel `map (\r -> r.<field>) <source>` into `(source_name, field)`,
     /// where `<source>` is a bare `*src`, a `filter f *src`, or the pipe form
     /// `*src |> map (\r -> r.<field>)` / `*src |> filter f |> map (\r -> ...)`.
@@ -6488,6 +6539,29 @@ impl Codegen {
                 }
                 return result;
             }
+
+        // Composable call-form query chain `op … (… *src)` → rewrite to the
+        // equivalent pipe and delegate to the pipe-chain pushdown, which fuses
+        // filter/map/sortBy/take/drop/count/sum compositions into one query.
+        // Only fires when the last argument is itself a call/pipe (a real
+        // composition) — a bare-source call stays on its dedicated fast path.
+        if !user_shadows_special
+            && !args.is_empty()
+            && matches!(
+                Self::query_form_name(func_expr),
+                Some("filter" | "map" | "sortBy" | "take" | "takeRelation" | "drop"
+                    | "dropRelation" | "count" | "sum")
+            )
+            && matches!(
+                args[args.len() - 1].node,
+                ast::ExprKind::App { .. }
+                    | ast::ExprKind::BinOp { op: ast::BinOp::Pipe, .. }
+            )
+            && let Some(piped) = self.call_chain_to_pipe(expr)
+            && let Some(v) = self.try_compile_pipe_sql(builder, &piped, env, db)
+        {
+            return v;
+        }
 
         // Special case: count *rel → SQL COUNT(*)  (bare `count` or `base.count`)
         if Self::query_form_name(func_expr) == Some("count")
@@ -7353,6 +7427,7 @@ impl Codegen {
             }
 
         // Special case: takeRelation N (sortBy f *source) → SQL ORDER BY + LIMIT
+        // Special case: take/takeRelation N <source> → SQL LIMIT (legacy path).
         if let ast::ExprKind::Var(name) = &func_expr.node
             && (name == "takeRelation" || name == "take") && args.len() == 2 && !user_shadows_special {
                 // args[0] = N, args[1] = sortBy f *source (or just *source)

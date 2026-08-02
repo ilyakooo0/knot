@@ -120,9 +120,9 @@ pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     "elem", "encrypt", "fileExists", "filter", "findFirst", "fold", "forEach",
     "fork", "hash", "head", "hexDecode", "id", "inter", "length", "listDir",
     "map", "match", "maxOn", "minOn", "not", "parseJson", "race", "randomInt",
-    "readFile", "removeFile", "reverse", "sign", "single", "sleep", "sortBy",
-    "startsWith", "strip", "stripFloatUnit", "stripUnit", "take", "textToBytes", "toJson",
-    "toLower", "toUpper", "traverse", "trim", "upsertBy", "verify",
+    "readFile", "removeFile", "reverse", "sign", "single", "sleep", "sortBy", "sortByDesc",
+    "startsWith", "strip", "stripFloatUnit", "stripUnit", "take", "textToBytes", "toAsciiLower", "toAsciiUpper", "toJson",
+    "toLower", "toUpper", "traverse", "trim", "trimAscii", "ltrimAscii", "rtrimAscii", "byteLength", "upsertBy", "verify",
     "withFloatUnit", "withUnit", "writeFile",
     // Numeric/text conversions.
     "floor", "intToFloat", "textToInt", "textToFloat",

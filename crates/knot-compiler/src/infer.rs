@@ -109,6 +109,7 @@ pub enum StdlibFn {
     Filter,
     Map,
     SortBy,
+    SortByDesc,
     Take,
     Drop,
     FindFirst,
@@ -132,6 +133,7 @@ impl StdlibFn {
             "filter" => StdlibFn::Filter,
             "map" => StdlibFn::Map,
             "sortBy" => StdlibFn::SortBy,
+            "sortByDesc" => StdlibFn::SortByDesc,
             "take" => StdlibFn::Take,
             "drop" => StdlibFn::Drop,
             "findFirst" => StdlibFn::FindFirst,
@@ -9899,6 +9901,23 @@ impl Infer {
             ),
         );
 
+        // sortByDesc : ∀a b. (a -> b) -> [a] -> [a]
+        let a = self.fresh_var();
+        let b = self.fresh_var();
+        self.bind_top(
+            "sortByDesc",
+            Scheme::poly(
+                vec![a, b],
+                Ty::Fun(
+                    Box::new(Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(b)))),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                    )),
+                ),
+            ),
+        );
+
         // diff : ∀a. [a] -> [a] -> [a]
         let a = self.fresh_var();
         self.bind_top(
@@ -10402,6 +10421,28 @@ impl Infer {
             "trim",
             Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
         );
+
+        // trimAscii / ltrimAscii / rtrimAscii : Text -> Text
+        for name in ["trimAscii", "ltrimAscii", "rtrimAscii"] {
+            self.bind_top(
+                name,
+                Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+            );
+        }
+
+        // byteLength : Text -> Int
+        self.bind_top(
+            "byteLength",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Int))),
+        );
+
+        // toAsciiLower / toAsciiUpper : Text -> Text
+        for name in ["toAsciiLower", "toAsciiUpper"] {
+            self.bind_top(
+                name,
+                Scheme::mono(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Text))),
+            );
+        }
 
         // contains : Text -> Text -> Bool
         self.bind_top(

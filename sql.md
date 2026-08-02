@@ -68,6 +68,8 @@ misfiring SQL.
 | `map` (record projection) | `map (\r -> {a: r.x, …}) *src` | `SELECT "x" AS "a", …` (with `DISTINCT` when the projection collapses rows) |
 | `map` (scalar) | `map (\r -> r.f) *src` | pushed **only when a terminal aggregate/head consumes the column** (scalar relations reconstruct as records otherwise) |
 | `sortBy` | `sortBy (\r -> r.k) *src` | `ORDER BY k` |
+| `sortByDesc` | `sortByDesc (\r -> r.k) *src` | `ORDER BY k DESC` |
+| `sortBy` / `sortByDesc` (multi-key) | `sortBy (\r -> {a: r.x, b: r.y}) *src` | `ORDER BY x, y` (record-literal key, each value a plain field; per-column type guard) |
 | `take` | `take N *src` | `LIMIT MAX(CAST(? AS INTEGER), 0)` |
 | `drop` | `drop N *src` | `LIMIT -1 OFFSET ?` |
 | `distinct` | `distinct (map (\r -> r.f) *src)`, `distinct (map (\r -> {…}) *src)` | `SELECT DISTINCT …` |
@@ -102,6 +104,9 @@ misfiring SQL.
 | `elem` (relation-derived, in a WHERE) | `elem t.f (*other \|> map (\u -> u.g))` | `t.f IN (SELECT g FROM other)` (text/bool/uuid cols only) |
 | `contains` | `contains haystack needle` (in a predicate) | `INSTR(haystack, needle) > 0` |
 | `startsWith` / `endsWith` | `startsWith "ap" t.title` / `endsWith "ce" t.title` | `title GLOB 'ap*'` / `title GLOB '*ce'` (GLOB, not LIKE — case-sensitive, metachars escaped) |
+| `trimAscii` / `ltrimAscii` / `rtrimAscii` | `trimAscii t.title == "x"` (in a predicate) | `TRIM(title, X'20090A0D0B0C')` / `LTRIM(…)` / `RTRIM(…)` (ASCII-whitespace charset: space, tab, LF, CR, VT, FF — matches Knot's runtime exactly) |
+| `byteLength` | `byteLength t.title == 5` (in a predicate) | `LENGTH(CAST(title AS BLOB))` (byte count, not char count) |
+| `toAsciiLower` / `toAsciiUpper` | `toAsciiLower t.title == "x"` (in a predicate) | `LOWER(title)` / `UPPER(title)` (ASCII-only case map — byte-identical to SQLite) |
 
 ### Set operations
 
@@ -168,16 +173,20 @@ Pushdown also fires for compositions of the above, via three recipes:
 | `traverse` / `forEach` / `bind` | Effectful / monadic. |
 | `match` | Pattern dispatch, not a `WHERE`. |
 | `reverse` | Returns `IO`; not a query op. |
-| `toUpper` / `toLower` | Unicode case-mapping diverges from SQLite's ASCII-only `UPPER`/`LOWER` (`straße` → `STRASSE` in Knot, `STRAßE` in SQLite). |
-| `length` (on Text) | SQLite `LENGTH` stops at NUL; Knot counts all characters. |
+| `toUpper` / `toLower` | Unicode case-mapping diverges from SQLite's ASCII-only `UPPER`/`LOWER` (`straße` → `STRASSE` in Knot, `STRAßE` in SQLite). Use `toAsciiUpper`/`toAsciiLower` (ASCII-only) for the pushable form. |
+| `trim` | Rust `str::trim` trims Unicode whitespace; SQLite `TRIM` can't express multi-byte whitespace. Use `trimAscii` (ASCII whitespace only) for the pushable form. |
+| `length` (on Text) | SQLite `LENGTH` stops at NUL; Knot counts all characters. Use `byteLength` (bytes) for the pushable form. |
 | `MIN`/`MAX` over non-numeric columns | Type divergence — stays in memory (`minmax_pushdown_type_ok`). |
-| `sortBy` over Int projections or floats | `KNOT_INT` collation / SQL order vs `total_cmp` divergence (`sortby_projection_pushable`). |
+| `sortBy` over Int projections or floats | `KNOT_INT` collation / SQL order vs `total_cmp` divergence (`sortby_projection_pushable`). A multi-key record whose **any** key column is float/tag/bool stays in memory for the whole sort. |
 | ADT / nested-relation schemas (`#` / `[`) | Non-plain schemas don't map to a single flat table. |
 | Views (`*view`) | Only real source tables push down; views never do. |
 
 Decision rule for string ops: push down only when SQLite's semantics are
 byte-identical to Knot's runtime (`contains`/`INSTR`: yes; case-mapping/length:
-no). `startsWith`/`endsWith` use `GLOB` (case-sensitive, matching Rust) rather
+no). Where Knot's semantics are Unicode (`toUpper`/`toLower`/`trim`/`length`),
+the language provides ASCII-only siblings (`toAsciiLower`/`toAsciiUpper`,
+`trimAscii`/`ltrimAscii`/`rtrimAscii`, `byteLength`) whose runtime is *defined*
+to match SQLite byte-for-byte — those are the pushable forms. `startsWith`/`endsWith` use `GLOB` (case-sensitive, matching Rust) rather
 than `LIKE` (ASCII-case-insensitive by default), with every GLOB metacharacter
 in the literal pattern escaped — so the gate holds only for a literal pattern
 against a plain Text column.

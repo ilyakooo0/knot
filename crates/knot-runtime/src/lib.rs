@@ -6285,6 +6285,21 @@ pub extern "C-unwind" fn knot_relation_sort_by(
     key_fn: *mut Value,
     rel: *mut Value,
 ) -> *mut Value {
+    sort_by_impl(db, key_fn, rel, false)
+}
+
+/// sortByDesc(key_fn, rel) — descending sortBy. Same dedup semantics; the
+/// comparator is reversed.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_relation_sort_by_desc(
+    db: *mut c_void,
+    key_fn: *mut Value,
+    rel: *mut Value,
+) -> *mut Value {
+    sort_by_impl(db, key_fn, rel, true)
+}
+
+fn sort_by_impl(db: *mut c_void, key_fn: *mut Value, rel: *mut Value, desc: bool) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
         _ => return rel,
@@ -6299,7 +6314,10 @@ pub extern "C-unwind" fn knot_relation_sort_by(
             (row, key)
         })
         .collect();
-    indexed.sort_by(|(_, a), (_, b)| compare_keys(db, *a, *b));
+    indexed.sort_by(|(_, a), (_, b)| {
+        let ord = compare_keys(db, *a, *b);
+        if desc { ord.reverse() } else { ord }
+    });
 
     // Dedup consecutive equal elements (sortBy semantics — result is a set).
     // Use the same `compare_keys` the sort used so a user `Ord` impl that
@@ -10875,6 +10893,75 @@ pub extern "C-unwind" fn knot_text_trim(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => alloc(Value::Text(Arc::from(s.trim()))),
         _ => panic!("knot runtime: trim expected Text, got {}", type_name(v)),
+    }
+}
+
+/// ASCII-only whitespace set, matching SQLite's TRIM(col, chars) charset so the
+/// runtime and the pushed-down SQL are byte-identical. Covers the six ASCII
+/// whitespace chars: space, \t, \n, \r, \x0b (VT), \x0c (FF).
+const ASCII_WS: &[char] = &[' ', '\t', '\n', '\r', '\u{b}', '\u{c}'];
+
+/// trim_ascii(v) — trim leading/trailing ASCII whitespace only (NOT Unicode
+/// whitespace). Byte-identical to SQLite TRIM(col, ' \t\n\r\x0b\x0c').
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_text_trim_ascii(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => alloc(Value::Text(Arc::from(
+            s.trim_matches(|c| ASCII_WS.contains(&c)),
+        ))),
+        _ => panic!("knot runtime: trimAscii expected Text, got {}", type_name(v)),
+    }
+}
+
+/// ltrim_ascii(v) — trim leading ASCII whitespace only.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_text_ltrim_ascii(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => alloc(Value::Text(Arc::from(
+            s.trim_start_matches(|c| ASCII_WS.contains(&c)),
+        ))),
+        _ => panic!("knot runtime: ltrimAscii expected Text, got {}", type_name(v)),
+    }
+}
+
+/// rtrim_ascii(v) — trim trailing ASCII whitespace only.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_text_rtrim_ascii(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => alloc(Value::Text(Arc::from(
+            s.trim_end_matches(|c| ASCII_WS.contains(&c)),
+        ))),
+        _ => panic!("knot runtime: rtrimAscii expected Text, got {}", type_name(v)),
+    }
+}
+
+/// byte_length(v) — number of UTF-8 bytes (Rust str::len / as_bytes().len()).
+/// Byte-identical to SQLite LENGTH(CAST(col AS BLOB)).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_text_byte_length(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => alloc(Value::Int(s.len() as i64)),
+        _ => panic!("knot runtime: byteLength expected Text, got {}", type_name(v)),
+    }
+}
+
+/// to_ascii_lower(v) — ASCII-only lowercase (Rust str::to_ascii_lowercase).
+/// Byte-identical to SQLite LOWER(col).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_text_to_ascii_lower(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => alloc(Value::Text(Arc::from(s.to_ascii_lowercase()))),
+        _ => panic!("knot runtime: toAsciiLower expected Text, got {}", type_name(v)),
+    }
+}
+
+/// to_ascii_upper(v) — ASCII-only uppercase (Rust str::to_ascii_uppercase).
+/// Byte-identical to SQLite UPPER(col).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_text_to_ascii_upper(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Text(s) => alloc(Value::Text(Arc::from(s.to_ascii_uppercase()))),
+        _ => panic!("knot runtime: toAsciiUpper expected Text, got {}", type_name(v)),
     }
 }
 

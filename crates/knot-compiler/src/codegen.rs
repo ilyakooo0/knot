@@ -1366,6 +1366,7 @@ impl Codegen {
         self.declare_rt("knot_relation_filter", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_match", &[p, p], &[p]);
         self.declare_rt("knot_relation_sort_by", &[p, p, p], &[p]);
+        self.declare_rt("knot_relation_sort_by_desc", &[p, p, p], &[p]);
         self.declare_rt("knot_relation_take", &[p, p], &[p]);
         self.declare_rt("knot_relation_drop", &[p, p], &[p]);
         self.declare_rt("knot_take", &[p, p], &[p]);
@@ -1415,6 +1416,12 @@ impl Codegen {
         self.declare_rt("knot_text_drop", &[p, p], &[p]);
         self.declare_rt("knot_text_length", &[p], &[p]);
         self.declare_rt("knot_text_trim", &[p], &[p]);
+        self.declare_rt("knot_text_trim_ascii", &[p], &[p]);
+        self.declare_rt("knot_text_ltrim_ascii", &[p], &[p]);
+        self.declare_rt("knot_text_rtrim_ascii", &[p], &[p]);
+        self.declare_rt("knot_text_byte_length", &[p], &[p]);
+        self.declare_rt("knot_text_to_ascii_lower", &[p], &[p]);
+        self.declare_rt("knot_text_to_ascii_upper", &[p], &[p]);
         self.declare_rt("knot_text_contains", &[p, p], &[p]);
         self.declare_rt("knot_text_starts_with", &[p, p], &[p]);
         self.declare_rt("knot_text_ends_with", &[p, p], &[p]);
@@ -2035,8 +2042,8 @@ impl Codegen {
             // so they can live as fields of the `base` record (`base.count`,
             // `base.union`, `base.bind`). `sum` is already registered above.
             "count", "union", "bind",
-            "toUpper", "toLower", "sortBy",
-            "length", "trim", "contains", "startsWith", "endsWith", "elem", "reverse",
+            "toUpper", "toLower", "sortBy", "sortByDesc",
+            "length", "trim", "trimAscii", "ltrimAscii", "rtrimAscii", "byteLength", "toAsciiLower", "toAsciiUpper", "contains", "startsWith", "endsWith", "elem", "reverse",
             "chars", "id", "not", "toJson", "parseJson",
             "traverse", "take", "drop",
             "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
@@ -2809,6 +2816,12 @@ impl Codegen {
         self.define_stdlib_fn_1("toLower", "knot_text_to_lower");
         self.define_stdlib_fn_1("length", "knot_text_length");
         self.define_stdlib_fn_1("trim", "knot_text_trim");
+        self.define_stdlib_fn_1("trimAscii", "knot_text_trim_ascii");
+        self.define_stdlib_fn_1("ltrimAscii", "knot_text_ltrim_ascii");
+        self.define_stdlib_fn_1("rtrimAscii", "knot_text_rtrim_ascii");
+        self.define_stdlib_fn_1("byteLength", "knot_text_byte_length");
+        self.define_stdlib_fn_1("toAsciiLower", "knot_text_to_ascii_lower");
+        self.define_stdlib_fn_1("toAsciiUpper", "knot_text_to_ascii_upper");
         self.define_stdlib_fn_1("reverse", "knot_text_reverse");
         self.define_stdlib_fn_1("chars", "knot_text_chars");
         self.define_stdlib_fn_1("id", "knot_value_id");
@@ -2846,6 +2859,7 @@ impl Codegen {
         self.define_stdlib_fn_2("drop", "knot_drop", false);
         self.define_stdlib_fn_2("match", "knot_relation_match", false);
         self.define_stdlib_fn_2("sortBy", "knot_relation_sort_by", true);
+        self.define_stdlib_fn_2("sortByDesc", "knot_relation_sort_by_desc", true);
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
         self.define_stdlib_fn_2("startsWith", "knot_text_starts_with", false);
         self.define_stdlib_fn_2("endsWith", "knot_text_ends_with", false);
@@ -6002,7 +6016,7 @@ impl Codegen {
                 let reduced = beta_reduce(rel_expr, &self.fun_bodies, &self.let_bindings);
                 let (order_by, base): (Vec<String>, ast::Expr) =
                     match peel_sort_by(&reduced, &self.fun_bodies, &self.let_bindings) {
-                        Some((key_lam, inner)) => {
+                        Some((key_lam, inner, desc)) => {
                             let (key_bind, key_body) = extract_single_param_lambda(
                                 &key_lam, &self.fun_bodies, &self.let_bindings,
                             )?;
@@ -6027,6 +6041,7 @@ impl Codegen {
                             }
                             let col_sql =
                                 extract_sql_field_access(&key_bind, key_body, "", &inner_schema)?;
+                            let col_sql = if desc { format!("{} DESC", col_sql) } else { col_sql };
                             (vec![col_sql], inner)
                         }
                         None => (Vec::new(), rel_expr.clone()),
@@ -12615,15 +12630,35 @@ impl Codegen {
                 };
                 Some(self.emit_query(builder, &query, schema, env, db, None, Some(expr_span)))
             }
-            "sortBy" => {
-                // sortBy (\m -> m.field) *source → SELECT * FROM source ORDER BY field
+            "sortBy" | "sortByDesc" => {
+                // sortBy (\\m -> m.field) *source → SELECT * FROM source ORDER BY field
                 // ORDER BY CASE loses KNOT_INT collation for Int projections and
                 // SQL float ordering diverges from total_cmp — keep both in
-                // memory (see sortby_projection_pushable).
-                if !sortby_projection_pushable(&bind_var, body, schema) {
-                    return None;
-                }
-                let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
+                // memory (see sortby_projection_pushable). sortByDesc emits the
+                // same column with a DESC direction; the projection guard is
+                // direction-agnostic so it applies unchanged.
+                // A record-literal key `{k1: r.c1, k2: r.c2}` decomposes to a
+                // multi-column ORDER BY; per-column guard inside the helper.
+                let desc = fn_name == "sortByDesc";
+                let order_by: Vec<String> =
+                    if let Some(cols) = extract_sql_multi_key_columns(&bind_var, body, "", schema)
+                    {
+                        if desc {
+                            cols.into_iter().map(|c| format!("{} DESC", c)).collect()
+                        } else {
+                            cols
+                        }
+                    } else {
+                        if !sortby_projection_pushable(&bind_var, body, schema) {
+                            return None;
+                        }
+                        let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
+                        if desc {
+                            vec![format!("{} DESC", col_sql)]
+                        } else {
+                            vec![col_sql]
+                        }
+                    };
                 let query = Query {
                     plan: SqlQueryPlan {
                         tables: vec![SqlTable {
@@ -12634,7 +12669,7 @@ impl Codegen {
                         conditions: Vec::new(),
                         params: Vec::new(),
                         select_columns: schema_select_columns(schema, ""),
-                        order_by: vec![col_sql],
+                        order_by,
                         limit: None,
                         offset: None,
                         distinct: false,
@@ -14723,6 +14758,39 @@ impl Codegen {
 
     /// Try to compile a single-table expression as a SQL atom.
     /// Handles: `bind_var.field` → column ref, literals/vars → `?`, arithmetic combos.
+    /// Compile a byte-identical ASCII text builtin applied to the bind var's
+    /// field into its SQL form. Each runtime impl is ASCII-only and exactly
+    /// matches the SQLite form:
+    ///   trimAscii/ltrimAscii/rtrimAscii -> TRIM/LTRIM/RTRIM with the full
+    ///     ASCII-whitespace charset (space, \t, \n, \r, \x0b, \x0c) as a blob
+    ///     literal, since the no-charset form trims ASCII space only.
+    ///   toAsciiLower/toAsciiUpper -> LOWER/UPPER (SQLite's are ASCII-only).
+    ///   byteLength -> LENGTH(CAST(col AS BLOB)): counts UTF-8 bytes, matching
+    ///     str::len, and never hits the NUL-stop of char-counting LENGTH.
+    /// Returns None (in-memory fallback) for any other head or a param-carrying
+    /// argument.
+    fn compile_ascii_text_fn(
+        bind_var: &str,
+        func: &ast::Expr,
+        arg: &ast::Expr,
+    ) -> Option<SqlFragment> {
+        let name = Self::query_form_name(func)?;
+        let col = Self::try_compile_single_table_atom(bind_var, arg)?;
+        if !col.params.is_empty() {
+            return None;
+        }
+        let sql = match name {
+            "trimAscii" => format!("TRIM({}, X'20090A0D0B0C')", col.sql),
+            "ltrimAscii" => format!("LTRIM({}, X'20090A0D0B0C')", col.sql),
+            "rtrimAscii" => format!("RTRIM({}, X'20090A0D0B0C')", col.sql),
+            "toAsciiLower" => format!("LOWER({})", col.sql),
+            "toAsciiUpper" => format!("UPPER({})", col.sql),
+            "byteLength" => format!("LENGTH(CAST({} AS BLOB))", col.sql),
+            _ => return None,
+        };
+        Some(SqlFragment { sql, params: vec![] })
+    }
+
     fn try_compile_single_table_atom(
         bind_var: &str,
         expr: &ast::Expr,
@@ -14779,20 +14847,19 @@ impl Codegen {
                 })
             }
             // Built-in functions: toUpper, toLower, trim, length
-            ast::ExprKind::App { func, .. } => {
-                if let ast::ExprKind::Var(_) = &func.node {
-                    // NOTE: toUpper/toLower are deliberately NOT pushed
-                    // down — SQLite's UPPER/LOWER are ASCII-only while the
-                    // runtime does full Unicode case mapping. Likewise
-                    // trim: SQLite TRIM strips ASCII spaces only, while
-                    // the runtime trims all Unicode whitespace. length is
-                    // also NOT pushed down: SQLite LENGTH() counts chars
-                    // before the first NUL byte, while knot_text_length
-                    // counts all chars.
-                    None
-                } else {
-                    None
+            ast::ExprKind::App { func, arg } => {
+                if let Some(frag) = Self::compile_ascii_text_fn(bind_var, func, arg) {
+                    return Some(frag);
                 }
+                // NOTE: toUpper/toLower are deliberately NOT pushed
+                // down — SQLite's UPPER/LOWER are ASCII-only while the
+                // runtime does full Unicode case mapping. Likewise
+                // trim: SQLite TRIM strips ASCII spaces only, while
+                // the runtime trims all Unicode whitespace. length is
+                // also NOT pushed down: SQLite LENGTH() counts chars
+                // before the first NUL byte, while knot_text_length
+                // counts all chars.
+                None
             }
             _ => {
                 if Self::expr_refs_var(expr, bind_var) {
@@ -16943,20 +17010,24 @@ fn peel_sort_by(
     expr: &ast::Expr,
     fun_bodies: &HashMap<String, ast::Expr>,
     let_bindings: &HashMap<String, ast::Expr>,
-) -> Option<(ast::Expr, ast::Expr)> {
+) -> Option<(ast::Expr, ast::Expr, bool)> {
     let reduced = beta_reduce(expr, fun_bodies, let_bindings);
     if let ast::ExprKind::App { func, arg: source } = reduced.node
         && let ast::ExprKind::App { func: name_expr, arg: key_lambda } = func.node
     {
-        let is_sort_by = match &name_expr.node {
-            ast::ExprKind::Var(n) => n == "sortBy",
-            ast::ExprKind::FieldAccess { expr, field } => {
-                field == "sortBy" && matches!(&expr.node, ast::ExprKind::Var(n) if n == "base")
+        let name = match &name_expr.node {
+            ast::ExprKind::Var(n) => Some(n.as_str()),
+            ast::ExprKind::FieldAccess { expr, field }
+                if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") =>
+            {
+                Some(field.as_str())
             }
-            _ => false,
+            _ => None,
         };
-        if is_sort_by {
-            return Some((*key_lambda, *source));
+        match name {
+            Some("sortBy") => return Some((*key_lambda, *source, false)),
+            Some("sortByDesc") => return Some((*key_lambda, *source, true)),
+            _ => {}
         }
     }
     None
@@ -17708,6 +17779,39 @@ fn escape_glob_pattern(s: &str) -> String {
         }
     }
     out
+}
+
+/// Decompose a record-literal sort key `{k1: r.c1, k2: r.c2, ...}` (every value a
+/// simple field access on the bind var) into ORDER BY columns. Records compare
+/// field-by-field in literal order (see `compare_values`), which matches SQL
+/// `ORDER BY c1, c2, ...`; each column's declared collation (e.g. KNOT_INT for
+/// Int columns) applies automatically, as with the single-column sortBy path.
+/// Returns None when any value is not a simple field access on `bind_var`, or
+/// any key column's type is float/tag/bool (per-column projection guard —
+/// same byte-identical rule as single-key sortBy).
+fn extract_sql_multi_key_columns(
+    bind_var: &str,
+    body: &ast::Expr,
+    alias: &str,
+    schema: &str,
+) -> Option<Vec<String>> {
+    let ast::ExprKind::Record(fields) = &body.node else {
+        return None;
+    };
+    if fields.len() < 2 {
+        return None;
+    }
+    let mut cols = Vec::with_capacity(fields.len());
+    for f in fields {
+        if f.sig.is_some() {
+            return None;
+        }
+        if !sortby_projection_pushable(bind_var, &f.value, schema) {
+            return None;
+        }
+        cols.push(extract_sql_field_access(bind_var, &f.value, alias, schema)?);
+    }
+    Some(cols)
 }
 
 fn extract_sql_field_access(

@@ -5895,9 +5895,21 @@ impl Codegen {
                                     return Some((source_name, field.clone()));
                                 }
                     }
-        // Pipe form: `source |> map (\r -> r.<field>)` — beta_reduce leaves the
-        // pipe as `map (\r -> ...) source`, which the arm above already
-        // handles. No extra case needed.
+        // Pipe form: `source |> map (\r -> r.<field>)`. beta_reduce does NOT
+        // collapse pipes, so match the BinOp::Pipe shape directly: lhs is the
+        // source, rhs is `map (\r -> r.<field>)`.
+        if let ast::ExprKind::BinOp { op: ast::BinOp::Pipe, lhs, rhs } = &reduced.node
+            && let ast::ExprKind::App { func: map_head, arg: map_lambda } = &rhs.node
+                && Self::query_form_name(map_head) == Some("map") {
+                    let source_name = self.resolve_source(lhs)?;
+                    let (bind_var, body) = extract_single_param_lambda(map_lambda, &self.fun_bodies, &self.let_bindings)?;
+                    let body: &ast::Expr = &body;
+                    if let ast::ExprKind::FieldAccess { expr: rec, field } = &body.node
+                        && let ast::ExprKind::Var(v) = &rec.node
+                            && v == &bind_var {
+                                return Some((source_name, field.clone()));
+                            }
+                }
         None
     }
 
@@ -5916,6 +5928,45 @@ impl Codegen {
         builder: &mut FunctionBuilder,
         db: Value,
     ) -> Option<Value> {
+        // `head (map (\r -> r.f) src)` / `src |> map (\r -> r.f) |> head`:
+        // select only the projected column and return the 1-col schema. Peel
+        // the map, then build the first-row query over the inner source with
+        // the projection applied. Only single-column field projections (the
+        // shape `peel_map_projection` recognizes); anything richer falls back.
+        let map_peel = self.peel_map_projection(rel_expr);
+        if let Some((map_src, map_field)) = &map_peel {
+            if !self.views.contains_key(map_src)
+                && let Some(base_schema) = self.source_schemas.get(map_src).cloned()
+                && !base_schema.starts_with('#')
+                && !base_schema.contains('[')
+                && let Some(type_str) = lookup_col_type_from_schema(&base_schema, map_field)
+            {
+                let select_columns = vec![SqlSelectColumn {
+                    result_field: map_field.clone(),
+                    alias: String::new(),
+                    source_col: map_field.clone(),
+                    type_str: type_str.clone(),
+                    sql_expr: None,
+                }];
+                let proj_schema = format!("{}:{}", map_field, type_str);
+                let plan = SqlQueryPlan {
+                    tables: vec![SqlTable {
+                        source_name: map_src.clone(),
+                        alias: String::new(),
+                        subquery: None,
+                    }],
+                    conditions: Vec::new(),
+                    params: Vec::new(),
+                    select_columns,
+                    order_by: Vec::new(),
+                    limit: Some(SqlParamSource::Literal(ast::Literal::Int("1".to_string()))),
+                    offset: None,
+                    distinct: false,
+                };
+                let query = Query { plan, terminal: QueryTerminal::Rows };
+                return Some(self.emit_query(builder, &query, &proj_schema, env, db, None));
+            }
+        }
         // Resolve the source to (plan, schema). Two shapes: a bare/`filter`
         // source (single table, optional WHERE) or a do-block plan.
         let (mut plan, schema): (SqlQueryPlan, String) =

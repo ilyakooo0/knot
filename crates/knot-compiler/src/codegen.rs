@@ -2020,7 +2020,7 @@ impl Codegen {
         // knot_relation_*/knot_text_* runtime functions below.
         let stdlib_names = [
             "filter", "map", "fold", "forEach", "match", "single", "any", "all", "diff", "inter", "sum", "avg",
-            "minOn", "maxOn", "countWhere", "head", "findFirst",
+            "minOn", "maxOn", "countWhere", "head", "findFirst", "distinct",
             // Relation query forms, registered as first-class function values
             // so they can live as fields of the `base` record (`base.count`,
             // `base.union`, `base.bind`). `sum` is already registered above.
@@ -2794,6 +2794,7 @@ impl Codegen {
         // 1-param: direct delegation to runtime
         self.define_stdlib_fn_1("single", "knot_relation_single");
         self.define_stdlib_fn_1("head", "knot_relation_head");
+        self.define_stdlib_fn_1("distinct", "knot_relation_dedup");
         self.define_stdlib_fn_1("toUpper", "knot_text_to_upper");
         self.define_stdlib_fn_1("toLower", "knot_text_to_lower");
         self.define_stdlib_fn_1("length", "knot_text_length");
@@ -6755,6 +6756,79 @@ impl Codegen {
                         };
                         return self.emit_query(builder, &query, &result_schema, env, db, None);
                     }
+            }
+
+        // Special case: distinct (map f *rel) → SELECT DISTINCT. Relations are
+        // already sets, so `distinct` is only meaningful over a projection that
+        // collapses rows; push it to SELECT DISTINCT over the projected column
+        // (scalar map) or columns (record map). Other shapes fall back to the
+        // in-memory dedup runtime fn.
+        if Self::query_form_name(func_expr) == Some("distinct") && args.len() == 1 && !user_shadows_special {
+                // Scalar projection: distinct (map (\r -> r.f) *src) →
+                // SELECT DISTINCT "f" FROM _knot_src.
+                if let Some((source_name, field)) = self.peel_map_projection(args[0])
+                    && !self.views.contains_key(&source_name)
+                        && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                            && !schema.starts_with('#') && !schema.contains('[')
+                                && let Some(type_str) = lookup_col_type_from_schema(&schema, &field) {
+                                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                    let sql = format!(
+                                        "SELECT DISTINCT {} FROM {}",
+                                        quote_sql_ident(&field), table
+                                    );
+                                    let result_schema = format!("{}:{}", field, type_str);
+                                    self.emit_stm_track_read(builder, &source_name);
+                                    let params_rel = self.compile_sql_params(builder, &[], env, db);
+                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                                    return self.call_rt(
+                                        builder,
+                                        "knot_source_query",
+                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                    );
+                                }
+                // Record projection: distinct (map (\r -> {a: r.x, ...}) *src) →
+                // SELECT DISTINCT "x" AS "a", ... FROM _knot_src.
+                let red = beta_reduce(args[0], &self.fun_bodies, &self.let_bindings);
+                if let ast::ExprKind::App { func: mf, arg: msrc } = &red.node
+                    && let ast::ExprKind::App { func: mhead, arg: map_lambda } = &mf.node
+                        && Self::query_form_name(mhead) == Some("map")
+                            && let Some(source_name) = self.resolve_source(msrc)
+                                && !self.views.contains_key(&source_name)
+                    && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                        && !schema.starts_with('#') && !schema.contains('[')
+                            && let Some((bind_var, body)) = extract_single_param_lambda(map_lambda, &self.fun_bodies, &self.let_bindings) {
+                                let body: &ast::Expr = &body;
+                                if let Some(select_cols) =
+                                    analyze_map_select(&bind_var, body, "", &schema)
+                                        && !select_cols.is_empty() {
+                                            let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                                            let col_list = select_cols.iter()
+                                                .map(|c| {
+                                                    let e = c.sql_expr.clone().unwrap_or_else(|| {
+                                                        if c.alias.is_empty() { quote_sql_ident(&c.source_col) }
+                                                        else { format!("{}.{}", c.alias, quote_sql_ident(&c.source_col)) }
+                                                    });
+                                                    format!("{} AS {}", e, quote_sql_ident(&c.result_field))
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .join(", ");
+                                            let result_schema = select_cols.iter()
+                                                .map(|c| format!("{}:{}", c.result_field, c.type_str))
+                                                .collect::<Vec<_>>()
+                                                .join(", ");
+                                            let sql = format!("SELECT DISTINCT {} FROM {}", col_list, table);
+                                            self.emit_stm_track_read(builder, &source_name);
+                                            let params_rel = self.compile_sql_params(builder, &[], env, db);
+                                            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                            let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                                            return self.call_rt(
+                                                builder,
+                                                "knot_source_query",
+                                                &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                            );
+                                        }
+                            }
             }
 
         // Special case: single *rel / single (filter f *rel) / single (do {...}) → LIMIT 2

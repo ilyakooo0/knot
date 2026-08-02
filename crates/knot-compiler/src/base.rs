@@ -116,7 +116,7 @@ boolToText  { into : Bool -> Text
 pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     "all", "any", "appendFile", "avg", "bytesConcat", "bytesFromHex",
     "bytesGet", "bytesLength", "bytesSlice", "bytesToHex", "bytesToText",
-    "chars", "contains", "countWhere", "decrypt", "diff", "dress", "drop",
+    "chars", "contains", "countWhere", "decrypt", "diff", "distinct", "dress", "drop",
     "elem", "encrypt", "fileExists", "filter", "findFirst", "fold", "forEach",
     "fork", "hash", "head", "hexDecode", "id", "inter", "length", "listDir",
     "map", "match", "maxOn", "minOn", "not", "parseJson", "race", "randomInt",

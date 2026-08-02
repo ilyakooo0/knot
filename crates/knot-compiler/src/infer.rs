@@ -9746,6 +9746,23 @@ impl Infer {
             ),
         );
 
+        // distinct : ∀a. [a] -> [a]  (builtin → knot_relation_dedup). Relations
+        // are already sets, so the in-memory path is a dedup no-op; the value
+        // is the SQL pushdown — `distinct (map f *src)` → SELECT DISTINCT.
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "distinct",
+                Scheme::poly(
+                    vec![a],
+                    Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                    ),
+                ),
+            );
+        }
+
         // forEach : ∀a r. [a] -> (a -> IO {|r} {}) -> IO {|r} {}  (builtin →
         // knot_relation_for_each). Relation-FIRST arg order (unlike map).
         // IO-effect iterator: runs `action` on each row for its side effects.

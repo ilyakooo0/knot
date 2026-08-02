@@ -10412,6 +10412,24 @@ impl Infer {
             )),
         );
 
+        // startsWith : Text -> Text -> Bool
+        self.bind_top(
+            "startsWith",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bool))),
+            )),
+        );
+
+        // endsWith : Text -> Text -> Bool
+        self.bind_top(
+            "endsWith",
+            Scheme::mono(Ty::Fun(
+                Box::new(Ty::Text),
+                Box::new(Ty::Fun(Box::new(Ty::Text), Box::new(Ty::Bool))),
+            )),
+        );
+
         // elem : ∀a. a -> [a] -> Bool
         let a = self.fresh_var();
         self.bind_top(

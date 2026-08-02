@@ -10891,6 +10891,32 @@ pub extern "C-unwind" fn knot_text_contains(needle: *mut Value, haystack: *mut V
     }
 }
 
+/// starts_with(prefix, s) — does `s` begin with `prefix`?
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_text_starts_with(prefix: *mut Value, s: *mut Value) -> *mut Value {
+    let prefix: &str = match unsafe { as_ref(prefix) } {
+        Value::Text(t) => t,
+        _ => panic!("knot runtime: startsWith expected Text as first arg"),
+    };
+    match unsafe { as_ref(s) } {
+        Value::Text(t) => alloc_bool(t.starts_with(prefix)),
+        _ => panic!("knot runtime: startsWith expected Text as second arg"),
+    }
+}
+
+/// ends_with(suffix, s) — does `s` end with `suffix`?
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_text_ends_with(suffix: *mut Value, s: *mut Value) -> *mut Value {
+    let suffix: &str = match unsafe { as_ref(suffix) } {
+        Value::Text(t) => t,
+        _ => panic!("knot runtime: endsWith expected Text as first arg"),
+    };
+    match unsafe { as_ref(s) } {
+        Value::Text(t) => alloc_bool(t.ends_with(suffix)),
+        _ => panic!("knot runtime: endsWith expected Text as second arg"),
+    }
+}
+
 /// elem(needle, haystack) — check if a list contains a value (by structural equality)
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_list_elem(needle: *mut Value, haystack: *mut Value) -> *mut Value {

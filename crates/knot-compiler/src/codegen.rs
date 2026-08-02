@@ -1416,6 +1416,8 @@ impl Codegen {
         self.declare_rt("knot_text_length", &[p], &[p]);
         self.declare_rt("knot_text_trim", &[p], &[p]);
         self.declare_rt("knot_text_contains", &[p, p], &[p]);
+        self.declare_rt("knot_text_starts_with", &[p, p], &[p]);
+        self.declare_rt("knot_text_ends_with", &[p, p], &[p]);
         self.declare_rt("knot_list_elem", &[p, p], &[p]);
         self.declare_rt("knot_text_reverse", &[p], &[p]);
         self.declare_rt("knot_text_chars", &[p], &[p]);
@@ -2034,7 +2036,7 @@ impl Codegen {
             // `base.union`, `base.bind`). `sum` is already registered above.
             "count", "union", "bind",
             "toUpper", "toLower", "sortBy",
-            "length", "trim", "contains", "elem", "reverse",
+            "length", "trim", "contains", "startsWith", "endsWith", "elem", "reverse",
             "chars", "id", "not", "toJson", "parseJson",
             "traverse", "take", "drop",
             "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
@@ -2845,6 +2847,8 @@ impl Codegen {
         self.define_stdlib_fn_2("match", "knot_relation_match", false);
         self.define_stdlib_fn_2("sortBy", "knot_relation_sort_by", true);
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
+        self.define_stdlib_fn_2("startsWith", "knot_text_starts_with", false);
+        self.define_stdlib_fn_2("endsWith", "knot_text_ends_with", false);
         self.define_stdlib_fn_2("elem", "knot_list_elem", false);
         self.define_stdlib_fn_2("diff", "knot_relation_diff", true);
         self.define_stdlib_fn_2("inter", "knot_relation_inter", true);
@@ -14479,6 +14483,38 @@ impl Codegen {
                 // `contains`/`elem` and the `base.`-qualified forms.
                 if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node
                     && let Some(name) = Self::query_form_name(inner_func) {
+                        // `startsWith prefix col` / `endsWith suffix col` →
+                        // `col GLOB '<pat>*'` / `col GLOB '*<pat>'`. GLOB (not
+                        // LIKE) because Rust's starts_with/ends_with are
+                        // case-sensitive and GLOB matches case-sensitively,
+                        // whereas SQLite LIKE is ASCII-case-insensitive by
+                        // default — so LIKE would NOT be byte-identical. The
+                        // column must be the bind var's Text field; the
+                        // pattern must be a Text literal with every GLOB
+                        // metacharacter (`* ? [ ]`) and the escape char
+                        // escaped, otherwise the in-memory and SQL results
+                        // diverge → fall back.
+                        if matches!(name, "startsWith" | "endsWith") {
+                            let col_frag = Self::try_compile_single_table_atom(bind_var, arg)?;
+                            if !col_frag.params.is_empty() {
+                                // Column must be a plain field access, not a param.
+                                return None;
+                            }
+                            // Pattern must be a Text literal we can escape.
+                            if let ast::ExprKind::Lit(ast::Literal::Text(pat)) = &first_arg.node {
+                                let escaped = escape_glob_pattern(pat);
+                                let glob = if name == "startsWith" {
+                                    format!("'{}*'", escaped)
+                                } else {
+                                    format!("'*{}'", escaped)
+                                };
+                                return Some(SqlFragment {
+                                    sql: format!("{} GLOB {}", col_frag.sql, glob),
+                                    params: vec![],
+                                });
+                            }
+                            return None;
+                        }
                         if name == "contains" {
                             let needle = Self::try_compile_single_table_atom(bind_var, first_arg)?;
                             let haystack = Self::try_compile_single_table_atom(bind_var, arg)?;
@@ -17653,6 +17689,25 @@ fn peel_group_map(
         return Some(args[0].clone());
     }
     Some(reduced)
+}
+
+/// Escape a literal string for use inside a SQLite GLOB pattern, wrapping
+/// each GLOB metacharacter in a character class so it matches literally.
+/// `*`→`[*]`, `?`→`[?]`, `[`→`[[]`, `]`→`[]]`. Also escapes the SQL single
+/// quote (doubling) since the pattern is inlined as a quoted literal.
+fn escape_glob_pattern(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '*' => out.push_str("[*]"),
+            '?' => out.push_str("[?]"),
+            '[' => out.push_str("[[]"),
+            ']' => out.push_str("[]]"),
+            '\'' => out.push_str("\'\'"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn extract_sql_field_access(

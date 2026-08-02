@@ -20,12 +20,13 @@ fn main() {
         "build" => {
             if args.len() < 3 {
                 eprintln!("Error: missing source file");
-                eprintln!("Usage: knot build <file.knot> [-o <path>] [--name=value ...]");
+                eprintln!("Usage: knot build <file.knot> [-o <path>] [--debug] [--name=value ...]");
                 process::exit(1);
             }
             // Parse -o/--output and compile-time overrides from remaining args
             let mut overrides = HashMap::new();
             let mut output: Option<PathBuf> = None;
+            let mut debug = false;
             let mut i = 3;
             while i < args.len() {
                 if args[i] == "-o" {
@@ -48,6 +49,11 @@ fn main() {
                     output = Some(PathBuf::from(val));
                     i += 1;
                 } else if let Some(rest) = args[i].strip_prefix("--") {
+                    if rest == "debug" {
+                        debug = true;
+                        i += 1;
+                        continue;
+                    }
                     if rest == "output" {
                         if i + 1 >= args.len() {
                             eprintln!("Error: missing value for --output");
@@ -109,7 +115,7 @@ fn main() {
                 }
             }
 
-            cmd_build(&args[2], output.as_deref(), &overrides);
+            cmd_build(&args[2], output.as_deref(), &overrides, debug);
         }
         "fmt" => {
             cmd_fmt(&args[2..]);
@@ -127,7 +133,8 @@ fn print_usage() {
     eprintln!("Knot compiler");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  knot build <file.knot> [-o <path>] [--name=value ...]  Compile with optional output path and constant overrides");
+    eprintln!("  knot build <file.knot> [-o <path>] [--debug] [--name=value ...]  Compile with optional output path and constant overrides");
+    eprintln!("      --debug   Print each expression that generates SQL with the SQL it pushed down");
     eprintln!("  knot fmt [--check] [--stdout] <file.knot>              Format a source file in place ('-' reads stdin, writes stdout)");
     eprintln!("  knot help                                              Show this help message");
 }
@@ -264,7 +271,7 @@ fn same_file_path(a: &std::path::Path, b: &std::path::Path) -> bool {
     normalize(a) == normalize(b)
 }
 
-fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overrides: &HashMap<String, String>) {
+fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overrides: &HashMap<String, String>, debug: bool) {
     let source_path = PathBuf::from(source_file);
 
     // Read source
@@ -469,7 +476,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     }
 
     // Code generation
-    let obj_bytes = match codegen::compile(&program, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, &elem_pushdown_ok, &show_unit_strings, &sum_float_spans, &relation_fields, &with_fields, &implicit_refs, &type_arg_spans, &implicit_dict_args, &resolved_calls, &todo_types, &todo_bindings, &trace_types, &trace_bindings, &source, overrides) {
+    let obj_bytes = match codegen::compile(&program, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, &elem_pushdown_ok, &show_unit_strings, &sum_float_spans, &relation_fields, &with_fields, &implicit_refs, &type_arg_spans, &implicit_dict_args, &resolved_calls, &todo_types, &todo_bindings, &trace_types, &trace_bindings, &source, overrides, debug) {
         Ok(bytes) => bytes,
         Err(diags) => {
             for diag in &diags {

@@ -365,6 +365,9 @@ pub struct Codegen {
     source_text: String,
     /// Program filename, shown in the hole report header.
     source_name: String,
+    /// `--debug`: print every expression that generates SQL with the SQL it
+    /// pushed down. Set from the CLI; read by `debug_sql`.
+    debug: bool,
 
     // Names of `with`-bound locals and whether each one's bound value is
     // IO-producing (`self.expr_is_io(value)`). Such a name used inside the
@@ -725,6 +728,7 @@ pub fn compile(
     trace_bindings: &crate::infer::TraceBindings,
     source: &str,
     compile_time_overrides: &HashMap<String, String>,
+    debug: bool,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     crate::stack::grow(|| {
         compile_inner(
@@ -751,6 +755,7 @@ pub fn compile(
             trace_bindings,
             source,
             compile_time_overrides,
+            debug,
         )
     })
 }
@@ -780,8 +785,10 @@ fn compile_inner(
     trace_bindings: &crate::infer::TraceBindings,
     source: &str,
     compile_time_overrides: &HashMap<String, String>,
+    debug: bool,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
     let mut cg = Codegen::new();
+    cg.debug = debug;
     cg.todo_types = todo_types.clone();
     cg.todo_bindings = todo_bindings.clone();
     cg.trace_types = trace_types.clone();
@@ -1143,6 +1150,7 @@ impl Codegen {
             trace_bindings: HashMap::new(),
             source_text: String::new(),
             source_name: String::new(),
+            debug: false,
             with_io_locals: Vec::new(),
             elem_pushdown_ok: crate::infer::ElemPushdownOk::default(),
             show_unit_strings: HashMap::new(),
@@ -5965,7 +5973,7 @@ impl Codegen {
                     distinct: false,
                 };
                 let query = Query { plan, terminal: QueryTerminal::Rows };
-                return Some(self.emit_query(builder, &query, &proj_schema, env, db, None));
+                return Some(self.emit_query(builder, &query, &proj_schema, env, db, None, Some(rel_expr.span)));
             }
         }
         // Resolve the source to (plan, schema). Two shapes: a bare/`filter`
@@ -6097,7 +6105,7 @@ impl Codegen {
             plan.limit = Some(SqlParamSource::Literal(ast::Literal::Int("1".to_string())));
         }
         let query = Query { plan, terminal: QueryTerminal::Rows };
-        Some(self.emit_query(builder, &query, &schema, env, db, None))
+        Some(self.emit_query(builder, &query, &schema, env, db, None, Some(rel_expr.span)))
     }
 
     /// Does this argument expression have a Π-lite type-argument head? Only the
@@ -6661,7 +6669,7 @@ impl Codegen {
                                         },
                                         terminal: QueryTerminal::Count,
                                     };
-                                    return self.emit_query(builder, &query, &schema, env, db, None);
+                                    return self.emit_query(builder, &query, &schema, env, db, None, Some(expr.span));
                                 }
                 }
 
@@ -6754,7 +6762,7 @@ impl Codegen {
                             },
                             terminal: QueryTerminal::Count,
                         };
-                        return self.emit_query(builder, &query, &result_schema, env, db, None);
+                        return self.emit_query(builder, &query, &result_schema, env, db, None, Some(expr.span));
                     }
             }
 
@@ -6933,6 +6941,7 @@ impl Codegen {
                 if let Some(plan) = plan_result {
                         let mut sql = plan.build_sql();
                         sql.push_str(" LIMIT 2");
+                        self.debug_sql(Some(expr.span), &sql);
                         let result_schema = plan.build_result_schema();
                         let preds = try_extract_preds_for_single_table_plan(plan_stmts, &plan);
                         let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
@@ -7072,6 +7081,7 @@ impl Codegen {
                         let f = self.compile_expr(builder, args[0], env, db);
                         let init = self.compile_expr(builder, args[1], env, db);
                         let sql = plan.build_sql();
+                        self.debug_sql(stmts.first().map(|s| s.span), &sql);
                         let result_schema = plan.build_result_schema();
                         let preds = try_extract_preds_for_single_table_plan(stmts, &plan);
                         let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
@@ -7157,7 +7167,7 @@ impl Codegen {
                         && let Some(schema) = self.source_schemas.get(&source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[')
                                 && let Some(result) = self.try_compile_app_sql(
-                                    builder, name, args[0], &source_name, &schema, env, db,
+                                    builder, name, args[0], &source_name, &schema, env, db, expr.span,
                                 ) {
                                     return result;
                                 }
@@ -7211,7 +7221,7 @@ impl Codegen {
                                                         result_flag,
                                                     },
                                                 };
-                                                return self.emit_query(builder, &query, &schema, env, db, None);
+                                                return self.emit_query(builder, &query, &schema, env, db, None, Some(expr.span));
                                             }
                                     }
                     }
@@ -7310,7 +7320,7 @@ impl Codegen {
                                             result_flag,
                                         },
                                     };
-                                    return self.emit_query(builder, &query, &result_schema, env, db, None);
+                                    return self.emit_query(builder, &query, &result_schema, env, db, None, Some(expr.span));
                                 }
                             }
                 }
@@ -7495,7 +7505,7 @@ impl Codegen {
                             },
                             terminal: QueryTerminal::Exists { negated },
                         };
-                        return self.emit_query(builder, &query, &schema, env, db, None);
+                        return self.emit_query(builder, &query, &schema, env, db, None, Some(expr.span));
                     }
                 }
 
@@ -7620,7 +7630,7 @@ impl Codegen {
                                                             },
                                                             terminal: QueryTerminal::Rows,
                                                         };
-                                                        return self.emit_query(builder, &query, &schema, env, db, Some(n_val));
+                                                        return self.emit_query(builder, &query, &schema, env, db, Some(n_val), Some(expr.span));
                                                     }
                                                 }
                                     // Case 2: sortBy f (do { m <- *source; where ...; yield m })
@@ -7698,7 +7708,7 @@ impl Codegen {
                                     },
                                     terminal: QueryTerminal::Rows,
                                 };
-                                return self.emit_query(builder, &query, &schema, env, db, Some(n_val));
+                                return self.emit_query(builder, &query, &schema, env, db, Some(n_val), Some(expr.span));
                             }
 
                 // takeRelation N (filter f *source) → SQL WHERE + LIMIT
@@ -7729,7 +7739,7 @@ impl Codegen {
                                         },
                                         terminal: QueryTerminal::Rows,
                                     };
-                                    return self.emit_query(builder, &query, &schema, env, db, Some(n_val));
+                                    return self.emit_query(builder, &query, &schema, env, db, Some(n_val), Some(expr.span));
                                 }
                 }
             }
@@ -7761,7 +7771,7 @@ impl Codegen {
                                     terminal: QueryTerminal::Rows,
                                 };
                                 let n_val = self.compile_expr(builder, args[0], env, db);
-                                return self.emit_query(builder, &query, &schema, env, db, Some(n_val));
+                                return self.emit_query(builder, &query, &schema, env, db, Some(n_val), Some(expr.span));
                             }
 
         // SQL set operations: diff/inter/union on two source relations
@@ -7802,7 +7812,7 @@ impl Codegen {
                                 right: sub_b,
                             },
                         };
-                        return self.emit_query(builder, &query, &result_schema, env, db, None);
+                        return self.emit_query(builder, &query, &result_schema, env, db, None, Some(expr.span));
                     }
                 }
         }
@@ -7898,7 +7908,7 @@ impl Codegen {
                                                 result_flag,
                                             },
                                         };
-                                        return self.emit_query(builder, &query, &schema, env, db, None);
+                                        return self.emit_query(builder, &query, &schema, env, db, None, Some(expr.span));
                                     }
                                 }
 
@@ -12454,6 +12464,7 @@ impl Codegen {
         let plan = self.analyze_sql_plan(stmts, env)?;
 
         let sql = plan.build_sql();
+        self.debug_sql(stmts.first().map(|s| s.span), &sql);
         let result_schema = plan.build_result_schema();
 
         self.emit_stm_track_reads_for_plan(builder, &plan);
@@ -12480,6 +12491,7 @@ impl Codegen {
         schema: &str,
         env: &mut Env,
         db: Value,
+        expr_span: ast::Span,
     ) -> Option<Value> {
         // User trait impls on primitives change operator semantics that
         // SQL can't replicate — fall back to in-memory evaluation.
@@ -12546,7 +12558,7 @@ impl Codegen {
                         result_flag,
                     },
                 };
-                Some(self.emit_query(builder, &query, schema, env, db, None))
+                Some(self.emit_query(builder, &query, schema, env, db, None, Some(expr_span)))
             }
             "countWhere" => {
                 let frag = self.try_compile_sql_expr(&bind_var, body, schema)?;
@@ -12567,7 +12579,7 @@ impl Codegen {
                     },
                     terminal: QueryTerminal::Count,
                 };
-                Some(self.emit_query(builder, &query, schema, env, db, None))
+                Some(self.emit_query(builder, &query, schema, env, db, None, Some(expr_span)))
             }
             "sortBy" => {
                 // sortBy (\m -> m.field) *source → SELECT * FROM source ORDER BY field
@@ -12595,7 +12607,7 @@ impl Codegen {
                     },
                     terminal: QueryTerminal::Rows,
                 };
-                Some(self.emit_query(builder, &query, schema, env, db, None))
+                Some(self.emit_query(builder, &query, schema, env, db, None, Some(expr_span)))
             }
             _ => None,
         }
@@ -12643,7 +12655,7 @@ impl Codegen {
         // split into a pushable prefix (compiled to a FROM (…)) and the
         // remaining suffix ops (the outer query over that subquery).
         if !pipe_ops_order_pushable(&ops)
-            && let Some(v) = self.try_compile_staged_pipe(builder, &source_name, &schema, &ops, env, db)
+            && let Some(v) = self.try_compile_staged_pipe(builder, &source_name, &schema, &ops, env, db, expr.span)
         {
             return Some(v);
         }
@@ -12833,7 +12845,7 @@ impl Codegen {
                 },
                 terminal: QueryTerminal::Aggregate { func, col_sql, result_flag },
             };
-            Some(self.emit_query(builder, &query, &schema, env, db, None))
+            Some(self.emit_query(builder, &query, &schema, env, db, None, Some(expr.span)))
         } else if is_count {
             // COUNT(*) ignores LIMIT/OFFSET — a count after take/drop must
             // fall back. (Also rejected by the order check.)
@@ -12856,7 +12868,7 @@ impl Codegen {
                 },
                 terminal: QueryTerminal::Count,
             };
-            Some(self.emit_query(builder, &query, &schema, env, db, None))
+            Some(self.emit_query(builder, &query, &schema, env, db, None, Some(expr.span)))
         } else {
             // A scalar (non-record) map yields a relation of bare values
             // (dedup'd, set semantics). The record-reconstructing Rows path
@@ -12907,6 +12919,7 @@ impl Codegen {
             };
 
             let sql = plan.build_sql();
+            self.debug_sql(Some(expr.span), &sql);
             let result_schema = plan.build_result_schema();
             self.emit_stm_track_reads_for_plan(builder, &plan);
             let mut all_params = plan.params;
@@ -12945,6 +12958,7 @@ impl Codegen {
         ops: &[PipeOp],
         env: &mut Env,
         db: Value,
+        expr_span: ast::Span,
     ) -> Option<Value> {
         // Find the longest canonical-order prefix that yields ROWS (no
         // aggregate/count terminal) and leaves a non-empty suffix.
@@ -13011,9 +13025,10 @@ impl Codegen {
                 suffix,
                 env,
                 db,
+                expr_span,
             );
         };
-        Some(self.emit_query(builder, &suffix_query, &result_schema, env, db, None))
+        Some(self.emit_query(builder, &suffix_query, &result_schema, env, db, None, Some(expr_span)))
     }
 
     /// Recursive helper for `try_compile_staged_pipe` when the suffix is itself
@@ -13028,6 +13043,7 @@ impl Codegen {
         ops: &[PipeOp],
         env: &mut Env,
         db: Value,
+        expr_span: ast::Span,
     ) -> Option<Value> {
         let mut split = None;
         for k in (1..ops.len()).rev() {
@@ -13081,9 +13097,10 @@ impl Codegen {
                 suffix,
                 env,
                 db,
+                expr_span,
             );
         };
-        Some(self.emit_query(builder, &suffix_query, &result_schema, env, db, None))
+        Some(self.emit_query(builder, &suffix_query, &result_schema, env, db, None, Some(expr_span)))
     }
 
     /// Build a `Query` for a canonical-order op list over a single table (a
@@ -13377,8 +13394,10 @@ impl Codegen {
         if let ast::ExprKind::Do(stmts) = &expr.node {
             let plan = self.analyze_sql_plan(stmts, env)?;
             let tables = plan.tables.iter().map(|t| t.source_name.clone()).collect();
+            let sql = plan.build_sql();
+            self.debug_sql(stmts.first().map(|s| s.span), &sql);
             return Some(SetOpSubquery {
-                sql: plan.build_sql(),
+                sql,
                 schema: plan.build_result_schema(),
                 params: plan.params,
                 tables,
@@ -14510,6 +14529,24 @@ impl Codegen {
     /// `SqlParamSource`). When `Some`, it is pushed onto the params relation
     /// after the static WHERE params — matching the `?` the plan's
     /// `limit_offset_suffix` emits. `None` for queries with no runtime limit.
+    ///
+    /// `--debug` helper: print the source expression (located by `span`) and
+    /// the SQL it pushed down. No-op unless the `debug` flag is set. Spans
+    /// from desugared/prelude code (start ≥ the source length) print just the
+    /// SQL without a source snippet.
+    fn debug_sql(&self, span: Option<ast::Span>, sql: &str) {
+        if !self.debug {
+            return;
+        }
+        let snippet = span
+            .filter(|s| s.end <= self.source_text.len() && s.start < s.end)
+            .map(|s| self.source_text[s.start..s.end].trim().to_string())
+            .map(|t| t.chars().take(120).collect::<String>());
+        match snippet {
+            Some(expr) => eprintln!("[sql] `{}` =>\n      {}", expr, sql),
+            None => eprintln!("[sql] =>\n      {}", sql),
+        }
+    }
     fn emit_query(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -14518,8 +14555,10 @@ impl Codegen {
         env: &mut Env,
         db: Value,
         limit_val: Option<Value>,
+        span: Option<ast::Span>,
     ) -> Value {
         let sql = query.build_sql();
+        self.debug_sql(span, &sql);
         // STM read-tracking + param sources differ by terminal: single-plan
         // terminals read the plan's tables/params; a SetOp reads and binds
         // across BOTH lowered subqueries.

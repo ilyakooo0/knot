@@ -14198,6 +14198,94 @@ impl Codegen {
     /// integer text-cast treatment).
     /// Field accesses on bind_var become column references;
     /// literals and free variables become bind parameters (?).
+    /// Translate the predicate of a correlated `any`/`all` into SQL for the
+    /// EXISTS subquery's WHERE. Two scopes:
+    ///   * `inner_var.col`  → unqualified `"col"` (innermost table).
+    ///   * `outer_var.col`  → `"_knot_<outer>"."col"` (table-qualified, so a
+    ///     same-named inner column can't capture it).
+    /// Literals inline. Supports the six comparisons, && / ||, not. Anything
+    /// else → None (caller falls back to in-memory).
+    fn translate_correlated_pred(
+        &self,
+        inner_var: &str,
+        inner_schema: &str,
+        outer_var: &str,
+        outer_src: &str,
+        expr: &ast::Expr,
+    ) -> Option<SqlFragment> {
+        match &expr.node {
+            ast::ExprKind::BinOp { op, lhs, rhs } => {
+                use ast::BinOp as B;
+                match op {
+                    B::And | B::Or => {
+                        let l = self.translate_correlated_pred(inner_var, inner_schema, outer_var, outer_src, lhs)?;
+                        let r = self.translate_correlated_pred(inner_var, inner_schema, outer_var, outer_src, rhs)?;
+                        let kw = if matches!(op, B::And) { "AND" } else { "OR" };
+                        let mut params = l.params;
+                        params.extend(r.params);
+                        Some(SqlFragment { sql: format!("({} {} {})", l.sql, kw, r.sql), params })
+                    }
+                    B::Eq | B::Neq | B::Lt | B::Gt | B::Le | B::Ge => {
+                        let l = self.correlated_operand(inner_var, inner_schema, outer_var, outer_src, lhs)?;
+                        let r = self.correlated_operand(inner_var, inner_schema, outer_var, outer_src, rhs)?;
+                        let sym = match op {
+                            B::Eq => "=", B::Neq => "!=", B::Lt => "<",
+                            B::Gt => ">", B::Le => "<=", B::Ge => ">=",
+                            _ => unreachable!(),
+                        };
+                        let mut params = l.params;
+                        params.extend(r.params);
+                        Some(SqlFragment { sql: format!("({} {} {})", l.sql, sym, r.sql), params })
+                    }
+                    _ => None,
+                }
+            }
+            ast::ExprKind::UnaryOp { op: ast::UnaryOp::Not, operand } => {
+                let inner = self.translate_correlated_pred(inner_var, inner_schema, outer_var, outer_src, operand)?;
+                Some(SqlFragment { sql: format!("(NOT {})", inner.sql), params: inner.params })
+            }
+            _ => None,
+        }
+    }
+
+    /// One operand of a correlated comparison: inner col (unqualified), outer
+    /// col (table-qualified), or a literal param.
+    fn correlated_operand(
+        &self,
+        inner_var: &str,
+        inner_schema: &str,
+        outer_var: &str,
+        outer_src: &str,
+        expr: &ast::Expr,
+    ) -> Option<SqlFragment> {
+        if let ast::ExprKind::FieldAccess { expr: e, field: col } = &expr.node
+            && let ast::ExprKind::Var(v) = &e.node
+        {
+            if v == inner_var {
+                lookup_col_type_from_schema(inner_schema, col)?;
+                return Some(SqlFragment { sql: quote_sql_ident(col), params: vec![] });
+            }
+            if v == outer_var {
+                return Some(SqlFragment {
+                    sql: format!(
+                        "{}.{}",
+                        quote_sql_ident(&format!("_knot_{}", outer_src)),
+                        quote_sql_ident(col)
+                    ),
+                    params: vec![],
+                });
+            }
+        }
+        // Literal → param (byte-identical binding).
+        if let ast::ExprKind::Lit(lit) = &expr.node {
+            return Some(SqlFragment {
+                sql: "?".to_string(),
+                params: vec![SqlParamSource::Literal(lit.clone())],
+            });
+        }
+        None
+    }
+
     fn try_compile_sql_expr(
         &self,
         bind_var: &str,
@@ -14336,6 +14424,57 @@ impl Codegen {
                             params: inner.params,
                         });
                     }
+                // Correlated EXISTS: `any pred *other` / `all pred *other`
+                // where pred references BOTH the inner row (its lambda param)
+                // and the current (outer) row `bind_var`. Emits
+                // `EXISTS(SELECT 1 FROM other WHERE <pred>)`. The outer column
+                // is qualified with the table name so it can't be captured by
+                // a same-named inner column; the inner columns are
+                // unqualified (innermost scope). Byte-identical: the EXISTS
+                // row set equals the in-memory any/all over the same rows.
+                if let ast::ExprKind::App { func: inner_func, arg: pred_lambda } = &func.node
+                    && let Some(fname) = Self::query_form_name(inner_func)
+                    && matches!(fname, "any" | "all")
+                {
+                    if let Some(sub_src) = self.resolve_source(arg)
+                        && !self.views.contains_key(&sub_src)
+                        && let Some(sub_schema) = self.source_schemas.get(&sub_src).cloned()
+                        && !sub_schema.starts_with('#')
+                        && !sub_schema.contains('[')
+                        && let Some((inner_var, inner_body)) = extract_single_param_lambda(
+                            pred_lambda, &self.fun_bodies, &self.let_bindings,
+                        )
+                    {
+                        // Reverse-lookup the outer source name from its schema
+                        // so we can table-qualify outer refs inside the
+                        // subquery. Schemas are unique per source.
+                        let outer_src = self
+                            .source_schemas
+                            .iter()
+                            .find(|(_, s)| *s == schema)
+                            .map(|(n, _)| n.clone())?;
+                        let inner_body: &ast::Expr = &inner_body;
+                        let frag = self.translate_correlated_pred(
+                            &inner_var, &sub_schema, bind_var, &outer_src, inner_body,
+                        )?;
+                        // all pred rel  ⇔  no row FAILS pred  ⇔
+                        // NOT EXISTS(SELECT 1 WHERE NOT pred). Negate both the
+                        // EXISTS and the inner predicate.
+                        let (not_kw, where_sql) = if fname == "all" {
+                            ("NOT ", format!("NOT ({})", frag.sql))
+                        } else {
+                            ("", frag.sql)
+                        };
+                        let sub_sql = format!(
+                            "{}EXISTS(SELECT 1 FROM {} WHERE {})",
+                            not_kw,
+                            quote_sql_ident(&format!("_knot_{}", sub_src)),
+                            where_sql,
+                        );
+                        return Some(SqlFragment { sql: sub_sql, params: frag.params });
+                    }
+                    return None;
+                }
                 // Two-arg builtins: App(App(<head>, arg1), arg2). Accept both
                 // `contains`/`elem` and the `base.`-qualified forms.
                 if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node

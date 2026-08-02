@@ -7337,14 +7337,26 @@ impl Codegen {
                     let built: Option<ExistsParts> = (|| {
                         // Resolve the table + (for `elem`) the projected column.
                         // `elem val (map (\r -> r.f) *src)` peels the map; the other
-                        // ops take a bare `*src`.
+                        // ops take a bare `*src`. For any/all, a `filter q *src`
+                        // source is peeled too: its condition is AND-ed into the
+                        // EXISTS WHERE below (`any p (filter q *src)` →
+                        // EXISTS(… WHERE q AND p)).
+                        let mut filter_cond: Option<(String, ast::Expr)> = None;
                         let (source_name, map_col): (String, Option<String>) = if name == "elem" {
                             match self.peel_map_projection(args[1]) {
                                 Some((src, col)) => (src, Some(col)),
                                 None => (self.resolve_source(args[1])?, None),
                             }
                         } else {
-                            (self.resolve_source(args[1])?, None)
+                            match extract_filter_on_source(
+                                args[1], &self.source_var_binds, &self.fun_bodies, &self.let_bindings,
+                            ) {
+                                Some((src, bind, body)) => {
+                                    filter_cond = Some((bind, body));
+                                    (src, None)
+                                }
+                                None => (self.resolve_source(args[1])?, None),
+                            }
                         };
                         if self.views.contains_key(&source_name) { return None; }
                         let schema = self.source_schemas.get(&source_name)?.clone();
@@ -7354,11 +7366,25 @@ impl Codegen {
                                 let (pb, pbody) = extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings)?;
                                 let pbody: &ast::Expr = &pbody;
                                 let frag = self.try_compile_sql_expr(&pb, pbody, &schema)?;
+                                // A peeled `filter q *src` source contributes its
+                                // condition first (textually before the predicate's
+                                // params in the WHERE), then the predicate.
+                                let (mut conds, mut prms) = (Vec::new(), Vec::new());
+                                if let Some((fb, fbody)) = &filter_cond {
+                                    let fbody: &ast::Expr = fbody;
+                                    let ffrag = self.try_compile_sql_expr(fb, fbody, &schema)?;
+                                    conds.push(ffrag.sql);
+                                    prms.extend(ffrag.params);
+                                }
                                 if name == "all" {
                                     // all pred rel  ⇔  no row *fails* pred.
-                                    (vec![format!("NOT ({})", frag.sql)], frag.params, true)
+                                    conds.push(format!("NOT ({})", frag.sql));
+                                    prms.extend(frag.params);
+                                    (conds, prms, true)
                                 } else {
-                                    (vec![frag.sql], frag.params, false)
+                                    conds.push(frag.sql);
+                                    prms.extend(frag.params);
+                                    (conds, prms, false)
                                 }
                             }
                             _ => {

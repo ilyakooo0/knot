@@ -5972,6 +5972,7 @@ impl Codegen {
                     offset: None,
                     distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                 };
                 let query = Query { plan, terminal: QueryTerminal::Rows };
                 return Some(self.emit_query(builder, &query, &proj_schema, env, db, None, Some(rel_expr.span)));
@@ -6085,6 +6086,7 @@ impl Codegen {
                         offset: offset_param,
                         distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                     },
                     schema,
                 )
@@ -6669,6 +6671,7 @@ impl Codegen {
                                             offset: None,
                                             distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                                         },
                                         terminal: QueryTerminal::Count,
                                     };
@@ -6763,6 +6766,7 @@ impl Codegen {
                                 offset: None,
                                 distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                             },
                             terminal: QueryTerminal::Count,
                         };
@@ -7219,6 +7223,7 @@ impl Codegen {
                                                         offset: None,
                                                         distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                                                     },
                                                     terminal: QueryTerminal::Aggregate {
                                                         func: sql_func,
@@ -7319,6 +7324,7 @@ impl Codegen {
                                             offset: None,
                                             distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                                         },
                                         terminal: QueryTerminal::Aggregate {
                                             func: sql_func,
@@ -7509,6 +7515,7 @@ impl Codegen {
                                 offset: None,
                                 distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                             },
                             terminal: QueryTerminal::Exists { negated },
                         };
@@ -7635,6 +7642,7 @@ impl Codegen {
                                                                 offset: None,
                                                                 distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                                                             },
                                                             terminal: QueryTerminal::Rows,
                                                         };
@@ -7714,6 +7722,7 @@ impl Codegen {
                                         offset: None,
                                         distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                                     },
                                     terminal: QueryTerminal::Rows,
                                 };
@@ -7746,6 +7755,7 @@ impl Codegen {
                                             offset: None,
                                             distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                                         },
                                         terminal: QueryTerminal::Rows,
                                     };
@@ -7778,6 +7788,7 @@ impl Codegen {
                                         offset: Some(SqlParamSource::Var("__offset__".into())),
                                         distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                                     },
                                     terminal: QueryTerminal::Rows,
                                 };
@@ -7817,6 +7828,7 @@ impl Codegen {
                                 offset: None,
                                 distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                             },
                             terminal: QueryTerminal::SetOp {
                                 op: sql_op,
@@ -7914,6 +7926,7 @@ impl Codegen {
                                                 offset: None,
                                                 distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                                             },
                                             terminal: QueryTerminal::Aggregate {
                                                 func,
@@ -12565,6 +12578,7 @@ impl Codegen {
                         offset: None,
                         distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                     },
                     terminal: QueryTerminal::Aggregate {
                         func,
@@ -12591,6 +12605,7 @@ impl Codegen {
                         offset: None,
                         distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                     },
                     terminal: QueryTerminal::Count,
                 };
@@ -12620,6 +12635,7 @@ impl Codegen {
                         offset: None,
                         distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                     },
                     terminal: QueryTerminal::Rows,
                 };
@@ -12859,6 +12875,7 @@ impl Codegen {
                     offset: None,
                     distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                 },
                 terminal: QueryTerminal::Aggregate { func, col_sql, result_flag },
             };
@@ -12883,6 +12900,7 @@ impl Codegen {
                     offset: None,
                     distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                 },
                 terminal: QueryTerminal::Count,
             };
@@ -12935,6 +12953,7 @@ impl Codegen {
                 offset,
                 distinct,
                 group_by: Vec::new(),
+                having: Vec::new(),
             };
 
             let sql = plan.build_sql();
@@ -13293,6 +13312,7 @@ impl Codegen {
                     offset: None,
                     distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                 },
                 terminal: QueryTerminal::Aggregate { func, col_sql, result_flag },
             };
@@ -13313,6 +13333,7 @@ impl Codegen {
                     offset: None,
                     distinct: false,
             group_by: Vec::new(),
+            having: Vec::new(),
                 },
                 terminal: QueryTerminal::Count,
             };
@@ -13350,6 +13371,7 @@ impl Codegen {
                 offset,
                 distinct,
                 group_by: Vec::new(),
+                having: Vec::new(),
             };
             let result_schema = plan.build_result_schema();
             Some((Query { plan, terminal: QueryTerminal::Rows }, result_schema))
@@ -13498,6 +13520,97 @@ impl Codegen {
         }
     }
 
+    /// Translate a post-groupBy `where` condition into a HAVING fragment.
+    /// Leaf operands may be aggregates over the group var (`count v`,
+    /// `sum (map ..)`, `avg ..`, `minOn/maxOn ..`), a group-key column
+    /// reference (`v.col`), or a literal/param. Boolean connectives and the
+    /// six comparisons compose. Anything else → None (fall back to in-memory).
+    fn translate_having(
+        &self,
+        gvar: &str,
+        alias: &str,
+        schema: &str,
+        group_keys: &[(String, String, String)],
+        cond: &ast::Expr,
+        env: &Env,
+    ) -> Option<String> {
+        match &cond.node {
+            ast::ExprKind::BinOp { op, lhs, rhs } => {
+                use ast::BinOp as B;
+                match op {
+                    B::And | B::Or => {
+                        let l = self.translate_having(gvar, alias, schema, group_keys, lhs, env)?;
+                        let r = self.translate_having(gvar, alias, schema, group_keys, rhs, env)?;
+                        let kw = if matches!(op, B::And) { "AND" } else { "OR" };
+                        Some(format!("({} {} {})", l, kw, r))
+                    }
+                    B::Eq | B::Neq | B::Lt | B::Gt | B::Le | B::Ge => {
+                        let l = self.having_operand_sql(gvar, alias, schema, group_keys, lhs, env)?;
+                        let r = self.having_operand_sql(gvar, alias, schema, group_keys, rhs, env)?;
+                        let sym = match op {
+                            B::Eq => "=",
+                            B::Neq => "!=",
+                            B::Lt => "<",
+                            B::Gt => ">",
+                            B::Le => "<=",
+                            B::Ge => ">=",
+                            _ => unreachable!(),
+                        };
+                        Some(format!("({} {} {})", l, sym, r))
+                    }
+                    _ => None,
+                }
+            }
+            ast::ExprKind::UnaryOp { op: ast::UnaryOp::Not, operand } => {
+                let inner =
+                    self.translate_having(gvar, alias, schema, group_keys, operand, env)?;
+                Some(format!("(NOT {})", inner))
+            }
+            _ => None,
+        }
+    }
+
+    /// One operand of a HAVING comparison: aggregate over the group var, a
+    /// group-key column reference, or a literal/param.
+    fn having_operand_sql(
+        &self,
+        gvar: &str,
+        alias: &str,
+        schema: &str,
+        group_keys: &[(String, String, String)],
+        expr: &ast::Expr,
+        env: &Env,
+    ) -> Option<String> {
+        // Group-key column reference `v.col`.
+        if let ast::ExprKind::FieldAccess { expr: e, field: col } = &expr.node
+            && let ast::ExprKind::Var(v) = &e.node
+            && v == gvar
+        {
+            return group_keys
+                .iter()
+                .find(|(n, _, _)| n == col)
+                .map(|(_, csql, _)| csql.clone());
+        }
+        // Literal — inline (int/float verbatim, text single-quoted, bool 1/0).
+        if let ast::ExprKind::Lit(lit) = &expr.node {
+            return match lit {
+                ast::Literal::Int(s) => Some(s.clone()),
+                ast::Literal::Float(f) => Some(format!("{}", f)),
+                ast::Literal::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
+                ast::Literal::Text(t) => Some(format!("'{}'", t.replace('\'', "''"))),
+                ast::Literal::Bytes(_) => None,
+            };
+        }
+        // Aggregate over the group var.
+        if let Some((agg_sql, _)) = self.group_aggregate_sql(gvar, alias, schema, expr) {
+            return Some(agg_sql);
+        }
+        // A let-bound or env value — not supported in HAVING yet (would need
+        // param plumbing through the having vec).
+        let _ = env;
+        None
+    }
+
     fn analyze_sql_plan(
         &self,
         stmts: &[ast::Stmt],
@@ -13521,6 +13634,9 @@ impl Codegen {
         // ((result_field, qualified_sql_col, type_str)) from `groupBy {k: v.col}`.
         let mut group_var: Option<String> = None;
         let mut group_keys: Vec<(String, String, String)> = Vec::new();
+        // HAVING conditions from `where` stmts that appear AFTER groupBy and
+        // reference only aggregates over the group var / group keys.
+        let mut having_conditions: Vec<String> = Vec::new();
 
         for stmt in &stmts[..stmts.len() - 1] {
             match &stmt.node {
@@ -13567,11 +13683,24 @@ impl Codegen {
                     // `self` is available; on no change the condition is used
                     // as-is.
                     let cond = &self.inline_pure_sql_helpers(cond);
-                    let frag = Self::try_compile_multi_table_sql_expr(
-                        &bind_to_alias, &bind_to_schema, cond, env, &let_binds,
-                    )?;
-                    conditions.push(frag.sql);
-                    params.extend(frag.params);
+                    if group_var.is_some() {
+                        // Post-groupBy `where` → HAVING. It may only reference
+                        // aggregates over the group var, the group keys, and
+                        // literals; anything else falls back to in-memory.
+                        let gvar = group_var.clone().unwrap();
+                        let alias = bind_to_alias.get(&gvar)?.clone();
+                        let gschema = bind_to_schema.get(&gvar)?.clone();
+                        let h = self.translate_having(
+                            &gvar, &alias, &gschema, &group_keys, cond, env,
+                        )?;
+                        having_conditions.push(h);
+                    } else {
+                        let frag = Self::try_compile_multi_table_sql_expr(
+                            &bind_to_alias, &bind_to_schema, cond, env, &let_binds,
+                        )?;
+                        conditions.push(frag.sql);
+                        params.extend(frag.params);
+                    }
                 }
                 ast::StmtKind::GroupBy { key } => {
                     // Fused GROUP BY: single-source block, a record of simple
@@ -13727,6 +13856,7 @@ impl Codegen {
             offset: None,
             distinct: false,
             group_by,
+            having: having_conditions,
         })
     }
 
@@ -15830,6 +15960,9 @@ struct SqlQueryPlan {
     /// `GROUP BY` key expressions (qualified SQL, e.g. `t0.\"owner\"`). Empty
     /// for non-grouped queries. Set only by the fused groupBy pushdown.
     group_by: Vec<String>,
+    /// `HAVING` conditions (post-aggregation filters). Empty unless a `where`
+    /// follows a fused groupBy and references only aggregates/keys.
+    having: Vec<String>,
 }
 
 struct SqlTable {
@@ -15909,6 +16042,10 @@ impl SqlQueryPlan {
 
         if !self.group_by.is_empty() {
             sql.push_str(&format!(" GROUP BY {}", self.group_by.join(", ")));
+        }
+
+        if !self.having.is_empty() {
+            sql.push_str(&format!(" HAVING {}", self.having.join(" AND ")));
         }
 
         if !self.order_by.is_empty() {

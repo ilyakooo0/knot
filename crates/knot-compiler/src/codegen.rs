@@ -6013,7 +6013,7 @@ impl Codegen {
                 }
                 (
                     SqlQueryPlan {
-                        tables: vec![SqlTable { source_name, alias }],
+                        tables: vec![SqlTable { source_name, alias, subquery: None }],
                         conditions,
                         params,
                         select_columns: schema_select_columns(&schema, ""),
@@ -6597,6 +6597,7 @@ impl Codegen {
                                             tables: vec![SqlTable {
                                                 source_name: source_name.to_string(),
                                                 alias: String::new(),
+                                                subquery: None,
                                             }],
                                             conditions: vec![frag.sql],
                                             params: frag.params,
@@ -7069,6 +7070,7 @@ impl Codegen {
                                                         tables: vec![SqlTable {
                                                             source_name: source_name.to_string(),
                                                             alias: String::new(),
+                                                            subquery: None,
                                                         }],
                                                         conditions: vec![frag.sql],
                                                         params: frag.params,
@@ -7330,6 +7332,7 @@ impl Codegen {
                                 tables: vec![SqlTable {
                                     source_name: source_name.clone(),
                                     alias: String::new(),
+                                    subquery: None,
                                 }],
                                 conditions,
                                 params,
@@ -7454,6 +7457,7 @@ impl Codegen {
                                                                 tables: vec![SqlTable {
                                                                     source_name,
                                                                     alias: String::new(),
+                                                                    subquery: None,
                                                                 }],
                                                                 conditions: Vec::new(),
                                                                 params: Vec::new(),
@@ -7531,6 +7535,7 @@ impl Codegen {
                                         tables: vec![SqlTable {
                                             source_name: source_name.clone(),
                                             alias: String::new(),
+                                            subquery: None,
                                         }],
                                         conditions: Vec::new(),
                                         params: Vec::new(),
@@ -7561,6 +7566,7 @@ impl Codegen {
                                             tables: vec![SqlTable {
                                                 source_name: source_name.to_string(),
                                                 alias: String::new(),
+                                                subquery: None,
                                             }],
                                             conditions: vec![frag.sql],
                                             params: frag.params,
@@ -7591,6 +7597,7 @@ impl Codegen {
                                         tables: vec![SqlTable {
                                             source_name: source_name.clone(),
                                             alias: String::new(),
+                                            subquery: None,
                                         }],
                                         conditions: Vec::new(),
                                         params: Vec::new(),
@@ -7724,6 +7731,7 @@ impl Codegen {
                                                 tables: vec![SqlTable {
                                                     source_name: source_name.to_string(),
                                                     alias: String::new(),
+                                                    subquery: None,
                                                 }],
                                                 conditions: Vec::new(),
                                                 params: Vec::new(),
@@ -12371,6 +12379,7 @@ impl Codegen {
                         tables: vec![SqlTable {
                             source_name: source_name.to_string(),
                             alias: String::new(), // bare FROM, unqualified cols
+                            subquery: None,
                         }],
                         conditions: Vec::new(),
                         params: Vec::new(),
@@ -12395,6 +12404,7 @@ impl Codegen {
                         tables: vec![SqlTable {
                             source_name: source_name.to_string(),
                             alias: String::new(),
+                            subquery: None,
                         }],
                         conditions: vec![frag.sql],
                         params: frag.params,
@@ -12422,6 +12432,7 @@ impl Codegen {
                         tables: vec![SqlTable {
                             source_name: source_name.to_string(),
                             alias: String::new(),
+                            subquery: None,
                         }],
                         conditions: Vec::new(),
                         params: Vec::new(),
@@ -12477,8 +12488,14 @@ impl Codegen {
         // the in-memory semantics when the pipe ops appear in the canonical
         // order filter* → sortBy? → map? → drop? → take? → aggregate?.
         // Out-of-order pipelines (e.g. `take 5 |> drop 2`, `take 3 |>
-        // filter f`) have different semantics and must fall back to the
-        // general in-memory path.
+        // filter f`) have different semantics. Try the staged-subquery path:
+        // split into a pushable prefix (compiled to a FROM (…)) and the
+        // remaining suffix ops (the outer query over that subquery).
+        if !pipe_ops_order_pushable(&ops)
+            && let Some(v) = self.try_compile_staged_pipe(builder, &source_name, &schema, &ops, env, db)
+        {
+            return Some(v);
+        }
         if !pipe_ops_order_pushable(&ops) {
             return None;
         }
@@ -12654,7 +12671,7 @@ impl Codegen {
             }
             let query = Query {
                 plan: SqlQueryPlan {
-                    tables: vec![SqlTable { source_name, alias }],
+                    tables: vec![SqlTable { source_name, alias, subquery: None }],
                     conditions,
                     params,
                     select_columns: Vec::new(),
@@ -12677,7 +12694,7 @@ impl Codegen {
             let alias = if conditions.is_empty() { String::new() } else { alias };
             let query = Query {
                 plan: SqlQueryPlan {
-                    tables: vec![SqlTable { source_name, alias }],
+                    tables: vec![SqlTable { source_name, alias, subquery: None }],
                     conditions,
                     params,
                     select_columns: Vec::new(),
@@ -12727,6 +12744,7 @@ impl Codegen {
                 tables: vec![SqlTable {
                     source_name,
                     alias,
+                    subquery: None,
                 }],
                 conditions,
                 params,
@@ -12755,6 +12773,396 @@ impl Codegen {
                 "knot_source_query",
                 &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
             ))
+        }
+    }
+
+    /// Staged pushdown for out-of-order pipe chains. When the ops don't fit
+    /// the single-query clause order (`pipe_ops_order_pushable`), split them
+    /// into a pushable PREFIX (compiled to a `FROM (…)` subquery) and the
+    /// remaining SUFFIX ops (the outer query over that subquery). E.g.:
+    ///   `*src |> take 3 |> drop 1`  → `SELECT … FROM (SELECT … LIMIT 3) LIMIT -1 OFFSET 1`
+    ///   `*src |> take 2 |> map f`   → `SELECT f… FROM (SELECT … LIMIT 2)`
+    ///   `*src |> take 2 |> map (\p->p.n) |> sum` → `SELECT SUM(n) FROM (SELECT … LIMIT 2)`
+    /// The prefix is always in canonical order (so `build_canonical_pipe_query`
+    /// handles it); the suffix is processed recursively so multi-stage chains
+    /// nest. Returns None (in-memory fallback) when no clean split exists.
+    fn try_compile_staged_pipe(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        source_name: &str,
+        schema: &str,
+        ops: &[PipeOp],
+        env: &mut Env,
+        db: Value,
+    ) -> Option<Value> {
+        // Find the longest canonical-order prefix that yields ROWS (no
+        // aggregate/count terminal) and leaves a non-empty suffix.
+        let mut split = None;
+        for k in (1..ops.len()).rev() {
+            let prefix = &ops[..k];
+            if pipe_ops_order_pushable(prefix)
+                && !prefix.iter().any(|op| {
+                    matches!(
+                        op,
+                        PipeOp::Count
+                            | PipeOp::CountWhere { .. }
+                            | PipeOp::Sum { .. }
+                            | PipeOp::SumDirect
+                            | PipeOp::Avg { .. }
+                            | PipeOp::Min { .. }
+                            | PipeOp::Max { .. }
+                    )
+                })
+            {
+                split = Some(k);
+                break;
+            }
+        }
+        let k = split?;
+
+        // Build the prefix as a Rows query over the real base table.
+        let base_table = SqlTable {
+            source_name: source_name.to_string(),
+            alias: "t0".to_string(),
+            subquery: None,
+        };
+        let (prefix_query, prefix_schema) =
+            self.build_canonical_pipe_query(base_table, schema, &ops[..k], env, true)?;
+        if !matches!(prefix_query.terminal, QueryTerminal::Rows) {
+            return None;
+        }
+        let prefix_sql = prefix_query.build_sql();
+        // The subquery's bound params, in textual order: WHERE params, then
+        // LIMIT, then OFFSET (matching `limit_offset_suffix`).
+        let mut prefix_params = prefix_query.plan.params.clone();
+        if let Some(lim) = &prefix_query.plan.limit {
+            prefix_params.push(lim.clone());
+        }
+        if let Some(off) = &prefix_query.plan.offset {
+            prefix_params.push(off.clone());
+        }
+
+        // The suffix reads the subquery (aliased t0) with the prefix's output
+        // schema. Recurse so a still-non-canonical suffix nests further.
+        let sub_table = SqlTable {
+            source_name: source_name.to_string(),
+            alias: "t0".to_string(),
+            subquery: Some((prefix_sql, prefix_params)),
+        };
+        let suffix = &ops[k..];
+        let (suffix_query, result_schema) = if pipe_ops_order_pushable(suffix) {
+            self.build_canonical_pipe_query(sub_table, &prefix_schema, suffix, env, false)?
+        } else {
+            return self.try_compile_staged_pipe_over(
+                builder,
+                sub_table,
+                &prefix_schema,
+                suffix,
+                env,
+                db,
+            );
+        };
+        Some(self.emit_query(builder, &suffix_query, &result_schema, env, db, None))
+    }
+
+    /// Recursive helper for `try_compile_staged_pipe` when the suffix is itself
+    /// out-of-order: build the next stage's subquery from the current (already
+    /// possibly a subquery) table and continue. Mirrors the split logic but
+    /// threads the table through instead of re-deriving it from a source name.
+    fn try_compile_staged_pipe_over(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        table: SqlTable,
+        schema: &str,
+        ops: &[PipeOp],
+        env: &mut Env,
+        db: Value,
+    ) -> Option<Value> {
+        let mut split = None;
+        for k in (1..ops.len()).rev() {
+            let prefix = &ops[..k];
+            if pipe_ops_order_pushable(prefix)
+                && !prefix.iter().any(|op| {
+                    matches!(
+                        op,
+                        PipeOp::Count
+                            | PipeOp::CountWhere { .. }
+                            | PipeOp::Sum { .. }
+                            | PipeOp::SumDirect
+                            | PipeOp::Avg { .. }
+                            | PipeOp::Min { .. }
+                            | PipeOp::Max { .. }
+                    )
+                })
+            {
+                split = Some(k);
+                break;
+            }
+        }
+        let k = split?;
+        let source_name = table.source_name.clone();
+        let (prefix_query, prefix_schema) =
+            self.build_canonical_pipe_query(table, schema, &ops[..k], env, true)?;
+        if !matches!(prefix_query.terminal, QueryTerminal::Rows) {
+            return None;
+        }
+        let prefix_sql = prefix_query.build_sql();
+        let mut prefix_params = prefix_query.plan.params.clone();
+        if let Some(lim) = &prefix_query.plan.limit {
+            prefix_params.push(lim.clone());
+        }
+        if let Some(off) = &prefix_query.plan.offset {
+            prefix_params.push(off.clone());
+        }
+        let sub_table = SqlTable {
+            source_name,
+            alias: "t0".to_string(),
+            subquery: Some((prefix_sql, prefix_params)),
+        };
+        let suffix = &ops[k..];
+        let (suffix_query, result_schema) = if pipe_ops_order_pushable(suffix) {
+            self.build_canonical_pipe_query(sub_table, &prefix_schema, suffix, env, false)?
+        } else {
+            return self.try_compile_staged_pipe_over(
+                builder,
+                sub_table,
+                &prefix_schema,
+                suffix,
+                env,
+                db,
+            );
+        };
+        Some(self.emit_query(builder, &suffix_query, &result_schema, env, db, None))
+    }
+
+    /// Build a `Query` for a canonical-order op list over a single table (a
+    /// real base table or a staged subquery) with the given schema. Handles
+    /// filter*/sortBy?/map?/drop?/take?/aggregate?/count?. Returns the query
+    /// and its result schema. Shared by `try_compile_pipe_sql`'s staged path.
+    /// `allow_scalar_rows`: a scalar (single-column) `map` projection is
+    /// normally rejected at the top level because the record-reconstructing
+    /// Rows runtime can't rebuild a bare value relation — but as a FROM
+    /// subquery (read positionally by the outer query) it's fine, so the
+    /// staged prefix passes true.
+    fn build_canonical_pipe_query(
+        &mut self,
+        table: SqlTable,
+        schema: &str,
+        ops: &[PipeOp],
+        env: &mut Env,
+        allow_scalar_rows: bool,
+    ) -> Option<(Query, String)> {
+        let alias = table.alias.clone();
+        let schema = schema.to_string();
+        let mut bind_aliases: HashMap<String, String> = HashMap::new();
+        let mut bind_schemas: HashMap<String, String> = HashMap::new();
+        let mut conditions: Vec<String> = Vec::new();
+        let mut params: Vec<SqlParamSource> = Vec::new();
+        let mut select_override: Option<Vec<SqlSelectColumn>> = None;
+        let mut is_count = false;
+        let mut limit: Option<SqlParamSource> = None;
+        let mut offset: Option<SqlParamSource> = None;
+        let mut order_by_cols: Vec<String> = Vec::new();
+        let mut aggregate: Option<(&str, String, bool)> = None;
+        let mut map_is_scalar = false;
+
+        for op in ops {
+            match op {
+                PipeOp::Filter { bind_var, body } => {
+                    if is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    bind_schemas.insert(bind_var.clone(), schema.clone());
+                    let frag = Self::try_compile_multi_table_sql_expr(
+                        &bind_aliases, &bind_schemas, body, env, &HashMap::new(),
+                    )?;
+                    conditions.push(frag.sql);
+                    params.extend(frag.params);
+                }
+                PipeOp::Map { bind_var, body } => {
+                    if is_count || select_override.is_some() || aggregate.is_some() {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let cols = analyze_map_select(bind_var, body, &alias, &schema)?;
+                    map_is_scalar = !matches!(&body.node, ast::ExprKind::Record(_));
+                    select_override = Some(cols);
+                }
+                PipeOp::Count => {
+                    if is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    is_count = true;
+                }
+                PipeOp::Take { n } | PipeOp::TakeRelation { n } => {
+                    if limit.is_some() || is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    limit = Some(expr_to_sql_param(n)?);
+                }
+                PipeOp::Drop { n } => {
+                    if offset.is_some() || is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    offset = Some(expr_to_sql_param(n)?);
+                }
+                PipeOp::SortBy { bind_var, body } => {
+                    if is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    if !sortby_projection_pushable(bind_var, body, &schema) {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
+                    order_by_cols.push(col_sql);
+                }
+                PipeOp::Sum { bind_var, body } => {
+                    if is_count || aggregate.is_some() || select_override.is_some() {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
+                    aggregate = Some(("SUM", col_sql, sum_result_is_float(bind_var, body, &schema)));
+                }
+                PipeOp::SumDirect => {
+                    if is_count || aggregate.is_some() {
+                        return None;
+                    }
+                    let cols = select_override.as_ref()?;
+                    if cols.len() != 1 {
+                        return None;
+                    }
+                    let col = &cols[0];
+                    let col_sql = col.sql_expr.clone().unwrap_or_else(|| {
+                        format!("{}.{}", col.alias, quote_sql_ident(&col.source_col))
+                    });
+                    let is_float = col.type_str == "float";
+                    aggregate = Some(("SUM", col_sql, is_float));
+                }
+                PipeOp::Avg { bind_var, body } => {
+                    if is_count || aggregate.is_some() || select_override.is_some() {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
+                    aggregate = Some(("AVG", col_sql, false));
+                }
+                PipeOp::Min { bind_var, body } => {
+                    if is_count || aggregate.is_some() || select_override.is_some() {
+                        return None;
+                    }
+                    if !minmax_pushdown_type_ok(bind_var, body, &schema) {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
+                    let arg_sql = col_sql_for_minmax(&col_sql, bind_var, body, &schema);
+                    let is_text = minmax_result_is_text(bind_var, body, &schema);
+                    aggregate = Some(("MIN", arg_sql, is_text));
+                }
+                PipeOp::Max { bind_var, body } => {
+                    if is_count || aggregate.is_some() || select_override.is_some() {
+                        return None;
+                    }
+                    if !minmax_pushdown_type_ok(bind_var, body, &schema) {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
+                    let arg_sql = col_sql_for_minmax(&col_sql, bind_var, body, &schema);
+                    let is_text = minmax_result_is_text(bind_var, body, &schema);
+                    aggregate = Some(("MAX", arg_sql, is_text));
+                }
+                PipeOp::CountWhere { bind_var, body } => {
+                    if is_count || aggregate.is_some() || select_override.is_some() {
+                        return None;
+                    }
+                    bind_aliases.insert(bind_var.clone(), alias.clone());
+                    bind_schemas.insert(bind_var.clone(), schema.clone());
+                    let frag = Self::try_compile_multi_table_sql_expr(
+                        &bind_aliases, &bind_schemas, body, env, &HashMap::new(),
+                    )?;
+                    conditions.push(frag.sql);
+                    params.extend(frag.params);
+                    is_count = true;
+                }
+            }
+        }
+
+        if let Some((func, col_sql, result_flag)) = aggregate {
+            if limit.is_some() || offset.is_some() {
+                return None;
+            }
+            let query = Query {
+                plan: SqlQueryPlan {
+                    tables: vec![table],
+                    conditions,
+                    params,
+                    select_columns: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    distinct: false,
+                },
+                terminal: QueryTerminal::Aggregate { func, col_sql, result_flag },
+            };
+            let result_schema = schema.clone();
+            Some((query, result_schema))
+        } else if is_count {
+            if limit.is_some() || offset.is_some() {
+                return None;
+            }
+            let query = Query {
+                plan: SqlQueryPlan {
+                    tables: vec![table],
+                    conditions,
+                    params,
+                    select_columns: Vec::new(),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                    distinct: false,
+                },
+                terminal: QueryTerminal::Count,
+            };
+            let result_schema = schema.clone();
+            Some((query, result_schema))
+        } else {
+            if map_is_scalar && !allow_scalar_rows {
+                return None;
+            }
+            let full_col_count = parse_schema_columns(&schema).len();
+            let mut distinct = false;
+            let select_columns = if let Some(cols) = select_override {
+                distinct = cols.len() < full_col_count
+                    || cols.iter().any(|c| c.sql_expr.is_some());
+                cols
+            } else {
+                parse_schema_columns(&schema)
+                    .into_iter()
+                    .map(|(col_name, type_str)| SqlSelectColumn {
+                        result_field: col_name.clone(),
+                        alias: alias.clone(),
+                        source_col: col_name,
+                        type_str,
+                        sql_expr: None,
+                    })
+                    .collect()
+            };
+            let plan = SqlQueryPlan {
+                tables: vec![table],
+                conditions,
+                params,
+                select_columns,
+                order_by: order_by_cols,
+                limit,
+                offset,
+                distinct,
+            };
+            let result_schema = plan.build_result_schema();
+            Some((Query { plan, terminal: QueryTerminal::Rows }, result_schema))
         }
     }
 
@@ -12880,6 +13288,7 @@ impl Codegen {
                     tables.push(SqlTable {
                         source_name,
                         alias,
+                        subquery: None,
                     });
                 }
                 ast::StmtKind::Where { cond } => {
@@ -13974,6 +14383,14 @@ impl Codegen {
             }
             _ => {
                 self.emit_stm_track_reads_for_plan(builder, &query.plan);
+                // A FROM-subquery's params appear textually before the outer
+                // query's own WHERE/LIMIT/OFFSET params (the `(…)` precedes
+                // the outer clauses in the rendered SQL), so prepend them.
+                for table in &query.plan.tables {
+                    if let Some((_, sub_params)) = &table.subquery {
+                        all_params.extend(sub_params.iter().cloned());
+                    }
+                }
                 all_params.extend(query.plan.params.iter().cloned());
                 // The Rows terminal may carry LIMIT/OFFSET params (take/drop):
                 // append after the WHERE params, LIMIT-then-OFFSET, matching
@@ -15056,6 +15473,14 @@ struct SqlQueryPlan {
 struct SqlTable {
     source_name: String,
     alias: String,
+    /// When set, the FROM item is a materialized subquery `(<sql>) AS alias`
+    /// instead of the base table `_knot_<source_name>`. Carries the subquery's
+    /// bound params, which precede the outer query's own params in the final
+    /// SQL. Enables staged pushdown of out-of-order compositions (e.g.
+    /// `take N |> drop M`, `take N |> map f`, aggregate over a bounded page):
+    /// the pushable prefix becomes the subquery, the remaining op the outer
+    /// query. `source_name` still names the underlying source for read-tracking.
+    subquery: Option<(String, Vec<SqlParamSource>)>,
 }
 
 struct SqlSelectColumn {
@@ -15096,11 +15521,15 @@ impl SqlQueryPlan {
             .tables
             .iter()
             .map(|t| {
-                format!(
-                    "{} AS {}",
-                    quote_sql_ident(&format!("_knot_{}", t.source_name)),
-                    t.alias
-                )
+                if let Some((sub_sql, _)) = &t.subquery {
+                    format!("({}) AS {}", sub_sql, t.alias)
+                } else {
+                    format!(
+                        "{} AS {}",
+                        quote_sql_ident(&format!("_knot_{}", t.source_name)),
+                        t.alias
+                    )
+                }
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -15350,11 +15779,18 @@ impl Query {
             .tables
             .iter()
             .map(|t| {
-                let tbl = quote_sql_ident(&format!("_knot_{}", t.source_name));
-                if t.alias.is_empty() {
-                    tbl
+                if let Some((sub_sql, _)) = &t.subquery {
+                    // Materialized subquery — always aliased (a bare `(…)` FROM
+                    // item without an alias can't be referenced by the outer
+                    // query's qualified columns).
+                    format!("({}) AS {}", sub_sql, t.alias)
                 } else {
-                    format!("{} AS {}", tbl, t.alias)
+                    let tbl = quote_sql_ident(&format!("_knot_{}", t.source_name));
+                    if t.alias.is_empty() {
+                        tbl
+                    } else {
+                        format!("{} AS {}", tbl, t.alias)
+                    }
                 }
             })
             .collect::<Vec<_>>()

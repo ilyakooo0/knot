@@ -97,8 +97,11 @@ misfiring SQL.
 |----|------|-----|
 | `any` | `any pred *src`, `any pred (filter q *src)` | `EXISTS(SELECT 1 FROM … WHERE [q AND] pred)` |
 | `all` | `all pred *src`, `all pred (filter q *src)` | `NOT EXISTS(SELECT 1 FROM … WHERE [q AND] NOT pred)` |
+| `any`/`all` (correlated, in a WHERE) | `any (\u -> u.f == t.g) *other` | `EXISTS(SELECT 1 FROM other WHERE f = t.g)` — inner cols unqualified, outer cols table-qualified (`NOT EXISTS … NOT pred` for `all`) |
 | `elem` | `elem val (map (\r -> r.f) *src)`, `elem val [lit, …]` | `EXISTS(… WHERE f = ?)` / `IN (?,?,…)` |
+| `elem` (relation-derived, in a WHERE) | `elem t.f (*other \|> map (\u -> u.g))` | `t.f IN (SELECT g FROM other)` (text/bool/uuid cols only) |
 | `contains` | `contains haystack needle` (in a predicate) | `INSTR(haystack, needle) > 0` |
+| `startsWith` / `endsWith` | `startsWith "ap" t.title` / `endsWith "ce" t.title` | `title GLOB 'ap*'` / `title GLOB '*ce'` (GLOB, not LIKE — case-sensitive, metachars escaped) |
 
 ### Set operations
 
@@ -114,10 +117,33 @@ positionally).
 
 ### Grouping
 
-`groupBy` runs inside SQLite but **not** as SQL `GROUP BY`: it materializes the
-source into a temp table and orders by the keys (`knot_relation_group_by`), so
-per-group aggregates then run row-by-row in Knot. A genuine fused
-`SELECT key, COUNT(*) … GROUP BY key` pushdown is a separate, open opportunity.
+A `groupBy` do-block over a single source relation, yielding only its group
+keys plus aggregates over the group var, compiles to a genuine fused
+`SELECT key, AGG(…) … GROUP BY key`:
+
+```knot
+do
+  t <- *tasks
+  where t.done == 0
+  groupBy { owner t.owner }
+  yield { owner t.owner n (base.count t) total (base.sum (base.map (\r -> r.hours) t)) }
+-- → SELECT owner, COUNT(*), SUM(hours) FROM _knot_tasks WHERE done = 0 GROUP BY owner
+```
+
+Aggregates that fuse: `count`, `sum`, `avg`, `minOn`, `maxOn` over the group
+var. A `where` *after* the `groupBy` becomes a `HAVING` clause when it
+references only aggregates over the group var, the group keys, and literals:
+
+```knot
+groupBy { owner t.owner }
+where base.count t > 1
+-- → … GROUP BY owner HAVING (COUNT(*) > 1)
+```
+
+A `groupBy` whose yield reaches into a group row (anything but keys +
+aggregates), or whose `HAVING` uses a richer shape, stays on the older
+in-memory path (materialize + `knot_relation_group_by`, per-group aggregates
+row-by-row in Knot).
 
 ### Compositions
 
@@ -151,7 +177,10 @@ Pushdown also fires for compositions of the above, via three recipes:
 
 Decision rule for string ops: push down only when SQLite's semantics are
 byte-identical to Knot's runtime (`contains`/`INSTR`: yes; case-mapping/length:
-no).
+no). `startsWith`/`endsWith` use `GLOB` (case-sensitive, matching Rust) rather
+than `LIKE` (ASCII-case-insensitive by default), with every GLOB metacharacter
+in the literal pattern escaped — so the gate holds only for a literal pattern
+against a plain Text column.
 
 ---
 

@@ -5971,6 +5971,7 @@ impl Codegen {
                     limit: Some(SqlParamSource::Literal(ast::Literal::Int("1".to_string()))),
                     offset: None,
                     distinct: false,
+            group_by: Vec::new(),
                 };
                 let query = Query { plan, terminal: QueryTerminal::Rows };
                 return Some(self.emit_query(builder, &query, &proj_schema, env, db, None, Some(rel_expr.span)));
@@ -6083,6 +6084,7 @@ impl Codegen {
                         limit: take_param,
                         offset: offset_param,
                         distinct: false,
+            group_by: Vec::new(),
                     },
                     schema,
                 )
@@ -6666,6 +6668,7 @@ impl Codegen {
                                             limit: None,
                                             offset: None,
                                             distinct: false,
+            group_by: Vec::new(),
                                         },
                                         terminal: QueryTerminal::Count,
                                     };
@@ -6759,6 +6762,7 @@ impl Codegen {
                                 limit: None,
                                 offset: None,
                                 distinct: false,
+            group_by: Vec::new(),
                             },
                             terminal: QueryTerminal::Count,
                         };
@@ -7214,6 +7218,7 @@ impl Codegen {
                                                         limit: None,
                                                         offset: None,
                                                         distinct: false,
+            group_by: Vec::new(),
                                                     },
                                                     terminal: QueryTerminal::Aggregate {
                                                         func: sql_func,
@@ -7313,6 +7318,7 @@ impl Codegen {
                                             limit: None,
                                             offset: None,
                                             distinct: false,
+            group_by: Vec::new(),
                                         },
                                         terminal: QueryTerminal::Aggregate {
                                             func: sql_func,
@@ -7502,6 +7508,7 @@ impl Codegen {
                                 limit: None,
                                 offset: None,
                                 distinct: false,
+            group_by: Vec::new(),
                             },
                             terminal: QueryTerminal::Exists { negated },
                         };
@@ -7627,6 +7634,7 @@ impl Codegen {
                                                                 limit: Some(SqlParamSource::Var("__limit__".into())),
                                                                 offset: None,
                                                                 distinct: false,
+            group_by: Vec::new(),
                                                             },
                                                             terminal: QueryTerminal::Rows,
                                                         };
@@ -7705,6 +7713,7 @@ impl Codegen {
                                         limit: Some(SqlParamSource::Var("__limit__".into())),
                                         offset: None,
                                         distinct: false,
+            group_by: Vec::new(),
                                     },
                                     terminal: QueryTerminal::Rows,
                                 };
@@ -7736,6 +7745,7 @@ impl Codegen {
                                             limit: Some(SqlParamSource::Var("__limit__".into())),
                                             offset: None,
                                             distinct: false,
+            group_by: Vec::new(),
                                         },
                                         terminal: QueryTerminal::Rows,
                                     };
@@ -7767,6 +7777,7 @@ impl Codegen {
                                         limit: None,
                                         offset: Some(SqlParamSource::Var("__offset__".into())),
                                         distinct: false,
+            group_by: Vec::new(),
                                     },
                                     terminal: QueryTerminal::Rows,
                                 };
@@ -7805,6 +7816,7 @@ impl Codegen {
                                 limit: None,
                                 offset: None,
                                 distinct: false,
+            group_by: Vec::new(),
                             },
                             terminal: QueryTerminal::SetOp {
                                 op: sql_op,
@@ -7901,6 +7913,7 @@ impl Codegen {
                                                 limit: None,
                                                 offset: None,
                                                 distinct: false,
+            group_by: Vec::new(),
                                             },
                                             terminal: QueryTerminal::Aggregate {
                                                 func,
@@ -12551,6 +12564,7 @@ impl Codegen {
                         limit: None,
                         offset: None,
                         distinct: false,
+            group_by: Vec::new(),
                     },
                     terminal: QueryTerminal::Aggregate {
                         func,
@@ -12576,6 +12590,7 @@ impl Codegen {
                         limit: None,
                         offset: None,
                         distinct: false,
+            group_by: Vec::new(),
                     },
                     terminal: QueryTerminal::Count,
                 };
@@ -12604,6 +12619,7 @@ impl Codegen {
                         limit: None,
                         offset: None,
                         distinct: false,
+            group_by: Vec::new(),
                     },
                     terminal: QueryTerminal::Rows,
                 };
@@ -12842,6 +12858,7 @@ impl Codegen {
                     limit: None,
                     offset: None,
                     distinct: false,
+            group_by: Vec::new(),
                 },
                 terminal: QueryTerminal::Aggregate { func, col_sql, result_flag },
             };
@@ -12865,6 +12882,7 @@ impl Codegen {
                     limit: None,
                     offset: None,
                     distinct: false,
+            group_by: Vec::new(),
                 },
                 terminal: QueryTerminal::Count,
             };
@@ -12916,6 +12934,7 @@ impl Codegen {
                 limit,
                 offset,
                 distinct,
+                group_by: Vec::new(),
             };
 
             let sql = plan.build_sql();
@@ -13273,6 +13292,7 @@ impl Codegen {
                     limit: None,
                     offset: None,
                     distinct: false,
+            group_by: Vec::new(),
                 },
                 terminal: QueryTerminal::Aggregate { func, col_sql, result_flag },
             };
@@ -13292,6 +13312,7 @@ impl Codegen {
                     limit: None,
                     offset: None,
                     distinct: false,
+            group_by: Vec::new(),
                 },
                 terminal: QueryTerminal::Count,
             };
@@ -13328,6 +13349,7 @@ impl Codegen {
                 limit,
                 offset,
                 distinct,
+                group_by: Vec::new(),
             };
             let result_schema = plan.build_result_schema();
             Some((Query { plan, terminal: QueryTerminal::Rows }, result_schema))
@@ -13407,6 +13429,75 @@ impl Codegen {
         None
     }
 
+    /// SQL aggregate expression for one yield field of a fused GROUP BY query.
+    /// `gvar` is the group var; `alias`/`schema` describe the underlying source
+    /// table. Returns `(sql_expr, type_str)` for the SELECT column, or None if
+    /// the field isn't a pushable aggregate over the group (→ in-memory).
+    ///
+    /// Supported shapes (the group var is a `[T]` sub-relation after groupBy):
+    ///   count v                -> COUNT(*)          (int)
+    ///   sum   (\r -> r.f)      -> SUM(alias."f")    (int|float)
+    ///   avg   (\r -> r.f)      -> AVG(alias."f")    (float)
+    ///   minOn (\r -> r.f) v    -> MIN(alias."f")    (non-text col type)
+    ///   maxOn (\r -> r.f) v    -> MAX(alias."f")    (non-text col type)
+    ///   sum (map (\r->r.f) v)  -> SUM(alias."f")    (map sugar)
+    /// The projection lambda must be a plain `r.f` field access; anything
+    /// richer (arithmetic, calls, text/tag min/max) falls back to in-memory.
+    fn group_aggregate_sql(
+        &self,
+        gvar: &str,
+        alias: &str,
+        schema: &str,
+        value: &ast::Expr,
+    ) -> Option<(String, String)> {
+        let (head, args) = collect_app_args(value);
+        let name = Self::query_form_name(&head)?;
+        match name {
+            "count" if args.len() == 1 && is_var(&args[0], gvar) => {
+                Some(("COUNT(*)".to_string(), "int".to_string()))
+            }
+            // `sum rel` where rel is `map (\r->r.f) v` (1 arg).
+            "sum" if args.len() == 1 => {
+                let lambda =
+                    peel_group_map(&args[0], gvar, &self.fun_bodies, &self.let_bindings)?;
+                let (pb, body) =
+                    extract_single_param_lambda(&lambda, &self.fun_bodies, &self.let_bindings)?;
+                let col = extract_sql_field_access(&pb, &body, alias, schema)?;
+                let col_ty = infer_sql_expr_type(&pb, &body, schema)?;
+                if col_ty != "int" && col_ty != "float" {
+                    return None; // SUM over text/tag is meaningless
+                }
+                Some((format!("SUM({})", col), col_ty))
+            }
+            // `avg (\r->r.f) v` (2 args: lambda + group var).
+            "avg" if args.len() == 2 && is_var(&args[1], gvar) => {
+                let (pb, body) =
+                    extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings)?;
+                let col = extract_sql_field_access(&pb, &body, alias, schema)?;
+                let col_ty = infer_sql_expr_type(&pb, &body, schema)?;
+                if col_ty != "int" && col_ty != "float" {
+                    return None;
+                }
+                Some((format!("AVG({})", col), "float".to_string()))
+            }
+            "minOn" | "maxOn" if args.len() == 2 && is_var(&args[1], gvar) => {
+                let (pb, body) =
+                    extract_single_param_lambda(&args[0], &self.fun_bodies, &self.let_bindings)?;
+                // Same byte-identical gate as the flat minOn/maxOn pushdown:
+                // text uses SQLite BINARY collation vs Knot's Ord on ADTs and
+                // tags reconstruct constructors. Keep to non-text columns.
+                if minmax_result_is_text(&pb, &body, schema) {
+                    return None;
+                }
+                let col = extract_sql_field_access(&pb, &body, alias, schema)?;
+                let col_ty = infer_sql_expr_type(&pb, &body, schema)?;
+                let func = if name == "minOn" { "MIN" } else { "MAX" };
+                Some((format!("{}({})", func, col), col_ty))
+            }
+            _ => None,
+        }
+    }
+
     fn analyze_sql_plan(
         &self,
         stmts: &[ast::Stmt],
@@ -13426,6 +13517,10 @@ impl Codegen {
         let let_binds: HashMap<String, ast::Expr> = HashMap::new();
         let mut conditions: Vec<String> = Vec::new();
         let mut params: Vec<SqlParamSource> = Vec::new();
+        // Fused groupBy: the bind var being grouped and the key columns
+        // ((result_field, qualified_sql_col, type_str)) from `groupBy {k: v.col}`.
+        let mut group_var: Option<String> = None;
+        let mut group_keys: Vec<(String, String, String)> = Vec::new();
 
         for stmt in &stmts[..stmts.len() - 1] {
             match &stmt.node {
@@ -13478,6 +13573,34 @@ impl Codegen {
                     conditions.push(frag.sql);
                     params.extend(frag.params);
                 }
+                ast::StmtKind::GroupBy { key } => {
+                    // Fused GROUP BY: single-source block, a record of simple
+                    // `var.col` key projections, and no earlier group. Anything
+                    // else → fall back to the in-memory temp-table path.
+                    if group_var.is_some() || tables.len() != 1 {
+                        return None;
+                    }
+                    let key_fields = match &key.node {
+                        ast::ExprKind::Record(fields) => fields,
+                        _ => return None,
+                    };
+                    // The group var is the (single) bind var.
+                    let (gvar, alias) = bind_to_alias.iter().next()?;
+                    let gschema = bind_to_schema.get(gvar)?.clone();
+                    for kf in key_fields {
+                        if let ast::ExprKind::FieldAccess { expr, field: col } = &kf.value.node
+                            && let ast::ExprKind::Var(v) = &expr.node
+                            && v == gvar
+                            && let Some(ty) = lookup_col_type_from_schema(&gschema, col)
+                        {
+                            let col_sql = format!("{}.{}", alias, quote_sql_ident(col));
+                            group_keys.push((kf.name.clone(), col_sql, ty));
+                            continue;
+                        }
+                        return None;
+                    }
+                    group_var = Some(gvar.clone());
+                }
                 _ => return None,
             }
         }
@@ -13497,6 +13620,46 @@ impl Codegen {
         let mut select_columns: Vec<SqlSelectColumn> = Vec::new();
 
         match &yield_expr.node {
+            ast::ExprKind::Record(fields) if group_var.is_some() => {
+                // Fused GROUP BY yield: each field is either a group-key column
+                // (`var.col`, must match a key) or an aggregate over the group
+                // var (`count v`, `sum (\r->r.f)`, `minOn (\r->r.f) v`, …).
+                let gvar = group_var.clone().unwrap();
+                let alias = bind_to_alias.get(&gvar)?.clone();
+                let gschema = bind_to_schema.get(&gvar)?.clone();
+                for field in fields {
+                    // Key column? `v.col` matching one of the group keys (by the
+                    // key's result-field name or the underlying column name).
+                    if let ast::ExprKind::FieldAccess { expr, field: col } = &field.value.node
+                        && let ast::ExprKind::Var(v) = &expr.node
+                        && *v == gvar
+                    {
+                        if let Some((_, csql, cty)) =
+                            group_keys.iter().find(|(n, _, _)| n == col || n == &field.name)
+                        {
+                            select_columns.push(SqlSelectColumn {
+                                result_field: field.name.clone(),
+                                alias: alias.clone(),
+                                source_col: col.clone(),
+                                type_str: cty.clone(),
+                                sql_expr: Some(csql.clone()),
+                            });
+                            continue;
+                        }
+                        return None;
+                    }
+                    // Aggregate over the group var.
+                    let (agg_sql, agg_ty) =
+                        self.group_aggregate_sql(&gvar, &alias, &gschema, &field.value)?;
+                    select_columns.push(SqlSelectColumn {
+                        result_field: field.name.clone(),
+                        alias: alias.clone(),
+                        source_col: field.name.clone(),
+                        type_str: agg_ty,
+                        sql_expr: Some(agg_sql),
+                    });
+                }
+            }
             ast::ExprKind::Record(fields) => {
                 for field in fields {
                     // Try simple field access first: var.column
@@ -13549,6 +13712,11 @@ impl Codegen {
             _ => return None,
         }
 
+        // A grouped query projects exactly its keys + aggregates (enforced by
+        // the grouped-yield arm above). Populate GROUP BY from the key columns.
+        let group_by: Vec<String> =
+            group_keys.iter().map(|(_, csql, _)| csql.clone()).collect();
+
         Some(SqlQueryPlan {
             tables,
             conditions,
@@ -13558,6 +13726,7 @@ impl Codegen {
             limit: None,
             offset: None,
             distinct: false,
+            group_by,
         })
     }
 
@@ -15658,6 +15827,9 @@ struct SqlQueryPlan {
     /// could shrink a `take`/`drop` window). Never set for identity
     /// (`SELECT *`) single-table reads, whose rows are already unique.
     distinct: bool,
+    /// `GROUP BY` key expressions (qualified SQL, e.g. `t0.\"owner\"`). Empty
+    /// for non-grouped queries. Set only by the fused groupBy pushdown.
+    group_by: Vec<String>,
 }
 
 struct SqlTable {
@@ -15734,6 +15906,10 @@ impl SqlQueryPlan {
                 distinct_kw, select, from, where_clause
             )
         };
+
+        if !self.group_by.is_empty() {
+            sql.push_str(&format!(" GROUP BY {}", self.group_by.join(", ")));
+        }
 
         if !self.order_by.is_empty() {
             sql.push_str(&format!(" ORDER BY {}", self.order_by.join(", ")));
@@ -17127,6 +17303,47 @@ fn cast_arithmetic_for_where(sql: &str) -> String {
 
 /// Extract a SQL column reference from a lambda body like `\x -> x.price`.
 /// Returns the SQL fragment e.g. `t0."price"` (or just `"price"` if alias is empty).
+/// Peel a curried application into (head, args): `f a b` → (f, [a, b]).
+fn collect_app_args(expr: &ast::Expr) -> (ast::Expr, Vec<ast::Expr>) {
+    let mut args = Vec::new();
+    let mut cur = expr;
+    while let ast::ExprKind::App { func, arg } = &cur.node {
+        args.push((**arg).clone());
+        cur = func;
+    }
+    args.reverse();
+    (cur.clone(), args)
+}
+
+/// Is this expression exactly the variable `name`?
+fn is_var(expr: &ast::Expr, name: &str) -> bool {
+    matches!(&expr.node, ast::ExprKind::Var(v) if v == name)
+}
+
+/// Normalise a grouped aggregate's collection argument to the projection
+/// lambda: `map (\r -> r.f) v` (over the group var) → the lambda; a bare
+/// lambda passes through unchanged. Anything else → None.
+fn peel_group_map(
+    arg: &ast::Expr,
+    gvar: &str,
+    fun_bodies: &HashMap<String, ast::Expr>,
+    let_bindings: &HashMap<String, ast::Expr>,
+) -> Option<ast::Expr> {
+    let reduced = beta_reduce(arg, fun_bodies, let_bindings);
+    let (head, args) = collect_app_args(&reduced);
+    let head_is_map = match &head.node {
+        ast::ExprKind::Var(n) => n == "map",
+        ast::ExprKind::FieldAccess { expr, field } => {
+            field == "map" && matches!(&expr.node, ast::ExprKind::Var(n) if n == "base")
+        }
+        _ => false,
+    };
+    if head_is_map && args.len() == 2 && is_var(&args[1], gvar) {
+        return Some(args[0].clone());
+    }
+    Some(reduced)
+}
+
 fn extract_sql_field_access(
     bind_var: &str,
     body: &ast::Expr,

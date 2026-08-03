@@ -665,7 +665,6 @@ module.exports = grammar({
         $.source_ref,
         $.derived_ref,
         $.record_expression,
-        $.record_update_expression,
         $.list_expression,
         $.parenthesized_expression,
       ),
@@ -686,22 +685,6 @@ module.exports = grammar({
           ":",
           field("value", $._expression),
         ),
-        field("value", $._expression),
-      ),
-
-    record_update_expression: ($) =>
-      seq(
-        "{",
-        field("base", $._expression),
-        "|",
-        sep1($.update_field, ","),
-        "}",
-      ),
-
-    update_field: ($) =>
-      seq(
-        field("name", $.lower_identifier),
-        ":",
         field("value", $._expression),
       ),
 

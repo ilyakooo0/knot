@@ -267,12 +267,6 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
                 walk_expr(&f.value, r);
             }
         }
-        ExprKind::RecordUpdate { base, fields } => {
-            walk_expr(base, r);
-            for f in fields {
-                walk_expr(&f.value, r);
-            }
-        }
         ExprKind::FieldAccess { expr, field } => {
             // Qualified constructor `Color.Red`: the base is the data type and
             // `field` is the constructor. Count the ctor as used so the data

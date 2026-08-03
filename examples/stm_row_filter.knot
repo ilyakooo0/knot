@@ -17,7 +17,7 @@ findById (\aid rows -> base.single (base.filter (\a -> a.id == aid) rows))
 setBalance (\aid newBalance rows -> do
   r <- rows
   yield (case r.id == aid of
-    Bool.True {} -> {r | balance newBalance}
+    Bool.True {} -> (base.unify r {balance newBalance})
     Bool.False {} -> r))
 
 credit (\aid amount -> atomic do

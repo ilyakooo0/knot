@@ -524,11 +524,6 @@ fn span_is_record_pun(module: &ast::Expr, source: &str, span: Span) -> bool {
                     *found = true;
                     return;
                 }
-            ast::ExprKind::RecordUpdate { base, fields }
-                if pun_field_in_fields(fields, base.span.end, source, span) => {
-                    *found = true;
-                    return;
-                }
             ast::ExprKind::Lambda { params, .. }
                 if params.iter().any(|p| pun_in_pat(p, source, span)) => {
                     *found = true;
@@ -986,17 +981,6 @@ fn field_sites_in_expr<F: FnMut(&str, Span)>(expr: &ast::Expr, source: &str, f: 
                 // empty and no site is reported. That's deliberate — the
                 // token doubles as a variable reference and is handled by
                 // the symbol-rename path instead.
-                if let Some(span) =
-                    find_word_in_source(source, &fld.name, search_start, fld.value.span.start)
-                {
-                    f(&fld.name, span);
-                }
-                search_start = fld.value.span.end;
-            }
-        }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            let mut search_start = base.span.end;
-            for fld in fields {
                 if let Some(span) =
                     find_word_in_source(source, &fld.name, search_start, fld.value.span.start)
                 {

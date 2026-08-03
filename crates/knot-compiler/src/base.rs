@@ -277,12 +277,6 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
                 shift_expr_spans(&mut fl.value, offset);
             }
         }
-        RecordUpdate { base, fields } => {
-            shift_expr_spans(base, offset);
-            for fl in fields {
-                shift_expr_spans(&mut fl.value, offset);
-            }
-        }
         List(items) => {
             for it in items {
                 shift_expr_spans(it, offset);

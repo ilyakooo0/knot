@@ -371,12 +371,6 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 walk_exprs(&fl.value, f);
             }
         }
-        ExprKind::RecordUpdate { base, fields } => {
-            walk_exprs(base, f);
-            for fl in fields {
-                walk_exprs(&fl.value, f);
-            }
-        }
         ExprKind::List(items) => {
             for it in items {
                 walk_exprs(it, f);
@@ -513,12 +507,6 @@ fn collect_type_and_data_refs<'a>(
             collect_type_and_data_refs(value, aliases, data_decls)
         }
         ExprKind::Record(fields) => {
-            for fl in fields {
-                collect_type_and_data_refs(&fl.value, aliases, data_decls);
-            }
-        }
-        ExprKind::RecordUpdate { base, fields } => {
-            collect_type_and_data_refs(base, aliases, data_decls);
             for fl in fields {
                 collect_type_and_data_refs(&fl.value, aliases, data_decls);
             }
@@ -765,12 +753,6 @@ fn walk_record_sources<'m>(
     match &e.node {
         ExprKind::SourceDecl { name, ty, migrations } => f(name, ty, migrations),
         ExprKind::Record(fields) => {
-            for fld in fields {
-                walk_record_sources(&fld.value, f);
-            }
-        }
-        ExprKind::RecordUpdate { base, fields } => {
-            walk_record_sources(base, f);
             for fld in fields {
                 walk_record_sources(&fld.value, f);
             }

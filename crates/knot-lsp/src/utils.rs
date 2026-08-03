@@ -526,12 +526,6 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
                 f(&fld.value);
             }
         }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            f(base);
-            for fld in fields {
-                f(&fld.value);
-            }
-        }
         ast::ExprKind::List(elems) => {
             for e in elems {
                 f(e);

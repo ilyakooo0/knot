@@ -163,12 +163,6 @@ fn collect_containing_spans(expr: &ast::Expr, offset: usize, spans: &mut Vec<Spa
                 collect_containing_spans(&f.value, offset, spans);
             }
         }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            collect_containing_spans(base, offset, spans);
-            for f in fields {
-                collect_containing_spans(&f.value, offset, spans);
-            }
-        }
         ast::ExprKind::List(elems) => {
             for e in elems {
                 collect_containing_spans(e, offset, spans);

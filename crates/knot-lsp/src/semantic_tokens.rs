@@ -559,12 +559,6 @@ impl<'a> TokenCollector<'a> {
                     self.visit_expr(&f.value);
                 }
             }
-            ast::ExprKind::RecordUpdate { base, fields } => {
-                self.visit_expr(base);
-                for f in fields {
-                    self.visit_expr(&f.value);
-                }
-            }
             ast::ExprKind::List(elems) => {
                 for e in elems {
                     self.visit_expr(e);

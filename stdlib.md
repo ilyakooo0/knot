@@ -462,9 +462,9 @@ transfer \from to amount -> atomic do
   *accounts = do
     a <- accounts
     yield (case a.name == from of
-      Bool.True {} -> {a | balance (a.balance - amount)}
+      Bool.True {} -> (base.unify a {balance (a.balance - amount)})
       Bool.False {} -> (case a.name == to of
-        Bool.True {} -> {a | balance (a.balance + amount)}
+        Bool.True {} -> (base.unify a {balance (a.balance + amount)})
         Bool.False {} -> a))
 ```
 

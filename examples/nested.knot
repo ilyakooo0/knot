@@ -20,10 +20,10 @@ type Person = {name: Text, age: Int 1}
   -- Remove Eve from every team: rewrite each team's members list.
   *teams = do
     t <- teams
-    yield { t | members (do
+    yield (base.unify t {members (do
       m <- t.members
       where m.name != "Eve"
-      yield m) }
+      yield m) })
 
   base.println "After:"
   teams2 <- full *teams

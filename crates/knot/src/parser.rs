@@ -2299,66 +2299,13 @@ impl Parser {
             ));
         }
 
-        // New record syntax: whitespace-separated `name value` pairs, no `:` or
+        // Record literal: whitespace-separated `name value` pairs, no `:` or
         // `,`. A field value is a single atom / postfix chain / parenthesized
         // (or list / nested-record) compound — i.e. `parse_postfix`, which never
         // consumes a following bare identifier as an application argument. A bare
-        // `Lower` after a value therefore always opens the next field.
-        //
-        // A record UPDATE `{base | name value, ...}` is detected by speculatively
-        // parsing a leading postfix expression and checking for a top-level `|`.
-        // A leading `Lower` is always a field name, never an update base, so we
-        // only speculate when the first token is NOT a plain identifier.
-        let first_is_lower = matches!(self.peek(), TokenKind::Lower(_));
-        if !first_is_lower {
-            // Speculative base parse for `{base | …}` (e.g. base is a parenthesized
-            // expr, field-access chain, etc.). A bare-identifier base is handled by
-            // the named-field path below and disambiguated there.
-            let saved = self.save();
-            let diag_count = self.diagnostics.len();
-            if let Some(first_expr) = self.parse_postfix() {
-                self.skip_newlines();
-                if self.eat(&TokenKind::Pipe) {
-                    let update_fields = self.parse_record_update_fields()?;
-                    let end_tok = self
-                        .expect(&TokenKind::RBrace, "expected '}' to close record update")
-                        .ok()?;
-                    return Some(Spanned::new(
-                        ExprKind::RecordUpdate {
-                            base: Box::new(first_expr),
-                            fields: update_fields,
-                        },
-                        Span::new(start.start, end_tok.span.end),
-                    ));
-                }
-            }
-            self.restore(saved);
-            self.diagnostics.truncate(diag_count);
-        } else {
-            // Leading identifier: could still be an update `{base | …}` where base
-            // is a plain var or field-access chain. Parse the postfix, check `|`.
-            let saved = self.save();
-            let diag_count = self.diagnostics.len();
-            if let Some(head) = self.parse_postfix() {
-                self.skip_newlines();
-                if self.eat(&TokenKind::Pipe) {
-                    let update_fields = self.parse_record_update_fields()?;
-                    let end_tok = self
-                        .expect(&TokenKind::RBrace, "expected '}' to close record update")
-                        .ok()?;
-                    return Some(Spanned::new(
-                        ExprKind::RecordUpdate {
-                            base: Box::new(head),
-                            fields: update_fields,
-                        },
-                        Span::new(start.start, end_tok.span.end),
-                    ));
-                }
-            }
-            self.restore(saved);
-            self.diagnostics.truncate(diag_count);
-        }
-
+        // `Lower` after a value therefore always opens the next field. (Record
+        // UPDATE syntax `{base | name value, …}` was removed: use `unify base
+        // {name value, …}`.)
         // Named fields: `name value name2 value2 …`
         //
         // A field may carry a standalone type-signature line, written like a
@@ -2901,35 +2848,6 @@ impl Parser {
         let using_fn = self.parse_expr()?;
         self.block_indent = prev_block_indent;
         Some(crate::ast::SourceMigration { from_ty, to_ty, using_fn })
-    }
-
-    /// Parse the `name value …` fields after the `|` in a record update
-    /// `{base | name value, …}`. Stops before the closing `}`.
-    fn parse_record_update_fields(&mut self) -> Option<Vec<Field<Expr>>> {
-        let mut update_fields = Vec::new();
-        self.skip_newlines();
-        if !self.at(&TokenKind::RBrace) {
-            loop {
-                self.skip_newlines();
-                if self.at(&TokenKind::RBrace) {
-                    break;
-                }
-                let (fname, _) = self
-                    .expect_lower("expected field name in record update")
-                    .ok()?;
-                self.skip_newlines();
-                let Some(val) = self.parse_postfix() else {
-                    self.error("expected field value after field name in record update");
-                    return None;
-                };
-                update_fields.push(Field {
-                    name: fname,
-                    value: val,
-                });
-            }
-        }
-        self.skip_newlines();
-        Some(update_fields)
     }
 
     fn parse_list_expr(&mut self, start: Span) -> Option<Expr> {

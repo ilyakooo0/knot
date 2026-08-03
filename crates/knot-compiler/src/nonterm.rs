@@ -196,12 +196,6 @@ fn collect_unguarded_calls<'a>(
                 collect_unguarded_calls(&f.value, defs, caller_name, caller, out);
             }
         }
-        RecordUpdate { base, fields } => {
-            collect_unguarded_calls(base, defs, caller_name, caller, out);
-            for f in fields {
-                collect_unguarded_calls(&f.value, defs, caller_name, caller, out);
-            }
-        }
         FieldAccess { expr, .. } => collect_unguarded_calls(expr, defs, caller_name, caller, out),
         List(items) => {
             for it in items {

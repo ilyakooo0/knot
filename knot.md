@@ -90,7 +90,7 @@ type Person = {name: Text, age: Int 1}
 
 Field access: `person.name`
 
-Record update: `{person | age (person.age + 1)}`
+Record merge: `base.unify person {age (person.age + 1)}` — right-biased; see `unify`.
 
 Note the two syntaxes differ: **values** are `{name "Alice" age 30}` (space-separated, no `:` or `,`); **types** are `{name: Text, age: Int 1}` (`:` after each field name, `,` between fields). There is no field-name punning — a record value always pairs an explicit field name with its value (`{name t.name age t.age}`).
 
@@ -422,7 +422,7 @@ birthday \name -> do
   *people = do
     p <- people
     yield (case p.name == name of
-      Bool.True {}  -> {p | age (p.age + 1)}
+      Bool.True {}  -> (base.unify p {age (p.age + 1)})
       Bool.False {} -> p)
 
 -- Delete (filter to keep)
@@ -594,10 +594,10 @@ updateTeams do
   teams <- full *teams
   *teams = do
     t <- teams
-    yield {t | members do
+    yield (base.unify t {members do
       m <- t.members
       where m.name != "Eve"
-      yield m}
+      yield m})
 ```
 
 ---
@@ -749,7 +749,7 @@ birthday \name -> do
   *people = do               -- IO {}
     p <- people
     yield (case p.name == name of
-      Bool.True {}  -> {p | age (p.age + 1)}
+      Bool.True {}  -> (base.unify p {age (p.age + 1)})
       Bool.False {} -> p)
 -- Inferred effects: {rw *people}
 -- Type: Text -> IO {} {}
@@ -1191,7 +1191,7 @@ The compiler maintains a lockfile (`<name>.schema.lock`) tracking persisted sche
 *people : [{name: Text, age: Int 1}]
   migrate from {name: Text, age: Int 1}
   to {name: Text, age: Int 1, email: Text}
-  using (\old -> {old | email (old.name ++ "@unknown.com")})
+  using (\old -> (base.unify old {email (old.name ++ "@unknown.com")}))
 ```
 
 ---
@@ -1346,7 +1346,7 @@ complete \title -> do
   *todos = do
     t <- todos
     yield (case t.title == title of
-      Bool.True {} -> {t | status (Status.Resolved {resolution "done"})}
+      Bool.True {} -> (base.unify t {status (Status.Resolved {resolution "done"})})
       Bool.False {} -> t)
 
 assign \title person -> do
@@ -1354,7 +1354,7 @@ assign \title person -> do
   *todos = do
     t <- todos
     yield (case t.title == title of
-      Bool.True {} -> {t | status (Status.InProgress {assignee person})}
+      Bool.True {} -> (base.unify t {status (Status.InProgress {assignee person})})
       Bool.False {} -> t)
 
 pending \owner -> do
@@ -1425,7 +1425,7 @@ updateWhere \target newValue -> do
   *rel = do
     r <- rel
     yield (case r.id == target of
-      Bool.True {}  -> {r | field newValue}
+      Bool.True {}  -> (base.unify r {field newValue})
       Bool.False {} -> r)
 ```
 

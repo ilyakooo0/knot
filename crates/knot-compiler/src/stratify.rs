@@ -334,12 +334,6 @@ fn collect_edges(
                 collect_edges(&f.value, polarity, node_names, env, partial_diffs, diff_wrappers, out);
             }
         }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            collect_edges(base, polarity, node_names, env, partial_diffs, diff_wrappers, out);
-            for f in fields {
-                collect_edges(&f.value, polarity, node_names, env, partial_diffs, diff_wrappers, out);
-            }
-        }
         ast::ExprKind::FieldAccess { expr, .. } => {
             collect_edges(expr, polarity, node_names, env, partial_diffs, diff_wrappers, out);
         }

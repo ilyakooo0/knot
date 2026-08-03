@@ -177,18 +177,6 @@ fn collect_field_name_spans(
                 search_start = f.value.span.end;
             }
         }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            let mut search_start = base.span.end;
-            for f in fields {
-                if f.name == field_name {
-                    match find_word_in_source(source, field_name, search_start, f.value.span.start) {
-                        Some(span) => ranges.push(span),
-                        None => *pun_seen = true,
-                    }
-                }
-                search_start = f.value.span.end;
-            }
-        }
         ast::ExprKind::FieldAccess {
             expr: inner, field, ..
         }

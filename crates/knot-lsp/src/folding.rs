@@ -123,12 +123,6 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
                 collect_folding_ranges_expr(&f.value, source, ranges);
             }
         }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            collect_folding_ranges_expr(base, source, ranges);
-            for f in fields {
-                collect_folding_ranges_expr(&f.value, source, ranges);
-            }
-        }
         ast::ExprKind::FieldAccess { expr, .. } => {
             collect_folding_ranges_expr(expr, source, ranges);
         }

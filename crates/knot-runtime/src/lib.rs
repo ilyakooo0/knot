@@ -16906,8 +16906,8 @@ pub extern "C-unwind" fn knot_atomic_rollback(db: *mut c_void) {
 
 // ── Record update ─────────────────────────────────────────────────
 
-/// Create a new record by copying `base` and overriding fields.
-/// This implements `{base | field1: val1, field2: val2}`.
+/// Copy a record (`relation_add_fields` clones each row before overriding
+/// fields on the copy).
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_record_update(base: *mut Value) -> *mut Value {
     match unsafe { as_ref(base) } {
@@ -16923,87 +16923,6 @@ pub extern "C-unwind" fn knot_record_update(base: *mut Value) -> *mut Value {
         }
         _ => panic!("knot runtime: record update requires a Record base, got {}", type_name(base)),
     }
-}
-
-/// Batch record update: copy base and merge sorted update fields in one pass.
-/// `data` points to a flat array of triples: [key_ptr, key_len, value, ...]
-/// Fields MUST be pre-sorted by name. O(n+m) merge vs O(m log n) repeated insert.
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_record_update_batch(
-    base: *mut Value,
-    data: *const usize,
-    count: usize,
-) -> *mut Value {
-    let base_fields = match unsafe { as_ref(base) } {
-        Value::Record(fields) => fields,
-        _ => panic!("knot runtime: record update requires a Record base, got {}", type_name(base)),
-    };
-
-    // Parse update fields from flat array
-    let mut updates: Vec<(String, *mut Value)> = (0..count)
-        .map(|i| {
-            let offset = i * 3;
-            let key_ptr = unsafe { *data.add(offset) as *const u8 };
-            let key_len = unsafe { *data.add(offset + 1) };
-            let value = unsafe { *data.add(offset + 2) as *mut Value };
-            let name = unsafe { str_from_raw(key_ptr, key_len) }.to_string();
-            (name, value)
-        })
-        .collect();
-
-    // Defensive sort by field name — codegen is expected to pre-sort, but a
-    // bug there would silently produce wrong merge results. Sort here too.
-    updates.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-    // Merge sorted base fields with sorted update fields
-    let mut result = Vec::with_capacity(base_fields.len() + count);
-    let mut base_idx = 0;
-    let mut upd_idx = 0;
-
-    while base_idx < base_fields.len() && upd_idx < updates.len() {
-        let base_name: &str = &base_fields[base_idx].name;
-        let upd_name = updates[upd_idx].0.as_str();
-        match base_name.cmp(upd_name) {
-            std::cmp::Ordering::Less => {
-                result.push(RecordField {
-                    name: base_fields[base_idx].name.clone(),
-                    value: base_fields[base_idx].value,
-                });
-                base_idx += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                result.push(RecordField {
-                    name: base_fields[base_idx].name.clone(),
-                    value: updates[upd_idx].1,
-                });
-                base_idx += 1;
-                upd_idx += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                result.push(RecordField {
-                    name: intern_str(&updates[upd_idx].0),
-                    value: updates[upd_idx].1,
-                });
-                upd_idx += 1;
-            }
-        }
-    }
-    while base_idx < base_fields.len() {
-        result.push(RecordField {
-            name: base_fields[base_idx].name.clone(),
-            value: base_fields[base_idx].value,
-        });
-        base_idx += 1;
-    }
-    while upd_idx < updates.len() {
-        result.push(RecordField {
-            name: intern_str(&updates[upd_idx].0),
-            value: updates[upd_idx].1,
-        });
-        upd_idx += 1;
-    }
-
-    alloc(Value::Record(result))
 }
 
 // ── View operations ──────────────────────────────────────────────

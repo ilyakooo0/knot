@@ -1190,7 +1190,6 @@ impl Codegen {
         self.declare_rt("knot_record_field_by_index", &[p, p], &[p]);
         self.declare_rt("knot_record_from_pairs", &[p, p], &[p]);
         self.declare_rt("knot_record_update", &[p], &[p]);
-        self.declare_rt("knot_record_update_batch", &[p, p, p], &[p]);
 
         // Relation operations
         self.declare_rt("knot_relation_empty", &[], &[p]);
@@ -4349,34 +4348,6 @@ impl Codegen {
                 }
             }
 
-            ast::ExprKind::RecordUpdate { base, fields } => {
-                let base_val = self.compile_expr(builder, base, env, db);
-                let n = fields.len();
-                // Compile and sort update fields for batch merge
-                let mut compiled: Vec<(&str, Value)> = Vec::with_capacity(n);
-                for f in fields {
-                    let val = self.compile_expr(builder, &f.value, env, db);
-                    compiled.push((&f.name, val));
-                }
-                compiled.sort_by_key(|(name, _)| *name);
-
-                let ptr_bytes = self.ptr_type.bytes() as i32;
-                let slot_size = (3 * n as u32) * ptr_bytes as u32;
-                let slot = builder.create_sized_stack_slot(
-                    StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
-                );
-                for (i, (name, val)) in compiled.iter().enumerate() {
-                    let (key_ptr, key_len) = self.string_ptr(builder, name);
-                    let base_off = (i as i32) * (3 * ptr_bytes);
-                    builder.ins().stack_store(key_ptr, slot, base_off);
-                    builder.ins().stack_store(key_len, slot, base_off + ptr_bytes);
-                    builder.ins().stack_store(*val, slot, base_off + 2 * ptr_bytes);
-                }
-                let data_ptr = builder.ins().stack_addr(self.ptr_type, slot, 0);
-                let count = builder.ins().iconst(self.ptr_type, n as i64);
-                self.call_rt(builder, "knot_record_update_batch", &[base_val, data_ptr, count])
-            }
-
             ast::ExprKind::FieldAccess { expr, field } => {
                 // `base.todo` — the unimplemented hole, reached through the
                 // `base` namespace. Dispatch-only (no `base` record field holds
@@ -5809,12 +5780,6 @@ impl Codegen {
             Record(fields) => fields
                 .iter()
                 .all(|f| self.collect_direct_write_targets(&f.value, out)),
-            RecordUpdate { base, fields } => {
-                self.collect_direct_write_targets(base, out)
-                    && fields
-                        .iter()
-                        .all(|f| self.collect_direct_write_targets(&f.value, out))
-            }
             List(items) => items
                 .iter()
                 .all(|e| self.collect_direct_write_targets(e, out)),
@@ -9581,9 +9546,7 @@ impl Codegen {
                 matches!(&expr.node, ast::ExprKind::Var(n) if n == "base")
                     && builtins.contains(field.as_str())
             }
-            ast::ExprKind::Record(_)
-            | ast::ExprKind::RecordUpdate { .. }
-            | ast::ExprKind::List(_) => false,
+            ast::ExprKind::Record(_) | ast::ExprKind::List(_) => false,
             _ => false,
         }
     }
@@ -9786,10 +9749,6 @@ impl Codegen {
             ast::ExprKind::Record(fields) => fields
                 .iter()
                 .any(|f| Self::expr_contains_writes(&f.value, write_fns, known_fns, passthrough_fns)),
-            ast::ExprKind::RecordUpdate { base, fields } => {
-                Self::expr_contains_writes(base, write_fns, known_fns, passthrough_fns)
-                    || fields.iter().any(|f| Self::expr_contains_writes(&f.value, write_fns, known_fns, passthrough_fns))
-            }
             ast::ExprKind::FieldAccess { expr, .. } => {
                 Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns)
             }
@@ -12429,10 +12388,6 @@ impl Codegen {
             ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => Self::references_source(body, source_name),
             ast::ExprKind::Record(fields) => {
                 fields.iter().any(|f| Self::references_source(&f.value, source_name))
-            }
-            ast::ExprKind::RecordUpdate { base, fields } => {
-                Self::references_source(base, source_name)
-                    || fields.iter().any(|f| Self::references_source(&f.value, source_name))
             }
             ast::ExprKind::FieldAccess { expr, .. } => Self::references_source(expr, source_name),
             ast::ExprKind::List(elems) => {
@@ -15839,10 +15794,6 @@ fn expr_has_user_calls(expr: &ast::Expr, user_fns: &HashMap<String, (FuncId, usi
         ast::ExprKind::Record(fields) => {
             fields.iter().any(|f| expr_has_user_calls(&f.value, user_fns))
         }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            expr_has_user_calls(base, user_fns)
-                || fields.iter().any(|f| expr_has_user_calls(&f.value, user_fns))
-        }
         ast::ExprKind::FieldAccess { expr, .. } => expr_has_user_calls(expr, user_fns),
         ast::ExprKind::Lambda { body, .. } => expr_has_user_calls(body, user_fns),
         ast::ExprKind::Annot { expr, .. } => expr_has_user_calls(expr, user_fns),
@@ -15890,12 +15841,6 @@ fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
                 .iter()
                 .any(|p| matches!(&p.node, ast::PatKind::Var(n) if n == var_name));
             !rebinds && expr_references_var(body, var_name)
-        }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            expr_references_var(base, var_name)
-                || fields
-                    .iter()
-                    .any(|f| expr_references_var(&f.value, var_name))
         }
         ast::ExprKind::TimeUnitLit { value, .. } => expr_references_var(value, var_name),
         ast::ExprKind::Annot { expr, .. } => expr_references_var(expr, var_name),
@@ -17351,16 +17296,6 @@ fn beta_reduce_inner(
                 })
                 .collect(),
         ),
-        RecordUpdate { base, fields } => RecordUpdate {
-            base: Box::new(beta_reduce_inner(base, fun_bodies, let_bindings, visited, fuel)),
-            fields: fields
-                .iter()
-                .map(|f| ast::Field {
-                    name: f.name.clone(),
-                    value: beta_reduce_inner(&f.value, fun_bodies, let_bindings, visited, fuel),
-                })
-                .collect(),
-        },
         List(items) => List(
             items
                 .iter()
@@ -17457,18 +17392,6 @@ fn substitute_inner(
                 })
                 .collect::<Option<Vec<_>>>()?,
         ),
-        RecordUpdate { base, fields } => RecordUpdate {
-            base: Box::new(substitute_inner(base, var, value, value_fv)?),
-            fields: fields
-                .iter()
-                .map(|f| {
-                    substitute_inner(&f.value, var, value, value_fv).map(|v| ast::Field {
-                        name: f.name.clone(),
-                        value: v,
-                    })
-                })
-                .collect::<Option<Vec<_>>>()?,
-        },
         List(items) => List(
             items
                 .iter()
@@ -17524,10 +17447,6 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => false,
         ViewDecl { body, .. } | DerivedDecl { body, .. } => expr_mentions_var(body, var),
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
-        RecordUpdate { base, fields } => {
-            expr_mentions_var(base, var)
-                || fields.iter().any(|f| expr_mentions_var(&f.value, var))
-        }
         FieldAccess { expr: e, .. } => expr_mentions_var(e, var),
         List(items) => items.iter().any(|e| expr_mentions_var(e, var)),
         Lambda { body, .. } => expr_mentions_var(body, var),
@@ -17611,12 +17530,6 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
         UnaryOp { operand, .. } => collect_free_vars_set(operand, bound, free),
         FieldAccess { expr: e, .. } => collect_free_vars_set(e, bound, free),
         Record(fields) => {
-            for f in fields {
-                collect_free_vars_set(&f.value, bound, free);
-            }
-        }
-        RecordUpdate { base, fields } => {
-            collect_free_vars_set(base, bound, free);
             for f in fields {
                 collect_free_vars_set(&f.value, bound, free);
             }
@@ -18566,10 +18479,6 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
         ast::ExprKind::Record(fields) => {
             fields.iter().any(|f| expr_contains_derived_ref(&f.value, name))
         }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            expr_contains_derived_ref(base, name)
-                || fields.iter().any(|f| expr_contains_derived_ref(&f.value, name))
-        }
         ast::ExprKind::FieldAccess { expr, .. } => expr_contains_derived_ref(expr, name),
         ast::ExprKind::List(elems) => elems.iter().any(|e| expr_contains_derived_ref(e, name)),
         ast::ExprKind::Lambda { body, .. } => expr_contains_derived_ref(body, name),
@@ -18676,12 +18585,6 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
             free.push(format!("__derived_self_{}", name));
         }
         ast::ExprKind::Record(fields) => {
-            for f in fields {
-                collect_free_vars(&f.value, bound, free);
-            }
-        }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            collect_free_vars(base, bound, free);
             for f in fields {
                 collect_free_vars(&f.value, bound, free);
             }
@@ -18858,9 +18761,6 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
                 })
         }
         ast::ExprKind::Record(fields) => fields.iter().any(|f| expr_refs_var(&f.value, var)),
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            expr_refs_var(base, var) || fields.iter().any(|f| expr_refs_var(&f.value, var))
-        }
         ast::ExprKind::List(elems) => elems.iter().any(|e| expr_refs_var(e, var)),
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
@@ -18969,10 +18869,6 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         }
         // `{p | age: 1}` rebuilds the whole record `p`, so the base is a value
         // use even though field names appear next to it.
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            expr_uses_var_as_value(base, var)
-                || fields.iter().any(|f| expr_uses_var_as_value(&f.value, var))
-        }
         ast::ExprKind::List(elems) => {
             elems.iter().any(|e| expr_uses_var_as_value(e, var))
         }
@@ -19282,13 +19178,6 @@ fn pretty_expr(expr: &ast::Expr) -> String {
                 .map(|f| format!("{}: {}", f.name, pretty_expr(&f.value)))
                 .collect();
             format!("{{{}}}", fs.join(", "))
-        }
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            let fs: Vec<String> = fields
-                .iter()
-                .map(|f| format!("{}: {}", f.name, pretty_expr(&f.value)))
-                .collect();
-            format!("{{{} | {}}}", pretty_expr(base), fs.join(", "))
         }
         ast::ExprKind::FieldAccess { expr, field } => {
             format!("{}.{}", pretty_expr(expr), field)

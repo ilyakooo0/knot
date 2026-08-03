@@ -151,12 +151,6 @@ fn lint_expr(
                 lint_expr(&f.value, source_schemas, views, fun_bodies, diags);
             }
         }
-        ExprKind::RecordUpdate { base, fields } => {
-            lint_expr(base, source_schemas, views, fun_bodies, diags);
-            for f in fields {
-                lint_expr(&f.value, source_schemas, views, fun_bodies, diags);
-            }
-        }
         ExprKind::List(elems) => {
             for e in elems {
                 lint_expr(e, source_schemas, views, fun_bodies, diags);
@@ -956,10 +950,6 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => false,
         ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => references_source(body, source_name),
         ExprKind::Record(fields) => fields.iter().any(|f| references_source(&f.value, source_name)),
-        ExprKind::RecordUpdate { base, fields } => {
-            references_source(base, source_name)
-                || fields.iter().any(|f| references_source(&f.value, source_name))
-        }
         ExprKind::FieldAccess { expr, .. } => references_source(expr, source_name),
         ExprKind::List(elems) => elems.iter().any(|e| references_source(e, source_name)),
         ExprKind::BinOp { lhs, rhs, .. } => {

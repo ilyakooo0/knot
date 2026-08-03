@@ -544,12 +544,6 @@ impl<'a> DefResolver<'a> {
                     self.resolve_expr(&f.value);
                 }
             }
-            ast::ExprKind::RecordUpdate { base, fields } => {
-                self.resolve_expr(base);
-                for f in fields {
-                    self.resolve_expr(&f.value);
-                }
-            }
             ast::ExprKind::FieldAccess { expr, .. } => self.resolve_expr(expr),
             ast::ExprKind::List(elems) => {
                 for e in elems {

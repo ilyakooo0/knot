@@ -97,12 +97,6 @@ pub enum ExprKind {
     /// `{name: "Alice", age: 30}`
     Record(Vec<RecordField>),
 
-    /// `{t | age: t.age + 1}`
-    RecordUpdate {
-        base: Box<Expr>,
-        fields: Vec<Field<Expr>>,
-    },
-
     /// `t.name`
     FieldAccess { expr: Box<Expr>, field: Name },
 

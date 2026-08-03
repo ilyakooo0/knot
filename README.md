@@ -136,17 +136,20 @@ person {name "Ada" addr {city "London" zip "E1"}}
   yield {})
 ```
 
-Records are immutable, but a **record update** builds a new record from an old
-one with some fields replaced — `{base | field newValue ...}` (spaces again, no
-commas):
+Records are immutable, but `base.unify` builds a new record by merging an old
+one with some fields replaced or added — right-biased, so the second record's
+fields win on a name conflict:
 
 ```knot
 with {
 pt    {x 3 y 4}
-moved ({pt | x 10})               -- like pt, but x is 10
+moved (base.unify pt {x 10})       -- like pt, but x is 10
 }
 (base.println (base.show moved))  -- "{x: 10, y: 4}"
 ```
+
+`unify` can also add fields the base didn't have (`base.unify pt {z 5}` is
+`{x: 3, y: 4, z: 5}`); see `unify` in the stdlib reference.
 
 The empty record `{}` is the **unit** value — the "nothing interesting here"
 result. A `do` block that only performs effects ends in `yield {}` to produce
@@ -332,12 +335,12 @@ type Todo = {title: Text, done: Int 1}
   base.println ("open: " ++ base.show (base.count open))
 
   -- update: bind the rows to a local, then map, marking one done
-  -- ({t | done 1} is a record update)
+  -- (base.unify t {done 1} merges the row with the new field value)
   todos <- full *todos
   *todos = (do
     t <- todos
     yield (case t.title == "write guide" of
-      Bool.True {} -> {t | done 1}
+      Bool.True {} -> (base.unify t {done 1})
       Bool.False {} -> t))
   yield {})
 ```

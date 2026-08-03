@@ -5514,60 +5514,6 @@ impl Infer {
                 Ty::Record(field_tys, None)
             }
 
-            ast::ExprKind::RecordUpdate { base, fields } => {
-                let base_ty = self.infer_expr(base);
-                let mut update_fields = BTreeMap::new();
-                for field in fields {
-                    let val_ty = self.infer_expr(&field.value);
-                    update_fields.insert(field.name.clone(), val_ty);
-                }
-                // The base must be some record; `rv` captures its row.
-                let rv = self.fresh_var();
-                let constraint = Ty::Record(BTreeMap::new(), Some(rv));
-                self.unify(&base_ty, &constraint, base.span);
-
-                match self.apply(&Ty::Var(rv)) {
-                    // The base's fields are fully known: overlay the updates
-                    // on them. Fields the base already has keep their type;
-                    // any others extend it — `{base | field: val}` is both
-                    // update and extension syntax.
-                    Ty::Record(base_fields, None) => {
-                        let mut result = base_fields.clone();
-                        for (name, update_ty) in update_fields {
-                            if let Some(base_field_ty) = base_fields.get(&name)
-                            {
-                                let base_field_ty = base_field_ty.clone();
-                                self.unify(
-                                    &update_ty,
-                                    &base_field_ty,
-                                    base.span,
-                                );
-                            }
-                            result.insert(name, update_ty);
-                        }
-                        Ty::Record(result, None)
-                    }
-                    // The base's row is still open, so we cannot tell whether
-                    // it already holds the updated fields. Split the row into
-                    // those fields and a `rest` tail carrying everything else,
-                    // which requires the base to have them.
-                    //
-                    // Reusing the base's whole row as the result's tail (the
-                    // previous approach) let a field sit in the tail *and* be
-                    // named explicitly in the result. `{r | f: v}` and `r`
-                    // then looked like they disagreed about `f`, so unifying
-                    // the two — as `if c then {r | f: v} else r` does — failed
-                    // with "record fields don't match".
-                    _ => {
-                        let rest = self.fresh_var();
-                        let constraint =
-                            Ty::Record(update_fields.clone(), Some(rest));
-                        self.unify(&base_ty, &constraint, base.span);
-                        Ty::Record(update_fields, Some(rest))
-                    }
-                }
-            }
-
             ast::ExprKind::FieldAccess { expr: e, field } => {
                 // Qualified constructor: `Color.Red`. The base parsed as a
                 // `Constructor` (capitalized) but names a DATA TYPE; resolve
@@ -7281,8 +7227,53 @@ impl Infer {
             return Some(Ty::Var(result));
         }
 
-        match (Self::closed_record_fields(&left_res), Self::closed_record_fields(&right_res)) {
-            (Ok(f1), Ok(f2)) => Some(Self::merge_record_fields(f1, f2)),
+        // Right-biased merge over possibly-open records. The common case is
+        // `unify base {updates}` — an open left (a lambda parameter / relation
+        // row whose full shape isn't pinned) merged with a closed right (a
+        // literal of updates). Overlay the right's fields on the left, keeping
+        // the left's row tail so the rest of the base's fields flow through —
+        // the same right-biased overlay record-update syntax used. A genuinely
+        // non-record argument is the only hard error.
+        match (
+            Self::record_fields(&left_res),
+            Self::record_fields(&right_res),
+        ) {
+            (Ok((f1, None)), Ok((f2, tail2))) => {
+                // Closed left: overlay the right's fields, keep the right's tail
+                // (a closed left contributes no tail).
+                let mut merged = f1;
+                for (k, v) in f2 {
+                    merged.insert(k, v);
+                }
+                Some(Ty::Record(merged, tail2))
+            }
+            (Ok((f1, Some(_))), Ok((f2, tail2))) => {
+                // Open left: the base's other fields live in its row tail, so we
+                // cannot just name the right's fields explicitly AND keep the
+                // base's tail — a field would sit in both, and unifying the
+                // result with the base (as `case … -> unify r {..} ; _ -> r`
+                // does) would then report "record fields don't match". Split
+                // the row instead (record-update's approach): the result names
+                // the merged fields and a FRESH tail, and the base is
+                // constrained to have the right's fields, so its own tail
+                // becomes that fresh tail with the named fields excluded.
+                let rest = self.fresh_var();
+                let mut merged = f1;
+                for (k, v) in &f2 {
+                    merged.insert(k.clone(), v.clone());
+                }
+                let result = Ty::Record(merged.clone(), Some(rest));
+                // Constrain the base: it must contain the merged known fields,
+                // with the same fresh tail (so its other fields flow into
+                // `rest`).
+                let base_constraint = Ty::Record(merged, Some(rest));
+                let base_ty = self.apply(&left_ty).clone();
+                self.unify(&base_ty, &base_constraint, args[0].span);
+                // A right tail beyond the fresh one is not expressible here;
+                // the common `unify base {literal-updates}` case has none.
+                let _ = tail2;
+                Some(result)
+            }
             (Err(msg), _) | (_, Err(msg)) => {
                 self.error(msg, expr.span);
                 // Return Unit to stop the generic application path emitting a
@@ -7292,20 +7283,15 @@ impl Infer {
         }
     }
 
-    /// Extract a closed record's field map, or an error message if the type
-    /// is an open record (free row tail) or not a record at all.
-    fn closed_record_fields(
+    /// Extract a record's field map and row tail (`None` = closed). The only
+    /// error is a genuinely non-record argument.
+    fn record_fields(
         ty: &Ty,
-    ) -> Result<std::collections::BTreeMap<String, Ty>, String> {
+    ) -> Result<(std::collections::BTreeMap<String, Ty>, Option<TyVar>), String> {
         match ty.peel_alias() {
-            Ty::Record(fields, None) => Ok(fields.clone()),
-            Ty::Record(_, Some(_)) => Err(
-                "unify requires a statically-known record shape, but an argument has an open record type".into(),
-            ),
+            Ty::Record(fields, tail) => Ok((fields.clone(), *tail)),
             other => Err(format!(
                 "unify expects record arguments, got {}",
-                // Display via a temporary; the Infer method needs &self, so
-                // format the variant name structurally here.
                 match other {
                     Ty::Int => "Int".to_string(),
                     Ty::Float => "Float".to_string(),
@@ -7316,18 +7302,6 @@ impl Infer {
                 }
             )),
         }
-    }
-
-    /// Right-biased record field union: `f2`'s type wins on a name conflict.
-    fn merge_record_fields(
-        f1: std::collections::BTreeMap<String, Ty>,
-        f2: std::collections::BTreeMap<String, Ty>,
-    ) -> Ty {
-        let mut merged = f1;
-        for (k, v) in f2 {
-            merged.insert(k, v);
-        }
-        Ty::Record(merged, None)
     }
 
     fn try_infer_fetch(&mut self, expr: &ast::Expr) -> Option<Ty> {
@@ -7801,11 +7775,15 @@ impl Infer {
             let left = self.apply(&d.left).clone();
             let right = self.apply(&d.right).clone();
             match (
-                Self::closed_record_fields(&left),
-                Self::closed_record_fields(&right),
+                Self::record_fields(&left),
+                Self::record_fields(&right),
             ) {
-                (Ok(f1), Ok(f2)) => {
-                    let merged = Self::merge_record_fields(f1, f2);
+                (Ok((f1, tail1)), Ok((f2, tail2))) => {
+                    let mut merged = f1;
+                    for (k, v) in f2 {
+                        merged.insert(k, v);
+                    }
+                    let merged = Ty::Record(merged, tail1.or(tail2));
                     self.unify(&Ty::Var(d.result), &merged, d.span);
                 }
                 (Err(msg), _) | (_, Err(msg)) => {
@@ -12251,15 +12229,6 @@ fn value_references_source_inner(
                 &f.value, source_name, aliases, let_bindings, visited,
             )
         }),
-        ast::ExprKind::RecordUpdate { base, fields } => {
-            value_references_source_inner(
-                base, source_name, aliases, let_bindings, visited,
-            ) || fields.iter().any(|f| {
-                value_references_source_inner(
-                    &f.value, source_name, aliases, let_bindings, visited,
-                )
-            })
-        }
         ast::ExprKind::FieldAccess { expr, .. } => value_references_source_inner(
             expr, source_name, aliases, let_bindings, visited,
         ),
@@ -13043,12 +13012,6 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
                 f(&mut fl.value);
             }
         }
-        RecordUpdate { base, fields } => {
-            f(base);
-            for fl in fields {
-                f(&mut fl.value);
-            }
-        }
         FieldAccess { expr, .. } => f(expr),
         List(items) => {
             for it in items {
@@ -13167,12 +13130,6 @@ pub(crate) fn walk_exprs_read<'a>(e: &'a ast::Expr, f: &mut impl FnMut(&'a ast::
                 walk_exprs_read(&fl.value, f);
             }
         }
-        RecordUpdate { base, fields } => {
-            walk_exprs_read(base, f);
-            for fl in fields {
-                walk_exprs_read(&fl.value, f);
-            }
-        }
         List(items) => {
             for it in items {
                 walk_exprs_read(it, f);
@@ -13275,12 +13232,6 @@ fn for_each_data_ctor_scoped<'a>(
             Atomic(x) | Refine(x) => walk(x, d, f),
             TimeUnitLit { value, .. } => walk(value, d, f),
             Record(fields) => {
-                for fl in fields {
-                    walk(&fl.value, d, f);
-                }
-            }
-            RecordUpdate { base, fields } => {
-                walk(base, d, f);
                 for fl in fields {
                     walk(&fl.value, d, f);
                 }

@@ -136,12 +136,6 @@ fn walk_expr_children_read(expr: &Expr, f: &mut impl FnMut(&Expr)) {
                 f(&field.value);
             }
         }
-        ExprKind::RecordUpdate { base, fields } => {
-            f(base);
-            for field in fields {
-                f(&field.value);
-            }
-        }
         ExprKind::FieldAccess { expr: e, .. } => f(e),
         ExprKind::List(elems) => {
             for e in elems {
@@ -343,12 +337,6 @@ fn collect_fun_bodies<'a>(
                 collect_fun_bodies(&fl.value, fun_bodies, fun_sig_io);
             }
         }
-        ExprKind::RecordUpdate { base, fields } => {
-            collect_fun_bodies(base, fun_bodies, fun_sig_io);
-            for fl in fields {
-                collect_fun_bodies(&fl.value, fun_bodies, fun_sig_io);
-            }
-        }
         ExprKind::List(items) => {
             for it in items {
                 collect_fun_bodies(it, fun_bodies, fun_sig_io);
@@ -481,9 +469,7 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
             matches!(&expr.node, ExprKind::Var(n) if n == "base")
                 && builtins.contains(field.as_str())
         }
-        ExprKind::Record(_)
-        | ExprKind::RecordUpdate { .. }
-        | ExprKind::List(_) => false,
+        ExprKind::Record(_) | ExprKind::List(_) => false,
         _ => {
             if let Some(inner) = expr.node.as_yield_arg() {
                 expr_contains_io(inner, builtins, io_fns)
@@ -600,12 +586,6 @@ fn walk_expr_children(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
         }
         ExprKind::Lambda { body, .. } => f(body),
         ExprKind::Record(fields) => {
-            for field in fields {
-                f(&mut field.value);
-            }
-        }
-        ExprKind::RecordUpdate { base, fields } => {
-            f(base);
             for field in fields {
                 f(&mut field.value);
             }
@@ -727,12 +707,6 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
         }
 
         ExprKind::Record(fields) => {
-            for f in fields {
-                desugar_expr(&mut f.value, io_fns, source_vars);
-            }
-        }
-        ExprKind::RecordUpdate { base, fields } => {
-            desugar_expr(base, io_fns, source_vars);
             for f in fields {
                 desugar_expr(&mut f.value, io_fns, source_vars);
             }

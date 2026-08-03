@@ -167,7 +167,7 @@ addMember \teamName person -> do
   *teams = do
     t <- teams
     yield (case t.name == teamName of
-      Bool.True {} -> {t | members (base.union t.members [person])}
+      Bool.True {} -> (base.unify t {members (base.union t.members [person])})
       Bool.False {} -> t)
 
 -- Remove a member from all teams
@@ -175,10 +175,10 @@ removePerson \personName -> do
   teams <- full *teams
   *teams = do
     t <- teams
-    yield {t | members do
+    yield (base.unify t {members do
       m <- t.members
       where m.name != personName
-      yield m}
+      yield m})
 ```
 
 #### Flattening and Nesting
@@ -657,7 +657,7 @@ birthday \name -> do
   people <- full *people
   *people = do
     p <- people
-    yield (case p.name == name of Bool.True {} -> {p | age (p.age + 1)}; Bool.False {} -> p)
+    yield (case p.name == name of Bool.True {} -> (base.unify p {age (p.age + 1)}); Bool.False {} -> p)
 ```
 
 ### Effect Annotations
@@ -670,7 +670,7 @@ birthday \name -> do
   people <- full *people
   *people = do
     p <- people
-    yield (case p.name == name of Bool.True {} -> {p | age (p.age + 1)}; Bool.False {} -> p)
+    yield (case p.name == name of Bool.True {} -> (base.unify p {age (p.age + 1)}); Bool.False {} -> p)
 ```
 
 ### IO and Transactions
@@ -910,7 +910,7 @@ assign \title owner person -> do
   *todos = do
     t <- todos
     yield (case t.title == title of
-      Bool.True {} -> {t | owner person}
+      Bool.True {} -> (base.unify t {owner person})
       Bool.False {} -> t)
 
 pendingFor \user page limit -> do
@@ -1173,9 +1173,9 @@ transfer \from to amount -> do
   *accounts = do
     a <- accounts
     yield (case a.name == from of
-      Bool.True {} -> {a | balance (a.balance - amount)}
+      Bool.True {} -> (base.unify a {balance (a.balance - amount)})
       Bool.False {} -> (case a.name == to of
-        Bool.True {} -> {a | balance (a.balance + amount)}
+        Bool.True {} -> (base.unify a {balance (a.balance + amount)})
         Bool.False {} -> a))
 
 batchTransfer \transfers ->
@@ -1201,7 +1201,7 @@ birthday \name -> do
   people <- full *people
   *people = do
     p <- people
-    yield (case p.name == "Alice" of Bool.True {} -> {p | age (p.age + 1)}; Bool.False {} -> p)
+    yield (case p.name == "Alice" of Bool.True {} -> (base.unify p {age (p.age + 1)}); Bool.False {} -> p)
 
 -- Delete: filter to keep the rest
 removePerson \name -> do
@@ -1365,7 +1365,7 @@ data Status
 *people : [{name: Text, age: Int 1}]
   migrate from {name: Text, age: Int 1}
   to {name: Text, age: Int 1, email: Text}
-  using (\old -> {old | email (old.name ++ "@unknown.com")})
+  using (\old -> (base.unify old {email (old.name ++ "@unknown.com")}))
 
 *todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
 ```
@@ -1396,7 +1396,7 @@ Breaking changes require a `migrate` block:
 *people : [{name: Text, age: Int 1}]
   migrate from {name: Text, age: Int 1}
   to {name: Text, age: Int 1, email: Text}
-  using (\old -> {old | email (old.name ++ "@unknown.com")})
+  using (\old -> (base.unify old {email (old.name ++ "@unknown.com")}))
 ```
 
 ADT migrations use pattern matching:
@@ -1407,9 +1407,9 @@ data Status = Open {} | InProgress {assignee: Text} | Resolved {resolution: Text
 *todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
   migrate from {title: Text, owner: Text, priority: Priority, status: Status}
   to {title: Text, owner: Text, priority: Priority, status: Status}
-  using (\old -> {old | status (case old.status of
+  using (\old -> (base.unify old {status (case old.status of
     Status.InProgress {assignee a} -> Status.Resolved {resolution ("closed by " ++ a)}
-    other -> other)})
+    other -> other)}))
 ```
 
 After a successful compile, `schema.lock` is updated.
@@ -2062,7 +2062,7 @@ assign \title owner person -> do
   *todos = do
     t <- todos
     yield (case t.title == title && t.owner == owner of
-      Bool.True {} -> {t | status (Status.InProgress {assignee person})}
+      Bool.True {} -> (base.unify t {status (Status.InProgress {assignee person})})
       Bool.False {} -> t)
 
 resolve \title owner msg -> do
@@ -2070,7 +2070,7 @@ resolve \title owner msg -> do
   *todos = do
     t <- todos
     yield (case t.title == title && t.owner == owner of
-      Bool.True {} -> {t | status (Status.Resolved {resolution msg})}
+      Bool.True {} -> (base.unify t {status (Status.Resolved {resolution msg})})
       Bool.False {} -> t)
 
 api (serve Api where

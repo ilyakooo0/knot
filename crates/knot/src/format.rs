@@ -586,21 +586,6 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         ExprKind::ImplicitRef(n) => format!("^{}", n),
         ExprKind::TypeHole => "_".to_string(),
         ExprKind::Record(fields) => render_record_inline(fields),
-        ExprKind::RecordUpdate { base, fields } => {
-            let mut s = String::from("{");
-            s.push_str(&render_expr_inline(base, Prec::Lowest));
-            s.push_str(" | ");
-            for (i, f) in fields.iter().enumerate() {
-                if i > 0 {
-                    s.push(' ');
-                }
-                s.push_str(&f.name);
-                s.push(' ');
-                s.push_str(&render_expr_inline(&f.value, Prec::Atom));
-            }
-            s.push('}');
-            s
-        }
         ExprKind::FieldAccess { expr, field } => {
             format!("{}.{}", render_expr_inline(expr, Prec::Atom), field)
         }
@@ -1094,7 +1079,6 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
         }
         ExprKind::List(items) => render_list_block(p, items),
         ExprKind::Record(fields) => render_record_block(p, fields),
-        ExprKind::RecordUpdate { base, fields } => render_record_update_block(p, base, fields),
         ExprKind::App { .. } => render_app_block(p, e, parent),
         ExprKind::BinOp { op, lhs, rhs } => render_binop_block(p, *op, lhs, rhs, parent),
         ExprKind::Set { target, value } => {
@@ -1297,22 +1281,6 @@ fn render_record_block(p: &mut Printer, fields: &[RecordField]) {
                 p.write(&render_type_scheme(sig));
                 p.newline();
             }
-            p.write(&f.name);
-            p.write(" ");
-            render_expr(p, &f.value, Prec::Atom);
-            p.newline();
-        }
-    });
-    p.write("}");
-}
-
-fn render_record_update_block(p: &mut Printer, base: &Expr, fields: &[Field<Expr>]) {
-    p.write("{");
-    p.write(&render_expr_inline(base, Prec::Lowest));
-    p.write(" |");
-    p.newline();
-    p.with_indent(|p| {
-        for f in fields.iter() {
             p.write(&f.name);
             p.write(" ");
             render_expr(p, &f.value, Prec::Atom);

@@ -1459,6 +1459,7 @@ dependencies = [
  "cranelift-native",
  "cranelift-object",
  "gimli",
+ "indexmap",
  "knot",
  "knot-runtime",
  "object",

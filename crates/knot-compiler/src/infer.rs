@@ -8,6 +8,7 @@ use knot::ast;
 use knot::ast::Span;
 use knot::diagnostic::Diagnostic;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use indexmap::IndexMap;
 
 /// Collect all variable names bound by a pattern, recursing into
 /// Constructor, Record, List, and Cons sub-patterns.
@@ -435,6 +436,12 @@ type TyVar = u32;
 /// Internal type representation for unification-based inference.
 // `TyCon` deliberately shares the `Ty` prefix — it is standard PL terminology
 // ("type constructor") and renaming would ripple across the whole crate.
+/// Field/constructor map for records and variants. `IndexMap` preserves source
+/// definition order (records) / declaration order (variants) so consumers that
+/// care about order — implicit-field `^name` resolution, `show` output, JSON
+/// encoding — see a stable, source-faithful sequence instead of BTreeMap's
+/// alphabetical sort. By-key access (`get`/`contains_key`/`insert`) is unchanged.
+type FieldMap = IndexMap<String, Ty>;
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, PartialEq)]
 enum Ty {
@@ -450,14 +457,17 @@ enum Ty {
     /// Function type.
     Fun(Box<Ty>, Box<Ty>),
     /// Record with named fields and optional row variable (open record).
-    Record(BTreeMap<String, Ty>, Option<TyVar>),
+    /// Fields keep source definition order (IndexMap) so implicit-field `^name`
+    /// resolution can try them bottom-to-top; record-type equality is by-key,
+    /// so order is not semantic.
+    Record(FieldMap, Option<TyVar>),
     /// Relation (set) type: [T].
     Relation(Box<Ty>),
     /// Named algebraic data type with optional type arguments.
     Con(String, Vec<Ty>),
     /// Variant with named constructors and optional row variable (open variant).
     /// Each constructor maps to its field types as a Record.
-    Variant(BTreeMap<String, Ty>, Option<TyVar>),
+    Variant(FieldMap, Option<TyVar>),
     /// Unapplied type constructor (e.g. `[]`, `Maybe`).
     /// Used for higher-kinded type polymorphism.
     TyCon(String),
@@ -497,7 +507,7 @@ enum Ty {
 
 impl Ty {
     fn unit() -> Ty {
-        Ty::Record(BTreeMap::new(), None)
+        Ty::Record(IndexMap::new(), None)
     }
 
     /// Strip outer `Ty::Alias` wrappers to expose the underlying type.
@@ -1755,7 +1765,7 @@ impl Infer {
                 Ty::Fun(Box::new(self.apply_impl(p, excluded)), Box::new(self.apply_impl(r, excluded)))
             }
             Ty::Record(fields, row) => {
-                let mut applied: BTreeMap<String, Ty> = fields
+                let mut applied: FieldMap = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), self.apply_impl(v, excluded)))
                     .collect();
@@ -1776,7 +1786,7 @@ impl Infer {
                 }
             }
             Ty::Variant(ctors, row) => {
-                let mut applied: BTreeMap<String, Ty> = ctors
+                let mut applied: FieldMap = ctors
                     .iter()
                     .map(|(k, v)| (k.clone(), self.apply_impl(v, excluded)))
                     .collect();
@@ -2731,10 +2741,10 @@ impl Infer {
     /// unlinked.
     fn flatten_record_row(
         &mut self,
-        fields: &BTreeMap<String, Ty>,
+        fields: &FieldMap,
         row: Option<TyVar>,
         span: Span,
-    ) -> (BTreeMap<String, Ty>, Option<TyVar>) {
+    ) -> (FieldMap, Option<TyVar>) {
         let mut all = fields.clone();
         let mut tail = row;
         while let Some(rv) = tail {
@@ -2763,14 +2773,14 @@ impl Infer {
 
     fn unify_records(
         &mut self,
-        f1: &BTreeMap<String, Ty>,
+        f1: &FieldMap,
         r1: Option<TyVar>,
-        f2: &BTreeMap<String, Ty>,
+        f2: &FieldMap,
         r2: Option<TyVar>,
         span: Span,
         t1_provided: bool,
     ) {
-        // Unify common fields (BTreeMap lookup is O(log n), no HashSet needed)
+        // Unify common fields (IndexMap lookup is O(1), no HashSet needed)
         for (key, ty1) in f1 {
             if let Some(ty2) = f2.get(key) {
                 self.unify_dir(ty1, ty2, span, t1_provided);
@@ -2800,12 +2810,12 @@ impl Infer {
             self.unify_dir(&v1, &v2, span, t1_provided);
         }
 
-        let only1: BTreeMap<String, Ty> = all1
+        let only1: FieldMap = all1
             .iter()
             .filter(|(k, _)| !all2.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let only2: BTreeMap<String, Ty> = all2
+        let only2: FieldMap = all2
             .iter()
             .filter(|(k, _)| !all1.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -2896,9 +2906,9 @@ impl Infer {
 
     fn unify_variants(
         &mut self,
-        c1: &BTreeMap<String, Ty>,
+        c1: &FieldMap,
         r1: Option<TyVar>,
-        c2: &BTreeMap<String, Ty>,
+        c2: &FieldMap,
         r2: Option<TyVar>,
         span: Span,
         t1_provided: bool,
@@ -2910,12 +2920,12 @@ impl Infer {
             }
         }
 
-        let mut only1: BTreeMap<String, Ty> = c1
+        let mut only1: FieldMap = c1
             .iter()
             .filter(|(k, _)| !c2.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let mut only2: BTreeMap<String, Ty> = c2
+        let mut only2: FieldMap = c2
             .iter()
             .filter(|(k, _)| !c1.contains_key(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -3063,9 +3073,9 @@ impl Infer {
                 (var, arg_ty.clone())
             })
             .collect();
-        let mut ctors = BTreeMap::new();
+        let mut ctors = IndexMap::new();
         for (ctor_name, fields) in &info.ctors {
-            let field_tys: BTreeMap<String, Ty> = fields
+            let field_tys: FieldMap = fields
                 .iter()
                 .map(|(fname, fty)| {
                     let ty = self.ast_type_to_ty(fty);
@@ -3274,7 +3284,7 @@ impl Infer {
                 Box::new(self.subst_ty(r, mapping)),
             ),
             Ty::Record(fields, row) => {
-                let mut new_fields: BTreeMap<_, _> = fields
+                let mut new_fields: FieldMap = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), self.subst_ty(v, mapping)))
                     .collect();
@@ -3298,7 +3308,7 @@ impl Infer {
                 Ty::Record(new_fields, new_row)
             }
             Ty::Variant(ctors, row) => {
-                let mut new_ctors: BTreeMap<_, _> = ctors
+                let mut new_ctors: FieldMap = ctors
                     .iter()
                     .map(|(k, v)| (k.clone(), self.subst_ty(v, mapping)))
                     .collect();
@@ -4155,7 +4165,7 @@ impl Infer {
                 if fields.is_empty() && rest.is_none() {
                     return Ty::unit();
                 }
-                let field_tys: BTreeMap<String, Ty> = fields
+                let field_tys: FieldMap = fields
                     .iter()
                     .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
                     .collect();
@@ -4196,10 +4206,10 @@ impl Infer {
                 constructors,
                 rest,
             } => {
-                let ctor_tys: BTreeMap<String, Ty> = constructors
+                let ctor_tys: FieldMap = constructors
                     .iter()
                     .map(|c| {
-                        let field_tys: BTreeMap<String, Ty> = c
+                        let field_tys: FieldMap = c
                             .fields
                             .iter()
                             .map(|f| {
@@ -4576,7 +4586,7 @@ impl Infer {
             })
             .collect();
 
-        let field_tys: BTreeMap<String, Ty> = info
+        let field_tys: FieldMap = info
             .fields
             .iter()
             .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
@@ -4625,7 +4635,7 @@ impl Infer {
             })
             .collect();
 
-        let field_tys: BTreeMap<String, Ty> = fields
+        let field_tys: FieldMap = fields
             .iter()
             .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
             .collect();
@@ -4981,10 +4991,11 @@ impl Infer {
     /// and function bindings are invisible) for a field named `name` whose
     /// type unifies with `expected`. Search order: nearest scope first,
     /// then shallowest record-nesting depth (a binding's own fields beat
-    /// fields of nested records), then fields in sorted order (record types
-    /// store fields in a `BTreeMap`, so source declaration order is
-    /// unavailable). Each candidate is tested with a speculative unify
-    /// against a throwaway clone of the real substitution; only the winning
+    /// fields of nested records), then fields in source definition order
+    /// bottom-to-top (record types store fields in an `IndexMap` preserving
+    /// declaration order, iterated in reverse). Each candidate is tested
+    /// with a speculative unify against a throwaway clone of the real
+    /// substitution; only the winning
     /// candidate's constraints are committed to `self`. The resolved
     /// (root binding, field path) is recorded in `implicit_refs` keyed by
     /// `span` so codegen can lower `^name` to a projection chain.
@@ -5027,7 +5038,8 @@ impl Infer {
         // Candidate search over an immutable view of the scopes. Walk
         // innermost-to-outermost (nearest scope wins across the whole
         // search) and BFS the record's fields shallowest-first; `fields` is
-        // a `BTreeMap`, so within a level iteration is by sorted field name.
+        // an `IndexMap` in source definition order, iterated in REVERSE so
+        // within a level the bottom-defined field is tried first.
         let mut candidates: Vec<(String, Vec<String>, Ty)> =
             with_candidate.into_iter().collect();
         'scopes: for scope in self.scopes.iter().rev() {
@@ -5049,6 +5061,7 @@ impl Infer {
                 let frontier: Vec<(Vec<String>, Ty)> = match root_ty.peel_alias() {
                     Ty::Record(fields, _) => fields
                         .iter()
+                        .rev() // bottom-to-top: last-defined field tried first
                         .map(|(f, t)| (vec![f.clone()], t.clone()))
                         .collect(),
                     _ => Vec::new(),
@@ -5069,10 +5082,10 @@ impl Infer {
                         // Descend into nested record fields (without
                         // committing anything: `apply` is read-only).
                         if let Ty::Record(sub, _) = self.apply(&field_ty).peel_alias().clone() {
-                            for (f, t) in sub {
+                            for (f, t) in sub.iter().rev() {
                                 let mut p = path.clone();
-                                p.push(f);
-                                next.push((p, t));
+                                p.push(f.clone());
+                                next.push((p, t.clone()));
                             }
                         }
                     }
@@ -5470,7 +5483,7 @@ impl Infer {
                         );
                     }
                 }
-                let field_tys: BTreeMap<String, Ty> = fields
+                let field_tys: FieldMap = fields
                     .iter()
                     .map(|f| {
                         // A signature-only field (`name : Type`, no `=`) is a
@@ -5650,7 +5663,7 @@ impl Infer {
                 let field_ty = self.fresh();
                 let rv = self.fresh_var();
                 let constraint = Ty::Record(
-                    BTreeMap::from([(field.clone(), field_ty.clone())]),
+                    IndexMap::from([(field.clone(), field_ty.clone())]),
                     Some(rv),
                 );
                 self.unify(&base_ty, &constraint, e.span);
@@ -6644,9 +6657,9 @@ impl Infer {
                 // keep the `{} -> data_ty` form because the applied syntax is
                 // always `rec.Name.Ctor {}` (a record application), matching
                 // how `Ctor {}` is typed through the App arm.
-                let mut ns_fields = BTreeMap::new();
+                let mut ns_fields = IndexMap::new();
                 for ctor in constructors {
-                    let field_tys: BTreeMap<String, Ty> = ctor
+                    let field_tys: FieldMap = ctor
                         .fields
                         .iter()
                         .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
@@ -6687,7 +6700,7 @@ impl Infer {
                 // `Ty::Con("rec.Api")` produced by the hoisted `DeclKind::Route`
                 // (desugar `hoist_record_routes`); the record value itself is
                 // erased to unit at runtime.
-                let mut ns_fields = BTreeMap::new();
+                let mut ns_fields = IndexMap::new();
                 for entry in entries {
                     let input_ty = self.route_input_record_ty(entry);
                     ns_fields.insert(entry.constructor.clone(), Ty::Fun(Box::new(input_ty), Box::new(Ty::Con(name.clone(), vec![]))));
@@ -6906,7 +6919,7 @@ impl Infer {
                 let resolved = self.apply(expected);
                 if let Ty::Record(expected_fields, None) = resolved.peel_alias() {
                     let expected_fields = expected_fields.clone();
-                    let mut field_tys = BTreeMap::new();
+                    let mut field_tys = IndexMap::new();
                     for f in fields {
                         // Required CLI constant (sig-only field, empty-record
                         // placeholder value): take the sig type, skip the value.
@@ -7111,7 +7124,7 @@ impl Infer {
     /// the handler receives (path params + query params + body fields +
     /// request headers) and the rate-limit `key` function's first argument.
     fn route_input_record_ty(&mut self, entry: &ast::RouteEntry) -> Ty {
-        let mut input_fields: BTreeMap<String, Ty> = BTreeMap::new();
+        let mut input_fields: FieldMap = IndexMap::new();
         for seg in &entry.path {
             if let ast::PathSegment::Param { name, ty } = seg {
                 input_fields.insert(name.clone(), self.ast_type_to_ty(ty));
@@ -7150,7 +7163,7 @@ impl Infer {
                         .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
                         .collect();
                     Ty::Record(
-                        BTreeMap::from([
+                        IndexMap::from([
                             ("body".into(), resp),
                             ("headers".into(), Ty::Record(hdrs, None)),
                         ]),
@@ -7287,7 +7300,7 @@ impl Infer {
     /// error is a genuinely non-record argument.
     fn record_fields(
         ty: &Ty,
-    ) -> Result<(std::collections::BTreeMap<String, Ty>, Option<TyVar>), String> {
+    ) -> Result<(FieldMap, Option<TyVar>), String> {
         match ty.peel_alias() {
             Ty::Record(fields, tail) => Ok((fields.clone(), *tail)),
             other => Err(format!(
@@ -7357,14 +7370,14 @@ impl Infer {
         if is_fetch_with {
             let opts_ty = self.infer_expr(args[1]);
             let header_row = Ty::Record(
-                BTreeMap::from([
+                IndexMap::from([
                     ("name".into(), Ty::Text),
                     ("value".into(), Ty::Text),
                 ]),
                 None,
             );
             let expected_opts = Ty::Record(
-                BTreeMap::from([(
+                IndexMap::from([(
                     "headers".into(),
                     Ty::Relation(Box::new(header_row)),
                 )]),
@@ -7398,7 +7411,7 @@ impl Infer {
                 self.annotation_vars.insert(p.clone(), v);
             }
             if let Some(record_ty) = &record_ty {
-                let field_tys: BTreeMap<String, Ty> = info
+                let field_tys: FieldMap = info
                     .fields
                     .iter()
                     .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
@@ -7428,7 +7441,7 @@ impl Infer {
                     None,
                 );
                 Ty::Record(
-                    BTreeMap::from([
+                    IndexMap::from([
                         ("body".into(), raw_body_ty),
                         ("headers".into(), headers_ty),
                     ]),
@@ -7438,7 +7451,7 @@ impl Infer {
             _ => raw_body_ty,
         };
         let err_ty = Ty::Record(
-            BTreeMap::from([
+            IndexMap::from([
                 ("message".into(), Ty::Text),
                 ("status".into(), Ty::Int),
             ]),
@@ -7968,7 +7981,7 @@ impl Infer {
                 }
             }
             ast::PatKind::Record(field_pats) => {
-                let mut field_types = BTreeMap::new();
+                let mut field_types = IndexMap::new();
                 for fp in field_pats {
                     if field_types.contains_key(&fp.name) {
                         self.error(
@@ -8227,7 +8240,7 @@ impl Infer {
                                 let rv = *rv;
                                 self.bind_var(
                                     rv,
-                                    Ty::Variant(BTreeMap::new(), None),
+                                    Ty::Variant(IndexMap::new(), None),
                                     span,
                                 );
                                 return;
@@ -8910,7 +8923,7 @@ impl Infer {
                         let v = self.fresh_var();
                         self.annotation_vars.insert(p.clone(), v);
                     }
-                    let field_tys: BTreeMap<String, Ty> = ctors[0]
+                    let field_tys: FieldMap = ctors[0]
                         .fields
                         .iter()
                         .map(|f| {
@@ -9400,10 +9413,10 @@ impl Infer {
         self.aliases.insert(
             "RefinementError".into(),
             Ty::Record(
-                BTreeMap::from([
+                IndexMap::from([
                     ("typeName".into(), Ty::Text),
                     ("violations".into(), Ty::Relation(Box::new(Ty::Record(
-                        BTreeMap::from([
+                        IndexMap::from([
                             ("field".into(), Ty::Con("Maybe".into(), vec![Ty::Text])),
                             ("message".into(), Ty::Text),
                         ]),
@@ -9421,7 +9434,7 @@ impl Infer {
         self.aliases.insert(
             "HttpError".into(),
             Ty::Record(
-                BTreeMap::from([
+                IndexMap::from([
                     ("status".into(), Ty::Int),
                     ("message".into(), Ty::Text),
                 ]),
@@ -9434,7 +9447,7 @@ impl Infer {
         self.aliases.insert(
             "RequestCtx".into(),
             Ty::Record(
-                BTreeMap::from([
+                IndexMap::from([
                     ("clientIp".into(), Ty::Text),
                     ("receivedAt".into(), Ty::int_with_unit(UnitTy::named("Ms"))),
                     (
@@ -9805,7 +9818,7 @@ impl Infer {
             let a = self.fresh_var();
             let b = self.fresh_var();
             let err_ty = Ty::Record(
-                BTreeMap::from([
+                IndexMap::from([
                     ("message".into(), Ty::Text),
                     ("status".into(), Ty::Int),
                 ]),
@@ -10977,7 +10990,7 @@ impl Infer {
 
         // generateKeyPair : IO {random} {privateKey: Bytes, publicKey: Bytes}
         let key_pair_record = Ty::Record(
-            BTreeMap::from([
+            IndexMap::from([
                 ("privateKey".into(), Ty::Bytes),
                 ("publicKey".into(), Ty::Bytes),
             ]),
@@ -11474,14 +11487,14 @@ impl Infer {
             )),
         );
         let limit_ty = Ty::Record(
-            BTreeMap::from([
+            IndexMap::from([
                 ("requests".into(), Ty::Int),
                 ("window".into(), Ty::int_with_unit(UnitTy::named("Ms"))),
             ]),
             None,
         );
         let expected = Ty::Record(
-            BTreeMap::from([
+            IndexMap::from([
                 ("key".into(), key_ty),
                 ("limit".into(), limit_ty),
             ]),

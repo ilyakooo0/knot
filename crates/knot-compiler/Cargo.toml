@@ -28,3 +28,9 @@ object = { version = "0.39", default-features = false, features = ["write"] }
 # refined types). `gh-release` statically links a prebuilt libz3 (downloaded at
 # build time), so the compiler binary is self-contained — no runtime Z3 dep.
 z3 = { version = "0.20", default-features = false, features = ["gh-release"] }
+# Content-hash of the embedded runtime archive, used at link time to reject a
+# stale on-disk libknot_runtime.a (replaces the old mtime heuristic).
+blake3 = { version = "1", default-features = false }
+
+[build-dependencies]
+blake3 = { version = "1", default-features = false }

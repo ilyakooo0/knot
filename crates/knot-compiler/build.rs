@@ -100,6 +100,13 @@ fn main() {
     if let Some(src) = runtime_path {
         std::fs::copy(&src, &dest).expect("failed to copy libknot_runtime.a to OUT_DIR");
         println!("cargo:rustc-cfg=has_embedded_runtime");
+        // Stamp the content hash of the archive we're embedding. At link time
+        // the compiler hashes any on-disk candidate and compares — a match
+        // means byte-identical bits (fresh), regardless of mtimes or which
+        // archive produced them.
+        let bytes = std::fs::read(&dest).expect("failed to read embedded runtime for hashing");
+        let hash = blake3::hash(&bytes).to_hex();
+        println!("cargo:rustc-env=KNOT_EMBEDDED_RUNTIME_HASH={hash}");
     }
 
     println!("cargo:rustc-check-cfg=cfg(has_embedded_runtime)");

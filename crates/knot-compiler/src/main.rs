@@ -542,67 +542,29 @@ fn is_extracted_temp_runtime(p: &std::path::Path) -> bool {
             })
 }
 
-/// Returns true if the runtime archive `lib` is stale — i.e. the newest
-/// source file under `crates/knot-runtime/src/` (recursively) or the
-/// runtime crate's `Cargo.toml` has an mtime newer than the archive itself.
-/// Falls back to `false` (assume fresh) when the workspace root can't be
-/// located or mtimes can't be compared, so we never block builds spuriously.
-fn is_runtime_stale(lib: &std::path::Path, exe_dir: &std::path::Path) -> bool {
-    // Walk up from the compiler's directory to find the workspace root
-    // (the directory containing `crates/knot-runtime/`). In a cargo
-    // workspace the compiler binary lives in `target/<profile>/`, so the
-    // workspace root is two levels above `exe_dir`.
-    let workspace_root = exe_dir
-        .ancestors()
-        .skip(1) // skip `target/<profile>` itself
-        .find(|d| d.join("crates/knot-runtime").is_dir());
+/// The blake3 content hash of the runtime archive this compiler embeds (set by
+/// build.rs when an archive was embedded). Comparing a candidate archive's hash
+/// against this is the freshness check: a match means byte-identical bits, so
+/// the archive is exactly what this compiler would link — independent of file
+/// mtimes, clock skew, or which build produced it.
+const EMBEDDED_RUNTIME_HASH: Option<&str> = option_env!("KNOT_EMBEDDED_RUNTIME_HASH");
 
-    let workspace_root = match workspace_root {
-        Some(r) => r,
-        None => return false, // can't locate workspace — assume fresh
-    };
+/// Hash an archive's bytes. `None` on read error.
+fn hash_archive(p: &std::path::Path) -> Option<String> {
+    std::fs::read(p)
+        .ok()
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+}
 
-    let lib_mtime = match std::fs::metadata(lib).and_then(|m| m.modified()) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-
-    // Recursively find the newest mtime among all `*.rs` files under
-    // `crates/knot-runtime/src/`, plus the runtime crate's `Cargo.toml`.
-    let mut newest_src: Option<std::time::SystemTime> = None;
-
-    fn consider(
-        p: &std::path::Path,
-        newest: &mut Option<std::time::SystemTime>,
-    ) {
-        if let Ok(m) = std::fs::metadata(p).and_then(|m| m.modified())
-            && newest.map(|n| m > n).unwrap_or(true) {
-            *newest = Some(m);
-        }
-    }
-
-    fn walk_dir(dir: &std::path::Path, newest: &mut Option<std::time::SystemTime>) {
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for entry in rd.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    walk_dir(&p, newest);
-                } else if p.extension().map(|e| e == "rs").unwrap_or(false) {
-                    consider(&p, newest);
-                }
-            }
-        }
-    }
-
-    walk_dir(&workspace_root.join("crates/knot-runtime/src"), &mut newest_src);
-    consider(
-        &workspace_root.join("crates/knot-runtime/Cargo.toml"),
-        &mut newest_src,
-    );
-
-    match newest_src {
-        Some(src_mtime) => src_mtime > lib_mtime,
-        None => false, // no source files found — assume fresh
+/// True if `lib` is stale — its content differs from the runtime archive this
+/// compiler embeds. Falls back to `false` (assume fresh) when there's no
+/// embedded runtime to compare against or the file can't be read, so we never
+/// block builds spuriously. Replaces the old mtime walk: content comparison is
+/// immune to clock skew, `touch`, and VCS checkouts that reset mtimes.
+fn is_runtime_stale(lib: &std::path::Path) -> bool {
+    match EMBEDDED_RUNTIME_HASH {
+        Some(expected) => hash_archive(lib).map(|h| h != expected).unwrap_or(false),
+        None => false,
     }
 }
 
@@ -611,19 +573,15 @@ fn find_runtime() -> PathBuf {
     if let Ok(path) = std::env::var("KNOT_RUNTIME_LIB") {
         let p = PathBuf::from(&path);
         if p.exists() {
-            // Warn if the archive is stale relative to the runtime source,
+            // Warn if the archive's content differs from the embedded runtime,
             // but still use it — the user set the override explicitly.
-            if let Some(exe_dir) = std::env::current_exe()
-                .ok()
-                .and_then(|e| e.parent().map(|p| p.to_path_buf()))
-                && is_runtime_stale(&p, &exe_dir)
-            {
-                    eprintln!(
-                        "Warning: KNOT_RUNTIME_LIB archive '{}' is older than \
-                         crates/knot-runtime/src/ — rebuild knot-runtime to \
-                         pick up source changes",
-                        path
-                    );
+            if is_runtime_stale(&p) {
+                eprintln!(
+                    "Warning: KNOT_RUNTIME_LIB archive '{}' content differs from \
+                     the runtime this compiler embeds — rebuild knot-runtime to \
+                     pick up source changes",
+                    path
+                );
             }
             return p;
         }
@@ -642,13 +600,14 @@ fn find_runtime() -> PathBuf {
         && let Some(exe_dir) = exe.parent() {
             let candidate = exe_dir.join("libknot_runtime.a");
             if candidate.exists() {
-                // Freshness check: if the runtime source is newer than the
-                // archive, the archive is stale (e.g. only knot-compiler was
-                // rebuilt). Skip it and fall through to the embedded runtime
+                // Freshness check: if the archive's content differs from the
+                // runtime this compiler embeds (e.g. only knot-compiler was
+                // rebuilt, or knot-runtime sources changed), the archive is
+                // stale. Skip it and fall through to the embedded runtime
                 // rather than silently linking stale code.
-                if is_runtime_stale(&candidate, exe_dir) {
+                if is_runtime_stale(&candidate) {
                     eprintln!(
-                        "Warning: {} is older than crates/knot-runtime/src/ \
+                        "Warning: {} content differs from the embedded runtime \
                          — skipping stale archive, falling back to embedded \
                          runtime. Run `cargo build -p knot-runtime` to refresh.",
                         candidate.display()

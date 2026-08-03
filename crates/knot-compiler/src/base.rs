@@ -121,7 +121,7 @@ pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     "fork", "hash", "head", "hexDecode", "id", "inter", "length", "listDir",
     "map", "match", "maxOn", "minOn", "not", "parseJson", "race", "randomInt",
     "readFile", "removeFile", "reverse", "sign", "single", "sleep", "sortBy", "sortByDesc",
-    "startsWith", "strip", "stripFloatUnit", "stripUnit", "take", "textToBytes", "toAsciiLower", "toAsciiUpper", "toJson",
+    "startsWith", "strip", "stripFloatUnit", "stripUnit", "take", "textToBytes", "toAsciiLower", "toAsciiUpper", "abs", "intMin", "intMax", "clamp", "toJson",
     "toLower", "toUpper", "traverse", "trim", "trimAscii", "ltrimAscii", "rtrimAscii", "byteLength", "upsertBy", "verify",
     "withFloatUnit", "withUnit", "writeFile",
     // Numeric/text conversions.

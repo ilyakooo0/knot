@@ -10896,6 +10896,66 @@ pub extern "C-unwind" fn knot_text_trim(v: *mut Value) -> *mut Value {
     }
 }
 
+/// abs : Int -> Int. Rust's `i64::abs` panics on `i64::MIN` (overflow); SQLite's
+/// `ABS` errors on the same input — both reject it, so the pushed-down SQL
+/// (`ABS(CAST(col AS INTEGER))`) and this runtime agree on every input.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_int_abs(v: *mut Value) -> *mut Value {
+    match unsafe { as_ref(v) } {
+        Value::Int(n) => knot_value_int(n.abs()),
+        _ => panic!("knot runtime: abs expected Int, got {}", type_name(v)),
+    }
+}
+
+/// intMin / intMax : Int -> Int -> Int. Byte-identical to SQLite's two-argument
+/// scalar `min(a, b)` / `max(a, b)` for integer inputs (plain i64 comparison;
+/// SQLite's scalar min/max use the same numeric ordering for integers).
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_int_min(a: *mut Value, b: *mut Value) -> *mut Value {
+    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
+        (Value::Int(x), Value::Int(y)) => knot_value_int((*x).min(*y)),
+        _ => panic!(
+            "knot runtime: intMin expected Int, got {} and {}",
+            type_name(a),
+            type_name(b)
+        ),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_int_max(a: *mut Value, b: *mut Value) -> *mut Value {
+    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
+        (Value::Int(x), Value::Int(y)) => knot_value_int((*x).max(*y)),
+        _ => panic!(
+            "knot runtime: intMax expected Int, got {} and {}",
+            type_name(a),
+            type_name(b)
+        ),
+    }
+}
+
+/// clamp : Int -> Int -> Int -> Int. `clamp lo hi x = min(max(x, lo), hi)`,
+/// matching the pushed-down `min(max(CAST(x AS INTEGER), lo), hi)`. No
+/// divergence: integer min/max compare identically in Rust and SQLite.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_int_clamp(
+    _db: *mut c_void,
+    lo: *mut Value,
+    hi: *mut Value,
+    x: *mut Value,
+) -> *mut Value {
+    match (
+        unsafe { as_ref(lo) },
+        unsafe { as_ref(hi) },
+        unsafe { as_ref(x) },
+    ) {
+        (Value::Int(lo), Value::Int(hi), Value::Int(x)) => {
+            knot_value_int((*x).clamp(*lo, *hi))
+        }
+        _ => panic!("knot runtime: clamp expected Int arguments"),
+    }
+}
+
 /// ASCII-only whitespace set, matching SQLite's TRIM(col, chars) charset so the
 /// runtime and the pushed-down SQL are byte-identical. Covers the six ASCII
 /// whitespace chars: space, \t, \n, \r, \x0b (VT), \x0c (FF).

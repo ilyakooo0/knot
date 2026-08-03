@@ -1422,6 +1422,10 @@ impl Codegen {
         self.declare_rt("knot_text_byte_length", &[p], &[p]);
         self.declare_rt("knot_text_to_ascii_lower", &[p], &[p]);
         self.declare_rt("knot_text_to_ascii_upper", &[p], &[p]);
+        self.declare_rt("knot_int_abs", &[p], &[p]);
+        self.declare_rt("knot_int_min", &[p, p], &[p]);
+        self.declare_rt("knot_int_max", &[p, p], &[p]);
+        self.declare_rt("knot_int_clamp", &[p, p, p, p], &[p]);
         self.declare_rt("knot_text_contains", &[p, p], &[p]);
         self.declare_rt("knot_text_starts_with", &[p, p], &[p]);
         self.declare_rt("knot_text_ends_with", &[p, p], &[p]);
@@ -2052,6 +2056,7 @@ impl Codegen {
             "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex", "hexDecode",
             "bytesGet", "hash",
             "floor", "intToFloat", "textToInt", "textToFloat",
+            "abs", "intMin", "intMax", "clamp",
             "readFile", "writeFile", "appendFile",
             "fileExists", "removeFile", "listDir",
             "randomInt", "sleep", "fork", "race",
@@ -2822,6 +2827,10 @@ impl Codegen {
         self.define_stdlib_fn_1("byteLength", "knot_text_byte_length");
         self.define_stdlib_fn_1("toAsciiLower", "knot_text_to_ascii_lower");
         self.define_stdlib_fn_1("toAsciiUpper", "knot_text_to_ascii_upper");
+        self.define_stdlib_fn_1("abs", "knot_int_abs");
+        self.define_stdlib_fn_2("intMin", "knot_int_min", false);
+        self.define_stdlib_fn_2("intMax", "knot_int_max", false);
+        self.define_stdlib_fn_3("clamp", "knot_int_clamp");
         self.define_stdlib_fn_1("reverse", "knot_text_reverse");
         self.define_stdlib_fn_1("chars", "knot_text_chars");
         self.define_stdlib_fn_1("id", "knot_value_id");
@@ -14791,6 +14800,48 @@ impl Codegen {
         Some(SqlFragment { sql, params: vec![] })
     }
 
+    /// Compile a scalar Int function application in a WHERE atom to SQL:
+    /// `abs x` -> `ABS(x)`, `intMin a b` -> `min(a,b)`, `intMax a b` ->
+    /// `max(a,b)`, `clamp lo hi x` -> `min(max(x,lo),hi)`. Args compile via the
+    /// single-table atom translator (which handles field refs, literals, and
+    /// nested arithmetic/fn calls); any param-bearing or non-pushable arg bails
+    /// to the in-memory path. Byte-identical to SQLite's numeric builtins.
+    fn compile_int_fn_atom(bind_var: &str, expr: &ast::Expr) -> Option<SqlFragment> {
+        let mut args: Vec<&ast::Expr> = Vec::new();
+        let mut head = expr;
+        while let ast::ExprKind::App { func, arg } = &head.node {
+            args.push(arg);
+            head = func;
+        }
+        args.reverse();
+        let name = Self::query_form_name(head)?;
+        // Compile each arg, threading its SQL params (literal/var args become
+        // `?` params) into the combined fragment in argument order.
+        let mut params = Vec::new();
+        // Int columns are TEXT-stored: cast each argument to INTEGER so the
+        // numeric builtins use integer ordering and yield an integer result
+        // (otherwise ABS/min/max apply REAL/text affinity and diverge from the
+        // Int runtime). Literal/var params pass through unchanged.
+        let mut compile = |e: &ast::Expr| -> Option<String> {
+            let f = Self::try_compile_single_table_atom(bind_var, e)?;
+            params.extend(f.params);
+            // Columns are TEXT-stored and literal/var params bind as TEXT, so
+            // cast every argument (column or `?`) to INTEGER for correct
+            // numeric ordering and an integer result type.
+            Some(format!("CAST({} AS INTEGER)", f.sql))
+        };
+        let sql = match (name, args.as_slice()) {
+            ("abs", [x]) => format!("ABS({})", compile(x)?),
+            ("intMin", [a, b]) => format!("min({}, {})", compile(a)?, compile(b)?),
+            ("intMax", [a, b]) => format!("max({}, {})", compile(a)?, compile(b)?),
+            ("clamp", [lo, hi, x]) => {
+                format!("min(max({}, {}), {})", compile(x)?, compile(lo)?, compile(hi)?)
+            }
+            _ => return None,
+        };
+        Some(SqlFragment { sql, params })
+    }
+
     fn try_compile_single_table_atom(
         bind_var: &str,
         expr: &ast::Expr,
@@ -14846,9 +14897,13 @@ impl Codegen {
                     params,
                 })
             }
-            // Built-in functions: toUpper, toLower, trim, length
+            // Built-in functions: ASCII text ops, and scalar Int fns
+            // (abs/intMin/intMax/clamp) that are byte-identical to SQLite.
             ast::ExprKind::App { func, arg } => {
                 if let Some(frag) = Self::compile_ascii_text_fn(bind_var, func, arg) {
+                    return Some(frag);
+                }
+                if let Some(frag) = Self::compile_int_fn_atom(bind_var, expr) {
                     return Some(frag);
                 }
                 // NOTE: toUpper/toLower are deliberately NOT pushed
@@ -17710,9 +17765,14 @@ fn expr_to_sql_param(expr: &ast::Expr) -> Option<SqlParamSource> {
 /// Also wraps built-in functions like LENGTH() that return INTEGER.
 fn cast_arithmetic_for_where(sql: &str) -> String {
     // Arithmetic atoms are wrapped in parentheses by try_compile_sql_atom;
-    // both those and built-in functions like LENGTH() yield INTEGER results
-    // that need the same CAST-to-TEXT treatment for correct WHERE comparison.
-    if (sql.starts_with('(') && !sql.starts_with("(CAST")) || sql.starts_with("LENGTH(") {
+    // both those and Int-returning builtins (LENGTH, ABS, scalar min/max)
+    // yield INTEGER results that need the same CAST-to-TEXT treatment for
+    // correct WHERE comparison against TEXT-stored Int columns/params.
+    let int_fn = sql.starts_with("LENGTH(")
+        || sql.starts_with("ABS(")
+        || sql.starts_with("min(")
+        || sql.starts_with("max(");
+    if (sql.starts_with('(') && !sql.starts_with("(CAST")) || int_fn {
         format!("CAST({} AS TEXT) COLLATE KNOT_INT", sql)
     } else {
         sql.to_string()
@@ -17881,20 +17941,69 @@ fn try_sql_arithmetic_expr(
             let r = try_sql_arithmetic_expr(bind_var, rhs, alias, schema)?;
             Some(format!("({} {} {})", l, sql_op, r))
         }
-        // Built-in functions: toUpper, toLower, trim, length
-        ast::ExprKind::App { func, .. } => {
-            if let ast::ExprKind::Var(_) = &func.node {
-                // toUpper/toLower deliberately not pushed down (SQLite
-                // UPPER/LOWER are ASCII-only; the runtime is Unicode-aware).
-                // trim likewise: SQLite TRIM strips ASCII spaces only, the
-                // runtime trims all Unicode whitespace. length likewise:
-                // SQLite LENGTH() counts chars before the first NUL byte,
-                // while knot_text_length counts all chars.
-                None
-            } else {
-                None
-            }
+        // Scalar Int functions byte-identical to SQLite: abs -> ABS,
+        // intMin/intMax -> two-argument scalar min/max, clamp lo hi x ->
+        // min(max(x, lo), hi). toUpper/toLower/trim/length are deliberately
+        // NOT pushed (SQLite semantics diverge from the Unicode runtime);
+        // their ASCII siblings live in compile_ascii_text_fn.
+        ast::ExprKind::App { .. } => try_sql_int_fn_app(bind_var, expr, alias, schema),
+        _ => None,
+    }
+}
+
+/// Resolve the function name of an application head: a bare `Var` or a
+/// `base.`-qualified `FieldAccess` (prelude namespaces bind directly).
+fn int_fn_app_head(func: &ast::Expr) -> Option<&str> {
+    match &func.node {
+        ast::ExprKind::Var(name) => Some(name.as_str()),
+        ast::ExprKind::FieldAccess { expr, field } => {
+            if let ast::ExprKind::Var(ns) = &expr.node
+                && ns == "base" {
+                    return Some(field.as_str());
+                }
+            None
         }
+        _ => None,
+    }
+}
+
+/// Try to compile a scalar Int function application to SQL. Peels the curried
+/// application spine and maps: `abs x` -> `ABS(x)`, `intMin a b` -> `min(a,b)`,
+/// `intMax a b` -> `max(a,b)`, `clamp lo hi x` -> `min(max(x,lo),hi)`. Every
+/// argument must itself be a pushable Int arithmetic expression; any Float/tag
+/// argument or unrecognized callee bails to the in-memory path.
+fn try_sql_int_fn_app(
+    bind_var: &str,
+    expr: &ast::Expr,
+    alias: &str,
+    schema: &str,
+) -> Option<String> {
+    // Collect (head, args) by walking the App spine inward.
+    let mut args: Vec<&ast::Expr> = Vec::new();
+    let mut head = expr;
+    while let ast::ExprKind::App { func, arg } = &head.node {
+        args.push(arg);
+        head = func;
+    }
+    args.reverse();
+    let name = int_fn_app_head(head)?;
+    // Int columns are TEXT-stored, so SQLite would apply these numeric
+    // builtins with REAL/text affinity (ABS("3") -> 3.0, min("10","9") -> "10"
+    // lexicographic). Cast each argument to INTEGER so both the ordering and
+    // the result type match the Int runtime exactly.
+    let arg_sql = |e: &ast::Expr| -> Option<String> {
+        Some(format!("CAST({} AS INTEGER)", try_sql_arithmetic_expr(bind_var, e, alias, schema)?))
+    };
+    match (name, args.as_slice()) {
+        ("abs", [x]) => Some(format!("ABS({})", arg_sql(x)?)),
+        ("intMin", [a, b]) => Some(format!("min({}, {})", arg_sql(a)?, arg_sql(b)?)),
+        ("intMax", [a, b]) => Some(format!("max({}, {})", arg_sql(a)?, arg_sql(b)?)),
+        ("clamp", [lo, hi, x]) => Some(format!(
+            "min(max({}, {}), {})",
+            arg_sql(x)?,
+            arg_sql(lo)?,
+            arg_sql(hi)?
+        )),
         _ => None,
     }
 }
@@ -18015,15 +18124,17 @@ pub(crate) fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str
                 }
             }
         }
-        // Built-in functions
-        ast::ExprKind::App { func, .. } => {
-            if let ast::ExprKind::Var(name) = &func.node {
-                match name.as_str() {
-                    "length" => Some("int".to_string()),
-                    _ => None,
-                }
-            } else {
-                None
+        // Built-in functions: walk the curried App spine to the head so both
+        // bare (`abs x`) and qualified (`base.abs x`) forms resolve.
+        ast::ExprKind::App { .. } => {
+            let mut head = expr;
+            while let ast::ExprKind::App { func, .. } = &head.node {
+                head = func;
+            }
+            match int_fn_app_head(head)? {
+                // All of these return Int (length counts, abs/min/max/clamp are Int).
+                "length" | "abs" | "intMin" | "intMax" | "clamp" => Some("int".to_string()),
+                _ => None,
             }
         }
         _ => None,

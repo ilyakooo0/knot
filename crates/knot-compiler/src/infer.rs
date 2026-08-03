@@ -10737,6 +10737,16 @@ impl Infer {
             Scheme::mono(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Float))),
         );
 
+        // abs : Int -> Int  (pushable to ABS)
+        self.bind_top("abs", Scheme::mono(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))));
+        // intMin / intMax : Int -> Int -> Int  (pushable to scalar min/max)
+        let int2 = Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))));
+        self.bind_top("intMin", Scheme::mono(int2.clone()));
+        self.bind_top("intMax", Scheme::mono(int2));
+        // clamp : Int -> Int -> Int -> Int  (pushable to min(max(x,lo),hi))
+        let int3 = Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))))));
+        self.bind_top("clamp", Scheme::mono(int3));
+
         // textToInt : Text -> Maybe Int  (Nothing on malformed input)
         self.bind_top(
             "textToInt",

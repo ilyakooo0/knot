@@ -107,6 +107,16 @@ misfiring SQL.
 | `trimAscii` / `ltrimAscii` / `rtrimAscii` | `trimAscii t.title == "x"` (in a predicate) | `TRIM(title, X'20090A0D0B0C')` / `LTRIM(…)` / `RTRIM(…)` (ASCII-whitespace charset: space, tab, LF, CR, VT, FF — matches Knot's runtime exactly) |
 | `byteLength` | `byteLength t.title == 5` (in a predicate) | `LENGTH(CAST(title AS BLOB))` (byte count, not char count) |
 | `toAsciiLower` / `toAsciiUpper` | `toAsciiLower t.title == "x"` (in a predicate) | `LOWER(title)` / `UPPER(title)` (ASCII-only case map — byte-identical to SQLite) |
+| `abs` | `abs t.a > 4` (in a predicate) | `ABS(CAST(a AS INTEGER))` (Int; both Rust `i64::abs` and SQLite `ABS` reject the min-int) |
+| `intMin` / `intMax` | `intMin t.a t.b > 2` (in a predicate) | `min(CAST(a AS INTEGER), CAST(b AS INTEGER))` / `max(…)` (SQLite two-argument scalar form) |
+| `clamp` | `clamp lo hi t.a == 5` (in a predicate) | `min(max(CAST(a AS INTEGER), lo), hi)` (i.e. `clamp lo hi x = min(max(x, lo), hi)`) |
+
+These Int fns also push down inside `sum`/`minOn`/`maxOn` projections and
+arithmetic (`+`/`-`/`*`/`/`) compositions, and are typed `int` in the result
+column. Because Knot Ints are stored as `TEXT`, every argument is wrapped in
+`CAST(… AS INTEGER)` so SQLite applies the builtin with integer ordering and
+yields an integer result (otherwise `ABS("3")` → `3.0` and `min("10","9")` →
+`"10"` lexicographic, diverging from the Int runtime).
 
 ### Set operations
 

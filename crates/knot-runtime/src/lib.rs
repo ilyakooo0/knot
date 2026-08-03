@@ -10956,6 +10956,39 @@ pub extern "C-unwind" fn knot_int_clamp(
     }
 }
 
+/// unify : {r1} -> {r2} -> {r1 ∪ r2} — record merge, right-biased. All fields
+/// from both arguments; on a name conflict the right argument's value wins.
+/// The result fields are sorted by name (the runtime's record invariant: field
+/// lookup is a binary search by name). Both arguments must be records — the
+/// type checker guarantees closed, statically-known shapes.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_record_unify(a: *mut Value, b: *mut Value) -> *mut Value {
+    match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
+        (Value::Record(fa), Value::Record(fb)) => {
+            // BTreeMap keeps fields sorted by name; inserting b's fields after
+            // a's makes the right value win on conflict.
+            let mut merged: std::collections::BTreeMap<Arc<str>, *mut Value> =
+                std::collections::BTreeMap::new();
+            for f in fa.iter() {
+                merged.insert(f.name.clone(), f.value);
+            }
+            for f in fb.iter() {
+                merged.insert(f.name.clone(), f.value);
+            }
+            let mut fields = take_record_vec(merged.len());
+            for (name, value) in merged {
+                fields.push(RecordField { name, value });
+            }
+            alloc(Value::Record(fields))
+        }
+        _ => panic!(
+            "knot runtime: unify expected records, got {} and {}",
+            type_name(a),
+            type_name(b)
+        ),
+    }
+}
+
 /// ASCII-only whitespace set, matching SQLite's TRIM(col, chars) charset so the
 /// runtime and the pushed-down SQL are byte-identical. Covers the six ASCII
 /// whitespace chars: space, \t, \n, \r, \x0b (VT), \x0c (FF).

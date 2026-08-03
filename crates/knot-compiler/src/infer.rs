@@ -702,6 +702,21 @@ struct DeferredUnitBinop {
     span: Span,
 }
 
+/// A deferred `unify` shape computation: one or both argument types was an
+/// unresolved type variable at the call node (e.g. a lambda parameter whose
+/// record shape is only pinned when the lambda unifies with its call site, as
+/// in `map (\row -> unify row {defaults}) *items`). Re-checked at end-of-
+/// inference, when the argument may have resolved to a closed record; the
+/// merged field map is then unified with `result`, the fresh variable returned
+/// as the application's type so inference could proceed.
+#[derive(Debug, Clone)]
+struct DeferredUnify {
+    left: Ty,
+    right: Ty,
+    result: TyVar,
+    span: Span,
+}
+
 // ── Constructor and data type metadata ────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1090,6 +1105,9 @@ struct Infer {
     /// instantiation re-arms its own copy; the rest are resolved once at
     /// end-of-inference by `resolve_deferred_unit_binops`.
     deferred_unit_binops: Vec<DeferredUnitBinop>,
+    /// Deferred `unify` shape computations, resolved at end-of-inference by
+    /// `resolve_deferred_unifies`.
+    deferred_unifies: Vec<DeferredUnify>,
 
     /// Spans of `elem` haystack args whose element type is SQL-pushable
     /// (Text/Float/Bool). Recorded during App inference, exported for codegen.
@@ -1171,6 +1189,7 @@ impl Infer {
             suppress_refine_intro: None,
             user_top_level_names: HashSet::new(),
             deferred_unit_binops: Vec::new(),
+            deferred_unifies: Vec::new(),
             elem_pushdown_ok: ElemPushdownOk::default(),
         }
     }
@@ -5984,6 +6003,17 @@ impl Infer {
                     return ty;
                 }
 
+                // Special case: `unify a b` — record merge, right-biased. The
+                // result type is shape-dependent (the union of the two
+                // argument field maps), which no single forall-quantified
+                // scheme can express without a row-union type operator, so it
+                // is computed here from the two argument types. Both arguments
+                // must be closed, statically-known records (a free row tail
+                // makes the union underdetermined → type error).
+                if let Some(ty) = self.try_infer_unify(expr) {
+                    return ty;
+                }
+
                 // Implicit-dictionary callsite: `clamp 0 10 42` where `clamp`
                 // carries a `^`-field constraint. The function's scheme was
                 // elaborated to take a leading dictionary record (see desugar);
@@ -7202,6 +7232,104 @@ impl Infer {
     /// is `fetch url (Ctor {..})` or `fetch url opts (Ctor {..})`.
     /// This skips the constructor's `respond` field and resolves the
     /// response type from route metadata.
+    /// Infer `unify a b` (record merge, right-biased). Peel the 2-arg spine;
+    /// the head must be the `unify` builtin (bare or `base.`-qualified). Both
+    /// arguments must infer to closed records (no free row tail — a tail makes
+    /// the field-set underdetermined). The result field map is the union with
+    /// the right argument's type winning on a name conflict.
+    fn try_infer_unify(&mut self, expr: &ast::Expr) -> Option<Ty> {
+        let mut args: Vec<&ast::Expr> = Vec::new();
+        let mut head = expr;
+        while let ast::ExprKind::App { func, arg } = &head.node {
+            args.push(arg);
+            head = func;
+        }
+        args.reverse();
+        if args.len() != 2 {
+            return None;
+        }
+        let is_unify = match &head.node {
+            ast::ExprKind::Var(n) => n == "unify",
+            ast::ExprKind::FieldAccess { expr: base, field } => {
+                field == "unify" && matches!(&base.node, ast::ExprKind::Var(n) if n == "base")
+            }
+            _ => false,
+        };
+        if !is_unify {
+            return None;
+        }
+
+        let left_ty = self.infer_expr(args[0]);
+        let right_ty = self.infer_expr(args[1]);
+        let left_res = self.apply(&left_ty).clone();
+        let right_res = self.apply(&right_ty).clone();
+
+        // If either argument is still an unresolved type variable (a lambda
+        // parameter whose record shape is pinned only when the lambda unifies
+        // with its call site), defer the shape computation to end-of-inference
+        // and return a fresh result variable so inference can proceed.
+        if matches!(left_res.peel_alias(), Ty::Var(_))
+            || matches!(right_res.peel_alias(), Ty::Var(_))
+        {
+            let result = self.fresh_var();
+            self.deferred_unifies.push(DeferredUnify {
+                left: left_res,
+                right: right_res,
+                result,
+                span: expr.span,
+            });
+            return Some(Ty::Var(result));
+        }
+
+        match (Self::closed_record_fields(&left_res), Self::closed_record_fields(&right_res)) {
+            (Ok(f1), Ok(f2)) => Some(Self::merge_record_fields(f1, f2)),
+            (Err(msg), _) | (_, Err(msg)) => {
+                self.error(msg, expr.span);
+                // Return Unit to stop the generic application path emitting a
+                // second, confusing mismatch on top of ours.
+                Some(Ty::Unit(UnitTy::dimensionless()))
+            }
+        }
+    }
+
+    /// Extract a closed record's field map, or an error message if the type
+    /// is an open record (free row tail) or not a record at all.
+    fn closed_record_fields(
+        ty: &Ty,
+    ) -> Result<std::collections::BTreeMap<String, Ty>, String> {
+        match ty.peel_alias() {
+            Ty::Record(fields, None) => Ok(fields.clone()),
+            Ty::Record(_, Some(_)) => Err(
+                "unify requires a statically-known record shape, but an argument has an open record type".into(),
+            ),
+            other => Err(format!(
+                "unify expects record arguments, got {}",
+                // Display via a temporary; the Infer method needs &self, so
+                // format the variant name structurally here.
+                match other {
+                    Ty::Int => "Int".to_string(),
+                    Ty::Float => "Float".to_string(),
+                    Ty::Text => "Text".to_string(),
+                    Ty::Bool => "Bool".to_string(),
+                    Ty::Relation(_) => "a relation".to_string(),
+                    _ => "a non-record type".to_string(),
+                }
+            )),
+        }
+    }
+
+    /// Right-biased record field union: `f2`'s type wins on a name conflict.
+    fn merge_record_fields(
+        f1: std::collections::BTreeMap<String, Ty>,
+        f2: std::collections::BTreeMap<String, Ty>,
+    ) -> Ty {
+        let mut merged = f1;
+        for (k, v) in f2 {
+            merged.insert(k, v);
+        }
+        Ty::Record(merged, None)
+    }
+
     fn try_infer_fetch(&mut self, expr: &ast::Expr) -> Option<Ty> {
         let ctor_name = fetch_ctor_name(expr)?;
 
@@ -7657,6 +7785,32 @@ impl Infer {
                 // strip the refinement before unifying to prevent laundering.
                 let result_ty = self.degrade_refinement(result_ty, d.span);
                 self.unify(&Ty::Var(d.result), &result_ty, d.span);
+            }
+        }
+    }
+
+    /// Resolve `unify` shape computations deferred when an argument was an
+    /// unresolved type variable at the call node. Runs after all declaration
+    /// bodies are inferred, when a lambda parameter's record shape may have
+    /// been pinned by its call site. Re-applies both argument types; if both
+    /// are now closed records the merged field map is unified with the
+    /// placeholder result variable, otherwise the shape error is emitted.
+    fn resolve_deferred_unifies(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred_unifies);
+        for d in &deferred {
+            let left = self.apply(&d.left).clone();
+            let right = self.apply(&d.right).clone();
+            match (
+                Self::closed_record_fields(&left),
+                Self::closed_record_fields(&right),
+            ) {
+                (Ok(f1), Ok(f2)) => {
+                    let merged = Self::merge_record_fields(f1, f2);
+                    self.unify(&Ty::Var(d.result), &merged, d.span);
+                }
+                (Err(msg), _) | (_, Err(msg)) => {
+                    self.error(msg, d.span);
+                }
             }
         }
     }
@@ -10747,6 +10901,29 @@ impl Infer {
         let int3 = Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))))));
         self.bind_top("clamp", Scheme::mono(int3));
 
+        // unify : {r1} -> {r2} -> {r1 ∪ r2} — record merge, right-biased. The
+        // result type is shape-dependent (a function of both arguments' field
+        // names), which no single forall-scheme can express without a row-union
+        // type operator, so the real typing is a special case in
+        // `try_infer_unify`. This placeholder scheme exists only so the name
+        // resolves in scope; the special case overrides it for full
+        // applications, and the fully-polymorphic body is harmless when the
+        // special case doesn't fire (e.g. partial application, which is
+        // shape-dependent and thus not precisely typeable anyway).
+        let ua = self.fresh_var();
+        let ub = self.fresh_var();
+        let uc = self.fresh_var();
+        self.bind_top(
+            "unify",
+            Scheme::poly(
+                vec![ua, ub, uc],
+                Ty::Fun(
+                    Box::new(Ty::Var(ua)),
+                    Box::new(Ty::Fun(Box::new(Ty::Var(ub)), Box::new(Ty::Var(uc)))),
+                ),
+            ),
+        );
+
         // textToInt : Text -> Maybe Int  (Nothing on malformed input)
         self.bind_top(
             "textToInt",
@@ -12456,6 +12633,7 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
     // run before check_constraints so the Num constraints it registers are
     // still checked.
     infer.resolve_deferred_unit_binops();
+    infer.resolve_deferred_unifies();
 
     // Phase 4b3: Settle desugared do-blocks' final bare expressions — `pure e`
     // or `e` itself — and rewrite the markers out of the AST. Runs before

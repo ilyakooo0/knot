@@ -1426,6 +1426,7 @@ impl Codegen {
         self.declare_rt("knot_int_min", &[p, p], &[p]);
         self.declare_rt("knot_int_max", &[p, p], &[p]);
         self.declare_rt("knot_int_clamp", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_record_unify", &[p, p], &[p]);
         self.declare_rt("knot_text_contains", &[p, p], &[p]);
         self.declare_rt("knot_text_starts_with", &[p, p], &[p]);
         self.declare_rt("knot_text_ends_with", &[p, p], &[p]);
@@ -2056,7 +2057,7 @@ impl Codegen {
             "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex", "hexDecode",
             "bytesGet", "hash",
             "floor", "intToFloat", "textToInt", "textToFloat",
-            "abs", "intMin", "intMax", "clamp",
+            "abs", "intMin", "intMax", "clamp", "unify",
             "readFile", "writeFile", "appendFile",
             "fileExists", "removeFile", "listDir",
             "randomInt", "sleep", "fork", "race",
@@ -2831,6 +2832,7 @@ impl Codegen {
         self.define_stdlib_fn_2("intMin", "knot_int_min", false);
         self.define_stdlib_fn_2("intMax", "knot_int_max", false);
         self.define_stdlib_fn_3("clamp", "knot_int_clamp");
+        self.define_stdlib_fn_2("unify", "knot_record_unify", false);
         self.define_stdlib_fn_1("reverse", "knot_text_reverse");
         self.define_stdlib_fn_1("chars", "knot_text_chars");
         self.define_stdlib_fn_1("id", "knot_value_id");

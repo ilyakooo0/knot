@@ -16,6 +16,7 @@ Complete reference for all built-in functions, traits, and types.
 - [JSON](#json)
 - [Bytes](#bytes)
 - [Numeric Conversion](#numeric-conversion)
+- [Record Operations](#record-operations)
 - [Morphs (`base.morph`)](#morphs-basemorph)
 - [HTTP](#http)
 - [Cryptography](#cryptography)
@@ -928,6 +929,44 @@ textToFloat : Text -> Maybe (Float 1)
 ```
 
 Parse a float. Returns `Nothing {}` on malformed input.
+
+---
+
+## Record Operations
+
+### `unify`
+
+```
+unify : {r1} -> {r2} -> {r1 ∪ r2}   (shape computed at the call site)
+```
+
+Merge two records. The result has every field from both arguments; on a name
+conflict the **right** argument's value (and type) wins.
+
+```knot
+unify {a 1 name "x"} {b 2}            -- {a: 1, b: 2, name: "x"}
+unify {name "l" a 1} {name "r" c 3.0} -- {a: 1, c: 3.0, name: "r"}
+unify {a 1} {a 2}                      -- {a: 2}
+```
+
+Both arguments must have **statically-known, closed record shapes** — passing a
+value whose record type has an open (unresolved) row is a type error. Relation
+rows work: `map (\row -> unify row {active 1}) (full *items)` merges defaults
+into every row.
+
+`unify` is shape-dependent — its result type is a function of the two argument
+field names, computed by the type checker at the call site rather than by a
+single `forall` scheme. It does not push down to SQL (a per-row record merge is
+not a column operation), so over a relation it reads the relation into memory
+(`full *items`).
+
+> **Known limitation (pre-existing):** projecting a field that exists *only* on
+> the merged record inside a `map`/`filter` over a list or relation —
+> `map (\r -> (unify r {active 1}).active) xs` — returns at most one row. This
+> is a general bug with projecting a computed record's field in a list/relation
+> `map` (it reproduces with a plain `{a r.a b 1}.b` construction, no `unify`
+> involved), not specific to `unify`. Project the whole merged record, or a
+> field from the original row, instead.
 
 ---
 

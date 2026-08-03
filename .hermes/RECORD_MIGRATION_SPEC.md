@@ -24,8 +24,9 @@ a nested record (`{...}`), a list (`[...]`), an already-parenthesized expr.
        `{name: e.name}`     -> `{name e.name}`        (field-access is atomic)
        `{x: {a: 1}}`        -> `{x {a 1}}`            (nested record, recurse)
 
-2. Record UPDATE  `{base | f: v, g: w}`   -> `{base | f v g w}`
-   - keep `|`, same value-parenthesization rule.
+2. Record UPDATE — REMOVED. `{base | f: v, g: w}` / `{base | f v g w}` no
+   longer parse. Use `base.unify base {f v g w}` instead (right-biased merge;
+   it is update AND extension, and works on open rows like lambda params).
 
 3. `with` BLOCK  `with {x: e, y: e2} body` -> `with {x e y e2} body`
    - field names are the bindings; same value-parenthesization rule.

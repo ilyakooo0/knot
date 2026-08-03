@@ -949,10 +949,13 @@ unify {name "l" a 1} {name "r" c 3.0} -- {a: 1, c: 3.0, name: "r"}
 unify {a 1} {a 2}                      -- {a: 2}
 ```
 
-Both arguments must have **statically-known, closed record shapes** — passing a
-value whose record type has an open (unresolved) row is a type error. Relation
-rows work: `map (\row -> unify row {active 1}) (full *items)` merges defaults
-into every row.
+Arguments may be closed records **or open rows**. Merging into an open row — a
+lambda parameter or relation row whose full shape isn't pinned at the call
+site — overlays the right's fields and constrains the base to contain them, so
+`case r.id == x of Bool.True {} -> unify r {balance y}; Bool.False {} -> r`
+type-checks (the merged result and the bare row agree on the other fields).
+Relation rows work: `map (\row -> unify row {active 1}) (full *items)` merges
+defaults into every row. A genuinely non-record argument is a type error.
 
 `unify` is shape-dependent — its result type is a function of the two argument
 field names, computed by the type checker at the call site rather than by a

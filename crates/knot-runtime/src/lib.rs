@@ -21223,6 +21223,198 @@ mod index_extraction_tests {
     }
 }
 
+// ── extract_source ───────────────────────────────────────────────────
+// End-to-end coverage for `extract`: every Value kind renders to Knot text,
+// and the round-trip-critical cases (qualified constructors, closures with
+// captures, curried builtins, multi-arg leaf IO) produce re-parseable forms.
+#[cfg(test)]
+mod extract_source_tests {
+    use super::*;
+
+    fn text(s: &str) -> *mut Value {
+        alloc(Value::Text(Arc::from(s)))
+    }
+    fn ctor(tag: &str, payload: *mut Value) -> *mut Value {
+        alloc(Value::Constructor(intern_str(tag), payload))
+    }
+    fn record(fields: &[(&str, *mut Value)]) -> *mut Value {
+        alloc(Value::Record(
+            fields
+                .iter()
+                .map(|(n, v)| RecordField { name: intern_str(n), value: *v })
+                .collect(),
+        ))
+    }
+    fn func(source: &str, env: *mut Value) -> *mut Value {
+        alloc(Value::Function(Box::new(FunctionInner {
+            fn_ptr: std::ptr::null(),
+            env,
+            source: intern_str(source),
+            extract_source: None,
+        })))
+    }
+    fn func_full(source: &str, env: *mut Value, xsrc: &str) -> *mut Value {
+        alloc(Value::Function(Box::new(FunctionInner {
+            fn_ptr: std::ptr::null(),
+            env,
+            source: intern_str(source),
+            extract_source: Some(intern_str(xsrc)),
+        })))
+    }
+
+    // ── scalars ─────────────────────────────────────────────────────
+    #[test]
+    fn int() {
+        assert_eq!(extract_source(alloc_int(42)), "42");
+    }
+    #[test]
+    fn int_negative_and_big() {
+        assert_eq!(extract_source(alloc_int(-7)), "-7");
+        assert_eq!(extract_source(alloc_int(i64::MAX)), i64::MAX.to_string());
+    }
+    #[test]
+    fn float() {
+        assert_eq!(extract_source(alloc(Value::Float(3.5))), "3.5");
+    }
+    #[test]
+    fn text_quoted_and_escaped() {
+        assert_eq!(extract_source(text("hi")), "\"hi\"");
+        assert_eq!(extract_source(text("a\"b\\c\nd")), "\"a\\\"b\\\\c\\nd\"");
+    }
+    #[test]
+    fn bool() {
+        assert_eq!(extract_source(alloc(Value::Bool(true))), "Bool.True {}");
+        assert_eq!(extract_source(alloc(Value::Bool(false))), "Bool.False {}");
+    }
+    #[test]
+    fn unit() {
+        assert_eq!(extract_source(alloc(Value::Unit)), "{}");
+    }
+    #[test]
+    fn bytes() {
+        assert_eq!(extract_source(alloc(Value::Bytes(Arc::from(&[1u8, 2][..])))), "b\"0102\"");
+    }
+
+    // ── collections ─────────────────────────────────────────────────
+    #[test]
+    fn record_() {
+        let r = record(&[("a", alloc_int(1)), ("b", text("x"))]);
+        assert_eq!(extract_source(r), "{a 1 b \"x\"}");
+    }
+    #[test]
+    fn record_nested() {
+        let inner = record(&[("n", alloc_int(2))]);
+        let r = record(&[("outer", inner)]);
+        assert_eq!(extract_source(r), "{outer {n 2}}");
+    }
+    #[test]
+    fn relation_() {
+        let rel = alloc(Value::Relation(vec![
+            record(&[("n", alloc_int(1))]),
+            record(&[("n", alloc_int(2))]),
+        ]));
+        assert_eq!(extract_source(rel), "[{n 1} {n 2}]");
+    }
+
+    // ── constructors ────────────────────────────────────────────────
+    #[test]
+    fn ctor_qualified_payload() {
+        let v = ctor("Maybe.Just", record(&[("value", alloc_int(3))]));
+        assert_eq!(extract_source(v), "Maybe.Just {value 3}");
+    }
+    #[test]
+    fn ctor_qualified_nullary() {
+        // A materialized `Maybe.Nothing {}` Constructor with a unit payload.
+        let v = ctor("Maybe.Nothing", alloc(Value::Unit));
+        assert_eq!(extract_source(v), "Maybe.Nothing {}");
+    }
+    #[test]
+    fn ctor_unqualified_user_payload() {
+        let v = ctor("Circle", record(&[("radius", alloc(Value::Float(3.14)))]));
+        assert_eq!(extract_source(v), "Circle {radius 3.14}");
+    }
+
+    // ── closures ────────────────────────────────────────────────────
+    #[test]
+    fn closure_no_captures() {
+        let f = func("\\x -> x", std::ptr::null_mut());
+        assert_eq!(extract_source(f), "\\x -> x");
+    }
+    #[test]
+    fn closure_with_captures() {
+        let env = record(&[("x", alloc_int(10))]);
+        let f = func("\\y -> x + y", env);
+        assert_eq!(extract_source(f), "with {x 10} (\\y -> x + y)");
+    }
+    #[test]
+    fn closure_capture_is_function() {
+        // A captured dependency that is itself a closure re-extracts.
+        let dep = func("\\n -> n + 1", std::ptr::null_mut());
+        let env = record(&[("inc", dep)]);
+        let f = func("\\x -> inc x", env);
+        assert_eq!(extract_source(f), "with {inc \\n -> n + 1} (\\x -> inc x)");
+    }
+
+    // ── curried builtins (c1) ───────────────────────────────────────
+    #[test]
+    fn curried_builtin_first_arg_raw_env() {
+        // define_stdlib_fn_2 passes arg1 directly as the (non-record) env.
+        let arg1 = func("\\r -> r.x", std::ptr::null_mut());
+        let f = func("map", arg1);
+        assert_eq!(extract_source(f), "(base.map (\\r -> r.x))");
+    }
+    #[test]
+    fn curried_builtin_positional_record_env() {
+        // fn_3 middle/inner capture a {0,1}-keyed record.
+        let env = record(&[("0", func("\\a -> \\b -> a", std::ptr::null_mut())), ("1", alloc_int(0))]);
+        let f = func("fold", env);
+        assert_eq!(extract_source(f), "(base.fold (\\a -> \\b -> a) (0))");
+    }
+    #[test]
+    fn curried_builtin_scalar_first_arg() {
+        let f = func("take", alloc_int(2));
+        assert_eq!(extract_source(f), "(base.take (2))");
+    }
+
+    // ── nullary-ctor value-fns (c3) ─────────────────────────────────
+    #[test]
+    fn nullary_ctor_uses_extract_override() {
+        // `Maybe.Nothing` as a bare value-fn: show-source is bare, extract is qualified.
+        let f = func_full("Nothing", alloc(Value::Unit), "Maybe.Nothing {}");
+        assert_eq!(extract_source(f), "Maybe.Nothing {}");
+    }
+    #[test]
+    fn zero_arity_builtin_without_override_stays_bare() {
+        // A 0-capture builtin (Unit env, no override) emits the bare source.
+        let f = func("count", alloc(Value::Unit));
+        assert_eq!(extract_source(f), "count");
+    }
+
+    // ── IO (c2) ─────────────────────────────────────────────────────
+    fn io(source: &str, env: *mut Value) -> *mut Value {
+        alloc(Value::IO(Box::new(IOInner {
+            fn_ptr: std::ptr::null(),
+            env,
+            source: intern_str(source),
+        })))
+    }
+    #[test]
+    fn io_known_source_returned() {
+        let v = io("base.sleep 5", alloc(Value::Unit));
+        assert_eq!(extract_source(v), "base.sleep 5");
+    }
+    #[test]
+    fn io_multiarg_leaf_source_returned() {
+        let v = io("base.writeFile (\"/tmp/x\") (\"hi\")", std::ptr::null_mut());
+        assert_eq!(extract_source(v), "base.writeFile (\"/tmp/x\") (\"hi\")");
+    }
+    #[test]
+    fn io_unknown_source_falls_back() {
+        let v = io("", std::ptr::null_mut());
+        assert_eq!(extract_source(v), "<<IO>>");
+    }
+}
+
 
 
 

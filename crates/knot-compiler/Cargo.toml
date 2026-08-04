@@ -35,6 +35,7 @@ blake3 = { version = "1", default-features = false }
 # is retained so implicit-field (^name) resolution can try fields in
 # bottom-to-top declaration order instead of BTreeMap's alphabetical order.
 indexmap = { version = "2", default-features = false }
+cranelift-jit = "0.131"
 
 [build-dependencies]
 blake3 = { version = "1", default-features = false }

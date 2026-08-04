@@ -36,8 +36,8 @@ enum SourceBindInvalidation {
     AllSources,
 }
 
-pub struct Codegen {
-    module: ObjectModule,
+pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
+    module: M,
     ctx: Context,
     builder_ctx: FunctionBuilderContext,
     /// Accumulates .eh_frame entries for every generated function so the
@@ -1043,7 +1043,9 @@ fn compile_inner(
 
 // ── Constructor ───────────────────────────────────────────────────
 
-impl Codegen {
+impl Codegen<ObjectModule> {
+    /// Build the AOT (`ObjectModule`) backend: host ISA + object module, then
+    /// delegate to the backend-agnostic `with_module`.
     fn new() -> Self {
         let mut flag_builder = settings::builder();
         flag_builder.set("is_pic", "true").unwrap();
@@ -1061,18 +1063,30 @@ impl Codegen {
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .expect("failed to build ISA");
-        let ptr_type = isa.pointer_type();
-
         let builder = ObjectBuilder::new(
             isa,
             "knot_program",
             cranelift_module::default_libcall_names(),
         )
         .expect("failed to create ObjectBuilder");
-        let mut module = ObjectModule::new(builder);
-        // is_pic is set above, so .eh_frame pointers use PC-relative encoding.
-        let unwind = crate::unwind::UnwindContext::new(&mut module, true);
+        Self::with_module(ObjectModule::new(builder))
+    }
 
+    // ── Finish ────────────────────────────────────────────────────
+
+    fn finish(self) -> Vec<u8> {
+        let mut product = self.module.finish();
+        self.unwind.emit(&mut product);
+        product.emit().unwrap()
+    }
+}
+
+impl<M: cranelift_module::Module> Codegen<M> {
+    /// Build a `Codegen` around an already-constructed module. Backend-agnostic:
+    /// the ISA/unwind setup is the same for `ObjectModule` (AOT) and `JITModule`.
+    fn with_module(module: M) -> Self {
+        let unwind = crate::unwind::UnwindContext::new(module.isa(), true);
+        let ptr_type = module.isa().pointer_type();
         Self {
             ctx: module.make_context(),
             module,
@@ -3118,7 +3132,7 @@ impl Codegen {
 
         self.module.define_function(func_id, &mut ctx).unwrap();
         // Record unwind info while ctx still holds the compiled code.
-        self.unwind.add_function(&mut self.module, func_id, &ctx);
+        self.unwind.add_function(self.module.isa(), func_id, &ctx);
         self.builder_ctx = fb_ctx;
         self.ctx = ctx;
         self.module.clear_context(&mut self.ctx);
@@ -4126,14 +4140,6 @@ impl Codegen {
             let zero = builder.ins().iconst(types::I32, 0);
             builder.ins().return_(&[zero]);
         });
-    }
-
-    // ── Finish ────────────────────────────────────────────────────
-
-    fn finish(self) -> Vec<u8> {
-        let mut product = self.module.finish();
-        self.unwind.emit(&mut product);
-        product.emit().unwrap()
     }
 
     // ── Expression compilation ────────────────────────────────────
@@ -18365,9 +18371,9 @@ fn case_pattern_is_irrefutable(pat: &ast::Pat) -> bool {
     }
 }
 
-fn bind_do_pattern(
+fn bind_do_pattern<M: cranelift_module::Module>(
     builder: &mut FunctionBuilder,
-    cg: &mut Codegen,
+    cg: &mut Codegen<M>,
     pat: &ast::Pat,
     val: Value,
     env: &mut Env,

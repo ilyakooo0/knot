@@ -13,10 +13,10 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::Endianness;
-use cranelift_codegen::isa::unwind::UnwindInfo;
+use cranelift_codegen::isa::{unwind::UnwindInfo, TargetIsa};
 use cranelift_codegen::Context;
 use cranelift_module::{DataId, FuncId, Module};
-use cranelift_object::{ObjectModule, ObjectProduct};
+use cranelift_object::ObjectProduct;
 use gimli::write::{Address, CieId, EhFrame, EndianVec, FrameTable, Result as WriteResult, Section, Writer};
 use gimli::{RunTimeEndian, SectionId};
 use object::write::{Relocation, StandardSection};
@@ -35,14 +35,14 @@ pub(crate) struct UnwindContext {
 }
 
 impl UnwindContext {
-    pub(crate) fn new(module: &mut ObjectModule, pic_eh_frame: bool) -> Self {
-        let endian = match module.isa().endianness() {
+    pub(crate) fn new(isa: &dyn TargetIsa, pic_eh_frame: bool) -> Self {
+        let endian = match isa.endianness() {
             Endianness::Little => RunTimeEndian::Little,
             Endianness::Big => RunTimeEndian::Big,
         };
         let mut frame_table = FrameTable::default();
 
-        let cie_id = if let Some(mut cie) = module.isa().create_systemv_cie() {
+        let cie_id = if let Some(mut cie) = isa.create_systemv_cie() {
             if pic_eh_frame {
                 cie.fde_address_encoding =
                     gimli::DwEhPe(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
@@ -62,14 +62,14 @@ impl UnwindContext {
     /// compiled code.
     pub(crate) fn add_function(
         &mut self,
-        module: &mut ObjectModule,
+        isa: &dyn TargetIsa,
         func_id: FuncId,
         context: &Context,
     ) {
         let unwind_info = match context
             .compiled_code()
             .expect("add_function called before compilation")
-            .create_unwind_info(module.isa())
+            .create_unwind_info(isa)
             .expect("failed to create unwind info")
         {
             Some(ui) => ui,

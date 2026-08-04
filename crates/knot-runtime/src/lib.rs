@@ -7929,6 +7929,51 @@ pub extern "C-unwind" fn knot_value_call(
 /// path and SIGSEGV'd on Rust's default 8MB stack. The work-stack version
 /// completes without call-stack growth. `escape_text` selects whether `Text`
 /// values are JSON-escaped (field context) or printed raw (top-level `println`).
+///
+/// `show` rendering for a Function/IO. Unlike `extract` (which wraps a
+/// closure's captures in `with {…}` so the text re-evaluates standalone),
+/// `show` just prints the actual code: a closure shows its lambda source, a
+/// curried builtin shows the re-applied form `(base.map (\r -> r.x))` (its
+/// captured args are positional, not named, so there's no `with` to emit), and
+/// a nullary-ctor value-fn shows its bare name. IO shows its recorded source,
+/// falling back to `<<IO>>` when unknown.
+fn show_function(f: &FunctionInner) -> String {
+    if let Some(x) = &f.extract_source {
+        // Nullary-ctor value-fn (`Maybe.Nothing`): extract carries the qualified
+        // form, but show stays bare — strip a trailing ` {}` and any `Type.`
+        // qualifier so it renders `Nothing`.
+        let bare = x.strip_suffix(" {}").unwrap_or(x);
+        let bare = bare.rsplit('.').next().unwrap_or(bare);
+        return bare.to_string();
+    }
+    let env = f.env;
+    if env.is_null() {
+        return f.source.to_string();
+    }
+    match unsafe { as_ref(env) } {
+        Value::Unit => f.source.to_string(),
+        Value::Record(fields) => {
+            // Positional curried-builtin env ({0,1,…}): re-apply the op.
+            if !fields.is_empty() && fields.iter().all(|fl| fl.name.parse::<usize>().is_ok()) {
+                let args: Vec<String> = fields
+                    .iter()
+                    .map(|fl| format!("({})", extract_source(fl.value)))
+                    .collect();
+                format!("(base.{} {})", f.source, args.join(" "))
+            } else {
+                // Named captures: a closure — show the lambda source, no `with`.
+                f.source.to_string()
+            }
+        }
+        // Non-record, non-Unit env: a curried builtin's first arg passed raw.
+        _ => format!("(base.{} ({}))", f.source, extract_source(env)),
+    }
+}
+
+fn show_io(io: &IOInner) -> String {
+    if io.source.is_empty() { "<<IO>>".to_string() } else { io.source.to_string() }
+}
+
 fn format_value_iter(v: *mut Value, escape_text: bool) -> String {
     enum FmtTask {
         Render(*mut Value, bool), // value, escape_text-for-this-subtree
@@ -8004,7 +8049,6 @@ fn format_value_iter(v: *mut Value, escape_text: bool) -> String {
                     Value::Constructor(tag, payload) => {
                         if is_nullary_payload(*payload) {
                             out.push_str(ctor_leaf(tag));
-                            out.push_str(" {}");
                         } else {
                             // Field context for payload: the recursive
                             // format_value_field was used for Constructor
@@ -8014,8 +8058,8 @@ fn format_value_iter(v: *mut Value, escape_text: bool) -> String {
                             stack.push(FmtTask::Lit(format!("{} ", ctor_leaf(tag))));
                         }
                     }
-                    Value::Function(f) => out.push_str(&f.source),
-                    Value::IO(_) => out.push_str("<<IO>>"),
+                    Value::Function(f) => out.push_str(&show_function(f)),
+                    Value::IO(io) => out.push_str(&show_io(io)),
                     Value::Pair(_, _) => out.push_str("<<Pair>>"),
                 }
             }
@@ -8313,14 +8357,13 @@ pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
                         // first and the spine's tail never recurses.
                         if is_nullary_payload(*payload) {
                             out.push_str(ctor_leaf(tag));
-                            out.push_str(" {}");
                         } else {
                             stack.push(Task::Render(*payload));
                             stack.push(Task::Lit(format!("{} ", ctor_leaf(tag))));
                         }
                     }
-                    Value::Function(f) => out.push_str(&f.source),
-                    Value::IO(_) => out.push_str("<<IO>>"),
+                    Value::Function(f) => out.push_str(&show_function(f)),
+                    Value::IO(io) => out.push_str(&show_io(io)),
                     Value::Pair(_, _) => out.push_str("<<Pair>>"),
                 }
             }

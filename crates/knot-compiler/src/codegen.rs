@@ -4224,14 +4224,23 @@ impl Codegen {
             }
 
             ast::ExprKind::Constructor(name) => {
-                // A bare constructor in a non-application position is a
-                // first-class function value (`True : {} -> Bool`, etc.).
-                // Eta-expand it into a closure that applies the constructor to
-                // its payload argument, so `f True` / `map Just xs` / `let g =
-                // None` pass a callable. Applied forms (`Ctor {..}`) are
-                // emitted directly by `compile_application`, never reaching
-                // here.
+                // A bare constructor in a non-application position must not be
+                // a value. Constructors are always applied to their record
+                // (payload `Ctor {f …}` or nullary `Ctor {}`); a bare reference
+                // (`map Just xs`, `let g = Nothing`) has no record and is a
+                // type error. Applied forms (`Ctor {..}`) are emitted directly
+                // by `compile_application`, never reaching here. Prelude-internal
+                // uses (shifted spans) are exempt.
                 let name = name.clone();
+                if expr.span.start < crate::base::PRELUDE_SPAN_OFFSET {
+                    return self.push_codegen_error(
+                        builder,
+                        expr.span,
+                        format!(
+                            "constructor '{name}' must be applied to a record — write `{name} {{…}}` (or `{name} {{}}` if it takes no payload)"
+                        ),
+                    );
+                }
                 self.emit_ctor_as_function_value(builder, &name)
             }
 
@@ -4449,6 +4458,19 @@ impl Codegen {
                         .get(type_name.as_str())
                         .is_some_and(|ctors| ctors.iter().any(|c| c == field))
                 {
+                    // A bare `Type.Ctor` reference has no record. Constructors
+                    // are always applied — `Maybe.Just {value …}`, or
+                    // `Maybe.Nothing {}` for the nullary one. Reject a bare
+                    // reference; prelude-internal uses (shifted spans) exempt.
+                    if outer_span.start < crate::base::PRELUDE_SPAN_OFFSET {
+                        return self.push_codegen_error(
+                            builder,
+                            outer_span,
+                            format!(
+                                "constructor '{type_name}.{field}' must be applied to a record — write `{type_name}.{field} {{…}}` (or `{type_name}.{field} {{}}` if it takes no payload)"
+                            ),
+                        );
+                    }
                     return self.emit_ctor_as_function_value_qualified(
                         builder,
                         field,

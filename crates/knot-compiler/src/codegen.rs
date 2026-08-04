@@ -1176,6 +1176,7 @@ impl Codegen {
         self.declare_rt("knot_value_bool", &[types::I32], &[p]);
         self.declare_rt("knot_value_unit", &[], &[p]);
         self.declare_rt("knot_value_function", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_value_function_full", &[p, p, p, p, p, p], &[p]);
         self.declare_rt("knot_value_constructor", &[p, p, p], &[p]);
 
         // Value accessors
@@ -1697,21 +1698,57 @@ impl Codegen {
     /// Emit a bare constructor reference as a first-class function value:
     /// `knot_value_function(closure_addr, unit_env, name_ptr, name_len)` where
     /// the closure applies the constructor to its payload argument.
+    ///
+    /// `is_nullary_ctor`: True when a built-in constructor is nullary (carries
+    /// no payload): `True`/`False` (bool), `Nil` (List), or a nullable `None`
+    /// ctor (`Nothing`). These are the value-fns that need a qualified
+    /// `extract_source` since their `Constructor` only materializes on apply.
+    fn is_nullary_ctor(&self, name: &str) -> bool {
+        matches!(name, "True" | "False" | "Nil" | "Nothing")
+            || matches!(self.nullable_ctors.get(name), Some(NullableRole::None))
+    }
+
     fn emit_ctor_as_function_value(
         &mut self,
         builder: &mut FunctionBuilder,
         name: &str,
+    ) -> cranelift_codegen::ir::Value {
+        self.emit_ctor_as_function_value_qualified(builder, name, None)
+    }
+
+    /// Emit a built-in constructor as a first-class function value. When
+    /// `qualifier` is the owning type (`Maybe`, `Bool`, …) and the ctor is
+    /// nullary, the value gets an `extract_source` override of the qualified,
+    /// re-parseable form (`Maybe.Nothing {}`) while `show` stays bare.
+    fn emit_ctor_as_function_value_qualified(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        name: &str,
+        qualifier: Option<&str>,
     ) -> cranelift_codegen::ir::Value {
         let closure_id = self.ctor_value_closure_id(name);
         let closure_ref = self.module.declare_func_in_func(closure_id, builder.func);
         let fn_addr = builder.ins().func_addr(self.ptr_type, closure_ref);
         let unit = self.call_rt(builder, "knot_value_unit", &[]);
         let (name_ptr, name_len) = self.string_ptr(builder, name);
-        self.call_rt(
-            builder,
-            "knot_value_function",
-            &[fn_addr, unit, name_ptr, name_len],
-        )
+        // Only nullary constructors need the qualified extract override: a
+        // payload ctor extracts via the `Constructor` arm (already qualified),
+        // but a nullary one is bare value-fn whose `Constructor` never
+        // materializes until applied.
+        if let Some(q) = qualifier.filter(|_| self.is_nullary_ctor(name)) {
+            let (x_ptr, x_len) = self.string_ptr(builder, &format!("{}.{} {{}}", q, name));
+            self.call_rt(
+                builder,
+                "knot_value_function_full",
+                &[fn_addr, unit, name_ptr, name_len, x_ptr, x_len],
+            )
+        } else {
+            self.call_rt(
+                builder,
+                "knot_value_function",
+                &[fn_addr, unit, name_ptr, name_len],
+            )
+        }
     }
 
     /// Define a 1-param stdlib function that directly delegates to a runtime function.
@@ -4412,7 +4449,11 @@ impl Codegen {
                         .get(type_name.as_str())
                         .is_some_and(|ctors| ctors.iter().any(|c| c == field))
                 {
-                    return self.emit_ctor_as_function_value(builder, field);
+                    return self.emit_ctor_as_function_value_qualified(
+                        builder,
+                        field,
+                        Some(type_name.as_str()),
+                    );
                 }
                 // `db.*name` — a source-relation field (the field name starts
                 // with `*`) on a record that declares it via `SourceDecl`. The

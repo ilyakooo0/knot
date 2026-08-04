@@ -1004,6 +1004,7 @@ impl Arena {
                         fn_ptr: f.fn_ptr,
                         env: ne,
                         source: f.source.clone(),
+                        extract_source: f.extract_source.clone(),
                     })))
                 } else { val }
             }
@@ -1124,6 +1125,7 @@ impl Arena {
                     fn_ptr: f.fn_ptr,
                     env: self.promote_value(f.env),
                     source: f.source.clone(),
+                    extract_source: f.extract_source.clone(),
                 }))
             }
             Value::IO(io) => {
@@ -1209,6 +1211,7 @@ impl Arena {
                     fn_ptr: f.fn_ptr,
                     env: self.clone_from_child(f.env, child),
                     source: f.source.clone(),
+                    extract_source: f.extract_source.clone(),
                 }))
             }
             Value::IO(io) => {
@@ -3985,6 +3988,11 @@ pub struct FunctionInner {
     pub fn_ptr: *const u8,
     pub env: *mut Value,
     pub source: Arc<str>,
+    /// Optional override for `extract` (e.g. a nullary-ctor value-fn like
+    /// `Maybe.Nothing` shows as `Nothing` via `source` but must extract to the
+    /// qualified, re-parseable `Maybe.Nothing {}`). `None` → extract derives
+    /// from `source` + `env` as usual.
+    pub extract_source: Option<Arc<str>>,
 }
 
 /// Payload for `Value::IO`: boxed to keep `Value` compact. `source` is the
@@ -4554,6 +4562,26 @@ fn alloc_io_leaf(fn_ptr: *const u8, env: *mut Value, name: &str, has_arg: bool) 
     } else {
         intern_str(&format!("base.{}", name))
     };
+    alloc_io(fn_ptr, env, source)
+}
+
+/// Allocate a 2-arg leaf IO (`base.writeFile`, `base.encrypt`, …) whose extract
+/// source is `base.<op> <extract a1> <extract a2>` (each arg parenthesized so a
+/// lambda/record arg doesn't bind greedily). `env` stays the runtime record the
+/// thunk reads.
+fn alloc_io_leaf2(
+    fn_ptr: *const u8,
+    env: *mut Value,
+    name: &str,
+    a1: *mut Value,
+    a2: *mut Value,
+) -> *mut Value {
+    let source = intern_str(&format!(
+        "base.{} ({}) ({})",
+        name,
+        extract_source(a1),
+        extract_source(a2)
+    ));
     alloc_io(fn_ptr, env, source)
 }
 
@@ -5134,7 +5162,35 @@ pub extern "C-unwind" fn knot_value_function(
     src_len: usize,
 ) -> *mut Value {
     let source = intern_str(unsafe { str_from_raw(src_ptr, src_len) });
-    alloc(Value::Function(Box::new(FunctionInner { fn_ptr, env, source })))
+    alloc(Value::Function(Box::new(FunctionInner {
+        fn_ptr,
+        env,
+        source,
+        extract_source: None,
+    })))
+}
+
+/// `knot_value_function` with an explicit `extract` override. Used for the
+/// nullary-ctor value-fns (`Maybe.Nothing`, `Bool.True`): `source` stays the
+/// bare name so `show` is unchanged, while `extract_source` carries the
+/// qualified, re-parseable form.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_value_function_full(
+    fn_ptr: *const u8,
+    env: *mut Value,
+    src_ptr: *const u8,
+    src_len: usize,
+    xsrc_ptr: *const u8,
+    xsrc_len: usize,
+) -> *mut Value {
+    let source = intern_str(unsafe { str_from_raw(src_ptr, src_len) });
+    let extract_source = Some(intern_str(unsafe { str_from_raw(xsrc_ptr, xsrc_len) }));
+    alloc(Value::Function(Box::new(FunctionInner {
+        fn_ptr,
+        env,
+        source,
+        extract_source,
+    })))
 }
 
 #[unsafe(no_mangle)]
@@ -8001,16 +8057,25 @@ fn extract_escape_text(s: &str) -> String {
 
 /// Render a closure's captured env as a `with {…}` dependency block wrapping
 /// the lambda source. `env` is the named record of captures codegen builds
-/// (single capture is a 1-field record); a null env or a non-record (e.g. a
-/// stdlib-fn positional capture) yields the source unchanged.
+/// (single capture is a 1-field record). A null env (0-capture lambda) yields
+/// the source unchanged. A NON-record, non-null env is a stdlib-fn positional
+/// capture (curried builtins pass arg1 directly as env): emit an application
+/// `base.<op> <extract env>` so the partial re-applies.
 fn wrap_with_env(source: &str, env: *mut Value) -> String {
     if env.is_null() {
         return source.to_string();
     }
     if let Value::Record(fields) = unsafe { as_ref(env) } {
-        // Stdlib-fn currying uses positional keys "0","1",… — those aren't
-        // real variable names, so don't emit a `with` block for them.
-        if fields.is_empty() || fields.iter().any(|f| f.name.parse::<usize>().is_ok()) {
+        // A record with positional keys "0","1",… is a stdlib-fn double-curry
+        // env — apply the captured args in order instead of a `with` block.
+        if !fields.is_empty() && fields.iter().all(|f| f.name.parse::<usize>().is_ok()) {
+            let args: Vec<String> = fields
+                .iter()
+                .map(|f| format!("({})", extract_source(f.value)))
+                .collect();
+            return format!("(base.{} {})", source, args.join(" "));
+        }
+        if fields.is_empty() {
             return source.to_string();
         }
         let inner: Vec<String> = fields
@@ -8019,7 +8084,15 @@ fn wrap_with_env(source: &str, env: *mut Value) -> String {
             .collect();
         format!("with {{{}}} ({})", inner.join(" "), source)
     } else {
-        source.to_string()
+        // Non-record, non-null env. A Unit env is a 0-arity builtin (e.g. the
+        // bare `Nothing`/`True` value fns) — no captured arg, emit the bare
+        // source. Any other non-record env is a curried builtin's first arg
+        // passed raw; `source` is the bare op name (e.g. "map") — apply it.
+        if matches!(unsafe { as_ref(env) }, Value::Unit) {
+            source.to_string()
+        } else {
+            format!("(base.{} ({}))", source, extract_source(env))
+        }
     }
 }
 
@@ -8073,7 +8146,10 @@ fn extract_source(v: *mut Value) -> String {
                 format!("{} {}", tag, extract_source(*payload))
             }
         }
-        Value::Function(f) => wrap_with_env(&f.source, f.env),
+        Value::Function(f) => match &f.extract_source {
+            Some(x) => x.to_string(),
+            None => wrap_with_env(&f.source, f.env),
+        },
         Value::IO(io) => {
             if io.source.is_empty() {
                 "<<IO>>".to_string()
@@ -8382,7 +8458,10 @@ fn component_source(v: *mut Value) -> String {
         Value::IO(io) => {
             if io.source.is_empty() { "<<IO>>".to_string() } else { io.source.to_string() }
         }
-        Value::Function(f) => wrap_with_env(&f.source, f.env),
+        Value::Function(f) => match &f.extract_source {
+            Some(x) => x.to_string(),
+            None => wrap_with_env(&f.source, f.env),
+        },
         _ => extract_source(v),
     }
 }
@@ -8523,6 +8602,7 @@ fn deep_clone_with(val: *mut Value, mut alloc_node: impl FnMut(Value) -> *mut Va
                     fn_ptr: f.fn_ptr,
                     env: std::ptr::null_mut(),
                     source: f.source.clone(),
+                    extract_source: f.extract_source.clone(),
                 }))
             }
             Value::IO(io) => {
@@ -9526,7 +9606,7 @@ pub extern "C-unwind" fn knot_fs_write_file_io(path: *mut Value, contents: *mut 
         let c = knot_record_field(env, c"_c".as_ptr().cast(), 2);
         knot_fs_write_file(p, c)
     }
-    alloc_io(thunk as *const u8, env, intern_str(""))
+    alloc_io_leaf2(thunk as *const u8, env, "writeFile", path, contents)
 }
 
 #[unsafe(no_mangle)]
@@ -9541,7 +9621,7 @@ pub extern "C-unwind" fn knot_fs_append_file_io(path: *mut Value, contents: *mut
         let c = knot_record_field(env, c"_c".as_ptr().cast(), 2);
         knot_fs_append_file(p, c)
     }
-    alloc_io(thunk as *const u8, env, intern_str(""))
+    alloc_io_leaf2(thunk as *const u8, env, "appendFile", path, contents)
 }
 
 #[unsafe(no_mangle)]
@@ -9765,6 +9845,7 @@ pub extern "C-unwind" fn knot_trace(
         fn_ptr: apply as *const u8,
         env,
         source: Arc::from("trace"),
+        extract_source: None,
     })))
 }
 
@@ -16561,6 +16642,7 @@ fn build_request_ctx(
         fn_ptr: knot_rate_limit_header_lookup as *const u8,
         env: header_env,
         source: intern_str("RequestCtx.header"),
+        extract_source: None,
     })));
     let mut fields = vec![
         RecordField {
@@ -20971,7 +21053,7 @@ pub extern "C-unwind" fn knot_crypto_encrypt_io(public_key: *mut Value, plaintex
         let plaintext = knot_record_field(env, b.as_ptr(), b.len());
         knot_crypto_encrypt(public_key, plaintext)
     }
-    alloc_io(thunk as *const u8, env, intern_str(""))
+    alloc_io_leaf2(thunk as *const u8, env, "encrypt", public_key, plaintext)
 }
 
 

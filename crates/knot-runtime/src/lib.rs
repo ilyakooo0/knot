@@ -21458,6 +21458,109 @@ mod extract_source_tests {
     }
 }
 
+// ── show (display) ───────────────────────────────────────────────────
+// `show` returns the actual code for functions/IO (no <closure>/<<IO>>
+// placeholder, no `with {…}`), and renders nullary ctors display-stable.
+#[cfg(test)]
+mod show_tests {
+    use super::*;
+
+    fn text(s: &str) -> *mut Value {
+        alloc(Value::Text(Arc::from(s)))
+    }
+    fn ctor(tag: &str, payload: *mut Value) -> *mut Value {
+        alloc(Value::Constructor(intern_str(tag), payload))
+    }
+    fn record(fields: &[(&str, *mut Value)]) -> *mut Value {
+        alloc(Value::Record(
+            fields
+                .iter()
+                .map(|(n, v)| RecordField { name: intern_str(n), value: *v })
+                .collect(),
+        ))
+    }
+    fn func(source: &str, env: *mut Value) -> *mut Value {
+        alloc(Value::Function(Box::new(FunctionInner {
+            fn_ptr: std::ptr::null(),
+            env,
+            source: intern_str(source),
+            extract_source: None,
+        })))
+    }
+    fn io(source: &str) -> *mut Value {
+        alloc(Value::IO(Box::new(IOInner {
+            fn_ptr: std::ptr::null(),
+            env: std::ptr::null_mut(),
+            source: intern_str(source),
+        })))
+    }
+
+    #[test]
+    fn closure_shows_lambda_source_no_closure_placeholder() {
+        let f = func("\\x -> x + 1", std::ptr::null_mut());
+        assert_eq!(format_value(f), "\\x -> x + 1");
+    }
+    #[test]
+    fn closure_with_captures_shows_lambda_no_with() {
+        let env = record(&[("x", alloc_int(10))]);
+        let f = func("\\y -> x + y", env);
+        // show prints the lambda body, NOT the `with {…}` extract form.
+        assert_eq!(format_value(f), "\\y -> x + y");
+    }
+    #[test]
+    fn curried_builtin_shows_reapplied() {
+        let arg1 = func("\\r -> r.x", std::ptr::null_mut());
+        let f = func("map", arg1);
+        assert_eq!(format_value(f), "(base.map (\\r -> r.x))");
+    }
+    #[test]
+    fn curried_builtin_positional_record_shows_reapplied() {
+        let env = record(&[("0", func("\\a -> \\b -> a", std::ptr::null_mut())), ("1", alloc_int(0))]);
+        let f = func("fold", env);
+        assert_eq!(format_value(f), "(base.fold (\\a -> \\b -> a) (0))");
+    }
+    #[test]
+    fn nullary_ctor_value_fn_shows_bare() {
+        let f = alloc(Value::Function(Box::new(FunctionInner {
+            fn_ptr: std::ptr::null(),
+            env: alloc(Value::Unit),
+            source: intern_str("Nothing"),
+            extract_source: Some(intern_str("Maybe.Nothing {}")),
+        })));
+        assert_eq!(format_value(f), "Nothing");
+    }
+    #[test]
+    fn materialized_nullary_ctor_shows_bare_not_tag_braces() {
+        // `Maybe.Nothing {}` re-parsed → Constructor with unit payload → bare.
+        let v = ctor("Maybe.Nothing", alloc(Value::Unit));
+        assert_eq!(format_value(v), "Nothing");
+    }
+    #[test]
+    fn payload_ctor_shows_bare_leaf() {
+        let v = ctor("Maybe.Just", record(&[("value", alloc_int(3))]));
+        assert_eq!(format_value(v), "Just {value: 3}");
+    }
+    #[test]
+    fn io_shows_source_not_placeholder() {
+        assert_eq!(format_value(io("base.sleep 5")), "base.sleep 5");
+    }
+    #[test]
+    fn io_multiarg_shows_source() {
+        assert_eq!(format_value(io("base.writeFile (\"/tmp/x\") (\"hi\")")), "base.writeFile (\"/tmp/x\") (\"hi\")");
+    }
+    #[test]
+    fn io_unknown_source_still_placeholder() {
+        assert_eq!(format_value(io("")), "<<IO>>");
+    }
+    #[test]
+    fn plain_values_unaffected() {
+        assert_eq!(format_value(alloc_int(42)), "42");
+        // field-context display quotes Text
+        assert_eq!(format_value(text("hi")), "\"hi\"");
+        assert_eq!(format_value(alloc(Value::Unit)), "{}");
+    }
+}
+
 
 
 

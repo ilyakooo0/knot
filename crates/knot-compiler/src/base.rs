@@ -135,6 +135,9 @@ pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     // Console IO builtins (registered as stdlib function values in codegen).
     "println", "print", "putLine", "logInfo", "logWarn", "logError", "logDebug",
     "show",
+    // Value → evaluable Knot source (dependency-collecting). Registered as a
+    // stdlib function value in codegen.
+    "extract",
     // 0-arg IO builtins. Each is a re-runnable IO thunk (`Value::IO(thunk, _)`)
     // produced fresh by the bare-`Var` dispatch, so holding the action as a
     // record field is safe — forcing `base.now` twice runs `knot_now` twice.

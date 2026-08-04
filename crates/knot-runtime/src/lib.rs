@@ -1007,10 +1007,12 @@ impl Arena {
                     })))
                 } else { val }
             }
-            Value::IO(fp, env) => {
-                let ne = self.promote_value(*env);
-                if ne != *env {
-                    self.alloc_pinned(Value::IO(*fp, ne))
+            Value::IO(io) => {
+                let ne = self.promote_value(io.env);
+                if ne != io.env {
+                    self.alloc_pinned(Value::IO(Box::new(IOInner {
+                        fn_ptr: io.fn_ptr, env: ne, source: io.source.clone(),
+                    })))
                 } else { val }
             }
             Value::Pair(a, b) => {
@@ -1124,8 +1126,10 @@ impl Arena {
                     source: f.source.clone(),
                 }))
             }
-            Value::IO(fp, env) => {
-                Value::IO(*fp, self.promote_value(*env))
+            Value::IO(io) => {
+                Value::IO(Box::new(IOInner {
+                    fn_ptr: io.fn_ptr, env: self.promote_value(io.env), source: io.source.clone(),
+                }))
             }
             Value::Pair(a, b) => {
                 Value::Pair(self.promote_value(*a), self.promote_value(*b))
@@ -1207,8 +1211,10 @@ impl Arena {
                     source: f.source.clone(),
                 }))
             }
-            Value::IO(fp, env) => {
-                Value::IO(*fp, self.clone_from_child(*env, child))
+            Value::IO(io) => {
+                Value::IO(Box::new(IOInner {
+                    fn_ptr: io.fn_ptr, env: self.clone_from_child(io.env, child), source: io.source.clone(),
+                }))
             }
             Value::Pair(a, b) => {
                 Value::Pair(
@@ -3960,8 +3966,10 @@ pub enum Value {
     ///
     /// Boxed so the three-field tuple doesn't bloat every `Value` slot.
     Function(Box<FunctionInner>),
-    /// IO thunk — fn_ptr: extern "C" fn(db: *mut KnotDb, env: *mut Value) -> *mut Value
-    IO(*const u8, *mut Value),
+    /// IO thunk — fn_ptr: extern "C" fn(db: *mut KnotDb, env: *mut Value) -> *mut Value.
+    /// Boxed so the `source` (the Knot text that produced the action, for
+    /// `extract`) doesn't bloat every Value slot.
+    IO(Box<IOInner>),
     /// Internal two-pointer tuple used to build closure envs without
     /// allocating a `Record` + `Vec<RecordField>` + two `String`s per
     /// construction.  Used by `knot_io_bind`, `knot_io_then`, `knot_io_map`,
@@ -3974,6 +3982,16 @@ pub enum Value {
 
 /// Payload for `Value::Function`: boxed to keep `Value` compact.
 pub struct FunctionInner {
+    pub fn_ptr: *const u8,
+    pub env: *mut Value,
+    pub source: Arc<str>,
+}
+
+/// Payload for `Value::IO`: boxed to keep `Value` compact. `source` is the
+/// Knot text that produced the action (a do-block, `base.<op> <arg>` for a leaf
+/// builtin, or a composed `>>=`/`>>`/`map` chain); `extract` returns it. Empty
+/// when unknown, in which case `extract` falls back to `<<IO>>`.
+pub struct IOInner {
     pub fn_ptr: *const u8,
     pub env: *mut Value,
     pub source: Arc<str>,
@@ -4522,6 +4540,23 @@ fn alloc(v: Value) -> *mut Value {
     ARENA.with(|a| a.borrow_mut().alloc(v))
 }
 
+/// Allocate an IO thunk with its producing source text (for `extract`).
+fn alloc_io(fn_ptr: *const u8, env: *mut Value, source: Arc<str>) -> *mut Value {
+    alloc(Value::IO(Box::new(IOInner { fn_ptr, env, source })))
+}
+
+/// Allocate a leaf builtin IO whose source is `base.<name> <extract env>`
+/// (or `base.<name>` for a 0-arg leaf). Used by the console/file builtins so
+/// `extract` of the action reproduces the call with its argument inlined.
+fn alloc_io_leaf(fn_ptr: *const u8, env: *mut Value, name: &str, has_arg: bool) -> *mut Value {
+    let source = if has_arg {
+        intern_str(&format!("base.{} {}", name, extract_source(env)))
+    } else {
+        intern_str(&format!("base.{}", name))
+    };
+    alloc_io(fn_ptr, env, source)
+}
+
 /// Allocate an `i64` integer.  The singleton cache for `[-128, 127]`
 /// is tried first, then pointer tagging for i61-range values
 /// (≈ 2.3 × 10^18), falling back to an arena `Int` for the tails of
@@ -4714,7 +4749,7 @@ fn type_name(v: *mut Value) -> &'static str {
         Value::Relation(_) => "Relation",
         Value::Constructor(_, _) => "Constructor",
         Value::Function(_) => "Function",
-        Value::IO(_, _) => "IO",
+        Value::IO(_) => "IO",
         Value::Pair(_, _) => "Pair",
     }
 }
@@ -4744,7 +4779,7 @@ fn brief_value(v: *mut Value) -> String {
         Value::Relation(rows) => format!("Relation({} rows)", rows.len()),
         Value::Constructor(tag, _) => format!("Constructor({})", &**tag),
         Value::Function(f) => format!("Function({})", &*f.source),
-        Value::IO(_, _) => "IO".to_string(),
+        Value::IO(_) => "IO".to_string(),
         Value::Pair(_, _) => "Pair".to_string(),
     }
 }
@@ -5165,7 +5200,7 @@ pub extern "C-unwind" fn knot_value_get_tag(v: *mut Value) -> i32 {
         Value::Constructor(_, _) => 7,
         Value::Function(_) => 8,
         Value::Bytes(_) => 10,
-        Value::IO(_, _) => 11,
+        Value::IO(_) => 11,
         Value::Pair(_, _) => 12,
     }
 }
@@ -6883,15 +6918,15 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                         buf.extend_from_slice(&(f.fn_ptr as usize).to_le_bytes());
                         stack.push(HashTask::Value(f.env));
                     }
-                    Value::IO(fn_ptr, env) => {
+                    Value::IO(io) => {
                         // Mirror `values_equal`: two IO values are equal iff
                         // they share the same fn pointer AND equal environments.
                         // Hashing only the tag byte collapsed distinct IO
                         // actions in dedup paths (union/concat/bind), silently
                         // dropping actions.
                         buf.push(11);
-                        buf.extend_from_slice(&(*fn_ptr as usize).to_le_bytes());
-                        stack.push(HashTask::Value(*env));
+                        buf.extend_from_slice(&(io.fn_ptr as usize).to_le_bytes());
+                        stack.push(HashTask::Value(io.env));
                     }
                     Value::Pair(a, b) => {
                         // Pair is an internal-only variant for IO thunk envs;
@@ -7065,11 +7100,11 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
                 }
                 stack.push((a.env, b.env));
             }
-            (Value::IO(fn_a, env_a), Value::IO(fn_b, env_b)) => {
-                if fn_a != fn_b {
+            (Value::IO(a), Value::IO(b)) => {
+                if a.fn_ptr != b.fn_ptr {
                     return false;
                 }
-                stack.push((*env_a, *env_b));
+                stack.push((a.env, b.env));
             }
             (Value::Pair(aa, ab), Value::Pair(ba, bb)) => {
                 // Push in reverse so `a` pops first (matches recursive order).
@@ -7922,7 +7957,7 @@ fn format_value_iter(v: *mut Value, escape_text: bool) -> String {
                         }
                     }
                     Value::Function(f) => out.push_str(&f.source),
-                    Value::IO(_, _) => out.push_str("<<IO>>"),
+                    Value::IO(_) => out.push_str("<<IO>>"),
                     Value::Pair(_, _) => out.push_str("<<Pair>>"),
                 }
             }
@@ -7944,6 +7979,115 @@ fn format_value(v: *mut Value) -> String {
 fn format_value_field(v: *mut Value) -> String {
     format_value_iter(v, true)
 }
+
+/// Escape a Text value so it re-reads as the same string inside a `"..."`
+/// literal. Mirrors the escapes knot's lexer accepts.
+fn extract_escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Render a closure's captured env as a `with {…}` dependency block wrapping
+/// the lambda source. `env` is the named record of captures codegen builds
+/// (single capture is a 1-field record); a null env or a non-record (e.g. a
+/// stdlib-fn positional capture) yields the source unchanged.
+fn wrap_with_env(source: &str, env: *mut Value) -> String {
+    if env.is_null() {
+        return source.to_string();
+    }
+    if let Value::Record(fields) = unsafe { as_ref(env) } {
+        // Stdlib-fn currying uses positional keys "0","1",… — those aren't
+        // real variable names, so don't emit a `with` block for them.
+        if fields.is_empty() || fields.iter().any(|f| f.name.parse::<usize>().is_ok()) {
+            return source.to_string();
+        }
+        let inner: Vec<String> = fields
+            .iter()
+            .map(|f| format!("{} {}", f.name, extract_source(f.value)))
+            .collect();
+        format!("with {{{}}} ({})", inner.join(" "), source)
+    } else {
+        source.to_string()
+    }
+}
+
+/// Render a runtime value as evaluable Knot source (`extract : a -> Text`).
+/// Data literals round-trip; closures/IO wrap their captured dependencies in a
+/// `with {…}` block so the text is self-contained. Constructors use the
+/// qualified tag when known (else bare). IO uses its recorded source, falling
+/// back to `<<IO>>` when unknown.
+fn extract_source(v: *mut Value) -> String {
+    if v.is_null() {
+        return "{}".to_string();
+    }
+    match unsafe { as_ref(v) } {
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => {
+            // Keep a decimal point so the literal re-reads as Float.
+            let s = format!("{}", f);
+            if s.contains('.') || s.contains('e') || s.contains("inf") || s.contains("NaN") {
+                s
+            } else {
+                format!("{}.0", s)
+            }
+        }
+        Value::Text(s) => format!("\"{}\"", extract_escape_text(s)),
+        Value::Bool(b) => if *b { "Bool.True {}" } else { "Bool.False {}" }.to_string(),
+        Value::Bytes(b) => {
+            let mut out = String::from("b\"");
+            for byte in b.iter() {
+                use std::fmt::Write;
+                let _ = write!(out, "{:02x}", byte);
+            }
+            out.push('"');
+            out
+        }
+        Value::Unit => "{}".to_string(),
+        Value::Record(fields) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|f| format!("{} {}", f.name, extract_source(f.value)))
+                .collect();
+            format!("{{{}}}", inner.join(" "))
+        }
+        Value::Relation(rows) => {
+            let inner: Vec<String> = rows.iter().map(|r| extract_source(*r)).collect();
+            format!("[{}]", inner.join(" "))
+        }
+        Value::Constructor(tag, payload) => {
+            if is_nullary_payload(*payload) {
+                format!("{} {{}}", tag)
+            } else {
+                format!("{} {}", tag, extract_source(*payload))
+            }
+        }
+        Value::Function(f) => wrap_with_env(&f.source, f.env),
+        Value::IO(io) => {
+            if io.source.is_empty() {
+                "<<IO>>".to_string()
+            } else {
+                io.source.to_string()
+            }
+        }
+        Value::Pair(_, _) => "<<pair>>".to_string(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_value_extract(v: *mut Value) -> *mut Value {
+    alloc(Value::Text(Arc::from(extract_source(v))))
+}
+
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_read_line() -> *mut Value {
@@ -8098,7 +8242,7 @@ pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
                         }
                     }
                     Value::Function(f) => out.push_str(&f.source),
-                    Value::IO(_, _) => out.push_str("<<IO>>"),
+                    Value::IO(_) => out.push_str("<<IO>>"),
                     Value::Pair(_, _) => out.push_str("<<Pair>>"),
                 }
             }
@@ -8139,25 +8283,41 @@ pub extern "C-unwind" fn knot_value_show_unit(
 
 // ── IO monad ─────────────────────────────────────────────────────
 
-/// Create an IO value wrapping a thunk function pointer and captured environment.
+/// Create an IO value wrapping a thunk function pointer, captured environment,
+/// and the source text of the do-block it came from (for `extract`).
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_io_wrap(fn_ptr: *const u8, env: *mut Value) -> *mut Value {
-    alloc(Value::IO(fn_ptr, env))
+pub extern "C-unwind" fn knot_io_wrap(
+    fn_ptr: *const u8,
+    env: *mut Value,
+    src_ptr: *const u8,
+    src_len: usize,
+) -> *mut Value {
+    let source = intern_str(unsafe { str_from_raw(src_ptr, src_len) });
+    alloc_io(fn_ptr, env, source)
 }
 
-/// Create an IO thunk from a function pointer and captured environment.
-/// Used by codegen to defer IO do-block execution until knot_io_run.
+/// Create an IO thunk from a function pointer, captured environment, and the
+/// do-block source. Used by codegen to defer IO do-block execution until
+/// knot_io_run; the source lets `extract` reproduce the action.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_io_new(fn_ptr: *const u8, env: *mut Value) -> *mut Value {
-    alloc(Value::IO(fn_ptr, env))
+pub extern "C-unwind" fn knot_io_new(
+    fn_ptr: *const u8,
+    env: *mut Value,
+    src_ptr: *const u8,
+    src_len: usize,
+) -> *mut Value {
+    let source = intern_str(unsafe { str_from_raw(src_ptr, src_len) });
+    alloc_io(fn_ptr, env, source)
 }
 
-/// Wrap a pure value in an IO thunk (IO.pure / return).
+/// Wrap a pure value in an IO thunk (IO.pure / return). Its extract source is
+/// `base.pure <extract val>`.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_io_pure(val: *mut Value) -> *mut Value {
     // Create a thunk that just returns val.
     // We encode this as IO with null fn_ptr — knot_io_run checks for this.
-    alloc(Value::IO(std::ptr::null(), val))
+    let source = intern_str(&format!("base.pure {}", extract_source(val)));
+    alloc_io(std::ptr::null(), val, source)
 }
 
 /// Execute an IO thunk. If the value is not IO, return it as-is.
@@ -8177,9 +8337,9 @@ pub extern "C-unwind" fn knot_io_run(db: *mut c_void, val: *mut Value) -> *mut V
             return current;
         }
         match unsafe { as_ref(current) } {
-            Value::IO(fn_ptr, env) => {
-                let fn_ptr = *fn_ptr;
-                let env = *env;
+            Value::IO(io) => {
+                let fn_ptr = io.fn_ptr;
+                let env = io.env;
                 if fn_ptr.is_null() {
                     return env;
                 }
@@ -8209,19 +8369,29 @@ fn pair_unpack(env: *mut Value) -> (*mut Value, *mut Value) {
     }
 }
 
+/// The extract-source of an IO or Function component of a composed action.
+/// IO uses its recorded source; a Function uses its lambda source (wrapped in
+/// its captured deps). Anything else extracts generically.
+fn component_source(v: *mut Value) -> String {
+    if v.is_null() {
+        return "<<IO>>".to_string();
+    }
+    match unsafe { as_ref(v) } {
+        Value::IO(io) => {
+            if io.source.is_empty() { "<<IO>>".to_string() } else { io.source.to_string() }
+        }
+        Value::Function(f) => wrap_with_env(&f.source, f.env),
+        _ => extract_source(v),
+    }
+}
+
 /// Monadic bind for IO: knot_io_bind(io, f) -> IO
-/// Creates a new IO thunk that, when run:
-///   1. Runs `io` to get result `a`
-///   2. Calls `f(a)` to get a new IO action
-///   3. Runs that IO action
-///
 /// The env is a `Value::Pair(io, f)` — a two-pointer tuple — instead of a
-/// Record with named fields.  This skips one `Vec<RecordField>` allocation
-/// and two `String` allocations (the field names "_io", "_f") per bind.
-/// Over a long-running program with many IO chains that's millions of
-/// avoided allocations.
+/// Record with named fields, skipping allocations on hot IO chains.
+/// Source: `<io> >>= <f>` so `extract` reproduces the composed action.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_io_bind(io: *mut Value, f: *mut Value) -> *mut Value {
+    let source = intern_str(&format!("({} >>= {})", component_source(io), component_source(f)));
     let env = alloc(Value::Pair(io, f));
 
     extern "C-unwind" fn bind_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
@@ -8231,12 +8401,14 @@ pub extern "C-unwind" fn knot_io_bind(io: *mut Value, f: *mut Value) -> *mut Val
         knot_io_run(db, io2)
     }
 
-    alloc(Value::IO(bind_thunk as *const u8, env))
+    alloc_io(bind_thunk as *const u8, env, source)
 }
 
 /// Sequence two IO actions, discarding the first result: knot_io_then(io1, io2) -> IO
+/// Source: `<io1> >> <io2>`.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut Value {
+    let source = intern_str(&format!("({} >> {})", component_source(io1), component_source(io2)));
     let env = alloc(Value::Pair(io1, io2));
 
     extern "C-unwind" fn then_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
@@ -8245,12 +8417,14 @@ pub extern "C-unwind" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut 
         knot_io_run(db, io2)
     }
 
-    alloc(Value::IO(then_thunk as *const u8, env))
+    alloc_io(then_thunk as *const u8, env, source)
 }
 
-/// map(f, io) — apply f to the result of an IO action
+/// map(f, io) — apply f to the result of an IO action.
+/// Source: `base.map <f> <io>`.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Value {
+    let source = intern_str(&format!("(base.map {} {})", component_source(f), component_source(io)));
     let env = alloc(Value::Pair(io, f));
 
     extern "C-unwind" fn map_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
@@ -8259,10 +8433,9 @@ pub extern "C-unwind" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Valu
         knot_value_call(db, f, a)
     }
 
-    alloc(Value::IO(map_thunk as *const u8, env))
+    alloc_io(map_thunk as *const u8, env, source)
 }
 
-// ── Spawn / threading ────────────────────────────────────────────
 
 /// Deep-clone a Value tree so it can be sent to another thread.
 /// Uses Box::new (not the thread-local arena) so values survive arena resets.
@@ -8350,9 +8523,13 @@ fn deep_clone_with(val: *mut Value, mut alloc_node: impl FnMut(Value) -> *mut Va
                     source: f.source.clone(),
                 }))
             }
-            Value::IO(fn_ptr, env) => {
-                to_alloc.push(*env);
-                Value::IO(*fn_ptr, std::ptr::null_mut())
+            Value::IO(io) => {
+                to_alloc.push(io.env);
+                Value::IO(Box::new(IOInner {
+                    fn_ptr: io.fn_ptr,
+                    env: std::ptr::null_mut(),
+                    source: io.source.clone(),
+                }))
             }
             Value::Pair(a, b) => {
                 to_alloc.push(*a);
@@ -8390,8 +8567,8 @@ fn deep_clone_with(val: *mut Value, mut alloc_node: impl FnMut(Value) -> *mut Va
             (Value::Function(src_f), Value::Function(dst_f)) => {
                 dst_f.env = lookup_or_identity(&map, src_f.env);
             }
-            (Value::IO(_, src_env), Value::IO(_, dst_env)) => {
-                *dst_env = lookup_or_identity(&map, *src_env);
+            (Value::IO(src), Value::IO(dst)) => {
+                dst.env = lookup_or_identity(&map, src.env);
             }
             (Value::Pair(src_a, src_b), Value::Pair(dst_a, dst_b)) => {
                 *dst_a = lookup_or_identity(&map, *src_a);
@@ -8457,7 +8634,7 @@ unsafe fn deep_drop_value(val: *mut Value) {
                 }
                 Value::Constructor(_, inner) => stack.push(*inner),
                 Value::Function(f) => stack.push(f.env),
-                Value::IO(_, env) => stack.push(*env),
+                Value::IO(io) => stack.push(io.env),
                 Value::Pair(a, b) => {
                     stack.push(*a);
                     stack.push(*b);
@@ -8577,7 +8754,7 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
         alloc(Value::Unit)
     }
 
-    alloc(Value::IO(spawn_thunk as *const u8, env))
+    alloc_io(spawn_thunk as *const u8, env, intern_str(""))
 }
 
 /// Race two IO actions concurrently.  Returns an IO thunk that, when run,
@@ -8916,7 +9093,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
         alloc(Value::Constructor(intern_str(ctor_name), record))
     }
 
-    alloc(Value::IO(race_thunk as *const u8, env))
+    alloc_io(race_thunk as *const u8, env, intern_str(""))
 }
 
 /// Wait until all `fork`ed threads have completed.  Called from generated
@@ -9267,7 +9444,7 @@ pub extern "C-unwind" fn knot_println_io(v: *mut Value) -> *mut Value {
         let _ = db;
         knot_println(env)
     }
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io_leaf(thunk as *const u8, env, "println", true)
 }
 
 #[unsafe(no_mangle)]
@@ -9277,7 +9454,7 @@ pub extern "C-unwind" fn knot_print_io(v: *mut Value) -> *mut Value {
         let _ = db;
         knot_print(env)
     }
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io_leaf(thunk as *const u8, env, "print", true)
 }
 
 #[unsafe(no_mangle)]
@@ -9286,7 +9463,7 @@ pub extern "C-unwind" fn knot_log_info_io(v: *mut Value) -> *mut Value {
         let _ = db;
         knot_log_info(env)
     }
-    alloc(Value::IO(thunk as *const u8, v))
+    alloc_io_leaf(thunk as *const u8, v, "logInfo", true)
 }
 
 #[unsafe(no_mangle)]
@@ -9295,7 +9472,7 @@ pub extern "C-unwind" fn knot_log_warn_io(v: *mut Value) -> *mut Value {
         let _ = db;
         knot_log_warn(env)
     }
-    alloc(Value::IO(thunk as *const u8, v))
+    alloc_io_leaf(thunk as *const u8, v, "logWarn", true)
 }
 
 #[unsafe(no_mangle)]
@@ -9304,7 +9481,7 @@ pub extern "C-unwind" fn knot_log_error_io(v: *mut Value) -> *mut Value {
         let _ = db;
         knot_log_error(env)
     }
-    alloc(Value::IO(thunk as *const u8, v))
+    alloc_io_leaf(thunk as *const u8, v, "logError", true)
 }
 
 #[unsafe(no_mangle)]
@@ -9313,7 +9490,7 @@ pub extern "C-unwind" fn knot_log_debug_io(v: *mut Value) -> *mut Value {
         let _ = db;
         knot_log_debug(env)
     }
-    alloc(Value::IO(thunk as *const u8, v))
+    alloc_io_leaf(thunk as *const u8, v, "logDebug", true)
 }
 
 #[unsafe(no_mangle)]
@@ -9322,7 +9499,7 @@ pub extern "C-unwind" fn knot_read_line_io() -> *mut Value {
         let _ = db;
         knot_read_line()
     }
-    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
+    alloc_io(thunk as *const u8, std::ptr::null_mut(), intern_str(""))
 }
 
 #[unsafe(no_mangle)]
@@ -9332,7 +9509,7 @@ pub extern "C-unwind" fn knot_fs_read_file_io(path: *mut Value) -> *mut Value {
         let _ = db;
         knot_fs_read_file(env)
     }
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io_leaf(thunk as *const u8, env, "readFile", true)
 }
 
 #[unsafe(no_mangle)]
@@ -9347,7 +9524,7 @@ pub extern "C-unwind" fn knot_fs_write_file_io(path: *mut Value, contents: *mut 
         let c = knot_record_field(env, c"_c".as_ptr().cast(), 2);
         knot_fs_write_file(p, c)
     }
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io(thunk as *const u8, env, intern_str(""))
 }
 
 #[unsafe(no_mangle)]
@@ -9362,7 +9539,7 @@ pub extern "C-unwind" fn knot_fs_append_file_io(path: *mut Value, contents: *mut
         let c = knot_record_field(env, c"_c".as_ptr().cast(), 2);
         knot_fs_append_file(p, c)
     }
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io(thunk as *const u8, env, intern_str(""))
 }
 
 #[unsafe(no_mangle)]
@@ -9372,7 +9549,7 @@ pub extern "C-unwind" fn knot_fs_file_exists_io(path: *mut Value) -> *mut Value 
         let _ = db;
         knot_fs_file_exists(env)
     }
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io_leaf(thunk as *const u8, env, "fileExists", true)
 }
 
 #[unsafe(no_mangle)]
@@ -9382,7 +9559,7 @@ pub extern "C-unwind" fn knot_fs_remove_file_io(path: *mut Value) -> *mut Value 
         let _ = db;
         knot_fs_remove_file(env)
     }
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io_leaf(thunk as *const u8, env, "removeFile", true)
 }
 
 #[unsafe(no_mangle)]
@@ -9392,7 +9569,7 @@ pub extern "C-unwind" fn knot_fs_list_dir_io(path: *mut Value) -> *mut Value {
         let _ = db;
         knot_fs_list_dir(env)
     }
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io_leaf(thunk as *const u8, env, "listDir", true)
 }
 
 #[unsafe(no_mangle)]
@@ -9401,7 +9578,7 @@ pub extern "C-unwind" fn knot_now_io() -> *mut Value {
         let _ = db;
         knot_now()
     }
-    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
+    alloc_io(thunk as *const u8, std::ptr::null_mut(), intern_str(""))
 }
 
 #[unsafe(no_mangle)]
@@ -9411,7 +9588,7 @@ pub extern "C-unwind" fn knot_sleep_io(ms_val: *mut Value) -> *mut Value {
         let _ = db;
         knot_sleep(env)
     }
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io_leaf(thunk as *const u8, env, "sleep", true)
 }
 
 #[unsafe(no_mangle)]
@@ -9421,7 +9598,7 @@ pub extern "C-unwind" fn knot_random_int_io(bound: *mut Value) -> *mut Value {
         let _ = db;
         knot_random_int(env)
     }
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io_leaf(thunk as *const u8, env, "randomInt", true)
 }
 
 /// `base.todo` — an unimplemented hole. The compiler bakes the full pretty
@@ -9456,7 +9633,7 @@ pub extern "C-unwind" fn knot_todo_io(ctx_ptr: *const u8, ctx_len: usize) -> *mu
         std::process::exit(1);
     }
     let env = alloc(Value::Text(Arc::from(ctx.as_str())));
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io(thunk as *const u8, env, intern_str(""))
 }
 
 /// Read a C-style `(ptr, len)` string slice baked into the binary.
@@ -9543,7 +9720,7 @@ pub extern "C-unwind" fn knot_todo_vals_io(
         std::process::exit(1);
     }
     let env = alloc(Value::Text(Arc::from(report.as_str())));
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io(thunk as *const u8, env, intern_str(""))
 }
 
 /// Value-position `base.trace`. Mirrors `knot_todo_vals` in capture (baked
@@ -9595,7 +9772,7 @@ pub extern "C-unwind" fn knot_random_float_io() -> *mut Value {
         let _ = db;
         knot_random_float()
     }
-    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
+    alloc_io(thunk as *const u8, std::ptr::null_mut(), intern_str(""))
 }
 
 #[unsafe(no_mangle)]
@@ -9604,7 +9781,7 @@ pub extern "C-unwind" fn knot_random_uuid_io() -> *mut Value {
         let _ = db;
         knot_random_uuid()
     }
-    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
+    alloc_io(thunk as *const u8, std::ptr::null_mut(), intern_str(""))
 }
 
 // ── Standard library: relation operations ─────────────────────────
@@ -10049,7 +10226,7 @@ pub extern "C-unwind" fn knot_relation_for_each(
         alloc(Value::Unit)
     }
 
-    alloc(Value::IO(for_each_thunk as *const u8, env))
+    alloc_io(for_each_thunk as *const u8, env, intern_str(""))
 }
 
 /// head(rel) — first element of a relation as `Just {value: x}`, or
@@ -10114,7 +10291,7 @@ fn traverse_sequence_io(db: *mut c_void, ios: Vec<*mut Value>) -> *mut Value {
         alloc(Value::Relation(results))
     }
 
-    alloc(Value::IO(run_sequence as *const u8, actions_rel))
+    alloc_io(run_sequence as *const u8, actions_rel, intern_str(""))
 }
 
 /// Sequence [Maybe a] into Maybe [a] — Nothing if any element is Nothing.
@@ -18099,7 +18276,7 @@ fn write_value_json(v: *mut Value, wire: bool, out: &mut String) {
                     Value::Function(f) => {
                         push_json_string(out, &format!("<function: {}>", &*f.source))
                     }
-                    Value::IO(_, _) => out.push_str("\"<<IO>>\""),
+                    Value::IO(_) => out.push_str("\"<<IO>>\""),
                     Value::Pair(_, _) => out.push_str("\"<<Pair>>\""),
                 }
             }
@@ -18360,7 +18537,7 @@ pub extern "C-unwind" fn knot_http_listen_io(
         knot_http_listen(db, port_val, route_table, handler)
     }
 
-    alloc(Value::IO(listen_thunk as *const u8, env))
+    alloc_io(listen_thunk as *const u8, env, intern_str(""))
 }
 
 /// IO-thunk builder for `listenOn` — see `knot_http_listen_io`.
@@ -18389,7 +18566,7 @@ pub extern "C-unwind" fn knot_http_listen_on_io(
         knot_http_listen_on(db, host_val, port_val, route_table, handler)
     }
 
-    alloc(Value::IO(listen_on_thunk as *const u8, env))
+    alloc_io(listen_on_thunk as *const u8, env, intern_str(""))
 }
 
 /// Like `knot_http_listen`, but binds to the supplied host. If `host` looks
@@ -19767,7 +19944,7 @@ pub extern "C-unwind" fn knot_http_fetch_io(
         }
     }
 
-    alloc(Value::IO(fetch_thunk as *const u8, env))
+    alloc_io(fetch_thunk as *const u8, env, intern_str(""))
 }
 
 /// Percent-encode a string for use in URL path segments or query values.
@@ -20754,7 +20931,7 @@ pub extern "C-unwind" fn knot_crypto_generate_key_pair_io() -> *mut Value {
     extern "C-unwind" fn thunk(_db: *mut c_void, _env: *mut Value) -> *mut Value {
         knot_crypto_generate_key_pair()
     }
-    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
+    alloc_io(thunk as *const u8, std::ptr::null_mut(), intern_str(""))
 }
 
 #[unsafe(no_mangle)]
@@ -20762,7 +20939,7 @@ pub extern "C-unwind" fn knot_crypto_generate_signing_key_pair_io() -> *mut Valu
     extern "C-unwind" fn thunk(_db: *mut c_void, _env: *mut Value) -> *mut Value {
         knot_crypto_generate_signing_key_pair()
     }
-    alloc(Value::IO(thunk as *const u8, std::ptr::null_mut()))
+    alloc_io(thunk as *const u8, std::ptr::null_mut(), intern_str(""))
 }
 
 #[unsafe(no_mangle)]
@@ -20779,7 +20956,7 @@ pub extern "C-unwind" fn knot_crypto_encrypt_io(public_key: *mut Value, plaintex
         let plaintext = knot_record_field(env, b.as_ptr(), b.len());
         knot_crypto_encrypt(public_key, plaintext)
     }
-    alloc(Value::IO(thunk as *const u8, env))
+    alloc_io(thunk as *const u8, env, intern_str(""))
 }
 
 

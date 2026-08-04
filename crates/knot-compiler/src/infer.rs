@@ -9545,6 +9545,14 @@ impl Infer {
             Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text))),
         );
 
+        // extract : ∀a. a -> Text — render any value as evaluable Knot source,
+        // collecting closure/IO dependencies into a `with` block.
+        let a = self.fresh_var();
+        self.bind_top(
+            "extract",
+            Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text))),
+        );
+
         // union : ∀a. [a] -> [a] -> [a]
         let a = self.fresh_var();
         self.bind_top(

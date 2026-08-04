@@ -1246,6 +1246,7 @@ impl Codegen {
         self.declare_rt("knot_print", &[p], &[p]);
         self.declare_rt("knot_println", &[p], &[p]);
         self.declare_rt("knot_value_show", &[p], &[p]);
+        self.declare_rt("knot_value_extract", &[p], &[p]);
         self.declare_rt("knot_value_show_unit", &[p, p, p], &[p]);
         self.declare_rt("knot_guard_failed", &[], &[]);
 
@@ -1480,8 +1481,8 @@ impl Codegen {
         self.declare_rt("knot_relation_fixpoint", &[p, p, p], &[p]);
 
         // IO monad
-        self.declare_rt("knot_io_wrap", &[p, p], &[p]);
-        self.declare_rt("knot_io_new", &[p, p], &[p]);
+        self.declare_rt("knot_io_wrap", &[p, p, p, p], &[p]);
+        self.declare_rt("knot_io_new", &[p, p, p, p], &[p]);
         self.declare_rt("knot_io_pure", &[p], &[p]);
         self.declare_rt("knot_io_run", &[p, p], &[p]);
         self.declare_rt("knot_io_bind", &[p, p], &[p]);
@@ -2067,6 +2068,9 @@ impl Codegen {
             "println", "print", "putLine",
             "logInfo", "logWarn", "logError", "logDebug",
             "show",
+            // `extract` renders a value as evaluable Knot source (runtime
+            // `knot_value_extract`); first-class so `base.extract` works.
+            "extract",
             // List ADT builtins (`base.list.*`), exposed nested under the
             // `list` namespace in the prelude record. Runtime-implemented
             // (knot_list_*) since the prelude record can't self-reference.
@@ -2937,6 +2941,10 @@ impl Codegen {
         // special case, which `base.show` (a first-class value) does not hit.
         self.define_stdlib_fn_1("show", "knot_value_show");
 
+        // Extract: 1-param. Renders any value as evaluable Knot source
+        // (collecting closure/IO dependencies into a `with` block).
+        self.define_stdlib_fn_1("extract", "knot_value_extract");
+
         // Sleep: 1-param (IO-returning)
         self.define_stdlib_fn_1("sleep", "knot_sleep_io");
 
@@ -3321,12 +3329,10 @@ impl Codegen {
             let closure_env = builder.block_params(entry)[1];
             let arg = builder.block_params(entry)[2];
 
-            // Unpack free variables from closure env
-            if free_vars.len() == 1 {
-                // Single capture: env IS the value directly (no record)
-                env.set(&free_vars[0], closure_env);
-            } else {
-                // Multi-capture: env is a record, extract by index (sorted order)
+            // Unpack free variables from closure env. The env is always a
+            // named record (single capture is a 1-field record) so `extract`
+            // can recover each capture's name; extract by index (sorted).
+            if !free_vars.is_empty() {
                 let mut sorted_vars: Vec<&str> = free_vars.iter().map(|s| s.as_str()).collect();
                 sorted_vars.sort();
                 for (i, var_name) in sorted_vars.iter().enumerate() {
@@ -3393,10 +3399,9 @@ impl Codegen {
             let db = builder.block_params(entry)[0];
             let closure_env = builder.block_params(entry)[1];
 
-            // Unpack free variables from closure env (same pattern as lambdas)
-            if free_vars.len() == 1 {
-                env.set(&free_vars[0], closure_env);
-            } else if free_vars.len() > 1 {
+            // Unpack free variables from closure env (env is always a named
+            // record; single capture is index 0) — same pattern as lambdas.
+            if !free_vars.is_empty() {
                 let mut sorted_vars: Vec<&str> = free_vars.iter().map(|s| s.as_str()).collect();
                 sorted_vars.sort();
                 for (i, var_name) in sorted_vars.iter().enumerate() {
@@ -10078,16 +10083,9 @@ impl Codegen {
 
         let env_val = if free_vars.is_empty() {
             builder.ins().iconst(self.ptr_type, 0) // null env
-        } else if free_vars.len() == 1 {
-            match env.get(&free_vars[0]) {
-                Some(v) => v,
-                None => {
-                    let msg =
-                        format!("codegen: undefined captured variable '{}'", free_vars[0]);
-                    self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
-                }
-            }
         } else {
+            // Always a named record of captures (single capture = 1-field
+            // record) so `extract` recovers each name; single is index 0.
             let n = free_vars.len();
             let mut sorted_vars: Vec<&str> = free_vars.iter().map(|s| s.as_str()).collect();
             sorted_vars.sort();
@@ -10117,8 +10115,14 @@ impl Codegen {
             self.call_rt(builder, "knot_record_from_pairs", &[data_ptr, count])
         };
 
-        // Create IO value: IO(fn_ptr, env)
-        self.call_rt(builder, "knot_io_new", &[fn_addr, env_val])
+        // Create IO value: IO(fn_ptr, env, source). The source is the
+        // pretty-printed do-block, so `extract` of this thunk reproduces it.
+        let src = format!(
+            "(do {})",
+            stmts.iter().map(pretty_stmt).collect::<Vec<_>>().join(" ")
+        );
+        let (src_ptr, src_len) = self.string_ptr(builder, &src);
+        self.call_rt(builder, "knot_io_new", &[fn_addr, env_val, src_ptr, src_len])
     }
 
     /// Compile an expression in *argument* position, where the value is handed
@@ -11991,17 +11995,10 @@ impl Codegen {
 
         let env_val = if free_vars.is_empty() {
             builder.ins().iconst(self.ptr_type, 0) // null env
-        } else if free_vars.len() == 1 {
-            // Single capture: pass value directly as env (no record allocation)
-            match env.get(&free_vars[0]) {
-                Some(v) => v,
-                None => {
-                    let msg =
-                        format!("codegen: undefined captured variable '{}'", free_vars[0]);
-                    self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
-                }
-            }
         } else {
+            // Always build a named record of captures (even a single one) so
+            // `extract` can recover each captured variable's name and bind it
+            // in a `with` block. Single-capture is index 0.
             let n = free_vars.len();
             // Sort free vars so index-based extraction matches
             let mut sorted_vars: Vec<&str> = free_vars.iter().map(|s| s.as_str()).collect();

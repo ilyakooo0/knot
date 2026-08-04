@@ -8341,6 +8341,36 @@ impl Codegen {
                 }
             }
 
+            // `Type.Ctor payload` for a BUILT-IN data type (`Maybe.Just`,
+            // `Result.Ok`, `Ordering.Lt`, …): the type namespace is erased, so
+            // the leaf resolves to a bare constructor. Emit the *qualified* tag
+            // (`Maybe.Just`) so `extract` reproduces it; the runtime matches and
+            // stores the leaf (`Just`).
+            ast::ExprKind::FieldAccess { expr, field }
+                if let ast::ExprKind::Constructor(type_name) = &expr.node
+                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Bool" | "Ordering" | "List")
+                    && self
+                        .data_constructors
+                        .get(type_name)
+                        .is_some_and(|ctors| ctors.iter().any(|c| c == field)) =>
+            {
+                let ast::ExprKind::Constructor(type_name) = &expr.node else {
+                    unreachable!()
+                };
+                let qualified = format!("{}.{}", type_name, field);
+                let (tag_ptr, tag_len) = self.string_ptr(builder, &qualified);
+                let payload = if compiled_args.len() == 1 {
+                    compiled_args[0]
+                } else {
+                    self.call_rt(builder, "knot_value_unit", &[])
+                };
+                self.call_rt(
+                    builder,
+                    "knot_value_constructor",
+                    &[tag_ptr, tag_len, payload],
+                )
+            }
+
             // Constructor application: `Circle {radius: 3.14}`
             ast::ExprKind::Constructor(name) if name == "True" || name == "False" => {
                 let val = if name == "True" { 1i64 } else { 0i64 };

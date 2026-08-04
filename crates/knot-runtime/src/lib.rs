@@ -1573,7 +1573,7 @@ impl SqlVal {
             Value::Text(s) => SqlVal::Text((**s).to_string()),
             Value::Bool(b) => SqlVal::Int(*b as i64),
             Value::Bytes(b) => SqlVal::Blob((**b).to_vec()),
-            Value::Constructor(tag, _) => SqlVal::Text(tag.to_string()),
+            Value::Constructor(tag, _) => SqlVal::Text(ctor_leaf(tag).to_string()),
             Value::Unit => SqlVal::Null,
             _ => SqlVal::Null,
         }
@@ -5662,8 +5662,8 @@ fn temp_row_to_params(v: *mut Value, schema: &TempSchema) -> Vec<rusqlite::types
         TempSchema::Adt { all_fields, constructors } => {
             match unsafe { as_ref(v) } {
                 Value::Constructor(tag, payload) => {
-                    let mut params = vec![rusqlite::types::Value::Text(tag.to_string())];
-                    let ctor = constructors.iter().find(|(t, _)| t.as_str() == &**tag);
+                    let mut params = vec![rusqlite::types::Value::Text(ctor_leaf(tag).to_string())];
+                    let ctor = constructors.iter().find(|(t, _)| t.as_str() == ctor_leaf(tag));
                     for (fname, fty) in all_fields {
                         let has_field = ctor.is_some_and(|(_, fields)| {
                             fields.iter().any(|(n, _)| n == fname)
@@ -6855,8 +6855,8 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                     }
                     Value::Constructor(tag, payload) => {
                         buf.push(7);
-                        buf.extend_from_slice(&(tag.len() as u64).to_le_bytes());
-                        buf.extend_from_slice(tag.as_bytes());
+                        buf.extend_from_slice(&(ctor_leaf(tag).len() as u64).to_le_bytes());
+                        buf.extend_from_slice(ctor_leaf(tag).as_bytes());
                         // Nullary constructors have three runtime forms:
                         // `Constructor(tag, Unit)`, `Constructor(tag, Record([]))`,
                         // and `Constructor(tag, null)`. Canonicalize all to the
@@ -7061,7 +7061,7 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
                 }
             }
             (Value::Constructor(ta, pa), Value::Constructor(tb, pb)) => {
-                if ta != tb {
+                if ctor_leaf(ta) != ctor_leaf(tb) {
                     return false;
                 }
                 // Nullary constructors have two runtime representations:
@@ -7614,6 +7614,8 @@ pub extern "C-unwind" fn knot_register_ctor_order(
 /// constructor, or a value built before init) fall back to comparing the tag
 /// names, which at least keeps the ordering total and deterministic.
 fn compare_ctor_tags(a: &str, b: &str) -> std::cmp::Ordering {
+    let a = ctor_leaf(a);
+    let b = ctor_leaf(b);
     if a == b {
         return std::cmp::Ordering::Equal;
     }
@@ -7945,7 +7947,7 @@ fn format_value_iter(v: *mut Value, escape_text: bool) -> String {
                     }
                     Value::Constructor(tag, payload) => {
                         if is_nullary_payload(*payload) {
-                            out.push_str(tag);
+                            out.push_str(ctor_leaf(tag));
                             out.push_str(" {}");
                         } else {
                             // Field context for payload: the recursive
@@ -7953,7 +7955,7 @@ fn format_value_iter(v: *mut Value, escape_text: bool) -> String {
                             // payloads in both format_value and
                             // format_value_field, so always escape.
                             stack.push(FmtTask::Render(*payload, true));
-                            stack.push(FmtTask::Lit(format!("{} ", tag)));
+                            stack.push(FmtTask::Lit(format!("{} ", ctor_leaf(tag))));
                         }
                     }
                     Value::Function(f) => out.push_str(&f.source),
@@ -8234,11 +8236,11 @@ pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
                         // structural so the payload string isn't materialized
                         // first and the spine's tail never recurses.
                         if is_nullary_payload(*payload) {
-                            out.push_str(tag);
+                            out.push_str(ctor_leaf(tag));
                             out.push_str(" {}");
                         } else {
                             stack.push(Task::Render(*payload));
-                            stack.push(Task::Lit(format!("{} ", tag)));
+                            stack.push(Task::Lit(format!("{} ", ctor_leaf(tag))));
                         }
                     }
                     Value::Function(f) => out.push_str(&f.source),
@@ -10299,10 +10301,10 @@ fn traverse_sequence_maybe(maybes: Vec<*mut Value>) -> *mut Value {
     let mut values = Vec::with_capacity(maybes.len());
     for &m in &maybes {
         match unsafe { as_ref(m) } {
-            Value::Constructor(tag, _) if &**tag == "Nothing" => {
+            Value::Constructor(tag, _) if ctor_leaf(tag) == "Nothing" => {
                 return alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit)));
             }
-            Value::Constructor(tag, inner) if &**tag == "Just" => {
+            Value::Constructor(tag, inner) if ctor_leaf(tag) == "Just" => {
                 values.push(extract_value_field(*inner));
             }
             _ => panic!("knot runtime: traverse expected Maybe, got {}", type_name(m)),
@@ -10316,8 +10318,8 @@ fn traverse_sequence_result(results: Vec<*mut Value>) -> *mut Value {
     let mut values = Vec::with_capacity(results.len());
     for &r in &results {
         match unsafe { as_ref(r) } {
-            Value::Constructor(tag, _) if &**tag == "Err" => return r,
-            Value::Constructor(tag, inner) if &**tag == "Ok" => {
+            Value::Constructor(tag, _) if ctor_leaf(tag) == "Err" => return r,
+            Value::Constructor(tag, inner) if ctor_leaf(tag) == "Ok" => {
                 values.push(extract_value_field(*inner));
             }
             _ => panic!("knot runtime: traverse expected Result, got {}", type_name(r)),
@@ -10475,8 +10477,8 @@ fn list_nil() -> *mut Value {
 /// Destructure a `List` value into `Some((head, tail))` for `Cons`, `None` for `Nil`.
 fn list_uncons(v: *mut Value) -> Option<(*mut Value, *mut Value)> {
     match unsafe { as_ref(v) } {
-        Value::Constructor(tag, payload) if &**tag == "Nil" => None,
-        Value::Constructor(tag, payload) if &**tag == "Cons" => {
+        Value::Constructor(tag, payload) if ctor_leaf(tag) == "Nil" => None,
+        Value::Constructor(tag, payload) if ctor_leaf(tag) == "Cons" => {
             let head = knot_record_field(*payload, b"head".as_ptr(), 4);
             let tail = knot_record_field(*payload, b"tail".as_ptr(), 4);
             Some((head, tail))
@@ -14410,10 +14412,10 @@ fn adt_row_to_params(
         Value::Constructor(tag, payload) => {
             let mut params = Vec::with_capacity(1 + adt.all_fields.len());
             // First column: _tag
-            params.push(rusqlite::types::Value::Text(tag.to_string()));
+            params.push(rusqlite::types::Value::Text(ctor_leaf(tag).to_string()));
 
             // Find which fields belong to this constructor
-            let ctor = adt.constructors.iter().find(|c| c.name.as_str() == &**tag)
+            let ctor = adt.constructors.iter().find(|c| c.name.as_str() == ctor_leaf(tag))
                 .unwrap_or_else(|| panic!(
                     "knot runtime: unknown constructor tag '{}' in ADT source write (known: {})",
                     tag, adt.constructors.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ")
@@ -15988,7 +15990,7 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
         Value::Text(s) => rusqlite::types::Value::Text((**s).to_string()),
         Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
         Value::Bytes(b) => rusqlite::types::Value::Blob((**b).to_vec()),
-        Value::Constructor(tag, _) => rusqlite::types::Value::Text(tag.to_string()),
+        Value::Constructor(tag, _) => rusqlite::types::Value::Text(ctor_leaf(tag).to_string()),
         Value::Relation(_) | Value::Record(_) => {
             rusqlite::types::Value::Text(value_to_json_db(v))
         }
@@ -16010,12 +16012,12 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),
         (Value::Bytes(b), _) => rusqlite::types::Value::Blob((**b).to_vec()),
         (Value::Constructor(tag, _), ColType::Tag) => {
-            rusqlite::types::Value::Text(tag.to_string())
+            rusqlite::types::Value::Text(ctor_leaf(tag).to_string())
         }
         (Value::Constructor(_, _), ColType::Json) => {
             rusqlite::types::Value::Text(value_to_json_db(v))
         }
-        (Value::Constructor(tag, _), _) => rusqlite::types::Value::Text(tag.to_string()),
+        (Value::Constructor(tag, _), _) => rusqlite::types::Value::Text(ctor_leaf(tag).to_string()),
         (Value::Relation(rows), ColType::Json) => {
             // Nested relations stored as JSON columns keep set semantics:
             // dedup rows before serializing, mirroring the INSERT OR IGNORE
@@ -16170,11 +16172,11 @@ pub extern "C-unwind" fn knot_maybe_bind(
     maybe: *mut Value,
 ) -> *mut Value {
     match unsafe { as_ref(maybe) } {
-        Value::Constructor(tag, payload) if &**tag == "Just" => {
+        Value::Constructor(tag, payload) if ctor_leaf(tag) == "Just" => {
             let v = knot_record_field(*payload, "value".as_ptr(), "value".len());
             knot_value_call(db, func, v)
         }
-        Value::Constructor(tag, _) if &**tag == "Nothing" => maybe,
+        Value::Constructor(tag, _) if ctor_leaf(tag) == "Nothing" => maybe,
         _ => maybe,
     }
 }
@@ -16197,11 +16199,11 @@ pub extern "C-unwind" fn knot_maybe_map(
     maybe: *mut Value,
 ) -> *mut Value {
     match unsafe { as_ref(maybe) } {
-        Value::Constructor(tag, payload) if &**tag == "Just" => {
+        Value::Constructor(tag, payload) if ctor_leaf(tag) == "Just" => {
             let v = knot_record_field(*payload, "value".as_ptr(), "value".len());
             knot_maybe_yield(knot_value_call(db, func, v))
         }
-        Value::Constructor(tag, _) if &**tag == "Nothing" => maybe,
+        Value::Constructor(tag, _) if ctor_leaf(tag) == "Nothing" => maybe,
         _ => maybe,
     }
 }
@@ -16223,12 +16225,12 @@ pub extern "C-unwind" fn knot_result_bind(
     result: *mut Value,
 ) -> *mut Value {
     match unsafe { as_ref(result) } {
-        Value::Constructor(tag, payload) if &**tag == "Ok" => {
+        Value::Constructor(tag, payload) if ctor_leaf(tag) == "Ok" => {
             // Extract value from Ok {value: v}
             let v = knot_record_field(*payload, "value".as_ptr(), "value".len());
             knot_value_call(db, func, v)
         }
-        Value::Constructor(tag, _) if &**tag == "Err" => {
+        Value::Constructor(tag, _) if ctor_leaf(tag) == "Err" => {
             // Propagate error
             result
         }
@@ -16434,11 +16436,11 @@ fn refinement_holds_at(
             _ => true,
         },
         RefStep::Unwrap => match unsafe { as_ref(value) } {
-            Value::Constructor(tag, payload) if &**tag == "Just" => {
+            Value::Constructor(tag, payload) if ctor_leaf(tag) == "Just" => {
                 let inner = knot_record_field(*payload, b"value".as_ptr(), 5);
                 refinement_holds_at(db, inner, rest, predicate)
             }
-            Value::Constructor(tag, _) if &**tag == "Nothing" => true,
+            Value::Constructor(tag, _) if ctor_leaf(tag) == "Nothing" => true,
             // Not a `Maybe` after all — the decoder handed back a bare value.
             // Check it rather than silently skipping it.
             _ => refinement_holds_at(db, value, rest, predicate),
@@ -16717,7 +16719,7 @@ fn rate_limit_key_for_request(
     let after_input = knot_value_call(db, cfg.key_fn, input);
     let result = knot_value_call(db, after_input, ctx);
     match unsafe { as_ref(result) } {
-        Value::Constructor(tag, payload) if &**tag == "Just" => {
+        Value::Constructor(tag, payload) if ctor_leaf(tag) == "Just" => {
             let value_field = match unsafe { as_ref(*payload) } {
                 Value::Record(fields) => fields
                     .iter()
@@ -17477,6 +17479,14 @@ pub extern "C-unwind" fn knot_value_pipe(
 // ── Constructor matching ──────────────────────────────────────────
 
 /// Check if a value is a constructor with the given tag.
+/// The leaf segment of a constructor tag: the part after the last `.`.
+/// Codegen stores the *qualified* tag (`Maybe.Just`) so `extract` reproduces
+/// it, but pattern-matching and storage compare the bare leaf (`Just`).
+/// For an already-bare tag this is the identity.
+fn ctor_leaf(tag: &str) -> &str {
+    tag.rsplit('.').next().unwrap_or(tag)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_constructor_matches(
     v: *mut Value,
@@ -17488,7 +17498,9 @@ pub extern "C-unwind" fn knot_constructor_matches(
     }
     let tag = unsafe { str_from_raw(tag_ptr, tag_len) };
     match unsafe { as_ref(v) } {
-        Value::Constructor(t, _) => (&**t == tag) as i32,
+        // Compare leaf-to-leaf: the stored tag may be qualified (`Maybe.Just`)
+        // while the query is the bare leaf (`Just`), or vice versa.
+        Value::Constructor(t, _) => (ctor_leaf(t) == ctor_leaf(tag)) as i32,
         // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
         Value::Text(s) => (&**s == tag) as i32,
         _ => 0,
@@ -17496,22 +17508,25 @@ pub extern "C-unwind" fn knot_constructor_matches(
 }
 
 /// Return a pointer to the constructor tag string data.
-/// Used to extract the tag once and compare multiple times.
+/// Used to extract the tag once and compare multiple times. Returns the *leaf*
+/// (segment after the last `.`) so the fast `knot_str_eq` pattern-match path
+/// compares the same leaf that `knot_constructor_matches` would.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_constructor_tag_ptr(v: *mut Value) -> *const u8 {
     match unsafe { as_ref(v) } {
-        Value::Constructor(t, _) => t.as_ptr(),
+        Value::Constructor(t, _) => ctor_leaf(t).as_ptr(),
         // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
         Value::Text(s) => s.as_ptr(),
         _ => panic!("knot runtime: expected Constructor in tag_ptr, got {} = {}", type_name(v), brief_value(v)),
     }
 }
 
-/// Return the length of the constructor tag string.
+/// Return the length of the constructor tag string (the leaf, matching
+/// `knot_constructor_tag_ptr`).
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_constructor_tag_len(v: *mut Value) -> usize {
     match unsafe { as_ref(v) } {
-        Value::Constructor(t, _) => t.len(),
+        Value::Constructor(t, _) => ctor_leaf(t).len(),
         // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
         Value::Text(s) => s.len(),
         _ => panic!("knot runtime: expected Constructor in tag_len, got {}", type_name(v)),
@@ -18128,7 +18143,7 @@ fn push_json_float(out: &mut String, n: f64) {
 /// "Nothing"). A user constructor named `Nothing` carrying fields is not
 /// treated as the Maybe constructor.
 fn is_nothing_ctor(tag: &str, payload: *mut Value) -> bool {
-    tag == "Nothing"
+    ctor_leaf(tag) == "Nothing"
         && (payload.is_null()
             || matches!(unsafe { as_ref(payload) }, Value::Unit)
             || matches!(unsafe { as_ref(payload) }, Value::Record(fs) if fs.is_empty()))
@@ -18137,7 +18152,7 @@ fn is_nothing_ctor(tag: &str, payload: *mut Value) -> bool {
 /// For a `Just`-tagged constructor, return its `value` payload field (the
 /// built-in Maybe shape is `Just {value: x}`). None for other shapes.
 fn just_ctor_value(tag: &str, payload: *mut Value) -> Option<*mut Value> {
-    if tag != "Just" || payload.is_null() {
+    if ctor_leaf(tag) != "Just" || payload.is_null() {
         return None;
     }
     match unsafe { as_ref(payload) } {
@@ -18268,7 +18283,7 @@ fn write_value_json(v: *mut Value, wire: bool, out: &mut String) {
                         // without colliding with user records that happen to use
                         // `tag`/`value` keys.
                         out.push_str("{\"__knot_ctor\":{\"tag\":");
-                        push_json_string(out, tag);
+                        push_json_string(out, ctor_leaf(tag));
                         out.push_str(",\"value\":");
                         work.push(Job::Lit("}}"));
                         work.push(Job::Emit(*payload));
@@ -18334,7 +18349,7 @@ fn value_to_json_with(db: *mut c_void, v: *mut Value, to_json_fn: *const u8) -> 
             // Match value_to_serde_json's `__knot_ctor` wrapper so reconstruction
             // round-trips and user records with `tag`/`value` keys aren't shadowed.
             let mut json = String::from("{\"__knot_ctor\":{\"tag\":");
-            json.push_str(&serde_json::to_string(&**tag).unwrap());
+            json.push_str(&serde_json::to_string(ctor_leaf(tag)).unwrap());
             json.push_str(",\"value\":");
             json.push_str(&call_to_json_dispatcher(db, *payload, to_json_fn));
             json.push_str("}}");
@@ -19095,11 +19110,11 @@ fn http_serve_loop(
                     // `value`; Err carries `{status, message}` in `error`.
                     let (status_code, body_val_opt, err_message): (u16, Option<*mut Value>, Option<String>) =
                         match unsafe { as_ref(result) } {
-                            Value::Constructor(tag, _) if &**tag == "Ok" => {
+                            Value::Constructor(tag, _) if ctor_leaf(tag) == "Ok" => {
                                 let value = knot_record_field(result, b"value".as_ptr(), 5);
                                 (200, Some(value), None)
                             }
-                            Value::Constructor(tag, _) if &**tag == "Err" => {
+                            Value::Constructor(tag, _) if ctor_leaf(tag) == "Err" => {
                                 let err = knot_record_field(result, b"error".as_ptr(), 5);
                                 let status_v = knot_record_field(err, b"status".as_ptr(), 6);
                                 let message_v = knot_record_field(err, b"message".as_ptr(), 7);
@@ -19965,10 +19980,10 @@ fn unwrap_maybe(v: *mut Value) -> Option<*mut Value> {
         return None;
     }
     match unsafe { as_ref(v) } {
-        Value::Constructor(tag, inner) if &**tag == "Just" => {
+        Value::Constructor(tag, inner) if ctor_leaf(tag) == "Just" => {
             Some(knot_record_field(*inner, "value".as_ptr(), 5))
         }
-        Value::Constructor(tag, _) if &**tag == "Nothing" => None,
+        Value::Constructor(tag, _) if ctor_leaf(tag) == "Nothing" => None,
         _ => Some(v),
     }
 }
@@ -20113,10 +20128,10 @@ fn fetch_value_to_text_opt(v: *mut Value) -> Option<String> {
         Value::Text(s) => Some((**s).to_string()),
         Value::Bool(b) => Some(b.to_string()),
         Value::Constructor(tag, payload) => {
-            if &**tag == "Nothing" {
+            if ctor_leaf(tag) == "Nothing" {
                 return None;
             }
-            if &**tag == "Just" {
+            if ctor_leaf(tag) == "Just" {
                 return fetch_value_to_text_opt(knot_record_field(
                     *payload,
                     "value".as_ptr(),

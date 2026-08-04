@@ -7644,6 +7644,70 @@ fn register_ctor_order(type_name: &str, ctors: &[&str]) {
     }
 }
 
+/// Source text of each user-declared `data` type, keyed by type name. `extract`
+/// replays it so an extracted ADT value is self-contained (the only global it
+/// references is `base`): `extract(Status.InProgress {…})` renders
+/// `with {data Status = Open {} | InProgress {assignee: Text}} (Status.InProgress {…})`.
+/// Builtins (`Maybe`/`Result`/…) are never registered — they live in the
+/// prelude that ships with `base`, so their values need no inline declaration.
+static DATA_DECLS: std::sync::LazyLock<RwLock<HashMap<Arc<str>, Arc<str>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Register one user `data` declaration's source text for `extract`. Called
+/// once per `data` decl at program init from generated code.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_register_data_decl(
+    type_ptr: *const u8,
+    type_len: usize,
+    decl_ptr: *const u8,
+    decl_len: usize,
+) {
+    let type_name = unsafe { str_from_raw(type_ptr, type_len) };
+    let decl = unsafe { str_from_raw(decl_ptr, decl_len) };
+    if type_name.is_empty() || decl.is_empty() {
+        return;
+    }
+    DATA_DECLS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(intern_str(type_name), intern_str(decl));
+}
+
+/// If `tag` names a constructor of a *user-declared* `data` type (one present
+/// in `DATA_DECLS`), rewrite the bare tag in `applied` to the qualified
+/// `Type.Ctor` and wrap the whole expression in `with {data …}` so the
+/// extracted text is self-contained (its only global is `base`). Builtins and
+/// unknown tags pass through unchanged.
+fn wrap_user_ctor_decl(tag: &str, applied: &str) -> String {
+    let leaf = ctor_leaf(tag);
+    // Resolve the type(s) that declare this ctor; prefer one whose decl we
+    // recorded (a user type — builtins are never registered).
+    let type_name: Option<Arc<str>> = {
+        let order = CTOR_ORDER.read().unwrap_or_else(|e| e.into_inner());
+        let decls = DATA_DECLS.read().unwrap_or_else(|e| e.into_inner());
+        order
+            .get(leaf)
+            .and_then(|entries| entries.iter().map(|(t, _)| t.clone()).find(|t| decls.contains_key(t)))
+    };
+    let Some(ty) = type_name else {
+        return applied.to_string();
+    };
+    let decl = {
+        let decls = DATA_DECLS.read().unwrap_or_else(|e| e.into_inner());
+        match decls.get(&ty) {
+            Some(d) => d.to_string(),
+            None => return applied.to_string(),
+        }
+    };
+    // Rewrite the leading bare tag to `Type.Ctor`. The applied form starts with
+    // the tag (possibly already qualified); normalize to the leaf then qualify.
+    let rest = applied
+        .strip_prefix(tag)
+        .or_else(|| applied.strip_prefix(leaf))
+        .unwrap_or("");
+    format!("with {{{}}} ({}.{}{})", decl, ty, leaf, rest)
+}
+
 /// Register a `data` declaration's constructor order. `ctors` is the
 /// comma-separated constructor list in declaration order, e.g.
 /// `"Low,Medium,High,Critical"`.
@@ -8184,11 +8248,12 @@ fn extract_source(v: *mut Value) -> String {
             format!("[{}]", inner.join(" "))
         }
         Value::Constructor(tag, payload) => {
-            if is_nullary_payload(*payload) {
+            let applied = if is_nullary_payload(*payload) {
                 format!("{} {{}}", tag)
             } else {
                 format!("{} {}", tag, extract_source(*payload))
-            }
+            };
+            wrap_user_ctor_decl(tag, &applied)
         }
         Value::Function(f) => match &f.extract_source {
             Some(x) => x.to_string(),

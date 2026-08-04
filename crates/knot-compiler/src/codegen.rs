@@ -1253,6 +1253,7 @@ impl Codegen {
 
         // Constructor declaration order (backs structural `Ord` on ADTs)
         self.declare_rt("knot_register_ctor_order", &[p, p, p, p], &[]);
+        self.declare_rt("knot_register_data_decl", &[p, p, p, p], &[]);
 
         // Database
         self.declare_rt("knot_db_open", &[p, p], &[p]);
@@ -3882,6 +3883,27 @@ impl Codegen {
                         "knot_register_ctor_order",
                         &[name_ptr, name_len, ctors_ptr, ctors_len],
                     );
+
+                    // Register the decl's source text so `extract` can inline it
+                    // (`with {data …} (…)`), making an extracted ADT value
+                    // self-contained. Slice the original `data X = …` from the
+                    // program source via the decl's span. Skip builtins — their
+                    // spans are shifted into the prelude and they need no inline
+                    // declaration anyway.
+                    let (ds, de) = (decl.span.start, decl.span.end);
+                    if de > ds
+                        && de <= cg.source_text.len()
+                        && decl.span.start < crate::base::PRELUDE_SPAN_OFFSET
+                    {
+                        let decl_src = cg.source_text[ds..de].to_string();
+                        let (n_ptr, n_len) = cg.string_ptr(builder, decl.name);
+                        let (d_ptr, d_len) = cg.string_ptr(builder, &decl_src);
+                        cg.call_rt_void(
+                            builder,
+                            "knot_register_data_decl",
+                            &[n_ptr, n_len, d_ptr, d_len],
+                        );
+                    }
                 }
             }
 

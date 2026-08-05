@@ -11018,6 +11018,11 @@ fn type_subsumes(snippet: &str, expected: &str) -> bool {
 fn subsumes(s: &TyDesc, e: &TyDesc, subst: &mut Vec<(String, TyDesc)>) -> bool {
     match (s, e) {
         (TyDesc::Opaque, _) | (_, TyDesc::Opaque) => true,
+        // An EXPECTED type variable means the caller is generic at that
+        // position — it accepts whatever the snippet produces there, so it
+        // never constrains the match. (e.g. `show (f.value 42)` leaves the
+        // result a free var; the snippet's `a -> a` must still be accepted.)
+        (_, TyDesc::Var(_)) => true,
         // A snippet variable instantiates to the expected type, consistently.
         (TyDesc::Var(v), _) => {
             if let Some((_, bound)) = subst.iter().find(|(n, _)| n == v) {
@@ -22176,8 +22181,17 @@ mod subsumption_tests {
     }
 
     #[test]
-    fn concrete_does_not_subsume_polymorphic() {
-        assert!(!type_subsumes("Int", "a"));
+    fn expected_var_is_unconstrained() {
+        // An expected type variable means the caller is generic at that
+        // position — any snippet type is usable there.
+        assert!(type_subsumes("Int", "a"));
+        assert!(type_subsumes("Text", "b"));
+        // ... including under a function constructor: `a -> a` applied where
+        // only the argument is pinned (`Int`) and the result is generic.
+        assert!(type_subsumes("a -> a", "Int -> a"));
+        assert!(type_subsumes("a -> a", "Int -> b"));
+        // A concrete function whose argument doesn't match is still rejected.
+        assert!(!type_subsumes("Text -> Text", "Int -> a"));
     }
 
     #[test]

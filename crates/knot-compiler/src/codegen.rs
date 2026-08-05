@@ -397,6 +397,13 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // than `Int 0`. See `infer::SumFloatSpans`.
     sum_float_spans: crate::infer::SumFloatSpans,
 
+    // For each `base.compile src` call whose context pins the expected type
+    // `a`, that expected type as a descriptor string, keyed by call span.
+    // Codegen passes it to the runtime, which rejects the call (`Nothing`)
+    // unless the JIT-compiled snippet's type subsumes it. Absent spans accept
+    // any type. See `infer::CompileExpectedTypes`.
+    compile_expected_types: crate::infer::CompileExpectedTypes,
+
     // Spans of field accesses whose field type is a relation (`t.members` where
     // `members : [{who: Text}]`). A record's field types are unreachable from
     // the AST, so this is the only way codegen can tell a nested-relation field
@@ -716,6 +723,7 @@ pub fn compile(
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
     sum_float_spans: &crate::infer::SumFloatSpans,
+    compile_expected_types: &crate::infer::CompileExpectedTypes,
     relation_fields: &crate::infer::RelationFieldSpans,
     with_fields: &crate::infer::WithFields,
     implicit_refs: &crate::infer::ImplicitRefs,
@@ -747,6 +755,7 @@ pub fn compile(
             elem_pushdown_ok,
             show_unit_strings,
             sum_float_spans,
+            compile_expected_types,
             relation_fields,
             with_fields,
             implicit_refs,
@@ -783,6 +792,7 @@ pub fn compile_with<M: cranelift_module::Module>(
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
     sum_float_spans: &crate::infer::SumFloatSpans,
+    compile_expected_types: &crate::infer::CompileExpectedTypes,
     relation_fields: &crate::infer::RelationFieldSpans,
     with_fields: &crate::infer::WithFields,
     implicit_refs: &crate::infer::ImplicitRefs,
@@ -813,6 +823,7 @@ pub fn compile_with<M: cranelift_module::Module>(
         elem_pushdown_ok,
         show_unit_strings,
         sum_float_spans,
+        compile_expected_types,
         relation_fields,
         with_fields,
         implicit_refs,
@@ -843,6 +854,7 @@ fn compile_inner<M: cranelift_module::Module>(
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
     sum_float_spans: &crate::infer::SumFloatSpans,
+    compile_expected_types: &crate::infer::CompileExpectedTypes,
     relation_fields: &crate::infer::RelationFieldSpans,
     with_fields: &crate::infer::WithFields,
     implicit_refs: &crate::infer::ImplicitRefs,
@@ -923,6 +935,7 @@ fn compile_inner<M: cranelift_module::Module>(
     cg.elem_pushdown_ok = elem_pushdown_ok.clone();
     cg.show_unit_strings = show_unit_strings.clone();
     cg.sum_float_spans = sum_float_spans.clone();
+    cg.compile_expected_types = compile_expected_types.clone();
     cg.relation_fields = relation_fields.clone();
     cg.type_arg_spans = type_arg_spans.clone();
     cg.source_refinements = type_env.source_refinements.clone();
@@ -1278,6 +1291,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             elem_pushdown_ok: crate::infer::ElemPushdownOk::default(),
             show_unit_strings: HashMap::new(),
             sum_float_spans: crate::infer::SumFloatSpans::new(),
+            compile_expected_types: crate::infer::CompileExpectedTypes::new(),
             relation_fields: crate::infer::RelationFieldSpans::new(),
             type_arg_spans: crate::infer::TypeArgSpans::new(),
             io_do_tail_iterated: false,

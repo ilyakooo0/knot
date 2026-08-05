@@ -96,6 +96,8 @@ pub fn compile_and_run(
         todo_bindings,
         trace_types,
         trace_bindings,
+        _compile_expected_types,
+        file_body_type,
     ) = infer::check(&mut program);
     if infer_diags
         .iter()
@@ -104,9 +106,10 @@ pub fn compile_and_run(
         return Err(CompileError(render_diags(&infer_diags, source)));
     }
 
-    // The program's body type, for the caller's `Maybe a` check. `type_info`
-    // maps top-level names to type strings; the file body is bound as `main`.
-    let body_ty = type_info.get("main").cloned();
+    // The program's body type, for the caller's `Maybe a` check — the file
+    // body is inferred as the root `main` and surfaced by `check` directly
+    // (it is not a named top-level decl, so `type_info` never holds it).
+    let body_ty = file_body_type;
 
     // Relations the snippet declares (for the host-relation check).
     let relations: Vec<String> = type_env.source_schemas.keys().cloned().collect();
@@ -117,6 +120,8 @@ pub fn compile_and_run(
     // address; the JITModule itself is intentionally leaked (compiled code may
     // be re-entered and holds references into it).
     let overrides = std::collections::HashMap::new();
+    // A JIT'd snippet has no `base.compile` expected-type context of its own.
+    let compile_expected_types = knot_compiler::infer::CompileExpectedTypes::new();
     // Return the entry address as usize (Send) — *const u8 isn't Send and
     // can't cross stack::grow's thread boundary.
     let entry = knot_compiler::stack::grow(|| -> Result<usize, CompileError> {
@@ -133,6 +138,7 @@ pub fn compile_and_run(
             &elem_pushdown_ok,
             &show_unit_strings,
             &sum_float_spans,
+            &compile_expected_types,
             &relation_fields,
             &with_fields,
             &implicit_refs,

@@ -259,6 +259,14 @@ pub type RelationFieldSpans = HashSet<Span>;
 /// empty `[Float]` would otherwise return `Int 0` instead of `Float 0.0`.
 pub type SumFloatSpans = HashSet<Span>;
 
+/// For each `base.compile src` call site whose context pins the result type
+/// `a`, the expected type of the JIT-compiled snippet, as a descriptor string.
+/// Keyed by the call's span. A call whose `a` stays a free variable (context
+/// never constrains it) is absent — the runtime then accepts whatever type the
+/// snippet produces. Codegen passes the descriptor to the runtime, which
+/// rejects the call (`Nothing`) unless the snippet's own type subsumes it.
+pub type CompileExpectedTypes = HashMap<Span, String>;
+
 /// Spans of explicit type arguments consumed by the Π-lite application
 /// diversion (`apply Int …` — the `Int` head). Codegen drops these arguments
 /// (they are erased; the type-witness param has no runtime representation), so
@@ -906,6 +914,19 @@ struct Infer {
     /// so codegen can tell the runtime which zero an EMPTY relation sums to.
     sum_calls: Vec<(Span, TyVar)>,
 
+    /// Tracks `compile src` application sites for the expected-type check.
+    /// Each entry records (app_span, return_type_var); post-inference the var
+    /// resolves to `Maybe a`, and the inner `a` is the type the caller expects
+    /// the compiled snippet to have. Codegen hands that expected `a` to the
+    /// runtime, which rejects the call (`Nothing`) unless the snippet's own
+    /// type scheme subsumes it.
+    compile_calls: Vec<(Span, TyVar)>,
+
+    /// The inferred type of the program's file body (`main`), captured at the
+    /// Phase-4z root inference. Surfaced to `base.compile`'s JIT so the runtime
+    /// can check the snippet's type against the caller's expected `a`.
+    file_body_ty: Option<Ty>,
+
     /// Tracks `parseJson` application sites for compile-time FromJSON dispatch.
     /// Each entry records (app_span, return_type_var).
     from_json_calls: Vec<(Span, TyVar)>,
@@ -1159,6 +1180,8 @@ impl Infer {
             unify_depth: 0,
             traverse_calls: Vec::new(),
             sum_calls: Vec::new(),
+            compile_calls: Vec::new(),
+            file_body_ty: None,
             from_json_calls: Vec::new(),
             show_calls: Vec::new(),
             known_impls: HashSet::new(),
@@ -6327,6 +6350,17 @@ impl Infer {
                     && n == "sum"
                         && let Ty::Var(res_v) = &result_ty {
                             self.sum_calls.push((expr.span, *res_v));
+                        }
+
+                // Track `compile src` applications: the resolved result type
+                // is `Maybe a`; the inner `a` is the type the caller expects
+                // the JIT-compiled snippet to have. Codegen hands it to the
+                // runtime, which rejects the call (`Nothing`) unless the
+                // snippet's own type subsumes it.
+                if let ast::ExprKind::Var(n) = &func.node
+                    && n == "compile"
+                        && let Ty::Var(res_v) = &result_ty {
+                            self.compile_calls.push((expr.span, *res_v));
                         }
 
                 // Track `elem needle haystack` haystack types for SQL pushdown.
@@ -12373,6 +12407,8 @@ pub type CheckOutput = (
     TodoBindings,
     TraceTypes,
     TraceBindings,
+    CompileExpectedTypes,
+    Option<String>,
 );
 
 /// Run type inference on a parsed module. Returns diagnostics,
@@ -12523,7 +12559,8 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
                         // type-import scope (`with {Maybe …}`) around the body
                         // inference ourselves — else bare ctors never resolve.
                         let pushed = infer.push_with_ctor_imports(types, record.span);
-                        let _ = infer.infer_expr(body);
+                        let bt = infer.infer_expr(body);
+                        infer.file_body_ty = Some(bt);
                         if pushed {
                             infer.with_ctor_imports.pop();
                         }
@@ -12534,12 +12571,14 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
                         // scope and the body's bare field references (`map`,
                         // `show`) resolve. Inferring only `body` would leave
                         // them unbound in this pass.
-                        let _ = infer.infer_expr(cur);
+                        let bt = infer.infer_expr(cur);
+                        infer.file_body_ty = Some(bt);
                     }
                     break;
                 }
                 _ => {
-                    let _ = infer.infer_expr(cur);
+                    let bt = infer.infer_expr(cur);
+                    infer.file_body_ty = Some(bt);
                     break;
                 }
             }
@@ -12763,6 +12802,34 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
         }
     }
 
+    // Phase 5c': Resolve the expected `a` of each `compile src` call, keyed by
+    // the call span. The result type is `Maybe a`; the inner `a` is what the
+    // caller expects the JIT-compiled snippet to be. Codegen hands it to the
+    // runtime, which rejects the call (`Nothing`) unless the snippet's type
+    // subsumes it. A call whose `a` stays a free variable (context never pins
+    // it — e.g. under polymorphic `show`) carries NO expected type and accepts
+    // whatever the snippet produces.
+    let mut compile_expected_types = CompileExpectedTypes::new();
+    for (span, res_v) in &infer.compile_calls {
+        let resolved = infer.apply(&Ty::Var(*res_v));
+        let inner = match resolved.peel_alias() {
+            Ty::Con(n, args) if n == "Maybe" && args.len() == 1 => args[0].clone(),
+            _ => continue,
+        };
+        let inner = infer.apply(&inner);
+        // Skip unconstrained `a`: a bare type var means the caller accepts any
+        // type, so there is nothing to check against.
+        if matches!(inner.peel_alias(), Ty::Var(_)) {
+            continue;
+        }
+        let var_map = var_map_for(&inner);
+        let unit_var_map = unit_var_map_for(&inner);
+        compile_expected_types.insert(
+            *span,
+            display_ty_clean(&inner, &var_map, &unit_var_map),
+        );
+    }
+
     // Phase 5d: Sieve the field accesses whose field turned out to be a
     // relation. `t.members : [{who: Text}]` makes `m <- t.members` a relation
     // bind (inference types `m` as the ELEMENT), so codegen has to iterate the
@@ -12854,6 +12921,18 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
 
     let type_info = infer.extract_type_info();
     let local_type_info = infer.extract_local_type_info();
+
+    // The program's file-body (`main`) type, surfaced for `base.compile`'s
+    // runtime check: the JIT'd snippet's body type is compared against the
+    // caller's expected `a`. Rendered with the same clean display as
+    // `local_type_info` (free unit vars defaulted to dimensionless).
+    let file_body_type = infer.file_body_ty.as_ref().map(|ty| {
+        let applied = infer.apply(ty);
+        let applied = default_free_unit_vars(&applied);
+        let var_map = var_map_for(&applied);
+        let unit_var_map = unit_var_map_for(&applied);
+        display_ty_clean(&applied, &var_map, &unit_var_map)
+    });
     let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
     let with_fields: WithFields = infer.with_fields.iter().cloned().collect();
     let type_arg_spans: TypeArgSpans = infer.type_arg_spans.clone();
@@ -12864,7 +12943,7 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
     let trace_types = infer.extract_trace_types();
     let trace_bindings = infer.extract_trace_bindings();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, infer.resolved_calls.clone(), todo_types, todo_bindings, trace_types, trace_bindings)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, infer.resolved_calls.clone(), todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, file_body_type)
 }
 
 

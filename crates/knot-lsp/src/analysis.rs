@@ -553,6 +553,8 @@ pub fn analyze_document(
             _todo_bindings,
             _trace_types,
             _trace_bindings,
+            _compile_expected_types,
+            _file_body_type,
         ) = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_user));
         type_info = inferred_types;

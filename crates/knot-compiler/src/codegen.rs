@@ -1386,6 +1386,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_value_show", &[p], &[p]);
         self.declare_rt("knot_value_extract", &[p], &[p]);
         self.declare_rt("knot_builtin_compile", &[p], &[p]);
+        // `base.compile src` whose context pins the expected type `a`: the
+        // descriptor string (ptr+len) is checked against the JIT'd snippet's
+        // own type; a definite mismatch returns `Nothing`.
+        self.declare_rt("knot_builtin_compile_typed", &[p, p, p], &[p]);
         self.declare_rt("knot_value_show_unit", &[p, p, p], &[p]);
         self.declare_rt("knot_guard_failed", &[], &[]);
 
@@ -6831,6 +6835,33 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
                 return result;
             }
+
+        // `base.compile src` whose context pins the expected type `a`: pass
+        // the descriptor to the typed extern so the runtime can reject the
+        // call (`Nothing`) when the JIT'd snippet's type doesn't subsume it.
+        // Absent from `compile_expected_types` (context never pins `a`, e.g.
+        // under polymorphic `show`) → falls through to the untyped extern,
+        // accepting whatever type the snippet produces.
+        if !user_shadows_special && args.len() == 1 {
+            let is_compile = match &func_expr.node {
+                ast::ExprKind::Var(n) => n == "compile",
+                ast::ExprKind::FieldAccess { expr: ns, field } => {
+                    field == "compile" && matches!(&ns.node, ast::ExprKind::Var(n) if n == "base")
+                }
+                _ => false,
+            };
+            if is_compile
+                && let Some(expected) = self.compile_expected_types.get(&expr.span).cloned()
+            {
+                let src = self.compile_arg_expr(builder, args[0], env, db);
+                let (eptr, elen) = self.string_ptr(builder, &expected);
+                return self.call_rt(
+                    builder,
+                    "knot_builtin_compile_typed",
+                    &[src, eptr, elen],
+                );
+            }
+        }
 
         // Composable call-form query chain `op … (… *src)` → rewrite to the
         // equivalent pipe and delegate to the pipe-chain pushdown, which fuses

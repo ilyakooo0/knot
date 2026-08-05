@@ -45,3 +45,31 @@ fn jit_rejects_type_error() {
     let res = compile_and_run("1 + \"not an int\"", db);
     assert!(res.is_err(), "type error should fail compilation");
 }
+
+// The JIT surfaces the snippet's inferred body type so `base.compile`'s
+// runtime check can test it against the caller's expected `a`.
+
+#[test]
+fn jit_surfaces_scalar_body_type() {
+    init_compile_rt();
+    let db = db();
+    let out = compile_and_run("42", db).expect("JIT compile failed");
+    assert_eq!(out.ty.as_deref(), Some("Int"));
+}
+
+#[test]
+fn jit_surfaces_polymorphic_lambda_type() {
+    init_compile_rt();
+    let db = db();
+    let out = compile_and_run("\\x -> x", db).expect("JIT compile failed");
+    // Identity is polymorphic: a type variable on both sides.
+    assert_eq!(out.ty.as_deref(), Some("a -> a"));
+}
+
+#[test]
+fn jit_surfaces_text_body_type() {
+    init_compile_rt();
+    let db = db();
+    let out = compile_and_run("\"hello\"", db).expect("JIT compile failed");
+    assert_eq!(out.ty.as_deref(), Some("Text"));
+}

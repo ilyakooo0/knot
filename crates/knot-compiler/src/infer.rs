@@ -6352,15 +6352,28 @@ impl Infer {
                             self.sum_calls.push((expr.span, *res_v));
                         }
 
-                // Track `compile src` applications: the resolved result type
-                // is `Maybe a`; the inner `a` is the type the caller expects
-                // the JIT-compiled snippet to have. Codegen hands it to the
+                // Track `compile src` applications: the result type is
+                // `Maybe a`; the inner `a` is the type the caller expects the
+                // JIT-compiled snippet to have. Codegen hands it to the
                 // runtime, which rejects the call (`Nothing`) unless the
-                // snippet's own type subsumes it.
-                if let ast::ExprKind::Var(n) = &func.node
-                    && n == "compile"
-                        && let Ty::Var(res_v) = &result_ty {
-                            self.compile_calls.push((expr.span, *res_v));
+                // snippet's own type subsumes it. `compile`'s result unifies
+                // directly with `Maybe a` (not a bare var), so peel the `Maybe`
+                // and record the inner `a`'s var. Matches both bare `compile`
+                // and the namespaced `base.compile`.
+                let is_compile_app = match &func.node {
+                    ast::ExprKind::Var(n) => n == "compile",
+                    ast::ExprKind::FieldAccess { expr: ns, field } => {
+                        field == "compile"
+                            && matches!(&ns.node, ast::ExprKind::Var(n) if n == "base")
+                    }
+                    _ => false,
+                };
+                if is_compile_app
+                        && let Ty::Con(mn, margs) = self.apply(&result_ty).peel_alias()
+                        && mn == "Maybe"
+                        && margs.len() == 1
+                        && let Ty::Var(inner_v) = self.apply(&margs[0]).peel_alias() {
+                            self.compile_calls.push((expr.span, *inner_v));
                         }
 
                 // Track `elem needle haystack` haystack types for SQL pushdown.
@@ -12811,17 +12824,18 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
     // whatever the snippet produces.
     let mut compile_expected_types = CompileExpectedTypes::new();
     for (span, res_v) in &infer.compile_calls {
-        let resolved = infer.apply(&Ty::Var(*res_v));
-        let inner = match resolved.peel_alias() {
-            Ty::Con(n, args) if n == "Maybe" && args.len() == 1 => args[0].clone(),
-            _ => continue,
-        };
-        let inner = infer.apply(&inner);
+        // `res_v` is the inner `a` of the call's `Maybe a` result (the caller's
+        // expected type for the snippet), resolved now that inference is done.
+        let inner = infer.apply(&Ty::Var(*res_v));
         // Skip unconstrained `a`: a bare type var means the caller accepts any
         // type, so there is nothing to check against.
         if matches!(inner.peel_alias(), Ty::Var(_)) {
             continue;
         }
+        // Default free unit variables to dimensionless, as `local_type_info`
+        // does — `Int u` (unit unconstrained) means plain `Int`, and the
+        // snippet's dimensionless `Int` must match it.
+        let inner = default_free_unit_vars(&inner);
         let var_map = var_map_for(&inner);
         let unit_var_map = unit_var_map_for(&inner);
         compile_expected_types.insert(

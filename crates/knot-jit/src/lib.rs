@@ -109,7 +109,10 @@ pub fn compile_and_run(
     // The program's body type, for the caller's `Maybe a` check — the file
     // body is inferred as the root `main` and surfaced by `check` directly
     // (it is not a named top-level decl, so `type_info` never holds it).
-    let body_ty = file_body_type;
+    // Enrich ADT names with their full constructor signatures so the runtime's
+    // subsumption check compares constructor sets, not just names.
+    let body_ty = file_body_type
+        .map(|s| infer::enrich_descriptor_with_adts(&s, &type_env.aliases));
 
     // Relations the snippet declares (for the host-relation check).
     let relations: Vec<String> = type_env.source_schemas.keys().cloned().collect();

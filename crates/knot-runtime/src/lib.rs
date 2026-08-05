@@ -10757,6 +10757,11 @@ enum TyDesc {
     Relation(Box<TyDesc>),
     /// ADT constructor applied to args (`Maybe Int`, `IO T`, `Name a b`).
     App(String, Vec<TyDesc>),
+    /// A nominal ADT with its full constructor signature, produced by
+    /// knot-compiler's `enrich_descriptor_with_adts` (`Priority{Low|High}`,
+    /// `Status{Open|InProgress{assignee:Text}}`). Compared structurally on the
+    /// constructor set.
+    Adt(String, Vec<(String, Vec<(String, TyDesc)>)>),
 }
 
 /// Parse a descriptor; `TyDesc::Opaque` on any unsupported construct.
@@ -10953,11 +10958,63 @@ impl TyParser {
                             };
                             Some(TyDesc::Scalar(base, unit))
                         }
-                        _ => Some(TyDesc::App(name.to_string(), Vec::new())),
+                        _ => {
+                            let name = name.to_string();
+                            // `Name{Ctor{f:T,...}|...}` — a nominal ADT with its
+                            // constructor signature (from knot-compiler's
+                            // enrichment). Bare `{` after a name is the ADT
+                            // marker, not a record argument.
+                            if self.peek() == Some("{") {
+                                if let Some(ctors) = self.adt_sig() {
+                                    return Some(TyDesc::Adt(name, ctors));
+                                }
+                                // Malformed signature → opaque (conservative).
+                                return Some(TyDesc::Opaque);
+                            }
+                            Some(TyDesc::App(name, Vec::new()))
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Parse an ADT constructor signature body `{Ctor{f:T,...}|Ctor|...}`
+    /// (the leading `{` is the next token). Returns the constructor list.
+    fn adt_sig(&mut self) -> Option<Vec<(String, Vec<(String, TyDesc)>)>> {
+        self.eat("{");
+        let mut ctors = Vec::new();
+        loop {
+            let cname = self.next()?;
+            // A constructor name is a type-level identifier (uppercase).
+            if !cname.chars().next()?.is_uppercase() {
+                return None;
+            }
+            let mut fields = Vec::new();
+            if self.peek() == Some("{") {
+                self.eat("{");
+                if !self.eat("}") {
+                    loop {
+                        let fname = self.next()?;
+                        self.eat(":");
+                        let fty = self.ty()?;
+                        fields.push((fname, fty));
+                        if self.eat(",") {
+                            continue;
+                        }
+                        self.eat("}");
+                        break;
+                    }
+                }
+            }
+            ctors.push((cname, fields));
+            if self.eat("|") {
+                continue;
+            }
+            self.eat("}");
+            break;
+        }
+        Some(ctors)
     }
 
     fn record_ty(&mut self) -> Option<TyDesc> {
@@ -11050,6 +11107,27 @@ fn subsumes(s: &TyDesc, e: &TyDesc, subst: &mut Vec<(String, TyDesc)>) -> bool {
             n1 == n2
                 && a1.len() == a2.len()
                 && a1.iter().zip(a2).all(|(x, y)| subsumes(x, y, subst))
+        }
+        // Nominal ADTs with constructor signatures. The snippet's value flows
+        // into the host's `case`, which is written against the EXPECTED type's
+        // constructors — so the snippet must not produce a constructor the host
+        // can't match: snippet ctors ⊆ expected ctors, and each shared ctor's
+        // fields must be covariantly compatible (snippet field ⊑ expected).
+        (TyDesc::Adt(sn, sc), TyDesc::Adt(en, ec)) => {
+            sn == en
+                && sc.iter().all(|(ctor, sfields)| {
+                    ec.iter().find(|(ec2, _)| ec2 == ctor).is_some_and(|(_, efields)| {
+                        sfields.len() == efields.len()
+                            && sfields.iter().zip(efields).all(|((sn2, sty), (en2, ety))| {
+                                sn2 == en2 && subsumes(sty, ety, subst)
+                            })
+                    })
+                })
+        }
+        // One side enriched, the other a bare name (unenriched — e.g. an older
+        // or non-ADT-bearing descriptor): fall back to nominal name comparison.
+        (TyDesc::Adt(n1, _), TyDesc::App(n2, a)) | (TyDesc::App(n2, a), TyDesc::Adt(n1, _)) => {
+            n1 == n2 && a.is_empty()
         }
         _ => false,
     }
@@ -22192,6 +22270,52 @@ mod subsumption_tests {
         assert!(type_subsumes("a -> a", "Int -> b"));
         // A concrete function whose argument doesn't match is still rejected.
         assert!(!type_subsumes("Text -> Text", "Int -> a"));
+    }
+
+    #[test]
+    fn adt_nominal_and_ctor_sets() {
+        // Identical ADTs subsume.
+        assert!(type_subsumes("Priority{Low|High}", "Priority{Low|High}"));
+        // Same name, snippet has a ctor the expected lacks → reject (the
+        // host's `case` wouldn't cover it).
+        assert!(!type_subsumes(
+            "Priority{Low|High|Medium}",
+            "Priority{Low|High}"
+        ));
+        // Snippet has FEWER ctors than expected → accept (host covers all the
+        // snippet can produce).
+        assert!(type_subsumes("Priority{Low}", "Priority{Low|High}"));
+        // Different type name, even with identical ctors → reject (nominal).
+        assert!(!type_subsumes("Level{Low|High}", "Priority{Low|High}"));
+        // Constructor payload field type must match.
+        assert!(!type_subsumes(
+            "Status{Open|InProgress{assignee: Int}}",
+            "Status{Open|InProgress{assignee: Text}}"
+        ));
+        assert!(type_subsumes(
+            "Status{Open|InProgress{assignee: Text}}",
+            "Status{Open|InProgress{assignee: Text}}"
+        ));
+    }
+
+    #[test]
+    fn adt_vs_bare_name_falls_back_to_nominal() {
+        // One side enriched, the other a bare name (unenriched descriptor):
+        // accept iff the names match.
+        assert!(type_subsumes("Priority{Low|High}", "Priority"));
+        assert!(!type_subsumes("Priority{Low|High}", "Level"));
+    }
+
+    #[test]
+    fn adt_nested_in_function() {
+        assert!(type_subsumes(
+            "Int -> Priority{Low|High}",
+            "Int -> Priority{Low|High}"
+        ));
+        assert!(!type_subsumes(
+            "Int -> Priority{Low|Medium}",
+            "Int -> Priority{Low|High}"
+        ));
     }
 
     #[test]

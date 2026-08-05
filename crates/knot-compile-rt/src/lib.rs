@@ -22,6 +22,8 @@ pub unsafe extern "C" fn knot_compile_impl(
     db: *mut c_void,
     out_ty_ptr: *mut *mut u8,
     out_ty_len: *mut usize,
+    out_rels_ptr: *mut *mut u8,
+    out_rels_len: *mut usize,
 ) -> *mut knot_runtime::Value {
     // Null out-params up front so a compile error leaves them well-defined.
     unsafe {
@@ -30,6 +32,12 @@ pub unsafe extern "C" fn knot_compile_impl(
         }
         if !out_ty_len.is_null() {
             *out_ty_len = 0;
+        }
+        if !out_rels_ptr.is_null() {
+            *out_rels_ptr = std::ptr::null_mut();
+        }
+        if !out_rels_len.is_null() {
+            *out_rels_len = 0;
         }
     }
 
@@ -52,6 +60,21 @@ pub unsafe extern "C" fn knot_compile_impl(
                         std::ptr::copy_nonoverlapping(ty.as_ptr(), buf, ty.len());
                         *out_ty_ptr = buf;
                         *out_ty_len = ty.len();
+                    }
+                } else {
+                    unsafe { libc::free(buf as *mut c_void) };
+                }
+            }
+            // Hand the snippet's declared relations back as a comma-separated
+            // malloc'd buffer, for the runtime's host-relation check.
+            if !out_rels_ptr.is_null() && !out_rels_len.is_null() {
+                let csv = cv.relations.join(",");
+                let buf = unsafe { libc::malloc(csv.len().max(1)) as *mut u8 };
+                if !buf.is_null() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(csv.as_ptr(), buf, csv.len());
+                        *out_rels_ptr = buf;
+                        *out_rels_len = csv.len();
                     }
                 } else {
                     unsafe { libc::free(buf as *mut c_void) };

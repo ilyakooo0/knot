@@ -10706,6 +10706,8 @@ type CompileImpl = unsafe extern "C" fn(
     db: *mut c_void,
     out_ty_ptr: *mut *mut u8,
     out_ty_len: *mut usize,
+    out_rels_ptr: *mut *mut u8,
+    out_rels_len: *mut usize,
 ) -> *mut Value;
 
 static COMPILE_IMPL: std::sync::atomic::AtomicPtr<c_void> =
@@ -10749,8 +10751,11 @@ pub extern "C-unwind" fn knot_builtin_compile(src: *mut Value) -> *mut Value {
         (db_path.as_ptr(), db_path.len())
     };
     let db = knot_db_open(pstr, plen);
+
     let mut ty_ptr: *mut u8 = std::ptr::null_mut();
     let mut ty_len: usize = 0;
+    let mut rels_ptr: *mut u8 = std::ptr::null_mut();
+    let mut rels_len: usize = 0;
     let value = unsafe {
         f(
             source.as_ptr(),
@@ -10758,11 +10763,43 @@ pub extern "C-unwind" fn knot_builtin_compile(src: *mut Value) -> *mut Value {
             db,
             &mut ty_ptr,
             &mut ty_len,
+            &mut rels_ptr,
+            &mut rels_len,
         )
     };
+
     if value.is_null() {
+        if !ty_ptr.is_null() {
+            unsafe { libc::free(ty_ptr as *mut c_void) };
+        }
+        if !rels_ptr.is_null() {
+            unsafe { libc::free(rels_ptr as *mut c_void) };
+        }
         return maybe_nothing();
     }
+
+    // `*rel` guard: a snippet may only use relations the host program defined.
+    // The snippet's declared relations come back as a comma-separated list;
+    // reject (Nothing) if any isn't in the host's registered relation set.
+    if !rels_ptr.is_null() {
+        let bytes = unsafe { std::slice::from_raw_parts(rels_ptr, rels_len) };
+        let rels_csv = String::from_utf8_lossy(bytes).into_owned();
+        unsafe { libc::free(rels_ptr as *mut c_void) };
+        if !rels_csv.is_empty() {
+            let host_rels = SOURCE_SCHEMAS.read().unwrap_or_else(|e| e.into_inner());
+            let foreign = rels_csv
+                .split(',')
+                .any(|r| !r.is_empty() && !host_rels.contains_key(r));
+            drop(host_rels);
+            if foreign {
+                if !ty_ptr.is_null() {
+                    unsafe { libc::free(ty_ptr as *mut c_void) };
+                }
+                return maybe_nothing();
+            }
+        }
+    }
+
     // TODO: unify the compiled program's type (ty_ptr/ty_len) against the
     // caller's expected `a`; Nothing on mismatch. For now accept any type.
     if !ty_ptr.is_null() {

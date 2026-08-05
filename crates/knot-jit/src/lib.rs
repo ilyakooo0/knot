@@ -22,6 +22,12 @@ pub struct CompiledValue {
     /// The inferred type of the compiled program's body (for the caller's
     /// `Maybe a` unification check). `None` if it couldn't be determined.
     pub ty: Option<String>,
+    /// Relations the snippet declares (`*name : T` in a `with` block), for the
+    /// caller's host-relation check: a snippet may only use relations the host
+    /// program defined. The JIT never runs the generated `main`'s source-init
+    /// (its entry is `knot_user_main`), so these are surfaced statically from
+    /// the snippet's type env rather than observed at runtime.
+    pub relations: Vec<String>,
 }
 
 /// Error from JIT compilation: a human-readable diagnostic message.
@@ -102,6 +108,9 @@ pub fn compile_and_run(
     // maps top-level names to type strings; the file body is bound as `main`.
     let body_ty = type_info.get("main").cloned();
 
+    // Relations the snippet declares (for the host-relation check).
+    let relations: Vec<String> = type_env.source_schemas.keys().cloned().collect();
+
     // ── Codegen into a JITModule, on a grown stack ──
     // JITModule is not Send, so it can't cross stack::grow's thread boundary.
     // Compile + finalize inside grow and return only the Send-safe entry
@@ -149,7 +158,7 @@ pub fn compile_and_run(
         unsafe { std::mem::transmute(entry) };
     let value = entry_fn(db);
 
-    Ok(CompiledValue { value, ty: body_ty })
+    Ok(CompiledValue { value, ty: body_ty, relations })
 }
 
 /// Render a list of diagnostics into a single message string.

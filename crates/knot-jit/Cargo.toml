@@ -9,10 +9,14 @@ crate-type = ["rlib"]
 [dependencies]
 knot = { workspace = true }
 knot-compiler = { workspace = true }
-knot-runtime = { workspace = true }
 cranelift-codegen = { workspace = true }
 cranelift-frontend = { workspace = true }
 cranelift-module = { workspace = true }
 cranelift-jit = { workspace = true }
 cranelift-native = { workspace = true }
 libc = { workspace = true }
+
+[dev-dependencies]
+# Tests open a real runtime db handle to pass to compile_and_run; the lib
+# itself stays runtime-agnostic (no knot-runtime dep) to avoid a Cargo cycle.
+knot-runtime = { workspace = true }

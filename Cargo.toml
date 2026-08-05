@@ -19,6 +19,7 @@ libc = "0.2"
 knot = { path = "crates/knot" }
 knot-compiler = { path = "crates/knot-compiler" }
 knot-runtime = { path = "crates/knot-runtime" }
+knot-jit = { path = "crates/knot-jit" }
 cranelift-codegen = "0.131"
 cranelift-frontend = "0.131"
 cranelift-module = "0.131"

@@ -11,11 +11,14 @@ use knot_compiler::codegen::{self, Codegen};
 use knot_compiler::{desugar, infer, types};
 
 /// The result of JIT-compiling a knot source string: the resolved entry
-/// address plus the `Value*` produced by running it. The `Value` is owned by
-/// the runtime arena and lives as long as the host process's runtime does.
+/// address plus the value produced by running it. The produced value is an
+/// opaque pointer into the host runtime's arena (a `Value*` in knot-runtime's
+/// terms); knot-jit deliberately treats it as `*mut c_void` so it has no
+/// dependency on knot-runtime (which would create a Cargo cycle — knot-runtime
+/// depends on knot-jit for the `compile` builtin).
 pub struct CompiledValue {
-    /// Raw pointer to the produced `knot_runtime::Value`.
-    pub value: *mut knot_runtime::Value,
+    /// Opaque pointer to the produced value (`knot_runtime::Value*`).
+    pub value: *mut std::ffi::c_void,
     /// The inferred type of the compiled program's body (for the caller's
     /// `Maybe a` unification check). `None` if it couldn't be determined.
     pub ty: Option<String>,
@@ -142,7 +145,7 @@ pub fn compile_and_run(
     })?;
 
     // ── Call knot_user_main(db) -> Value* ──
-    let entry_fn: extern "C" fn(*mut std::ffi::c_void) -> *mut knot_runtime::Value =
+    let entry_fn: extern "C" fn(*mut std::ffi::c_void) -> *mut std::ffi::c_void =
         unsafe { std::mem::transmute(entry) };
     let value = entry_fn(db);
 

@@ -20,3 +20,6 @@ libc = { workspace = true }
 # Tests open a real runtime db handle to pass to compile_and_run; the lib
 # itself stays runtime-agnostic (no knot-runtime dep) to avoid a Cargo cycle.
 knot-runtime = { workspace = true }
+# Generated `main` calls `knot_compile_rt_init`; the JIT'd code must resolve it
+# in-process, so the test binary links knot-compile-rt (which provides it).
+knot-compile-rt = { workspace = true }

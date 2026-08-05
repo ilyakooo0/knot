@@ -110,6 +110,39 @@ fn main() {
     }
 
     println!("cargo:rustc-check-cfg=cfg(has_embedded_runtime)");
+
+    // ── JIT compile-runtime archive (knot-compile-rt) ──
+    // Always linked into compiled programs so `base.compile` works. Found in
+    // the target dir (the `knot` binary depends on knot-compile-rt, so cargo
+    // builds it first); embedded so the compiler binary stays self-contained.
+    // No self-spawned build here (unlike the runtime fallback) — knot-compile-rt
+    // is always a normal dependency of the binary that drives linking.
+    {
+        let crt_dest = out_path.join("libknot_compile_rt.a");
+        let _ = std::fs::remove_file(&crt_dest);
+        let target_dir = std::env::var("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| workspace_root.join("target"));
+        let crt_src = out_path
+            .ancestors()
+            .take_while(|p| p.starts_with(&target_dir))
+            .map(|p| p.join("libknot_compile_rt.a"))
+            .find(|p| is_valid_lib(p))
+            .or_else(|| {
+                ["release", "debug"]
+                    .iter()
+                    .map(|prof| target_dir.join(prof).join("libknot_compile_rt.a"))
+                    .find(|p| is_valid_lib(p))
+            });
+        if let Some(src) = crt_src {
+            std::fs::copy(&src, &crt_dest)
+                .expect("failed to copy libknot_compile_rt.a to OUT_DIR");
+            println!("cargo:rustc-cfg=has_embedded_compile_rt");
+        }
+    }
+    println!("cargo:rustc-check-cfg=cfg(has_embedded_compile_rt)");
+    println!("cargo:rerun-if-changed=../knot-compile-rt/src");
+    println!("cargo:rerun-if-changed=../knot-compile-rt/Cargo.toml");
     // Watch the whole runtime source tree (cargo tracks directories
     // recursively), not just lib.rs — log.rs/tui.rs edits must also
     // refresh the embedded runtime.

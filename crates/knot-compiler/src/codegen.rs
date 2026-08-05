@@ -1375,6 +1375,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_value_show_unit", &[p, p, p], &[p]);
         self.declare_rt("knot_guard_failed", &[], &[]);
 
+        // JIT compile-runtime init (linked from the knot-compile-rt archive):
+        // registers the in-process compile implementation. Called once at
+        // program startup so `base.compile` is live.
+        self.declare_rt("knot_compile_rt_init", &[], &[]);
+
         // Constructor declaration order (backs structural `Ord` on ADTs)
         self.declare_rt("knot_register_ctor_order", &[p, p, p, p], &[]);
         self.declare_rt("knot_register_data_decl", &[p, p, p, p], &[]);
@@ -3852,6 +3857,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.build_function(main_id, sig, |cg, builder, entry| {
             let argc = builder.block_params(entry)[0];
             let argv = builder.block_params(entry)[1];
+
+            // Register the JIT compile implementation (from the always-linked
+            // knot-compile-rt archive) so `base.compile` is live at runtime.
+            cg.call_rt_void(builder, "knot_compile_rt_init", &[]);
 
             // Register route tables for the api command
             let mut route_tables: Vec<(Value, Vec<ast::RouteEntry>)> = Vec::new();

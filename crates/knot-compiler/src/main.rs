@@ -494,13 +494,18 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
 
     // Find runtime
     let runtime_path = find_runtime();
+    // The JIT compile-runtime archive, always linked so `base.compile` works.
+    let compile_rt_path = find_compile_rt();
 
     // Link (output path computed and collision-checked above)
-    if let Err(e) = linker::link(&obj_path, &runtime_path, &output_path) {
+    if let Err(e) = linker::link(&obj_path, &runtime_path, &compile_rt_path, &output_path) {
         eprintln!("Link error: {}", e);
         let _ = std::fs::remove_file(&obj_path);
         if is_extracted_temp_runtime(&runtime_path) {
             let _ = std::fs::remove_file(&runtime_path);
+        }
+        if is_extracted_temp_compile_rt(&compile_rt_path) {
+            let _ = std::fs::remove_file(&compile_rt_path);
         }
         process::exit(1);
     }
@@ -510,6 +515,9 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     // Remove temp runtime if it was extracted from embedded bytes
     if is_extracted_temp_runtime(&runtime_path) {
         let _ = std::fs::remove_file(&runtime_path);
+    }
+    if is_extracted_temp_compile_rt(&compile_rt_path) {
+        let _ = std::fs::remove_file(&compile_rt_path);
     }
 
     // Update schema lockfile from the (prelude-wrapped, desugared) program.
@@ -528,6 +536,14 @@ const EMBEDDED_RUNTIME: Option<&[u8]> =
     Some(include_bytes!(concat!(env!("OUT_DIR"), "/libknot_runtime.a")));
 #[cfg(not(has_embedded_runtime))]
 const EMBEDDED_RUNTIME: Option<&[u8]> = None;
+
+/// JIT compile-runtime archive (knot-compile-rt), embedded at build time and
+/// always linked into compiled programs so `base.compile` works in-process.
+#[cfg(has_embedded_compile_rt)]
+const EMBEDDED_COMPILE_RT: Option<&[u8]> =
+    Some(include_bytes!(concat!(env!("OUT_DIR"), "/libknot_compile_rt.a")));
+#[cfg(not(has_embedded_compile_rt))]
+const EMBEDDED_COMPILE_RT: Option<&[u8]> = None;
 
 /// True if `p` is a runtime archive that `find_runtime` extracted into the
 /// temp directory for this process (and which is therefore ours to delete).
@@ -663,5 +679,80 @@ fn find_runtime() -> PathBuf {
     eprintln!("Error: cannot find libknot_runtime.a");
     eprintln!("Ensure knot-runtime is built (cargo build -p knot-runtime)");
     eprintln!("Or set KNOT_RUNTIME_LIB=/path/to/libknot_runtime.a");
+    process::exit(1);
+}
+
+/// True if `p` is a compile-rt archive `find_compile_rt` extracted into the
+/// temp dir (and which is therefore ours to delete).
+fn is_extracted_temp_compile_rt(p: &std::path::Path) -> bool {
+    let tmp_dir = std::env::temp_dir();
+    p.parent() == Some(tmp_dir.as_path())
+        && p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| {
+                n.starts_with(&format!("libknot_compile_rt_{}_", std::process::id()))
+                    && n.ends_with(".a")
+            })
+}
+
+/// Locate the knot-compile-rt archive (JIT compile-runtime), always linked
+/// into compiled programs so `base.compile` works. Mirrors `find_runtime`:
+/// KNOT_COMPILE_RT_LIB override → beside the compiler exe → extract embedded.
+fn find_compile_rt() -> PathBuf {
+    if let Ok(path) = std::env::var("KNOT_COMPILE_RT_LIB") {
+        let p = PathBuf::from(&path);
+        if p.exists() {
+            return p;
+        }
+        eprintln!(
+            "Error: KNOT_COMPILE_RT_LIB is set to '{}' but the file does not exist",
+            path
+        );
+        process::exit(1);
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        let candidate = exe_dir.join("libknot_compile_rt.a");
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    if let Some(bytes) = EMBEDDED_COMPILE_RT {
+        use std::io::Write;
+        for attempt in 0..32u32 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let tmp = std::env::temp_dir().join(format!(
+                "libknot_compile_rt_{}_{}_{:08x}.a",
+                std::process::id(),
+                attempt,
+                nonce
+            ));
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            match opts.open(&tmp) {
+                Ok(mut f) => {
+                    if f.write_all(bytes).is_ok() {
+                        return tmp;
+                    }
+                    let _ = std::fs::remove_file(&tmp);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => break,
+            }
+        }
+    }
+    eprintln!("Error: cannot find libknot_compile_rt.a");
+    eprintln!("Ensure knot-compile-rt is built (cargo build -p knot-compile-rt)");
+    eprintln!("Or set KNOT_COMPILE_RT_LIB=/path/to/libknot_compile_rt.a");
     process::exit(1);
 }

@@ -7,12 +7,19 @@ use std::process::Command;
 pub fn link(
     object_path: &Path,
     runtime_path: &Path,
+    compile_rt_path: &Path,
     output_path: &Path,
 ) -> Result<(), String> {
     let mut cmd = Command::new("cc");
+    // Link order: the program object first, then the JIT compile-runtime
+    // (knot-compile-rt, which provides `knot_compile_impl`/`knot_compile_rt_init`
+    // and pulls in the compiler+cranelift+z3), then the knot runtime that
+    // satisfies its undefined `knot_*` references. Archives are scanned
+    // left-to-right, so a provider must come after its users.
     cmd.arg("-o")
         .arg(output_path)
         .arg(object_path)
+        .arg(compile_rt_path)
         .arg(runtime_path);
 
     // Export the program's `knot_*` runtime symbols into the dynamic symbol
@@ -28,8 +35,12 @@ pub fn link(
     // On macOS, link system libraries needed by the Rust runtime
     if cfg!(target_os = "macos") {
         cmd.arg("-lSystem").arg("-lresolv").arg("-liconv");
+        // knot-compile-rt embeds Z3 (C++), needing the C++ stdlib.
+        cmd.arg("-lc++");
     } else if cfg!(target_os = "linux") {
         cmd.arg("-lpthread").arg("-ldl").arg("-lm");
+        // knot-compile-rt embeds Z3 (C++, `__cxa_*`).
+        cmd.arg("-lstdc++");
     } else {
         return Err(format!(
             "unsupported target OS for linking: {}; only macOS and Linux are supported",

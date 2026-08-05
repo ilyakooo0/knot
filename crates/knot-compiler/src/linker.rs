@@ -15,6 +15,16 @@ pub fn link(
         .arg(object_path)
         .arg(runtime_path);
 
+    // Export the program's `knot_*` runtime symbols into the dynamic symbol
+    // table so code JIT-compiled at runtime by the `compile` builtin can
+    // resolve them against the running process (dlsym RTLD_DEFAULT). Without
+    // this the linker keeps them local and JIT symbol resolution fails.
+    if cfg!(target_os = "macos") {
+        cmd.arg("-Wl,-export_dynamic");
+    } else {
+        cmd.arg("-Wl,--export-dynamic");
+    }
+
     // On macOS, link system libraries needed by the Rust runtime
     if cfg!(target_os = "macos") {
         cmd.arg("-lSystem").arg("-lresolv").arg("-liconv");

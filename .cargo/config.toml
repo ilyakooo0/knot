@@ -1,0 +1,7 @@
+# Export the host binary's `knot_*` runtime symbols into the dynamic symbol
+# table so code JIT-compiled at runtime (the `compile` builtin / knot-jit) can
+# resolve them against the running process via dlsym(RTLD_DEFAULT). AOT builds
+# also pass this via knot-compiler's linker (linker.rs); this config covers
+# Rust-built binaries in this workspace (tests, dev tools).
+[build]
+rustflags = ["-C", "link-args=-Wl,--export-dynamic"]

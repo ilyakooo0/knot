@@ -15,6 +15,7 @@ edition = "2024"
 # unwind.rs), so the system unwinder can walk those frames.
 
 [workspace.dependencies]
+libc = "0.2"
 knot = { path = "crates/knot" }
 knot-compiler = { path = "crates/knot-compiler" }
 knot-runtime = { path = "crates/knot-runtime" }
@@ -22,6 +23,7 @@ cranelift-codegen = "0.131"
 cranelift-frontend = "0.131"
 cranelift-module = "0.131"
 cranelift-object = "0.131"
+cranelift-jit = "0.131"
 cranelift-native = "0.131"
 target-lexicon = "0.13"
 rusqlite = { version = "0.39", features = ["bundled", "collation"] }

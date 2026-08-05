@@ -730,8 +730,12 @@ pub fn compile(
     compile_time_overrides: &HashMap<String, String>,
     debug: bool,
 ) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
+    // ObjectModule (and the Vec<u8> result) is Send, so the AOT path compiles
+    // on a grown stack. The JIT path (knot-jit) wraps compile_with in its own
+    // grow that returns only the Send-safe entry address — see knot-jit.
     crate::stack::grow(|| {
-        compile_inner(
+        compile_with(
+            Codegen::new(),
             program,
             type_env,
             source_file,
@@ -758,10 +762,16 @@ pub fn compile(
             debug,
         )
     })
+    .map(Codegen::finish)
 }
 
+/// Backend-generic compile entry: run the shared pipeline into the given
+/// `Codegen<M>` and return it so the caller finishes backend-specifically
+/// (ObjectModule → object bytes; JITModule → finalized in-process code).
+/// Used by knot-jit for in-process JIT compilation.
 #[allow(clippy::too_many_arguments)]
-fn compile_inner(
+pub fn compile_with<M: cranelift_module::Module>(
+    cg: Codegen<M>,
     program: &ast::Expr,
     type_env: &TypeEnv,
     source_file: &str,
@@ -786,8 +796,67 @@ fn compile_inner(
     source: &str,
     compile_time_overrides: &HashMap<String, String>,
     debug: bool,
-) -> Result<Vec<u8>, Vec<knot::diagnostic::Diagnostic>> {
-    let mut cg = Codegen::new();
+) -> Result<Codegen<M>, Vec<knot::diagnostic::Diagnostic>> {
+    // No stack::grow here: the caller wraps as needed. knot-jit grows the
+    // stack around this call and returns only the Send-safe entry address;
+    // the AOT `compile` grows around compile_with + finish itself.
+    compile_inner(
+        cg,
+        program,
+        type_env,
+        source_file,
+        monad_info,
+        refine_targets,
+        refined_types,
+        from_json_targets,
+        type_info,
+        elem_pushdown_ok,
+        show_unit_strings,
+        sum_float_spans,
+        relation_fields,
+        with_fields,
+        implicit_refs,
+        type_arg_spans,
+        implicit_dict_args,
+        resolved_calls,
+        todo_types,
+        todo_bindings,
+        trace_types,
+        trace_bindings,
+        source,
+        compile_time_overrides,
+        debug,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_inner<M: cranelift_module::Module>(
+    mut cg: Codegen<M>,
+    program: &ast::Expr,
+    type_env: &TypeEnv,
+    source_file: &str,
+    monad_info: &MonadInfo,
+    refine_targets: &crate::infer::RefineTargets,
+    refined_types: &crate::infer::RefinedTypeInfoMap,
+    from_json_targets: &crate::infer::FromJsonTargets,
+    type_info: &crate::infer::TypeInfo,
+    elem_pushdown_ok: &crate::infer::ElemPushdownOk,
+    show_unit_strings: &crate::infer::ShowUnitStrings,
+    sum_float_spans: &crate::infer::SumFloatSpans,
+    relation_fields: &crate::infer::RelationFieldSpans,
+    with_fields: &crate::infer::WithFields,
+    implicit_refs: &crate::infer::ImplicitRefs,
+    type_arg_spans: &crate::infer::TypeArgSpans,
+    implicit_dict_args: &crate::infer::ImplicitDictArgs,
+    resolved_calls: &crate::infer::ResolvedCalls,
+    todo_types: &crate::infer::TodoTypes,
+    todo_bindings: &crate::infer::TodoBindings,
+    trace_types: &crate::infer::TraceTypes,
+    trace_bindings: &crate::infer::TraceBindings,
+    source: &str,
+    compile_time_overrides: &HashMap<String, String>,
+    debug: bool,
+) -> Result<Codegen<M>, Vec<knot::diagnostic::Diagnostic>> {
     cg.debug = debug;
     cg.todo_types = todo_types.clone();
     cg.todo_bindings = todo_bindings.clone();
@@ -1038,7 +1107,7 @@ fn compile_inner(
     if !cg.diagnostics.is_empty() {
         return Err(cg.diagnostics);
     }
-    Ok(cg.finish())
+    Ok(cg)
 }
 
 // ── Constructor ───────────────────────────────────────────────────
@@ -1078,6 +1147,46 @@ impl Codegen<ObjectModule> {
         let mut product = self.module.finish();
         self.unwind.emit(&mut product);
         product.emit().unwrap()
+    }
+}
+
+// ── JIT backend (in-process compilation for the `compile` builtin) ──
+
+impl Codegen<cranelift_jit::JITModule> {
+    /// Build the JIT backend: a `JITModule` whose imported `knot_*` runtime
+    /// symbols resolve to the *host process's* addresses (the running program
+    /// already links knot-runtime, so its symbols are reachable via
+    /// `dlsym(RTLD_DEFAULT, …)`). No disk, no subprocess — the compiled code
+    /// runs in-process against the same runtime the host uses.
+    pub fn new_jit() -> Self {
+        use cranelift_jit::{JITBuilder, JITModule};
+        let mut builder = JITBuilder::new(cranelift_module::default_libcall_names())
+            .expect("failed to create JITBuilder for host target");
+        builder.symbol_lookup_fn(Box::new(|name: &str| {
+            let Ok(cname) = std::ffi::CString::new(name) else {
+                return None;
+            };
+            // RTLD_DEFAULT (null handle) searches the global symbol table,
+            // which includes the host executable's exported symbols.
+            let ptr = unsafe { libc::dlsym(std::ptr::null_mut(), cname.as_ptr()) };
+            if ptr.is_null() {
+                None
+            } else {
+                Some(ptr as *const u8)
+            }
+        }));
+        Self::with_module(JITModule::new(builder))
+    }
+
+    /// Finalize the JIT'd definitions and return the module with the resolved
+    /// address of `knot_user_main` (the program's body as `fn(db) -> Value*`).
+    pub fn finish_jit(mut self) -> (*const u8, cranelift_jit::JITModule) {
+        self.module
+            .finalize_definitions()
+            .expect("JIT finalize_definitions failed");
+        let main_id = self.user_fns["main"].0;
+        let addr = self.module.get_finalized_function(main_id);
+        (addr, self.module)
     }
 }
 

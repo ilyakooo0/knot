@@ -19,6 +19,7 @@ cranelift-frontend = { workspace = true }
 cranelift-module = { workspace = true }
 cranelift-object = { workspace = true }
 cranelift-native = { workspace = true }
+libc = { workspace = true }
 target-lexicon = { workspace = true }
 # .eh_frame emission for generated functions (see src/unwind.rs) — versions
 # pinned to what cranelift 0.131 itself uses.

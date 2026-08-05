@@ -1469,6 +1469,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "knot-compile-rt"
+version = "0.1.0"
+dependencies = [
+ "knot-jit",
+ "knot-runtime",
+ "libc",
+]
+
+[[package]]
 name = "knot-compiler"
 version = "0.1.0"
 dependencies = [

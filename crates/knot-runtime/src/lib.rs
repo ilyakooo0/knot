@@ -10687,6 +10687,90 @@ fn maybe_nothing() -> *mut Value {
     alloc(Value::Constructor(intern_str("Nothing"), encode_unit()))
 }
 
+// ── `compile : Text -> Maybe a` ────────────────────────────────────
+//
+// The JIT compiler is not part of knot-runtime (that would create a Cargo
+// cycle — knot-compiler's build.rs builds knot-runtime). Instead the program
+// links a separate `knot-compile-rt` archive whose code registers a compile
+// implementation here at startup; `base.compile` calls through the pointer.
+// A program built without the JIT archive leaves the slot empty and
+// `base.compile` returns `Nothing` for everything.
+
+/// Signature of the registered compile implementation: takes the program
+/// source and the host db handle, returns the forced value plus the inferred
+/// type string (out-params), or null on any compile error. Implemented by
+/// knot-compile-rt (`knot_compile_impl`).
+type CompileImpl = unsafe extern "C" fn(
+    src_ptr: *const u8,
+    src_len: usize,
+    db: *mut c_void,
+    out_ty_ptr: *mut *mut u8,
+    out_ty_len: *mut usize,
+) -> *mut Value;
+
+static COMPILE_IMPL: std::sync::atomic::AtomicPtr<c_void> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Registered by knot-compile-rt at program startup to install the compile
+/// implementation. Called from the generated program's `main`.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_register_compile_impl(f: *mut c_void) {
+    COMPILE_IMPL.store(f, std::sync::atomic::Ordering::Release);
+}
+
+/// Look up the registered compile implementation, if any.
+fn compile_impl() -> Option<CompileImpl> {
+    let p = COMPILE_IMPL.load(std::sync::atomic::Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut c_void, CompileImpl>(p) })
+    }
+}
+
+/// `base.compile : Text -> Maybe a`. Compile+run the knot program in `src`
+/// in-process against the host runtime, returning `Just {value}` on success
+/// and `Nothing` on any compile error or when no JIT is linked.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_builtin_compile(src: *mut Value) -> *mut Value {
+    let Some(f) = compile_impl() else {
+        return maybe_nothing();
+    };
+    let Value::Text(source) = (unsafe { as_ref(src) }) else {
+        return maybe_nothing();
+    };
+    // Open a db handle for the snippet. knot_db_open records the path on first
+    // open (DB_PATH), so reuse it; a pure program (no store) gets :memory:.
+    // A snippet reading the host's persisted relations thus sees real data.
+    let db_path = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (pstr, plen) = if db_path.is_empty() {
+        (":memory:".as_bytes().as_ptr(), ":memory:".len())
+    } else {
+        (db_path.as_ptr(), db_path.len())
+    };
+    let db = knot_db_open(pstr, plen);
+    let mut ty_ptr: *mut u8 = std::ptr::null_mut();
+    let mut ty_len: usize = 0;
+    let value = unsafe {
+        f(
+            source.as_ptr(),
+            source.len(),
+            db,
+            &mut ty_ptr,
+            &mut ty_len,
+        )
+    };
+    if value.is_null() {
+        return maybe_nothing();
+    }
+    // TODO: unify the compiled program's type (ty_ptr/ty_len) against the
+    // caller's expected `a`; Nothing on mismatch. For now accept any type.
+    if !ty_ptr.is_null() {
+        unsafe { libc::free(ty_ptr as *mut c_void) };
+    }
+    maybe_just(value)
+}
+
 /// nil — the empty List (1-arg builtin that ignores its argument, so the
 /// bare `base.list.nil` function value has the standard 1-param shape).
 #[unsafe(no_mangle)]

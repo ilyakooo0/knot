@@ -20,6 +20,7 @@ knot = { path = "crates/knot" }
 knot-compiler = { path = "crates/knot-compiler" }
 knot-runtime = { path = "crates/knot-runtime" }
 knot-jit = { path = "crates/knot-jit" }
+knot-compile-rt = { path = "crates/knot-compile-rt" }
 cranelift-codegen = "0.131"
 cranelift-frontend = "0.131"
 cranelift-module = "0.131"

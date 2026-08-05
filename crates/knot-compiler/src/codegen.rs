@@ -1371,6 +1371,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_println", &[p], &[p]);
         self.declare_rt("knot_value_show", &[p], &[p]);
         self.declare_rt("knot_value_extract", &[p], &[p]);
+        self.declare_rt("knot_builtin_compile", &[p], &[p]);
         self.declare_rt("knot_value_show_unit", &[p, p, p], &[p]);
         self.declare_rt("knot_guard_failed", &[], &[]);
 
@@ -2232,6 +2233,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // `extract` renders a value as evaluable Knot source (runtime
             // `knot_value_extract`); first-class so `base.extract` works.
             "extract",
+            // `compile` JIT-compiles+evals a source string (runtime
+            // `knot_builtin_compile`); first-class so `base.compile` works.
+            "compile",
             // List ADT builtins (`base.list.*`), exposed nested under the
             // `list` namespace in the prelude record. Runtime-implemented
             // (knot_list_*) since the prelude record can't self-reference.
@@ -3105,6 +3109,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // Extract: 1-param. Renders any value as evaluable Knot source
         // (collecting closure/IO dependencies into a `with` block).
         self.define_stdlib_fn_1("extract", "knot_value_extract");
+        self.define_stdlib_fn_1("compile", "knot_builtin_compile");
 
         // Sleep: 1-param (IO-returning)
         self.define_stdlib_fn_1("sleep", "knot_sleep_io");

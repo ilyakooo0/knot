@@ -9553,6 +9553,22 @@ impl Infer {
             Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text))),
         );
 
+        // compile : ∀a. Text -> Maybe a — JIT-compile+eval a knot source string
+        // in-process against the host runtime. `Just {value}` on success (the
+        // value forced at compile time, typed as `a`), `Nothing` on any compile
+        // error or when the program's type doesn't match `a`.
+        let a = self.fresh_var();
+        self.bind_top(
+            "compile",
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(
+                    Box::new(Ty::Text),
+                    Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(a)])),
+                ),
+            ),
+        );
+
         // union : ∀a. [a] -> [a] -> [a]
         let a = self.fresh_var();
         self.bind_top(

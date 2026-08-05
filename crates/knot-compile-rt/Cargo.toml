@@ -1,0 +1,14 @@
+[package]
+name = "knot-compile-rt"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+# Staticlib so the linker can embed this into compiled knot programs alongside
+# libknot_runtime.a; rlib so the knot binary / tests can use it as a normal dep.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+knot-jit = { workspace = true }
+knot-runtime = { workspace = true }
+libc = { workspace = true }

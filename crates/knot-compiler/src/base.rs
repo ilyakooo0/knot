@@ -138,6 +138,10 @@ pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     // Value → evaluable Knot source (dependency-collecting). Registered as a
     // stdlib function value in codegen.
     "extract",
+    // In-process JIT compile+eval: `compile : Text -> Maybe a`. Registered as
+    // a stdlib function value in codegen (calls knot_builtin_compile, which
+    // dispatches through the runtime's registered compile implementation).
+    "compile",
     // 0-arg IO builtins. Each is a re-runnable IO thunk (`Value::IO(thunk, _)`)
     // produced fresh by the bare-`Var` dispatch, so holding the action as a
     // record field is safe — forcing `base.now` twice runs `knot_now` twice.

@@ -8,6 +8,45 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process;
 
+/// Prepend the host's `data` declarations for any ADTs a `base.compile`
+/// expected-type descriptor references, so the JIT can compare constructor sets
+/// structurally (nominal-by-structure) rather than by bare name. The output is
+/// `data A = ... \n data B = ... \n <type>` — leading `data` decls, then the
+/// type. Only ADTs the host actually declares (`ResolvedType::Adt`) are
+/// emitted; scalar/record/alias names pass through untouched.
+fn prepend_host_data_decls(
+    descriptor: &str,
+    aliases: &HashMap<String, types::ResolvedType>,
+) -> String {
+    // Collect host ADT names appearing in the descriptor. A name match is
+    // whole-word: the descriptor is source-type syntax, so an ADT appears as an
+    // identifier token.
+    let mut decls: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (name, resolved) in aliases {
+        if let types::ResolvedType::Adt(ctors) = resolved
+            && !seen.contains(name.as_str())
+            && references_name(descriptor, name)
+        {
+            seen.insert(name.as_str());
+            decls.push(types::adt_to_data_decl(name, ctors));
+        }
+    }
+    if decls.is_empty() {
+        descriptor.to_string()
+    } else {
+        format!("{}\n{}", decls.join("\n"), descriptor)
+    }
+}
+
+/// Does `descriptor` mention `name` as a whole identifier (not as a substring
+/// of a longer identifier)?
+fn references_name(descriptor: &str, name: &str) -> bool {
+    descriptor
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .any(|tok| tok == name)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -386,12 +425,17 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
 
     // Type inference
     let (infer_diags, monad_info, type_info, _local_types, refine_targets, refined_types, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, resolved_calls, todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, _file_body_type) = infer::check(&mut program);
-    // Enrich the expected-type descriptor of each `compile` call with the
-    // host's ADT constructor signatures, so the runtime's subsumption check
-    // against the snippet compares constructor sets, not just type names.
+    // The expected-type descriptor of each `compile` call is knot source-type
+    // syntax (from `display_ty_clean`). For ADTs the bare NAME alone is
+    // insufficient — the JIT must compare constructor sets, and `Priority` says
+    // nothing about `{Low|High}` vs `{Low|High|Medium}`. So when the expected
+    // type references a host ADT, prepend the host's `data` declaration(s) for
+    // those ADTs (existing knot syntax, not an invented grammar). The JIT
+    // splits the leading `data` decls from the trailing type, registers them,
+    // and compares ctor sets structurally.
     let compile_expected_types: infer::CompileExpectedTypes = compile_expected_types
         .into_iter()
-        .map(|(span, desc)| (span, infer::enrich_descriptor_with_adts(&desc, &type_env.aliases)))
+        .map(|(span, desc)| (span, prepend_host_data_decls(&desc, &type_env.aliases)))
         .collect();
     if !infer_diags.is_empty() {
         for diag in &infer_diags {

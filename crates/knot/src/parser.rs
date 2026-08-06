@@ -224,6 +224,35 @@ impl Parser {
 
         (expr, self.diagnostics)
     }
+
+    /// Parse a standalone type annotation (knot's source type syntax, e.g.
+    /// `Int 1 -> Maybe (Int 1)`, `{x: Int 1, y: Int 1}`, `Priority`) into an
+    /// `ast::Type`. Used to reconstitute an expected `base.compile` type —
+    /// emitted by the host compiler as source — back into a real type on the
+    /// JIT side, so subsumption runs on actual `Ty`s, not strings.
+    pub fn parse_type_annotation(mut self) -> Option<Type> {
+        self.skip_newlines();
+        let ty = self.parse_type()?;
+        self.skip_newlines();
+        if !self.at_eof() {
+            return None; // trailing tokens — not a single clean type
+        }
+        if self.diagnostics.iter().any(|d| d.severity == crate::diagnostic::Severity::Error) {
+            return None;
+        }
+        Some(ty)
+    }
+}
+
+/// Lex + parse a standalone type-annotation string into an `ast::Type`.
+/// Returns `None` on any lex/parse error or trailing tokens.
+pub fn parse_type_str(source: &str) -> Option<Type> {
+    let lexer = crate::lexer::Lexer::new(source);
+    let (tokens, lex_diags) = lexer.tokenize();
+    if lex_diags.iter().any(|d| d.severity == crate::diagnostic::Severity::Error) {
+        return None;
+    }
+    Parser::new(source.to_string(), tokens).parse_type_annotation()
 }
 
 // ── Recursion depth guard ────────────────────────────────────────────

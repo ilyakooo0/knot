@@ -24,7 +24,7 @@ fn db() -> *mut std::ffi::c_void {
 fn jit_compiles_and_runs_pure_int() {
     init_compile_rt();
     let db = db();
-    let out = compile_and_run("base.println (base.show (40 + 2))", db)
+    let out = compile_and_run("base.println (base.show (40 + 2))", db, None)
         .expect("JIT compile failed");
     assert!(!out.value.is_null(), "JIT produced a null Value");
 }
@@ -33,7 +33,7 @@ fn jit_compiles_and_runs_pure_int() {
 fn jit_compiles_and_runs_closure() {
     init_compile_rt();
     let db = db();
-    let out = compile_and_run("base.println (base.show ((\\x -> x * 2 + 1) 10))", db)
+    let out = compile_and_run("base.println (base.show ((\\x -> x * 2 + 1) 10))", db, None)
         .expect("JIT compile failed");
     assert!(!out.value.is_null());
 }
@@ -42,7 +42,7 @@ fn jit_compiles_and_runs_closure() {
 fn jit_rejects_type_error() {
     init_compile_rt();
     let db = db();
-    let res = compile_and_run("1 + \"not an int\"", db);
+    let res = compile_and_run("1 + \"not an int\"", db, None);
     assert!(res.is_err(), "type error should fail compilation");
 }
 
@@ -53,7 +53,7 @@ fn jit_rejects_type_error() {
 fn jit_surfaces_scalar_body_type() {
     init_compile_rt();
     let db = db();
-    let out = compile_and_run("42", db).expect("JIT compile failed");
+    let out = compile_and_run("42", db, None).expect("JIT compile failed");
     assert_eq!(out.ty.as_deref(), Some("Int"));
 }
 
@@ -61,7 +61,7 @@ fn jit_surfaces_scalar_body_type() {
 fn jit_surfaces_polymorphic_lambda_type() {
     init_compile_rt();
     let db = db();
-    let out = compile_and_run("\\x -> x", db).expect("JIT compile failed");
+    let out = compile_and_run("\\x -> x", db, None).expect("JIT compile failed");
     // Identity is polymorphic: a type variable on both sides.
     assert_eq!(out.ty.as_deref(), Some("a -> a"));
 }
@@ -70,6 +70,6 @@ fn jit_surfaces_polymorphic_lambda_type() {
 fn jit_surfaces_text_body_type() {
     init_compile_rt();
     let db = db();
-    let out = compile_and_run("\"hello\"", db).expect("JIT compile failed");
+    let out = compile_and_run("\"hello\"", db, None).expect("JIT compile failed");
     assert_eq!(out.ty.as_deref(), Some("Text"));
 }

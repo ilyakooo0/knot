@@ -10704,6 +10704,8 @@ type CompileImpl = unsafe extern "C" fn(
     src_ptr: *const u8,
     src_len: usize,
     db: *mut c_void,
+    expected_ptr: *const u8,
+    expected_len: usize,
     out_ty_ptr: *mut *mut u8,
     out_ty_len: *mut usize,
     out_rels_ptr: *mut *mut u8,
@@ -10730,408 +10732,6 @@ fn compile_impl() -> Option<CompileImpl> {
     }
 }
 
-// ─── Type-descriptor subsumption (for `base.compile`'s runtime check) ───────
-//
-// A minimal recursive-descent parser over the type-descriptor strings the
-// compiler emits (`infer::display_ty_clean`) plus a subsumption matcher: does
-// the SNIPPET's type, treating its type variables as universally quantified
-// (α-renamable), instantiate to the EXPECTED type? Anything that doesn't parse
-// is Opaque and conservatively accepted — the checker must never reject a
-// working program over a grammar gap.
-
-/// A parsed type descriptor, or `Opaque` for anything the parser doesn't cover.
-#[derive(Debug, Clone, PartialEq)]
-enum TyDesc {
-    /// Couldn't parse — accept.
-    Opaque,
-    /// Type variable (`a`, `r`, …). In the SNIPPET's type these carry
-    /// polymorphism.
-    Var(String),
-    /// Scalar with an optional unit suffix (`Int u` → base "Int", unit "u").
-    Scalar(&'static str, Option<String>),
-    /// Function type.
-    Fun(Box<TyDesc>, Box<TyDesc>),
-    /// Record; `Some(var)` is the open-row tail.
-    Record(Vec<(String, TyDesc)>, Option<String>),
-    /// Relation (list) of an element type.
-    Relation(Box<TyDesc>),
-    /// ADT constructor applied to args (`Maybe Int`, `IO T`, `Name a b`).
-    App(String, Vec<TyDesc>),
-    /// A nominal ADT with its full constructor signature, produced by
-    /// knot-compiler's `enrich_descriptor_with_adts` (`Priority{Low|High}`,
-    /// `Status{Open|InProgress{assignee:Text}}`). Compared structurally on the
-    /// constructor set.
-    Adt(String, Vec<(String, Vec<(String, TyDesc)>)>),
-}
-
-/// Parse a descriptor; `TyDesc::Opaque` on any unsupported construct.
-fn parse_ty_desc(s: &str) -> TyDesc {
-    let toks = lex_ty(s.trim());
-    let mut p = TyParser { toks, pos: 0 };
-    match p.ty() {
-        Some(t) if p.at_end() => t,
-        _ => TyDesc::Opaque,
-    }
-}
-
-/// Tokenizer: identifiers (incl. unit text like `M/s`), single-char
-/// punctuation, and the `->` arrow.
-fn lex_ty(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let b: Vec<char> = s.chars().collect();
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if c.is_whitespace() {
-            i += 1;
-        } else if c == '-' && i + 1 < b.len() && b[i + 1] == '>' {
-            out.push("->".to_string());
-            i += 2;
-        } else if "{}[]()<>|,.:".contains(c) {
-            out.push(c.to_string());
-            i += 1;
-        } else if c.is_alphanumeric() || c == '_' || c == '/' || c == '*' {
-            let start = i;
-            while i < b.len()
-                && (b[i].is_alphanumeric() || b[i] == '_' || b[i] == '/' || b[i] == '*')
-            {
-                i += 1;
-            }
-            out.push(b[start..i].iter().collect());
-        } else {
-            out.push("\u{0}".to_string()); // unrecognized char → parse failure
-            i += 1;
-        }
-    }
-    out
-}
-
-struct TyParser {
-    toks: Vec<String>,
-    pos: usize,
-}
-
-impl TyParser {
-    fn at_end(&self) -> bool {
-        self.pos >= self.toks.len()
-    }
-    fn peek(&self) -> Option<&str> {
-        self.toks.get(self.pos).map(String::as_str)
-    }
-    fn next(&mut self) -> Option<String> {
-        let t = self.toks.get(self.pos).cloned();
-        if t.is_some() {
-            self.pos += 1;
-        }
-        t
-    }
-    fn eat(&mut self, want: &str) -> bool {
-        if self.peek() == Some(want) {
-            self.pos += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    /// `ty := forall a b. ty | fun_ty`
-    fn ty(&mut self) -> Option<TyDesc> {
-        if self.peek() == Some("forall") {
-            self.next();
-            while let Some(t) = self.peek() {
-                if t == "." {
-                    break;
-                }
-                self.next();
-            }
-            if !self.eat(".") {
-                return None;
-            }
-            return self.ty();
-        }
-        self.fun_ty()
-    }
-
-    /// `fun_ty := app_ty (-> fun_ty)?` (right-assoc).
-    fn fun_ty(&mut self) -> Option<TyDesc> {
-        let param = self.app_ty()?;
-        if self.eat("->") {
-            let ret = self.fun_ty()?;
-            Some(TyDesc::Fun(Box::new(param), Box::new(ret)))
-        } else {
-            Some(param)
-        }
-    }
-
-    /// `app_ty := atom (atom)*` — left-assoc type application.
-    fn app_ty(&mut self) -> Option<TyDesc> {
-        let head = self.atom()?;
-        let mut args = Vec::new();
-        while self.is_atom_start() {
-            args.push(self.atom()?);
-        }
-        if args.is_empty() {
-            return Some(head);
-        }
-        match head {
-            TyDesc::Var(n) => Some(TyDesc::App(n, args)),
-            TyDesc::App(n, a) if a.is_empty() => {
-                let mut a2 = vec![];
-                a2.extend(args);
-                Some(TyDesc::App(n, a2))
-            }
-            _ => None, // applying a non-constructor — opaque
-        }
-    }
-
-    fn is_atom_start(&self) -> bool {
-        matches!(self.peek(), Some(t) if {
-            let c = t.chars().next().unwrap_or('\0');
-            c.is_alphanumeric() || c == '_' || c == '{' || c == '[' || c == '(' || c == '<'
-        })
-    }
-
-    /// `atom := scalar | var | record | relation | (ty) | variant`
-    fn atom(&mut self) -> Option<TyDesc> {
-        let t = self.next()?;
-        match t.as_str() {
-            "{" => self.record_ty(),
-            "[" => {
-                let el = self.ty()?;
-                if !self.eat("]") {
-                    return None;
-                }
-                Some(TyDesc::Relation(Box::new(el)))
-            }
-            "(" => {
-                let inner = self.ty()?;
-                if !self.eat(")") {
-                    return None;
-                }
-                Some(inner)
-            }
-            "<" => {
-                // Variant: skip to the matching `>` (rare in compile results).
-                let mut depth = 1;
-                while let Some(tok) = self.next() {
-                    if tok == "<" {
-                        depth += 1;
-                    } else if tok == ">" {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                }
-                if depth != 0 {
-                    return None;
-                }
-                Some(TyDesc::Opaque)
-            }
-            name => {
-                if name == "\u{0}" {
-                    return None;
-                }
-                let first = name.chars().next()?;
-                if first.is_lowercase() || first == '_' {
-                    Some(TyDesc::Var(name.to_string()))
-                } else {
-                    match name {
-                        "Int" | "Float" | "Text" | "Bool" | "Bytes" | "Uuid" => {
-                            let base: &'static str = match name {
-                                "Int" => "Int",
-                                "Float" => "Float",
-                                "Text" => "Text",
-                                "Bool" => "Bool",
-                                "Bytes" => "Bytes",
-                                _ => "Uuid",
-                            };
-                            // Optional unit suffix directly following (Int/Float).
-                            let unit = if (base == "Int" || base == "Float")
-                                && matches!(self.peek(), Some(u) if {
-                                    let f = u.chars().next().unwrap_or('\0');
-                                    f.is_lowercase() || f == '*' || f == 'M' || f == 'm'
-                                }) {
-                                self.next()
-                            } else {
-                                None
-                            };
-                            Some(TyDesc::Scalar(base, unit))
-                        }
-                        _ => {
-                            let name = name.to_string();
-                            // `Name{Ctor{f:T,...}|...}` — a nominal ADT with its
-                            // constructor signature (from knot-compiler's
-                            // enrichment). Bare `{` after a name is the ADT
-                            // marker, not a record argument.
-                            if self.peek() == Some("{") {
-                                if let Some(ctors) = self.adt_sig() {
-                                    return Some(TyDesc::Adt(name, ctors));
-                                }
-                                // Malformed signature → opaque (conservative).
-                                return Some(TyDesc::Opaque);
-                            }
-                            Some(TyDesc::App(name, Vec::new()))
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Parse an ADT constructor signature body `{Ctor{f:T,...}|Ctor|...}`
-    /// (the leading `{` is the next token). Returns the constructor list.
-    fn adt_sig(&mut self) -> Option<Vec<(String, Vec<(String, TyDesc)>)>> {
-        self.eat("{");
-        let mut ctors = Vec::new();
-        loop {
-            let cname = self.next()?;
-            // A constructor name is a type-level identifier (uppercase).
-            if !cname.chars().next()?.is_uppercase() {
-                return None;
-            }
-            let mut fields = Vec::new();
-            if self.peek() == Some("{") {
-                self.eat("{");
-                if !self.eat("}") {
-                    loop {
-                        let fname = self.next()?;
-                        self.eat(":");
-                        let fty = self.ty()?;
-                        fields.push((fname, fty));
-                        if self.eat(",") {
-                            continue;
-                        }
-                        self.eat("}");
-                        break;
-                    }
-                }
-            }
-            ctors.push((cname, fields));
-            if self.eat("|") {
-                continue;
-            }
-            self.eat("}");
-            break;
-        }
-        Some(ctors)
-    }
-
-    fn record_ty(&mut self) -> Option<TyDesc> {
-        let mut fields = Vec::new();
-        let mut open = None;
-        if self.eat("}") {
-            return Some(TyDesc::Record(fields, None));
-        }
-        loop {
-            if self.eat("|") {
-                let v = self.next()?;
-                if !self.eat("}") {
-                    return None;
-                }
-                open = Some(v);
-                break;
-            }
-            let fname = self.next()?;
-            if fname == "}" {
-                break;
-            }
-            if !self.eat(":") {
-                return None; // not a `field: Ty` — opaque
-            }
-            let fty = self.ty()?;
-            fields.push((fname, fty));
-            if self.eat(",") {
-                continue;
-            }
-            if self.eat("|") {
-                let v = self.next()?;
-                if !self.eat("}") {
-                    return None;
-                }
-                open = Some(v);
-                break;
-            }
-            if self.eat("}") {
-                break;
-            }
-            return None;
-        }
-        Some(TyDesc::Record(fields, open))
-    }
-}
-
-/// Does `snippet` (the JIT'd snippet's type, vars = universally quantified)
-/// subsume `expected` (the caller's `a`)? Conservatively TRUE when either side
-/// is Opaque.
-fn type_subsumes(snippet: &str, expected: &str) -> bool {
-    let s = parse_ty_desc(snippet);
-    let e = parse_ty_desc(expected);
-    // Bindings for the SNIPPET's quantified vars, built up during the match.
-    let mut subst: Vec<(String, TyDesc)> = Vec::new();
-    subsumes(&s, &e, &mut subst)
-}
-
-fn subsumes(s: &TyDesc, e: &TyDesc, subst: &mut Vec<(String, TyDesc)>) -> bool {
-    match (s, e) {
-        (TyDesc::Opaque, _) | (_, TyDesc::Opaque) => true,
-        // An EXPECTED type variable means the caller is generic at that
-        // position — it accepts whatever the snippet produces there, so it
-        // never constrains the match. (e.g. `show (f.value 42)` leaves the
-        // result a free var; the snippet's `a -> a` must still be accepted.)
-        (_, TyDesc::Var(_)) => true,
-        // A snippet variable instantiates to the expected type, consistently.
-        (TyDesc::Var(v), _) => {
-            if let Some((_, bound)) = subst.iter().find(|(n, _)| n == v) {
-                bound == e
-            } else {
-                subst.push((v.clone(), e.clone()));
-                true
-            }
-        }
-        (TyDesc::Scalar(b1, u1), TyDesc::Scalar(b2, u2)) => b1 == b2 && u1 == u2,
-        // Invariant param for v1 (a polymorphic `a -> a` still matches
-        // `Int -> Int` via the var rule); covariant result.
-        (TyDesc::Fun(p1, r1), TyDesc::Fun(p2, r2)) => {
-            subsumes(p1, p2, subst) && subsumes(r1, r2, subst)
-        }
-        (TyDesc::Relation(a), TyDesc::Relation(b)) => subsumes(a, b, subst),
-        // Width subsumption: a snippet record with MORE fields subsumes an
-        // expected record with FEWER; shared fields must match.
-        (TyDesc::Record(sf, _), TyDesc::Record(ef, _)) => ef.iter().all(|(name, ety)| {
-            sf.iter()
-                .find(|(n, _)| n == name)
-                .is_some_and(|(_, sty)| subsumes(sty, ety, subst))
-        }),
-        (TyDesc::App(n1, a1), TyDesc::App(n2, a2)) => {
-            n1 == n2
-                && a1.len() == a2.len()
-                && a1.iter().zip(a2).all(|(x, y)| subsumes(x, y, subst))
-        }
-        // Nominal ADTs with constructor signatures. The snippet's value flows
-        // into the host's `case`, which is written against the EXPECTED type's
-        // constructors — so the snippet must not produce a constructor the host
-        // can't match: snippet ctors ⊆ expected ctors, and each shared ctor's
-        // fields must be covariantly compatible (snippet field ⊑ expected).
-        (TyDesc::Adt(sn, sc), TyDesc::Adt(en, ec)) => {
-            sn == en
-                && sc.iter().all(|(ctor, sfields)| {
-                    ec.iter().find(|(ec2, _)| ec2 == ctor).is_some_and(|(_, efields)| {
-                        sfields.len() == efields.len()
-                            && sfields.iter().zip(efields).all(|((sn2, sty), (en2, ety))| {
-                                sn2 == en2 && subsumes(sty, ety, subst)
-                            })
-                    })
-                })
-        }
-        // One side enriched, the other a bare name (unenriched — e.g. an older
-        // or non-ADT-bearing descriptor): fall back to nominal name comparison.
-        (TyDesc::Adt(n1, _), TyDesc::App(n2, a)) | (TyDesc::App(n2, a), TyDesc::Adt(n1, _)) => {
-            n1 == n2 && a.is_empty()
-        }
-        _ => false,
-    }
-}
 
 /// Shared JIT compile+run for `base.compile`. On success returns the forced
 /// value and the snippet's body-type descriptor (freed by the caller). On any
@@ -11141,7 +10741,7 @@ fn subsumes(s: &TyDesc, e: &TyDesc, subst: &mut Vec<(String, TyDesc)>) -> bool {
 /// `*rel` guard: a snippet may only use relations the host program defined —
 /// the snippet's declared relations are checked against the host's registered
 /// relation set, foreign `*rel` → null.
-fn compile_run(source: &[u8]) -> (*mut Value, Option<String>) {
+fn compile_run(source: &[u8], expected: Option<&[u8]>) -> (*mut Value, Option<String>) {
     let Some(f) = compile_impl() else {
         return (std::ptr::null_mut(), None);
     };
@@ -11156,6 +10756,13 @@ fn compile_run(source: &[u8]) -> (*mut Value, Option<String>) {
     };
     let db = knot_db_open(pstr, plen);
 
+    // The host's expected type (source-annotation string) forwarded to the JIT,
+    // which runs the real-type subsumption. Empty → unpinned.
+    let (eptr, elen) = match expected {
+        Some(e) if !e.is_empty() => (e.as_ptr(), e.len()),
+        _ => (std::ptr::null(), 0),
+    };
+
     let mut ty_ptr: *mut u8 = std::ptr::null_mut();
     let mut ty_len: usize = 0;
     let mut rels_ptr: *mut u8 = std::ptr::null_mut();
@@ -11165,6 +10772,8 @@ fn compile_run(source: &[u8]) -> (*mut Value, Option<String>) {
             source.as_ptr(),
             source.len(),
             db,
+            eptr,
+            elen,
             &mut ty_ptr,
             &mut ty_len,
             &mut rels_ptr,
@@ -11224,7 +10833,7 @@ pub extern "C-unwind" fn knot_builtin_compile(src: *mut Value) -> *mut Value {
     let Value::Text(source) = (unsafe { as_ref(src) }) else {
         return maybe_nothing();
     };
-    let (value, _ty) = compile_run(source.as_bytes());
+    let (value, _ty) = compile_run(source.as_bytes(), None);
     if value.is_null() {
         maybe_nothing()
     } else {
@@ -11233,11 +10842,12 @@ pub extern "C-unwind" fn knot_builtin_compile(src: *mut Value) -> *mut Value {
 }
 
 /// `base.compile src` whose context pins the expected type `a`: like
-/// `knot_builtin_compile`, but additionally rejects the call (`Nothing`)
-/// unless the JIT'd snippet's body type SUBSUMES the expected type `expected`
-/// (descriptor ptr+len) — i.e. the snippet's type scheme is instantiable to
-/// `a`, so the host can consume the value as an `a`. A snippet whose type
-/// can't be determined (None) is accepted (nothing to check against).
+/// `knot_builtin_compile`, but forwards the expected type (a knot source
+/// type-annotation string) to the JIT, which checks the snippet's body type
+/// against it on REAL types (`infer::ty_subsumes`) inside its own inference
+/// context — rejecting (returning null → `Nothing`) when the snippet's type
+/// isn't usable where the expected type is wanted. No string comparison here:
+/// the runtime is a dumb pipe; the analysis lives in the JIT's typechecker.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_builtin_compile_typed(
     src: *mut Value,
@@ -11247,18 +10857,13 @@ pub extern "C-unwind" fn knot_builtin_compile_typed(
     let Value::Text(source) = (unsafe { as_ref(src) }) else {
         return maybe_nothing();
     };
-    let expected = unsafe { std::slice::from_raw_parts(expected_ptr, expected_len) };
-    let expected = String::from_utf8_lossy(expected).into_owned();
-    let (value, ty) = compile_run(source.as_bytes());
+    let expected = if expected_ptr.is_null() || expected_len == 0 {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(expected_ptr, expected_len) })
+    };
+    let (value, _ty) = compile_run(source.as_bytes(), expected);
     if value.is_null() {
-        return maybe_nothing();
-    }
-    // Subsumption: the snippet's type must be usable where an `a` is expected.
-    // A None type (couldn't infer) is conservatively accepted; a parse failure
-    // on either side is too (don't break working programs over the checker).
-    if let Some(snippet_ty) = ty
-        && !type_subsumes(&snippet_ty, &expected)
-    {
         return maybe_nothing();
     }
     maybe_just(value)
@@ -22222,119 +21827,3 @@ mod show_tests {
 
 
 
-
-
-
-#[cfg(test)]
-mod subsumption_tests {
-    use super::type_subsumes;
-
-    #[test]
-    fn identical_scalars() {
-        assert!(type_subsumes("Int", "Int"));
-        assert!(type_subsumes("Text", "Text"));
-        assert!(type_subsumes("Bool", "Bool"));
-    }
-
-    #[test]
-    fn distinct_scalars_rejected() {
-        assert!(!type_subsumes("Text", "Int"));
-        assert!(!type_subsumes("Int", "Text"));
-        assert!(!type_subsumes("Bool", "Int"));
-    }
-
-    #[test]
-    fn scalars_are_exact_no_coercion() {
-        // The runtime check is strict: distinct scalar bases never subsume,
-        // even Int/Float (no implicit coercion in the descriptor check).
-        assert!(!type_subsumes("Int", "Float"));
-        assert!(!type_subsumes("Float", "Int"));
-    }
-
-    #[test]
-    fn polymorphic_subsumes_concrete() {
-        assert!(type_subsumes("a -> a", "Int -> Int"));
-        assert!(type_subsumes("a", "Int"));
-        assert!(type_subsumes("a", "Text"));
-    }
-
-    #[test]
-    fn expected_var_is_unconstrained() {
-        // An expected type variable means the caller is generic at that
-        // position — any snippet type is usable there.
-        assert!(type_subsumes("Int", "a"));
-        assert!(type_subsumes("Text", "b"));
-        // ... including under a function constructor: `a -> a` applied where
-        // only the argument is pinned (`Int`) and the result is generic.
-        assert!(type_subsumes("a -> a", "Int -> a"));
-        assert!(type_subsumes("a -> a", "Int -> b"));
-        // A concrete function whose argument doesn't match is still rejected.
-        assert!(!type_subsumes("Text -> Text", "Int -> a"));
-    }
-
-    #[test]
-    fn adt_nominal_and_ctor_sets() {
-        // Identical ADTs subsume.
-        assert!(type_subsumes("Priority{Low|High}", "Priority{Low|High}"));
-        // Same name, snippet has a ctor the expected lacks → reject (the
-        // host's `case` wouldn't cover it).
-        assert!(!type_subsumes(
-            "Priority{Low|High|Medium}",
-            "Priority{Low|High}"
-        ));
-        // Snippet has FEWER ctors than expected → accept (host covers all the
-        // snippet can produce).
-        assert!(type_subsumes("Priority{Low}", "Priority{Low|High}"));
-        // Different type name, even with identical ctors → reject (nominal).
-        assert!(!type_subsumes("Level{Low|High}", "Priority{Low|High}"));
-        // Constructor payload field type must match.
-        assert!(!type_subsumes(
-            "Status{Open|InProgress{assignee: Int}}",
-            "Status{Open|InProgress{assignee: Text}}"
-        ));
-        assert!(type_subsumes(
-            "Status{Open|InProgress{assignee: Text}}",
-            "Status{Open|InProgress{assignee: Text}}"
-        ));
-    }
-
-    #[test]
-    fn adt_vs_bare_name_falls_back_to_nominal() {
-        // One side enriched, the other a bare name (unenriched descriptor):
-        // accept iff the names match.
-        assert!(type_subsumes("Priority{Low|High}", "Priority"));
-        assert!(!type_subsumes("Priority{Low|High}", "Level"));
-    }
-
-    #[test]
-    fn adt_nested_in_function() {
-        assert!(type_subsumes(
-            "Int -> Priority{Low|High}",
-            "Int -> Priority{Low|High}"
-        ));
-        assert!(!type_subsumes(
-            "Int -> Priority{Low|Medium}",
-            "Int -> Priority{Low|High}"
-        ));
-    }
-
-    #[test]
-    fn function_types_contravariant() {
-        assert!(type_subsumes("Int -> Int", "Int -> Int"));
-        assert!(!type_subsumes("Int -> Text", "Int -> Int"));
-    }
-
-    #[test]
-    fn unparseable_is_accepted_conservatively() {
-        assert!(type_subsumes("{{{{", "Int"));
-        assert!(type_subsumes("Int", "???"));
-        assert!(type_subsumes("", "Int"));
-    }
-
-    #[test]
-    fn records_width_subtyping() {
-        assert!(type_subsumes("{value: Int, extra: Text}", "{value: Int}"));
-        assert!(!type_subsumes("{value: Int}", "{value: Int, extra: Text}"));
-        assert!(!type_subsumes("{value: Text}", "{value: Int}"));
-    }
-}

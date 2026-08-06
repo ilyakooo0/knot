@@ -2004,6 +2004,30 @@ impl Infer {
 
     // ── Unification ──────────────────────────────────────────────
 
+    /// `snippet ⊑ expected` — is the snippet's inferred type usable where the
+    /// host's expected type is wanted? Checked on real `Ty`s with the
+    /// language's own unifier, not a parallel string comparison.
+    ///
+    /// Mechanism: unify snippet against expected in a snapshot/restore of the
+    /// substitution, succeeding iff unification produces no error. This reuses
+    /// `unify`'s handling of record width, function contravariance, ADTs (via
+    /// `Ty::Con` + the alias table, recursion included), and units. Free vars on
+    /// EITHER side are unifiable (matching the existing contract that an
+    /// expected type variable is unconstrained — a generic call site accepts
+    /// whatever the snippet produces there).
+    fn ty_subsumes(&mut self, snippet: &Ty, expected: &Ty, span: Span) -> bool {
+        let subst_snapshot = self.subst.clone();
+        let unit_subst_snapshot = self.unit_subst.clone();
+        let errors_snapshot = self.errors.len();
+        self.unify(snippet, expected, span);
+        let ok = self.errors.len() == errors_snapshot;
+        // Probe only: discard any bindings/errors the unification produced.
+        self.subst = subst_snapshot;
+        self.unit_subst = unit_subst_snapshot;
+        self.errors.truncate(errors_snapshot);
+        ok
+    }
+
     fn unify(&mut self, t1: &Ty, t2: &Ty, span: Span) {
         // By convention `t1` is the actual/provided type and `t2` the
         // expected/required type (most call sites follow this order).
@@ -12251,311 +12275,6 @@ fn display_ty_clean_inner(
     }
 }
 
-/// Expand ADT type names in a rendered type descriptor into their full
-/// constructor signatures, so a type crossing a `base.compile` boundary is
-/// compared on its constructor set, not just its name.
-///
-/// `Priority` -> `Priority{Low|High}`; payload ctors carry their field types:
-/// `Status` -> `Status{Open|InProgress{assignee:Text}}`; a type parameter stays
-/// a variable: `Maybe a` -> `Maybe{Just{value:a}|Nothing}`. Names that are not
-/// ADTs in `aliases` (scalars, records — already inline, type aliases to
-/// non-ADTs) pass through unchanged. Expansion is recursive so an ADT nested in
-/// a record field, function, or relation is also expanded.
-///
-/// The grammar this produces is read back by knot-runtime's `TyDesc` parser
-/// (`Name{...}` = ADT, bare `{...}` = record). Unparseable input is returned
-/// unchanged (the runtime then treats both sides as opaque and accepts — the
-/// conservative default that never breaks a working program).
-pub fn enrich_descriptor_with_adts(
-    descriptor: &str,
-    aliases: &HashMap<String, crate::types::ResolvedType>,
-) -> String {
-    use crate::types::ResolvedType as R;
-    // Fast path: no ADTs in scope, nothing can expand.
-    if !aliases.values().any(|a| matches!(a, R::Adt(_))) {
-        return descriptor.to_string();
-    }
-    let toks = lex_descriptor(descriptor);
-    let mut p = DescParser {
-        toks: &toks,
-        pos: 0,
-    };
-    match p.parse_ty() {
-        Some(tree) if p.pos == toks.len() => render_desc(&expand_desc(&tree, aliases)),
-        // Couldn't parse (or trailing tokens): leave the descriptor as-is.
-        _ => descriptor.to_string(),
-    }
-}
-
-/// A parsed descriptor type, mirroring knot-runtime's `TyDesc`. `Name` is a
-/// bare type constructor (scalar or not-yet-expanded ADT); `Adt` is produced
-/// only by `expand_desc`.
-#[derive(Debug, Clone, PartialEq)]
-enum DescTree {
-    Var(String),
-    Name(String),
-    /// Type-constructor application: `Maybe Int`, `Either a b`.
-    App(Box<DescTree>, Box<DescTree>),
-    Record(Vec<(String, DescTree)>),
-    Relation(Box<DescTree>),
-    Fun(Box<DescTree>, Box<DescTree>),
-    Adt(String, Vec<(String, Vec<(String, DescTree)>)>),
-}
-
-fn lex_descriptor(s: &str) -> Vec<String> {
-    let mut toks = Vec::new();
-    let mut cur = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c.is_alphanumeric() || c == '_' {
-            cur.push(c);
-        } else if c == '-' && chars.peek() == Some(&'>') {
-            if !cur.is_empty() {
-                toks.push(std::mem::take(&mut cur));
-            }
-            chars.next();
-            toks.push("->".to_string());
-        } else {
-            if !cur.is_empty() {
-                toks.push(std::mem::take(&mut cur));
-            }
-            if !c.is_whitespace() {
-                toks.push(c.to_string());
-            }
-        }
-    }
-    if !cur.is_empty() {
-        toks.push(cur);
-    }
-    toks
-}
-
-struct DescParser<'a> {
-    toks: &'a [String],
-    pos: usize,
-}
-
-impl DescParser<'_> {
-    fn peek(&self) -> Option<&str> {
-        self.toks.get(self.pos).map(|s| s.as_str())
-    }
-    fn next(&mut self) -> Option<String> {
-        let t = self.peek()?.to_string();
-        self.pos += 1;
-        Some(t)
-    }
-    fn eat(&mut self, t: &str) -> bool {
-        if self.peek() == Some(t) {
-            self.pos += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn parse_ty(&mut self) -> Option<DescTree> {
-        let left = self.parse_app()?;
-        if self.eat("->") {
-            let right = self.parse_ty()?;
-            Some(DescTree::Fun(Box::new(left), Box::new(right)))
-        } else {
-            Some(left)
-        }
-    }
-
-    /// Type-constructor application: `Maybe Int`, `Either a b`. Left-assoc.
-    fn parse_app(&mut self) -> Option<DescTree> {
-        let mut t = self.parse_atom()?;
-        while self.at_atom_start() {
-            let arg = self.parse_atom()?;
-            t = DescTree::App(Box::new(t), Box::new(arg));
-        }
-        Some(t)
-    }
-
-    fn at_atom_start(&self) -> bool {
-        matches!(self.peek(), Some(t) if {
-            let c = t.chars().next().unwrap_or('\0');
-            c.is_alphabetic() || c == '_' || t == "{" || t == "[" || t == "("
-        } && t != "->")
-    }
-
-    fn parse_atom(&mut self) -> Option<DescTree> {
-        let head = self.peek()?.to_string();
-        match head.as_str() {
-            "{" => self.parse_record(),
-            "[" => {
-                self.next();
-                let inner = self.parse_ty()?;
-                self.eat("]");
-                Some(DescTree::Relation(Box::new(inner)))
-            }
-            "(" => {
-                self.next();
-                let inner = self.parse_ty()?;
-                self.eat(")");
-                Some(inner)
-            }
-            _ => {
-                let first = head.chars().next()?;
-                self.next();
-                if first.is_lowercase() || first == '_' {
-                    Some(DescTree::Var(head))
-                } else if first.is_uppercase() {
-                    Some(DescTree::Name(head))
-                } else {
-                    None
-                }
-            }
-        }
-    }
-
-    fn parse_record(&mut self) -> Option<DescTree> {
-        self.eat("{");
-        let mut fields = Vec::new();
-        if self.eat("}") {
-            return Some(DescTree::Record(fields));
-        }
-        loop {
-            // Optional open-record row var `{r | ...}` — treat as unparseable
-            // for enrichment (leave the original string untouched).
-            if self.peek() == Some("|") {
-                return None;
-            }
-            let fname = self.next()?;
-            self.eat(":");
-            let fty = self.parse_ty()?;
-            fields.push((fname, fty));
-            if self.eat(",") {
-                continue;
-            }
-            self.eat("}");
-            break;
-        }
-        Some(DescTree::Record(fields))
-    }
-}
-
-/// Expand whole-ADT `Name` leaves into `Adt` with their constructor signatures.
-fn expand_desc(
-    t: &DescTree,
-    aliases: &HashMap<String, crate::types::ResolvedType>,
-) -> DescTree {
-    use crate::types::ResolvedType as R;
-    match t {
-        DescTree::Name(n) => match aliases.get(n) {
-            Some(R::Adt(ctors)) => DescTree::Adt(
-                n.clone(),
-                ctors
-                    .iter()
-                    .map(|(cn, fields)| {
-                        (
-                            cn.clone(),
-                            fields
-                                .iter()
-                                .map(|(fn_, ft)| (fn_.clone(), resolved_to_desc(ft, aliases)))
-                                .collect(),
-                        )
-                    })
-                    .collect(),
-            ),
-            _ => t.clone(),
-        },
-        DescTree::Record(fs) => DescTree::Record(
-            fs.iter()
-                .map(|(n, ft)| (n.clone(), expand_desc(ft, aliases)))
-                .collect(),
-        ),
-        DescTree::Relation(i) => DescTree::Relation(Box::new(expand_desc(i, aliases))),
-        DescTree::App(f, a) => DescTree::App(
-            Box::new(expand_desc(f, aliases)),
-            Box::new(expand_desc(a, aliases)),
-        ),
-        DescTree::Fun(p, r) => DescTree::Fun(
-            Box::new(expand_desc(p, aliases)),
-            Box::new(expand_desc(r, aliases)),
-        ),
-        _ => t.clone(),
-    }
-}
-
-/// A `ResolvedType` (from an ADT field's declared type) as a descriptor tree.
-fn resolved_to_desc(
-    ty: &crate::types::ResolvedType,
-    aliases: &HashMap<String, crate::types::ResolvedType>,
-) -> DescTree {
-    use crate::types::ResolvedType as R;
-    match ty {
-        R::Int => DescTree::Name("Int".into()),
-        R::Float => DescTree::Name("Float".into()),
-        R::Text => DescTree::Name("Text".into()),
-        R::Bool => DescTree::Name("Bool".into()),
-        R::Bytes => DescTree::Name("Bytes".into()),
-        R::Uuid => DescTree::Name("Uuid".into()),
-        R::Unit => DescTree::Name("Unit".into()),
-        // A named field type (another alias/ADT): keep the name; the runtime
-        // compares it nominally. Expanding it here would recurse into cycles.
-        R::Named(n) => DescTree::Name(n.clone()),
-        R::Record(fs) => DescTree::Record(
-            fs.iter()
-                .map(|(n, t)| (n.clone(), resolved_to_desc(t, aliases)))
-                .collect(),
-        ),
-        R::Relation(i) => DescTree::Relation(Box::new(resolved_to_desc(i, aliases))),
-        R::Function(p, r) => DescTree::Fun(
-            Box::new(resolved_to_desc(p, aliases)),
-            Box::new(resolved_to_desc(r, aliases)),
-        ),
-        R::Adt(_) => DescTree::Name("<adt>".into()),
-    }
-}
-
-/// Render a descriptor tree back to the canonical string the runtime parses.
-fn render_desc(t: &DescTree) -> String {
-    match t {
-        DescTree::Var(v) => v.clone(),
-        DescTree::Name(n) => n.clone(),
-        DescTree::Record(fs) => {
-            let inner: Vec<String> = fs
-                .iter()
-                .map(|(n, ft)| format!("{}: {}", n, render_desc(ft)))
-                .collect();
-            format!("{{{}}}", inner.join(", "))
-        }
-        DescTree::Relation(i) => format!("[{}]", render_desc(i)),
-        DescTree::App(f, a) => {
-            let as_ = match **a {
-                DescTree::Fun(..) | DescTree::App(..) => format!("({})", render_desc(a)),
-                _ => render_desc(a),
-            };
-            format!("{} {}", render_desc(f), as_)
-        }
-        DescTree::Fun(p, r) => {
-            let ps = match **p {
-                DescTree::Fun(..) => format!("({})", render_desc(p)),
-                _ => render_desc(p),
-            };
-            format!("{} -> {}", ps, render_desc(r))
-        }
-        DescTree::Adt(n, ctors) => {
-            let inner: Vec<String> = ctors
-                .iter()
-                .map(|(cn, fields)| {
-                    if fields.is_empty() {
-                        cn.clone()
-                    } else {
-                        let fs: Vec<String> = fields
-                            .iter()
-                            .map(|(fn_, ft)| format!("{}: {}", fn_, render_desc(ft)))
-                            .collect();
-                        format!("{}{{{}}}", cn, fs.join(", "))
-                    }
-                })
-                .collect();
-            format!("{}{{{}}}", n, inner.join("|"))
-        }
-    }
-}
 
 // ── `set` full-replacement detection ──────────────────────────────
 
@@ -12743,7 +12462,38 @@ pub type CheckOutput = (
 /// Runs on a grown stack: a desugared `do` block nests one `__bind` per
 /// statement, and `infer_expr` recurses through every level.
 pub fn check(program: &mut ast::Expr) -> CheckOutput {
-    crate::stack::grow(|| check_inner(program))
+    crate::stack::grow(|| check_inner(program, None))
+}
+
+// ── Compile-snippet subsumption (Option A) ─────────────────────────────────
+//
+// When the JIT compiles a `base.compile` snippet, the HOST's expected type
+// travels to it as a source-syntax type-annotation string. To check "the
+// snippet's type is usable where the expected type is wanted" on REAL types
+// (not a lossy string comparison), the expected string is passed INTO `check`
+// as a parameter (a thread-local would NOT survive `stack::grow`'s thread
+// hop), and — while the snippet's `Infer` is still alive at the end of
+// `check_inner` — parsed into a `Ty` in that same context (so the snippet's
+// own `data` ADT definitions resolve) and checked with `ty_subsumes` against
+// the snippet's inferred file-body type. The verdict is returned via a
+// shared cell so the 25-field `CheckOutput` tuple is untouched.
+static SUBSUMPTION_VERDICT: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// Like `check`, but additionally subsumes the program's body type against
+/// `expected_src` (a knot source type-annotation string, possibly prefixed by
+/// the host's `data` decls). The verdict is retrievable via
+/// `take_subsumption_verdict` after this returns.
+pub fn check_with_expected(program: &mut ast::Expr, expected_src: &str) -> CheckOutput {
+    let src = expected_src.to_string();
+    crate::stack::grow(|| check_inner(program, Some(&src)))
+}
+
+/// Read (and clear) the verdict produced by the last `check_with_expected`.
+/// `Some(true)` = snippet subsumes expected; `Some(false)` = it doesn't;
+/// `None` = the expected type failed to parse, or the snippet had no
+/// inferrable body type.
+pub fn take_subsumption_verdict() -> Option<bool> {
+    SUBSUMPTION_VERDICT.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// Is this expression a reference to the `todo` hole, `base.todo`? Purely
@@ -12775,7 +12525,124 @@ fn expr_is_trace_ref(expr: &ast::Expr) -> bool {
     )
 }
 
-fn check_inner(program: &mut ast::Expr) -> CheckOutput {
+/// Split a `base.compile` expected-type payload into the host's prepended
+/// `data` declarations and the trailing type. The host emits
+/// `data A = ... \n data B = ... \n <type>`; the decls let the JIT compare
+/// constructor sets structurally. Returns `(name → ctor-name-set, type_src)`.
+/// With no leading `data` lines the set is empty and the whole string is the
+/// type.
+fn split_host_data_decls(
+    src: &str,
+) -> (HashMap<String, Vec<(String, Vec<(String, String)>)>>, String) {
+    let mut sets: HashMap<String, Vec<(String, Vec<(String, String)>)>> = HashMap::new();
+    let mut rest = src;
+    loop {
+        let trimmed = rest.trim_start();
+        if !trimmed.starts_with("data ") {
+            return (sets, trimmed.to_string());
+        }
+        // Consume one line: `data Name = Ctor {} | Ctor {f: T} | ...`.
+        let (line, next) = match trimmed.find('\n') {
+            Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
+            None => (trimmed, ""),
+        };
+        if let Some((name, ctors)) = parse_data_decl_ctors(line) {
+            sets.insert(name, ctors);
+        }
+        rest = next;
+        if rest.trim().is_empty() {
+            return (sets, String::new());
+        }
+    }
+}
+
+/// Parse `data Name = Ctor1 {f: T, ..} | Ctor2 {..}` into
+/// `(Name, [(Ctor, [(field, field_src)])])`. Field types are kept as source
+/// substrings (e.g. `Int 1`, `Text`) so the JIT can re-parse them into real
+/// `Ty`s and unify against the snippet's payload types. Returns `None` if the
+/// line isn't a well-formed `data` decl.
+fn parse_data_decl_ctors(
+    line: &str,
+) -> Option<(String, Vec<(String, Vec<(String, String)>)>)> {
+    let body = line.strip_prefix("data ")?.trim();
+    let (name, rhs) = body.split_once('=')?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let ctors = rhs
+        .split('|')
+        .map(|arm| {
+            let arm = arm.trim();
+            // `Ctor {}` or `Ctor {f: T, g: U}` — split ctor name from the
+            // brace body (space-separated, not comma, per knot's ctor syntax).
+            let cname = arm.split_whitespace().next().unwrap_or("").to_string();
+            let fields = match (arm.find('{'), arm.rfind('}')) {
+                (Some(open), Some(close)) if close > open => {
+                    let inner = &arm[open + 1..close];
+                    inner
+                        .split(',')
+                        .filter_map(|f| {
+                            let f = f.trim();
+                            if f.is_empty() {
+                                return None;
+                            }
+                            let (fname, fty) = f.split_once(':')?;
+                            Some((fname.trim().to_string(), fty.trim().to_string()))
+                        })
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            (cname, fields)
+        })
+        .collect();
+    Some((name, ctors))
+}
+
+/// Are the snippet's constructors usable where the host's are expected, for
+/// every ADT the host declared? Two checks per shared ADT:
+///  1. **Ctor-set subset** — the snippet's ctors ⊆ the host's (the host's
+///     `case` only has arms for ctors it knows; a snippet-only ctor like
+///     `Medium` is unsound).
+///  2. **Payload covariance** — for each shared ctor, the snippet's field
+///     types must unify with the host's (a snippet `InProgress {assignee:
+///     Text}` is unusable where the host binds `assignee: Int`).
+/// Field types are unified as real `Ty`s via `ast_type_to_ty` + `ty_subsumes`.
+/// ADTs only one side declares are unconstrained.
+fn ctor_sets_contained(
+    infer: &mut Infer,
+    host: &HashMap<String, Vec<(String, Vec<(String, String)>)>>,
+    snippet_data: &HashMap<String, DataInfo>,
+    span: Span,
+) -> bool {
+    host.iter().all(|(name, host_ctors)| {
+        let Some(info) = snippet_data.get(name) else {
+            return true; // snippet doesn't declare this ADT
+        };
+        info.ctors.iter().all(|(cname, snippet_fields)| {
+            // Ctor-set subset.
+            let Some((_, host_fields)) = host_ctors.iter().find(|(hc, _)| hc == cname) else {
+                return false; // snippet-only ctor
+            };
+            // Payload covariance: every shared field's types must unify.
+            snippet_fields.iter().all(|(fname, snippet_fty)| {
+                let Some((_, host_fty_src)) = host_fields.iter().find(|(hf, _)| hf == fname)
+                else {
+                    return false; // snippet-only field
+                };
+                let snippet_ty = infer.ast_type_to_ty(snippet_fty);
+                let Some(host_ast) = knot::parser::parse_type_str(host_fty_src) else {
+                    return true; // unparseable host field — conservative accept
+                };
+                let host_ty = infer.ast_type_to_ty(&host_ast);
+                infer.ty_subsumes(&snippet_ty, &host_ty, span)
+            })
+        })
+    })
+}
+
+fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutput {
     let mut infer = Infer::new();
 
     // Every user-written numeric type must carry an explicit unit (bare
@@ -13246,6 +13113,45 @@ fn check_inner(program: &mut ast::Expr) -> CheckOutput {
     // runtime check: the JIT'd snippet's body type is compared against the
     // caller's expected `a`. Rendered with the same clean display as
     // `local_type_info` (free unit vars defaulted to dimensionless).
+    // Option A: if an expected type was threaded in (JIT compile-snippet path),
+    // parse it into a real `Ty` in THIS live inference context (so the
+    // snippet's own `data` ADT names resolve) and check the body type subsumes
+    // it — on real types, not strings. The verdict rides back via the static;
+    // the probe leaves `infer` untouched.
+    if let Some(src) = expected_src {
+        // The host prepends its `data` declarations for ADTs the expected
+        // type references (so ctor SETS can be compared, not just names).
+        // Split them off: leading `data Name = ...` lines, then the type.
+        let (host_ctor_sets, type_src) = split_host_data_decls(src);
+        let verdict = match knot::parser::parse_type_str(&type_src) {
+            Some(ast_ty) => {
+                let expected = infer.ast_type_to_ty(&ast_ty);
+                match infer.file_body_ty.clone() {
+                    Some(body) => {
+                        let body = infer.apply(&body);
+                        // Name-based subsumption first, then — for ADTs the
+                        // host declared — the snippet's ctor set must be a
+                        // SUBSET of the host's (the host's `case` can only
+                        // have arms for ctors it knows).
+                        let data_types = infer.data_types.clone();
+                        Some(
+                            infer.ty_subsumes(&body, &expected, ast_ty.span)
+                                && ctor_sets_contained(
+                                    &mut infer,
+                                    &host_ctor_sets,
+                                    &data_types,
+                                    ast_ty.span,
+                                ),
+                        )
+                    }
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        *SUBSUMPTION_VERDICT.lock().unwrap_or_else(|e| e.into_inner()) = verdict;
+    }
+
     let file_body_type = infer.file_body_ty.as_ref().map(|ty| {
         let applied = infer.apply(ty);
         let applied = default_free_unit_vars(&applied);
@@ -13988,79 +13894,3 @@ fn uncurry_fetch(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
 
 // ── Tests ─────────────────────────────────────────────────────────
 
-
-
-#[cfg(test)]
-mod adt_descriptor_tests {
-    use super::enrich_descriptor_with_adts;
-    use crate::types::ResolvedType as R;
-    use std::collections::HashMap;
-
-    fn aliases(pairs: Vec<(&str, R)>) -> HashMap<String, R> {
-        pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
-    }
-
-    #[test]
-    fn nullary_adt_expands() {
-        let a = aliases(vec![(
-            "Priority",
-            R::Adt(vec![("Low".into(), vec![]), ("High".into(), vec![])]),
-        )]);
-        assert_eq!(
-            enrich_descriptor_with_adts("Priority", &a),
-            "Priority{Low|High}"
-        );
-    }
-
-    #[test]
-    fn payload_ctor_fields_expand() {
-        let a = aliases(vec![(
-            "Status",
-            R::Adt(vec![
-                ("Open".into(), vec![]),
-                ("InProgress".into(), vec![("assignee".into(), R::Text)]),
-            ]),
-        )]);
-        assert_eq!(
-            enrich_descriptor_with_adts("Status", &a),
-            "Status{Open|InProgress{assignee: Text}}"
-        );
-    }
-
-    #[test]
-    fn adt_nested_in_function_expands() {
-        let a = aliases(vec![(
-            "Priority",
-            R::Adt(vec![("Low".into(), vec![]), ("High".into(), vec![])]),
-        )]);
-        assert_eq!(
-            enrich_descriptor_with_adts("Int -> Priority", &a),
-            "Int -> Priority{Low|High}"
-        );
-    }
-
-    #[test]
-    fn non_adt_names_pass_through() {
-        let a = aliases(vec![(
-            "Priority",
-            R::Adt(vec![("Low".into(), vec![])]),
-        )]);
-        // Scalars, records, vars untouched.
-        assert_eq!(enrich_descriptor_with_adts("Int", &a), "Int");
-        assert_eq!(
-            enrich_descriptor_with_adts("{value: Int}", &a),
-            "{value: Int}"
-        );
-        assert_eq!(enrich_descriptor_with_adts("a -> a", &a), "a -> a");
-    }
-
-    #[test]
-    fn unparseable_left_unchanged() {
-        let a = aliases(vec![("Priority", R::Adt(vec![("Low".into(), vec![])]))]);
-        // Open record with row var: enrichment bails, returns input verbatim.
-        assert_eq!(
-            enrich_descriptor_with_adts("{r | value: Int}", &a),
-            "{r | value: Int}"
-        );
-    }
-}

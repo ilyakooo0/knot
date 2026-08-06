@@ -20,6 +20,8 @@ pub unsafe extern "C" fn knot_compile_impl(
     src_ptr: *const u8,
     src_len: usize,
     db: *mut c_void,
+    expected_ptr: *const u8,
+    expected_len: usize,
     out_ty_ptr: *mut *mut u8,
     out_ty_len: *mut usize,
     out_rels_ptr: *mut *mut u8,
@@ -45,8 +47,17 @@ pub unsafe extern "C" fn knot_compile_impl(
     let Ok(source) = std::str::from_utf8(src_bytes) else {
         return std::ptr::null_mut();
     };
+    // The host's expected type as a source-annotation string; empty = unpinned
+    // (no subsumption check). Forwarded to the JIT so it runs the real-type
+    // subsumption inside its own inference context.
+    let expected: Option<&str> = if expected_ptr.is_null() || expected_len == 0 {
+        None
+    } else {
+        let b = unsafe { std::slice::from_raw_parts(expected_ptr, expected_len) };
+        std::str::from_utf8(b).ok()
+    };
 
-    match knot_jit::compile_and_run(source, db) {
+    match knot_jit::compile_and_run(source, db, expected) {
         Ok(cv) => {
             // Hand the inferred type back as a malloc'd buffer (C ABI — the
             // runtime frees it). Only when we actually have one.

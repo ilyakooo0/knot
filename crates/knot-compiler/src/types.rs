@@ -24,6 +24,61 @@ pub enum ResolvedType {
     Adt(Vec<(String, Vec<(String, ResolvedType)>)>),
 }
 
+/// Render a `ResolvedType` as knot source-type syntax (the form `parse_type`
+/// reads back), e.g. `Int 1`, `Text`, `{name: Text, age: Int 1}`,
+/// `[{who: Text}]`, `Int 1 -> Text`. `Named` stays a bare name (an ADT or
+/// alias reference). Used to transmit a host type across the `base.compile`
+/// boundary in a form the JIT can re-parse into a real `Ty`.
+pub fn resolved_to_source(ty: &ResolvedType) -> String {
+    match ty {
+        ResolvedType::Int => "Int 1".into(),
+        ResolvedType::Float => "Float 1".into(),
+        ResolvedType::Text => "Text".into(),
+        ResolvedType::Bool => "Bool 1".into(),
+        ResolvedType::Bytes => "Bytes".into(),
+        ResolvedType::Uuid => "Uuid".into(),
+        ResolvedType::Unit => "{}".into(),
+        ResolvedType::Record(fields) => {
+            let inner: Vec<String> = fields
+                .iter()
+                .map(|(n, t)| format!("{n}: {}", resolved_to_source(t)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        ResolvedType::Relation(elem) => format!("[{}]", resolved_to_source(elem)),
+        ResolvedType::Function(a, b) => {
+            format!("{} -> {}", resolved_to_source(a), resolved_to_source(b))
+        }
+        ResolvedType::Named(name) => name.clone(),
+        // A bare ADT *type* renders as its name; the structure is transmitted
+        // separately via `adt_to_data_decl` when ctor sets matter.
+        ResolvedType::Adt(_) => "<adt>".into(),
+    }
+}
+
+/// Render a `data` declaration for a named ADT (its full constructor set), e.g.
+/// `data Priority = Low {} | High {}` or
+/// `data Status = Open {} | InProgress {assignee: Text}`. Transmitted alongside
+/// an expected type so the JIT can compare constructor sets against the
+/// snippet's same-named ADT — nominal-by-structure, not name-only.
+pub fn adt_to_data_decl(name: &str, ctors: &[(String, Vec<(String, ResolvedType)>)]) -> String {
+    let arms: Vec<String> = ctors
+        .iter()
+        .map(|(cname, fields)| {
+            if fields.is_empty() {
+                format!("{cname} {{}}")
+            } else {
+                let inner: Vec<String> = fields
+                    .iter()
+                    .map(|(fname, fty)| format!("{fname}: {}", resolved_to_source(fty)))
+                    .collect();
+                format!("{cname} {{{}}}", inner.join(", "))
+            }
+        })
+        .collect();
+    format!("data {name} = {}", arms.join(" | "))
+}
+
 /// An associated type definition from an impl block.
 /// e.g. `type Item [a] = a` produces args=[Relation(Var("a"))], ty=Var("a")
 #[derive(Debug, Clone)]

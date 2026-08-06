@@ -48,9 +48,15 @@ impl std::error::Error for CompileError {}
 ///
 /// `db` is the host program's open database handle (from `knot_db_open`) so a
 /// compiled snippet that reads the host's persisted relations sees real data.
+/// `expected_src`, when `Some`, is the host's expected type for the snippet as
+/// a knot source type-annotation string (e.g. `Int 1 -> Maybe (Int 1)`,
+/// `Priority`). It is threaded into inference so the snippet's body type is
+/// checked against it on REAL types (`infer::ty_subsumes`); a `false` verdict
+/// makes this return `Err` (the runtime then yields `Nothing`).
 pub fn compile_and_run(
     source: &str,
     db: *mut std::ffi::c_void,
+    expected_src: Option<&str>,
 ) -> Result<CompiledValue, CompileError> {
     // ── Lex ──
     let lexer = knot::lexer::Lexer::new(source);
@@ -75,6 +81,8 @@ pub fn compile_and_run(
     // ── Desugar + type env + infer ──
     desugar::desugar(&mut program);
     let type_env = types::TypeEnv::from_program(&program);
+    // Run inference, subsuming the body type against the host's expected type
+    // (if any) on real types inside `check` — the verdict is read after.
     let (
         infer_diags,
         monad_info,
@@ -98,7 +106,10 @@ pub fn compile_and_run(
         trace_bindings,
         _compile_expected_types,
         file_body_type,
-    ) = infer::check(&mut program);
+    ) = match expected_src {
+        Some(exp) => infer::check_with_expected(&mut program, exp),
+        None => infer::check(&mut program),
+    };
     if infer_diags
         .iter()
         .any(|d| d.severity == knot::diagnostic::Severity::Error)
@@ -106,13 +117,23 @@ pub fn compile_and_run(
         return Err(CompileError(render_diags(&infer_diags, source)));
     }
 
-    // The program's body type, for the caller's `Maybe a` check — the file
-    // body is inferred as the root `main` and surfaced by `check` directly
-    // (it is not a named top-level decl, so `type_info` never holds it).
-    // Enrich ADT names with their full constructor signatures so the runtime's
-    // subsumption check compares constructor sets, not just names.
-    let body_ty = file_body_type
-        .map(|s| infer::enrich_descriptor_with_adts(&s, &type_env.aliases));
+    // Option A: the real-type subsumption verdict from `check`. A `false` means
+    // the snippet's body type isn't usable where the host's expected type is
+    // wanted — reject (the runtime yields `Nothing`). `None` (no expected type
+    // / unparseable / no body type) conservatively accepts, matching the prior
+    // "don't break working programs over the checker" contract.
+    if infer::take_subsumption_verdict() == Some(false) {
+        return Err(CompileError(format!(
+            "compiled snippet's type is not usable where the expected type `{expected_src:?}` is wanted"
+        )));
+    }
+
+    // The program's body type, surfaced for the caller's `Maybe a` record (the
+    // file body is inferred as the root `main`, not a named decl, so
+    // `type_info` never holds it). Passed through verbatim — no descriptor
+    // enrichment: the expected type is a knot source annotation now, and the
+    // subsumption already ran on real `Ty`s inside `check`.
+    let body_ty = file_body_type;
 
     // Relations the snippet declares (for the host-relation check).
     let relations: Vec<String> = type_env.source_schemas.keys().cloned().collect();

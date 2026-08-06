@@ -12619,44 +12619,156 @@ fn parse_data_decl_ctors(
     Some((name, ctors))
 }
 
-/// Are the snippet's constructors usable where the host's are expected, for
-/// every ADT the host declared? Two checks per shared ADT:
-///  1. **Ctor-set subset** — the snippet's ctors ⊆ the host's (the host's
-///     `case` only has arms for ctors it knows; a snippet-only ctor like
-///     `Medium` is unsound).
-///  2. **Payload covariance** — for each shared ctor, the snippet's field
-///     types must unify with the host's (a snippet `InProgress {assignee:
-///     Text}` is unusable where the host binds `assignee: Int`).
-/// Field types are unified as real `Ty`s via `ast_type_to_ty` + `ty_subsumes`.
-/// ADTs only one side declares are unconstrained.
-fn ctor_sets_contained(
+/// The polarity of a type position, for variance-aware constructor checking.
+/// `Co` = the snippet produces and the host consumes (return types, covariant
+/// fields); `Contra` = the host produces and the snippet consumes (function
+/// parameters); `Inv` = both (an ADT appearing at mixed polarity), which
+/// requires the constructor sets to be exactly equal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Variance {
+    Co,
+    Contra,
+    Inv,
+}
+
+impl Variance {
+    /// Flip across a function-parameter (contravariant) position. `Inv`
+    /// absorbs: once a position is invariant, nesting can't recover variance.
+    fn flip(self) -> Self {
+        match self {
+            Variance::Co => Variance::Contra,
+            Variance::Contra => Variance::Co,
+            Variance::Inv => Variance::Inv,
+        }
+    }
+}
+
+/// Are the snippet's ADT constructors usable where the host's are expected,
+/// at the correct VARIANCE for each occurrence? The host is the consumer of
+/// the snippet's result; the subset direction that keeps it sound flips with
+/// polarity:
+///  - Covariant (the snippet's return): snippet ctors ⊆ host ctors — the
+///    host's `case` must cover everything the snippet can produce.
+///  - Contravariant (a function parameter the host fills): host ctors ⊆
+///    snippet ctors — the snippet must accept everything the host passes in.
+///  - Invariant (mixed positions): the two ctor sets must be equal.
+/// Payload field types recurse at the same variance (a `List Priority` return
+/// is covariant in `Priority`); field subsumption flips direction under
+/// `Contra`. ADTs only one side declares are unconstrained.
+fn ctor_sets_variance_ok(
     infer: &mut Infer,
+    expected: &Ty,
     host: &HashMap<String, Vec<(String, Vec<(String, String)>)>>,
     snippet_data: &HashMap<String, DataInfo>,
     span: Span,
 ) -> bool {
-    host.iter().all(|(name, host_ctors)| {
-        let Some(info) = snippet_data.get(name) else {
-            return true; // snippet doesn't declare this ADT
+    walk_expected(infer, expected, Variance::Co, host, snippet_data, span)
+}
+
+fn walk_expected(
+    infer: &mut Infer,
+    ty: &Ty,
+    var: Variance,
+    host: &HashMap<String, Vec<(String, Vec<(String, String)>)>>,
+    snippet_data: &HashMap<String, DataInfo>,
+    span: Span,
+) -> bool {
+    match ty.peel_alias() {
+        Ty::Fun(p, r) => {
+            // Parameter is contravariant, result keeps the current variance.
+            walk_expected(infer, p, var.flip(), host, snippet_data, span)
+                && walk_expected(infer, r, var, host, snippet_data, span)
+        }
+        Ty::Con(name, args) => {
+            // `Int`/`Float` carry a Unit arg, not an ADT — skip the ctor check
+            // for them, but still recurse (harmless; their args are Units).
+            let is_numeric = (name == "Int" || name == "Float") && args.len() == 1;
+            let adt_ok = is_numeric
+                || check_adt_ctors(infer, name, var, host, snippet_data, span);
+            adt_ok
+                && args
+                    .iter()
+                    .all(|a| walk_expected(infer, a, var, host, snippet_data, span))
+        }
+        Ty::Record(fields, _) | Ty::Variant(fields, _) => fields
+            .values()
+            .all(|f| walk_expected(infer, f, var, host, snippet_data, span)),
+        Ty::Relation(inner) | Ty::IO(inner) => {
+            walk_expected(infer, inner, var, host, snippet_data, span)
+        }
+        Ty::App(f, a) => {
+            walk_expected(infer, f, var, host, snippet_data, span)
+                && walk_expected(infer, a, var, host, snippet_data, span)
+        }
+        Ty::Forall(_, inner) => walk_expected(infer, inner, var, host, snippet_data, span),
+        // Scalars, type variables, units, TyCon: no constructors to compare.
+        _ => true,
+    }
+}
+
+/// Compare the constructor sets of one shared ADT `name` at variance `var`,
+/// and recurse into payload field types with matching direction.
+fn check_adt_ctors(
+    infer: &mut Infer,
+    name: &str,
+    var: Variance,
+    host: &HashMap<String, Vec<(String, Vec<(String, String)>)>>,
+    snippet_data: &HashMap<String, DataInfo>,
+    span: Span,
+) -> bool {
+    let Some(host_ctors) = host.get(name) else {
+        return true; // host didn't declare this ADT — nothing to compare
+    };
+    let Some(info) = snippet_data.get(name) else {
+        return true; // snippet doesn't declare it either
+    };
+    let snippet_has = |c: &str| info.ctors.iter().any(|(cn, _)| cn == c);
+    let host_has = |c: &str| host_ctors.iter().any(|(cn, _)| cn == c);
+    let sets_ok = match var {
+        // Covariant: snippet produces ⊆ host consumes (no snippet-only ctor).
+        Variance::Co => info.ctors.iter().all(|(cn, _)| host_has(cn)),
+        // Contravariant: host produces ⊆ snippet consumes (no host-only ctor
+        // the snippet couldn't match on).
+        Variance::Contra => host_ctors.iter().all(|(cn, _)| snippet_has(cn)),
+        // Invariant: exact equality.
+        Variance::Inv => {
+            info.ctors.iter().all(|(cn, _)| host_has(cn))
+                && host_ctors.iter().all(|(cn, _)| snippet_has(cn))
+        }
+    };
+    if !sets_ok {
+        return false;
+    }
+    // Payload field types, at matching variance. For each shared ctor, the
+    // field types present in the CONSUMED side must be subsumed by the
+    // PRODUCED side. Under Co the snippet produces (snippet field ⊆ host
+    // field); under Contra the host produces (host field ⊆ snippet field).
+    info.ctors.iter().all(|(cname, snippet_fields)| {
+        let Some((_, host_fields)) = host_ctors.iter().find(|(hc, _)| hc == cname) else {
+            // A ctor only on the produced/consumed side — already handled by
+            // the set check above; nothing to compare field-wise here.
+            return true;
         };
-        info.ctors.iter().all(|(cname, snippet_fields)| {
-            // Ctor-set subset.
-            let Some((_, host_fields)) = host_ctors.iter().find(|(hc, _)| hc == cname) else {
-                return false; // snippet-only ctor
+        snippet_fields.iter().all(|(fname, snippet_fty)| {
+            let Some((_, host_fty_src)) = host_fields.iter().find(|(hf, _)| hf == fname) else {
+                // Field present only on the snippet side. Sound iff the host's
+                // ctor (which the host pattern-matches on) doesn't bind it.
+                return true;
             };
-            // Payload covariance: every shared field's types must unify.
-            snippet_fields.iter().all(|(fname, snippet_fty)| {
-                let Some((_, host_fty_src)) = host_fields.iter().find(|(hf, _)| hf == fname)
-                else {
-                    return false; // snippet-only field
-                };
-                let snippet_ty = infer.ast_type_to_ty(snippet_fty);
-                let Some(host_ast) = knot::parser::parse_type_str(host_fty_src) else {
-                    return true; // unparseable host field — conservative accept
-                };
-                let host_ty = infer.ast_type_to_ty(&host_ast);
-                infer.ty_subsumes(&snippet_ty, &host_ty, span)
-            })
+            let snippet_ty = infer.ast_type_to_ty(snippet_fty);
+            let Some(host_ast) = knot::parser::parse_type_str(host_fty_src) else {
+                return true; // unparseable host field — conservative accept
+            };
+            let host_ty = infer.ast_type_to_ty(&host_ast);
+            match var {
+                Variance::Co => infer.ty_subsumes(&snippet_ty, &host_ty, span),
+                Variance::Contra => infer.ty_subsumes(&host_ty, &snippet_ty, span),
+                // Invariant fields: require subsumption both ways.
+                Variance::Inv => {
+                    infer.ty_subsumes(&snippet_ty, &host_ty, span)
+                        && infer.ty_subsumes(&host_ty, &snippet_ty, span)
+                }
+            }
         })
     })
 }
@@ -13150,15 +13262,18 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                 match infer.file_body_ty.clone() {
                     Some(body) => {
                         let body = infer.apply(&body);
-                        // Name-based subsumption first, then — for ADTs the
-                        // host declared — the snippet's ctor set must be a
-                        // SUBSET of the host's (the host's `case` can only
-                        // have arms for ctors it knows).
+                        // Name-based subsumption first, then a VARIANCE-AWARE
+                        // constructor check over the expected type: at each ADT
+                        // occurrence the snippet/host ctor-set relation must
+                        // hold in the direction that position's polarity
+                        // demands (return = snippet ⊆ host; parameter =
+                        // host ⊆ snippet; mixed = equal).
                         let data_types = infer.data_types.clone();
                         Some(
                             infer.ty_subsumes(&body, &expected, ast_ty.span)
-                                && ctor_sets_contained(
+                                && ctor_sets_variance_ok(
                                     &mut infer,
+                                    &expected,
                                     &host_ctor_sets,
                                     &data_types,
                                     ast_ty.span,

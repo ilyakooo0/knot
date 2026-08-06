@@ -12164,7 +12164,20 @@ fn display_ty_clean(
     names: &HashMap<TyVar, usize>,
     unit_names: &HashMap<UnitVar, usize>,
 ) -> String {
-    display_ty_clean_inner(ty, names, unit_names, false)
+    display_ty_clean_inner(ty, names, unit_names, false, false)
+}
+
+/// Render a type for the `base.compile` expected-type WIRE: identical to
+/// `display_ty_clean` except dimensionless `Int`/`Float` keep their unit as
+/// `Int 1`/`Float 1`, so the string round-trips through `parser::parse_type_str`
+/// (the JIT's expected-type parser requires an explicit unit; bare `Int` would
+/// parse to `Ty::Error` and wrongly reject a dimensionless-Int snippet).
+fn display_ty_wire(
+    ty: &Ty,
+    names: &HashMap<TyVar, usize>,
+    unit_names: &HashMap<UnitVar, usize>,
+) -> String {
+    display_ty_clean_inner(ty, names, unit_names, false, true)
 }
 
 fn display_ty_clean_inner(
@@ -12172,23 +12185,27 @@ fn display_ty_clean_inner(
     names: &HashMap<TyVar, usize>,
     unit_names: &HashMap<UnitVar, usize>,
     in_fun: bool,
+    wire: bool,
 ) -> String {
     match ty {
         Ty::Var(v) => var_letter(names.get(v).copied().unwrap_or(*v as usize)),
-        Ty::Int => "Int".into(),
-        Ty::Float => "Float".into(),
+        // Primitive `Int`/`Float` are dimensionless; on the wire render them
+        // with the explicit `1` unit so they re-parse (bare `Int`/`Float` is a
+        // unit-annotation error in the JIT's expected-type parser).
+        Ty::Int => if wire { "Int 1".into() } else { "Int".into() },
+        Ty::Float => if wire { "Float 1".into() } else { "Float".into() },
         Ty::Text => "Text".into(),
         Ty::Bool => "Bool".into(),
         Ty::Bytes => "Bytes".into(),
         Ty::Uuid => "Uuid".into(),
         Ty::Assoc(name, inner) => {
-            format!("{} {}", name, display_ty_clean_inner(inner, names, unit_names, true))
+            format!("{} {}", name, display_ty_clean_inner(inner, names, unit_names, true, wire))
         }
         Ty::Fun(p, r) => {
             let s = format!(
                 "{} -> {}",
-                display_ty_clean_inner(p, names, unit_names, true),
-                display_ty_clean_inner(r, names, unit_names, false)
+                display_ty_clean_inner(p, names, unit_names, true, wire),
+                display_ty_clean_inner(r, names, unit_names, false, wire)
             );
             if in_fun {
                 format!("({})", s)
@@ -12202,21 +12219,23 @@ fn display_ty_clean_inner(
             }
             let mut parts: Vec<String> = fields
                 .iter()
-                .map(|(n, t)| format!("{}: {}", n, display_ty_clean(t, names, unit_names)))
+                .map(|(n, t)| format!("{}: {}", n, display_ty_clean_inner(t, names, unit_names, false, wire)))
                 .collect();
             if let Some(rv) = row {
                 parts.push(format!("| {}", var_letter(names.get(rv).copied().unwrap_or(*rv as usize))));
             }
             format!("{{{}}}", parts.join(", "))
         }
-        Ty::Relation(inner) => format!("[{}]", display_ty_clean(inner, names, unit_names)),
+        Ty::Relation(inner) => format!("[{}]", display_ty_clean_inner(inner, names, unit_names, false, wire)),
         Ty::Con(name, args) => {
             // Unit-bearing Int/Float → `Int u`/`Float u`, collapsing to
-            // `Int`/`Float` when dimensionless.
+            // `Int`/`Float` when dimensionless. On the compile-expected WIRE
+            // keep the dimensionless unit as `Int 1`/`Float 1` so the string
+            // re-parses (bare `Int` has no unit and would become `Ty::Error`).
             if (name == "Int" || name == "Float") && args.len() == 1
                 && let Ty::Unit(u) = args[0].peel_alias() {
                     if u.is_dimensionless() {
-                        return name.clone();
+                        return if wire { format!("{} 1", name) } else { name.clone() };
                     }
                     return format!("{} {}", name, display_unit_clean(u, unit_names));
                 }
@@ -12224,14 +12243,14 @@ fn display_ty_clean_inner(
                 name.clone()
             } else {
                 let args_str: Vec<String> =
-                    args.iter().map(|a| display_ty_clean(a, names, unit_names)).collect();
+                    args.iter().map(|a| display_ty_clean_inner(a, names, unit_names, false, wire)).collect();
                 format!("{} {}", name, args_str.join(" "))
             }
         }
         Ty::Variant(ctors, row) => {
             let mut parts: Vec<String> = ctors
                 .iter()
-                .map(|(name, ft)| format!("{} {}", name, display_ty_clean(ft, names, unit_names)))
+                .map(|(name, ft)| format!("{} {}", name, display_ty_clean_inner(ft, names, unit_names, false, wire)))
                 .collect();
             if let Some(rv) = row {
                 parts.push(var_letter(names.get(rv).copied().unwrap_or(*rv as usize)));
@@ -12241,15 +12260,15 @@ fn display_ty_clean_inner(
         Ty::TyCon(name) => name.clone(),
         Ty::App(f, a) => format!(
             "({} {})",
-            display_ty_clean(f, names, unit_names),
-            display_ty_clean(a, names, unit_names)
+            display_ty_clean_inner(f, names, unit_names, false, wire),
+            display_ty_clean_inner(a, names, unit_names, false, wire)
         ),
         Ty::IO(inner) => {
-            format!("IO {}", display_ty_clean(inner, names, unit_names))
+            format!("IO {}", display_ty_clean_inner(inner, names, unit_names, false, wire))
         }
         Ty::Forall(vars, inner) => {
             if vars.is_empty() {
-                display_ty_clean_inner(inner, names, unit_names, in_fun)
+                display_ty_clean_inner(inner, names, unit_names, in_fun, wire)
             } else {
                 let bound: Vec<String> = vars
                     .iter()
@@ -12258,7 +12277,7 @@ fn display_ty_clean_inner(
                 let s = format!(
                     "forall {}. {}",
                     bound.join(" "),
-                    display_ty_clean_inner(inner, names, unit_names, false)
+                    display_ty_clean_inner(inner, names, unit_names, false, wire)
                 );
                 if in_fun {
                     format!("({})", s)
@@ -13011,9 +13030,11 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         let inner = default_free_unit_vars(&inner);
         let var_map = var_map_for(&inner);
         let unit_var_map = unit_var_map_for(&inner);
+        // Render for the WIRE (round-trippable): dimensionless `Int`/`Float`
+        // keep their `1` unit so the JIT's `parse_type_str` re-parses them.
         compile_expected_types.insert(
             *span,
-            display_ty_clean(&inner, &var_map, &unit_var_map),
+            display_ty_wire(&inner, &var_map, &unit_var_map),
         );
     }
 

@@ -6394,9 +6394,9 @@ impl Infer {
                 };
                 if is_compile_app
                         && let Ty::Con(mn, margs) = self.apply(&result_ty).peel_alias()
-                        && mn == "Maybe"
-                        && margs.len() == 1
-                        && let Ty::Var(inner_v) = self.apply(&margs[0]).peel_alias() {
+                        && mn == "Result"
+                        && margs.len() == 2
+                        && let Ty::Var(inner_v) = self.apply(&margs[1]).peel_alias() {
                             self.compile_calls.push((expr.span, *inner_v));
                         }
 
@@ -9624,10 +9624,11 @@ impl Infer {
             Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Text))),
         );
 
-        // compile : ∀a. Text -> Maybe a — JIT-compile+eval a knot source string
-        // in-process against the host runtime. `Just {value}` on success (the
-        // value forced at compile time, typed as `a`), `Nothing` on any compile
-        // error or when the program's type doesn't match `a`.
+        // compile : ∀a. Text -> Result Text a — JIT-compile+eval a knot source
+        // string in-process against the host runtime. `Ok {value}` on success
+        // (the value forced at compile time, typed as `a`); `Err {error: Text}`
+        // carrying the compile-error message on any compile error, or when the
+        // program's type doesn't match `a`.
         let a = self.fresh_var();
         self.bind_top(
             "compile",
@@ -9635,7 +9636,10 @@ impl Infer {
                 vec![a],
                 Ty::Fun(
                     Box::new(Ty::Text),
-                    Box::new(Ty::Con("Maybe".into(), vec![Ty::Var(a)])),
+                    Box::new(Ty::Con(
+                        "Result".into(),
+                        vec![Ty::Text, Ty::Var(a)],
+                    )),
                 ),
             ),
         );

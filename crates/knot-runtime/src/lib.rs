@@ -10687,6 +10687,18 @@ fn maybe_nothing() -> *mut Value {
     alloc(Value::Constructor(intern_str("Nothing"), encode_unit()))
 }
 
+/// The `Ok {value}` constructor (built-in `data Result e a = Err {error: e} | Ok {value: a}`).
+fn result_ok(v: *mut Value) -> *mut Value {
+    let record = alloc(Value::Record(vec![RecordField { name: intern_str("value"), value: v }]));
+    alloc(Value::Constructor(intern_str("Ok"), record))
+}
+
+/// The `Err {error}` constructor.
+fn result_err(e: *mut Value) -> *mut Value {
+    let record = alloc(Value::Record(vec![RecordField { name: intern_str("error"), value: e }]));
+    alloc(Value::Constructor(intern_str("Err"), record))
+}
+
 // ── `compile : Text -> Maybe a` ────────────────────────────────────
 //
 // The JIT compiler is not part of knot-runtime (that would create a Cargo
@@ -10710,6 +10722,8 @@ type CompileImpl = unsafe extern "C" fn(
     out_ty_len: *mut usize,
     out_rels_ptr: *mut *mut u8,
     out_rels_len: *mut usize,
+    out_err_ptr: *mut *mut u8,
+    out_err_len: *mut usize,
 ) -> *mut Value;
 
 static COMPILE_IMPL: std::sync::atomic::AtomicPtr<c_void> =
@@ -10741,9 +10755,16 @@ fn compile_impl() -> Option<CompileImpl> {
 /// `*rel` guard: a snippet may only use relations the host program defined —
 /// the snippet's declared relations are checked against the host's registered
 /// relation set, foreign `*rel` → null.
-fn compile_run(source: &[u8], expected: Option<&[u8]>) -> (*mut Value, Option<String>) {
+fn compile_run(
+    source: &[u8],
+    expected: Option<&[u8]>,
+) -> (*mut Value, Option<String>, Option<String>) {
     let Some(f) = compile_impl() else {
-        return (std::ptr::null_mut(), None);
+        return (
+            std::ptr::null_mut(),
+            None,
+            Some("no JIT linked (knot-compile-rt not registered)".into()),
+        );
     };
     // Open a db handle for the snippet. knot_db_open records the path on first
     // open (DB_PATH), so reuse it; a pure program (no store) gets :memory:.
@@ -10767,6 +10788,8 @@ fn compile_run(source: &[u8], expected: Option<&[u8]>) -> (*mut Value, Option<St
     let mut ty_len: usize = 0;
     let mut rels_ptr: *mut u8 = std::ptr::null_mut();
     let mut rels_len: usize = 0;
+    let mut err_ptr: *mut u8 = std::ptr::null_mut();
+    let mut err_len: usize = 0;
     let value = unsafe {
         f(
             source.as_ptr(),
@@ -10778,7 +10801,19 @@ fn compile_run(source: &[u8], expected: Option<&[u8]>) -> (*mut Value, Option<St
             &mut ty_len,
             &mut rels_ptr,
             &mut rels_len,
+            &mut err_ptr,
+            &mut err_len,
         )
+    };
+
+    // Take ownership of the error buffer (malloc'd by the compile impl), if any.
+    let err = if !err_ptr.is_null() {
+        let bytes = unsafe { std::slice::from_raw_parts(err_ptr, err_len) };
+        let s = String::from_utf8_lossy(bytes).into_owned();
+        unsafe { libc::free(err_ptr as *mut c_void) };
+        Some(s)
+    } else {
+        None
     };
 
     // Free the relation list; the type buffer is returned (caller frees).
@@ -10798,7 +10833,7 @@ fn compile_run(source: &[u8], expected: Option<&[u8]>) -> (*mut Value, Option<St
 
     if value.is_null() {
         free_ty(ty_ptr);
-        return (std::ptr::null_mut(), None);
+        return (std::ptr::null_mut(), None, err);
     }
     // Foreign-`*rel` guard.
     if !rels_csv.is_empty() {
@@ -10809,7 +10844,11 @@ fn compile_run(source: &[u8], expected: Option<&[u8]>) -> (*mut Value, Option<St
         drop(host_rels);
         if foreign {
             free_ty(ty_ptr);
-            return (std::ptr::null_mut(), None);
+            return (
+                std::ptr::null_mut(),
+                None,
+                Some("snippet declares a relation the host program doesn't have".into()),
+            );
         }
     }
 
@@ -10821,33 +10860,42 @@ fn compile_run(source: &[u8], expected: Option<&[u8]>) -> (*mut Value, Option<St
     } else {
         None
     };
-    (value, ty)
+    (value, ty, None)
 }
 
-/// `base.compile : Text -> Maybe a`. Compile+run the knot program in `src`
-/// in-process against the host runtime, returning `Just {value}` on success
-/// and `Nothing` on any compile error, foreign `*rel`, or when no JIT is
-/// linked. Accepts whatever type the snippet produces.
+/// Wrap a compile outcome as a `Result Text a` value: `Ok {value}` on success,
+/// `Err {error: <message>}` on failure. `err` is the JIT's compile-error string;
+/// a null value with no message yields a generic one.
+fn compile_result(value: *mut Value, err: Option<String>) -> *mut Value {
+    if value.is_null() {
+        let msg = err.unwrap_or_else(|| "compile failed".into());
+        result_err(knot_value_text(msg.as_ptr(), msg.len()))
+    } else {
+        result_ok(value)
+    }
+}
+
+/// `base.compile : Text -> Result Text a`. Compile+run the knot program in
+/// `src` in-process against the host runtime, returning `Ok {value}` on success
+/// and `Err {error}` (with the compile-error message) on any compile error,
+/// foreign `*rel`, or when no JIT is linked. Accepts whatever type the snippet
+/// produces.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_builtin_compile(src: *mut Value) -> *mut Value {
     let Value::Text(source) = (unsafe { as_ref(src) }) else {
-        return maybe_nothing();
+        return result_err(knot_value_text("compile expects a Text source".as_ptr(), 28));
     };
-    let (value, _ty) = compile_run(source.as_bytes(), None);
-    if value.is_null() {
-        maybe_nothing()
-    } else {
-        maybe_just(value)
-    }
+    let (value, _ty, err) = compile_run(source.as_bytes(), None);
+    compile_result(value, err)
 }
 
 /// `base.compile src` whose context pins the expected type `a`: like
 /// `knot_builtin_compile`, but forwards the expected type (a knot source
 /// type-annotation string) to the JIT, which checks the snippet's body type
 /// against it on REAL types (`infer::ty_subsumes`) inside its own inference
-/// context — rejecting (returning null → `Nothing`) when the snippet's type
-/// isn't usable where the expected type is wanted. No string comparison here:
-/// the runtime is a dumb pipe; the analysis lives in the JIT's typechecker.
+/// context — rejecting (returning null → `Err`) when the snippet's type isn't
+/// usable where the expected type is wanted. No string comparison here: the
+/// runtime is a dumb pipe; the analysis lives in the JIT's typechecker.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_builtin_compile_typed(
     src: *mut Value,
@@ -10855,18 +10903,15 @@ pub extern "C-unwind" fn knot_builtin_compile_typed(
     expected_len: usize,
 ) -> *mut Value {
     let Value::Text(source) = (unsafe { as_ref(src) }) else {
-        return maybe_nothing();
+        return result_err(knot_value_text("compile expects a Text source".as_ptr(), 28));
     };
     let expected = if expected_ptr.is_null() || expected_len == 0 {
         None
     } else {
         Some(unsafe { std::slice::from_raw_parts(expected_ptr, expected_len) })
     };
-    let (value, _ty) = compile_run(source.as_bytes(), expected);
-    if value.is_null() {
-        return maybe_nothing();
-    }
-    maybe_just(value)
+    let (value, _ty, err) = compile_run(source.as_bytes(), expected);
+    compile_result(value, err)
 }
 
 /// nil — the empty List (1-arg builtin that ignores its argument, so the

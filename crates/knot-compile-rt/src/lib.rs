@@ -26,6 +26,8 @@ pub unsafe extern "C" fn knot_compile_impl(
     out_ty_len: *mut usize,
     out_rels_ptr: *mut *mut u8,
     out_rels_len: *mut usize,
+    out_err_ptr: *mut *mut u8,
+    out_err_len: *mut usize,
 ) -> *mut knot_runtime::Value {
     // Null out-params up front so a compile error leaves them well-defined.
     unsafe {
@@ -40,6 +42,12 @@ pub unsafe extern "C" fn knot_compile_impl(
         }
         if !out_rels_len.is_null() {
             *out_rels_len = 0;
+        }
+        if !out_err_ptr.is_null() {
+            *out_err_ptr = std::ptr::null_mut();
+        }
+        if !out_err_len.is_null() {
+            *out_err_len = 0;
         }
     }
 
@@ -95,7 +103,24 @@ pub unsafe extern "C" fn knot_compile_impl(
             // knot-runtime Value again.
             cv.value as *mut knot_runtime::Value
         }
-        Err(_) => std::ptr::null_mut(),
+        Err(e) => {
+            // Hand the compile-error message back as a malloc'd buffer (C ABI —
+            // the runtime frees it) so `base.compile` can return `Err {error}`.
+            let msg = e.0;
+            if !out_err_ptr.is_null() && !out_err_len.is_null() {
+                let buf = unsafe { libc::malloc(msg.len().max(1)) as *mut u8 };
+                if !buf.is_null() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(msg.as_ptr(), buf, msg.len());
+                        *out_err_ptr = buf;
+                        *out_err_len = msg.len();
+                    }
+                } else {
+                    unsafe { libc::free(buf as *mut c_void) };
+                }
+            }
+            std::ptr::null_mut()
+        }
     }
 }
 

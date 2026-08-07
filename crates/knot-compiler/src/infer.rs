@@ -12673,6 +12673,18 @@ fn walk_expected(
     snippet_data: &HashMap<String, DataInfo>,
     span: Span,
 ) -> bool {
+    // A NAMED single-variant ADT arrives as `Alias(name, Record)` (the record
+    // bridge), which `peel_alias` would strip to a bare `Record` — losing the
+    // name and skipping the ctor/field check entirely. Run that check on the
+    // name FIRST (it compares the snippet's `DataInfo` payload field types
+    // against the host's `data` decl), then peel and recurse as usual. This is
+    // what makes a single-variant `data Wrap = W {n: Text}` snippet reject
+    // against a host expecting `W {n: Int 1}`.
+    if let Ty::Alias(name, _) = ty {
+        if !check_adt_ctors(infer, name, var, host, snippet_data, span) {
+            return false;
+        }
+    }
     match ty.peel_alias() {
         Ty::Fun(p, r) => {
             // Parameter is contravariant, result keeps the current variance.

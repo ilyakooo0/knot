@@ -46,6 +46,7 @@ pub enum TokenKind {
     RBrace,
     LBracket,
     RBracket,
+    Tilde,
 
     // Operators
     Eq,
@@ -135,6 +136,7 @@ impl TokenKind {
             TokenKind::RBrace => "'}'",
             TokenKind::LBracket => "'['",
             TokenKind::RBracket => "']'",
+            TokenKind::Tilde => "'~'",
             TokenKind::Eq => "'='",
             TokenKind::EqEq => "'=='",
             TokenKind::BangEq => "'!='",
@@ -1032,6 +1034,7 @@ impl<'src> Lexer<'src> {
             b'}' => TokenKind::RBrace,
             b'[' => TokenKind::LBracket,
             b']' => TokenKind::RBracket,
+            b'~' => TokenKind::Tilde,
             _ => {
                 let char_start = self.pos - 1;
                 // Skip remaining bytes of multi-byte UTF-8 character

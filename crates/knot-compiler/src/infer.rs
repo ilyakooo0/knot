@@ -12760,7 +12760,9 @@ fn check_adt_ctors(
                 return true; // unparseable host field — conservative accept
             };
             let host_ty = infer.ast_type_to_ty(&host_ast);
-            match var {
+            // Name/subsumption check of the field type, in the direction this
+            // variance demands…
+            let names_ok = match var {
                 Variance::Co => infer.ty_subsumes(&snippet_ty, &host_ty, span),
                 Variance::Contra => infer.ty_subsumes(&host_ty, &snippet_ty, span),
                 // Invariant fields: require subsumption both ways.
@@ -12768,7 +12770,15 @@ fn check_adt_ctors(
                     infer.ty_subsumes(&snippet_ty, &host_ty, span)
                         && infer.ty_subsumes(&host_ty, &snippet_ty, span)
                 }
+            };
+            if !names_ok {
+                return false;
             }
+            // …and if the field is itself a host-declared ADT, recurse the
+            // CONSTRUCTOR-SET check into it at the same variance. Name
+            // subsumption (`Con("Priority") == Con("Priority")`) can't see that
+            // the snippet's `Priority` has an extra ctor the host can't read.
+            walk_expected(infer, &host_ty, var, host, snippet_data, span)
         })
     })
 }

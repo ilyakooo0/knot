@@ -18,24 +18,47 @@ fn prepend_host_data_decls(
     descriptor: &str,
     aliases: &HashMap<String, types::ResolvedType>,
 ) -> String {
-    // Collect host ADT names appearing in the descriptor. A name match is
-    // whole-word: the descriptor is source-type syntax, so an ADT appears as an
-    // identifier token.
+    // Collect host ADT names appearing in the descriptor, TRANSITIVELY: an
+    // included `data Task = Todo {pri: Priority}` decl references `Priority`,
+    // so `Priority`'s decl must come along too, recursively — otherwise the
+    // JIT sees a payload type it can't resolve as a host ADT and the ctor-set
+    // check treats it as unconstrained (unsound).
     let mut decls: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (name, resolved) in aliases {
-        if let types::ResolvedType::Adt(ctors) = resolved
-            && !seen.contains(name.as_str())
-            && references_name(descriptor, name)
-        {
-            seen.insert(name.as_str());
-            decls.push(types::adt_to_data_decl(name, ctors));
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Worklist seeded with names directly in the descriptor; grow with names
+    // referenced by each included decl.
+    let mut worklist: Vec<String> = aliases
+        .keys()
+        .filter(|name| {
+            matches!(aliases.get(*name), Some(types::ResolvedType::Adt(_)))
+                && references_name(descriptor, name)
+        })
+        .cloned()
+        .collect();
+    while let Some(name) = worklist.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
         }
+        let Some(types::ResolvedType::Adt(ctors)) = aliases.get(&name) else {
+            continue;
+        };
+        let decl = types::adt_to_data_decl(&name, ctors);
+        // Enqueue any ADT this decl's payload fields reference.
+        for other in aliases.keys() {
+            if !seen.contains(other)
+                && matches!(aliases.get(other), Some(types::ResolvedType::Adt(_)))
+                && references_name(&decl, other)
+            {
+                worklist.push(other.clone());
+            }
+        }
+        decls.push(decl);
     }
     if decls.is_empty() {
         descriptor.to_string()
     } else {
-        format!("{}\n{}", decls.join("\n"), descriptor)
+        let out = format!("{}\n{}", decls.join("\n"), descriptor);
+        out
     }
 }
 

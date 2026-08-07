@@ -1392,10 +1392,16 @@ fn resolve_type(
             "Bool" => ResolvedType::Bool,
             "Bytes" => ResolvedType::Bytes,
             "Uuid" => ResolvedType::Uuid,
-            _ => aliases
-                .get(name)
-                .cloned()
-                .unwrap_or(ResolvedType::Named(name.clone())),
+            _ => match aliases.get(name) {
+                // A multi-variant ADT reference stays NAMED: the ctor set is
+                // transmitted separately (via `adt_to_data_decl`), and inlining
+                // it here would render the field as the `<adt>` placeholder,
+                // losing the name a nested reference (e.g. `Task.pri: Priority`)
+                // needs to resolve. Record aliases (single-variant) still inline
+                // so the record bridge sees the structural shape.
+                Some(ResolvedType::Adt(_)) => ResolvedType::Named(name.clone()),
+                other => other.cloned().unwrap_or(ResolvedType::Named(name.clone())),
+            },
         },
         TypeKind::Record { fields, .. } => {
             let resolved: Vec<(String, ResolvedType)> = fields
@@ -1627,6 +1633,11 @@ fn re_resolve_inner(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>, 
                 return ty.clone(); // break cycle
             }
             match aliases.get(name) {
+                // Keep a reference to a multi-variant ADT NAMED: its ctor set
+                // is transmitted separately (`adt_to_data_decl`), and inlining
+                // would render the field as the `<adt>` placeholder, losing the
+                // name a nested reference (`Task.pri: Priority`) must resolve.
+                Some(ResolvedType::Adt(_)) => ty.clone(),
                 Some(resolved) => {
                     seen.insert(name.clone());
                     let result = re_resolve_inner(resolved, aliases, seen);

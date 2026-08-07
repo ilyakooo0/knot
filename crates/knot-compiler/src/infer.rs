@@ -13141,6 +13141,9 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         // `res_v` is the inner `a` of the call's `Maybe a` result (the caller's
         // expected type for the snippet), resolved now that inference is done.
         let inner = infer.apply(&Ty::Var(*res_v));
+        if std::env::var("KNOT_DEBUG_CC").is_ok() {
+            eprintln!("[cc] inner={:?}", inner);
+        }
         // Skip unconstrained `a`: a bare type var means the caller accepts any
         // type, so there is nothing to check against.
         if matches!(inner.peel_alias(), Ty::Var(_)) {

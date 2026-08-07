@@ -14,39 +14,92 @@ use std::process;
 /// `data A = ... \n data B = ... \n <type>` — leading `data` decls, then the
 /// type. Only ADTs the host actually declares (`ResolvedType::Adt`) are
 /// emitted; scalar/record/alias names pass through untouched.
+/// Render a single-variant ADT's `data` decl. Single-variant `data Name =
+/// Ctor {..}` is stored in `aliases` as `ResolvedType::Record` (the ctor name
+/// is dropped); `ctor_name` recovers it from `TypeEnv.constructors`.
+fn single_variant_to_data_decl(
+    name: &str,
+    ctor_name: &str,
+    fields: &[(String, types::ResolvedType)],
+) -> String {
+    let inner: Vec<String> = fields
+        .iter()
+        .map(|(fname, fty)| format!("{fname}: {}", types::resolved_to_source(fty)))
+        .collect();
+    format!("data {name} = {ctor_name} {{{}}}", inner.join(", "))
+}
+
 fn prepend_host_data_decls(
     descriptor: &str,
     aliases: &HashMap<String, types::ResolvedType>,
+    constructors: &HashMap<String, Vec<(String, types::ResolvedType)>>,
 ) -> String {
     // Collect host ADT names appearing in the descriptor, TRANSITIVELY: an
     // included `data Task = Todo {pri: Priority}` decl references `Priority`,
     // so `Priority`'s decl must come along too, recursively — otherwise the
     // JIT sees a payload type it can't resolve as a host ADT and the ctor-set
     // check treats it as unconstrained (unsound).
+    //
+    // Multi-variant ADTs live in `aliases` as `ResolvedType::Adt`; SINGLE-
+    // variant `data Name = Ctor {..}` live there as `ResolvedType::Record`
+    // (the record bridge). Both must be emitted — a single-variant ADT's ctor
+    // set is trivially equal on both sides, but its PAYLOAD fields (e.g.
+    // `pri: Priority`) are exactly where a nested ctor-set difference hides.
+    // Build a reverse map from a single-variant's record fields to its ctor
+    // name so we can reconstruct `data Name = Ctor {..}`.
+    let ctor_of_record: HashMap<String, String> = aliases
+        .iter()
+        .filter_map(|(name, rt)| {
+            if let types::ResolvedType::Record(fields) = rt {
+                // Find the constructor whose field names match this record's.
+                constructors.iter().find_map(|(ctor, cfields)| {
+                    let same = cfields.len() == fields.len()
+                        && cfields
+                            .iter()
+                            .zip(fields.iter())
+                            .all(|((cn, _), (fn_, _))| cn == fn_);
+                    same.then(|| (name.clone(), ctor.clone()))
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Resolve a name to its `data` decl text, for either storage form.
+    let decl_of = |name: &str| -> Option<String> {
+        match aliases.get(name) {
+            Some(types::ResolvedType::Adt(ctors)) => {
+                Some(types::adt_to_data_decl(name, ctors))
+            }
+            Some(types::ResolvedType::Record(fields)) => {
+                let ctor = ctor_of_record.get(name)?;
+                Some(single_variant_to_data_decl(name, ctor, fields))
+            }
+            _ => None,
+        }
+    };
+
     let mut decls: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Worklist seeded with names directly in the descriptor; grow with names
     // referenced by each included decl.
     let mut worklist: Vec<String> = aliases
         .keys()
-        .filter(|name| {
-            matches!(aliases.get(*name), Some(types::ResolvedType::Adt(_)))
-                && references_name(descriptor, name)
-        })
+        .filter(|name| decl_of(name).is_some() && references_name(descriptor, name))
         .cloned()
         .collect();
     while let Some(name) = worklist.pop() {
         if !seen.insert(name.clone()) {
             continue;
         }
-        let Some(types::ResolvedType::Adt(ctors)) = aliases.get(&name) else {
+        let Some(decl) = decl_of(&name) else {
             continue;
         };
-        let decl = types::adt_to_data_decl(&name, ctors);
         // Enqueue any ADT this decl's payload fields reference.
         for other in aliases.keys() {
             if !seen.contains(other)
-                && matches!(aliases.get(other), Some(types::ResolvedType::Adt(_)))
+                && decl_of(other).is_some()
                 && references_name(&decl, other)
             {
                 worklist.push(other.clone());
@@ -458,7 +511,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     // and compares ctor sets structurally.
     let compile_expected_types: infer::CompileExpectedTypes = compile_expected_types
         .into_iter()
-        .map(|(span, desc)| (span, prepend_host_data_decls(&desc, &type_env.aliases)))
+        .map(|(span, desc)| (span, prepend_host_data_decls(&desc, &type_env.aliases, &type_env.constructors)))
         .collect();
     if !infer_diags.is_empty() {
         for diag in &infer_diags {

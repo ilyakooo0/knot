@@ -216,3 +216,119 @@ fn adt_contravariant_identical_accepted() {
         Some(true)
     );
 }
+
+// ── Parameterized wrappers around an ADT ────────────────────────────────────
+// The ctor-set check must recurse through `Maybe` / relation `[…]` to reach the
+// ADT inside, at the wrapper's (covariant) variance.
+
+#[test]
+fn adt_inside_maybe_narrower_accepted() {
+    assert_eq!(
+        subsumes(
+            "with {\ndata Priority = Low {} | High {}\n}\n(Maybe.Just {value (Priority.Low {})})",
+            "data Priority = Low {} | High {} | Medium {}\nMaybe Priority"
+        ),
+        Some(true)
+    );
+}
+
+#[test]
+fn adt_inside_maybe_wider_rejected() {
+    assert_eq!(
+        subsumes(
+            "with {\ndata Priority = Low {} | High {} | Medium {}\n}\n(Maybe.Just {value (Priority.Medium {})})",
+            "data Priority = Low {} | High {}\nMaybe Priority"
+        ),
+        Some(false)
+    );
+}
+
+#[test]
+fn adt_inside_relation_narrower_accepted() {
+    assert_eq!(
+        subsumes(
+            "with {\ndata Priority = Low {}\n}\n[(Priority.Low {})]",
+            "data Priority = Low {} | High {}\n[Priority]"
+        ),
+        Some(true)
+    );
+}
+
+#[test]
+fn adt_inside_relation_wider_rejected() {
+    assert_eq!(
+        subsumes(
+            "with {\ndata Priority = Low {} | High {} | Medium {}\n}\n[(Priority.Medium {})]",
+            "data Priority = Low {} | High {}\n[Priority]"
+        ),
+        Some(false)
+    );
+}
+
+// ── Invariant position (ADT in both param and result of one function) ───────
+// `Priority -> Priority` puts `Priority` at mixed polarity: the ctor sets must
+// be exactly EQUAL — neither a narrower nor a wider snippet is usable.
+
+#[test]
+fn adt_invariant_identical_accepted() {
+    assert_eq!(
+        subsumes(
+            "with {\ndata Priority = Low {} | High {}\n}\n(\\p -> case p of\n  Priority.Low {} -> (Priority.Low {})\n  Priority.High {} -> (Priority.High {}))",
+            "data Priority = Low {} | High {}\nPriority -> Priority"
+        ),
+        Some(true)
+    );
+}
+
+#[test]
+fn adt_invariant_narrower_rejected() {
+    assert_eq!(
+        subsumes(
+            "with {\ndata Priority = Low {}\n}\n(\\p -> case p of\n  Priority.Low {} -> (Priority.Low {}))",
+            "data Priority = Low {} | High {}\nPriority -> Priority"
+        ),
+        Some(false)
+    );
+}
+
+// ── Payload field-set checks ────────────────────────────────────────────────
+// The consumed side binds ctor fields; those fields must be PRESENT in the
+// produced side (a name the host binds but the snippet lacks is a runtime
+// "field not found" panic). Field-name and missing-field mismatches reject.
+
+/// The host binds `n`; the snippet's ctor has `count` instead. Reject.
+#[test]
+fn adt_field_name_mismatch_rejected() {
+    assert_eq!(
+        subsumes(
+            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {count: Int 1}\n}\n(Wrap.W {count 7})",
+            "data Wrap = W {n: Int 1}\nWrap"
+        ),
+        Some(false)
+    );
+}
+
+/// The host binds a field the snippet's ctor doesn't have at all. Reject.
+#[test]
+fn adt_field_missing_rejected() {
+    assert_eq!(
+        subsumes(
+            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {n: Int 1}\n}\n(Wrap.W {n 7})",
+            "data Wrap = W {n: Int 1, extra: Text}\nWrap"
+        ),
+        Some(false)
+    );
+}
+
+/// A payload field that is itself an ADT recurses the ctor-set check: the
+/// inner ctor sets must relate at the enclosing variance.
+#[test]
+fn adt_payload_multi_ctor_field_mismatch_rejected() {
+    assert_eq!(
+        subsumes(
+            "with {\ndata Priority = Low {} | High {}\ndata Shape = Circle {r: Text} | Square {}\n}\n(Shape.Circle {r \"x\"})",
+            "data Shape = Circle {r: Int 1} | Square {}\nShape"
+        ),
+        Some(false)
+    );
+}

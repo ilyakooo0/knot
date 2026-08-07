@@ -12751,20 +12751,42 @@ fn check_adt_ctors(
     if !sets_ok {
         return false;
     }
-    // Payload field types, at matching variance. For each shared ctor, the
-    // field types present in the CONSUMED side must be subsumed by the
-    // PRODUCED side. Under Co the snippet produces (snippet field ⊆ host
-    // field); under Contra the host produces (host field ⊆ snippet field).
+    // Payload field types, at matching variance. The CONSUMED side destructures
+    // the value, so every field it binds must be PRESENT in the produced side
+    // with a subsumable type; extra fields on the produced side are ignored.
+    // Under Co the host consumes (host fields ⊆ snippet fields, snippet field
+    // type ⊆ host field type); under Contra the snippet consumes (the mirror);
+    // under Inv the field sets must be equal and each type mutually subsumable.
     info.ctors.iter().all(|(cname, snippet_fields)| {
         let Some((_, host_fields)) = host_ctors.iter().find(|(hc, _)| hc == cname) else {
             // A ctor only on the produced/consumed side — already handled by
             // the set check above; nothing to compare field-wise here.
             return true;
         };
+        // Field PRESENCE: the consumed side's fields must all exist in the
+        // produced side, else the consumer binds a field that isn't there
+        // (e.g. host reads `n` but the snippet produced `count` — a runtime
+        // "field not found" panic). Co: consumed=host; Contra: consumed=snippet;
+        // Inv: both directions.
+        let snippet_has = |f: &str| snippet_fields.iter().any(|(n, _)| n == f);
+        let host_has = |f: &str| host_fields.iter().any(|(n, _)| n == f);
+        let presence_ok = match var {
+            Variance::Co => host_fields.iter().all(|(hf, _)| snippet_has(hf)),
+            Variance::Contra => snippet_fields.iter().all(|(sf, _)| host_has(sf)),
+            Variance::Inv => {
+                host_fields.iter().all(|(hf, _)| snippet_has(hf))
+                    && snippet_fields.iter().all(|(sf, _)| host_has(sf))
+            }
+        };
+        if !presence_ok {
+            return false;
+        }
         snippet_fields.iter().all(|(fname, snippet_fty)| {
             let Some((_, host_fty_src)) = host_fields.iter().find(|(hf, _)| hf == fname) else {
-                // Field present only on the snippet side. Sound iff the host's
-                // ctor (which the host pattern-matches on) doesn't bind it.
+                // Field present only on the snippet (produced) side. Sound iff
+                // the host's ctor doesn't bind it — under Co the host ignores
+                // it; presence (above) already guarantees the host's own fields
+                // exist, so a snippet-only field is fine here.
                 return true;
             };
             let snippet_ty = infer.ast_type_to_ty(snippet_fty);

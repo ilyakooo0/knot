@@ -5,14 +5,10 @@ type Todo = {title: Text, owner: Text, priority: Priority}
 
 *todos : [Todo]
 
-route TodoApi where
-  GET /todos/{owner: Text} headers {xForwardedFor: Maybe Text} -> [Todo] = GetTodos
-  POST {title: Text, owner: Text, priority: Text} /todos -> Todo = CreateTodo
-
-route AdminApi where
-  GET /admin/count -> Int 1 = GetCount
-
-route Api = TodoApi | AdminApi
+api Api where
+  GetTodos get /todos/{owner: Text} @{xForwardedFor: Maybe Text} -> [Todo]
+  CreateTodo post /todos ={title: Text, owner: Text, priority: Text} -> Todo
+  GetCount get /admin/count -> Int 1
 
 addTodo (\title owner priority -> do
   todos <- full *todos
@@ -22,7 +18,7 @@ getTodos (\owner -> do
   todos <- full *todos
   with {result (do t <- todos; where t.owner == owner; yield t)} yield result)
 
-api (serve Api where
+srv (serve Api where
   GetTodos = \{owner owner xForwardedFor xForwardedFor} -> do
     case xForwardedFor of
       Maybe.Just {value ip} -> base.logInfo ("GetTodos from " ++ ip)
@@ -38,4 +34,4 @@ api (serve Api where
     todos <- full *todos
     yield (Result.Ok {value (base.count todos)}))
 }
-(base.listen 8080 api)
+(base.listen 8080 srv)

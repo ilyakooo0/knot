@@ -449,7 +449,6 @@ impl<'src> Lexer<'src> {
             match text {
                 "data" => return TokenKind::Data,
                 "type" => return TokenKind::Type,
-                "route" => return TokenKind::Route,
                 "serve" => return TokenKind::Serve,
                 "migrate" => return TokenKind::Migrate,
                 "where" => return TokenKind::Where,

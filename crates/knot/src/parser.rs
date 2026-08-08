@@ -17,6 +17,11 @@ pub struct Parser {
     /// Used in route entry parsing to prevent the type parser from consuming
     /// the `headers` keyword.
     stop_type_at_headers: bool,
+    /// When true, the cross-newline type-application continuation stops at an
+    /// `Upper` token on the following line. Set while parsing an `api` route's
+    /// response type, where the next line's leading `Upper` is the next route's
+    /// constructor name, never a type argument.
+    stop_type_app_at_route_entry: bool,
     /// When true, `can_start_type_atom` returns false for `Lower("to")` and
     /// `Lower("using")`. Used while parsing the `from`/`to` types of a
     /// `migrate` declaration so a single-line migrate doesn't have its clause
@@ -86,6 +91,7 @@ impl Parser {
             diagnostics: Vec::new(),
             context: Vec::new(),
             stop_type_at_headers: false,
+            stop_type_app_at_route_entry: false,
             stop_type_at_migrate_clauses: false,
             record_value_sig_type: false,
             block_indent: usize::MAX,
@@ -970,6 +976,157 @@ impl Parser {
             }
         }
         entries
+    }
+
+    /// Parse the entries of an `api Name where …` block. Each entry is
+    /// `Ctor <- method /path/{p: T}?{q: T}&{..} @{h: T} ={body: T} -> Resp`.
+    /// Layout: entries are indented strictly deeper than the `api` keyword's
+    /// column (`floor`); a dedent ends the block.
+    fn parse_api_route_entries(&mut self, floor: usize) -> Vec<RouteEntry> {
+        let mut entries = vec![];
+        loop {
+            self.skip_newlines();
+            if self.at_eof() {
+                break;
+            }
+            if self.cur_column() <= floor {
+                break;
+            }
+            // An entry starts with an Upper constructor name followed by a
+            // lowercase HTTP method (`Get get /users/… -> …`).
+            if !(matches!(self.peek(), TokenKind::Upper(_))
+                && matches!(self.peek_ahead(1), TokenKind::Lower(m) if matches!(m.as_str(), "get"|"post"|"put"|"patch"|"delete")))
+            {
+                break;
+            }
+            match self.parse_api_route_entry() {
+                Some(entry) => entries.push(entry),
+                None => break,
+            }
+        }
+        entries
+    }
+
+    /// Parse one `Ctor method template -> Response` entry (whitespace-separated:
+    /// no `<-`). The template's `{p: T}` path params, `?{q: T}` query params,
+    /// `@{h: T}` headers, and `={..}` body fields merge into the route's request
+    /// constructor fields.
+    fn parse_api_route_entry(&mut self) -> Option<RouteEntry> {
+        let (constructor, _) = self
+            .expect_upper("expected route constructor name")
+            .ok()?;
+
+        // Method: lowercase verb (get, post, put, patch, delete), separated from
+        // the constructor name by whitespace alone.
+        let method = match self.peek() {
+            TokenKind::Lower(m) => match m.as_str() {
+                "get" => Some(HttpMethod::Get),
+                "post" => Some(HttpMethod::Post),
+                "put" => Some(HttpMethod::Put),
+                "delete" => Some(HttpMethod::Delete),
+                "patch" => Some(HttpMethod::Patch),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(method) = method else {
+            self.error(format!(
+                "expected HTTP method (get, post, put, patch, delete), found '{:?}'",
+                self.peek()
+            ));
+            return None;
+        };
+        self.advance();
+
+        // Path: /seg/{p: Type}/...
+        self.skip_newlines();
+        let path = self.parse_route_path();
+
+        // Query params: `?{q: Type}&{..}` — the `&`-separated form mirrors the
+        // wire; each param is its own `{name: Type}` group.
+        self.skip_newlines();
+        let mut query_params = Vec::new();
+        if self.eat(&TokenKind::Question) {
+            loop {
+                query_params.extend(self.parse_api_typed_fields("query parameter"));
+                self.skip_newlines();
+                if !self.eat(&TokenKind::Ampersand) {
+                    break;
+                }
+            }
+        }
+
+        // Header: `@{name: Type}` — a single typed header per `@`.
+        self.skip_newlines();
+        let request_headers = if self.eat(&TokenKind::At) {
+            self.parse_api_typed_fields("header")
+        } else {
+            Vec::new()
+        };
+
+        // Body: `={name: Type, ...}` — the payload, one record of fields.
+        self.skip_newlines();
+        let body_fields = if self.eat(&TokenKind::Eq) {
+            self.parse_api_typed_fields("body")
+        } else {
+            Vec::new()
+        };
+
+        // Response type: `-> Type` (required — every route declares its response).
+        self.skip_newlines();
+        self.expect(&TokenKind::Arrow, "expected '->' before route response type")
+            .ok()?;
+        self.stop_type_at_headers = true;
+        self.stop_type_app_at_route_entry = true;
+        let response_ty = self.parse_type();
+        self.stop_type_at_headers = false;
+        self.stop_type_app_at_route_entry = false;
+        let response_ty = Some(response_ty?);
+
+        Some(RouteEntry {
+            method,
+            path,
+            body_fields,
+            query_params,
+            request_headers,
+            response_ty,
+            response_headers: Vec::new(),
+            rate_limit: None,
+            constructor,
+        })
+    }
+
+    /// Parse `{name: Type, ...}` into typed fields (shared by query/header/body).
+    fn parse_api_typed_fields(&mut self, what: &str) -> Vec<Field<Type>> {
+        let mut fields = Vec::new();
+        if !self.eat(&TokenKind::LBrace) {
+            self.error(format!("expected '{{' to open {what} fields"));
+            return fields;
+        }
+        self.skip_newlines();
+        if !self.at(&TokenKind::RBrace) {
+            loop {
+                self.skip_newlines();
+                let Ok((fname, _)) = self.expect_lower("expected field name") else {
+                    break;
+                };
+                if self.expect(&TokenKind::Colon, "expected ':' after field name").is_err() {
+                    break;
+                }
+                let Some(ty) = self.parse_type() else { break };
+                fields.push(Field { name: fname, value: ty });
+                self.skip_newlines();
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                self.skip_newlines();
+                if self.at(&TokenKind::RBrace) {
+                    break; // trailing comma
+                }
+            }
+        }
+        let _ = self.expect(&TokenKind::RBrace, "expected '}' to close fields");
+        fields
     }
 
     fn parse_route_entry(&mut self) -> Option<RouteEntry> {
@@ -2507,6 +2664,37 @@ impl Parser {
                 });
                 continue;
             }
+            // `api Name where …` — the URL-template HTTP DSL. Each entry is
+            // `Ctor <- method /path/{p: T}?{q: T} @{h: T} ={body: T} -> Resp`.
+            // Produces a `RouteDecl` exactly like `route`, so the existing type
+            // derivation / serve / fetch machinery applies unchanged; only the
+            // surface syntax differs.
+            if matches!(self.peek(), TokenKind::Lower(k) if k == "api")
+                && matches!(self.peek_ahead(1), TokenKind::Upper(_))
+                && matches!(self.peek_ahead(2), TokenKind::Where)
+            {
+                let aspan = self.span();
+                let api_col = self.cur_column();
+                self.advance(); // consume `api`
+                let (aname, _) = self
+                    .expect_upper("expected API name after 'api'")
+                    .ok()?;
+                self.expect(&TokenKind::Where, "expected 'where' after api name")
+                    .ok()?;
+                let entries = self.parse_api_route_entries(api_col);
+                fields.push(RecordField {
+                    name: aname.clone(),
+                    value: Spanned::new(
+                        ExprKind::RouteDecl {
+                            name: aname,
+                            entries,
+                        },
+                        aspan,
+                    ),
+                    sig: None,
+                });
+                continue;
+            }
             // `*name : Type` — an embedded source-relation declaration; or
             // `*name = expr` / `*name : Type = expr` — an embedded view. The
             // field is literally named `*name`; its value is a marker (the
@@ -3929,9 +4117,15 @@ impl Parser {
             // follows it.
             let next_is_value_field = self.record_value_sig_type
                 && matches!(self.peek(), TokenKind::Lower(_));
+            // While parsing an `api` route's response type, a leading `Upper`
+            // on the next line is the next route's constructor name, never a
+            // type argument — stop regardless of indentation.
+            let next_is_route_entry = self.stop_type_app_at_route_entry
+                && matches!(self.peek(), TokenKind::Upper(_));
             if !self.at_eof()
                 && !next_starts_decl
                 && !next_is_value_field
+                && !next_is_route_entry
                 && self.cur_column() > self.block_indent
                 && self.can_start_type_atom()
             {

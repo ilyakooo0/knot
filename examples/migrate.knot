@@ -1,0 +1,28 @@
+-- Schema evolution with `migrate`.
+--
+-- A relation's stored schema can change over time. `migrate from Old to New
+-- using <fn>` declares how rows written under the OLD shape are upgraded to
+-- the NEW shape on read: `from`/`to` name the record types, `using` is the
+-- upgrade function applied to each legacy row.
+--
+-- NOTE: relation columns must use ADT flags, not the primitive `Bool` — a
+-- `Bool` column panics in the storage layer (pre-existing runtime issue).
+with {
+
+data Active = Yes {} | No {}
+
+-- Version 1 of the schema: people had just a name.
+type PersonV1 = {name: Text}
+
+-- Version 2 adds an `active` flag. Existing rows stored as PersonV1 are
+-- upgraded by `using`, which fills the new field with a default.
+type PersonV2 = {name: Text, active: Active}
+
+*people : [PersonV2]
+  migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
+
+}
+(do
+  full *people = [{name "Alice" active (Active.Yes {})} {name "Bob" active (Active.No {})}]
+  rows <- full *people
+  base.println (base.show rows))

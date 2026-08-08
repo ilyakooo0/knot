@@ -1,0 +1,27 @@
+-- Higher-rank types with `forall`.
+--
+-- A `forall a. T` type in a function-argument signature makes the argument
+-- itself polymorphic: the caller passes a function that works for ANY type,
+-- and the callee picks the type. This is a rank-2 type — the `forall` sits
+-- inside the argument, not at the top of the whole signature.
+with {
+
+-- `applyTwice` takes a polymorphic function `f : forall a. a -> a` and uses
+-- it at two different types (Text and Int). An ordinary `\x -> x` is
+-- monomorphic once inferred; only a `forall`-typed parameter lets the callee
+-- choose a fresh instantiation at each call. Returns a record of both.
+applyTwice (\(f : (forall a. a -> a)) -> {asText (f "text") asInt (f 42)})
+
+-- A higher-rank argument where the passed function turns anything into a
+-- singleton list, used at Int and Text.
+wrapAny (\(f : (forall a. a -> [a])) -> {nums (f 7) words (f "seven")})
+
+}
+(do
+  -- `\y -> y` is the polymorphic identity; the callee applies it at Text and Int.
+  with { r (applyTwice (\y -> y)) }
+    (base.println (r.asText ++ " and " ++ base.show r.asInt))
+
+  -- `\x -> [x]` wraps anything in a singleton list.
+  with { w (wrapAny (\x -> [x])) }
+    (base.println (base.show w.nums ++ " and " ++ base.show w.words)))

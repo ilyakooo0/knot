@@ -637,12 +637,16 @@ See `examples/log_test.knot`.
 isn't woken by writes to `id = 2`. See `examples/race.knot`,
 `examples/stm_row_filter.knot`.
 
-**HTTP routes and serving.** `route Api where ... = Endpoint` declarations
-define endpoints by ADT constructor. `serve Api where E = handler`
-type-checks every handler against the declared method/path/body/query/
-headers/response, and `base.listen 8080 api` runs the server. Route
-composition (`route Api = TodoApi | AdminApi`) merges sub-APIs. Per-route
-rate limiting is built in. See `examples/routes.knot`.
+**HTTP routes and serving.** `api Name where ...` declares endpoints with a
+URL-template syntax: each line is a constructor, an HTTP method, a path with
+typed `{param: Type}` segments, optional `?{query: Type}` params, `@{request
+headers: Type}`, a `={body: Type}`, and a `-> Response` type. A trailing
+`@{...}` after the response declares response headers (the handler then
+returns `{body, headers}`). `serve Name where Ctor = handler` type-checks
+every handler against the declared method/path/body/query/headers/response
+with full exhaustiveness, and `base.listen 8080 srv` runs the server.
+Per-route `rateLimit {key, limit: {requests, window}}` is built in. See
+`examples/routes.knot` and `examples/apiserver.knot`.
 
 **Refined types.** `type Port = Int 1 where \p -> p > 0 && p < 65536` is a
 nominal type whose predicate is checked at boundaries — relation writes,

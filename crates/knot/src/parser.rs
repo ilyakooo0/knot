@@ -1083,6 +1083,17 @@ impl Parser {
         self.stop_type_app_at_route_entry = false;
         let response_ty = Some(response_ty?);
 
+        // Optional response headers: `@{name: Type}` after the `-> Type`. The
+        // same `@{}` marker as request headers, but positioned after the
+        // response arrow — position (before vs after `->`) carries the
+        // direction. `@` cannot start a type atom, so this is unambiguous.
+        self.skip_newlines();
+        let response_headers = if self.eat(&TokenKind::At) {
+            self.parse_api_typed_fields("response header")
+        } else {
+            Vec::new()
+        };
+
         // Optional rate limit: `rateLimit <expr>` (on its own continuation
         // line). Same shape as the `route` DSL: a record
         // `{key: Input -> RequestCtx -> Maybe a, limit: {requests, window}}`.
@@ -1101,7 +1112,7 @@ impl Parser {
             query_params,
             request_headers,
             response_ty,
-            response_headers: Vec::new(),
+            response_headers,
             rate_limit,
             constructor,
         })

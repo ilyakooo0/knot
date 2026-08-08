@@ -229,6 +229,13 @@ pub type ImplicitRefs = HashMap<Span, (String, Vec<String>)>;
 /// dictionary. Codegen splices the projected record as the leading argument.
 pub type ImplicitDictArgs = HashMap<Span, (String, Vec<String>)>;
 
+/// `<>name` collecting-fold resolutions: the `<>` head's span → the UNIQUE
+/// synthetic span of each collected candidate's `ImplicitRef` projection
+/// (innermost-first). Each synthetic span's `(root, path)` resolution lives in
+/// `implicit_refs`; codegen emits an `ImplicitRef` node per span and unrolls
+/// the `<>name folder init` spine into a left-nested fold over them.
+pub type CollectRefs = HashMap<Span, Vec<Span>>;
+
 /// Prefix for the unique, per-`with`-site alias a `with` field is also bound
 /// under during inference (and codegen's flat `Env`): `{PREFIX}{with_span_start}@{field}`.
 /// `^field` resolves against the alias so its codegen `Var` hits the lexically
@@ -244,6 +251,11 @@ pub const WITH_FIELD_ALIAS_PREFIX: &str = "\0with:";
 /// record alias is only created when a `^`-constrained callsite inside the
 /// body resolved its dictionary to this `with`. Shared with codegen.
 pub const WITH_RECORD_ALIAS_PREFIX: &str = "\0withrec:";
+
+/// Base offset for the synthetic spans `<>` mints for its per-candidate
+/// `ImplicitRef` projections (registered in `implicit_refs`). Far above any
+/// real source offset so synthetic spans never collide with genuine ones.
+pub const COLLECT_SYNTH_BASE: usize = 1 << 40;
 
 /// Spans of field-access expressions (`t.members`) whose field type is a
 /// relation. Codegen cannot re-derive this — a record's field types are not
@@ -957,6 +969,9 @@ struct Infer {
     /// argument at that application. Keyed by the application's span (the
     /// outermost `App` node's span).
     implicit_dict_args: HashMap<Span, (String, Vec<String>)>,
+    /// `<>name` collecting-fold resolutions: the `<>` head's span → every
+    /// collected `(root, path)`, innermost-first (see `CollectRefs`).
+    collect_refs: CollectRefs,
 
     /// Deferred trait constraint checks, resolved after inference.
     deferred_constraints: Vec<DeferredConstraint>,
@@ -1187,6 +1202,7 @@ impl Infer {
             known_impls: HashSet::new(),
             implicit_dict_fns: HashMap::new(),
             implicit_dict_args: HashMap::new(),
+            collect_refs: HashMap::new(),
             deferred_constraints: Vec::new(),
             next_constraint_seq: 0,
             binding_types: Vec::new(),
@@ -5224,6 +5240,314 @@ impl Infer {
         Ty::Error
     }
 
+    /// Collect EVERY in-scope record field named `name` whose type unifies
+    /// with `expected`, across ALL enclosing scopes (innermost-first) — the
+    /// `<>` counterpart to `resolve_implicit_ref`'s single-match search.
+    ///
+    /// Two deliberate differences from `^`'s search:
+    ///  - NO early-exit at the first matching scope: `<>` wants the whole
+    ///    nested stack so inner and outer context both contribute (rule A).
+    ///  - Returns every unifying candidate (rule C type filter), instead of
+    ///    requiring exactly one.
+    ///
+    /// Each result is `(root_binding, field_path, field_ty)` — the same
+    /// triple `implicit_refs` records for `^`, so codegen can emit the
+    /// projection chain `root.path…name` unchanged.
+    fn collect_all_implicit_fields(
+        &mut self,
+        name: &str,
+        expected: &Ty,
+        span: Span,
+    ) -> Vec<(String, Vec<String>, Ty)> {
+        // Gather (root, path, ty) candidates from every scope, innermost
+        // first. Mirrors the `with`-frame + record-BFS logic in
+        // `resolve_implicit_ref`, but keeps walking outward.
+        let mut candidates: Vec<(String, Vec<String>, Ty)> = Vec::new();
+
+        // Pass 1: `with`-frame records. A `with {svcA {log …}}` frame binds
+        // `svcA` as a field of the with-record. The runtime dictionary for a
+        // `svcA` reference is the field value, bound in codegen under the
+        // per-site FIELD alias `\0with:<span>@svcA` (see codegen's `With` arm)
+        // — EXCEPT the innermost `with` frame, whose fields are read via the
+        // shared bare-name slot (inference's `Var` arm deliberately does not
+        // redirect the innermost; see its comment). So: innermost frame →
+        // bare field-name root; deeper frames → `\0with:<span>@field` alias
+        // root. BFS into record-typed fields for a nested `…log` at any
+        // depth, rooting the projection at that field root and projecting the
+        // REMAINING path: `svcA.log` → root `…@svcA`, path `[log]`.
+        // Root a with-frame field reference the way inference's `Var` arm does:
+        // the INNERMOST `with` frame reads via the shared bare-name slot (its
+        // fields are bound directly by the frame); DEEPER frames must use the
+        // per-site field alias `\0with:<span>@field`, which codegen binds and
+        // which stays lexically correct across nesting where the bare slot is
+        // runtime-order-dependent. Codegen emits each candidate as an
+        // `ImplicitRef` (the `^` path), which compiles `Var(root)` directly.
+        let innermost_with_idx = self
+            .with_scope_stack
+            .iter()
+            .rposition(Option::is_some);
+        for (idx, (with_frame, _scope)) in self
+            .with_scope_stack
+            .iter()
+            .zip(self.scopes.iter())
+            .enumerate()
+            .rev()
+        {
+            let Some((with_span, field_schemes)) = with_frame else {
+                continue;
+            };
+            let field_root = |fname: &str| -> String {
+                if Some(idx) == innermost_with_idx {
+                    fname.to_string()
+                } else {
+                    format!("{WITH_FIELD_ALIAS_PREFIX}{}@{fname}", with_span.start)
+                }
+            };
+            // Direct field binding `with {log …}`: `log` is a top-level field.
+            if let Some(scheme) = field_schemes.get(name) {
+                candidates.push((field_root(name), Vec::new(), scheme.ty.clone()));
+            }
+            // BFS into record-typed fields for a nested `…log` at any depth.
+            let mut frontier: Vec<(Vec<String>, Ty)> = field_schemes
+                .iter()
+                .map(|(f, s)| (vec![f.clone()], self.apply(&s.ty).clone()))
+                .collect();
+            loop {
+                let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
+                let mut descended = false;
+                for (path, field_ty) in &frontier {
+                    if *path.last().expect("non-empty path") == name {
+                        // Root at the FIRST path element's BARE field name,
+                        // matching `^`'s record-BFS root (`bind_name`): the
+                        // `with` binds each field into the flat `Env`, which
+                        // prototypes into nested bodies, so a bare `Var(app)`
+                        // resolves the outer record correctly across nesting.
+                        let root = path[0].clone();
+                        let rest: Vec<String> = path[1..].to_vec();
+                        candidates.push((root, rest, field_ty.clone()));
+                    }
+                    if let Ty::Record(sub, _) = self.apply(field_ty).peel_alias().clone() {
+                        for (f, t) in sub.iter() {
+                            let mut p = path.clone();
+                            p.push(f.clone());
+                            next.push((p, t.clone()));
+                            descended = true;
+                        }
+                    }
+                }
+                if !descended {
+                    break;
+                }
+                frontier = next;
+            }
+        }
+
+        // Pass 2: record-BFS over every scope's bindings, innermost-first,
+        // descending into nested record fields (no shallowest-depth early
+        // exit — `<>` collects at any depth in any scope). SKIP bindings that
+        // are `with`-record fields: those were already collected in Pass 1
+        // rooted at the reliable `\0withrec:` alias, and re-collecting them
+        // via the shared bare-name slot would double-count AND risk the
+        // unreliable bare resolution.
+        let with_field_names: std::collections::HashSet<&str> = self
+            .with_scope_stack
+            .iter()
+            .flatten()
+            .flat_map(|(_, fm)| fm.keys().map(String::as_str))
+            .collect();
+        for scope in self.scopes.iter().rev() {
+            // (path-to-current-record, record_fields) frontier per binding.
+            let mut frontier: Vec<(String, Vec<String>, Ty)> = Vec::new();
+            for (bind_name, scheme) in scope {
+                if with_field_names.contains(bind_name.as_str()) {
+                    continue;
+                }
+                let root_ty = self.apply(&scheme.ty).clone();
+                if let Ty::Record(fields, _) = root_ty.peel_alias() {
+                    for (f, t) in fields.iter().rev() {
+                        frontier.push((bind_name.clone(), vec![f.clone()], t.clone()));
+                    }
+                }
+            }
+            // BFS descend until no frontier entry has a record-typed field.
+            loop {
+                let mut next: Vec<(String, Vec<String>, Ty)> = Vec::new();
+                let mut descended = false;
+                for (root, path, field_ty) in &frontier {
+                    if *path.last().expect("non-empty path") == name {
+                        candidates.push((root.clone(), path.clone(), field_ty.clone()));
+                    }
+                    if let Ty::Record(sub, _) = self.apply(field_ty).peel_alias().clone() {
+                        for (f, t) in sub.iter().rev() {
+                            let mut p = path.clone();
+                            p.push(f.clone());
+                            next.push((root.clone(), p, t.clone()));
+                            descended = true;
+                        }
+                    }
+                }
+                if !descended {
+                    break;
+                }
+                frontier = next;
+            }
+        }
+
+        // Type filter (rule C): keep only candidates whose field type unifies
+        // with `expected`, via the same speculative-substitution trial `^`
+        // uses — a failed trial leaves the real substitution untouched.
+        let mut kept: Vec<(String, Vec<String>, Ty)> = Vec::new();
+        for (root, path, field_ty) in candidates {
+            let mut trial: HashMap<TyVar, Ty> = HashMap::with_capacity(self.subst.len());
+            for v in self.subst.keys() {
+                let resolved = self.apply(&Ty::Var(*v));
+                trial.insert(*v, resolved);
+            }
+            let mut trial_errors: Vec<(String, Span)> = Vec::new();
+            std::mem::swap(&mut self.subst, &mut trial);
+            std::mem::swap(&mut self.errors, &mut trial_errors);
+            self.unify(&field_ty.clone(), expected, span);
+            std::mem::swap(&mut self.subst, &mut trial);
+            std::mem::swap(&mut self.errors, &mut trial_errors);
+            if trial_errors.is_empty() {
+                kept.push((root, path, field_ty));
+            }
+        }
+        kept
+    }
+
+    /// Detect `<>name folder init` (an app spine headed by `CollectFold` with
+    /// exactly two args) and rewrite it IN PLACE to the unrolled fold
+    /// `folder (folder … (folder init proj1) … projN)`, where each `projK` is
+    /// the explicit projection `rootK.pathK…name` for the Kth collected
+    /// candidate. Returns the rewritten expression's type, or `None` if this
+    /// isn't a `<>`-fold spine.
+    ///
+    /// The synthetic chain is ordinary `App`/`FieldAccess`/`Var`, and each
+    /// projection's field type is known at its own site, so heterogeneous
+    /// fragment shapes typecheck (the whole reason `<>` folds rather than
+    /// listing). The collected `(root, path)` list is recorded in
+    /// `collect_refs` keyed by the `<>` head's span so codegen unrolls the
+    /// same fold over the ORIGINAL spine.
+    fn try_infer_collect_fold(&mut self, expr: &ast::Expr) -> Option<Ty> {
+        // Peel `App(App(CollectFold(name), folder), init)`.
+        let ast::ExprKind::App { func: f1, arg: init } = &expr.node else {
+            return None;
+        };
+        let ast::ExprKind::App { func: f0, arg: folder } = &f1.node else {
+            return None;
+        };
+        let ast::ExprKind::CollectFold(name) = &f0.node else {
+            return None;
+        };
+        let name = name.clone();
+        let head_span = f0.span;
+        let span = expr.span;
+
+        // Collect candidates against the open-row element type (a fresh var;
+        // for logging it is pinned to `{ | c}` by the folder's `unify`).
+        let elem = self.fresh();
+        let candidates = self.collect_all_implicit_fields(&name, &elem, span);
+
+        // Register each candidate in `implicit_refs` under a UNIQUE synthetic
+        // span, and record those spans (innermost-first) in `collect_refs` for
+        // codegen. Codegen emits each projection as an `ImplicitRef` node with
+        // its span, so it compiles through the SAME `^` path that resolves
+        // outer `with`-records lexically across nesting (a bare `Var(root)`
+        // would read the runtime-order-dependent shared slot instead).
+        let synth_spans: Vec<Span> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, (root, path, _))| {
+                // Reserved high range, unique per (head span, index).
+                let synth = Span {
+                    start: COLLECT_SYNTH_BASE + head_span.start * 64 + i,
+                    end: COLLECT_SYNTH_BASE + head_span.start * 64 + i + 1,
+                };
+                self.implicit_refs
+                    .insert(synth, (root.clone(), path.clone()));
+                synth
+            })
+            .collect();
+        self.collect_refs.insert(head_span, synth_spans.clone());
+
+        // Build the projection expr for one candidate: an `ImplicitRef` node
+        // with the candidate's unique synthetic span (its resolution is in
+        // `implicit_refs`). Inference's `ImplicitRef` arm reads that entry.
+        // Build the projection expr for one candidate's TYPE: `Var(root).f1…name`.
+        // Inference only needs the field's type here; codegen separately emits
+        // each candidate as an `ImplicitRef` node (using the synthetic spans in
+        // `collect_refs`) so nested `with`-records resolve lexically.
+        let proj = |i: usize, span: Span| -> ast::Expr {
+            let (root, path, _ty) = &candidates[i];
+            let mut e = ast::Expr {
+                node: ast::ExprKind::Var(root.clone()),
+                span,
+            };
+            for field in path {
+                e = ast::Expr {
+                    node: ast::ExprKind::FieldAccess {
+                        expr: Box::new(e),
+                        field: field.clone(),
+                    },
+                    span,
+                };
+            }
+            e
+        };
+
+        // Unroll outermost-first so that, with the right-biased `unify` folder
+        // `(\acc frag -> base.unify frag acc)`, the INNERMOST fragment is
+        // applied last and wins per-field.
+        //
+        // When the folder is a lambda LITERAL `\p1 p2 -> body`, beta-reduce
+        // `folder acc p` to `body[p1:=acc, p2:=p]` at each site. This keeps
+        // every `base.unify` in the body applied to CONCRETE argument types —
+        // reusing one lambda at N sites would instead infer its body once
+        // with unresolved params and trip the deferred-`unify` gap ("unify
+        // expects record arguments, got a non-record type").
+        let apply_folder = |folder: &ast::Expr, a: ast::Expr, b: ast::Expr| -> ast::Expr {
+            if let ast::ExprKind::Lambda { params, body, .. } = &folder.node
+                && params.len() == 2
+                && let ast::PatKind::Var(p1) = &params[0].node
+                && let ast::PatKind::Var(p2) = &params[1].node
+            {
+                let mut substituted = (**body).clone();
+                subst_var(&mut substituted, p1, &a);
+                subst_var(&mut substituted, p2, &b);
+                return substituted;
+            }
+            // Fallback: ordinary curried application `folder a b`.
+            ast::Expr {
+                node: ast::ExprKind::App {
+                    func: Box::new(ast::Expr {
+                        node: ast::ExprKind::App {
+                            func: Box::new(folder.clone()),
+                            arg: Box::new(a),
+                        },
+                        span,
+                    }),
+                    arg: Box::new(b),
+                },
+                span,
+            }
+        };
+
+        // Fold innermost-first (candidates are already innermost-first). The
+        // folder `\acc frag -> base.unify frag acc` puts `frag` on the LEFT and
+        // `acc` on the RIGHT, and `unify` is right-biased — so wrapping the
+        // NEXT-outer fragment around the accumulated inner merge keeps the
+        // INNERMOST fragment on the right of the outermost `unify`, i.e. it
+        // wins per-field. Result: `unify outer (unify … (unify inner init))`.
+        let mut acc = (**init).clone();
+        for (i, _) in candidates.iter().enumerate() {
+            let p = proj(i, span);
+            acc = apply_folder(folder, acc, p);
+        }
+
+        Some(self.infer_expr(&acc))
+    }
+
     fn infer_expr(&mut self, expr: &ast::Expr) -> Ty {
         let ty = self.infer_expr_inner(expr);
         // Record the inferred type of every `base.todo` (or `with base` → bare
@@ -5477,6 +5801,19 @@ impl Infer {
                 // recorded for codegen (see `resolve_implicit_ref`).
                 let expected = self.fresh();
                 self.resolve_implicit_ref(name, &expected, expr.span)
+            }
+
+            ast::ExprKind::CollectFold(name) => {
+                // A bare `<>name` not applied to `folder init` — the fold is
+                // only meaningful applied. (`<>name folder init` is handled
+                // in the App arm via `try_infer_collect_fold`.)
+                self.error(
+                    format!(
+                        "`<>{name}` must be applied to a folder and an initial value: `<>{name} folder init`"
+                    ),
+                    expr.span,
+                );
+                Ty::Error
             }
 
             ast::ExprKind::TypeHole => {
@@ -6017,6 +6354,13 @@ impl Infer {
                 // must be closed, statically-known records (a free row tail
                 // makes the union underdetermined → type error).
                 if let Some(ty) = self.try_infer_unify(expr) {
+                    return ty;
+                }
+
+                // Collecting fold: `<>name folder init`. Unrolled to a chain
+                // of explicit projections so heterogeneous fragment shapes
+                // typecheck; see `try_infer_collect_fold`.
+                if let Some(ty) = self.try_infer_collect_fold(expr) {
                     return ty;
                 }
 
@@ -12328,6 +12672,8 @@ fn value_references_source_inner(
         ast::ExprKind::SourceRef { name, .. } => name == source_name,
         // `^x` reads a record field, never a source relation directly.
         ast::ExprKind::ImplicitRef(_) => false,
+        // `<>x` likewise reads record fields, never a source relation.
+        ast::ExprKind::CollectFold(_) => false,
         // `_` hole reads nothing.
         ast::ExprKind::TypeHole => false,
         ast::ExprKind::Var(name) => {
@@ -12463,6 +12809,7 @@ pub type CheckOutput = (
     TypeArgSpans,
     ImplicitRefs,
     ImplicitDictArgs,
+    CollectRefs,
     ResolvedCalls,
     TodoTypes,
     TodoBindings,
@@ -13351,12 +13698,13 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
     let type_arg_spans: TypeArgSpans = infer.type_arg_spans.clone();
     let implicit_refs: ImplicitRefs = infer.implicit_refs.clone();
     let implicit_dict_args: ImplicitDictArgs = infer.implicit_dict_args.clone();
+    let collect_refs: CollectRefs = infer.collect_refs.clone();
     let todo_types = infer.extract_todo_types();
     let todo_bindings = infer.extract_todo_bindings();
     let trace_types = infer.extract_trace_types();
     let trace_bindings = infer.extract_trace_bindings();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, infer.resolved_calls.clone(), todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, file_body_type)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, collect_refs, infer.resolved_calls.clone(), todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, file_body_type)
 }
 
 
@@ -13531,7 +13879,7 @@ fn rewrite_result_markers(expr: &mut ast::Expr, pure_spans: &HashSet<Span>) {
 fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Expr)) {
     use ast::ExprKind::*;
     match &mut expr.node {
-        Lit(_) | Var(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) => {}
+        Lit(_) | Var(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | CollectFold(_) => {}
         TypeHole => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         RouteDecl { .. } | RouteCompositeDecl { .. } => {}
@@ -13589,6 +13937,112 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
                 f(&mut h.body);
             }
         }
+    }
+}
+
+/// Substitute every free occurrence of `var` in `expr` with `replacement`.
+/// Used by `<>`'s fold unroll to beta-reduce a lambda-literal folder at each
+/// projection site, so the body's `base.unify` sees concrete argument types.
+/// Naive (no alpha-renaming): safe here because the folder is a 2-param lambda
+/// applied to a projection/init that references no binder shadowed inside.
+pub(crate) fn subst_var(expr: &mut ast::Expr, var: &str, replacement: &ast::Expr) {
+    // Replace this node if it's the variable, then recurse into children.
+    if let ast::ExprKind::Var(n) = &expr.node
+        && n == var
+    {
+        *expr = replacement.clone();
+        return;
+    }
+    use ast::ExprKind::*;
+    match &mut expr.node {
+        App { func, arg } => {
+            subst_var(func, var, replacement);
+            subst_var(arg, var, replacement);
+        }
+        FieldAccess { expr: e, .. } => subst_var(e, var, replacement),
+        Lambda { body, params, .. } => {
+            // Do not substitute under a re-binding of `var` (shadowing).
+            let rebinds = params
+                .iter()
+                .flat_map(pat_bound_names_pub)
+                .any(|n| n == var);
+            if !rebinds {
+                subst_var(body, var, replacement);
+            }
+        }
+        Record(fields) => {
+            for fl in fields {
+                subst_var(&mut fl.value, var, replacement);
+            }
+        }
+        With { record, body, .. } => {
+            subst_var(record, var, replacement);
+            subst_var(body, var, replacement);
+        }
+        BinOp { lhs, rhs, .. } => {
+            subst_var(lhs, var, replacement);
+            subst_var(rhs, var, replacement);
+        }
+        UnaryOp { operand, .. } => subst_var(operand, var, replacement),
+        Case { scrutinee, arms } => {
+            subst_var(scrutinee, var, replacement);
+            for arm in arms {
+                subst_var(&mut arm.body, var, replacement);
+            }
+        }
+        Do(stmts) => {
+            for s in stmts {
+                match &mut s.node {
+                    ast::StmtKind::Bind { expr: e, .. } => subst_var(e, var, replacement),
+                    ast::StmtKind::Where { cond } => subst_var(cond, var, replacement),
+                    ast::StmtKind::GroupBy { key } => subst_var(key, var, replacement),
+                    ast::StmtKind::Expr(e) => subst_var(e, var, replacement),
+                    _ => {}
+                }
+            }
+        }
+        Set { target, value } | FullSet { target, value } => {
+            subst_var(target, var, replacement);
+            subst_var(value, var, replacement);
+        }
+        Atomic(inner) | Refine(inner) => subst_var(inner, var, replacement),
+        TimeUnitLit { value, .. } => subst_var(value, var, replacement),
+        Annot { expr: e, .. } => subst_var(e, var, replacement),
+        List(items) => {
+            for i in items {
+                subst_var(i, var, replacement);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Names bound by a pattern (public helper for `subst_var`'s shadowing check).
+fn pat_bound_names_pub(pat: &ast::Pat) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_pat_names(pat, &mut out);
+    out
+}
+
+fn collect_pat_names(pat: &ast::Pat, out: &mut Vec<String>) {
+    use ast::PatKind::*;
+    match &pat.node {
+        Var(n) => out.push(n.clone()),
+        Record(fields) => {
+            for f in fields {
+                match &f.pattern {
+                    Some(p) => collect_pat_names(p, out),
+                    None => out.push(f.name.clone()), // punned `{name}`
+                }
+            }
+        }
+        Constructor { payload, .. } => collect_pat_names(payload, out),
+        List(items) => {
+            for i in items {
+                collect_pat_names(i, out);
+            }
+        }
+        _ => {}
     }
 }
 

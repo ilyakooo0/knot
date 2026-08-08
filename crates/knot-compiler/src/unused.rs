@@ -246,6 +246,8 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         // unused-analysis runs on the AST without that map, so it can't name
         // the root binding. Treat as using nothing (no leaf refs).
         ExprKind::ImplicitRef(_) => {}
+        // `<>x` is likewise a field projection resolved during inference.
+        ExprKind::CollectFold(_) => {}
         ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}

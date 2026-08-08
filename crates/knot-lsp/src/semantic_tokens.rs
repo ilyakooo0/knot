@@ -451,6 +451,9 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::ImplicitRef(_) => {
                 self.add(self.strip_parens(expr.span), TOK_VARIABLE, MOD_READONLY);
             }
+            ast::ExprKind::CollectFold(_) => {
+                self.add(self.strip_parens(expr.span), TOK_VARIABLE, MOD_READONLY);
+            }
             ast::ExprKind::TypeHole => {
                 self.add(self.strip_parens(expr.span), TOK_VARIABLE, MOD_READONLY);
             }

@@ -698,7 +698,7 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
 fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) {
     match &mut expr.node {
         ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Constructor(_)
-        | ExprKind::SourceRef { .. } | ExprKind::DerivedRef(_) | ExprKind::ImplicitRef(_) | ExprKind::TypeHole => {}
+        | ExprKind::SourceRef { .. } | ExprKind::DerivedRef(_) | ExprKind::ImplicitRef(_) | ExprKind::CollectFold(_) | ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
         ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}

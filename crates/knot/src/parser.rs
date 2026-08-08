@@ -1796,6 +1796,16 @@ impl Parser {
                     false
                 }
             }
+            TokenKind::Collect => {
+                // Collecting fold `<>name` only when `<>` is immediately
+                // adjacent to a Lower token (mirrors `^name`).
+                if let Some(next) = self.tokens.get(self.pos + 1) {
+                    let cur_end = self.peek_token().span.end;
+                    matches!(next.kind, TokenKind::Lower(_)) && next.span.start == cur_end
+                } else {
+                    false
+                }
+            }
             // `_` — a hole. Valid as an application argument: as a type
             // argument it is inferred; as a value it behaves like `base.todo`.
             TokenKind::Underscore => true,
@@ -2121,6 +2131,24 @@ impl Parser {
                         self.error(
                             "expected identifier after '^' for implicit field projection",
                         );
+                        None
+                    }
+                }
+            }
+            TokenKind::Collect => {
+                // <>name — collecting fold head
+                self.advance();
+                match self.peek() {
+                    TokenKind::Lower(_) => {
+                        let tok = self.advance();
+                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                        Some(Spanned::new(
+                            ExprKind::CollectFold(name),
+                            Span::new(start.start, tok.span.end),
+                        ))
+                    }
+                    _ => {
+                        self.error("expected identifier after '<>' for collecting fold");
                         None
                     }
                 }

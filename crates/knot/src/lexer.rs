@@ -75,6 +75,7 @@ pub enum TokenKind {
     OrOr,
     PipeGt,
     Caret,
+    Collect,
 
     // Arrows
     Arrow,
@@ -154,6 +155,7 @@ impl TokenKind {
             TokenKind::OrOr => "'||'",
             TokenKind::PipeGt => "'|>'",
             TokenKind::Caret => "'^'",
+            TokenKind::Collect => "'<>'",
             TokenKind::Arrow => "'->'",
             TokenKind::FatArrow => "'=>'",
             TokenKind::LArrow => "'<-'",
@@ -916,7 +918,9 @@ impl<'src> Lexer<'src> {
 
         let kind = match ch {
             b'<' => {
-                if self.eat(b'-') {
+                if self.eat(b'>') {
+                    TokenKind::Collect
+                } else if self.eat(b'-') {
                     TokenKind::LArrow
                 } else if self.eat(b'=') {
                     TokenKind::Le

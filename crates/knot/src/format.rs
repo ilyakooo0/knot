@@ -584,6 +584,7 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         }
         ExprKind::DerivedRef(n) => format!("&{}", n),
         ExprKind::ImplicitRef(n) => format!("^{}", n),
+        ExprKind::CollectFold(n) => format!("<>{}", n),
         ExprKind::TypeHole => "_".to_string(),
         ExprKind::Record(fields) => render_record_inline(fields),
         ExprKind::FieldAccess { expr, field } => {

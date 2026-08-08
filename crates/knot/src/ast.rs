@@ -87,6 +87,13 @@ pub enum ExprKind {
     /// field named `name` whose type unifies with the expected type.
     ImplicitRef(Name),
 
+    /// `<>name` — collecting fold head. When applied as `<>name folder init`,
+    /// folds every in-scope record field named `name` (all enclosing
+    /// `with`-scopes, innermost-first, type-filtered to the fold's element
+    /// type) through `folder`, starting from `init`. The compiler unrolls the
+    /// fold per candidate, so heterogeneous fragment shapes are fine.
+    CollectFold(Name),
+
     /// `_` in expression position — a HOLE. In a type-argument slot (consumed
     /// by `consume_type_arg`) it is an inferrable type hole (`TypeKind::Hole`
     /// → a fresh unification variable). In any other (value) position it

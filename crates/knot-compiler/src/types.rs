@@ -448,6 +448,7 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
         | ExprKind::SourceRef { .. }
         | ExprKind::DerivedRef(_)
         | ExprKind::ImplicitRef(_)
+        | ExprKind::CollectFold(_)
         | ExprKind::TypeHole
         | ExprKind::TypeCtor { .. }
         | ExprKind::DataCtor { .. }

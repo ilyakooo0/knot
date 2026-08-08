@@ -347,6 +347,8 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // record supplying the dictionary, resolved during inference. Codegen
     // splices the projected record as the leading argument at that application.
     implicit_dict_args: crate::infer::ImplicitDictArgs,
+    /// `<>name` collecting-fold resolutions (see `crate::infer::CollectRefs`).
+    collect_refs: crate::infer::CollectRefs,
 
     /// `base.todo` / bare-`todo` reference span → the type it was expected to
     /// produce. Rendered into the runtime hole report at codegen time.
@@ -729,6 +731,7 @@ pub fn compile(
     implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
     implicit_dict_args: &crate::infer::ImplicitDictArgs,
+    collect_refs: &crate::infer::CollectRefs,
     resolved_calls: &crate::infer::ResolvedCalls,
     todo_types: &crate::infer::TodoTypes,
     todo_bindings: &crate::infer::TodoBindings,
@@ -761,6 +764,7 @@ pub fn compile(
             implicit_refs,
             type_arg_spans,
             implicit_dict_args,
+            collect_refs,
             resolved_calls,
             todo_types,
             todo_bindings,
@@ -798,6 +802,7 @@ pub fn compile_with<M: cranelift_module::Module>(
     implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
     implicit_dict_args: &crate::infer::ImplicitDictArgs,
+    collect_refs: &crate::infer::CollectRefs,
     resolved_calls: &crate::infer::ResolvedCalls,
     todo_types: &crate::infer::TodoTypes,
     todo_bindings: &crate::infer::TodoBindings,
@@ -829,6 +834,7 @@ pub fn compile_with<M: cranelift_module::Module>(
         implicit_refs,
         type_arg_spans,
         implicit_dict_args,
+        collect_refs,
         resolved_calls,
         todo_types,
         todo_bindings,
@@ -860,6 +866,7 @@ fn compile_inner<M: cranelift_module::Module>(
     implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
     implicit_dict_args: &crate::infer::ImplicitDictArgs,
+    collect_refs: &crate::infer::CollectRefs,
     resolved_calls: &crate::infer::ResolvedCalls,
     todo_types: &crate::infer::TodoTypes,
     todo_bindings: &crate::infer::TodoBindings,
@@ -932,6 +939,7 @@ fn compile_inner<M: cranelift_module::Module>(
     cg.with_fields = with_fields.clone();
     cg.implicit_refs = implicit_refs.clone();
     cg.implicit_dict_args = implicit_dict_args.clone();
+    cg.collect_refs = collect_refs.clone();
     cg.elem_pushdown_ok = elem_pushdown_ok.clone();
     cg.show_unit_strings = show_unit_strings.clone();
     cg.sum_float_spans = sum_float_spans.clone();
@@ -1280,6 +1288,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             with_fields: HashMap::new(),
             implicit_refs: HashMap::new(),
             implicit_dict_args: HashMap::new(),
+            collect_refs: HashMap::new(),
             todo_types: HashMap::new(),
             todo_bindings: HashMap::new(),
             trace_types: HashMap::new(),
@@ -4701,6 +4710,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 val
             }
 
+            ast::ExprKind::CollectFold(name) => {
+                // `<>name folder init` is unrolled by inference into an
+                // ordinary App/FieldAccess chain (see try_infer_collect_fold),
+                // so a bare `CollectFold` reaching codegen means it was never
+                // applied — inference already reports that as an error.
+                panic!(
+                    "codegen: `<>{name}` at {:?} reached codegen unapplied \
+                     (inference should have rejected it)",
+                    expr.span
+                );
+            }
+
             ast::ExprKind::With { record, body, .. } => {
                 // Evaluate the record, then bind each of its fields (from
                 // inference's `with_fields`) as a local for the body. A cloned
@@ -5086,6 +5107,67 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
 
             ast::ExprKind::App { func, arg } => {
+                // `<>name folder init` — collecting fold. Inference recorded
+                // the collected (root, path) fragments in `collect_refs`
+                // keyed by the `<>` head's span; unroll to a left-nested fold
+                // `folder (folder … init proj1 …) projN`, outermost-first so
+                // a right-biased folder lets the innermost fragment win.
+                if let ast::ExprKind::App { func: f0, arg: folder } = &func.node
+                    && let ast::ExprKind::CollectFold(_) = &f0.node
+                {
+                    let init = arg;
+                    let cands = self
+                        .collect_refs
+                        .get(&f0.span)
+                        .cloned()
+                        .unwrap_or_default();
+                    let ast::ExprKind::CollectFold(cf_name) = &f0.node else {
+                        unreachable!()
+                    };
+                    // Build the unrolled fold as a synthetic AST. Each candidate
+                    // projection is an `ImplicitRef` node with its unique
+                    // synthetic span (its `(root, path)` resolution is in
+                    // `implicit_refs`), so it compiles through the SAME `^`
+                    // path that resolves outer `with`-records lexically across
+                    // nesting.
+                    //   folder (folder … init proj1 …) projN   (outermost-first)
+                    let mut acc = (**init).clone();
+                    for span in cands.iter() {
+                        let p = ast::Expr {
+                            node: ast::ExprKind::ImplicitRef(cf_name.clone()),
+                            span: *span,
+                        };
+                        // Beta-reduce a lambda-literal folder (`\p1 p2 -> body`)
+                        // to `body[p1:=acc, p2:=p]`, mirroring inference so the
+                        // body's `base.unify` sees concrete argument types.
+                        if let ast::ExprKind::Lambda { params, body, .. } = &folder.node
+                            && params.len() == 2
+                            && let ast::PatKind::Var(p1) = &params[0].node
+                            && let ast::PatKind::Var(p2) = &params[1].node
+                        {
+                            let mut substituted = (**body).clone();
+                            crate::infer::subst_var(&mut substituted, p1, &acc);
+                            crate::infer::subst_var(&mut substituted, p2, &p);
+                            acc = substituted;
+                            continue;
+                        }
+                        let inner = ast::Expr {
+                            node: ast::ExprKind::App {
+                                func: folder.clone(),
+                                arg: Box::new(acc),
+                            },
+                            span: expr.span,
+                        };
+                        acc = ast::Expr {
+                            node: ast::ExprKind::App {
+                                func: Box::new(inner),
+                                arg: Box::new(p),
+                            },
+                            span: expr.span,
+                        };
+                    }
+                    return self.compile_expr(builder, &acc, env, db);
+                }
                 // Check for monadic yield: __yield(e) or yield(e)
                 if let ast::ExprKind::Var(name) = &func.node
                     && (name == "__yield" || name == "yield") {
@@ -5957,6 +6039,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
             Var(name) => !self.write_functions.contains(name),
             // `^x` reads a record field; it never writes to a source.
             ImplicitRef(_) => true,
+            // `<>x` likewise only reads record fields.
+            CollectFold(_) => true,
             TypeHole => true,
             // A route declaration marker carries no value and never writes.
             RouteDecl { .. } | RouteCompositeDecl { .. } => true,
@@ -12664,6 +12748,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         match &expr.node {
             ast::ExprKind::SourceRef { name, .. } => name == source_name,
             ast::ExprKind::ImplicitRef(_) => false,
+            ast::ExprKind::CollectFold(_) => false,
             ast::ExprKind::TypeHole => false,
             ast::ExprKind::Lit(_)
             | ast::ExprKind::Var(_)
@@ -17485,7 +17570,7 @@ fn beta_reduce_inner(
             }
             Var(name.clone())
         }
-        ImplicitRef(_) | TypeHole => expr.node.clone(),
+        ImplicitRef(_) | CollectFold(_) | TypeHole => expr.node.clone(),
         SubsetConstraint { .. } => expr.node.clone(),
         RouteDecl { .. } | RouteCompositeDecl { .. } => expr.node.clone(),
         With { record, body, types } => {
@@ -17617,7 +17702,7 @@ fn substitute_inner(
     let span = expr.span;
     let new_node = match &expr.node {
         Var(name) if name == var => return Some(value.clone()),
-        Var(_) | Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
+        Var(_) | Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {
             return Some(expr.clone())
         }
@@ -17729,7 +17814,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     };
     match &expr.node {
         Var(name) => name == var,
-        Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
+        Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => false,
         ViewDecl { body, .. } | DerivedDecl { body, .. } => expr_mentions_var(body, var),
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
@@ -17778,7 +17863,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
                 free.insert(name.clone());
             }
         }
-        Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | TypeHole | TypeCtor { .. }
+        Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {}
         ViewDecl { body, .. } | DerivedDecl { body, .. } => collect_free_vars_set(body, bound, free),
         Lambda { params, body, .. } => {
@@ -18758,7 +18843,7 @@ fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
     match &expr.node {
         ast::ExprKind::DerivedRef(n) => n == name,
         ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef { .. } | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::TypeHole | ast::ExprKind::TypeCtor { .. }
+        | ast::ExprKind::SourceRef { .. } | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::CollectFold(_) | ast::ExprKind::TypeHole | ast::ExprKind::TypeCtor { .. }
         | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_contains_derived_ref(body, name),
@@ -18857,6 +18942,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
         ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => collect_free_vars(body, bound, free),
         ast::ExprKind::ImplicitRef(_) => {}
+        ast::ExprKind::CollectFold(_) => {}
         ast::ExprKind::TypeHole => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
         ast::ExprKind::DerivedRef(name) => {
@@ -19021,6 +19107,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::ImplicitRef(_)
+        | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::TypeHole
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
@@ -19111,6 +19198,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::ImplicitRef(_)
+        | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::TypeHole
         | ast::ExprKind::DerivedRef(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
@@ -19439,6 +19527,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::Lit(lit) => pretty_lit(lit),
         ast::ExprKind::Var(name) => name.clone(),
         ast::ExprKind::ImplicitRef(name) => format!("^{name}"),
+        ast::ExprKind::CollectFold(name) => format!("<>{name}"),
         ast::ExprKind::TypeHole => "_".to_string(),
         ast::ExprKind::Constructor(name) => name.clone(),
         ast::ExprKind::TypeCtor { name, .. } => name.clone(),

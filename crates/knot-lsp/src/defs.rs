@@ -483,6 +483,7 @@ impl<'a> DefResolver<'a> {
             // `^name` resolves to a record field at inference time; no single
             // binding site to reference here.
             ast::ExprKind::ImplicitRef(_) => {},
+            ast::ExprKind::CollectFold(_) => {},
             ast::ExprKind::TypeHole => {},
 
             ast::ExprKind::Lambda { params, body, .. } => {

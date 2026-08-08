@@ -235,6 +235,7 @@ fn collect_edges(
         | ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::ImplicitRef(_)
+        | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::TypeHole => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}

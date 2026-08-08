@@ -1083,6 +1083,17 @@ impl Parser {
         self.stop_type_app_at_route_entry = false;
         let response_ty = Some(response_ty?);
 
+        // Optional rate limit: `rateLimit <expr>` (on its own continuation
+        // line). Same shape as the `route` DSL: a record
+        // `{key: Input -> RequestCtx -> Maybe a, limit: {requests, window}}`.
+        self.skip_newlines();
+        let rate_limit = if matches!(self.peek(), TokenKind::Lower(s) if s == "rateLimit") {
+            self.advance();
+            self.parse_expr()
+        } else {
+            None
+        };
+
         Some(RouteEntry {
             method,
             path,
@@ -1091,7 +1102,7 @@ impl Parser {
             request_headers,
             response_ty,
             response_headers: Vec::new(),
-            rate_limit: None,
+            rate_limit,
             constructor,
         })
     }

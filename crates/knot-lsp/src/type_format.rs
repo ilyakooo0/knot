@@ -22,6 +22,9 @@ pub fn format_type_scheme(ts: &TypeScheme) -> String {
             ast::Constraint::ImplicitField { field, ty } => {
                 s.push_str(&format!("(^ {} : {}) => ", field, format_type_kind(&ty.node)));
             }
+            ast::Constraint::CollectField { field, ty } => {
+                s.push_str(&format!("(<> {} : {}) => ", field, format_type_kind(&ty.node)));
+            }
         }
     }
     s.push_str(&format_type_kind(&ts.ty.node));

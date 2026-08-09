@@ -359,6 +359,9 @@ fn render_constraint(c: &Constraint) -> String {
         Constraint::ImplicitField { field, ty } => {
             format!("(^{field} : {})", render_type(ty))
         }
+        Constraint::CollectField { field, ty } => {
+            format!("(<>{field} : {})", render_type(ty))
+        }
     }
 }
 

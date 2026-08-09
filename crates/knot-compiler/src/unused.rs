@@ -200,6 +200,7 @@ fn walk_constraint(c: &Constraint, r: &mut Refs) {
             }
         }
         Constraint::ImplicitField { ty, .. } => walk_type(ty, r),
+        Constraint::CollectField { ty, .. } => walk_type(ty, r),
     }
 }
 

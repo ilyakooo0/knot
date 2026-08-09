@@ -1588,6 +1588,9 @@ fn function_constraint_summary(module: &ast::Expr, name: &str) -> Option<String>
                         knot::ast::Constraint::ImplicitField { field, ty } => {
                             format!("`(^ {} : {})`", field, format_type_kind(&ty.node))
                         }
+                        knot::ast::Constraint::CollectField { field, ty } => {
+                            format!("`(<> {} : {})`", field, format_type_kind(&ty.node))
+                        }
                     })
                     .collect();
                 return Some(format!("*Constraints:* {}", cs.join(", ")));

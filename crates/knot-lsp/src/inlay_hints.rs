@@ -1171,6 +1171,9 @@ fn add_constraint_hints(
                             knot::ast::Constraint::ImplicitField { field, ty } => {
                                 format!("(^ {} : {})", field, format_type_kind(&ty.node))
                             }
+                            knot::ast::Constraint::CollectField { field, ty } => {
+                                format!("(<> {} : {})", field, format_type_kind(&ty.node))
+                            }
                         })
                         .collect();
                     return Some(cs);

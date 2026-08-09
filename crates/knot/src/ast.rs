@@ -525,6 +525,11 @@ pub enum Constraint {
     /// hidden dictionary argument; callsites resolve it by searching scope for
     /// a record providing `field` at `Type`.
     ImplicitField { field: Name, ty: Type },
+    /// `(<>field : Type)` — an implicit-field FOLD constraint. Like
+    /// `ImplicitField`, but the hidden dictionary argument is the `<>`-merged
+    /// fold of EVERY enclosing scope's `field` (innermost-first), not the
+    /// single innermost match. Used by `base.log` to merge all `logCtx` scopes.
+    CollectField { field: Name, ty: Type },
 }
 
 impl Constraint {
@@ -533,6 +538,7 @@ impl Constraint {
         match self {
             Constraint::Trait { trait_name, .. } => trait_name,
             Constraint::ImplicitField { field, .. } => field,
+            Constraint::CollectField { field, .. } => field,
         }
     }
 
@@ -541,6 +547,7 @@ impl Constraint {
         match self {
             Constraint::Trait { args, .. } => args.iter().collect(),
             Constraint::ImplicitField { ty, .. } => vec![ty],
+            Constraint::CollectField { ty, .. } => vec![ty],
         }
     }
 }

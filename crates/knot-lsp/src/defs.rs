@@ -154,6 +154,7 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
                         Some(trait_name.as_str())
                     }
                     knot::ast::Constraint::ImplicitField { .. } => None,
+                    knot::ast::Constraint::CollectField { .. } => None,
                 }),
                 dspan.start,
                 scheme.ty.span.start,

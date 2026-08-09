@@ -1139,6 +1139,7 @@ pub(crate) fn constraints_for_type_var<'a>(
                 args.iter().any(|t| type_mentions_var(t, var_name))
             }
             ast::Constraint::ImplicitField { ty, .. } => type_mentions_var(ty, var_name),
+            ast::Constraint::CollectField { ty, .. } => type_mentions_var(ty, var_name),
         })
         .collect()
 }

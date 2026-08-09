@@ -1193,6 +1193,29 @@ impl Parser {
                         }
                     }
                 }
+                // Implicit-field FOLD constraint: `(<>field : Type) =>`.
+                if matches!(self.peek(), TokenKind::Collect) {
+                    self.advance(); // `<>`
+                    if let TokenKind::Lower(field) = self.peek().clone() {
+                        self.advance();
+                        self.skip_newlines();
+                        if self.eat(&TokenKind::Colon) {
+                            self.skip_newlines();
+                            if let Some(ty) = self.parse_type() {
+                                self.skip_newlines();
+                                if self.eat(&TokenKind::RParen) {
+                                    let pre_arrow = self.save();
+                                    self.skip_newlines();
+                                    if self.eat(&TokenKind::FatArrow) {
+                                        constraints.push(Constraint::CollectField { field, ty });
+                                        continue;
+                                    }
+                                    self.restore(pre_arrow);
+                                }
+                            }
+                        }
+                    }
+                }
                 self.restore(after_lparen);
                 self.restore(saved);
                 break;

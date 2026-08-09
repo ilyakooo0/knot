@@ -9497,6 +9497,9 @@ impl Infer {
                         ast::Constraint::ImplicitField { .. } => {
                             // Handled in the implicit-field pipeline.
                         }
+                        ast::Constraint::CollectField { .. } => {
+                            // Handled in the implicit-field pipeline (folds <>).
+                        }
                     }
                 }
                 let raw_ty = self.ast_type_to_ty(&scheme.ty);
@@ -11683,6 +11686,10 @@ impl Infer {
                                     }
                                     ast::Constraint::ImplicitField { .. } => {
                                         // Recorded into `implicit_dict_fns` below.
+                                    }
+                                    ast::Constraint::CollectField { .. } => {
+                                        // Recorded into `implicit_dict_fns` below
+                                        // (as a fold).
                                     }
                                 }
                             }

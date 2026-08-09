@@ -207,14 +207,34 @@ with { request {method <m> path <p> logCtx {requestId <fresh uuid> method <m> pa
 
 so every log inside a handler is request-scoped for free.
 
-## 6. Everything to stderr
+## 6. Everything to stderr, in one shape
 
-Terminal/JSON as today. The JSON path splats structured fields, with context
-merged in by `base.log` before the sink sees the event:
+**One unified output shape.** Everything the app emits to stderr — `base.log`,
+its wrappers, and `trace` — goes through the same `emitStderr` sink and the
+same line shape: a `msg` headline plus the remaining event fields splatted
+(terminal), or one JSON-lines object (non-terminal). There is no separate
+ad-hoc format for any producer.
 
 ```json
 {"level":"info","msg":"user logged in","userId":42,"requestId":"abc123","timestamp":1710900045.0}
 ```
+
+### 6a. `trace` is a `Debug`-level event
+
+`trace` (the lexical debugging probe) is folded into this infrastructure. A
+`trace` emits a structured event at the `Debug` level through `emitStderr`, so
+it is `--debug`-gated like all other debug logging and renders in the unified
+shape:
+
+- `msg` = the trace call-site label (baked source context).
+- `value` = the traced value.
+- `scope` = the auto-captured in-scope bindings, as a nested record field
+  (replacing the old free-text "values in scope:" dump).
+- `<>` `logCtx` context is merged in, exactly as for `base.log` — so a `trace`
+  inside a request handler carries `requestId`/method/path too.
+
+The old bespoke `eprintln!` "values in scope:" layout is removed; `trace` is
+just `base.debug` with lexical-locals auto-attached, plus context.
 
 ## 7. Out of scope (per constraints)
 
@@ -232,11 +252,12 @@ merged in by `base.log` before the sink sees the event:
 | `Level` ADT | `data Level = Debug {} \| Info {} \| Warn {} \| Error {}` | builtin registration |
 | core log | `base.log : Level -> {msg: Text \| r} -> IO {console} {}` | no |
 | wrappers | `base.debug/info/warn/error` | no |
+| `trace` | emits a `Debug` event (`msg`/`value`/`scope` + `<>` context) through the same sink | no (reroute existing) |
 | structured event | record, `msg` + open row | no (existing records) |
 | context collect | `<>name : (acc -> { \| c} -> acc) -> acc -> acc` — `^`'s finder, folding all matches at their projection sites; innermost-first; no-match → initial acc | **yes — one operator** |
 | context scope | ordinary `with {dict {... logCtx {...}}} (...)` — any dictionary opts in via a `logCtx` field | no (existing `with`) |
-| filtering | `--debug` gates `Debug` | no (existing) |
-| sink | stderr, terminal/JSON | no (existing) |
+| filtering | `--debug` gates `Debug` (incl. `trace`) | no (existing) |
+| sink | one `emitStderr` — `msg` headline + field splat, terminal/JSON | **yes — one runtime fn** |
 
 **One new language feature: `<>`.** It generalizes the existing `^`
 projection from "the unique match" to "all matches, innermost-first" — and in

@@ -709,7 +709,7 @@ fn collect_named_alias_refs(
                 out.insert(name.clone());
             }
         }
-        TypeKind::Var(_) | TypeKind::Hole => {}
+        TypeKind::Var(_) | TypeKind::Hole | TypeKind::Callsite => {}
         TypeKind::App { func, arg } => {
             collect_named_alias_refs(func, alias_names, out);
             collect_named_alias_refs(arg, alias_names, out);
@@ -857,7 +857,7 @@ impl<'a> ReservedFieldWalker<'a> {
             }
             // A function can never be stored in a column, so nothing below one
             // reaches a table.
-            TypeKind::Function { .. } | TypeKind::Var(_) | TypeKind::Hole => {}
+            TypeKind::Function { .. } | TypeKind::Var(_) | TypeKind::Hole | TypeKind::Callsite => {}
         }
     }
 
@@ -1557,6 +1557,7 @@ fn resolve_type(
             ResolvedType::Named("unknown".into())
         }
         TypeKind::Hole => ResolvedType::Named("unknown".into()),
+        TypeKind::Callsite => ResolvedType::Named("unknown".into()),
         TypeKind::Variant { constructors, .. } => {
             let ctors: Vec<(String, Vec<(String, ResolvedType)>)> =
                 constructors
@@ -1980,6 +1981,7 @@ fn apply_type_subst(ty: &Type, subst: &HashMap<String, Type>) -> Type {
             ty: Box::new(apply_type_subst(inner, subst)),
         },
         TypeKind::Hole => TypeKind::Hole,
+        TypeKind::Callsite => TypeKind::Callsite,
         TypeKind::UnitAnnotated { base, unit } => TypeKind::UnitAnnotated {
             base: Box::new(apply_type_subst(base, subst)),
             unit: unit.clone(),

@@ -378,7 +378,7 @@ impl<'a> DefResolver<'a> {
                     .unwrap_or(ty.span);
                 self.add_ref(span, name);
             }
-            TypeKind::Var(_) | TypeKind::Hole => {}
+            TypeKind::Var(_) | TypeKind::Hole | TypeKind::Callsite => {}
             TypeKind::App { func, arg } => {
                 self.resolve_type(func, source);
                 self.resolve_type(arg, source);

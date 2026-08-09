@@ -302,6 +302,7 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             }
         }
         TypeKind::Hole => "_".into(),
+        TypeKind::Callsite => "?".into(),
         TypeKind::UnitAnnotated { base, unit } => {
             // `Float M`, `Float (M / S^2)`, `Float u` — space-separated
             // application. Parenthesize compound units (those with operators)
@@ -359,9 +360,10 @@ fn render_constraint(c: &Constraint) -> String {
         Constraint::ImplicitField { field, ty } => {
             format!("(^{field} : {})", render_type(ty))
         }
-        Constraint::CollectField { field, ty } => {
-            format!("(<>{field} : {})", render_type(ty))
-        }
+        Constraint::CollectField { field, ty } => match ty {
+            Some(ty) => format!("(<>{field} : {})", render_type(ty)),
+            None => format!("(<>{field})"),
+        },
     }
 }
 

@@ -229,14 +229,6 @@ pub type ImplicitRefs = HashMap<Span, (String, Vec<String>)>;
 /// dictionary. Codegen splices the projected record as the leading argument.
 pub type ImplicitDictArgs = HashMap<Span, (String, Vec<String>)>;
 
-/// Callsite resolutions for FOLD dictionaries: application span → the field
-/// name plus the UNIQUE synthetic span of each collected `field` fragment's
-/// `ImplicitRef` projection (innermost-first). Each synthetic span's
-/// `(root, path)` lives in `implicit_refs`; codegen merges them with
-/// `base.unify` from `{}` and splices the result as the leading argument
-/// (vs `ImplicitDictArgs`'s single record).
-pub type FoldDictArgs = HashMap<Span, (String, Vec<Span>)>;
-
 /// `<>name` collecting-fold resolutions: the `<>` head's span → the UNIQUE
 /// synthetic span of each collected candidate's `ImplicitRef` projection
 /// (innermost-first). Each synthetic span's `(root, path)` resolution lives in
@@ -264,12 +256,6 @@ pub const WITH_RECORD_ALIAS_PREFIX: &str = "\0withrec:";
 /// `ImplicitRef` projections (registered in `implicit_refs`). Far above any
 /// real source offset so synthetic spans never collide with genuine ones.
 pub const COLLECT_SYNTH_BASE: usize = 1 << 40;
-
-/// Base offset for the synthetic spans a `(<>field : T) =>` fold-constraint
-/// mints for its per-candidate `ImplicitRef` projections at each callsite.
-/// A distinct range from `COLLECT_SYNTH_BASE` so the two synthetic-span spaces
-/// never collide.
-pub const FOLD_DICT_SYNTH_BASE: usize = 1 << 41;
 
 /// Spans of field-access expressions (`t.members`) whose field type is a
 /// relation. Codegen cannot re-derive this — a record's field types are not
@@ -977,24 +963,12 @@ struct Infer {
     /// from scope instead of receiving them explicitly.
     implicit_dict_fns: HashMap<String, Vec<(String, Ty)>>,
 
-    /// For each implicit-dict function, the subset of its constraint fields
-    /// declared with the FOLD marker `(<>field : T) =>` (vs single-match
-    /// `(^field : T) =>`). At the callsite a fold field's dictionary is the
-    /// `base.unify`-merged fold of EVERY enclosing scope's `field`, collected
-    /// via `collect_all_implicit_fields`, not the single innermost match.
-    fold_dict_fields: HashMap<String, Vec<String>>,
-
     /// Callsite resolutions for implicit dictionaries: application span → the
     /// `(root_binding, field_path)` of the in-scope record that supplies the
     /// dictionary. Codegen splices the projected record as the leading
     /// argument at that application. Keyed by the application's span (the
     /// outermost `App` node's span).
     implicit_dict_args: HashMap<Span, (String, Vec<String>)>,
-    /// Callsite resolutions for FOLD dictionaries: application span → the
-    /// synthetic spans of every collected `field` fragment (each registered in
-    /// `implicit_refs`), innermost-first. Codegen merges them with `base.unify`
-    /// starting from `{}` and splices the result as the leading argument.
-    fold_dict_args: FoldDictArgs,
     /// `<>name` collecting-fold resolutions: the `<>` head's span → every
     /// collected `(root, path)`, innermost-first (see `CollectRefs`).
     collect_refs: CollectRefs,
@@ -1227,9 +1201,7 @@ impl Infer {
             show_calls: Vec::new(),
             known_impls: HashSet::new(),
             implicit_dict_fns: HashMap::new(),
-            fold_dict_fields: HashMap::new(),
             implicit_dict_args: HashMap::new(),
-            fold_dict_args: HashMap::new(),
             collect_refs: HashMap::new(),
             deferred_constraints: Vec::new(),
             next_constraint_seq: 0,
@@ -4293,6 +4265,12 @@ impl Infer {
                 }
             }
             ast::TypeKind::Hole => self.fresh(),
+            // `?` — callsite-derived type. Maps to a fresh inference variable,
+            // like `_`, but SEMANTICALLY distinct: it is not solved to one
+            // concrete type at the definition; each callsite grounds it against
+            // the resolved `<>` fold. For now it unifies as a fresh var; the
+            // per-callsite grounding is driven by the fold-constraint machinery.
+            ast::TypeKind::Callsite => self.fresh(),
             ast::TypeKind::Variant {
                 constructors,
                 rest,
@@ -4873,43 +4851,17 @@ impl Infer {
             result = ret;
         }
         // Now the dictionary types are ground; resolve each against the
-        // in-scope records and record the splice for codegen.
-        let fold_fields: Vec<String> = self
-            .fold_dict_fields
-            .get(name)
-            .cloned()
-            .unwrap_or_default();
+        // in-scope records and record the splice for codegen. Only
+        // single-match (`^field`) dicts reach here — fold (`<>`) constraints
+        // are not registered in `implicit_dict_fns`, since the caller passes
+        // the fold dict explicitly as a `<>field folder init` expression.
         for (i, (field, _)) in dicts.iter().enumerate() {
             let dict_ty = self.apply(&dict_tys[i]);
             let field_ty = match dict_ty.peel_alias() {
                 Ty::Record(fields, _) => fields.get(field).cloned().unwrap_or(dict_ty),
                 _ => dict_ty,
             };
-            if fold_fields.contains(field) {
-                // FOLD constraint `(<>field : T) =>`: collect EVERY enclosing
-                // scope's `field` (innermost-first), register each under a
-                // unique synthetic span, and record the span list for codegen
-                // to merge with `base.unify` starting from `{}`.
-                let candidates = self.collect_all_implicit_fields(field);
-                let synth_spans: Vec<Span> = candidates
-                    .iter()
-                    .enumerate()
-                    .map(|(j, (root, path, _))| {
-                        let synth = Span {
-                            start: FOLD_DICT_SYNTH_BASE + expr.span.start * 256 + (i * 64 + j),
-                            end: FOLD_DICT_SYNTH_BASE + expr.span.start * 256 + (i * 64 + j) + 1,
-                        };
-                        self.implicit_refs
-                            .insert(synth, (root.clone(), path.clone()));
-                        synth
-                    })
-                    .collect();
-                self.fold_dict_args.insert(expr.span, (field.clone(), synth_spans.clone()));
-                // Also register under `collect_refs` (keyed by the callsite
-                // span) so codegen can build the merged record via the SAME
-                // `<>field base.unify {}` CollectFold machinery.
-                self.collect_refs.insert(expr.span, synth_spans);
-            } else if let Some((root, path)) = self.resolve_dict(field, &field_ty, expr.span) {
+            if let Some((root, path)) = self.resolve_dict(field, &field_ty, expr.span) {
                 self.implicit_dict_args.insert(expr.span, (root, path));
             }
         }
@@ -11764,25 +11716,15 @@ impl Infer {
                                     ast::Constraint::ImplicitField { field, ty } => {
                                         Some((field.clone(), self.ast_type_to_ty(ty)))
                                     }
-                                    ast::Constraint::CollectField { field, ty } => {
-                                        Some((field.clone(), self.ast_type_to_ty(ty)))
-                                    }
+                                    // `(<>field)` fold constraints are NOT
+                                    // registered here: the caller passes the
+                                    // dict EXPLICITLY as a `<>field folder init`
+                                    // expression, so there is no implicit
+                                    // dictionary to resolve from scope. The
+                                    // function is an ordinary leading-param fn.
                                     _ => None,
                                 })
                                 .collect();
-                            let fold_fields: Vec<String> = ts
-                                .constraints
-                                .iter()
-                                .filter_map(|c| match c {
-                                    ast::Constraint::CollectField { field, .. } => {
-                                        Some(field.clone())
-                                    }
-                                    _ => None,
-                                })
-                                .collect();
-                            if !fold_fields.is_empty() {
-                                self.fold_dict_fields.insert(name.to_string(), fold_fields);
-                            }
                             if !implicit.is_empty() {
                                 self.implicit_dict_fns.insert(name.to_string(), implicit);
                             }
@@ -11797,6 +11739,31 @@ impl Infer {
                                 .values()
                                 .copied()
                                 .collect();
+                            // `(<>field)` fold constraints elaborate to a leading
+                            // dict param whose type is a fresh var (Hole/Callsite),
+                            // NOT a named annotation var — so it isn't in
+                            // `annotation_vars` and would otherwise stay
+                            // MONOMORPHIC across callsites (every call shares the
+                            // one dict var, so two calls with differently-shaped
+                            // contexts collide: "record fields don't match").
+                            // Quantify it (and any `_` hole in the signature) so
+                            // each callsite instantiates a fresh dict var. Only
+                            // quantify vars that are free in the rebuilt
+                            // annotation type but NOT free in the enclosing env
+                            // (outer-scope vars must stay shared) and not
+                            // skolems (rigid body-check vars).
+                            let env_free = self.free_vars_in_env();
+                            let mut extra: Vec<TyVar> = self
+                                .free_vars(&ann_ty)
+                                .into_iter()
+                                .filter(|v| {
+                                    !vars.contains(v)
+                                        && !self.skolems.contains(v)
+                                        && !env_free.contains(v)
+                                })
+                                .collect();
+                            extra.sort_unstable();
+                            vars.append(&mut extra);
                             // Capture deferred `*`/`/` unit-composition checks
                             // whose result var resolves to a skolemized
                             // annotation variable, so each call-site
@@ -12891,7 +12858,6 @@ pub type CheckOutput = (
     TypeArgSpans,
     ImplicitRefs,
     ImplicitDictArgs,
-    FoldDictArgs,
     CollectRefs,
     ResolvedCalls,
     TodoTypes,
@@ -13781,14 +13747,13 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
     let type_arg_spans: TypeArgSpans = infer.type_arg_spans.clone();
     let implicit_refs: ImplicitRefs = infer.implicit_refs.clone();
     let implicit_dict_args: ImplicitDictArgs = infer.implicit_dict_args.clone();
-    let fold_dict_args: crate::infer::FoldDictArgs = infer.fold_dict_args.clone();
     let collect_refs: CollectRefs = infer.collect_refs.clone();
     let todo_types = infer.extract_todo_types();
     let todo_bindings = infer.extract_todo_bindings();
     let trace_types = infer.extract_trace_types();
     let trace_bindings = infer.extract_trace_bindings();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, fold_dict_args, collect_refs, infer.resolved_calls.clone(), todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, file_body_type)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, collect_refs, infer.resolved_calls.clone(), todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, file_body_type)
 }
 
 
@@ -14477,7 +14442,7 @@ fn collect_alias_refs(
                 out.insert(name.clone());
             }
         }
-        ast::TypeKind::Var(_) | ast::TypeKind::Hole => {}
+        ast::TypeKind::Var(_) | ast::TypeKind::Hole | ast::TypeKind::Callsite => {}
         ast::TypeKind::App { func, arg } => {
             collect_alias_refs(func, alias_names, out);
             collect_alias_refs(arg, alias_names, out);

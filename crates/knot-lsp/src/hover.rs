@@ -330,8 +330,9 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                 knot::ast::Constraint::ImplicitField { field, ty } => {
                     format!("`(^ {} : {})`", field, format_type_kind(&ty.node))
                 }
-                knot::ast::Constraint::CollectField { field, ty } => {
-                    format!("`(<> {} : {})`", field, format_type_kind(&ty.node))
+                knot::ast::Constraint::CollectField { field, ty } => match ty {
+                    Some(ty) => format!("`(<> {} : {})`", field, format_type_kind(&ty.node)),
+                    None => format!("`(<> {})`", field),
                 }
             })
             .collect();

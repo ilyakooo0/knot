@@ -488,31 +488,40 @@ fn dict_param_name(field: &str) -> Name {
     format!("__dict_{field}")
 }
 
-/// Elaborate a function's `^`-field signature constraints into hidden leading
-/// dictionary parameters, rewriting each body occurrence of `^field` to
-/// `__dict_<field>.field` and prepending `{field : F} ->` to the declared
-/// type. Shared by top-level funs and record-field funs. Returns the implicit
-/// constraints in declared order.
+/// Elaborate a function's implicit-field signature constraints into hidden
+/// leading dictionary parameters. Two shapes:
+///
+/// - `(^field : T) =>` (single-match): rewrite body `^field` →
+///   `__dict_<field>.field` (the dict is a record `{field : T}` holding the
+///   operation), prepend `{field : T} ->` to the declared type. The callsite
+///   auto-splices the innermost matching scope record.
+///
+/// - `(<>field)` (fold, annotation-free): rewrite body `^field` →
+///   `__dict_<field>` (the dict IS the merged value, not a record wrapping
+///   it), prepend `F ->` to the declared type (F = the fold's result type, a
+///   `_` hole → fresh inference var when annotation-free). The CALLER passes
+///   the dict explicitly as a `<>field folder init` fold expression, whose
+///   result becomes the dict value directly. Returns the implicit constraints
+///   in declared order.
 fn elaborate_implicit_dicts(body: &mut Expr, ty: &mut Option<TypeScheme>) -> Vec<(Name, Type)> {
-    let implicit: Vec<(Name, Type)> = ty
+    // (field, dict type, is_fold)
+    let implicit: Vec<(Name, Type, bool)> = ty
         .as_ref()
         .map(|ts| {
             ts.constraints
                 .iter()
                 .filter_map(|c| match c {
                     Constraint::ImplicitField { field, ty } => {
-                        Some((field.clone(), ty.clone()))
+                        Some((field.clone(), ty.clone(), false))
                     }
-                    // A `(<>field : T) =>` FOLD constraint elaborates
-                    // IDENTICALLY to `(^field : T) =>` (hidden leading
-                    // `{field : F} ->` dict param, body `^field` →
-                    // `__dict_<field>.field`); the ONLY difference is at the
-                    // callsite, where the dict is the `base.unify`-merged fold
-                    // of every enclosing scope's `field` (not the single
-                    // innermost match). See infer's `fold_dict_fields` and
-                    // codegen's `compile_fold_dict`.
                     Constraint::CollectField { field, ty } => {
-                        Some((field.clone(), ty.clone()))
+                        // No annotation → dict type is a `_` HOLE (fresh
+                        // inference var), grounded at the callsite by the
+                        // caller's explicit `<>` fold.
+                        let fty = ty.clone().unwrap_or_else(|| {
+                            Spanned::new(TypeKind::Hole, Span::new(0, 0))
+                        });
+                        Some((field.clone(), fty, true))
                     }
                     _ => None,
                 })
@@ -520,13 +529,13 @@ fn elaborate_implicit_dicts(body: &mut Expr, ty: &mut Option<TypeScheme>) -> Vec
         })
         .unwrap_or_default();
     if implicit.is_empty() {
-        return implicit;
+        return Vec::new();
     }
     let span = body.span;
-    for (field, _) in &implicit {
-        rewrite_implicit_refs(body, field);
+    for (field, _, is_fold) in &implicit {
+        rewrite_implicit_refs(body, field, *is_fold);
     }
-    for (field, _) in implicit.iter().rev() {
+    for (field, _, _) in implicit.iter().rev() {
         let dict = dict_param_name(field);
         let placeholder = Spanned::new(ExprKind::Lit(Literal::Bool(false)), span);
         let old_body = std::mem::replace(body, placeholder);
@@ -539,21 +548,26 @@ fn elaborate_implicit_dicts(body: &mut Expr, ty: &mut Option<TypeScheme>) -> Vec
             span,
         );
     }
-    // Elaborate the declared type: prepend `{field : F} ->` for each
-    // implicit-field constraint (innermost constraint last, so the first
-    // declared constraint is the outermost/first param).
+    // Elaborate the declared type: prepend the dict param for each constraint
+    // (innermost constraint last, so the first declared constraint is the
+    // outermost/first param). Single-match dicts are records `{field : F}`;
+    // fold dicts are the BARE fold-result type `F` (the merged value itself).
     if let Some(ts) = ty {
-        for (field, fty) in implicit.iter().rev() {
-            let dict_ty = Spanned::new(
-                TypeKind::Record {
-                    fields: vec![Field {
-                        name: field.clone(),
-                        value: fty.clone(),
-                    }],
-                    rest: None,
-                },
-                fty.span,
-            );
+        for (field, fty, is_fold) in implicit.iter().rev() {
+            let dict_ty = if *is_fold {
+                fty.clone()
+            } else {
+                Spanned::new(
+                    TypeKind::Record {
+                        fields: vec![Field {
+                            name: field.clone(),
+                            value: fty.clone(),
+                        }],
+                        rest: None,
+                    },
+                    fty.span,
+                )
+            };
             let old_span = ts.ty.span;
             let old = std::mem::replace(&mut ts.ty, dict_ty.clone());
             ts.ty = Spanned::new(
@@ -565,27 +579,30 @@ fn elaborate_implicit_dicts(body: &mut Expr, ty: &mut Option<TypeScheme>) -> Vec
             );
         }
     }
-    implicit
+    implicit.into_iter().map(|(f, t, _)| (f, t)).collect()
 }
 
-/// Rewrite every `^field` implicit projection in `expr` to an explicit
-/// dictionary projection `__dict_<field>.field`, so the constrained function's
-/// body reads its operations off the hidden dictionary parameter.
-fn rewrite_implicit_refs(expr: &mut Expr, field: &str) {
+/// Rewrite every `^field` implicit projection in `expr`. For a single-match
+/// constraint the dict is a record, so `^field` → `__dict_<field>.field`. For
+/// a FOLD constraint the dict IS the merged value, so `^field` →
+/// `__dict_<field>` (the whole dictionary parameter).
+fn rewrite_implicit_refs(expr: &mut Expr, field: &str, is_fold: bool) {
     if let ExprKind::ImplicitRef(name) = &expr.node
         && name == field
     {
         let span = expr.span;
-        expr.node = ExprKind::FieldAccess {
-            expr: Box::new(Spanned::new(
-                ExprKind::Var(dict_param_name(field)),
-                span,
-            )),
-            field: field.to_string(),
+        let dict_var = Spanned::new(ExprKind::Var(dict_param_name(field)), span);
+        expr.node = if is_fold {
+            dict_var.node
+        } else {
+            ExprKind::FieldAccess {
+                expr: Box::new(dict_var),
+                field: field.to_string(),
+            }
         };
         return;
     }
-    walk_expr_children(expr, &mut |child| rewrite_implicit_refs(child, field));
+    walk_expr_children(expr, &mut |child| rewrite_implicit_refs(child, field, is_fold));
 }
 
 /// Recurse over all direct child expressions of `expr`.

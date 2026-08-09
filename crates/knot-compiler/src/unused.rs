@@ -200,7 +200,11 @@ fn walk_constraint(c: &Constraint, r: &mut Refs) {
             }
         }
         Constraint::ImplicitField { ty, .. } => walk_type(ty, r),
-        Constraint::CollectField { ty, .. } => walk_type(ty, r),
+        Constraint::CollectField { ty, .. } => {
+            if let Some(ty) = ty {
+                walk_type(ty, r);
+            }
+        }
     }
 }
 
@@ -391,7 +395,7 @@ fn walk_type(t: &Type, r: &mut Refs) {
         TypeKind::Named(name) => {
             r.types.insert(name.clone());
         }
-        TypeKind::Var(_) | TypeKind::Hole => {}
+        TypeKind::Var(_) | TypeKind::Hole | TypeKind::Callsite => {}
         TypeKind::App { func, arg } => {
             walk_type(func, r);
             walk_type(arg, r);

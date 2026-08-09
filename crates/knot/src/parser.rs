@@ -1193,26 +1193,31 @@ impl Parser {
                         }
                     }
                 }
-                // Implicit-field FOLD constraint: `(<>field : Type) =>`.
+                // Implicit-field FOLD constraint: `(<>field)` (annotation-free)
+                // or legacy `(<>field : Type)`. The annotation is OPTIONAL: the
+                // dict type is normally derived at the callsite from the
+                // explicit `<>` fold, so a name-only constraint is the norm.
                 if matches!(self.peek(), TokenKind::Collect) {
                     self.advance(); // `<>`
                     if let TokenKind::Lower(field) = self.peek().clone() {
                         self.advance();
                         self.skip_newlines();
-                        if self.eat(&TokenKind::Colon) {
+                        // Optional `: Type` annotation.
+                        let ty = if self.eat(&TokenKind::Colon) {
                             self.skip_newlines();
-                            if let Some(ty) = self.parse_type() {
-                                self.skip_newlines();
-                                if self.eat(&TokenKind::RParen) {
-                                    let pre_arrow = self.save();
-                                    self.skip_newlines();
-                                    if self.eat(&TokenKind::FatArrow) {
-                                        constraints.push(Constraint::CollectField { field, ty });
-                                        continue;
-                                    }
-                                    self.restore(pre_arrow);
-                                }
+                            self.parse_type()
+                        } else {
+                            None
+                        };
+                        self.skip_newlines();
+                        if self.eat(&TokenKind::RParen) {
+                            let pre_arrow = self.save();
+                            self.skip_newlines();
+                            if self.eat(&TokenKind::FatArrow) {
+                                constraints.push(Constraint::CollectField { field, ty });
+                                continue;
                             }
+                            self.restore(pre_arrow);
                         }
                     }
                 }
@@ -4009,6 +4014,10 @@ impl Parser {
             TokenKind::Underscore => {
                 let tok = self.advance();
                 Some(Spanned::new(TypeKind::Hole, tok.span))
+            }
+            TokenKind::Question => {
+                let tok = self.advance();
+                Some(Spanned::new(TypeKind::Callsite, tok.span))
             }
             TokenKind::LBrace => {
                 self.advance();

@@ -482,6 +482,13 @@ pub enum TypeKind {
     /// `_` — type hole, inferred by the type checker.
     Hole,
 
+    /// `?` — callsite-derived type. Concretely known at each CALLSITE, not at
+    /// the definition: used in a `(<>field : ?) =>` fold-constraint, where the
+    /// collected fragments' merged type grounds it per call. Maps to an open
+    /// row variable the body constrains via field access and each callsite
+    /// grounds against its merged record type.
+    Callsite,
+
     /// `Float M`, `Float (M / S^2)`, `Float u` — a type-level unit
     /// expression, appearing as the argument of a type application to
     /// `Int`/`Float`. Carries the compile-time unit algebra (`*`, `/`, `^`).
@@ -525,11 +532,13 @@ pub enum Constraint {
     /// hidden dictionary argument; callsites resolve it by searching scope for
     /// a record providing `field` at `Type`.
     ImplicitField { field: Name, ty: Type },
-    /// `(<>field : Type)` — an implicit-field FOLD constraint. Like
-    /// `ImplicitField`, but the hidden dictionary argument is the `<>`-merged
-    /// fold of EVERY enclosing scope's `field` (innermost-first), not the
-    /// single innermost match. Used by `base.log` to merge all `logCtx` scopes.
-    CollectField { field: Name, ty: Type },
+    /// `(<>field)` — an implicit-field FOLD constraint. Name-only: asserts the
+    /// callsite must SUPPLY a `field` value, produced by an explicit `<>` fold
+    /// (`<>field folder init`) passed as the dict argument. No type annotation:
+    /// the dict's type is inferred at the CALLSITE from the fold, not declared
+    /// here. An optional legacy `: Type` annotation (`ty`) fixes the dict type
+    /// instead of deriving it. Used by `base.log` to merge all `logCtx` scopes.
+    CollectField { field: Name, ty: Option<Type> },
 }
 
 impl Constraint {
@@ -547,7 +556,7 @@ impl Constraint {
         match self {
             Constraint::Trait { args, .. } => args.iter().collect(),
             Constraint::ImplicitField { ty, .. } => vec![ty],
-            Constraint::CollectField { ty, .. } => vec![ty],
+            Constraint::CollectField { ty, .. } => ty.iter().collect(),
         }
     }
 }

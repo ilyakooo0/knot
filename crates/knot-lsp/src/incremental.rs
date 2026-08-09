@@ -523,7 +523,7 @@ fn collect_type_names(ty: &ast::Type, out: &mut HashSet<String>) {
         ast::TypeKind::Named(name) => {
             out.insert(name.clone());
         }
-        ast::TypeKind::Var(_) | ast::TypeKind::Hole => {}
+        ast::TypeKind::Var(_) | ast::TypeKind::Hole | ast::TypeKind::Callsite => {}
         ast::TypeKind::App { func, arg } => {
             collect_type_names(func, out);
             collect_type_names(arg, out);

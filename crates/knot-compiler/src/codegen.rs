@@ -347,10 +347,6 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // record supplying the dictionary, resolved during inference. Codegen
     // splices the projected record as the leading argument at that application.
     implicit_dict_args: crate::infer::ImplicitDictArgs,
-    /// `(<>field : T) =>` fold-dict callsite resolutions: application span → the
-    /// synthetic spans of every collected `field` fragment. Codegen merges them
-    /// with `base.unify` from `{}` and splices the result as the leading arg.
-    fold_dict_args: crate::infer::FoldDictArgs,
     /// `<>name` collecting-fold resolutions (see `crate::infer::CollectRefs`).
     collect_refs: crate::infer::CollectRefs,
 
@@ -735,7 +731,6 @@ pub fn compile(
     implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
     implicit_dict_args: &crate::infer::ImplicitDictArgs,
-    fold_dict_args: &crate::infer::FoldDictArgs,
     collect_refs: &crate::infer::CollectRefs,
     resolved_calls: &crate::infer::ResolvedCalls,
     todo_types: &crate::infer::TodoTypes,
@@ -769,7 +764,6 @@ pub fn compile(
             implicit_refs,
             type_arg_spans,
             implicit_dict_args,
-            fold_dict_args,
             collect_refs,
             resolved_calls,
             todo_types,
@@ -808,7 +802,6 @@ pub fn compile_with<M: cranelift_module::Module>(
     implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
     implicit_dict_args: &crate::infer::ImplicitDictArgs,
-    fold_dict_args: &crate::infer::FoldDictArgs,
     collect_refs: &crate::infer::CollectRefs,
     resolved_calls: &crate::infer::ResolvedCalls,
     todo_types: &crate::infer::TodoTypes,
@@ -841,7 +834,6 @@ pub fn compile_with<M: cranelift_module::Module>(
         implicit_refs,
         type_arg_spans,
         implicit_dict_args,
-        fold_dict_args,
         collect_refs,
         resolved_calls,
         todo_types,
@@ -874,7 +866,6 @@ fn compile_inner<M: cranelift_module::Module>(
     implicit_refs: &crate::infer::ImplicitRefs,
     type_arg_spans: &crate::infer::TypeArgSpans,
     implicit_dict_args: &crate::infer::ImplicitDictArgs,
-    fold_dict_args: &crate::infer::FoldDictArgs,
     collect_refs: &crate::infer::CollectRefs,
     resolved_calls: &crate::infer::ResolvedCalls,
     todo_types: &crate::infer::TodoTypes,
@@ -948,7 +939,6 @@ fn compile_inner<M: cranelift_module::Module>(
     cg.with_fields = with_fields.clone();
     cg.implicit_refs = implicit_refs.clone();
     cg.implicit_dict_args = implicit_dict_args.clone();
-    cg.fold_dict_args = fold_dict_args.clone();
     cg.collect_refs = collect_refs.clone();
     cg.elem_pushdown_ok = elem_pushdown_ok.clone();
     cg.show_unit_strings = show_unit_strings.clone();
@@ -1298,7 +1288,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             with_fields: HashMap::new(),
             implicit_refs: HashMap::new(),
             implicit_dict_args: HashMap::new(),
-            fold_dict_args: HashMap::new(),
             collect_refs: HashMap::new(),
             todo_types: HashMap::new(),
             todo_bindings: HashMap::new(),
@@ -6539,48 +6528,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         val
     }
 
-    /// Compile a `(<>field : T) =>` fold-dictionary: merge EVERY collected
-    /// `field` fragment (registered as synthetic-span `ImplicitRef`s in
-    /// `implicit_refs`, listed in `fold_dict_args[span]`) into one record via
-    /// `base.unify` (`knot_record_unify`, right-biased), starting from `{}`.
-    /// Fragments are innermost-first, so iterate them in REVERSE (outermost
-    /// first) — the innermost then becomes the rightmost `unify` argument and
-    /// wins on conflicting keys, matching `with`-scope shadowing.
-    fn compile_fold_dict(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        span: ast::Span,
-        env: &mut Env,
-        db: Value,
-    ) -> Value {
-        // `{}` — empty record base. `knot_record_empty` takes a capacity hint.
-        let (field, spans) = self.fold_dict_args.get(&span).cloned().unwrap_or_default();
-        let cap = builder.ins().iconst(self.ptr_type, spans.len() as i64);
-        let mut acc = self.call_rt(builder, "knot_record_empty", &[cap]);
-        // Outermost-first: innermost fragment ends up rightmost in `unify`.
-        for synth in spans.iter().rev() {
-            let frag = self.compile_expr(
-                builder,
-                &ast::Expr {
-                    node: ast::ExprKind::ImplicitRef(field.clone()),
-                    span: *synth,
-                },
-                env,
-                db,
-            );
-            // `knot_record_unify(a, b)` — right-biased field union.
-            acc = self.call_rt(builder, "knot_record_unify", &[acc, frag]);
-        }
-        // Wrap the merged record as `{field : merged}` so the elaborated
-        // body's `__dict_<field>.field` projection (see desugar) reads the
-        // fold — matching the `(^field : T) =>` single-match dict shape.
-        let one = builder.ins().iconst(self.ptr_type, 1);
-        let wrapped = self.call_rt(builder, "knot_record_empty", &[one]);
-        let (key_ptr, key_len) = self.string_ptr(builder, &field);
-        self.call_rt_void(builder, "knot_record_set_field", &[wrapped, key_ptr, key_len, acc]);
-        wrapped
-    }
-
     /// Resolve the dispatch name of an applied function head for the
     /// server/network special forms (`fetch`, `fetchWith`, `listen`,
     /// `listenOn`). These are compile-time macros (they build route tables /
@@ -6960,10 +6907,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // elaborated function takes it first), exactly like the
                 // top-level call path below.
                 let mut compiled_args: Vec<Value> = Vec::new();
-                if self.fold_dict_args.contains_key(&expr.span) {
-                    let dict_val = self.compile_fold_dict(builder, expr.span, env, db);
-                    compiled_args.push(dict_val);
-                } else if let Some((root, path)) = self.implicit_dict_args.get(&expr.span).cloned() {
+                if let Some((root, path)) = self.implicit_dict_args.get(&expr.span).cloned() {
                     let dict_val =
                         self.compile_root_path(builder, &root, &path, expr.span, env, db);
                     compiled_args.push(dict_val);
@@ -8358,14 +8302,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // Implicit dictionary: prepend the record resolved during inference as
         // the leading argument (the function was elaborated to take it first).
-        // A `(<>field : T) =>` FOLD constraint merges EVERY enclosing scope's
-        // field via base.unify from `{}`; a `(^field : T) =>` single-match
-        // splices the one resolved record.
+        // Only single-match `(^field : T) =>` constraints auto-splice; a
+        // `(<>field)` fold is an ordinary explicit leading arg.
         let mut compiled_args: Vec<Value> = Vec::new();
-        if self.fold_dict_args.contains_key(&expr.span) {
-            let dict_val = self.compile_fold_dict(builder, expr.span, env, db);
-            compiled_args.push(dict_val);
-        } else if let Some((root, path)) = self.implicit_dict_args.get(&expr.span).cloned() {
+        if let Some((root, path)) = self.implicit_dict_args.get(&expr.span).cloned() {
             let dict_val =
                 self.compile_root_path(builder, &root, &path, expr.span, env, db);
             compiled_args.push(dict_val);

@@ -22,8 +22,9 @@ pub fn format_type_scheme(ts: &TypeScheme) -> String {
             ast::Constraint::ImplicitField { field, ty } => {
                 s.push_str(&format!("(^ {} : {}) => ", field, format_type_kind(&ty.node)));
             }
-            ast::Constraint::CollectField { field, ty } => {
-                s.push_str(&format!("(<> {} : {}) => ", field, format_type_kind(&ty.node)));
+            ast::Constraint::CollectField { field, ty } => match ty {
+                Some(ty) => s.push_str(&format!("(<> {} : {}) => ", field, format_type_kind(&ty.node))),
+                None => s.push_str(&format!("(<> {}) => ", field)),
             }
         }
     }
@@ -115,6 +116,7 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
             format!("IO {}", format_type_kind_d(&ty.node, d))
         }
         TypeKind::Hole => "_".into(),
+        TypeKind::Callsite => "?".into(),
         TypeKind::UnitAnnotated { base, unit } => {
             // `Float M`, `Float (M / S^2)` — space-separated, parens for compound.
             let u = format_unit_expr_d(unit, d);

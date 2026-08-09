@@ -682,7 +682,7 @@ impl<'a> TokenCollector<'a> {
             // Leaves with no named sub-types. Listed explicitly (rather than a
             // `_` wildcard) so a newly added `TypeKind` variant surfaces as a
             // non-exhaustive-match error here instead of being silently skipped.
-            ast::TypeKind::Var(_) | ast::TypeKind::Hole => {}
+            ast::TypeKind::Var(_) | ast::TypeKind::Hole | ast::TypeKind::Callsite => {}
         }
     }
 

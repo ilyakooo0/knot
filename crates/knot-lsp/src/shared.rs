@@ -1139,7 +1139,9 @@ pub(crate) fn constraints_for_type_var<'a>(
                 args.iter().any(|t| type_mentions_var(t, var_name))
             }
             ast::Constraint::ImplicitField { ty, .. } => type_mentions_var(ty, var_name),
-            ast::Constraint::CollectField { ty, .. } => type_mentions_var(ty, var_name),
+            ast::Constraint::CollectField { ty, .. } => {
+                ty.as_ref().is_some_and(|ty| type_mentions_var(ty, var_name))
+            }
         })
         .collect()
 }
@@ -1147,7 +1149,7 @@ pub(crate) fn constraints_for_type_var<'a>(
 fn type_mentions_var(ty: &ast::Type, var: &str) -> bool {
     match &ty.node {
         ast::TypeKind::Var(n) => n == var,
-        ast::TypeKind::Named(_) | ast::TypeKind::Hole => false,
+        ast::TypeKind::Named(_) | ast::TypeKind::Hole | ast::TypeKind::Callsite => false,
         ast::TypeKind::App { func, arg } => {
             type_mentions_var(func, var) || type_mentions_var(arg, var)
         }

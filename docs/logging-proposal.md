@@ -67,7 +67,7 @@ No per-module config, no runtime mutation. The runtime stays as simple as the
 current `AtomicBool` check. Because the level is a value, a program can gate
 its own logging without runtime support (see §7 note).
 
-## 5. Context propagation via `<>` — collect the `log` field, don't project
+## 5. Context propagation via `<>` — collect the `logCtx` field, don't project
 
 ### 5a. Why not `^`
 
@@ -107,15 +107,15 @@ not.
   wants the single closest, `<>` wants the whole nested stack so inner and
   outer context both contribute.) Every `with`-ed record carrying the field
   participates, whether or not you "meant" it as context — so the field name
-  (`log`) is a reserved-by-convention slot: don't put a record-typed `log`
-  field on a record unless you intend it as log context.
-- **Type filter, always on (rule C).** `<>` keeps only candidates whose type
-  unifies with the fold's expected element type (shared with `^`'s
-  speculative-unification step). For logging the element is the open row
-  `{ | c}`, so a non-record `log` field (e.g. `log : Float -> Float`) fails
-  that unification and is silently excluded — never reaching the folder, no
-  crash. The filter is by *type*, not intent: an unrelated *record*-typed
-  `log` in scope is still collected (that's rule A's contract).
+  (`logCtx`) is a reserved-by-convention slot: don't put a record-typed
+  `logCtx` field on a record unless you intend it as log context.
+- **Name-only collection (no type filter).** `<>` collects purely by field
+  name and unrolls the provided folder over every match; shape compatibility
+  is enforced by the fold itself, so a mis-shaped fragment (e.g. a `logCtx`
+  that isn't a record, or whose field types conflict on a shared key) fails
+  the fold's own `unify`/arithmetic at its precise site — a compile error,
+  not a silent skip. `logCtx` is reserved-by-convention: don't reuse it for
+  anything but log context.
 - **The same finder as `^`, a different final step.** `^name` works in three
   steps: (1) collect in-scope fields named `name`, (2) keep the ones that
   unify with the expected type, (3) require *exactly one*. `<>` runs (1) —
@@ -133,7 +133,7 @@ not.
 For logging, the folder is a record merge:
 
 ```knot
-merged = (<>log) (\acc frag -> base.unify frag acc) {}
+merged = (<>logCtx) (\acc frag -> base.unify frag acc) {}
 ```
 
 (`base.unify` is right-biased, so folding innermost-first makes the
@@ -169,15 +169,15 @@ required for `<>`.
 
 ### 5c. Context lives on the dictionaries you already have
 
-Because `<>` collects the `log` field from **every** in-scope record, context
-attaches to whatever dictionary you've `with`-ed — no dedicated context
-record required. Each dictionary carries its own `log` fragment saying "when
-logging inside my scope, attach this":
+Because `<>` collects the `logCtx` field from **every** in-scope record,
+context attaches to whatever dictionary you've `with`-ed — no dedicated
+context record required. Each dictionary carries its own `logCtx` fragment
+saying "when logging inside my scope, attach this":
 
 ```knot
-with { httpCtx {requestId "abc" handler "createUser" log {requestId "abc"}} } (do
-  with { dbCtx {pool "primary" log {span "db" query "insert"}} } (do
-    -- <>log : [ {span "db" query "insert"}, {requestId "abc"} ]
+with { httpCtx {requestId "abc" handler "createUser" logCtx {requestId "abc"}} } (do
+  with { dbCtx {pool "primary" logCtx {span "db" query "insert"}} } (do
+    -- <>logCtx : [ {span "db" query "insert"}, {requestId "abc"} ]
     base.info {msg "creating user"})))
 ```
 
@@ -188,20 +188,20 @@ winning per-field**, with the event's own fields winning overall:
 INFO creating user  {span: "db", query: "insert", requestId: "abc", msg: "creating user"}
 ```
 
-Inside the inner `with`, `<>log` is `[{span "db" query "insert"}, {requestId
-"abc"}]`; folded innermost-first that merges to `{span "db", query "insert",
-requestId "abc"}`. Outside, only the `httpCtx` fragment is in scope.
+Inside the inner `with`, `<>logCtx` is `[{span "db" query "insert"},
+{requestId "abc"}]`; folded innermost-first that merges to `{span "db", query
+"insert", requestId "abc"}`. Outside, only the `httpCtx` fragment is in scope.
 **Override-in-a-new-context falls out of ordinary nested `with` blocks — no
 intrinsic, no special form.** The `with` structure *is* the scoping, and any
-dictionary can carry context by adding a `log` field.
+dictionary can carry context by adding a `logCtx` field.
 
 ### 5d. The HTTP layer sets the base context
 
 `serve`/`listen` wrap each handler invocation in a dictionary carrying a
-`log` fragment:
+`logCtx` fragment:
 
 ```knot
-with { request {method <m> path <p> log {requestId <fresh uuid> method <m> path <p>}} }
+with { request {method <m> path <p> logCtx {requestId <fresh uuid> method <m> path <p>}} }
   (handler ...)
 ```
 
@@ -234,7 +234,7 @@ merged in by `base.log` before the sink sees the event:
 | wrappers | `base.debug/info/warn/error` | no |
 | structured event | record, `msg` + open row | no (existing records) |
 | context collect | `<>name : (acc -> { \| c} -> acc) -> acc -> acc` — `^`'s finder, folding all matches at their projection sites; innermost-first; no-match → initial acc | **yes — one operator** |
-| context scope | ordinary `with {dict {... log {...}}} (...)` — any dictionary opts in via a `log` field | no (existing `with`) |
+| context scope | ordinary `with {dict {... logCtx {...}}} (...)` — any dictionary opts in via a `logCtx` field | no (existing `with`) |
 | filtering | `--debug` gates `Debug` | no (existing) |
 | sink | stderr, terminal/JSON | no (existing) |
 
@@ -247,11 +247,11 @@ is ordinary knot.
 
 ```knot
 base.log (\level event ->
-  with { merged ((<>log) (\acc frag -> base.unify frag acc) {}) }   -- fold context, innermost wins
+  with { merged ((<>logCtx) (\acc frag -> base.unify frag acc) {}) }   -- fold context, innermost wins
     (emitStderr level (base.unify merged event)))                     -- event fields win overall
 ```
 
-(`<>` folds the collected `log` fragments through the caller's merge
+(`<>` folds the collected `logCtx` fragments through the caller's merge
 function, each at its own projection site and concrete type — no list is ever
 built, so no shared element type is needed. `base.unify` is right-biased, so
 innermost-first folding makes the innermost fragment win per-field; the final

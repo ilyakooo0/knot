@@ -1,0 +1,18 @@
+-- Fold dictionaries: `(<>field : T) =>` signature constraints.
+--
+-- Like `(^field : T) =>`, but at each callsite the dictionary is the
+-- `base.unify`-merged fold of EVERY enclosing scope's `field` (innermost
+-- scope wins on conflicting keys), not the single innermost match. The body
+-- reads the merged record through `^field` exactly as a single-match dict.
+--
+-- Here `logCtx` appears in TWO scopes: nested `outer.logCtx` supplies
+-- `service`, the inner `logCtx` supplies `requestId`. The fold merges them.
+with {
+mylog : (<>logCtx : { service : Text | r }) => Text -> IO {}
+mylog (\msg -> base.println (base.show ^logCtx ++ " | " ++ msg))
+}
+(do
+    (with {logCtx {service "shop"}} (mylog "single"))
+    (with {outer {logCtx {service "shop"}}} (
+        with {logCtx {requestId 42}} (
+            mylog "merged"))))

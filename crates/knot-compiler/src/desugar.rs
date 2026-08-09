@@ -69,7 +69,7 @@ fn elaborate_all_implicit_dicts(expr: &mut Expr) {
                 .is_some_and(|ts| {
                     ts.constraints
                         .iter()
-                        .any(|c| matches!(c, Constraint::ImplicitField { .. }))
+                        .any(|c| matches!(c, Constraint::ImplicitField { .. } | Constraint::CollectField { .. }))
                 });
             if has_implicit && matches!(field.value.node, ExprKind::Lambda { .. }) {
                 elaborate_implicit_dicts(&mut field.value, &mut field.sig);
@@ -501,6 +501,17 @@ fn elaborate_implicit_dicts(body: &mut Expr, ty: &mut Option<TypeScheme>) -> Vec
                 .iter()
                 .filter_map(|c| match c {
                     Constraint::ImplicitField { field, ty } => {
+                        Some((field.clone(), ty.clone()))
+                    }
+                    // A `(<>field : T) =>` FOLD constraint elaborates
+                    // IDENTICALLY to `(^field : T) =>` (hidden leading
+                    // `{field : F} ->` dict param, body `^field` →
+                    // `__dict_<field>.field`); the ONLY difference is at the
+                    // callsite, where the dict is the `base.unify`-merged fold
+                    // of every enclosing scope's `field` (not the single
+                    // innermost match). See infer's `fold_dict_fields` and
+                    // codegen's `compile_fold_dict`.
+                    Constraint::CollectField { field, ty } => {
                         Some((field.clone(), ty.clone()))
                     }
                     _ => None,

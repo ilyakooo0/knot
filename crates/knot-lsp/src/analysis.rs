@@ -548,6 +548,7 @@ pub fn analyze_document(
             _type_args,
             _implicit_refs,
             _implicit_dict_args,
+            _fold_dict_args,
             _collect_refs,
             _resolved_calls,
             _todo_types,

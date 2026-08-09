@@ -1654,6 +1654,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_log_warn_io", &[p], &[p]);
         self.declare_rt("knot_log_error_io", &[p], &[p]);
         self.declare_rt("knot_log_debug_io", &[p], &[p]);
+        // Unified structured-log sink: (level, msg, ctx) -> unit. Called by the
+        // `base.log` special form after folding the caller's logCtx scopes.
+        self.declare_rt("knot_emit_log", &[p, p, p], &[p]);
         self.declare_rt("knot_read_line_io", &[], &[p]);
         self.declare_rt("knot_fs_read_file_io", &[p], &[p]);
         self.declare_rt("knot_fs_write_file_io", &[p, p], &[p]);

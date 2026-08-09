@@ -84,6 +84,70 @@ pub fn log(level: LogLevel, message: &str) {
     }
 }
 
+/// A single context field, pre-rendered for both output shapes.
+/// `terminal` is the `value` rendered for the `k: v` splat; `json` is the
+/// value rendered as a JSON fragment (used verbatim inside the object).
+pub struct CtxField {
+    pub name: String,
+    pub terminal: String,
+    pub json: String,
+}
+
+/// Emit one structured log line in the unified shape:
+///   terminal: `LEVEL msg k: v, k: v`   (ctx splat only when non-empty)
+///   JSON:     `{"level","msg",...ctx,"timestamp"}`  (ctx merged into the object)
+///
+/// `level_tag` is the constructor leaf ("Debug"/"Info"/"Warn"/"Error").
+/// `debug`-level lines are gated on `--debug`. The whole line is built in a
+/// single buffer and written with ONE locked `writeln!`, so concurrent
+/// threads never interleave bytes *within* a line.
+pub fn emit(level_tag: &str, msg: &str, ctx: Vec<CtxField>) {
+    let level = match level_tag {
+        "Debug" => LogLevel::Debug,
+        "Warn" => LogLevel::Warn,
+        "Error" => LogLevel::Error,
+        _ => LogLevel::Info,
+    };
+    if matches!(level, LogLevel::Debug) && !debug_enabled() {
+        return;
+    }
+
+    let stderr = std::io::stderr();
+    let mut handle = stderr.lock();
+    let mut line = String::new();
+
+    if stderr.is_terminal() {
+        use std::fmt::Write;
+        let _ = write!(line, "{}{}\x1b[0m {}", level.color(), level.label(), msg);
+        if !ctx.is_empty() {
+            let splat = ctx
+                .iter()
+                .map(|f| format!("{}: {}", f.name, f.terminal))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(line, " {{{splat}}}");
+        }
+    } else {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let mut obj = serde_json::Map::new();
+        obj.insert("level".into(), serde_json::Value::String(level.as_str().into()));
+        obj.insert("msg".into(), serde_json::Value::String(msg.into()));
+        for f in &ctx {
+            // The json fragment was rendered by write_value_json; parse it back
+            // into a Value so the object is well-formed.
+            let v = serde_json::from_str(&f.json).unwrap_or(serde_json::Value::Null);
+            obj.insert(f.name.clone(), v);
+        }
+        obj.insert("timestamp".into(), serde_json::json!(ts));
+        line = serde_json::Value::Object(obj).to_string();
+    }
+
+    let _ = writeln!(handle, "{line}");
+}
+
 pub fn log_debug(message: &str) {
     if debug_enabled() {
         log(LogLevel::Debug, message);

@@ -8331,6 +8331,40 @@ pub extern "C-unwind" fn knot_log_debug(v: *mut Value) -> *mut Value {
     alloc(Value::Unit)
 }
 
+/// Structured log sink for the unified logging design. Takes the level as a
+/// `Level.X` constructor value, the message as Text, and the merged context as
+/// a record. Walks the record's fields and emits one unified line:
+///   terminal: `LEVEL msg k: v, …`   JSON: `{"level","msg",…ctx,"timestamp"}`
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_emit_log(
+    level: *mut Value,
+    msg: *mut Value,
+    ctx: *mut Value,
+) -> *mut Value {
+    let level_tag = match unsafe { as_ref(level) } {
+        Value::Constructor(tag, _) => ctor_leaf(tag).to_string(),
+        Value::Text(s) => s.to_string(),
+        _ => "Info".to_string(),
+    };
+    let msg_text = match unsafe { as_ref(msg) } {
+        Value::Text(s) => s.to_string(),
+        _ => format_value(msg),
+    };
+    let fields = match unsafe { as_ref(ctx) } {
+        Value::Record(fields) => fields
+            .iter()
+            .map(|f| log::CtxField {
+                name: f.name.to_string(),
+                terminal: format_value_field(f.value),
+                json: value_to_json(f.value),
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    log::emit(&level_tag, &msg_text, fields);
+    alloc(Value::Unit)
+}
+
 /// Convert a value to its text representation (returned as a Value::Text).
 /// Panic when a `where` guard fails inside an IO do-block.
 #[unsafe(no_mangle)]

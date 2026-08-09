@@ -15,27 +15,29 @@ data Level = Debug {} | Info {} | Warn {} | Error {}
 An ordinary ADT, registered as a builtin (like `Maybe`/`Result`). A
 first-class value: pass it, store it, compute it, pattern-match it.
 
-## 2. A log event is a record
+## 2. `log` takes a plain message; context comes from `<>`
 
 ```knot
-base.log : Level -> {msg: Text | r} -> IO {console} {}
+base.log : Level -> Text -> IO {console} {}
 ```
 
-Mandatory `msg: Text` plus an **open row `| r`** — any extra fields,
-type-checked per call site:
+The caller passes a plain message string. Structured context is **not** part of
+the call — it is collected from the enclosing `with`-scopes via `<>` and
+appended by `log` itself (§5). Per-event structured fields are set through a
+`logCtx` context scope rather than inline:
 
 ```knot
-base.log (Info {}) {msg "user logged in" userId 42 ip "1.2.3.4"}
-base.log (Warn {}) {msg "slow query" durationMs 2340}
+base.log (Info {}) "user logged in"
+with { logCtx {userId 42 ip "1.2.3.4"} } (base.log (Info {}) "user logged in")
 ```
 
-Terminal stderr:
+Terminal stderr (context splat only when non-empty):
 ```
-INFO user logged in  {userId: 42, ip: "1.2.3.4"}
+INFO user logged in  userId: 42, ip: "1.2.3.4"
 ```
 
-Non-terminal stderr keeps the existing JSON-lines path, extended to splat
-the event fields into the JSON object.
+Non-terminal stderr keeps the existing JSON-lines path, with the merged
+context fields splatted into the JSON object.
 
 ## 3. Ergonomic wrappers
 
@@ -46,17 +48,18 @@ base.warn  = base.log (Warn {})
 base.error = base.log (Error {})
 ```
 
-`base.info {msg "..." userId 42}` reads like the old `base.logInfo "..."`,
-but structured. `base.log` takes a *computed* level:
+`base.info "..."` reads exactly like the old `base.logInfo "..."`. `base.log`
+takes a *computed* level:
 
 ```knot
 base.log (case status >= 500 of
   Bool.True {} -> Error {}
-  Bool.False {} -> Info {}) {msg "request done" status status}
+  Bool.False {} -> Info {}) "request done"
 ```
 
 **Migration:** `logInfo/Warn/Error/Debug` are kept one release as deprecated
-aliases wrapping their argument as `{msg (base.show a)}`, then removed.
+aliases (`base.logInfo = base.info`, etc.) — the message argument is unchanged
+(`Text`), so call sites port by renaming — then removed.
 
 ## 4. Filtering — the existing `--debug` flag, no more
 
@@ -250,10 +253,10 @@ just `base.debug` with lexical-locals auto-attached, plus context.
 | Item | Form | New machinery? |
 |---|---|---|
 | `Level` ADT | `data Level = Debug {} \| Info {} \| Warn {} \| Error {}` | builtin registration |
-| core log | `base.log : Level -> {msg: Text \| r} -> IO {console} {}` | no |
+| core log | `base.log : Level -> Text -> IO {console} {}` | no |
 | wrappers | `base.debug/info/warn/error` | no |
 | `trace` | emits a `Debug` event (`msg`/`value`/`scope` + `<>` context) through the same sink | no (reroute existing) |
-| structured event | record, `msg` + open row | no (existing records) |
+| context event | the merged `logCtx` record, built by `<>` inside `log` | no (existing records) |
 | context collect | `<>name : (acc -> { \| c} -> acc) -> acc -> acc` — `^`'s finder, folding all matches at their projection sites; innermost-first; no-match → initial acc | **yes — one operator** |
 | context scope | ordinary `with {dict {... logCtx {...}}} (...)` — any dictionary opts in via a `logCtx` field | no (existing `with`) |
 | filtering | `--debug` gates `Debug` (incl. `trace`) | no (existing) |
@@ -267,13 +270,15 @@ is ordinary knot.
 ## The `base.log` reference implementation (sketch)
 
 ```knot
-base.log (\level event ->
-  with { merged ((<>logCtx) (\acc frag -> base.unify frag acc) {}) }   -- fold context, innermost wins
-    (emitStderr level (base.unify merged event)))                     -- event fields win overall
+base.log (\level msg ->
+  with { ctx ((<>logCtx) (\acc frag -> base.unify frag acc) {}) }   -- fold context, innermost wins
+    (emitStderr level msg ctx))                                       -- sink renders msg + ctx splat
 ```
 
 (`<>` folds the collected `logCtx` fragments through the caller's merge
 function, each at its own projection site and concrete type — no list is ever
 built, so no shared element type is needed. `base.unify` is right-biased, so
-innermost-first folding makes the innermost fragment win per-field; the final
-`base.unify merged event` lets the event's own fields override the context.)
+innermost-first folding makes the innermost fragment win per-field. The sink
+`emitStderr` renders `LEVEL msg` plus the context fields as a `k: v` splat
+(terminal) or splatted into the JSON-lines object — walking `ctx`'s fields,
+which is the one thing pure knot can't express.)

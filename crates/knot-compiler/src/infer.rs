@@ -5240,25 +5240,22 @@ impl Infer {
         Ty::Error
     }
 
-    /// Collect EVERY in-scope record field named `name` whose type unifies
-    /// with `expected`, across ALL enclosing scopes (innermost-first) — the
-    /// `<>` counterpart to `resolve_implicit_ref`'s single-match search.
+    /// Collect EVERY in-scope record field named `name`, across ALL enclosing
+    /// scopes (innermost-first) — the `<>` counterpart to
+    /// `resolve_implicit_ref`'s single-match search.
     ///
-    /// Two deliberate differences from `^`'s search:
-    ///  - NO early-exit at the first matching scope: `<>` wants the whole
-    ///    nested stack so inner and outer context both contribute (rule A).
-    ///  - Returns every unifying candidate (rule C type filter), instead of
-    ///    requiring exactly one.
+    /// Pure NAME collection, NO type filter: `<>` gathers by field name alone
+    /// and unrolls the provided folder over every match. Shape compatibility
+    /// is enforced by the fold itself (a mis-shaped fragment fails the fold's
+    /// own `unify`/arithmetic at its precise site) — there is no silent
+    /// skipping. The only deliberate difference from `^`'s search is NO
+    /// early-exit at the first matching scope: `<>` wants the whole nested
+    /// stack so inner and outer context both contribute.
     ///
     /// Each result is `(root_binding, field_path, field_ty)` — the same
     /// triple `implicit_refs` records for `^`, so codegen can emit the
     /// projection chain `root.path…name` unchanged.
-    fn collect_all_implicit_fields(
-        &mut self,
-        name: &str,
-        expected: &Ty,
-        span: Span,
-    ) -> Vec<(String, Vec<String>, Ty)> {
+    fn collect_all_implicit_fields(&mut self, name: &str) -> Vec<(String, Vec<String>, Ty)> {
         // Gather (root, path, ty) candidates from every scope, innermost
         // first. Mirrors the `with`-frame + record-BFS logic in
         // `resolve_implicit_ref`, but keeps walking outward.
@@ -5393,27 +5390,7 @@ impl Infer {
             }
         }
 
-        // Type filter (rule C): keep only candidates whose field type unifies
-        // with `expected`, via the same speculative-substitution trial `^`
-        // uses — a failed trial leaves the real substitution untouched.
-        let mut kept: Vec<(String, Vec<String>, Ty)> = Vec::new();
-        for (root, path, field_ty) in candidates {
-            let mut trial: HashMap<TyVar, Ty> = HashMap::with_capacity(self.subst.len());
-            for v in self.subst.keys() {
-                let resolved = self.apply(&Ty::Var(*v));
-                trial.insert(*v, resolved);
-            }
-            let mut trial_errors: Vec<(String, Span)> = Vec::new();
-            std::mem::swap(&mut self.subst, &mut trial);
-            std::mem::swap(&mut self.errors, &mut trial_errors);
-            self.unify(&field_ty.clone(), expected, span);
-            std::mem::swap(&mut self.subst, &mut trial);
-            std::mem::swap(&mut self.errors, &mut trial_errors);
-            if trial_errors.is_empty() {
-                kept.push((root, path, field_ty));
-            }
-        }
-        kept
+        candidates
     }
 
     /// Detect `<>name folder init` (an app spine headed by `CollectFold` with
@@ -5444,10 +5421,9 @@ impl Infer {
         let head_span = f0.span;
         let span = expr.span;
 
-        // Collect candidates against the open-row element type (a fresh var;
-        // for logging it is pinned to `{ | c}` by the folder's `unify`).
-        let elem = self.fresh();
-        let candidates = self.collect_all_implicit_fields(&name, &elem, span);
+        // Collect candidates purely by field name — no type filter. Shape
+        // compatibility is enforced by the unrolled fold itself at each site.
+        let candidates = self.collect_all_implicit_fields(&name);
 
         // Register each candidate in `implicit_refs` under a UNIQUE synthetic
         // span, and record those spans (innermost-first) in `collect_refs` for

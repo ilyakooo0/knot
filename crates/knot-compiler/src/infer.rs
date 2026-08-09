@@ -9724,6 +9724,32 @@ impl Infer {
             },
         );
 
+        // Built-in ADT: data Level = Debug {} | Info {} | Warn {} | Error {}
+        // (log severity; first-class value — pass/compute/pattern-match it).
+        for ctor in ["Debug", "Info", "Warn", "Error"] {
+            self.constructors.insert(
+                ctor.into(),
+                vec![CtorInfo {
+                    data_type: "Level".into(),
+                    data_params: vec![],
+                    fields: vec![],
+                }],
+            );
+        }
+        self.data_types.insert(
+            "Level".into(),
+            DataInfo {
+                params: vec![],
+                ctors: vec![
+                    ("Debug".into(), vec![]),
+                    ("Info".into(), vec![]),
+                    ("Warn".into(), vec![]),
+                    ("Error".into(), vec![]),
+                ],
+            },
+        );
+        self.builtin_data_types.insert("Level".into());
+
         // Built-in ADT: data Result e a = Err {error: e} | Ok {value: a}
         self.constructors.insert(
             "Err".into(),

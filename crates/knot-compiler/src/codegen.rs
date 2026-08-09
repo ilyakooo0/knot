@@ -2206,6 +2206,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             vec!["True".into(), "False".into()],
         );
         self.data_constructors.insert(
+            "Level".into(),
+            vec!["Debug".into(), "Info".into(), "Warn".into(), "Error".into()],
+        );
+        self.data_constructors.insert(
             "List".into(),
             vec!["Nil".into(), "Cons".into()],
         );
@@ -4630,7 +4634,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // User ctors are handled by `embedded_ctors` above; this case
                 // only fires for the built-in types (never in `embedded_ctors`).
                 if let ast::ExprKind::Constructor(type_name) = &expr.node
-                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Bool" | "Ordering" | "List")
+                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Bool" | "Ordering" | "List" | "Level")
                     && self
                         .data_constructors
                         .get(type_name.as_str())
@@ -8691,7 +8695,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // stores the leaf (`Just`).
             ast::ExprKind::FieldAccess { expr, field }
                 if let ast::ExprKind::Constructor(type_name) = &expr.node
-                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Bool" | "Ordering" | "List")
+                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Bool" | "Ordering" | "List" | "Level")
                     && self
                         .data_constructors
                         .get(type_name)
@@ -20215,5 +20219,6 @@ fn eval_expr_num(expr: &ast::Expr, lit: &CompileLit, param_name: &str) -> Option
         _ => None,
     }
 }
+
 
 

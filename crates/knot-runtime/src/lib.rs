@@ -9965,22 +9965,30 @@ pub extern "C-unwind" fn knot_trace(
     count: usize,
 ) -> *mut Value {
     let report = render_todo_with_vals(ctx_ptr, ctx_len, names, vals, count);
-    // Closure body: print the report, then the traced value, then return it.
-    // Signature matches `knot_value_call`'s transmuted call convention.
+    // Closure body: emit the report (source context) + traced value through the
+    // structured Debug log (`log::emit`), then return the value unchanged. The
+    // Debug level gates the line on `--debug`, and the output shares the unified
+    // terminal/JSON shape with `base.log`. Signature matches `knot_value_call`'s
+    // transmuted call convention.
     extern "C-unwind" fn apply(_db: *mut c_void, env: *mut Value, arg: *mut Value) -> *mut Value {
-        if let Value::Text(s) = unsafe { as_ref(env) } {
-            eprintln!("{s}");
-        }
-        let shown = if arg.is_null() {
-            String::from("<unavailable>")
+        let msg = match unsafe { as_ref(env) } {
+            Value::Text(s) => s.to_string(),
+            _ => String::from("`trace` probe"),
+        };
+        let (terminal, json) = if arg.is_null() {
+            (String::from("<unavailable>"), String::from("null"))
         } else {
             match unsafe { as_ref(arg) } {
-                Value::Function(_) => String::from("<function>"),
-                Value::IO(..) => String::from("<IO action>"),
-                _ => format_value(arg),
+                Value::Function(_) => (String::from("<function>"), String::from("\"<function>\"")),
+                Value::IO(..) => (String::from("<IO action>"), String::from("\"<IO action>\"")),
+                _ => (format_value(arg), value_to_json(arg)),
             }
         };
-        eprintln!("  traced value = {shown}");
+        crate::log::emit(
+            "Debug",
+            &msg,
+            vec![crate::log::CtxField { name: String::from("value"), terminal, json }],
+        );
         arg
     }
     let env = alloc(Value::Text(Arc::from(report.as_str())));

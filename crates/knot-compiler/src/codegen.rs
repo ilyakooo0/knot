@@ -6813,15 +6813,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
         }
         let (line, col) = knot::diagnostic::line_col(&self.source_text, span.start);
-        knot::diagnostic::Diagnostic::error(msg)
-            .label(span, "traced here")
-            .note(format!(
-                "`base.trace` at {}:{}:{} — remove it when done debugging",
-                self.source_name,
-                line,
-                col + 1,
-            ))
-            .render(&self.source_text, &self.source_name)
+        // The trace report is emitted through the structured Debug log
+        // (`log::emit`) as the `msg`. Keep it a plain single line — `file:line`
+        // plus the traced type — so the JSON/terminal log stays readable (no
+        // ANSI diagnostic chrome). The in-scope binding *values* are spilled at
+        // the trace site and appended by the runtime (`render_todo_with_vals`).
+        let _ = col;
+        format!("{msg} ({}:{line})", self.source_name)
     }
 
     /// Emit the STM `retry` primitive. Shared by the bare `retry` Var arm and

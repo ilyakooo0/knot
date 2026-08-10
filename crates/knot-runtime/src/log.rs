@@ -58,6 +58,48 @@ impl LogLevel {
     }
 }
 
+/// `HH:MM:SS` in the current (local) time zone, for the terminal log prefix.
+/// Uses libc's `localtime_r` (no chrono dependency); falls back to UTC on
+/// non-unix targets or if the conversion fails.
+#[cfg(unix)]
+fn local_time_string() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+    // SAFETY: `localtime_r` writes into `tm` and returns it on success; the
+    // `tm` struct is plain data with no Drop, so an uninit-then-assume-init
+    // read after a successful call is sound.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if !libc::localtime_r(&secs, &mut tm).is_null() {
+            format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+        } else {
+            utc_time_string(secs as u64)
+        }
+    }
+}
+
+/// `HH:MM:SS` UTC, used when local time is unavailable (non-unix, or
+/// `localtime_r` failure).
+#[cfg(unix)]
+fn utc_time_string(secs: u64) -> String {
+    let s = secs % 86_400;
+    format!("{:02}:{:02}:{:02}Z", s / 3600, (s / 60) % 60, s % 60)
+}
+
+/// `HH:MM:SS` on non-unix targets (no `localtime_r`) — UTC with a `Z` suffix.
+#[cfg(not(unix))]
+fn local_time_string() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let s = secs % 86_400;
+    format!("{:02}:{:02}:{:02}Z", s / 3600, (s / 60) % 60, s % 60)
+}
+
 pub fn log(level: LogLevel, message: &str) {
     let stderr = std::io::stderr();
     let mut handle = stderr.lock();
@@ -65,7 +107,8 @@ pub fn log(level: LogLevel, message: &str) {
     if stderr.is_terminal() {
         let _ = writeln!(
             handle,
-            "{}{}\x1b[0m {}",
+            "{} {}{}\x1b[0m {}",
+            local_time_string(),
             level.color(),
             level.label(),
             message,
@@ -118,7 +161,14 @@ pub fn emit(level_tag: &str, msg: &str, ctx: Vec<CtxField>) {
 
     if stderr.is_terminal() {
         use std::fmt::Write;
-        let _ = write!(line, "{}{}\x1b[0m {}", level.color(), level.label(), msg);
+        let _ = write!(
+            line,
+            "{} {}{}\x1b[0m {}",
+            local_time_string(),
+            level.color(),
+            level.label(),
+            msg
+        );
         if !ctx.is_empty() {
             let splat = ctx
                 .iter()

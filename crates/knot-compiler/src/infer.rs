@@ -13481,11 +13481,48 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
     // whose fields are already decls), and register the with's field names.
     {
         let mut cur: &ast::Expr = program;
+        // Scopes/frames pushed for collapsed outer literal `with`s below; kept
+        // live until the innermost body is inferred, then popped in reverse.
+        let mut collapsed_withs: Vec<ast::Span> = Vec::new();
         loop {
             match &cur.node {
-                ast::ExprKind::With { body, .. }
+                ast::ExprKind::With { record, body, .. }
                     if matches!(body.node, ast::ExprKind::With { .. }) =>
                 {
+                    // A nested literal-record `with`: the collapse below skips
+                    // the normal `With` arm, which is what pushes this `with`'s
+                    // field scope and `with_scope_stack` frame. Without that the
+                    // innermost body's `<>`/`^` collection sees only the
+                    // INNERMOST `with`'s fields — an outer `with {outer {logCtx
+                    // …}}` is invisible, so `base.info` never merges
+                    // `outer.logCtx`. Push the scope + frame here (mirroring the
+                    // `With` arm) so every collapsed outer `with` stays visible
+                    // to the innermost body.
+                    if let ast::ExprKind::Record(field_exprs) = &record.node {
+                        let mut field_tys: Vec<(String, Ty)> =
+                            Vec::with_capacity(field_exprs.len());
+                        for f in field_exprs {
+                            let val_ty = infer.infer_expr(&f.value);
+                            field_tys.push((f.name.clone(), val_ty));
+                        }
+                        infer.with_fields.push((
+                            cur.span,
+                            field_tys.iter().map(|(n, _)| n.clone()).collect(),
+                        ));
+                        infer.push_scope();
+                        for (name, ty) in &field_tys {
+                            infer.bind_at(name, Scheme::mono(ty.clone()), record.span);
+                        }
+                        *infer.with_scope_stack.last_mut().expect("just pushed") =
+                            Some((
+                                cur.span,
+                                field_tys
+                                    .iter()
+                                    .map(|(n, t)| (n.clone(), Scheme::mono(t.clone())))
+                                    .collect(),
+                            ));
+                        collapsed_withs.push(cur.span);
+                    }
                     cur = body;
                 }
                 ast::ExprKind::With { record, body, types } => {
@@ -13525,6 +13562,12 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                     break;
                 }
             }
+        }
+        // Pop the scopes/frames pushed for collapsed outer `with`s above so the
+        // compiler's scope stack returns to its prior depth for later phases.
+        // (`pop_scope` pops both `scopes` and `with_scope_stack` together.)
+        for _ in &collapsed_withs {
+            infer.pop_scope();
         }
     }
 

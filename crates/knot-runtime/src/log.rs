@@ -58,9 +58,11 @@ impl LogLevel {
     }
 }
 
-/// `HH:MM:SS` in the current (local) time zone, for the terminal log prefix.
-/// Uses libc's `localtime_r` (no chrono dependency); falls back to UTC on
-/// non-unix targets or if the conversion fails.
+/// `HH:MM:SS±HH:MM` in the user's own machine time zone, for the terminal log
+/// prefix. `localtime_r` resolves the zone from the system (`TZ` env /
+/// `/etc/localtime`); `tm_gmtoff` reports that zone's UTC offset, so the prefix
+/// is self-describing (e.g. `23:18:22+03:00`). Falls back to UTC (with a `Z`)
+/// on non-unix targets or if the conversion fails.
 #[cfg(unix)]
 fn local_time_string() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,7 +76,18 @@ fn local_time_string() -> String {
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if !libc::localtime_r(&secs, &mut tm).is_null() {
-            format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+            let off = tm.tm_gmtoff; // seconds east of UTC (the machine's zone)
+            let sign = if off < 0 { '-' } else { '+' };
+            let a = off.abs();
+            format!(
+                "{:02}:{:02}:{:02}{}{:02}:{:02}",
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec,
+                sign,
+                a / 3600,
+                (a % 3600) / 60
+            )
         } else {
             utc_time_string(secs as u64)
         }

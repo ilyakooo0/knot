@@ -8331,6 +8331,26 @@ pub extern "C-unwind" fn knot_log_debug(v: *mut Value) -> *mut Value {
     alloc(Value::Unit)
 }
 
+thread_local! {
+    /// Per-request auto-context for structured logging. The HTTP serve loop
+    /// sets this to a `{requestId, method, path}` record before invoking a
+    /// handler and clears it afterward. `knot_emit_log` merges it under the
+    /// compile-time `<>logCtx` dict so an explicit `with {logCtx …}` in the
+    /// handler body overrides the auto request context (handler intent wins).
+    static REQUEST_LOG_CTX: std::cell::Cell<*mut Value> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Set the per-request log context record (`{requestId, method, path}`).
+/// Called by the HTTP serve loop before invoking a handler.
+fn set_request_log_ctx(ctx: *mut Value) {
+    REQUEST_LOG_CTX.with(|c| c.set(ctx));
+}
+
+/// Clear the per-request log context after the handler returns.
+fn clear_request_log_ctx() {
+    REQUEST_LOG_CTX.with(|c| c.set(std::ptr::null_mut()));
+}
+
 /// Structured log sink for the unified logging design. Takes the level as a
 /// `Level.X` constructor value, the message as Text, and the merged context as
 /// a record. Walks the record's fields and emits one unified line:
@@ -8351,7 +8371,7 @@ pub extern "C-unwind" fn knot_emit_log(
         Value::Text(s) => s.to_string(),
         _ => format_value(msg),
     };
-    let fields = match unsafe { as_ref(ctx) } {
+    let mut fields: Vec<log::CtxField> = match unsafe { as_ref(ctx) } {
         Value::Record(fields) => fields
             .iter()
             .map(|f| log::CtxField {
@@ -8362,6 +8382,25 @@ pub extern "C-unwind" fn knot_emit_log(
             .collect(),
         _ => Vec::new(),
     };
+    // Merge the per-request auto-context (`{requestId, method, path}` set by the
+    // HTTP serve loop) UNDER the compile-time `<>logCtx` dict: fields the
+    // handler already set (via an explicit `with {logCtx …}`) win; the request
+    // context only fills in the rest. Field order in the emitted line keeps the
+    // handler's own fields first.
+    let req_ctx = REQUEST_LOG_CTX.with(|c| c.get());
+    if !req_ctx.is_null()
+        && let Value::Record(req_fields) = unsafe { as_ref(req_ctx) }
+    {
+        for f in req_fields {
+            if !fields.iter().any(|have| have.name.as_str() == &*f.name) {
+                fields.push(log::CtxField {
+                    name: f.name.to_string(),
+                    terminal: format_value_field(f.value),
+                    json: value_to_json(f.value),
+                });
+            }
+        }
+    }
     log::emit(&level_tag, &msg_text, fields);
     alloc(Value::Unit)
 }
@@ -19168,6 +19207,11 @@ fn http_serve_loop(
                 let entry_request_headers = entry.request_headers.clone();
                 let entry_response_headers = entry.response_headers.clone();
                 let entry_constructor = entry.constructor.clone();
+                // Capture the request's own method + path for the per-request
+                // log auto-context (`{requestId, method, path}`) threaded to
+                // `knot_emit_log` while the handler runs.
+                let req_method = method.clone();
+                let req_path = path.clone();
                 let entry_refinements: Vec<FieldRefinement> = table.field_refinements
                     .iter()
                     .filter(|r| r.constructor == entry_constructor)
@@ -19552,6 +19596,18 @@ fn http_serve_loop(
 
                     let ctor_val = alloc(Value::Constructor(intern_str(&entry_constructor), record));
 
+                    // Per-request log auto-context: build {requestId, method, path}
+                    // and set the thread-local so any `base.log`/`info`/… inside
+                    // the handler emits it (merged under the handler's own
+                    // compile-time `<>logCtx` fields). Cleared after the handler
+                    // returns so concurrent/sequential requests never leak ctx.
+                    let req_log_ctx = alloc(Value::Record(vec![
+                        RecordField { name: intern_str("requestId"), value: knot_random_uuid() },
+                        RecordField { name: intern_str("method"), value: alloc(Value::Text(Arc::from(req_method.as_str()))) },
+                        RecordField { name: intern_str("path"), value: alloc(Value::Text(Arc::from(req_path.as_str()))) },
+                    ]));
+                    set_request_log_ctx(req_log_ctx);
+
                     // Call handler. The Server value is just a Knot function
                     // that takes the route ADT and returns the endpoint's
                     // declared response (or {body, headers} when response
@@ -19560,6 +19616,7 @@ fn http_serve_loop(
                     while matches!(unsafe { as_ref(result) }, Value::IO(..)) {
                         result = knot_io_run(db, result);
                     }
+                    clear_request_log_ctx();
                     Ok(result)
                     }));
 

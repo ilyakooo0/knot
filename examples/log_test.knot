@@ -1,6 +1,6 @@
 (do
-  base.logInfo "starting up"
-  base.logWarn "something looks fishy"
-  base.logError "something is broken"
-  base.logDebug "verbose details (only with --debug)"
+  base.info "starting up"
+  base.warn "something looks fishy"
+  base.error "something is broken"
+  base.debug "verbose details (only with --debug)"
   base.println "done")

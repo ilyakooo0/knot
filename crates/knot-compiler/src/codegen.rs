@@ -2280,7 +2280,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // Console IO builtins, registered so they become first-class
             // function values living as fields of the `base` record.
             "println", "print", "putLine",
-            "logInfo", "logWarn", "logError", "logDebug",
+            // `logInfo`/`logWarn`/`logError`/`logDebug` are deprecated prelude
+            // `base` record fields (with a `(<>logCtx)` constraint), NOT stdlib
+            // fns — registering them here would declare a `knot_user_logInfo`
+            // that is never defined.
             // `base.log`'s runtime target (level + msg + merged ctx). Registered
             // here so the prelude `log`/`info`/… bodies' bare `emitLog` resolves
             // to a fn value, but NOT in `BASE_STDLIB_FNS` — it is prelude-internal,
@@ -3079,10 +3082,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.define_stdlib_fn_1("println", "knot_println_io");
         self.define_stdlib_fn_1("print", "knot_print_io");
         self.define_stdlib_fn_1("putLine", "knot_println_io");
-        self.define_stdlib_fn_1("logInfo", "knot_log_info_io");
-        self.define_stdlib_fn_1("logWarn", "knot_log_warn_io");
-        self.define_stdlib_fn_1("logError", "knot_log_error_io");
-        self.define_stdlib_fn_1("logDebug", "knot_log_debug_io");
+        // `logInfo`/`logWarn`/`logError`/`logDebug` are now deprecated prelude
+        // `base` record fields threading `<>logCtx` (not stdlib fns); the old
+        // `knot_log_*_io` runtime fns stay linked but unregistered.
         // `base.log`'s runtime target: level + msg + merged ctx record.
         self.define_stdlib_fn_3("emitLog", "knot_emit_log");
 
@@ -6566,7 +6568,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         db: Value,
     ) -> Value {
         let (_field, frag_spans) = self.fold_dict_args.get(&span).cloned().unwrap_or_default();
-        eprintln!("TRACE compile_fold_dict span={:?} frag_spans={:?} roots={:?} env_has_logCtx={}", span, frag_spans, frag_spans.iter().map(|s| self.implicit_refs.get(s).cloned()).collect::<Vec<_>>(), env.bindings.contains_key("logCtx"));
         let cap = builder.ins().iconst(self.ptr_type, frag_spans.len() as i64);
         let mut acc = self.call_rt(builder, "knot_record_empty", &[cap]);
         // frag_spans is innermost-first; fold outermost-first so the right-
@@ -8492,23 +8493,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::Var(name) if name == "print" => {
                 if compiled_args.len() == 1 {
                     self.call_rt(builder, "knot_print_io", &[compiled_args[0]])
-                } else {
-                    self.call_rt(builder, "knot_value_unit", &[])
-                }
-            }
-            ast::ExprKind::Var(name)
-                if name == "logInfo" || name == "logWarn"
-                    || name == "logError" || name == "logDebug" =>
-            {
-                let rt = match name.as_str() {
-                    "logInfo" => "knot_log_info_io",
-                    "logWarn" => "knot_log_warn_io",
-                    "logError" => "knot_log_error_io",
-                    "logDebug" => "knot_log_debug_io",
-                    _ => unreachable!(),
-                };
-                if compiled_args.len() == 1 {
-                    self.call_rt(builder, rt, &[compiled_args[0]])
                 } else {
                     self.call_rt(builder, "knot_value_unit", &[])
                 }

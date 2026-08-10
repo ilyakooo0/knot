@@ -10029,17 +10029,10 @@ impl Infer {
             )),
         );
 
-        // logInfo / logWarn / logError / logDebug : ∀a. a -> IO {console} {}
-        for log_name in ["logInfo", "logWarn", "logError", "logDebug"] {
-            let a = self.fresh_var();
-            self.bind_top(
-                log_name,
-                Scheme::poly(vec![a], Ty::Fun(
-                    Box::new(Ty::Var(a)),
-                    Box::new(Ty::IO(Box::new(Ty::unit()))),
-                )),
-            );
-        }
+        // `logInfo`/`logWarn`/`logError`/`logDebug` are deprecated prelude
+        // `base` record fields with a `(<>logCtx)` constraint — NOT top-level
+        // polymorphic stdlib fns. No binding here; the prelude record supplies
+        // them (and threads the caller's logCtx).
 
         // emitLog : ∀c. Level -> Text -> c -> IO {console} {} — `base.log`'s
         // runtime target. `c` is the (already merged) logCtx record; kept

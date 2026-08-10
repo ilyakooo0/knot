@@ -74,6 +74,21 @@ warn (\msg -> emitLog (Level.Warn {}) msg ^logCtx)
 error : (<>logCtx) => Text -> IO {}
 error (\msg -> emitLog (Level.Error {}) msg ^logCtx)
 
+-- Deprecated renames of the level wrappers above (the pre-`base.<level>` API).
+-- Each threads the caller's `logCtx` exactly like its modern counterpart; kept
+-- for source compatibility. Prefer `base.debug`/`info`/`warn`/`error`.
+logDebug : (<>logCtx) => Text -> IO {}
+logDebug (\msg -> emitLog (Level.Debug {}) msg ^logCtx)
+
+logInfo : (<>logCtx) => Text -> IO {}
+logInfo (\msg -> emitLog (Level.Info {}) msg ^logCtx)
+
+logWarn : (<>logCtx) => Text -> IO {}
+logWarn (\msg -> emitLog (Level.Warn {}) msg ^logCtx)
+
+logError : (<>logCtx) => Text -> IO {}
+logError (\msg -> emitLog (Level.Error {}) msg ^logCtx)
+
 -- List ADT namespace (`base.list.*`). Each field is a codegen builtin
 -- (`Var(listX)` resolves to the registered knot_list_* function value), so
 -- the prelude record needs no self-reference for recursion. `nil` is the
@@ -156,7 +171,9 @@ pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     // application head. `bind` here is relation flatMap (`knot_relation_bind`).
     "count", "union", "sum", "bind",
     // Console IO builtins (registered as stdlib function values in codegen).
-    "println", "print", "putLine", "logInfo", "logWarn", "logError", "logDebug",
+    // `logInfo`/`logWarn`/`logError`/`logDebug` are deliberately NOT here — they
+    // are deprecated prelude `base` record fields threading `<>logCtx`.
+    "println", "print", "putLine",
     "show",
     // Value → evaluable Knot source (dependency-collecting). Registered as a
     // stdlib function value in codegen.

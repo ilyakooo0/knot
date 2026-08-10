@@ -4834,7 +4834,16 @@ impl Infer {
                 self.unify(&result, &Ty::Fun(Box::new(arg_ty), Box::new(ret.clone())), a.span);
                 result = ret;
             }
+            let fold_fields: Vec<String> = self
+                .fold_dict_fields
+                .get(&path)
+                .cloned()
+                .unwrap_or_default();
             for (i, (field, _)) in dicts.iter().enumerate() {
+                if fold_fields.contains(field) {
+                    self.resolve_fold_dict(field, expr.span);
+                    continue;
+                }
                 let dict_ty = self.apply(&dict_tys[i]);
                 let field_ty = match dict_ty.peel_alias() {
                     Ty::Record(fields, _) => fields.get(field).cloned().unwrap_or(dict_ty),
@@ -5378,7 +5387,11 @@ impl Infer {
                 let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
                 let mut descended = false;
                 for (path, field_ty) in &frontier {
-                    if *path.last().expect("non-empty path") == name {
+                    // Depth-1 paths are the with's DIRECT fields, already
+                    // collected by the `field_schemes.get(name)` lookup above —
+                    // re-collecting them here would double-count. Only nested
+                    // (`outer.parts`, depth ≥ 2) matches belong to the BFS.
+                    if path.len() > 1 && *path.last().expect("non-empty path") == name {
                         // Root at the FIRST path element's BARE field name,
                         // matching `^`'s record-BFS root (`bind_name`): the
                         // `with` binds each field into the flat `Env`, which
@@ -5425,6 +5438,16 @@ impl Infer {
                     continue;
                 }
                 let root_ty = self.apply(&scheme.ty).clone();
+                // A scope binding whose NAME is the sought field is a direct
+                // candidate at depth 0, whatever its type (`parts = 5`, `logCtx
+                // = {…}`, `tag = True`): the `<>` fold is general, not
+                // record-only. Mirrors `resolve_dict`'s
+                // `scope.contains_key(field)` candidate and also covers a
+                // `with` field surfaced as a decl in the Phase-4z body pass
+                // (where the `with` frame is not on `with_scope_stack`).
+                if bind_name == name {
+                    candidates.push((bind_name.clone(), Vec::new(), root_ty.clone()));
+                }
                 if let Ty::Record(fields, _) = root_ty.peel_alias() {
                     for (f, t) in fields.iter().rev() {
                         frontier.push((bind_name.clone(), vec![f.clone()], t.clone()));
@@ -10018,6 +10041,24 @@ impl Infer {
             );
         }
 
+        // emitLog : ∀c. Level -> Text -> c -> IO {console} {} — `base.log`'s
+        // runtime target. `c` is the (already merged) logCtx record; kept
+        // polymorphic since the merged shape is callsite-dependent.
+        let c = self.fresh_var();
+        self.bind_top(
+            "emitLog",
+            Scheme::poly(vec![c], Ty::Fun(
+                Box::new(Ty::Con("Level".into(), vec![])),
+                Box::new(Ty::Fun(
+                    Box::new(Ty::Text),
+                    Box::new(Ty::Fun(
+                        Box::new(Ty::Var(c)),
+                        Box::new(Ty::IO(Box::new(Ty::unit()))),
+                    )),
+                )),
+            )),
+        );
+
         // readLine : IO {console} Text
         self.bind_top("readLine", Scheme::mono(
             Ty::IO(Box::new(Ty::Text)),
@@ -11600,6 +11641,52 @@ impl Infer {
         // returning, so user code never sees these names. Generalize the
         // inferred record type so each `base.X` access re-instantiates.
         let base_record = crate::base::prelude_base_record();
+        // Register the `base` record's dictionary constraints (`^`/`<>`
+        // fields) under their dotted `base.<name>` paths, exactly as
+        // `infer_declarations` does for user namespaced records, so a
+        // `base.log` (or any constrained `base.*` fn) splices its dictionary
+        // at the user's callsite the same way a user-defined constrained fn
+        // does. `bind_base_record` types the record directly and never runs
+        // `infer_declarations`, so without this the constraint would not fire.
+        if let ast::ExprKind::Record(base_fields) = &base_record.node {
+            for f in base_fields {
+                let Some(sig) = &f.sig else { continue };
+                let saved_flag = self.in_type_annotation;
+                let saved_av = std::mem::take(&mut self.annotation_vars);
+                let saved_auv = std::mem::take(&mut self.annotation_unit_vars);
+                self.in_type_annotation = true;
+                let implicit: Vec<(String, Ty)> = sig
+                    .constraints
+                    .iter()
+                    .filter_map(|c| match c {
+                        ast::Constraint::ImplicitField { field, ty } => {
+                            Some((field.clone(), self.ast_type_to_ty(ty)))
+                        }
+                        ast::Constraint::CollectField { field, .. } => {
+                            Some((field.clone(), self.fresh()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let folds: Vec<String> = sig
+                    .constraints
+                    .iter()
+                    .filter_map(|c| match c {
+                        ast::Constraint::CollectField { field, .. } => Some(field.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                self.in_type_annotation = saved_flag;
+                self.annotation_vars = saved_av;
+                self.annotation_unit_vars = saved_auv;
+                if !implicit.is_empty() {
+                    self.implicit_dict_fns.insert(format!("base.{}", f.name), implicit);
+                }
+                if !folds.is_empty() {
+                    self.fold_dict_fields.insert(format!("base.{}", f.name), folds);
+                }
+            }
+        }
         self.scopes.push(self.stdlib_schemes.clone());
         self.push_scope();
         let inferred = self.infer_expr(&base_record);
@@ -11691,6 +11778,21 @@ impl Infer {
                                             ast::Constraint::ImplicitField { field, ty } => {
                                                 Some((field.clone(), self.ast_type_to_ty(ty)))
                                             }
+                                            ast::Constraint::CollectField { field, .. } => {
+                                                // `(<>field)` fold: dict collected+merged
+                                                // at the callsite; type is a fresh var.
+                                                Some((field.clone(), self.fresh()))
+                                            }
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    let ffolds: Vec<String> = sig
+                                        .constraints
+                                        .iter()
+                                        .filter_map(|c| match c {
+                                            ast::Constraint::CollectField { field, .. } => {
+                                                Some(field.clone())
+                                            }
                                             _ => None,
                                         })
                                         .collect();
@@ -11702,6 +11804,10 @@ impl Infer {
                                             format!("{name}.{}", f.name),
                                             fimplicit,
                                         );
+                                    }
+                                    if !ffolds.is_empty() {
+                                        self.fold_dict_fields
+                                            .insert(format!("{name}.{}", f.name), ffolds);
                                     }
                                 }
                             }

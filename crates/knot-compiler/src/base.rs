@@ -51,6 +51,29 @@ unless (\cond action -> case cond of
   Bool.True {} -> yield {}
   Bool.False {} -> action)
 
+-- Structured logging. `log` carries a `(<>logCtx)` fold constraint: at each
+-- callsite the compiler merges every in-scope `logCtx` record (`base.unify`
+-- from `{}`, innermost scope wins) and passes the merged record as the hidden
+-- dictionary, so the caller writes only the level and message. The body reads
+-- the merged context via `^logCtx` and emits through `knot_emit_log`
+-- (`emitLog`). The `debug`/`info`/`warn`/`error` wrappers fix the level; each
+-- is self-contained (a record field can't reference a sibling bare) and
+-- re-declares the constraint so the caller's context threads through.
+log : (<>logCtx) => Level -> Text -> IO {}
+log (\level msg -> emitLog level msg ^logCtx)
+
+debug : (<>logCtx) => Text -> IO {}
+debug (\msg -> emitLog (Level.Debug {}) msg ^logCtx)
+
+info : (<>logCtx) => Text -> IO {}
+info (\msg -> emitLog (Level.Info {}) msg ^logCtx)
+
+warn : (<>logCtx) => Text -> IO {}
+warn (\msg -> emitLog (Level.Warn {}) msg ^logCtx)
+
+error : (<>logCtx) => Text -> IO {}
+error (\msg -> emitLog (Level.Error {}) msg ^logCtx)
+
 -- List ADT namespace (`base.list.*`). Each field is a codegen builtin
 -- (`Var(listX)` resolves to the registered knot_list_* function value), so
 -- the prelude record needs no self-reference for recursion. `nil` is the
@@ -218,6 +241,12 @@ pub(crate) fn prelude_base_record() -> ast::Expr {
             base_record = Some(base_field.value.clone());
         }
     let mut record = base_record.expect("prelude source has no `base` field");
+    // Elaborate the constrained `base.*` fns (`log`, `info`, …): prepend the
+    // hidden `__dict_<field>` parameter and rewrite the body's `^field` to it.
+    // The prelude is parsed raw (no `desugar` pass), so without this their
+    // `^field` would resolve against the prelude scope, not the dictionary
+    // the callsite splices in.
+    crate::desugar::elaborate_all_implicit_dicts(&mut record);
     shift_expr_spans(&mut record, PRELUDE_SPAN_OFFSET);
     record
 }

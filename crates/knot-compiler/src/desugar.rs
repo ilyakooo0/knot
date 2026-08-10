@@ -57,7 +57,13 @@ fn desugar_inner(expr: &mut Expr) {
 /// field whose signature carries `(^field : T) =>` constraints and whose
 /// value is a lambda (a record-field function). Recurses so nested `with`
 /// records are covered.
-fn elaborate_all_implicit_dicts(expr: &mut Expr) {
+///
+/// `pub(crate)` so the prelude (`prelude_base_record`) can elaborate its own
+/// constrained `base.*` fns (`log`, `info`, …) — the prelude AST is parsed
+/// raw and never passes through `desugar`, so without this their `^field`
+/// bodies would resolve against the prelude scope instead of the hidden
+/// dictionary parameter.
+pub(crate) fn elaborate_all_implicit_dicts(expr: &mut Expr) {
     // Recurse first (bottom-up) so inner records are elaborated before the
     // outer record's fields are inspected.
     walk_expr_children(expr, &mut |child| elaborate_all_implicit_dicts(child));

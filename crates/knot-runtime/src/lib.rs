@@ -8337,6 +8337,7 @@ pub extern "C-unwind" fn knot_log_debug(v: *mut Value) -> *mut Value {
 ///   terminal: `LEVEL msg k: v, …`   JSON: `{"level","msg",…ctx,"timestamp"}`
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_emit_log(
+    _db: *mut c_void,
     level: *mut Value,
     msg: *mut Value,
     ctx: *mut Value,

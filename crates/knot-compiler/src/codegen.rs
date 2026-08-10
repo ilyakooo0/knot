@@ -1667,9 +1667,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_log_warn_io", &[p], &[p]);
         self.declare_rt("knot_log_error_io", &[p], &[p]);
         self.declare_rt("knot_log_debug_io", &[p], &[p]);
-        // Unified structured-log sink: (level, msg, ctx) -> unit. Called by the
+        // Unified structured-log sink: (db, level, msg, ctx) -> unit. Called by the
         // `base.log` special form after folding the caller's logCtx scopes.
-        self.declare_rt("knot_emit_log", &[p, p, p], &[p]);
+        self.declare_rt("knot_emit_log", &[p, p, p, p], &[p]);
         self.declare_rt("knot_read_line_io", &[], &[p]);
         self.declare_rt("knot_fs_read_file_io", &[p], &[p]);
         self.declare_rt("knot_fs_write_file_io", &[p, p], &[p]);
@@ -2281,6 +2281,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // function values living as fields of the `base` record.
             "println", "print", "putLine",
             "logInfo", "logWarn", "logError", "logDebug",
+            // `base.log`'s runtime target (level + msg + merged ctx). Registered
+            // here so the prelude `log`/`info`/… bodies' bare `emitLog` resolves
+            // to a fn value, but NOT in `BASE_STDLIB_FNS` — it is prelude-internal,
+            // not a user-facing `base.emitLog`.
+            "emitLog",
             "show",
             // `extract` renders a value as evaluable Knot source (runtime
             // `knot_value_extract`); first-class so `base.extract` works.
@@ -3078,6 +3083,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.define_stdlib_fn_1("logWarn", "knot_log_warn_io");
         self.define_stdlib_fn_1("logError", "knot_log_error_io");
         self.define_stdlib_fn_1("logDebug", "knot_log_debug_io");
+        // `base.log`'s runtime target: level + msg + merged ctx record.
+        self.define_stdlib_fn_3("emitLog", "knot_emit_log");
 
         // 2-param: curried (outer captures arg1, inner calls runtime)
         self.define_stdlib_fn_2("filter", "knot_relation_filter", true);
@@ -6559,6 +6566,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         db: Value,
     ) -> Value {
         let (_field, frag_spans) = self.fold_dict_args.get(&span).cloned().unwrap_or_default();
+        eprintln!("TRACE compile_fold_dict span={:?} frag_spans={:?} roots={:?} env_has_logCtx={}", span, frag_spans, frag_spans.iter().map(|s| self.implicit_refs.get(s).cloned()).collect::<Vec<_>>(), env.bindings.contains_key("logCtx"));
         let cap = builder.ins().iconst(self.ptr_type, frag_spans.len() as i64);
         let mut acc = self.call_rt(builder, "knot_record_empty", &[cap]);
         // frag_spans is innermost-first; fold outermost-first so the right-

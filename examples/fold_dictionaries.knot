@@ -1,19 +1,21 @@
 -- Fold dictionaries: `(<>field)` signature constraints.
 --
--- The constraint declares a leading "dictionary" parameter holding the fold
--- of the in-scope `field` values; the caller supplies it explicitly as a
--- `<>` collecting fold (`(<>field folder init)`), so the fold shape and
--- result type are the caller's choice. The body reads it through `^field`.
+-- The constraint declares a hidden leading "dictionary" parameter holding the
+-- merge of every in-scope `field` value. The caller passes ONLY the visible
+-- arguments; at the callsite the compiler collects all in-scope `field`
+-- records and merges them with `base.unify` from `{}` (innermost scope wins
+-- on conflicting keys), passing the merged record as the dictionary. The body
+-- reads it through `^field`.
 --
 -- Here `logCtx` appears in TWO scopes: nested `outer.logCtx` supplies
--- `service`, the inner `logCtx` supplies `requestId`. `(<>logCtx base.unify
--- {})` merges them (innermost scope wins on conflicting keys).
+-- `service`, the inner `logCtx` supplies `requestId`. `mylog` collects and
+-- merges both automatically.
 with {
 mylog : (<>logCtx) => Text -> IO {}
 mylog (\msg -> base.println (base.show ^logCtx ++ " | " ++ msg))
 }
 (do
-    (with {logCtx {service "shop"}} (mylog (<>logCtx base.unify {}) "single"))
+    (with {logCtx {service "shop"}} (mylog "single"))
     (with {outer {logCtx {service "shop"}}} (
         with {logCtx {requestId 42}} (
-            mylog (<>logCtx base.unify {}) "merged"))))
+            mylog "merged"))))

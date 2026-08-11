@@ -143,10 +143,22 @@ pub fn log(level: LogLevel, message: &str) {
 /// A single context field, pre-rendered for both output shapes.
 /// `terminal` is the `value` rendered for the `k: v` splat; `json` is the
 /// value rendered as a JSON fragment (used verbatim inside the object).
+/// `raw` is the value rendered WITHOUT Text escaping: `terminal`/`json`
+/// escape newlines to `\n` so the splat and the JSON line stay on one line,
+/// while `raw` preserves them so a multiline Text field can be shown as an
+/// indented block under the log line on a TTY. JSON output never consults
+/// `raw`.
 pub struct CtxField {
     pub name: String,
     pub terminal: String,
     pub json: String,
+    pub raw: String,
+}
+
+impl CtxField {
+    fn is_multiline(&self) -> bool {
+        self.raw.contains('\n')
+    }
 }
 
 /// Emit one structured log line in the unified shape:
@@ -157,6 +169,20 @@ pub struct CtxField {
 /// `debug`-level lines are gated on `--debug`. The whole line is built in a
 /// single buffer and written with ONE locked `writeln!`, so concurrent
 /// threads never interleave bytes *within* a line.
+///
+/// A context field whose `raw` rendering contains a newline is lifted out of
+/// the terminal splat and printed as an indented block beneath the log line
+/// (single-line fields keep the inline `k=v` splat, in order):
+///
+///   HH:MM:SS+03:00  ERROR  failed to compile module
+///     source
+///     │ fn main =
+///     │   let x = 1 in
+///     │   x
+///
+/// JSON output is unaffected: the value stays a `\n`-escaped string on the
+/// single emitted line. Multiline blocks follow the line inside the same
+/// locked write, so the record still lands atomically.
 pub fn emit(level_tag: &str, msg: &str, ctx: Vec<CtxField>) {
     let level = match level_tag {
         "Debug" => LogLevel::Debug,
@@ -191,13 +217,20 @@ pub fn emit(level_tag: &str, msg: &str, ctx: Vec<CtxField>) {
             level.label(),
             msg
         );
-        if !ctx.is_empty() {
-            let splat = ctx
+        let single: Vec<&CtxField> = ctx.iter().filter(|f| !f.is_multiline()).collect();
+        if !single.is_empty() {
+            let splat = single
                 .iter()
                 .map(|f| format!("{}={}", f.name, f.terminal))
                 .collect::<Vec<_>>()
                 .join(" ");
             let _ = write!(line, "  {DIM}{splat}{RESET}");
+        }
+        for f in ctx.iter().filter(|f| f.is_multiline()) {
+            let _ = write!(line, "\n  {DIM}{}{RESET}", f.name);
+            for value_line in f.raw.lines() {
+                let _ = write!(line, "\n  {DIM}│{RESET} {DIM}{value_line}{RESET}");
+            }
         }
     } else {
         let ts = std::time::SystemTime::now()

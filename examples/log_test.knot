@@ -3,4 +3,10 @@
   base.warn "something looks fishy"
   base.error "something is broken"
   base.debug "verbose details (only with --debug)"
+  with {logCtx {availableMb 64}}
+    (base.warn "low memory")
+  with {logCtx {source "fn main =\n  let x = 1 in\n  x" error "type mismatch at line 2" availableMb 64}}
+    (base.error "failed to compile module")
+  with {logCtx {event "shutdown"}}
+    (base.info "bye")
   base.println "done")

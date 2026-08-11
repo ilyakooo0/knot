@@ -14,7 +14,7 @@ use std::process::Command;
 /// Locate the workspace `knot` compiler binary. Cargo sets
 /// `CARGO_BIN_EXE_<name>` for binaries in the *same* package, but knot lives
 /// in a sibling crate, so resolve it from the target dir.
-fn knot_bin() -> PathBuf {
+pub fn knot_bin() -> PathBuf {
     // tests run with CWD = the crate dir (crates/knot-jit)
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop(); // crates/
@@ -80,6 +80,13 @@ pub fn assert_stdout(name: &str, src: &str, expected: &str) {
 pub fn build_program(name: &str, src: &str) -> (PathBuf, PathBuf) {
     let dir = std::env::temp_dir().join(format!("knot_e2e_{}_{}", name, std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    build_in_dir(name, src, &dir);
+    (dir.join(name), dir)
+}
+
+/// Build `src` as `dir/name`, reusing `dir` (so a later binary shares the
+/// same `<db>` files as an earlier one — for schema-evolution tests).
+pub fn build_in_dir(name: &str, src: &str, dir: &Path) {
     let src_path = dir.join(format!("{name}.knot"));
     std::fs::write(&src_path, src).unwrap();
     let bin_path = dir.join(name);
@@ -95,5 +102,20 @@ pub fn build_program(name: &str, src: &str) -> (PathBuf, PathBuf) {
         "knot build failed for {name}:\n{}",
         String::from_utf8_lossy(&build.stderr)
     );
-    (bin_path, dir)
+}
+
+/// Run an already-built binary in `dir`, returning trimmed stdout.
+pub fn run_bin(bin: &Path, dir: &Path) -> String {
+    let out = Command::new(bin)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run binary");
+    assert!(
+        out.status.success(),
+        "binary {} exited {:?}\nstderr:\n{}",
+        bin.display(),
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim_end().to_string()
 }

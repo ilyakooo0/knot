@@ -60,6 +60,39 @@ fn file_write_read_roundtrip() {
 }
 
 #[test]
+fn morph_resolution() {
+    // `(^into)` resolves against an annotated toplevel binding's declared
+    // type, via base.morph.<from>To<to>.into.
+    assert_stdout(
+        "morph",
+        r#"with {
+asInt : Maybe (Int 1)
+asInt ((^into) "42")
+asText : Text
+asText ((^into) 7)
+}
+(do
+  base.println (base.show asInt)
+  base.println asText
+  yield {})"#,
+        "\"Just {value: 42}\"\n\"7\"\n{}",
+    );
+}
+
+#[test]
+fn traverse_io() {
+    // Only IO is a supported traverse applicative.
+    assert_stdout(
+        "traverse",
+        r#"(do
+  r <- (base.traverse (\n -> base.println (base.show (n * 2))) [1 2])
+  base.println (base.show r)
+  yield {})"#,
+        "\"2\"\n\"4\"\n\"[{}, {}]\"\n{}",
+    );
+}
+
+#[test]
 fn atomic_transfer() {
     // `atomic do ...` returns the relation written; bind it (or `_`) so the
     // enclosing do-block's value isn't the relation.

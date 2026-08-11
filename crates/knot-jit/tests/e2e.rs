@@ -11,6 +11,40 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// A knot-e2e working dir that deletes itself (and the ~200MB binary inside)
+/// on drop. Without this, repeated test runs fill the disk.
+pub struct TempDir(pub PathBuf);
+
+impl TempDir {
+    pub fn fresh(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "knot_e2e_{}_{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir); // clear any stale same-pid dir
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// Locate the workspace `knot` compiler binary. Cargo sets
 /// `CARGO_BIN_EXE_<name>` for binaries in the *same* package, but knot lives
 /// in a sibling crate, so resolve it from the target dir.
@@ -30,12 +64,7 @@ pub fn knot_bin() -> PathBuf {
 /// (stdout, stderr, exit_code). The program runs with the temp dir as CWD so
 /// any `<name>.db` it creates is isolated and removed on cleanup.
 pub fn run_program(name: &str, src: &str) -> (String, String, i32) {
-    let dir = std::env::temp_dir().join(format!(
-        "knot_e2e_{}_{}",
-        name,
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TempDir::fresh(name); // removed (with the binary) on return
     let src_path = dir.join(format!("{name}.knot"));
     std::fs::write(&src_path, src).unwrap();
     let bin_path = dir.join(name);
@@ -54,7 +83,7 @@ pub fn run_program(name: &str, src: &str) -> (String, String, i32) {
     );
 
     let run = Command::new(&bin_path)
-        .current_dir(&dir)
+        .current_dir(dir.path())
         .output()
         .expect("failed to run compiled program");
     let stdout = String::from_utf8_lossy(&run.stdout).to_string();
@@ -75,12 +104,12 @@ pub fn assert_stdout(name: &str, src: &str, expected: &str) {
     );
 }
 
-/// Build a program without running it, returning the binary path and its
-/// working dir (caller runs it — e.g. a long-lived HTTP server).
-pub fn build_program(name: &str, src: &str) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("knot_e2e_{}_{}", name, std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    build_in_dir(name, src, &dir);
+/// Build a program without running it. The caller owns the returned TempDir —
+/// run the binary (e.g. a long-lived HTTP server) and let the dir drop to
+/// remove the binary.
+pub fn build_program(name: &str, src: &str) -> (PathBuf, TempDir) {
+    let dir = TempDir::fresh(name);
+    build_in_dir(name, src, dir.path());
     (dir.join(name), dir)
 }
 

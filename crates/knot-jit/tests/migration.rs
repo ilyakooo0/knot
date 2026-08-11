@@ -9,18 +9,16 @@
 //! upgraded.
 
 mod e2e;
-use e2e::{build_in_dir, knot_bin, run_bin};
+use e2e::{build_in_dir, knot_bin, run_bin, TempDir};
 
-fn dir_for(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("knot_e2e_{}_{}", name, std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn dir_for(name: &str) -> TempDir {
+    TempDir::fresh(name)
 }
 
 /// Build `src` as `dir/<name>` and run it, returning trimmed stdout.
-fn build_and_run(dir: &std::path::Path, name: &str, src: &str) -> String {
-    build_in_dir(name, src, dir);
-    run_bin(&dir.join(name), dir)
+fn build_and_run(dir: &TempDir, name: &str, src: &str) -> String {
+    build_in_dir(name, src, dir.path());
+    run_bin(&dir.join(name), dir.path())
 }
 
 #[test]

@@ -11,7 +11,7 @@ use std::time::Duration;
 fn with_server(name: &str, src: &str, port: u16, f: impl FnOnce(&str)) {
     let (bin, dir) = build_program(name, src);
     let mut child = Command::new(&bin)
-        .current_dir(&dir)
+        .current_dir(dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

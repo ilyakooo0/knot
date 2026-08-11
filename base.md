@@ -364,8 +364,7 @@ record is one line.
 
 The runtime's own events (HTTP serve-loop errors, migrations, watcher panics)
 emit through the same machinery, so in JSON mode every stderr line is a
-well-formed record. `base.logInfo`/`logWarn`/`logError`/`logDebug` are
-deprecated aliases kept for source compatibility.
+well-formed record.
 
 ### `base.show`
 

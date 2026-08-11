@@ -636,8 +636,6 @@ A context field whose value contains a newline renders on a TTY as a guttered
 block beneath the log line (single-line fields stay inline as `k=v`); in JSON
 mode the value stays `\n`-escaped on the single emitted line.
 
-`logInfo`/`logWarn`/`logError`/`logDebug` are deprecated aliases.
-
 ### `show`
 
 ```

@@ -120,7 +120,7 @@ pub fn log(level: LogLevel, message: &str) {
     if stderr.is_terminal() {
         let _ = writeln!(
             handle,
-            "{} {}{}\x1b[0m {}",
+            "\x1b[90m{}\x1b[0m  \x1b[1m{}{:<5}\x1b[0m  \x1b[97m{}\x1b[0m",
             local_time_string(),
             level.color(),
             level.label(),
@@ -174,9 +174,18 @@ pub fn emit(level_tag: &str, msg: &str, ctx: Vec<CtxField>) {
 
     if stderr.is_terminal() {
         use std::fmt::Write;
+        // Glanceable layout, columns aligned by the fixed-width level:
+        //   <dim>HH:MM:SS±HH:MM</>  <bold color>LEVEL</>  <bright>msg</>  <dim>k=v k=v</>
+        // Timestamp and ctx recede (dim); the level's color + bold catches the
+        // eye; the message is the brightest thing on the line. ctx is dim
+        // space-separated `k=v` (grep-able) instead of `{k: v, k: v}`.
+        const DIM: &str = "\x1b[90m";
+        const BOLD: &str = "\x1b[1m";
+        const BRIGHT: &str = "\x1b[97m";
+        const RESET: &str = "\x1b[0m";
         let _ = write!(
             line,
-            "{} {}{}\x1b[0m {}",
+            "{DIM}{}{RESET}  {BOLD}{}{:<5}{RESET}  {BRIGHT}{}{RESET}",
             local_time_string(),
             level.color(),
             level.label(),
@@ -185,10 +194,10 @@ pub fn emit(level_tag: &str, msg: &str, ctx: Vec<CtxField>) {
         if !ctx.is_empty() {
             let splat = ctx
                 .iter()
-                .map(|f| format!("{}: {}", f.name, f.terminal))
+                .map(|f| format!("{}={}", f.name, f.terminal))
                 .collect::<Vec<_>>()
-                .join(", ");
-            let _ = write!(line, " {{{splat}}}");
+                .join(" ");
+            let _ = write!(line, "  {DIM}{splat}{RESET}");
         }
     } else {
         let ts = std::time::SystemTime::now()

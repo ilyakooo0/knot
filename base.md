@@ -52,9 +52,9 @@ Map an effectful/partial function over each row, sequencing the results
 
 ### `base.bind`
 ```
-base.bind : [a] -> (a -> [b]) -> [b]
+base.bind : (a -> [b]) -> [a] -> [b]
 ```
-Relation flatMap.
+Relation flatMap (function first, then the relation).
 
 ### `base.forEach`
 ```
@@ -82,16 +82,18 @@ Sum of a numeric relation, preserving the unit.
 
 ### `base.avg`
 ```
-base.avg : [Float u] -> Float u
+base.avg : (a -> Float u) -> [a] -> Float u
 ```
-Mean of a numeric relation.
+Mean of the projected key across rows.
 
 ### `base.minOn` / `base.maxOn`
 ```
-base.minOn : (a -> b) -> [a] -> Maybe a
-base.maxOn : (a -> b) -> [a] -> Maybe a
+base.minOn : (a -> b) -> [a] -> b
+base.maxOn : (a -> b) -> [a] -> b
 ```
-Row with the smallest/largest projected key; `Nothing` on empty.
+The smallest/largest projected key (the key, not the row). **Aborts the
+program on an empty relation** — there is no `Nothing` case; guard with
+`base.count`/non-emptiness first.
 
 ### `base.min` / `base.max`
 ```
@@ -123,9 +125,9 @@ An arbitrary row (relations are unordered), `Nothing` on empty.
 
 ### `base.findFirst`
 ```
-base.findFirst : (a -> Bool) -> [a] -> Maybe a
+base.findFirst : [a] -> (a -> Bool) -> Maybe a
 ```
-An arbitrary row satisfying the predicate.
+An arbitrary row satisfying the predicate (relation-first arg order).
 
 ### `base.any` / `base.all`
 ```
@@ -170,9 +172,10 @@ Keep / skip the first *n* rows (only meaningful on a sorted relation).
 
 ### `base.reverse`
 ```
-base.reverse : [a] -> [a]
+base.reverse : Text -> Text
 ```
-Reverse the iteration order of a sorted relation.
+Reverse a text. (Relations are unordered, so there is no relation `reverse`;
+order a relation with `sortBy`/`sortByDesc` instead.)
 
 ### `base.upsertBy`
 ```

@@ -488,6 +488,91 @@ Every function's type records what it can do. `base.println` returns
 so the compiler *rejects* a `println` inside it. You don't write these
 annotations — they're inferred.
 
+### Nested relations
+
+A record field can itself hold a relation — `[T]` nested inside a row. Nested
+relations persist as JSON in SQLite and are queryable by binding into the
+field (`m <- team.members`), so a hierarchy (a team and its members) lives in
+one row. See `examples/nested.knot`.
+
+### Grouping — `groupBy`
+
+Inside a comprehension, `groupBy {key row.field}` partitions a relation by the
+key fields; after it, the bound variable becomes the sub-relation for that
+group, so aggregates apply per-group:
+
+```knot
+(do
+  t <- *todos
+  where t.done == 0
+  groupBy {owner t.owner}
+  yield {owner t.owner count (base.count t)})
+```
+
+Multiple keys (`groupBy {region o.region status o.status}`) nest the grouping.
+Pushed down to `GROUP BY` when the query is translatable. See
+`examples/groupby.knot`.
+
+### Pipe-forward — `|>`
+
+`x |> f |> g` is `g (f x)` — function composition read left to right, the
+idiomatic way to chain relation combinators:
+
+```knot
+yield (employees
+  |> base.filter (\e -> e.salary > 150000)
+  |> base.map (\e -> {name e.name salary e.salary}))
+```
+
+### Higher-rank types — `forall`
+
+A `forall a. T` in a function-*argument* signature makes the argument itself
+polymorphic (rank-2): the caller passes a function that works for *any* type,
+and the callee picks the type at each use:
+
+```knot
+with {
+applyTwice (\(f : (forall a. a -> a)) -> {asText (f "text") asInt (f 42)})
+}
+(do
+  with { r (applyTwice (\y -> y)) }
+    (base.println (r.asText ++ " and " ++ base.show r.asInt)))
+-- "text and 42"
+```
+
+An ordinary inferred function is monomorphic once inferred; only a
+`forall`-typed parameter lets the callee instantiate it at several types. See
+`examples/forall.knot`.
+
+### Type-directed conversions — `base.morph`
+
+`base.morph` is a nested record of conversions keyed by source then target
+type — `base.morph.textToInt.into : Text -> Maybe (Int 1)`. It's consumed by
+the `^into` implicit-field projection, which resolves the conversion by *both*
+the argument's type and the expected result type:
+
+```knot
+asInt : Text -> Maybe (Int 1)
+asInt (\s -> (^into) s)     -- resolves base.morph.textToInt.into
+```
+
+See `base.md` §Morphs and `examples/morph.knot`.
+
+### Filtering a relation by variant — `base.match`
+
+`base.match (Ctor {}) rows` keeps only the rows of an ADT relation built with
+`Ctor`, returning their payloads — the cross-variant query over a mixed
+relation. See `base.md`.
+
+### Collecting folds — `(<>field) =>`
+
+The sibling of the `(^field)` dictionary constraint: a `(<>field)` constraint
+collects *every* in-scope `field` at the call site and merges them
+(innermost-wins), passing the merged record as a hidden argument. This is how
+structured-logging context threads through: `base.info` declares
+`(<>logCtx)`, so `with {logCtx {...}}` blocks accumulate context that the
+logger attaches automatically. See `examples/fold_dictionaries.knot`.
+
 ### Handy builtins (the `base.` namespace)
 
 ```knot
@@ -645,8 +730,9 @@ headers: Type}`, a `={body: Type}`, and a `-> Response` type. A trailing
 returns `{body, headers}`). `serve Name where Ctor = handler` type-checks
 every handler against the declared method/path/body/query/headers/response
 with full exhaustiveness, and `base.listen 8080 srv` runs the server.
-Per-route `rateLimit {key, limit: {requests, window}}` is built in. See
-`examples/routes.knot` and `examples/apiserver.knot`.
+Per-route `rateLimit {key, limit: {requests, window}}` is built in. Routes
+compose: shared path prefixes factor out, and several `api` blocks merge into
+one server. See `examples/routes.knot` and `examples/apiserver.knot`.
 
 **Refined types.** `type Port = Int 1 where \p -> p > 0 && p < 65536` is a
 nominal type whose predicate is checked at boundaries — relation writes,

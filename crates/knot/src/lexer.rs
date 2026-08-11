@@ -88,19 +88,20 @@ pub enum TokenKind {
     Colon,
     Pipe,
     Backslash,
-    /// `\/` — effect-row union in IO type syntax.
+    /// `\\/` — effect-row union in IO type syntax.
     BackslashSlash,
     Ampersand,
     At,
     Underscore,
     Question,
-
-    // Layout
     Newline,
     Semicolon,
-
-    // End
     Eof,
+
+    /// `---` documentation comment. Carries the markdown text of one doc line
+    /// (`--- text`) or one whole doc block (`---`-only open … `---`-only
+    /// close). Attached by the parser to the immediately-following declaration.
+    Doc(String),
 }
 
 impl TokenKind {
@@ -172,6 +173,7 @@ impl TokenKind {
             TokenKind::Newline => "newline",
             TokenKind::Semicolon => "';'",
             TokenKind::Eof => "end of file",
+            TokenKind::Doc(_) => "documentation comment",
         }
     }
 
@@ -264,12 +266,104 @@ impl<'src> Lexer<'src> {
             self.pos += 3;
         }
 
+        // Block-comment toggles: a line holding ONLY a bare `--` (no text) opens
+        // or closes a block comment; a line holding ONLY a bare `---` opens or
+        // closes a documentation block. Neither emits a token for its own line.
+        let mut in_block_comment = false;
+        let mut in_doc_block = false;
+
         loop {
             self.skip_whitespace();
 
-            // Comments: `--` to end of line
+            // Comments: `--` line/block, `---` doc line/block.
             if self.check(b'-') && self.peek_at(1) == Some(b'-') {
+                let is_doc = self.peek_at(2) == Some(b'-');
+                let marker_len = if is_doc { 3 } else { 2 };
+                let after = self.pos + marker_len;
+                // A bare marker (only whitespace then a line end / EOF) toggles a
+                // block. Anything else on the line is a line comment / doc line.
+                if self.only_blank_until_line_end(after) {
+                    if is_doc {
+                        in_doc_block = !in_doc_block;
+                    } else {
+                        in_block_comment = !in_block_comment;
+                    }
+                    self.skip_line_comment();
+                    continue;
+                }
+                if is_doc {
+                    // `--- text`: a one-line doc comment; emit a Doc token.
+                    let start = self.pos;
+                    let text = self.take_line_comment_text(marker_len);
+                    tokens.push(Token {
+                        kind: TokenKind::Doc(text),
+                        span: self.span_from(start),
+                    });
+                    continue;
+                }
+                // `-- text`: an ordinary line comment — skip it.
                 self.skip_line_comment();
+                continue;
+            }
+
+            // Inside a block comment, swallow everything until the closing bare
+            // `--` line (handled above, so this branch just skips content).
+            if in_block_comment {
+                if self.at_end() {
+                    self.diagnostics.push(
+                        Diagnostic::error("unterminated block comment")
+                            .label(self.span_from(self.pos), "block comment opened here never closed"),
+                    );
+                    break;
+                }
+                self.advance();
+                continue;
+            }
+
+            // Inside a doc block, accumulate lines into a single Doc token until
+            // the closing bare `---` line.
+            if in_doc_block {
+                if self.at_end() {
+                    self.diagnostics.push(
+                        Diagnostic::error("unterminated documentation block")
+                            .label(self.span_from(self.pos), "doc block opened here never closed"),
+                    );
+                    break;
+                }
+                let block_start = self.pos;
+                let mut text = String::new();
+                loop {
+                    self.skip_whitespace();
+                    if self.check(b'-')
+                        && self.peek_at(1) == Some(b'-')
+                        && self.peek_at(2) == Some(b'-')
+                        && self.only_blank_until_line_end(self.pos + 3)
+                    {
+                        in_doc_block = false;
+                        self.skip_line_comment();
+                        break;
+                    }
+                    if self.at_end() {
+                        in_doc_block = false;
+                        break;
+                    }
+                    let line = self.take_line_comment_text(0);
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&line);
+                    // consume the newline (or EOF)
+                    if matches!(self.peek(), Some(b'\n') | Some(b'\r')) {
+                        self.advance();
+                    }
+                }
+                let trimmed = text.trim_end().to_string();
+                if !trimmed.is_empty() {
+                    tokens.push(Token {
+                        kind: TokenKind::Doc(trimmed),
+                        span: self.span_from(block_start),
+                    });
+                }
                 continue;
             }
 
@@ -395,6 +489,45 @@ impl<'src> Lexer<'src> {
             }
             self.advance();
         }
+    }
+
+    /// Whether the bytes from `pos` to the end of the current line are only
+    /// spaces/tabs (i.e. the marker at `pos` is bare — nothing but blank space
+    /// follows it before the line ends or the file does). Used to distinguish a
+    /// block-comment toggle (`--` alone) from a line comment (`-- text`).
+    fn only_blank_until_line_end(&self, pos: usize) -> bool {
+        let mut i = pos;
+        while i < self.bytes.len() {
+            match self.bytes[i] {
+                b' ' | b'\t' => i += 1,
+                b'\n' | b'\r' => return true,
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Consume the rest of the current line starting `marker_len` bytes ahead
+    /// (skipping one leading space after the marker) and return its text with
+    /// surrounding whitespace trimmed. Leaves the terminating newline for the
+    /// main loop. Used to capture doc-comment / doc-block line contents.
+    fn take_line_comment_text(&mut self, marker_len: usize) -> String {
+        for _ in 0..marker_len {
+            self.advance();
+        }
+        // Skip a single leading space after the marker (markdown body starts
+        // after `-- ` / `--- `), but preserve deeper indentation.
+        if self.peek() == Some(b' ') {
+            self.advance();
+        }
+        let start = self.pos;
+        while let Some(b) = self.peek() {
+            if b == b'\n' || b == b'\r' {
+                break;
+            }
+            self.advance();
+        }
+        self.source[start..self.pos].trim().to_string()
     }
 
     // ── Main dispatch ───────────────────────────────────────────────
@@ -1057,4 +1190,75 @@ impl<'src> Lexer<'src> {
 
 // ── Tests ───────────────────────────────────────────────────────────
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kinds(src: &str) -> Vec<TokenKind> {
+        Lexer::new(src).tokenize().0.into_iter().map(|t| t.kind).collect()
+    }
+
+    fn has_doc(kinds: &[TokenKind], needle: &str) -> bool {
+        kinds.iter().any(|k| matches!(k, TokenKind::Doc(d) if d.contains(needle)))
+    }
+
+    #[test]
+    fn line_comment_skipped() {
+        let k = kinds("x -- a comment\ny");
+        assert!(k.iter().all(|t| !matches!(t, TokenKind::Doc(_))));
+        assert!(kinds("x -- a comment\ny").iter().any(|t| matches!(t, TokenKind::Lower(n) if n == "y")));
+    }
+
+    #[test]
+    fn doc_line_comment() {
+        let k = kinds("--- adds two numbers\nadd");
+        assert!(has_doc(&k, "adds two numbers"));
+    }
+
+    #[test]
+    fn block_comment_toggle() {
+        // bare `--` opens and closes; the middle is swallowed entirely.
+        let k = kinds("a\n--\nthis is hidden\nso is this\n--\nb");
+        assert!(k.iter().any(|t| matches!(t, TokenKind::Lower(n) if n == "a")));
+        assert!(k.iter().any(|t| matches!(t, TokenKind::Lower(n) if n == "b")));
+        assert!(k.iter().all(|t| !matches!(t, TokenKind::Lower(n) if n == "this" || n == "hidden")));
+    }
+
+    #[test]
+    fn doc_block_toggle() {
+        let k = kinds("---\n# Title\n\nSome *markdown* docs.\n---\nadd");
+        assert!(has_doc(&k, "# Title"));
+        assert!(has_doc(&k, "Some *markdown* docs."));
+    }
+
+    #[test]
+    fn doc_block_multiline_single_token() {
+        let k = kinds("---\nline one\nline two\n---\nadd");
+        // One merged Doc token containing both lines.
+        let docs: Vec<_> = k.iter().filter_map(|t| match t {
+            TokenKind::Doc(d) => Some(d.clone()),
+            _ => None,
+        }).collect();
+        assert_eq!(docs.len(), 1);
+        assert!(docs[0].contains("line one") && docs[0].contains("line two"));
+    }
+
+    #[test]
+    fn consecutive_doc_lines_separate_tokens() {
+        // The parser merges consecutive Doc tokens; the lexer emits one per line.
+        let k = kinds("--- first\n--- second\nadd");
+        let n = k.iter().filter(|t| matches!(t, TokenKind::Doc(_))).count();
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn marker_with_text_is_not_a_toggle() {
+        // `-- text` is a line comment, NOT a block opener.
+        let k = kinds("-- just a comment\nfoo");
+        assert!(k.iter().any(|t| matches!(t, TokenKind::Lower(n) if n == "foo")));
+        // `--- text` is a doc line, NOT a doc-block opener.
+        let k2 = kinds("--- a doc line\nbar");
+        assert!(k2.iter().any(|t| matches!(t, TokenKind::Lower(n) if n == "bar")));
+    }
+}
 

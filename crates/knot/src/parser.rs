@@ -2322,8 +2322,24 @@ impl Parser {
         // the sig-line layout is preserved through the formatter.
         let mut fields: Vec<RecordField> = Vec::new();
         let mut pending_sigs: Vec<(Name, TypeScheme)> = Vec::new();
+        // Markdown docs from `---` doc comments, accumulated until attached to
+        // the immediately-following field. Consecutive doc lines/blocks merge
+        // into one block separated by a blank line.
+        let mut pending_doc: Option<String> = None;
         loop {
             self.skip_newlines();
+            // Collect any `---` doc tokens preceding the next field.
+            while let TokenKind::Doc(d) = self.peek().clone() {
+                self.advance();
+                match &mut pending_doc {
+                    Some(acc) => {
+                        acc.push_str("\n\n");
+                        acc.push_str(&d);
+                    }
+                    None => pending_doc = Some(d),
+                }
+                self.skip_newlines();
+            }
             if self.at(&TokenKind::RBrace) {
                 break;
             }
@@ -2375,6 +2391,7 @@ impl Parser {
                         },
                     ),
                     sig: None,
+                    doc: pending_doc.take(),
                 });
                 continue;
             }
@@ -2422,6 +2439,7 @@ impl Parser {
                         },
                     ),
                     sig: None,
+                    doc: pending_doc.take(),
                 });
                 continue;
             }
@@ -2460,6 +2478,7 @@ impl Parser {
                         aspan,
                     ),
                     sig: None,
+                    doc: pending_doc.take(),
                 });
                 continue;
             }
@@ -2534,6 +2553,7 @@ impl Parser {
                             Span::new(sspan.start, end.end),
                         ),
                         sig: None,
+                        doc: pending_doc.take(),
                     });
                     continue;
                 }
@@ -2569,6 +2589,7 @@ impl Parser {
                                 sspan,
                             ),
                             sig: None,
+                            doc: pending_doc.take(),
                         });
                         continue;
                     }
@@ -2590,6 +2611,7 @@ impl Parser {
                             sspan,
                         ),
                         sig: None,
+                        doc: pending_doc.take(),
                     });
                     continue;
                 }
@@ -2612,6 +2634,7 @@ impl Parser {
                             sspan,
                         ),
                         sig: None,
+                        doc: pending_doc.take(),
                     });
                     continue;
                 }
@@ -2662,6 +2685,7 @@ impl Parser {
                             sspan,
                         ),
                         sig: None,
+                        doc: pending_doc.take(),
                     });
                     continue;
                 }
@@ -2701,6 +2725,7 @@ impl Parser {
                     name: tname.clone(),
                     value: Spanned::new(ExprKind::Constructor(tname), tspan),
                     sig: None,
+                    doc: pending_doc.take(),
                 });
                 continue;
             }
@@ -2745,6 +2770,7 @@ impl Parser {
                 name: fname,
                 value,
                 sig,
+                doc: pending_doc.take(),
             });
         }
 
@@ -2758,6 +2784,7 @@ impl Parser {
                 name: sname,
                 value: Spanned::new(ExprKind::Record(Vec::new()), start),
                 sig: Some(sty),
+                doc: None,
             });
         }
 

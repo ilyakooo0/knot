@@ -252,6 +252,7 @@ pub(crate) fn prelude_base_record() -> ast::Expr {
                             dummy_span,
                         ),
                         sig: None,
+                        doc: None,
                     });
                 }
             }

@@ -20735,6 +20735,153 @@ pub extern "C-unwind" fn knot_api_register(
     API_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push((name, SendPtr(cloned)));
 }
 
+// ── Documentation comments (`---`) ─────────────────────────────────────────
+//
+// Attached `---` doc comments are embedded into the compiled binary as
+// (decl_name, markdown) pairs registered at startup via `knot_doc_add`. The
+// `<program> docs` subcommand prints them all and exits without running main.
+
+static DOC_REGISTRY: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_doc_add(
+    name_ptr: *const u8,
+    name_len: usize,
+    md_ptr: *const u8,
+    md_len: usize,
+) {
+    let name = unsafe { str_from_raw(name_ptr, name_len) }.to_string();
+    let md = unsafe { str_from_raw(md_ptr, md_len) }.to_string();
+    DOC_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push((name, md));
+}
+
+/// Render one line of markdown with light terminal syntax highlighting.
+/// Headings bold, code spans/fences cyan, bold/emphasis preserved via ANSI.
+/// Plain lines pass through unchanged. Only used on a TTY.
+fn highlight_md_line(line: &str, out: &mut String) {
+    use std::fmt::Write;
+    const RESET: &str = "\x1b[0m";
+    const BOLD: &str = "\x1b[1m";
+    const DIM: &str = "\x1b[2m";
+    const CYAN: &str = "\x1b[36m";
+    const ITALIC: &str = "\x1b[3m";
+
+    let trimmed = line.trim_start();
+    // Fenced code block markers — dim the fence itself.
+    if trimmed.starts_with("```") {
+        let _ = write!(out, "{DIM}{line}{RESET}");
+        return;
+    }
+    // ATX headings — bold, strip nothing (keep the # for structure).
+    if trimmed.starts_with('#') {
+        let _ = write!(out, "{BOLD}{line}{RESET}");
+        return;
+    }
+    // List bullets — color the marker, keep the text.
+    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        let indent = &line[..line.len() - trimmed.len()];
+        let _ = write!(out, "{indent}{CYAN}-{RESET} ");
+        highlight_inline(rest, out);
+        return;
+    }
+    highlight_inline(line, out);
+}
+
+/// Inline markdown: `code` → cyan, **bold** → bold, *em* → italic.
+fn highlight_inline(text: &str, out: &mut String) {
+    use std::fmt::Write;
+    const RESET: &str = "\x1b[0m";
+    const BOLD: &str = "\x1b[1m";
+    const CYAN: &str = "\x1b[36m";
+    const ITALIC: &str = "\x1b[3m";
+
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let n = bytes.len();
+    while i < n {
+        // `code span`
+        if bytes[i] == b'`' {
+            if let Some(end) = text[i + 1..].find('`') {
+                let code = &text[i + 1..i + 1 + end];
+                let _ = write!(out, "{CYAN}{code}{RESET}");
+                i += 1 + end + 1;
+                continue;
+            }
+        }
+        // **bold**
+        if bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'*' {
+            if let Some(end) = text[i + 2..].find("**") {
+                let inner = &text[i + 2..i + 2 + end];
+                let _ = write!(out, "{BOLD}{inner}{RESET}");
+                i += 2 + end + 2;
+                continue;
+            }
+        }
+        // *em* (single star, not followed by another star)
+        if bytes[i] == b'*' && (i + 1 >= n || bytes[i + 1] != b'*') {
+            if let Some(end) = text[i + 1..].find('*') {
+                let inner = &text[i + 1..i + 1 + end];
+                let _ = write!(out, "{ITALIC}{inner}{RESET}");
+                i += 1 + end + 1;
+                continue;
+            }
+        }
+        let _ = write!(out, "{}", bytes[i] as char);
+        i += 1;
+    }
+}
+
+/// Handle `<program> docs` subcommand: print all embedded doc comments as
+/// markdown, syntax-highlighted when stdout is a terminal. Returns 1 if
+/// handled (caller should exit), 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_docs_handle(argc: i32, argv: *const *const u8) -> i32 {
+    if argc < 2 {
+        return 0;
+    }
+    let arg1 = unsafe {
+        let ptr = *argv.add(1);
+        let mut len = 0;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf8_lossy(std::slice::from_raw_parts(ptr, len)).to_string()
+    };
+    if arg1 != "docs" {
+        return 0;
+    }
+
+    let docs = DOC_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let is_tty = std::io::IsTerminal::is_terminal(&stdout);
+    let mut handle = stdout.lock();
+
+    if docs.is_empty() {
+        let _ = writeln!(handle, "No documentation comments (`---`) in this program.");
+        return 1;
+    }
+
+    for (name, md) in docs.iter() {
+        if is_tty {
+            // Bold decl name as a heading, then the highlighted markdown body.
+            let _ = writeln!(handle, "\x1b[1m\x1b[34m## {name}\x1b[0m");
+            for line in md.lines() {
+                let mut rendered = String::new();
+                highlight_md_line(line, &mut rendered);
+                let _ = writeln!(handle, "{rendered}");
+            }
+            let _ = writeln!(handle);
+        } else {
+            let _ = writeln!(handle, "## {name}");
+            let _ = writeln!(handle);
+            let _ = writeln!(handle, "{md}");
+            let _ = writeln!(handle);
+        }
+    }
+    1
+}
+
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_api_handle(argc: i32, argv: *const *const u8) -> i32 {
     if argc < 2 {

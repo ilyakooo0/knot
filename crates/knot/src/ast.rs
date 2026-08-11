@@ -583,6 +583,9 @@ pub struct RecordField {
     pub name: Name,
     pub value: Expr,
     pub sig: Option<TypeScheme>,
+    /// Markdown documentation attached via `---` doc comments immediately
+    /// preceding this field. `None` when the field has no doc.
+    pub doc: Option<String>,
 }
 
 /// A migration attached to a record-embedded source field:

@@ -1749,6 +1749,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // DB explorer TUI
         self.declare_rt("knot_db_handle", &[types::I32, p, p, p], &[types::I32]);
 
+        // Documentation comments (`---`), embedded and printed by the `docs`
+        // subcommand. `knot_doc_add(name_ptr, name_len, md_ptr, md_len)`
+        // registers one; `knot_docs_handle(argc, argv)` prints all and returns
+        // non-zero when argv[1] == "docs" so the binary exits without running
+        // main (mirrors knot_api_handle/knot_db_handle).
+        self.declare_rt("knot_doc_add", &[p, p, p, p], &[]);
+        self.declare_rt("knot_docs_handle", &[types::I32, p], &[types::I32]);
+
         // Arena GC — per-iteration reset and frame-based isolation
         self.declare_rt("knot_arena_mark", &[], &[p]);
         self.declare_rt("knot_arena_reset_to", &[p], &[]);
@@ -3909,6 +3917,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let all_routes: Vec<(String, Vec<ast::RouteEntry>)> =
             self.route_entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         let alias_ast = self.alias_ast.clone();
+        // Attached `---` doc comments (`(decl_name, markdown)`), embedded into
+        // the binary so the `docs` subcommand can print them without running
+        // main.
+        let all_docs = collect_docs(program);
 
         self.build_function(main_id, sig, |cg, builder, entry| {
             let argc = builder.block_params(entry)[0];
@@ -3917,6 +3929,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // Register the JIT compile implementation (from the always-linked
             // knot-compile-rt archive) so `base.compile` is live at runtime.
             cg.call_rt_void(builder, "knot_compile_rt_init", &[]);
+
+            // Register attached doc comments so the `docs` subcommand can print
+            // them. Each is (name, markdown) pushed onto the runtime's doc list.
+            for (dname, ddoc) in &all_docs {
+                let (nptr, nlen) = cg.string_ptr(builder, dname);
+                let (dptr, dlen) = cg.string_ptr(builder, ddoc);
+                cg.call_rt_void(builder, "knot_doc_add", &[nptr, nlen, dptr, dlen]);
+            }
 
             // Register route tables for the api command
             let mut route_tables: Vec<(Value, Vec<ast::RouteEntry>)> = Vec::new();
@@ -4001,6 +4021,27 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             builder.switch_to_block(normal_block2);
             builder.seal_block(normal_block2);
+
+            // Check if this is a "docs" command — print the embedded `---` doc
+            // comments and exit without running main.
+            let docs_result = {
+                let func_id = cg.runtime_fns["knot_docs_handle"];
+                let func_ref = cg.module.declare_func_in_func(func_id, builder.func);
+                let call = builder.ins().call(func_ref, &[argc, argv]);
+                builder.inst_results(call)[0]
+            };
+
+            let normal_block3 = builder.create_block();
+            let docs_exit_block = builder.create_block();
+            builder.ins().brif(docs_result, docs_exit_block, &[], normal_block3, &[]);
+
+            builder.switch_to_block(docs_exit_block);
+            builder.seal_block(docs_exit_block);
+            let zero_docs = builder.ins().iconst(types::I32, 0);
+            builder.ins().return_(&[zero_docs]);
+
+            builder.switch_to_block(normal_block3);
+            builder.seal_block(normal_block3);
 
             // Check --debug flag
             let debug_init_ref = cg.import_rt(builder, "knot_debug_init");
@@ -17712,6 +17753,7 @@ fn beta_reduce_inner(
                     name: f.name.clone(),
                     value: beta_reduce_inner(&f.value, fun_bodies, let_bindings, visited, fuel),
                     sig: f.sig.clone(),
+                    doc: f.doc.clone(),
                 })
                 .collect(),
         ),
@@ -17807,6 +17849,7 @@ fn substitute_inner(
                         name: f.name.clone(),
                         value: v,
                         sig: f.sig.clone(),
+                        doc: f.doc.clone(),
                     })
                 })
                 .collect::<Option<Vec<_>>>()?,
@@ -18828,6 +18871,54 @@ fn file_main_body(program: &ast::Expr) -> Option<&ast::Expr> {
     match &program.node {
         ast::ExprKind::Record(_) => None,
         _ => Some(program),
+    }
+}
+
+/// Walk the whole program AST collecting `(decl_name, markdown_doc)` for every
+/// record field that carries an attached `---` doc comment. Nested records
+/// (e.g. `with {outer {…}}`) are recursed into so docs on inner fields are
+/// found too. Order is source order (records are walked in field order).
+fn collect_docs(program: &ast::Expr) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    collect_docs_expr(program, &mut out);
+    out
+}
+
+fn collect_docs_expr(expr: &ast::Expr, out: &mut Vec<(String, String)>) {
+    if let ast::ExprKind::Record(fields) = &expr.node {
+        for f in fields {
+            if let Some(doc) = &f.doc {
+                out.push((f.name.clone(), doc.clone()));
+            }
+            // Recurse into the field's value so docs on nested `with {…}` /
+            // record fields are collected as well.
+            collect_docs_expr(&f.value, out);
+        }
+        return;
+    }
+    // Recurse through the handful of exprs that can wrap a record at the top
+    // level of a decl (`with {…} body`, application heads, etc.).
+    match &expr.node {
+        ast::ExprKind::With { record, body, .. } => {
+            collect_docs_expr(record, out);
+            collect_docs_expr(body, out);
+        }
+        ast::ExprKind::App { func, arg } => {
+            collect_docs_expr(func, out);
+            collect_docs_expr(arg, out);
+        }
+        ast::ExprKind::Lambda { body, .. } => collect_docs_expr(body, out),
+        ast::ExprKind::Do(stmts) => {
+            for s in stmts {
+                match &s.node {
+                    ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Expr(expr) => {
+                        collect_docs_expr(expr, out)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
     }
 }
 

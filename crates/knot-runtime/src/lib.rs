@@ -3242,11 +3242,23 @@ fn select_rows_with_rowid(
     );
     let mut stmt = match conn.prepare_cached(&sql) {
         Ok(s) => s,
-        Err(e) => { eprintln!("knot runtime: select_rows prepare error: {}", e); return None; }
+        Err(e) => {
+            log::log_error(&format!(
+                "knot runtime: select_rows prepare error: {}",
+                json_escape(&e.to_string())
+            ));
+            return None;
+        }
     };
     let mut q = match stmt.query(params) {
         Ok(q) => q,
-        Err(e) => { eprintln!("knot runtime: select_rows query error: {}", e); return None; }
+        Err(e) => {
+            log::log_error(&format!(
+                "knot runtime: select_rows query error: {}",
+                json_escape(&e.to_string())
+            ));
+            return None;
+        }
     };
     let n_cols = selected.len();
     let header: Arc<[ColName]> = selected
@@ -7333,16 +7345,6 @@ pub extern "C-unwind" fn knot_value_neq_i32(a: *mut Value, b: *mut Value) -> i32
     !values_equal(a, b) as i32
 }
 
-/// Diagnostic for null operands in ordered comparisons. Retained for
-/// potential future use; the operator wrappers now delegate to
-/// `compare_values` which handles nulls directly.
-#[allow(dead_code)]
-fn warn_null_comparison(a: *mut Value, b: *mut Value) {
-    eprintln!("knot runtime: comparison with null value (a={}, b={})",
-        if a.is_null() { "null".to_string() } else { brief_value(a) },
-        if b.is_null() { "null".to_string() } else { brief_value(b) });
-}
-
 fn compare_lt(a: *mut Value, b: *mut Value) -> bool {
     // `compare_values` already defines the null-operand policy
     // (null == null → Equal, null < Just x → Less), so no special
@@ -8146,6 +8148,20 @@ fn format_value_field(v: *mut Value) -> String {
     format_value_iter(v, true)
 }
 
+/// Rendering for a structured-log context field's `raw` (multiline block)
+/// form: like `format_value`, but a top-level `Text` is NOT wrapped in
+/// quotes — the block body should read as the raw text the program logged,
+/// one source line per output line. Non-Text values render exactly as
+/// `format_value`.
+fn format_log_raw(v: *mut Value) -> String {
+    if !v.is_null()
+        && let Value::Text(s) = unsafe { as_ref(v) }
+    {
+        return s.to_string();
+    }
+    format_value(v)
+}
+
 /// Escape a Text value so it re-reads as the same string inside a `"..."`
 /// literal. Mirrors the escapes knot's lexer accepts.
 fn extract_escape_text(s: &str) -> String {
@@ -8378,6 +8394,7 @@ pub extern "C-unwind" fn knot_emit_log(
                 name: f.name.to_string(),
                 terminal: format_value_field(f.value),
                 json: value_to_json(f.value),
+                raw: format_log_raw(f.value),
             })
             .collect(),
         _ => Vec::new(),
@@ -8397,6 +8414,7 @@ pub extern "C-unwind" fn knot_emit_log(
                     name: f.name.to_string(),
                     terminal: format_value_field(f.value),
                     json: value_to_json(f.value),
+                    raw: format_log_raw(f.value),
                 });
             }
         }
@@ -10014,19 +10032,40 @@ pub extern "C-unwind" fn knot_trace(
             Value::Text(s) => s.to_string(),
             _ => String::from("`trace` probe"),
         };
-        let (terminal, json) = if arg.is_null() {
-            (String::from("<unavailable>"), String::from("null"))
+        let (terminal, json, raw) = if arg.is_null() {
+            (
+                String::from("<unavailable>"),
+                String::from("null"),
+                String::from("<unavailable>"),
+            )
         } else {
             match unsafe { as_ref(arg) } {
-                Value::Function(_) => (String::from("<function>"), String::from("\"<function>\"")),
-                Value::IO(..) => (String::from("<IO action>"), String::from("\"<IO action>\"")),
-                _ => (format_value(arg), value_to_json(arg)),
+                Value::Function(_) => (
+                    String::from("<function>"),
+                    String::from("\"<function>\""),
+                    String::from("<function>"),
+                ),
+                Value::IO(..) => (
+                    String::from("<IO action>"),
+                    String::from("\"<IO action>\""),
+                    String::from("<IO action>"),
+                ),
+                _ => (
+                    format_value_field(arg),
+                    value_to_json(arg),
+                    format_log_raw(arg),
+                ),
             }
         };
         crate::log::emit(
             "Debug",
             &msg,
-            vec![crate::log::CtxField { name: String::from("value"), terminal, json }],
+            vec![crate::log::CtxField {
+                name: String::from("value"),
+                terminal,
+                json,
+                raw,
+            }],
         );
         arg
     }
@@ -12739,7 +12778,7 @@ pub extern "C-unwind" fn knot_source_migrate(
         None => return,
     }
 
-    eprintln!("Migrating source '{}'...", name);
+    log::log_info(&format!("Migrating source '{}'...", name));
 
     // 1. Read all rows using old schema
     let old_data = knot_source_read(db, name_ptr, name_len, old_schema_ptr, old_schema_len);
@@ -12846,7 +12885,11 @@ pub extern "C-unwind" fn knot_source_migrate(
         );
         debug_sql(&idx_sql);
         if let Err(e) = db_ref.conn.execute_batch(&idx_sql) {
-            eprintln!("knot runtime: warning: failed to create unique index during migration for {}: {}", name, e);
+            log::log_warn(&format!(
+                "knot runtime: failed to create unique index during migration for {}: {}",
+                name,
+                json_escape(&e.to_string())
+            ));
         }
 
         // Insert transformed rows (ADT: constructor values)
@@ -12914,7 +12957,7 @@ pub extern "C-unwind" fn knot_source_migrate(
         notify_relation_changed(name);
     }
 
-    eprintln!("Migrated source '{}': {} rows", name, old_rows.len());
+    log::log_info(&format!("Migrated source '{}': {} rows", name, old_rows.len()));
 }
 
 /// Compute a source's migrated rows *without* persisting them, so the compiler
@@ -17545,10 +17588,10 @@ pub extern "C-unwind" fn knot_atomic_commit(db: *mut c_void) {
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     wake_matching_watchers(&table_clone, &event_clone);
                 })).is_err() {
-                    eprintln!(
+                    log::log_error(&format!(
                         "knot runtime: watcher notification panicked for table '{}', event {:?}",
                         table, event
-                    );
+                    ));
                 }
             }
         });
@@ -19129,7 +19172,7 @@ fn http_serve_loop(
     let table: &'static RouteTable = unsafe { &*(route_table as *const RouteTable) };
     let server = Arc::new(tiny_http::Server::http(&addr)
         .unwrap_or_else(|e| panic!("knot runtime: failed to start HTTP server on {}: {}", addr, e)));
-    eprintln!("Knot HTTP server listening on http://{}", addr);
+    log::log_info(&format!("Knot HTTP server listening on http://{}", addr));
 
     loop {
         // Isolate each request's main-thread allocations in a dedicated
@@ -19146,7 +19189,10 @@ fn http_serve_loop(
         let request = match server.recv() {
             Ok(req) => req,
             Err(e) => {
-                eprintln!("knot runtime: error receiving request: {}", e);
+                log::log_error(&format!(
+                    "knot runtime: error receiving request: {}",
+                    json_escape(&e.to_string())
+                ));
                 ARENA.with(|a| a.borrow_mut().pop_frame());
                 continue;
             }
@@ -19246,8 +19292,8 @@ fn http_serve_loop(
                         // saturating: `max` may be u64::MAX (env override).
                         let mut limited = request.as_reader().take(max.saturating_add(1));
                         if limited.read_to_end(&mut buf).is_err() {
-                            eprintln!(
-                                "knot runtime: error reading request body; rejecting"
+                            log::log_warn(
+                                "knot runtime: error reading request body; rejecting",
                             );
                             let response = tiny_http::Response::from_string("{\"error\":\"bad request\"}")
                                 .with_status_code(400)
@@ -19257,10 +19303,10 @@ fn http_serve_loop(
                             return;
                         }
                         if buf.len() as u64 > max {
-                            eprintln!(
+                            log::log_warn(&format!(
                                 "knot runtime: request body exceeds {} byte limit; rejecting",
                                 max
-                            );
+                            ));
                             let response = tiny_http::Response::from_string("{\"error\":\"payload too large\"}")
                                 .with_status_code(413)
                                 .with_header("Content-Type: application/json".parse::<tiny_http::Header>().unwrap());
@@ -20001,7 +20047,10 @@ fn http_serve_loop(
                                 (500, "internal server error".to_string())
                             };
 
-                            eprintln!("[HTTP] handler panicked: {}", msg);
+                            log::log_error(&format!(
+                                "[HTTP] handler panicked: {}",
+                                json_escape(&msg)
+                            ));
                             let body = format!("{{\"error\":\"{}\"}}", json_escape(&error_msg));
                             let response = tiny_http::Response::from_string(&body)
                                 .with_status_code(status_code)

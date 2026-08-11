@@ -74,3 +74,26 @@ pub fn assert_stdout(name: &str, src: &str, expected: &str) {
         "stdout mismatch for {name}"
     );
 }
+
+/// Build a program without running it, returning the binary path and its
+/// working dir (caller runs it — e.g. a long-lived HTTP server).
+pub fn build_program(name: &str, src: &str) -> (PathBuf, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("knot_e2e_{}_{}", name, std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src_path = dir.join(format!("{name}.knot"));
+    std::fs::write(&src_path, src).unwrap();
+    let bin_path = dir.join(name);
+    let build = Command::new(knot_bin())
+        .arg("build")
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .output()
+        .expect("failed to run knot build");
+    assert!(
+        build.status.success(),
+        "knot build failed for {name}:\n{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    (bin_path, dir)
+}

@@ -93,6 +93,39 @@ fn traverse_io() {
 }
 
 #[test]
+fn compile_result_ok() {
+    assert_stdout(
+        "compile_ok",
+        r#"(case (base.compile "40 + 2" : Result Text (Int 1)) of
+  Result.Ok {value v} -> base.println ("ok: " ++ base.show v)
+  Result.Err {error e} -> base.println ("err: " ++ e))"#,
+        "\"ok: 42\"\n{}",
+    );
+}
+
+#[test]
+fn compile_result_err_on_mismatch() {
+    assert_stdout(
+        "compile_err",
+        r#"(case (base.compile "\"text\"" : Result Text (Int 1)) of
+  Result.Ok {value v} -> base.println "ok"
+  Result.Err {error e} -> base.println "err")"#,
+        "\"err\"\n{}",
+    );
+}
+
+#[test]
+fn compile_err_on_invalid_source() {
+    assert_stdout(
+        "compile_bad",
+        r#"(case (base.compile "1 +" : Result Text (Int 1)) of
+  Result.Ok {value v} -> base.println "ok"
+  Result.Err {error e} -> base.println "err")"#,
+        "\"err\"\n{}",
+    );
+}
+
+#[test]
 fn atomic_transfer() {
     // `atomic do ...` returns the relation written; bind it (or `_`) so the
     // enclosing do-block's value isn't the relation.

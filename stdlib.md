@@ -604,28 +604,39 @@ print : a -> IO {}
 
 Print a value to stdout without a trailing newline.
 
-### `logInfo` / `logWarn` / `logError` / `logDebug`
+### `debug` / `info` / `warn` / `error`
 
 ```
-logInfo  : a -> IO {}
-logWarn  : a -> IO {}
-logError : a -> IO {}
-logDebug : a -> IO {}
+debug : (<>logCtx) => Text -> IO {}
+info  : (<>logCtx) => Text -> IO {}
+warn  : (<>logCtx) => Text -> IO {}
+error : (<>logCtx) => Text -> IO {}
 ```
 
 Leveled logging to stderr (so output does not mix with `println` on stdout).
 When stderr is a TTY, output is colored; otherwise each record is written as
-one JSON line for log aggregators. `logDebug` only emits when the program is
+one JSON line for log aggregators. `debug` only emits when the program is
 launched with `--debug` — debug records are dropped silently otherwise. (Every
 compiled Knot program accepts `--debug` automatically; see
 [Runtime CLI](#runtime-cli).)
 
+Each logger carries a `(<>logCtx)` fold constraint: the compiler merges every
+`logCtx` record in scope at the call site (innermost scope wins) and attaches
+the fields as structured context, so the caller passes only the message.
+
 ```knot
 do
-  base.logInfo "starting"
-  base.logWarn {event "low memory" availableMb 64}
+  base.info "starting"
+  with {logCtx {availableMb 64}}
+    (base.warn "low memory")
   yield {}
 ```
+
+A context field whose value contains a newline renders on a TTY as a guttered
+block beneath the log line (single-line fields stay inline as `k=v`); in JSON
+mode the value stays `\n`-escaped on the single emitted line.
+
+`logInfo`/`logWarn`/`logError`/`logDebug` are deprecated aliases.
 
 ### `show`
 
@@ -1309,7 +1320,7 @@ subcommands without any user wiring:
 
 | Argument | Description |
 |----------|-------------|
-| `--debug` | Enable `logDebug` output; without this flag, `logDebug` calls are dropped silently. |
+| `--debug` | Enable `base.debug` output; without this flag, `base.debug` calls are dropped silently. |
 | `--help` | Print usage including any compile-time overrides exposed by the program. |
 | `--http-max-body-bytes=N` | Cap HTTP request and response bodies. Suffixes: `K`, `M`, `G`. Default `16M`. Applies to both `listen` and `fetch`. |
 | `--<name>=<value>` | Override a compile-time constant. The compiler exposes top-level constants annotated for override; see the program's own `--help`. The same flags may be set at build time via `knot build … --<name>=<value>`. |

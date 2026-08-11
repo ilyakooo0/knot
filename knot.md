@@ -948,10 +948,10 @@ result type (see [base.md](base.md#morphs-basemorph)).
 | `println` | `a -> IO {}` | Print with newline |
 | `print` | `a -> IO {}` | Print without newline |
 | `readLine` | `IO Text` | Read stdin line |
-| `logInfo` | `a -> IO {}` | Leveled log to stderr (INFO) |
-| `logWarn` | `a -> IO {}` | Leveled log to stderr (WARN) |
-| `logError` | `a -> IO {}` | Leveled log to stderr (ERROR) |
-| `logDebug` | `a -> IO {}` | DEBUG; only emits when run with `--debug` |
+| `debug` | `(<>logCtx) => Text -> IO {}` | Leveled log to stderr (DEBUG); only emits when run with `--debug` |
+| `info` | `(<>logCtx) => Text -> IO {}` | Leveled log to stderr (INFO) |
+| `warn` | `(<>logCtx) => Text -> IO {}` | Leveled log to stderr (WARN) |
+| `error` | `(<>logCtx) => Text -> IO {}` | Leveled log to stderr (ERROR) |
 | `readFile` | `Text -> IO Text` | Read file |
 | `writeFile` | `Text -> Text -> IO {}` | Write file (path, content) |
 | `appendFile` | `Text -> Text -> IO {}` | Append to file |

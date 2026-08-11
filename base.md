@@ -319,18 +319,53 @@ base.readLine : IO Text
 
 Read a line from stdin.
 
-### `base.logInfo` / `base.logWarn` / `base.logError` / `base.logDebug`
+### `base.debug` / `base.info` / `base.warn` / `base.error`
 
 ```
-base.logInfo  : a -> IO {}
-base.logWarn  : a -> IO {}
-base.logError : a -> IO {}
-base.logDebug : a -> IO {}
+base.debug : (<>logCtx) => Text -> IO {}
+base.info  : (<>logCtx) => Text -> IO {}
+base.warn  : (<>logCtx) => Text -> IO {}
+base.error : (<>logCtx) => Text -> IO {}
 ```
 
 Leveled logging to **stderr** (kept separate from `println`'s stdout). Colored
-on a TTY, one JSON line per record otherwise. `logDebug` is silent unless the
+on a TTY, one JSON line per record otherwise. `debug` is silent unless the
 program is run with `--debug`.
+
+The `(<>logCtx)` constraint merges every `logCtx` record in scope at the call
+site (innermost scope wins) and attaches the fields as structured context — the
+caller passes only the message:
+
+```knot
+do
+  base.info "starting"
+  with {logCtx {availableMb 64}}
+    (base.warn "low memory")
+  yield {}
+```
+
+On a TTY a single-line context field renders inline (`availableMb=64`); a
+field whose value contains a newline is lifted out of the splat and shown as a
+guttered block beneath the line:
+
+```
+WARN  low memory  availableMb=64
+ERROR failed to compile module  availableMb=64
+  source
+  │ fn main =
+  │   let x = 1 in
+  │   x
+```
+
+In JSON mode context fields merge into the emitted record (`{"level","msg",…
+ctx,"timestamp"}`); a field named `level`, `msg`, or `timestamp` replaces the
+default (later-wins, like record `unify`). Newlines stay `\n`-escaped so each
+record is one line.
+
+The runtime's own events (HTTP serve-loop errors, migrations, watcher panics)
+emit through the same machinery, so in JSON mode every stderr line is a
+well-formed record. `base.logInfo`/`logWarn`/`logError`/`logDebug` are
+deprecated aliases kept for source compatibility.
 
 ### `base.show`
 

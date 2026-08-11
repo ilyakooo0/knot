@@ -690,8 +690,9 @@ enforce referential integrity and uniqueness at write time. See
 `examples/constraints.knot`.
 
 **Other goodies.** Bytes and hex encoding, BLAKE3 hashing, UUIDv7,
-JSON encode/decode, file I/O, leveled logging (`logInfo`/`logWarn`/...),
-crypto (`generateKeyPair`/`encrypt`/`sign`/`verify`). See
+JSON encode/decode, file I/O, structured leveled logging
+(`base.info`/`base.warn`/… with `logCtx` context records), crypto
+(`generateKeyPair`/`encrypt`/`sign`/`verify`). See
 `examples/bytes.knot`, `examples/hash.knot`, `examples/uuid.knot`,
 `examples/json.knot`, `examples/crypto.knot`, `examples/log_test.knot`.
 
@@ -700,7 +701,7 @@ any required-argument constants declared in the source:
 
 ```sh
 ./my_program                     # run main
-./my_program --debug             # turn on logDebug output
+./my_program --debug             # turn on base.debug output
 ./my_program --help              # print usage + any required CLI arguments
 ./my_program --http-max-body-bytes=32M   # cap HTTP body size (K/M/G suffixes)
 ./my_program --port=8080         # supply a required CLI argument

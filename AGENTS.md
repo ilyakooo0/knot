@@ -65,10 +65,10 @@ let (module, parse_diags) = parser.parse_module();
 
 ### Runtime (`crates/knot-runtime/`)
 
-Compiled as a `staticlib` (with `rlib` for workspace dependency resolution). All functions use `extern "C"` ABI, called by Cranelift-generated code via symbol references. `lib.rs` is the main runtime; `log.rs` implements the leveled logger used by `logInfo`/`logWarn`/`logError`/`logDebug` (TTY-colored on stderr or one JSON record per line; `--debug` arg scanned by `debug_enabled()` gates `logDebug`); `tui.rs` is the `db` subcommand's terminal-UI database explorer (parses `_knot_schema`, paginates rows, drills into individual records).
+Compiled as a `staticlib` (with `rlib` for workspace dependency resolution). All functions use `extern "C"` ABI, called by Cranelift-generated code via symbol references. `lib.rs` is the main runtime; `log.rs` implements the leveled, structured logger behind `base.debug`/`info`/`warn`/`error` (and the deprecated `logInfo`/`logWarn`/`logError`/`logDebug` aliases): TTY-colored on stderr or one JSON record per line, with `(<>logCtx)` context fields merged in (a multiline field renders as a `│`-guttered block on a TTY, `\n`-escaped inline in JSON). The runtime's own events — HTTP serve-loop errors, source migrations, watcher panics — emit through the same logger so JSON-mode stderr stays one record per line; `knot_todo` reports, the GC stats dump, and CLI/usage errors stay raw stderr. `--debug` arg scanned by `debug_enabled()` gates `debug`. `tui.rs` is the `db` subcommand's terminal-UI database explorer (parses `_knot_schema`, paginates rows, drills into individual records).
 
 Compiled programs expose a common CLI without any user wiring:
-- `--debug` — enable `logDebug` output
+- `--debug` — enable `base.debug` output
 - `--help` — print usage including any compile-time overrides exposed via `knot_override_check_help` (the compiler emits this list at codegen time)
 - `--http-max-body-bytes=N` — cap HTTP request and response bodies (`K`/`M`/`G` suffixes, default `16M`); applies to both `listen` and `fetch`
 - `--<name>=<value>` — override a compile-time constant declared in the source (same flags accepted both at `knot build` and at run time)

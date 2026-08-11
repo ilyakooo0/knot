@@ -2806,6 +2806,7 @@ impl Parser {
             return None;
         }
         self.advance(); // consume `migrate`
+        self.skip_newlines(); // allow `migrate\n  from …` multi-line clauses
 
         let prev_block_indent = self.block_indent;
         self.block_indent = self.cur_column();

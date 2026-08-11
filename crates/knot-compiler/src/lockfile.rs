@@ -691,10 +691,14 @@ fn collect_record_migrations(e: &Expr, out: &mut String) {
             for f in fields {
                 if let ExprKind::SourceDecl { name, migrations, .. } = &f.value.node {
                     for m in migrations {
-                        out.push('\n');
+                        // The lockfile is re-parsed by parse_file_expr, whose
+                        // migration clause (parse_source_field_migration) has
+                        // NO relation name — the `*name` source field supplies
+                        // it. Emit the nameless form. The migration must hang
+                        // DIRECTLY off the `*name : T` field — no blank line,
+                        // or the field-parse ends and the clause won't attach.
                         out.push_str(&format!(
-                            "migrate *{}\n  from {}\n  to {}\n  using {}\n",
-                            name,
+                            "migrate\n  from {}\n  to {}\n  using {}\n",
                             knot::format::render_type(&m.from_ty),
                             knot::format::render_type(&m.to_ty),
                             knot::format::render_expr_source(&m.using_fn),

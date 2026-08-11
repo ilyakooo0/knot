@@ -96,14 +96,14 @@ type PersonV2 = {name: Text, active: Active}
 }
 
 #[test]
-fn migrate_lockfile_roundtrip_broken() {
-    // BUG (reproduced): after a program with a `migrate` declaration runs
-    // once (writing `prog.schema.lock`), rebuilding the SAME source fails
-    // with "parse errors in prog.schema.lock". Root cause: the lockfile is
-    // WRITTEN as `migrate *people from PersonV1 to PersonV2 using …` but the
-    // PARSER only accepts `migrate from … to … using …` (no `*rel` target),
-    // so the writer and parser disagree on migration syntax and the lockfile
-    // can't be re-read.
+fn migrate_lockfile_roundtrip() {
+    // Regression: a program with a `migrate` declaration, once run (writing
+    // `prog.schema.lock`), must rebuild cleanly. The lockfile writer and
+    // parser used to disagree on migration syntax (writer emitted
+    // `migrate *name from …`, parser accepted only the nameless
+    // `migrate from …` form, and rejected a multi-line clause), so the
+    // lockfile couldn't be re-read. Fixed: writer emits the nameless form,
+    // parser skips newlines after `migrate`.
     let dir = dir_for("mig_lock");
     let src = r#"with {
 data Active = Yes {} | No {}
@@ -119,7 +119,7 @@ type PersonV2 = {name: Text, active: Active}
     build_and_run(&dir, "mig_lock", src);
     assert!(dir.join("mig_lock.schema.lock").exists(), "lockfile written");
 
-    // Rebuild the same source: must currently FAIL to build.
+    // Rebuild the same source: must succeed and still read the migrated row.
     let build = std::process::Command::new(knot_bin())
         .arg("build")
         .arg(dir.join("mig_lock.knot"))
@@ -128,12 +128,9 @@ type PersonV2 = {name: Text, active: Active}
         .output()
         .expect("knot build");
     assert!(
-        !build.status.success(),
-        "expected rebuild to fail (lockfile round-trip bug), but it succeeded"
+        build.status.success(),
+        "rebuild failed (lockfile round-trip broke): {}",
+        String::from_utf8_lossy(&build.stderr)
     );
-    let stderr = String::from_utf8_lossy(&build.stderr);
-    assert!(
-        stderr.contains(".schema.lock; delete it and recompile"),
-        "unexpected rebuild error: {stderr}"
-    );
+    assert_eq!(run_bin(&dir.join("mig_lock"), dir.path()), "\"1\"\n{}");
 }

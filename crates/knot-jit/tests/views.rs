@@ -55,14 +55,10 @@ fn derived_relation_recomputes_on_access() {
 
 #[test]
 fn view_read_filters_constant_column() {
-    // BUG (reproduced): a filtered view `*openTodos = do t <- *todos; where …;
-    // yield …` read via `full *openTodos` queries a non-existent
-    // `_knot_openTodos` table ("query error: no such table") instead of
-    // resolving to the source `_knot_todos` with the constant-column filter.
-    // The view read dispatch does not resolve views inside do-block binds.
-    // This documents the current broken behavior — the program aborts.
-    let dir = e2e::TempDir::fresh("view_read");
-    e2e::build_in_dir(
+    // A filtered view `*openTodos = do t <- *todos; where …; yield …` read via
+    // `full *openTodos` resolves to the source `_knot_todos` with the
+    // constant-column filter — only the Open todo is returned.
+    assert_stdout(
         "view_read",
         r#"with {
 data Status = Open {} | Closed {}
@@ -77,25 +73,15 @@ data Status = Open {} | Closed {}
   rows <- full *openTodos
   base.println (base.show (base.count rows))
   yield {})"#,
-        dir.path(),
-    );
-    let out = std::process::Command::new(dir.path().join("view_read"))
-        .current_dir(dir.path())
-        .output()
-        .expect("run");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("no such table: _knot_openTodos"),
-        "expected view-read bug, got: {stderr}"
+        "\"1\"\n{}",
     );
 }
 
 #[test]
 fn view_write_autofills_constant_column() {
-    // BUG (reproduced): writing through a filtered view aborts the same way —
-    // the view is not resolved to its source table on the write path either.
-    let dir = e2e::TempDir::fresh("view_write");
-    e2e::build_in_dir(
+    // Writing through a filtered view resolves to the source table and
+    // auto-fills the constant column (status = Open).
+    assert_stdout(
         "view_write",
         r#"with {
 data Status = Open {} | Closed {}
@@ -109,17 +95,9 @@ data Status = Open {} | Closed {}
   full *openTodos = [{title "task"}]
   all <- full *todos
   base.println (base.show (base.count all))
+  base.println (base.show all)
   yield {})"#,
-        dir.path(),
-    );
-    let out = std::process::Command::new(dir.path().join("view_write"))
-        .current_dir(dir.path())
-        .output()
-        .expect("run");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("no such table: _knot_openTodos"),
-        "expected view-write bug, got: {stderr}"
+        "\"1\"\n\"[{status: Open, title: task}]\"\n{}",
     );
 }
 

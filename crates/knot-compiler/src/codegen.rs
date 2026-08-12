@@ -970,7 +970,13 @@ fn compile_inner<M: cranelift_module::Module>(
     // Collect view declarations and analyze provenance
     for decl in decl_views(program) {
         if let DeclViewKind::View { body: Some(body), .. } = decl.kind {
-            let name = decl.name;
+            // Normalize the key: `decl_views` yields the record field name
+            // WITH the leading `*` (`*openTodos`), but every read/write lookup
+            // uses the bare `SourceRef` name (`openTodos`). Store the bare
+            // name so the view dispatch actually fires — previously the
+            // `*`/bare mismatch made `full *view` fall through to a plain
+            // source read of a non-existent `_knot_<view>` table.
+            let name = decl.name.strip_prefix('*').unwrap_or(decl.name);
             match analyze_view(body) {
                 Ok(Some(info)) => {
                     cg.views.insert(name.to_string(), info);

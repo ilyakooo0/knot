@@ -10450,11 +10450,15 @@ pub extern "C-unwind" fn knot_relation_traverse(
         mapped.push(knot_value_call(db, func, row));
     }
 
-    // Determine applicative type from first result and sequence accordingly
+    // Determine applicative type from first result and sequence accordingly.
+    // Constructor tags may be qualified (`Maybe.Just`) or bare (`Just`)
+    // depending on how the value was built — compare the leaf name so both
+    // forms dispatch (previously a qualified `Maybe.Just` fell through to the
+    // "unsupported applicative" panic).
     match unsafe { as_ref(mapped[0]) } {
         Value::IO(..) => traverse_sequence_io(db, mapped),
         Value::Relation(..) => traverse_sequence_relation(mapped),
-        Value::Constructor(tag, ..) => match &**tag {
+        Value::Constructor(tag, ..) => match ctor_leaf(tag) {
             "Just" | "Nothing" => traverse_sequence_maybe(mapped),
             "Ok" | "Err" => traverse_sequence_result(mapped),
             _ => panic!(

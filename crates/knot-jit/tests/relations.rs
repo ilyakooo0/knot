@@ -293,10 +293,11 @@ fn mixed_type_relation_rejected() {
     assert_compile_err("[1 \"two\"]", "");
 }
 
-// ── Known doc/impl mismatch (not asserted — aborts the process) ──────────
+// ── minOn/maxOn on an empty relation (not asserted — aborts the process) ───
 //
 // base.minOn/base.maxOn on an EMPTY relation panic in the runtime
-// ("knot runtime: min/max on empty relation" → SIGABRT), which contradicts
-// the documented `-> Maybe a` / "`Nothing` on empty" contract and cannot be
-// exercised in-process (it kills the test runner). Verified manually against
-// a compiled binary: `base.maxOn (\p -> p.age) ([] : [P])` aborts.
+// ("knot runtime: min/max on empty relation" → SIGABRT). This is the
+// DOCUMENTED contract: both base.md and knot.md specify `-> b` (the bare
+// projected key, no `Nothing` case) and "aborts the program on an empty
+// relation — guard with base.count first". It cannot be exercised in-process
+// (it kills the test runner); verified manually against a compiled binary.

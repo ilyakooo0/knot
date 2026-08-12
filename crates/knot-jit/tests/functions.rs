@@ -1,6 +1,8 @@
 //! Higher-order functions, control flow, dictionaries, higher-rank types.
 
 mod harness;
+mod e2e;
+use e2e::assert_stdout;
 use harness::{assert_compile_err, assert_prog, assert_show, assert_show_set};
 
 // ── Lambdas & application ────────────────────────────────────────────────
@@ -50,12 +52,28 @@ fn hof_composition() {
     );
 }
 
-// NOTE: base.traverse is an IO traversal — the in-process JIT returns the
-// do-block unevaluated (IO needs the subprocess path). And a Maybe/Result
-// function ABORTS the process ("knot runtime: traverse unsupported
-// applicative"), contradicting the documented "f is IO, Maybe, or Result" —
-// only IO is actually supported. Both verified against compiled binaries;
-// not asserted in-process.
+#[test]
+fn traverse_maybe_and_result() {
+    // traverse sequences Maybe/Result applicatives (per the documented "f is
+    // IO, Maybe, or Result"): Just/Ok of the collected values, short-circuiting
+    // to Nothing/Err on the first failure. Verified via a compiled binary —
+    // the runtime dispatch compares the constructor leaf so a qualified
+    // `Maybe.Just` tag dispatches correctly.
+    assert_stdout(
+        "traverse_maybe",
+        r#"with {
+pos : Int 1 -> Maybe (Int 1)
+pos (\x -> case x > 0 of
+  Bool.True {} -> Maybe.Just {value x}
+  Bool.False {} -> Maybe.Nothing {})
+}
+(do
+  base.println (base.show (base.traverse pos [1 2 3]))
+  base.println (base.show (base.traverse pos [1 (-2) 3]))
+  yield {})"#,
+        "\"Just {value: [1, 2, 3]}\"\n\"Nothing\"\n{}",
+    );
+}
 
 // ── Control flow ─────────────────────────────────────────────────────────
 

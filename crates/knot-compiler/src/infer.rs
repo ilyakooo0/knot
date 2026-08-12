@@ -1522,6 +1522,24 @@ impl Infer {
             {
                 numeric_unit_compatible(&base, &value)
             }
+            // Records refine per-field: a record base `{age: Int 1}` matches a
+            // value `{age: Int <var>}` when every base field is present in the
+            // value with a compatible type (recursing so a unit-carrying
+            // scalar field matches a literal-derived `Int <var>`). Closed
+            // records only — an open row variable means extra unknown fields a
+            // whole-record `where` predicate might not expect.
+            (Ty::Record(bfields, None), Ty::Record(vfields, None)) => {
+                bfields.len() == vfields.len()
+                    && bfields.iter().all(|(name, bty)| {
+                        vfields
+                            .get(name)
+                            .map(|vty| {
+                                self.apply(bty) == self.apply(vty)
+                                    || self.refined_base_compatible(bty, vty)
+                            })
+                            .unwrap_or(false)
+                    })
+            }
             _ => false,
         }
     }
@@ -9297,6 +9315,52 @@ impl Infer {
             let base_ty = self.ast_type_to_ty(base_ty_ast);
             self.refined_types
                 .insert(name.clone(), (base_ty, predicate.clone()));
+        }
+        // Record aliases whose refinement lives on their fields
+        // (`type P = {age: Int 1 where …}`) are not `Refined` at the top
+        // level, so the loop above never registers them and `refine` cannot
+        // target them. Synthesize a whole-record predicate from the field
+        // refinements and register the alias so `refine` works.
+        {
+            let alias_ast_types: HashMap<String, ast::Type> = alias_decls
+                .iter()
+                .map(|(n, t, _)| (n.clone(), t.clone()))
+                .chain(
+                    refined_alias_decls
+                        .iter()
+                        .map(|(n, b, _)| (n.clone(), b.clone())),
+                )
+                .collect();
+            let refined_preds: HashMap<String, ast::Expr> = refined_alias_decls
+                .iter()
+                .map(|(n, _, p)| (n.clone(), p.clone()))
+                .collect();
+            let mut data_ctor_decls: HashMap<String, Vec<ast::ConstructorDef>> =
+                HashMap::new();
+            for_each_data_ctor(program, &mut |name, _params, ctors, _span| {
+                data_ctor_decls.insert(name.to_string(), ctors.to_vec());
+            });
+            let mut per_field: Vec<(String, ast::Type, ast::Expr)> = Vec::new();
+            for (name, ty, span) in &alias_decls {
+                if self.refined_types.contains_key(name) {
+                    continue;
+                }
+                if let ast::TypeKind::Record { fields, .. } = &ty.node {
+                    if let Some(pred) = crate::types::record_field_refinement_predicate(
+                        fields,
+                        &refined_preds,
+                        &alias_ast_types,
+                        &data_ctor_decls,
+                        *span,
+                    ) {
+                        per_field.push((name.clone(), ty.clone(), pred));
+                    }
+                }
+            }
+            for (name, ty, pred) in per_field {
+                let base_ty = self.ast_type_to_ty(&ty);
+                self.refined_types.insert(name, (base_ty, pred));
+            }
         }
         self.enforce_units = saved_enforce;
 

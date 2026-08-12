@@ -31,33 +31,34 @@ fn refine_rejects_invalid() {
 }
 
 #[test]
-fn refine_per_field_record_unsupported() {
-    // KNOWN LIMITATION (reproduced): `refine` cannot infer a target type for a
-    // PER-FIELD refined RECORD — `type VP = {age: Int 1 where …}` used as a
-    // refine target fails inference with "cannot infer refined type target
-    // (got {age: Int})". Scalar and cross-field refinements DO work (see
-    // refine_accepts_valid / refine_cross_field). Assert the current behavior.
-    let dir = e2e::TempDir::fresh("refine_field");
-    let src = r#"with {
+fn refine_per_field_record() {
+    // `refine` targets a record alias whose refinement lives on a field
+    // (`type VP = {age: Int 1 where …}`). The alias is registered with a
+    // synthesized whole-record predicate (`\r -> r.age >= 0 && r.age <= 150`),
+    // so a valid record yields Ok and an out-of-range field yields Err.
+    assert_stdout(
+        "refine_field_ok",
+        r#"with {
+type VP = {age: Int 1 where \x -> x >= 0 && x <= 150}
+asVP : {age: Int 1} -> Result {typeName: Text, violations: [{field: Maybe Text, message: Text}]} VP
+asVP (\r -> refine r)
+}
+(case asVP {age 30} of
+  Result.Ok {value _} -> base.println "ok"
+  Result.Err {error _} -> base.println "bad")"#,
+        "\"ok\"\n{}",
+    );
+    assert_stdout(
+        "refine_field_bad",
+        r#"with {
 type VP = {age: Int 1 where \x -> x >= 0 && x <= 150}
 asVP : {age: Int 1} -> Result {typeName: Text, violations: [{field: Maybe Text, message: Text}]} VP
 asVP (\r -> refine r)
 }
 (case asVP {age 200} of
   Result.Ok {value _} -> base.println "ok"
-  Result.Err {error _} -> base.println "bad")"#;
-    std::fs::write(dir.path().join("refine_field.knot"), src).unwrap();
-    let build = std::process::Command::new(e2e::knot_bin())
-        .arg("build")
-        .arg(dir.path().join("refine_field.knot"))
-        .arg("-o")
-        .arg(dir.path().join("refine_field"))
-        .output()
-        .expect("knot build");
-    let stderr = String::from_utf8_lossy(&build.stderr);
-    assert!(
-        !build.status.success() && stderr.contains("cannot infer refined type target"),
-        "expected per-field refine limitation, got: {stderr}"
+  Result.Err {error _} -> base.println "bad")"#,
+        "\"bad\"\n{}",
     );
 }
 

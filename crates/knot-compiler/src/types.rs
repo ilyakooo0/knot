@@ -1377,6 +1377,57 @@ fn synth_ctor_field_case(ctor: &str, field: &str, pred: Expr, span: Span) -> Exp
     synth_lambda(&scrut_param, case)
 }
 
+/// Build a whole-record Bool predicate `\r -> (pred1 r.f1) && (pred2 r.f2) && …`
+/// from the per-field refinements of a record type. Returns `None` when the
+/// record has no refined fields (so callers can skip registering it as a
+/// refined type). Used to let `refine` target a record alias whose refinement
+/// lives on its fields (`type P = {age: Int 1 where …}`), which the plain
+/// `Refined`-wrapper path never sees.
+pub fn record_field_refinement_predicate(
+    fields: &[knot::ast::Field<Type>],
+    refined_types: &HashMap<String, Expr>,
+    alias_ast_types: &HashMap<String, Type>,
+    data_ctor_decls: &HashMap<String, Vec<ConstructorDef>>,
+    span: Span,
+) -> Option<Expr> {
+    let mut seen = HashSet::new();
+    // (field, pred) pairs in source order; `field_value_predicates` already
+    // flattens stacked/aliased/nested refinements into field-value predicates.
+    let mut checks: Vec<(String, Expr)> = Vec::new();
+    for field in fields {
+        for (_label, pred) in field_value_predicates(
+            &field.name,
+            &field.value,
+            refined_types,
+            alias_ast_types,
+            data_ctor_decls,
+            &mut seen,
+        ) {
+            checks.push((field.name.clone(), pred));
+        }
+    }
+    if checks.is_empty() {
+        return None;
+    }
+    let param = synth_fresh_name();
+    let mut body: Option<Expr> = None;
+    for (field, pred) in checks {
+        let applied = synth_app(pred, synth_field(synth_var(&param, span), &field));
+        body = Some(match body {
+            None => applied,
+            Some(acc) => Spanned::new(
+                ExprKind::BinOp {
+                    op: BinOp::And,
+                    lhs: Box::new(acc),
+                    rhs: Box::new(applied),
+                },
+                span,
+            ),
+        });
+    }
+    Some(synth_lambda(&param, body?))
+}
+
 #[allow(clippy::type_complexity)]
 fn resolve_type(
     ty: &Type,

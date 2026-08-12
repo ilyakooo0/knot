@@ -12165,6 +12165,23 @@ impl Infer {
             }
         });
 
+        // Refined-type predicates must be pure `base -> Bool` functions.
+        // Checked here (not in `collect_types`) so the prelude is in scope —
+        // a legitimate predicate like `base.contains "@" s` resolves. The
+        // body must check against `Bool` given the parameter at the base
+        // type; an effectful (`IO …`) or non-`Bool` body is a compile error
+        // rather than a runtime "expected Bool, got IO" panic when the
+        // validator calls the predicate.
+        let preds: Vec<(Ty, ast::Expr)> = self
+            .refined_types
+            .values()
+            .map(|(b, p)| (b.clone(), p.clone()))
+            .collect();
+        for (base_ty, predicate) in preds {
+            let expected = Ty::Fun(Box::new(base_ty), Box::new(Ty::Bool));
+            self.check_expr(&predicate, &expected);
+        }
+
         // Routes: check field collisions and rate-limit exprs.
         for_each_route_marker(program, &mut |_name, entries| {
             if let Some(entries) = entries {

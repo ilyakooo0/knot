@@ -11815,6 +11815,28 @@ impl Infer {
                     None => (self.fresh(), Vec::new(), Vec::new()),
                 };
                 self.check_expr(body, &expected);
+                // Compile-time check: a top-level constant whose signature is
+                // an inline refined type (`x : Int 1 where \a -> a > 1`) and
+                // whose body is a literal (or named const) is checked against
+                // the predicate now, so `x 0` is a compile error rather than a
+                // silent refined-typed 0. (The inline `Refined` erases to its
+                // base in `ast_type_to_ty`, so this can't piggyback on the
+                // nominal-type introduction guard.)
+                if let Some(ts) = ty
+                    && let ast::TypeKind::Refined { predicate, .. } = &ts.ty.node
+                    && let Some(lit) =
+                        crate::codegen::extract_literal_with_consts(body, &self.const_literals)
+                    && let Some(false) =
+                        crate::codegen::eval_refine_predicate_pub(predicate, &lit)
+                {
+                    self.error(
+                        format!(
+                            "constant {} does not satisfy the refinement predicate",
+                            lit.display()
+                        ),
+                        body.span,
+                    );
+                }
                         // Record-field funs with `^`-field constraints: register
                         // each under its record path (`fns.greet`) so the
                         // callsite resolver can find it through a field-access

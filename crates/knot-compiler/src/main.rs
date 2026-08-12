@@ -699,6 +699,43 @@ fn hash_archive(p: &std::path::Path) -> Option<String> {
         .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }
 
+/// Rebuild the runtime staticlib in place when the compiler detects its
+/// exe-dir archive is stale. Locates the workspace by walking up from the
+/// executable (`<ws>/target/<profile>/knot`), then runs
+/// `cargo build -p knot-runtime` so the rebuilt archive lands where this
+/// lookup found it. Returns the refreshed archive's path on success, `None`
+/// if the workspace can't be located or the build fails (caller falls back
+/// to the embedded runtime).
+fn rebuild_runtime_at_exe(stale: &std::path::Path) -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    // exe = <ws>/target/<profile>/knot  →  ws = exe ../../..
+    let ws = exe.parent()?.parent()?.parent()?;
+    if !ws.join("crates/knot-runtime/Cargo.toml").exists() {
+        return None;
+    }
+    let profile = exe
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("debug")
+        .to_string();
+    let mut cmd = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    cmd.arg("build")
+        .arg("-p")
+        .arg("knot-runtime")
+        .current_dir(ws)
+        .stdout(std::process::Stdio::null());
+    if profile == "release" {
+        cmd.arg("--release");
+    }
+    eprintln!("knot: refreshing stale runtime archive (cargo build -p knot-runtime)...");
+    if cmd.status().ok()?.success() && !is_runtime_stale(stale) {
+        Some(stale.to_path_buf())
+    } else {
+        None
+    }
+}
+
 /// True if `lib` is stale — its content differs from the runtime archive this
 /// compiler embeds. Falls back to `false` (assume fresh) when there's no
 /// embedded runtime to compare against or the file can't be read, so we never
@@ -746,9 +783,19 @@ fn find_runtime() -> PathBuf {
                 // Freshness check: if the archive's content differs from the
                 // runtime this compiler embeds (e.g. only knot-compiler was
                 // rebuilt, or knot-runtime sources changed), the archive is
-                // stale. Skip it and fall through to the embedded runtime
-                // rather than silently linking stale code.
+                // stale. Rather than just warn, try to rebuild it in place —
+                // the compiler knows its own workspace (exe at
+                // <ws>/target/<profile>/knot), so it can refresh the archive
+                // the moment it detects staleness. This removes the recurring
+                // "run cargo build -p knot-runtime" manual step: the first
+                // compile after a runtime change rebuilds, and every compile
+                // after that is fresh.
                 if is_runtime_stale(&candidate) {
+                    if let Some(fresh) = rebuild_runtime_at_exe(&candidate) {
+                        return fresh;
+                    }
+                    // Couldn't rebuild (no workspace found, or build failed) —
+                    // fall back to the embedded runtime with the warning.
                     eprintln!(
                         "Warning: {} content differs from the embedded runtime \
                          — skipping stale archive, falling back to embedded \

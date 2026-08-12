@@ -1247,13 +1247,38 @@ impl Codegen<cranelift_jit::JITModule> {
     }
 }
 
+/// The result of an in-process JIT compile: the entry address (Send-safe
+/// usize), the snippet's inferred body-type source string (for the compile
+/// builtin's typed wrapper), and the relations the snippet declares (for the
+/// runtime's host-relation check).
+pub struct JitCompiled {
+    pub entry: usize,
+    pub body_ty: Option<String>,
+    pub relations: Vec<String>,
+}
+
 /// Compile `source` to machine code in-process and return the address of its
 /// `knot_user_main(db) -> Value*` entry (as a Send-safe usize), leaking the
 /// JITModule. `None` on any lex/parse/type/codegen error. Shared by
 /// [`eval_pure_to_bool`] and the compiler binary's `knot_compile_impl`.
 pub fn jit_entry(source: &str) -> Option<usize> {
+    jit_compile(source).map(|c| c.entry)
+}
+
+/// Compile `source` in-process, returning the entry plus the inferred body
+/// type and declared relations (the full result `knot_compile_impl` reports
+/// through its out-params).
+pub fn jit_compile(source: &str) -> Option<JitCompiled> {
+    jit_compile_typed(source, None)
+}
+
+/// Like [`jit_compile`], but subsume the snippet's body type against
+/// `expected` (the compile builtin's typed-wrapper annotation) on real types;
+/// a `false` verdict rejects the snippet (the value isn't usable where the
+/// expected type is wanted).
+pub fn jit_compile_typed(source: &str, expected: Option<&str>) -> Option<JitCompiled> {
     // Compile + finalize on ONE grown thread (JITModule is not Send).
-    crate::stack::grow(|| -> Option<usize> {
+    crate::stack::grow(|| -> Option<JitCompiled> {
         let lexer = knot::lexer::Lexer::new(source);
         let (tokens, lex_diags) = lexer.tokenize();
         if lex_diags
@@ -1296,13 +1321,22 @@ pub fn jit_entry(source: &str) -> Option<usize> {
             trace_types,
             trace_bindings,
             _compile_expected_types,
-            _file_body_type,
+            file_body_type,
             _refined_field_preds,
-        ) = crate::infer::check(&mut program);
+        ) = match expected {
+            Some(exp) => crate::infer::check_with_expected(&mut program, exp),
+            None => crate::infer::check(&mut program),
+        };
         if infer_diags
             .iter()
             .any(|d| d.severity == knot::diagnostic::Severity::Error)
         {
+            return None;
+        }
+        // A `false` subsumption verdict means the snippet's body type isn't
+        // usable where the expected type is wanted — reject (the caller
+        // surfaces a null value / Nothing).
+        if crate::infer::take_subsumption_verdict() == Some(false) {
             return None;
         }
         let overrides = HashMap::new();
@@ -1344,7 +1378,12 @@ pub fn jit_entry(source: &str) -> Option<usize> {
         // references into it. One per const-eval — bounded by the number of
         // refined literals in a program.
         std::mem::forget(module);
-        Some(entry as usize)
+        let relations: Vec<String> = type_env.source_schemas.keys().cloned().collect();
+        Some(JitCompiled {
+            entry: entry as usize,
+            body_ty: file_body_type,
+            relations,
+        })
     })
 }
 

@@ -136,32 +136,78 @@ pub extern "C-unwind" fn knot_compile_rt_init() {
 
 /// The compile implementation registered above. Mirrors knot-compile-rt's
 /// `knot_compile_impl`: compile+run the snippet in-process, returning the
-/// forced `Value*` (null on any error). Out-params for the inferred type /
-/// relations / error are left null — const-eval snippets are pure and the
-/// runtime only consults them for `base.compile`'s typed wrapper, which a
-/// const-eval predicate never uses.
+/// forced `Value*` (null on any error). Fills the inferred-type / relations
+/// out-params so `base.compile`'s typed wrapper and the host-relation check
+/// work; the error out-param is left null (the compile path surfaces failures
+/// as a null value rather than a rendered message).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn knot_compile_impl(
     src_ptr: *const u8,
     src_len: usize,
     db: *mut std::ffi::c_void,
-    _expected_ptr: *const u8,
-    _expected_len: usize,
-    _out_ty_ptr: *mut *mut u8,
-    _out_ty_len: *mut usize,
-    _out_rels_ptr: *mut *mut u8,
-    _out_rels_len: *mut usize,
-    _out_err_ptr: *mut *mut u8,
-    _out_err_len: *mut usize,
+    expected_ptr: *const u8,
+    expected_len: usize,
+    out_ty_ptr: *mut *mut u8,
+    out_ty_len: *mut usize,
+    out_rels_ptr: *mut *mut u8,
+    out_rels_len: *mut usize,
+    out_err_ptr: *mut *mut u8,
+    out_err_len: *mut usize,
 ) -> *mut knot_runtime::Value {
+    // Null out-params up front so a compile error leaves them well-defined.
+    unsafe {
+        for (p, l) in [
+            (out_ty_ptr, out_ty_len),
+            (out_rels_ptr, out_rels_len),
+            (out_err_ptr, out_err_len),
+        ] {
+            if !p.is_null() {
+                *p = std::ptr::null_mut();
+            }
+            if !l.is_null() {
+                *l = 0;
+            }
+        }
+    }
+
     let src_bytes = unsafe { std::slice::from_raw_parts(src_ptr, src_len) };
     let Ok(source) = std::str::from_utf8(src_bytes) else {
         return std::ptr::null_mut();
     };
-    match codegen::jit_entry(source) {
-        Some(entry) => {
+    // The host's expected type as a source-annotation string; empty = unpinned
+    // (no subsumption check).
+    let expected: Option<&str> = if expected_ptr.is_null() || expected_len == 0 {
+        None
+    } else {
+        let b = unsafe { std::slice::from_raw_parts(expected_ptr, expected_len) };
+        std::str::from_utf8(b).ok()
+    };
+
+    // Hand a string back as a malloc'd buffer (C ABI — the runtime frees it).
+    unsafe fn write_out(s: &str, ptr: *mut *mut u8, len: *mut usize) {
+        if ptr.is_null() || len.is_null() {
+            return;
+        }
+        let buf = unsafe { libc::malloc(s.len().max(1)) as *mut u8 };
+        if buf.is_null() {
+            return;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(s.as_ptr(), buf, s.len());
+            *ptr = buf;
+            *len = s.len();
+        }
+    }
+
+    match codegen::jit_compile_typed(source, expected) {
+        Some(compiled) => {
+            if let Some(ty) = &compiled.body_ty {
+                unsafe { write_out(ty, out_ty_ptr, out_ty_len) };
+            }
+            let csv = compiled.relations.join(",");
+            unsafe { write_out(&csv, out_rels_ptr, out_rels_len) };
             let entry_fn: extern "C" fn(*mut std::ffi::c_void) -> *mut knot_runtime::Value =
-                unsafe { std::mem::transmute(entry) };
+                unsafe { std::mem::transmute(compiled.entry) };
             entry_fn(db)
         }
         None => std::ptr::null_mut(),

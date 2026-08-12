@@ -1236,6 +1236,144 @@ impl Codegen<cranelift_jit::JITModule> {
     }
 }
 
+/// Compile `source` to machine code in-process and return the address of its
+/// `knot_user_main(db) -> Value*` entry (as a Send-safe usize), leaking the
+/// JITModule. `None` on any lex/parse/type/codegen error. Shared by
+/// [`eval_pure_to_bool`] and the compiler binary's `knot_compile_impl`.
+pub fn jit_entry(source: &str) -> Option<usize> {
+    // Compile + finalize on ONE grown thread (JITModule is not Send).
+    crate::stack::grow(|| -> Option<usize> {
+        let lexer = knot::lexer::Lexer::new(source);
+        let (tokens, lex_diags) = lexer.tokenize();
+        if lex_diags
+            .iter()
+            .any(|d| d.severity == knot::diagnostic::Severity::Error)
+        {
+            return None;
+        }
+        let parser = knot::parser::Parser::new(source.to_string(), tokens);
+        let (mut program, parse_diags) = parser.parse_file_expr();
+        if parse_diags
+            .iter()
+            .any(|d| d.severity == knot::diagnostic::Severity::Error)
+        {
+            return None;
+        }
+        crate::desugar::desugar(&mut program);
+        let type_env = crate::types::TypeEnv::from_program(&program);
+        let (
+            infer_diags,
+            monad_info,
+            type_info,
+            _local_types,
+            refine_targets,
+            refined_types,
+            from_json_targets,
+            elem_pushdown_ok,
+            show_unit_strings,
+            sum_float_spans,
+            relation_fields,
+            with_fields,
+            type_arg_spans,
+            implicit_refs,
+            implicit_dict_args,
+            fold_dict_args,
+            collect_refs,
+            resolved_calls,
+            todo_types,
+            todo_bindings,
+            trace_types,
+            trace_bindings,
+            _compile_expected_types,
+            _file_body_type,
+        ) = crate::infer::check(&mut program);
+        if infer_diags
+            .iter()
+            .any(|d| d.severity == knot::diagnostic::Severity::Error)
+        {
+            return None;
+        }
+        let overrides = HashMap::new();
+        let compile_expected_types = crate::infer::CompileExpectedTypes::new();
+        let cg = compile_with(
+            Codegen::new_jit(),
+            &program,
+            &type_env,
+            "<const-eval>",
+            &monad_info,
+            &refine_targets,
+            &refined_types,
+            &from_json_targets,
+            &type_info,
+            &elem_pushdown_ok,
+            &show_unit_strings,
+            &sum_float_spans,
+            &compile_expected_types,
+            &relation_fields,
+            &with_fields,
+            &implicit_refs,
+            &type_arg_spans,
+            &implicit_dict_args,
+            &fold_dict_args,
+            &collect_refs,
+            &resolved_calls,
+            &todo_types,
+            &todo_bindings,
+            &trace_types,
+            &trace_bindings,
+            source,
+            &overrides,
+            false,
+        )
+        .ok()?;
+        let (entry, module) = cg.finish_jit();
+        // Leak the module: the JIT'd code may be re-entered and holds
+        // references into it. One per const-eval — bounded by the number of
+        // refined literals in a program.
+        std::mem::forget(module);
+        Some(entry as usize)
+    })
+}
+
+/// Evaluate a pure knot snippet to a `Bool` at compile time, in-process.
+/// Used by the const-refinement checks: when a refined-typed constant or a
+/// `refine` argument is a compile-time literal but its predicate is beyond the
+/// small built-in evaluator (`eval_expr_bool`/`eval_expr_num` — e.g. it calls
+/// a pure builtin like `base.contains` or reads a record field), the compiler
+/// synthesizes `(<predicate>) (<literal>)` and runs it through the real JIT,
+/// which resolves `knot_*` runtime imports against this same process (the
+/// binary whole-archive-links and `--export-dynamic`s knot-runtime for exactly
+/// this). `None` means "cannot decide at compile time" — any lex/parse/type/
+/// codegen error, a non-`Bool` result, or evaluation exceeding the fuel bound
+/// — and the caller must fall back to the runtime check.
+///
+/// The runtime db/arena is a process-lazy in-memory handle (predicates are
+/// pure, so it is only ever an allocator).
+pub fn eval_pure_to_bool(source: &str) -> Option<bool> {
+    let entry = jit_entry(source)?;
+    // Run the JIT'd body under a fuel bound so a diverging predicate cannot
+    // hang the compiler. The entry runs on its own thread; on timeout we give
+    // up (the thread leaks — preferable to blocking compilation forever).
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let entry_fn: extern "C" fn(*mut std::ffi::c_void) -> *mut knot_runtime::Value =
+            unsafe { std::mem::transmute(entry) };
+        static MEM: &[u8] = b":memory:";
+        let db = unsafe { knot_runtime::knot_db_open(MEM.as_ptr(), MEM.len()) };
+        let value = entry_fn(db);
+        let result = if value.is_null() {
+            None
+        } else {
+            Some(unsafe { knot_runtime::knot_value_get_bool(value) } != 0)
+        };
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(r) => r,
+        Err(_) => None, // fuel exhausted — treat as "cannot decide"
+    }
+}
+
 impl<M: cranelift_module::Module> Codegen<M> {
     /// Build a `Codegen` around an already-constructed module. Backend-agnostic:
     /// the ISA/unwind setup is the same for `ObjectModule` (AOT) and `JITModule`.
@@ -20321,7 +20459,24 @@ fn eval_refine_predicate(pred: &ast::Expr, lit: &CompileLit) -> Option<bool> {
         _ => return None,
     };
     // Evaluate the body with the parameter bound to the literal.
-    eval_expr_bool(body, lit, &param_name)
+    match eval_expr_bool(body, lit, &param_name) {
+        Some(b) => Some(b),
+        // Beyond the small interpreter (a pure builtin call like
+        // `base.contains`, a record-field read, …): run the WHOLE predicate
+        // through the real in-process JIT. The literal renders as a knot
+        // literal (`CompileLit::display`: Int/Float/Bool bare, Text quoted).
+        // Still `None` when the predicate references outer scope, performs
+        // effects, or exceeds the fuel bound — the caller falls back to the
+        // runtime check.
+        None => {
+            let src = format!(
+                "({}) ({})",
+                knot::format::render_expr_source(pred),
+                lit.display()
+            );
+            eval_pure_to_bool(&src)
+        }
+    }
 }
 
 /// Public wrapper so inference can const-check a refinement predicate against

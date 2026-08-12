@@ -123,6 +123,51 @@ fn references_name(descriptor: &str, name: &str) -> bool {
         .any(|tok| tok == name)
 }
 
+/// The compiler binary's own `knot_compile_rt_init`. Generated `main` calls
+/// this at startup to register the JIT compile implementation; when the JIT
+/// runs in-process (compile-time const-eval) it resolves the symbol via
+/// `dlsym` against this binary, so the symbol must exist here. It lives in the
+/// BINARY (not the lib) so test binaries that link knot-compiler alongside
+/// knot-compile-rt don't get a duplicate `knot_compile_impl` from the rlib.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_compile_rt_init() {
+    knot_runtime::knot_register_compile_impl(knot_compile_impl as *mut std::ffi::c_void);
+}
+
+/// The compile implementation registered above. Mirrors knot-compile-rt's
+/// `knot_compile_impl`: compile+run the snippet in-process, returning the
+/// forced `Value*` (null on any error). Out-params for the inferred type /
+/// relations / error are left null — const-eval snippets are pure and the
+/// runtime only consults them for `base.compile`'s typed wrapper, which a
+/// const-eval predicate never uses.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn knot_compile_impl(
+    src_ptr: *const u8,
+    src_len: usize,
+    db: *mut std::ffi::c_void,
+    _expected_ptr: *const u8,
+    _expected_len: usize,
+    _out_ty_ptr: *mut *mut u8,
+    _out_ty_len: *mut usize,
+    _out_rels_ptr: *mut *mut u8,
+    _out_rels_len: *mut usize,
+    _out_err_ptr: *mut *mut u8,
+    _out_err_len: *mut usize,
+) -> *mut knot_runtime::Value {
+    let src_bytes = unsafe { std::slice::from_raw_parts(src_ptr, src_len) };
+    let Ok(source) = std::str::from_utf8(src_bytes) else {
+        return std::ptr::null_mut();
+    };
+    match codegen::jit_entry(source) {
+        Some(entry) => {
+            let entry_fn: extern "C" fn(*mut std::ffi::c_void) -> *mut knot_runtime::Value =
+                unsafe { std::mem::transmute(entry) };
+            entry_fn(db)
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -132,6 +177,16 @@ fn main() {
     }
 
     match args[1].as_str() {
+        // Hidden dev hook: evaluate a pure snippet to Bool via the in-process
+        // JIT (exercises the compile-time const-eval path directly).
+        "__const-eval" => {
+            let src = args.get(2).map(|s| s.as_str()).unwrap_or("true");
+            match codegen::eval_pure_to_bool(src) {
+                Some(b) => println!("{b}"),
+                None => println!("<none>"),
+            }
+            process::exit(0);
+        }
         "build" => {
             if args.len() < 3 {
                 eprintln!("Error: missing source file");

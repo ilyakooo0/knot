@@ -144,4 +144,42 @@ fn main() {
     // refresh the embedded runtime.
     println!("cargo:rerun-if-changed=../knot-runtime/src");
     println!("cargo:rerun-if-changed=../knot-runtime/Cargo.toml");
+
+    // A-experiment: whole-archive link the knot-runtime staticlib into the
+    // knot binary and export its knot_* symbols into the dynamic table so the
+    // JIT (running in-process for compile-time predicate eval) can resolve
+    // them via dlsym(RTLD_DEFAULT). The runtime is found the same way as the
+    // embedded archive above; this only ADDS link directives.
+    // --allow-multiple-definition: the staticlib bundles compiler_builtins
+    // objects that the binary already links from rustc's rlib — whole-archive
+    // would otherwise double-define them. The first (rustc) definition wins.
+    {
+        let target_dir = std::env::var("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| workspace_root.join("target"));
+        let rt = out_path
+            .ancestors()
+            .take_while(|p| p.starts_with(&target_dir))
+            .map(|p| p.join("libknot_runtime.a"))
+            .find(|p| is_valid_lib(p))
+            .or_else(|| {
+                ["release", "debug"]
+                    .iter()
+                    .map(|prof| target_dir.join(prof).join("libknot_runtime.a"))
+                    .find(|p| is_valid_lib(p))
+            });
+        if let Some(rt) = rt {
+            if cfg!(target_os = "macos") {
+                println!("cargo:rustc-link-arg=-Wl,-force_load,{}", rt.display());
+                println!("cargo:rustc-link-arg=-Wl,-export_dynamic");
+            } else {
+                println!("cargo:rustc-link-arg=-Wl,--allow-multiple-definition");
+                println!(
+                    "cargo:rustc-link-arg=-Wl,--whole-archive,{},--no-whole-archive",
+                    rt.display()
+                );
+                println!("cargo:rustc-link-arg=-Wl,--export-dynamic");
+            }
+        }
+    }
 }

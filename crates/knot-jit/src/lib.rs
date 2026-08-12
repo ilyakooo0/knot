@@ -108,6 +108,7 @@ pub fn compile_and_run(
         trace_bindings,
         _compile_expected_types,
         file_body_type,
+        refined_field_preds,
     ) = match expected_src {
         Some(exp) => infer::check_with_expected(&mut program, exp),
         None => infer::check(&mut program),
@@ -159,6 +160,7 @@ pub fn compile_and_run(
             &monad_info,
             &refine_targets,
             &refined_types,
+            &refined_field_preds,
             &from_json_targets,
             &type_info,
             &elem_pushdown_ok,

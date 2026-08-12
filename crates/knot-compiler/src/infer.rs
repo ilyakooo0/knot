@@ -169,6 +169,12 @@ pub type ResolvedCalls = HashMap<Span, FnIdentity>;
 /// Refined type info exported for codegen: type_name → predicate expression.
 pub type RefinedTypeInfoMap = HashMap<String, knot::ast::Expr>;
 
+/// Per-field refinement predicates exported for codegen: type_name →
+/// [(field, whole-record predicate `\r -> field_pred r.field`)]. Only record
+/// aliases refined on their fields appear; lets `refine` report WHICH field
+/// failed rather than a generic whole-record violation.
+pub type RefinedFieldPredsMap = HashMap<String, Vec<(String, knot::ast::Expr)>>;
+
 /// Maps `show` call-site spans to the canonical unit string of the argument
 /// (e.g. `"M"`, `"M/S^2"`). Only concrete units appear: units are erased at
 /// runtime, so this is the sole channel by which the unit reaches the emitted
@@ -1100,6 +1106,12 @@ struct Infer {
     // ── Refined types ─────────────────────────────────────────────
     /// Refined type metadata: type_name → (base Ty, predicate Expr).
     refined_types: HashMap<String, (Ty, knot::ast::Expr)>,
+    /// Per-field predicates for record aliases refined on their fields
+    /// (`type P = {age: Int 1 where …}`): type_name → [(field, whole-record
+    /// predicate `\r -> field_pred r.field`)]. Lets `refine` test fields one
+    /// at a time and report WHICH field failed, rather than a generic
+    /// whole-record violation. Empty for scalar/whole-record refinements.
+    refined_field_preds: HashMap<String, Vec<(String, knot::ast::Expr)>>,
     /// Refine expression type vars: (span, alpha_var, inner_ty) for post-inference resolution.
     refine_vars: Vec<(Span, TyVar, Ty)>,
     /// Top-level constant literals from the `with` declaration record
@@ -1256,6 +1268,7 @@ impl Infer {
             in_type_annotation: false,
             enforce_units: false,
             refined_types: HashMap::new(),
+            refined_field_preds: HashMap::new(),
             refine_vars: Vec::new(),
             const_literals: HashMap::new(),
             field_accesses: Vec::new(),
@@ -9341,6 +9354,7 @@ impl Infer {
                 data_ctor_decls.insert(name.to_string(), ctors.to_vec());
             });
             let mut per_field: Vec<(String, ast::Type, ast::Expr)> = Vec::new();
+            let mut field_preds: Vec<(String, Vec<(String, ast::Expr)>)> = Vec::new();
             for (name, ty, span) in &alias_decls {
                 if self.refined_types.contains_key(name) {
                     continue;
@@ -9355,11 +9369,23 @@ impl Infer {
                     ) {
                         per_field.push((name.clone(), ty.clone(), pred));
                     }
+                    if let Some(fps) = crate::types::record_field_predicates(
+                        fields,
+                        &refined_preds,
+                        &alias_ast_types,
+                        &data_ctor_decls,
+                        *span,
+                    ) {
+                        field_preds.push((name.clone(), fps));
+                    }
                 }
             }
             for (name, ty, pred) in per_field {
                 let base_ty = self.ast_type_to_ty(&ty);
                 self.refined_types.insert(name, (base_ty, pred));
+            }
+            for (name, fps) in field_preds {
+                self.refined_field_preds.insert(name, fps);
             }
         }
         self.enforce_units = saved_enforce;
@@ -13144,6 +13170,7 @@ pub type CheckOutput = (
     TraceBindings,
     CompileExpectedTypes,
     Option<String>,
+    RefinedFieldPredsMap,
 );
 
 /// Run type inference on a parsed module. Returns diagnostics,
@@ -14075,7 +14102,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
     let trace_types = infer.extract_trace_types();
     let trace_bindings = infer.extract_trace_bindings();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, fold_dict_args, collect_refs, infer.resolved_calls.clone(), todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, file_body_type)
+    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, fold_dict_args, collect_refs, infer.resolved_calls.clone(), todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, file_body_type, infer.refined_field_preds.clone())
 }
 
 

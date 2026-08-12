@@ -1390,25 +1390,7 @@ pub fn record_field_refinement_predicate(
     data_ctor_decls: &HashMap<String, Vec<ConstructorDef>>,
     span: Span,
 ) -> Option<Expr> {
-    let mut seen = HashSet::new();
-    // (field, pred) pairs in source order; `field_value_predicates` already
-    // flattens stacked/aliased/nested refinements into field-value predicates.
-    let mut checks: Vec<(String, Expr)> = Vec::new();
-    for field in fields {
-        for (_label, pred) in field_value_predicates(
-            &field.name,
-            &field.value,
-            refined_types,
-            alias_ast_types,
-            data_ctor_decls,
-            &mut seen,
-        ) {
-            checks.push((field.name.clone(), pred));
-        }
-    }
-    if checks.is_empty() {
-        return None;
-    }
+    let checks = record_field_checks(fields, refined_types, alias_ast_types, data_ctor_decls)?;
     let param = synth_fresh_name();
     let mut body: Option<Expr> = None;
     for (field, pred) in checks {
@@ -1426,6 +1408,57 @@ pub fn record_field_refinement_predicate(
         });
     }
     Some(synth_lambda(&param, body?))
+}
+
+/// The individual `(field, predicate)` refinements of a record type, each
+/// wrapped as a whole-record predicate `\r -> field_pred r.field` so callers
+/// (e.g. `refine`) can test fields one at a time and report WHICH field
+/// failed. Returns `None` when the record has no refined fields.
+pub fn record_field_predicates(
+    fields: &[knot::ast::Field<Type>],
+    refined_types: &HashMap<String, Expr>,
+    alias_ast_types: &HashMap<String, Type>,
+    data_ctor_decls: &HashMap<String, Vec<ConstructorDef>>,
+    span: Span,
+) -> Option<Vec<(String, Expr)>> {
+    let checks = record_field_checks(fields, refined_types, alias_ast_types, data_ctor_decls)?;
+    let mut out = Vec::new();
+    for (field, pred) in checks {
+        let param = synth_fresh_name();
+        let body = synth_app(pred, synth_field(synth_var(&param, span), &field));
+        out.push((field, synth_lambda(&param, body)));
+    }
+    Some(out)
+}
+
+/// The `(field, field_value_predicate)` pairs of a record type's refined
+/// fields (each predicate takes the FIELD value). `field_value_predicates`
+/// already flattens stacked/aliased/nested refinements. `None` when empty.
+fn record_field_checks(
+    fields: &[knot::ast::Field<Type>],
+    refined_types: &HashMap<String, Expr>,
+    alias_ast_types: &HashMap<String, Type>,
+    data_ctor_decls: &HashMap<String, Vec<ConstructorDef>>,
+) -> Option<Vec<(String, Expr)>> {
+    let mut seen = HashSet::new();
+    let mut checks: Vec<(String, Expr)> = Vec::new();
+    for field in fields {
+        for (_label, pred) in field_value_predicates(
+            &field.name,
+            &field.value,
+            refined_types,
+            alias_ast_types,
+            data_ctor_decls,
+            &mut seen,
+        ) {
+            checks.push((field.name.clone(), pred));
+        }
+    }
+    if checks.is_empty() {
+        None
+    } else {
+        Some(checks)
+    }
 }
 
 #[allow(clippy::type_complexity)]

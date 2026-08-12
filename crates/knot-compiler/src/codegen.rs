@@ -315,6 +315,11 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
 
     // Refined type predicates: type_name -> predicate AST expression
     refined_types: HashMap<String, knot::ast::Expr>,
+    // Per-field predicates for record aliases refined on their fields:
+    // type_name -> [(field, whole-record predicate `\r -> field_pred r.field`)].
+    // Lets `refine` report WHICH field failed. Empty for scalar/whole-record
+    // refinements. Populated post-construction via `set_refined_field_preds`.
+    refined_field_preds: crate::infer::RefinedFieldPredsMap,
     // Declared (unresolved) alias bodies: alias_name -> AST type. Unlike
     // `type_aliases`, these keep their `where` refinements, so
     // `collect_type_refinements` can follow `events: [GossipEvent]` into
@@ -726,6 +731,7 @@ pub fn compile(
     monad_info: &MonadInfo,
     refine_targets: &crate::infer::RefineTargets,
     refined_types: &crate::infer::RefinedTypeInfoMap,
+    refined_field_preds: &crate::infer::RefinedFieldPredsMap,
     from_json_targets: &crate::infer::FromJsonTargets,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
@@ -760,6 +766,7 @@ pub fn compile(
             monad_info,
             refine_targets,
             refined_types,
+            refined_field_preds,
             from_json_targets,
             type_info,
             elem_pushdown_ok,
@@ -799,6 +806,7 @@ pub fn compile_with<M: cranelift_module::Module>(
     monad_info: &MonadInfo,
     refine_targets: &crate::infer::RefineTargets,
     refined_types: &crate::infer::RefinedTypeInfoMap,
+    refined_field_preds: &crate::infer::RefinedFieldPredsMap,
     from_json_targets: &crate::infer::FromJsonTargets,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
@@ -832,6 +840,7 @@ pub fn compile_with<M: cranelift_module::Module>(
         monad_info,
         refine_targets,
         refined_types,
+        refined_field_preds,
         from_json_targets,
         type_info,
         elem_pushdown_ok,
@@ -865,6 +874,7 @@ fn compile_inner<M: cranelift_module::Module>(
     monad_info: &MonadInfo,
     refine_targets: &crate::infer::RefineTargets,
     refined_types: &crate::infer::RefinedTypeInfoMap,
+    refined_field_preds: &crate::infer::RefinedFieldPredsMap,
     from_json_targets: &crate::infer::FromJsonTargets,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
@@ -937,6 +947,7 @@ fn compile_inner<M: cranelift_module::Module>(
     cg.refine_targets = refine_targets.clone();
     cg.resolved_calls = resolved_calls.clone();
     cg.refined_types = refined_types.clone();
+    cg.refined_field_preds = refined_field_preds.clone();
     cg.alias_ast = decl_views(program)
         .iter()
         .filter_map(|d| match d.kind {
@@ -1286,6 +1297,7 @@ pub fn jit_entry(source: &str) -> Option<usize> {
             trace_bindings,
             _compile_expected_types,
             _file_body_type,
+            _refined_field_preds,
         ) = crate::infer::check(&mut program);
         if infer_diags
             .iter()
@@ -1303,6 +1315,7 @@ pub fn jit_entry(source: &str) -> Option<usize> {
             &monad_info,
             &refine_targets,
             &refined_types,
+            &_refined_field_preds,
             &from_json_targets,
             &type_info,
             &elem_pushdown_ok,
@@ -1442,6 +1455,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             atomic_arena_frames: 0,
             pending_index_frees: Vec::new(),
             refined_types: HashMap::new(),
+            refined_field_preds: HashMap::new(),
             alias_ast: HashMap::new(),
             refine_targets: HashMap::new(),
             resolved_calls: HashMap::new(),
@@ -9291,6 +9305,54 @@ impl<M: cranelift_module::Module> Codegen<M> {
         }
 
         let val = self.compile_expr(builder, inner, env, db);
+
+        // Per-field record refinement: test each field's predicate separately so
+        // a violation names WHICH field failed (`Just "field"`) rather than a
+        // generic whole-record violation. Falls through to the single
+        // whole-value check for scalar / whole-record refinements.
+        if let Some(field_preds) = self.refined_field_preds.get(&type_name).cloned() {
+            let merge_block = builder.create_block();
+            builder.append_block_param(merge_block, self.ptr_type);
+            let ok_block = builder.create_block();
+            // Chain: each field's predicate; on false jump to that field's err.
+            let mut next_check = builder.create_block();
+            builder.ins().jump(next_check, &[]);
+            for (i, (field_name, field_pred)) in field_preds.iter().enumerate() {
+                builder.switch_to_block(next_check);
+                builder.seal_block(next_check);
+                let fpred_fn = self.compile_expr(builder, field_pred, env, db);
+                let res = self.call_rt(builder, "knot_value_call", &[db, fpred_fn, val]);
+                let is_true = self.call_rt_typed(
+                    builder,
+                    "knot_value_get_bool",
+                    &[res],
+                    cranelift_codegen::ir::types::I32,
+                );
+                let err_block = builder.create_block();
+                let cont = if i + 1 < field_preds.len() {
+                    let b = builder.create_block();
+                    b
+                } else {
+                    ok_block
+                };
+                builder.ins().brif(is_true, cont, &[], err_block, &[]);
+                builder.switch_to_block(err_block);
+                builder.seal_block(err_block);
+                let err_val =
+                    self.build_refinement_err_field(builder, &type_name, Some(field_name));
+                builder.ins().jump(merge_block, &[err_val.into()]);
+                next_check = cont;
+            }
+            // All fields passed.
+            builder.switch_to_block(ok_block);
+            builder.seal_block(ok_block);
+            let ok_val = self.build_ok_result(builder, val);
+            builder.ins().jump(merge_block, &[ok_val.into()]);
+            builder.switch_to_block(merge_block);
+            builder.seal_block(merge_block);
+            return builder.block_params(merge_block)[0];
+        }
+
         let pred_fn = self.compile_expr(builder, &predicate_expr, env, db);
 
         // Call the predicate: pred(val) -> Bool
@@ -9411,6 +9473,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
     /// Build Err {error: {typeName: ..., violations: [...]}} constructor value
     fn build_refinement_err(&mut self, builder: &mut FunctionBuilder, type_name: &str) -> Value {
+        self.build_refinement_err_field(builder, type_name, None)
+    }
+
+    /// Build Err {error: {typeName: ..., violations: [...]}} with the violation
+    /// naming `field` (`Just "field"`) when `Some`, else `Nothing` (a
+    /// whole-value violation). Per-field records use `Some` so `refine` reports
+    /// WHICH field failed rather than a generic whole-record violation.
+    fn build_refinement_err_field(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        type_name: &str,
+        field: Option<&str>,
+    ) -> Value {
         // Build {typeName: type_name, violations: [{field: Nothing {}, message: "..."}]}
         let cap2 = builder.ins().iconst(self.ptr_type, 2);
         let error_rec = self.call_rt(builder, "knot_record_empty", &[cap2]);
@@ -9424,13 +9499,27 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let violation_rec = self.call_rt(builder, "knot_record_empty", &[cap2]);
 
         let (f_key_ptr, f_key_len) = self.string_ptr(builder, "field");
-        let (nothing_tag_ptr, nothing_tag_len) = self.string_ptr(builder, "Nothing");
-        let nothing_unit = self.call_rt(builder, "knot_value_unit", &[]);
-        let nothing_val = self.call_rt(builder, "knot_value_constructor", &[nothing_tag_ptr, nothing_tag_len, nothing_unit]);
-        self.call_rt_void(builder, "knot_record_set_field", &[violation_rec, f_key_ptr, f_key_len, nothing_val]);
+        let field_val = match field {
+            Some(name) => {
+                // Just "name"
+                let (nptr, nlen) = self.string_ptr(builder, name);
+                let text = self.call_rt(builder, "knot_value_text", &[nptr, nlen]);
+                let (just_tag_ptr, just_tag_len) = self.string_ptr(builder, "Just");
+                self.call_rt(builder, "knot_value_constructor", &[just_tag_ptr, just_tag_len, text])
+            }
+            None => {
+                let (nothing_tag_ptr, nothing_tag_len) = self.string_ptr(builder, "Nothing");
+                let nothing_unit = self.call_rt(builder, "knot_value_unit", &[]);
+                self.call_rt(builder, "knot_value_constructor", &[nothing_tag_ptr, nothing_tag_len, nothing_unit])
+            }
+        };
+        self.call_rt_void(builder, "knot_record_set_field", &[violation_rec, f_key_ptr, f_key_len, field_val]);
 
         let (m_key_ptr, m_key_len) = self.string_ptr(builder, "message");
-        let msg_str = format!("value does not satisfy '{}' predicate", type_name);
+        let msg_str = match field {
+            Some(name) => format!("field '{name}' does not satisfy '{type_name}' predicate"),
+            None => format!("value does not satisfy '{type_name}' predicate"),
+        };
         let (msg_ptr, msg_len) = self.string_ptr(builder, &msg_str);
         let msg_val = self.call_rt(builder, "knot_value_text", &[msg_ptr, msg_len]);
         self.call_rt_void(builder, "knot_record_set_field", &[violation_rec, m_key_ptr, m_key_len, msg_val]);

@@ -555,7 +555,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     let type_env = types::TypeEnv::from_program(&program);
 
     // Type inference
-    let (infer_diags, monad_info, type_info, _local_types, refine_targets, refined_types, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, fold_dict_args, collect_refs, resolved_calls, todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, _file_body_type) = infer::check(&mut program);
+    let (infer_diags, monad_info, type_info, _local_types, refine_targets, refined_types, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, fold_dict_args, collect_refs, resolved_calls, todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, _file_body_type, refined_field_preds) = infer::check(&mut program);
     // The expected-type descriptor of each `compile` call is knot source-type
     // syntax (from `display_ty_clean`). For ADTs the bare NAME alone is
     // insufficient — the JIT must compare constructor sets, and `Priority` says
@@ -658,7 +658,7 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     }
 
     // Code generation
-    let obj_bytes = match codegen::compile(&program, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &from_json_targets, &type_info, &elem_pushdown_ok, &show_unit_strings, &sum_float_spans, &compile_expected_types, &relation_fields, &with_fields, &implicit_refs, &type_arg_spans, &implicit_dict_args, &fold_dict_args, &collect_refs, &resolved_calls, &todo_types, &todo_bindings, &trace_types, &trace_bindings, &source, overrides, debug) {
+    let obj_bytes = match codegen::compile(&program, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &refined_field_preds, &from_json_targets, &type_info, &elem_pushdown_ok, &show_unit_strings, &sum_float_spans, &compile_expected_types, &relation_fields, &with_fields, &implicit_refs, &type_arg_spans, &implicit_dict_args, &fold_dict_args, &collect_refs, &resolved_calls, &todo_types, &todo_bindings, &trace_types, &trace_bindings, &source, overrides, debug) {
         Ok(bytes) => bytes,
         Err(diags) => {
             for diag in &diags {

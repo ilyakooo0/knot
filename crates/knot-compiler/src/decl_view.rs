@@ -27,7 +27,10 @@ pub enum DeclViewKind<'a> {
         ty: &'a ast::Type,
     },
     /// `*name : [T]` — a persisted source relation.
-    Source { ty: &'a ast::Type },
+    Source {
+        ty: &'a ast::Type,
+        migrations: &'a [ast::SourceMigration],
+    },
     /// `*name = body` — a view.
     View {
         ty: Option<&'a ast::TypeScheme>,
@@ -130,10 +133,10 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
                     span: fl.value.span,
                     kind: DeclViewKind::TypeAlias { params, ty },
                 }),
-                SourceDecl { ty, .. } => out.push(DeclView {
+                SourceDecl { ty, migrations, .. } => out.push(DeclView {
                     name: fl.name.as_str(),
                     span: fl.value.span,
-                    kind: DeclViewKind::Source { ty },
+                    kind: DeclViewKind::Source { ty, migrations },
                 }),
                 ViewDecl { ty, body, .. } => out.push(DeclView {
                     name: fl.name.as_str(),

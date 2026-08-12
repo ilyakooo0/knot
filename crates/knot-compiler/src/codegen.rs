@@ -4195,6 +4195,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if let DeclViewKind::Fun { body: Some(body), .. } = decl.kind {
                     collect_record_migrations(body, &mut migrate_sites);
                 }
+                // Top-level `with`-block sources carry their `migrate` clauses
+                // directly on the SourceDecl — collect those too, or a source
+                // declared at the top level never gets its migration emitted.
+                if let DeclViewKind::Source { migrations, .. } = decl.kind {
+                    // `migrate_schemas` is keyed by the bare relation name;
+                    // the decl name carries the leading `*`.
+                    let bare = decl.name.strip_prefix('*').unwrap_or(decl.name);
+                    for m in migrations {
+                        migrate_sites.push((bare.to_string(), m.using_fn.clone()));
+                    }
+                }
             }
             for (relation, using_fn) in &migrate_sites {
                 let relation = relation.clone();

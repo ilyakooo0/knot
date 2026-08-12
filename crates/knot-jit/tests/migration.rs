@@ -59,11 +59,13 @@ type PersonV2 = {name: Text, active: Active}
 }
 
 #[test]
-fn migrate_backfilled_adt_field_renders_empty() {
-    // BUG (reproduced): rows upgraded by `migrate` show their backfilled ADT
-    // field as EMPTY — `{active: , name: Alice}` — where a directly-built
-    // `Active.Yes {}` renders `{active: Yes, name: x}`. The migration's ADT
-    // reconstruction is broken (constructor not attached on read-back).
+fn migrate_backfilled_adt_field_renders_constructor() {
+    // Rows upgraded by `migrate` render their backfilled ADT field with its
+    // constructor — `{active: Yes, name: Alice}` — matching a directly-built
+    // `Active.Yes {}`. This requires the `migrate` fn to actually run: the
+    // codegen must emit `knot_source_migrate` for top-level `with`-block
+    // sources (previously only record-embedded sources were collected, so the
+    // migration never ran and `active` stayed empty).
     let dir = dir_for("mig_show");
     build_and_run(
         &dir,
@@ -91,8 +93,8 @@ type PersonV2 = {name: Text, active: Active}
   base.println (base.show people)
   yield {})"#,
     );
-    // Current (buggy) behavior: `active:` has no constructor printed.
-    assert_eq!(out, "\"[{active: , name: Alice}]\"\n{}");
+    // Fixed: the migrated ADT field renders its constructor.
+    assert_eq!(out, "\"[{active: Yes, name: Alice}]\"\n{}");
 }
 
 #[test]

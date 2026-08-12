@@ -1108,6 +1108,13 @@ fn compile_inner<M: cranelift_module::Module>(
             ));
         }
     }
+    // Bail out before codegen if declaration collection (or override
+    // validation) already produced errors — e.g. a duplicate definition.
+    // Continuing would reach `define_function`'s `DuplicateDefinition` unwrap
+    // and panic the compiler instead of reporting the diagnostic.
+    if !cg.diagnostics.is_empty() {
+        return Err(cg.diagnostics);
+    }
     cg.define_functions(program, type_env);
     cg.generate_main(program);
     // Drain lambdas and IO thunks created by generate_main (e.g., migration functions)
@@ -2218,6 +2225,32 @@ impl<M: cranelift_module::Module> Codegen<M> {
     // ── Declaration collection ────────────────────────────────────
 
     fn collect_declarations(&mut self, program: &ast::Expr) {
+        // Reject duplicate top-level definitions up front. A name declared
+        // twice registers two `knot_user_<name>` Cranelift declarations that
+        // resolve to the SAME func id; the second definition then fails
+        // `define_function` with `DuplicateDefinition` and panics the compiler
+        // on an unwrap. Surface a clean diagnostic instead. Sources/views are
+        // skipped (their `*`/`&`-prefixed field names make `decl.name` differ
+        // from the bare value name; their own redefinition rules apply).
+        {
+            let mut seen: HashMap<&str, ast::Span> = HashMap::new();
+            for decl in decl_views(program) {
+                if let DeclViewKind::Fun { body: Some(_), .. } = decl.kind {
+                    if let Some(first) = seen.get(decl.name) {
+                        self.diagnostics.push(
+                            knot::diagnostic::Diagnostic::error(format!(
+                                "`{}` is already defined in an enclosing scope, and shadowing is not allowed",
+                                decl.name
+                            ))
+                            .label(decl.span, "duplicate definition")
+                            .label(*first, "first defined here"),
+                        );
+                    } else {
+                        seen.insert(decl.name, decl.span);
+                    }
+                }
+            }
+        }
         // Register built-in ADT constructors so trait dispatchers can find their
         // ctor lists. Inference treats these as built-in types (see
         // `register_builtins` in infer.rs), so they don't appear as user-source

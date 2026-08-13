@@ -24,6 +24,15 @@ pub fn link(
     }
     cmd.arg(runtime_path);
 
+    // Strip the regular symbol table and debug info from the produced binary:
+    // those symbols are only useful for debugging the *generated* code, and
+    // they dominate binary size (a debug-built runtime leaves ~50MB of them).
+    // Stripping is SAFE for `base.compile`: the JIT resolves `knot_*` symbols
+    // via dlsym, which reads the DYNAMIC symbol table (.dynsym), and `-s`
+    // preserves that (it's populated by --export-dynamic). Cross-platform:
+    // `-s` is the strip flag for both GNU ld and Apple's ld64.
+    cmd.arg("-s");
+
     // Export the program's `knot_*` runtime symbols into the dynamic symbol
     // table so code JIT-compiled at runtime by the `compile` builtin can
     // resolve them against the running process (dlsym RTLD_DEFAULT). Without

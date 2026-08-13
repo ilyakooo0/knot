@@ -19196,13 +19196,10 @@ fn uncurry_app(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
 
 /// The program's entry-point expression. A `.knot` file IS a single
 /// expression, so the whole program is compiled as `main` — its value is the
-/// program's result. `None` only for a bare record with no body (a pure
-/// declaration file, e.g. a lockfile).
+/// program's result. ANY value is a valid result, including a bare record
+/// (`{a 1 b 2}` returns the record `{a: 1, b: 2}`).
 fn file_main_body(program: &ast::Expr) -> Option<&ast::Expr> {
-    match &program.node {
-        ast::ExprKind::Record(_) => None,
-        _ => Some(program),
-    }
+    Some(program)
 }
 
 /// Walk the whole program AST collecting `(decl_name, markdown_doc)` for every

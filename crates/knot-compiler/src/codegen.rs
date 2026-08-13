@@ -9014,6 +9014,21 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
             }
 
+            // `Bool.True {}` / `Bool.False {}`: Bool is compiler-special-cased
+            // (a primitive `Value::Bool`, not a tagged Constructor), so the
+            // qualified form must produce the SAME `Value::Bool` the bare
+            // `True`/`False` arm below does — otherwise predicate results read
+            // via `knot_value_get_bool` panic on `Constructor(Bool.True)`.
+            ast::ExprKind::FieldAccess { expr, field }
+                if let ast::ExprKind::Constructor(type_name) = &expr.node
+                    && type_name.as_str() == "Bool"
+                    && (field == "True" || field == "False") =>
+            {
+                let val = if field == "True" { 1i64 } else { 0i64 };
+                let arg = builder.ins().iconst(cranelift_codegen::ir::types::I32, val);
+                self.call_rt(builder, "knot_value_bool", &[arg])
+            }
+
             // `Type.Ctor payload` for a BUILT-IN data type (`Maybe.Just`,
             // `Result.Ok`, `Ordering.Lt`, …): the type namespace is erased, so
             // the leaf resolves to a bare constructor. Emit the *qualified* tag
@@ -9021,7 +9036,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // stores the leaf (`Just`).
             ast::ExprKind::FieldAccess { expr, field }
                 if let ast::ExprKind::Constructor(type_name) = &expr.node
-                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Bool" | "Ordering" | "List" | "Level")
+                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Ordering" | "List" | "Level")
                     && self
                         .data_constructors
                         .get(type_name)

@@ -82,15 +82,12 @@ fn tojson_nested_records_and_lists() {
 }
 
 #[test]
-fn tojson_adt_bool_is_tagged_object() {
-    // DISCOVERY: an ADT constructor (even Bool.True) serializes as a tagged
-    // object {"__knot_ctor":{tag,value}}, NOT a JSON boolean. Only knot's
-    // primitive Bool (from comparisons) serializes as true/false.
-    assert_show(
-        "base.toJson (Bool.True {})",
-        "{\"__knot_ctor\":{\"tag\":\"True\",\"value\":{}}}",
-    );
-    // a real Bool value serializes as a JSON boolean
+fn tojson_bool_is_primitive() {
+    // Bool is a primitive Value::Bool, not a tagged ADT. The qualified
+    // `Bool.True {}` and a comparison result are the SAME runtime value, so
+    // both serialize as a JSON boolean (not a `__knot_ctor` envelope).
+    assert_show("base.toJson (Bool.True {})", "true");
+    assert_show("base.toJson (Bool.False {})", "false");
     assert_show("base.toJson (1 == 1)", "true");
 }
 

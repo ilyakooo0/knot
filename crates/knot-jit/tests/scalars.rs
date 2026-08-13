@@ -169,11 +169,11 @@ fn bytes_invalid_utf8() {
 fn json_scalars() {
     assert_show("base.toJson 42", "42");
     assert_show("base.toJson \"hi\"", "\"hi\"");
-    // ADTs serialize with the constructor envelope, so a Bool is NOT `true`.
-    assert_show(
-        "base.toJson (Bool.True {})",
-        "{\"__knot_ctor\":{\"tag\":\"True\",\"value\":{}}}",
-    );
+    // Bool is a primitive Value::Bool (not a tagged ADT), so the qualified
+    // `Bool.True {}` serializes as a JSON boolean — same as a comparison
+    // result. (`1 == 1` and `Bool.True {}` are the same runtime value.)
+    assert_show("base.toJson (Bool.True {})", "true");
+    assert_show("base.toJson (Bool.False {})", "false");
 }
 
 #[test]

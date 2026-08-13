@@ -13150,33 +13150,38 @@ fn value_references_source_inner(
 /// themselves, and the span-keyed facts codegen cannot re-derive on its own
 /// (monad kinds, refine/parseJson targets, `elem` pushdown eligibility, `show`
 /// units, `sum`'s numeric result type).
-pub type CheckOutput = (
-    Vec<Diagnostic>,
-    MonadInfo,
-    TypeInfo,
-    LocalTypeInfo,
-    RefineTargets,
-    RefinedTypeInfoMap,
-    FromJsonTargets,
-    ElemPushdownOk,
-    ShowUnitStrings,
-    SumFloatSpans,
-    RelationFieldSpans,
-    WithFields,
-    TypeArgSpans,
-    ImplicitRefs,
-    ImplicitDictArgs,
-    FoldDictArgs,
-    CollectRefs,
-    ResolvedCalls,
-    TodoTypes,
-    TodoBindings,
-    TraceTypes,
-    TraceBindings,
-    CompileExpectedTypes,
-    Option<String>,
-    RefinedFieldPredsMap,
-);
+///
+/// The result of running type inference on a module. A named struct (not a
+/// tuple) so the 25 outputs can't be silently reordered or mismatched by
+/// position — a positional tuple of this size already produced an arity bug.
+pub struct CheckOutput {
+    pub diagnostics: Vec<Diagnostic>,
+    pub monad_info: MonadInfo,
+    pub type_info: TypeInfo,
+    pub local_type_info: LocalTypeInfo,
+    pub refine_targets: RefineTargets,
+    pub refined_type_info: RefinedTypeInfoMap,
+    pub from_json_targets: FromJsonTargets,
+    pub elem_pushdown_ok: ElemPushdownOk,
+    pub show_unit_strings: ShowUnitStrings,
+    pub sum_float_spans: SumFloatSpans,
+    pub relation_field_spans: RelationFieldSpans,
+    pub with_fields: WithFields,
+    pub type_arg_spans: TypeArgSpans,
+    pub implicit_refs: ImplicitRefs,
+    pub implicit_dict_args: ImplicitDictArgs,
+    pub fold_dict_args: FoldDictArgs,
+    pub collect_refs: CollectRefs,
+    pub resolved_calls: ResolvedCalls,
+    pub todo_types: TodoTypes,
+    pub todo_bindings: TodoBindings,
+    pub trace_types: TraceTypes,
+    pub trace_bindings: TraceBindings,
+    pub compile_expected_types: CompileExpectedTypes,
+    /// The inferred type of the program's body expression, if it has one.
+    pub file_body_type: Option<String>,
+    pub refined_field_preds: RefinedFieldPredsMap,
+}
 
 /// Run type inference on a parsed module. Returns diagnostics,
 /// resolved monad info for desugared do-blocks, and inferred type info
@@ -14107,7 +14112,33 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
     let trace_types = infer.extract_trace_types();
     let trace_bindings = infer.extract_trace_bindings();
 
-    (infer.to_diagnostics(), monad_info, type_info, local_type_info, refine_targets, refined_type_info, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, fold_dict_args, collect_refs, infer.resolved_calls.clone(), todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, file_body_type, infer.refined_field_preds.clone())
+    CheckOutput {
+        diagnostics: infer.to_diagnostics(),
+        monad_info,
+        type_info,
+        local_type_info,
+        refine_targets,
+        refined_type_info,
+        from_json_targets,
+        elem_pushdown_ok,
+        show_unit_strings,
+        sum_float_spans,
+        relation_field_spans: relation_fields,
+        with_fields,
+        type_arg_spans,
+        implicit_refs,
+        implicit_dict_args,
+        fold_dict_args,
+        collect_refs,
+        resolved_calls: infer.resolved_calls.clone(),
+        todo_types,
+        todo_bindings,
+        trace_types,
+        trace_bindings,
+        compile_expected_types,
+        file_body_type,
+        refined_field_preds: infer.refined_field_preds.clone(),
+    }
 }
 
 

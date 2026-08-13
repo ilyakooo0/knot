@@ -1297,18 +1297,18 @@ pub fn jit_compile_typed(source: &str, expected: Option<&str>) -> Option<JitComp
         }
         crate::desugar::desugar(&mut program);
         let type_env = crate::types::TypeEnv::from_program(&program);
-        let (
-            infer_diags,
+        let crate::infer::CheckOutput {
+            diagnostics: infer_diags,
             monad_info,
             type_info,
-            _local_types,
+            local_type_info: _local_types,
             refine_targets,
-            refined_types,
+            refined_type_info: refined_types,
             from_json_targets,
             elem_pushdown_ok,
             show_unit_strings,
             sum_float_spans,
-            relation_fields,
+            relation_field_spans: relation_fields,
             with_fields,
             type_arg_spans,
             implicit_refs,
@@ -1320,10 +1320,10 @@ pub fn jit_compile_typed(source: &str, expected: Option<&str>) -> Option<JitComp
             todo_bindings,
             trace_types,
             trace_bindings,
-            _compile_expected_types,
+            compile_expected_types: _compile_expected_types,
             file_body_type,
-            _refined_field_preds,
-        ) = match expected {
+            refined_field_preds: _refined_field_preds,
+        } = match expected {
             Some(exp) => crate::infer::check_with_expected(&mut program, exp),
             None => crate::infer::check(&mut program),
         };

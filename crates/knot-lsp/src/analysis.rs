@@ -532,33 +532,15 @@ pub fn analyze_document(
             d.labels.iter().any(|l| in_user_decl(&l.span))
         };
 
-        let (
-            infer_diags,
-            mi,
-            inferred_types,
-            local_types,
-            rt,
+        let knot_compiler::infer::CheckOutput {
+            diagnostics: infer_diags,
+            monad_info: mi,
+            type_info: inferred_types,
+            local_type_info: local_types,
+            refine_targets: rt,
             refined_type_info,
-            _from_json,
-            _elem_pushdown,
-            _show_units,
-            _sum_floats,
-            _relation_fields,
-            _with_fields,
-            _type_args,
-            _implicit_refs,
-            _implicit_dict_args,
-            _fold_dict_args,
-            _collect_refs,
-            _resolved_calls,
-            _todo_types,
-            _todo_bindings,
-            _trace_types,
-            _trace_bindings,
-            _compile_expected_types,
-            _file_body_type,
-            _refined_field_preds,
-        ) = knot_compiler::infer::check(&mut analysis_module);
+            ..
+        } = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_user));
         type_info = inferred_types;
         local_type_info = local_types;

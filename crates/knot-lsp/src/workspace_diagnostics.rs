@@ -708,7 +708,7 @@ fn analyze_unopened_file_inner(
 
         knot_compiler::desugar::desugar(&mut analysis_module);
 
-        let (infer_diags, ..) = knot_compiler::infer::check(&mut analysis_module);
+        let knot_compiler::infer::CheckOutput { diagnostics: infer_diags, .. } = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_importer));
 
         all_diags.extend(

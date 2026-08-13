@@ -83,18 +83,18 @@ pub fn compile_and_run(
     let type_env = types::TypeEnv::from_program(&program);
     // Run inference, subsuming the body type against the host's expected type
     // (if any) on real types inside `check` — the verdict is read after.
-    let (
-        infer_diags,
+    let infer::CheckOutput {
+        diagnostics: infer_diags,
         monad_info,
         type_info,
-        _local_types,
+        local_type_info: _local_types,
         refine_targets,
-        refined_types,
+        refined_type_info: refined_types,
         from_json_targets,
         elem_pushdown_ok,
         show_unit_strings,
         sum_float_spans,
-        relation_fields,
+        relation_field_spans: relation_fields,
         with_fields,
         type_arg_spans,
         implicit_refs,
@@ -106,10 +106,10 @@ pub fn compile_and_run(
         todo_bindings,
         trace_types,
         trace_bindings,
-        _compile_expected_types,
+        compile_expected_types: _compile_expected_types,
         file_body_type,
         refined_field_preds,
-    ) = match expected_src {
+    } = match expected_src {
         Some(exp) => infer::check_with_expected(&mut program, exp),
         None => infer::check(&mut program),
     };

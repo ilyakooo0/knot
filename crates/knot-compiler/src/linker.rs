@@ -7,7 +7,7 @@ use std::process::Command;
 pub fn link(
     object_path: &Path,
     runtime_path: &Path,
-    compile_rt_path: &Path,
+    compile_rt_path: Option<&Path>,
     output_path: &Path,
 ) -> Result<(), String> {
     let mut cmd = Command::new("cc");
@@ -15,12 +15,14 @@ pub fn link(
     // (knot-compile-rt, which provides `knot_compile_impl`/`knot_compile_rt_init`
     // and pulls in the compiler+cranelift+z3), then the knot runtime that
     // satisfies its undefined `knot_*` references. Archives are scanned
-    // left-to-right, so a provider must come after its users.
-    cmd.arg("-o")
-        .arg(output_path)
-        .arg(object_path)
-        .arg(compile_rt_path)
-        .arg(runtime_path);
+    // left-to-right, so a provider must come after its users. `compile_rt_path`
+    // is None for programs that never call `base.compile` — omitting the
+    // archive drops the embedded compiler (cranelift+Z3) from the binary.
+    cmd.arg("-o").arg(output_path).arg(object_path);
+    if let Some(crt) = compile_rt_path {
+        cmd.arg(crt);
+    }
+    cmd.arg(runtime_path);
 
     // Export the program's `knot_*` runtime symbols into the dynamic symbol
     // table so code JIT-compiled at runtime by the `compile` builtin can

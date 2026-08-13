@@ -729,18 +729,28 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
 
     // Find runtime
     let runtime_path = find_runtime();
-    // The JIT compile-runtime archive, always linked so `base.compile` works.
-    let compile_rt_path = find_compile_rt();
+    // The JIT compile-runtime archive, linked only when the program actually
+    // calls `base.compile` — otherwise omitting it drops the embedded compiler
+    // (cranelift+Z3, ~50MB) from the produced binary. Codegen likewise skips
+    // the `knot_compile_rt_init` call for such programs (it would be an
+    // undefined symbol without the archive).
+    let compile_rt_path = if infer::uses_compile_builtin(&program) {
+        Some(find_compile_rt())
+    } else {
+        None
+    };
 
     // Link (output path computed and collision-checked above)
-    if let Err(e) = linker::link(&obj_path, &runtime_path, &compile_rt_path, &output_path) {
+    if let Err(e) = linker::link(&obj_path, &runtime_path, compile_rt_path.as_deref(), &output_path) {
         eprintln!("Link error: {}", e);
         let _ = std::fs::remove_file(&obj_path);
         if is_extracted_temp_runtime(&runtime_path) {
             let _ = std::fs::remove_file(&runtime_path);
         }
-        if is_extracted_temp_compile_rt(&compile_rt_path) {
-            let _ = std::fs::remove_file(&compile_rt_path);
+        if let Some(crt) = &compile_rt_path
+            && is_extracted_temp_compile_rt(crt)
+        {
+            let _ = std::fs::remove_file(crt);
         }
         process::exit(1);
     }
@@ -751,8 +761,10 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     if is_extracted_temp_runtime(&runtime_path) {
         let _ = std::fs::remove_file(&runtime_path);
     }
-    if is_extracted_temp_compile_rt(&compile_rt_path) {
-        let _ = std::fs::remove_file(&compile_rt_path);
+    if let Some(crt) = &compile_rt_path
+        && is_extracted_temp_compile_rt(crt)
+    {
+        let _ = std::fs::remove_file(crt);
     }
 
     // Update schema lockfile from the (prelude-wrapped, desugared) program.

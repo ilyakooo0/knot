@@ -4178,14 +4178,23 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // the binary so the `docs` subcommand can print them without running
         // main.
         let all_docs = collect_docs(program);
+        // Only register the JIT compile impl when the program actually uses
+        // `base.compile`. When it doesn't, the produced binary is linked
+        // WITHOUT the knot-compile-rt archive (see main.rs), so emitting this
+        // call would reference an undefined `knot_compile_rt_init` symbol and
+        // the link would fail. Skipping it drops cranelift+Z3 from the binary.
+        let emit_compile_init = crate::infer::uses_compile_builtin(program);
 
         self.build_function(main_id, sig, |cg, builder, entry| {
             let argc = builder.block_params(entry)[0];
             let argv = builder.block_params(entry)[1];
 
-            // Register the JIT compile implementation (from the always-linked
-            // knot-compile-rt archive) so `base.compile` is live at runtime.
-            cg.call_rt_void(builder, "knot_compile_rt_init", &[]);
+            // Register the JIT compile implementation (from the knot-compile-rt
+            // archive) so `base.compile` is live at runtime — only when the
+            // program uses it (and the archive is therefore linked).
+            if emit_compile_init {
+                cg.call_rt_void(builder, "knot_compile_rt_init", &[]);
+            }
 
             // Register attached doc comments so the `docs` subcommand can print
             // them. Each is (name, markdown) pushed onto the runtime's doc list.

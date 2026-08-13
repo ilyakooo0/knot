@@ -14590,11 +14590,35 @@ fn for_each_type_ctor<'a>(
     program: &'a ast::Expr,
     f: &mut impl FnMut(&'a str, &'a [ast::Name], &'a ast::Type, Span),
 ) {
+
     walk_exprs_read(program, &mut |e| {
         if let ast::ExprKind::TypeCtor { name, params, ty } = &e.node {
             f(name, params, ty, e.span);
         }
     });
+}
+
+/// Whether the program statically references the `base.compile` builtin (as
+/// `compile` or `base.compile`). Conservative: any matching name/field counts
+/// as usage, even if shadowed — a false positive only means the compile
+/// runtime is linked (no size win), never a broken binary. Used to skip
+/// linking the JIT compiler archive (`knot-compile-rt`) into programs that
+/// never compile at runtime, dropping cranelift+Z3 from the produced binary.
+pub fn uses_compile_builtin(program: &ast::Expr) -> bool {
+    let mut found = false;
+    walk_exprs_read(program, &mut |e| {
+        match &e.node {
+            ast::ExprKind::Var(n) if n == "compile" => found = true,
+            ast::ExprKind::FieldAccess { expr: ns, field }
+                if field == "compile"
+                    && matches!(&ns.node, ast::ExprKind::Var(n) if n == "base") =>
+            {
+                found = true;
+            }
+            _ => {}
+        }
+    });
+    found
 }
 
 /// Visit every `DataCtor` (`data`) marker in the program.

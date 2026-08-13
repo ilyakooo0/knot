@@ -1169,28 +1169,43 @@ fn compile_inner<M: cranelift_module::Module>(
 
 // ── Constructor ───────────────────────────────────────────────────
 
+/// Build the host ISA at maximum optimization, shared by the AOT
+/// (`ObjectModule`) and JIT (`JITModule`) backends. `opt_level=speed` turns on
+/// cranelift's full egraph optimization pipeline (inlining, GVN, const-prop,
+/// LICM, dead-code elimination) — the default `none` did no optimization at
+/// all. `pic` differs by backend: AOT object files need position-independent
+/// code (`is_pic=true`), while the JIT requires `is_pic=false` (it panics
+/// otherwise). The PAC-disabling below is preserved for both: Apple Silicon
+/// return-address signing breaks `.eh_frame` unwinding through generated
+/// frames.
+fn build_isa(pic: bool) -> std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa> {
+    let mut flag_builder = settings::builder();
+    flag_builder
+        .set("is_pic", if pic { "true" } else { "false" })
+        .unwrap();
+    flag_builder.set("opt_level", "speed").unwrap();
+    let mut isa_builder =
+        cranelift_native::builder().expect("failed to detect host CPU");
+    // cranelift-native enables return-address signing (PAC) on Apple Silicon.
+    // The resulting RA_SIGN_STATE DWARF expressions in our .eh_frame are
+    // rejected by Apple's libunwind when it steps through generated frames,
+    // turning every panic that crosses generated code into a fatal "failed to
+    // initiate panic" abort — which defeats the runtime's catch_unwind
+    // recovery (HTTP 500s, race cancellation). Plain arm64 macOS binaries
+    // don't sign return addresses anyway.
+    let _ = isa_builder.set("sign_return_address", "false");
+    let _ = isa_builder.set("sign_return_address_with_bkey", "false");
+    isa_builder
+        .finish(settings::Flags::new(flag_builder))
+        .expect("failed to build ISA")
+}
+
 impl Codegen<ObjectModule> {
     /// Build the AOT (`ObjectModule`) backend: host ISA + object module, then
     /// delegate to the backend-agnostic `with_module`.
     fn new() -> Self {
-        let mut flag_builder = settings::builder();
-        flag_builder.set("is_pic", "true").unwrap();
-        let mut isa_builder =
-            cranelift_native::builder().expect("failed to detect host CPU");
-        // cranelift-native enables return-address signing (PAC) on Apple
-        // Silicon. The resulting RA_SIGN_STATE DWARF expressions in our
-        // .eh_frame are rejected by Apple's libunwind when it steps through
-        // generated frames, turning every panic that crosses generated code
-        // into a fatal "failed to initiate panic" abort — which defeats the
-        // runtime's catch_unwind recovery (HTTP 500s, race cancellation).
-        // Plain arm64 macOS binaries don't sign return addresses anyway.
-        let _ = isa_builder.set("sign_return_address", "false");
-        let _ = isa_builder.set("sign_return_address_with_bkey", "false");
-        let isa = isa_builder
-            .finish(settings::Flags::new(flag_builder))
-            .expect("failed to build ISA");
         let builder = ObjectBuilder::new(
-            isa,
+            build_isa(true),
             "knot_program",
             cranelift_module::default_libcall_names(),
         )
@@ -1217,8 +1232,13 @@ impl Codegen<cranelift_jit::JITModule> {
     /// runs in-process against the same runtime the host uses.
     pub fn new_jit() -> Self {
         use cranelift_jit::{JITBuilder, JITModule};
-        let mut builder = JITBuilder::new(cranelift_module::default_libcall_names())
-            .expect("failed to create JITBuilder for host target");
+        // `with_isa` supplies the maximally-optimizing host ISA (build_isa);
+        // the default `new` would use opt_level=none. Then install the custom
+        // lookup (with_isa defaults to dlsym anyway, but be explicit).
+        let mut builder = JITBuilder::with_isa(
+            build_isa(false),
+            cranelift_module::default_libcall_names(),
+        );
         builder.symbol_lookup_fn(Box::new(|name: &str| {
             let Ok(cname) = std::ffi::CString::new(name) else {
                 return None;

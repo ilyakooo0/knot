@@ -1460,6 +1460,36 @@ countOpen \rel ->
 -- Inferred: works on tickets, issues, orders — anything with an Open status variant
 ```
 
+### Explicit Type Arguments
+
+A lambda can bind a type as an explicit, erased parameter with `\(T : Type)`. At the call site the type is passed as a bare uppercase name, before the value arguments:
+
+```knot
+apply (\(T : Type) (x : T) -> x)
+
+apply Int 42      -- 42
+apply Text "hi"   -- "hi"
+```
+
+The witness `T` is a scoped type variable: it constrains exactly where you name it. An unannotated parameter (`\(T : Type) x -> x`) is *not* linked to `T` — write `(x : T)` to connect them. The witness is fully erased at runtime (it has no value); `apply` compiles to the identity function.
+
+```knot
+apply Int "hi"    -- type error: expected Int, found Text
+```
+
+### Higher-Rank Polymorphism
+
+A parameter's type can itself be polymorphic via an inline `forall`, so the caller must pass a function that works for *every* type, not one fixed type:
+
+```knot
+twice (\(f : (forall a. a -> a)) -> (f (f 7)))
+
+twice (\y -> y)            -- 7: the identity is polymorphic
+twice (\(x : Int 1) -> x)  -- type error: a monomorphic function cannot be used at every type
+```
+
+This is predicative rank-N polymorphism: the `forall` is only allowed in function argument/result positions, never inside a record, variant, or type application.
+
 ### Units of Measure
 
 Compile-time units on `Int` and `Float`. Units are fully erased at runtime — no performance cost, no runtime representation. **Every `Int` and `Float` type must carry a unit** — there is no bare `Int`/`Float`. A dimensionless numeric is written explicitly as `Int 1` / `Float 1`.

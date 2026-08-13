@@ -1413,10 +1413,16 @@ pub fn eval_pure_to_bool(source: &str) -> Option<bool> {
         static MEM: &[u8] = b":memory:";
         let db = unsafe { knot_runtime::knot_db_open(MEM.as_ptr(), MEM.len()) };
         let value = entry_fn(db);
+        // Read the result as a Bool WITHOUT panicking: `knot_value_get_bool`
+        // panics on a non-Bool, which would unwind this thread and rely on the
+        // channel-drop to signal "cannot decide". Check the tag first (3 =
+        // Bool) so a non-Bool result is a clean `None` instead of a panic.
         let result = if value.is_null() {
             None
-        } else {
+        } else if unsafe { knot_runtime::knot_value_get_tag(value) } == 3 {
             Some(unsafe { knot_runtime::knot_value_get_bool(value) } != 0)
+        } else {
+            None // non-Bool result — cannot decide at compile time
         };
         let _ = tx.send(result);
     });

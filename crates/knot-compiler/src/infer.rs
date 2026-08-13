@@ -3905,9 +3905,14 @@ impl Infer {
     ///
     /// `span` is the new binding site, used for the error. Internal
     /// compiler-generated names (the `\0with:` alias prefix and friends) are
-    /// exempt — they are not user-visible and are free to collide.
+    /// exempt — they are not user-visible and are free to collide. So are
+    /// PRELUDE-INTERNAL bindings (span in the prelude range): the prelude's own
+    /// lambda params (`min (\a b -> …)`) are not user bindings and must be free
+    /// to use any name — without the exemption a user field named `a` (bound in
+    /// `scopes[0]` by pre-registration) would falsely "shadow" the prelude's
+    /// internal `\a`.
     fn bind_at(&mut self, name: &str, scheme: Scheme, span: Span) {
-        if !name.starts_with('\0') {
+        if !name.starts_with('\0') && span.start < crate::base::PRELUDE_SPAN_OFFSET {
             let shadows_enclosing =
                 self.scopes.iter().rev().skip(1).any(|s| s.contains_key(name));
             if shadows_enclosing {

@@ -33,3 +33,13 @@ tiny_http = "0.12"
 ureq = "3"
 serde_json = "1"
 ariadne = "0.6"
+
+# Strip DEBUG INFO (not symbols) from release binaries, incl. the released
+# `knot` compiler. Debug info is the dominant size cost and is useless in a
+# shipped compiler. Symbols are KEPT so panic backtraces stay readable — the
+# runtime recovers from panics via catch_unwind (see the panic=unwind note
+# above), and a stripped-of-symbols compiler would make those backtraces
+# opaque. This is independent of the `-s` the linker adds to PRODUCED knot
+# binaries (those need --export-dynamic/.dynsym for JIT; this is the compiler).
+[profile.release]
+strip = "debuginfo"

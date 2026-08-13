@@ -20817,7 +20817,6 @@ fn highlight_md_line(line: &str, out: &mut String) {
     const BOLD: &str = "\x1b[1m";
     const DIM: &str = "\x1b[2m";
     const CYAN: &str = "\x1b[36m";
-    const ITALIC: &str = "\x1b[3m";
 
     let trimmed = line.trim_start();
     // Fenced code block markers — dim the fence itself.
@@ -20853,31 +20852,28 @@ fn highlight_inline(text: &str, out: &mut String) {
     let n = bytes.len();
     while i < n {
         // `code span`
-        if bytes[i] == b'`' {
-            if let Some(end) = text[i + 1..].find('`') {
-                let code = &text[i + 1..i + 1 + end];
-                let _ = write!(out, "{CYAN}{code}{RESET}");
-                i += 1 + end + 1;
-                continue;
-            }
+        if bytes[i] == b'`'
+            && let Some(end) = text[i + 1..].find('`') {
+            let code = &text[i + 1..i + 1 + end];
+            let _ = write!(out, "{CYAN}{code}{RESET}");
+            i += 1 + end + 1;
+            continue;
         }
         // **bold**
-        if bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'*' {
-            if let Some(end) = text[i + 2..].find("**") {
-                let inner = &text[i + 2..i + 2 + end];
-                let _ = write!(out, "{BOLD}{inner}{RESET}");
-                i += 2 + end + 2;
-                continue;
-            }
+        if bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'*'
+            && let Some(end) = text[i + 2..].find("**") {
+            let inner = &text[i + 2..i + 2 + end];
+            let _ = write!(out, "{BOLD}{inner}{RESET}");
+            i += 2 + end + 2;
+            continue;
         }
         // *em* (single star, not followed by another star)
-        if bytes[i] == b'*' && (i + 1 >= n || bytes[i + 1] != b'*') {
-            if let Some(end) = text[i + 1..].find('*') {
-                let inner = &text[i + 1..i + 1 + end];
-                let _ = write!(out, "{ITALIC}{inner}{RESET}");
-                i += 1 + end + 1;
-                continue;
-            }
+        if bytes[i] == b'*' && (i + 1 >= n || bytes[i + 1] != b'*')
+            && let Some(end) = text[i + 1..].find('*') {
+            let inner = &text[i + 1..i + 1 + end];
+            let _ = write!(out, "{ITALIC}{inner}{RESET}");
+            i += 1 + end + 1;
+            continue;
         }
         let _ = write!(out, "{}", bytes[i] as char);
         i += 1;
@@ -21965,8 +21961,8 @@ mod extract_source_tests {
     }
     #[test]
     fn ctor_unqualified_user_payload() {
-        let v = ctor("Circle", record(&[("radius", alloc(Value::Float(3.14)))]));
-        assert_eq!(extract_source(v), "Circle {radius 3.14}");
+        let v = ctor("Circle", record(&[("radius", alloc(Value::Float(2.5)))]));
+        assert_eq!(extract_source(v), "Circle {radius 2.5}");
     }
 
     // ── closures ────────────────────────────────────────────────────

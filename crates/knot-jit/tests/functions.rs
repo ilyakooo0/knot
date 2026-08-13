@@ -3,7 +3,7 @@
 mod harness;
 mod e2e;
 use e2e::assert_stdout;
-use harness::{assert_compile_err, assert_prog, assert_show, assert_show_set};
+use harness::{assert_compile_err, assert_show, assert_show_set};
 
 // ── Lambdas & application ────────────────────────────────────────────────
 

@@ -3,5 +3,15 @@
 # resolve them against the running process via dlsym(RTLD_DEFAULT). AOT builds
 # also pass this via knot-compiler's linker (linker.rs); this config covers
 # Rust-built binaries in this workspace (tests, dev tools).
-[build]
+#
+# The flag is linker-specific: `--export-dynamic` is the GNU/ELF form (Linux),
+# while macOS's ld64 (Mach-O) uses `-export_dynamic` — and rejects the GNU
+# spelling with "linker command failed". Scope per-target so cross-building
+# the macOS release binary isn't broken by the ELF flag. (macOS also gets
+# `-force_load`/`-export_dynamic` from knot-compiler's build.rs, so it needs
+# nothing here.)
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-args=-Wl,--export-dynamic"]
+
+[target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-args=-Wl,--export-dynamic"]

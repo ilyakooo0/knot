@@ -10,7 +10,7 @@ use knot_jit::compile_and_run;
 // dlsym(RTLD_DEFAULT) — and registering it exercises the same init path a real
 // compiled program takes.
 fn init_compile_rt() {
-    unsafe { knot_compile_rt::knot_compile_rt_init() }
+    knot_compile_rt::knot_compile_rt_init()
 }
 
 fn db() -> *mut std::ffi::c_void {

@@ -689,7 +689,7 @@ fn collect_record_migrations(e: &Expr, out: &mut String) {
     match &e.node {
         ExprKind::Record(fields) => {
             for f in fields {
-                if let ExprKind::SourceDecl { name, migrations, .. } = &f.value.node {
+                if let ExprKind::SourceDecl { name: _, migrations, .. } = &f.value.node {
                     for m in migrations {
                         // The lockfile is re-parsed by parse_file_expr, whose
                         // migration clause (parse_source_field_migration) has

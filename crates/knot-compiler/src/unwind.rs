@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use cranelift_codegen::ir::Endianness;
 use cranelift_codegen::isa::{unwind::UnwindInfo, TargetIsa};
 use cranelift_codegen::Context;
-use cranelift_module::{DataId, FuncId, Module};
+use cranelift_module::{DataId, FuncId};
 use cranelift_object::ObjectProduct;
 use gimli::write::{Address, CieId, EhFrame, EndianVec, FrameTable, Result as WriteResult, Section, Writer};
 use gimli::{RunTimeEndian, SectionId};

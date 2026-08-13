@@ -4,7 +4,6 @@
 mod harness;
 mod e2e;
 use harness::assert_show;
-use e2e::assert_stdout;
 
 #[test]
 fn result_do_block_all_ok() {

@@ -15,6 +15,13 @@ use std::ffi::c_void;
 ///
 /// `out_ty` is a freshly `malloc`'d, NUL-free buffer of length `*out_ty_len`
 /// (caller frees with `libc::free`), or null when the type is unknown.
+///
+/// # Safety
+///
+/// Called from knot-runtime via the registered function pointer. `src_ptr` /
+/// `expected_ptr` must point to `src_len` / `expected_len` valid bytes (need
+/// not be NUL-terminated); `db` must be a live knot-runtime db handle. Any
+/// non-null out-param pointer must be valid for writes of its payload.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn knot_compile_impl(
     src_ptr: *const u8,

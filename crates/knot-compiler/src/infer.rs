@@ -4966,9 +4966,9 @@ impl Infer {
     /// Peel an application spine whose head is `^name` into (name, args in
     /// application order, head span). Returns `None` when the expression is
     /// not a `^name` applied to at least one argument.
-    fn peel_implicit_ref_app<'a>(
-        expr: &'a ast::Expr,
-    ) -> Option<(&'a str, Vec<&'a ast::Expr>, Span)> {
+    fn peel_implicit_ref_app(
+        expr: &ast::Expr,
+    ) -> Option<(&str, Vec<&ast::Expr>, Span)> {
         let mut args: Vec<&ast::Expr> = Vec::new();
         let mut head = expr;
         while let ast::ExprKind::App { func, arg } = &head.node {
@@ -5228,6 +5228,9 @@ impl Infer {
             // depth search as soon as the FIRST binding found a match at a
             // deeper level, so a later sibling's same-depth field was never
             // reached.)
+            // Local BFS state — a one-off shape; naming it would obscure more
+            // than it clarifies.
+            #[allow(clippy::type_complexity)]
             let mut frontiers: Vec<(String, Vec<(Vec<String>, Ty)>)> = Vec::new();
             for (bind_name, scheme) in scope {
                 let root_ty = self.apply(&scheme.ty);
@@ -13259,6 +13262,16 @@ fn expr_is_trace_ref(expr: &ast::Expr) -> bool {
     )
 }
 
+/// The constructor-set descriptor for an ADT: `adt name → [ctor name →
+/// [field name → field type]]`. Built from the host's prepended `data` decls
+/// and compared against the snippet's `data` decls during `base.compile`
+/// ctor-set subsumption. Factored out of five signatures that repeated it.
+type CtorSets = HashMap<String, Vec<(String, Vec<(String, String)>)>>;
+
+/// One ADT's constructor list: `[ctor name → [field name → field type]]` —
+/// the value type of [`CtorSets`].
+type CtorList = Vec<(String, Vec<(String, String)>)>;
+
 /// Split a `base.compile` expected-type payload into the host's prepended
 /// `data` declarations and the trailing type. The host emits
 /// `data A = ... \n data B = ... \n <type>`; the decls let the JIT compare
@@ -13267,8 +13280,8 @@ fn expr_is_trace_ref(expr: &ast::Expr) -> bool {
 /// type.
 fn split_host_data_decls(
     src: &str,
-) -> (HashMap<String, Vec<(String, Vec<(String, String)>)>>, String) {
-    let mut sets: HashMap<String, Vec<(String, Vec<(String, String)>)>> = HashMap::new();
+) -> (CtorSets, String) {
+    let mut sets: CtorSets = HashMap::new();
     let mut rest = src;
     loop {
         let trimmed = rest.trim_start();
@@ -13297,7 +13310,7 @@ fn split_host_data_decls(
 /// line isn't a well-formed `data` decl.
 fn parse_data_decl_ctors(
     line: &str,
-) -> Option<(String, Vec<(String, Vec<(String, String)>)>)> {
+) -> Option<(String, CtorList)> {
     let body = line.strip_prefix("data ")?.trim();
     let (name, rhs) = body.split_once('=')?;
     let name = name.trim().to_string();
@@ -13343,6 +13356,15 @@ fn parse_data_decl_ctors(
 enum Variance {
     Co,
     Contra,
+    // Never CONSTRUCTED by the current walk: it propagates `var` unchanged
+    // through every type constructor's parameters (treating them all as
+    // covariant), which is sound for knot's actual constructors (List, Maybe,
+    // Relation, records — all covariant in their params) and only flips
+    // Co↔Contra across function parameters. `Inv` is kept for the day a
+    // genuinely invariant constructor exists, and its match arms below already
+    // implement the equal-both-ways check. Suppress the dead-code lint rather
+    // than delete the documented invariant logic.
+    #[allow(dead_code)]
     Inv,
 }
 
@@ -13367,13 +13389,14 @@ impl Variance {
 ///  - Contravariant (a function parameter the host fills): host ctors ⊆
 ///    snippet ctors — the snippet must accept everything the host passes in.
 ///  - Invariant (mixed positions): the two ctor sets must be equal.
+///
 /// Payload field types recurse at the same variance (a `List Priority` return
 /// is covariant in `Priority`); field subsumption flips direction under
 /// `Contra`. ADTs only one side declares are unconstrained.
 fn ctor_sets_variance_ok(
     infer: &mut Infer,
     expected: &Ty,
-    host: &HashMap<String, Vec<(String, Vec<(String, String)>)>>,
+    host: &CtorSets,
     snippet_data: &HashMap<String, DataInfo>,
     span: Span,
 ) -> bool {
@@ -13384,7 +13407,7 @@ fn walk_expected(
     infer: &mut Infer,
     ty: &Ty,
     var: Variance,
-    host: &HashMap<String, Vec<(String, Vec<(String, String)>)>>,
+    host: &CtorSets,
     snippet_data: &HashMap<String, DataInfo>,
     span: Span,
 ) -> bool {
@@ -13395,10 +13418,10 @@ fn walk_expected(
     // against the host's `data` decl), then peel and recurse as usual. This is
     // what makes a single-variant `data Wrap = W {n: Text}` snippet reject
     // against a host expecting `W {n: Int 1}`.
-    if let Ty::Alias(name, _) = ty {
-        if !check_adt_ctors(infer, name, var, host, snippet_data, span) {
-            return false;
-        }
+    if let Ty::Alias(name, _) = ty
+        && !check_adt_ctors(infer, name, var, host, snippet_data, span)
+    {
+        return false;
     }
     match ty.peel_alias() {
         Ty::Fun(p, r) => {
@@ -13439,7 +13462,7 @@ fn check_adt_ctors(
     infer: &mut Infer,
     name: &str,
     var: Variance,
-    host: &HashMap<String, Vec<(String, Vec<(String, String)>)>>,
+    host: &CtorSets,
     snippet_data: &HashMap<String, DataInfo>,
     span: Span,
 ) -> bool {
@@ -14431,7 +14454,6 @@ pub(crate) fn subst_var(expr: &mut ast::Expr, var: &str, replacement: &ast::Expr
                     ast::StmtKind::Where { cond } => subst_var(cond, var, replacement),
                     ast::StmtKind::GroupBy { key } => subst_var(key, var, replacement),
                     ast::StmtKind::Expr(e) => subst_var(e, var, replacement),
-                    _ => {}
                 }
             }
         }

@@ -8,6 +8,9 @@
 //! workspace `knot` binary, runs it there (so its `<name>.db` is isolated),
 //! and inspects output.
 
+// Shared across integration-test crates, each of which uses only a subset.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

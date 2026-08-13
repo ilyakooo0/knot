@@ -9,11 +9,15 @@
 //! The test binary links `knot-runtime`, so `Value` and `knot_value_show` are
 //! directly available.
 
+// Each integration-test file is its own crate and uses only the subset of
+// these shared helpers it needs, so any one crate sees the rest as "unused".
+#![allow(dead_code)]
+
 use knot_jit::compile_and_run;
 use knot_runtime::Value;
 
 pub fn init() {
-    unsafe { knot_compile_rt::knot_compile_rt_init() }
+    knot_compile_rt::knot_compile_rt_init()
 }
 
 /// Open a fresh in-memory db for a snippet.

@@ -140,6 +140,13 @@ pub extern "C-unwind" fn knot_compile_rt_init() {
 /// out-params so `base.compile`'s typed wrapper and the host-relation check
 /// work; the error out-param is left null (the compile path surfaces failures
 /// as a null value rather than a rendered message).
+///
+/// # Safety
+///
+/// Called from knot-runtime via the registered function pointer. `src_ptr`
+/// must point to `src_len` valid bytes of knot source (need not be
+/// NUL-terminated); `db` must be a live knot-runtime db handle. Any non-null
+/// out-param pointer must be valid for writes of its documented payload.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn knot_compile_impl(
     src_ptr: *const u8,

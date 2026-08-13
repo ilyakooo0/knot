@@ -13,7 +13,7 @@ use cranelift_codegen::ir::{AbiParam, InstBuilder, StackSlotData, StackSlotKind,
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use crate::decl_view::{decl_views, DeclViewKind};
 use knot::ast;
@@ -1411,7 +1411,7 @@ pub fn eval_pure_to_bool(source: &str) -> Option<bool> {
         let entry_fn: extern "C" fn(*mut std::ffi::c_void) -> *mut knot_runtime::Value =
             unsafe { std::mem::transmute(entry) };
         static MEM: &[u8] = b":memory:";
-        let db = unsafe { knot_runtime::knot_db_open(MEM.as_ptr(), MEM.len()) };
+        let db = knot_runtime::knot_db_open(MEM.as_ptr(), MEM.len());
         let value = entry_fn(db);
         // Read the result as a Bool WITHOUT panicking: `knot_value_get_bool`
         // panics on a non-Bool, which would unwind this thread and rely on the
@@ -1419,17 +1419,18 @@ pub fn eval_pure_to_bool(source: &str) -> Option<bool> {
         // Bool) so a non-Bool result is a clean `None` instead of a panic.
         let result = if value.is_null() {
             None
-        } else if unsafe { knot_runtime::knot_value_get_tag(value) } == 3 {
-            Some(unsafe { knot_runtime::knot_value_get_bool(value) } != 0)
+        } else if knot_runtime::knot_value_get_tag(value) == 3 {
+            Some(knot_runtime::knot_value_get_bool(value) != 0)
         } else {
             None // non-Bool result — cannot decide at compile time
         };
         let _ = tx.send(result);
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(r) => r,
-        Err(_) => None, // fuel exhausted — treat as "cannot decide"
-    }
+    // Fuel exhausted (timeout / eval-thread panic dropping the sender) →
+    // "cannot decide". Option<bool> is None in both the Err and the inner-None
+    // cases, so unwrap_or_default flattens to exactly the wanted verdict.
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or_default()
 }
 
 impl<M: cranelift_module::Module> Codegen<M> {
@@ -6575,13 +6576,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // the projection applied. Only single-column field projections (the
         // shape `peel_map_projection` recognizes); anything richer falls back.
         let map_peel = self.peel_map_projection(rel_expr);
-        if let Some((map_src, map_field)) = &map_peel {
-            if !self.views.contains_key(map_src)
-                && let Some(base_schema) = self.source_schemas.get(map_src).cloned()
-                && !base_schema.starts_with('#')
-                && !base_schema.contains('[')
-                && let Some(type_str) = lookup_col_type_from_schema(&base_schema, map_field)
-            {
+        if let Some((map_src, map_field)) = &map_peel
+            && !self.views.contains_key(map_src)
+            && let Some(base_schema) = self.source_schemas.get(map_src).cloned()
+            && !base_schema.starts_with('#')
+            && !base_schema.contains('[')
+            && let Some(type_str) = lookup_col_type_from_schema(&base_schema, map_field)
+        {
                 let select_columns = vec![SqlSelectColumn {
                     result_field: map_field.clone(),
                     alias: String::new(),
@@ -6608,7 +6609,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 };
                 let query = Query { plan, terminal: QueryTerminal::Rows };
                 return Some(self.emit_query(builder, &query, &proj_schema, env, db, None, Some(rel_expr.span)));
-            }
         }
         // Resolve the source to (plan, schema). Two shapes: a bare/`filter`
         // source (single table, optional WHERE) or a do-block plan.
@@ -9390,8 +9390,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 );
                 let err_block = builder.create_block();
                 let cont = if i + 1 < field_preds.len() {
-                    let b = builder.create_block();
-                    b
+                    builder.create_block()
                 } else {
                     ok_block
                 };
@@ -13790,6 +13789,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// The prefix is always in canonical order (so `build_canonical_pipe_query`
     /// handles it); the suffix is processed recursively so multi-stage chains
     /// nest. Returns None (in-memory fallback) when no clean split exists.
+    #[allow(clippy::too_many_arguments)] // threads staged-pipe codegen context; bundling would obscure
     fn try_compile_staged_pipe(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -13875,6 +13875,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// out-of-order: build the next stage's subquery from the current (already
     /// possibly a subquery) table and continue. Mirrors the split logic but
     /// threads the table through instead of re-deriving it from a source name.
+    #[allow(clippy::too_many_arguments)] // threads staged-pipe codegen context; bundling would obscure
     fn try_compile_staged_pipe_over(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -15005,6 +15006,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     ///   * `inner_var.col`  → unqualified `"col"` (innermost table).
     ///   * `outer_var.col`  → `"_knot_<outer>"."col"` (table-qualified, so a
     ///     same-named inner column can't capture it).
+    ///
     /// Literals inline. Supports the six comparisons, && / ||, not. Anything
     /// else → None (caller falls back to in-memory).
     fn translate_correlated_pred(
@@ -15932,6 +15934,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             None => eprintln!("[sql] =>\n      {}", sql),
         }
     }
+    #[allow(clippy::too_many_arguments)] // query emission needs plan + schema + env + db + params; bundling would obscure
     fn emit_query(
         &mut self,
         builder: &mut FunctionBuilder,

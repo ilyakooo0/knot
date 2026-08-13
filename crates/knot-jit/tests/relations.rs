@@ -7,7 +7,7 @@
 //!   multi-row unsorted relations use `assert_show_set`.
 
 mod harness;
-use harness::{assert_compile_err, assert_prog, assert_show, assert_show_set};
+use harness::{assert_compile_err, assert_show, assert_show_set};
 
 // ── Construction & basic shape ───────────────────────────────────────────
 

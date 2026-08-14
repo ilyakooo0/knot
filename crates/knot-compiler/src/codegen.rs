@@ -2236,6 +2236,26 @@ impl<M: cranelift_module::Module> Codegen<M> {
         });
     }
 
+    /// `vecCount : Vec a -> Int` — the `Vec` overload of `count`, reached via
+    /// `base.vec.count` and resolved by `^count`. Shares the relation runtime
+    /// representation, so it delegates to `knot_relation_len` exactly like
+    /// `count`; the only difference is the (Vec-typed) scheme. Keyed bare
+    /// (internal-only, not a base field).
+    fn define_stdlib_vec_count(&mut self) {
+        let (func_id, _) = self.global_fns["vecCount"];
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.params.push(AbiParam::new(self.ptr_type)); // vec
+        sig.returns.push(AbiParam::new(self.ptr_type));
+
+        self.build_function(func_id, sig, |cg, builder, entry| {
+            let vec = builder.block_params(entry)[1];
+            let len = cg.call_rt(builder, "knot_relation_len", &[vec]);
+            let result = cg.call_rt(builder, "knot_value_int", &[len]);
+            builder.ins().return_(&[result]);
+        });
+    }
+
     /// Define the global `base` record as a 0-param function returning a record
     /// of every stdlib function value plus the prelude's polymorphic helpers.
     /// Binding `base` as a 0-param `global_fns` entry makes the bare-`Var` path
@@ -2568,6 +2588,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             "listNil", "listCons", "listIsNil", "listHead", "listTail",
             "listLength", "listMap", "listFilter", "listFold", "listReverse",
             "listAppend", "listFromRelation", "listToRelation",
+            // Vec data-op builtins (`base.vec.*`), the `Vec` overloads resolved
+            // via `^count` etc. Internal-only (bare keys): user code reaches
+            // them only through the `vec` namespace record.
+            "vecCount",
         ];
         for name in &stdlib_names {
             self.register_stdlib_fn(name);
@@ -3374,6 +3398,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.define_stdlib_fn_2("inter", "knot_relation_inter", true);
         self.define_stdlib_sum();
         self.define_stdlib_count();
+        self.define_stdlib_vec_count();
         self.define_stdlib_fn_2("union", "knot_relation_union", true);
         self.define_stdlib_fn_2("bind", "knot_relation_bind", true);
         self.define_stdlib_fn_2("avg", "knot_relation_avg", true);

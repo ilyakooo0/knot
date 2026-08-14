@@ -5170,6 +5170,29 @@ impl Infer {
         self.fold_dict_args.insert(span, (field.to_string(), frag_spans));
     }
 
+    /// Speculatively unify `field_ty` against `expected` on a throwaway clone
+    /// of the substitution. Returns the post-unify speculative substitution on
+    /// success (nothing committed to `self`), or `None` if it does not match.
+    fn try_implicit_candidate(
+        &mut self,
+        field_ty: &Ty,
+        expected: &Ty,
+        span: Span,
+    ) -> Option<HashMap<TyVar, Ty>> {
+        let mut trial: HashMap<TyVar, Ty> = HashMap::with_capacity(self.subst.len());
+        for v in self.subst.keys() {
+            let resolved = self.apply(&Ty::Var(*v));
+            trial.insert(*v, resolved);
+        }
+        let mut trial_errors: Vec<(String, Span)> = Vec::new();
+        std::mem::swap(&mut self.subst, &mut trial);
+        std::mem::swap(&mut self.errors, &mut trial_errors);
+        self.unify(&field_ty.clone(), expected, span);
+        std::mem::swap(&mut self.subst, &mut trial);
+        std::mem::swap(&mut self.errors, &mut trial_errors);
+        if trial_errors.is_empty() { Some(trial) } else { None }
+    }
+
     /// then shallowest record-nesting depth (a binding's own fields beat
     /// fields of nested records), then fields in source definition order
     /// bottom-to-top (record types store fields in an `IndexMap` preserving
@@ -5215,56 +5238,47 @@ impl Infer {
                 break;
             }
         }
-        // Candidate search over an immutable view of the scopes. Walk
-        // innermost-to-outermost (nearest scope wins across the whole
-        // search) and BFS the record's fields shallowest-first; `fields` is
-        // an `IndexMap` in source definition order, iterated in REVERSE so
-        // within a level the bottom-defined field is tried first.
-        let mut candidates: Vec<(String, Vec<String>, Ty)> =
-            with_candidate.into_iter().collect();
-        'scopes: for scope in self.scopes.iter().rev() {
-            // Level-synchronized BFS across ALL record bindings in this
-            // scope. Every binding's frontier advances one depth level per
-            // round; we only stop descending once a given LEVEL (across all
-            // bindings) has produced at least one candidate. This is the
-            // "shallowest depth wins" rule — but a *shared* depth, so two
-            // sibling records that both carry the field at the same nesting
-            // (e.g. `int.morph.into` and `text.morph.into`) are BOTH
-            // collected, letting the type-directed disambiguation below pick
-            // between them. (The previous per-binding loop broke out of the
-            // depth search as soon as the FIRST binding found a match at a
-            // deeper level, so a later sibling's same-depth field was never
-            // reached.)
-            // Local BFS state — a one-off shape; naming it would obscure more
-            // than it clarifies.
-            #[allow(clippy::type_complexity)]
-            let mut frontiers: Vec<(String, Vec<(Vec<String>, Ty)>)> = Vec::new();
+        // Search each in-scope record ONE AT A TIME, innermost scope first.
+        // Within a record, BFS its fields and accept a field only when BOTH
+        // its name matches AND its type unifies with `expected` — keep
+        // searching (descending into nested records) until a match is found.
+        // Only when a whole record is exhausted (no name+type match anywhere
+        // in it) do we move to the next record / next scope. There is no
+        // "shallowest name-match stops the search" cutoff: a same-named field
+        // whose type does not match no longer shadows a deeper field whose
+        // type does. `fields` is an `IndexMap` in source order, iterated in
+        // REVERSE so the bottom-defined field is tried first within a level.
+        //
+        // Two passes to satisfy the borrow checker: first collect the
+        // name-matching fields GROUPED BY RECORD (an immutable walk over
+        // `self.scopes`, preserving per-record order), then type-check
+        // record-by-record (mutable), stopping at the first record that
+        // yields a match.
+        let mut searched: Vec<String> = Vec::new();
+        // Name-matching fields, one inner Vec per record, innermost record
+        // first. Each entry: (root binding, field path, field type).
+        let mut by_record: Vec<Vec<(String, Vec<String>, Ty)>> = Vec::new();
+        if let Some((root, path, field_ty)) = with_candidate {
+            // The direct `with`-field candidate is the innermost binding.
+            by_record.push(vec![(root, path, field_ty)]);
+        }
+        for scope in self.scopes.iter().rev() {
             for (bind_name, scheme) in scope {
                 let root_ty = self.apply(&scheme.ty);
-                let frontier: Vec<(Vec<String>, Ty)> = match root_ty.peel_alias() {
-                    Ty::Record(fields, _) => fields
-                        .iter()
-                        .rev() // bottom-to-top: last-defined field tried first
-                        .map(|(f, t)| (vec![f.clone()], t.clone()))
-                        .collect(),
-                    _ => Vec::new(),
-                };
-                if !frontier.is_empty() {
-                    frontiers.push((bind_name.clone(), frontier));
-                }
-            }
-            'depth: while frontiers.iter().any(|(_, f)| !f.is_empty()) {
-                let found_before = candidates.len();
-                // Advance every binding's frontier by one level.
-                for (bind_name, frontier) in frontiers.iter_mut() {
+                let Ty::Record(fields, _) = root_ty.peel_alias() else { continue };
+                let mut group: Vec<(String, Vec<String>, Ty)> = Vec::new();
+                let mut frontier: Vec<(Vec<String>, Ty)> = fields
+                    .iter()
+                    .rev()
+                    .map(|(f, t)| (vec![f.clone()], t.clone()))
+                    .collect();
+                while !frontier.is_empty() {
                     let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
                     for (path, field_ty) in frontier.drain(..) {
                         if *path.last().expect("non-empty path") == name {
-                            candidates.push((bind_name.clone(), path.clone(), field_ty.clone()));
+                            group.push((bind_name.clone(), path.clone(), field_ty.clone()));
                         }
-                        // Descend into nested record fields (without
-                        // committing anything: `apply` is read-only).
-                        if let Ty::Record(sub, _) = self.apply(&field_ty).peel_alias().clone() {
+                        if let Ty::Record(sub, _) = self.apply(&field_ty).peel_alias() {
                             for (f, t) in sub.iter().rev() {
                                 let mut p = path.clone();
                                 p.push(f.clone());
@@ -5272,50 +5286,34 @@ impl Infer {
                             }
                         }
                     }
-                    *frontier = next;
+                    frontier = next;
                 }
-                // Shallowest depth wins: if this LEVEL produced any candidate,
-                // stop descending (deeper nesting is never considered).
-                if candidates.len() > found_before {
-                    break 'depth;
+                if !group.is_empty() {
+                    by_record.push(group);
                 }
-            }
-            if !candidates.is_empty() {
-                break 'scopes;
             }
         }
 
-        // Speculatively unify EACH candidate against `expected`. The
-        // speculative substitution CLONES the real one but points every
-        // variable straight at its fully-resolved type, so bindings made
-        // during a trial are all at fresh or resolved-root variables and
-        // never reach a shared deeper chain — applying a winner's diff to
-        // the real substitution is then a faithful replay. Collect every
-        // candidate that unifies: exactly one means a clean resolution;
-        // more than one means the projection is genuinely ambiguous (two
-        // in-scope fields of the same name and compatible type), which is a
-        // hard error rather than a silent first-wins pick.
-        let mut searched: Vec<String> = Vec::new();
-        // (root binding, field path, field type, post-unify speculative subst)
+        // Type-check record-by-record (innermost first), stopping at the first
+        // record whose fields produce at least one match. Collect all matches
+        // within that record so same-record ambiguity is still reported.
         type Winner = (String, Vec<String>, Ty, HashMap<TyVar, Ty>);
         let mut winners: Vec<Winner> = Vec::new();
-        for (root, path, field_ty) in &candidates {
-            let mut trial: HashMap<TyVar, Ty> = HashMap::with_capacity(self.subst.len());
-            for v in self.subst.keys() {
-                let resolved = self.apply(&Ty::Var(*v));
-                trial.insert(*v, resolved);
+        for group in &by_record {
+            for (root, path, field_ty) in group {
+                searched.push(format!(
+                    "{}.{} : {}",
+                    root,
+                    path.join("."),
+                    self.display_ty(field_ty)
+                ));
+                if let Some(trial) = self.try_implicit_candidate(field_ty, expected, span) {
+                    winners.push((root.clone(), path.clone(), field_ty.clone(), trial));
+                }
             }
-            let mut trial_errors: Vec<(String, Span)> = Vec::new();
-            std::mem::swap(&mut self.subst, &mut trial);
-            std::mem::swap(&mut self.errors, &mut trial_errors);
-            self.unify(&field_ty.clone(), expected, span);
-            std::mem::swap(&mut self.subst, &mut trial);
-            std::mem::swap(&mut self.errors, &mut trial_errors);
-            // `trial` now holds the post-unify speculative substitution.
-            if trial_errors.is_empty() {
-                winners.push((root.clone(), path.clone(), field_ty.clone(), trial));
+            if !winners.is_empty() {
+                break;
             }
-            searched.push(format!("{}.{} : {}", root, path.join("."), self.display_ty(field_ty)));
         }
 
         match winners.len() {
@@ -10252,6 +10250,30 @@ impl Infer {
                             "Vec".into(),
                             vec![Ty::Var(a)],
                         )))),
+                    ),
+                },
+            );
+        }
+
+        // vecCount : ∀a u. Vec a -> Int u  — the `Vec` overload of `count`.
+        // Resolved via `^count`: `base.count : [a] -> Int u` and
+        // `base.vec.count : Vec a -> Int u` are the two candidates; the
+        // argument's type picks one. Prelude-internal (referenced only as
+        // `base.vec.count`), so it is keyed bare, not a base field.
+        {
+            let a = self.fresh_var();
+            let u = self.fresh_unit_var();
+            let int_u = Ty::int_with_unit(UnitTy::var(u));
+            self.bind_top(
+                "vecCount",
+                Scheme {
+                    vars: vec![a],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    unit_binops: vec![],
+                    ty: Ty::Fun(
+                        Box::new(Ty::Con("Vec".into(), vec![Ty::Var(a)])),
+                        Box::new(int_u),
                     ),
                 },
             );

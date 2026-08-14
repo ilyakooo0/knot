@@ -111,6 +111,15 @@ fromRelation listFromRelation
 toRelation listToRelation
 }
 
+-- Vec namespace (`base.vec.*`): the concrete-sequence overloads of the data
+-- ops, resolved via `^count` (etc.) against the relation-typed `base.*`
+-- forms. The `^` resolver searches the full record with name+type matching,
+-- so a `Vec a` argument reaches `base.vec.count` (nested here) even though
+-- `base.count : [a] -> Int u` fails to unify with it.
+vec {
+count vecCount
+}
+
 -- Morph namespace (`base.morph.*`): type-directed conversions resolved by the
 -- `^into` projection. Each `<from>To<to>` record holds an `into : S -> T`
 -- function with an EXPLICIT concrete signature (an un-annotated body could

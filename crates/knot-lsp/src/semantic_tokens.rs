@@ -344,12 +344,6 @@ impl<'a> TokenCollector<'a> {
                 }
                 self.visit_expr(body);
             }
-            ast::ExprKind::DerivedDecl { name, body, .. } => {
-                if let Some(s) = find_word_in_source(self.source, name, dspan.start, dspan.end) {
-                    self.add(s, TOK_NAMESPACE, MOD_DECLARATION | MOD_READONLY);
-                }
-                self.visit_expr(body);
-            }
             ast::ExprKind::RouteDecl { name, entries } => {
                 if let Some(s) = find_word_in_source(self.source, name, dspan.start, dspan.end) {
                     self.add(s, TOK_TYPE, MOD_DECLARATION);
@@ -445,9 +439,6 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::SourceRef { .. } => {
                 self.add(self.strip_parens(expr.span), TOK_NAMESPACE, 0);
             }
-            ast::ExprKind::DerivedRef(_) => {
-                self.add(self.strip_parens(expr.span), TOK_NAMESPACE, MOD_READONLY);
-            }
             ast::ExprKind::ImplicitRef(_) => {
                 self.add(self.strip_parens(expr.span), TOK_VARIABLE, MOD_READONLY);
             }
@@ -533,7 +524,7 @@ impl<'a> TokenCollector<'a> {
                 // Highlight mutation targets distinctly. We re-emit the target
                 // span with a MUTATION modifier overlaying whatever inner type
                 // visit_expr would assign.
-                if let ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_) = &target.node {
+                if let ast::ExprKind::SourceRef { .. } = &target.node {
                     self.add(target.span, TOK_NAMESPACE, MOD_MUTATION);
                 } else {
                     self.visit_expr(target);
@@ -625,7 +616,7 @@ impl<'a> TokenCollector<'a> {
             }
             ast::ExprKind::RouteCompositeDecl { .. } => {}
             // A view field's annotation and body are highlighted.
-            ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {
+            ast::ExprKind::ViewDecl { ty, body, .. } => {
                 if let Some(scheme) = ty {
                     self.visit_type(&scheme.ty);
                 }

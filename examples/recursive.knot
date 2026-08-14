@@ -1,22 +1,20 @@
--- Derived relations: read-only computed views over source relations.
--- A `&name = body` declaration is recomputed on each access — never persisted.
+-- Query fields: read-only computed views over source relations.
+-- A `name <query>` field is recomputed on each access — never persisted.
 with {
 *manages : [{manager: Text, report: Text}]
 
-&directReports = (do
-  manages <- full *manages
-  yield (do
-    m <- manages
-    yield {manager m.manager report m.report}))
+directReports (do
+  m <- *manages
+  yield {manager m.manager report m.report})
 }
 (do
   full *manages = [
-    {manager "Alice" report "Bob"} 
-    {manager "Alice" report "Carol"} 
+    {manager "Alice" report "Bob"}
+    {manager "Alice" report "Carol"}
     {manager "Bob" report "Dave"}
   ]
   base.println "Direct reports:"
-  rows <- &directReports
+  rows <- base.run directReports
   base.println (base.show rows)
-  base.println ("Total: " ++ base.show (base.count rows))
+  base.println ("Total: " ++ base.show (base.count directReports))
   yield {})

@@ -100,7 +100,7 @@ fn build_dependency_graph(program: &ast::Expr) -> (HashSet<String>, HashMap<Stri
     // and detect user functions that are curried aliases of `diff`.
     for decl in decl_views(program) {
         match decl.kind {
-            DeclViewKind::Derived { .. } | DeclViewKind::View { .. } => {
+            DeclViewKind::View { .. } => {
                 node_names.insert(decl.name.to_string());
                 edges.entry(decl.name.to_string()).or_default();
             }
@@ -115,16 +115,12 @@ fn build_dependency_graph(program: &ast::Expr) -> (HashSet<String>, HashMap<Stri
 
     // Second pass: walk each node's body to find edges.
     for decl in decl_views(program) {
-        match decl.kind {
-            DeclViewKind::Derived { body: Some(body), .. }
-            | DeclViewKind::View { body: Some(body), .. } => {
-                let mut found = Vec::new();
-                let env = HashMap::new();
-                let partial_diffs = HashMap::new();
-                collect_edges(body, Polarity::Positive, &node_names, &env, &partial_diffs, &diff_wrappers, &mut found);
-                edges.get_mut(decl.name).unwrap().extend(found);
-            }
-            _ => {}
+        if let DeclViewKind::View { body: Some(body), .. } = decl.kind {
+            let mut found = Vec::new();
+            let env = HashMap::new();
+            let partial_diffs = HashMap::new();
+            collect_edges(body, Polarity::Positive, &node_names, &env, &partial_diffs, &diff_wrappers, &mut found);
+            edges.get_mut(decl.name).unwrap().extend(found);
         }
     }
 
@@ -209,9 +205,6 @@ fn collect_edges(
     out: &mut Vec<Edge>,
 ) {
     match &expr.node {
-        ast::ExprKind::DerivedRef(name) if node_names.contains(name) => {
-            out.push(Edge { target: name.clone(), polarity, span: expr.span });
-        }
         // A source-read from a *view* creates an edge too. Views are nodes
         // (their bodies can in turn reference derived relations, forming
         // cycles); ordinary user sources are not nodes, so non-view
@@ -231,15 +224,14 @@ fn collect_edges(
                 out.push(Edge { target: node.clone(), polarity, span: expr.span });
             }
         }
-        ast::ExprKind::DerivedRef(_)
-        | ast::ExprKind::Lit(_)
+        ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::TypeHole => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
-        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+        ast::ExprKind::ViewDecl { body, .. } => {
             collect_edges(body, polarity, node_names, env, partial_diffs, diff_wrappers, out)
         }
 
@@ -270,7 +262,6 @@ fn collect_edges(
                             span: f.value.span,
                         },
                         &f.value,
-                        node_names,
                         &mut body_env_storage,
                         &mut body_partial_storage,
                     );
@@ -430,7 +421,7 @@ fn collect_edges(
                 match &s.node {
                     ast::StmtKind::Bind { pat, expr } => {
                         collect_edges(expr, polarity, node_names, &local_env, &local_partial, diff_wrappers, out);
-                        bind_derived_alias(pat, expr, node_names, &mut local_env, &mut local_partial);
+                        bind_derived_alias(pat, expr, &mut local_env, &mut local_partial);
                     }
                     ast::StmtKind::Where { cond } => {
                         collect_edges(cond, polarity, node_names, &local_env, &local_partial, diff_wrappers, out);
@@ -481,17 +472,12 @@ fn collect_edges(
 fn bind_derived_alias(
     pat: &ast::Pat,
     expr: &ast::Expr,
-    node_names: &HashSet<String>,
     env: &mut HashMap<String, String>,
     partial_diffs: &mut HashMap<String, ast::Expr>,
 ) {
     if let ast::PatKind::Var(v) = &pat.node {
         let stripped = strip_head_wrappers(expr);
         match &stripped.node {
-            ast::ExprKind::DerivedRef(name) if node_names.contains(name) => {
-                env.insert(v.clone(), name.clone());
-                partial_diffs.remove(v);
-            }
             // `let d = diff` — track the alias so a later `d all self` is still
             // recognized as set difference (negation) at its application site.
             ast::ExprKind::Var(name) if name == "diff" => {
@@ -736,15 +722,9 @@ fn check_inner(program: &ast::Expr) -> Vec<Diagnostic> {
     let mut view_names: HashSet<String> = HashSet::new();
     for decl in decl_views(program) {
         let span = decl.body().map(|b| b.span).unwrap_or(ast::Span { start: 0, end: 0 });
-        match decl.kind {
-            DeclViewKind::Derived { .. } => {
-                decl_spans.insert(decl.name.to_string(), span);
-            }
-            DeclViewKind::View { .. } => {
-                decl_spans.insert(decl.name.to_string(), span);
-                view_names.insert(decl.name.to_string());
-            }
-            _ => {}
+        if let DeclViewKind::View { .. } = decl.kind {
+            decl_spans.insert(decl.name.to_string(), span);
+            view_names.insert(decl.name.to_string());
         }
     }
 

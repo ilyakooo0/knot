@@ -228,15 +228,6 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                 }
                 break;
             }
-            knot::ast::ExprKind::DerivedDecl { name, .. } if name == word => {
-                if let Some(inferred) = doc.type_info.get(word) {
-                    let schema = format_schema_from_type_str(inferred);
-                    if !schema.is_empty() {
-                        value.push_str(&format!("\n\n**Derived schema:**\n{schema}"));
-                    }
-                }
-                break;
-            }
             _ => {}
         }
     }
@@ -353,7 +344,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     if let Some(field_at) = &field_at_cursor {
         let owner_source = match &field_at.receiver {
             ReceiverKind::Var(name) => resolve_var_to_source(&doc.module, name, lookup_offset),
-            ReceiverKind::SourceRef(name) | ReceiverKind::DerivedRef(name) => Some(name.clone()),
+            ReceiverKind::SourceRef(name) => Some(name.clone()),
             ReceiverKind::Other => None,
         };
         if let Some(source_name) = owner_source.as_deref()

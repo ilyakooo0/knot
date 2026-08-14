@@ -108,11 +108,6 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
                 resolver.define(name, span);
                 resolver.register_extra_definition_tokens(dspan, name, span);
             }
-            ExprKind::DerivedDecl { name, .. } => {
-                let span = name_span(name);
-                resolver.define(name, span);
-                resolver.register_extra_definition_tokens(dspan, name, span);
-            }
             ExprKind::RouteDecl { name, entries } => {
                 resolver.define(name, name_span(name));
                 // Each endpoint's constructor (`… -> Response = GetUsers`) is a
@@ -170,7 +165,7 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
             resolve_scheme(&mut resolver, scheme);
         }
         match &decl.value.node {
-            ExprKind::ViewDecl { body, ty, .. } | ExprKind::DerivedDecl { body, ty, .. } => {
+            ExprKind::ViewDecl { body, ty, .. } => {
                 if let Some(scheme) = ty {
                     resolve_scheme(&mut resolver, scheme);
                 }
@@ -480,7 +475,6 @@ impl<'a> DefResolver<'a> {
             ast::ExprKind::Var(name) => self.add_ref(expr.span, name),
             ast::ExprKind::Constructor(name) => self.add_ref(expr.span, name),
             ast::ExprKind::SourceRef { name, .. } => self.add_ref(expr.span, name),
-            ast::ExprKind::DerivedRef(name) => self.add_ref(expr.span, name),
             // `^name` resolves to a record field at inference time; no single
             // binding site to reference here.
             ast::ExprKind::ImplicitRef(_) => {},
@@ -624,7 +618,7 @@ impl<'a> DefResolver<'a> {
             }
             ast::ExprKind::RouteCompositeDecl { .. } => {}
             // A view field's annotation and body are both navigable.
-            ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {
+            ast::ExprKind::ViewDecl { ty, body, .. } => {
                 if let Some(scheme) = ty {
                     self.resolve_type(&scheme.ty, self.source);
                 }
@@ -704,13 +698,6 @@ pub fn build_details(program: &Expr) -> HashMap<String, String> {
                     .map(|t| format!(" : {}", format_type_scheme(t)))
                     .unwrap_or_default();
                 details.insert(name.clone(), format!("*{name}{ty_str} (view)"));
-            }
-            ExprKind::DerivedDecl { name, ty, .. } => {
-                let ty_str = ty
-                    .as_ref()
-                    .map(|t| format!(" : {}", format_type_scheme(t)))
-                    .unwrap_or_default();
-                details.insert(name.clone(), format!("&{name}{ty_str} (derived)"));
             }
             ExprKind::RouteDecl { name, .. } => {
                 details.insert(name.clone(), format!("route {name}"));

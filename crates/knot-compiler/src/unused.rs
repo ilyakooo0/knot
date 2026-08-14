@@ -32,8 +32,6 @@ struct Refs {
     /// `*name` references: `SourceRef`, `Set` targets, `FullSet` targets,
     /// `At` relations, effect-row `r`/`w`, and subset relation paths.
     sources: HashSet<String>,
-    /// `&name` references.
-    deriveds: HashSet<String>,
 }
 
 /// Check the user's declarations for unused names.
@@ -96,14 +94,6 @@ pub fn check(program: &Expr) -> Vec<Diagnostic> {
                     diags.push(make_warning("view", name, dspan));
                 }
             }
-            DeclViewKind::Derived { .. } => {
-                if starts_with_underscore(name) {
-                    continue;
-                }
-                if !referenced_by_others(&per_decl, i, name, |r| &r.deriveds) {
-                    diags.push(make_warning("derived relation", name, dspan));
-                }
-            }
             // Skip everything else: routes (top-level API surface),
             // migrations, and subset constraints.
             _ => {}
@@ -150,14 +140,6 @@ fn walk_decl(decl: &DeclView, r: &mut Refs) {
         DeclViewKind::TypeAlias { ty, .. } => walk_type(ty, r),
         DeclViewKind::Source { ty, .. } => walk_type(ty, r),
         DeclViewKind::View { ty, body, .. } => {
-            if let Some(scheme) = ty {
-                walk_scheme(scheme, r);
-            }
-            if let Some(b) = body {
-                walk_expr(b, r);
-            }
-        }
-        DeclViewKind::Derived { ty, body, .. } => {
             if let Some(scheme) = ty {
                 walk_scheme(scheme, r);
             }
@@ -256,7 +238,7 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
-        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => walk_expr(body, r),
+        ExprKind::ViewDecl { body, .. } => walk_expr(body, r),
         ExprKind::Var(name) => {
             r.values.insert(name.clone());
         }
@@ -265,9 +247,6 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         }
         ExprKind::SourceRef { name, .. } => {
             r.sources.insert(name.clone());
-        }
-        ExprKind::DerivedRef(name) => {
-            r.deriveds.insert(name.clone());
         }
         ExprKind::Record(fields) => {
             for f in fields {

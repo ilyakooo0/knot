@@ -65,8 +65,7 @@ pub(crate) fn handle_linked_editing_range(
             );
         }
         match &decl.value.node {
-            knot::ast::ExprKind::ViewDecl { ty, body, .. }
-            | knot::ast::ExprKind::DerivedDecl { ty, body, .. } => {
+            knot::ast::ExprKind::ViewDecl { ty, body, .. } => {
                 if let Some(scheme) = ty {
                     collect_type_field_name_spans(
                         &scheme.ty,

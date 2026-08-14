@@ -316,7 +316,7 @@ impl TypeEnv {
         }
 
         // Second pass: compute source schemas, migration schemas, and subset
-        // constraints from the `SourceDecl`/`DerivedDecl`/`SubsetConstraint`
+        // constraints from the `SourceDecl`/`SubsetConstraint`
         // markers embedded in the program's record literals.
         let mut subset_constraints = Vec::new();
         let mut source_refinements: HashMap<String, Vec<(Option<String>, String, Expr)>> = HashMap::new();
@@ -354,12 +354,6 @@ impl TypeEnv {
                             .or_default()
                             .push((old_schema, new_schema));
                     }
-                }
-                ExprKind::DerivedDecl { name, ty: Some(scheme), .. } => {
-                    let schema = schema_for_source(
-                        &scheme.ty, &aliases, &associated_types, &single_variant_params, &multi_variant_params,
-                    );
-                    source_schemas.insert(name.clone(), schema);
                 }
                 _ => {}
             }
@@ -439,14 +433,13 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 walk_exprs(&h.body, f);
             }
         }
-        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+        ExprKind::ViewDecl { body, .. } => {
             walk_exprs(body, f)
         }
         ExprKind::Lit(_)
         | ExprKind::Var(_)
         | ExprKind::Constructor(_)
         | ExprKind::SourceRef { .. }
-        | ExprKind::DerivedRef(_)
         | ExprKind::ImplicitRef(_)
         | ExprKind::CollectFold(_)
         | ExprKind::TypeHole
@@ -580,7 +573,7 @@ fn collect_type_and_data_refs<'a>(
                 collect_type_and_data_refs(&h.body, aliases, data_decls);
             }
         }
-        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+        ExprKind::ViewDecl { body, .. } => {
             collect_type_and_data_refs(body, aliases, data_decls)
         }
         _ => {}

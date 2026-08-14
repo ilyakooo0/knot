@@ -213,7 +213,7 @@ pub(crate) fn handle_rename(
     // Rename every local usage that resolves to this definition.
     for (usage_span, target_span) in &doc.references {
         if *target_span == decl_span || *target_span == name_span {
-            // `SourceRef`/`DerivedRef` usage spans include the `*`/`&`
+            // `SourceRef` usage spans include the `*`
             // sigil — the edit must only replace the name.
             let span = edit_span(&doc.source, *usage_span);
             changes.entry(uri.clone()).or_default().push(TextEdit {
@@ -555,7 +555,7 @@ fn span_is_record_pun(module: &ast::Expr, source: &str, span: Span) -> bool {
             continue;
         }
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+            ast::ExprKind::ViewDecl { body, .. } => {
                 pun_in_expr(body, source, span, &mut found)
             }
             _ => {
@@ -567,24 +567,24 @@ fn span_is_record_pun(module: &ast::Expr, source: &str, span: Span) -> bool {
     found
 }
 
-/// Narrow a reference span to its editable name token. `SourceRef` /
-/// `DerivedRef` expression spans include the leading `*`/`&` sigil (the
-/// parser builds them from the sigil token's start), and identifiers can
-/// never begin with those bytes — so a rename edit must skip the sigil or
-/// it gets deleted along with the old name. Reference *display* (find-
-/// references, highlight) keeps the full span; only edits are narrowed.
+/// Narrow a reference span to its editable name token. `SourceRef` expression
+/// spans include the leading `*` sigil (the parser builds them from the sigil
+/// token's start), and identifiers can never begin with that byte — so a
+/// rename edit must skip the sigil or it gets deleted along with the old name.
+/// Reference *display* (find-references, highlight) keeps the full span; only
+/// edits are narrowed.
 fn edit_span(source: &str, span: Span) -> Span {
     let bytes = source.as_bytes();
     // Skip any leading noise before the identifier: a `(` folded into the span
     // (the parser rewrites a parenthesized expression's span to start at `(`),
-    // the `*`/`&` relation sigils, and ASCII whitespace. This handles nested
-    // forms like `(*users)` / `((*users))` / `(&d)` whose SourceRef/DerivedRef
+    // the `*` relation sigil, and ASCII whitespace. This handles nested
+    // forms like `(*users)` / `((*users))` whose SourceRef
     // span begins at `(`, not the sigil — narrowing only `span.start` would
     // otherwise replace the whole `(*users)` and drop the sigil and parens.
     let mut start = span.start;
     while start < span.end {
         match bytes.get(start) {
-            Some(b'(') | Some(b'*') | Some(b'&') => start += 1,
+            Some(b'(') | Some(b'*') => start += 1,
             Some(b) if b.is_ascii_whitespace() => start += 1,
             _ => break,
         }
@@ -769,7 +769,7 @@ pub(crate) fn collect_shadowed_names(
 
     for decl in top_fields(module) {
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+            ast::ExprKind::ViewDecl { body, .. } => {
                 walk(body, old_name, new_name, &mut Vec::new(), out);
             }
             _ => {
@@ -858,7 +858,7 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::RecordField, source: &s
         field_sites_in_type(&scheme.ty, source, f);
     }
     match &decl.value.node {
-        ast::ExprKind::ViewDecl { ty, body, .. } | ast::ExprKind::DerivedDecl { ty, body, .. } => {
+        ast::ExprKind::ViewDecl { ty, body, .. } => {
             if let Some(scheme) = ty {
                 field_sites_in_type(&scheme.ty, source, f);
             }

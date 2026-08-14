@@ -176,7 +176,7 @@ fn lint_expr(
                 lint_expr(&h.body, source_schemas, views, fun_bodies, diags);
             }
         }
-        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+        ExprKind::ViewDecl { body, .. } => {
             lint_expr(body, source_schemas, views, fun_bodies, diags);
         }
         // Terminals — nothing to recurse into
@@ -186,8 +186,7 @@ fn lint_expr(
         | ExprKind::SourceRef { .. }
         | ExprKind::ImplicitRef(_)
         | ExprKind::CollectFold(_)
-        | ExprKind::TypeHole
-        | ExprKind::DerivedRef(_) => {}
+        | ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
     }
 }
@@ -947,10 +946,9 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         | ExprKind::Constructor(_)
         | ExprKind::ImplicitRef(_)
         | ExprKind::CollectFold(_)
-        | ExprKind::DerivedRef(_)
         | ExprKind::TypeHole => false,
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => false,
-        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => references_source(body, source_name),
+        ExprKind::ViewDecl { body, .. } => references_source(body, source_name),
         ExprKind::Record(fields) => fields.iter().any(|f| references_source(&f.value, source_name)),
         ExprKind::FieldAccess { expr, .. } => references_source(expr, source_name),
         ExprKind::List(elems) => elems.iter().any(|e| references_source(e, source_name)),

@@ -350,24 +350,23 @@ Comprehensions over a source push down to SQL (`WHERE`, joins, aggregates
 like `count`/`sum`/`avg`, `sortBy`). A `<name>.schema.lock` file tracks the
 schema across runs for automatic migration.
 
-### Derived relations — `&name`
+### Query fields
 
-Prefix a name with `&` to declare a **derived relation**: a read-only,
-computed view over one or more source relations. Unlike a source relation it
-is never persisted — its body is re-evaluated on each access, so it always
+A `with`-level binding whose value is a relation query (a comprehension, a
+source, or a relation literal) is a **query field**: a read-only, computed view
+over one or more source relations. It is typed as a plain relation `[T]` and is
+never persisted — the query is re-evaluated on each access, so it always
 reflects the current state of its inputs. Recursive and mutually-recursive
-derived relations are supported (transitive closures, etc.).
+query fields are supported (transitive closures, etc.).
 
 ```knot
 with {
 *manages : [{manager: Text, report: Text}]
 
 -- recomputed on every read; rows are projected from *manages
-&directReports = (do
-  manages <- full *manages
-  yield (do
-    m <- manages
-    yield {manager m.manager report m.report}))
+directReports (do
+  m <- *manages
+  yield {manager m.manager report m.report})
 }
 (do
   full *manages = [
@@ -375,9 +374,9 @@ with {
     {manager "Alice" report "Carol"}
     {manager "Bob" report "Dave"}
   ]
-  rows <- &directReports
+  rows <- base.run directReports
   base.println (base.show rows)
-  base.println ("Total: " ++ base.show (base.count rows))   -- "Total: 3"
+  base.println ("Total: " ++ base.show (base.count directReports))   -- "Total: 3"
   yield {})
 ```
 
@@ -683,7 +682,7 @@ against a Rust runtime. Most of the language is implemented and demonstrated
 under [examples/](examples/):
 
 **Relations and queries.** Source relations (`*name : [T]`), pure
-expression-bindings, and derived relations (`&name = ...`) compose through
+expression-bindings, and query fields (`name <query>`) compose through
 `do`-notation. Comprehension queries push down to SQL when they can —
 `filter`, `map`, `count`, `countWhere`, `sum`, `avg`, `minOn`, `maxOn`,
 multi-table joins, `groupBy`, and `sortBy` all become SELECT statements with

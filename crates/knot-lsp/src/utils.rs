@@ -541,7 +541,7 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
                 f(&h.body);
             }
         }
-        // Leaves: Lit, Var, Constructor, SourceRef, DerivedRef, TypeCtor.
+        // Leaves: Lit, Var, Constructor, SourceRef, TypeCtor.
         ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::CollectFold(_) => {}
         ast::ExprKind::TypeHole => {}
@@ -549,14 +549,13 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
         | ast::ExprKind::Var(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef { .. }
-        | ast::ExprKind::DerivedRef(_)
         | ast::ExprKind::TypeCtor { .. }
         | ast::ExprKind::DataCtor { .. }
         | ast::ExprKind::SourceDecl { .. }
         | ast::ExprKind::SubsetConstraint { .. }
         | ast::ExprKind::RouteDecl { .. }
         | ast::ExprKind::RouteCompositeDecl { .. } => {}
-        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => f(body),
+        ast::ExprKind::ViewDecl { body, .. } => f(body),
     }
 }
 

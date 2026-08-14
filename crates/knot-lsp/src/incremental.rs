@@ -246,8 +246,7 @@ fn hash_field_signature(field: &ast::RecordField) -> u64 {
             ("source_sig", name).hash(&mut h);
             strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
         }
-        ExprKind::ViewDecl { name, ty, body }
-        | ExprKind::DerivedDecl { name, ty, body } => {
+        ExprKind::ViewDecl { name, ty, body } => {
             ("vd_sig", name).hash(&mut h);
             match ty {
                 Some(ts) => {
@@ -293,7 +292,7 @@ fn hash_structure(program: &Expr) -> u64 {
                 ("source", name).hash(&mut h);
                 strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
             }
-            ExprKind::ViewDecl { name, ty, .. } | ExprKind::DerivedDecl { name, ty, .. } => {
+            ExprKind::ViewDecl { name, ty, .. } => {
                 ("vd", name).hash(&mut h);
                 if let Some(ts) = ty {
                     strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
@@ -349,7 +348,7 @@ fn collect_field_deps(field: &ast::RecordField) -> HashSet<String> {
         ExprKind::SourceDecl { ty, .. } => {
             collect_type_names(ty, &mut deps);
         }
-        ExprKind::ViewDecl { ty, body, .. } | ExprKind::DerivedDecl { ty, body, .. } => {
+        ExprKind::ViewDecl { ty, body, .. } => {
             if let Some(ts) = ty {
                 collect_type_names(&ts.ty, &mut deps);
                 for c in &ts.constraints {
@@ -558,7 +557,7 @@ fn collect_expr_names(expr: &ast::Expr, out: &mut HashSet<String>) {
         ast::ExprKind::Var(name) => {
             out.insert(name.clone());
         }
-        ast::ExprKind::SourceRef { name, .. } | ast::ExprKind::DerivedRef(name) => {
+        ast::ExprKind::SourceRef { name, .. } => {
             out.insert(name.clone());
         }
         ast::ExprKind::Constructor(name) => {

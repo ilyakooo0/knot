@@ -278,7 +278,7 @@ fn route_is_listened_inner(
     }
     for decl in top_fields(program) {
         match &decl.value.node {
-            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+            ExprKind::ViewDecl { body, .. } => {
                 let mut found = false;
                 walk(body, route_name, &mut found, 0);
                 if found {
@@ -351,7 +351,7 @@ pub(crate) fn find_enclosing_application(
             continue;
         }
         match &decl.value.node {
-            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+            ExprKind::ViewDecl { body, .. } => {
                 find_app_in_expr(body, source, offset, &mut best);
             }
             // Route `rateLimit` expressions can contain applications that
@@ -515,7 +515,7 @@ pub(crate) fn find_enclosing_atomic_expr(
             continue;
         }
         match &decl.value.node {
-            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+            ExprKind::ViewDecl { body, .. } => {
                 walk(body, source, offset, &mut best, 0)
             }
             // Route `rateLimit` expressions are user-edited code.
@@ -639,7 +639,6 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
             },
             ast::ExprKind::Var(n) | ast::ExprKind::Constructor(n) => n.clone(),
             ast::ExprKind::SourceRef { name: n, .. } => format!("*{n}"),
-            ast::ExprKind::DerivedRef(n) => format!("&{n}"),
             ast::ExprKind::FieldAccess { expr: recv, field } => {
                 format!("{}.{field}", go(recv, true)?)
             }
@@ -850,9 +849,8 @@ pub(crate) struct FieldAccessAt {
 pub(crate) enum ReceiverKind {
     /// `someVar.field` — most common case.
     Var(String),
-    /// `*src.field` or `&derived.field`.
+    /// `*src.field`.
     SourceRef(String),
-    DerivedRef(String),
     /// Anything else; refinement lookup is not supported for these.
     Other,
 }
@@ -873,7 +871,6 @@ pub(crate) fn find_field_access_at_offset(
         match &expr.node {
             ast::ExprKind::Var(n) => ReceiverKind::Var(n.clone()),
             ast::ExprKind::SourceRef { name: n, .. } => ReceiverKind::SourceRef(n.clone()),
-            ast::ExprKind::DerivedRef(n) => ReceiverKind::DerivedRef(n.clone()),
             _ => ReceiverKind::Other,
         }
     }
@@ -903,7 +900,7 @@ pub(crate) fn find_field_access_at_offset(
     let mut best = None;
     for decl in top_fields(program) {
         match &decl.value.node {
-            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+            ExprKind::ViewDecl { body, .. } => {
                 walk(body, source, offset, &mut best, 0)
             }
             // The `rateLimit <expr>` clause on a route entry is user-edited
@@ -963,7 +960,7 @@ pub(crate) fn resolve_var_to_source(
 
     fn rhs_source_name(rhs: &ast::Expr) -> Option<String> {
         match &rhs.node {
-            ast::ExprKind::SourceRef { name: n, .. } | ast::ExprKind::DerivedRef(n) => Some(n.clone()),
+            ast::ExprKind::SourceRef { name: n, .. } => Some(n.clone()),
             // `filter f *src`, `take n *src`, etc. — peel App chains to find
             // an underlying source ref.
             ast::ExprKind::App { func, arg } => {
@@ -1018,7 +1015,7 @@ pub(crate) fn resolve_var_to_source(
             continue;
         }
         match &decl.value.node {
-            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+            ExprKind::ViewDecl { body, .. } => {
                 walk(body, var_name, &mut found, 0);
             }
             _ => {
@@ -1110,7 +1107,7 @@ pub(crate) fn find_enclosing_type_scheme(
         }
         // View/Derived marker type annotations.
         let marker_ty = match &decl.value.node {
-            ExprKind::ViewDecl { name: _, ty, .. } | ExprKind::DerivedDecl { name: _, ty, .. } => {
+            ExprKind::ViewDecl { name: _, ty, .. } => {
                 ty.as_ref()
             }
             _ => None,

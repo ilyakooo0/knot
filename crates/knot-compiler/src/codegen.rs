@@ -121,6 +121,26 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     /// `io_relation_vars` scope).
     decl_relation_vars: HashSet<String>,
 
+    /// Self-referential (recursive) relation query fields in scope: bare field
+    /// name -> the global fixpoint fn key whose call evaluates the transitive
+    /// closure. A recursive field is NOT inlined via `let_bindings` (that
+    /// would loop); instead `Var(field)` emits a call to the fixpoint wrapper.
+    /// Scoped: pushed/popped around each `with` body.
+    fixpoint_rel_fields: Vec<HashMap<String, String>>,
+
+    /// True while compiling a recursive query field's fixpoint body fn. Inside
+    /// a fixpoint body, source reads evaluate in-memory (the query is iterated
+    /// by `knot_relation_fixpoint`, not pushed down to a single SQL
+    /// statement), so the `full` user-gate on a bare `*src` read must not fire.
+    inside_fixpoint_body: bool,
+
+    /// Recursive query fields awaiting definition: (global fn key, body,
+    /// field_name). The `With` arm only REGISTERS the wrapper in `global_fns`
+    /// and queues the definition here — building the body/wrapper fns
+    /// mid-expression would re-enter `build_function` and corrupt the enclosing
+    /// function's builder state. Drained in the deferred-definition pass.
+    pending_query_fixpoints: Vec<(String, ast::Expr, String)>,
+
     /// Relation-valued locals captured by the current closure (lambda / IO
     /// thunk) compilation. Codegen compiles closures as separate Cranelift
     /// functions whose bodies are emitted AFTER the enclosing scope that
@@ -180,12 +200,6 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
 
     // Subset constraints: (sub, sup) relation paths
     subset_constraints: Vec<(knot::ast::RelationPath, knot::ast::RelationPath)>,
-
-    // Names of derived relations that are self-referencing (recursive)
-    recursive_derived: HashSet<String>,
-
-    // Body function IDs for recursive derived relations: name -> func_id
-    recursive_body_fns: HashMap<String, FuncId>,
 
     // Route entries: route_name -> entries (for HTTP codegen)
     route_entries: HashMap<String, Vec<ast::RouteEntry>>,
@@ -494,6 +508,11 @@ struct PendingLambda {
     /// the lambda body is compiled so `x <- name` binds keep per-row
     /// iteration across the deferred-compilation boundary.
     captured_rel_vars: HashSet<String>,
+    /// Whether the lambda was created inside a recursive query field's
+    /// fixpoint body — restored at compile time so source reads in the body
+    /// stay in-memory (the `full` user-gate doesn't fire across the deferred
+    /// boundary).
+    inside_fixpoint: bool,
 }
 
 /// A deferred IO do-block body compiled as a thunk function.
@@ -507,6 +526,12 @@ struct PendingIoThunk {
     /// the thunk body is compiled so `x <- name` binds keep per-row
     /// iteration across the deferred-compilation boundary.
     captured_rel_vars: HashSet<String>,
+    /// Recursive query-field fixpoint frames in scope at the capture site
+    /// (`fixpoint_rel_fields`). A `with` body that is an IO do-block compiles
+    /// as a deferred thunk AFTER the `with` frame popped, so the fixpoint
+    /// routing for a recursive field would otherwise be lost. Seeded back
+    /// while the thunk body is compiled.
+    captured_fixpoint_fields: Vec<HashMap<String, String>>,
 }
 
 /// A deferred trampoline for a multi-param user function.
@@ -1127,8 +1152,18 @@ fn compile_inner<M: cranelift_module::Module>(
     }
     cg.define_functions(program, type_env);
     cg.generate_main(program);
-    // Drain lambdas and IO thunks created by generate_main (e.g., migration functions)
-    while !cg.pending_lambdas.is_empty() || !cg.pending_io_thunks.is_empty() || !cg.pending_trampolines.is_empty() {
+    // Drain lambdas, IO thunks, trampolines, AND recursive query-field
+    // fixpoints created by generate_main (e.g., migration functions, or a
+    // top-level `with` registering a recursive field).
+    while !cg.pending_lambdas.is_empty()
+        || !cg.pending_io_thunks.is_empty()
+        || !cg.pending_trampolines.is_empty()
+        || !cg.pending_query_fixpoints.is_empty()
+    {
+        let fixpoints = std::mem::take(&mut cg.pending_query_fixpoints);
+        for (key, body, field_name) in fixpoints {
+            cg.define_query_fixpoint(&key, &body, &field_name);
+        }
         let lambdas: Vec<PendingLambda> = std::mem::take(&mut cg.pending_lambdas);
         for lambda in lambdas {
             cg.define_lambda_function(&lambda);
@@ -1145,6 +1180,7 @@ fn compile_inner<M: cranelift_module::Module>(
     if !cg.diagnostics.is_empty() {
         return Err(cg.diagnostics);
     }
+
     // Any `full`-marked read that never reached the in-memory full-load
     // fallback was pushed down to SQL — its `full` marker is unnecessary.
     let unnecessary: Vec<ast::Span> = cg
@@ -1477,6 +1513,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let_bindings: HashMap::new(),
             io_relation_vars: HashSet::new(),
             decl_relation_vars: HashSet::new(),
+            fixpoint_rel_fields: Vec::new(),
+            inside_fixpoint_body: false,
+            pending_query_fixpoints: Vec::new(),
             closure_relation_vars: HashSet::new(),
             constructors: HashMap::new(),
             embedded_ctors: HashSet::new(),
@@ -1492,8 +1531,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             diagnostics: Vec::new(),
             data_constructors: HashMap::new(),
             subset_constraints: Vec::new(),
-            recursive_derived: HashSet::new(),
-            recursive_body_fns: HashMap::new(),
             route_entries: HashMap::new(),
             fetch_route_entries: HashMap::new(),
             type_aliases: HashMap::new(),
@@ -2622,6 +2659,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
             match decl.kind {
                 DeclViewKind::Fun { body: Some(body), .. } => {
                     {
+                        // A self-referential relation query field is a fixpoint,
+                        // handled by the `With` arm — NOT registered as a plain
+                        // global fn (its body would self-call the global fn and
+                        // diverge). Skip registration entirely.
+                        if self.expr_is_known_relation(body)
+                            && expr_mentions_free_var(body, name)
+                        {
+                            continue;
+                        }
                         // Skip user functions that shadow stdlib builtins —
                         // the stdlib version is already registered.
                         if self.global_fns.contains_key(name) {
@@ -2644,43 +2690,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             .unwrap();
                         self.global_fns.insert(name.to_string(), (func_id, n_params));
                         self.fun_bodies.insert(name.to_string(), body.clone());
-                    }
-                }
-                DeclViewKind::Derived { body: Some(body), .. } => {
-                    // `decl_views` yields the field name WITH the `&` marker
-                    // (`&directReports`), but `DerivedRef` (desugar) and the
-                    // `DerivedRef` codegen arm use the BARE name. Strip the
-                    // marker once here so registration, self-reference
-                    // detection, and the fixpoint keys all agree with the
-                    // reference site — otherwise the lookup in the `DerivedRef`
-                    // arm misses ("undefined derived relation").
-                    let name = name.strip_prefix('&').unwrap_or(name);
-                    // Derived relations are 0-param functions (only db param)
-                    let mut sig = self.module.make_signature();
-                    sig.params.push(AbiParam::new(self.ptr_type)); // db
-                    sig.returns.push(AbiParam::new(self.ptr_type));
-                    let func_name = format!("knot_user_{}", name);
-                    let func_id = self
-                        .module
-                        .declare_function(&func_name, Linkage::Local, &sig)
-                        .unwrap();
-                    self.global_fns.insert(name.to_string(), (func_id, 0));
-
-                    // Detect self-referencing (recursive) derived relations
-                    if expr_contains_derived_ref(body, name) {
-                        self.recursive_derived.insert(name.to_string());
-
-                        // Declare body function: (db, self_val) -> result
-                        let mut body_sig = self.module.make_signature();
-                        body_sig.params.push(AbiParam::new(self.ptr_type)); // db
-                        body_sig.params.push(AbiParam::new(self.ptr_type)); // self_val
-                        body_sig.returns.push(AbiParam::new(self.ptr_type));
-                        let body_func_name = format!("knot_user_{}_body", name);
-                        let body_func_id = self
-                            .module
-                            .declare_function(&body_func_name, Linkage::Local, &body_sig)
-                            .unwrap();
-                        self.recursive_body_fns.insert(name.to_string(), body_func_id);
                     }
                 }
                 DeclViewKind::Data { ctors, .. } => {
@@ -3505,39 +3514,37 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         for decl in decl_views(program) {
             let name = decl.name;
-            match decl.kind {
-                DeclViewKind::Fun { body: Some(body), .. } => {
-                    {
-                        // Define exactly the user functions the registration
-                        // pass registered — it inserts into `fun_bodies` only
-                        // when it does NOT skip (i.e. the bare key was free:
-                        // either no stdlib collision, or the stdlib fn is a
-                        // base field living under `base.<name>`). Internal-only
-                        // stdlib primitives take the bare key, so a same-named
-                        // user decl is skipped at registration and absent from
-                        // `fun_bodies` — correctly skipped here too.
-                        if !self.fun_bodies.contains_key(name) {
-                            continue;
-                        }
-                        // If body is a lambda, extract its params for direct compilation.
-                        // Peel type-witness layers so `\(A : Type) -> \x -> …`
-                        // is defined with the runtime arity of `\x -> …`. For a
-                        // non-lambda body this returns `([], body)` unchanged.
-                        let (vparams, vbody) = value_lambda_chain(body);
-                        self.define_user_function(name, &vparams, vbody);
+            if let DeclViewKind::Fun { body: Some(body), .. } = decl.kind {
+                {
+                    // A self-referential relation query field (a recursive
+                    // query / fixpoint) is NOT a plain 0-param function —
+                    // defining it via `define_user_function` would compile a
+                    // body whose self-reference resolves to the global fn
+                    // itself (infinite recursion). The `With` arm routes it
+                    // to `knot_relation_fixpoint` instead. Skip it here.
+                    let is_recursive_query = self.expr_is_known_relation(body)
+                        && expr_mentions_free_var(body, name);
+                    if is_recursive_query {
+                        continue;
                     }
-                }
-                DeclViewKind::Derived { body: Some(body), .. } => {
-                    // Same `&`-strip as the registration pass above: keys are
-                    // the BARE name (matching `DerivedRef`).
-                    let name = name.strip_prefix('&').unwrap_or(name);
-                    if self.recursive_derived.contains(name) {
-                        self.define_recursive_derived(name, body);
-                    } else {
-                        self.define_user_function(name, &[], body);
+                    // Define exactly the user functions the registration
+                    // pass registered — it inserts into `fun_bodies` only
+                    // when it does NOT skip (i.e. the bare key was free:
+                    // either no stdlib collision, or the stdlib fn is a
+                    // base field living under `base.<name>`). Internal-only
+                    // stdlib primitives take the bare key, so a same-named
+                    // user decl is skipped at registration and absent from
+                    // `fun_bodies` — correctly skipped here too.
+                    if !self.fun_bodies.contains_key(name) {
+                        continue;
                     }
+                    // If body is a lambda, extract its params for direct compilation.
+                    // Peel type-witness layers so `\(A : Type) -> \x -> …`
+                    // is defined with the runtime arity of `\x -> …`. For a
+                    // non-lambda body this returns `([], body)` unchanged.
+                    let (vparams, vbody) = value_lambda_chain(body);
+                    self.define_user_function(name, &vparams, vbody);
                 }
-                _ => {}
             }
         }
 
@@ -3550,8 +3557,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // are picked up by that loop.
         self.define_base_record();
 
-        // Compile any pending lambdas and IO thunks (may generate more)
-        while !self.pending_lambdas.is_empty() || !self.pending_io_thunks.is_empty() || !self.pending_trampolines.is_empty() {
+        // Compile pending lambdas, IO thunks, trampolines, AND recursive
+        // query-field fixpoints — any of which may generate more (a fixpoint
+        // body contains lambdas; a `With` arm compiled late can register a new
+        // fixpoint). Loop until all queues drain.
+        while !self.pending_lambdas.is_empty()
+            || !self.pending_io_thunks.is_empty()
+            || !self.pending_trampolines.is_empty()
+            || !self.pending_query_fixpoints.is_empty()
+        {
+            let fixpoints = std::mem::take(&mut self.pending_query_fixpoints);
+            for (key, body, field_name) in fixpoints {
+                self.define_query_fixpoint(&key, &body, &field_name);
+            }
             let lambdas: Vec<PendingLambda> =
                 std::mem::take(&mut self.pending_lambdas);
             for lambda in lambdas {
@@ -3774,58 +3792,71 @@ impl<M: cranelift_module::Module> Codegen<M> {
         });
     }
 
-    /// Define a recursive derived relation using fixpoint iteration.
-    /// Generates two functions:
-    /// - `knot_user_<name>_body(db, self_val)`: the body with self-references
-    ///   reading from `self_val` instead of recursing
-    /// - `knot_user_<name>(db)`: wrapper that calls `knot_relation_fixpoint`
-    fn define_recursive_derived(&mut self, name: &str, body: &ast::Expr) {
-        let body_func_id = self.recursive_body_fns[name];
-        let name_owned = name.to_string();
+    /// Define a recursive bare query field (`with` field whose body references
+    /// its own name) as a fixpoint. Builds (1) a body fn `(db, self_val)` that
+    /// binds the field's OWN name to `self_val` (so the body's `Var(field)`
+    /// self-reference reads the accumulator) and compiles the query body
+    /// in-memory, and (2) a 0-param wrapper fn (registered in `global_fns`
+    /// under `key`) that calls `knot_relation_fixpoint(db, body, empty)`. The
+    /// field's `with`-body references route to the wrapper via the `Var` arm's
+    /// `fixpoint_rel_fields` lookup.
+    fn define_query_fixpoint(&mut self, key: &str, body: &ast::Expr, field_name: &str) {
+        // 1. Body fn: (db, self_val) -> result
+        let body_func_name = format!("{key}_body");
+        let mut body_sig = self.module.make_signature();
+        body_sig.params.push(AbiParam::new(self.ptr_type)); // db
+        body_sig.params.push(AbiParam::new(self.ptr_type)); // self_val
+        body_sig.returns.push(AbiParam::new(self.ptr_type));
+        let body_func_id = self
+            .module
+            .declare_function(&body_func_name, Linkage::Local, &body_sig)
+            .unwrap();
+
         let body_owned = body.clone();
+        let field_name_owned = field_name.to_string();
+        self.build_function(body_func_id, body_sig, |cg, builder, entry| {
+        let mut env = Env::new();
+            let db = builder.block_params(entry)[0];
+            let self_val = builder.block_params(entry)[1];
+            // Bind the field's own name to the accumulator so the body's
+            // `Var(field)` self-reference reads it (the `Var` arm's env lookup
+            // wins over the fixpoint route inside this fn).
+            env.set(&field_name_owned, self_val);
+            // The accumulator IS a relation: mark it so a `r <- field` bind in
+            // the body iterates it per-row (including across the deferred
+            // comprehension-lambda boundary via `closure_relation_vars`).
+            cg.io_relation_vars.insert(field_name_owned.clone());
+            cg.closure_relation_vars.insert(field_name_owned.clone());
+            // A recursive query reads its sources in-memory (no pushdown) —
+            // mark them so the `full` user-gate doesn't fire inside the body.
+            cg.inside_fixpoint_body = true;
+            let result = cg.compile_expr(builder, &body_owned, &mut env, db);
+            cg.inside_fixpoint_body = false;
+            cg.io_relation_vars.remove(&field_name_owned);
+            cg.closure_relation_vars.remove(&field_name_owned);
+            builder.ins().return_(&[result]);
+        });
 
-        // 1. Define the body function: (db, self_val) -> result
-        {
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(self.ptr_type)); // db
-            sig.params.push(AbiParam::new(self.ptr_type)); // self_val
-            sig.returns.push(AbiParam::new(self.ptr_type));
+        // 2. Wrapper fn: (db) -> result, calling knot_relation_fixpoint. The
+        // wrapper was ALREADY declared + registered in `global_fns` by the
+        // `With` arm (so body `Var(field)` refs resolve); here we just define it.
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(self.ptr_type)); // db
+        sig.returns.push(AbiParam::new(self.ptr_type));
+        let wrapper_func_id = self.global_fns[key].0;
 
-            let self_key = format!("__derived_self_{}", name_owned);
-
-            self.build_function(body_func_id, sig, |cg, builder, entry| {
-                let mut env = Env::new();
-                let db = builder.block_params(entry)[0];
-                let self_val = builder.block_params(entry)[1];
-                // Inject self-reference into env so DerivedRef uses it
-                env.set(&self_key, self_val);
-
-                let result = cg.compile_expr(builder, &body_owned, &mut env, db);
-                builder.ins().return_(&[result]);
-            });
-        }
-
-        // 2. Define the wrapper function: (db) -> result
-        //    Calls knot_relation_fixpoint(db, body_fn_ptr, empty_relation)
-        {
-            let (wrapper_func_id, _) = self.global_fns[name];
-            let mut sig = self.module.make_signature();
-            sig.params.push(AbiParam::new(self.ptr_type)); // db
-            sig.returns.push(AbiParam::new(self.ptr_type));
-
-            self.build_function(wrapper_func_id, sig, |cg, builder, entry| {
-                let db = builder.block_params(entry)[0];
-                let initial = cg.call_rt(builder, "knot_relation_empty", &[]);
-                let body_ref = cg.module.declare_func_in_func(body_func_id, builder.func);
-                let body_addr = builder.ins().func_addr(cg.ptr_type, body_ref);
-                let result = cg.call_rt(
-                    builder,
-                    "knot_relation_fixpoint",
-                    &[db, body_addr, initial],
-                );
-                builder.ins().return_(&[result]);
-            });
-        }
+        self.build_function(wrapper_func_id, sig, |cg, builder, entry| {
+            let db = builder.block_params(entry)[0];
+            let initial = cg.call_rt(builder, "knot_relation_empty", &[]);
+            let body_ref = cg.module.declare_func_in_func(body_func_id, builder.func);
+            let body_addr = builder.ins().func_addr(cg.ptr_type, body_ref);
+            let result = cg.call_rt(
+                builder,
+                "knot_relation_fixpoint",
+                &[db, body_addr, initial],
+            );
+            builder.ins().return_(&[result]);
+        });
     }
 
     fn define_lambda_function(&mut self, lambda: &PendingLambda) {
@@ -3841,12 +3872,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let body = lambda.body.clone();
         let free_vars = lambda.free_vars.clone();
         let captured_rel_vars = lambda.captured_rel_vars.clone();
+        let inside_fixpoint = lambda.inside_fixpoint;
 
         // Mirror define_io_thunk_function: relation-valued captured locals
         // must be visible to `expr_is_relation_var` while the lambda body is
         // compiled, even though the registering scope is gone.
         let prev_closure_relation_vars = self.closure_relation_vars.clone();
         self.closure_relation_vars.extend(captured_rel_vars);
+        // Restore the fixpoint-body flag across the deferred boundary so source
+        // reads in the body stay in-memory (no `full` user-gate).
+        let prev_inside_fixpoint = self.inside_fixpoint_body;
+        self.inside_fixpoint_body = inside_fixpoint;
 
         self.build_function(func_id, sig, |cg, builder, entry| {
             let mut env = Env::new();
@@ -3898,6 +3934,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         });
 
         self.closure_relation_vars = prev_closure_relation_vars;
+        self.inside_fixpoint_body = prev_inside_fixpoint;
     }
 
     /// Compile a pending IO do-block thunk function.
@@ -3912,12 +3949,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let stmts = thunk.stmts.clone();
         let free_vars = thunk.free_vars.clone();
         let captured_rel_vars = thunk.captured_rel_vars.clone();
+        let captured_fixpoint_fields = thunk.captured_fixpoint_fields.clone();
 
         // See the field's doc comment: relation-valued captured locals must
         // be visible to `expr_is_relation_var` while the body is compiled,
         // even though the scope that registered them is long gone.
         let prev_closure_relation_vars = self.closure_relation_vars.clone();
         self.closure_relation_vars.extend(captured_rel_vars);
+        // Restore the recursive query-field fixpoint frames so a recursive
+        // field referenced in this thunk routes to its fixpoint wrapper.
+        let prev_fixpoint_rel_fields = std::mem::replace(
+            &mut self.fixpoint_rel_fields,
+            captured_fixpoint_fields,
+        );
 
         self.build_function(func_id, sig, |cg, builder, entry| {
             let mut env = Env::new();
@@ -3943,8 +3987,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
         });
 
         self.closure_relation_vars = prev_closure_relation_vars;
+        self.fixpoint_rel_fields = prev_fixpoint_rel_fields;
     }
-
     /// Get or create a trampoline function that wraps a user function with the
     /// standard lambda calling convention (db, env, arg) -> result.
     /// For 1-param user functions: trampoline(db, env, arg) calls user_fn(db, arg).
@@ -3990,6 +4034,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 body,
                 free_vars: vec![],
                 captured_rel_vars: HashSet::new(),
+                inside_fixpoint: self.inside_fixpoint_body,
             });
         } else {
             // For multi-param functions: generate curry chain via build_function
@@ -4699,6 +4744,23 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
 
             ast::ExprKind::Var(name) => {
+                // A recursive (fixpoint) relation query field in scope: emit a
+                // call to its fixpoint wrapper fn. Checked before env.bindings
+                // (which holds no entry for these fields in the `with` body)
+                // but AFTER — inside the fixpoint body fn, the field's own
+                // name is env-bound to the `self_val` accumulator, so the env
+                // lookup below wins there. Innermost frame wins.
+                for frame in self.fixpoint_rel_fields.iter().rev() {
+                    if let Some(fn_key) = frame.get(name.as_str())
+                        && !env.bindings.contains_key(name.as_str())
+                        && let Some((func_id, 0)) = self.global_fns.get(fn_key).copied()
+                    {
+                        let func_ref =
+                            self.module.declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(func_ref, &[db]);
+                        return builder.inst_results(call)[0];
+                    }
+                }
                 // A local or captured binding shadows any builtin of the same
                 // name (e.g. a lambda param `\now -> now`, or `retry <- ...`).
                 // The applied-call path already consults `env` first; the bare
@@ -4827,8 +4889,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // A bare `*rel` read that reaches here was not consumed by any
                 // SQL-pushdown matcher — it loads the whole relation into
                 // memory via `knot_source_read`. Require the user to opt in
-                // with `full *rel`.
-                if !full {
+                // with `full *rel` — EXCEPT inside a fixpoint body, where the
+                // read is necessarily in-memory (the recursive query is
+                // iterated by `knot_relation_fixpoint`, not pushed down).
+                if !full && !self.inside_fixpoint_body {
                     return self.push_codegen_error(
                         builder,
                         expr.span,
@@ -4922,26 +4986,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     } else {
                         rel
                     }
-                }
-            }
-
-            ast::ExprKind::DerivedRef(name) => {
-                // For recursive derived relations, self-references use the
-                // current accumulator value passed via the environment.
-                let self_key = format!("__derived_self_{}", name);
-                if let Some(&self_val) = env.bindings.get(&self_key) {
-                    self_val
-                } else if let Some((func_id, 0)) = self.global_fns.get(name).copied() {
-                    let func_ref =
-                        self.module.declare_func_in_func(func_id, builder.func);
-                    let call = builder.ins().call(func_ref, &[db]);
-                    builder.inst_results(call)[0]
-                } else {
-                    self.push_codegen_error(
-                        builder,
-                        expr.span,
-                        format!("codegen: undefined derived relation '&{}'", name),
-                    )
                 }
             }
 
@@ -5139,12 +5183,46 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // other names stay visible, so argument-position references to
                 // outer `with` fields (`with {ctor r.Pair}`,
                 // `with {xs (filter … xs)}`) keep working.
+                // Determine relation-valued fields BEFORE building the record:
+                // they are LAZY (never materialized into the record) — a
+                // recursive (self-referential) relation field compiled eagerly
+                // here would invoke its fixpoint during record construction and
+                // diverge. So they are excluded from `compiled_fields` entirely.
+                let mut rel_fields: Vec<String> = Vec::new();
+                let mut lazy_rel_fields: Vec<String> = Vec::new();
+                if let ast::ExprKind::Record(fields) = &record.node {
+                    for f in fields {
+                        let rel_valued = matches!(&f.value.node, ast::ExprKind::List(_))
+                            || self.expr_is_known_relation(&f.value)
+                            || self.expr_is_relation_var(&f.value)
+                            || matches!(&f.value.node, ast::ExprKind::Do(stmts)
+                                if stmts.last().is_some_and(|s| matches!(&s.node,
+                                    ast::StmtKind::Expr(e) if e.node.as_yield_arg().is_some())))
+                            || self.desugared_monad_kind(&f.value) == Some(MonadKind::Relation);
+                        if rel_valued {
+                            rel_fields.push(f.name.clone());
+                            // Lazy iff the query reads a source/derived (not a
+                            // constant list literal).
+                            if !matches!(&f.value.node, ast::ExprKind::List(_)) {
+                                lazy_rel_fields.push(f.name.clone());
+                            }
+                        }
+                    }
+                }
                 let record_val = if let ast::ExprKind::Record(field_exprs) =
                     &record.node
                 {
                     let mut compiled_fields: Vec<(&String, Value)> =
                         Vec::with_capacity(field_exprs.len());
                     for f in field_exprs {
+                        // Skip LAZY relation fields: not materialized into the
+                        // record (resolved via `let_bindings` inlining or the
+                        // fixpoint route). Compiling them here would evaluate
+                        // the query eagerly — and for a recursive field,
+                        // diverge during record construction.
+                        if lazy_rel_fields.iter().any(|n| n == &f.name) {
+                            continue;
+                        }
                         // Required CLI constant (sig-only field, empty-record
                         // placeholder value): bind the field to a call of the
                         // registered required-const function (which reads
@@ -5227,50 +5305,64 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // yield i`) can be unwrapped (`knot_io_run`) to the relation the
                 // body expects — mirroring the old `let r = do … yield …` which
                 // bound the run relation.
-                let mut io_scope = self
+                let io_scope = self
                     .with_io_scope_for(expr.span, record)
                     .unwrap_or_default();
-                let mut rel_fields: Vec<String> = Vec::new();
-                if let ast::ExprKind::Record(fields) = &record.node {
-                    for f in fields {
-                        // Unwrap only RELATION-valued IO fields (queries like
-                        // `r: do i <- *src …; yield i`) so the body iterates /
-                        // counts the relation. Bare IO ACTIONS (`println …`,
-                        // `readFile …`) and lambdas stay lazy — the old `let`
-                        // deferred them and only ran them when used.
-                        let rel_valued = matches!(&f.value.node, ast::ExprKind::List(_))
-                            || self.expr_is_known_relation(&f.value)
-                            || self.expr_is_relation_var(&f.value)
-                            || matches!(&f.value.node, ast::ExprKind::Do(stmts)
-                                if stmts.last().is_some_and(|s| matches!(&s.node,
-                                    ast::StmtKind::Expr(e) if e.node.as_yield_arg().is_some())))
-                            || self.desugared_monad_kind(&f.value) == Some(MonadKind::Relation);
-                        if rel_valued {
-                            rel_fields.push(f.name.clone());
+                // (`rel_fields` / `lazy_rel_fields` were computed above, before
+                // the record build, so the record literal can skip them.)
+                // Relation query fields are LAZY and transparent: they are NOT
+                // materialized into the record. Instead each is registered in
+                // `let_bindings` (below) so the SQL planner / beta-reduction
+                // inline the field's query at each use, folding pushdown
+                // through to the underlying source and re-reading it fresh.
+                // This fixes the stale-snapshot bug (previously the field was
+                // unwrapped once at the `with` site, before the body's writes).
+
+                // RECURSIVE query fields (a lazy field whose body references
+                // its own name) are FIXPOINTS: register a global fixpoint fn
+                // (body fn (db, self_val) + wrapper calling
+                // `knot_relation_fixpoint`) and route `Var(field)` to it.
+                // Inlining would recurse forever; the fixpoint iterates the
+                // body in-memory until no new rows. Keyed per-`with`-site so
+                // two blocks with a same-named recursive field don't collide.
+                let mut fixpoint_frame: HashMap<String, String> = HashMap::new();
+                if let ast::ExprKind::Record(field_exprs) = &record.node {
+                    for f in field_exprs {
+                        if !lazy_rel_fields.iter().any(|n| n == &f.name) {
+                            continue;
                         }
+                        // Precise self-reference check: the field's body must
+                        // actually contain a free `Var(f.name)`. (NOT
+                        // `expr_references_var`, which conservatively returns
+                        // true for comprehensions/other nodes it doesn't model.)
+                        if !expr_mentions_free_var(&f.value, &f.name) {
+                            continue;
+                        }
+                        let key = format!("__withfix_{}_{}", expr.span.start, f.name);
+                        // REGISTER the wrapper (declare + global_fns) now so the
+                        // body's `Var(field)` references resolve, but QUEUE the
+                        // body/wrapper definition for the deferred pass —
+                        // building them here would re-enter `build_function`
+                        // mid-expression and corrupt the enclosing builder.
+                        let mut sig = self.module.make_signature();
+                        sig.params.push(AbiParam::new(self.ptr_type)); // db
+                        sig.returns.push(AbiParam::new(self.ptr_type));
+                        let wrapper_id = self
+                            .module
+                            .declare_function(&key, Linkage::Local, &sig)
+                            .unwrap();
+                        self.global_fns.insert(key.clone(), (wrapper_id, 0));
+                        self.pending_query_fixpoints.push((
+                            key.clone(),
+                            f.value.clone(),
+                            f.name.clone(),
+                        ));
+                        fixpoint_frame.insert(f.name.clone(), key);
                     }
                 }
-                // Unwrap relation-valued IO fields IN THE RECORD so every read
-                // of the field — including a deferred IO-thunk capturing it via
-                // the closure env — sees the relation, not the raw IO thunk.
-                // Non-relation IO fields (lambdas/actions) stay lazy.
-                for name in &rel_fields {
-                    let (key_ptr, key_len) = self.string_ptr(builder, name);
-                    let raw = self.call_rt(
-                        builder,
-                        "knot_record_field",
-                        &[record_val, key_ptr, key_len],
-                    );
-                    let unwrapped = self.call_rt(builder, "knot_io_run", &[db, raw]);
-                    let (kp2, kl2) = self.string_ptr(builder, name);
-                    self.call_rt_void(
-                        builder,
-                        "knot_record_set_field",
-                        &[record_val, kp2, kl2, unwrapped],
-                    );
-                    // The field is now a plain relation: drop its IO mark so
-                    // `expr_is_io(Var r)` is false and binds iterate per-row.
-                    io_scope.remove(name);
+                let pushed_fixpoint = !fixpoint_frame.is_empty();
+                if pushed_fixpoint {
+                    self.fixpoint_rel_fields.push(fixpoint_frame);
                 }
                 if let Some(fields) = self.with_fields.get(&expr.span).cloned() {
                     // Bind the whole `with` record under a per-site alias so an
@@ -5280,6 +5372,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         format!("{}{}", crate::infer::WITH_RECORD_ALIAS_PREFIX, expr.span.start);
                     body_env.set(&rec_alias, record_val);
                     for field in fields {
+                        // Lazy relation query fields (source-reading queries)
+                        // are NOT bound from the record (which holds only the
+                        // unevaluated thunk); they resolve via `let_bindings`
+                        // inlining. List-literal fields are constant and bound
+                        // eagerly below (closures may capture them).
+                        if lazy_rel_fields.iter().any(|n| n == &field) {
+                            continue;
+                        }
                         let (key_ptr, key_len) = self.string_ptr(builder, &field);
                         let field_val = self.call_rt(
                             builder,
@@ -5340,7 +5440,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if let ast::ExprKind::Record(field_exprs) = &record.node {
                     for f in field_exprs {
                         let is_pure = pure_field_names.iter().any(|n| n == &f.name);
-                        if is_pure && !self.let_bindings.contains_key(&f.name) {
+                        // Recursive (fixpoint) fields are routed to a global
+                        // fixpoint fn, NOT inlined — inlining would loop.
+                        let is_fixpoint = self
+                            .fixpoint_rel_fields
+                            .last()
+                            .is_some_and(|fr| pushed_fixpoint && fr.contains_key(&f.name));
+                        if is_pure && !is_fixpoint && !self.let_bindings.contains_key(&f.name) {
                             self.let_bindings.insert(f.name.clone(), f.value.clone());
                             let_added.push(f.name.clone());
                         }
@@ -5354,6 +5460,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     self.io_relation_vars.remove(n);
                 }
                 self.with_io_locals.pop();
+                if pushed_fixpoint {
+                    self.fixpoint_rel_fields.pop();
+                }
                 result
             }
 
@@ -6033,7 +6142,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.call_rt(builder, "knot_value_unit", &[])
             }
 
-            ast::ExprKind::ViewDecl { .. } | ast::ExprKind::DerivedDecl { .. } => {
+            ast::ExprKind::ViewDecl { .. } => {
                 // An embedded view/derived declaration is likewise a static marker:
                 // the relation is registered and compiled via the
                 // hoisted top-level `DeclKind::View`/`Derived` (desugar
@@ -6509,9 +6618,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
             Serve { handlers, .. } => handlers
                 .iter()
                 .all(|h| self.collect_direct_write_targets(&h.body, out)),
-            Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) => true,
+            Lit(_) | Constructor(_) | SourceRef { .. } => true,
             TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => true,
-            ViewDecl { body, .. } | DerivedDecl { body, .. } => self.collect_direct_write_targets(body, out),
+            ViewDecl { body, .. } => self.collect_direct_write_targets(body, out),
         }
     }
 
@@ -7406,21 +7515,20 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // marker is implied) and wraps the materialized relation as `IO (Vec a)`
         // via `knot_relation_run_io`.
         if Self::query_form_name(func_expr) == Some("run")
-            && args.len() == 1 && !user_shadows_special {
-            if let Some(source_name) = self.resolve_source(args[0])
-                && !self.views.contains_key(&source_name)
-                && let Some(schema) = self.source_schemas.get(&source_name).cloned()
-            {
-                self.emit_stm_track_read(builder, &source_name);
-                let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
-                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                let rel = self.call_rt(
-                    builder,
-                    "knot_source_read",
-                    &[db, name_ptr, name_len, schema_ptr, schema_len],
-                );
-                return self.call_rt(builder, "knot_relation_run_io", &[rel]);
-            }
+            && args.len() == 1 && !user_shadows_special
+            && let Some(source_name) = self.resolve_source(args[0])
+            && !self.views.contains_key(&source_name)
+            && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+        {
+            self.emit_stm_track_read(builder, &source_name);
+            let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
+            let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+            let rel = self.call_rt(
+                builder,
+                "knot_source_read",
+                &[db, name_ptr, name_len, schema_ptr, schema_len],
+            );
+            return self.call_rt(builder, "knot_relation_run_io", &[rel]);
         }
 
         // Special case: count *rel → SQL COUNT(*)  (bare `count` or `base.count`)
@@ -10280,7 +10388,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// Check if a do-block should be compiled as IO (contains IO-producing builtins).
     /// Compile an expression that will be used as the value of a `set`/`replace`.
     /// Do-blocks in set-value position are always relational comprehensions,
-    /// even when they contain SourceRef/DerivedRef binds (which would normally
+    /// even when they contain SourceRef binds (which would normally
     /// cause `is_io_do_block` to classify them as IO).
     fn compile_set_value_expr(
         &mut self,
@@ -10411,7 +10519,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn expr_contains_io(expr: &ast::Expr, builtins: &HashSet<&str>, io_fns: &HashSet<String>) -> bool {
         match &expr.node {
             ast::ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name),
-            ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_) => true,
+            // A query over a source/derived is a pure, lazy `[T]` — NOT IO.
+            // Only writes (`set`/`full =`) and `atomic` are effects. `full`
+            // is a viewer-only tag with no semantic effect.
+            ast::ExprKind::SourceRef { .. } => false,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::App { func, arg } => {
@@ -10728,7 +10839,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 ) || self.io_functions.contains(name)
                 || Self::io_scopes_lookup(scopes, name)
             }
-            ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_) => true,
+            // A query over a source/derived is a pure, lazy `[T]` — NOT IO.
+            // `full` is a viewer-only tag with no semantic effect.
+            ast::ExprKind::SourceRef { .. } => false,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
@@ -10849,7 +10962,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// Check whether an expression's IO-ness involves *external* effects
     /// (console/fs/network/clock/random builtins, fork/race, atomic blocks,
     /// relation writes, user IO functions) rather than plain relation reads.
-    /// Relation-only IO (`IO {} [T]` produced by SourceRef/DerivedRef
+    /// Relation-only IO (`IO {} [T]` produced by a SourceRef
     /// comprehensions) is treated by inference as the underlying relation
     /// when let-bound, so codegen must run it eagerly; external-effect IO
     /// bound by `let` must stay deferred and run at its use sites.
@@ -10866,7 +10979,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             // Relation reads are the "pure DB" IO that inference lets flow
             // as the relation value itself.
-            ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_) => false,
+            ast::ExprKind::SourceRef { .. } => false,
             // Writes and atomic blocks must not run at `let` time.
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
@@ -10978,6 +11091,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             stmts: stmts.to_vec(),
             free_vars: free_vars.clone(),
             captured_rel_vars,
+            captured_fixpoint_fields: self.fixpoint_rel_fields.clone(),
         });
 
         // Build the closure env: capture free variables (same pattern as lambdas)
@@ -11140,7 +11254,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     );
                     let rhs_is_io_relation_source = matches!(
                         &expr.node,
-                        ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_)
+                        ast::ExprKind::SourceRef { .. }
                     );
                     // A comprehension TAIL inside a sequential IO block:
                     //
@@ -11922,7 +12036,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // Inner expr must be hoistable (source, derived, var, or list).
                 let hoistable = match &inner_expr.node {
                     ast::ExprKind::SourceRef { .. }
-                    | ast::ExprKind::DerivedRef(_)
                     | ast::ExprKind::List(_) => true,
                     // A `Var` is only hoistable when it resolves OUTSIDE this
                     // do-block. A var bound by another Bind in this block is
@@ -12060,8 +12173,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             }
                             primary_row_val = Some(row);
                             match &expr.node {
-                                ast::ExprKind::SourceRef { name, .. }
-                                | ast::ExprKind::DerivedRef(name) => {
+                                ast::ExprKind::SourceRef { name, .. } => {
                                     primary_source = Some(name.clone());
                                     primary_schema = self.source_schemas.get(name).cloned();
                                 }
@@ -12232,7 +12344,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         let is_known_relation = matches!(
                             &expr.node,
                             ast::ExprKind::SourceRef { .. }
-                                | ast::ExprKind::DerivedRef(_)
                                 | ast::ExprKind::List(_)
                                 | ast::ExprKind::Do(_)
                                 | ast::ExprKind::Set { .. }
@@ -12283,8 +12394,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         }
                         primary_row_val = Some(row);
                         match &expr.node {
-                            ast::ExprKind::SourceRef { name, .. }
-                            | ast::ExprKind::DerivedRef(name) => {
+                            ast::ExprKind::SourceRef { name, .. } => {
                                 primary_source = Some(name.clone());
                                 primary_schema = self.source_schemas.get(name).cloned();
                             }
@@ -12890,6 +13000,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             body: body.clone(),
             free_vars: free_vars.clone(),
             captured_rel_vars,
+            inside_fixpoint: self.inside_fixpoint_body,
         });
 
         // Build the closure: capture free variables into a record
@@ -13282,11 +13393,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::TypeHole => false,
             ast::ExprKind::Lit(_)
             | ast::ExprKind::Var(_)
-            | ast::ExprKind::Constructor(_)
-            | ast::ExprKind::DerivedRef(_) => false,
+            | ast::ExprKind::Constructor(_) => false,
             ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
             ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => Self::references_source(body, source_name),
+            ast::ExprKind::ViewDecl { body, .. } => Self::references_source(body, source_name),
             ast::ExprKind::Record(fields) => {
                 fields.iter().any(|f| Self::references_source(&f.value, source_name))
             }
@@ -16225,24 +16335,23 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // t.status` keeps its bind-the-value semantics.
             ast::ExprKind::FieldAccess { .. } => self.relation_fields.contains(&expr.span),
             // Application of known relation-returning stdlib functions
-            ast::ExprKind::App { func, .. } => {
-                if let ast::ExprKind::Var(name) = &func.node {
-                    matches!(name.as_str(),
+            ast::ExprKind::App { .. } => {
+                // Head of the application spine — a bare `union …` or a
+                // namespaced `base.union …` (FieldAccess). Both return a relation.
+                let rel_fn = |n: &str| {
+                    matches!(n,
                         "filter" | "map" | "take" | "drop" | "diff" | "inter"
                         | "union" | "reverse" | "chars" | "sort" | "sortBy"
                     )
-                } else if let ast::ExprKind::App { func: inner, .. } = &func.node {
-                    // Curried: (filter pred) applied to relation
-                    if let ast::ExprKind::Var(name) = &inner.node {
-                        matches!(name.as_str(),
-                            "filter" | "map" | "take" | "drop" | "diff" | "inter"
-                            | "union" | "sort" | "sortBy"
-                        )
-                    } else {
-                        false
-                    }
-                } else {
-                    false
+                };
+                let mut head = expr;
+                while let ast::ExprKind::App { func, .. } = &head.node {
+                    head = func;
+                }
+                match &head.node {
+                    ast::ExprKind::Var(n) => rel_fn(n),
+                    ast::ExprKind::FieldAccess { field, .. } => rel_fn(field),
+                    _ => false,
                 }
             }
             _ => false,
@@ -16715,7 +16824,6 @@ fn expr_has_user_calls(expr: &ast::Expr, global_fns: &HashMap<String, (FuncId, u
         | ast::ExprKind::Var(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::SourceRef { .. }
-        | ast::ExprKind::DerivedRef(_)
         | ast::ExprKind::List(_) => false,
         // Conservative: treat complex nodes as potentially having user calls
         _ => true,
@@ -16727,8 +16835,7 @@ fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
         ast::ExprKind::Var(name) => name == var_name,
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef { .. }
-        | ast::ExprKind::DerivedRef(_) => false,
+        | ast::ExprKind::SourceRef { .. } => false,
         ast::ExprKind::Record(fields) => fields
             .iter()
             .any(|f| expr_references_var(&f.value, var_name)),
@@ -16753,6 +16860,17 @@ fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
         // Conservatively return true for complex expressions
         _ => true,
     }
+}
+
+/// Precise self-reference check for recursive query fields: true iff `name`
+/// occurs FREE in `expr` (respecting binders — a lambda param or do-bind that
+/// rebinds `name` shadows it). Unlike `expr_references_var` (which returns true
+/// for any node it doesn't model, e.g. comprehensions), this is exact, so a
+/// non-recursive comprehension field is NOT mistaken for a fixpoint.
+fn expr_mentions_free_var(expr: &ast::Expr, name: &str) -> bool {
+    let mut free = HashSet::new();
+    collect_free_vars_set(expr, &HashSet::new(), &mut free);
+    free.contains(name)
 }
 
 // ── SQL compilation types ─────────────────────────────────────────
@@ -18211,10 +18329,10 @@ fn beta_reduce_inner(
         // For constructs that bind names (Case arms, Do statements, Set, etc.)
         // we keep them unchanged: SQL pushdown never sees these inside the
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
-        Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | Case { .. } | Do(_)
+        Lit(_) | Constructor(_) | SourceRef { .. } | Case { .. } | Do(_)
         | Set { .. } | FullSet { .. } | Atomic(_) | TimeUnitLit { .. }
         | Annot { .. } | Refine(_) | Serve { .. } | TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. }
-        | ViewDecl { .. } | DerivedDecl { .. } => return expr.clone(),
+        | ViewDecl { .. } => return expr.clone(),
     };
     ast::Spanned { node: new_node, span }
 }
@@ -18237,7 +18355,7 @@ fn substitute_inner(
     let span = expr.span;
     let new_node = match &expr.node {
         Var(name) if name == var => return Some(value.clone()),
-        Var(_) | Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
+        Var(_) | Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {
             return Some(expr.clone())
         }
@@ -18260,11 +18378,6 @@ fn substitute_inner(
             types: types.clone(),
         },
         ViewDecl { name, ty, body } => ViewDecl {
-            name: name.clone(),
-            ty: ty.clone(),
-            body: Box::new(substitute_inner(body, var, value, value_fv)?),
-        },
-        DerivedDecl { name, ty, body } => DerivedDecl {
             name: name.clone(),
             ty: ty.clone(),
             body: Box::new(substitute_inner(body, var, value, value_fv)?),
@@ -18350,9 +18463,9 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     };
     match &expr.node {
         Var(name) => name == var,
-        Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
+        Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => false,
-        ViewDecl { body, .. } | DerivedDecl { body, .. } => expr_mentions_var(body, var),
+        ViewDecl { body, .. } => expr_mentions_var(body, var),
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
         FieldAccess { expr: e, .. } => expr_mentions_var(e, var),
         List(items) => items.iter().any(|e| expr_mentions_var(e, var)),
@@ -18399,9 +18512,9 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
                 free.insert(name.clone());
             }
         }
-        Lit(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
+        Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {}
-        ViewDecl { body, .. } | DerivedDecl { body, .. } => collect_free_vars_set(body, bound, free),
+        ViewDecl { body, .. } => collect_free_vars_set(body, bound, free),
         Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
             for p in params {
@@ -19419,55 +19532,6 @@ fn collect_pat_var_names(pat: &ast::Pat, out: &mut HashSet<String>) {
     }
 }
 
-/// Check if an expression contains a DerivedRef to the given name (self-reference detection).
-fn expr_contains_derived_ref(expr: &ast::Expr, name: &str) -> bool {
-    match &expr.node {
-        ast::ExprKind::DerivedRef(n) => n == name,
-        ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef { .. } | ast::ExprKind::ImplicitRef(_) | ast::ExprKind::CollectFold(_) | ast::ExprKind::TypeHole | ast::ExprKind::TypeCtor { .. }
-        | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
-        ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
-        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_contains_derived_ref(body, name),
-        ast::ExprKind::Record(fields) => {
-            fields.iter().any(|f| expr_contains_derived_ref(&f.value, name))
-        }
-        ast::ExprKind::FieldAccess { expr, .. } => expr_contains_derived_ref(expr, name),
-        ast::ExprKind::List(elems) => elems.iter().any(|e| expr_contains_derived_ref(e, name)),
-        ast::ExprKind::Lambda { body, .. } => expr_contains_derived_ref(body, name),
-        ast::ExprKind::App { func, arg } => {
-            expr_contains_derived_ref(func, name) || expr_contains_derived_ref(arg, name)
-        }
-        ast::ExprKind::With { record, body, .. } => {
-            expr_contains_derived_ref(record, name) || expr_contains_derived_ref(body, name)
-        }
-        ast::ExprKind::BinOp { lhs, rhs, .. } => {
-            expr_contains_derived_ref(lhs, name) || expr_contains_derived_ref(rhs, name)
-        }
-        ast::ExprKind::UnaryOp { operand, .. } => expr_contains_derived_ref(operand, name),
-        ast::ExprKind::Case { scrutinee, arms } => {
-            expr_contains_derived_ref(scrutinee, name)
-                || arms.iter().any(|a| expr_contains_derived_ref(&a.body, name))
-        }
-        ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
-            ast::StmtKind::Bind { expr, .. } => expr_contains_derived_ref(expr, name),
-            ast::StmtKind::Where { cond } => expr_contains_derived_ref(cond, name),
-            ast::StmtKind::GroupBy { key } => expr_contains_derived_ref(key, name),
-            ast::StmtKind::Expr(e) => expr_contains_derived_ref(e, name),
-        }),
-        ast::ExprKind::Atomic(inner) => {
-            expr_contains_derived_ref(inner, name)
-        }
-        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
-            expr_contains_derived_ref(target, name) || expr_contains_derived_ref(value, name)
-        }
-        ast::ExprKind::TimeUnitLit { value, .. } => expr_contains_derived_ref(value, name),
-        ast::ExprKind::Annot { expr, .. } => expr_contains_derived_ref(expr, name),
-        ast::ExprKind::Refine(inner) => expr_contains_derived_ref(inner, name),
-        ast::ExprKind::Serve { handlers, .. } => handlers
-            .iter()
-            .any(|h| expr_contains_derived_ref(&h.body, name)),
-    }
-}
 
 /// Extract all variable names bound by a pattern (handles destructuring).
 fn pat_bound_names(pat: &ast::Pat) -> Vec<String> {
@@ -19521,22 +19585,11 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::SourceDecl { .. } => {}
         ast::ExprKind::SubsetConstraint { .. } => {}
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
-        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => collect_free_vars(body, bound, free),
+        ast::ExprKind::ViewDecl { body, .. } => collect_free_vars(body, bound, free),
         ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::CollectFold(_) => {}
         ast::ExprKind::TypeHole => {}
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
-        ast::ExprKind::DerivedRef(name) => {
-            // A recursive derived relation passes its in-progress accumulator
-            // through the env under `__derived_self_<name>` (see the DerivedRef
-            // codegen arm). When the self-reference appears inside a lambda, the
-            // lambda must capture that key — otherwise it falls through to the
-            // public wrapper and restarts the fixpoint from the empty relation.
-            // Outside a recursive body the key is absent from the env and the
-            // capture filter drops it, so this is harmless for ordinary derived
-            // references.
-            free.push(format!("__derived_self_{}", name));
-        }
         ast::ExprKind::Record(fields) => {
             for f in fields {
                 collect_free_vars(&f.value, bound, free);
@@ -19689,11 +19742,10 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::CollectFold(_)
-        | ast::ExprKind::TypeHole
-        | ast::ExprKind::DerivedRef(_) => false,
+        | ast::ExprKind::TypeHole => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
-        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_refs_var(body, var),
+        ast::ExprKind::ViewDecl { body, .. } => expr_refs_var(body, var),
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
         ast::ExprKind::With { record, body, .. } => {
@@ -19780,11 +19832,10 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::SourceRef { .. }
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::CollectFold(_)
-        | ast::ExprKind::TypeHole
-        | ast::ExprKind::DerivedRef(_) => false,
+        | ast::ExprKind::TypeHole => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
-        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => expr_uses_var_as_value(body, var),
+        ast::ExprKind::ViewDecl { body, .. } => expr_uses_var_as_value(body, var),
         // `var.field` is a ROW use, not a value use — the whole point of this
         // walker. A field access on anything else still recurses (`f x . name`
         // may well pass `var` to `f`), as does a nested base (`var.a.b` has
@@ -20122,12 +20173,10 @@ fn pretty_expr(expr: &ast::Expr) -> String {
             format!("{} <= {}", path(sub), path(sup))
         }
         ast::ExprKind::ViewDecl { name, .. } => format!("*{}", name),
-        ast::ExprKind::DerivedDecl { name, .. } => format!("&{}", name),
         ast::ExprKind::RouteDecl { name, .. } | ast::ExprKind::RouteCompositeDecl { name, .. } => {
             format!("route {}", name)
         }
         ast::ExprKind::SourceRef { name, .. } => format!("*{}", name),
-        ast::ExprKind::DerivedRef(name) => format!("&{}", name),
         ast::ExprKind::Record(fields) => {
             let fs: Vec<String> = fields
                 .iter()

@@ -69,7 +69,7 @@ pub(crate) fn handle_inlay_hint(
 
         // Classify the field: marker vs named-function, and whether it has a sig.
         let (fname, fsig, is_relation_marker) = match &decl.value.node {
-            ast::ExprKind::ViewDecl { name, ty, .. } | ast::ExprKind::DerivedDecl { name, ty, .. } => {
+            ast::ExprKind::ViewDecl { name, ty, .. } => {
                 (name.as_str(), ty.as_ref(), true)
             }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
@@ -338,7 +338,7 @@ fn add_closing_label_hints(
     let mut spans: Vec<(Span, String)> = Vec::new();
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+            ast::ExprKind::ViewDecl { body, .. } => {
                 collect(body, &doc.source, &mut spans)
             }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
@@ -515,7 +515,7 @@ fn add_record_pattern_field_hints(
     let mut record_pats: Vec<RecordPat> = Vec::new();
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+            ast::ExprKind::ViewDecl { body, .. } => {
                 walk_expr(body, &doc.source, &mut record_pats)
             }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
@@ -698,7 +698,7 @@ fn add_unit_literal_hints(
 
     fn collect_literals_in_decl(decl: &ast::RecordField, out: &mut Vec<(Span, ast::Expr)>) {
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+            ast::ExprKind::ViewDecl { body, .. } => {
                 walk_for_unit_bindings(body, out);
             }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
@@ -845,7 +845,7 @@ fn add_parameter_name_hints(
         hints: &mut Vec<InlayHint>,
     ) {
         let body = match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => body,
+            ast::ExprKind::ViewDecl { body, .. } => body,
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
@@ -1084,7 +1084,7 @@ fn add_monad_context_hints(
         hints: &mut Vec<InlayHint>,
     ) {
         let body = match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => body,
+            ast::ExprKind::ViewDecl { body, .. } => body,
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
@@ -1193,7 +1193,7 @@ fn add_constraint_hints(
         hints: &mut Vec<InlayHint>,
     ) {
         let body = match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => body,
+            ast::ExprKind::ViewDecl { body, .. } => body,
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,

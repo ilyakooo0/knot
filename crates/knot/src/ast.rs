@@ -79,9 +79,6 @@ pub enum ExprKind {
     /// ignores the flag.
     SourceRef { name: Name, full: bool },
 
-    /// `&seniors` — reference to a derived relation.
-    DerivedRef(Name),
-
     /// `^name` — implicit field projection: DFS the fields of in-scope record
     /// bindings (innermost scope first, shallowest, earliest field) for a
     /// field named `name` whose type unifies with the expected type.
@@ -234,18 +231,6 @@ pub enum ExprKind {
     /// a marker (the view is registered statically and resolved by path).
     ViewDecl {
         /// Field name WITHOUT the leading `*` (e.g. `openTodos`).
-        name: Name,
-        ty: Option<TypeScheme>,
-        body: Box<Expr>,
-    },
-
-    /// `&seniors = expr` (or `&seniors : Type = expr`) inside a record
-    /// literal — an embedded derived declaration. Mirrors a top-level
-    /// derived declaration; the field is literally named `&name` and its value
-    /// is a marker (the derived relation is registered statically and resolved
-    /// by path).
-    DerivedDecl {
-        /// Field name WITHOUT the leading `&` (e.g. `seniors`).
         name: Name,
         ty: Option<TypeScheme>,
         body: Box<Expr>,

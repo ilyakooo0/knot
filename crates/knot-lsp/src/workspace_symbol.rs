@@ -40,7 +40,6 @@ pub(crate) fn build_workspace_symbol_entries(
             }
             ExprKind::SourceDecl { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
             ExprKind::ViewDecl { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
-            ExprKind::DerivedDecl { name, .. } => (format!("&{name}"), SymbolKind::VARIABLE, None),
             ExprKind::RouteDecl { name, .. } | ExprKind::RouteCompositeDecl { name, .. } => {
                 (format!("route {name}"), SymbolKind::MODULE, None)
             }

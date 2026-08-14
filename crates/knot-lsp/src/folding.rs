@@ -32,7 +32,7 @@ pub(crate) fn handle_folding_range(
 
         // Fold sub-expressions within declarations
         match &decl.value.node {
-            ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+            ExprKind::ViewDecl { body, .. } => {
                 collect_folding_ranges_expr(body, &doc.source, &mut ranges);
             }
             ExprKind::SourceDecl { .. } | ExprKind::DataCtor { .. }

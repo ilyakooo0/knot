@@ -109,9 +109,6 @@ fn collect_source_fields_in_expr(
                     Some((name.clone(), RecordRelKind::Source))
                 }
                 ExprKind::ViewDecl { name, .. } => Some((name.clone(), RecordRelKind::Source)),
-                ExprKind::DerivedDecl { name, .. } => {
-                    Some((name.clone(), RecordRelKind::Derived))
-                }
                 _ => None,
             })
             .collect();
@@ -190,16 +187,15 @@ fn walk_expr_children_read(expr: &Expr, f: &mut impl FnMut(&Expr)) {
     }
 }
 
-/// Whether a record-embedded relation field is a source/view (`*name`, read+write
-/// via `SourceRef`) or a derived relation (`&name`, read-only via `DerivedRef`).
+/// A record-embedded relation field is a source/view (`*name`, read+write via
+/// `SourceRef`). (Derived relations were removed — `&name` is gone.)
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RecordRelKind {
     Source,
-    Derived,
 }
 
-/// Rewrite `rec.*name` → `SourceRef { name, .. }` / `rec.&name` → `DerivedRef(name)`
-/// when `rec` is a static source-record that declares that relation.
+/// Rewrite `rec.*name` → `SourceRef { name, .. }` when `rec` is a static
+/// source-record that declares that relation.
 fn rewrite_record_source_refs(expr: &mut Expr) {
     let map = collect_record_source_fields(expr);
     if map.is_empty() {
@@ -219,14 +215,12 @@ fn rewrite_source_refs_in_expr(
     {
         let stripped = field
             .strip_prefix('*')
-            .map(|n| (n, RecordRelKind::Source))
-            .or_else(|| field.strip_prefix('&').map(|n| (n, RecordRelKind::Derived)));
+            .map(|n| (n, RecordRelKind::Source));
         if let Some((bare, kind)) = stripped
             && names.iter().any(|(n, k)| n == bare && *k == kind)
         {
             expr.node = match kind {
                 RecordRelKind::Source => ExprKind::SourceRef { name: bare.to_string(), full: false },
-                RecordRelKind::Derived => ExprKind::DerivedRef(bare.to_string()),
             };
             return;
         }
@@ -356,7 +350,7 @@ fn collect_fun_bodies<'a>(
                 collect_fun_bodies(&h.body, fun_bodies, fun_sig_io);
             }
         }
-        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+        ExprKind::ViewDecl { body, .. } => {
             collect_fun_bodies(body, fun_bodies, fun_sig_io)
         }
         _ => {}
@@ -428,7 +422,7 @@ fn type_returns_io(ty: &Type) -> bool {
 fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<String>) -> bool {
     match &expr.node {
         ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name.as_str()),
-        ExprKind::SourceRef { .. } | ExprKind::DerivedRef(_) => true,
+        ExprKind::SourceRef { .. } => true,
         ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
         ExprKind::Atomic(_) => true,
         ExprKind::TimeUnitLit { value, .. } => expr_contains_io(value, builtins, io_fns),
@@ -732,11 +726,11 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
 fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) {
     match &mut expr.node {
         ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Constructor(_)
-        | ExprKind::SourceRef { .. } | ExprKind::DerivedRef(_) | ExprKind::ImplicitRef(_) | ExprKind::CollectFold(_) | ExprKind::TypeHole => {}
+        | ExprKind::SourceRef { .. } | ExprKind::ImplicitRef(_) | ExprKind::CollectFold(_) | ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
         ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
-        ExprKind::ViewDecl { body, .. } | ExprKind::DerivedDecl { body, .. } => {
+        ExprKind::ViewDecl { body, .. } => {
             desugar_expr(body, io_fns, source_vars)
         }
 
@@ -1216,7 +1210,7 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
                 && name.as_str() != "retry")
                 || io_fns.contains(name.as_str())
         }
-        ExprKind::SourceRef { .. } | ExprKind::DerivedRef(_) => true,
+        ExprKind::SourceRef { .. } => true,
         ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
         ExprKind::Atomic(_) => true,
         ExprKind::BinOp { lhs, rhs, .. } => {

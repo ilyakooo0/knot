@@ -1,4 +1,4 @@
-//! Derived relations (`&name = expr` — read-only, recomputed per access) and
+//! Query fields (`name <query>` — read-only, recomputed per access) and
 //! views (`*name = do …` — bidirectional, constant-column auto-fill).
 //!
 //! Subprocess — these operate on persisted source relations.
@@ -12,16 +12,13 @@ fn derived_relation_reads_source() {
         "drv_read",
         r#"with {
 *manages : [{manager: Text, report: Text}]
-&directReports = (do
-  ms <- full *manages
-  yield (do
-    m <- ms
-    yield {manager m.manager report m.report}))
+directReports (do
+  m <- *manages
+  yield {manager m.manager report m.report})
 }
 (do
   full *manages = [{manager "A" report "B"} {manager "A" report "C"} {manager "B" report "D"}]
-  rows <- &directReports
-  base.println (base.show (base.count rows))
+  base.println (base.show (base.count directReports))
   yield {})"#,
         "\"3\"\n{}",
     );
@@ -35,18 +32,16 @@ fn derived_relation_recomputes_on_access() {
         "drv_recompute",
         r#"with {
 *items : [{n: Int 1}]
-&doubled = (do
-  rs <- full *items
-  yield (do
-    r <- rs
-    yield {n (r.n * 2)}))
+doubled (do
+  r <- *items
+  yield {n (r.n * 2)})
 }
 (do
   full *items = [{n 1}]
-  a <- &doubled
+  a <- base.run doubled
   base.println (base.show a)
   full *items = [{n 5}]
-  b <- &doubled
+  b <- base.run doubled
   base.println (base.show b)
   yield {})"#,
         "\"[{n: 2}]\"\n\"[{n: 10}]\"\n{}",
@@ -107,16 +102,15 @@ fn derived_relation_aggregates() {
         "drv_agg",
         r#"with {
 *sales : [{region: Text, amount: Int 1}]
-&total = (do
-  rs <- full *sales
-  yield {sum (base.sum (do r <- rs; yield r.amount))})
+amounts (do
+  r <- *sales
+  yield {amount r.amount})
 }
 (do
   full *sales = [{region "x" amount 10} {region "y" amount 20} {region "x" amount 5}]
-  t <- &total
-  base.println (base.show t)
+  base.println (base.show {sum (base.sum (do r <- amounts; yield r.amount))})
   yield {})"#,
-        // binding a derived relation whose body yields a bare record gives the record
+        // a query field iterated in an aggregate comprehension over the source
         "\"{sum: 35}\"\n{}",
     );
 }

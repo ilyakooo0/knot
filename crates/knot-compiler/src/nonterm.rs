@@ -99,6 +99,14 @@ fn check_inner(program: &ast::Expr) -> Vec<Diagnostic> {
         if reported.contains(name) {
             continue;
         }
+        // A self-referencing RELATION query field is a fixpoint (terminates
+        // via `knot_relation_fixpoint`), not a diverging function — skip it.
+        if let Some(def) = defs.get(name)
+            && def.arity == 0
+            && is_relation_query(def.body)
+        {
+            continue;
+        }
         if let Some(cycle) = find_cycle(name, &edges) {
             for member in &cycle {
                 reported.insert(member.clone());
@@ -251,6 +259,41 @@ fn peel_app(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
     }
     args.reverse();
     (cur, args)
+}
+
+/// Whether a 0-arg definition body is a relation query — a comprehension
+/// (`__bind`/`__from`/`__yield` App-chain after desugaring), a relation
+/// literal, or a relation-combinator application (`union`/`inter`/…). A
+/// self-referencing relation query is a FIXPOINT: it terminates via
+/// `knot_relation_fixpoint` (iterate until no new rows), not via a `case`
+/// guard, so it must NOT be flagged as divergent. (Post-desugar, so a
+/// comprehension is an App-chain headed by a relation combinator.)
+fn is_relation_query(body: &ast::Expr) -> bool {
+    use ast::ExprKind::*;
+    match &body.node {
+        List(_) => true,
+        Do(_) => true,
+        App { .. } => {
+            let (head, _) = peel_app(body);
+            let rel_head = |n: &str| {
+                matches!(
+                    n,
+                    "union" | "inter" | "difference" | "bind" | "__bind"
+                        | "__from" | "__yield" | "__select" | "filter" | "map"
+                )
+            };
+            match &head.node {
+                // Bare `union …` / desugared `__bind …`.
+                Var(n) => rel_head(n),
+                // `base.union …` (a namespaced relation combinator).
+                FieldAccess { field, .. } => rel_head(field),
+                _ => false,
+            }
+        }
+        // A `with`-wrapped or refined relation query still produces a relation.
+        With { .. } | Refine(_) | Annot { .. } => true,
+        _ => false,
+    }
 }
 
 /// True when each application argument is syntactically the caller's own

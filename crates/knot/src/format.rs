@@ -587,7 +587,6 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         ExprKind::SourceRef { name: n, full } => {
             if *full { format!("full *{}", n) } else { format!("*{}", n) }
         }
-        ExprKind::DerivedRef(n) => format!("&{}", n),
         ExprKind::ImplicitRef(n) => format!("^{}", n),
         ExprKind::CollectFold(n) => format!("<>{}", n),
         ExprKind::TypeHole => "_".to_string(),
@@ -810,19 +809,6 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
                     render_expr_inline(body, Prec::Lowest)
                 ),
                 None => format!("*{} = {}", name, render_expr_inline(body, Prec::Lowest)),
-            }
-        }
-        ExprKind::DerivedDecl { name, ty, body } => {
-            // Renders the embedded derived line: `&name = body` or
-            // `&name : Type = body`. The field is literally named `&name`.
-            match ty {
-                Some(scheme) => format!(
-                    "&{} : {} = {}",
-                    name,
-                    render_type(&scheme.ty),
-                    render_expr_inline(body, Prec::Lowest)
-                ),
-                None => format!("&{} = {}", name, render_expr_inline(body, Prec::Lowest)),
             }
         }
         ExprKind::SubsetConstraint { sub, sup } => {

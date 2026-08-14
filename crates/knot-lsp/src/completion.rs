@@ -199,37 +199,6 @@ pub(crate) fn handle_completion(
         }
     }
 
-    // Context-aware: after `&` only suggest derived names
-    if trigger_char == Some(b'&') {
-        if inside_string_or_comment(latest_source, offset.saturating_sub(1)) {
-            return None;
-        }
-        // `&&` (or `&` after an expression) is the boolean operator, not a
-        // derived-ref prefix — fall through to general completion.
-        if !trigger_is_operator {
-            // Mirror the general path's sigil handling so accepting an item
-            // right after the typed `&` replaces the sigil instead of `&&name`.
-            let edit_range = sigil_replace_range(latest_source, offset);
-            for decl in top_fields(&doc.module) {
-                if let ast::ExprKind::DerivedDecl { name, .. } = &decl.value.node {
-                    let detail = doc.type_info.get(name.as_str()).cloned();
-                    items.push(CompletionItem {
-                        label: format!("&{name}"),
-                        kind: Some(CompletionItemKind::VARIABLE),
-                        insert_text: Some(format!("&{name}")),
-                        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                            range: edit_range,
-                            new_text: format!("&{name}"),
-                        })),
-                        detail,
-                        ..Default::default()
-                    });
-                }
-            }
-            return Some(CompletionResponse::Array(items));
-        }
-    }
-
     // Context-aware: after `/` in an import line, suggest file paths
     if trigger_char == Some(b'/') {
         // Don't hijack `/` typed inside a string literal or comment — the
@@ -506,19 +475,6 @@ pub(crate) fn handle_completion(
                     text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                         range: sigil_edit_range,
                         new_text: format!("*{name}"),
-                    })),
-                    detail: doc.type_info.get(name.as_str()).cloned(),
-                    ..Default::default()
-                });
-            }
-            ast::ExprKind::DerivedDecl { name, .. } => {
-                items.push(CompletionItem {
-                    label: format!("&{name}"),
-                    kind: Some(CompletionItemKind::VARIABLE),
-                    insert_text: Some(format!("&{name}")),
-                    text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-                        range: sigil_edit_range,
-                        new_text: format!("&{name}"),
                     })),
                     detail: doc.type_info.get(name.as_str()).cloned(),
                     ..Default::default()
@@ -918,7 +874,7 @@ fn find_enclosing_do_span(module: &ast::Expr, offset: usize) -> Option<Span> {
             continue;
         }
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+            ast::ExprKind::ViewDecl { body, .. } => {
                 walk(body, offset, &mut best)
             }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
@@ -954,7 +910,7 @@ fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -
             continue;
         }
         let body: &ast::Expr = match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => body,
+            ast::ExprKind::ViewDecl { body, .. } => body,
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => continue,

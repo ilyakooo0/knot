@@ -858,9 +858,6 @@ struct Infer {
     /// Source/view relation types: name → full type (always Relation(...)).
     source_types: HashMap<String, Ty>,
 
-    /// Derived relation types: name → full type.
-    derived_types: HashMap<String, Ty>,
-
     /// Names that are views (for lenient set checking).
     view_names: HashSet<String>,
 
@@ -1217,7 +1214,6 @@ impl Infer {
             data_types: HashMap::new(),
             builtin_data_types: std::collections::HashSet::new(),
             source_types: HashMap::new(),
-            derived_types: HashMap::new(),
             view_names: HashSet::new(),
             aliases: HashMap::new(),
             param_aliases: HashMap::new(),
@@ -3840,9 +3836,6 @@ impl Infer {
         for ty in self.source_types.values() {
             self.collect_free_vars(ty, &mut s);
         }
-        for ty in self.derived_types.values() {
-            self.collect_free_vars(ty, &mut s);
-        }
         s
     }
 
@@ -3859,9 +3852,6 @@ impl Infer {
             }
         }
         for ty in self.source_types.values() {
-            self.collect_free_unit_vars(ty, &mut s);
-        }
-        for ty in self.derived_types.values() {
             self.collect_free_unit_vars(ty, &mut s);
         }
         s
@@ -5935,25 +5925,14 @@ impl Infer {
 
             ast::ExprKind::SourceRef { name, .. } => {
                 if let Some(ty) = self.source_types.get(name).cloned() {
-                    Ty::IO(Box::new(ty))
+                    // A source IS the table: a query over it is a pure, lazy
+                    // `[T]`. Only `run` (the explicit read) produces IO. The
+                    // `full` flag is a source-level informational tag for the
+                    // code viewer — it has no effect on the type or semantics.
+                    ty
                 } else {
                     self.error(
                         format!("unknown source relation '*{}'", name),
-                        expr.span,
-                    );
-                    Ty::Error
-                }
-            }
-
-            ast::ExprKind::DerivedRef(name) => {
-                if let Some(ty) = self.derived_types.get(name).cloned() {
-                    // A derived relation's reads aren't known at this site;
-                    // the effect-checker pass tracks them. Type-system effects
-                    // start empty here and grow via unification.
-                    Ty::IO(Box::new(ty))
-                } else {
-                    self.error(
-                        format!("unknown derived relation '&{}'", name),
                         expr.span,
                     );
                     Ty::Error
@@ -6241,7 +6220,26 @@ impl Infer {
                                 masked.push((idx, scope, frame));
                             }
                         }
+                        // Recursive query field: a relation-valued field whose
+                        // body references its OWN name (`Var(f.name)`) is a
+                        // fixpoint. Pre-bind the name to a fresh relation-type
+                        // var so the self-reference resolves during value
+                        // inference (letrec-style); the inferred value type
+                        // unifies with it below.
+                        let self_referencing = expr_references_var(&f.value, &f.name);
+                        let rec_var = if self_referencing {
+                            let elem = self.fresh();
+                            let rel = Ty::Relation(Box::new(elem));
+                            self.bind_at(&f.name, Scheme::mono(rel.clone()), f.value.span);
+                            Some(rel)
+                        } else {
+                            None
+                        };
                         let val_ty = self.infer_expr(&f.value);
+                        if let Some(rel) = rec_var {
+                            // Unify the recursive var with the inferred body type.
+                            self.unify(&rel, &val_ty, f.value.span);
+                        }
                         for (idx, scope, frame) in masked.into_iter().rev() {
                             self.scopes[idx] = scope;
                             self.with_scope_stack[idx] = Some(frame);
@@ -7249,23 +7247,6 @@ impl Infer {
                 };
                 self.source_types.insert(name.clone(), resolved.clone());
                 self.view_names.insert(name.clone());
-                Ty::IO(Box::new(resolved))
-            }
-            ast::ExprKind::DerivedDecl { name, ty, .. } => {
-                // A derived relation embedded in a record value literal
-                // (`{&seniors = …}`). The relation type is registered by the
-                // hoisted top-level `DeclKind::Derived` (desugar
-                // `hoist_record_views`); the field reads through it. Derived
-                // reads aren't known at this site (mirrors `DerivedRef`) — the
-                // effect-checker pass tracks them, so effects start empty.
-                let resolved = match ty {
-                    Some(scheme) => {
-                        self.annotation_vars.clear();
-                        self.ast_type_to_ty(&scheme.ty)
-                    }
-                    None => self.derived_types.get(name).cloned().unwrap_or_else(|| self.fresh()),
-                };
-                self.derived_types.insert(name.clone(), resolved.clone());
                 Ty::IO(Box::new(resolved))
             }
         }
@@ -8941,7 +8922,9 @@ impl Infer {
                     returns_io(&resolved)
                 })
             }
-            ast::ExprKind::SourceRef { .. } | ast::ExprKind::DerivedRef(_) => true,
+            // A query over a source/derived is a pure, lazy `[T]` — NOT IO.
+            // Only writes (`set`/`full =`) and `atomic` are effects.
+            ast::ExprKind::SourceRef { .. } => false,
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(_) => true,
             ast::ExprKind::BinOp { lhs, rhs, .. } => {
@@ -9005,6 +8988,25 @@ impl Infer {
                     let resolved = self.apply(&expr_ty);
                     let is_ctor_pat =
                         matches!(&pat.node, ast::PatKind::Constructor { .. });
+
+                    // `rows <- full *rel`: a `full`-marked source read loads the
+                    // WHOLE relation into memory and binds it as a relation
+                    // value `[T]` — it does NOT iterate per-row. (`full` is a
+                    // viewer-facing tag for the intentional whole-table load.)
+                    let is_full_read_bind = matches!(
+                        &expr.node,
+                        ast::ExprKind::SourceRef { full: true, .. }
+                    );
+                    if is_full_read_bind {
+                        self.check_pattern(pat, &resolved);
+                        // Track `rows <- full *foo` for `set` detection too.
+                        if let ast::PatKind::Var(var_name) = &pat.node
+                            && let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node {
+                            self.source_var_binds
+                                .insert(var_name.clone(), source_name.clone());
+                        }
+                        continue;
+                    }
 
                     // In a view body the do-block is a relation
                     // comprehension (codegen's `analyze_view`): a bind from
@@ -9553,15 +9555,6 @@ impl Infer {
                     };
                     self.source_types.insert(name.to_string(), resolved);
                     self.view_names.insert(name.to_string());
-                }
-                RelMarker::Derived { name, ty, .. } => {
-                    let resolved = if let Some(scheme) = ty {
-                        self.annotation_vars.clear();
-                        self.ast_type_to_ty(&scheme.ty)
-                    } else {
-                        self.fresh()
-                    };
-                    self.derived_types.insert(name.to_string(), resolved);
                 }
             }
         });
@@ -12210,53 +12203,29 @@ impl Infer {
                     }
         });
 
-        // Views and derived relations.
+        // Views.
         for_each_relation_marker(program, &mut |m| {
-            match m {
-                RelMarker::View { name, body: Some(body), .. } => {
-                    let expected =
-                        self.source_types.get(name).cloned().unwrap_or_else(
-                            || self.fresh(),
-                        );
-                    // View bodies are relation comprehensions (codegen's
-                    // `analyze_view`): `*view = *src` aliases the source
-                    // relation and `*view = do ...` iterates its elements.
-                    // Relation reads are IO-typed everywhere else, so type
-                    // the body in comprehension mode (do-binds iterate
-                    // elements) and peel any remaining IO wrapper before
-                    // unifying with the view's relation type `[T]`.
-                    let prev = self.in_view_comprehension;
-                    self.in_view_comprehension = true;
-                    let inferred = self.infer_expr(body);
-                    self.in_view_comprehension = prev;
-                    let inferred = match self.apply(&inferred) {
-                        Ty::IO(inner) => (*inner).clone(),
-                        other => other,
-                    };
-                    self.unify(&inferred, &expected, body.span);
-                }
-                RelMarker::Derived { name, body: Some(body), .. } => {
-                    let expected = self
-                        .derived_types
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_else(|| self.fresh());
-                    let inferred = self.infer_expr(body);
-                    // The body computes the relation via IO-typed reads, but
-                    // the derived relation itself IS the resulting relation
-                    // (`&name` references re-wrap it in IO at each use, see
-                    // `ExprKind::DerivedRef`) — peel the IO wrapper before
-                    // unifying. For un-annotated deriveds this also binds
-                    // the fresh var from `collect_sources` to the plain
-                    // `[T]` instead of `IO {} [T]` (which made `&name`
-                    // produce a nested `IO (IO [T])`).
-                    let inferred = match self.apply(&inferred) {
-                        Ty::IO(inner) => (*inner).clone(),
-                        other => other,
-                    };
-                    self.unify(&inferred, &expected, body.span);
-                }
-                _ => {}
+            if let RelMarker::View { name, body: Some(body), .. } = m {
+                let expected =
+                    self.source_types.get(name).cloned().unwrap_or_else(
+                        || self.fresh(),
+                    );
+                // View bodies are relation comprehensions (codegen's
+                // `analyze_view`): `*view = *src` aliases the source
+                // relation and `*view = do ...` iterates its elements.
+                // Relation reads are IO-typed everywhere else, so type
+                // the body in comprehension mode (do-binds iterate
+                // elements) and peel any remaining IO wrapper before
+                // unifying with the view's relation type `[T]`.
+                let prev = self.in_view_comprehension;
+                self.in_view_comprehension = true;
+                let inferred = self.infer_expr(body);
+                self.in_view_comprehension = prev;
+                let inferred = match self.apply(&inferred) {
+                    Ty::IO(inner) => (*inner).clone(),
+                    other => other,
+                };
+                self.unify(&inferred, &expected, body.span);
             }
         });
 
@@ -12478,14 +12447,6 @@ impl Infer {
         }
 
         for (name, ty) in &self.source_types {
-            let applied = self.apply(ty);
-            info.insert(
-                name.clone(),
-                display_ty_clean(&applied, &var_map_for(&applied), &unit_var_map_for(&applied)),
-            );
-        }
-
-        for (name, ty) in &self.derived_types {
             let applied = self.apply(ty);
             info.insert(
                 name.clone(),
@@ -13114,11 +13075,10 @@ fn value_references_source_inner(
             false
         }
         ast::ExprKind::Lit(_)
-        | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::DerivedRef(_) => false,
+        | ast::ExprKind::Constructor(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
-        ast::ExprKind::ViewDecl { body, .. } | ast::ExprKind::DerivedDecl { body, .. } => {
+        ast::ExprKind::ViewDecl { body, .. } => {
             value_references_source_inner(
                 body, source_name, aliases, let_bindings, visited,
             )
@@ -14397,11 +14357,11 @@ fn rewrite_result_markers(expr: &mut ast::Expr, pure_spans: &HashSet<Span>) {
 fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Expr)) {
     use ast::ExprKind::*;
     match &mut expr.node {
-        Lit(_) | Var(_) | Constructor(_) | SourceRef { .. } | DerivedRef(_) | ImplicitRef(_) | CollectFold(_) => {}
+        Lit(_) | Var(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) => {}
         TypeHole => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         RouteDecl { .. } | RouteCompositeDecl { .. } => {}
-        ViewDecl { body, .. } | DerivedDecl { body, .. } => f(body),
+        ViewDecl { body, .. } => f(body),
         Record(fields) => {
             for fl in fields {
                 f(&mut fl.value);
@@ -14577,11 +14537,6 @@ enum RelMarker<'a> {
         ty: Option<&'a ast::TypeScheme>,
         body: Option<&'a ast::Expr>,
     },
-    Derived {
-        name: &'a str,
-        ty: Option<&'a ast::TypeScheme>,
-        body: Option<&'a ast::Expr>,
-    },
 }
 
 /// Read-only recursion over every sub-expression.
@@ -14641,7 +14596,7 @@ pub(crate) fn walk_exprs_read<'a>(e: &'a ast::Expr, f: &mut impl FnMut(&'a ast::
                 walk_exprs_read(&h.body, f);
             }
         }
-        ViewDecl { body, .. } | DerivedDecl { body, .. } => walk_exprs_read(body, f),
+        ViewDecl { body, .. } => walk_exprs_read(body, f),
         _ => {}
     }
 }
@@ -14677,6 +14632,24 @@ pub fn uses_compile_builtin(program: &ast::Expr) -> bool {
                 found = true;
             }
             _ => {}
+        }
+    });
+    found
+}
+
+/// Whether `expr` references `name` as a bare `Var` — used to detect a
+/// recursive query field (a `with` field whose body mentions its own name,
+/// making it a fixpoint). Conservative: a `Var(name)` shadowed by an inner
+/// lambda/do binding still counts, which only over-approximates recursion
+/// (the fixpoint result equals the non-recursive one when the self-reference
+/// is in fact shadowed away), never the reverse.
+fn expr_references_var(expr: &ast::Expr, name: &str) -> bool {
+    let mut found = false;
+    walk_exprs_read(expr, &mut |e| {
+        if let ast::ExprKind::Var(n) = &e.node
+            && n == name
+        {
+            found = true;
         }
     });
     found
@@ -14771,7 +14744,7 @@ fn for_each_data_ctor_scoped<'a>(
                     walk(&h.body, d, f);
                 }
             }
-            ViewDecl { body, .. } | DerivedDecl { body, .. } => walk(body, d, f),
+            ViewDecl { body, .. } => walk(body, d, f),
             _ => {}
         }
     }
@@ -14786,13 +14759,6 @@ fn for_each_relation_marker<'a>(program: &'a ast::Expr, f: &mut impl FnMut(RelMa
         }
         ast::ExprKind::ViewDecl { name, ty, body } => {
             f(RelMarker::View {
-                name,
-                ty: ty.as_ref(),
-                body: Some(body),
-            });
-        }
-        ast::ExprKind::DerivedDecl { name, ty, body } => {
-            f(RelMarker::Derived {
                 name,
                 ty: ty.as_ref(),
                 body: Some(body),
@@ -14855,7 +14821,6 @@ fn for_each_named_fn<'a>(
                     | ast::ExprKind::TypeCtor { .. }
                     | ast::ExprKind::SourceDecl { .. }
                     | ast::ExprKind::ViewDecl { .. }
-                    | ast::ExprKind::DerivedDecl { .. }
                     | ast::ExprKind::RouteDecl { .. }
                     | ast::ExprKind::RouteCompositeDecl { .. }
                     | ast::ExprKind::SubsetConstraint { .. }

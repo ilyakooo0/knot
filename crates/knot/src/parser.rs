@@ -1800,19 +1800,10 @@ impl Parser {
                 // as an atom starter; it's handled by the binop loop.)
                 true
             }
-            TokenKind::AmpersandIdent(_) => {
-                // `&name` is a single derived-reference token — always a valid
-                // application argument (mirrors StarIdent).
-                true
-            }
             TokenKind::Ampersand => {
-                // Derived ref `&name` only when `&` is immediately adjacent to a Lower token.
-                if let Some(next) = self.tokens.get(self.pos + 1) {
-                    let cur_end = self.peek_token().span.end;
-                    matches!(next.kind, TokenKind::Lower(_)) && next.span.start == cur_end
-                } else {
-                    false
-                }
+                // `&` is only a route query-param separator (`?{q}&{..}`),
+                // never an atom starter.
+                false
             }
             TokenKind::Caret => {
                 // Implicit field projection `^name` only when `^` is immediately
@@ -1923,25 +1914,6 @@ impl Parser {
                 if matches!(self.peek(), TokenKind::StarIdent(_)) {
                     let tok = self.advance();
                     let TokenKind::StarIdent(field) = tok.kind else { unreachable!() };
-                    let field_span = tok.span;
-                    if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
-                    spine_charged += 1;
-                    let span = Span::new(expr.span.start, field_span.end);
-                    expr = Spanned::new(
-                        ExprKind::FieldAccess {
-                            expr: Box::new(expr),
-                            field,
-                        },
-                        span,
-                    );
-                    continue;
-                }
-                // A derived-relation field is literally named `&name` (an
-                // AmpersandIdent), accessed as `db.&seniors` — the field name
-                // KEEPS the leading `&`.
-                if matches!(self.peek(), TokenKind::AmpersandIdent(_)) {
-                    let tok = self.advance();
-                    let TokenKind::AmpersandIdent(field) = tok.kind else { unreachable!() };
                     let field_span = tok.span;
                     if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
                     spine_charged += 1;
@@ -2181,32 +2153,10 @@ impl Parser {
                     }
                 }
             }
-            TokenKind::AmpersandIdent(_) => {
-                // `&name` lexed as a single token — derived reference.
-                let tok = self.advance();
-                let TokenKind::AmpersandIdent(n) = tok.kind else { unreachable!() };
-                Some(Spanned::new(
-                    ExprKind::DerivedRef(n.trim_start_matches('&').to_string()),
-                    Span::new(start.start, tok.span.end),
-                ))
-            }
             TokenKind::Ampersand => {
-                // &name — derived reference
-                self.advance();
-                match self.peek() {
-                    TokenKind::Lower(_) => {
-                        let tok = self.advance();
-                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
-                        Some(Spanned::new(
-                            ExprKind::DerivedRef(name),
-                            Span::new(start.start, tok.span.end),
-                        ))
-                    }
-                    _ => {
-                        self.error("expected identifier after '&' for derived reference");
-                        None
-                    }
-                }
+                // `&` is only a route query-param separator — never an atom.
+                self.error("unexpected '&'");
+                None
             }
             TokenKind::LParen => {
                 self.advance();
@@ -2640,57 +2590,6 @@ impl Parser {
                 }
 
                 self.error("expected ':' or '=' after record source/view field name");
-                return None;
-            }
-            // `&name = expr` / `&name : Type = expr` — an embedded derived
-            // declaration. The field is literally named `&name`; its value is a
-            // marker (the relation is registered statically and resolved by
-            // path). Mirrors the top-level `parse_derived`.
-            if matches!(self.peek(), TokenKind::AmpersandIdent(_)) {
-                let tok = self.advance();
-                let TokenKind::AmpersandIdent(sname) = tok.kind else { unreachable!() };
-                let sspan = tok.span;
-                let bare_name = sname.trim_start_matches('&').to_string();
-
-                // Optional inline annotation: `&name : Type = body`.
-                let ty = if self.eat(&TokenKind::Colon) {
-                    self.skip_newlines();
-                    let saved_flag = self.record_value_sig_type;
-                    self.record_value_sig_type = true;
-                    let sty = self.parse_type();
-                    self.record_value_sig_type = saved_flag;
-                    let Some(sty) = sty else {
-                        self.error("expected type after ':' in record derived declaration");
-                        return None;
-                    };
-                    Some(crate::ast::TypeScheme { constraints: vec![], ty: sty })
-                } else {
-                    None
-                };
-
-                if self.eat(&TokenKind::Eq) {
-                    self.skip_newlines();
-                    let Some(body) = self.parse_expr() else {
-                        self.error("expected derived body after '=' in record derived declaration");
-                        return None;
-                    };
-                    fields.push(RecordField {
-                        name: sname.clone(),
-                        value: Spanned::new(
-                            ExprKind::DerivedDecl {
-                                name: bare_name,
-                                ty,
-                                body: Box::new(body),
-                            },
-                            sspan,
-                        ),
-                        sig: None,
-                        doc: pending_doc.take(),
-                    });
-                    continue;
-                }
-
-                self.error("expected '=' after record derived field name");
                 return None;
             }
             // Signature line: `name : Type`. The value for `name` is supplied by

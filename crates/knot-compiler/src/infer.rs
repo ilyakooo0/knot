@@ -11778,7 +11778,15 @@ impl Infer {
                 }
             }
         }
-        self.scopes.push(self.stdlib_schemes.clone());
+        // The prelude's stdlib fields reference `Var("base.<name>")` (the
+        // flattened, unshadowable key). Push the stdlib schemes under BOTH the
+        // bare name (for any prelude-internal bare refs like `emitLog`) and the
+        // `base.<name>` key (for the injected stdlib fields) so both resolve.
+        let mut stdlib_scope = self.stdlib_schemes.clone();
+        for (name, scheme) in self.stdlib_schemes.clone() {
+            stdlib_scope.insert(format!("base.{}", name), scheme);
+        }
+        self.scopes.push(stdlib_scope);
         self.push_scope();
         let inferred = self.infer_expr(&base_record);
         let resolved = self.apply(&inferred);

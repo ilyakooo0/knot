@@ -65,24 +65,11 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // User function declarations: name -> (func_id, param_count)
     user_fns: HashMap<String, (FuncId, usize)>,
 
-    // Names registered as stdlib builtins (skip user redefinitions)
-    stdlib_fns: HashSet<String>,
-
     // Stdlib names the user re-defines at top level. A user-defined function
     // OVERRIDES a same-named builtin (see compile_app's shadowing rule), so the
     // stdlib version is neither registered nor defined for these names — the
     // user's declaration flows through the normal function path instead.
     user_shadowed_stdlib: HashSet<String>,
-
-    // When a user shadows a stdlib name, the stdlib fn is still defined under a
-    // reserved `__stdlib_<name>` symbol so the `base` record's `base.<name>`
-    // field (compiled as `Var(name)`) can resolve to the STDLIB closure, not
-    // the shadowing user fn — otherwise `with {compile base.compile}` makes
-    // `base.compile` self-referential (the base record's `compile` field would
-    // resolve to the user's `compile`, which reads `base` → infinite cycle →
-    // runtime stack overflow). Maps the bare name → the `__stdlib_<name>`
-    // FuncId. Consulted ONLY while building the base record.
-    stdlib_base_syms: HashMap<String, cranelift_module::FuncId>,
 
     // Source relation schemas: name -> schema descriptor
     source_schemas: HashMap<String, String>,
@@ -1480,9 +1467,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             text_literal_slots: HashMap::new(),
             runtime_fns: HashMap::new(),
             user_fns: HashMap::new(),
-            stdlib_fns: HashSet::new(),
             user_shadowed_stdlib: HashSet::new(),
-            stdlib_base_syms: HashMap::new(),
             source_schemas: HashMap::new(),
             source_var_binds: HashMap::new(),
             source_bind_invalidations: Vec::new(),
@@ -2025,23 +2010,46 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
     /// Register a standard library function as a user_fn.
     /// All stdlib functions are registered as 1-param so they curry properly.
+    ///
+    /// USER-FACING base fields (members of `BASE_STDLIB_FNS`) are keyed by the
+    /// FLATTENED `base.<name>` — a bare `Var` can never spell it (`.` isn't an
+    /// identifier char), so a user declaration named `<name>` lands under the
+    /// bare key and NEVER collides with or shadows the stdlib `base.<name>`.
+    /// INTERNAL-only primitives (`emitLog`, `listNil`, …) — not base fields,
+    /// unreachable from user source — keep their bare key so the prelude's own
+    /// bodies can reference them bare.
     fn register_stdlib_fn(&mut self, name: &str) {
-        // A user redefinition of this name wins — skip the stdlib registration
-        // so `user_fns[name]` is free for the user's own declaration.
-        if self.user_shadowed_stdlib.contains(name) {
-            return;
-        }
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
         sig.params.push(AbiParam::new(self.ptr_type)); // arg1
         sig.returns.push(AbiParam::new(self.ptr_type));
-        let func_name = format!("knot_user_{}", name);
+        let key = Self::stdlib_key(name);
+        let func_name = format!("knot_stdlib_{}", name);
         let func_id = self
             .module
             .declare_function(&func_name, Linkage::Local, &sig)
             .unwrap();
-        self.user_fns.insert(name.into(), (func_id, 1));
-        self.stdlib_fns.insert(name.into());
+        self.user_fns.insert(key, (func_id, 1));
+    }
+
+    /// Is `name` a globally-resolvable function — a user decl (bare key) or a
+    /// stdlib fn (flattened `base.<name>` key, or internal-only bare key)?
+    /// Used by the closure/thunk free-var filters to decide a global doesn't
+    /// need capturing.
+    fn has_global_fn(&self, name: &str) -> bool {
+        self.user_fns.contains_key(name)
+            || self.user_fns.contains_key(&format!("base.{}", name))
+    }
+
+    /// The `user_fns` key a stdlib fn is registered under: `base.<name>` for
+    /// user-facing base fields, the bare name for internal-only primitives.
+    /// Must match `register_stdlib_fn`'s keying.
+    fn stdlib_key(name: &str) -> String {
+        if crate::base::BASE_STDLIB_FNS.contains(&name) {
+            format!("base.{}", name)
+        } else {
+            name.to_string()
+        }
     }
 
     /// Declare a helper closure function with the standard (db, env, arg) -> result signature.
@@ -2175,21 +2183,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
     }
 
     /// Define a 1-param stdlib function that directly delegates to a runtime function.
+    /// Reads the stdlib fn from its flattened `base.<name>` key (unshadowable).
     fn define_stdlib_fn_1(&mut self, name: &str, rt_name: &str) {
         let rt_name_owned = rt_name.to_string();
-        // User redefinition overrides the stdlib version's BARE name. But the
-        // `base` record still needs the stdlib closure for `base.<name>`, so
-        // when shadowed we define the stdlib body under `__stdlib_<name>`
-        // (recorded in `stdlib_base_syms`) — otherwise `base.<name>` resolves
-        // to the user's fn (cyclic for `with {compile base.compile}`).
-        if self.user_shadowed_stdlib.contains(name) {
-            let rt = rt_name_owned.clone();
-            self.define_shadowed_stdlib_sym(name, move |cg, builder, _db, arg| {
-                cg.call_rt(builder, &rt, &[arg])
-            });
-            return;
-        }
-        let func_id = { let (func_id, _) = self.user_fns[name]; func_id };
+        let func_id = { let (func_id, _) = self.user_fns[&Self::stdlib_key(name)]; func_id };
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
         sig.params.push(AbiParam::new(self.ptr_type)); // arg
@@ -2202,36 +2199,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         });
     }
 
-    /// Define a 1-param stdlib body under the reserved `__stdlib_<name>` symbol
-    /// using the CLOSURE calling convention (db, env, arg) — env ignored — and
-    /// record it in `stdlib_base_syms` so the `base` record's `base.<name>`
-    /// field resolves to the stdlib closure even when the user shadowed the
-    /// bare name. Used when `user_shadowed_stdlib` contains `name`; the bare
-    /// `name` keeps resolving to the user's fn via `user_fns`.
-    fn define_shadowed_stdlib_sym(
-        &mut self,
-        name: &str,
-        body: impl Fn(&mut Self, &mut cranelift_frontend::FunctionBuilder, cranelift_codegen::ir::Value, cranelift_codegen::ir::Value) -> cranelift_codegen::ir::Value + 'static,
-    ) {
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(self.ptr_type)); // db
-        sig.params.push(AbiParam::new(self.ptr_type)); // env (ignored)
-        sig.params.push(AbiParam::new(self.ptr_type)); // arg
-        sig.returns.push(AbiParam::new(self.ptr_type));
-        let sym = format!("__stdlib_{}", name);
-        let id = self
-            .module
-            .declare_function(&sym, Linkage::Local, &sig)
-            .unwrap();
-        self.stdlib_base_syms.insert(name.to_string(), id);
-        self.build_function(id, sig, |cg, builder, entry| {
-            let db = builder.block_params(entry)[0];
-            let arg = builder.block_params(entry)[2]; // arg (env ignored)
-            let result = body(cg, builder, db, arg);
-            builder.ins().return_(&[result]);
-        });
-    }
-
     /// Define `sum : [a] -> a` (direct aggregation, no projection). The bare
     /// `sum` value is a 1-param closure over `knot_relation_sum_direct` with
     /// `is_float = 0`; the common `sum rel` application is intercepted at the
@@ -2240,14 +2207,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// (e.g. `map sum rels`) only hits empty relations as Int, which is the
     /// right zero for the overwhelmingly common `[Int]`/non-empty case.
     fn define_stdlib_sum(&mut self) {
-        if self.user_shadowed_stdlib.contains("sum") {
-            self.define_shadowed_stdlib_sym("sum", |cg, builder, db, rel| {
-                let is_float = builder.ins().iconst(types::I64, 0);
-                cg.call_rt(builder, "knot_relation_sum_direct", &[db, rel, is_float])
-            });
-            return;
-        }
-        let (func_id, _) = self.user_fns["sum"];
+        let (func_id, _) = self.user_fns[&Self::stdlib_key("sum")];
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
         sig.params.push(AbiParam::new(self.ptr_type)); // rel
@@ -2268,14 +2228,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// The unit annotation `u` is statically inferred and erased at runtime, so
     /// the value carries a plain dimensionless Int here.
     fn define_stdlib_count(&mut self) {
-        if self.user_shadowed_stdlib.contains("count") {
-            self.define_shadowed_stdlib_sym("count", |cg, builder, _db, rel| {
-                let len = cg.call_rt(builder, "knot_relation_len", &[rel]);
-                cg.call_rt(builder, "knot_value_int", &[len])
-            });
-            return;
-        }
-        let (func_id, _) = self.user_fns["count"];
+        let (func_id, _) = self.user_fns[&Self::stdlib_key("count")];
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
         sig.params.push(AbiParam::new(self.ptr_type)); // rel
@@ -2336,27 +2289,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // prelude `with` compiles, so the global record and the `with` field
         // have identical values.
         let base_record = crate::base::prelude_base_record();
-        // Seed the base-record build's env with the STDLIB closures for any
-        // stdlib names the user shadowed. `Var(name)` resolution consults
-        // `env.bindings` FIRST (before `user_fns`), so a shadowed `compile`
-        // here binds to the `__stdlib_compile` closure, not the user's fn —
-        // keeping `base.compile` non-cyclic. The closure value wraps the
-        // `__stdlib_<name>` fn address (the same shape `define_stdlib_fn_1`
-        // produces for the bare name).
-        let shadowed: Vec<(String, cranelift_module::FuncId)> =
-            self.stdlib_base_syms.iter().map(|(k, v)| (k.clone(), *v)).collect();
         self.build_function(func_id, sig, |cg, builder, entry| {
             let db = builder.block_params(entry)[0];
             let mut env = Env::new();
-            for (name, fid) in &shadowed {
-                let func_ref = cg.module.declare_func_in_func(*fid, builder.func);
-                let fn_addr = builder.ins().func_addr(cg.ptr_type, func_ref);
-                let null = builder.ins().iconst(cg.ptr_type, 0);
-                let (src_ptr, src_len) = cg.string_ptr(builder, name);
-                let closure =
-                    cg.call_rt(builder, "knot_value_function", &[fn_addr, null, src_ptr, src_len]);
-                env.set(name, closure);
-            }
             let record = cg.compile_expr(builder, &base_record, &mut env, db);
             builder.ins().return_(&[record]);
         });
@@ -2371,46 +2306,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
         rt_name: &str,
         rt_needs_db: bool,
     ) {
-        // User redefinition overrides the stdlib version's bare name. When
-        // shadowed, the `base` record still needs the stdlib curried value for
-        // `base.<name>`: define the inner closure + a closure-convention outer
-        // wrapper under `__stdlib_<name>` symbols (recorded in
-        // `stdlib_base_syms`), so `base.<name>` doesn't resolve to the user's fn.
-        if self.user_shadowed_stdlib.contains(name) {
-            let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
-            // inner closure: (db, env=arg1, arg2) -> rt_fn(...)
-            let mut inner_sig = self.module.make_signature();
-            inner_sig.params.push(AbiParam::new(self.ptr_type)); // db
-            inner_sig.params.push(AbiParam::new(self.ptr_type)); // env = arg1
-            inner_sig.params.push(AbiParam::new(self.ptr_type)); // arg2
-            inner_sig.returns.push(AbiParam::new(self.ptr_type));
-            let rt_inner = rt_name.to_string();
-            self.build_function(inner_id, inner_sig, |cg, builder, entry| {
-                let db = builder.block_params(entry)[0];
-                let arg1 = builder.block_params(entry)[1];
-                let arg2 = builder.block_params(entry)[2];
-                let result = if rt_needs_db {
-                    cg.call_rt(builder, &rt_inner, &[db, arg1, arg2])
-                } else {
-                    cg.call_rt(builder, &rt_inner, &[arg1, arg2])
-                };
-                builder.ins().return_(&[result]);
-            });
-            // outer wrapper, closure convention (db, env, arg1) — env ignored —
-            // returning Function(inner, arg1). This is the `base.<name>` value.
-            let fn_name = name.to_string();
-            self.define_shadowed_stdlib_sym(name, move |cg, builder, _db, arg1| {
-                let inner_ref = cg.module.declare_func_in_func(inner_id, builder.func);
-                let fn_addr = builder.ins().func_addr(cg.ptr_type, inner_ref);
-                let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
-                cg.call_rt(builder, "knot_value_function", &[fn_addr, arg1, src_ptr, src_len])
-            });
-            return;
-        }
+        // Stdlib fns are always under the flattened `base.<name>` key — no
+        // shadow branch; the bare name is the user's alone.
         let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
 
         // Define the outer function: passes arg1 directly as env (no record allocation)
-        let (func_id, _) = self.user_fns[name];
+        let (func_id, _) = self.user_fns[&Self::stdlib_key(name)];
         let mut outer_sig = self.module.make_signature();
         outer_sig.params.push(AbiParam::new(self.ptr_type)); // db
         outer_sig.params.push(AbiParam::new(self.ptr_type)); // arg1
@@ -2460,43 +2361,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
         name: &str,
         rt_name: &str,
     ) {
-        // User redefinition overrides the stdlib version's bare name. When
-        // shadowed, the `base` record still needs the stdlib curried value for
-        // `base.<name>` — define the whole chain under `__stdlib_<name>` symbols.
-        let shadowed = self.user_shadowed_stdlib.contains(name);
-        let (mid_name, inner_name) = if shadowed {
-            (
-                format!("__stdlib_{}_shadow_mid", name),
-                format!("__stdlib_{}_shadow_apply", name),
-            )
-        } else {
-            (
-                format!("__stdlib_{}_mid", name),
-                format!("__stdlib_{}_apply", name),
-            )
-        };
-        let middle_id = self.declare_closure_fn(&mid_name);
-        let inner_id = self.declare_closure_fn(&inner_name);
+        // Stdlib fns are always under the flattened `base.<name>` key — no
+        // shadow branch; the bare name is the user's alone.
+        let middle_id = self.declare_closure_fn(&format!("__stdlib_{}_mid", name));
+        let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
 
-        // Outer: passes arg1 directly as env (no record allocation). When
-        // shadowed it's defined under `__stdlib_<name>_outer` (the curried
-        // `(db, arg1) -> Function` entry); the `base` record uses a separate
-        // closure-convention wrapper registered in `stdlib_base_syms` below.
+        // Outer: passes arg1 directly as env (no record allocation).
         let mut outer_sig = self.module.make_signature();
         outer_sig.params.push(AbiParam::new(self.ptr_type));
         outer_sig.params.push(AbiParam::new(self.ptr_type));
         outer_sig.returns.push(AbiParam::new(self.ptr_type));
 
         let fn_name = name.to_string();
-        let outer_id = if shadowed {
-            let sym = format!("__stdlib_{}_outer", name);
-            self.module
-                .declare_function(&sym, Linkage::Local, &outer_sig)
-                .unwrap()
-        } else {
-            let (func_id, _) = self.user_fns[name];
-            func_id
-        };
+        let outer_id = { let (func_id, _) = self.user_fns[&Self::stdlib_key(name)]; func_id };
         self.build_function(outer_id, outer_sig, |cg, builder, entry| {
             let arg1 = builder.block_params(entry)[1];
 
@@ -2508,16 +2385,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 cg.call_rt(builder, "knot_value_function", &[fn_addr, arg1, src_ptr, src_len]);
             builder.ins().return_(&[result]);
         });
-
-        // When shadowed, register a closure-convention (db, env, arg1) wrapper
-        // that calls the curried outer — this is the value `base.<name>` holds.
-        if shadowed {
-            self.define_shadowed_stdlib_sym(name, move |cg, builder, _db, arg1| {
-                let outer_ref = cg.module.declare_func_in_func(outer_id, builder.func);
-                let call = builder.ins().call(outer_ref, &[_db, arg1]);
-                builder.inst_results(call)[0]
-            });
-        }
 
         // Middle: env IS arg1 directly; captures (arg1, arg2) in record for inner
         let mut mid_sig = self.module.make_signature();
@@ -3620,9 +3487,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
             match decl.kind {
                 DeclViewKind::Fun { body: Some(body), .. } => {
                     {
-                        // Skip user functions that shadow stdlib builtins —
-                        // the stdlib version is already defined above.
-                        if self.stdlib_fns.contains(name) {
+                        // Define exactly the user functions the registration
+                        // pass registered — it inserts into `fun_bodies` only
+                        // when it does NOT skip (i.e. the bare key was free:
+                        // either no stdlib collision, or the stdlib fn is a
+                        // base field living under `base.<name>`). Internal-only
+                        // stdlib primitives take the bare key, so a same-named
+                        // user decl is skipped at registration and absent from
+                        // `fun_bodies` — correctly skipped here too.
+                        if !self.fun_bodies.contains_key(name) {
                             continue;
                         }
                         // If body is a lambda, extract its params for direct compilation.
@@ -4838,6 +4711,21 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // `knot_now_io` here, producing an `IO` value where the type
                 // checker inferred `Int` (a runtime panic when later used).
                 let fn_name: &str = name.as_str();
+                // Prelude-internal bare references to a base-field stdlib fn
+                // (e.g. the `into` conversion namespace's `into textToBytes`)
+                // name the bare fn, but base-field stdlib fns are keyed
+                // `base.<name>`. Resolve those via the flattened key. Gated on
+                // the prelude span offset so USER code's bare `count` still hits
+                // the undefined-variable path (the base-only gate), never this.
+                let resolved_key: String = if expr.span.start >= crate::base::PRELUDE_SPAN_OFFSET
+                    && !self.user_fns.contains_key(fn_name)
+                    && self.user_fns.contains_key(&format!("base.{}", fn_name))
+                {
+                    format!("base.{}", fn_name)
+                } else {
+                    fn_name.to_string()
+                };
+                let fn_name: &str = &resolved_key;
                 if let Some((func_id, n_params)) = self.user_fns.get(fn_name).copied() {
                     if n_params == 0 {
                         // 0-param function is a constant — call it directly
@@ -4857,25 +4745,31 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         return self.call_rt(builder, "knot_value_function", &[fn_addr, null, src_ptr, src_len]);
                     }
                 }
-                if name == "now" {
+                // 0-arg IO builtins. The prelude's base-record fields reference
+                // them as `Var("base.now")` (the flattened, unshadowable key);
+                // user code can only reach them as `base.now` (a FieldAccess,
+                // handled elsewhere). Strip the `base.` prefix so both the
+                // prelude's `Var("base.now")` and any bare form resolve here.
+                let bare_name: &str = name.strip_prefix("base.").unwrap_or(name.as_str());
+                if bare_name == "now" {
                     return self.call_rt(builder, "knot_now_io", &[]);
                 }
-                if name == "randomFloat" {
+                if bare_name == "randomFloat" {
                     return self.call_rt(builder, "knot_random_float_io", &[]);
                 }
-                if name == "randomUuid" {
+                if bare_name == "randomUuid" {
                     return self.call_rt(builder, "knot_random_uuid_io", &[]);
                 }
-                if name == "generateKeyPair" {
+                if bare_name == "generateKeyPair" {
                     return self.call_rt(builder, "knot_crypto_generate_key_pair_io", &[]);
                 }
-                if name == "generateSigningKeyPair" {
+                if bare_name == "generateSigningKeyPair" {
                     return self.call_rt(builder, "knot_crypto_generate_signing_key_pair_io", &[]);
                 }
-                if name == "readLine" {
+                if bare_name == "readLine" {
                     return self.call_rt(builder, "knot_read_line_io", &[]);
                 }
-                if name == "retry" {
+                if bare_name == "retry" {
                     return self.emit_retry(builder);
                 }
                 // `env` and `user_fns` were both consulted above; anything

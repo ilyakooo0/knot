@@ -247,8 +247,12 @@ pub(crate) fn prelude_base_record() -> ast::Expr {
                 for name in BASE_STDLIB_FNS {
                     base_fields.push(ast::RecordField {
                         name: (*name).to_string(),
+                        // Reference the stdlib fn by its FLATTENED `base.<name>`
+                        // key — a `Var` string containing a dot, unutterable in
+                        // user source, so it always resolves to the stdlib fn and
+                        // is never shadowed by a user decl named `<name>`.
                         value: ast::Spanned::new(
-                            ast::ExprKind::Var((*name).to_string()),
+                            ast::ExprKind::Var(format!("base.{}", name)),
                             dummy_span,
                         ),
                         sig: None,

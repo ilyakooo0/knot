@@ -62,8 +62,10 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // Runtime function declarations (imported)
     runtime_fns: HashMap<String, FuncId>,
 
-    // User function declarations: name -> (func_id, param_count)
-    user_fns: HashMap<String, (FuncId, usize)>,
+    // Global function table: flattened name -> (func_id, param_count). Holds
+    // user declarations (bare keys), stdlib fns (`base.<name>` for base fields,
+    // bare for internal primitives), the `base` record itself, and trait impls.
+    global_fns: HashMap<String, (FuncId, usize)>,
 
     // Stdlib names the user re-defines at top level. A user-defined function
     // OVERRIDES a same-named builtin (see compile_app's shadowing rule), so the
@@ -510,7 +512,7 @@ struct PendingIoThunk {
 /// A deferred trampoline for a multi-param user function.
 /// Generates a curry chain that directly calls the user function,
 /// avoiding the infinite recursion that occurs when trampolines
-/// resolve back through user_fns.
+/// resolve back through global_fns.
 struct PendingTrampoline {
     trampoline_id: FuncId,
     user_fn_name: String,
@@ -1010,7 +1012,7 @@ fn compile_inner<M: cranelift_module::Module>(
                 continue;
             }
             // Already registered (e.g. by a duplicate decl) — skip.
-            if cg.user_fns.contains_key(name) {
+            if cg.global_fns.contains_key(name) {
                 continue;
             }
             let classified = classify_required_constant_type(
@@ -1041,7 +1043,7 @@ fn compile_inner<M: cranelift_module::Module>(
                 .module
                 .declare_function(&func_name, Linkage::Local, &sig)
                 .unwrap();
-            cg.user_fns.insert(name.to_string(), (func_id, 0));
+            cg.global_fns.insert(name.to_string(), (func_id, 0));
             cg.overridable_constants.insert(name.to_string(), base_type.clone());
             cg.required_constants.push(RequiredConstant {
                 name: name.to_string(),
@@ -1057,7 +1059,7 @@ fn compile_inner<M: cranelift_module::Module>(
             if name == "main" {
                 continue;
             }
-            if let Some((_, 0)) = cg.user_fns.get(name)
+            if let Some((_, 0)) = cg.global_fns.get(name)
                 && let Some(ty_str) = type_info.get(name)
                 && let Some(base_type) =
                     scalar_override_type(ty_str, &cg.type_aliases, &cg.refined_types)
@@ -1258,7 +1260,7 @@ impl Codegen<cranelift_jit::JITModule> {
         self.module
             .finalize_definitions()
             .expect("JIT finalize_definitions failed");
-        let main_id = self.user_fns["main"].0;
+        let main_id = self.global_fns["main"].0;
         let addr = self.module.get_finalized_function(main_id);
         (addr, self.module)
     }
@@ -1466,7 +1468,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             string_counter: 0,
             text_literal_slots: HashMap::new(),
             runtime_fns: HashMap::new(),
-            user_fns: HashMap::new(),
+            global_fns: HashMap::new(),
             user_shadowed_stdlib: HashSet::new(),
             source_schemas: HashMap::new(),
             source_var_binds: HashMap::new(),
@@ -2029,10 +2031,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             .module
             .declare_function(&func_name, Linkage::Local, &sig)
             .unwrap();
-        self.user_fns.insert(key, (func_id, 1));
+        self.global_fns.insert(key, (func_id, 1));
     }
 
-    /// The `user_fns` key a stdlib fn is registered under: `base.<name>` for
+    /// The `global_fns` key a stdlib fn is registered under: `base.<name>` for
     /// user-facing base fields, the bare name for internal-only primitives.
     /// Must match `register_stdlib_fn`'s keying.
     fn stdlib_key(name: &str) -> String {
@@ -2177,7 +2179,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// Reads the stdlib fn from its flattened `base.<name>` key (unshadowable).
     fn define_stdlib_fn_1(&mut self, name: &str, rt_name: &str) {
         let rt_name_owned = rt_name.to_string();
-        let func_id = { let (func_id, _) = self.user_fns[&Self::stdlib_key(name)]; func_id };
+        let func_id = { let (func_id, _) = self.global_fns[&Self::stdlib_key(name)]; func_id };
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
         sig.params.push(AbiParam::new(self.ptr_type)); // arg
@@ -2198,7 +2200,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// (e.g. `map sum rels`) only hits empty relations as Int, which is the
     /// right zero for the overwhelmingly common `[Int]`/non-empty case.
     fn define_stdlib_sum(&mut self) {
-        let (func_id, _) = self.user_fns[&Self::stdlib_key("sum")];
+        let (func_id, _) = self.global_fns[&Self::stdlib_key("sum")];
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
         sig.params.push(AbiParam::new(self.ptr_type)); // rel
@@ -2219,7 +2221,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// The unit annotation `u` is statically inferred and erased at runtime, so
     /// the value carries a plain dimensionless Int here.
     fn define_stdlib_count(&mut self) {
-        let (func_id, _) = self.user_fns[&Self::stdlib_key("count")];
+        let (func_id, _) = self.global_fns[&Self::stdlib_key("count")];
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
         sig.params.push(AbiParam::new(self.ptr_type)); // rel
@@ -2235,7 +2237,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
     /// Define the global `base` record as a 0-param function returning a record
     /// of every stdlib function value plus the prelude's polymorphic helpers.
-    /// Binding `base` as a 0-param `user_fns` entry makes the bare-`Var` path
+    /// Binding `base` as a 0-param `global_fns` entry makes the bare-`Var` path
     /// resolve it everywhere — including decl bodies and nested `with` field
     /// values, which compile in fresh envs that never see the injected prelude
     /// `with`. This is what makes the hard gate (option A) viable: `base.X`
@@ -2256,7 +2258,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // `base` was registered as a 0-param function during the registration
         // phase (so decl bodies see it); reuse that FuncId. If for some reason
         // it wasn't registered, declare it now.
-        let func_id = match self.user_fns.get("base") {
+        let func_id = match self.global_fns.get("base") {
             Some(&(fid, 0)) => fid,
             _ => {
                 let mut sig = self.module.make_signature();
@@ -2266,7 +2268,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     .module
                     .declare_function("knot_user_base", Linkage::Local, &sig)
                     .unwrap();
-                self.user_fns.insert("base".to_string(), (fid, 0));
+                self.global_fns.insert("base".to_string(), (fid, 0));
                 fid
             }
         };
@@ -2276,7 +2278,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // Compile the prelude's fully-assembled `base` record (helpers
         // `min`/`max`/`when`/`unless` as closures + every stdlib `Var(name)`
-        // field resolved via `user_fns`). This is the same AST the injected
+        // field resolved via `global_fns`). This is the same AST the injected
         // prelude `with` compiles, so the global record and the `with` field
         // have identical values.
         let base_record = crate::base::prelude_base_record();
@@ -2302,7 +2304,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
 
         // Define the outer function: passes arg1 directly as env (no record allocation)
-        let (func_id, _) = self.user_fns[&Self::stdlib_key(name)];
+        let (func_id, _) = self.global_fns[&Self::stdlib_key(name)];
         let mut outer_sig = self.module.make_signature();
         outer_sig.params.push(AbiParam::new(self.ptr_type)); // db
         outer_sig.params.push(AbiParam::new(self.ptr_type)); // arg1
@@ -2364,7 +2366,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         outer_sig.returns.push(AbiParam::new(self.ptr_type));
 
         let fn_name = name.to_string();
-        let outer_id = { let (func_id, _) = self.user_fns[&Self::stdlib_key(name)]; func_id };
+        let outer_id = { let (func_id, _) = self.global_fns[&Self::stdlib_key(name)]; func_id };
         self.build_function(outer_id, outer_sig, |cg, builder, entry| {
             let arg1 = builder.block_params(entry)[1];
 
@@ -2501,7 +2503,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // builtin (compile_app documents this rule). Collect those names up
         // front so we neither register nor define the stdlib version for them —
         // the user's declaration then flows through the normal function path
-        // and `user_fns[name]` ends up pointing at the user's code. Without
+        // and `global_fns[name]` ends up pointing at the user's code. Without
         // this, the program type-checks against the user's semantics (inference
         // binds the user decl after `register_builtins`) but silently runs the
         // stdlib's.
@@ -2571,10 +2573,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // Register the global `base` record as a 0-param function NOW (during
         // the registration phase) so decl bodies — compiled later in
-        // `define_functions` — already see `user_fns["base"]` when they
+        // `define_functions` — already see `global_fns["base"]` when they
         // reference it. The body is defined by `define_base_record` (called in
         // `define_functions` after every stdlib fn is defined).
-        if !self.user_shadowed_stdlib.contains("base") && !self.user_fns.contains_key("base") {
+        if !self.user_shadowed_stdlib.contains("base") && !self.global_fns.contains_key("base") {
             let mut sig = self.module.make_signature();
             sig.params.push(AbiParam::new(self.ptr_type)); // db
             sig.returns.push(AbiParam::new(self.ptr_type));
@@ -2582,7 +2584,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .module
                 .declare_function("knot_user_base", Linkage::Local, &sig)
                 .unwrap();
-            self.user_fns.insert("base".to_string(), (func_id, 0));
+            self.global_fns.insert("base".to_string(), (func_id, 0));
         }
 
         // Composite route declarations (`route Name = A | B`), resolved to a
@@ -2596,7 +2598,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     {
                         // Skip user functions that shadow stdlib builtins —
                         // the stdlib version is already registered.
-                        if self.user_fns.contains_key(name) {
+                        if self.global_fns.contains_key(name) {
                             continue;
                         }
                         // If the body is a lambda, extract its params for direct-call optimization.
@@ -2614,7 +2616,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             .module
                             .declare_function(&func_name, Linkage::Local, &sig)
                             .unwrap();
-                        self.user_fns.insert(name.to_string(), (func_id, n_params));
+                        self.global_fns.insert(name.to_string(), (func_id, n_params));
                         self.fun_bodies.insert(name.to_string(), body.clone());
                     }
                 }
@@ -2636,7 +2638,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         .module
                         .declare_function(&func_name, Linkage::Local, &sig)
                         .unwrap();
-                    self.user_fns.insert(name.to_string(), (func_id, 0));
+                    self.global_fns.insert(name.to_string(), (func_id, 0));
 
                     // Detect self-referencing (recursive) derived relations
                     if expr_contains_derived_ref(body, name) {
@@ -2758,7 +2760,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     // ── Built-in [] impls for HKT traits ─────────────────────────
 
     /// Register mangled functions for Functor/Applicative/Monad/Alternative/Foldable [] impls.
-    /// The mangled names are declared as ordinary functions in `user_fns`;
+    /// The mangled names are declared as ordinary functions in `global_fns`;
     /// `__bind`/`__yield`/`__empty` compilation looks them up by name.
     fn register_builtin_relation_impls(&mut self) {
         // (mangled_name, n_user_params)
@@ -2777,7 +2779,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         ];
         for (mangled, n_params) in &impls {
             // Don't register if already defined (by user code or the prelude)
-            if self.user_fns.contains_key(*mangled) {
+            if self.global_fns.contains_key(*mangled) {
                 continue;
             }
             let mut sig = self.module.make_signature();
@@ -2791,7 +2793,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .module
                 .declare_function(&func_name, Linkage::Local, &sig)
                 .unwrap();
-            self.user_fns
+            self.global_fns
                 .insert(mangled.to_string(), (func_id, *n_params));
         }
     }
@@ -2806,7 +2808,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ("Monad_IO_bind", 2),
         ];
         for (mangled, n_params) in &impls {
-            if self.user_fns.contains_key(*mangled) {
+            if self.global_fns.contains_key(*mangled) {
                 continue;
             }
             let mut sig = self.module.make_signature();
@@ -2820,7 +2822,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .module
                 .declare_function(&func_name, Linkage::Local, &sig)
                 .unwrap();
-            self.user_fns
+            self.global_fns
                 .insert(mangled.to_string(), (func_id, *n_params));
         }
     }
@@ -2836,7 +2838,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ("Alternative_Maybe_empty", 0),
         ];
         for (mangled, n_params) in &impls {
-            if self.user_fns.contains_key(*mangled) {
+            if self.global_fns.contains_key(*mangled) {
                 continue;
             }
             let mut sig = self.module.make_signature();
@@ -2850,7 +2852,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .module
                 .declare_function(&func_name, Linkage::Local, &sig)
                 .unwrap();
-            self.user_fns
+            self.global_fns
                 .insert(mangled.to_string(), (func_id, *n_params));
         }
     }
@@ -2890,7 +2892,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         ];
         for (mangled, n_params) in &impls {
             // Don't register if already defined (by user code or the prelude)
-            if self.user_fns.contains_key(*mangled) {
+            if self.global_fns.contains_key(*mangled) {
                 continue;
             }
             let mut sig = self.module.make_signature();
@@ -2904,7 +2906,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .module
                 .declare_function(&func_name, Linkage::Local, &sig)
                 .unwrap();
-            self.user_fns
+            self.global_fns
                 .insert(mangled.to_string(), (func_id, *n_params));
         }
     }
@@ -2916,7 +2918,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // Helper macro: only define if this impl was registered by the builtin path
         macro_rules! define_if_registered {
             ($name:expr, $body:expr) => {
-                if let Some(&(func_id, _)) = self.user_fns.get($name) {
+                if let Some(&(func_id, _)) = self.global_fns.get($name) {
                     $body(self, func_id);
                 }
             };
@@ -3095,7 +3097,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn define_builtin_io_impls(&mut self) {
         macro_rules! define_if_registered {
             ($name:expr, $body:expr) => {
-                if let Some(&(func_id, _)) = self.user_fns.get($name) {
+                if let Some(&(func_id, _)) = self.global_fns.get($name) {
                     $body(self, func_id);
                 }
             };
@@ -3151,7 +3153,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn define_builtin_maybe_impls(&mut self) {
         macro_rules! define_if_registered {
             ($name:expr, $body:expr) => {
-                if let Some(&(func_id, _)) = self.user_fns.get($name) {
+                if let Some(&(func_id, _)) = self.global_fns.get($name) {
                     $body(self, func_id);
                 }
             };
@@ -3219,7 +3221,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn define_builtin_primitive_impls(&mut self) {
         macro_rules! define_if_registered {
             ($name:expr, $body:expr) => {
-                if let Some(&(func_id, _)) = self.user_fns.get($name) {
+                if let Some(&(func_id, _)) = self.global_fns.get($name) {
                     $body(self, func_id);
                 }
             };
@@ -3588,7 +3590,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         params: &[ast::Pat],
         body: &ast::Expr,
     ) {
-        let (func_id, _) = self.user_fns[name];
+        let (func_id, _) = self.global_fns[name];
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
         for _ in params {
@@ -3675,7 +3677,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// a clear error if the argument is missing, and runs any attached
     /// refinement predicate before returning.
     fn define_required_constant(&mut self, constant: &RequiredConstant) {
-        let (func_id, _) = self.user_fns[constant.name.as_str()];
+        let (func_id, _) = self.global_fns[constant.name.as_str()];
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
         sig.returns.push(AbiParam::new(self.ptr_type));
@@ -3778,7 +3780,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // 2. Define the wrapper function: (db) -> result
         //    Calls knot_relation_fixpoint(db, body_fn_ptr, empty_relation)
         {
-            let (wrapper_func_id, _) = self.user_fns[name];
+            let (wrapper_func_id, _) = self.global_fns[name];
             let mut sig = self.module.make_signature();
             sig.params.push(AbiParam::new(self.ptr_type)); // db
             sig.returns.push(AbiParam::new(self.ptr_type));
@@ -3982,7 +3984,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     ///                  inner(db,env,arg3)      → user_fn(db,arg1,arg2,arg3)
     /// General pattern builds n_params-1 curry stages.
     fn define_trampoline(&mut self, tramp: &PendingTrampoline) {
-        let (user_fn_id, _) = self.user_fns[&tramp.user_fn_name];
+        let (user_fn_id, _) = self.global_fns[&tramp.user_fn_name];
         let n_params = tramp.n_params;
         let fn_name = tramp.user_fn_name.clone();
 
@@ -4164,7 +4166,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .module
                 .declare_function("knot_user_main", Linkage::Local, &msig)
                 .unwrap();
-            self.user_fns.insert("main".to_string(), (fid, 0));
+            self.global_fns.insert("main".to_string(), (fid, 0));
             // Compile the body into `knot_user_main`.
             self.build_function(fid, msig, |cg, builder, entry| {
                 let db = builder.block_params(entry)[0];
@@ -4694,9 +4696,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // A user-defined top-level declaration whose name collides with
                 // one of the zero-arg builtins below (`now`, `randomFloat`,
                 // `retry`, …) shadows the builtin. None of those names are
-                // stdlib functions, so a `user_fns` hit here is always a genuine
+                // stdlib functions, so a `global_fns` hit here is always a genuine
                 // user declaration, never a stdlib registration. The applied-call
-                // path already consults `user_fns` before its builtin special
+                // path already consults `global_fns` before its builtin special
                 // cases; the bare reference must too, or the user's declaration
                 // is compiled but never referenced — e.g. `now = 5` would emit
                 // `knot_now_io` here, producing an `IO` value where the type
@@ -4709,15 +4711,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // the prelude span offset so USER code's bare `count` still hits
                 // the undefined-variable path (the base-only gate), never this.
                 let resolved_key: String = if expr.span.start >= crate::base::PRELUDE_SPAN_OFFSET
-                    && !self.user_fns.contains_key(fn_name)
-                    && self.user_fns.contains_key(&format!("base.{}", fn_name))
+                    && !self.global_fns.contains_key(fn_name)
+                    && self.global_fns.contains_key(&format!("base.{}", fn_name))
                 {
                     format!("base.{}", fn_name)
                 } else {
                     fn_name.to_string()
                 };
                 let fn_name: &str = &resolved_key;
-                if let Some((func_id, n_params)) = self.user_fns.get(fn_name).copied() {
+                if let Some((func_id, n_params)) = self.global_fns.get(fn_name).copied() {
                     if n_params == 0 {
                         // 0-param function is a constant — call it directly
                         let func_ref =
@@ -4763,7 +4765,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if bare_name == "retry" {
                     return self.emit_retry(builder);
                 }
-                // `env` and `user_fns` were both consulted above; anything
+                // `env` and `global_fns` were both consulted above; anything
                 // reaching here is a genuinely undefined variable.
                 self.push_codegen_error(
                     builder,
@@ -4901,7 +4903,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let self_key = format!("__derived_self_{}", name);
                 if let Some(&self_val) = env.bindings.get(&self_key) {
                     self_val
-                } else if let Some((func_id, 0)) = self.user_fns.get(name).copied() {
+                } else if let Some((func_id, 0)) = self.global_fns.get(name).copied() {
                     let func_ref =
                         self.module.declare_func_in_func(func_id, builder.func);
                     let call = builder.ins().call(func_ref, &[db]);
@@ -5125,7 +5127,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             && matches!(&f.value.node, ast::ExprKind::Record(fs) if fs.is_empty())
                         {
                             let v = if let Some((func_id, 0)) =
-                                self.user_fns.get(f.name.as_str()).copied()
+                                self.global_fns.get(f.name.as_str()).copied()
                             {
                                 let func_ref =
                                     self.module.declare_func_in_func(func_id, builder.func);
@@ -5364,7 +5366,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         && let (ast::ExprKind::Var(fn_name), ast::ExprKind::Constructor(ctor_name)) = (&match_fn.node, &match_arg.node)
                             && fn_name == "match"
                             && !env.bindings.contains_key(fn_name)
-                            && !(self.top_fn_names.contains(fn_name) && self.user_fns.contains_key(fn_name)) {
+                            && !(self.top_fn_names.contains(fn_name) && self.global_fns.contains_key(fn_name)) {
                                 if let ast::ExprKind::SourceRef { name: source_name, .. } = &lhs.node
                                     && let Some(schema) = self.source_schemas.get(source_name).cloned() {
                                         let (name_ptr, name_len) =
@@ -7267,7 +7269,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // A user-defined top-level function shadows any same-named builtin,
         // stdlib function, or SQL-pushdown special form. When present, skip all
         // the name-based special-case dispatch below and fall through to the
-        // normal `user_fns` call arm in the match — mirroring the `traverse`
+        // normal `global_fns` call arm in the match — mirroring the `traverse`
         // special form, which already guards on `top_fn_names`. Without this a
         // top-level `count = \xs -> …` would silently be replaced by the
         // built-in `knot_source_query_count` SQL pushdown. (None of the
@@ -7276,7 +7278,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let user_shadows_special = matches!(
             &func_expr.node,
             ast::ExprKind::Var(name)
-                if self.top_fn_names.contains(name) && self.user_fns.contains_key(name)
+                if self.top_fn_names.contains(name) && self.global_fns.contains_key(name)
         );
 
         // A locally-bound name (lambda param, `let`, do-bind, captured free
@@ -8730,7 +8732,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         );
                     }
                     let bind_fn = format!("Monad_{}_bind", type_name);
-                    if let Some(&(func_id, _)) = self.user_fns.get(&bind_fn) {
+                    if let Some(&(func_id, _)) = self.global_fns.get(&bind_fn) {
                         let func_ref = self
                             .module
                             .declare_func_in_func(func_id, builder.func);
@@ -8755,7 +8757,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let target = self.from_json_targets.get(&expr.span).cloned();
                 if let Some(type_name) = target.as_ref().and_then(|t| t.type_name.as_deref()) {
                     let impl_fn = format!("FromJSON_{}_parseJson", type_name);
-                    if let Some(&(func_id, _)) = self.user_fns.get(&impl_fn) {
+                    if let Some(&(func_id, _)) = self.global_fns.get(&impl_fn) {
                         let func_ref = self
                             .module
                             .declare_func_in_func(func_id, builder.func);
@@ -8780,7 +8782,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     );
                 }
                 // Fall through to generic parseJson (dispatcher or runtime)
-                if let Some(&(func_id, expected_params)) = self.user_fns.get("parseJson")
+                if let Some(&(func_id, expected_params)) = self.global_fns.get("parseJson")
                     && compiled_args.len() == expected_params {
                         let func_ref = self
                             .module
@@ -8793,10 +8795,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             // Direct call to a known user function
             ast::ExprKind::Var(name)
-                if self.user_fns.contains_key(name) =>
+                if self.global_fns.contains_key(name) =>
             {
                 let fn_name: &str = name.as_str();
-                let (func_id, expected_params) = self.user_fns[fn_name];
+                let (func_id, expected_params) = self.global_fns[fn_name];
                 if compiled_args.len() == expected_params {
                     let func_ref = self
                         .module
@@ -10184,7 +10186,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             return self.call_rt(builder, "knot_result_yield", &[val]);
         }
         let yield_fn = format!("Applicative_{}_yield", type_name);
-        if let Some(&(func_id, _)) = self.user_fns.get(&yield_fn) {
+        if let Some(&(func_id, _)) = self.global_fns.get(&yield_fn) {
             let func_ref = self
                 .module
                 .declare_func_in_func(func_id, builder.func);
@@ -10212,7 +10214,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             return self.call_rt(builder, "knot_result_empty", &[]);
         }
         let empty_fn = format!("Alternative_{}_empty", type_name);
-        if let Some(&(func_id, _)) = self.user_fns.get(&empty_fn) {
+        if let Some(&(func_id, _)) = self.global_fns.get(&empty_fn) {
             let func_ref = self
                 .module
                 .declare_func_in_func(func_id, builder.func);
@@ -10890,7 +10892,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let do_expr = ast::Spanned::new(ast::ExprKind::Do(stmts.to_vec()), dummy_span);
         // Capture everything bound in the enclosing local scope — including
         // names that shadow top-level functions/constants or builtins (the
-        // local binding wins; the previous user_fns filter silently resolved
+        // local binding wins; the previous global_fns filter silently resolved
         // such names to the global inside the thunk). Names not in env are
         // unshadowed globals/builtins, resolved inside the thunk body.
         let free_vars: Vec<String> = find_free_vars(&do_expr, &[])
@@ -12149,7 +12151,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // allocations immediately, keeping only the return value.
                     let needs_frame = !loop_stack.is_empty()
                         && use_filter_pushdown.is_none()
-                        && expr_has_user_calls(expr, &self.user_fns);
+                        && expr_has_user_calls(expr, &self.global_fns);
 
                     if needs_frame {
                         self.call_rt_void(builder, "knot_arena_push_frame", &[]);
@@ -12806,7 +12808,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     return env.bindings.contains_key(v);
                 }
                 env.bindings.contains_key(v)
-                    || (!self.user_fns.contains_key(v) && !is_builtin_name(v))
+                    || (!self.global_fns.contains_key(v) && !is_builtin_name(v))
             })
             .collect();
         // Relation-valued locals captured into this lambda must stay
@@ -15885,7 +15887,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 SqlParamSource::Literal(lit) => self.compile_lit(builder, lit),
                 // Var/FieldAccess names that aren't local bindings are
                 // top-level constants — resolve them through compile_expr
-                // (env → user_fns), matching the Expr-style fallback that
+                // (env → global_fns), matching the Expr-style fallback that
                 // try_compile_sql_atom uses, instead of panicking in
                 // `Env::get`.
                 SqlParamSource::Var(name) => {
@@ -16093,7 +16095,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let value_sources: Vec<SqlParamSource> =
             preds.iter().flat_map(|p| p.values.clone()).collect();
         // Every value source must be resolvable here: locals via `env`,
-        // top-level constants via `user_fns`. Do-local `let` names from a
+        // top-level constants via `global_fns`. Do-local `let` names from a
         // pushed-down SQL plan are neither — the plan substituted their
         // defining expressions, but the pred extractor still emits the raw
         // `Var`. Skip the precision upgrade and keep the broad `All` filter
@@ -16102,7 +16104,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let resolvable = value_sources.iter().all(|p| match p {
             SqlParamSource::Literal(_) | SqlParamSource::Expr(_) => true,
             SqlParamSource::Var(v) | SqlParamSource::FieldAccess(v, _) => {
-                env.bindings.contains_key(v) || self.user_fns.contains_key(v)
+                env.bindings.contains_key(v) || self.global_fns.contains_key(v)
             }
         });
         if !resolvable {
@@ -16622,41 +16624,41 @@ fn expr_is_promote_safe(expr: &ast::Expr) -> bool {
 
 /// functions (not builtins/runtime). Such calls may produce significant
 /// intermediate arena allocations that benefit from frame isolation.
-fn expr_has_user_calls(expr: &ast::Expr, user_fns: &HashMap<String, (FuncId, usize)>) -> bool {
+fn expr_has_user_calls(expr: &ast::Expr, global_fns: &HashMap<String, (FuncId, usize)>) -> bool {
     match &expr.node {
         ast::ExprKind::App { func, arg } => {
             // Check if the function head is a user-defined function
             let head_is_user_fn = match &func.node {
-                ast::ExprKind::Var(name) => user_fns.contains_key(name.as_str()),
+                ast::ExprKind::Var(name) => global_fns.contains_key(name.as_str()),
                 // Curried application: f x y → App(App(Var("f"), x), y)
-                ast::ExprKind::App { .. } => expr_has_user_calls(func, user_fns),
+                ast::ExprKind::App { .. } => expr_has_user_calls(func, global_fns),
                 _ => false,
             };
             head_is_user_fn
-                || expr_has_user_calls(func, user_fns)
-                || expr_has_user_calls(arg, user_fns)
+                || expr_has_user_calls(func, global_fns)
+                || expr_has_user_calls(arg, global_fns)
         }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
-            expr_has_user_calls(lhs, user_fns) || expr_has_user_calls(rhs, user_fns)
+            expr_has_user_calls(lhs, global_fns) || expr_has_user_calls(rhs, global_fns)
         }
-        ast::ExprKind::UnaryOp { operand, .. } => expr_has_user_calls(operand, user_fns),
+        ast::ExprKind::UnaryOp { operand, .. } => expr_has_user_calls(operand, global_fns),
         ast::ExprKind::Case { scrutinee, arms } => {
-            expr_has_user_calls(scrutinee, user_fns)
-                || arms.iter().any(|a| expr_has_user_calls(&a.body, user_fns))
+            expr_has_user_calls(scrutinee, global_fns)
+                || arms.iter().any(|a| expr_has_user_calls(&a.body, global_fns))
         }
         ast::ExprKind::Record(fields) => {
-            fields.iter().any(|f| expr_has_user_calls(&f.value, user_fns))
+            fields.iter().any(|f| expr_has_user_calls(&f.value, global_fns))
         }
-        ast::ExprKind::FieldAccess { expr, .. } => expr_has_user_calls(expr, user_fns),
-        ast::ExprKind::Lambda { body, .. } => expr_has_user_calls(body, user_fns),
-        ast::ExprKind::Annot { expr, .. } => expr_has_user_calls(expr, user_fns),
-        ast::ExprKind::TimeUnitLit { value, .. } => expr_has_user_calls(value, user_fns),
-        ast::ExprKind::Refine(inner) => expr_has_user_calls(inner, user_fns),
+        ast::ExprKind::FieldAccess { expr, .. } => expr_has_user_calls(expr, global_fns),
+        ast::ExprKind::Lambda { body, .. } => expr_has_user_calls(body, global_fns),
+        ast::ExprKind::Annot { expr, .. } => expr_has_user_calls(expr, global_fns),
+        ast::ExprKind::TimeUnitLit { value, .. } => expr_has_user_calls(value, global_fns),
+        ast::ExprKind::Refine(inner) => expr_has_user_calls(inner, global_fns),
         ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
-            ast::StmtKind::Bind { expr, .. } => expr_has_user_calls(expr, user_fns),
-            ast::StmtKind::Where { cond } => expr_has_user_calls(cond, user_fns),
-            ast::StmtKind::GroupBy { key } => expr_has_user_calls(key, user_fns),
-            ast::StmtKind::Expr(e) => expr_has_user_calls(e, user_fns),
+            ast::StmtKind::Bind { expr, .. } => expr_has_user_calls(expr, global_fns),
+            ast::StmtKind::Where { cond } => expr_has_user_calls(cond, global_fns),
+            ast::StmtKind::GroupBy { key } => expr_has_user_calls(key, global_fns),
+            ast::StmtKind::Expr(e) => expr_has_user_calls(e, global_fns),
         }),
         // Leaves: no function calls
         ast::ExprKind::Lit(_)

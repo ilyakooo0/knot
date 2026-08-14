@@ -145,7 +145,7 @@ boolToText  { into : Bool -> Text
 "#;
 
 /// Stdlib builtins exposed as fields of `base` (`base.map`, `base.filter`, …).
-/// Each is registered by codegen as a curried function value in `user_fns`;
+/// Each is registered by codegen as a curried function value in `global_fns`;
 /// the prelude record references them as `name: Var(name)` so the `base`
 /// record assembles to real function values. Dispatch-only builtins
 /// (`println`, `show`, `now`, …) and intrinsic constructors

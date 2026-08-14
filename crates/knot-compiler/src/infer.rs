@@ -828,7 +828,7 @@ struct Infer {
     /// `count`, …). These NEVER enter `scopes` — user code cannot name them
     /// bare (they are naturally undefined). `base`'s record type and the
     /// `base.<special-form>`/`base.<query-form>` arms instantiate from here,
-    /// mirroring how codegen keeps stdlib closures in its internal `user_fns`
+    /// mirroring how codegen keeps stdlib closures in its internal `global_fns`
     /// registry rather than any source-level scope.
     stdlib_schemes: HashMap<String, Scheme>,
 

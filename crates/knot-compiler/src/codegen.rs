@@ -2032,15 +2032,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.user_fns.insert(key, (func_id, 1));
     }
 
-    /// Is `name` a globally-resolvable function — a user decl (bare key) or a
-    /// stdlib fn (flattened `base.<name>` key, or internal-only bare key)?
-    /// Used by the closure/thunk free-var filters to decide a global doesn't
-    /// need capturing.
-    fn has_global_fn(&self, name: &str) -> bool {
-        self.user_fns.contains_key(name)
-            || self.user_fns.contains_key(&format!("base.{}", name))
-    }
-
     /// The `user_fns` key a stdlib fn is registered under: `base.<name>` for
     /// user-facing base fields, the bare name for internal-only primitives.
     /// Must match `register_stdlib_fn`'s keying.

@@ -1590,6 +1590,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_relation_push", &[p, p], &[]);
         self.declare_rt("knot_relation_extend", &[p, p], &[]);
         self.declare_rt("knot_relation_len", &[p], &[p]);
+        self.declare_rt("knot_relation_run_io", &[p], &[p]);
         self.declare_rt("knot_relation_get", &[p, p], &[p]);
         self.declare_rt("knot_relation_tail", &[p], &[p]);
         self.declare_rt("knot_relation_union", &[p, p, p], &[p]);
@@ -2537,6 +2538,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             "floor", "intToFloat", "textToInt", "textToFloat",
             "abs", "intMin", "intMax", "clamp", "unify",
             "readFile", "writeFile", "appendFile",
+            "run",
             "fileExists", "removeFile", "listDir",
             "randomInt", "sleep", "fork", "race",
             "encrypt", "decrypt", "sign", "verify",
@@ -3455,6 +3457,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // File system: 1-param (IO-returning)
         self.define_stdlib_fn_1("readFile", "knot_fs_read_file_io");
+        self.define_stdlib_fn_1("run", "knot_relation_run_io");
         self.define_stdlib_fn_1("fileExists", "knot_fs_file_exists_io");
         self.define_stdlib_fn_1("removeFile", "knot_fs_remove_file_io");
         self.define_stdlib_fn_1("listDir", "knot_fs_list_dir_io");
@@ -7371,6 +7374,28 @@ impl<M: cranelift_module::Module> Codegen<M> {
             && let Some(v) = self.try_compile_pipe_sql(builder, &piped, env, db)
         {
             return v;
+        }
+
+        // Special case: `run *source` — the explicit query→data boundary. Reads
+        // the whole source into memory (a deliberate full read, so the `full`
+        // marker is implied) and wraps the materialized relation as `IO (Vec a)`
+        // via `knot_relation_run_io`.
+        if Self::query_form_name(func_expr) == Some("run")
+            && args.len() == 1 && !user_shadows_special {
+            if let Some(source_name) = self.resolve_source(args[0])
+                && !self.views.contains_key(&source_name)
+                && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+            {
+                self.emit_stm_track_read(builder, &source_name);
+                let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
+                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                let rel = self.call_rt(
+                    builder,
+                    "knot_source_read",
+                    &[db, name_ptr, name_len, schema_ptr, schema_len],
+                );
+                return self.call_rt(builder, "knot_relation_run_io", &[rel]);
+            }
         }
 
         // Special case: count *rel → SQL COUNT(*)  (bare `count` or `base.count`)

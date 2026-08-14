@@ -4178,6 +4178,13 @@ impl Infer {
                 "Bytes" => Ty::Bytes,
                 "Uuid" => Ty::Uuid,
                 "[]" => Ty::TyCon("[]".into()),
+                // `Vec` — the concrete in-memory sequence type constructor.
+                // `App(TyCon("Vec"), a)` reduces to `Con("Vec", [a])` in
+                // `normalize_app`. Distinct from `[]` (the lazy relation/query
+                // type): a `Vec T` is always materialized data, so ops on it
+                // never re-query a source. `run : [T] -> IO (Vec T)` is the
+                // explicit boundary that forces a query into a Vec.
+                "Vec" => Ty::TyCon("Vec".into()),
                 _ => {
                     // Record-confined type name from an enclosing `with` peel
                     // over an embedded `type`/`data`. Consulted FIRST so it
@@ -10221,6 +10228,30 @@ impl Infer {
                     ty: Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
                         Box::new(int_u),
+                    ),
+                },
+            );
+        }
+
+        // run : ∀a. [a] -> IO (Vec a)
+        // The explicit query→data boundary: forces a (possibly source-backed)
+        // relation and returns the materialized concrete `Vec a`. After `run`,
+        // the value is frozen data — further reads never re-query.
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "run",
+                Scheme {
+                    vars: vec![a],
+                    unit_vars: vec![],
+                    constraints: vec![],
+                    unit_binops: vec![],
+                    ty: Ty::Fun(
+                        Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
+                        Box::new(Ty::IO(Box::new(Ty::Con(
+                            "Vec".into(),
+                            vec![Ty::Var(a)],
+                        )))),
                     ),
                 },
             );

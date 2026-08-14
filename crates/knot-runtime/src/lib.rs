@@ -6325,6 +6325,21 @@ pub extern "C-unwind" fn knot_relation_len(rel: *mut Value) -> usize {
     }
 }
 
+/// `run : [a] -> IO (Vec a)`. The query→data boundary: forces a relation and
+/// returns it as a concrete `Vec`. A `Vec` shares the `Value::Relation`
+/// representation (an in-memory vector of rows), so the read is the identity
+/// once the relation value is materialized — the IO wrapper makes the
+/// (potentially source-touching) read explicit in the type.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_relation_run_io(rel: *mut Value) -> *mut Value {
+    let env = rel;
+    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
+        let _ = db;
+        env
+    }
+    alloc_io_leaf(thunk as *const u8, env, "run", true)
+}
+
 /// Take the first `n` elements from a relation.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_take(

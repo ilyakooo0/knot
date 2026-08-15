@@ -117,7 +117,7 @@ fn build_dependency_graph(program: &ast::Expr) -> (HashSet<String>, HashMap<Stri
     for decl in decl_views(program) {
         if let DeclViewKind::View { body: Some(body), .. } = decl.kind {
             let mut found = Vec::new();
-            let env = HashMap::new();
+            let env = HashSet::new();
             let partial_diffs = HashMap::new();
             collect_edges(body, Polarity::Positive, &node_names, &env, &partial_diffs, &diff_wrappers, &mut found);
             edges.get_mut(decl.name).unwrap().extend(found);
@@ -199,7 +199,7 @@ fn collect_edges(
     expr: &ast::Expr,
     polarity: Polarity,
     node_names: &HashSet<String>,
-    env: &HashMap<String, String>,
+    env: &HashSet<String>,
     partial_diffs: &HashMap<String, ast::Expr>,
     diff_wrappers: &HashMap<String, [String; 2]>,
     out: &mut Vec<Edge>,
@@ -212,18 +212,10 @@ fn collect_edges(
         ast::ExprKind::SourceRef { name, .. } if node_names.contains(name) => {
             out.push(Edge { target: name.clone(), polarity, span: expr.span });
         }
-        // A variable aliasing a node carries that node's dependency at the
-        // variable's current polarity.
-        ast::ExprKind::Var(name) => {
-            // Skip the `diff`-alias sentinel: such a variable is a function
-            // value, not a relation reference, so it contributes no edge here
-            // (its negation effect is handled at the application site).
-            if let Some(node) = env.get(name)
-                && node != DIFF_ALIAS
-            {
-                out.push(Edge { target: node.clone(), polarity, span: expr.span });
-            }
-        }
+        // A variable aliasing `diff` is a function value, not a relation
+        // reference — it contributes no edge here (its negation effect is
+        // handled at the application site). Other variables aren't tracked.
+        ast::ExprKind::Var(_) => {}
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_)
         | ast::ExprKind::ImplicitRef(_)
@@ -465,14 +457,14 @@ fn collect_edges(
 /// variable name clears a stale alias (shadowing).
 ///
 /// `partial_diffs` tracks let-bindings of partially-applied `diff`
-/// (`let d = diff X`). The bare-`diff` alias (`let d = diff`) goes into `env`
-/// under the DIFF_ALIAS sentinel; a *partially-applied* `diff` stores the
+/// (`let d = diff X`). The bare-`diff` alias (`let d = diff`) goes into `env`;
+/// a *partially-applied* `diff` stores the
 /// bound positive base in `partial_diffs` so the App arm of `collect_edges`
 /// can recover the `(diff X) Y` shape from a syntactic `d Y`.
 fn bind_derived_alias(
     pat: &ast::Pat,
     expr: &ast::Expr,
-    env: &mut HashMap<String, String>,
+    env: &mut HashSet<String>,
     partial_diffs: &mut HashMap<String, ast::Expr>,
 ) {
     if let ast::PatKind::Var(v) = &pat.node {
@@ -481,7 +473,7 @@ fn bind_derived_alias(
             // `let d = diff` — track the alias so a later `d all self` is still
             // recognized as set difference (negation) at its application site.
             ast::ExprKind::Var(name) if name == "diff" => {
-                env.insert(v.clone(), DIFF_ALIAS.to_string());
+                env.insert(v.clone());
                 partial_diffs.remove(v);
             }
             // `let d = diff X` — partially-applied diff. Store the bound
@@ -493,11 +485,10 @@ fn bind_derived_alias(
                 partial_diffs.insert(v.clone(), (**base).clone());
                 env.remove(v);
             }
-            // Aliasing another already-aliased variable (`let y = x`) carries
-            // the alias transitively; anything else drops a stale mapping.
-            ast::ExprKind::Var(other) if env.contains_key(other) => {
-                let target = env[other].clone();
-                env.insert(v.clone(), target);
+            // Aliasing another already-diff-aliased variable (`let y = x`)
+            // carries the alias transitively; anything else drops it.
+            ast::ExprKind::Var(other) if env.contains(other) => {
+                env.insert(v.clone());
                 partial_diffs.remove(v);
             }
             ast::ExprKind::Var(other) if partial_diffs.contains_key(other) => {
@@ -512,11 +503,6 @@ fn bind_derived_alias(
         }
     }
 }
-
-/// Sentinel stored in the alias `env` to mark a local variable bound to the
-/// `diff` builtin (`let d = diff`). `\0` can't appear in a real relation name,
-/// so it never collides with a derived-relation alias value.
-const DIFF_ALIAS: &str = "\0diff";
 
 /// Strip the expression wrappers that are transparent for negation analysis —
 /// a type annotation, a unit ascription, or a `refine` — mirroring
@@ -534,17 +520,17 @@ fn strip_head_wrappers(expr: &ast::Expr) -> &ast::Expr {
 /// Check if `expr` is a single application of `diff` (the set-difference
 /// builtin) — `App(Var("diff"), arg)` — returning the subtracted `arg` if so.
 /// Transparent wrappers around the application or its head are stripped, and a
-/// local variable aliased to `diff` (`let d = diff`, tracked in `env` via the
-/// `DIFF_ALIAS` sentinel) is recognized too.
+/// local variable aliased to `diff` (`let d = diff`, tracked in `env`) is
+/// recognized too.
 fn is_diff_applied_once<'a>(
     expr: &'a ast::Expr,
-    env: &HashMap<String, String>,
+    env: &HashSet<String>,
 ) -> Option<&'a ast::Expr> {
     let expr = strip_head_wrappers(expr);
     if let ast::ExprKind::App { func, arg } = &expr.node {
         let func = strip_head_wrappers(func);
         if let ast::ExprKind::Var(name) = &func.node
-            && (name == "diff" || env.get(name).map(String::as_str) == Some(DIFF_ALIAS))
+            && (name == "diff" || env.contains(name))
         {
             return Some(arg);
         }

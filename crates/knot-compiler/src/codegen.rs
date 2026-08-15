@@ -182,10 +182,6 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // codegen emits a `knot_source_drop` call for each so the stored table is
     // deleted on startup.
     dropped_sources: Vec<String>,
-
-    // View declarations: view_name -> provenance info
-    views: HashMap<String, ViewInfo>,
-
     // Collected diagnostics
     diagnostics: Vec<knot::diagnostic::Diagnostic>,
 
@@ -469,20 +465,6 @@ enum NullableRole {
     None,
     /// The constructor with fields (e.g. Just) — encoded as bare payload
     Some,
-}
-
-/// Provenance info for a view declaration, extracted at compile time.
-#[derive(Clone)]
-#[allow(dead_code)]
-struct ViewInfo {
-    /// The underlying source relation name.
-    source_name: String,
-    /// Source columns: (yield_field_name, source_field_name).
-    source_columns: Vec<(String, String)>,
-    /// Constant columns: (field_name, constant_expr).
-    constant_columns: Vec<(String, ast::Expr)>,
-    /// The full view body expression (for read compilation).
-    body: ast::Expr,
 }
 
 struct PendingLambda {
@@ -978,30 +960,6 @@ fn compile_inner<M: cranelift_module::Module>(
         cg.constructors.insert(name.clone(), field_strs);
     }
     cg.declare_runtime_fns();
-    // Collect view declarations and analyze provenance
-    for decl in decl_views(program) {
-        if let DeclViewKind::View { body: Some(body), .. } = decl.kind {
-            // Normalize the key: `decl_views` yields the record field name
-            // WITH the leading `*` (`*openTodos`), but every read/write lookup
-            // uses the bare `SourceRef` name (`openTodos`). Store the bare
-            // name so the view dispatch actually fires — previously the
-            // `*`/bare mismatch made `full *view` fall through to a plain
-            // source read of a non-existent `_knot_<view>` table.
-            let name = decl.name.strip_prefix('*').unwrap_or(decl.name);
-            match analyze_view(body) {
-                Ok(Some(info)) => {
-                    cg.views.insert(name.to_string(), info);
-                }
-                Ok(None) => {}
-                Err((span, msg)) => {
-                    cg.diagnostics.push(
-                        knot::diagnostic::Diagnostic::error(msg)
-                            .label(span, "unsupported view filter"),
-                    );
-                }
-            }
-        }
-    }
     cg.collect_declarations(program);
     // Register body-less top-level constants as required CLI arguments.
     // Each becomes a 0-param user_fn whose body reads --<name>=value at startup,
@@ -1507,7 +1465,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             db_path: String::new(),
             migrate_schemas: HashMap::new(),
             dropped_sources: Vec::new(),
-            views: HashMap::new(),
             diagnostics: Vec::new(),
             data_constructors: HashMap::new(),
             subset_constraints: Vec::new(),
@@ -4860,88 +4817,24 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // INFO diagnostic naming full in-memory reads.
                 self.in_memory_source_reads
                     .insert(name.clone(), expr.span);
-                // Check if this is a view reference
-                let view_info = self.views.get(name).cloned();
-                if let Some(view) = view_info {
-                    if view.constant_columns.is_empty() && view.source_columns.is_empty() {
-                        // Simple alias: read the underlying source directly
-                        let schema = self
-                            .source_schemas
-                            .get(&view.source_name)
-                            .cloned()
-                            .unwrap_or_default();
-                        let (name_ptr, name_len) =
-                            self.string_ptr(builder, &view.source_name);
-                        let (schema_ptr, schema_len) =
-                            self.string_ptr(builder, &schema);
-                        self.call_rt(
-                            builder,
-                            "knot_source_read",
-                            &[db, name_ptr, name_len, schema_ptr, schema_len],
-                        )
-                    } else {
-                        // Filtered/projected view: SELECT source columns WHERE constants match
-                        let view_schema = self.compute_view_schema(&view);
-                        let (src_to_view, _) = Self::compute_view_renames(&view);
-                        let (filter_where, constant_cols) =
-                            self.compute_view_filter(&view);
-
-                        let filter_params = self.compile_view_filter_params(
-                            builder,
-                            &constant_cols,
-                            env,
-                            db,
-                        );
-
-                        let (name_ptr, name_len) =
-                            self.string_ptr(builder, &view.source_name);
-                        let (schema_ptr, schema_len) =
-                            self.string_ptr(builder, &view_schema);
-                        let (filter_ptr, filter_len) =
-                            self.string_ptr(builder, &filter_where);
-
-                        let result = self.call_rt(
-                            builder,
-                            "knot_view_read",
-                            &[
-                                db,
-                                name_ptr,
-                                name_len,
-                                schema_ptr,
-                                schema_len,
-                                filter_ptr,
-                                filter_len,
-                                filter_params,
-                            ],
-                        );
-                        // Rename source columns → view columns if any differ
-                        if src_to_view.is_empty() {
-                            result
-                        } else {
-                            let (map_ptr, map_len) = self.string_ptr(builder, &src_to_view);
-                            self.call_rt(builder, "knot_relation_rename_columns", &[result, map_ptr, map_len])
-                        }
-                    }
+                let schema = self
+                    .source_schemas
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default();
+                let (name_ptr, name_len) = self.string_ptr(builder, name);
+                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                let rel = self.call_rt(
+                    builder,
+                    "knot_source_read",
+                    &[db, name_ptr, name_len, schema_ptr, schema_len],
+                );
+                if self.scalar_sources.contains(name) {
+                    // Scalar source: unwrap first row's _value field,
+                    // or return a default if the relation is empty.
+                    self.call_rt(builder, "knot_scalar_source_unwrap", &[rel])
                 } else {
-                    let schema = self
-                        .source_schemas
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_default();
-                    let (name_ptr, name_len) = self.string_ptr(builder, name);
-                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                    let rel = self.call_rt(
-                        builder,
-                        "knot_source_read",
-                        &[db, name_ptr, name_len, schema_ptr, schema_len],
-                    );
-                    if self.scalar_sources.contains(name) {
-                        // Scalar source: unwrap first row's _value field,
-                        // or return a default if the relation is empty.
-                        self.call_rt(builder, "knot_scalar_source_unwrap", &[rel])
-                    } else {
-                        rel
-                    }
+                    rel
                 }
             }
 
@@ -5671,12 +5564,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::Set { target, value } => {
                 // target should be a SourceRef (source or view)
                 if let ast::ExprKind::SourceRef { name, .. } = &target.node {
-                    // Check if target is a view
-                    let view_info = self.views.get(name).cloned();
-                    if let Some(view) = view_info {
-                        return self.compile_view_set(builder, &view, name, value, env, db);
-                    }
-
                     let schema = self
                         .source_schemas
                         .get(name)
@@ -5848,12 +5735,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             ast::ExprKind::FullSet { target, value } => {
                 if let ast::ExprKind::SourceRef { name, .. } = &target.node {
-                    // Check if target is a view
-                    let view_info = self.views.get(name).cloned();
-                    if let Some(view) = view_info {
-                        return self.compile_view_set(builder, &view, name, value, env, db);
-                    }
-
                     let schema = self
                         .source_schemas
                         .get(name)
@@ -6098,14 +5979,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.call_rt(builder, "knot_value_unit", &[])
             }
 
-            ast::ExprKind::ViewDecl { .. } => {
-                // An embedded view/derived declaration is likewise a static marker:
-                // the relation is registered and compiled via the
-                // hoisted top-level `DeclKind::View`/`Derived` (desugar
-                // `hoist_record_views`); the record field compiles to unit.
-                self.call_rt(builder, "knot_value_unit", &[])
-            }
-
             ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {
                 // An embedded route declaration is a static marker: the
                 // route's entries are registered statically (path-keyed) and
@@ -6114,294 +5987,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.call_rt(builder, "knot_value_unit", &[])
             }
         }
-    }
-
-    // ── View compilation ─────────────────────────────────────────
-
-    /// Compute the view schema: subset of source schema for source columns only.
-    /// Uses SOURCE column names (for correct SQL against the source table).
-    fn compute_view_schema(&self, view: &ViewInfo) -> String {
-        let source_schema = self
-            .source_schemas
-            .get(&view.source_name)
-            .cloned()
-            .unwrap_or_default();
-        let src_col_set: std::collections::HashSet<&str> = view
-            .source_columns
-            .iter()
-            .map(|(_, src_col)| src_col.as_str())
-            .collect();
-        split_schema_fields(&source_schema)
-            .into_iter()
-            .filter(|part| {
-                let src_name = part.split(':').next().unwrap_or("");
-                src_col_set.contains(src_name)
-            })
-            .collect::<Vec<_>>()
-            .join(",")
-    }
-
-    /// Compute rename mapping strings for views that rename columns.
-    /// Returns `(src_to_view, view_to_src)` — empty strings when no renames.
-    fn compute_view_renames(view: &ViewInfo) -> (String, String) {
-        let renames: Vec<(&str, &str)> = view
-            .source_columns
-            .iter()
-            .filter(|(view_col, src_col)| view_col != src_col)
-            .map(|(view_col, src_col)| (src_col.as_str(), view_col.as_str()))
-            .collect();
-        if renames.is_empty() {
-            return (String::new(), String::new());
-        }
-        let src_to_view = renames
-            .iter()
-            .map(|(s, v)| format!("{}>{}",s, v))
-            .collect::<Vec<_>>()
-            .join(",");
-        let view_to_src = renames
-            .iter()
-            .map(|(s, v)| format!("{}>{}",v, s))
-            .collect::<Vec<_>>()
-            .join(",");
-        (src_to_view, view_to_src)
-    }
-
-    /// Compute the WHERE clause and constant column expressions for a view.
-    fn compute_view_filter(&self, view: &ViewInfo) -> (String, Vec<(String, ast::Expr)>) {
-        let filter_parts: Vec<String> = view
-            .constant_columns
-            .iter()
-            .enumerate()
-            .map(|(i, (name, _))| format!("{} = ?{}", quote_sql_ident(name), i + 1))
-            .collect();
-        let filter_where = filter_parts.join(" AND ");
-        (filter_where, view.constant_columns.clone())
-    }
-
-    fn compile_view_set(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        view: &ViewInfo,
-        view_name: &str,
-        value: &ast::Expr,
-        env: &mut Env,
-        db: Value,
-    ) -> Value {
-        let source_name = view.source_name.clone();
-        let source_schema = self
-            .source_schemas
-            .get(&source_name)
-            .cloned()
-            .unwrap_or_default();
-
-        // Compute the view-filtered schema (only columns the view selects).
-        // Uses source column names for correct SQL against the source table.
-        let view_schema = if view.source_columns.is_empty() {
-            source_schema.clone()
-        } else {
-            self.compute_view_schema(view)
-        };
-
-        // Compute rename mapping: view→source for writing (records have view names)
-        let (_, view_to_src) = Self::compute_view_renames(view);
-
-        // Check for append optimization: set *view = union *view newRows.
-        // Inline let/fun bindings first so the union shape is visible
-        // even when value is a let-bound `Var`.
-        let inlined_value = beta_reduce(value, &self.fun_bodies, &self.let_bindings);
-        if let Some(new_rows_expr) = self.match_union_append(view_name, &inlined_value) {
-            let new_rows_expr = new_rows_expr.clone();
-            let mut new_rows = self.compile_expr(builder, &new_rows_expr, env, db);
-            // Rename view columns → source columns before writing
-            if !view_to_src.is_empty() {
-                let (map_ptr, map_len) = self.string_ptr(builder, &view_to_src);
-                new_rows = self.call_rt(builder, "knot_relation_rename_columns", &[new_rows, map_ptr, map_len]);
-            }
-            let augmented =
-                self.compile_view_augment(builder, new_rows, &view.constant_columns, env, db);
-            let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
-            // Augmented rows have view columns + constants, which may be a
-            // subset of the full source schema for projected views.  Pass a
-            // schema that covers exactly the columns present in the rows.
-            let append_schema = if view.source_columns.is_empty() {
-                source_schema.clone()
-            } else {
-                let mut present: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
-                for (_, src_col) in &view.source_columns {
-                    present.insert(src_col.as_str());
-                }
-                for (col_name, _) in &view.constant_columns {
-                    present.insert(col_name.as_str());
-                }
-                split_schema_fields(&source_schema)
-                    .into_iter()
-                    .filter(|part| {
-                        let name = part.split(':').next().unwrap_or("");
-                        present.contains(name)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
-            let (schema_ptr, schema_len) = self.string_ptr(builder, &append_schema);
-            // Validate refined types on the rows actually written to the
-            // underlying source (post-rename, post-constant-augment) — view
-            // writes must not bypass the source's refinement predicates.
-            let written_cols = schema_col_names(&append_schema);
-            self.emit_refinement_checks_filtered(
-                builder, &source_name, augmented, Some(&written_cols), env, db,
-            );
-            self.call_rt_void(
-                builder,
-                "knot_source_append",
-                &[db, name_ptr, name_len, schema_ptr, schema_len, augmented],
-            );
-        } else if view.constant_columns.is_empty() {
-            // No constant columns — use diff-write on underlying source
-            // view_schema uses source column names for correct SQL.
-            let mut val = self.compile_set_value_expr(builder, value, env, db);
-            // Rename view columns → source columns before writing
-            if !view_to_src.is_empty() {
-                let (map_ptr, map_len) = self.string_ptr(builder, &view_to_src);
-                val = self.call_rt(builder, "knot_relation_rename_columns", &[val, map_ptr, map_len]);
-            }
-            let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
-            let (schema_ptr, schema_len) = self.string_ptr(builder, &view_schema);
-            // Validate refined types on the rows written through the view
-            // (post-rename) — view writes must not bypass the underlying
-            // source's refinement predicates.
-            let written_cols = schema_col_names(&view_schema);
-            self.emit_refinement_checks_filtered(
-                builder, &source_name, val, Some(&written_cols), env, db,
-            );
-            self.call_rt_void(
-                builder,
-                "knot_source_diff_write",
-                &[db, name_ptr, name_len, schema_ptr, schema_len, val],
-            );
-        } else {
-            // General case: delete matching rows, insert new rows with constants
-            let mut new_val = self.compile_set_value_expr(builder, value, env, db);
-            // Rename view columns → source columns before writing
-            if !view_to_src.is_empty() {
-                let (map_ptr, map_len) = self.string_ptr(builder, &view_to_src);
-                new_val = self.call_rt(builder, "knot_relation_rename_columns", &[new_val, map_ptr, map_len]);
-            }
-            let augmented =
-                self.compile_view_augment(builder, new_val, &view.constant_columns, env, db);
-
-            // Build filter WHERE clause
-            let filter_parts: Vec<String> = view
-                .constant_columns
-                .iter()
-                .enumerate()
-                .map(|(i, (name, _))| format!("{} = ?{}", quote_sql_ident(name), i + 1))
-                .collect();
-            let filter_where = filter_parts.join(" AND ");
-
-            // Build filter params
-            let constant_cols = view.constant_columns.clone();
-            let filter_params =
-                self.compile_view_filter_params(builder, &constant_cols, env, db);
-
-            let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
-            // Augmented rows have view columns + constants, which may be a
-            // subset of the full source schema for projected views.  Pass a
-            // schema that covers exactly the columns present in the rows.
-            let write_schema = if view.source_columns.is_empty() {
-                source_schema.clone()
-            } else {
-                let mut present: std::collections::HashSet<&str> =
-                    std::collections::HashSet::new();
-                for (_, src_col) in &view.source_columns {
-                    present.insert(src_col.as_str());
-                }
-                for (col_name, _) in &view.constant_columns {
-                    present.insert(col_name.as_str());
-                }
-                split_schema_fields(&source_schema)
-                    .into_iter()
-                    .filter(|part| {
-                        let name = part.split(':').next().unwrap_or("");
-                        present.contains(name)
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
-            let (schema_ptr, schema_len) = self.string_ptr(builder, &write_schema);
-            let (filter_ptr, filter_len) = self.string_ptr(builder, &filter_where);
-
-            // Validate refined types on the rows actually written to the
-            // underlying source (post-rename, post-constant-augment) — view
-            // writes must not bypass the source's refinement predicates.
-            let written_cols = schema_col_names(&write_schema);
-            self.emit_refinement_checks_filtered(
-                builder, &source_name, augmented, Some(&written_cols), env, db,
-            );
-            self.call_rt_void(
-                builder,
-                "knot_view_write",
-                &[
-                    db,
-                    name_ptr,
-                    name_len,
-                    schema_ptr,
-                    schema_len,
-                    filter_ptr,
-                    filter_len,
-                    filter_params,
-                    augmented,
-                ],
-            );
-        }
-
-        self.call_rt(builder, "knot_value_unit", &[])
-    }
-
-    /// Augment each row in a relation with constant column values.
-    fn compile_view_augment(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        relation: Value,
-        constant_columns: &[(String, ast::Expr)],
-        env: &mut Env,
-        db: Value,
-    ) -> Value {
-        if constant_columns.is_empty() {
-            return relation;
-        }
-
-        // Build extra fields record
-        let n = constant_columns.len();
-        let n_val = builder.ins().iconst(self.ptr_type, n as i64);
-        let extra = self.call_rt(builder, "knot_record_empty", &[n_val]);
-        for (name, expr) in constant_columns {
-            let val = self.compile_expr(builder, expr, env, db);
-            let (key_ptr, key_len) = self.string_ptr(builder, name);
-            self.call_rt_void(
-                builder,
-                "knot_record_set_field",
-                &[extra, key_ptr, key_len, val],
-            );
-        }
-
-        self.call_rt(builder, "knot_relation_add_fields", &[relation, extra])
-    }
-
-    /// Build a flat relation of SQL parameter values from constant column expressions.
-    fn compile_view_filter_params(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        constant_columns: &[(String, ast::Expr)],
-        env: &mut Env,
-        db: Value,
-    ) -> Value {
-        let rel = self.call_rt(builder, "knot_relation_empty", &[]);
-        for (_, expr) in constant_columns {
-            let val = self.compile_expr(builder, expr, env, db);
-            self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
-        }
-        rel
     }
 
     // ── Application compilation ───────────────────────────────────
@@ -6492,7 +6077,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         match &expr.node {
             Set { target, value } | FullSet { target, value } => {
                 let target_ok = match &target.node {
-                    SourceRef { name, .. } if !self.views.contains_key(name) => {
+                    SourceRef { name, .. } => {
                         out.push(name.clone());
                         true
                     }
@@ -6576,7 +6161,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .all(|h| self.collect_direct_write_targets(&h.body, out)),
             Lit(_) | Constructor(_) | SourceRef { .. } => true,
             TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => true,
-            ViewDecl { body, .. } => self.collect_direct_write_targets(body, out),
         }
     }
 
@@ -6725,7 +6309,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // shape `peel_map_projection` recognizes); anything richer falls back.
         let map_peel = self.peel_map_projection(rel_expr);
         if let Some((map_src, map_field)) = &map_peel
-            && !self.views.contains_key(map_src)
             && let Some(base_schema) = self.source_schemas.get(map_src).cloned()
             && !base_schema.starts_with('#')
             && !base_schema.contains('[')
@@ -6793,9 +6376,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 Some((s, _, _)) => s,
                                 None => self.resolve_source(&inner)?,
                             };
-                            if self.views.contains_key(&inner_src) {
-                                return None;
-                            }
                             let inner_schema =
                                 self.source_schemas.get(&inner_src)?.clone();
                             if !sortby_projection_pushable(&key_bind, key_body, &inner_schema) {
@@ -6838,9 +6418,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         Some((src, bind, body)) => (src, Some((bind, body))),
                         None => (self.resolve_source(&base_reduced)?, None),
                     };
-                if self.views.contains_key(&source_name) {
-                    return None;
-                }
                 let schema = self.source_schemas.get(&source_name)?.clone();
                 if schema.starts_with('#') || schema.contains('[') {
                     return None;
@@ -7473,7 +7050,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         if Self::query_form_name(func_expr) == Some("run")
             && args.len() == 1 && !user_shadows_special
             && let Some(source_name) = self.resolve_source(args[0])
-            && !self.views.contains_key(&source_name)
             && let Some(schema) = self.source_schemas.get(&source_name).cloned()
         {
             self.in_memory_source_reads
@@ -7494,8 +7070,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             && args.len() == 1 && !user_shadows_special {
                 if let Some(source_name) = self.resolve_source(args[0]) {
                     // Only for actual sources, not views
-                    if !self.views.contains_key(&source_name)
-                        && self.source_schemas.contains_key(&source_name)
+                    if self.source_schemas.contains_key(&source_name)
                     {
                         self.emit_stm_track_read(builder, &source_name);
                         let (name_ptr, name_len) =
@@ -7514,8 +7089,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 {
                     let source_name: &str = &source_name;
                     let filter_body: &ast::Expr = &filter_body;
-                    if !self.views.contains_key(source_name)
-                        && let Some(schema) = self.source_schemas.get(source_name).cloned()
+                    if let Some(schema) = self.source_schemas.get(source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[')
                                 && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                     let query = Query {
@@ -7549,7 +7123,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     peel_take_drop(&beta_reduce(args[0], &self.fun_bodies, &self.let_bindings),
                                    &self.fun_bodies, &self.let_bindings)
                     && let Some(source_name) = self.resolve_source(&inner)
-                    && !self.views.contains_key(&source_name)
                     && let Some(schema) = self.source_schemas.get(&source_name).cloned()
                     && !schema.starts_with('#') && !schema.contains('[')
                     && let Some(n_param) = expr_to_sql_param(&n) {
@@ -7579,7 +7152,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // `*source |> map ...` (beta_reduce collapses the pipe to
                 // `map ... source`).
                 if let Some((source_name, _field)) = self.peel_map_projection(args[0])
-                    && !self.views.contains_key(&source_name)
                         && self.source_schemas.contains_key(&source_name) {
                             self.emit_stm_track_read(builder, &source_name);
                             let (name_ptr, name_len) =
@@ -7645,7 +7217,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // Scalar projection: distinct (map (\r -> r.f) *src) →
                 // SELECT DISTINCT "f" FROM _knot_src.
                 if let Some((source_name, field)) = self.peel_map_projection(args[0])
-                    && !self.views.contains_key(&source_name)
                         && let Some(schema) = self.source_schemas.get(&source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[')
                                 && let Some(type_str) = lookup_col_type_from_schema(&schema, &field) {
@@ -7672,7 +7243,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     && let ast::ExprKind::App { func: mhead, arg: map_lambda } = &mf.node
                         && Self::query_form_name(mhead) == Some("map")
                             && let Some(source_name) = self.resolve_source(msrc)
-                                && !self.views.contains_key(&source_name)
                     && let Some(schema) = self.source_schemas.get(&source_name).cloned()
                         && !schema.starts_with('#') && !schema.contains('[')
                             && let Some((bind_var, body)) = extract_single_param_lambda(map_lambda, &self.fun_bodies, &self.let_bindings) {
@@ -7714,7 +7284,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             && name == "single" && args.len() == 1 && !user_shadows_special {
                 // single *source → SELECT ... LIMIT 2 then knot_relation_single
                 if let Some(source_name) = self.resolve_source(args[0])
-                    && !self.views.contains_key(&source_name)
                         && let Some(schema) = self.source_schemas.get(&source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[') {
                                 let table = quote_sql_ident(&format!("_knot_{}", source_name));
@@ -7741,8 +7310,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     extract_filter_on_source(args[0], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
                 {
                     let filter_body: &ast::Expr = &filter_body;
-                    if !self.views.contains_key(&source_name)
-                        && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                    if let Some(schema) = self.source_schemas.get(&source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[')
                                 && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                     let table = quote_sql_ident(&format!("_knot_{}", source_name));
@@ -7898,7 +7466,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             && name == "fold" && args.len() == 3 && !user_shadows_special {
                 // fold f init *source → SELECT cols FROM table; stream
                 if let ast::ExprKind::SourceRef { name: source_name, .. } = &args[2].node
-                    && !self.views.contains_key(source_name)
                         && let Some(schema) = self.source_schemas.get(source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[') {
                                 let source_name = source_name.clone();
@@ -7918,8 +7485,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     extract_filter_on_source(args[2], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
                 {
                     let filter_body: &ast::Expr = &filter_body;
-                    if !self.views.contains_key(&source_name)
-                        && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                    if let Some(schema) = self.source_schemas.get(&source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[')
                                 && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                     let f = self.compile_expr(builder, args[0], env, db);
@@ -8033,7 +7599,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         };
         if let Some(name) = aggregate_pushdown_name {
                 if let Some(source_name) = self.resolve_source(args[1])
-                    && !self.views.contains_key(&source_name)
                         && let Some(schema) = self.source_schemas.get(&source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[')
                                 && let Some(result) = self.try_compile_app_sql(
@@ -8049,8 +7614,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     {
                         let source_name: &str = &source_name;
                         let filter_body: &ast::Expr = &filter_body;
-                        if !self.views.contains_key(source_name)
-                            && let Some(schema) = self.source_schemas.get(source_name).cloned()
+                        if let Some(schema) = self.source_schemas.get(source_name).cloned()
                                 && !schema.starts_with('#') && !schema.contains('[')
                                     && let Some((agg_bind, agg_body)) = extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings) {
                                         let agg_body: &ast::Expr = &agg_body;
@@ -8206,8 +7770,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     {
                         let source_name: &str = &source_name;
                         let filter_body: &ast::Expr = &filter_body;
-                        if !self.views.contains_key(source_name)
-                            && let Some(schema) = self.source_schemas.get(source_name).cloned()
+                        if let Some(schema) = self.source_schemas.get(source_name).cloned()
                                 && !schema.starts_with('#') && !schema.contains('[')
                                     && let Some((pred_bind, pred_body)) = extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings) {
                                         let pred_body: &ast::Expr = &pred_body;
@@ -8316,7 +7879,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 None => (self.resolve_source(args[1])?, None),
                             }
                         };
-                        if self.views.contains_key(&source_name) { return None; }
                         let schema = self.source_schemas.get(&source_name)?.clone();
                         if schema.starts_with('#') || schema.contains('[') { return None; }
                         let (conditions, params, negated) = match name {
@@ -8479,7 +8041,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                     let sort_body: &ast::Expr = &sort_body;
                                     // Case 1: sortBy f *source → SQL ORDER BY + LIMIT
                                     if let ast::ExprKind::SourceRef { name: source_name, .. } = &sort_source.node
-                                        && !self.views.contains_key(source_name)
                                             && let Some(schema) = self.source_schemas.get(source_name).cloned()
                                                 && !schema.starts_with('#') && !schema.contains('[') {
                                                     // Same ORDER BY guards as the other sortBy paths:
@@ -8565,7 +8126,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
                 // takeRelation N *source → SQL LIMIT (no ORDER BY)
                 if let Some(source_name) = self.resolve_source(args[1])
-                    && !self.views.contains_key(&source_name)
                         && let Some(schema) = self.source_schemas.get(&source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[') {
                                 let n_val = self.compile_expr(builder, args[0], env, db);
@@ -8597,8 +8157,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 {
                     let source_name: &str = &source_name;
                     let filter_body: &ast::Expr = &filter_body;
-                    if !self.views.contains_key(source_name)
-                        && let Some(schema) = self.source_schemas.get(source_name).cloned()
+                    if let Some(schema) = self.source_schemas.get(source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[')
                                 && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
                                     let n_val = self.compile_expr(builder, args[0], env, db);
@@ -8632,7 +8191,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         if let ast::ExprKind::Var(name) = &func_expr.node
             && (name == "dropRelation" || name == "drop") && args.len() == 2 && !user_shadows_special
                 && let Some(source_name) = self.resolve_source(args[1])
-                    && !self.views.contains_key(&source_name)
                         && let Some(schema) = self.source_schemas.get(&source_name).cloned()
                             && !schema.starts_with('#') && !schema.contains('[') {
                                 let query = Query {
@@ -8755,7 +8313,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // materializing the projected column. Also covers the pipe
                     // form `*source |> map ...` (beta_reduce collapses it).
                     if let Some((source_name, field)) = self.peel_map_projection(args[0])
-                        && !self.views.contains_key(&source_name)
                             && let Some(schema) = self.source_schemas.get(&source_name).cloned()
                                 && !schema.starts_with('#') && !schema.contains('[') {
                                     let bind_var = "x".to_string();
@@ -12174,8 +11731,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // ── Filter pushdown: try to push Where clauses into SQL ──
                     let use_filter_pushdown = if let ast::PatKind::Var(bind_var) = &pat.node {
                         if let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node {
-                            if !self.views.contains_key(source_name)
-                                && self.source_schemas.contains_key(source_name)
+                            if self.source_schemas.contains_key(source_name)
                             {
                                 // Look ahead at subsequent Where stmts
                                 let mut sql_fragments: Vec<(usize, SqlFragment)> = Vec::new();
@@ -13353,7 +12909,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             | ast::ExprKind::Constructor(_) => false,
             ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
             ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
-            ast::ExprKind::ViewDecl { body, .. } => Self::references_source(body, source_name),
             ast::ExprKind::Record(fields) => {
                 fields.iter().any(|f| Self::references_source(&f.value, source_name))
             }
@@ -13642,9 +13197,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::Var(name) => self.source_var_binds.get(name)?.clone(),
             _ => return None,
         };
-        if self.views.contains_key(&source_name) {
-            return None;
-        }
         let schema = self.source_schemas.get(&source_name)?.clone();
         if schema.starts_with('#') || schema.contains('[') {
             return None;
@@ -14362,9 +13914,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
     ) -> Option<SetOpSubquery> {
         // Case 1: bare *source or bound variable
         if let Some(source_name) = self.resolve_source(expr) {
-            if self.views.contains_key(&source_name) {
-                return None;
-            }
             let schema = self.source_schemas.get(&source_name)?;
             if schema.starts_with('#') || schema.contains('[') {
                 return None;
@@ -14388,9 +13937,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         {
             let source_name: &str = &source_name;
             let filter_body: &ast::Expr = &filter_body;
-            if self.views.contains_key(source_name) {
-                return None;
-            }
             let schema = self.source_schemas.get(source_name)?;
             if schema.starts_with('#') || schema.contains('[') {
                 return None;
@@ -14630,9 +14176,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         return None;
                     };
 
-                    if self.views.contains_key(&source_name) {
-                        return None;
-                    }
                     let schema = self.source_schemas.get(&source_name)?.clone();
                     if schema.starts_with('#') || schema.contains('[') {
                         return None;
@@ -15413,7 +14956,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     && matches!(fname, "any" | "all")
                 {
                     if let Some(sub_src) = self.resolve_source(arg)
-                        && !self.views.contains_key(&sub_src)
                         && let Some(sub_schema) = self.source_schemas.get(&sub_src).cloned()
                         && !sub_schema.starts_with('#')
                         && !sub_schema.contains('[')
@@ -16543,146 +16085,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
     }
 }
 
-// ── View analysis ─────────────────────────────────────────────────
-
-/// Analyze a view body expression to extract column provenance.
-/// Returns `None` if the view body cannot be analyzed (unsupported pattern).
-/// Analyze a view body. Returns `Ok(Some(info))` when the body is a
-/// recognizable view, `Ok(None)` when it isn't a view shape at all, and
-/// `Err((span, msg))` when it *is* a view but contains a `where` filter we
-/// cannot represent — the caller turns that into a diagnostic. We must not
-/// silently drop such a filter (that would return unfiltered rows on read and
-/// write rows that violate the filter), and we must not panic on valid input.
-fn analyze_view(body: &ast::Expr) -> Result<Option<ViewInfo>, (ast::Span, String)> {
-    // Case 1: simple alias — *view = *source
-    if let ast::ExprKind::SourceRef { name: source_name, .. } = &body.node {
-        return Ok(Some(ViewInfo {
-            source_name: source_name.clone(),
-            source_columns: vec![],
-            constant_columns: vec![],
-            body: body.clone(),
-        }));
-    }
-
-    // Case 2: do-block with bind + yield
-    if let ast::ExprKind::Do(stmts) = &body.node {
-        // Find the bind statement: t <- *source
-        let bind_info = stmts.iter().find_map(|s| {
-            if let ast::StmtKind::Bind { pat, expr } = &s.node
-                && let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node
-                    && let ast::PatKind::Var(var_name) = &pat.node {
-                        return Some((var_name.clone(), source_name.clone()));
-                    }
-            None
-        });
-        let bind_info = match bind_info {
-            Some(bi) => bi,
-            None => return Ok(None),
-        };
-
-        let (bind_var, source_name) = bind_info;
-
-        // Find the yield expression with a record
-        let yield_record = stmts.iter().rev().find_map(|s| {
-            if let ast::StmtKind::Expr(expr) = &s.node
-                && let Some(inner) = expr.node.as_yield_arg()
-                    && let ast::ExprKind::Record(fields) = &inner.node {
-                        return Some(fields.clone());
-                    }
-            None
-        });
-        let yield_record = match yield_record {
-            Some(yr) => yr,
-            None => return Ok(None),
-        };
-
-        let mut source_columns = Vec::new();
-        let mut constant_columns = Vec::new();
-
-        // Extract `where <bindvar>.<col> == <const>` filter statements. Such a
-        // filter restricts the view (read side) and implies a constant column
-        // to auto-fill on write, exactly like a constant yield field — so we
-        // record it as a constant column keyed by the *source* column name.
-        // Forms we cannot reduce to `col == const` (e.g. inequalities, computed
-        // predicates) make the view unanalyzable for writes; bail out so we
-        // never silently drop a filter.
-        for s in stmts {
-            if let ast::StmtKind::Where { cond } = &s.node {
-                if let ast::ExprKind::BinOp {
-                    op: ast::BinOp::Eq,
-                    lhs,
-                    rhs,
-                } = &cond.node
-                {
-                    // Identify which side is `bindvar.col` and which is the
-                    // constant (must not reference the bind var).
-                    let field_of = |e: &ast::Expr| -> Option<String> {
-                        if let ast::ExprKind::FieldAccess { expr, field } = &e.node
-                            && let ast::ExprKind::Var(v) = &expr.node
-                                && v == &bind_var {
-                                    return Some(field.clone());
-                                }
-                        None
-                    };
-                    let lhs_col = field_of(lhs);
-                    let rhs_col = field_of(rhs);
-                    match (lhs_col, rhs_col) {
-                        (Some(col), None) if !expr_references_var(rhs, &bind_var) => {
-                            constant_columns.push((col, (**rhs).clone()));
-                            continue;
-                        }
-                        (None, Some(col)) if !expr_references_var(lhs, &bind_var) => {
-                            constant_columns.push((col, (**lhs).clone()));
-                            continue;
-                        }
-                        _ => {}
-                    }
-                }
-                // Any other `where` form can't be represented in ViewInfo's
-                // constant-column model. Report a diagnostic rather than
-                // silently dropping the filter (which would return unfiltered
-                // rows on read and write rows that violate the filter) or
-                // panicking the whole compile on otherwise-valid input.
-                return Err((
-                    cond.span,
-                    "unsupported `where` filter in view body — view `where` clauses \
-                     must have the form `<bindvar>.<field> == <constant>`"
-                        .to_string(),
-                ));
-            }
-        }
-
-        for field in &yield_record {
-            // Check if it's a field access on the bind var: t.field
-            if let ast::ExprKind::FieldAccess {
-                expr,
-                field: accessed_field,
-            } = &field.value.node
-                && let ast::ExprKind::Var(var_name) = &expr.node
-                    && var_name == &bind_var {
-                        source_columns.push((field.name.clone(), accessed_field.clone()));
-                        continue;
-                    }
-            // Check it doesn't reference the bind var (constant column)
-            if !expr_references_var(&field.value, &bind_var) {
-                constant_columns.push((field.name.clone(), field.value.clone()));
-            }
-            // If it references bind_var but isn't a simple field access,
-            // it's a computed column — view reads work, writes are not supported.
-        }
-
-        return Ok(Some(ViewInfo {
-            source_name,
-            source_columns,
-            constant_columns,
-            body: body.clone(),
-        }));
-    }
-
-    Ok(None)
-}
-
-/// Check if an expression references a specific variable name.
 /// Check if an expression contains function applications to user-defined
 /// Escape-analysis hint: returns true if `expr` trivially evaluates to a
 /// value that does not need `knot_arena_promote` to survive an
@@ -17702,29 +17104,6 @@ pub(crate) fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Optio
     None
 }
 
-fn parse_schema_columns(schema: &str) -> Vec<(String, String)> {
-    split_schema_fields(schema)
-        .into_iter()
-        .filter_map(|part| {
-            let colon = part.find(':')?;
-            let name = part[..colon].to_string();
-            let ty = part[colon + 1..].to_string();
-            Some((name, ty))
-        })
-        .collect()
-}
-
-/// Column names of a schema descriptor (bracket-aware).
-fn schema_col_names(schema: &str) -> HashSet<String> {
-    split_schema_fields(schema)
-        .into_iter()
-        .map(|part| part.split(':').next().unwrap_or("").to_string())
-        .filter(|n| !n.is_empty())
-        .collect()
-}
-
-/// Split a schema descriptor by commas while respecting `[...]` bracket nesting
-/// for nested relation fields (e.g. `name:text,items:[price:int,qty:int]`).
 pub(crate) fn split_schema_fields(s: &str) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
@@ -17742,6 +17121,18 @@ pub(crate) fn split_schema_fields(s: &str) -> Vec<&str> {
     }
     parts.push(&s[start..]);
     parts
+}
+
+fn parse_schema_columns(schema: &str) -> Vec<(String, String)> {
+    split_schema_fields(schema)
+        .into_iter()
+        .filter_map(|part| {
+            let colon = part.find(':')?;
+            let name = part[..colon].to_string();
+            let ty = part[colon + 1..].to_string();
+            Some((name, ty))
+        })
+        .collect()
 }
 
 // ── Pipe chain analysis ───────────────────────────────────────────
@@ -18288,8 +17679,7 @@ fn beta_reduce_inner(
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
         Lit(_) | Constructor(_) | SourceRef { .. } | Case { .. } | Do(_)
         | Set { .. } | FullSet { .. } | Atomic(_) | TimeUnitLit { .. }
-        | Annot { .. } | Refine(_) | Serve { .. } | TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. }
-        | ViewDecl { .. } => return expr.clone(),
+        | Annot { .. } | Refine(_) | Serve { .. } | TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } => return expr.clone(),
     };
     ast::Spanned { node: new_node, span }
 }
@@ -18333,11 +17723,6 @@ fn substitute_inner(
             record: Box::new(substitute_inner(record, var, value, value_fv)?),
             body: Box::new(substitute_inner(body, var, value, value_fv)?),
             types: types.clone(),
-        },
-        ViewDecl { name, ty, body } => ViewDecl {
-            name: name.clone(),
-            ty: ty.clone(),
-            body: Box::new(substitute_inner(body, var, value, value_fv)?),
         },
         App { func, arg } => App {
             func: Box::new(substitute_inner(func, var, value, value_fv)?),
@@ -18422,7 +17807,6 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
         Var(name) => name == var,
         Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => false,
-        ViewDecl { body, .. } => expr_mentions_var(body, var),
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
         FieldAccess { expr: e, .. } => expr_mentions_var(e, var),
         List(items) => items.iter().any(|e| expr_mentions_var(e, var)),
@@ -18471,7 +17855,6 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
         }
         Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
         | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {}
-        ViewDecl { body, .. } => collect_free_vars_set(body, bound, free),
         Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
             for p in params {
@@ -19542,7 +18925,6 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::SourceDecl { .. } => {}
         ast::ExprKind::SubsetConstraint { .. } => {}
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
-        ast::ExprKind::ViewDecl { body, .. } => collect_free_vars(body, bound, free),
         ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::CollectFold(_) => {}
         ast::ExprKind::TypeHole => {}
@@ -19702,7 +19084,6 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::TypeHole => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
-        ast::ExprKind::ViewDecl { body, .. } => expr_refs_var(body, var),
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
         ast::ExprKind::With { record, body, .. } => {
@@ -19792,7 +19173,6 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::TypeHole => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
-        ast::ExprKind::ViewDecl { body, .. } => expr_uses_var_as_value(body, var),
         // `var.field` is a ROW use, not a value use — the whole point of this
         // walker. A field access on anything else still recurses (`f x . name`
         // may well pass `var` to `f`), as does a nested base (`var.a.b` has
@@ -20129,7 +19509,6 @@ fn pretty_expr(expr: &ast::Expr) -> String {
             };
             format!("{} <= {}", path(sub), path(sup))
         }
-        ast::ExprKind::ViewDecl { name, .. } => format!("*{}", name),
         ast::ExprKind::RouteDecl { name, .. } | ast::ExprKind::RouteCompositeDecl { name, .. } => {
             format!("route {}", name)
         }

@@ -85,15 +85,7 @@ pub fn check(program: &Expr) -> Vec<Diagnostic> {
                     diags.push(make_warning("source", name, dspan));
                 }
             }
-            DeclViewKind::View { .. } => {
-                if starts_with_underscore(name) {
-                    continue;
-                }
-                // Views are queried with `*name` like sources.
-                if !referenced_by_others(&per_decl, i, name, |r| &r.sources) {
-                    diags.push(make_warning("view", name, dspan));
-                }
-            }
+
             // Skip everything else: routes (top-level API surface),
             // migrations, and subset constraints.
             _ => {}
@@ -139,14 +131,6 @@ fn walk_decl(decl: &DeclView, r: &mut Refs) {
         }
         DeclViewKind::TypeAlias { ty, .. } => walk_type(ty, r),
         DeclViewKind::Source { ty, .. } => walk_type(ty, r),
-        DeclViewKind::View { ty, body, .. } => {
-            if let Some(scheme) = ty {
-                walk_scheme(scheme, r);
-            }
-            if let Some(b) = body {
-                walk_expr(b, r);
-            }
-        }
         DeclViewKind::Fun { ty, body, .. } => {
             if let Some(scheme) = ty {
                 walk_scheme(scheme, r);
@@ -238,7 +222,6 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
-        ExprKind::ViewDecl { body, .. } => walk_expr(body, r),
         ExprKind::Var(name) => {
             r.values.insert(name.clone());
         }

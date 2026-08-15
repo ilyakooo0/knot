@@ -20,13 +20,10 @@ use crate::types::TypeEnv;
 
 /// Run the SQL lint analysis on a program and return informational diagnostics.
 pub fn check(program: &Expr, type_env: &TypeEnv) -> Vec<Diagnostic> {
-    let views: HashSet<&str> = decl_views(program)
-        .iter()
-        .filter_map(|d| match d.kind {
-            DeclViewKind::View { .. } => Some(d.name),
-            _ => None,
-        })
-        .collect();
+    // Views were removed; this set is always empty. Kept as a parameter so the
+    // read-side lints (which distinguish view reads from source reads) compile
+    // unchanged — with no views, every `views.contains(..)` is false.
+    let views: HashSet<&str> = HashSet::new();
 
     // Collect top-level function bodies so the pipe-chain lint can mirror
     // codegen's beta-reduction: a filter/aggregate lambda that calls a user
@@ -175,9 +172,6 @@ fn lint_expr(
             for h in handlers {
                 lint_expr(&h.body, source_schemas, views, fun_bodies, diags);
             }
-        }
-        ExprKind::ViewDecl { body, .. } => {
-            lint_expr(body, source_schemas, views, fun_bodies, diags);
         }
         // Terminals — nothing to recurse into
         ExprKind::Lit(_)
@@ -948,7 +942,6 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         | ExprKind::CollectFold(_)
         | ExprKind::TypeHole => false,
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => false,
-        ExprKind::ViewDecl { body, .. } => references_source(body, source_name),
         ExprKind::Record(fields) => fields.iter().any(|f| references_source(&f.value, source_name)),
         ExprKind::FieldAccess { expr, .. } => references_source(expr, source_name),
         ExprKind::List(elems) => elems.iter().any(|e| references_source(e, source_name)),

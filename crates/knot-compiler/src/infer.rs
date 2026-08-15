@@ -7220,22 +7220,6 @@ impl Infer {
                 // merges other routes' endpoints. It carries no value namespace.
                 Ty::unit()
             }
-            ast::ExprKind::ViewDecl { name, ty, .. } => {
-                // A view embedded in a record value literal (`{*openTodos = …}`).
-                // The actual relation type is registered by the hoisted
-                // top-level `DeclKind::View` (desugar `hoist_record_views`);
-                // here the field reads through it, so type it as a view READ
-                // (`IO {Reads name} [T]`). With an annotation use it, else a
-                // fresh var the hoisted decl's check will pin down.
-                self.annotation_vars.clear();
-                let resolved = match ty {
-                    Some(scheme) => self.ast_type_to_ty(&scheme.ty),
-                    None => self.source_types.get(name).cloned().unwrap_or_else(|| self.fresh()),
-                };
-                self.source_types.insert(name.clone(), resolved.clone());
-                self.view_names.insert(name.clone());
-                Ty::IO(Box::new(resolved))
-            }
         }
     }
 
@@ -9532,16 +9516,6 @@ impl Infer {
                     self.annotation_vars.clear();
                     let resolved = self.ast_type_to_ty(ty);
                     self.source_types.insert(name.to_string(), resolved);
-                }
-                RelMarker::View { name, ty, .. } => {
-                    let resolved = if let Some(scheme) = ty {
-                        self.annotation_vars.clear();
-                        self.ast_type_to_ty(&scheme.ty)
-                    } else {
-                        Ty::Relation(Box::new(self.fresh()))
-                    };
-                    self.source_types.insert(name.to_string(), resolved);
-                    self.view_names.insert(name.to_string());
                 }
             }
         });
@@ -12190,32 +12164,6 @@ impl Infer {
                     }
         });
 
-        // Views.
-        for_each_relation_marker(program, &mut |m| {
-            if let RelMarker::View { name, body: Some(body), .. } = m {
-                let expected =
-                    self.source_types.get(name).cloned().unwrap_or_else(
-                        || self.fresh(),
-                    );
-                // View bodies are relation comprehensions (codegen's
-                // `analyze_view`): `*view = *src` aliases the source
-                // relation and `*view = do ...` iterates its elements.
-                // Relation reads are IO-typed everywhere else, so type
-                // the body in comprehension mode (do-binds iterate
-                // elements) and peel any remaining IO wrapper before
-                // unifying with the view's relation type `[T]`.
-                let prev = self.in_view_comprehension;
-                self.in_view_comprehension = true;
-                let inferred = self.infer_expr(body);
-                self.in_view_comprehension = prev;
-                let inferred = match self.apply(&inferred) {
-                    Ty::IO(inner) => (*inner).clone(),
-                    other => other,
-                };
-                self.unify(&inferred, &expected, body.span);
-            }
-        });
-
         // Refined-type predicates must be pure `base -> Bool` functions.
         // Checked here (not in `collect_types`) so the prelude is in scope —
         // a legitimate predicate like `base.contains "@" s` resolves. The
@@ -13065,11 +13013,6 @@ fn value_references_source_inner(
         | ast::ExprKind::Constructor(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
-        ast::ExprKind::ViewDecl { body, .. } => {
-            value_references_source_inner(
-                body, source_name, aliases, let_bindings, visited,
-            )
-        }
         ast::ExprKind::Record(fields) => fields.iter().any(|f| {
             value_references_source_inner(
                 &f.value, source_name, aliases, let_bindings, visited,
@@ -14348,7 +14291,6 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
         TypeHole => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         RouteDecl { .. } | RouteCompositeDecl { .. } => {}
-        ViewDecl { body, .. } => f(body),
         Record(fields) => {
             for fl in fields {
                 f(&mut fl.value);
@@ -14519,11 +14461,6 @@ enum RelMarker<'a> {
         name: &'a str,
         ty: &'a ast::Type,
     },
-    View {
-        name: &'a str,
-        ty: Option<&'a ast::TypeScheme>,
-        body: Option<&'a ast::Expr>,
-    },
 }
 
 /// Read-only recursion over every sub-expression.
@@ -14583,7 +14520,6 @@ pub(crate) fn walk_exprs_read<'a>(e: &'a ast::Expr, f: &mut impl FnMut(&'a ast::
                 walk_exprs_read(&h.body, f);
             }
         }
-        ViewDecl { body, .. } => walk_exprs_read(body, f),
         _ => {}
     }
 }
@@ -14731,27 +14667,18 @@ fn for_each_data_ctor_scoped<'a>(
                     walk(&h.body, d, f);
                 }
             }
-            ViewDecl { body, .. } => walk(body, d, f),
             _ => {}
         }
     }
     walk(program, 0, f);
 }
 
-/// Visit every relation marker (`*source` / view / `&derived`).
+/// Visit every source declaration (`*name : Type`).
 fn for_each_relation_marker<'a>(program: &'a ast::Expr, f: &mut impl FnMut(RelMarker<'a>)) {
-    walk_exprs_read(program, &mut |e| match &e.node {
-        ast::ExprKind::SourceDecl { name, ty, .. } => {
+    walk_exprs_read(program, &mut |e| {
+        if let ast::ExprKind::SourceDecl { name, ty, .. } = &e.node {
             f(RelMarker::Source { name, ty });
         }
-        ast::ExprKind::ViewDecl { name, ty, body } => {
-            f(RelMarker::View {
-                name,
-                ty: ty.as_ref(),
-                body: Some(body),
-            });
-        }
-        _ => {}
     });
 }
 
@@ -14807,7 +14734,6 @@ fn for_each_named_fn<'a>(
                 ast::ExprKind::DataCtor { .. }
                     | ast::ExprKind::TypeCtor { .. }
                     | ast::ExprKind::SourceDecl { .. }
-                    | ast::ExprKind::ViewDecl { .. }
                     | ast::ExprKind::RouteDecl { .. }
                     | ast::ExprKind::RouteCompositeDecl { .. }
                     | ast::ExprKind::SubsetConstraint { .. }

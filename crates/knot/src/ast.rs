@@ -222,17 +222,6 @@ pub enum ExprKind {
         migrations: Vec<SourceMigration>,
     },
 
-    /// `*openTodos = expr` (or `*openTodos : Type = expr`) inside a record
-    /// literal — an embedded view declaration. Mirrors a top-level
-    /// view declaration; the field is literally named `*name` and its value is
-    /// a marker (the view is registered statically and resolved by path).
-    ViewDecl {
-        /// Field name WITHOUT the leading `*` (e.g. `openTodos`).
-        name: Name,
-        ty: Option<TypeScheme>,
-        body: Box<Expr>,
-    },
-
     /// A subset constraint embedded in a record value literal:
     /// `{…, *orders.customer <= *people.name, …}` (or the whole-relation form
     /// `*a <= *b`). Mirrors a top-level subset constraint; the

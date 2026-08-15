@@ -2,7 +2,7 @@
 //!
 //! Usage: knot build <file.knot>
 
-use knot_compiler::{codegen, desugar, infer, linker, lockfile, nonterm, stratify, types};
+use knot_compiler::{codegen, desugar, infer, linker, lockfile, nonterm, types};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -664,20 +664,6 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
             .label(span, "debug probe")
             .note("remove `base.trace` before shipping");
             eprintln!("{}", diag.render(&source, &filename));
-        }
-    }
-
-    // Stratification check for recursive derived relations
-    let strat_diags = stratify::check(&program);
-    if !strat_diags.is_empty() {
-        for diag in &strat_diags {
-            eprintln!("{}", diag.render(&source, &filename));
-        }
-        if strat_diags
-            .iter()
-            .any(|d| d.severity == knot::diagnostic::Severity::Error)
-        {
-            process::exit(1);
         }
     }
 

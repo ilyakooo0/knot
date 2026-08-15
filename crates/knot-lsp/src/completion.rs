@@ -180,7 +180,7 @@ pub(crate) fn handle_completion(
             // the typed `*` replaces the sigil instead of producing `**name`.
             let edit_range = sigil_replace_range(latest_source, offset);
             for decl in top_fields(&doc.module) {
-                if let ast::ExprKind::SourceDecl { name, .. } | ast::ExprKind::ViewDecl { name, .. } = &decl.value.node {
+                if let ast::ExprKind::SourceDecl { name, .. } = &decl.value.node {
                     let detail = doc.type_info.get(name.as_str()).cloned();
                     items.push(CompletionItem {
                         label: format!("*{name}"),
@@ -467,7 +467,7 @@ pub(crate) fn handle_completion(
                     ..Default::default()
                 });
             }
-            ast::ExprKind::SourceDecl { name, .. } | ast::ExprKind::ViewDecl { name, .. } => {
+            ast::ExprKind::SourceDecl { name, .. } => {
                 items.push(CompletionItem {
                     label: format!("*{name}"),
                     kind: Some(CompletionItemKind::VARIABLE),
@@ -874,9 +874,6 @@ fn find_enclosing_do_span(module: &ast::Expr, offset: usize) -> Option<Span> {
             continue;
         }
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } => {
-                walk(body, offset, &mut best)
-            }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -910,7 +907,6 @@ fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -
             continue;
         }
         let body: &ast::Expr = match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } => body,
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => continue,

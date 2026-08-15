@@ -554,15 +554,8 @@ fn span_is_record_pun(module: &ast::Expr, source: &str, span: Span) -> bool {
         if dspan.start > span.start || span.end > dspan.end {
             continue;
         }
-        match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } => {
-                pun_in_expr(body, source, span, &mut found)
-            }
-            _ => {
-                // A named function field.
-                pun_in_expr(&decl.value, source, span, &mut found)
-            }
-        }
+            // A named function field.
+            pun_in_expr(&decl.value, source, span, &mut found)
     }
     found
 }
@@ -768,15 +761,8 @@ pub(crate) fn collect_shadowed_names(
     }
 
     for decl in top_fields(module) {
-        match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } => {
-                walk(body, old_name, new_name, &mut Vec::new(), out);
-            }
-            _ => {
-                // A named function field.
-                walk(&decl.value, old_name, new_name, &mut Vec::new(), out);
-            }
-        }
+            // A named function field.
+            walk(&decl.value, old_name, new_name, &mut Vec::new(), out);
     }
 }
 
@@ -858,12 +844,6 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::RecordField, source: &s
         field_sites_in_type(&scheme.ty, source, f);
     }
     match &decl.value.node {
-        ast::ExprKind::ViewDecl { ty, body, .. } => {
-            if let Some(scheme) = ty {
-                field_sites_in_type(&scheme.ty, source, f);
-            }
-            field_sites_in_expr(body, source, f);
-        }
         ast::ExprKind::DataCtor { constructors, .. } => {
             // Constructor fields appear sequentially in source order, so a
             // single running cursor across all constructors keeps each

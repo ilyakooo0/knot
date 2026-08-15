@@ -10,7 +10,6 @@ pub mod nonterm;
 pub mod refine_smt;
 pub mod sql_lint;
 pub mod stack;
-pub mod stratify;
 pub mod types;
 pub(crate) mod unwind;
 pub mod unused;

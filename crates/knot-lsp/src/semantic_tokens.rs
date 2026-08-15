@@ -338,12 +338,6 @@ impl<'a> TokenCollector<'a> {
                 }
                 self.visit_type(ty);
             }
-            ast::ExprKind::ViewDecl { name, body, .. } => {
-                if let Some(s) = find_word_in_source(self.source, name, dspan.start, dspan.end) {
-                    self.add(s, TOK_NAMESPACE, MOD_DECLARATION);
-                }
-                self.visit_expr(body);
-            }
             ast::ExprKind::RouteDecl { name, entries } => {
                 if let Some(s) = find_word_in_source(self.source, name, dspan.start, dspan.end) {
                     self.add(s, TOK_TYPE, MOD_DECLARATION);
@@ -616,12 +610,6 @@ impl<'a> TokenCollector<'a> {
             }
             ast::ExprKind::RouteCompositeDecl { .. } => {}
             // A view field's annotation and body are highlighted.
-            ast::ExprKind::ViewDecl { ty, body, .. } => {
-                if let Some(scheme) = ty {
-                    self.visit_type(&scheme.ty);
-                }
-                self.visit_expr(body);
-            }
         }
     }
 

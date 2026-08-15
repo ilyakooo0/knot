@@ -433,9 +433,6 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
                 walk_exprs(&h.body, f);
             }
         }
-        ExprKind::ViewDecl { body, .. } => {
-            walk_exprs(body, f)
-        }
         ExprKind::Lit(_)
         | ExprKind::Var(_)
         | ExprKind::Constructor(_)
@@ -572,9 +569,6 @@ fn collect_type_and_data_refs<'a>(
             for h in handlers {
                 collect_type_and_data_refs(&h.body, aliases, data_decls);
             }
-        }
-        ExprKind::ViewDecl { body, .. } => {
-            collect_type_and_data_refs(body, aliases, data_decls)
         }
         _ => {}
     }

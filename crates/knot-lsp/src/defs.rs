@@ -103,7 +103,7 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
             ExprKind::TypeCtor { name, .. } => {
                 resolver.define(name, name_span(name));
             }
-            ExprKind::SourceDecl { name, .. } | ExprKind::ViewDecl { name, .. } => {
+            ExprKind::SourceDecl { name, .. } => {
                 let span = name_span(name);
                 resolver.define(name, span);
                 resolver.register_extra_definition_tokens(dspan, name, span);
@@ -165,12 +165,6 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
             resolve_scheme(&mut resolver, scheme);
         }
         match &decl.value.node {
-            ExprKind::ViewDecl { body, ty, .. } => {
-                if let Some(scheme) = ty {
-                    resolve_scheme(&mut resolver, scheme);
-                }
-                resolver.resolve_expr(body);
-            }
             ExprKind::SourceDecl { ty, .. } => {
                 resolver.resolve_type(ty, source);
             }
@@ -618,12 +612,6 @@ impl<'a> DefResolver<'a> {
             }
             ast::ExprKind::RouteCompositeDecl { .. } => {}
             // A view field's annotation and body are both navigable.
-            ast::ExprKind::ViewDecl { ty, body, .. } => {
-                if let Some(scheme) = ty {
-                    self.resolve_type(&scheme.ty, self.source);
-                }
-                self.resolve_expr(body);
-            }
         }
     }
 }
@@ -691,13 +679,6 @@ pub fn build_details(program: &Expr) -> HashMap<String, String> {
                     name.clone(),
                     format!("*{name} : [{}]", format_type_kind(&ty.node)),
                 );
-            }
-            ExprKind::ViewDecl { name, ty, .. } => {
-                let ty_str = ty
-                    .as_ref()
-                    .map(|t| format!(" : {}", format_type_scheme(t)))
-                    .unwrap_or_default();
-                details.insert(name.clone(), format!("*{name}{ty_str} (view)"));
             }
             ExprKind::RouteDecl { name, .. } => {
                 details.insert(name.clone(), format!("route {name}"));

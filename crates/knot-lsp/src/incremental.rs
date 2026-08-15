@@ -246,19 +246,6 @@ fn hash_field_signature(field: &ast::RecordField) -> u64 {
             ("source_sig", name).hash(&mut h);
             strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
         }
-        ExprKind::ViewDecl { name, ty, body } => {
-            ("vd_sig", name).hash(&mut h);
-            match ty {
-                Some(ts) => {
-                    strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
-                    strip_spans(&format!("{:?}", ts.constraints)).hash(&mut h);
-                }
-                None => {
-                    "untyped".hash(&mut h);
-                    strip_spans(&format!("{:?}", body.node)).hash(&mut h);
-                }
-            }
-        }
         // Data / route / etc.: shape *is* the signature — full hash.
         ExprKind::DataCtor { .. } | ExprKind::TypeCtor { .. }
         | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. }
@@ -291,12 +278,6 @@ fn hash_structure(program: &Expr) -> u64 {
             ExprKind::SourceDecl { name, ty, .. } => {
                 ("source", name).hash(&mut h);
                 strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
-            }
-            ExprKind::ViewDecl { name, ty, .. } => {
-                ("vd", name).hash(&mut h);
-                if let Some(ts) = ty {
-                    strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
-                }
             }
             ExprKind::DataCtor { name, constructors, .. } => {
                 ("data", name).hash(&mut h);
@@ -347,17 +328,6 @@ fn collect_field_deps(field: &ast::RecordField) -> HashSet<String> {
     match &field.value.node {
         ExprKind::SourceDecl { ty, .. } => {
             collect_type_names(ty, &mut deps);
-        }
-        ExprKind::ViewDecl { ty, body, .. } => {
-            if let Some(ts) = ty {
-                collect_type_names(&ts.ty, &mut deps);
-                for c in &ts.constraints {
-                    for arg in c.types() {
-                        collect_type_names(arg, &mut deps);
-                    }
-                }
-            }
-            collect_expr_names(body, &mut deps);
         }
         ExprKind::TypeCtor { ty, .. } => {
             collect_type_names(ty, &mut deps);

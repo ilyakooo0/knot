@@ -796,19 +796,6 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             }
             s
         }
-        ExprKind::ViewDecl { name, ty, body } => {
-            // Renders the embedded view line: `*name = body` or
-            // `*name : Type = body`. The field is literally named `*name`.
-            match ty {
-                Some(scheme) => format!(
-                    "*{} : {} = {}",
-                    name,
-                    render_type(&scheme.ty),
-                    render_expr_inline(body, Prec::Lowest)
-                ),
-                None => format!("*{} = {}", name, render_expr_inline(body, Prec::Lowest)),
-            }
-        }
         ExprKind::SubsetConstraint { sub, sup } => {
             // Renders the embedded constraint: `*a.f <= *b.g` / `*a <= *b`.
             let path = |p: &crate::ast::RelationPath| match &p.field {

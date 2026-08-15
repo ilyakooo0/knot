@@ -711,11 +711,6 @@ fn analyze_unopened_file_inner(
         let knot_compiler::infer::CheckOutput { diagnostics: infer_diags, .. } = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_importer));
 
-        all_diags.extend(
-            knot_compiler::stratify::check(&analysis_module)
-                .into_iter()
-                .filter(anchored_in_importer),
-        );
 
         // Unused-definition warnings: use pre-prelude decls so prelude/imported
         // names are not flagged.

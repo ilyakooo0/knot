@@ -562,11 +562,6 @@ pub fn analyze_document(
             }
         }
 
-        all_diags.extend(
-            knot_compiler::stratify::check(&analysis_module)
-                .into_iter()
-                .filter(anchored_in_user),
-        );
 
         // Unused-definition warnings: run on the user's pre-prelude decls so
         // we don't flag prelude/imported names. Cached as part of

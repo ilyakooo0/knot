@@ -108,7 +108,6 @@ fn collect_source_fields_in_expr(
                 ExprKind::SourceDecl { name, .. } => {
                     Some((name.clone(), RecordRelKind::Source))
                 }
-                ExprKind::ViewDecl { name, .. } => Some((name.clone(), RecordRelKind::Source)),
                 _ => None,
             })
             .collect();
@@ -182,7 +181,6 @@ fn walk_expr_children_read(expr: &Expr, f: &mut impl FnMut(&Expr)) {
                 f(&h.body);
             }
         }
-        ExprKind::ViewDecl { body, .. } => f(body),
         _ => {}
     }
 }
@@ -349,9 +347,6 @@ fn collect_fun_bodies<'a>(
             for h in handlers {
                 collect_fun_bodies(&h.body, fun_bodies, fun_sig_io);
             }
-        }
-        ExprKind::ViewDecl { body, .. } => {
-            collect_fun_bodies(body, fun_bodies, fun_sig_io)
         }
         _ => {}
     }
@@ -661,7 +656,6 @@ fn walk_expr_children(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
                 f(&mut h.body);
             }
         }
-        ExprKind::ViewDecl { body, .. } => f(body),
         _ => {}
     }
 }
@@ -730,10 +724,6 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
         ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
-        ExprKind::ViewDecl { body, .. } => {
-            desugar_expr(body, io_fns, source_vars)
-        }
-
         ExprKind::Record(fields) => {
             for f in fields {
                 desugar_expr(&mut f.value, io_fns, source_vars);

@@ -278,13 +278,6 @@ fn route_is_listened_inner(
     }
     for decl in top_fields(program) {
         match &decl.value.node {
-            ExprKind::ViewDecl { body, .. } => {
-                let mut found = false;
-                walk(body, route_name, &mut found, 0);
-                if found {
-                    return true;
-                }
-            }
             // A composite `route Api = A | B` that is itself listened/served
             // wires in every component route.
             ExprKind::RouteCompositeDecl { name, components }
@@ -351,9 +344,6 @@ pub(crate) fn find_enclosing_application(
             continue;
         }
         match &decl.value.node {
-            ExprKind::ViewDecl { body, .. } => {
-                find_app_in_expr(body, source, offset, &mut best);
-            }
             // Route `rateLimit` expressions can contain applications that
             // need signature help.
             ExprKind::RouteDecl { entries, .. } => {
@@ -515,9 +505,6 @@ pub(crate) fn find_enclosing_atomic_expr(
             continue;
         }
         match &decl.value.node {
-            ExprKind::ViewDecl { body, .. } => {
-                walk(body, source, offset, &mut best, 0)
-            }
             // Route `rateLimit` expressions are user-edited code.
             ExprKind::RouteDecl { entries, .. } => {
                 for entry in entries {
@@ -900,9 +887,6 @@ pub(crate) fn find_field_access_at_offset(
     let mut best = None;
     for decl in top_fields(program) {
         match &decl.value.node {
-            ExprKind::ViewDecl { body, .. } => {
-                walk(body, source, offset, &mut best, 0)
-            }
             // The `rateLimit <expr>` clause on a route entry is user-edited
             // code (`{key: \input ctx -> …}`) that dereferences fields.
             ExprKind::RouteDecl { entries, .. } => {
@@ -1014,15 +998,8 @@ pub(crate) fn resolve_var_to_source(
         if !(dspan.start <= cursor_offset && cursor_offset < dspan.end) {
             continue;
         }
-        match &decl.value.node {
-            ExprKind::ViewDecl { body, .. } => {
-                walk(body, var_name, &mut found, 0);
-            }
-            _ => {
-                // A named function field.
-                walk(&decl.value, var_name, &mut found, 0);
-            }
-        }
+            // A named function field.
+            walk(&decl.value, var_name, &mut found, 0);
         if found.is_some() {
             break;
         }
@@ -1101,18 +1078,6 @@ pub(crate) fn find_enclosing_type_scheme(
     for decl in top_fields(program) {
         // The field's own signature.
         if let Some(scheme) = &decl.sig
-            && scheme_contains_offset(scheme, offset)
-        {
-            return Some((scheme, decl.name.as_str()));
-        }
-        // View/Derived marker type annotations.
-        let marker_ty = match &decl.value.node {
-            ExprKind::ViewDecl { name: _, ty, .. } => {
-                ty.as_ref()
-            }
-            _ => None,
-        };
-        if let Some(scheme) = marker_ty
             && scheme_contains_offset(scheme, offset)
         {
             return Some((scheme, decl.name.as_str()));

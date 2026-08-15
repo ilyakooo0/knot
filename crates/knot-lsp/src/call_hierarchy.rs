@@ -17,7 +17,6 @@ use crate::utils::{
 fn decl_info(decl: &knot::ast::RecordField) -> (&str, &str, &ast::Expr, Span) {
     let dspan = decl.value.span;
     match &decl.value.node {
-        ExprKind::ViewDecl { name, .. } => (name.as_str(), "view", &decl.value, dspan),
         ExprKind::DataCtor { name, .. } => (name.as_str(), "data", &decl.value, dspan),
         ExprKind::SourceDecl { name, .. } => (name.as_str(), "source", &decl.value, dspan),
         _ => (decl.name.as_str(), "fn", &decl.value, dspan),
@@ -206,15 +205,8 @@ pub(crate) fn handle_call_hierarchy_outgoing(
             }
         recurse_expr(expr, |e| collect_higher_order_args(e, out));
     }
-    match &source_decl.value.node {
-        ExprKind::ViewDecl { body, .. } => {
-            collect_higher_order_args(body, &mut higher_order_arg_spans);
-        }
-        _ => {
-            // A named function field.
-            collect_higher_order_args(&source_decl.value, &mut higher_order_arg_spans);
-        }
-    }
+    // A named function field.
+    collect_higher_order_args(&source_decl.value, &mut higher_order_arg_spans);
 
     // Collect all references within this declaration that point to other
     // declarations. Track whether each call site is a direct call or a

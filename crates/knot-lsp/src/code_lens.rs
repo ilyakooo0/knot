@@ -24,7 +24,6 @@ pub(crate) fn handle_code_lens(
         let dspan = decl.value.span;
         let decl_name = match &decl.value.node {
             ExprKind::SourceDecl { name, .. }
-            | ExprKind::ViewDecl { name, .. }
             | ExprKind::DataCtor { name, .. }
             | ExprKind::RouteDecl { name, .. }
             | ExprKind::RouteCompositeDecl { name, .. } => name.as_str(),

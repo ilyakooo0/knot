@@ -31,11 +31,6 @@ pub enum DeclViewKind<'a> {
         ty: &'a ast::Type,
         migrations: &'a [ast::SourceMigration],
     },
-    /// `*name = body` — a view.
-    View {
-        ty: Option<&'a ast::TypeScheme>,
-        body: Option<&'a ast::Expr>,
-    },
     /// A named function: a record field with a lambda body and/or a signature.
     Fun {
         ty: Option<&'a ast::TypeScheme>,
@@ -64,13 +59,13 @@ pub struct DeclView<'a> {
 impl<'a> DeclView<'a> {
     pub fn body(&self) -> Option<&'a ast::Expr> {
         match self.kind {
-            DeclViewKind::View { body, .. } | DeclViewKind::Fun { body, .. } => body,
+            DeclViewKind::Fun { body, .. } => body,
             _ => None,
         }
     }
     pub fn ty(&self) -> Option<&'a ast::TypeScheme> {
         match self.kind {
-            DeclViewKind::View { ty, .. } | DeclViewKind::Fun { ty, .. } => ty,
+            DeclViewKind::Fun { ty, .. } => ty,
             _ => None,
         }
     }
@@ -128,14 +123,6 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
                     name: fl.name.as_str(),
                     span: fl.value.span,
                     kind: DeclViewKind::Source { ty, migrations },
-                }),
-                ViewDecl { ty, body, .. } => out.push(DeclView {
-                    name: fl.name.as_str(),
-                    span: fl.value.span,
-                    kind: DeclViewKind::View {
-                        ty: ty.as_ref(),
-                        body: Some(body),
-                    },
                 }),
                 RouteDecl { entries, .. } => out.push(DeclView {
                     name: fl.name.as_str(),

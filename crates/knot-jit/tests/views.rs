@@ -1,5 +1,4 @@
-//! Query fields (`name <query>` — read-only, recomputed per access) and
-//! views (`*name = do …` — bidirectional, constant-column auto-fill).
+//! Query fields (`name <query>` — read-only, recomputed per access).
 //!
 //! Subprocess — these operate on persisted source relations.
 
@@ -45,54 +44,6 @@ doubled (do
   base.println (base.show b)
   yield {})"#,
         "\"[{n: 2}]\"\n\"[{n: 10}]\"\n{}",
-    );
-}
-
-#[test]
-fn view_read_filters_constant_column() {
-    // A filtered view `*openTodos = do t <- *todos; where …; yield …` read via
-    // `*openTodos` resolves to the source `_knot_todos` with the
-    // constant-column filter — only the Open todo is returned.
-    assert_stdout(
-        "view_read",
-        r#"with {
-data Status = Open {} | Closed {}
-*todos : [{title: Text, status: Status}]
-*openTodos = do
-  t <- *todos
-  where t.status == Status.Open {}
-  yield {title t.title}
-}
-(do
-  full *todos = [{title "a" status (Status.Open {})} {title "b" status (Status.Closed {})}]
-  rows <- *openTodos
-  base.println (base.show (base.count rows))
-  yield {})"#,
-        "\"1\"\n{}",
-    );
-}
-
-#[test]
-fn view_write_autofills_constant_column() {
-    // Writing through a filtered view resolves to the source table and
-    // auto-fills the constant column (status = Open).
-    assert_stdout(
-        "view_write",
-        r#"with {
-data Status = Open {} | Closed {}
-*todos : [{title: Text, status: Status}]
-*openTodos = do
-  t <- *todos
-  where t.status == Status.Open {}
-  yield {title t.title}
-}
-(do
-  full *openTodos = [{title "task"}]
-  all <- *todos
-  base.println (base.show (base.count all))
-  base.println (base.show all)
-  yield {})"#,
-        "\"1\"\n\"[{status: Open, title: task}]\"\n{}",
     );
 }
 

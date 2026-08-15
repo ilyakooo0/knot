@@ -7,7 +7,7 @@ use knot::ast::TypeKind;
 use knot_compiler::decl_view::{decl_views, DeclViewKind};
 
 use crate::shared::{
-    constraints_for_type_var, extract_record_fields, find_enclosing_application,
+    constraints_for_type_var, find_enclosing_application,
     find_enclosing_type_scheme, find_field_access_at_offset, find_field_refinement,
     format_route_constructor_hover, parse_function_params, predicate_to_source,
     resolve_var_to_source, ReceiverKind,
@@ -216,15 +216,6 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                 let schema = format_schema_from_type(&ty.node);
                 if !schema.is_empty() {
                     value.push_str(&format!("\n\n**Schema:**\n{schema}"));
-                }
-                break;
-            }
-            knot::ast::ExprKind::ViewDecl { name, .. } if name == word => {
-                if let Some(inferred) = doc.type_info.get(word) {
-                    let schema = format_schema_from_type_str(inferred);
-                    if !schema.is_empty() {
-                        value.push_str(&format!("\n\n**View schema:**\n{schema}"));
-                    }
                 }
                 break;
             }
@@ -554,75 +545,3 @@ fn format_schema_from_type(ty: &TypeKind) -> String {
     }
 }
 
-/// Format a type string like `[{name: Text, age: Int}]` as a schema table.
-fn format_schema_from_type_str(type_str: &str) -> String {
-    let s = type_str.trim();
-    // Unwrap IO wrapper
-    let s = if let Some(rest) = s.strip_prefix("IO ") {
-        if rest.starts_with('{') {
-            if let Some(close) = rest.find('}') {
-                rest[close + 1..].trim()
-            } else {
-                rest
-            }
-        } else {
-            rest
-        }
-    } else {
-        s
-    };
-    // Unwrap relation brackets
-    let s = if s.starts_with('[') && s.ends_with(']') {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    };
-    // Parse record fields
-    if s.starts_with('{') && s.ends_with('}') {
-        let fields = extract_record_fields(s);
-        let inner = &s[1..s.len() - 1];
-        if fields.is_empty() {
-            return String::new();
-        }
-        let mut lines = Vec::new();
-        lines.push("| Field | Type |".to_string());
-        lines.push("|-------|------|".to_string());
-        // Parse field:type pairs from inner. The `>` of `->`/`=>` is an
-        // arrow, not a closing bracket — skipping it keeps the depth from
-        // going negative after a function-typed field (which would merge
-        // the remaining rows into one).
-        let mut depth = 0i32;
-        let mut current = String::new();
-        let mut prev = '\0';
-        for ch in inner.chars() {
-            match ch {
-                '{' | '[' | '(' | '<' => {
-                    depth += 1;
-                    current.push(ch);
-                }
-                '>' if prev == '-' || prev == '=' => {
-                    current.push(ch);
-                }
-                '}' | ']' | ')' | '>' => {
-                    depth -= 1;
-                    current.push(ch);
-                }
-                ',' if depth == 0 => {
-                    if let Some((name, ty)) = current.trim().split_once(':') {
-                        lines.push(format!("| `{}` | `{}` |", name.trim(), ty.trim()));
-                    }
-                    current.clear();
-                }
-                '|' if depth == 0 => break,
-                _ => current.push(ch),
-            }
-            prev = ch;
-        }
-        if let Some((name, ty)) = current.trim().split_once(':') {
-            lines.push(format!("| `{}` | `{}` |", name.trim(), ty.trim()));
-        }
-        lines.join("\n")
-    } else {
-        String::new()
-    }
-}

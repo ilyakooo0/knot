@@ -57,8 +57,7 @@ pub(crate) fn handle_code_action(
         // inferred type as the suggested signature.
         let is_unannotated_fn = decl.sig.is_none()
             && !matches!(decl.value.node,
-                ast::ExprKind::ViewDecl { .. }
-                | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
+                ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
                 | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
                 | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. });
         if is_unannotated_fn
@@ -95,41 +94,6 @@ pub(crate) fn handle_code_action(
                     }));
                 }
             }
-
-        // Action: Add type annotation to unannotated views. Same
-        // effect-merging treatment as the Fun case above.
-        if let ast::ExprKind::ViewDecl { name, ty: None, .. } = &decl.value.node
-            && let Some(inferred) = doc.type_info.get(name)
-        {
-            let signature = inferred.clone();
-            let decl_text = safe_slice(&doc.source, decl.value.span);
-            if let Some(eq_pos) = decl_text.find('=') {
-                let insert_offset = decl.value.span.start + eq_pos;
-                let insert_pos = offset_to_position(&doc.source, insert_offset);
-
-                let mut changes = HashMap::new();
-                changes.insert(
-                    uri.clone(),
-                    vec![TextEdit {
-                        range: Range {
-                            start: insert_pos,
-                            end: insert_pos,
-                        },
-                        new_text: format!(": {signature} "),
-                    }],
-                );
-
-                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                    title: format!("Add type annotation: {signature}"),
-                    kind: Some(CodeActionKind::QUICKFIX),
-                    edit: Some(WorkspaceEdit {
-                        changes: Some(changes),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }));
-            }
-        }
     }
 
     // Diagnostic-attached quick fixes: suggest similar names for unknown identifiers
@@ -331,9 +295,6 @@ pub(crate) fn handle_code_action(
     // Action: Fill case arms — check if cursor is inside a case expression
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } => {
-                find_case_actions(body, doc, uri, range_start, range_end, &mut actions);
-            }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -534,9 +495,6 @@ pub(crate) fn handle_code_action(
             continue;
         }
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } => {
-                find_inline_actions(body, doc, uri, range_start, &mut actions);
-            }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -783,11 +741,6 @@ fn find_add_wildcard_arm_at(
     }
     for decl in top_fields(module) {
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } => {
-                if let Some(hit) = walk(body, source, offset) {
-                    return Some(hit);
-                }
-            }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -877,17 +830,6 @@ fn find_wrap_in_err_at(
     }
     for decl in top_fields(module) {
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } => {
-                if let Some(span) = walk(body, range_start, range_end) {
-                    let text = source.get(span.start..span.end)?;
-                    let body = if is_atomic_expr_text(text) {
-                        text.to_string()
-                    } else {
-                        format!("({text})")
-                    };
-                    return Some((span, format!("Err {{error {body}}}")));
-                }
-            }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -982,9 +924,6 @@ fn selection_matches_expr_node(module: &ast::Expr, source: &str, lo: usize, hi: 
         found
     }
     top_fields(module).iter().any(|decl| match &decl.value.node {
-        ast::ExprKind::ViewDecl { body, .. } => {
-            walk(body, source, target)
-        }
         ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
         | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
         | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
@@ -1667,9 +1606,6 @@ pub(crate) fn enclosing_do_stmt_range(
             continue;
         }
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } => {
-                walk(body, sel_start, sel_end, &mut best)
-            }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -1758,9 +1694,6 @@ fn find_flip_binary_at(
     let mut best = None;
     for decl in top_fields(module) {
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } => {
-                walk(body, source, offset, &mut best)
-            }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -1868,9 +1801,6 @@ fn find_pipe_conversion_at(
     let mut best = None;
     for decl in top_fields(module) {
         match &decl.value.node {
-            ast::ExprKind::ViewDecl { body, .. } => {
-                walk(body, source, offset, &mut best, false, false)
-            }
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}

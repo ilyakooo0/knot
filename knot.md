@@ -135,10 +135,9 @@ type TodoList = [{title: Text, done: Bool}]
 There are five kinds of top-level declarations:
 
 | Declaration | Kind | Description |
-|---|---|---|
+|---|---|---|---|
 | `*foo : [T]` | Source relation | Persisted in SQLite, mutable via `*foo = expr` |
-| `*foo = expr` | View | Bidirectional query over sources |
-| `&foo = expr` | Derived relation | Read-only, recomputed on access |
+| `foo <query>` | Query field | Read-only, recomputed on access |
 | `foo = expr` | Constant/function | Pure value, no DB effects |
 | `type Foo = T` | Type alias | Name for a type |
 
@@ -149,15 +148,8 @@ data Status = Open {} | Closed {}
 *people : [{name: Text, age: Int 1}]
 *todos : [{title: Text, owner: Text}]
 
--- View: settable query over a source
-*openTodos = do
-  t <- *todos
-  yield {title t.title owner t.owner status Status.Open {}}
-
--- Derived: read-only computed relation
-&seniors = do
-  people <- *people
-  yield (base.filter (\p -> p.age > 65) people)
+-- Query field: read-only computed relation
+seniors (base.filter (\p -> p.age > 65) *people)
 
 -- Constant
 maxRetries (3)
@@ -598,90 +590,41 @@ updateTeams do
 
 ---
 
-## Views
+## Query Fields
 
-A `*`-prefixed declaration with a body is a view — reads compute the query, writes propagate back:
+A field whose value is a query is a **query field**: a read-only, computed
+relation that is recomputed each time it is read. Query fields are pure and
+lazy — declaring one reads nothing; the query runs when the field is used.
 
 ```knot
-data Priority = Low {} | High {}
 data Status = Open {} | Closed {}
-*todos : [{title: Text, owner: Text, priority: Priority}]
-*openTodos = do
-  t <- *todos
-  yield {title t.title owner t.owner priority t.priority status Status.Open {}}
-```
-
-Constant columns (like `status: Open {}`) are:
-- **On read**: used as a filter (only open todos)
-- **On write**: auto-filled (inserting through the view adds `status: Open {}`)
-- **Hidden from the type**: the view's type omits constant columns
-
-```knot
-data Priority = Low {} | High {}
-data Status = Open {} | Closed {}
-*todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
-*openTodos = do
-  t <- *todos
-  where t.status == Status.Open {}
-  yield {title t.title owner t.owner priority t.priority}
-
--- Insert through view — status auto-filled
-addOpenTodo do
-  openTodos <- *openTodos
-  *openTodos = base.union openTodos [{title "New task" owner "Alice" priority Priority.High {}}]
-```
-
----
-
-## Derived Relations
-
-Read-only computed relations, prefixed with `&`:
-
-```knot
-*people : [{name: Text, age: Int 1}]
 *todos : [{title: Text, owner: Text, done: Int 1}]
-&seniors = do
-  people <- *people
-  yield (base.filter (\p -> p.age > 65) people)
 
-&stats = do
-  with {result do
-    t <- *todos
-    groupBy {owner t.owner}
-    yield {owner t.owner total (base.count t)}}
-  (do
-    yield result)
+openTodos (do
+  t <- *todos
+  where t.done == 0
+  yield {title t.title owner t.owner})
 ```
 
-### Recursive Derived Relations
+Query fields compose: one query field can reference another, and SQL pushdown
+folds through the chain — the whole composed query is pushed down to a single
+SQL statement when the planner can translate it, or evaluated in memory
+otherwise. `base.run` materializes a query field into a concrete `Vec`.
 
-Datalog-style fixpoint iteration for transitive closure:
+### Recursive query fields
+
+A query field that references its own name computes a fixpoint (transitive
+closure):
 
 ```knot
 *manages : [{manager: Text, report: Text}]
 
--- Base case: direct management edges, renamed to ancestor/descendant
-&direct = (do
-  manages <- *manages
-  yield (do
-    m <- manages
-    yield {ancestor m.manager descendant m.report}))
-
--- Recursive: ancestor/descendant via fixpoint over the base case
-&reportsTo = do
-  reportsTo <- &reportsTo     -- self-reference (IO bind)
-  manages <- *manages
-  direct <- &direct
-  with {step do
-    r <- reportsTo
-    m <- manages
-    where r.descendant == m.manager
-    yield {ancestor r.ancestor descendant m.report}}
-  (do
-    yield (base.union direct step))
+reportsTo (base.union *manages (do
+  r <- reportsTo
+  m <- *manages
+  where r.report == m.manager
+  yield {manager r.manager report m.report}))
 ```
-
----
 
 ## No User-Facing Traits
 

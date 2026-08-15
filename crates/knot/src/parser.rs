@@ -2410,8 +2410,7 @@ impl Parser {
                 });
                 continue;
             }
-            // `*name : Type` — an embedded source-relation declaration; or
-            // `*name = expr` / `*name : Type = expr` — an embedded view. The
+            // `*name : Type` — an embedded source-relation declaration. The
             // field is literally named `*name`; its value is a marker (the
             // relation is registered statically and resolved by path). Parses
             // the type with `record_value_sig_type` set so a following field
@@ -2496,31 +2495,6 @@ impl Parser {
                         self.error("expected type after ':' in record source declaration");
                         return None;
                     };
-                    // Annotated view: `*name : Type = body`.
-                    if self.eat(&TokenKind::Eq) {
-                        self.skip_newlines();
-                        let Some(body) = self.parse_expr() else {
-                            self.error("expected view body after '=' in record view declaration");
-                            return None;
-                        };
-                        fields.push(RecordField {
-                            name: sname.clone(),
-                            value: Spanned::new(
-                                ExprKind::ViewDecl {
-                                    name: bare_name,
-                                    ty: Some(crate::ast::TypeScheme {
-                                        constraints: vec![],
-                                        ty: sty,
-                                    }),
-                                    body: Box::new(body),
-                                },
-                                sspan,
-                            ),
-                            sig: None,
-                            doc: pending_doc.take(),
-                        });
-                        continue;
-                    }
                     // Source: optional migration clauses hanging off the field:
                     // `*todos : [Todo] migrate from A to B using f …`. Mirrors
                     // top-level `migrate` decls (cumulative).
@@ -2544,30 +2518,14 @@ impl Parser {
                     continue;
                 }
 
-                // Unannotated view: `*name = body`.
-                if self.eat(&TokenKind::Eq) {
-                    self.skip_newlines();
-                    let Some(body) = self.parse_expr() else {
-                        self.error("expected view body after '=' in record view declaration");
-                        return None;
-                    };
-                    fields.push(RecordField {
-                        name: sname.clone(),
-                        value: Spanned::new(
-                            ExprKind::ViewDecl {
-                                name: bare_name,
-                                ty: None,
-                                body: Box::new(body),
-                            },
-                            sspan,
-                        ),
-                        sig: None,
-                        doc: pending_doc.take(),
-                    });
-                    continue;
+                // `*name = ...` was a view; views were removed. A source is
+                // declared `*name : Type` (with a type, no body).
+                if self.at(&TokenKind::Eq) {
+                    self.error("views were removed: declare a source as `*name : Type`; a computed query is a plain field");
+                    return None;
                 }
 
-                self.error("expected ':' or '=' after record source/view field name");
+                self.error("expected ':' after record source field name");
                 return None;
             }
             // Signature line: `name : Type`. The value for `name` is supplied by

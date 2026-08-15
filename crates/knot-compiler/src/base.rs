@@ -362,7 +362,6 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
         Lit(_) | Var(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         RouteDecl { .. } | RouteCompositeDecl { .. } => {}
-        ViewDecl { body, .. } => shift_expr_spans(body, offset),
     }
 }
 

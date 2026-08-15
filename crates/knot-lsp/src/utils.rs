@@ -555,7 +555,6 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
         | ast::ExprKind::SubsetConstraint { .. }
         | ast::ExprKind::RouteDecl { .. }
         | ast::ExprKind::RouteCompositeDecl { .. } => {}
-        ast::ExprKind::ViewDecl { body, .. } => f(body),
     }
 }
 

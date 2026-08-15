@@ -64,29 +64,14 @@ pub(crate) fn handle_linked_editing_range(
                 &mut linked_spans,
             );
         }
-        match &decl.value.node {
-            knot::ast::ExprKind::ViewDecl { ty, body, .. } => {
-                if let Some(scheme) = ty {
-                    collect_type_field_name_spans(
-                        &scheme.ty,
-                        word,
-                        &doc.source,
-                        &mut linked_spans,
-                    );
-                }
-                collect_field_name_spans(body, word, &doc.source, &mut linked_spans, &mut pun_seen);
-            }
-            _ => {
-                // A named function field: walk its body.
-                collect_field_name_spans(
-                    &decl.value,
-                    word,
-                    &doc.source,
-                    &mut linked_spans,
-                    &mut pun_seen,
-                );
-            }
-        }
+            // A named function field: walk its body.
+            collect_field_name_spans(
+                &decl.value,
+                word,
+                &doc.source,
+                &mut linked_spans,
+                &mut pun_seen,
+            );
         if pun_seen {
             return None;
         }

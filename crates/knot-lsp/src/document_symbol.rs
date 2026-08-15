@@ -163,19 +163,6 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     children: None,
                 });
             }
-            ExprKind::ViewDecl { name, ty, .. } => {
-                let declared = ty.as_ref().map(format_type_scheme);
-                symbols.push(DocumentSymbol {
-                    name: format!("*{name}"),
-                    detail: detail_for(doc, name, declared).or_else(|| Some("view".into())),
-                    kind: SymbolKind::VARIABLE,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: None,
-                });
-            }
             ExprKind::SubsetConstraint { .. } => {}
             ExprKind::RouteDecl { name, entries } => {
                 // Advance the search cursor past each matched constructor so an

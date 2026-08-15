@@ -227,6 +227,11 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // relation being written — hence the span set.
     relational_do_spans: HashSet<ast::Span>,
 
+    // Source tables read fully into memory (not pushed down to SQL): the
+    // `run *source` fast path and the in-memory `knot_source_read` fallback.
+    // Surfaced as a build-time INFO diagnostic naming each such table.
+    in_memory_source_reads: HashMap<String, ast::Span>,
+
     // Resolved monad types for desugared do-blocks (from type inference)
     monad_info: MonadInfo,
 
@@ -1162,6 +1167,30 @@ fn compile_inner<M: cranelift_module::Module>(
     if !cg.diagnostics.is_empty() {
         return Err(cg.diagnostics);
     }
+    // INFO: `run` (or any materialization) that reads a source table fully into
+    // memory instead of pushing the query down to SQL. One diagnostic listing
+    // every such table; advice only — it never fails the build.
+    if !cg.in_memory_source_reads.is_empty() {
+        let mut entries: Vec<(&String, &ast::Span)> = cg.in_memory_source_reads.iter().collect();
+        entries.sort_by_key(|(n, _)| (*n).clone());
+        let names = entries
+            .iter()
+            .map(|(n, _)| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut diag = knot::diagnostic::Diagnostic::info(format!(
+            "full in-memory table read{}: {}",
+            if entries.len() == 1 { "" } else { "s" },
+            names
+        ));
+        for (name, span) in &entries {
+            diag = diag.label(**span, format!("`{name}` is loaded fully into memory here"));
+        }
+        diag = diag
+            .note("the query is materialized by `base.run` without SQL pushdown, so the whole table is loaded into memory")
+            .note("to resolve: express the filter/projection in the query so the planner pushes it down to SQL; narrow with `where`/`take`; or use `base.count`/`base.sum` when you only need an aggregate");
+        eprintln!("{}", diag.render(&cg.source_text, &cg.source_name));
+    }
     Ok(cg)
 }
 
@@ -1499,6 +1528,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             type_aliases: HashMap::new(),
             user_fn_trampolines: HashMap::new(),
             relational_do_spans: HashSet::new(),
+            in_memory_source_reads: HashMap::new(),
             monad_info: HashMap::new(),
             nullable_ctors: HashMap::new(),
             io_functions: HashSet::new(),
@@ -4849,7 +4879,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::SourceRef { name, .. } => {
                 // A bare `*rel` read that reaches here was not consumed by any
                 // SQL-pushdown matcher — it loads the whole relation into
-                // memory via `knot_source_read`.
+                // memory via `knot_source_read`. Track it for the build-time
+                // INFO diagnostic naming full in-memory reads.
+                self.in_memory_source_reads
+                    .insert(name.clone(), expr.span);
                 // Check if this is a view reference
                 let view_info = self.views.get(name).cloned();
                 if let Some(view) = view_info {
@@ -7466,6 +7499,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
             && !self.views.contains_key(&source_name)
             && let Some(schema) = self.source_schemas.get(&source_name).cloned()
         {
+            self.in_memory_source_reads
+                .insert(source_name.clone(), args[0].span);
             self.emit_stm_track_read(builder, &source_name);
             let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
             let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);

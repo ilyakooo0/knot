@@ -1751,19 +1751,6 @@ impl Infer {
         }
     }
 
-    /// Get the unit from a type, if it has one. Returns None for dimensionless
-    /// or non-numeric types.
-    #[allow(dead_code)]
-    fn type_unit(&self, ty: &Ty) -> Option<UnitTy> {
-        ty.unit_of().map(|u| self.apply_unit(u))
-    }
-
-    /// Check if a type is numeric (Int, Float, or unit-bearing Int/Float).
-    #[allow(dead_code)]
-    fn is_numeric(&self, ty: &Ty) -> bool {
-        ty.is_int_like() || ty.is_float_like()
-    }
-
     fn error(&mut self, msg: String, span: Span) {
         // Dedup identical diagnostics: the alias fixpoint and multi-pass
         // collection can re-derive the same error at the same span several

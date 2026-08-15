@@ -128,12 +128,6 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     /// Scoped: pushed/popped around each `with` body.
     fixpoint_rel_fields: Vec<HashMap<String, String>>,
 
-    /// True while compiling a recursive query field's fixpoint body fn. Inside
-    /// a fixpoint body, source reads evaluate in-memory (the query is iterated
-    /// by `knot_relation_fixpoint`, not pushed down to a single SQL
-    /// statement), so the `full` user-gate on a bare `*src` read must not fire.
-    inside_fixpoint_body: bool,
-
     /// Recursive query fields awaiting definition: (global fn key, body,
     /// field_name). The `With` arm only REGISTERS the wrapper in `global_fns`
     /// and queues the definition here — building the body/wrapper fns
@@ -503,11 +497,6 @@ struct PendingLambda {
     /// the lambda body is compiled so `x <- name` binds keep per-row
     /// iteration across the deferred-compilation boundary.
     captured_rel_vars: HashSet<String>,
-    /// Whether the lambda was created inside a recursive query field's
-    /// fixpoint body — restored at compile time so source reads in the body
-    /// stay in-memory (the `full` user-gate doesn't fire across the deferred
-    /// boundary).
-    inside_fixpoint: bool,
 }
 
 /// A deferred IO do-block body compiled as a thunk function.
@@ -1506,7 +1495,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             io_relation_vars: HashSet::new(),
             decl_relation_vars: HashSet::new(),
             fixpoint_rel_fields: Vec::new(),
-            inside_fixpoint_body: false,
             pending_query_fixpoints: Vec::new(),
             closure_relation_vars: HashSet::new(),
             constructors: HashMap::new(),
@@ -1906,7 +1894,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_relation_index_lookup", &[p, p], &[p]);
         self.declare_rt("knot_relation_index_free", &[p], &[]);
 
-        // Fixpoint iteration for recursive derived relations
+        // Fixpoint iteration for recursive query fields
         self.declare_rt("knot_relation_fixpoint", &[p, p, p], &[p]);
 
         // IO monad
@@ -3818,11 +3806,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // comprehension-lambda boundary via `closure_relation_vars`).
             cg.io_relation_vars.insert(field_name_owned.clone());
             cg.closure_relation_vars.insert(field_name_owned.clone());
-            // A recursive query reads its sources in-memory (no pushdown) —
-            // mark them so the `full` user-gate doesn't fire inside the body.
-            cg.inside_fixpoint_body = true;
             let result = cg.compile_expr(builder, &body_owned, &mut env, db);
-            cg.inside_fixpoint_body = false;
             cg.io_relation_vars.remove(&field_name_owned);
             cg.closure_relation_vars.remove(&field_name_owned);
             builder.ins().return_(&[result]);
@@ -3863,17 +3847,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let body = lambda.body.clone();
         let free_vars = lambda.free_vars.clone();
         let captured_rel_vars = lambda.captured_rel_vars.clone();
-        let inside_fixpoint = lambda.inside_fixpoint;
 
         // Mirror define_io_thunk_function: relation-valued captured locals
         // must be visible to `expr_is_relation_var` while the lambda body is
         // compiled, even though the registering scope is gone.
         let prev_closure_relation_vars = self.closure_relation_vars.clone();
         self.closure_relation_vars.extend(captured_rel_vars);
-        // Restore the fixpoint-body flag across the deferred boundary so source
-        // reads in the body stay in-memory (no `full` user-gate).
-        let prev_inside_fixpoint = self.inside_fixpoint_body;
-        self.inside_fixpoint_body = inside_fixpoint;
 
         self.build_function(func_id, sig, |cg, builder, entry| {
             let mut env = Env::new();
@@ -3925,7 +3904,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         });
 
         self.closure_relation_vars = prev_closure_relation_vars;
-        self.inside_fixpoint_body = prev_inside_fixpoint;
     }
 
     /// Compile a pending IO do-block thunk function.
@@ -4025,7 +4003,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 body,
                 free_vars: vec![],
                 captured_rel_vars: HashSet::new(),
-                inside_fixpoint: self.inside_fixpoint_body,
             });
         } else {
             // For multi-param functions: generate curry chain via build_function
@@ -7490,9 +7467,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
         }
 
         // Special case: `run *source` — the explicit query→data boundary. Reads
-        // the whole source into memory (a deliberate full read, so the `full`
-        // marker is implied) and wraps the materialized relation as `IO (Vec a)`
-        // via `knot_relation_run_io`.
+        // the whole source into memory (a full in-memory read, reported by the
+        // build-time Advice) and wraps the materialized relation as
+        // `IO (Vec a)` via `knot_relation_run_io`.
         if Self::query_form_name(func_expr) == Some("run")
             && args.len() == 1 && !user_shadows_special
             && let Some(source_name) = self.resolve_source(args[0])
@@ -12981,7 +12958,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             body: body.clone(),
             free_vars: free_vars.clone(),
             captured_rel_vars,
-            inside_fixpoint: self.inside_fixpoint_body,
         });
 
         // Build the closure: capture free variables into a record
@@ -20420,26 +20396,6 @@ fn collect_record_migrations(body: &ast::Expr, out: &mut Vec<(String, ast::Expr)
     }
 }
 
-pub fn type_name_to_tag(name: &str) -> Option<i64> {
-    match name {
-        "Int" => Some(0),
-        "Float" => Some(1),
-        "Text" => Some(2),
-        "Bool" => Some(3),
-        "Unit" => Some(4),
-        "Relation" => Some(6),
-        "Bytes" => Some(10),
-        "IO" => Some(11),
-        // `Uuid` has no distinct runtime tag — it is stored as `Value::Text`
-        // (tag 2). Mapping it lets an `impl T Uuid` participate in dispatch
-        // instead of being silently dropped (which would panic at runtime via
-        // `knot_trait_no_impl`). A program with both `impl T Text` and
-        // `impl T Uuid` is inherently ambiguous at the tag level, but the type
-        // checker keeps the two from being reached by the wrong value.
-        "Uuid" => Some(2),
-        _ => None,
-    }
-}
 
 /// Convert route path segments to a pattern string like "/todos/{owner:text}".
 fn path_segments_to_pattern(

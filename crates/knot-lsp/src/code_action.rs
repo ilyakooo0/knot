@@ -96,42 +96,39 @@ pub(crate) fn handle_code_action(
                 }
             }
 
-        // Action: Add type annotation to unannotated views/derived. Same
+        // Action: Add type annotation to unannotated views. Same
         // effect-merging treatment as the Fun case above.
-        match &decl.value.node {
-            ast::ExprKind::ViewDecl { name, ty: None, .. } => {
-                if let Some(inferred) = doc.type_info.get(name) {
-                    let signature = inferred.clone();
-                    let decl_text = safe_slice(&doc.source, decl.value.span);
-                    if let Some(eq_pos) = decl_text.find('=') {
-                        let insert_offset = decl.value.span.start + eq_pos;
-                        let insert_pos = offset_to_position(&doc.source, insert_offset);
+        if let ast::ExprKind::ViewDecl { name, ty: None, .. } = &decl.value.node
+            && let Some(inferred) = doc.type_info.get(name)
+        {
+            let signature = inferred.clone();
+            let decl_text = safe_slice(&doc.source, decl.value.span);
+            if let Some(eq_pos) = decl_text.find('=') {
+                let insert_offset = decl.value.span.start + eq_pos;
+                let insert_pos = offset_to_position(&doc.source, insert_offset);
 
-                        let mut changes = HashMap::new();
-                        changes.insert(
-                            uri.clone(),
-                            vec![TextEdit {
-                                range: Range {
-                                    start: insert_pos,
-                                    end: insert_pos,
-                                },
-                                new_text: format!(": {signature} "),
-                            }],
-                        );
+                let mut changes = HashMap::new();
+                changes.insert(
+                    uri.clone(),
+                    vec![TextEdit {
+                        range: Range {
+                            start: insert_pos,
+                            end: insert_pos,
+                        },
+                        new_text: format!(": {signature} "),
+                    }],
+                );
 
-                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                            title: format!("Add type annotation: {signature}"),
-                            kind: Some(CodeActionKind::QUICKFIX),
-                            edit: Some(WorkspaceEdit {
-                                changes: Some(changes),
-                                ..Default::default()
-                            }),
-                            ..Default::default()
-                        }));
-                    }
-                }
+                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                    title: format!("Add type annotation: {signature}"),
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(changes),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }));
             }
-            _ => {}
         }
     }
 

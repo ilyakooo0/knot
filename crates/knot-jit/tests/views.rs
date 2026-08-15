@@ -51,7 +51,7 @@ doubled (do
 #[test]
 fn view_read_filters_constant_column() {
     // A filtered view `*openTodos = do t <- *todos; where …; yield …` read via
-    // `full *openTodos` resolves to the source `_knot_todos` with the
+    // `*openTodos` resolves to the source `_knot_todos` with the
     // constant-column filter — only the Open todo is returned.
     assert_stdout(
         "view_read",
@@ -65,7 +65,7 @@ data Status = Open {} | Closed {}
 }
 (do
   full *todos = [{title "a" status (Status.Open {})} {title "b" status (Status.Closed {})}]
-  rows <- full *openTodos
+  rows <- *openTodos
   base.println (base.show (base.count rows))
   yield {})"#,
         "\"1\"\n{}",
@@ -88,7 +88,7 @@ data Status = Open {} | Closed {}
 }
 (do
   full *openTodos = [{title "task"}]
-  all <- full *todos
+  all <- *todos
   base.println (base.show (base.count all))
   base.println (base.show all)
   yield {})"#,

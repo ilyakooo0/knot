@@ -1355,9 +1355,8 @@ impl Parser {
             TokenKind::Full => {
                 // `full *rel = expr` is a replace-set expression. So is
                 // `full db.*rel = expr` (a source-field on a record-var:
-                // `Lower` `.` `StarIdent`). A bare `full *rel` (no `=`) is a
-                // full-read marker: the user acknowledges the read loads the
-                // whole relation into memory. Otherwise `full` is a regular
+                // `Lower` `.` `StarIdent`). `full` only marks a WRITE; a bare
+                // `*rel` read needs no marker. Otherwise `full` is a regular
                 // identifier.
                 let mut offset = 1;
                 while self.peek_ahead(offset) == &TokenKind::Newline {
@@ -1374,8 +1373,9 @@ impl Parser {
                     self.skip_newlines();
                     self.parse_set_with_start(true, replace_start)
                 } else if next == &TokenKind::Star || matches!(next, TokenKind::StarIdent(_)) {
-                    // Bare `*rel` target: read vs write decided by a following `=`.
-                    // Find the token just past the source reference.
+                    // `full` before a source is only valid as a write
+                    // (`full *rel = expr`). A bare `full *rel` read-marker was
+                    // removed — reads are written `*rel`.
                     let past = if matches!(next, TokenKind::StarIdent(_)) {
                         offset + 1 // `*rel` is one token
                     } else {
@@ -1389,30 +1389,8 @@ impl Parser {
                         self.skip_newlines();
                         self.parse_set_with_start(true, replace_start)
                     } else {
-                        // Read: `full *rel` — mark the SourceRef as full.
-                        let start = self.span();
-                        self.advance(); // consume `full`
-                        self.skip_newlines();
-                        let tok = self.advance();
-                        let name = match tok.kind {
-                            TokenKind::StarIdent(n) => n.trim_start_matches('*').to_string(),
-                            TokenKind::Star => {
-                                let id = self.advance();
-                                match id.kind {
-                                    TokenKind::Lower(n) => n,
-                                    _ => {
-                                        self.error("expected identifier after '*' for source reference");
-                                        return None;
-                                    }
-                                }
-                            }
-                            _ => unreachable!(),
-                        };
-                        let end = self.prev_span();
-                        Some(Spanned::new(
-                            ExprKind::SourceRef { name, full: true },
-                            Span::new(start.start, end.end),
-                        ))
+                        self.error("`full` only marks a write (`full *rel = ...`); a read is just `*rel`");
+                        None
                     }
                 } else {
                     // `full` used as a regular identifier — fall through to
@@ -2093,7 +2071,7 @@ impl Parser {
                 let tok = self.advance();
                 let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
                 Some(Spanned::new(
-                    ExprKind::SourceRef { name: n.trim_start_matches('*').to_string(), full: false },
+                    ExprKind::SourceRef { name: n.trim_start_matches('*').to_string() },
                     Span::new(start.start, tok.span.end),
                 ))
             }
@@ -2105,7 +2083,7 @@ impl Parser {
                         let tok = self.advance();
                         let TokenKind::Lower(name) = tok.kind else { unreachable!() };
                         Some(Spanned::new(
-                            ExprKind::SourceRef { name, full: false },
+                            ExprKind::SourceRef { name },
                             Span::new(start.start, tok.span.end),
                         ))
                     }

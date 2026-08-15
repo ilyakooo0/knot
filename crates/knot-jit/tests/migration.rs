@@ -89,7 +89,7 @@ type PersonV2 = {name: Text, active: Active}
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 }
 (do
-  people <- full *people
+  people <- *people
   base.println (base.show people)
   yield {})"#,
     );

@@ -8989,17 +8989,17 @@ impl Infer {
                     let is_ctor_pat =
                         matches!(&pat.node, ast::PatKind::Constructor { .. });
 
-                    // `rows <- full *rel`: a `full`-marked source read loads the
-                    // WHOLE relation into memory and binds it as a relation
-                    // value `[T]` — it does NOT iterate per-row. (`full` is a
-                    // viewer-facing tag for the intentional whole-table load.)
-                    let is_full_read_bind = matches!(
-                        &expr.node,
-                        ast::ExprKind::SourceRef { full: true, .. }
-                    );
+                    // `rows <- *rel` in an IO do-block loads the WHOLE relation
+                    // into memory and binds it as a relation value `[T]` — it
+                    // does NOT iterate per-row. (In a pure comprehension the
+                    // same `i <- *rel` bind iterates per-row; the difference is
+                    // the block's monad: `in_io_do` is set by the prescan when
+                    // the block performs IO.)
+                    let is_full_read_bind = self.in_io_do
+                        && matches!(&expr.node, ast::ExprKind::SourceRef { .. });
                     if is_full_read_bind {
                         self.check_pattern(pat, &resolved);
-                        // Track `rows <- full *foo` for `set` detection too.
+                        // Track `rows <- *foo` for `set` detection too.
                         if let ast::PatKind::Var(var_name) = &pat.node
                             && let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node {
                             self.source_var_binds

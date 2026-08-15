@@ -336,7 +336,7 @@ type Todo = {title: Text, done: Int 1}
 
   -- update: bind the rows to a local, then map, marking one done
   -- (base.unify t {done 1} merges the row with the new field value)
-  todos <- full *todos
+  todos <- *todos
   *todos = (do
     t <- todos
     yield (case t.title == "write guide" of

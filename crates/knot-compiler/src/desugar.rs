@@ -220,7 +220,7 @@ fn rewrite_source_refs_in_expr(
             && names.iter().any(|(n, k)| n == bare && *k == kind)
         {
             expr.node = match kind {
-                RecordRelKind::Source => ExprKind::SourceRef { name: bare.to_string(), full: false },
+                RecordRelKind::Source => ExprKind::SourceRef { name: bare.to_string() },
             };
             return;
         }

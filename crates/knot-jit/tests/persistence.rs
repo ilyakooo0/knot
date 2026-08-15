@@ -38,7 +38,7 @@ type C = {n: Int 1}
 }
 (do
   full *cs = [{n 1} {n 2} {n 3}]
-  rows <- full *cs
+  rows <- *cs
   base.println (base.show (base.count rows))
   base.println (base.show (base.sum (base.map (\c -> c.n) rows)))
   yield {})"#,
@@ -138,7 +138,7 @@ type Account = {name: Text, balance: Int 1}
 (do
   full *accounts = [{name "from" balance 100} {name "to" balance 0}]
   _ <- atomic do
-    rows <- full *accounts
+    rows <- *accounts
     *accounts = base.map (\a ->
       case a.name == "from" of
         Bool.True {} -> (base.unify a {balance (a.balance - 40)})
@@ -146,7 +146,7 @@ type Account = {name: Text, balance: Int 1}
           Bool.True {} -> (base.unify a {balance (a.balance + 40)})
           Bool.False {} -> a)) rows
     yield {}
-  base.println (base.show (full *accounts))
+  base.println (base.show *accounts)
   yield {})"#,
         "\"[{balance: 60, name: from}, {balance: 40, name: to}]\"\n{}",
     );

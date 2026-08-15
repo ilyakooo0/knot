@@ -584,9 +584,7 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         ExprKind::Var(n) if n == "yield" && parent == Prec::Atom => format!("({})", n),
         ExprKind::Var(n) => n.clone(),
         ExprKind::Constructor(n) => n.clone(),
-        ExprKind::SourceRef { name: n, full } => {
-            if *full { format!("full *{}", n) } else { format!("*{}", n) }
-        }
+        ExprKind::SourceRef { name: n } => format!("*{}", n),
         ExprKind::ImplicitRef(n) => format!("^{}", n),
         ExprKind::CollectFold(n) => format!("<>{}", n),
         ExprKind::TypeHole => "_".to_string(),

@@ -227,16 +227,6 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // relation being written — hence the span set.
     relational_do_spans: HashSet<ast::Span>,
 
-    // Spans of `SourceRef` reads written `full *rel`. A `full` marker is only
-    // *needed* when the read loads the whole relation into memory; if codegen
-    // pushes the read down to SQL instead, the marker is unnecessary and is
-    // reported as an error. Populated during expression compilation.
-    full_read_spans: HashSet<ast::Span>,
-    // Spans of `SourceRef` reads that actually reached the in-memory full-load
-    // fallback (`knot_source_read`). The difference `full_read_spans -
-    // full_read_in_memory` is the set of unnecessary `full` markers.
-    full_read_in_memory: HashSet<ast::Span>,
-
     // Resolved monad types for desugared do-blocks (from type inference)
     monad_info: MonadInfo,
 
@@ -927,14 +917,6 @@ fn compile_inner<M: cranelift_module::Module>(
     cg.trace_types = trace_types.clone();
     cg.trace_bindings = trace_bindings.clone();
     cg.source_text = source.to_string();
-    // Collect every `SourceRef` read the user marked `full`, so that any which
-    // codegen pushes down to SQL (and therefore never reaches the in-memory
-    // full-load fallback) can be reported as unnecessary at the end.
-    crate::infer::walk_exprs_read(program, &mut |e| {
-        if let ast::ExprKind::SourceRef { full: true, .. } = &e.node {
-            cg.full_read_spans.insert(e.span);
-        }
-    });
     cg.source_name = source_file.to_string();
     // Seed the relation-typed top-level constant set from inference's type
     // strings (`[T]` / `[T; units]` display forms). Used by
@@ -1176,25 +1158,6 @@ fn compile_inner<M: cranelift_module::Module>(
         for tramp in &trampolines {
             cg.define_trampoline(tramp);
         }
-    }
-    if !cg.diagnostics.is_empty() {
-        return Err(cg.diagnostics);
-    }
-
-    // Any `full`-marked read that never reached the in-memory full-load
-    // fallback was pushed down to SQL — its `full` marker is unnecessary.
-    let unnecessary: Vec<ast::Span> = cg
-        .full_read_spans
-        .difference(&cg.full_read_in_memory)
-        .copied()
-        .collect();
-    for span in unnecessary {
-        cg.diagnostics.push(
-            knot::diagnostic::Diagnostic::error(
-                "unnecessary `full`: this read is pushed down to SQL, so it does not load the whole relation into memory",
-            )
-            .label(span, "here"),
-        );
     }
     if !cg.diagnostics.is_empty() {
         return Err(cg.diagnostics);
@@ -1536,8 +1499,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             type_aliases: HashMap::new(),
             user_fn_trampolines: HashMap::new(),
             relational_do_spans: HashSet::new(),
-            full_read_spans: HashSet::new(),
-            full_read_in_memory: HashSet::new(),
             monad_info: HashMap::new(),
             nullable_ctors: HashMap::new(),
             io_functions: HashSet::new(),
@@ -4885,25 +4846,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.emit_ctor_as_function_value(builder, &name)
             }
 
-            ast::ExprKind::SourceRef { name, full } => {
+            ast::ExprKind::SourceRef { name, .. } => {
                 // A bare `*rel` read that reaches here was not consumed by any
                 // SQL-pushdown matcher — it loads the whole relation into
-                // memory via `knot_source_read`. Require the user to opt in
-                // with `full *rel` — EXCEPT inside a fixpoint body, where the
-                // read is necessarily in-memory (the recursive query is
-                // iterated by `knot_relation_fixpoint`, not pushed down).
-                if !full && !self.inside_fixpoint_body {
-                    return self.push_codegen_error(
-                        builder,
-                        expr.span,
-                        format!(
-                            "reading `*{name}` loads the whole relation into memory (no SQL pushdown); write `full *{name}` to allow this",
-                        ),
-                    );
-                }
-                // The read IS in-memory: this `full` marker is necessary, so it
-                // is not reported as unnecessary at the end of codegen.
-                self.full_read_in_memory.insert(expr.span);
+                // memory via `knot_source_read`.
                 // Check if this is a view reference
                 let view_info = self.views.get(name).cloned();
                 if let Some(view) = view_info {

@@ -73,11 +73,8 @@ pub enum ExprKind {
     /// `Circle`, `Open` — PascalCase constructor reference.
     Constructor(Name),
 
-    /// `*people` — reference to a source relation. `full` is set when the
-    /// user wrote `full *people`, acknowledging that the read loads the whole
-    /// relation into memory (no SQL pushdown). A read that *is* pushed down
-    /// ignores the flag.
-    SourceRef { name: Name, full: bool },
+    /// `*people` — reference to a source relation.
+    SourceRef { name: Name },
 
     /// `^name` — implicit field projection: DFS the fields of in-scope record
     /// bindings (innermost scope first, shallowest, earliest field) for a

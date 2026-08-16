@@ -514,7 +514,7 @@ struct PendingTrampoline {
 
 #[derive(Clone)]
 struct Env {
-    bindings: HashMap<String, Value>,
+    bindings: HashMap<crate::infer::Binding, Value>,
 }
 
 impl Env {
@@ -524,16 +524,16 @@ impl Env {
         }
     }
 
-    /// Look up a binding. Returns `None` for an unbound name — callers turn that
-    /// into a codegen diagnostic (via `Codegen::push_codegen_error`) rather than
-    /// panicking, since a well-typed program never reaches an unbound variable
-    /// but malformed input still could.
-    fn get(&self, name: &str) -> Option<Value> {
-        self.bindings.get(name).copied()
+    /// Look up a binding by its key. Returns `None` for an unbound name —
+    /// callers turn that into a codegen diagnostic (via
+    /// `Codegen::push_codegen_error`) rather than panicking, since a well-typed
+    /// program never reaches an unbound variable but malformed input still could.
+    fn get(&self, key: &crate::infer::Binding) -> Option<Value> {
+        self.bindings.get(key).copied()
     }
 
-    fn set(&mut self, name: &str, val: Value) {
-        self.bindings.insert(name.to_string(), val);
+    fn set(&mut self, key: crate::infer::Binding, val: Value) {
+        self.bindings.insert(key, val);
     }
 }
 
@@ -3757,7 +3757,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // Bind the field's own name to the accumulator so the body's
             // `Var(field)` self-reference reads it (the `Var` arm's env lookup
             // wins over the fixpoint route inside this fn).
-            env.set(&field_name_owned, self_val);
+            env.set(crate::infer::Binding::User(field_name_owned.clone()), self_val);
             // The accumulator IS a relation: mark it so a `r <- field` bind in
             // the body iterates it per-row (including across the deferred
             // comprehension-lambda boundary via `closure_relation_vars`).
@@ -3827,18 +3827,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let idx = builder.ins().iconst(cg.ptr_type, i as i64);
                     let field_val =
                         cg.call_rt(builder, "knot_record_field_by_index", &[closure_env, idx]);
-                    env.set(var_name, field_val);
+                    env.set(crate::infer::Binding::User(var_name.to_string()), field_val);
                 }
             }
 
             // Bind parameter — use the original pattern for destructuring
             if let Some(ref pat) = param_pat {
                 match &pat.node {
-                    ast::PatKind::Var(name) => env.set(name, arg),
+                    ast::PatKind::Var(name) => env.set(crate::infer::Binding::User(name.clone()), arg),
                     _ => cg.bind_io_pattern(builder, pat, arg, &mut env, None),
                 }
             } else if params.len() == 1 {
-                env.set(&params[0], arg);
+                env.set(crate::infer::Binding::User(params[0].clone()), arg);
             }
 
             // If the body is an IO do-block, compile it eagerly inline
@@ -3903,7 +3903,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let idx = builder.ins().iconst(cg.ptr_type, i as i64);
                     let field_val =
                         cg.call_rt(builder, "knot_record_field_by_index", &[closure_env, idx]);
-                    env.set(var_name, field_val);
+                    env.set(crate::infer::Binding::User(var_name.to_string()), field_val);
                 }
             }
 
@@ -4677,7 +4677,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // lookup below wins there. Innermost frame wins.
                 for frame in self.fixpoint_rel_fields.iter().rev() {
                     if let Some(fn_key) = frame.get(name.as_str())
-                        && !env.bindings.contains_key(name.as_str())
+                        && !env.bindings.contains_key(&crate::infer::Binding::User(name.clone()))
                         && let Some((func_id, 0)) = self.global_fns.get(fn_key).copied()
                     {
                         let func_ref =
@@ -4692,7 +4692,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // builtin special-cases below must do the same or they would
                 // hijack the binding (and, for `retry`, emit STM control flow
                 // instead of reading the variable).
-                if let Some(&val) = env.bindings.get(name.as_str()) {
+                if let Some(&val) = env.bindings.get(&crate::infer::Binding::User(name.clone())) {
                     // Inference may have resolved this Var to a field of the
                     // innermost enclosing `with` and recorded the `with` site's
                     // unique alias in `implicit_refs` (see infer's `Var` arm).
@@ -4702,7 +4702,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // slot holds the LEXICALLY correct one. Look the alias up
                     // first; fall back to the bare slot if it is absent.
                     if let Some((alias, _)) = self.implicit_refs.get(&expr.span)
-                        && let Some(&aval) = env.bindings.get(alias.as_str())
+                        && let Some(&aval) = env.bindings.get(alias)
                     {
                         return aval;
                     }
@@ -4988,15 +4988,28 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         expr.span
                     );
                 };
-                let mut val = self.compile_expr(
-                    builder,
-                    &ast::Expr {
-                        node: ast::ExprKind::Var(root),
-                        span: expr.span,
-                    },
-                    env,
-                    db,
-                );
+                // `root` is a `Binding`. An internal alias is a plain env
+                // binding — look it up directly. A user name may be a local
+                // binding OR the global `base` record / a global fn, which only
+                // the full `Var` codegen resolves — round-trip through `Var`.
+                let mut val = match &root {
+                    crate::infer::Binding::Internal(_) => env.get(&root).unwrap_or_else(|| {
+                        panic!(
+                            "codegen: `^{name}` root {root:?} at {:?} is unbound \
+                             (inference should have rejected it)",
+                            expr.span
+                        )
+                    }),
+                    crate::infer::Binding::User(name) => self.compile_expr(
+                        builder,
+                        &ast::Expr {
+                            node: ast::ExprKind::Var(name.clone()),
+                            span: expr.span,
+                        },
+                        env,
+                        db,
+                    ),
+                };
                 for field in &path {
                     let (key_ptr, key_len) = self.string_ptr(builder, field);
                     val = self.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len]);
@@ -5108,13 +5121,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         // aliases `\0with:…@f` never appear in a field value's
                         // free vars — they start with `\0`, unutterable in
                         // source — so only the bare name needs removal.)
-                        if field_env.bindings.contains_key(&f.name)
+                        if field_env.bindings.contains_key(&crate::infer::Binding::User(f.name.clone()))
                             && self
                                 .with_fields
                                 .values()
                                 .any(|fs| fs.iter().any(|n| n == &f.name))
                         {
-                            field_env.bindings.remove(&f.name);
+                            field_env.bindings.remove(&crate::infer::Binding::User(f.name.clone()));
                         }
                         let v = self.compile_expr(
                             builder,
@@ -5217,9 +5230,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // Bind the whole `with` record under a per-site alias so an
                     // implicit dictionary resolved to this `with` frame (an
                     // `\0withrec:<span>` root) projects it.
-                    let rec_alias =
-                        format!("{}{}", crate::infer::WITH_RECORD_ALIAS_PREFIX, expr.span.start);
-                    body_env.set(&rec_alias, record_val);
+                    let rec_alias = crate::infer::Binding::Internal(
+                        crate::infer::InternalName::WithRecord { span_start: expr.span.start },
+                    );
+                    body_env.set(rec_alias.clone(), record_val);
                     for field in fields {
                         // Lazy relation query fields (source-reading queries)
                         // are NOT bound from the record (which holds only the
@@ -5235,22 +5249,21 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             "knot_record_field",
                             &[record_val, key_ptr, key_len],
                         );
-                        body_env.set(&field, field_val);
+                        body_env.set(crate::infer::Binding::User(field.clone()), field_val);
                         // Also bind the per-`with`-site alias inference
                         // resolved `^field` to (see infer's `With` arm and
-                        // `resolve_implicit_ref`). The alias
-                        // (`\0with:<with_span>@<field>`) is unique to this
-                        // `with` site, so `^field`'s emitted `Var(alias)`
-                        // hits THIS block's dictionary in the flat `Env` —
-                        // two `with` blocks projecting the same field name no
-                        // longer collide on the shared bare-name slot.
-                        let alias = format!(
-                            "{}{}@{}",
-                            crate::infer::WITH_FIELD_ALIAS_PREFIX,
-                            expr.span.start,
-                            field
+                        // `resolve_implicit_ref`). The alias is unique to this
+                        // `with` site (span-qualified), so `^field` hits THIS
+                        // block's dictionary in the flat `Env` — two `with`
+                        // blocks projecting the same field name no longer
+                        // collide on the shared bare-name slot.
+                        body_env.set(
+                            crate::infer::Binding::Internal(crate::infer::InternalName::WithField {
+                                span_start: expr.span.start,
+                                field: field.clone(),
+                            }),
+                            field_val,
                         );
-                        body_env.set(&alias, field_val);
                     }
                 }
                 // Track which bound fields hold IO-producing values so
@@ -5351,7 +5364,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     if let ast::ExprKind::App { func: match_fn, arg: match_arg } = &rhs.node
                         && let (ast::ExprKind::Var(fn_name), ast::ExprKind::Constructor(ctor_name)) = (&match_fn.node, &match_arg.node)
                             && fn_name == "match"
-                            && !env.bindings.contains_key(fn_name)
+                            && !env.bindings.contains_key(&crate::infer::Binding::User(fn_name.clone()))
                             && !(self.top_fn_names.contains(fn_name) && self.global_fns.contains_key(fn_name)) {
                                 if let ast::ExprKind::SourceRef { name: source_name, .. } = &lhs.node
                                     && let Some(schema) = self.source_schemas.get(source_name).cloned() {
@@ -6541,21 +6554,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn compile_root_path(
         &mut self,
         builder: &mut FunctionBuilder,
-        root: &str,
+        root: &crate::infer::Binding,
         path: &[String],
         span: ast::Span,
         env: &mut Env,
-        db: Value,
     ) -> Value {
-        let mut val = self.compile_expr(
-            builder,
-            &ast::Expr {
-                node: ast::ExprKind::Var(root.to_string()),
-                span,
-            },
-            env,
-            db,
-        );
+        let mut val = env.get(root).unwrap_or_else(|| {
+            panic!(
+                "codegen: implicit-dictionary root {root:?} at {span:?} is unbound \
+                 (inference should have rejected it)"
+            )
+        });
         for field in path {
             let (key_ptr, key_len) = self.string_ptr(builder, field);
             val = self.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len]);
@@ -6578,7 +6587,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         builder: &mut FunctionBuilder,
         span: ast::Span,
         env: &mut Env,
-        db: Value,
     ) -> Value {
         let (_field, frag_spans) = self.fold_dict_args.get(&span).cloned().unwrap_or_default();
         let cap = builder.ins().iconst(self.ptr_type, frag_spans.len() as i64);
@@ -6586,8 +6594,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // frag_spans is innermost-first; fold outermost-first so the right-
         // biased `unify acc frag` lets the innermost fragment win.
         for frag_span in frag_spans.iter().rev() {
-            let (root, path) = self.implicit_refs.get(frag_span).cloned().unwrap_or_default();
-            let frag = self.compile_root_path(builder, &root, &path, *frag_span, env, db);
+            let Some((root, path)) = self.implicit_refs.get(frag_span).cloned() else {
+                continue;
+            };
+            let frag = self.compile_root_path(builder, &root, &path, *frag_span, env);
             acc = self.call_rt(builder, "knot_record_unify", &[acc, frag]);
         }
         acc
@@ -6642,7 +6652,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             .unwrap_or_default();
         let mut pairs: Vec<(String, cranelift_codegen::ir::Value)> = Vec::new();
         for name in &names {
-            if let Some(v) = env.get(name) {
+            if let Some(v) = env.get(&crate::infer::Binding::User(name.clone())) {
                 pairs.push((name.clone(), v));
             }
         }
@@ -6743,7 +6753,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             .unwrap_or_default();
         let mut pairs: Vec<(String, cranelift_codegen::ir::Value)> = Vec::new();
         for name in &names {
-            if let Some(v) = env.get(name) {
+            if let Some(v) = env.get(&crate::infer::Binding::User(name.clone())) {
                 pairs.push((name.clone(), v));
             }
         }
@@ -6961,7 +6971,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // `\count -> count xs` (shadowing the stdlib `count`) would call the
         // global instead of the local value.
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && env.bindings.contains_key(name) {
+            && env.bindings.contains_key(&crate::infer::Binding::User(name.clone())) {
                 // Implicit dictionary: a `with`-field function with a
                 // `(^field : T) =>` constraint is called through the local
                 // env binding (the `with` frame binds it). Inference recorded
@@ -6971,11 +6981,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // top-level call path below.
                 let mut compiled_args: Vec<Value> = Vec::new();
                 if self.fold_dict_args.contains_key(&expr.span) {
-                    let dict_val = self.compile_fold_dict(builder, expr.span, env, db);
+                    let dict_val = self.compile_fold_dict(builder, expr.span, env);
                     compiled_args.push(dict_val);
                 } else if let Some((root, path)) = self.implicit_dict_args.get(&expr.span).cloned() {
                     let dict_val =
-                        self.compile_root_path(builder, &root, &path, expr.span, env, db);
+                        self.compile_root_path(builder, &root, &path, expr.span, env);
                     compiled_args.push(dict_val);
                 }
                 compiled_args.extend(
@@ -7369,7 +7379,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // reference it (`where t.a == lim`) resolve at runtime — the
                     // old `let lim = 1` bound `lim` as an ordinary local.
                     let val = self.compile_expr(builder, v, env, db);
-                    env.set(n, val);
+                    env.set(crate::infer::Binding::User(n.clone()), val);
                 }
                 let plan_result = if !plan_stmts.is_empty() {
                     self.analyze_sql_plan(plan_stmts, env)
@@ -8280,7 +8290,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         if let ast::ExprKind::Var(name) = &func_expr.node
             && name == "traverse"
                 && args.len() == 2
-                && !env.bindings.contains_key("traverse")
+                && !env.bindings.contains_key(&crate::infer::Binding::User("traverse".to_string()))
                 && !self.top_fn_names.contains("traverse")
                 && let Some(kind) = self.monad_info.get(&expr.span).cloned() {
                     let kind_str = match &kind {
@@ -8375,11 +8385,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // `(^field : T) =>` splices the innermost match.
         let mut compiled_args: Vec<Value> = Vec::new();
         if self.fold_dict_args.contains_key(&expr.span) {
-            let dict_val = self.compile_fold_dict(builder, expr.span, env, db);
+            let dict_val = self.compile_fold_dict(builder, expr.span, env);
             compiled_args.push(dict_val);
         } else if let Some((root, path)) = self.implicit_dict_args.get(&expr.span).cloned() {
             let dict_val =
-                self.compile_root_path(builder, &root, &path, expr.span, env, db);
+                self.compile_root_path(builder, &root, &path, expr.span, env);
             compiled_args.push(dict_val);
         }
         compiled_args.extend(
@@ -9578,7 +9588,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         env: &mut Env,
     ) {
         match &pat.node {
-            ast::PatKind::Var(name) => env.set(name, val),
+            ast::PatKind::Var(name) => env.set(crate::infer::Binding::User(name.clone()), val),
             ast::PatKind::Wildcard => {}
             ast::PatKind::Constructor { name, payload, .. } => {
                 if name == "True" || name == "False" {
@@ -9608,7 +9618,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         self.bind_case_pattern(builder, inner_pat, field_val, env);
                     } else {
                         // Punned: {name} means {name: name}
-                        env.set(&fp.name, field_val);
+                        env.set(crate::infer::Binding::User(fp.name.clone()), field_val);
                     }
                 }
             }
@@ -9676,7 +9686,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         fail_block: cranelift_codegen::ir::Block,
     ) {
         match &pat.node {
-            ast::PatKind::Var(name) => env.set(name, val),
+            ast::PatKind::Var(name) => env.set(crate::infer::Binding::User(name.clone()), val),
             ast::PatKind::Wildcard => {}
             // Top-level literal equality was tested by compile_case.
             ast::PatKind::Lit(_) => {}
@@ -9696,7 +9706,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         );
                     } else {
                         // Punned: {name} means {name: name}
-                        env.set(&fp.name, field_val);
+                        env.set(crate::infer::Binding::User(fp.name.clone()), field_val);
                     }
                 }
             }
@@ -9744,7 +9754,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             builder.seal_block(cont);
         };
         match &pat.node {
-            ast::PatKind::Var(name) => env.set(name, val),
+            ast::PatKind::Var(name) => env.set(crate::infer::Binding::User(name.clone()), val),
             ast::PatKind::Wildcard => {}
             ast::PatKind::Lit(lit) => {
                 let lit_val = self.compile_lit(builder, lit);
@@ -9801,7 +9811,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             builder, inner_pat, field_val, env, fail_block,
                         );
                     } else {
-                        env.set(&fp.name, field_val);
+                        env.set(crate::infer::Binding::User(fp.name.clone()), field_val);
                     }
                 }
             }
@@ -10575,7 +10585,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // unshadowed globals/builtins, resolved inside the thunk body.
         let free_vars: Vec<String> = find_free_vars(&do_expr, &[])
             .into_iter()
-            .filter(|v| env.bindings.contains_key(v))
+            .filter(|v| env.bindings.contains_key(&crate::infer::Binding::User(v.clone())))
             .collect();
         // Relation-valued locals captured into this thunk must stay
         // per-row-iterable inside it. The thunk body is compiled later
@@ -10628,7 +10638,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
             );
             for (i, var_name) in sorted_vars.iter().enumerate() {
-                let val = match env.get(var_name) {
+                let val = match env.get(&crate::infer::Binding::User(var_name.to_string())) {
                     Some(v) => v,
                     None => {
                         let msg =
@@ -11131,7 +11141,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     ) {
         match &pat.node {
             ast::PatKind::Var(name) => {
-                env.bindings.insert(name.clone(), val);
+                env.bindings.insert(crate::infer::Binding::User(name.clone()), val);
             }
             ast::PatKind::Wildcard => {}
             ast::PatKind::Record(fields) => {
@@ -11145,7 +11155,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     if let Some(ref inner_pat) = f.pattern {
                         self.bind_io_pattern(builder, inner_pat, field_val, env, done_block);
                     } else {
-                        env.bindings.insert(f.name.clone(), field_val);
+                        env.bindings.insert(crate::infer::Binding::User(f.name.clone()), field_val);
                     }
                 }
             }
@@ -11643,7 +11653,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         let idx_val = prebuilt_indices[&stmt_idx];
 
                         // Look up matching rows via the pre-built hash index
-                        let outer_val = match env.get(&plan.outer_var) {
+                        let outer_val = match env.get(&crate::infer::Binding::User(plan.outer_var.clone())) {
                             Some(v) => v,
                             None => {
                                 let msg = format!(
@@ -11762,10 +11772,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                             let params_ok = frag.params.iter().all(|p| match p {
                                                 SqlParamSource::Literal(_) | SqlParamSource::Expr(_) => true,
                                                 SqlParamSource::Var(v) => {
-                                                    v != bind_var && env.bindings.contains_key(v)
+                                                    v != bind_var && env.bindings.contains_key(&crate::infer::Binding::User(v.clone()))
                                                 }
                                                 SqlParamSource::FieldAccess(v, _) => {
-                                                    v != bind_var && env.bindings.contains_key(v)
+                                                    v != bind_var && env.bindings.contains_key(&crate::infer::Binding::User(v.clone()))
                                                 }
                                             });
                                             if params_ok {
@@ -12293,7 +12303,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         &[groups, g_i],
                     );
                     if let Some(var_name) = primary_var.as_ref() {
-                        env.set(var_name, group);
+                        env.set(crate::infer::Binding::User(var_name.clone()), group);
                     }
 
                     loop_stack.push(LoopInfo {
@@ -12479,9 +12489,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // capture it only when the enclosing body actually provides it,
                 // never via the "unshadowed local" fallback (it has no global).
                 if v.starts_with("__derived_self_") {
-                    return env.bindings.contains_key(v);
+                    return env.bindings.contains_key(&crate::infer::Binding::User(v.clone()));
                 }
-                env.bindings.contains_key(v)
+                env.bindings.contains_key(&crate::infer::Binding::User(v.clone()))
                     || (!self.global_fns.contains_key(v) && !is_builtin_name(v))
             })
             .collect();
@@ -12537,7 +12547,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
             );
             for (i, var_name) in sorted_vars.iter().enumerate() {
-                let val = match env.get(var_name) {
+                let val = match env.get(&crate::infer::Binding::User(var_name.to_string())) {
                     Some(v) => v,
                     None => {
                         let msg =
@@ -14554,7 +14564,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // Field access on env variable or global — compute at runtime
                     return Some(SqlFragment {
                         sql: "?".to_string(),
-                        params: vec![if env.bindings.contains_key(name) {
+                        params: vec![if env.bindings.contains_key(&crate::infer::Binding::User(name.clone())) {
                             SqlParamSource::FieldAccess(name.clone(), field.clone())
                         } else {
                             SqlParamSource::Expr(expr.clone())
@@ -14577,7 +14587,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         sql: "?".to_string(),
                         params: vec![SqlParamSource::Expr(let_expr.clone())],
                     })
-                } else if env.bindings.contains_key(name) {
+                } else if env.bindings.contains_key(&crate::infer::Binding::User(name.clone())) {
                     Some(SqlFragment {
                         sql: "?".to_string(),
                         params: vec![SqlParamSource::Var(name.clone())],
@@ -15550,7 +15560,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // try_compile_sql_atom uses, instead of panicking in
                 // `Env::get`.
                 SqlParamSource::Var(name) => {
-                    if let Some(&v) = env.bindings.get(name.as_str()) {
+                    if let Some(&v) = env.bindings.get(&crate::infer::Binding::User(name.clone())) {
                         v
                     } else {
                         // Check let_bindings first — a do-local let variable
@@ -15570,7 +15580,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
                 SqlParamSource::FieldAccess(var, field) => {
                     let let_expr = self.let_bindings.get(var).cloned();
-                    let record = if let Some(&v) = env.bindings.get(var.as_str()) {
+                    let record = if let Some(&v) = env.bindings.get(&crate::infer::Binding::User(var.clone())) {
                         v
                     } else if let Some(let_expr) = let_expr {
                         self.compile_expr(builder, &let_expr, env, db)
@@ -15763,7 +15773,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let resolvable = value_sources.iter().all(|p| match p {
             SqlParamSource::Literal(_) | SqlParamSource::Expr(_) => true,
             SqlParamSource::Var(v) | SqlParamSource::FieldAccess(v, _) => {
-                env.bindings.contains_key(v) || self.global_fns.contains_key(v)
+                env.bindings.contains_key(&crate::infer::Binding::User(v.clone())) || self.global_fns.contains_key(v)
             }
         });
         if !resolvable {
@@ -18622,7 +18632,7 @@ fn bind_do_pattern<M: cranelift_module::Module>(
     skips: &mut Vec<cranelift_codegen::ir::Block>,
 ) {
     match &pat.node {
-        ast::PatKind::Var(name) => env.set(name, val),
+        ast::PatKind::Var(name) => env.set(crate::infer::Binding::User(name.clone()), val),
         ast::PatKind::Wildcard => {}
         ast::PatKind::Record(fields) => {
             for fp in fields {
@@ -18632,7 +18642,7 @@ fn bind_do_pattern<M: cranelift_module::Module>(
                 if let Some(inner_pat) = &fp.pattern {
                     bind_do_pattern(builder, cg, inner_pat, field_val, env, skips);
                 } else {
-                    env.set(&fp.name, field_val);
+                    env.set(crate::infer::Binding::User(fp.name.clone()), field_val);
                 }
             }
         }

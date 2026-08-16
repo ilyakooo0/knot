@@ -228,12 +228,15 @@ pub type WithFields = HashMap<Span, Vec<String>>;
 /// span: (root binding name, field path from the root to the field).
 /// Codegen lowers `^name` to the root variable followed by one record-field
 /// projection per path element.
-pub type ImplicitRefs = HashMap<Span, (String, Vec<String>)>;
+/// Maps a `^name` (`ImplicitRef`) span to its resolved dictionary root (a
+/// user field name for the innermost `with` frame, an internal alias for
+/// deeper frames) plus the remaining field path to project.
+pub type ImplicitRefs = HashMap<Span, (Binding, Vec<String>)>;
 
 /// Callsite resolutions for implicit dictionaries: application span → the
 /// `(root_binding, field_path)` of the in-scope record supplying the
 /// dictionary. Codegen splices the projected record as the leading argument.
-pub type ImplicitDictArgs = HashMap<Span, (String, Vec<String>)>;
+pub type ImplicitDictArgs = HashMap<Span, (Binding, Vec<String>)>;
 
 /// Callsite resolutions for FOLD dictionaries: application span → the field
 /// name plus the UNIQUE synthetic span of each collected `field` fragment's
@@ -250,21 +253,58 @@ pub type FoldDictArgs = HashMap<Span, (String, Vec<Span>)>;
 /// the `<>name folder init` spine into a left-nested fold over them.
 pub type CollectRefs = HashMap<Span, Vec<Span>>;
 
-/// Prefix for the unique, per-`with`-site alias a `with` field is also bound
-/// under during inference (and codegen's flat `Env`): `{PREFIX}{with_span_start}@{field}`.
-/// `^field` resolves against the alias so its codegen `Var` hits the lexically
-/// correct slot; the bare field name keeps working for direct references.
-/// `\0` makes the alias unutterable in source, so it can never collide with a
-/// user binding. Shared with codegen (`crate::infer::WITH_FIELD_ALIAS_PREFIX`).
-pub const WITH_FIELD_ALIAS_PREFIX: &str = "\0with:";
+/// A compiler-generated name for an implicit-dictionary alias, distinct from
+/// every user-written identifier by construction (users can't name a `with`
+/// span or this variant). The span makes it unique per `with` site — two
+/// nested `with` blocks with same-named fields get distinct aliases, so they
+/// don't collide on the flat env's shared bare-name slot.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum InternalName {
+    /// Per-`with`-site, per-`field` alias. `^field` resolves to it so its
+    /// codegen lookup hits the lexically correct slot.
+    WithField { span_start: usize, field: String },
+    /// Per-`with`-site alias for the whole RECORD VALUE. Created when a
+    /// `^`-constrained callsite resolves its dictionary to this `with`, so the
+    /// record can be projected whole.
+    WithRecord { span_start: usize },
+}
 
-/// Prefix for the unique, per-`with`-site alias a `with` block's RECORD VALUE
-/// is bound under during codegen, so an implicit dictionary resolved to that
-/// `with` frame can project the whole record: `{PREFIX}{with_span_start}`.
-/// Distinct from `WITH_FIELD_ALIAS_PREFIX` (which aliases each *field*); the
-/// record alias is only created when a `^`-constrained callsite inside the
-/// body resolved its dictionary to this `with`. Shared with codegen.
-pub const WITH_RECORD_ALIAS_PREFIX: &str = "\0withrec:";
+/// A binding key in codegen's `Env`: either a user-written variable name or a
+/// compiler-generated internal alias. Keeping them as one enum means the env
+/// never needs to mangle internal names into the user-name string space.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Binding {
+    /// A user-written variable / field / parameter name.
+    User(String),
+    /// A compiler-generated internal alias.
+    Internal(InternalName),
+}
+
+impl Binding {
+    /// The codegen env key. User names pass through unchanged; internal
+    /// aliases are mangled with a `\0` prefix — a byte the lexer can never put
+    /// in an identifier — so an alias can never collide with a user name.
+    pub fn to_key(&self) -> String {
+        match self {
+            Binding::User(name) => name.clone(),
+            Binding::Internal(InternalName::WithField { span_start, field }) => {
+                format!("\0with:{span_start}@{field}")
+            }
+            Binding::Internal(InternalName::WithRecord { span_start }) => {
+                format!("\0withrec:{span_start}")
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Binding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Binding::User(name) => f.write_str(name),
+            Binding::Internal(_) => f.write_str("<implicit dictionary>"),
+        }
+    }
+}
 
 /// Base offset for the synthetic spans `<>` mints for its per-candidate
 /// `ImplicitRef` projections (registered in `implicit_refs`). Far above any
@@ -985,7 +1025,7 @@ struct Infer {
     /// dictionary. Codegen splices the projected record as the leading
     /// argument at that application. Keyed by the application's span (the
     /// outermost `App` node's span).
-    implicit_dict_args: HashMap<Span, (String, Vec<String>)>,
+    implicit_dict_args: HashMap<Span, (Binding, Vec<String>)>,
 
     /// For each implicit-dict function, the subset of its constraint fields
     /// declared with the FOLD marker `(<>field)` (vs single-match `(^field)`).
@@ -1129,7 +1169,7 @@ struct Infer {
     /// to `self.scopes` (a `with` pushes exactly one scope). Lets the `Var` arm
     /// detect that a variable resolved to a `with` FIELD and redirect codegen's
     /// flat-`Env` lookup to that `with` site's unique alias (see the `Var` arm
-    /// and `WITH_FIELD_ALIAS_PREFIX`). A `None` scope entry keeps the two stacks
+    /// and `InternalName::WithField`). A `None` scope entry keeps the two stacks
     /// aligned when a non-`with` construct pushes a scope.
     with_scope_stack: Vec<Option<(Span, HashMap<String, Scheme>)>>,
     /// Stack of per-`with` constructor-import scopes (one frame per enclosing
@@ -5018,7 +5058,7 @@ impl Infer {
     /// - A `with {compare …}` / `with intOrdDesc` frame resolves to the `with`
     ///   record value, bound by codegen under `\0withrec:<span>`; the path is
     ///   the field's nesting inside that record (minus the field itself).
-    fn resolve_dict(&mut self, field: &str, field_ty: &Ty, span: Span) -> Option<(String, Vec<String>)> {
+    fn resolve_dict(&mut self, field: &str, field_ty: &Ty, span: Span) -> Option<(Binding, Vec<String>)> {
         // Candidate 0: an enclosing `with` frame that binds `field`. Snapshot
         // the frames first (immutable scan) so the speculative unify below can
         // borrow `self` mutably.
@@ -5052,7 +5092,9 @@ impl Infer {
             std::mem::swap(&mut self.subst, &mut trial);
             if ok {
                 self.subst = trial;
-                let alias = format!("{WITH_RECORD_ALIAS_PREFIX}{}", with_span.start);
+                let alias = Binding::Internal(InternalName::WithRecord {
+                    span_start: with_span.start,
+                });
                 // The `with` record itself is the dictionary (its `field` is
                 // bound directly by the frame).
                 return Some((alias, Vec::new()));
@@ -5062,7 +5104,7 @@ impl Infer {
         // General case: BFS in-scope record bindings for one with a `field`
         // unifying with `field_ty`. The dict is the record projected along the
         // path to `field`, minus the field itself.
-        let mut candidates: Vec<(String, Vec<String>, Ty)> = Vec::new();
+        let mut candidates: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
         'scopes: for scope in self.scopes.iter().rev() {
             for (bind_name, scheme) in scope {
                 let root_ty = self.apply(&scheme.ty);
@@ -5077,7 +5119,7 @@ impl Infer {
                     let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
                     for (path, fty) in frontier {
                         if *path.last().expect("non-empty path") == field {
-                            candidates.push((bind_name.clone(), path.clone(), fty.clone()));
+                            candidates.push((Binding::User(bind_name.clone()), path.clone(), fty.clone()));
                         }
                         if let Ty::Record(sub, _) = self.apply(&fty).peel_alias().clone() {
                             for (f, t) in sub {
@@ -5189,12 +5231,12 @@ impl Infer {
         // `with` blocks would both hit the same outer record, and a nested
         // `with` could not shadow the outer). A direct `with`-field binding
         // for `name` therefore takes precedence: it is candidate 0, rooted at
-        // the `with` site's unique alias (see `WITH_FIELD_ALIAS_PREFIX` and
+        // the `with` site's unique alias (see `InternalName::WithField` and
         // codegen's `With` arm, which binds the field's value under that
         // alias), and the innermost such `with` wins (nested shadows, siblings
         // don't collide). A direct NON-`with` binding keeps its historical
         // meaning — the BFS field projection off that binding.
-        let mut with_candidate: Option<(String, Vec<String>, Ty)> = None;
+        let mut with_candidate: Option<(Binding, Vec<String>, Ty)> = None;
         for (with_frame, scope) in self
             .with_scope_stack
             .iter()
@@ -5204,8 +5246,10 @@ impl Infer {
             if let Some((with_span, field_schemes)) = with_frame
                 && let Some(scheme) = field_schemes.get(name)
             {
-                let alias =
-                    format!("{WITH_FIELD_ALIAS_PREFIX}{}@{name}", with_span.start);
+                let alias = Binding::Internal(InternalName::WithField {
+                    span_start: with_span.start,
+                    field: name.to_string(),
+                });
                 with_candidate = Some((alias, Vec::new(), scheme.ty.clone()));
                 break;
             }
@@ -5234,7 +5278,7 @@ impl Infer {
         let mut searched: Vec<String> = Vec::new();
         // Name-matching fields, one inner Vec per record, innermost record
         // first. Each entry: (root binding, field path, field type).
-        let mut by_record: Vec<Vec<(String, Vec<String>, Ty)>> = Vec::new();
+        let mut by_record: Vec<Vec<(Binding, Vec<String>, Ty)>> = Vec::new();
         if let Some((root, path, field_ty)) = with_candidate {
             // The direct `with`-field candidate is the innermost binding.
             by_record.push(vec![(root, path, field_ty)]);
@@ -5243,7 +5287,7 @@ impl Infer {
             for (bind_name, scheme) in scope {
                 let root_ty = self.apply(&scheme.ty);
                 let Ty::Record(fields, _) = root_ty.peel_alias() else { continue };
-                let mut group: Vec<(String, Vec<String>, Ty)> = Vec::new();
+                let mut group: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
                 let mut frontier: Vec<(Vec<String>, Ty)> = fields
                     .iter()
                     .rev()
@@ -5253,7 +5297,7 @@ impl Infer {
                     let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
                     for (path, field_ty) in frontier.drain(..) {
                         if *path.last().expect("non-empty path") == name {
-                            group.push((bind_name.clone(), path.clone(), field_ty.clone()));
+                            group.push((Binding::User(bind_name.clone()), path.clone(), field_ty.clone()));
                         }
                         if let Ty::Record(sub, _) = self.apply(&field_ty).peel_alias() {
                             for (f, t) in sub.iter().rev() {
@@ -5274,7 +5318,7 @@ impl Infer {
         // Type-check record-by-record (innermost first), stopping at the first
         // record whose fields produce at least one match. Collect all matches
         // within that record so same-record ambiguity is still reported.
-        type Winner = (String, Vec<String>, Ty, HashMap<TyVar, Ty>);
+        type Winner = (Binding, Vec<String>, Ty, HashMap<TyVar, Ty>);
         let mut winners: Vec<Winner> = Vec::new();
         for group in &by_record {
             for (root, path, field_ty) in group {
@@ -5350,11 +5394,11 @@ impl Infer {
     /// Each result is `(root_binding, field_path, field_ty)` — the same
     /// triple `implicit_refs` records for `^`, so codegen can emit the
     /// projection chain `root.path…name` unchanged.
-    fn collect_all_implicit_fields(&mut self, name: &str) -> Vec<(String, Vec<String>, Ty)> {
+    fn collect_all_implicit_fields(&mut self, name: &str) -> Vec<(Binding, Vec<String>, Ty)> {
         // Gather (root, path, ty) candidates from every scope, innermost
         // first. Mirrors the `with`-frame + record-BFS logic in
         // `resolve_implicit_ref`, but keeps walking outward.
-        let mut candidates: Vec<(String, Vec<String>, Ty)> = Vec::new();
+        let mut candidates: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
 
         // Pass 1: `with`-frame records. A `with {svcA {log …}}` frame binds
         // `svcA` as a field of the with-record. The runtime dictionary for a
@@ -5388,11 +5432,14 @@ impl Infer {
             let Some((with_span, field_schemes)) = with_frame else {
                 continue;
             };
-            let field_root = |fname: &str| -> String {
+            let field_root = |fname: &str| -> Binding {
                 if Some(idx) == innermost_with_idx {
-                    fname.to_string()
+                    Binding::User(fname.to_string())
                 } else {
-                    format!("{WITH_FIELD_ALIAS_PREFIX}{}@{fname}", with_span.start)
+                    Binding::Internal(InternalName::WithField {
+                        span_start: with_span.start,
+                        field: fname.to_string(),
+                    })
                 }
             };
             // Direct field binding `with {log …}`: `log` is a top-level field.
@@ -5418,7 +5465,7 @@ impl Infer {
                         // `with` binds each field into the flat `Env`, which
                         // prototypes into nested bodies, so a bare `Var(app)`
                         // resolves the outer record correctly across nesting.
-                        let root = path[0].clone();
+                        let root = Binding::User(path[0].clone());
                         let rest: Vec<String> = path[1..].to_vec();
                         candidates.push((root, rest, field_ty.clone()));
                     }
@@ -5453,7 +5500,7 @@ impl Infer {
             .collect();
         for scope in self.scopes.iter().rev() {
             // (path-to-current-record, record_fields) frontier per binding.
-            let mut frontier: Vec<(String, Vec<String>, Ty)> = Vec::new();
+            let mut frontier: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
             for (bind_name, scheme) in scope {
                 if with_field_names.contains(bind_name.as_str()) {
                     continue;
@@ -5467,17 +5514,17 @@ impl Infer {
                 // `with` field surfaced as a decl in the Phase-4z body pass
                 // (where the `with` frame is not on `with_scope_stack`).
                 if bind_name == name {
-                    candidates.push((bind_name.clone(), Vec::new(), root_ty.clone()));
+                    candidates.push((Binding::User(bind_name.clone()), Vec::new(), root_ty.clone()));
                 }
                 if let Ty::Record(fields, _) = root_ty.peel_alias() {
                     for (f, t) in fields.iter().rev() {
-                        frontier.push((bind_name.clone(), vec![f.clone()], t.clone()));
+                        frontier.push((Binding::User(bind_name.clone()), vec![f.clone()], t.clone()));
                     }
                 }
             }
             // BFS descend until no frontier entry has a record-typed field.
             loop {
-                let mut next: Vec<(String, Vec<String>, Ty)> = Vec::new();
+                let mut next: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
                 let mut descended = false;
                 for (root, path, field_ty) in &frontier {
                     if *path.last().expect("non-empty path") == name {
@@ -5566,7 +5613,7 @@ impl Infer {
         let proj = |i: usize, span: Span| -> ast::Expr {
             let (root, path, _ty) = &candidates[i];
             let mut e = ast::Expr {
-                node: ast::ExprKind::Var(root.clone()),
+                node: ast::ExprKind::Var(root.to_key()),
                 span,
             };
             for field in path {
@@ -5786,10 +5833,10 @@ impl Infer {
                             && let Some(scheme) = field_schemes.get(name)
                             && Some(idx) != innermost_with_idx
                         {
-                            let alias = format!(
-                                "{WITH_FIELD_ALIAS_PREFIX}{}@{name}",
-                                with_span.start
-                            );
+                            let alias = Binding::Internal(InternalName::WithField {
+                                span_start: with_span.start,
+                                field: name.to_string(),
+                            });
                             self.implicit_refs.insert(expr.span, (alias, Vec::new()));
                             return scheme.ty.clone();
                         }

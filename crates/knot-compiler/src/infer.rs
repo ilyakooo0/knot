@@ -282,16 +282,16 @@ pub enum Binding {
 
 impl Binding {
     /// The codegen env key. User names pass through unchanged; internal
-    /// aliases are mangled with a `\0` prefix — a byte the lexer can never put
-    /// in an identifier — so an alias can never collide with a user name.
+    /// aliases use a span-qualified form; uniqueness comes from the span, so
+    /// no special prefix is needed.
     pub fn to_key(&self) -> String {
         match self {
             Binding::User(name) => name.clone(),
             Binding::Internal(InternalName::WithField { span_start, field }) => {
-                format!("\0with:{span_start}@{field}")
+                format!("with{span_start}@{field}")
             }
             Binding::Internal(InternalName::WithRecord { span_start }) => {
-                format!("\0withrec:{span_start}")
+                format!("withrec{span_start}")
             }
         }
     }
@@ -3920,16 +3920,14 @@ impl Infer {
     /// other. `with base` itself binds `base`'s fields exactly as `with` on
     /// any other record would.
     ///
-    /// `span` is the new binding site, used for the error. Internal
-    /// compiler-generated names (the `\0with:` alias prefix and friends) are
-    /// exempt — they are not user-visible and are free to collide. So are
-    /// BASE-INTERNAL bindings (span in the prelude range): the stdlib's own
+    /// `span` is the new binding site, used for the error. BASE-INTERNAL
+    /// bindings (span in the prelude range) are exempt: the stdlib's own
     /// lambda params (`base.min (\\a b -> …)`) are not user bindings and must be
     /// free to use any name — without the exemption a user field named `a`
     /// (bound in `scopes[0]` by pre-registration) would falsely "shadow" the
     /// stdlib's internal `\a`.
     fn bind_at(&mut self, name: &str, scheme: Scheme, span: Span) {
-        if !name.starts_with('\0') && span.start < crate::base::PRELUDE_SPAN_OFFSET {
+        if span.start < crate::base::PRELUDE_SPAN_OFFSET {
             let shadows_enclosing =
                 self.scopes.iter().rev().skip(1).any(|s| s.contains_key(name));
             if shadows_enclosing {
@@ -5056,7 +5054,7 @@ impl Infer {
     ///
     /// - A named record `intOrd = {compare …}` resolves to `(intOrd, [path…])`.
     /// - A `with {compare …}` / `with intOrdDesc` frame resolves to the `with`
-    ///   record value, bound by codegen under `\0withrec:<span>`; the path is
+    ///   record value, bound by codegen under `with-record alias`; the path is
     ///   the field's nesting inside that record (minus the field itself).
     fn resolve_dict(&mut self, field: &str, field_ty: &Ty, span: Span) -> Option<(Binding, Vec<String>)> {
         // Candidate 0: an enclosing `with` frame that binds `field`. Snapshot
@@ -5403,18 +5401,18 @@ impl Infer {
         // Pass 1: `with`-frame records. A `with {svcA {log …}}` frame binds
         // `svcA` as a field of the with-record. The runtime dictionary for a
         // `svcA` reference is the field value, bound in codegen under the
-        // per-site FIELD alias `\0with:<span>@svcA` (see codegen's `With` arm)
+        // per-site FIELD alias `per-site field alias` (see codegen's `With` arm)
         // — EXCEPT the innermost `with` frame, whose fields are read via the
         // shared bare-name slot (inference's `Var` arm deliberately does not
         // redirect the innermost; see its comment). So: innermost frame →
-        // bare field-name root; deeper frames → `\0with:<span>@field` alias
+        // bare field-name root; deeper frames → `per-site field alias` alias
         // root. BFS into record-typed fields for a nested `…log` at any
         // depth, rooting the projection at that field root and projecting the
         // REMAINING path: `svcA.log` → root `…@svcA`, path `[log]`.
         // Root a with-frame field reference the way inference's `Var` arm does:
         // the INNERMOST `with` frame reads via the shared bare-name slot (its
         // fields are bound directly by the frame); DEEPER frames must use the
-        // per-site field alias `\0with:<span>@field`, which codegen binds and
+        // per-site field alias `per-site field alias`, which codegen binds and
         // which stays lexically correct across nesting where the bare slot is
         // runtime-order-dependent. Codegen emits each candidate as an
         // `ImplicitRef` (the `^` path), which compiles `Var(root)` directly.
@@ -5489,7 +5487,7 @@ impl Infer {
         // descending into nested record fields (no shallowest-depth early
         // exit — `<>` collects at any depth in any scope). SKIP bindings that
         // are `with`-record fields: those were already collected in Pass 1
-        // rooted at the reliable `\0withrec:` alias, and re-collecting them
+        // rooted at the reliable the with-record alias, and re-collecting them
         // via the shared bare-name slot would double-count AND risk the
         // unreliable bare resolution.
         let with_field_names: std::collections::HashSet<&str> = self

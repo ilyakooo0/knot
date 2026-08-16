@@ -5118,9 +5118,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         // lambda sees the builtin `show`, not the outer
                         // `with`'s. Other names stay visible, so
                         // argument-position captures keep working. (Per-site
-                        // aliases `\0with:…@f` never appear in a field value's
-                        // free vars — they start with `\0`, unutterable in
-                        // source — so only the bare name needs removal.)
+                        // field aliases never appear in a field value's free
+                        // vars — they're `Binding::Internal`, not a user name —
+                        // so only the bare name needs removal.)
                         if field_env.bindings.contains_key(&crate::infer::Binding::User(f.name.clone()))
                             && self
                                 .with_fields
@@ -5229,7 +5229,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if let Some(fields) = self.with_fields.get(&expr.span).cloned() {
                     // Bind the whole `with` record under a per-site alias so an
                     // implicit dictionary resolved to this `with` frame (an
-                    // `\0withrec:<span>` root) projects it.
+                    // `with-record alias` root) projects it.
                     let rec_alias = crate::infer::Binding::Internal(
                         crate::infer::InternalName::WithRecord { span_start: expr.span.start },
                     );

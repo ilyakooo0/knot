@@ -149,7 +149,7 @@ fn collect_unguarded_calls<'a>(
                 // param'd callee referenced bare is just a value (not yet
                 // applied), so it does not run — no edge.
                 if callee.arity == 0 {
-                    out.push(name.clone());
+                    out.push(name.as_str().to_string());
                 }
             }
         }
@@ -166,7 +166,7 @@ fn collect_unguarded_calls<'a>(
                         && callee.arity > 0
                         && args_match_params(&args, &caller.params)
                     {
-                        out.push(name.clone());
+                        out.push(name.as_str().to_string());
                     }
                 }
             // The head and every argument are still evaluated unconditionally.
@@ -284,7 +284,7 @@ fn is_relation_query(body: &ast::Expr) -> bool {
             };
             match &head.node {
                 // Bare `union …` / desugared `__bind …`.
-                Var(n) => rel_head(n),
+                Var(n) => rel_head(n.as_str()),
                 // `base.union …` (a namespaced relation combinator).
                 FieldAccess { field, .. } => rel_head(field),
                 _ => false,

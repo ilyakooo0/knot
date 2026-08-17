@@ -2055,7 +2055,7 @@ impl Parser {
             TokenKind::Lower(_) => {
                 let tok = self.advance();
                 let TokenKind::Lower(name) = tok.kind else { unreachable!() };
-                Some(Spanned::new(ExprKind::Var(name), tok.span))
+                Some(Spanned::new(ExprKind::Var(Binding::User(name)), tok.span))
             }
             TokenKind::Upper(_) => {
                 let tok = self.advance();
@@ -2064,7 +2064,7 @@ impl Parser {
             }
             TokenKind::Full => {
                 let tok = self.advance();
-                Some(Spanned::new(ExprKind::Var("full".into()), tok.span))
+                Some(Spanned::new(ExprKind::Var(Binding::User("full".into())), tok.span))
             }
             TokenKind::StarIdent(_) => {
                 // `*name` lexed as a single token — source reference.

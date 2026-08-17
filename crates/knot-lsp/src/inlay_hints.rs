@@ -811,7 +811,7 @@ fn add_parameter_name_hints(
                 // (`\add v -> add v 1`), the top-level decl's param names
                 // don't apply — suppress conservatively.
                 if !shadowed.contains(name.as_str()) {
-                    emit_arg_hints(doc, name, &args, range_start, range_end, hints);
+                    emit_arg_hints(doc, name.as_str(), &args, range_start, range_end, hints);
                 }
             }
             walk_apps(callee, doc, shadowed, range_start, range_end, hints);
@@ -1111,7 +1111,7 @@ fn add_constraint_hints(
             let (callee, args) = flatten_app_chain(expr);
             if let ast::ExprKind::Var(name) = &callee.node
                 && callee.span.start >= range_start && callee.span.end <= range_end
-                    && let Some(constraints) = constraints_for_callee(&doc.module, name)
+                    && let Some(constraints) = constraints_for_callee(&doc.module, name.as_str())
                         && !constraints.is_empty() {
                             let label = format!("[{}]", constraints.join(", "));
                             hints.push(InlayHint {

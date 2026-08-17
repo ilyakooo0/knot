@@ -209,7 +209,7 @@ fn rewrite_source_refs_in_expr(
     // Rewrite this node first (top-down so a rewritten ref isn't descended into).
     if let ExprKind::FieldAccess { expr: base, field } = &expr.node
         && let ExprKind::Var(rec) = &base.node
-        && let Some(names) = map.get(rec)
+        && let Some(names) = map.get(rec.as_str())
     {
         let stripped = field
             .strip_prefix('*')
@@ -586,7 +586,7 @@ fn rewrite_implicit_refs(expr: &mut Expr, field: &str, is_fold: bool) {
         && name == field
     {
         let span = expr.span;
-        let dict_var = Spanned::new(ExprKind::Var(dict_param_name(field)), span);
+        let dict_var = Spanned::new(ExprKind::Var(crate::infer::Binding::User(dict_param_name(field))), span);
         expr.node = if is_fold {
             dict_var.node
         } else {
@@ -935,7 +935,7 @@ fn is_sql_compilable(stmts: &[Stmt], source_vars: &HashSet<String>) -> bool {
                     // do-block (codegen resolves these via source_var_binds).
                     let ok = match &expr.node {
                         ExprKind::SourceRef { .. } => true,
-                        ExprKind::Var(v) => source_vars.contains(v),
+                        ExprKind::Var(v) => source_vars.contains(v.as_str()),
                         _ => false,
                     };
                     if ok {
@@ -1487,7 +1487,7 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
 /// `__bind (\__tmp -> case __tmp of { Ctor pat -> rest; _ -> [] }) expr`
 fn desugar_ctor_bind(pat: &Pat, expr: &Expr, rest: &Expr, span: Span) -> Expr {
     let tmp = fresh_var();
-    let tmp_var = spanned(ExprKind::Var(tmp.clone()), span);
+    let tmp_var = spanned(ExprKind::Var(crate::infer::Binding::User(tmp.clone())), span);
 
     let case_expr = spanned(
         ExprKind::Case {
@@ -1526,7 +1526,7 @@ fn mk_yield(inner: Expr, span: Span) -> Expr {
     spanned(
         ExprKind::App {
             func: Box::new(spanned(
-                ExprKind::Var("__yield".into()),
+                ExprKind::Var(crate::infer::Binding::User("__yield".into())),
                 fresh_monad_span(span),
             )),
             arg: Box::new(inner),
@@ -1546,7 +1546,7 @@ fn mk_result(inner: Expr, span: Span) -> Expr {
     spanned(
         ExprKind::App {
             func: Box::new(spanned(
-                ExprKind::Var(RESULT_MARKER.into()),
+                ExprKind::Var(crate::infer::Binding::User(RESULT_MARKER.into())),
                 fresh_monad_span(span),
             )),
             arg: Box::new(inner),
@@ -1563,7 +1563,7 @@ pub(crate) const RESULT_MARKER: &str = "__result";
 /// Build `Var("__empty")` with a unique synthesized span (see
 /// `fresh_monad_span`).
 fn mk_empty(span: Span) -> Expr {
-    spanned(ExprKind::Var("__empty".into()), fresh_monad_span(span))
+    spanned(ExprKind::Var(crate::infer::Binding::User("__empty".into())), fresh_monad_span(span))
 }
 
 /// Build `App(App(Var("__bind"), func), collection)`
@@ -1574,7 +1574,7 @@ fn mk_bind(func: Expr, collection: Expr, span: Span) -> Expr {
             func: Box::new(spanned(
                 ExprKind::App {
                     func: Box::new(spanned(
-                        ExprKind::Var("__bind".into()),
+                        ExprKind::Var(crate::infer::Binding::User("__bind".into())),
                         fresh_monad_span(span),
                     )),
                     arg: Box::new(func),

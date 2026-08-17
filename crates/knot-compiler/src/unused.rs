@@ -223,7 +223,7 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
         ExprKind::Var(name) => {
-            r.values.insert(name.clone());
+            r.values.insert(name.as_str().to_string());
         }
         ExprKind::Constructor(name) => {
             r.ctors.insert(name.clone());

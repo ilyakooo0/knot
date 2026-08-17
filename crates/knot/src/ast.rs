@@ -33,6 +33,106 @@ impl<T> Spanned<T> {
 /// An identifier. Could be interned later for performance.
 pub type Name = String;
 
+/// A compiler-generated name for an implicit-dictionary alias. Distinct from
+/// every user-written identifier by construction (a user can't name a `with`
+/// span or this variant); the span makes it unique per `with` site. Only
+/// produced by inference — never parsed from or formatted to source.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum InternalName {
+    /// Per-`with`-site, per-`field` alias.
+    WithField { span_start: usize, field: String },
+    /// Per-`with`-site alias for the whole record value.
+    WithRecord { span_start: usize },
+}
+
+/// A variable reference: either a user-written name or a compiler-generated
+/// internal alias. Keeping them as one enum means a `Var` never needs to
+/// mangle an internal alias into the user-name string space.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Binding {
+    /// A user-written variable name.
+    User(Name),
+    /// A compiler-generated internal alias.
+    Internal(InternalName),
+}
+
+impl Binding {
+    /// The user name, if this is a user binding.
+    pub fn as_user(&self) -> Option<&str> {
+        match self {
+            Binding::User(name) => Some(name),
+            Binding::Internal(_) => None,
+        }
+    }
+
+    /// True if this is the user binding with the given name.
+    pub fn is_user(&self, name: &str) -> bool {
+        matches!(self, Binding::User(n) if n == name)
+    }
+
+    /// The name as a string slice (the `Display` form). User names pass
+    /// through; internal aliases use their span-qualified form. Use this where
+    /// a `Var` name is consumed as a string (error messages, map keys).
+    pub fn as_str(&self) -> &str {
+        match self {
+            Binding::User(name) => name.as_str(),
+            // Internal aliases never reach string consumers in a well-formed
+            // pipeline (they're looked up as `Binding`), but if one does, the
+            // span-qualified form is a safe, unique fallback.
+            Binding::Internal(_) => "",
+        }
+    }
+}
+
+impl std::fmt::Display for Binding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Binding::User(name) => f.write_str(name),
+            Binding::Internal(InternalName::WithField { span_start, field }) => {
+                write!(f, "with{span_start}@{field}")
+            }
+            Binding::Internal(InternalName::WithRecord { span_start }) => {
+                write!(f, "withrec{span_start}")
+            }
+        }
+    }
+}
+
+// A `Binding` compares equal to a string only for the `User` variant — an
+// internal alias never equals any user name. This lets existing
+// `name == "lit"` / `map.get(name)`-style checks keep working where `name`
+// is now a `Binding`.
+impl PartialEq<str> for Binding {
+    fn eq(&self, other: &str) -> bool {
+        matches!(self, Binding::User(n) if n == other)
+    }
+}
+impl PartialEq<&str> for Binding {
+    fn eq(&self, other: &&str) -> bool {
+        matches!(self, Binding::User(n) if n == other)
+    }
+}
+impl PartialEq<Binding> for str {
+    fn eq(&self, other: &Binding) -> bool {
+        other == self
+    }
+}
+impl PartialEq<Binding> for &str {
+    fn eq(&self, other: &Binding) -> bool {
+        other == self
+    }
+}
+impl PartialEq<String> for Binding {
+    fn eq(&self, other: &String) -> bool {
+        matches!(self, Binding::User(n) if n == other)
+    }
+}
+impl PartialEq<Binding> for String {
+    fn eq(&self, other: &Binding) -> bool {
+        other == self
+    }
+}
+
 // ── Convenience aliases ────────────────────────────────────────────
 
 pub type Expr = Spanned<ExprKind>;
@@ -68,7 +168,7 @@ pub enum ExprKind {
     Lit(Literal),
 
     /// `x`, `formatTitle` — lowercase identifier.
-    Var(Name),
+    Var(Binding),
 
     /// `Circle`, `Open` — PascalCase constructor reference.
     Constructor(Name),
@@ -281,7 +381,7 @@ impl ExprKind {
     pub fn as_yield_arg(&self) -> Option<&Expr> {
         if let ExprKind::App { func, arg } = self
             && let ExprKind::Var(name) = &func.node
-                && name == "yield" {
+                && name.is_user("yield") {
                     return Some(arg);
                 }
         None

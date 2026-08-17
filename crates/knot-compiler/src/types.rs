@@ -1288,7 +1288,7 @@ fn synth_fresh_name() -> String {
 }
 
 fn synth_var(name: &str, span: Span) -> Expr {
-    Spanned::new(ExprKind::Var(name.into()), span)
+    Spanned::new(ExprKind::Var(crate::infer::Binding::User(name.into())), span)
 }
 
 fn synth_app(f: Expr, a: Expr) -> Expr {

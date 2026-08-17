@@ -253,58 +253,10 @@ pub type FoldDictArgs = HashMap<Span, (String, Vec<Span>)>;
 /// the `<>name folder init` spine into a left-nested fold over them.
 pub type CollectRefs = HashMap<Span, Vec<Span>>;
 
-/// A compiler-generated name for an implicit-dictionary alias, distinct from
-/// every user-written identifier by construction (users can't name a `with`
-/// span or this variant). The span makes it unique per `with` site — two
-/// nested `with` blocks with same-named fields get distinct aliases, so they
-/// don't collide on the flat env's shared bare-name slot.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum InternalName {
-    /// Per-`with`-site, per-`field` alias. `^field` resolves to it so its
-    /// codegen lookup hits the lexically correct slot.
-    WithField { span_start: usize, field: String },
-    /// Per-`with`-site alias for the whole RECORD VALUE. Created when a
-    /// `^`-constrained callsite resolves its dictionary to this `with`, so the
-    /// record can be projected whole.
-    WithRecord { span_start: usize },
-}
-
-/// A binding key in codegen's `Env`: either a user-written variable name or a
-/// compiler-generated internal alias. Keeping them as one enum means the env
-/// never needs to mangle internal names into the user-name string space.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Binding {
-    /// A user-written variable / field / parameter name.
-    User(String),
-    /// A compiler-generated internal alias.
-    Internal(InternalName),
-}
-
-impl Binding {
-    /// The codegen env key. User names pass through unchanged; internal
-    /// aliases use a span-qualified form; uniqueness comes from the span, so
-    /// no special prefix is needed.
-    pub fn to_key(&self) -> String {
-        match self {
-            Binding::User(name) => name.clone(),
-            Binding::Internal(InternalName::WithField { span_start, field }) => {
-                format!("with{span_start}@{field}")
-            }
-            Binding::Internal(InternalName::WithRecord { span_start }) => {
-                format!("withrec{span_start}")
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for Binding {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Binding::User(name) => f.write_str(name),
-            Binding::Internal(_) => f.write_str("<implicit dictionary>"),
-        }
-    }
-}
+// The variable/alias binding key lives in the AST (`Var(Binding)`); re-export
+// so existing `crate::infer::Binding` / `crate::infer::InternalName` paths keep
+// working.
+pub use knot::ast::{Binding, InternalName};
 
 /// Base offset for the synthetic spans `<>` mints for its per-candidate
 /// `ImplicitRef` projections (registered in `implicit_refs`). Far above any
@@ -4834,7 +4786,7 @@ impl Infer {
             }
         };
         fields.reverse();
-        let scheme = self.lookup(&root)?.clone();
+        let scheme = self.lookup(root.as_str())?.clone();
         let mut ty = self.instantiate_at(&scheme, expr.span);
         for field in fields {
             let resolved = self.apply(&ty);
@@ -4913,13 +4865,13 @@ impl Infer {
             }
             return Some(result);
         };
-        let dicts = self.implicit_dict_fns.get(name)?.clone();
+        let dicts = self.implicit_dict_fns.get(name.as_str())?.clone();
         let n_dicts = dicts.len();
         // If the caller already supplied the dictionaries explicitly (more
         // args than the non-dict parameters), don't treat this as implicit.
         // The non-dict arity is the function's curried arity minus the dicts;
         // with exactly `arity - n_dicts` args the dicts are implicit.
-        let scheme = self.lookup(name)?.clone();
+        let scheme = self.lookup(name.as_str())?.clone();
         let arity = curry_arity(&scheme.ty);
         let explicit_arity = arity - n_dicts;
         if args.len() != explicit_arity {
@@ -4953,7 +4905,7 @@ impl Infer {
         // resolves the single innermost match.
         let fold_fields: Vec<String> = self
             .fold_dict_fields
-            .get(name)
+            .get(name.as_str())
             .cloned()
             .unwrap_or_default();
         for (i, (field, _)) in dicts.iter().enumerate() {
@@ -5611,7 +5563,7 @@ impl Infer {
         let proj = |i: usize, span: Span| -> ast::Expr {
             let (root, path, _ty) = &candidates[i];
             let mut e = ast::Expr {
-                node: ast::ExprKind::Var(root.to_key()),
+                node: ast::ExprKind::Var(root.clone()),
                 span,
             };
             for field in path {
@@ -5769,14 +5721,14 @@ impl Infer {
                 // in `scopes` and resolves normally. Prelude-internal uses
                 // resolve via the temporary stdlib scope `bind_base_record`
                 // pushes. `retry` is handled by its own `atomic` check above.
-                if let Some(ty) = self.lookup_instantiate_at(name, expr.span) {
+                if let Some(ty) = self.lookup_instantiate_at(name.as_str(), expr.span) {
                     // This bare Var resolved through `scopes` — i.e. to a user
                     // binding (top-level fn, `let`, lambda param, or `with`
                     // field), never to a stdlib value-fn (those live only in
                     // `stdlib_schemes`, absent from `scopes`). Record the
                     // identity so codegen knows this call head is NOT the
                     // builtin even though the name may collide with one.
-                    if StdlibFn::from_name(name).is_some() {
+                    if StdlibFn::from_name(name.as_str()).is_some() {
                         self.resolved_calls.insert(expr.span, FnIdentity::User);
                     }
                     // If this Var resolved to a field of a `with` that codegen
@@ -5828,7 +5780,7 @@ impl Infer {
                         .rev()
                     {
                         if let Some((with_span, field_schemes)) = with_frame
-                            && let Some(scheme) = field_schemes.get(name)
+                            && let Some(scheme) = field_schemes.get(name.as_str())
                             && Some(idx) != innermost_with_idx
                         {
                             let alias = Binding::Internal(InternalName::WithField {
@@ -5838,7 +5790,7 @@ impl Infer {
                             self.implicit_refs.insert(expr.span, (alias, Vec::new()));
                             return scheme.ty.clone();
                         }
-                        if scope.contains_key(name) {
+                        if scope.contains_key(name.as_str()) {
                             break;
                         }
                     }
@@ -6663,12 +6615,12 @@ impl Infer {
                     // on the head would yield `Ty::Error` and trip the
                     // `unreachable!` arity assumption below.
                     let gated = head.span.start < crate::base::PRELUDE_SPAN_OFFSET
-                        && crate::base::is_gated_stdlib(head_name)
-                        && !self.bound_in_user_scope(head_name);
+                        && crate::base::is_gated_stdlib(head_name.as_str())
+                        && !self.bound_in_user_scope(head_name.as_str());
                     if gated {
                         None
                     } else {
-                        self.lookup(head_name)
+                        self.lookup(head_name.as_str())
                             .is_some_and(|s| takes_two_args(&s.ty))
                             .then(|| ((**head).clone(), (**lam).clone()))
                     }
@@ -8925,8 +8877,8 @@ impl Infer {
                 self.expr_is_io_prescan(func) || self.expr_is_io_prescan(arg)
             }
             ast::ExprKind::Var(name) => {
-                (crate::builtins::is_io_builtin(name) || name == "fork" || name == "race")
-                || self.lookup(name).is_some_and(|scheme| {
+                (crate::builtins::is_io_builtin(name.as_str()) || name == "fork" || name == "race")
+                || self.lookup(name.as_str()).is_some_and(|scheme| {
                     fn returns_io(ty: &Ty) -> bool {
                         match ty {
                             Ty::IO(_) => true,
@@ -13039,17 +12991,17 @@ fn value_references_source_inner(
         // `_` hole reads nothing.
         ast::ExprKind::TypeHole => false,
         ast::ExprKind::Var(name) => {
-            if aliases.get(name).map(|s| s.as_str()) == Some(source_name) {
+            if aliases.get(name.as_str()).map(|s| s.as_str()) == Some(source_name) {
                 return true;
             }
             // Fold through let bindings: `let foo = ...; *rel = foo`
             // counts as referencing the source if the body does.
-            if visited.insert(name.clone())
-                && let Some(body) = let_bindings.get(name) {
+            if visited.insert(name.as_str().to_string())
+                && let Some(body) = let_bindings.get(name.as_str()) {
                     let result = value_references_source_inner(
                         body, source_name, aliases, let_bindings, visited,
                     );
-                    visited.remove(name);
+                    visited.remove(name.as_str());
                     return result;
                 }
             false
@@ -14315,7 +14267,7 @@ fn rewrite_result_markers(expr: &mut ast::Expr, pure_spans: &HashSet<Span>) {
         && matches!(&func.node, ast::ExprKind::Var(n) if n == crate::desugar::RESULT_MARKER)
     {
         if pure_spans.contains(&func.span) {
-            func.node = ast::ExprKind::Var("__yield".into());
+            func.node = ast::ExprKind::Var(crate::infer::Binding::User("__yield".into()));
             rewrite_result_markers(arg, pure_spans);
         } else {
             let mut inner = (**arg).clone();

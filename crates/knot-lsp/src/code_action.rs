@@ -989,7 +989,7 @@ fn find_case_actions(
                                 doc.local_type_info.get(def_span).cloned()
                             })
                     })
-                    .or_else(|| doc.type_info.get(name).cloned())
+                    .or_else(|| doc.type_info.get(name.as_str()).cloned())
             }
             _ => None,
         };

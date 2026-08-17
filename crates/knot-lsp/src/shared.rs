@@ -318,7 +318,10 @@ pub(crate) fn expr_references_name(expr: &ast::Expr, name: &str) -> bool {
             return;
         }
         match &expr.node {
-            ast::ExprKind::Var(n) | ast::ExprKind::Constructor(n) if n == name => {
+            ast::ExprKind::Var(n) if n.is_user(name) => {
+                *found = true;
+            }
+            ast::ExprKind::Constructor(n) if n == name => {
                 *found = true;
             }
             _ => recurse_expr(expr, |e| walk(e, name, found, depth + 1)),
@@ -402,7 +405,7 @@ fn find_app_in_expr_at(
 
         // cur is now the function at the head
         let func_name = match &cur.node {
-            ast::ExprKind::Var(name) => Some(name.clone()),
+            ast::ExprKind::Var(name) => Some(name.as_str().to_string()),
             ast::ExprKind::Constructor(name) => Some(name.clone()),
             _ => None,
         };
@@ -624,7 +627,8 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
                 ast::Literal::Bool(b) => b.to_string(),
                 ast::Literal::Bytes(_) => return None,
             },
-            ast::ExprKind::Var(n) | ast::ExprKind::Constructor(n) => n.clone(),
+            ast::ExprKind::Var(n) => n.as_str().to_string(),
+            ast::ExprKind::Constructor(n) => n.clone(),
             ast::ExprKind::SourceRef { name: n, .. } => format!("*{n}"),
             ast::ExprKind::FieldAccess { expr: recv, field } => {
                 format!("{}.{field}", go(recv, true)?)
@@ -856,7 +860,7 @@ pub(crate) fn find_field_access_at_offset(
 ) -> Option<FieldAccessAt> {
     fn classify_receiver(expr: &ast::Expr) -> ReceiverKind {
         match &expr.node {
-            ast::ExprKind::Var(n) => ReceiverKind::Var(n.clone()),
+            ast::ExprKind::Var(n) => ReceiverKind::Var(n.as_str().to_string()),
             ast::ExprKind::SourceRef { name: n, .. } => ReceiverKind::SourceRef(n.clone()),
             _ => ReceiverKind::Other,
         }

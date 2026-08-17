@@ -261,7 +261,7 @@ pub(crate) fn prelude_base_record() -> ast::Expr {
                         // user source, so it always resolves to the stdlib fn and
                         // is never shadowed by a user decl named `<name>`.
                         value: ast::Spanned::new(
-                            ast::ExprKind::Var(format!("base.{}", name)),
+                            ast::ExprKind::Var(crate::infer::Binding::User(format!("base.{}", name))),
                             dummy_span,
                         ),
                         sig: None,

@@ -490,7 +490,7 @@ fn strip_spans(s: &str) -> String {
 fn collect_type_names(ty: &ast::Type, out: &mut HashSet<String>) {
     match &ty.node {
         ast::TypeKind::Named(name) => {
-            out.insert(name.clone());
+            out.insert(name.as_str().to_string());
         }
         ast::TypeKind::Var(_) | ast::TypeKind::Hole | ast::TypeKind::Callsite => {}
         ast::TypeKind::App { func, arg } => {
@@ -525,13 +525,13 @@ fn collect_type_names(ty: &ast::Type, out: &mut HashSet<String>) {
 fn collect_expr_names(expr: &ast::Expr, out: &mut HashSet<String>) {
     match &expr.node {
         ast::ExprKind::Var(name) => {
-            out.insert(name.clone());
+            out.insert(name.as_str().to_string());
         }
         ast::ExprKind::SourceRef { name, .. } => {
-            out.insert(name.clone());
+            out.insert(name.as_str().to_string());
         }
         ast::ExprKind::Constructor(name) => {
-            out.insert(name.clone());
+            out.insert(name.as_str().to_string());
         }
         ast::ExprKind::Serve { api, .. } => {
             out.insert(api.clone());

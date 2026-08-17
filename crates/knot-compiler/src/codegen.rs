@@ -3942,11 +3942,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let body = ast::Spanned::new(
                 ast::ExprKind::App {
                     func: Box::new(ast::Spanned::new(
-                        ast::ExprKind::Var(name.to_string()),
+                        ast::ExprKind::Var(crate::infer::Binding::User(name.to_string())),
                         dummy_span,
                     )),
                     arg: Box::new(ast::Spanned::new(
-                        ast::ExprKind::Var("__trampoline_arg".into()),
+                        ast::ExprKind::Var(crate::infer::Binding::User("__trampoline_arg".into())),
                         dummy_span,
                     )),
                 },
@@ -4677,7 +4677,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // lookup below wins there. Innermost frame wins.
                 for frame in self.fixpoint_rel_fields.iter().rev() {
                     if let Some(fn_key) = frame.get(name.as_str())
-                        && !env.bindings.contains_key(&crate::infer::Binding::User(name.clone()))
+                        && !env.bindings.contains_key(name)
                         && let Some((func_id, 0)) = self.global_fns.get(fn_key).copied()
                     {
                         let func_ref =
@@ -4692,7 +4692,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // builtin special-cases below must do the same or they would
                 // hijack the binding (and, for `retry`, emit STM control flow
                 // instead of reading the variable).
-                if let Some(&val) = env.bindings.get(&crate::infer::Binding::User(name.clone())) {
+                if let Some(&val) = env.bindings.get(name) {
                     // Inference may have resolved this Var to a field of the
                     // innermost enclosing `with` and recorded the `with` site's
                     // unique alias in `implicit_refs` (see infer's `Var` arm).
@@ -4758,7 +4758,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // user code can only reach them as `base.now` (a FieldAccess,
                 // handled elsewhere). Strip the `base.` prefix so both the
                 // prelude's `Var("base.now")` and any bare form resolve here.
-                let bare_name: &str = name.strip_prefix("base.").unwrap_or(name.as_str());
+                let bare_name: &str = name.as_str().strip_prefix("base.").unwrap_or(name.as_str());
                 if bare_name == "now" {
                     return self.call_rt(builder, "knot_now_io", &[]);
                 }
@@ -4956,7 +4956,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // instead, exactly as a bare `*name` SourceRef would.
                 if let Some(src_name) = field.strip_prefix('*')
                     && let ast::ExprKind::Var(rec_name) = &expr.node
-                    && self.record_has_source_decl(rec_name, src_name)
+                    && self.record_has_source_decl(rec_name.as_str(), src_name)
                 {
                     let schema = self
                         .source_schemas
@@ -5003,7 +5003,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     crate::infer::Binding::User(name) => self.compile_expr(
                         builder,
                         &ast::Expr {
-                            node: ast::ExprKind::Var(name.clone()),
+                            node: ast::ExprKind::Var(crate::infer::Binding::User(name.clone())),
                             span: expr.span,
                         },
                         env,
@@ -5364,8 +5364,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     if let ast::ExprKind::App { func: match_fn, arg: match_arg } = &rhs.node
                         && let (ast::ExprKind::Var(fn_name), ast::ExprKind::Constructor(ctor_name)) = (&match_fn.node, &match_arg.node)
                             && fn_name == "match"
-                            && !env.bindings.contains_key(&crate::infer::Binding::User(fn_name.clone()))
-                            && !(self.top_fn_names.contains(fn_name) && self.global_fns.contains_key(fn_name)) {
+                            && !env.bindings.contains_key(fn_name)
+                            && !(self.top_fn_names.contains(fn_name.as_str()) && self.global_fns.contains_key(fn_name.as_str())) {
                                 if let ast::ExprKind::SourceRef { name: source_name, .. } = &lhs.node
                                     && let Some(schema) = self.source_schemas.get(source_name).cloned() {
                                         let (name_ptr, name_len) =
@@ -6100,7 +6100,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             // A bare reference to a possibly-writing function: it may be
             // invoked later through a value we can't track.
-            Var(name) => !self.write_functions.contains(name),
+            Var(name) => !self.write_functions.contains(name.as_str()),
             // `^x` reads a record field; it never writes to a source.
             ImplicitRef(_) => true,
             // `<>x` likewise only reads record fields.
@@ -6125,7 +6125,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // computed expression) may write anything.
                 let (head, _) = uncurry_app(expr);
                 let head_attributable = match &strip_expr_wrappers(head).node {
-                    Var(name) => name_is_known_write_free(name),
+                    Var(name) => name_is_known_write_free(name.as_str()),
                     Constructor(_) => true,
                     Lambda { .. } => true, // body covered by recursion below
                     _ => false,
@@ -6151,7 +6151,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Expr(expr) => {
                     let unknown_io = matches!(
                         &strip_expr_wrappers(expr).node,
-                        Var(name) if !name_is_known_write_free(name)
+                        Var(name) if !name_is_known_write_free(name.as_str())
                     );
                     !unknown_io && self.collect_direct_write_targets(expr, out)
                 }
@@ -6205,7 +6205,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn resolve_source(&self, expr: &ast::Expr) -> Option<String> {
         match &expr.node {
             ast::ExprKind::SourceRef { name, .. } => Some(name.clone()),
-            ast::ExprKind::Var(name) => self.source_var_binds.get(name).cloned(),
+            ast::ExprKind::Var(name) => self.source_var_binds.get(name.as_str()).cloned(),
             _ => None,
         }
     }
@@ -6228,7 +6228,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::SourceRef { .. }
             | ast::ExprKind::BinOp { op: ast::BinOp::Pipe, .. }
             | ast::ExprKind::Do(_) => Some(expr.clone()),
-            ast::ExprKind::Var(name) if self.source_var_binds.contains_key(name) => {
+            ast::ExprKind::Var(name) if self.source_var_binds.contains_key(name.as_str()) => {
                 Some(expr.clone())
             }
             // Link: `partial_op relation` — convert the relation, pipe on the op.
@@ -6958,7 +6958,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let user_shadows_special = matches!(
             &func_expr.node,
             ast::ExprKind::Var(name)
-                if self.top_fn_names.contains(name) && self.global_fns.contains_key(name)
+                if self.top_fn_names.contains(name.as_str()) && self.global_fns.contains_key(name.as_str())
         );
 
         // A locally-bound name (lambda param, `let`, do-bind, captured free
@@ -6971,7 +6971,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // `\count -> count xs` (shadowing the stdlib `count`) would call the
         // global instead of the local value.
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && env.bindings.contains_key(&crate::infer::Binding::User(name.clone())) {
+            && env.bindings.contains_key(name) {
                 // Implicit dictionary: a `with`-field function with a
                 // `(^field : T) =>` constraint is called through the local
                 // env binding (the `with` frame binds it). Inference recorded
@@ -7179,7 +7179,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // that handles `*source |> ops |> count` directly.
                 if matches!(&args[0].node, ast::ExprKind::BinOp { op: ast::BinOp::Pipe, .. }) {
                     let count_rhs = ast::Expr {
-                        node: ast::ExprKind::Var("count".to_string()),
+                        node: ast::ExprKind::Var(crate::infer::Binding::User("count".to_string())),
                         span: args[0].span,
                     };
                     let piped = ast::Expr {
@@ -8329,7 +8329,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                     let body = ast::Expr {
                                         node: ast::ExprKind::FieldAccess {
                                             expr: Box::new(ast::Expr {
-                                                node: ast::ExprKind::Var(bind_var.clone()),
+                                                node: ast::ExprKind::Var(crate::infer::Binding::User(bind_var.clone())),
                                                 span: args[0].span,
                                             }),
                                             field: field.clone(),
@@ -8478,7 +8478,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             // Direct call to a known user function
             ast::ExprKind::Var(name)
-                if self.global_fns.contains_key(name) =>
+                if self.global_fns.contains_key(name.as_str()) =>
             {
                 let fn_name: &str = name.as_str();
                 let (func_id, expected_params) = self.global_fns[fn_name];
@@ -9024,7 +9024,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     h.endpoint_span,
                 );
                 let payload_var = ast::Spanned::new(
-                    ast::ExprKind::Var(payload_name.clone()),
+                    ast::ExprKind::Var(crate::infer::Binding::User(payload_name.clone())),
                     h.endpoint_span,
                 );
                 let arm_body = ast::Spanned::new(
@@ -9038,7 +9038,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             })
             .collect();
 
-        let req_var = ast::Spanned::new(ast::ExprKind::Var(req_name.clone()), span);
+        let req_var = ast::Spanned::new(ast::ExprKind::Var(crate::infer::Binding::User(req_name.clone())), span);
         let case_expr = ast::Spanned::new(
             ast::ExprKind::Case {
                 scrutinee: Box::new(req_var),
@@ -10016,7 +10016,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         loop {
             let mut changed = false;
             for (name, body) in &fun_bodies {
-                if self.io_functions.contains(name) {
+                if self.io_functions.contains(name.as_str()) {
                     continue;
                 }
                 if Self::expr_contains_io(body, &io_builtins, &self.io_functions) {
@@ -10043,7 +10043,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// Check if an expression contains IO calls (builtins or known IO user functions).
     fn expr_contains_io(expr: &ast::Expr, builtins: &HashSet<&str>, io_fns: &HashSet<String>) -> bool {
         match &expr.node {
-            ast::ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name),
+            ast::ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name.as_str()),
             // A query over a source/derived is a pure, lazy `[T]` — NOT IO.
             // Only writes (`set`/`full =`) and `atomic` are effects. `full`
             // is a viewer-only tag with no semantic effect.
@@ -10151,7 +10151,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         passthrough_fns: &HashSet<String>,
     ) -> bool {
         match &strip_expr_wrappers(expr).node {
-            ast::ExprKind::Var(name) => params.contains(name),
+            ast::ExprKind::Var(name) => params.contains(name.as_str()),
             ast::ExprKind::Case { arms, .. } => arms
                 .iter()
                 .any(|arm| Self::tail_returns_param(&arm.body, params, passthrough_fns)),
@@ -10160,10 +10160,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // of our params passed unapplied → we forward that param onward.
                 let (head, spine_args) = uncurry_app(expr);
                 match &strip_expr_wrappers(head).node {
-                    ast::ExprKind::Var(hname) if passthrough_fns.contains(hname) => spine_args
+                    ast::ExprKind::Var(hname) if passthrough_fns.contains(hname.as_str()) => spine_args
                         .iter()
                         .any(|a| matches!(&strip_expr_wrappers(a).node,
-                            ast::ExprKind::Var(n) if params.contains(n))),
+                            ast::ExprKind::Var(n) if params.contains(n.as_str()))),
                     _ => false,
                 }
             }
@@ -10182,7 +10182,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         loop {
             let mut changed = false;
             for (name, body) in &fun_bodies {
-                if self.write_functions.contains(name) {
+                if self.write_functions.contains(name.as_str()) {
                     continue;
                 }
                 if Self::expr_contains_writes(body, &self.write_functions, &self.top_fn_names, &self.passthrough_functions) {
@@ -10230,14 +10230,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // unknown provenance (e.g. an IO action received as a parameter).
         let unknown_io_value = |e: &ast::Expr| -> bool {
             match &strip_expr_wrappers(e).node {
-                ast::ExprKind::Var(name) => !name_is_known_write_free(name),
+                ast::ExprKind::Var(name) => !name_is_known_write_free(name.as_str()),
                 _ => false,
             }
         };
         match &expr.node {
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
             ast::ExprKind::Atomic(inner) => Self::expr_contains_writes(inner, write_fns, known_fns, passthrough_fns),
-            ast::ExprKind::Var(name) => write_fns.contains(name),
+            ast::ExprKind::Var(name) => write_fns.contains(name.as_str()),
             ast::ExprKind::App { func, arg } => {
                 // Conservatively treat applications of unknown callees as
                 // possibly-writing: a lambda received as a parameter
@@ -10245,7 +10245,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // can perform a write the static analysis can't see.
                 let (head, spine_args) = uncurry_app(expr);
                 let head_unknown = match &strip_expr_wrappers(head).node {
-                    ast::ExprKind::Var(name) => !name_is_known_write_free(name),
+                    ast::ExprKind::Var(name) => !name_is_known_write_free(name.as_str()),
                     ast::ExprKind::Constructor(_) => false,
                     // A literal lambda's body is covered by recursion below.
                     ast::ExprKind::Lambda { .. } => false,
@@ -10260,7 +10260,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // "known write-free". Treat such applications as possibly-writing.
                 let passthrough_arg_writes = matches!(
                     &strip_expr_wrappers(head).node,
-                    ast::ExprKind::Var(name) if passthrough_fns.contains(name)
+                    ast::ExprKind::Var(name) if passthrough_fns.contains(name.as_str())
                 ) && spine_args.iter().any(|a| unknown_io_value(a));
                 head_unknown
                     || passthrough_arg_writes
@@ -10357,12 +10357,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.expr_is_io_scoped(func, scopes) || self.expr_is_io_scoped(arg, scopes)
             }
             ast::ExprKind::Var(name) => {
-                crate::builtins::is_io_builtin(name)
+                crate::builtins::is_io_builtin(name.as_str())
                 || matches!(
                     name.as_str(),
                     "fork" | "race"
-                ) || self.io_functions.contains(name)
-                || Self::io_scopes_lookup(scopes, name)
+                ) || self.io_functions.contains(name.as_str())
+                || Self::io_scopes_lookup(scopes, name.as_str())
             }
             // A query over a source/derived is a pure, lazy `[T]` — NOT IO.
             // `full` is a viewer-only tag with no semantic effect.
@@ -10498,9 +10498,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.expr_has_external_io(func) || self.expr_has_external_io(arg)
             }
             ast::ExprKind::Var(name) => {
-                crate::builtins::is_io_builtin(name)
+                crate::builtins::is_io_builtin(name.as_str())
                     || matches!(name.as_str(), "fork" | "race")
-                    || self.io_functions.contains(name)
+                    || self.io_functions.contains(name.as_str())
             }
             // Relation reads are the "pure DB" IO that inference lets flow
             // as the relation value itself.
@@ -11705,7 +11705,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 ast::ExprKind::FieldAccess { expr: target, field } => {
                                     primary_schema = None;
                                     if let ast::ExprKind::Var(parent_var) = &target.node
-                                        && let Some(parent_schema) = var_schemas.get(parent_var) {
+                                        && let Some(parent_schema) = var_schemas.get(parent_var.as_str()) {
                                             primary_schema = extract_child_schema(parent_schema, field);
                                         }
                                     primary_source = None;
@@ -11714,7 +11714,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                     // Let-bound or previously-bound variable —
                                     // look up its schema from earlier binds.
                                     primary_source = None;
-                                    primary_schema = var_schemas.get(name).cloned();
+                                    primary_schema = var_schemas.get(name.as_str()).cloned();
                                 }
                                 _ => {
                                     primary_source = None;
@@ -11927,7 +11927,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 // extract the child field schema from the parent's schema.
                                 primary_schema = None;
                                 if let ast::ExprKind::Var(parent_var) = &target.node
-                                    && let Some(parent_schema) = var_schemas.get(parent_var) {
+                                    && let Some(parent_schema) = var_schemas.get(parent_var.as_str()) {
                                         primary_schema = extract_child_schema(parent_schema, field);
                                     }
                                 primary_source = None;
@@ -11936,7 +11936,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 // Let-bound or previously-bound variable —
                                 // look up its schema from earlier binds.
                                 primary_source = None;
-                                primary_schema = var_schemas.get(name).cloned();
+                                primary_schema = var_schemas.get(name.as_str()).cloned();
                             }
                             _ => {
                                 primary_source = None;
@@ -12178,7 +12178,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                     let base_is_primary = matches!(
                                         &key_base.node,
                                         ast::ExprKind::Var(v)
-                                            if Some(v) == primary_var.as_ref()
+                                            if primary_var.as_deref() == Some(v.as_str())
                                     );
                                     if !base_is_primary {
                                         self.diagnostics.push(
@@ -13204,7 +13204,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // Source must be a SourceRef or a variable bound from a source read
         let source_name = match &source.node {
             ast::ExprKind::SourceRef { name, .. } => name.clone(),
-            ast::ExprKind::Var(name) => self.source_var_binds.get(name)?.clone(),
+            ast::ExprKind::Var(name) => self.source_var_binds.get(name.as_str())?.clone(),
             _ => return None,
         };
         let schema = self.source_schemas.get(&source_name)?.clone();
@@ -14181,7 +14181,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         name.clone()
                     } else if let ast::ExprKind::Var(var_name) = &expr.node {
                         // Variable bound from a source read (e.g. `allMessages <- *messages`)
-                        self.source_var_binds.get(var_name)?.clone()
+                        self.source_var_binds.get(var_name.as_str())?.clone()
                     } else {
                         return None;
                     };
@@ -14322,8 +14322,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // Try simple field access first: var.column
                     if let ast::ExprKind::FieldAccess { expr, field: col_name } = &field.value.node
                         && let ast::ExprKind::Var(var_name) = &expr.node
-                            && let Some(alias) = bind_to_alias.get(var_name)
-                                && let Some(schema) = bind_to_schema.get(var_name)
+                            && let Some(alias) = bind_to_alias.get(var_name.as_str())
+                                && let Some(schema) = bind_to_schema.get(var_name.as_str())
                                     && let Some(type_str) = lookup_col_type_from_schema(schema, col_name) {
                                         select_columns.push(SqlSelectColumn {
                                             result_field: field.name.clone(),
@@ -14354,8 +14354,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if tables.len() != 1 {
                     return None;
                 }
-                let alias = bind_to_alias.get(var_name)?.clone();
-                let schema = bind_to_schema.get(var_name)?;
+                let alias = bind_to_alias.get(var_name.as_str())?.clone();
+                let schema = bind_to_schema.get(var_name.as_str())?;
                 for (col_name, type_str) in parse_schema_columns(schema) {
                     select_columns.push(SqlSelectColumn {
                         result_field: col_name.clone(),
@@ -14564,8 +14564,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // Field access on env variable or global — compute at runtime
                     return Some(SqlFragment {
                         sql: "?".to_string(),
-                        params: vec![if env.bindings.contains_key(&crate::infer::Binding::User(name.clone())) {
-                            SqlParamSource::FieldAccess(name.clone(), field.clone())
+                        params: vec![if env.bindings.contains_key(name) {
+                            SqlParamSource::FieldAccess(name.as_str().to_string(), field.clone())
                         } else {
                             SqlParamSource::Expr(expr.clone())
                         }],
@@ -14587,10 +14587,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         sql: "?".to_string(),
                         params: vec![SqlParamSource::Expr(let_expr.clone())],
                     })
-                } else if env.bindings.contains_key(&crate::infer::Binding::User(name.clone())) {
+                } else if env.bindings.contains_key(name) {
                     Some(SqlFragment {
                         sql: "?".to_string(),
-                        params: vec![SqlParamSource::Var(name.clone())],
+                        params: vec![SqlParamSource::Var(name.as_str().to_string())],
                     })
                 } else {
                     // Global constant or user function — compile at runtime
@@ -15216,11 +15216,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         let param = match &value_side.node {
             ast::ExprKind::Lit(lit) => SqlParamSource::Literal(lit.clone()),
-            ast::ExprKind::Var(name) => SqlParamSource::Var(name.clone()),
+            ast::ExprKind::Var(name) => SqlParamSource::Var(name.as_str().to_string()),
             ast::ExprKind::FieldAccess { expr, field } => {
                 if let ast::ExprKind::Var(var_name) = &expr.node {
                     if var_name != bind_var {
-                        SqlParamSource::FieldAccess(var_name.clone(), field.clone())
+                        SqlParamSource::FieldAccess(var_name.as_str().to_string(), field.clone())
                     } else {
                         return None; // both sides are bind_var fields
                     }
@@ -15338,7 +15338,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // Field access on other variable → parameter
                     return Some(SqlFragment {
                         sql: "?".to_string(),
-                        params: vec![SqlParamSource::FieldAccess(name.clone(), field.clone())],
+                        params: vec![SqlParamSource::FieldAccess(name.as_str().to_string(), field.clone())],
                     });
                 }
                 None
@@ -15353,7 +15353,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
                 Some(SqlFragment {
                     sql: "?".to_string(),
-                    params: vec![SqlParamSource::Var(name.clone())],
+                    params: vec![SqlParamSource::Var(name.as_str().to_string())],
                 })
             }
             ast::ExprKind::BinOp { op, lhs, rhs } => {
@@ -15412,7 +15412,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn expr_is_source(node: &ast::ExprKind, source_name: &str, var_binds: &HashMap<String, String>) -> bool {
         match node {
             ast::ExprKind::SourceRef { name, .. } => name == source_name,
-            ast::ExprKind::Var(name) => var_binds.get(name).is_some_and(|s| s == source_name),
+            ast::ExprKind::Var(name) => var_binds.get(name.as_str()).is_some_and(|s| s == source_name),
             _ => false,
         }
     }
@@ -15571,7 +15571,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             self.compile_expr(builder, &let_expr, env, db)
                         } else {
                             let var_expr = ast::Spanned::new(
-                                ast::ExprKind::Var(name.clone()),
+                                ast::ExprKind::Var(crate::infer::Binding::User(name.as_str().to_string())),
                                 ast::Span::new(0, 0),
                             );
                             self.compile_expr(builder, &var_expr, env, db)
@@ -15586,7 +15586,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         self.compile_expr(builder, &let_expr, env, db)
                     } else {
                         let var_expr = ast::Spanned::new(
-                            ast::ExprKind::Var(var.clone()),
+                            ast::ExprKind::Var(crate::infer::Binding::User(var.clone())),
                             ast::Span::new(0, 0),
                         );
                         self.compile_expr(builder, &var_expr, env, db)
@@ -15803,9 +15803,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn expr_is_relation_var(&self, expr: &ast::Expr) -> bool {
         match &strip_expr_wrappers(expr).node {
             ast::ExprKind::Var(name) => {
-                self.io_relation_vars.contains(name)
-                    || self.closure_relation_vars.contains(name)
-                    || self.decl_relation_vars.contains(name)
+                self.io_relation_vars.contains(name.as_str())
+                    || self.closure_relation_vars.contains(name.as_str())
+                    || self.decl_relation_vars.contains(name.as_str())
             }
             _ => false,
         }
@@ -15858,7 +15858,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     head = func;
                 }
                 match &head.node {
-                    ast::ExprKind::Var(n) => rel_fn(n),
+                    ast::ExprKind::Var(n) => rel_fn(n.as_str()),
                     ast::ExprKind::FieldAccess { field, .. } => rel_fn(field),
                     _ => false,
                 }
@@ -16521,11 +16521,11 @@ fn field_access_of(bv: &str, e: &ast::Expr) -> Option<String> {
 fn simple_value_param(bv: &str, e: &ast::Expr) -> Option<SqlParamSource> {
     match &e.node {
         ast::ExprKind::Lit(lit) => Some(SqlParamSource::Literal(lit.clone())),
-        ast::ExprKind::Var(name) if name != bv => Some(SqlParamSource::Var(name.clone())),
+        ast::ExprKind::Var(name) if !name.is_user(bv) => Some(SqlParamSource::Var(name.as_str().to_string())),
         ast::ExprKind::FieldAccess { expr, field } => {
             if let ast::ExprKind::Var(name) = &expr.node
                 && name != bv {
-                    return Some(SqlParamSource::FieldAccess(name.clone(), field.clone()));
+                    return Some(SqlParamSource::FieldAccess(name.as_str().to_string(), field.clone()));
                 }
             None
         }
@@ -17429,7 +17429,7 @@ fn extract_filter_on_source(
         let resolve_source = |se: &ast::Expr| -> Option<String> {
             match &se.node {
                 ast::ExprKind::SourceRef { name, .. } => Some(name.clone()),
-                ast::ExprKind::Var(name) => source_var_binds.get(name).cloned(),
+                ast::ExprKind::Var(name) => source_var_binds.get(name.as_str()).cloned(),
                 _ => None,
             }
         };
@@ -17564,17 +17564,17 @@ fn beta_reduce_inner(
     let span = expr.span;
     let new_node = match &expr.node {
         Var(name) => {
-            if !visited.contains(name) {
+            if !visited.contains(name.as_str()) {
                 // Local let bindings shadow top-level functions: a let
                 // inside a do-block introduces a fresh name in scope,
                 // and the matchers see the do-block AST so the local
                 // definition is the relevant one.
-                let body = let_bindings.get(name).or_else(|| fun_bodies.get(name));
+                let body = let_bindings.get(name.as_str()).or_else(|| fun_bodies.get(name.as_str()));
                 if let Some(body) = body {
-                    visited.insert(name.clone());
+                    visited.insert(name.as_str().to_string());
                     let result =
                         beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel);
-                    visited.remove(name);
+                    visited.remove(name.as_str());
                     return result;
                 }
             }
@@ -17859,8 +17859,8 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
     use ast::ExprKind::*;
     match &expr.node {
         Var(name) => {
-            if !bound.contains(name) {
-                free.insert(name.clone());
+            if !bound.contains(name.as_str()) {
+                free.insert(name.as_str().to_string());
             }
         }
         Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
@@ -18038,7 +18038,7 @@ fn pat_captures(pat: &ast::Pat, free_vars: &HashSet<String>) -> bool {
 fn expr_to_sql_param(expr: &ast::Expr) -> Option<SqlParamSource> {
     match &expr.node {
         ast::ExprKind::Lit(lit) => Some(SqlParamSource::Literal(lit.clone())),
-        ast::ExprKind::Var(name) => Some(SqlParamSource::Var(name.clone())),
+        ast::ExprKind::Var(name) => Some(SqlParamSource::Var(name.as_str().to_string())),
         _ => None,
     }
 }
@@ -18927,7 +18927,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
             // when a local binding of the same name is in scope — i.e. the
             // global is shadowed and the LOCAL value must be captured.
             if !bound.contains(name.as_str()) {
-                free.push(name.clone());
+                free.push(name.as_str().to_string());
             }
         }
         ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => {}
@@ -19384,7 +19384,7 @@ pub(crate) fn sql_scalar_kind(
     match &e.node {
         ast::ExprKind::FieldAccess { expr: inner, field } => {
             if let ast::ExprKind::Var(v) = &inner.node {
-                Ok(match col_ty(v, field).as_deref() {
+                Ok(match col_ty(v.as_str(), field).as_deref() {
                     Some("int") => Some(SqlScalarKind::Int),
                     Some("float") => Some(SqlScalarKind::Float),
                     Some("text") => Some(SqlScalarKind::Text),
@@ -19489,7 +19489,7 @@ pub(crate) fn expr_has_tag_column(
     match &e.node {
         ast::ExprKind::FieldAccess { expr: inner, field } => {
             matches!(&inner.node, ast::ExprKind::Var(v)
-                if col_ty(v, field).as_deref() == Some("tag"))
+                if col_ty(v.as_str(), field).as_deref() == Some("tag"))
         }
         ast::ExprKind::UnaryOp { operand, .. } => expr_has_tag_column(operand, col_ty),
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
@@ -19504,7 +19504,7 @@ pub(crate) fn expr_has_tag_column(
 fn pretty_expr(expr: &ast::Expr) -> String {
     match &expr.node {
         ast::ExprKind::Lit(lit) => pretty_lit(lit),
-        ast::ExprKind::Var(name) => name.clone(),
+        ast::ExprKind::Var(name) => name.as_str().to_string(),
         ast::ExprKind::ImplicitRef(name) => format!("^{name}"),
         ast::ExprKind::CollectFold(name) => format!("<>{name}"),
         ast::ExprKind::TypeHole => "_".to_string(),
@@ -20062,7 +20062,7 @@ pub(crate) fn extract_literal_with_consts(
     consts: &std::collections::HashMap<String, CompileLit>,
 ) -> Option<CompileLit> {
     match &expr.node {
-        ast::ExprKind::Var(name) => consts.get(name).cloned(),
+        ast::ExprKind::Var(name) => consts.get(name.as_str()).cloned(),
         ast::ExprKind::Annot { expr, .. } => extract_literal_with_consts(expr, consts),
         _ => extract_literal(expr),
     }

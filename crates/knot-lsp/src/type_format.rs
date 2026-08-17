@@ -147,7 +147,7 @@ fn format_expr_brief_d(expr: &ast::ExprKind, depth: usize) -> String {
     }
     let d = depth + 1;
     match expr {
-        ast::ExprKind::Var(name) => name.clone(),
+        ast::ExprKind::Var(name) => name.as_str().to_string(),
         ast::ExprKind::Lit(ast::Literal::Int(n)) => n.to_string(),
         ast::ExprKind::Lit(ast::Literal::Float(f)) => f.to_string(),
         ast::ExprKind::Lit(ast::Literal::Text(s)) => format!("\"{}\"", s),

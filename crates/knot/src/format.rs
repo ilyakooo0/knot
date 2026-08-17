@@ -581,8 +581,8 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         // a Var named `yield` must keep its parens there: `f (yield)`.
         // Head position (Prec::App) must stay bare — `yield x` do-statements
         // are represented as `App(Var("yield"), x)`.
-        ExprKind::Var(n) if n == "yield" && parent == Prec::Atom => format!("({})", n),
-        ExprKind::Var(n) => n.clone(),
+        ExprKind::Var(n) if n.is_user("yield") && parent == Prec::Atom => format!("({})", n),
+        ExprKind::Var(n) => n.to_string(),
         ExprKind::Constructor(n) => n.clone(),
         ExprKind::SourceRef { name: n } => format!("*{}", n),
         ExprKind::ImplicitRef(n) => format!("^{}", n),

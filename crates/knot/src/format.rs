@@ -265,7 +265,7 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             s.push('}');
             s
         }
-        TypeKind::Relation(inner) => format!("[{}]", render_type(inner)),
+        TypeKind::Relation(inner) => format!("Rel {}", render_type_atom(inner)),
         TypeKind::Function { param, result } => {
             let s = format!("{} -> {}", render_type_prec(param, TyPrec::App), render_type_prec(result, TyPrec::Function));
             if ctx > TyPrec::Function {

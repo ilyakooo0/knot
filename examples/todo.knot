@@ -1,7 +1,7 @@
 with {
 type Todo = {title: Text, owner: Text, done: Int 1}
 
-*todos : [Todo]
+*todos : Rel Todo
 
 add (\title owner -> do
   todos <- full *todos

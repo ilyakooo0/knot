@@ -7,7 +7,7 @@ Knot is a functional relational programming language. Relations (typed sets) are
 ```knot
 type Person = {name: Text, age: Int 1}
 
-*people : [Person]
+*people : Rel Person
 
 do
   full *people = [{name "Alice" age 30} {name "Bob" age 25}]
@@ -96,11 +96,11 @@ Note the two syntaxes differ: **values** are `{name "Alice" age 30}` (space-sepa
 
 ### Relations
 
-A relation `[T]` is a typed **set** of `T` values. No duplicates. No ordering guarantees.
+A relation `Rel T` is a typed **set** of `T` values. No duplicates. No ordering guarantees.
 
 ```knot
-names (["Alice" "Bob" "Carol"]) -- [Text]
-empty ([]) -- [a]
+names (["Alice" "Bob" "Carol"]) -- Rel Text
+empty ([]) -- Rel a
 people ([{name "Alice" age 30}]) -- [{name: Text, age: Int 1}]
 ```
 
@@ -125,7 +125,7 @@ Constructing values: `Circle {radius: 5.0}`, `Nothing {}`, `Just {value: 42}`
 
 ```knot
 type Person = {name: Text, age: Int 1}
-type TodoList = [{title: Text, done: Bool}]
+type TodoList = Rel {title: Text, done: Bool}
 ```
 
 ---
@@ -136,7 +136,7 @@ There are five kinds of top-level declarations:
 
 | Declaration | Kind | Description |
 |---|---|---|---|
-| `*foo : [T]` | Source relation | Persisted in SQLite, mutable via `*foo = expr` |
+| `*foo : Rel T` | Source relation | Persisted in SQLite, mutable via `*foo = expr` |
 | `foo <query>` | Query field | Read-only, recomputed on access |
 | `foo = expr` | Constant/function | Pure value, no DB effects |
 | `type Foo = T` | Type alias | Name for a type |
@@ -145,8 +145,8 @@ There are five kinds of top-level declarations:
 data Status = Open {} | Closed {}
 
 -- Source: stored in DB
-*people : [{name: Text, age: Int 1}]
-*todos : [{title: Text, owner: Text}]
+*people : Rel {name: Text, age: Int 1}
+*todos : Rel {title: Text, owner: Text}
 
 -- Query field: read-only computed relation
 seniors (base.filter (\p -> p.age > 65) *people)
@@ -228,7 +228,7 @@ whatever the surrounding code requires and is generalized like a type variable:
 with {
 id : _ -> _
 id \x -> x
-first : [_] -> _
+first : Rel _ -> _
 first \xs -> base.head xs
 const : _ -> _ -> _
 const \x y -> x
@@ -264,7 +264,7 @@ argument. To share a type between positions, use an explicit type variable
 
 ## Do Blocks
 
-`do` blocks are the primary syntax for comprehensions and sequencing. They work on four types — relations `[a]`, `IO`, `Maybe`, and `Result` — compiled structurally, not via a `Monad` trait.
+`do` blocks are the primary syntax for comprehensions and sequencing. They work on four types — relations `Rel a`, `IO`, `Maybe`, and `Result` — compiled structurally, not via a `Monad` trait.
 
 ### Relation Comprehensions
 
@@ -272,7 +272,7 @@ A comprehension over one source filters and projects its rows:
 
 ```knot
 with {
-*employees : [{name: Text, salary: Int 1}]
+*employees : Rel {name: Text, salary: Int 1}
 }
 (with {result (do
   e <- *employees
@@ -287,8 +287,8 @@ single-table predicates:
 
 ```knot
 with {
-*employees : [{name: Text, dept: Text, salary: Int 1}]
-*departments : [{name: Text, budget: Int 1}]
+*employees : Rel {name: Text, dept: Text, salary: Int 1}
+*departments : Rel {name: Text, budget: Int 1}
 }
 (with {result (do
   e <- *employees
@@ -320,7 +320,7 @@ into memory. This happens at a `base.run` boundary or a whole-relation bind
 (`rows <- *rel` in an IO do-block), both of which materialize the query:
 
 ```knot
-*people : [{name: Text, age: Int 1}]
+*people : Rel {name: Text, age: Int 1}
 (do
   people <- *people            -- whole relation loaded into memory
   base.println (base.show (base.count people))
@@ -355,10 +355,10 @@ do
 
 ```knot
 -- IO do block with DB operations
-*people : [{name: Text, age: Int 1}]
+*people : Rel {name: Text, age: Int 1}
 addPerson \name age -> do
   people <- *people
-  *people = base.union people [{name name age age}]
+  *people = base.union people Rel {name name age age}
 ```
 
 The compiler detects whether a do block is relational or IO from the types. Relation operations (`*rel`, `&rel`, and writes `*rel = expr`) all return `IO value`.
@@ -370,8 +370,8 @@ Filter and destructure in one step:
 ```knot
 data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
 data Status = InProgress {assignee: Text} | Done {}
-*shapes : [Shape]
-*tickets : [{title: Text, status: Status}]
+*shapes : Rel Shape
+*tickets : Rel {title: Text, status: Status}
 &circles = do
   shapes <- *shapes
   with {result do
@@ -397,7 +397,7 @@ data Status = InProgress {assignee: Text} | Done {}
 Mutation is written `*rel = expr`, which makes the source relation equal to `expr`. There is no `set` keyword — the assignment is the bare `*rel = ...` form. The compiler recognizes common shapes (`*rel = union *rel [...]` → INSERT, conditional `map` → UPDATE, `filter` → DELETE) and emits minimal SQL; otherwise it rewrites the whole relation. Use `full *rel = expr` to force a full overwrite.
 
 ```knot
-*people : [{name: Text, age: Int 1}]
+*people : Rel {name: Text, age: Int 1}
 
 -- Insert (union with singleton)
 addPerson do
@@ -515,7 +515,7 @@ priority \p -> case p of
 ```knot
 describe \rel -> case rel of
   [] -> "empty"
-  [{name n}] -> "just " ++ n
+  Rel {name n} -> "just " ++ n
   Cons h t -> "first of many: " ++ base.show h.name
 ```
 
@@ -540,7 +540,7 @@ sumList \xs -> case xs of
 `groupBy` partitions a relation by key fields. After `groupBy`, the bound variable becomes a sub-relation:
 
 ```knot
-*todos : [{title: Text, owner: Text, done: Int 1}]
+*todos : Rel {title: Text, owner: Text, done: Int 1}
 &workload = do
   with {result do
     t <- *todos
@@ -562,10 +562,10 @@ After `groupBy {owner t.owner}`:
 
 ## Nested Relations
 
-Fields can hold `[T]` — sets nested inside rows:
+Fields can hold `Rel T` — sets nested inside rows:
 
 ```knot
-*teams : [{name: Text, members: [{name: Text, age: Int 1}]}]
+*teams : Rel {name: Text, members: [{name: Text, age: Int 1}}]
 
 -- Query into nested relations
 &allMembers = do
@@ -598,7 +598,7 @@ lazy — declaring one reads nothing; the query runs when the field is used.
 
 ```knot
 data Status = Open {} | Closed {}
-*todos : [{title: Text, owner: Text, done: Int 1}]
+*todos : Rel {title: Text, owner: Text, done: Int 1}
 
 openTodos (do
   t <- *todos
@@ -617,7 +617,7 @@ A query field that references its own name computes a fixpoint (transitive
 closure):
 
 ```knot
-*manages : [{manager: Text, report: Text}]
+*manages : Rel {manager: Text, report: Text}
 
 reportsTo (base.union *manages (do
   r <- reportsTo
@@ -637,11 +637,11 @@ The operators and higher-order functions are still there, but they are
 
 - `==` `!=` `<` `>` `<=` `>=` work on `Int 1`, `Float 1`, `Text` (equality also
   on `Bool`); `+` `-` `*` `/` `%` and unary `-` on numerics; `++` on `Text`
-  and `[a]`. No type class is involved — the compiler evaluates them directly.
+  and `Rel a`. No type class is involved — the compiler evaluates them directly.
 - `base.map`, `base.fold`, `base.traverse`, `base.bind`, etc. are plain
-  polymorphic functions over the concrete types `[a]`, `Maybe a`,
+  polymorphic functions over the concrete types `Rel a`, `Maybe a`,
   `Result e a`, and `IO`, with no bounds. Do-notation with `<-` works on
-  `[a]`, `IO`, `Maybe`, and `Result` because the compiler knows how to sequence
+  `Rel a`, `IO`, `Maybe`, and `Result` because the compiler knows how to sequence
   each of them — not because of a `Monad` instance you could write.
 
 Because there are no instances to define, there is also nothing to derive and
@@ -680,11 +680,11 @@ Relation operations are also `IO`-wrapped:
 
 ```knot
 type Person = {name: Text, age: Int 1}
-*people : [Person]
+*people : Rel Person
 
 -- All relation operations are IO:
 birthday \name -> do
-  people <- *people              -- IO [Person]
+  people <- *people              -- IO Rel Person
   *people = do               -- IO {}
     p <- people
     yield (case p.name == name of
@@ -699,7 +699,7 @@ birthday \name -> do
 `atomic` takes an IO expression containing only DB operations and runs it in a transaction:
 
 ```knot
-*orders : [{item: Text, qty: Int 1}]
+*orders : Rel {item: Text, qty: Int 1}
 handleOrder \item -> do
   orderId <- atomic do
     orders <- *orders
@@ -800,7 +800,7 @@ and the loser unwinds at its next safe point.
 | unary `-` | Negation | numerics |
 | `==` `!=` | Equality | `Int 1`, `Float 1`, `Text`, `Bool` |
 | `<` `>` `<=` `>=` | Comparison | `Int 1`, `Float 1`, `Text` |
-| `++` | Concatenation | `Text`, `[a]` |
+| `++` | Concatenation | `Text`, `Rel a` |
 | `&&` `\|\|` | Boolean logic | `Bool` (direct) |
 | `\|>` | Pipe forward | `x \|> f` = `f x` |
 
@@ -814,30 +814,30 @@ All intrinsic — no trait mechanism.
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `filter` | `(a -> Bool) -> [a] -> [a]` | Keep matching rows |
-| `map` | `(a -> b) -> [a] -> [b]` | Transform each row |
-| `match` | `Constructor -> [ADT] -> [Payload]` | Filter by variant |
-| `fold` | `(b -> a -> b) -> b -> [a] -> b` | Left fold |
-| `count` | `[a] -> Int u` | Number of rows |
-| `countWhere` | `(a -> Bool) -> [a] -> Int u` | Filtered count (SQL-pushed when possible) |
-| `sum` | `(a -> b) -> [a] -> b` | Sum projected field (preserves units) |
-| `avg` | `(a -> Float u) -> [a] -> Float u` | Average projected field (preserves units) |
-| `minOn` | `(a -> b) -> [a] -> b` | Min of projected field (panics on empty) |
-| `maxOn` | `(a -> b) -> [a] -> b` | Max of projected field (panics on empty) |
+| `filter` | `(a -> Bool) -> Rel a -> Rel a` | Keep matching rows |
+| `map` | `(a -> b) -> Rel a -> Rel b` | Transform each row |
+| `match` | `Constructor -> Rel ADT -> Rel Payload` | Filter by variant |
+| `fold` | `(b -> a -> b) -> b -> Rel a -> b` | Left fold |
+| `count` | `Rel a -> Int u` | Number of rows |
+| `countWhere` | `(a -> Bool) -> Rel a -> Int u` | Filtered count (SQL-pushed when possible) |
+| `sum` | `(a -> b) -> Rel a -> b` | Sum projected field (preserves units) |
+| `avg` | `(a -> Float u) -> Rel a -> Float u` | Average projected field (preserves units) |
+| `minOn` | `(a -> b) -> Rel a -> b` | Min of projected field (panics on empty) |
+| `maxOn` | `(a -> b) -> Rel a -> b` | Max of projected field (panics on empty) |
 | `min` | `a -> a -> a` | Binary min of two orderable values |
 | `max` | `a -> a -> a` | Binary max of two orderable values |
-| `head` | `[a] -> Maybe a` | First row, or `Nothing` if empty |
-| `findFirst` | `[a] -> (a -> Bool) -> Maybe a` | First row matching predicate |
-| `single` | `[a] -> Maybe a` | `Just x` for a singleton, `Nothing` otherwise |
-| `any` | `(a -> Bool) -> [a] -> Bool` | True if any row matches |
-| `all` | `(a -> Bool) -> [a] -> Bool` | True if every row matches |
-| `elem` | `a -> [a] -> Bool` | Membership by structural equality |
-| `union` | `[a] -> [a] -> [a]` | Set union |
-| `diff` | `[a] -> [a] -> [a]` | Set difference |
-| `inter` | `[a] -> [a] -> [a]` | Set intersection |
-| `sortBy` | `(a -> b) -> [a] -> [a]` | Reorder rows by projected key (`Ord b`) |
-| `take` | `Int 1 -> [a] -> [a]` | First *n* rows (`Sequence.take`) |
-| `drop` | `Int 1 -> [a] -> [a]` | Drop first *n* rows (`Sequence.drop`) |
+| `head` | `Rel a -> Maybe a` | First row, or `Nothing` if empty |
+| `findFirst` | `Rel a -> (a -> Bool) -> Maybe a` | First row matching predicate |
+| `single` | `Rel a -> Maybe a` | `Just x` for a singleton, `Nothing` otherwise |
+| `any` | `(a -> Bool) -> Rel a -> Bool` | True if any row matches |
+| `all` | `(a -> Bool) -> Rel a -> Bool` | True if every row matches |
+| `elem` | `a -> Rel a -> Bool` | Membership by structural equality |
+| `union` | `Rel a -> Rel a -> Rel a` | Set union |
+| `diff` | `Rel a -> Rel a -> Rel a` | Set difference |
+| `inter` | `Rel a -> Rel a -> Rel a` | Set intersection |
+| `sortBy` | `(a -> b) -> Rel a -> Rel a` | Reorder rows by projected key (`Ord b`) |
+| `take` | `Int 1 -> Rel a -> Rel a` | First *n* rows (`Sequence.take`) |
+| `drop` | `Int 1 -> Rel a -> Rel a` | Drop first *n* rows (`Sequence.drop`) |
 
 ### Text
 
@@ -848,7 +848,7 @@ All intrinsic — no trait mechanism.
 | `length` | `Text -> Int u` | Character count |
 | `trim` | `Text -> Text` | Strip whitespace |
 | `reverse` | `Text -> Text` | Reverse |
-| `chars` | `Text -> [Text]` | Split to characters |
+| `chars` | `Text -> Rel Text` | Split to characters |
 | `take` | `Int 1 -> Text -> Text` | First *n* characters (`Sequence.take`) |
 | `drop` | `Int 1 -> Text -> Text` | Drop first *n* characters (`Sequence.drop`) |
 | `contains` | `Text -> Text -> Bool` | Substring check |
@@ -878,7 +878,7 @@ All intrinsic — no trait mechanism.
 Type-directed conversions also live in the nested **`base.morph`** record,
 consumed by the `^into` implicit-field projection: `(^into) x` resolves the
 matching `base.morph.<from>To<to>.into` by both the argument and expected
-result type (see [base.md](base.md#morphs-basemorph)).
+result type (see Rel (base.md)(base.md#morphs-basemorph)).
 
 ### IO
 
@@ -896,7 +896,7 @@ result type (see [base.md](base.md#morphs-basemorph)).
 | `appendFile` | `Text -> Text -> IO {}` | Append to file |
 | `fileExists` | `Text -> IO Bool` | Check file exists |
 | `removeFile` | `Text -> IO {}` | Delete file |
-| `listDir` | `Text -> IO [Text]` | List directory |
+| `listDir` | `Text -> IO Rel Text` | List directory |
 | `now` | `IO Int Ms` | Unix timestamp (milliseconds) |
 | `sleep` | `Int Ms -> IO {}` | Pause the current thread |
 | `randomInt` | `Int u -> IO Int u` | Random int `[0, bound)`, preserves unit |
@@ -908,10 +908,10 @@ result type (see [base.md](base.md#morphs-basemorph)).
 | `retry` | `a` | Rollback and wait (inside `atomic` only) |
 | `when` | `Bool -> IO {} -> IO {}` | Run action when condition is true |
 | `unless` | `Bool -> IO {} -> IO {}` | Run action when condition is false |
-| `forEach` | `[a] -> (a -> IO {}) -> IO {}` | Sequence an action over each row |
+| `forEach` | `Rel a -> (a -> IO {}) -> IO {}` | Sequence an action over each row |
 | `listen` | `Int u -> Server a -> IO {}` | Start an HTTP server |
 | `fetch` | `Text -> Endpoint -> IO (Result HttpError T)` | Type-safe HTTP client |
-| `fetchWith` | `Text -> {headers: [..]} -> Endpoint -> IO (Result HttpError T)` | `fetch` with ad-hoc headers |
+| `fetchWith` | `Text -> {headers: Rel (..)} -> Endpoint -> IO (Result HttpError T)` | `fetch` with ad-hoc headers |
 
 `listen` takes a `Server` built by `serve API where` and binds the HTTP port.
 
@@ -964,10 +964,10 @@ HTTP routing with typed paths, query params, bodies, and headers:
 ```knot
 data Priority = Low {} | Medium {} | High {} | Critical {}
 type Todo = {title: Text, owner: Text, priority: Priority}
-*todos : [Todo]
+*todos : Rel Todo
 
 route TodoApi where
-  GET /todos/{owner: Text} -> [Todo] = GetTodos
+  GET /todos/{owner: Text} -> Rel Todo = GetTodos
   POST {title: Text, owner: Text} /todos -> Todo = CreateTodo
 
 route AdminApi where
@@ -978,7 +978,7 @@ route Api = TodoApi | AdminApi
 
 addTodo (\title owner -> do
   todos <- *todos
-  *todos = base.union todos [{title title owner owner priority (Priority.Low {})}])
+  *todos = base.union todos Rel {title title owner owner priority (Priority.Low {})})
 
 getTodos (\owner -> do
   todos <- *todos
@@ -1004,7 +1004,7 @@ api (serve Api where
 `Ok {value: v}` responds 200 with `v` as JSON. `Err {error: {status, message}}` responds with the given status code and a JSON error body:
 
 ```knot
-*people : [{id: Int 1, name: Text}]
+*people : Rel {id: Int 1, name: Text}
 route Api where
   GET /users/{id: Int 1} -> {id: Int 1, name: Text} = GetUser
 api (serve Api where
@@ -1024,7 +1024,7 @@ Request and response headers use the `headers` keyword:
 ```knot
 route Api where
   GET /todos headers {authorization: Text}
-    -> [{title: Text}] headers {xTotalCount: Int 1}
+    -> Rel {title: Text} headers {xTotalCount: Int 1}
     = GetTodos
   POST {title: Text} /todos headers {authorization: Text}
     -> {id: Int 1}
@@ -1037,9 +1037,9 @@ Request headers become constructor fields. When response headers are declared, t
 
 ```knot
 type Todo = {title: Text}
-*todos : [Todo]
+*todos : Rel Todo
 route Api where
-  GET /todos headers {authorization: Text} -> [Todo] headers {xTotalCount: Int 1} = GetTodos
+  GET /todos headers {authorization: Text} -> Rel Todo headers {xTotalCount: Int 1} = GetTodos
 
 api (serve Api where
   GetTodos = \{authorization authorization} -> do
@@ -1051,7 +1051,7 @@ Optional headers use `Maybe`:
 
 ```knot
 route Api where
-  GET /todos headers {authorization: Maybe Text} -> [Todo] = GetTodos
+  GET /todos headers {authorization: Maybe Text} -> Rel Todo = GetTodos
 ```
 
 Server gets `Nothing {}` if absent, `Just {value: "..."}` if present. In `fetch`, `Nothing` headers are skipped.
@@ -1062,7 +1062,7 @@ On the `fetch` side, header fields are sent automatically. When response headers
      the endpoint constructor is not yet value-accessible in expressions (doc-vs-impl gap). -->
 ```knot-skip
 result <- base.fetch "https://api.example.com" (GetTodos {authorization "Bearer tok"})
--- result : IO (Result ... {body: [Todo], headers: {xTotalCount: Int 1}})
+-- result : IO (Result ... {body: Rel Todo, headers: {xTotalCount: Int 1}})
 ```
 
 ### Rate Limiting
@@ -1110,7 +1110,7 @@ data Event = Gossip {payload: Text}
 serverLimit ({key (\input ctx -> Maybe.Just {value ctx.clientIp}) limit {requests 1000 window (60000 : Int Ms)}})
 
 route Api where
-  POST {events: [Event]} /federation/gossip -> {} rateLimit serverLimit = RecvGossip
+  POST {events: Rel Event} /federation/gossip -> {} rateLimit serverLimit = RecvGossip
 ```
 
 ---
@@ -1127,7 +1127,7 @@ The compiler maintains a lockfile (`<name>.schema.lock`) tracking persisted sche
 ### Migrations
 
 ```knot
-*people : [{name: Text, age: Int 1}]
+*people : Rel {name: Text, age: Int 1}
   migrate from {name: Text, age: Int 1}
   to {name: Text, age: Int 1, email: Text}
   using (\old -> (base.unify old {email (old.name ++ "@unknown.com")}))
@@ -1138,9 +1138,9 @@ The compiler maintains a lockfile (`<name>.schema.lock`) tracking persisted sche
 ## Subset Constraints
 
 ```knot
-*people : [{name: Text, age: Int 1}]
-*orders : [{customer: Text, amount: Int 1}]
-*users : [{name: Text, email: Text}]
+*people : Rel {name: Text, age: Int 1}
+*orders : Rel {customer: Text, amount: Int 1}
+*users : Rel {name: Text, email: Text}
 
 -- Referential integrity
 *orders.customer <= *people.name
@@ -1200,7 +1200,7 @@ type Nat = Int 1 where \x -> x >= 0
   yield {})
 ```
 
-`RefinementError = {typeName: Text, violations: [{field: Maybe Text, message: Text}]}`
+`RefinementError = {typeName: Text, violations: Rel {field: Maybe Text, message: Text}}`
 
 ### Automatic Validation
 
@@ -1208,7 +1208,7 @@ type Nat = Int 1 where \x -> x >= 0
 
 ```knot
 type Nat = Int 1 where \x -> x >= 0
-*people : [{name: Text, age: Nat}]
+*people : Rel {name: Text, age: Nat}
 
 -- This panics if any age is negative:
 do
@@ -1256,7 +1256,7 @@ compute do
   yield (a + b)
 ```
 
-`do` support is **fixed to these four types** (`[a]`, `IO`, `Maybe`, `Result`)
+`do` support is **fixed to these four types** (`Rel a`, `IO`, `Maybe`, `Result`)
 — there is no way to make a user-defined type work with `do`, because that
 would require a `Monad` instance and there is no trait system to write one in.
 
@@ -1274,11 +1274,11 @@ data Status
 
 type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
 
-*todos : [Todo]
+*todos : Rel Todo
 
 add \title owner priority -> do
   todos <- *todos
-  *todos = base.union todos [{title title owner owner priority priority status (Status.Open {})}]
+  *todos = base.union todos Rel {title title owner owner priority priority status (Status.Open {})}
 
 complete \title -> do
   todos <- *todos
@@ -1337,16 +1337,16 @@ do
 ### Insert
 
 ```knot
-*rel : [{value: Int 1}]
+*rel : Rel {value: Int 1}
 addRow \newRow -> do
   rel <- *rel
-  *rel = base.union rel [newRow]
+  *rel = base.union rel Rel newRow
 ```
 
 ### Delete by condition
 
 ```knot
-*rel : [{id: Int 1, field: Int 1}]
+*rel : Rel {id: Int 1, field: Int 1}
 deleteWhere \valueToDelete -> do
   rel <- *rel
   *rel = do
@@ -1358,7 +1358,7 @@ deleteWhere \valueToDelete -> do
 ### Update by condition
 
 ```knot
-*rel : [{id: Int 1, field: Int 1}]
+*rel : Rel {id: Int 1, field: Int 1}
 updateWhere \target newValue -> do
   rel <- *rel
   *rel = do
@@ -1371,8 +1371,8 @@ updateWhere \target newValue -> do
 ### Join two relations
 
 ```knot
-*employees : [{name: Text, dept: Text}]
-*departments : [{name: Text, budget: Int 1}]
+*employees : Rel {name: Text, dept: Text}
+*departments : Rel {name: Text, budget: Int 1}
 &joined = do
   employees <- *employees
   departments <- *departments
@@ -1388,8 +1388,8 @@ updateWhere \target newValue -> do
 ### Aggregate
 
 ```knot
-*orders : [{amount: Int 1}]
-*people : [{name: Text, age: Int 1}]
+*orders : Rel {amount: Int 1}
+*people : Rel {name: Text, age: Int 1}
 getTotal do
   orders <- *orders
   yield (base.fold (\acc x -> acc + x.amount) 0 orders)
@@ -1403,7 +1403,7 @@ getCount do
 
 ```knot
 data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
-*shapes : [Shape]
+*shapes : Rel Shape
 
 -- Using match
 &circles = do

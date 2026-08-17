@@ -9,8 +9,8 @@ fn subset_constraint_accepts_valid() {
         "subset_ok",
         r#"with {
 type Person = {name: Text, age: Int 1, email: Text}
-*people : [Person]
-*orders : [{customer: Text, amount: Int 1}]
+*people : Rel Person
+*orders : Rel {customer: Text, amount: Int 1}
 *orders.customer <= *people.name
 }
 (do
@@ -30,8 +30,8 @@ fn subset_constraint_rejects_orphan() {
         "subset_orphan",
         r#"with {
 type Person = {name: Text, age: Int 1, email: Text}
-*people : [Person]
-*orders : [{customer: Text, amount: Int 1}]
+*people : Rel Person
+*orders : Rel {customer: Text, amount: Int 1}
 *orders.customer <= *people.name
 }
 (do
@@ -62,7 +62,7 @@ fn uniqueness_constraint_rejects_duplicate() {
         "subset_uniq",
         r#"with {
 type Person = {name: Text, email: Text}
-*people : [Person]
+*people : Rel Person
 *people <= *people.email
 }
 (do

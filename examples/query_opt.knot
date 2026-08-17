@@ -3,8 +3,8 @@ with {
 type Employee = {name: Text, dept: Text, salary: Int 1}
 type Department = {name: Text, budget: Int 1}
 
-*employees : [Employee]
-*departments : [Department]
+*employees : Rel Employee
+*departments : Rel Department
 
 -- 1. Count pushdown: count *rel → SQL COUNT(*)
 countDemo (do

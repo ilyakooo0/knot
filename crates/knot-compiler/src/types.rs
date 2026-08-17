@@ -45,7 +45,7 @@ pub fn resolved_to_source(ty: &ResolvedType) -> String {
                 .collect();
             format!("{{{}}}", inner.join(", "))
         }
-        ResolvedType::Relation(elem) => format!("[{}]", resolved_to_source(elem)),
+        ResolvedType::Relation(elem) => format!("Rel {}", resolved_to_source(elem)),
         ResolvedType::Function(a, b) => {
             format!("{} -> {}", resolved_to_source(a), resolved_to_source(b))
         }

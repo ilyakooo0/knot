@@ -1941,11 +1941,11 @@ impl Infer {
     }
 
     /// Normalize a type-level application after substitution.
-    /// Reduces `App(TyCon("[]"), a)` → `Relation(a)`,
+    /// Reduces `App(TyCon("Rel"), a)` → `Relation(a)`,
     /// `App(TyCon(name), a)` → `Con(name, [a])`, etc.
     fn normalize_app(f: Ty, a: Ty) -> Ty {
         match f {
-            Ty::TyCon(ref name) if name == "[]" => Ty::Relation(Box::new(a)),
+            Ty::TyCon(ref name) if name == "Rel" => Ty::Relation(Box::new(a)),
             Ty::TyCon(ref name) if name == "IO" => Ty::IO(Box::new(a)),
             Ty::App(..) => Ty::App(Box::new(f), Box::new(a)),
             Ty::TyCon(name) => Ty::Con(name, vec![a]),
@@ -2445,11 +2445,11 @@ impl Infer {
             // hardcoding `t1_provided = true` via bare `unify`) is unsound for
             // rank-2 types — mirrors the `(App, App)` arm above.
             (Ty::App(f, a), Ty::Relation(b)) => {
-                self.unify_dir(f, &Ty::TyCon("[]".into()), span, t1_provided);
+                self.unify_dir(f, &Ty::TyCon("Rel".into()), span, t1_provided);
                 self.unify_dir(a, b, span, t1_provided);
             }
             (Ty::Relation(b), Ty::App(f, a)) => {
-                self.unify_dir(f, &Ty::TyCon("[]".into()), span, !t1_provided);
+                self.unify_dir(f, &Ty::TyCon("Rel".into()), span, !t1_provided);
                 self.unify_dir(a, b, span, !t1_provided);
             }
             // App(f, Unit(u)) vs dimensionless Int/Float: a unit-carrying
@@ -4144,12 +4144,12 @@ impl Infer {
                 "Bool" => Ty::Bool,
                 "Bytes" => Ty::Bytes,
                 "Uuid" => Ty::Uuid,
-                "[]" => Ty::TyCon("[]".into()),
+                "Rel" => Ty::TyCon("Rel".into()),
                 // `Vec` — the concrete in-memory sequence type constructor.
                 // `App(TyCon("Vec"), a)` reduces to `Con("Vec", [a])` in
-                // `normalize_app`. Distinct from `[]` (the lazy relation/query
+                // `normalize_app`. Distinct from `Rel` (the lazy relation/query
                 // type): a `Vec T` is always materialized data, so ops on it
-                // never re-query a source. `run : [T] -> IO (Vec T)` is the
+                // never re-query a source. `run : Rel T -> IO (Vec T)` is the
                 // explicit boundary that forces a query into a Vec.
                 "Vec" => Ty::TyCon("Vec".into()),
                 _ => {
@@ -4504,7 +4504,13 @@ impl Infer {
                 format!("{{{}}}", parts.join(", "))
             }
             Ty::Relation(inner) => {
-                format!("[{}]", self.display_ty(inner))
+                // `Rel T`; parenthesize a compound element type so `Rel` binds
+                // tighter than `->` / application (`Rel (a -> b)`).
+                let inner_s = self.display_ty(inner);
+                match inner.peel_alias() {
+                    Ty::Fun(..) | Ty::App(..) | Ty::Relation(_) => format!("Rel ({inner_s})"),
+                    _ => format!("Rel {inner_s}"),
+                }
             }
             Ty::Con(name, args) => {
                 // Unit-bearing Int/Float: `Con("Int", [Unit(u)])` → `Int u`,
@@ -8822,7 +8828,7 @@ impl Infer {
                 ));
                 let mut missing: Vec<&str> = Vec::new();
                 if !has_empty {
-                    missing.push("[]");
+                    missing.push("Rel");
                 }
                 if !has_cons {
                     missing.push("Cons head tail");
@@ -9183,7 +9189,7 @@ impl Infer {
                             Ty::Relation(_) => applied,
                             Ty::App(f, _) => {
                                 let f_applied = self.apply(f);
-                                if matches!(f_applied.peel_alias(), Ty::TyCon(n) if n == "[]") {
+                                if matches!(f_applied.peel_alias(), Ty::TyCon(n) if n == "Rel") {
                                     applied
                                 } else {
                                     Ty::Relation(Box::new(Ty::unit()))
@@ -9536,7 +9542,7 @@ impl Infer {
             Ty::Bool => Some("Bool".into()),
             Ty::Bytes => Some("Bytes".into()),
             Ty::Uuid => Some("Uuid".into()),
-            Ty::Relation(_) => Some("[]".into()),
+            Ty::Relation(_) => Some("Rel".into()),
             Ty::TyCon(name) => Some(name.clone()),
             // Refined nullary aliases (`type Nat = Int where ...`) are erased
             // at runtime, so trait impls on the base type satisfy constraints
@@ -12888,7 +12894,7 @@ fn display_ty_clean_inner(
             }
             format!("{{{}}}", parts.join(", "))
         }
-        Ty::Relation(inner) => format!("[{}]", display_ty_clean_inner(inner, names, unit_names, false, wire)),
+        Ty::Relation(inner) => format!("Rel {}", display_ty_clean_inner(inner, names, unit_names, true, wire)),
         Ty::Con(name, args) => {
             // Unit-bearing Int/Float → `Int u`/`Float u`, collapsing to
             // `Int`/`Float` when dimensionless. On the compile-expected WIRE
@@ -13527,7 +13533,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
     for trait_name in &["Functor", "Applicative", "Monad", "Alternative", "Foldable", "Traversable"] {
         infer
             .known_impls
-            .insert((trait_name.to_string(), "[]".to_string()));
+            .insert((trait_name.to_string(), "Rel".to_string()));
     }
     for trait_name in &["Functor", "Applicative", "Monad", "Alternative"] {
         infer
@@ -13554,7 +13560,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
     // `Bool` is deliberately not orderable): ADTs that opt in via
     // `deriving (Ord)` are registered by `collect_impls` and ordered through
     // the structural recursion in the runtime's `compare_values`.
-    for ty in &["Int", "Float", "Text", "Bool", "Bytes", "Uuid", "Record", "Variant", "[]"] {
+    for ty in &["Int", "Float", "Text", "Bool", "Bytes", "Uuid", "Record", "Variant", "Rel"] {
         infer.known_impls.insert(("Eq".to_string(), ty.to_string()));
     }
     for ty in &["Int", "Float", "Text"] {
@@ -13564,9 +13570,9 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         infer.known_impls.insert(("Num".to_string(), ty.to_string()));
     }
     infer.known_impls.insert(("Semigroup".to_string(), "Text".to_string()));
-    infer.known_impls.insert(("Semigroup".to_string(), "[]".to_string()));
+    infer.known_impls.insert(("Semigroup".to_string(), "Rel".to_string()));
     infer.known_impls.insert(("Sequence".to_string(), "Text".to_string()));
-    infer.known_impls.insert(("Sequence".to_string(), "[]".to_string()));
+    infer.known_impls.insert(("Sequence".to_string(), "Rel".to_string()));
 
     // Phase 3: Pre-register top-level names (builtins, functions, trait methods)
     infer.pre_register(program);
@@ -13822,7 +13828,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         // a missing-impl panic in codegen. Surface it as a clean diagnostic.
         if empty_spans.contains(span) {
             let alt_ty = match &kind {
-                MonadKind::Relation => Some("[]".to_string()),
+                MonadKind::Relation => Some("Rel".to_string()),
                 MonadKind::Adt(name) => Some(name.clone()),
                 MonadKind::IO => Some("IO".to_string()),
             };
@@ -14181,7 +14187,7 @@ fn action_monad_of(ty: &Ty) -> Option<MonadKind> {
             Some(MonadKind::Adt(name.clone()))
         }
         Ty::App(f, _) => action_monad_of(f).or_else(|| match f.peel_alias() {
-            Ty::TyCon(name) if name == "[]" => Some(MonadKind::Relation),
+            Ty::TyCon(name) if name == "Rel" => Some(MonadKind::Relation),
             Ty::TyCon(name) if name == "IO" => Some(MonadKind::IO),
             Ty::TyCon(name) => Some(MonadKind::Adt(name.clone())),
             _ => None,
@@ -14775,7 +14781,7 @@ fn for_each_route_composite<'a>(
 /// codegen dispatch. Defaults unresolved types to Relation.
 fn monad_kind_of(resolved: &Ty) -> MonadKind {
     match resolved.peel_alias() {
-        Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
+        Ty::TyCon(name) if name == "Rel" => MonadKind::Relation,
         Ty::TyCon(name) if name == "IO" => MonadKind::IO,
         Ty::TyCon(name) => MonadKind::Adt(name.clone()),
         Ty::Relation(_) => MonadKind::Relation,
@@ -14786,7 +14792,7 @@ fn monad_kind_of(resolved: &Ty) -> MonadKind {
             // classifying it as Adt("IO") would dispatch to a nonexistent
             // `Monad_IO_bind`.
             Ty::TyCon(name) if name == "IO" => MonadKind::IO,
-            Ty::TyCon(name) if name == "[]" => MonadKind::Relation,
+            Ty::TyCon(name) if name == "Rel" => MonadKind::Relation,
             Ty::TyCon(name) => MonadKind::Adt(name.clone()),
             _ => MonadKind::Relation,
         },

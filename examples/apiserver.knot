@@ -17,7 +17,7 @@ data Active = Yes {} | No {}
 
 type Task = {id: Int 1, title: Text, owner: Text, priority: Priority, done: Active}
 
-*tasks : [Task]
+*tasks : Rel Task
 
 -- Every route feature on display:
 --   List    — plain GET, returns a relation.
@@ -34,12 +34,12 @@ type Task = {id: Int 1, title: Text, owner: Text, priority: Priority, done: Acti
 -- literal-only routes on their own prefixes (`/search`, `/summary`, `/echo`)
 -- rather than alongside a `{param}` sibling.
 api Tasks where
-  List    get  /tasks -> [Task]
-  Get     get  /tasks/{id: Int 1} -> [Task]
-  Search  get  /search?{q: Text}&{limit: Int 1} -> [Task]
+  List    get  /tasks -> Rel Task
+  Get     get  /tasks/{id: Int 1} -> Rel Task
+  Search  get  /search?{q: Text}&{limit: Int 1} -> Rel Task
   Create  post /tasks ={title: Text, owner: Text} -> Task
   Echo    post /echo ={title: Text, owner: Text} -> Task @{xRequestId: Text}
-  Audit   get  /tasks/{id: Int 1}/audit @{authorization: Text} -> [Task]
+  Audit   get  /tasks/{id: Int 1}/audit @{authorization: Text} -> Rel Task
   Summary get  /summary -> Int 1
     rateLimit {key (\i c -> Maybe.Just {value "global"})
                limit {requests 100 window 60000}}

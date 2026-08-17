@@ -11,7 +11,7 @@ fn persisted_relation_groupby() {
         "groupby",
         r#"with {
 type Todo = {owner: Text, done: Int 1}
-*todos : [Todo]
+*todos : Rel Todo
 }
 (do
   full *todos = [{owner "x" done 0} {owner "x" done 1} {owner "y" done 0}]
@@ -34,7 +34,7 @@ fn persisted_relation_read_write() {
         "persist",
         r#"with {
 type C = {n: Int 1}
-*cs : [C]
+*cs : Rel C
 }
 (do
   full *cs = [{n 1} {n 2} {n 3}]
@@ -133,7 +133,7 @@ fn atomic_transfer() {
         "atomic",
         r#"with {
 type Account = {name: Text, balance: Int 1}
-*accounts : [Account]
+*accounts : Rel Account
 }
 (do
   full *accounts = [{name "from" balance 100} {name "to" balance 0}]

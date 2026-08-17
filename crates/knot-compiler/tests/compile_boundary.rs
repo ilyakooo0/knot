@@ -247,8 +247,8 @@ fn adt_inside_maybe_wider_rejected() {
 fn adt_inside_relation_narrower_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {}\n}\n[(Priority.Low {})]",
-            "data Priority = Low {} | High {}\n[Priority]"
+            "with {\ndata Priority = Low {}\n}\nRel (Priority.Low {})",
+            "data Priority = Low {} | High {}\nRel Priority"
         ),
         Some(true)
     );
@@ -258,8 +258,8 @@ fn adt_inside_relation_narrower_accepted() {
 fn adt_inside_relation_wider_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {} | Medium {}\n}\n[(Priority.Medium {})]",
-            "data Priority = Low {} | High {}\n[Priority]"
+            "with {\ndata Priority = Low {} | High {} | Medium {}\n}\nRel (Priority.Medium {})",
+            "data Priority = Low {} | High {}\nRel Priority"
         ),
         Some(false)
     );

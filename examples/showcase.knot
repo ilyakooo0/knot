@@ -29,7 +29,7 @@ type Product = {name: Text, price: Float 1, category: Category, inStock: Active}
 
 data Category = Electronics {} | Books {} | Clothing {} | Food {} | Software {}
 
-type Team = {name: Text, members: [{name: Text, role: Text}]}
+type Team = {name: Text, members: Rel {name: Text, role: Text}}
 
 type LogEntry = {timestamp: Int 1, level: Level, message: Text, source: Text}
 
@@ -39,15 +39,15 @@ type Metric = {name: Text, value: Float 1, tags: Text}
 
 -- ── Sources ──────────────────────────────────────────────────────
 
-*employees : [Employee]
-*projects : [Project]
-*tickets : [Ticket]
-*customers : [Customer]
-*orders : [Order]
-*products : [Product]
-*teams : [Team]
-*logs : [LogEntry]
-*metrics : [Metric]
+*employees : Rel Employee
+*projects : Rel Project
+*tickets : Rel Ticket
+*customers : Rel Customer
+*orders : Rel Order
+*products : Rel Product
+*teams : Rel Team
+*logs : Rel LogEntry
+*metrics : Rel Metric
 
 -- ── Seed data ────────────────────────────────────────────────────
 

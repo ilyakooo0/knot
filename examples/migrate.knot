@@ -18,7 +18,7 @@ type PersonV1 = {name: Text}
 -- upgraded by `using`, which fills the new field with a default.
 type PersonV2 = {name: Text, active: Active}
 
-*people : [PersonV2]
+*people : Rel PersonV2
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 
 }

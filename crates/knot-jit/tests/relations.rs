@@ -13,7 +13,7 @@ use harness::{assert_compile_err, assert_show, assert_show_set};
 
 #[test]
 fn empty_relation() {
-    assert_show("[] : [Int 1]", "[]");
+    assert_show("[] : Rel (Int 1)", "[]");
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn fold_sum() {
 
 #[test]
 fn fold_empty() {
-    assert_show("base.fold (\\a b -> a + b) 42 ([] : [Int 1])", "42");
+    assert_show("base.fold (\\a b -> a + b) 42 ([] : Rel (Int 1))", "42");
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn count_basic() {
 
 #[test]
 fn count_empty() {
-    assert_show("base.count ([] : [Int 1])", "0");
+    assert_show("base.count ([] : Rel (Int 1))", "0");
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn single_row() {
 #[test]
 fn single_empty_or_many() {
     // Nullary constructors show without a payload: `Nothing`, not `Nothing {}`.
-    assert_show("base.single ([] : [Int 1])", "Nothing");
+    assert_show("base.single ([] : Rel (Int 1))", "Nothing");
     assert_show("base.single [1 2]", "Nothing");
 }
 

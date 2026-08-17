@@ -14,7 +14,7 @@ applyTwice (\(f : (forall a. a -> a)) -> {asText (f "text") asInt (f 42)})
 
 -- A higher-rank argument where the passed function turns anything into a
 -- singleton list, used at Int and Text.
-wrapAny (\(f : (forall a. a -> [a])) -> {nums (f 7) words (f "seven")})
+wrapAny (\(f : (forall a. a -> Rel a)) -> {nums (f 7) words (f "seven")})
 
 }
 (do

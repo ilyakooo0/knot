@@ -1,7 +1,7 @@
 -- Query fields: read-only computed views over source relations.
 -- A `name <query>` field is recomputed on each access — never persisted.
 with {
-*manages : [{manager: Text, report: Text}]
+*manages : Rel {manager: Text, report: Text}
 
 directReports (do
   m <- *manages

@@ -2,8 +2,8 @@
 with {
 type Person = {name: Text, age: Int 1, email: Text}
 
-*people : [Person]
-*orders : [{customer: Text, amount: Int 1}]
+*people : Rel Person
+*orders : Rel {customer: Text, amount: Int 1}
 
 -- Referential integrity: every order's customer must be a person's name
 *orders.customer <= *people.name

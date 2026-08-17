@@ -1,7 +1,7 @@
 with {
 type Person = {name: Text, age: Int 1}
 
-*people : [Person]
+*people : Rel Person
 }
 (do
   full *people = [{name "Alice" age 30} {name "Bob" age 25} {name "Carol" age 35}]

@@ -157,7 +157,7 @@ impl ParsedType {
                     None => format!("<{}>", cs.join(" | ")),
                 }
             }
-            ParsedType::Relation(t) => format!("[{}]", t.render()),
+            ParsedType::Relation(t) => format!("Rel {}", t.render()),
             ParsedType::Io { effects, rest, ty } => {
                 // Open rows render `{fs | r}` / `{| r}` — the row variable is
                 // separated by `|`, never preceded by a comma.
@@ -186,14 +186,15 @@ impl ParsedType {
     /// argument position. Anything whose rendering contains a top-level space
     /// would re-associate wrongly as a bare application argument — a function
     /// (`a -> b`), an applied constructor (`Maybe Int` inside `List (Maybe
-    /// Int)` must not become `List Maybe Int`), an `IO … ty`, a `… where p`
-    /// refinement, or a `forall …`. Self-delimiting forms (records `{…}`,
-    /// variants `<…>`, relations `[…]`, unit annotations `T<u>`, bare names
-    /// and vars) need none.
+    /// Int)` must not become `List Maybe Int`), a relation (`Rel T`), an
+    /// `IO … ty`, a `… where p` refinement, or a `forall …`. Self-delimiting
+    /// forms (records `{…}`, variants `<…>`, unit annotations `T<u>`, bare
+    /// names and vars) need none.
     fn render_atomic(&self) -> String {
         let needs_parens = match self {
             ParsedType::Function(_, _)
             | ParsedType::Io { .. }
+            | ParsedType::Relation(_)
             | ParsedType::Refined { .. }
             | ParsedType::Forall(_, _) => true,
             ParsedType::Named(_, args) => !args.is_empty(),
@@ -390,13 +391,19 @@ impl<'a> Parser<'a> {
         let c = self.peek()?;
         match c {
             '(' => self.parse_paren(),
-            '[' => self.parse_relation(),
             '{' => self.parse_record(),
             '<' => self.parse_variant(),
             _ if c.is_alphabetic() || c == '_' => {
                 let name = self.consume_ident()?;
                 if name == "IO" {
                     return self.parse_io_tail();
+                }
+                if name == "Rel" {
+                    // `Rel T` — the relation type. Parse the element as an
+                    // atom (parens disambiguate compound elements).
+                    self.skip_ws();
+                    let inner = self.parse_atom()?;
+                    return Some(ParsedType::Relation(Box::new(inner)));
                 }
                 let mut node = if first_uppercase(&name) || name == "_" {
                     ParsedType::Named(name, Vec::new())
@@ -430,21 +437,6 @@ impl<'a> Parser<'a> {
         self.skip_ws();
         self.eat_char(')');
         Some(inner)
-    }
-
-    fn parse_relation(&mut self) -> Option<ParsedType> {
-        self.eat_char('[');
-        self.skip_ws();
-        if self.peek() == Some(']') {
-            self.eat_char(']');
-            // Bare `[]` is the empty list type constructor at value level;
-            // not common as a type, but represent it as a variable.
-            return Some(ParsedType::Named("[]".into(), Vec::new()));
-        }
-        let inner = self.parse_function()?;
-        self.skip_ws();
-        self.eat_char(']');
-        Some(ParsedType::Relation(Box::new(inner)))
     }
 
     fn parse_record(&mut self) -> Option<ParsedType> {

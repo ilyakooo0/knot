@@ -250,6 +250,26 @@ impl Parser {
     }
 }
 
+/// Fold `Rel T` (parsed as `App(Named "Rel", T)` by the generic type-app
+/// spine) into the canonical `TypeKind::Relation(T)` node, recursively through
+/// the application spine. A bare `Rel` (the type constructor, e.g.
+/// `impl Functor Rel`) is left as `Named "Rel"`.
+fn fold_rel_type_app(ty: Type) -> Type {
+    let Spanned { node, span } = ty;
+    match node {
+        TypeKind::App { func, arg } => {
+            let func = Box::new(fold_rel_type_app(*func));
+            let arg = Box::new(fold_rel_type_app(*arg));
+            if matches!(&func.node, TypeKind::Named(n) if n == "Rel") {
+                Spanned::new(TypeKind::Relation(arg), span)
+            } else {
+                Spanned::new(TypeKind::App { func, arg }, span)
+            }
+        }
+        other => Spanned::new(other, span),
+    }
+}
+
 /// Lex + parse a standalone type-annotation string into an `ast::Type`.
 /// Returns `None` on any lex/parse error or trailing tokens.
 pub fn parse_type_str(source: &str) -> Option<Type> {
@@ -3780,7 +3800,11 @@ impl Parser {
             }
         }
         self.recursion_depth -= spine_charged;
-        Some(func)
+        // `Rel T` is the relation type: fold `App(Named "Rel", T)` into the
+        // canonical `Relation(T)` node so every downstream consumer (inference,
+        // codegen, display) sees one form. A bare `Rel` (no argument) stays
+        // `Named "Rel"` — the relation type constructor, e.g. `impl Functor Rel`.
+        Some(fold_rel_type_app(func))
     }
 
     fn can_start_type_atom(&self) -> bool {
@@ -3887,8 +3911,14 @@ impl Parser {
                 self.parse_record_type(start)
             }
             TokenKind::LBracket => {
-                self.advance();
-                self.parse_relation_type(start)
+                // `[T]` relation-type syntax was renamed to `Rel T`. `[` no
+                // longer starts a type; reject with a targeted hint.
+                let tok = self.advance();
+                self.error_at(
+                    tok.span,
+                    "`[T]` relation-type syntax was renamed: write `Rel T` instead",
+                );
+                None
             }
             TokenKind::LParen => {
                 self.advance();
@@ -4011,31 +4041,6 @@ impl Parser {
             .ok()?;
         Some(Spanned::new(
             TypeKind::Record { fields, rest },
-            Span::new(start.start, end_tok.span.end),
-        ))
-    }
-
-    /// Parse the row-variable tail of an IO type after `|`:
-    /// `r1`, `_`, or `r1 \/ r2 \/ r3`. Returns an empty Vec on parse error.
-    fn parse_relation_type(&mut self, start: Span) -> Option<Type> {
-        // Already consumed `[`.
-        self.skip_newlines();
-        if self.eat(&TokenKind::RBracket) {
-            // `[]` as a type — the list/relation type constructor with no argument.
-            // This represents the `[]` type constructor used in `impl Functor []`.
-            return Some(Spanned::new(
-                TypeKind::Named("[]".into()),
-                Span::new(start.start, self.prev_span().end),
-            ));
-        }
-
-        let inner = self.parse_type()?;
-        self.skip_newlines();
-        let end_tok = self
-            .expect(&TokenKind::RBracket, "expected ']' to close relation type")
-            .ok()?;
-        Some(Spanned::new(
-            TypeKind::Relation(Box::new(inner)),
             Span::new(start.start, end_tok.span.end),
         ))
     }

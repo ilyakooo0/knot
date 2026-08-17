@@ -4,7 +4,7 @@
 with {
 type Line = {product: Text, price: Int 1, qty: Int 1}
 
-*lines : [Line]
+*lines : Rel Line
 
 totalDemo (do
   lines <- full *lines

@@ -81,7 +81,7 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
                 None => format!("{{{}}}", fs.join(", ")),
             }
         }
-        TypeKind::Relation(inner) => format!("[{}]", format_type_kind_d(&inner.node, d)),
+        TypeKind::Relation(inner) => format!("Rel {}", format_type_kind_d(&inner.node, d)),
         TypeKind::Function { param, result } => {
             let p = format_type_kind_d(&param.node, d);
             let r = format_type_kind_d(&result.node, d);

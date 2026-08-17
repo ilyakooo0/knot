@@ -1,9 +1,9 @@
 -- Nested relations: a record field can hold its own relation `[T]`.
 -- Stored in a child table linked by `_parent_id`; reads/writes are transparent.
 with {
-type Person = {name: Text, age: Int 1}
+type Person = {name Text age (Int 1)}
 
-*teams : Rel {name: Text, members: Rel Person}
+*teams : Rel {name Text members (Rel Person)}
 }
 (do
   full *teams = [

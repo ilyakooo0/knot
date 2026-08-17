@@ -16,7 +16,7 @@
     -- input is recoverable rather than fatal — match on the result.
     with { json (base.toJson { x 10 y 20 }) } (do
       base.println json
-      case base.parseJson json : Maybe {x: Int 1, y: Int 1} of
+      case base.parseJson json : Maybe {x (Int 1) y (Int 1)} of
         Maybe.Just { value value } -> base.println (base.show value)
         Maybe.Nothing {} -> base.println "parse failed"
 

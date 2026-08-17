@@ -41,7 +41,7 @@ fn deeply_nested() {
 #[test]
 fn nested_empty() {
     assert_show(
-        "{members ([] : Rel {name: Text})}",
+        "{members ([] : Rel {name Text})}",
         "{members: []}",
     );
 }

@@ -33,14 +33,14 @@ fn refine_rejects_invalid() {
 #[test]
 fn refine_per_field_record() {
     // `refine` targets a record alias whose refinement lives on a field
-    // (`type VP = {age: Int 1 where …}`). The alias is registered with a
+    // (`type VP = {age (Int 1 where …)}`). The alias is registered with a
     // synthesized whole-record predicate (`\r -> r.age >= 0 && r.age <= 150`),
     // so a valid record yields Ok and an out-of-range field yields Err.
     assert_stdout(
         "refine_field_ok",
         r#"with {
-type VP = {age: Int 1 where \x -> x >= 0 && x <= 150}
-asVP : {age: Int 1} -> Result {typeName: Text, violations: Rel {field: Maybe Text, message: Text}} VP
+type VP = {age (Int 1 where \x -> x >= 0 && x <= 150)}
+asVP : {age (Int 1)} -> Result {typeName Text violations (Rel {field (Maybe Text) message Text})} VP
 asVP (\r -> refine r)
 }
 (case asVP {age 30} of
@@ -51,8 +51,8 @@ asVP (\r -> refine r)
     assert_stdout(
         "refine_field_bad",
         r#"with {
-type VP = {age: Int 1 where \x -> x >= 0 && x <= 150}
-asVP : {age: Int 1} -> Result {typeName: Text, violations: Rel {field: Maybe Text, message: Text}} VP
+type VP = {age (Int 1 where \x -> x >= 0 && x <= 150)}
+asVP : {age (Int 1)} -> Result {typeName Text violations (Rel {field (Maybe Text) message Text})} VP
 asVP (\r -> refine r)
 }
 (case asVP {age 200} of
@@ -68,8 +68,8 @@ fn refine_cross_field() {
     assert_stdout(
         "refine_cross",
         r#"with {
-type R = {lo: Int 1, hi: Int 1} where \r -> r.lo <= r.hi
-asR : {lo: Int 1, hi: Int 1} -> Result {typeName: Text, violations: Rel {field: Maybe Text, message: Text}} R
+type R = {lo (Int 1) hi (Int 1)} where \r -> r.lo <= r.hi
+asR : {lo (Int 1) hi (Int 1)} -> Result {typeName Text violations (Rel {field (Maybe Text) message Text})} R
 asR (\r -> refine r)
 }
 (do
@@ -95,7 +95,7 @@ fn write_validation_rejects_violation() {
         "refine_write",
         r#"with {
 type Nat = Int 1 where \x -> x >= 0
-*people : Rel {name: Text, age: Nat}
+*people : Rel {name Text age Nat}
 }
 (do
   full *people = [{name "a" age (0 - 5)}]
@@ -122,7 +122,7 @@ fn write_validation_accepts_valid() {
         "refine_ok",
         r#"with {
 type Nat = Int 1 where \x -> x >= 0
-*people : Rel {name: Text, age: Nat}
+*people : Rel {name Text age Nat}
 }
 (do
   full *people = [{name "a" age 30}]

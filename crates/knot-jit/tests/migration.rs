@@ -29,7 +29,7 @@ fn migrate_backfills_new_field_count() {
         &dir,
         "mig_count",
         r#"with {
-type PersonV1 = {name: Text}
+type PersonV1 = {name Text}
 *people : Rel PersonV1
 }
 (do
@@ -46,8 +46,8 @@ type PersonV1 = {name: Text}
         "mig_count",
         r#"with {
 data Active = Yes {} | No {}
-type PersonV1 = {name: Text}
-type PersonV2 = {name: Text, active: Active}
+type PersonV1 = {name Text}
+type PersonV2 = {name Text active Active}
 *people : Rel PersonV2
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 }
@@ -61,7 +61,7 @@ type PersonV2 = {name: Text, active: Active}
 #[test]
 fn migrate_backfilled_adt_field_renders_constructor() {
     // Rows upgraded by `migrate` render their backfilled ADT field with its
-    // constructor — `{active: Yes, name: Alice}` — matching a directly-built
+    // constructor — `{active Yes name Alice}` — matching a directly-built
     // `Active.Yes {}`. This requires the `migrate` fn to actually run: the
     // codegen must emit `knot_source_migrate` for top-level `with`-block
     // sources (previously only record-embedded sources were collected, so the
@@ -71,7 +71,7 @@ fn migrate_backfilled_adt_field_renders_constructor() {
         &dir,
         "mig_show",
         r#"with {
-type PersonV1 = {name: Text}
+type PersonV1 = {name Text}
 *people : Rel PersonV1
 }
 (do
@@ -83,8 +83,8 @@ type PersonV1 = {name: Text}
         "mig_show",
         r#"with {
 data Active = Yes {} | No {}
-type PersonV1 = {name: Text}
-type PersonV2 = {name: Text, active: Active}
+type PersonV1 = {name Text}
+type PersonV2 = {name Text active Active}
 *people : Rel PersonV2
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 }
@@ -94,7 +94,7 @@ type PersonV2 = {name: Text, active: Active}
   yield {})"#,
     );
     // Fixed: the migrated ADT field renders its constructor.
-    assert_eq!(out, "\"[{active: Yes, name: Alice}]\"\n{}");
+    assert_eq!(out, "\"[{active Yes name Alice}]\"\n{}");
 }
 
 #[test]
@@ -109,8 +109,8 @@ fn migrate_lockfile_roundtrip() {
     let dir = dir_for("mig_lock");
     let src = r#"with {
 data Active = Yes {} | No {}
-type PersonV1 = {name: Text}
-type PersonV2 = {name: Text, active: Active}
+type PersonV1 = {name Text}
+type PersonV2 = {name Text active Active}
 *people : Rel PersonV2
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 }

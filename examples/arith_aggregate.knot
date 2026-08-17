@@ -2,7 +2,7 @@
 -- folds the arithmetic into the aggregate, emitting a single
 -- `SELECT SUM(<arith>) FROM <table>` instead of shipping every row.
 with {
-type Line = {product: Text, price: Int 1, qty: Int 1}
+type Line = {product Text price (Int 1) qty (Int 1)}
 
 *lines : Rel Line
 

@@ -72,13 +72,23 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
             format!("{f} {a}")
         }
         TypeKind::Record { fields, rest } => {
+            // Whitespace-separated `name Type` (matches the record-type
+            // surface); compound field types parenthesized.
             let fs: Vec<String> = fields
                 .iter()
-                .map(|f| format!("{}: {}", f.name, format_type_kind_d(&f.value.node, d)))
+                .map(|f| {
+                    let inner = format_type_kind_d(&f.value.node, d);
+                    match &f.value.node {
+                        TypeKind::Function { .. }
+                        | TypeKind::App { .. }
+                        | TypeKind::Relation(_) => format!("{} ({})", f.name, inner),
+                        _ => format!("{} {}", f.name, inner),
+                    }
+                })
                 .collect();
             match rest {
-                Some(r) => format!("{{{} | {r}}}", fs.join(", ")),
-                None => format!("{{{}}}", fs.join(", ")),
+                Some(r) => format!("{{{} | {r}}}", fs.join(" ")),
+                None => format!("{{{}}}", fs.join(" ")),
             }
         }
         TypeKind::Relation(inner) => format!("Rel {}", format_type_kind_d(&inner.node, d)),

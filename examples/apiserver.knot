@@ -15,18 +15,18 @@ data Priority = Low {} | Medium {} | High {} | Critical {}
 
 data Active = Yes {} | No {}
 
-type Task = {id: Int 1, title: Text, owner: Text, priority: Priority, done: Active}
+type Task = {id (Int 1) title Text owner Text priority Priority done Active}
 
 *tasks : Rel Task
 
 -- Every route feature on display:
 --   List    — plain GET, returns a relation.
---   Get     — a path parameter `{id: Int 1}`.
---   Search  — query parameters `?{q: Text}&{limit: Int 1}`.
---   Create  — a request body `={title: Text, owner: Text}`.
---   Echo    — a request body AND a response header `@{xRequestId: Text}`; the
+--   Get     — a path parameter `{id (Int 1)}`.
+--   Search  — query parameters `?{q Text}&{limit (Int 1)}`.
+--   Create  — a request body `={title Text owner Text}`.
+--   Echo    — a request body AND a response header `@{xRequestId Text}`; the
 --             handler returns `{body, headers}` when response headers exist.
---   Audit   — a request header `@{authorization: Text}` (before the `->`).
+--   Audit   — a request header `@{authorization Text}` (before the `->`).
 --   Summary — a rate limit `rateLimit {key, limit: {requests, window}}`.
 -- NOTE on path shapes: the router matches entries in declaration order and
 -- returns the first hit, so a literal segment (`/tasks/search`) at the same
@@ -35,11 +35,11 @@ type Task = {id: Int 1, title: Text, owner: Text, priority: Priority, done: Acti
 -- rather than alongside a `{param}` sibling.
 api Tasks where
   List    get  /tasks -> Rel Task
-  Get     get  /tasks/{id: Int 1} -> Rel Task
-  Search  get  /search?{q: Text}&{limit: Int 1} -> Rel Task
-  Create  post /tasks ={title: Text, owner: Text} -> Task
-  Echo    post /echo ={title: Text, owner: Text} -> Task @{xRequestId: Text}
-  Audit   get  /tasks/{id: Int 1}/audit @{authorization: Text} -> Rel Task
+  Get     get  /tasks/{id (Int 1)} -> Rel Task
+  Search  get  /search?{q Text}&{limit (Int 1)} -> Rel Task
+  Create  post /tasks ={title Text owner Text} -> Task
+  Echo    post /echo ={title Text owner Text} -> Task @{xRequestId Text}
+  Audit   get  /tasks/{id (Int 1)}/audit @{authorization Text} -> Rel Task
   Summary get  /summary -> Int 1
     rateLimit {key (\i c -> Maybe.Just {value "global"})
                limit {requests 100 window 60000}}

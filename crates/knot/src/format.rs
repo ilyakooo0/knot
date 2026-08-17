@@ -245,14 +245,17 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             }
         }
         TypeKind::Record { fields, rest } => {
+            // Whitespace-separated `name Type` pairs (matching the record
+            // literal); each field type is rendered as an atom (compound types
+            // parenthesized) so the next field name can't be absorbed into it.
             let mut s = String::from("{");
             for (i, f) in fields.iter().enumerate() {
                 if i > 0 {
-                    s.push_str(", ");
+                    s.push(' ');
                 }
                 s.push_str(&f.name);
-                s.push_str(": ");
-                s.push_str(&render_type(&f.value));
+                s.push(' ');
+                s.push_str(&render_type_atom(&f.value));
             }
             if let Some(r) = rest {
                 if !fields.is_empty() {
@@ -265,7 +268,16 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             s.push('}');
             s
         }
-        TypeKind::Relation(inner) => format!("Rel {}", render_type_atom(inner)),
+        TypeKind::Relation(inner) => {
+            // `Rel T` is application-shaped (two tokens), so it parenthesizes
+            // wherever an `App` would (atom/record-field context).
+            let s = format!("Rel {}", render_type_atom(inner));
+            if ctx > TyPrec::App {
+                format!("({})", s)
+            } else {
+                s
+            }
+        }
         TypeKind::Function { param, result } => {
             let s = format!("{} -> {}", render_type_prec(param, TyPrec::App), render_type_prec(result, TyPrec::Function));
             if ctx > TyPrec::Function {

@@ -5,7 +5,7 @@ Knot is a functional relational programming language. Relations (typed sets) are
 ## Quick Start
 
 ```knot
-type Person = {name: Text, age: Int 1}
+type Person = {name Text age (Int 1)}
 
 *people : Rel Person
 
@@ -85,14 +85,14 @@ Unit-preserving stdlib: `sum` (over a numeric relation) and `avg` (via its proje
 alice {name "Alice" age 30}
 
 -- Record TYPE: colon after each field name, comma-separated
-type Person = {name: Text, age: Int 1}
+type Person = {name Text age (Int 1)}
 ```
 
 Field access: `person.name`
 
 Record merge: `base.unify person {age (person.age + 1)}` — right-biased; see `unify`.
 
-Note the two syntaxes differ: **values** are `{name "Alice" age 30}` (space-separated, no `:` or `,`); **types** are `{name: Text, age: Int 1}` (`:` after each field name, `,` between fields). There is no field-name punning — a record value always pairs an explicit field name with its value (`{name t.name age t.age}`).
+Note the two syntaxes differ: **values** are `{name "Alice" age 30}` (space-separated, no `:` or `,`); **types** are `{name Text age (Int 1)}` (`:` after each field name, `,` between fields). There is no field-name punning — a record value always pairs an explicit field name with its value (`{name t.name age t.age}`).
 
 ### Relations
 
@@ -101,7 +101,7 @@ A relation `Rel T` is a typed **set** of `T` values. No duplicates. No ordering 
 ```knot
 names (["Alice" "Bob" "Carol"]) -- Rel Text
 empty ([]) -- Rel a
-people ([{name "Alice" age 30}]) -- [{name: Text, age: Int 1}]
+people ([{name "Alice" age 30}]) -- Rel {name Text age (Int 1)}
 ```
 
 ### ADTs (Algebraic Data Types)
@@ -111,10 +111,10 @@ data Priority = Low {} | Medium {} | High {} | Critical {}
 
 data Status
   = Open {}
-  | InProgress {assignee: Text}
-  | Resolved {resolution: Text}
+  | InProgress {assignee Text}
+  | Resolved {resolution Text}
 
-data Maybe a = Nothing {} | Just {value: a}
+data Maybe a = Nothing {} | Just {value a}
 ```
 
 **Every constructor requires `{}`** — even those with no fields. `Open {}`, not `Open`.
@@ -124,8 +124,8 @@ Constructing values: `Circle {radius: 5.0}`, `Nothing {}`, `Just {value: 42}`
 ### Type Aliases
 
 ```knot
-type Person = {name: Text, age: Int 1}
-type TodoList = Rel {title: Text, done: Bool}
+type Person = {name Text age (Int 1)}
+type TodoList = Rel {title Text done Bool}
 ```
 
 ---
@@ -145,8 +145,8 @@ There are five kinds of top-level declarations:
 data Status = Open {} | Closed {}
 
 -- Source: stored in DB
-*people : Rel {name: Text, age: Int 1}
-*todos : Rel {title: Text, owner: Text}
+*people : Rel {name Text age (Int 1)}
+*todos : Rel {title Text owner Text}
 
 -- Query field: read-only computed relation
 seniors (base.filter (\p -> p.age > 65) *people)
@@ -247,10 +247,8 @@ type, `_` is a unit hole — it binds the unit by unification, like a lowercase
 unit variable:
 
 ```knot
-with {
-double : Float _ -> Float _
-double \x -> x + x
-}
+with {double (Float _ -> Float _
+double \x -> x + x)}
 (do
   base.println (base.show (double (5.0 : Float M)))   -- 10.0 M — the unit flows through the hole
   yield {})
@@ -272,7 +270,7 @@ A comprehension over one source filters and projects its rows:
 
 ```knot
 with {
-*employees : Rel {name: Text, salary: Int 1}
+*employees : Rel {name Text salary (Int 1)}
 }
 (with {result (do
   e <- *employees
@@ -287,8 +285,8 @@ single-table predicates:
 
 ```knot
 with {
-*employees : Rel {name: Text, dept: Text, salary: Int 1}
-*departments : Rel {name: Text, budget: Int 1}
+*employees : Rel {name Text dept Text salary (Int 1)}
+*departments : Rel {name Text budget (Int 1)}
 }
 (with {result (do
   e <- *employees
@@ -320,7 +318,7 @@ into memory. This happens at a `base.run` boundary or a whole-relation bind
 (`rows <- *rel` in an IO do-block), both of which materialize the query:
 
 ```knot
-*people : Rel {name: Text, age: Int 1}
+*people : Rel {name Text age (Int 1)}
 (do
   people <- *people            -- whole relation loaded into memory
   base.println (base.show (base.count people))
@@ -355,7 +353,7 @@ do
 
 ```knot
 -- IO do block with DB operations
-*people : Rel {name: Text, age: Int 1}
+*people : Rel {name Text age (Int 1)}
 addPerson \name age -> do
   people <- *people
   *people = base.union people Rel {name name age age}
@@ -368,10 +366,10 @@ The compiler detects whether a do block is relational or IO from the types. Rela
 Filter and destructure in one step:
 
 ```knot
-data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
-data Status = InProgress {assignee: Text} | Done {}
+data Shape = Circle {radius (Float 1)} | Rect {width (Float 1) height (Float 1)}
+data Status = InProgress {assignee Text} | Done {}
 *shapes : Rel Shape
-*tickets : Rel {title: Text, status: Status}
+*tickets : Rel {title Text status Status}
 &circles = do
   shapes <- *shapes
   with {result do
@@ -397,7 +395,7 @@ data Status = InProgress {assignee: Text} | Done {}
 Mutation is written `*rel = expr`, which makes the source relation equal to `expr`. There is no `set` keyword — the assignment is the bare `*rel = ...` form. The compiler recognizes common shapes (`*rel = union *rel [...]` → INSERT, conditional `map` → UPDATE, `filter` → DELETE) and emits minimal SQL; otherwise it rewrites the whole relation. Use `full *rel = expr` to force a full overwrite.
 
 ```knot
-*people : Rel {name: Text, age: Int 1}
+*people : Rel {name Text age (Int 1)}
 
 -- Insert (union with singleton)
 addPerson do
@@ -496,7 +494,7 @@ The unqualified constructors are confined to the `with` body — the qualified f
 ### Case Expressions
 
 ```knot
-data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
+data Shape = Circle {radius (Float 1)} | Rect {width (Float 1) height (Float 1)}
 data Priority = Critical {} | High {} | Low {}
 
 describe \s -> case s of
@@ -540,7 +538,7 @@ sumList \xs -> case xs of
 `groupBy` partitions a relation by key fields. After `groupBy`, the bound variable becomes a sub-relation:
 
 ```knot
-*todos : Rel {title: Text, owner: Text, done: Int 1}
+*todos : Rel {title Text owner Text done (Int 1)}
 &workload = do
   with {result do
     t <- *todos
@@ -565,7 +563,7 @@ After `groupBy {owner t.owner}`:
 Fields can hold `Rel T` — sets nested inside rows:
 
 ```knot
-*teams : Rel {name: Text, members: [{name: Text, age: Int 1}}]
+*teams : Rel {name Text members (Rel {name Text age (Int 1)})}
 
 -- Query into nested relations
 &allMembers = do
@@ -598,7 +596,7 @@ lazy — declaring one reads nothing; the query runs when the field is used.
 
 ```knot
 data Status = Open {} | Closed {}
-*todos : Rel {title: Text, owner: Text, done: Int 1}
+*todos : Rel {title Text owner Text done (Int 1)}
 
 openTodos (do
   t <- *todos
@@ -617,7 +615,7 @@ A query field that references its own name computes a fixpoint (transitive
 closure):
 
 ```knot
-*manages : Rel {manager: Text, report: Text}
+*manages : Rel {manager Text report Text}
 
 reportsTo (base.union *manages (do
   r <- reportsTo
@@ -679,7 +677,7 @@ do
 Relation operations are also `IO`-wrapped:
 
 ```knot
-type Person = {name: Text, age: Int 1}
+type Person = {name Text age (Int 1)}
 *people : Rel Person
 
 -- All relation operations are IO:
@@ -699,7 +697,7 @@ birthday \name -> do
 `atomic` takes an IO expression containing only DB operations and runs it in a transaction:
 
 ```knot
-*orders : Rel {item: Text, qty: Int 1}
+*orders : Rel {item Text qty (Int 1)}
 handleOrder \item -> do
   orderId <- atomic do
     orders <- *orders
@@ -761,8 +759,8 @@ race : IO a -> IO b -> IO (Result a b)
 ```
 
 Run two IO actions concurrently and return the winner. The winner is reported
-using the built-in `Result` ADT — `Err {error: a}` when the left action wins,
-`Ok {value: b}` when the right action wins.
+using the built-in `Result` ADT — `Err {error a}` when the left action wins,
+`Ok {value b}` when the right action wins.
 
 ```knot
 slow do
@@ -911,7 +909,7 @@ result type (see Rel (base.md)(base.md#morphs-basemorph)).
 | `forEach` | `Rel a -> (a -> IO {}) -> IO {}` | Sequence an action over each row |
 | `listen` | `Int u -> Server a -> IO {}` | Start an HTTP server |
 | `fetch` | `Text -> Endpoint -> IO (Result HttpError T)` | Type-safe HTTP client |
-| `fetchWith` | `Text -> {headers: Rel (..)} -> Endpoint -> IO (Result HttpError T)` | `fetch` with ad-hoc headers |
+| `fetchWith` | `Text -> {headers (Rel (..))} -> Endpoint -> IO (Result HttpError T)` | `fetch` with ad-hoc headers |
 
 `listen` takes a `Server` built by `serve API where` and binds the HTTP port.
 
@@ -933,8 +931,8 @@ result type (see Rel (base.md)(base.md#morphs-basemorph)).
 
 | Function | Type | Description |
 |----------|------|-------------|
-| `generateKeyPair` | `IO ({privateKey: Bytes, publicKey: Bytes})` | X25519 keypair |
-| `generateSigningKeyPair` | `IO ({privateKey: Bytes, publicKey: Bytes})` | Ed25519 keypair |
+| `generateKeyPair` | `IO ({privateKey Bytes publicKey Bytes})` | X25519 keypair |
+| `generateSigningKeyPair` | `IO ({privateKey Bytes publicKey Bytes})` | Ed25519 keypair |
 | `encrypt` | `Bytes -> Bytes -> IO Bytes` | Sealed-box (public key, plaintext) |
 | `decrypt` | `Bytes -> Bytes -> Bytes` | Open sealed-box (private key, ciphertext) |
 | `sign` | `Bytes -> Bytes -> Bytes` | Ed25519 sign (private key, message) |
@@ -963,12 +961,12 @@ HTTP routing with typed paths, query params, bodies, and headers:
 
 ```knot
 data Priority = Low {} | Medium {} | High {} | Critical {}
-type Todo = {title: Text, owner: Text, priority: Priority}
+type Todo = {title Text owner Text priority Priority}
 *todos : Rel Todo
 
 route TodoApi where
-  GET /todos/{owner: Text} -> Rel Todo = GetTodos
-  POST {title: Text, owner: Text} /todos -> Todo = CreateTodo
+  GET /todos/{owner Text} -> Rel Todo = GetTodos
+  POST {title Text owner Text} /todos -> Todo = CreateTodo
 
 route AdminApi where
   GET /admin/count -> Int 1 = GetCount
@@ -997,16 +995,16 @@ api (serve Api where
     yield (Result.Ok {value (base.count todos)}))
 ```
 
-`serve API where` produces a value of type `Server API`. Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status: Int 1, message: Text}`. `listen : Int u -> Server a -> IO {}` binds the server to a port.
+`serve API where` produces a value of type `Server API`. Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status (Int 1) message Text}`. `listen : Int u -> Server a -> IO {}` binds the server to a port.
 
 ### HTTP Status Codes
 
-`Ok {value: v}` responds 200 with `v` as JSON. `Err {error: {status, message}}` responds with the given status code and a JSON error body:
+`Ok {value v}` responds 200 with `v` as JSON. `Err {error: {status, message}}` responds with the given status code and a JSON error body:
 
 ```knot
-*people : Rel {id: Int 1, name: Text}
+*people : Rel {id (Int 1) name Text}
 route Api where
-  GET /users/{id: Int 1} -> {id: Int 1, name: Text} = GetUser
+  GET /users/{id (Int 1)} -> {id (Int 1) name Text} = GetUser
 api (serve Api where
   GetUser = \{id id} -> do
     users <- *people
@@ -1023,11 +1021,11 @@ Request and response headers use the `headers` keyword:
 
 ```knot
 route Api where
-  GET /todos headers {authorization: Text}
-    -> Rel {title: Text} headers {xTotalCount: Int 1}
+  GET /todos headers {authorization Text}
+    -> Rel {title Text} headers {xTotalCount (Int 1)}
     = GetTodos
-  POST {title: Text} /todos headers {authorization: Text}
-    -> {id: Int 1}
+  POST {title Text} /todos headers {authorization Text}
+    -> {id (Int 1)}
     = CreateTodo
 ```
 
@@ -1036,10 +1034,10 @@ Field names use camelCase, auto-converted to HTTP-Header-Case: `authorization` �
 Request headers become constructor fields. When response headers are declared, the handler returns a `{body: ..., headers: ...}` record:
 
 ```knot
-type Todo = {title: Text}
+type Todo = {title Text}
 *todos : Rel Todo
 route Api where
-  GET /todos headers {authorization: Text} -> Rel Todo headers {xTotalCount: Int 1} = GetTodos
+  GET /todos headers {authorization Text} -> Rel Todo headers {xTotalCount (Int 1)} = GetTodos
 
 api (serve Api where
   GetTodos = \{authorization authorization} -> do
@@ -1051,18 +1049,18 @@ Optional headers use `Maybe`:
 
 ```knot
 route Api where
-  GET /todos headers {authorization: Maybe Text} -> Rel Todo = GetTodos
+  GET /todos headers {authorization (Maybe Text)} -> Rel Todo = GetTodos
 ```
 
 Server gets `Nothing {}` if absent, `Just {value: "..."}` if present. In `fetch`, `Nothing` headers are skipped.
 
-On the `fetch` side, header fields are sent automatically. When response headers are declared, the result wraps as `{body: T, headers: H}`:
+On the `fetch` side, header fields are sent automatically. When response headers are declared, the result wraps as `{body T headers H}`:
 
 <!-- doccheck: skip — the `fetch`+route-constructor form is documented here but
      the endpoint constructor is not yet value-accessible in expressions (doc-vs-impl gap). -->
 ```knot-skip
 result <- base.fetch "https://api.example.com" (GetTodos {authorization "Bearer tok"})
--- result : IO (Result ... {body: Rel Todo, headers: {xTotalCount: Int 1}})
+-- result : IO (Result ... {body (Rel Todo) headers {xTotalCount (Int 1)}})
 ```
 
 ### Rate Limiting
@@ -1070,14 +1068,10 @@ result <- base.fetch "https://api.example.com" (GetTodos {authorization "Bearer 
 Add a per-endpoint token-bucket rate limit with `rateLimit <expr>` (placed after the response type/headers, before `=`). The expression has type `RateLimit input a`:
 
 ```knot
-type RequestCtx = {
-  clientIp: Text,
-  receivedAt: Int Ms,
-  header: Text -> Maybe Text
-}
+type RequestCtx = {clientIp Text receivedAt (Int Ms) header (Text -> Maybe Text)}
 
 -- `key` is Ord a; returning Nothing exempts the request. `header` is a case-insensitive lookup.
-type RateLimit input a = {key: input -> RequestCtx -> Maybe a, limit: {requests: Int 1, window: Int Ms}}
+type RateLimit input a = {key: input -> RequestCtx -> Maybe a, limit: {requests (Int 1) window (Int Ms)}}
 ```
 
 `key` receives the same input record the handler does (path/query/body/header fields, combined) plus the runtime-supplied `RequestCtx`, so you can key on any field of either:
@@ -1088,15 +1082,15 @@ byClientIp \input ctx -> Maybe.Just {value ctx.clientIp}
 byOwner \{owner owner} ctx -> Maybe.Just {value owner}   -- key on a path/body field
 
 route Api where
-  GET /hello -> {message: Text}
+  GET /hello -> {message Text}
     rateLimit {key byClientIp limit {requests 100 window (60000 : Int Ms)}}
     = Hello
 
-  GET /user/{owner: Text} -> {message: Text}
+  GET /user/{owner Text} -> {message Text}
     rateLimit {key byOwner limit {requests 10 window (60000 : Int Ms)}}
     = User
 
-  GET /open -> {message: Text} = Open                  -- no clause = unlimited
+  GET /open -> {message Text} = Open                  -- no clause = unlimited
 ```
 
 The `key` value can be any `Ord` type — the runtime serializes it via `show` for the SQLite bucket key. Returning `Nothing` from `key` skips rate limiting for that request (e.g. exempt admin requests by reading `ctx.header "Authorization"`).
@@ -1106,11 +1100,11 @@ On rejection the runtime responds `429 Too Many Requests` with body `{"error":"R
 Common keying strategies are regular expressions, so extract them once and reuse:
 
 ```knot
-data Event = Gossip {payload: Text}
+data Event = Gossip {payload Text}
 serverLimit ({key (\input ctx -> Maybe.Just {value ctx.clientIp}) limit {requests 1000 window (60000 : Int Ms)}})
 
 route Api where
-  POST {events: Rel Event} /federation/gossip -> {} rateLimit serverLimit = RecvGossip
+  POST {events (Rel Event)} /federation/gossip -> {} rateLimit serverLimit = RecvGossip
 ```
 
 ---
@@ -1127,9 +1121,9 @@ The compiler maintains a lockfile (`<name>.schema.lock`) tracking persisted sche
 ### Migrations
 
 ```knot
-*people : Rel {name: Text, age: Int 1}
-  migrate from {name: Text, age: Int 1}
-  to {name: Text, age: Int 1, email: Text}
+*people : Rel {name Text age (Int 1)}
+  migrate from {name Text age (Int 1)}
+  to {name Text age (Int 1) email Text}
   using (\old -> (base.unify old {email (old.name ++ "@unknown.com")}))
 ```
 
@@ -1138,9 +1132,9 @@ The compiler maintains a lockfile (`<name>.schema.lock`) tracking persisted sche
 ## Subset Constraints
 
 ```knot
-*people : Rel {name: Text, age: Int 1}
-*orders : Rel {customer: Text, amount: Int 1}
-*users : Rel {name: Text, email: Text}
+*people : Rel {name Text age (Int 1)}
+*orders : Rel {customer Text amount (Int 1)}
+*users : Rel {name Text email Text}
 
 -- Referential integrity
 *orders.customer <= *people.name
@@ -1162,15 +1156,15 @@ Types restricted by predicate functions, checked at runtime boundaries.
 type Nat = Int 1 where \x -> x >= 0
 
 -- Per-field refinements
-type ValidPerson = {name: Text, age: Int 1 where \x -> x >= 0 && x <= 150}
+type ValidPerson = {name Text age (Int 1 where \x -> x >= 0 && x <= 150)}
 
 -- Cross-field refinements
-type Range = {lo: Int 1, hi: Int 1} where \r -> r.lo <= r.hi
+type Range = {lo (Int 1) hi (Int 1)} where \r -> r.lo <= r.hi
 
 -- ADT constructor refinements
 data Shape
-  = Circle {radius: Float 1 where \r -> r > 0.0}
-  | Rect {width: Float 1 where \w -> w > 0.0, height: Float 1 where \h -> h > 0.0}
+  = Circle {radius (Float 1 where \r -> r > 0.0)}
+  | Rect {width (Float 1 where \w -> w > 0.0, height: Float 1 where \h -> h > 0.0)}
 ```
 
 ### Checking with `refine`
@@ -1200,7 +1194,7 @@ type Nat = Int 1 where \x -> x >= 0
   yield {})
 ```
 
-`RefinementError = {typeName: Text, violations: Rel {field: Maybe Text, message: Text}}`
+`RefinementError = {typeName: Text, violations: Rel {field (Maybe Text) message Text}}`
 
 ### Automatic Validation
 
@@ -1208,7 +1202,7 @@ type Nat = Int 1 where \x -> x >= 0
 
 ```knot
 type Nat = Int 1 where \x -> x >= 0
-*people : Rel {name: Text, age: Nat}
+*people : Rel {name Text age Nat}
 
 -- This panics if any age is negative:
 do
@@ -1220,7 +1214,7 @@ do
 
 ```knot
 route Api where
-  POST {age: Nat} /users -> User = CreateUser
+  POST {age Nat} /users -> User = CreateUser
 
 -- POST with {"age": -1} returns 400 automatically
 ```
@@ -1269,10 +1263,10 @@ data Priority = Low {} | Medium {} | High {} | Critical {}
 
 data Status
   = Open {}
-  | InProgress {assignee: Text}
-  | Resolved {resolution: Text}
+  | InProgress {assignee Text}
+  | Resolved {resolution Text}
 
-type Todo = {title: Text, owner: Text, priority: Priority, status: Status}
+type Todo = {title Text owner Text priority Priority status Status}
 
 *todos : Rel Todo
 
@@ -1337,7 +1331,7 @@ do
 ### Insert
 
 ```knot
-*rel : Rel {value: Int 1}
+*rel : Rel {value (Int 1)}
 addRow \newRow -> do
   rel <- *rel
   *rel = base.union rel Rel newRow
@@ -1346,7 +1340,7 @@ addRow \newRow -> do
 ### Delete by condition
 
 ```knot
-*rel : Rel {id: Int 1, field: Int 1}
+*rel : Rel {id (Int 1) field (Int 1)}
 deleteWhere \valueToDelete -> do
   rel <- *rel
   *rel = do
@@ -1358,7 +1352,7 @@ deleteWhere \valueToDelete -> do
 ### Update by condition
 
 ```knot
-*rel : Rel {id: Int 1, field: Int 1}
+*rel : Rel {id (Int 1) field (Int 1)}
 updateWhere \target newValue -> do
   rel <- *rel
   *rel = do
@@ -1371,8 +1365,8 @@ updateWhere \target newValue -> do
 ### Join two relations
 
 ```knot
-*employees : Rel {name: Text, dept: Text}
-*departments : Rel {name: Text, budget: Int 1}
+*employees : Rel {name Text dept Text}
+*departments : Rel {name Text budget (Int 1)}
 &joined = do
   employees <- *employees
   departments <- *departments
@@ -1388,8 +1382,8 @@ updateWhere \target newValue -> do
 ### Aggregate
 
 ```knot
-*orders : Rel {amount: Int 1}
-*people : Rel {name: Text, age: Int 1}
+*orders : Rel {amount (Int 1)}
+*people : Rel {name Text age (Int 1)}
 getTotal do
   orders <- *orders
   yield (base.fold (\acc x -> acc + x.amount) 0 orders)
@@ -1402,7 +1396,7 @@ getCount do
 ### Filter by variant
 
 ```knot
-data Shape = Circle {radius: Float 1} | Rect {width: Float 1, height: Float 1}
+data Shape = Circle {radius (Float 1)} | Rect {width (Float 1) height (Float 1)}
 *shapes : Rel Shape
 
 -- Using match

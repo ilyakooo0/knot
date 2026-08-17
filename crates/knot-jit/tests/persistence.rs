@@ -10,7 +10,7 @@ fn persisted_relation_groupby() {
     assert_stdout(
         "groupby",
         r#"with {
-type Todo = {owner: Text, done: Int 1}
+type Todo = {owner Text done (Int 1)}
 *todos : Rel Todo
 }
 (do
@@ -33,7 +33,7 @@ fn persisted_relation_read_write() {
     assert_stdout(
         "persist",
         r#"with {
-type C = {n: Int 1}
+type C = {n (Int 1)}
 *cs : Rel C
 }
 (do
@@ -65,12 +65,10 @@ fn morph_resolution() {
     // type, via base.morph.<from>To<to>.into.
     assert_stdout(
         "morph",
-        r#"with {
-asInt : Maybe (Int 1)
+        r#"with {asInt : Maybe (Int 1)
 asInt ((^into) "42")
 asText : Text
-asText ((^into) 7)
-}
+asText ((^into) 7))}
 (do
   base.println (base.show asInt)
   base.println asText
@@ -132,7 +130,7 @@ fn atomic_transfer() {
     assert_stdout(
         "atomic",
         r#"with {
-type Account = {name: Text, balance: Int 1}
+type Account = {name Text balance (Int 1)}
 *accounts : Rel Account
 }
 (do

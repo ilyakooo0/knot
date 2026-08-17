@@ -4438,6 +4438,15 @@ impl Infer {
         self.display_ty_inner(ty, false)
     }
 
+    /// Render a type in "atom" position (a record field's type): parenthesize
+    /// compound forms (`Fun`, `App`, `Rel`) so the field boundary stays clear.
+    fn display_ty_atom(&self, ty: &Ty) -> String {
+        match ty.peel_alias() {
+            Ty::Fun(..) | Ty::App(..) | Ty::Relation(_) => format!("({})", self.display_ty(ty)),
+            _ => self.display_ty(ty),
+        }
+    }
+
     fn display_ty_inner(&self, ty: &Ty, in_fun: bool) -> String {
         match ty {
             Ty::Var(v) => match self.subst.get(v) {
@@ -4479,7 +4488,7 @@ impl Infer {
                 let mut parts: Vec<String> = fields
                     .iter()
                     .map(|(n, t)| {
-                        format!("{}: {}", n, self.display_ty(t))
+                        format!("{} {}", n, self.display_ty_atom(t))
                     })
                     .collect();
                 if let Some(rv) = row {
@@ -12885,14 +12894,24 @@ fn display_ty_clean_inner(
             if fields.is_empty() && row.is_none() {
                 return "{}".into();
             }
+            // Whitespace-separated `name Type` (matches the record-type
+            // surface syntax); compound field types are parenthesized so the
+            // next field name isn't absorbed. Re-parsed by the JIT's
+            // expected-type parser, so this must match the grammar.
             let mut parts: Vec<String> = fields
                 .iter()
-                .map(|(n, t)| format!("{}: {}", n, display_ty_clean_inner(t, names, unit_names, false, wire)))
+                .map(|(n, t)| {
+                    let inner = display_ty_clean_inner(t, names, unit_names, false, wire);
+                    match t.peel_alias() {
+                        Ty::Fun(..) | Ty::App(..) | Ty::Relation(_) => format!("{n} ({inner})"),
+                        _ => format!("{n} {inner}"),
+                    }
+                })
                 .collect();
             if let Some(rv) = row {
                 parts.push(format!("| {}", var_letter(names.get(rv).copied().unwrap_or(*rv as usize))));
             }
-            format!("{{{}}}", parts.join(", "))
+            format!("{{{}}}", parts.join(" "))
         }
         Ty::Relation(inner) => format!("Rel {}", display_ty_clean_inner(inner, names, unit_names, true, wire)),
         Ty::Con(name, args) => {
@@ -13280,18 +13299,10 @@ fn parse_data_decl_ctors(
             let cname = arm.split_whitespace().next().unwrap_or("").to_string();
             let fields = match (arm.find('{'), arm.rfind('}')) {
                 (Some(open), Some(close)) if close > open => {
-                    let inner = &arm[open + 1..close];
-                    inner
-                        .split(',')
-                        .filter_map(|f| {
-                            let f = f.trim();
-                            if f.is_empty() {
-                                return None;
-                            }
-                            let (fname, fty) = f.split_once(':')?;
-                            Some((fname.trim().to_string(), fty.trim().to_string()))
-                        })
-                        .collect()
+                    // Record-type fields: whitespace-separated `name Type` pairs.
+                    // The field type is one atom — a bare name/var, or a
+                    // parenthesized compound (`(Int 1)`, `(Rel Person)`).
+                    split_ctor_fields(&arm[open + 1..close])
                 }
                 _ => Vec::new(),
             };
@@ -13299,6 +13310,53 @@ fn parse_data_decl_ctors(
         })
         .collect();
     Some((name, ctors))
+}
+
+/// Split a record-type field body (`n (Int 1) extra Text`) into
+/// `(field_name, field_type_src)` pairs. Whitespace-separated `name Type`
+/// pairs; the type is one atom — a bare identifier, or a parenthesized
+/// compound (`(Int 1)`) which may itself contain spaces. Field types are kept
+/// as source substrings so the JIT can re-parse them into real `Ty`s.
+fn split_ctor_fields(inner: &str) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    let mut rest = inner.trim();
+    while !rest.is_empty() {
+        // Field name: a leading lowercase identifier.
+        let name_len = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '\''))
+            .unwrap_or(rest.len());
+        let name = rest[..name_len].trim();
+        if name.is_empty() {
+            break;
+        }
+        rest = rest[name_len..].trim_start();
+        // Field type: one atom — a parenthesized group (balanced) or a single
+        // whitespace-delimited token.
+        let (ty, next) = if rest.starts_with('(') {
+            let mut depth = 0;
+            let mut end = rest.len();
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            (&rest[..end], &rest[end..])
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            (&rest[..end], &rest[end..])
+        };
+        fields.push((name.to_string(), ty.trim().to_string()));
+        rest = next.trim_start();
+    }
+    fields
 }
 
 /// The polarity of a type position, for variance-aware constructor checking.

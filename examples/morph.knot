@@ -15,12 +15,12 @@
 --     bidirectional (check-mode) path: the contextual expected type threads
 --     through the enclosing `with` into the application's result.
 with {
-textToInt { into : Text -> Int 1
-            into (\s -> base.length s) }
-intToText { into : Int 1 -> Text
-            into (\n -> base.show n) }
-textToFloat { into : Text -> Float 1
-              into (\s -> 2.5) }
+textToInt {into (Text -> Int 1
+            into (\s -> base.length s))}
+intToText {into (Int 1 -> Text
+            into (\n -> base.show n))}
+textToFloat {into (Text -> Float 1
+              into (\s -> 2.5))}
 
 -- The ambient conversion scope: base.morph.<from-type>.<to-type>.into
 conv { morph {

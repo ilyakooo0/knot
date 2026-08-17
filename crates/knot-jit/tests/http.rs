@@ -89,7 +89,7 @@ fn http_path_param() {
         "http_param",
         r#"with {
 api Api where
-  GetUser get /users/{id: Int 1} -> Text
+  GetUser get /users/{id (Int 1)} -> Text
 }
 (base.listen 18082 (serve Api where
   GetUser = \{id id} -> yield (Result.Ok {value ("user " ++ base.show id)})))"#,
@@ -119,7 +119,7 @@ fn http_json_body() {
         "http_json",
         r#"with {
 api Api where
-  CreateUser post /users ={name: Text, age: Int 1} -> Text
+  CreateUser post /users ={name Text age (Int 1)} -> Text
 }
 (base.listen 18084 (serve Api where
   CreateUser = \{name name age age} -> yield (Result.Ok {value ("created " ++ name)})))"#,

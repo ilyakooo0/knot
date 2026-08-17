@@ -860,24 +860,21 @@ impl Parser {
         if self.eat(&TokenKind::LBrace) {
             self.skip_newlines();
             if !self.at(&TokenKind::RBrace) {
+                // Constructor payload fields use the record-type syntax:
+                // whitespace-separated `name Type` pairs, no `:` or `,`; each
+                // field type is a single atom (compound types parenthesized).
                 loop {
                     self.skip_newlines();
+                    if self.at(&TokenKind::RBrace) {
+                        break;
+                    }
                     let (fname, _) = self.expect_lower("expected field name in constructor").ok()?;
-                    self.expect(&TokenKind::Colon, "expected ':' after field name in constructor")
-                        .ok()?;
-                    let ty = self.parse_type()?;
+                    self.skip_newlines();
+                    let ty = self.parse_type_atom()?;
                     fields.push(Field {
                         name: fname,
                         value: ty,
                     });
-                    self.skip_newlines();
-                    if !self.eat(&TokenKind::Comma) {
-                        break;
-                    }
-                    self.skip_newlines();
-                    if self.at(&TokenKind::RBrace) {
-                        break; // trailing comma
-                    }
                 }
             }
             self.expect(&TokenKind::RBrace, "expected '}' to close constructor fields")
@@ -1084,24 +1081,19 @@ impl Parser {
         }
         self.skip_newlines();
         if !self.at(&TokenKind::RBrace) {
+            // Route typed fields (`?{q: T}`, `={f: T}`, `@{h: T}`) use the
+            // record-type syntax: whitespace-separated `name Type`, no `:`/`,`.
             loop {
                 self.skip_newlines();
+                if self.at(&TokenKind::RBrace) {
+                    break;
+                }
                 let Ok((fname, _)) = self.expect_lower("expected field name") else {
                     break;
                 };
-                if self.expect(&TokenKind::Colon, "expected ':' after field name").is_err() {
-                    break;
-                }
-                let Some(ty) = self.parse_type() else { break };
+                self.skip_newlines();
+                let Some(ty) = self.parse_type_atom() else { break };
                 fields.push(Field { name: fname, value: ty });
-                self.skip_newlines();
-                if !self.eat(&TokenKind::Comma) {
-                    break;
-                }
-                self.skip_newlines();
-                if self.at(&TokenKind::RBrace) {
-                    break; // trailing comma
-                }
             }
         }
         let _ = self.expect(&TokenKind::RBrace, "expected '}' to close fields");
@@ -1114,16 +1106,16 @@ impl Parser {
         while self.at(&TokenKind::Slash) {
             self.advance(); // consume `/`
             if self.at(&TokenKind::LBrace) {
-                // Path parameter: {name: Type}
+                // Path parameter: `{name Type}` — record-type syntax (the type
+                // is a single atom; compound types parenthesized).
                 self.advance();
                 if let Ok((pname, _)) = self.expect_lower("expected parameter name in path") {
-                    if self.eat(&TokenKind::Colon) {
-                        if let Some(ty) = self.parse_type() {
-                            segments.push(PathSegment::Param { name: pname, ty });
-                        }
+                    self.skip_newlines();
+                    if let Some(ty) = self.parse_type_atom() {
+                        segments.push(PathSegment::Param { name: pname, ty });
                     } else {
                         self.error(format!(
-                            "expected ':' and type after path parameter '{}' (e.g., {{{}: Int}})",
+                            "expected a type after path parameter '{}' (e.g., {{{} (Int 1)}})",
                             pname, pname
                         ));
                     }
@@ -3988,13 +3980,13 @@ impl Parser {
             ));
         }
 
-        // Record type: {field: Type, ... | rest?}
-        //
-        // Fields are separated by a comma OR by a newline — so a record type may
-        // be written one field per line without commas:
-        //   {name: Text
-        //    age: Int 1}
-        // A same-line field still requires a comma (`{name: Text, age: Int 1}`).
+        // Record type: whitespace-separated `name Type` pairs, matching the
+        // record-LITERAL syntax (`{name Text age (Int 1)}`). No `:` or `,`.
+        // A field's type is a single type ATOM (`parse_type_atom`), which never
+        // consumes a following bare identifier — so a lowercase ident after a
+        // type always opens the next field. Compound types (application like
+        // `Maybe Int`, `Rel Person`) must be parenthesized: `{members (Rel
+        // Person)}`. A trailing `| rowvar` gives an open record type.
         let mut fields = Vec::new();
         loop {
             self.skip_newlines();
@@ -4002,29 +3994,13 @@ impl Parser {
                 break;
             }
             let (fname, _) = self.expect_lower("expected field name in record type").ok()?;
-            self.expect(&TokenKind::Colon, "expected ':' after field name in record type")
-                .ok()?;
             self.skip_newlines();
-            let ty = self.parse_type()?;
+            let ty = self.parse_type_atom()?;
             fields.push(Field {
                 name: fname,
                 value: ty,
             });
-
-            // Field separator: an explicit comma, or a newline followed by
-            // another `field:` signature. Otherwise the record is done.
-            if self.eat(&TokenKind::Comma) {
-                continue;
-            }
-            if self.at(&TokenKind::Newline) {
-                let saved = self.save();
-                self.skip_newlines();
-                if self.at_field_signature() {
-                    continue;
-                }
-                self.restore(saved);
-            }
-            break;
+            // No separator: the next field (if any) is the next lowercase ident.
         }
 
         self.skip_newlines();

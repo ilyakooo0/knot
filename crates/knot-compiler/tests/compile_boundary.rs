@@ -120,8 +120,8 @@ fn adt_fieldless_narrower_snippet_accepted() {
 fn adt_nested_identical_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Task = Todo {pri: Priority}\n}\n(Task.Todo {pri (Priority.High {})})",
-            "data Priority = Low {} | High {}\ndata Task = Todo {pri: Priority}\nTask"
+            "with {\ndata Priority = Low {} | High {}\ndata Task = Todo {pri Priority}\n}\n(Task.Todo {pri (Priority.High {})})",
+            "data Priority = Low {} | High {}\ndata Task = Todo {pri Priority}\nTask"
         ),
         Some(true)
     );
@@ -133,8 +133,8 @@ fn adt_nested_identical_accepted() {
 fn adt_nested_extra_inner_ctor_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {} | Medium {}\ndata Task = Todo {pri: Priority}\n}\n(Task.Todo {pri (Priority.Medium {})})",
-            "data Priority = Low {} | High {}\ndata Task = Todo {pri: Priority}\nTask"
+            "with {\ndata Priority = Low {} | High {} | Medium {}\ndata Task = Todo {pri Priority}\n}\n(Task.Todo {pri (Priority.Medium {})})",
+            "data Priority = Low {} | High {}\ndata Task = Todo {pri Priority}\nTask"
         ),
         Some(false)
     );
@@ -146,8 +146,8 @@ fn adt_nested_extra_inner_ctor_rejected() {
 fn adt_nested_narrower_inner_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {}\ndata Task = Todo {pri: Priority}\n}\n(Task.Todo {pri (Priority.Low {})})",
-            "data Priority = Low {} | High {}\ndata Task = Todo {pri: Priority}\nTask"
+            "with {\ndata Priority = Low {}\ndata Task = Todo {pri Priority}\n}\n(Task.Todo {pri (Priority.Low {})})",
+            "data Priority = Low {} | High {}\ndata Task = Todo {pri Priority}\nTask"
         ),
         Some(true)
     );
@@ -159,8 +159,8 @@ fn adt_nested_narrower_inner_accepted() {
 fn adt_scalar_payload_match_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {n: Int 1}\n}\n(Wrap.W {n 7})",
-            "data Wrap = W {n: Int 1}\nWrap"
+            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {n (Int 1)}\n}\n(Wrap.W {n 7})",
+            "data Wrap = W {n (Int 1)}\nWrap"
         ),
         Some(true)
     );
@@ -170,8 +170,8 @@ fn adt_scalar_payload_match_accepted() {
 fn adt_scalar_payload_mismatch_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {n: Text}\n}\n(Wrap.W {n \"x\"})",
-            "data Wrap = W {n: Int 1}\nWrap"
+            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {n Text}\n}\n(Wrap.W {n \"x\"})",
+            "data Wrap = W {n (Int 1)}\nWrap"
         ),
         Some(false)
     );
@@ -301,8 +301,8 @@ fn adt_invariant_narrower_rejected() {
 fn adt_field_name_mismatch_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {count: Int 1}\n}\n(Wrap.W {count 7})",
-            "data Wrap = W {n: Int 1}\nWrap"
+            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {count (Int 1)}\n}\n(Wrap.W {count 7})",
+            "data Wrap = W {n (Int 1)}\nWrap"
         ),
         Some(false)
     );
@@ -313,8 +313,8 @@ fn adt_field_name_mismatch_rejected() {
 fn adt_field_missing_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {n: Int 1}\n}\n(Wrap.W {n 7})",
-            "data Wrap = W {n: Int 1, extra: Text}\nWrap"
+            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {n (Int 1)}\n}\n(Wrap.W {n 7})",
+            "data Wrap = W {n (Int 1) extra Text}\nWrap"
         ),
         Some(false)
     );
@@ -326,8 +326,8 @@ fn adt_field_missing_rejected() {
 fn adt_payload_multi_ctor_field_mismatch_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Shape = Circle {r: Text} | Square {}\n}\n(Shape.Circle {r \"x\"})",
-            "data Shape = Circle {r: Int 1} | Square {}\nShape"
+            "with {\ndata Priority = Low {} | High {}\ndata Shape = Circle {r Text} | Square {}\n}\n(Shape.Circle {r \"x\"})",
+            "data Shape = Circle {r (Int 1)} | Square {}\nShape"
         ),
         Some(false)
     );

@@ -135,13 +135,15 @@ impl ParsedType {
                 parts.join(" -> ")
             }
             ParsedType::Record(fields, rest) => {
+                // Whitespace-separated `name Type`; field types rendered atomic
+                // (compound parenthesized) to match the surface grammar.
                 let fs: Vec<String> = fields
                     .iter()
-                    .map(|(n, t)| format!("{n}: {}", t.render()))
+                    .map(|(n, t)| format!("{n} {}", t.render_atomic()))
                     .collect();
                 match rest {
-                    Some(r) => format!("{{{} | {r}}}", fs.join(", ")),
-                    None => format!("{{{}}}", fs.join(", ")),
+                    Some(r) => format!("{{{} | {r}}}", fs.join(" ")),
+                    None => format!("{{{}}}", fs.join(" ")),
                 }
             }
             ParsedType::Variant(ctors, rest) => {
@@ -459,16 +461,11 @@ impl<'a> Parser<'a> {
             }
             let name = self.consume_ident()?;
             self.skip_ws();
-            if !self.eat_char(':') {
-                return None;
-            }
-            self.skip_ws();
-            let ty = self.parse_function()?;
+            // Whitespace-separated `name Type` — the field type is a single
+            // atom (compound types are parenthesized in the source).
+            let ty = self.parse_atom()?;
             fields.push((name, ty));
             self.skip_ws();
-            if self.peek() == Some(',') {
-                self.eat_char(',');
-            }
         }
         Some(ParsedType::Record(fields, rest))
     }

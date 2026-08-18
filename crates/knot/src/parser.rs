@@ -2626,13 +2626,14 @@ impl Parser {
             //
             // Only speculate when the field opens with a token that
             // UNAMBIGUOUSLY starts a type — uppercase, `{`, `<`, `forall`, `_`.
-            // A lowercase-led field is a value binding (`x 1`, `textToBytes
-            // {…}`), never a type-first sig: a lowercase type-variable-led sig
-            // (`a -> a  f`) would be ambiguous with a binding, so those are
-            // written with `the` instead.
-            // `(` covers a parenthesised-constraint-led type `(<>ctx) => …`;
-            // a field can never open with `(` as a value binding (field names
-            // are lowercase idents or `*sources`), so it's unambiguous.
+            // A lowercase-led field is a value binding, never a type-first sig:
+            // a lowercase field with a record value (`vec {count vecCount}`)
+            // followed by a newline and another lowercase field (`morph {…}`)
+            // is indistinguishable from a `Type  name` sig — the newline is a
+            // gap, so `vec {…}` reads as the type and `morph` as the name.
+            // Tyvar-led sigs (`a -> IO T  f`) therefore need an explicit
+            // `forall` (`forall a. a -> IO T  f`), which is an unambiguous
+            // type-starter. `(` covers a constraint-led type `(<>ctx) => …`.
             if matches!(
                 self.peek(),
                 TokenKind::Upper(_)

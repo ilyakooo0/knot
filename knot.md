@@ -136,7 +136,7 @@ There are five kinds of top-level declarations:
 
 | Declaration | Kind | Description |
 |---|---|---|---|
-| `*foo : Rel T` | Source relation | Persisted in SQLite, mutable via `*foo = expr` |
+| `Rel T  *foo` | Source relation | Persisted in SQLite, mutable via `*foo = expr` |
 | `foo <query>` | Query field | Read-only, recomputed on access |
 | `foo = expr` | Constant/function | Pure value, no DB effects |
 | `type Foo = T` | Type alias | Name for a type |
@@ -234,8 +234,8 @@ _ -> _ -> _  const
 const \x y -> x
 }
 (do
-  base.println (base.show (id 42))        -- 42 : Int 1
-  base.println (id "hello")               -- "hello" : Text
+  base.println (base.show (id 42))        -- the (Int 1) 42
+  base.println (id "hello")               -- the Text "hello"
   base.println (base.show (first [10 20]))  -- element type inferred
   base.println (base.show (const 1 "two"))  -- three independent holes
   yield {})
@@ -254,7 +254,7 @@ double \x -> x + x)}
   yield {})
 ```
 
-Each occurrence is fresh: `f : _ -> _` does not force the result to equal the
+Each occurrence is fresh: `_ -> _  f` does not force the result to equal the
 argument. To share a type between positions, use an explicit type variable
 (`a`, `u`) instead of `_`.
 
@@ -658,9 +658,9 @@ producing an `a`, not immediate execution. `IO` takes a single type argument
 (the result type); there is no effect-row parameter:
 
 ```knot-skip
-println : a -> IO {}
-readFile : Text -> IO Text
-now : IO (Int Ms)
+forall a. a -> IO {}  println
+Text -> IO Text  readFile
+IO (Int Ms)  now
 ```
 
 A `do` block sequences `IO` actions; the whole block is itself an `IO`.
@@ -719,7 +719,7 @@ The body of `atomic` must be an IO expression containing only DB operations. Ext
 Fire-and-forget: runs an IO action on a new OS thread. Each thread gets its own SQLite connection (WAL mode).
 
 ```knot
--- base.fork : IO a -> IO {}
+-- forall a. IO a -> IO {}  base.fork
 (do
   base.fork do
     base.println "hello from thread 1"
@@ -757,7 +757,7 @@ conservatively.
 #### `race`
 
 ```knot-skip
-race : IO a -> IO b -> IO (Result a b)
+forall a b. IO a -> IO b -> IO (Result a b)  race
 ```
 
 Run two IO actions concurrently and return the winner. The winner is reported
@@ -997,7 +997,7 @@ api (serve Api where
     yield (Result.Ok {value (base.count todos)}))
 ```
 
-`serve API where` produces a value of type `Server API`. Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status (Int 1) message Text}`. `listen : Int u -> Server a -> IO {}` binds the server to a port.
+`serve API where` produces a value of type `Server API`. Each handler takes the request record and returns `Result HttpError T`, where `T` is the response type declared on the endpoint and `HttpError = {status (Int 1) message Text}`. `forall u a. Int u -> Server a -> IO {}  listen` binds the server to a port.
 
 ### HTTP Status Codes
 
@@ -1062,7 +1062,7 @@ On the `fetch` side, header fields are sent automatically. When response headers
      the endpoint constructor is not yet value-accessible in expressions (doc-vs-impl gap). -->
 ```knot-skip
 result <- base.fetch "https://api.example.com" (GetTodos {authorization "Bearer tok"})
--- result : IO (Result ... {body (Rel Todo) headers {xTotalCount (Int 1)}})
+-- IO (Result ... {body (Rel Todo) headers {xTotalCount (Int 1)}})  result
 ```
 
 ### Rate Limiting
@@ -1187,11 +1187,11 @@ type Nat = Int 1 where \x -> x >= 0
     Result.Err {error e} -> base.println ("Invalid: " ++ base.show e)
   -- Use in Result do-block
   with {validated do
-    n <- refine (the (Int 1) 3)     -- binds n : Nat on success, short-circuits on failure
+    n <- refine (the (Int 1) 3)     -- binds n (of type Nat) on success, short-circuits on failure
     m <- refine (the (Int 1) 4)
     yield (n + m)}
   (do
-    base.println (base.show validated)   -- validated : Result RefinementError (Int 1)
+    base.println (base.show validated)   -- Result RefinementError (Int 1)  validated
     yield {})
   yield {})
 ```

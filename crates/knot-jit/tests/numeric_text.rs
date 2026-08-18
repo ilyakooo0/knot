@@ -46,15 +46,15 @@ fn int_to_float() {
 
 #[test]
 fn text_to_int() {
-    assert_show("base.textToInt \"42\"", "Just {value: 42}");
-    assert_show("base.textToInt \"-7\"", "Just {value: -7}");
+    assert_show("base.textToInt \"42\"", "Just {value 42}");
+    assert_show("base.textToInt \"-7\"", "Just {value -7}");
     assert_show("base.textToInt \"abc\"", "Nothing");
     assert_show("base.textToInt \"12x\"", "Nothing");
 }
 
 #[test]
 fn text_to_float() {
-    assert_show("base.textToFloat \"1.5\"", "Just {value: 1.5}");
+    assert_show("base.textToFloat \"1.5\"", "Just {value 1.5}");
     assert_show("base.textToFloat \"nope\"", "Nothing");
 }
 
@@ -99,18 +99,18 @@ fn upsert_by_replaces_or_appends() {
     // replace matching
     assert_show(
         "base.upsertBy (\\r -> r.id == 1) {id 1 v 99} [{id 1 v 5} {id 2 v 6}]",
-        "[{id: 1, v: 99}, {id: 2, v: 6}]",
+        "[{id 1 v 99}, {id 2 v 6}]",
     );
     // append when no match
     assert_show(
         "base.upsertBy (\\r -> r.id == 9) {id 9 v 0} [{id 1 v 5}]",
-        "[{id: 1, v: 5}, {id: 9, v: 0}]",
+        "[{id 1 v 5}, {id 9 v 0}]",
     );
 }
 
 #[test]
 fn single_maybe() {
-    assert_show("base.single [42]", "Just {value: 42}");
+    assert_show("base.single [42]", "Just {value 42}");
     assert_show("base.single []", "Nothing");
     assert_show("base.single [1 2]", "Nothing"); // more than one
 }
@@ -131,13 +131,13 @@ fn count_where() {
 #[test]
 fn unify_right_biased() {
     // right-biased record merge
-    assert_show("base.unify {a 1 b 2} {b 99 c 3}", "{a: 1, b: 99, c: 3}");
+    assert_show("base.unify {a 1 b 2} {b 99 c 3}", "{a 1 b 99 c 3}");
 }
 
 #[test]
 fn strip_dress_units() {
     // strip drops the unit, dress adds one (dimensionless round-trip)
-    assert_show("base.strip (42 : Int 1)", "42");
+    assert_show("base.strip (the (Int 1) 42)", "42");
     assert_show("base.dress 7", "7");
 }
 

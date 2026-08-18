@@ -320,7 +320,7 @@ impl<'a> DefResolver<'a> {
     /// declaration as a self-reference to its canonical (first) name span.
     ///
     /// Multi-line declarations repeat their name at the start of each
-    /// defining line — most importantly `f : T` ⏎ `f = body`, which the
+    /// defining line — most importantly `T  f` ⏎ `f = body`, which the
     /// parser merges into a single decl. Top-level decls start at column 0,
     /// so any line inside the decl span that begins with the name (after an
     /// optional `*`/`&` relation sigil) is a definition token, never a body
@@ -641,7 +641,7 @@ pub fn build_details(program: &Expr) -> HashMap<String, String> {
                             let fields: Vec<String> = c
                                 .fields
                                 .iter()
-                                .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+                                .map(|f| format!("{} {}", f.name, format_type_kind(&f.value.node)))
                                 .collect();
                             format!("{} {{{}}}", c.name, fields.join(", "))
                         }
@@ -653,7 +653,7 @@ pub fn build_details(program: &Expr) -> HashMap<String, String> {
                     let fields: Vec<String> = ctor
                         .fields
                         .iter()
-                        .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+                        .map(|f| format!("{} {}", f.name, format_type_kind(&f.value.node)))
                         .collect();
                     let ctor_detail = if fields.is_empty() {
                         format!("{} — constructor of {name}", ctor.name)
@@ -687,14 +687,14 @@ pub fn build_details(program: &Expr) -> HashMap<String, String> {
                 details.insert(name.clone(), format!("route {name} = {}", components.join(" | ")));
             }
             _ => {
-                // A named function field: `name : Sig`.
+                // A named function field, type-first: `Sig  name`.
                 let name = &decl.name;
-                let ty_str = decl
+                let detail = decl
                     .sig
                     .as_ref()
-                    .map(|t| format!(" : {}", format_type_scheme(t)))
-                    .unwrap_or_default();
-                details.insert(name.clone(), format!("{name}{ty_str}"));
+                    .map(|t| format!("{}  {}", format_type_scheme(t), name))
+                    .unwrap_or_else(|| name.clone());
+                details.insert(name.clone(), detail);
             }
         }
     }

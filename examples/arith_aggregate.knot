@@ -4,16 +4,16 @@
 with {
 type Line = {product Text price (Int 1) qty (Int 1)}
 
-*lines : Rel Line
+Rel Line  *lines
 
 totalDemo (do
   lines <- full *lines
   -- Revenue per line is price*qty; the whole thing is one SQL SUM.
-  base.println ("Total revenue: " ++ base.show (*lines |> base.map (\l -> l.price * l.qty) |> base.sum)))
+  base.println ("Total revenue " ++ base.show (*lines |> base.map (\l -> l.price * l.qty) |> base.sum)))
 
 avgDemo (do
   lines <- full *lines
-  base.println ("Lines: " ++ base.show (base.count lines)))
+  base.println ("Lines " ++ base.show (base.count lines)))
 }
 
 do

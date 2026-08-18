@@ -17,7 +17,7 @@ fn text_literal() {
 
 #[test]
 fn record_show() {
-    assert_show("{x 3 y 4}", "{x: 3, y: 4}");
+    assert_show("{x 3 y 4}", "{x 3 y 4}");
 }
 
 #[test]

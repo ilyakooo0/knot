@@ -11,14 +11,14 @@ with {
 
 data Active = Yes {} | No {}
 
--- Version 1 of the schema: people had just a name.
+-- Version 1 of the schema people had just a name.
 type PersonV1 = {name Text}
 
 -- Version 2 adds an `active` flag. Existing rows stored as PersonV1 are
 -- upgraded by `using`, which fills the new field with a default.
 type PersonV2 = {name Text active Active}
 
-*people : Rel PersonV2
+Rel PersonV2  *people
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 
 }

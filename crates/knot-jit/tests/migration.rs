@@ -30,7 +30,7 @@ fn migrate_backfills_new_field_count() {
         "mig_count",
         r#"with {
 type PersonV1 = {name Text}
-*people : Rel PersonV1
+Rel PersonV1  *people
 }
 (do
   full *people = [{name "Alice"} {name "Bob"}]
@@ -48,7 +48,7 @@ type PersonV1 = {name Text}
 data Active = Yes {} | No {}
 type PersonV1 = {name Text}
 type PersonV2 = {name Text active Active}
-*people : Rel PersonV2
+Rel PersonV2  *people
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 }
 (do
@@ -72,7 +72,7 @@ fn migrate_backfilled_adt_field_renders_constructor() {
         "mig_show",
         r#"with {
 type PersonV1 = {name Text}
-*people : Rel PersonV1
+Rel PersonV1  *people
 }
 (do
   full *people = [{name "Alice"}]
@@ -85,7 +85,7 @@ type PersonV1 = {name Text}
 data Active = Yes {} | No {}
 type PersonV1 = {name Text}
 type PersonV2 = {name Text active Active}
-*people : Rel PersonV2
+Rel PersonV2  *people
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 }
 (do
@@ -111,7 +111,7 @@ fn migrate_lockfile_roundtrip() {
 data Active = Yes {} | No {}
 type PersonV1 = {name Text}
 type PersonV2 = {name Text active Active}
-*people : Rel PersonV2
+Rel PersonV2  *people
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 }
 (do

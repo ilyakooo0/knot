@@ -62,7 +62,7 @@ fn traverse_maybe_and_result() {
     assert_stdout(
         "traverse_maybe",
         r#"with {
-pos : Int 1 -> Maybe (Int 1)
+Int 1 -> Maybe (Int 1)  pos
 pos (\x -> case x > 0 of
   Bool.True {} -> Maybe.Just {value x}
   Bool.False {} -> Maybe.Nothing {})
@@ -71,7 +71,7 @@ pos (\x -> case x > 0 of
   base.println (base.show (base.traverse pos [1 2 3]))
   base.println (base.show (base.traverse pos [1 (-2) 3]))
   yield {})"#,
-        "\"Just {value: [1, 2, 3]}\"\n\"Nothing\"\n{}",
+        "\"Just {value [1, 2, 3]}\"\n\"Nothing\"\n{}",
     );
 }
 
@@ -121,8 +121,8 @@ fn implicit_field_ambiguous_rejected() {
 #[test]
 fn forall_rank2() {
     assert_show(
-        "with {\napplyTwice (\\(f : (forall a. a -> a)) -> {asText (f \"text\") asInt (f 42)})\n}\n(applyTwice (\\y -> y))",
-        "{asInt: 42, asText: text}",
+        "with {\napplyTwice (\\(the ((forall a. a -> a)) f) -> {asText (f \"text\") asInt (f 42)})\n}\n(applyTwice (\\y -> y))",
+        "{asInt 42 asText text}",
     );
 }
 
@@ -130,17 +130,17 @@ fn forall_rank2() {
 
 #[test]
 fn explicit_annotation() {
-    assert_show("(42 : Int 1)", "42");
+    assert_show("(the (Int 1) 42)", "42");
 }
 
 #[test]
 fn annotation_mismatch_rejected() {
-    assert_compile_err("(42 : Text)", "");
+    assert_compile_err("(the (Text) 42)", "");
 }
 
 #[test]
 fn wildcard_annotation() {
-    assert_show("(42 : Int _)", "42");
+    assert_show("(the (Int _) 42)", "42");
 }
 
 // ── Numeric edge cases ───────────────────────────────────────────────────

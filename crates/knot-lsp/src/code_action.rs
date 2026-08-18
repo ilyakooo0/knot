@@ -62,26 +62,31 @@ pub(crate) fn handle_code_action(
                 | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. });
         if is_unannotated_fn
             && let Some(inferred) = doc.type_info.get(&decl.name) {
-                let signature = inferred.clone();
-                // Insert the annotation inline on the definition
-                // (`name : Sig = body`), mirroring the View/Derived branch
-                // below — not as a separate standalone signature line.
-                let decl_text = safe_slice(&doc.source, decl.value.span);
-                if let Some(eq_pos) = decl_text.find('=') {
-                    let insert_offset = decl.value.span.start + eq_pos;
-                    let insert_pos = offset_to_position(&doc.source, insert_offset);
+               let signature = inferred.clone();
+                // Signatures are type-first and live on their own line above the
+                // binding: insert `Sig  name\n` at the start of the decl's line,
+                // preserving the line's existing indentation.
+                let line_start = doc.source[..decl.value.span.start]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let indent: String = doc.source[line_start..decl.value.span.start]
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .collect();
+                let insert_pos = offset_to_position(&doc.source, line_start);
 
-                    let mut changes = HashMap::new();
-                    changes.insert(
-                        uri.clone(),
-                        vec![TextEdit {
-                            range: Range {
-                                start: insert_pos,
-                                end: insert_pos,
-                            },
-                            new_text: format!(": {signature} "),
-                        }],
-                    );
+                let mut changes = HashMap::new();
+                changes.insert(
+                    uri.clone(),
+                    vec![TextEdit {
+                        range: Range {
+                            start: insert_pos,
+                            end: insert_pos,
+                        },
+                        new_text: format!("{indent}{signature}  {}\n", decl.name),
+                    }],
+                );
 
                     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                         title: format!("Add type annotation: {signature}"),
@@ -92,7 +97,6 @@ pub(crate) fn handle_code_action(
                         }),
                         ..Default::default()
                     }));
-                }
             }
     }
 
@@ -344,7 +348,7 @@ pub(crate) fn handle_code_action(
             // blocks, so the with-extraction is offered only when the
             // selection sits inside a do-block statement. The `with` wraps
             // the enclosing statement and every following statement in the
-            // same block: `with {name: e} (do\n  <stmt>\n  <rest>)`.
+            // same block: `with {name e} (do\n  <stmt>\n  <rest>)`.
             if let Some((stmt_start, block_end)) =
                 enclosing_do_stmt_range(&doc.module, sel_start, sel_end)
             {
@@ -488,7 +492,7 @@ pub(crate) fn handle_code_action(
     }
 
     // Action: Inline variable — if the cursor is on a field NAME of a
-    // `with {name: value} body` binding, offer to substitute the value at
+    // `with {name value} body` binding, offer to substitute the value at
     // every usage in `body` and unwrap the `with`.
     for decl in top_fields(&doc.module) {
         if decl.value.span.end < range_start || decl.value.span.start > range_end {

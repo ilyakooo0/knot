@@ -34,7 +34,7 @@ fn unbound_variable() {
 
 #[test]
 fn annotation_mismatch() {
-    assert_compile_err("(42 : Text)", "");
+    assert_compile_err("(the (Text) 42)", "");
 }
 
 #[test]
@@ -77,7 +77,7 @@ fn cross_scope_shadowing() {
 #[test]
 fn unit_mismatch() {
     assert_compile_err(
-        "with { unit Ms unit Usd } ((100 : Int Ms) + (50 : Int Usd))",
+        "with { unit Ms unit Usd } ((the (Int Ms) 100) + (the (Int Usd) 50))",
         "",
     );
 }
@@ -86,7 +86,7 @@ fn unit_mismatch() {
 fn record_unify_wrong_field_type() {
     // unify replacing a field with an incompatible type on a typed record.
     assert_compile_err(
-        "with {\ntype P = {x (Int 1)}\np ({} : P)\n}\n(base.unify {x 1} {x \"s\"})",
+        "with {\ntype P = {x (Int 1)}\np (the (P) {})\n}\n(base.unify {x 1} {x \"s\"})",
         "",
     );
 }

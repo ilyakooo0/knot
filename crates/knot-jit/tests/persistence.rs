@@ -11,7 +11,7 @@ fn persisted_relation_groupby() {
         "groupby",
         r#"with {
 type Todo = {owner Text done (Int 1)}
-*todos : Rel Todo
+Rel Todo  *todos
 }
 (do
   full *todos = [{owner "x" done 0} {owner "x" done 1} {owner "y" done 0}]
@@ -24,7 +24,7 @@ type Todo = {owner Text done (Int 1)}
   yield {})"#,
         // Set semantics: identical rows are deduped on write (INSERT OR
         // IGNORE), so distinct open rows only. owners x and y each have 1.
-        "\"[{count: 1, owner: x}, {count: 1, owner: y}]\"\n{}",
+        "\"[{count 1 owner x}, {count 1 owner y}]\"\n{}",
     );
 }
 
@@ -34,7 +34,7 @@ fn persisted_relation_read_write() {
         "persist",
         r#"with {
 type C = {n (Int 1)}
-*cs : Rel C
+Rel C  *cs
 }
 (do
   full *cs = [{n 1} {n 2} {n 3}]
@@ -65,15 +65,17 @@ fn morph_resolution() {
     // type, via base.morph.<from>To<to>.into.
     assert_stdout(
         "morph",
-        r#"with {asInt : Maybe (Int 1)
+        r#"with {
+Maybe (Int 1)  asInt
 asInt ((^into) "42")
-asText : Text
-asText ((^into) 7))}
+Text  asText
+asText ((^into) 7)
+}
 (do
   base.println (base.show asInt)
   base.println asText
   yield {})"#,
-        "\"Just {value: 42}\"\n\"7\"\n{}",
+        "\"Just {value 42}\"\n\"7\"\n{}",
     );
 }
 
@@ -94,7 +96,7 @@ fn traverse_io() {
 fn compile_result_ok() {
     assert_stdout(
         "compile_ok",
-        r#"(case (base.compile "40 + 2" : Result Text (Int 1)) of
+        r#"(case (the (Result Text (Int 1)) (base.compile "40 + 2")) of
   Result.Ok {value v} -> base.println ("ok: " ++ base.show v)
   Result.Err {error e} -> base.println ("err: " ++ e))"#,
         "\"ok: 42\"\n{}",
@@ -105,7 +107,7 @@ fn compile_result_ok() {
 fn compile_result_err_on_mismatch() {
     assert_stdout(
         "compile_err",
-        r#"(case (base.compile "\"text\"" : Result Text (Int 1)) of
+        r#"(case (the (Result Text (Int 1)) (base.compile "\"text\"")) of
   Result.Ok {value v} -> base.println "ok"
   Result.Err {error e} -> base.println "err")"#,
         "\"err\"\n{}",
@@ -116,7 +118,7 @@ fn compile_result_err_on_mismatch() {
 fn compile_err_on_invalid_source() {
     assert_stdout(
         "compile_bad",
-        r#"(case (base.compile "1 +" : Result Text (Int 1)) of
+        r#"(case (the (Result Text (Int 1)) (base.compile "1 +")) of
   Result.Ok {value v} -> base.println "ok"
   Result.Err {error e} -> base.println "err")"#,
         "\"err\"\n{}",
@@ -131,7 +133,7 @@ fn atomic_transfer() {
         "atomic",
         r#"with {
 type Account = {name Text balance (Int 1)}
-*accounts : Rel Account
+Rel Account  *accounts
 }
 (do
   full *accounts = [{name "from" balance 100} {name "to" balance 0}]
@@ -146,6 +148,6 @@ type Account = {name Text balance (Int 1)}
     yield {}
   base.println (base.show *accounts)
   yield {})"#,
-        "\"[{balance: 60, name: from}, {balance: 40, name: to}]\"\n{}",
+        "\"[{balance 60 name from}, {balance 40 name to}]\"\n{}",
     );
 }

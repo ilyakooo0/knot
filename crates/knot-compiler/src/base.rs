@@ -31,22 +31,20 @@ pub(crate) const PRELUDE_SPAN_OFFSET: usize = 1 << 40;
 const PRELUDE_SOURCE: &str = r#"
 {
 base {
-min : a -> a -> a
 min (\a b -> case a < b of
   Bool.True {} -> a
   Bool.False {} -> b)
 
-max : a -> a -> a
 max (\a b -> case a > b of
   Bool.True {} -> a
   Bool.False {} -> b)
 
-when : Bool -> IO {} -> IO {}
+Bool -> IO {} -> IO {}  when
 when (\cond action -> case cond of
   Bool.True {} -> action
   Bool.False {} -> yield {})
 
-unless : Bool -> IO {} -> IO {}
+Bool -> IO {} -> IO {}  unless
 unless (\cond action -> case cond of
   Bool.True {} -> yield {}
   Bool.False {} -> action)
@@ -59,34 +57,34 @@ unless (\cond action -> case cond of
 -- (`emitLog`). The `debug`/`info`/`warn`/`error` wrappers fix the level; each
 -- is self-contained (a record field can't reference a sibling bare) and
 -- re-declares the constraint so the caller's context threads through.
-log : (<>logCtx) => Level -> Text -> IO {}
+(<>logCtx) => Level -> Text -> IO {}  log
 log (\level msg -> emitLog level msg ^logCtx)
 
-debug : (<>logCtx) => Text -> IO {}
+(<>logCtx) => Text -> IO {}  debug
 debug (\msg -> emitLog (Level.Debug {}) msg ^logCtx)
 
-info : (<>logCtx) => Text -> IO {}
+(<>logCtx) => Text -> IO {}  info
 info (\msg -> emitLog (Level.Info {}) msg ^logCtx)
 
-warn : (<>logCtx) => Text -> IO {}
+(<>logCtx) => Text -> IO {}  warn
 warn (\msg -> emitLog (Level.Warn {}) msg ^logCtx)
 
-error : (<>logCtx) => Text -> IO {}
+(<>logCtx) => Text -> IO {}  error
 error (\msg -> emitLog (Level.Error {}) msg ^logCtx)
 
 -- Deprecated renames of the level wrappers above (the pre-`base.<level>` API).
 -- Each threads the caller's `logCtx` exactly like its modern counterpart; kept
 -- for source compatibility. Prefer `base.debug`/`info`/`warn`/`error`.
-logDebug : (<>logCtx) => Text -> IO {}
+(<>logCtx) => Text -> IO {}  logDebug
 logDebug (\msg -> emitLog (Level.Debug {}) msg ^logCtx)
 
-logInfo : (<>logCtx) => Text -> IO {}
+(<>logCtx) => Text -> IO {}  logInfo
 logInfo (\msg -> emitLog (Level.Info {}) msg ^logCtx)
 
-logWarn : (<>logCtx) => Text -> IO {}
+(<>logCtx) => Text -> IO {}  logWarn
 logWarn (\msg -> emitLog (Level.Warn {}) msg ^logCtx)
 
-logError : (<>logCtx) => Text -> IO {}
+(<>logCtx) => Text -> IO {}  logError
 logError (\msg -> emitLog (Level.Error {}) msg ^logCtx)
 
 -- List ADT namespace (`base.list.*`). Each field is a codegen builtin
@@ -128,25 +126,25 @@ count vecCount
 -- `Maybe`. Conversions needing a primitive not exposed as a base builtin are
 -- written as lambdas over the existing builtins.
 morph {
-textToBytes { into : Text -> Bytes
+textToBytes { Text -> Bytes  into
               into textToBytes }
-bytesToText { into : Bytes -> Maybe Text
+bytesToText { Bytes -> Maybe Text  into
               into bytesToText }
-bytesToHex  { into : Bytes -> Text
+bytesToHex  { Bytes -> Text  into
               into bytesToHex }
-textToBytesFromHex { into : Text -> Maybe Bytes
+textToBytesFromHex { Text -> Maybe Bytes  into
                      into bytesFromHex }
-intToFloat  { into : Int 1 -> Float 1
+intToFloat  { Int 1 -> Float 1  into
               into intToFloat }
-textToInt   { into : Text -> Maybe Int 1
+textToInt   { Text -> Maybe Int 1  into
               into textToInt }
-textToFloat { into : Text -> Maybe Float 1
+textToFloat { Text -> Maybe Float 1  into
               into textToFloat }
-intToText   { into : Int 1 -> Text
+intToText   { Int 1 -> Text  into
               into (\n -> show n) }
-floatToText { into : Float 1 -> Text
+floatToText { Float 1 -> Text  into
               into (\f -> show f) }
-boolToText  { into : Bool -> Text
+boolToText  { Bool -> Text  into
               into (\b -> show b) }
 }
 }

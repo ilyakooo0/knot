@@ -3,7 +3,7 @@ data Priority = Low {} | Medium {} | High {} | Critical {}
 
 type Todo = {title Text owner Text priority Priority}
 
-*todos : Rel Todo
+Rel Todo  *todos
 
 api Api where
   GetTodos get /todos/{owner Text} @{xForwardedFor (Maybe Text)} -> Rel Todo

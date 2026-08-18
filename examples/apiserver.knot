@@ -17,7 +17,7 @@ data Active = Yes {} | No {}
 
 type Task = {id (Int 1) title Text owner Text priority Priority done Active}
 
-*tasks : Rel Task
+Rel Task  *tasks
 
 -- Every route feature on display:
 --   List    — plain GET, returns a relation.
@@ -27,8 +27,8 @@ type Task = {id (Int 1) title Text owner Text priority Priority done Active}
 --   Echo    — a request body AND a response header `@{xRequestId Text}`; the
 --             handler returns `{body, headers}` when response headers exist.
 --   Audit   — a request header `@{authorization Text}` (before the `->`).
---   Summary — a rate limit `rateLimit {key, limit: {requests, window}}`.
--- NOTE on path shapes: the router matches entries in declaration order and
+--   Summary — a rate limit `rateLimit {key limit {requests, window}}`.
+-- NOTE on path shapes the router matches entries in declaration order and
 -- returns the first hit, so a literal segment (`/tasks/search`) at the same
 -- depth as a parameter (`/tasks/{id}`) is shadowed by the parameter. Put
 -- literal-only routes on their own prefixes (`/search`, `/summary`, `/echo`)

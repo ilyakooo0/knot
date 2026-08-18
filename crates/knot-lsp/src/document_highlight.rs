@@ -68,7 +68,7 @@ pub(crate) fn handle_document_highlight(
         // self-references so position-based resolution works from the body line,
         // but they are *declarations*, not READ usages. `references.rs` and
         // `code_lens.rs` apply the same filter — without it the `f =` body-line
-        // token of a `f : T` ⏎ `f = …` decl gets wrongly highlighted as a READ.
+        // token of a `T  f` ⏎ `f = …` decl gets wrongly highlighted as a READ.
         if *target_span == def_span
             && !crate::references::is_declaration_token(&doc.source, *usage_span)
         {

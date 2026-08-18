@@ -39,7 +39,7 @@ fn bytes_hex_roundtrip() {
         "case base.hexDecode (base.bytesToHex (base.textToBytes \"hi\")) of
            Maybe.Just {value b} -> base.bytesToText b
            Maybe.Nothing {} -> Maybe.Nothing {}",
-        "Just {value: hi}",
+        "Just {value hi}",
     );
 }
 
@@ -60,7 +60,7 @@ fn bytes_concat_and_slice() {
     // bytesSlice start len
     assert_show(
         "base.bytesToText (base.bytesSlice 1 2 (base.textToBytes \"abcd\"))",
-        "Just {value: bc}",
+        "Just {value bc}",
     );
 }
 
@@ -68,7 +68,7 @@ fn bytes_concat_and_slice() {
 fn bytes_from_hex() {
     assert_show("base.bytesFromHex \"zz\"", "Nothing");
     // bytesFromHex returns Maybe Bytes; show wraps it
-    assert_show("base.bytesFromHex \"6162\"", "Just {value: 6162}");
+    assert_show("base.bytesFromHex \"6162\"", "Just {value 6162}");
 }
 
 // ── toJson of nested / special ─────────────────────────────────────────────

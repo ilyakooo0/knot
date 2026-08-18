@@ -113,6 +113,13 @@ CONSTRAINT_DECL = re.compile(r'^\s*\*[a-zA-Z_]\w*(?:\.\w+)?\s*<=')
 # A `name <value>` with-field line (constant/function/derived with a body). The
 # value may be a literal, record, lambda, `do` block, source read, or call.
 FIELD_WITH_BODY = re.compile(r'^\s*[*&]?[a-zA-Z_]\w*\s+\S')
+# Type-first signature / source declaration: `Type  name` (a type, then a tall
+# 2+-space gap or the type's trailing token, then the annotated name). Covers
+# `Int 1 -> Int 1  addOne`, `Rel {name Text}  *people`, `IO a -> IO b  race`,
+# `Maybe (Int 1)  asInt`, record-type-led `{name Text}  x`, constraint-led
+# `(<>ctx) => T  f`. The separator is 2+ spaces (tall whitespace).
+TYPE_FIRST_DECL = re.compile(
+    r'^\s*(?:[A-Z][\w.]*|Rel\b|\{|\(|forall\b|_).*?\s{2,}[*a-z_]\w*\s*$', )
 EXPR_START = re.compile(r'^\s*[\(]?\s*(?:base\.|do\b|\(do\b|[a-zA-Z_][\w.]*\s*\()', )
 
 def _paren_balanced(s):
@@ -153,7 +160,8 @@ def split_decls_exprs(lines):
         indent = len(raw) - len(raw.lstrip())
         # a with-field: `name : T`, `name = v`, `name do ...`, `name \a -> ...`,
         # or `name <value>` (constant with a body). Dotted names (base.x) are not fields.
-        starts_decl = (bool(DECL_START.match(raw)) or bool(FIELD_WITH_BODY.match(raw))) \
+        starts_decl = (bool(DECL_START.match(raw)) or bool(FIELD_WITH_BODY.match(raw))
+                       or bool(TYPE_FIRST_DECL.match(raw))) \
                       and not s.startswith("(") and "." not in s.split(None, 1)[0]
         # a subset-constraint `*a.b <= *c.d` IS a declaration despite the dotted name
         starts_decl = starts_decl or bool(CONSTRAINT_DECL.match(raw))

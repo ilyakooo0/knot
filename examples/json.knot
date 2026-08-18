@@ -14,9 +14,7 @@
 
     -- Round-trip: encode then decode. parseJson returns `Maybe a` so malformed
     -- input is recoverable rather than fatal — match on the result.
-    with { json (base.toJson { x 10 y 20 }) } (do
-      base.println json
-      case base.parseJson json : Maybe {x (Int 1) y (Int 1)} of
+    with { json (base.toJson { x 10 y 20 }) } (the (Maybe {x (Int 1) y (Int 1)} of
         Maybe.Just { value value } -> base.println (base.show value)
         Maybe.Nothing {} -> base.println "parse failed"
 
@@ -30,4 +28,6 @@
         Maybe.Just { value value } -> base.println (base.show value)
         Maybe.Nothing {} -> base.println "parse failed (as expected)"
 
-      yield {})))
+      yield {}) do
+      base.println json
+      case base.parseJson json)))

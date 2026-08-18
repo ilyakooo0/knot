@@ -4,14 +4,14 @@
 with {
 type Item = {name Text price (Int 1)}
 
-*items : Rel Item
+Rel Item  *items
 
--- Append: `union items new` hidden behind a with.
+-- Append `union items new` hidden behind a with.
 appendDemo (do
   items <- full *items
   with {extra [{name "Charlie" price 30}]} with {merged (base.union items extra)} *items = merged)
 
--- Conditional update: do-block update body bound to a with.
+-- Conditional update do-block update body bound to a with.
 discountDemo (do
   items <- full *items
   with {discounted (do
@@ -20,7 +20,7 @@ discountDemo (do
       Bool.True {} -> (base.unify i {price (i.price - 5)})
       Bool.False {} -> i))} *items = discounted)
 
--- Filter only: do-block filter body bound to a with.
+-- Filter only do-block filter body bound to a with.
 pruneDemo (do
   items <- full *items
   with {kept (do i <- items; where i.price > 0; yield i)} *items = kept)

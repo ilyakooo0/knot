@@ -20,10 +20,10 @@ pub fn format_type_scheme(ts: &TypeScheme) -> String {
                 s.push_str(&format!("{} {} => ", trait_name, args.join(" ")));
             }
             ast::Constraint::ImplicitField { field, ty } => {
-                s.push_str(&format!("(^ {} : {}) => ", field, format_type_kind(&ty.node)));
+                s.push_str(&format!("({}  ^{}) => ", format_type_kind(&ty.node), field));
             }
             ast::Constraint::CollectField { field, ty } => match ty {
-                Some(ty) => s.push_str(&format!("(<> {} : {}) => ", field, format_type_kind(&ty.node))),
+                Some(ty) => s.push_str(&format!("({}  <>{}) => ", format_type_kind(&ty.node), field)),
                 None => s.push_str(&format!("(<> {}) => ", field)),
             }
         }
@@ -111,7 +111,7 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
                         let fs: Vec<String> = c
                             .fields
                             .iter()
-                            .map(|f| format!("{}: {}", f.name, format_type_kind_d(&f.value.node, d)))
+                            .map(|f| format!("{} {}", f.name, format_type_kind_d(&f.value.node, d)))
                             .collect();
                         format!("{} {{{}}}", c.name, fs.join(", "))
                     }
@@ -274,7 +274,7 @@ fn format_pat_brief_d(pat: &ast::PatKind, depth: usize) -> String {
                 .iter()
                 .map(|f| match &f.pattern {
                     None => f.name.clone(),
-                    Some(p) => format!("{}: {}", f.name, format_pat_brief_d(&p.node, d)),
+                    Some(p) => format!("{} {}", f.name, format_pat_brief_d(&p.node, d)),
                 })
                 .collect();
             format!("{{{}}}", parts.join(", "))

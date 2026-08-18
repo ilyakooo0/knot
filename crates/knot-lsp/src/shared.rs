@@ -579,7 +579,7 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
                 let inner: Vec<String> = fields
                     .iter()
                     .map(|f| match &f.pattern {
-                        Some(inner) => format!("{}: {}", f.name, pat(inner)),
+                        Some(inner) => format!("{} {}", f.name, pat(inner)),
                         None => f.name.clone(),
                     })
                     .collect();
@@ -695,7 +695,7 @@ pub(crate) fn render_route_entry(entry: &ast::RouteEntry) -> String {
         let fields: Vec<String> = entry
             .body_fields
             .iter()
-            .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+            .map(|f| format!("{} {}", f.name, format_type_kind(&f.value.node)))
             .collect();
         out.push_str(&format!("\n\n**Body:** `{{{}}}`", fields.join(", ")));
     }
@@ -703,7 +703,7 @@ pub(crate) fn render_route_entry(entry: &ast::RouteEntry) -> String {
         let fields: Vec<String> = entry
             .query_params
             .iter()
-            .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+            .map(|f| format!("{} {}", f.name, format_type_kind(&f.value.node)))
             .collect();
         out.push_str(&format!("\n\n**Query:** `{{{}}}`", fields.join(", ")));
     }
@@ -711,7 +711,7 @@ pub(crate) fn render_route_entry(entry: &ast::RouteEntry) -> String {
         let fields: Vec<String> = entry
             .request_headers
             .iter()
-            .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+            .map(|f| format!("{} {}", f.name, format_type_kind(&f.value.node)))
             .collect();
         out.push_str(&format!("\n\n**Request headers:** `{{{}}}`", fields.join(", ")));
     }
@@ -725,7 +725,7 @@ pub(crate) fn render_route_entry(entry: &ast::RouteEntry) -> String {
         let fields: Vec<String> = entry
             .response_headers
             .iter()
-            .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+            .map(|f| format!("{} {}", f.name, format_type_kind(&f.value.node)))
             .collect();
         out.push_str(&format!(
             "\n\n**Response headers:** `{{{}}}`",
@@ -788,7 +788,7 @@ pub(crate) fn pat_to_simple_name(pat: &ast::PatKind) -> String {
                 .iter()
                 .map(|f| match &f.pattern {
                     None => f.name.clone(),
-                    Some(p) => format!("{}: {}", f.name, pat_to_simple_name(&p.node)),
+                    Some(p) => format!("{} {}", f.name, pat_to_simple_name(&p.node)),
                 })
                 .collect();
             format!("{{{}}}", parts.join(", "))

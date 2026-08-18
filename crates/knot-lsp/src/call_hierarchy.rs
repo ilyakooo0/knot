@@ -119,7 +119,7 @@ pub(crate) fn handle_call_hierarchy_incoming(
         let caller_name = caller_name.to_string();
         // Collect call sites within this declaration that point to target_def.
         // Skip declaration tokens (the line-start name occurrence of a
-        // multi-line decl, e.g. the `f =` body line of a `f : T` ⏎ `f = …`
+        // multi-line decl, e.g. the `f =` body line of a `T  f` ⏎ `f = …`
         // function): `defs::register_extra_definition_tokens` records those as
         // self-references to the canonical definition span, which would
         // otherwise make every declaration appear to "call" itself. Genuine

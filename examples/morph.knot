@@ -9,7 +9,7 @@
 --     whose parameter type matches x);
 --
 --   * by the EXPECTED RESULT type — when the surrounding context demands a
---     concrete type (e.g. an annotation `v : Float 1 = (^into) x`), so two
+--     concrete type (the (Float 1 = (^into) x`) e.g. an annotation `v), so two
 --     morphs sharing x's source type (`text.int` vs `text.float`) are
 --     disambiguated by which one produces the required target. This is the
 --     bidirectional (check-mode) path: the contextual expected type threads
@@ -22,26 +22,26 @@ intToText {into (Int 1 -> Text
 textToFloat {into (Text -> Float 1
               into (\s -> 2.5))}
 
--- The ambient conversion scope: base.morph.<from-type>.<to-type>.into
+-- The ambient conversion scope base.morph.<from-type>.<to-type>.into
 conv { morph {
   text { int  { into textToInt.into }
          float { into textToFloat.into } }
   int  { text { into intToText.into } }
 } }
 
--- Argument-type-directed: distinct source types. (These are annotated too,
+-- Argument-type-directed distinct source types. (These are annotated too,
 -- because `text.int` and `text.float` below share the Text source — an
 -- un-annotated Text `into` would be ambiguous. The annotation is what lets
 -- the result type pick.)
 argInt  : Int 1
 argInt  (with conv ((^into) "hi"))   -- Text arg, wants Int 1
-argText : Text
+Text  argText
 argText (with conv ((^into) 41))     -- Int arg,  wants Text
 
--- Result-type-directed: same source (Text), annotation picks the target.
+-- Result-type-directed same source (Text), annotation picks the target.
 asInt   : Int 1
 asInt   (with conv ((^into) "hi"))   -- wants Int 1   -> morph.text.int.into
-asFloat : Float 1
+Float 1  asFloat
 asFloat (with conv ((^into) "hi"))   -- wants Float 1 -> morph.text.float.into
 }
 (do

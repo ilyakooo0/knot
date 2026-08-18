@@ -7,7 +7,7 @@
 -- as an end-to-end compile/run check on the codegen specialization path.
 with {
 type Account = {id (Int 1) balance (Int 1)}
-*accounts : Rel Account
+Rel Account  *accounts
 
 -- The `single (filter (\a -> a.id == ?) rows)` pattern is what the codegen
 -- recognizes as a `"id" = ?` simple equality; inside an atomic block the

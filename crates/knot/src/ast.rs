@@ -267,7 +267,7 @@ pub enum ExprKind {
         unit_name: Name,
     },
 
-    /// `(expr : Type)` — type annotation on expression.
+    /// `the (Type) expr` — type annotation on expression.
     Annot {
         expr: Box<Expr>,
         ty: Type,
@@ -524,7 +524,7 @@ pub enum TypeKind {
     /// `Maybe a`, `Result e a` — type application.
     App { func: Box<Type>, arg: Box<Type> },
 
-    /// `{name: Text, age: Int}` or `{name: Text | r}` — record type.
+    /// `{name Text age Int}` or `{name Text | r}` — record type.
     Record {
         fields: Vec<Field<Type>>,
         rest: Option<Name>,
@@ -643,12 +643,12 @@ pub struct Field<T> {
 
 /// A field in a record VALUE literal `{name value, ...}` — like `Field<Expr>`
 /// but may carry an optional standalone type signature from a preceding
-/// `name : Type` sig line:
-///   {name : Text
+/// type-first `Type  name` sig line:
+///   {Text  name
 ///    name "a"}
 /// The sig (when present) is enforced against the value's type. It is a full
 /// type scheme so a field function can take implicit-field constraints:
-/// `{greet : (^name : Text) => {} -> Text  greet \_ -> ^name}`.
+/// `{(Text  ^name) => {} -> Text  greet  greet \_ -> ^name}`.
 #[derive(Debug, Clone)]
 pub struct RecordField {
     pub name: Name,

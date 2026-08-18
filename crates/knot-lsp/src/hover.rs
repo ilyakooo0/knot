@@ -52,7 +52,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         .find(|(span, _)| span.start <= lookup_offset && lookup_offset < span.end)
     {
         let source_text = safe_slice(&doc.source, *span);
-        let detail = format!("{source_text} : {ty}");
+        let detail = format!("the ({ty}) {source_text}");
         return Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
@@ -109,7 +109,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     let mut type_for_refinement_scan: Option<String> = None;
     let detail_opt = if let Some(ty) = local_type {
         type_for_refinement_scan = Some(ty.clone());
-        Some(format!("{word} : {ty}"))
+        Some(format!("{ty}  {word}"))
     } else if on_field_token {
         // Record-field token: the name-based fallbacks below would show a
         // same-named GLOBAL's signature for `p.count` when a top-level
@@ -120,8 +120,11 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     } else if let Some(d) = doc.details.get(word) {
         let base = if let Some(inferred) = doc.type_info.get(word) {
             type_for_refinement_scan = Some(inferred.clone());
-            if !d.contains(':') {
-                format!("{d} : {inferred}")
+            // A detail that is just the bare name carries no signature; show the
+            // inferred type type-first. A detail already in `Sig  name` form is
+            // used as-is.
+            if d == word {
+                format!("{inferred}  {d}")
             } else {
                 d.clone()
             }
@@ -131,7 +134,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         Some(base)
     } else if let Some(inferred) = doc.type_info.get(word) {
         type_for_refinement_scan = Some(inferred.clone());
-        let base = format!("{word} : {inferred}");
+        let base = format!("{inferred}  {word}");
         Some(base)
     } else {
         None
@@ -196,9 +199,9 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                         })
                         .collect();
                     value.push_str(&format!(
-                        "\n\n*Signature:* `{} : {}`",
-                        func_name,
-                        highlighted.join(" → ")
+                        "\n\n*Signature:* `{}  {}`",
+                        highlighted.join(" → "),
+                        func_name
                     ));
                 }
             }
@@ -286,7 +289,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
             for (field, type_name, predicate) in refinements {
                 let pred_src = predicate_to_source(predicate, &doc.source);
                 let label = match field {
-                    Some(f) => format!("`{f}: {type_name}`"),
+                    Some(f) => format!("`{f} {type_name}`"),
                     None => format!("(whole element) `{type_name}`"),
                 };
                 value.push_str(&format!("\n- {label} — `{pred_src}`"));
@@ -310,10 +313,10 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                     format!("`{} {}`", trait_name, args.join(" "))
                 }
                 knot::ast::Constraint::ImplicitField { field, ty } => {
-                    format!("`(^ {} : {})`", field, format_type_kind(&ty.node))
+                    format!("`({}  ^{})`", format_type_kind(&ty.node), field)
                 }
                 knot::ast::Constraint::CollectField { field, ty } => match ty {
-                    Some(ty) => format!("`(<> {} : {})`", field, format_type_kind(&ty.node)),
+                    Some(ty) => format!("`({}  <>{})`", format_type_kind(&ty.node), field),
                     None => format!("`(<> {})`", field),
                 }
             })

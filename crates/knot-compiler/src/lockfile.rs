@@ -662,10 +662,10 @@ fn generate(program: &Expr, source_text: &str) -> String {
         }
     }
 
-    // Sources embedded in record-let literals (`db = { *todos : [Todo], … }`)
-    // synthesize an equivalent `*name : <ty>` declaration.
+    // Sources embedded in record-let literals (`db = { Rel Todo  *todos, … }`)
+    // synthesize an equivalent type-first `<ty>  *name` declaration.
     for (name, ty, _) in record_embedded_sources(program) {
-        body.push_str(&format!("*{} : {}\n", name, knot::format::render_type(&ty)));
+        body.push_str(&format!("{}  *{}\n", knot::format::render_type(&ty), name));
     }
 
     // Migrations attached to record-embedded source fields

@@ -11,7 +11,7 @@
 -- `service`, the inner `logCtx` supplies `requestId`. `mylog` collects and
 -- merges both automatically.
 with {
-mylog : (<>logCtx) => Text -> IO {}
+(<>logCtx) => Text -> IO {}  mylog
 mylog (\msg -> base.println (base.show ^logCtx ++ " | " ++ msg))
 }
 (do

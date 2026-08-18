@@ -8105,14 +8105,16 @@ fn format_value_iter(v: *mut Value, escape_text: bool) -> String {
                     Value::Unit => out.push_str("{}"),
                     Value::Record(fields) => {
                         // Push in reverse so tasks pop in forward order:
-                        // {field0: v0, field1: v1, ...}
+                        // {field0 v0 field1 v1 ...} — whitespace-separated,
+                        // matching the record-literal / record-type surface
+                        // syntax (no `:` or `,`).
                         stack.push(FmtTask::Lit("}".to_string()));
                         for (i, f) in fields.iter().enumerate().rev() {
                             stack.push(FmtTask::Render(f.value, true));
                             if i == 0 {
-                                stack.push(FmtTask::Lit(format!("{}: ", f.name)));
+                                stack.push(FmtTask::Lit(format!("{} ", f.name)));
                             } else {
-                                stack.push(FmtTask::Lit(format!(", {}: ", f.name)));
+                                stack.push(FmtTask::Lit(format!(" {} ", f.name)));
                             }
                         }
                         stack.push(FmtTask::Lit("{".to_string()));
@@ -8498,15 +8500,16 @@ pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
                     Value::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
                     Value::Unit => out.push_str("{}"),
                     Value::Record(fields) => {
-                        // {name: v, name: v} — push in reverse so tasks pop in
-                        // forward (source) order.
+                        // {name v name v} — whitespace-separated, matching the
+                        // record-literal surface syntax. Push in reverse so
+                        // tasks pop in forward (source) order.
                         stack.push(Task::Lit("}".to_string()));
                         for (i, f) in fields.iter().enumerate().rev() {
                             stack.push(Task::Render(f.value));
                             let sep = if i == 0 {
-                                format!("{}: ", f.name)
+                                format!("{} ", f.name)
                             } else {
-                                format!(", {}: ", f.name)
+                                format!(" {} ", f.name)
                             };
                             stack.push(Task::Lit(sep));
                         }
@@ -22141,7 +22144,7 @@ mod show_tests {
     #[test]
     fn payload_ctor_shows_bare_leaf() {
         let v = ctor("Maybe.Just", record(&[("value", alloc_int(3))]));
-        assert_eq!(format_value(v), "Just {value: 3}");
+        assert_eq!(format_value(v), "Just {value 3}");
     }
     #[test]
     fn io_shows_source_not_placeholder() {

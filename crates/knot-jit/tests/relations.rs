@@ -13,7 +13,7 @@ use harness::{assert_compile_err, assert_show, assert_show_set};
 
 #[test]
 fn empty_relation() {
-    assert_show("[] : Rel (Int 1)", "[]");
+    assert_show("(the (Rel (Int 1)) [])", "[]");
 }
 
 #[test]
@@ -25,7 +25,7 @@ fn scalar_relation() {
 fn record_relation() {
     assert_show_set(
         "[{name \"Ada\" age 36} {name \"Grace\" age 17}]",
-        &["{age: 36, name: Ada}", "{age: 17, name: Grace}"],
+        &["{age 36 name Ada}", "{age 17 name Grace}"],
     );
 }
 
@@ -33,7 +33,7 @@ fn record_relation() {
 fn nested_relation_field() {
     assert_show(
         "{team \"eng\" members [{name \"a\"}]}",
-        "{members: [{name: a}], team: eng}",
+        "{members [{name a}] team eng}",
     );
 }
 
@@ -58,7 +58,7 @@ fn map_basic() {
 fn map_to_record() {
     assert_show_set(
         "base.map (\\n -> {sq (n * n)}) [1 2 3]",
-        &["{sq: 1}", "{sq: 4}", "{sq: 9}"],
+        &["{sq 1}", "{sq 4}", "{sq 9}"],
     );
 }
 
@@ -69,7 +69,7 @@ fn fold_sum() {
 
 #[test]
 fn fold_empty() {
-    assert_show("base.fold (\\a b -> a + b) 42 ([] : Rel (Int 1))", "42");
+    assert_show("base.fold (\\a b -> a + b) 42 (the (Rel (Int 1)) [])", "42");
 }
 
 #[test]
@@ -90,7 +90,7 @@ fn count_basic() {
 
 #[test]
 fn count_empty() {
-    assert_show("base.count ([] : Rel (Int 1))", "0");
+    assert_show("base.count (the (Rel (Int 1)) [])", "0");
 }
 
 #[test]
@@ -165,22 +165,22 @@ fn any_all() {
 
 #[test]
 fn single_row() {
-    assert_show("base.single [7]", "Just {value: 7}");
+    assert_show("base.single [7]", "Just {value 7}");
 }
 
 #[test]
 fn single_empty_or_many() {
     // Nullary constructors show without a payload: `Nothing`, not `Nothing {}`.
-    assert_show("base.single ([] : Rel (Int 1))", "Nothing");
+    assert_show("base.single (the (Rel (Int 1)) [])", "Nothing");
     assert_show("base.single [1 2]", "Nothing");
 }
 
 #[test]
 fn head_findfirst() {
     // Constructor payloads show with `: ` separators (field-style).
-    assert_show("base.head [5 6]", "Just {value: 5}");
+    assert_show("base.head [5 6]", "Just {value 5}");
     // findFirst is relation-FIRST: [a] -> (a -> Bool) -> Maybe a.
-    assert_show("base.findFirst [1 2 3] (\\n -> n > 1)", "Just {value: 2}");
+    assert_show("base.findFirst [1 2 3] (\\n -> n > 1)", "Just {value 2}");
 }
 
 // ── ordering / slicing (sorted relations have a fixed iteration order) ───
@@ -189,7 +189,7 @@ fn head_findfirst() {
 fn sort_by() {
     assert_show(
         "base.sortBy (\\p -> p.age) [{n \"a\" age 30} {n \"b\" age 20}]",
-        "[{age: 20, n: b}, {age: 30, n: a}]",
+        "[{age 20 n b}, {age 30 n a}]",
     );
 }
 
@@ -231,24 +231,24 @@ fn record_nested_access() {
 
 #[test]
 fn unify_replaces_field() {
-    assert_show("base.unify {x 3 y 4} {x 10}", "{x: 10, y: 4}");
+    assert_show("base.unify {x 3 y 4} {x 10}", "{x 10 y 4}");
 }
 
 #[test]
 fn unify_adds_field() {
-    assert_show("base.unify {x 3} {z 5}", "{x: 3, z: 5}");
+    assert_show("base.unify {x 3} {z 5}", "{x 3 z 5}");
 }
 
 #[test]
 fn unify_right_biased() {
-    assert_show("base.unify {a 1 b 2} {b 20 c 30}", "{a: 1, b: 20, c: 30}");
+    assert_show("base.unify {a 1 b 2} {b 20 c 30}", "{a 1 b 20 c 30}");
 }
 
 #[test]
 fn upsert_replaces() {
     assert_show(
         "base.upsertBy (\\c -> c.user == \"a\") {user \"a\" n 5} [{user \"a\" n 1}]",
-        "[{n: 5, user: a}]",
+        "[{n 5 user a}]",
     );
 }
 
@@ -256,7 +256,7 @@ fn upsert_replaces() {
 fn upsert_inserts() {
     assert_show_set(
         "base.upsertBy (\\c -> c.user == \"b\") {user \"b\" n 1} [{user \"a\" n 1}]",
-        &["{n: 1, user: a}", "{n: 1, user: b}"],
+        &["{n 1 user a}", "{n 1 user b}"],
     );
 }
 

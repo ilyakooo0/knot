@@ -1,7 +1,7 @@
 with {
 type Sale = {item Text qty (Int 1) price (Int 1)}
 
-*sales : Rel Sale
+Rel Sale  *sales
 }
 (do
   full *sales = [

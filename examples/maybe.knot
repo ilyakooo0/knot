@@ -4,7 +4,7 @@
 -- Alternative were removed with the trait system). Do-blocks over Maybe
 -- dispatch structurally to the intrinsic Maybe bind/yield/empty.
 with {
--- Test: a simple do-block that uses Maybe as the monad
+-- Test a simple do-block that uses Maybe as the monad
 safeDivide (\x y -> case y == 0 of
   Bool.True {} -> Maybe.Nothing {}
   Bool.False {} -> Maybe.Just {value (x / y)})

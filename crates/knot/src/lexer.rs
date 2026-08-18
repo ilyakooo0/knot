@@ -91,7 +91,17 @@ pub enum TokenKind {
     At,
     Underscore,
     Question,
+    /// `the` — the inline type-annotation form: `the (Type) expr`. A keyword,
+    /// not a value, because its first argument is a *type* (no knot function
+    /// type can express that).
+    The,
     Newline,
+    /// Tall whitespace: a run of two or more spaces/tabs within a line (a
+    /// newline is `Newline`, separately). This is the type-annotation
+    /// separator — `Type  name` (a sig) vs `name value` (a binding, single
+    /// spaces). Single whitespace collapses to nothing; a tall run is
+    /// significant.
+    TallWs,
     Semicolon,
     Eof,
 
@@ -166,7 +176,9 @@ impl TokenKind {
             TokenKind::At => "'@'",
             TokenKind::Underscore => "'_'",
             TokenKind::Question => "'?'",
+            TokenKind::The => "'the'",
             TokenKind::Newline => "newline",
+            TokenKind::TallWs => "tall whitespace",
             TokenKind::Semicolon => "';'",
             TokenKind::Eof => "end of file",
             TokenKind::Doc(_) => "documentation comment",
@@ -192,6 +204,7 @@ impl TokenKind {
             TokenKind::With => Some("with"),
             TokenKind::Refine => Some("refine"),
             TokenKind::Forall => Some("forall"),
+            TokenKind::The => Some("the"),
             _ => None,
         }
     }
@@ -269,7 +282,25 @@ impl<'src> Lexer<'src> {
         let mut in_doc_block = false;
 
         loop {
-            self.skip_whitespace();
+            // Whitespace: a run of 2+ spaces/tabs within a line is a TALL
+            // whitespace — the type-annotation separator (`Type  name`). A
+            // single space/tab is insignificant and collapses away. Leading
+            // indentation (tall ws right after a newline / at file start) is
+            // layout, not an annotation separator, so it is not emitted.
+            {
+                let ws_start = self.pos;
+                let mut run = 0usize;
+                while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+                    self.advance();
+                    run += 1;
+                }
+                if run >= 2 && !last_was_newline && !tokens.is_empty() {
+                    tokens.push(Token {
+                        kind: TokenKind::TallWs,
+                        span: self.span_from(ws_start),
+                    });
+                }
+            }
 
             // Comments: `--` line/block, `---` doc line/block.
             if self.check(b'-') && self.peek_at(1) == Some(b'-') {
@@ -593,6 +624,7 @@ impl<'src> Lexer<'src> {
                 "with" => return TokenKind::With,
                 "refine" => return TokenKind::Refine,
                 "forall" => return TokenKind::Forall,
+                "the" => return TokenKind::The,
                 "true" => return TokenKind::Bool(true),
                 "false" => return TokenKind::Bool(false),
                 _ => {}

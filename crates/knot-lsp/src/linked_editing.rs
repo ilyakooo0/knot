@@ -178,7 +178,7 @@ fn collect_field_name_spans(
                 }
             }
         ast::ExprKind::Annot { ty, .. } => {
-            // Inline type annotations (`(r : {name: Text})`) carry record
+            // Inline type annotations (`(the ({name Text}) r)`) carry record
             // field names that must link alongside their value occurrences.
             // `recurse_expr` descends only into the annotation's inner
             // expression, never its type — mirror `rename.rs`'s

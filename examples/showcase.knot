@@ -1,7 +1,7 @@
 with {
--- Showcase: exercises many data types, ADTs, nested relations, and bulk data
--- Run: knot build examples/showcase.knot && ./examples/showcase
--- Then: ./examples/showcase db
+-- Showcase exercises many data types, ADTs, nested relations, and bulk data
+-- Run knot build examples/showcase.knot && ./examples/showcase
+-- Then ./examples/showcase db
 
 -- ── Types ────────────────────────────────────────────────────────
 
@@ -39,15 +39,15 @@ type Metric = {name Text value (Float 1) tags Text}
 
 -- ── Sources ──────────────────────────────────────────────────────
 
-*employees : Rel Employee
-*projects : Rel Project
-*tickets : Rel Ticket
-*customers : Rel Customer
-*orders : Rel Order
-*products : Rel Product
-*teams : Rel Team
-*logs : Rel LogEntry
-*metrics : Rel Metric
+Rel Employee  *employees
+Rel Project  *projects
+Rel Ticket  *tickets
+Rel Customer  *customers
+Rel Order  *orders
+Rel Product  *products
+Rel Team  *teams
+Rel LogEntry  *logs
+Rel Metric  *metrics
 
 -- ── Seed data ────────────────────────────────────────────────────
 
@@ -312,43 +312,43 @@ seedLogs (do
       message "Health check endpoint registered"
       source "routes"
     } 
-    {timestamp 1710900030 level (Level.Warn {}) message "Slow query detected: 2340ms" source "db"} 
+    {timestamp 1710900030 level (Level.Warn {}) message "Slow query detected 2340ms" source "db"} 
     {
       timestamp 1710900045
       level (Level.Info {})
-      message "Request: GET /api/users (200, 45ms)"
+      message "Request GET /api/users (200, 45ms)"
       source "http"
     } 
     {
       timestamp 1710900046
       level (Level.Info {})
-      message "Request: POST /api/orders (201, 120ms)"
+      message "Request POST /api/orders (201, 120ms)"
       source "http"
     } 
-    {timestamp 1710900047 level (Level.Debug {}) message "Cache miss for key: user:1234" source "cache"} 
+    {timestamp 1710900047 level (Level.Debug {}) message "Cache miss for key user:1234" source "cache"} 
     {
       timestamp 1710900048
       level (Level.Info {})
-      message "Request: GET /api/products (200, 32ms)"
+      message "Request GET /api/products (200, 32ms)"
       source "http"
     } 
     {
       timestamp 1710900060
       level (Level.Error {})
-      message "Connection refused: redis://localhost:6379"
+      message "Connection refused redis://localhost:6379"
       source "cache"
     } 
     {timestamp 1710900061 level (Level.Warn {}) message "Falling back to in-memory cache" source "cache"} 
     {
       timestamp 1710900090
       level (Level.Info {})
-      message "Request: PUT /api/users/42 (200, 88ms)"
+      message "Request PUT /api/users/42 (200, 88ms)"
       source "http"
     } 
     {
       timestamp 1710900100
       level (Level.Error {})
-      message "Timeout: external payment API (5000ms)"
+      message "Timeout external payment API (5000ms)"
       source "payments"
     } 
     {
@@ -360,27 +360,27 @@ seedLogs (do
     {
       timestamp 1710900105
       level (Level.Info {})
-      message "Payment processed: order #7821"
+      message "Payment processed order #7821"
       source "payments"
     } 
-    {timestamp 1710900120 level (Level.Debug {}) message "GC pause: 12ms" source "runtime"} 
+    {timestamp 1710900120 level (Level.Debug {}) message "GC pause 12ms" source "runtime"} 
     {
       timestamp 1710900150
       level (Level.Info {})
-      message "Cron: daily report generation started"
+      message "Cron daily report generation started"
       source "scheduler"
     } 
     {
       timestamp 1710900180
       level (Level.Info {})
-      message "Report generated: 1,247 rows exported"
+      message "Report generated 1,247 rows exported"
       source "scheduler"
     } 
     {timestamp 1710900200 level (Level.Warn {}) message "Disk usage at 82%" source "monitor"} 
     {
       timestamp 1710900300
       level (Level.Info {})
-      message "Request: DELETE /api/sessions/old (200)"
+      message "Request DELETE /api/sessions/old (200)"
       source "http"
     } 
     {timestamp 1710900301 level (Level.Info {}) message "Cleaned 847 expired sessions" source "auth"} 
@@ -393,14 +393,14 @@ seedLogs (do
     {
       timestamp 1710900500
       level (Level.Info {})
-      message "Backup completed: 2.4GB compressed"
+      message "Backup completed 2.4GB compressed"
       source "backup"
     } 
-    {timestamp 1710900600 level (Level.Debug {}) message "WebSocket connections: 142 active" source "ws"} 
+    {timestamp 1710900600 level (Level.Debug {}) message "WebSocket connections 142 active" source "ws"} 
     {
       timestamp 1710900700
       level (Level.Info {})
-      message "Rate limit applied: 10.0.5.23 (429)"
+      message "Rate limit applied 10.0.5.23 (429)"
       source "http"
     }
   ]

@@ -3,7 +3,7 @@
 with {
 type Person = {name Text age (Int 1)}
 
-*teams : Rel {name Text members (Rel Person)}
+Rel {name Text members (Rel Person)}  *teams
 }
 (do
   full *teams = [

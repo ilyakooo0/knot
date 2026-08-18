@@ -2,7 +2,7 @@
 with {
 type Employee = {name Text dept Text salary (Int 1)}
 
-*employees : Rel Employee
+Rel Employee  *employees
 
 -- Helper functions used inside lambda bodies.
 isHighEarner (\e -> e.salary > 75)

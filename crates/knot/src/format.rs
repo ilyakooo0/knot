@@ -208,7 +208,7 @@ fn render_route_entry_inline(e: &RouteEntry) -> String {
 }
 
 /// Render a type back to Knot source syntax. Used by the formatter and by the
-/// schema lockfile, which synthesizes `*name : <ty>` declarations for sources
+/// schema lockfile, which synthesizes `<ty>  *name` declarations for sources
 /// embedded in record literals.
 pub fn render_type(t: &Type) -> String {
     render_type_prec(t, TyPrec::Function)
@@ -369,11 +369,13 @@ fn render_constraint(c: &Constraint) -> String {
             }
             s
         }
+        // Type-first constraints: `(Type  ^field)` / `(Type  <>field)` — the
+        // `^`/`<>` prefixes the NAME; the type leads with a tall gap.
         Constraint::ImplicitField { field, ty } => {
-            format!("(^{field} : {})", render_type(ty))
+            format!("({}  ^{field})", render_type(ty))
         }
         Constraint::CollectField { field, ty } => match ty {
-            Some(ty) => format!("(<>{field} : {})", render_type(ty)),
+            Some(ty) => format!("({}  <>{field})", render_type(ty)),
             None => format!("(<>{field})"),
         },
     }
@@ -566,6 +568,17 @@ fn forces_multiline(e: &Expr) -> bool {
         ExprKind::Lambda { body, .. } => forces_multiline(body),
         ExprKind::App { func, arg } => forces_multiline(func) || forces_multiline(arg),
         ExprKind::Set { value, .. } | ExprKind::FullSet { value, .. } => forces_multiline(value),
+        // A record field with an explicit type signature must render as a
+        // separate type-first sig line (`Type  name`) above the `name value`
+        // field — collapsing it inline merges the sig and the value into an
+        // ambiguous single line. Force block layout.
+        ExprKind::Record(fields) => {
+            fields.iter().any(|f| f.sig.is_some())
+                || fields.iter().any(|f| forces_multiline(&f.value))
+        }
+        ExprKind::With { record, body, .. } => {
+            forces_multiline(record) || forces_multiline(body)
+        }
         _ => false,
     }
 }
@@ -575,12 +588,10 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
     // `let pat = value in body` — preserve the surface syntax instead of
     // printing the parser's `(\pat -> body) value` desugaring.
     if let Some((pat, ty, value, body)) = as_let_in(e) {
-        let mut s = format!("let {}", render_pat(pat));
+        let mut s = format!("let {} = ", render_pat(pat));
         if let Some(t) = ty {
-            s.push_str(" : ");
-            s.push_str(&render_type(t));
+            s.push_str(&format!("the ({}) ", render_type(t)));
         }
-        s.push_str(" = ");
         s.push_str(&render_expr_inline(value, Prec::Lowest));
         s.push_str(" in ");
         s.push_str(&render_expr_inline(body, Prec::Lowest));
@@ -642,9 +653,9 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         ExprKind::Lambda { params, ty_params, body } => {
             let mut s = String::from("\\");
             for tp in ty_params {
-                s.push_str(&format!("({} : Type)", tp.name));
+                s.push_str(&format!("(Type  {})", tp.name));
                 // Space after the witness only when value params follow, so a
-                // witness-only lambda renders `\(T : Type) -> …`, not `)  ->`.
+                // witness-only lambda renders `\\(Type  T) -> …`, not `)  ->`.
                 if !params.is_empty() {
                     s.push(' ');
                 }
@@ -756,11 +767,13 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             paren_if(parent > Prec::App, format!("{} {}", num, unit_name))
         }
         ExprKind::Annot { expr, ty } => {
+            // `the (Type) expr`. `the` binds tighter than application, so a
+            // multi-token inner expr is parenthesised by annot_inner_needs_parens.
             let mut inner = render_expr_inline(expr, Prec::Lowest);
             if annot_inner_needs_parens(expr, true) {
                 inner = format!("({})", inner);
             }
-            format!("({} : {})", inner, render_type(ty))
+            format!("(the ({}) {})", render_type(ty), inner)
         }
         ExprKind::Refine(inner) => {
             let s = format!("refine {}", render_expr_inline(inner, Prec::App));
@@ -795,9 +808,9 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         }
         ExprKind::SourceDecl { name, ty, migrations } => {
             // Renders the embedded source line. The field is literally named
-            // `*name`; here we emit the `*name : Type` declaration, plus any
-            // attached migration clauses.
-            let mut s = format!("*{} : {}", name, render_type(ty));
+            // `*name`; here we emit the type-first `Type  *name` declaration,
+            // plus any attached migration clauses.
+            let mut s = format!("{}  *{}", render_type(ty), name);
             for m in migrations {
                 s.push_str(&format!(
                     " migrate from {} to {} using {}",
@@ -940,9 +953,10 @@ fn escape_bytes(bs: &[u8]) -> String {
 /// Record fields render as whitespace-separated `name value` pairs (no `:` or
 /// `,`). The value is rendered at `Prec::Atom` so non-atomic values
 /// (applications, operators, lambdas, …) are parenthesized and the field
-/// boundary stays unambiguous on reparse. A field with an explicit type
-/// signature renders as `name : Type name value` — the sig-line form
-/// round-trips through the parser unchanged.
+/// boundary stays unambiguous on reparse. A field carrying an explicit type
+/// signature never reaches this inline path: `forces_multiline` routes such
+/// records to `render_record_block`, which puts the type-first `Type  name`
+/// sig on its own line above the `name value` field.
 fn render_record_inline(fields: &[RecordField]) -> String {
     let mut s = String::from("{");
     for (i, f) in fields.iter().enumerate() {
@@ -955,17 +969,18 @@ fn render_record_inline(fields: &[RecordField]) -> String {
             s.push_str(&render_expr_inline(&f.value, Prec::Atom));
             continue;
         }
-        // A source-declaration field renders as the bare `*name : Type` line —
+        // A source-declaration field renders as the bare type-first `Type  *name` line —
         // the field name is the source name (with `*`), so no separate
         // `name value`.
         if let ExprKind::SourceDecl { .. } = &f.value.node {
             s.push_str(&render_expr_inline(&f.value, Prec::Atom));
             continue;
         }
+        // Type-first signature line `Type  name`, then the `name value` field.
         if let Some(sig) = &f.sig {
-            s.push_str(&f.name);
-            s.push_str(" : ");
             s.push_str(&render_type_scheme(sig));
+            s.push_str("  ");
+            s.push_str(&f.name);
             s.push(' ');
         }
         s.push_str(&f.name);
@@ -981,22 +996,27 @@ fn render_record_inline_no_pun(fields: &[RecordField]) -> String {
     render_record_inline(fields)
 }
 
-/// Does an expression's parse end with a greedy `parse_expr` tail?
+/// Does an `Annot`'s inner expression need parentheses under `the (Type) expr`?
 ///
-/// `parse_expr` greedily consumes a trailing `: Type` postfix annotation, so
-/// when one of these expressions is the inner of an `Annot`, it must be
-/// parenthesized — otherwise `(\x -> x) : Int -> Int` would reformat to
-/// `(\x -> x : Int -> Int)` and the annotation would silently reattach to
-/// the lambda body on reparse. `inline` distinguishes the single-line
+/// `the` binds tighter than application, so an application inner must be
+/// parenthesised — `(the (T) (f x))` annotates the whole application, whereas
+/// `(the (T) f x)` would annotate only `f`. And an expression whose parse ends
+/// with a greedy `parse_expr` tail (lambda body, case-else, atomic/refine
+/// operand, set value) must also be parenthesised so the annotation does not
+/// reattach to that tail on reparse. `inline` distinguishes the single-line
 /// renderers: inline `case`/`do`/`serve` always self-parenthesize, but their
 /// multi-line renderings at `Prec::Lowest` do not.
 fn annot_inner_needs_parens(e: &Expr, inline: bool) -> bool {
     // `let … in body` — the body is parsed with `parse_expr`, which would
-    // greedily reattach a trailing `: Type` to the body on reparse.
+    // greedily reattach a trailing annotation to the body on reparse.
     if as_let_in(e).is_some() {
         return true;
     }
     match &e.node {
+        // `the (Type) expr` binds tighter than application, so an application
+        // inner (`f x`) must be parenthesised: `(the (Type) (f x))` annotates
+        // the whole application, whereas `(the (Type) f x)` would annotate `f`.
+        ExprKind::App { .. } => true,
         // Tail is `parse_expr`: lambda body, else-branch, atomic/refine
         // operand, set/replace value.
         ExprKind::Lambda { .. }
@@ -1025,11 +1045,10 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
         }
         p.write("let ");
         p.write(&render_pat(pat));
-        if let Some(t) = ty {
-            p.write(" : ");
-            p.write(&render_type(t));
-        }
         p.write(" = ");
+        if let Some(t) = ty {
+            p.write(&format!("the ({}) ", render_type(t)));
+        }
         render_expr(p, value, Prec::Lowest);
         p.write(" in ");
         render_expr(p, body, Prec::Lowest);
@@ -1042,14 +1061,14 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
         ExprKind::Do(stmts) => render_do_block(p, stmts, parent),
         ExprKind::Case { scrutinee, arms } => render_case_block(p, scrutinee, arms, parent),
         ExprKind::Lambda { params, ty_params, body } => {
-            // `\(T : Type) \x y -> body` where body is multiline
+            // `\\(Type  T) \\x y -> body` where body is multiline
             let need_parens = parent > Prec::Lowest;
             if need_parens {
                 p.write("(");
             }
             p.write("\\");
             for tp in ty_params {
-                p.write(&format!("({} : Type)", tp.name));
+                p.write(&format!("(Type  {})", tp.name));
                 if !params.is_empty() {
                     p.write(" ");
                 }
@@ -1120,7 +1139,10 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
             }
         }
         ExprKind::Annot { expr, ty } => {
-            p.write("(");
+            // `(the (Type) expr)`.
+            p.write("(the (");
+            p.write(&render_type(ty));
+            p.write(") ");
             let inner_parens = annot_inner_needs_parens(expr, false);
             if inner_parens {
                 p.write("(");
@@ -1129,8 +1151,6 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
             if inner_parens {
                 p.write(")");
             }
-            p.write(" : ");
-            p.write(&render_type(ty));
             p.write(")");
         }
         ExprKind::Serve { api, handlers, .. } => {
@@ -1155,6 +1175,14 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
             if need_parens {
                 p.write(")");
             }
+        }
+        // `with {record} body` forced multiline (e.g. a sig'd field): render the
+        // record as a block so each `Type  name` sig line gets its own line.
+        ExprKind::With { record, body, .. } => {
+            p.write("with ");
+            render_expr(p, record, Prec::Atom);
+            p.write(" ");
+            render_expr(p, body, Prec::Lowest);
         }
         _ => p.write(&render_expr_inline(e, parent)),
     }
@@ -1255,7 +1283,7 @@ fn render_record_block(p: &mut Printer, fields: &[RecordField]) {
                 p.newline();
                 continue;
             }
-            // A source-declaration field renders as the bare `*name : Type`
+            // A source-declaration field renders as the bare type-first `Type  *name`
             // line — the field name is the source name (with `*`).
             if let ExprKind::SourceDecl { .. } = &f.value.node {
                 render_expr(p, &f.value, Prec::Atom);
@@ -1263,11 +1291,11 @@ fn render_record_block(p: &mut Printer, fields: &[RecordField]) {
                 continue;
             }
             // A field with an explicit type signature keeps its sig-line
-            // layout: `name : Type` on its own line, then `name value`.
+            // layout: type-first `Type  name` on its own line, then `name value`.
             if let Some(sig) = &f.sig {
-                p.write(&f.name);
-                p.write(" : ");
                 p.write(&render_type_scheme(sig));
+                p.write("  ");
+                p.write(&f.name);
                 p.newline();
             }
             p.write(&f.name);
@@ -1403,7 +1431,7 @@ fn render_pat(p: &Pat) -> String {
             format!("Cons {} {}", render_pat_atom(head), render_pat_atom(tail))
         }
         PatKind::Annot { pat, ty } => {
-            format!("({} : {})", render_pat(pat), render_type(ty))
+            format!("(the ({}) {})", render_type(ty), render_pat(pat))
         }
     }
 }

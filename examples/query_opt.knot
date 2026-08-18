@@ -3,39 +3,39 @@ with {
 type Employee = {name Text dept Text salary (Int 1)}
 type Department = {name Text budget (Int 1)}
 
-*employees : Rel Employee
-*departments : Rel Department
+Rel Employee  *employees
+Rel Department  *departments
 
--- 1. Count pushdown: count *rel → SQL COUNT(*)
+-- 1. Count pushdown count *rel → SQL COUNT(*)
 countDemo (do
   employees <- full *employees
-  base.println ("Employee count: " ++ base.show (base.count employees)))
+  base.println ("Employee count " ++ base.show (base.count employees)))
 
--- 2. Filter pushdown: where clause → SQL WHERE
+-- 2. Filter pushdown where clause → SQL WHERE
 filterDemo (do
   employees <- full *employees
   base.println "High earners (salary > 75):"
   with {filtered (do e <- employees; where e.salary > 75; yield ("  " ++ e.name ++ " ($" ++ base.show e.salary ++ ")"))} (do r <- filtered; base.println r; yield {}))
 
--- 3. Hash join: equi-join via hash index
+-- 3. Hash join equi-join via hash index
 joinDemo (do
   employees <- full *employees
   departments <- full *departments
   base.println "Employee departments:"
-  with {joined (do e <- employees; d <- departments; where e.dept == d.name; yield ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget: $" ++ base.show d.budget ++ ")"))} (do r <- joined; base.println r; yield {}))
+  with {joined (do e <- employees; d <- departments; where e.dept == d.name; yield ("  " ++ e.name ++ " works in " ++ d.name ++ " (budget $" ++ base.show d.budget ++ ")"))} (do r <- joined; base.println r; yield {}))
 
--- 4. Full SQL: single-table filter → one SQL SELECT
+-- 4. Full SQL single-table filter → one SQL SELECT
 filterQuery (do
   employees <- full *employees
   with {result (do e <- employees; where e.salary > 75; yield {name e.name salary e.salary})} yield result)
 
--- 5. Full SQL: multi-table join + filter → one SQL SELECT
+-- 5. Full SQL multi-table join + filter → one SQL SELECT
 joinQuery (do
   employees <- full *employees
   departments <- full *departments
   with {result (do e <- employees; d <- departments; where e.dept == d.name; where e.salary > 75; yield {name e.name dept d.name budget d.budget})} yield result)
 
--- 6. Full SQL: yield entire row (single-table)
+-- 6. Full SQL yield entire row (single-table)
 allEmployees (do
   employees <- full *employees
   with {result (do e <- employees; yield e)} yield result)
@@ -46,22 +46,22 @@ printQuery (\label results -> do
   base.println ("  " ++ base.show r)
   yield {})
 
--- 7. Pipe: filter → SQL WHERE
+-- 7. Pipe filter → SQL WHERE
 pipeFilter (do
   employees <- full *employees
   yield (employees |> base.filter (\e -> e.salary > 75)))
 
--- 8. Pipe: filter + map → SQL WHERE + SELECT
+-- 8. Pipe filter + map → SQL WHERE + SELECT
 pipeFilterMap (do
   employees <- full *employees
   yield (employees |> base.filter (\e -> e.salary > 75) |> base.map (\e -> {name e.name salary e.salary})))
 
--- 9. Pipe: filter + count
+-- 9. Pipe filter + count
 pipeFilterCount (do
   employees <- full *employees
   with {filtered (employees |> base.filter (\e -> e.salary > 75))} yield (base.count filtered))
 
--- 10. Pipe: map only → SQL SELECT
+-- 10. Pipe map only → SQL SELECT
 pipeMap (do
   employees <- full *employees
   yield (employees |> base.map (\e -> {name e.name dept e.dept})))
@@ -69,14 +69,14 @@ pipeMap (do
 -- 11. minOn/maxOn projection → SQL MIN/MAX
 minMaxDemo (do
   employees <- full *employees
-  with {lo (base.minOn (\e -> e.salary) employees)} with {hi (base.maxOn (\e -> e.salary) employees)} base.println ("min salary: " ++ base.show lo ++ ", max salary: " ++ base.show hi))
+  with {lo (base.minOn (\e -> e.salary) employees)} with {hi (base.maxOn (\e -> e.salary) employees)} base.println ("min salary " ++ base.show lo ++ ", max salary " ++ base.show hi))
 
 -- 12. countWhere predicate → SQL COUNT(*) WHERE
 countWhereDemo (do
   employees <- full *employees
-  with {n (base.countWhere (\e -> e.dept == "Eng") employees)} base.println ("eng headcount: " ++ base.show n))
+  with {n (base.countWhere (\e -> e.dept == "Eng") employees)} base.println ("eng headcount " ++ base.show n))
 
--- 13. Pipe: filter + minOn/maxOn → SQL aggregate with WHERE
+-- 13. Pipe filter + minOn/maxOn → SQL aggregate with WHERE
 pipeFilterMin (do
   employees <- full *employees
   yield (employees |> base.filter (\e -> e.dept == "Eng") |> base.minOn (\e -> e.salary)))

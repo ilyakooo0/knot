@@ -45,7 +45,7 @@ fn race_returns_winner() {
     (base.println "fast")
   base.println (base.show winner)
   yield {})"#,
-        "\"fast\"\n\"Ok {value: {}}\"\n{}",
+        "\"fast\"\n\"Ok {value {}}\"\n{}",
     );
 }
 

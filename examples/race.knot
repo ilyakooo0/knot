@@ -6,11 +6,11 @@
 -- loser's.
 with {
 slow (do
-  base.sleep (1000 : Int Ms)
+  base.sleep (the (Int Ms) 1000)
   yield "slow")
 
 fast (do
-  base.sleep (50 : Int Ms)
+  base.sleep (the (Int Ms) 50)
   yield "fast")
 }
 (do

@@ -1,7 +1,7 @@
 with {
 type Todo = {title Text owner Text done (Int 1)}
 
-*todos : Rel Todo
+Rel Todo  *todos
 
 add (\title owner -> do
   todos <- full *todos

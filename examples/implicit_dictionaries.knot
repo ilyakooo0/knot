@@ -1,4 +1,4 @@
--- Implicit dictionaries: `(^field : T) =>` signature constraints.
+-- Implicit dictionaries: `(the (T) ^field) =>` signature constraints.
 --
 -- `clamp` needs a `compare` dictionary but doesn't name it. The compiler
 -- resolves the dictionary from lexical scope at each full-arity callsite.
@@ -19,7 +19,7 @@ intOrdDesc {compare (\a b -> case a < b of
     Bool.True {} -> (0 - 1)
     Bool.False {} -> 0)}
 
-clamp : (^compare : a -> a -> Int 1) => a -> a -> a -> a
+(a -> a -> Int 1  ^compare) => a -> a -> a -> a  clamp
 clamp (\lo hi x -> case ((^compare) x lo) < 0 of
   Bool.True {} -> lo
   Bool.False {} -> case ((^compare) x hi) > 0 of

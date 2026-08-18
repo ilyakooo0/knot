@@ -77,16 +77,36 @@ pub struct Parser {
     token_cols: Vec<usize>,
     /// Display column at end-of-input, used when `pos` is past the last token.
     eof_col: usize,
+    /// Byte offsets where a tall whitespace (2+ spaces, or a newline) occurred
+    /// in the source. `TallWs` tokens are stripped from the stream; this set
+    /// lets signature detection ask "was there a tall gap before this token?"
+    tall_gaps: HashSet<usize>,
 }
 
 // ── Public API ──────────────────────────────────────────────────────
 
 impl Parser {
     pub fn new(source: String, tokens: Vec<Token>) -> Self {
-        let (token_cols, eof_col) = Self::precompute_columns(&source, &tokens);
+        // Strip tall-whitespace tokens from the stream the parser walks, but
+        // record the byte offset each one occupied. A tall ws (2+ spaces, or a
+        // newline — see the lexer) is the type-annotation separator; a
+        // signature `Type  name` is detected by checking for a tall gap
+        // between the type's last token and the name. Everywhere else tall ws
+        // is layout and skipped.
+        let mut tall_gaps: HashSet<usize> = HashSet::new();
+        let mut tokens_kept: Vec<Token> = Vec::with_capacity(tokens.len());
+        for tok in tokens {
+            if matches!(tok.kind, TokenKind::TallWs) {
+                tall_gaps.insert(tok.span.start);
+            } else {
+                tokens_kept.push(tok);
+            }
+        }
+        let (token_cols, eof_col) = Self::precompute_columns(&source, &tokens_kept);
         Self {
             source,
-            tokens,
+            tokens: tokens_kept,
+            tall_gaps,
             pos: 0,
             diagnostics: Vec::new(),
             context: Vec::new(),
@@ -438,6 +458,30 @@ impl Parser {
             self.pos += 1;
         }
         tok
+    }
+
+    /// Is there a tall whitespace (2+ spaces, or a newline) immediately before
+    /// the current token? This is the type-annotation separator: in a
+    /// signature `Type  name` the tall gap ends the type and precedes the
+    /// name. `TallWs` tokens are stripped from the stream, so this consults
+    /// the `tall_gaps` side-set (and treats a `Newline` token as a tall gap).
+    fn tall_gap_before_current(&self) -> bool {
+        let cur_start = self.peek_token().span.start;
+        // A `Newline` token directly before the current token is a tall gap.
+        if self.pos > 0
+            && matches!(self.tokens.get(self.pos - 1).map(|t| &t.kind), Some(TokenKind::Newline))
+        {
+            return true;
+        }
+        // Otherwise, a stripped `TallWs` occupied some offset in (prev_end, cur_start].
+        let prev_end = if self.pos > 0 {
+            self.tokens.get(self.pos - 1).map(|t| t.span.end).unwrap_or(0)
+        } else {
+            0
+        };
+        self.tall_gaps
+            .iter()
+            .any(|&g| g >= prev_end && g < cur_start)
     }
 
     fn expect(&mut self, kind: &TokenKind, msg: &str) -> Result<Token, ()> {
@@ -1183,25 +1227,72 @@ impl Parser {
             if matches!(self.peek(), TokenKind::LParen) {
                 let after_lparen = self.save();
                 self.advance(); // `(`
+                // Type-first constraint: `(Type  ^field) =>` or `(Type  <>field) =>`.
+                // The `^`/`<>` prefixes the NAME; the type leads, separated by a
+                // tall gap (2+ spaces or newline). Tentatively parse a type, then
+                // a tall gap, then the marker-prefixed field name.
+                if matches!(
+                    self.peek(),
+                    TokenKind::Upper(_)
+                        | TokenKind::LBrace
+                        | TokenKind::LParen
+                        | TokenKind::Forall
+                        | TokenKind::Underscore
+                ) {
+                    let ty_saved = self.save();
+                    let ty_diag = self.diagnostics.len();
+                    let saved_flag = self.record_value_sig_type;
+                    self.record_value_sig_type = true;
+                    let ty = self.parse_type();
+                    self.record_value_sig_type = saved_flag;
+                    let had_gap = self.tall_gap_before_current()
+                        || matches!(self.peek(), TokenKind::Newline);
+                    if had_gap {
+                        self.skip_newlines();
+                    }
+                    // `^field` (implicit) or `<>field` (fold).
+                    let is_caret = matches!(self.peek(), TokenKind::Caret);
+                    let is_collect = matches!(self.peek(), TokenKind::Collect);
+                    if let (Some(ty), true, true) = (ty, had_gap, is_caret || is_collect) {
+                        self.advance(); // `^` or `<>`
+                        if let TokenKind::Lower(field) = self.peek().clone() {
+                            self.advance();
+                            self.skip_newlines();
+                            if self.eat(&TokenKind::RParen) {
+                                let pre_arrow = self.save();
+                                self.skip_newlines();
+                                if self.eat(&TokenKind::FatArrow) {
+                                    let c = if is_caret {
+                                        Constraint::ImplicitField { field, ty }
+                                    } else {
+                                        Constraint::CollectField {
+                                            field,
+                                            ty: Some(ty),
+                                        }
+                                    };
+                                    constraints.push(c);
+                                    continue;
+                                }
+                                self.restore(pre_arrow);
+                            }
+                        }
+                    }
+                    self.restore(ty_saved);
+                    self.diagnostics.truncate(ty_diag);
+                }
                 if matches!(self.peek(), TokenKind::Caret) {
                     self.advance(); // `^`
-                    if let TokenKind::Lower(field) = self.peek().clone() {
+                    if let TokenKind::Lower(_field) = self.peek().clone() {
                         self.advance();
                         self.skip_newlines();
-                        if self.eat(&TokenKind::Colon) {
-                            self.skip_newlines();
-                            if let Some(ty) = self.parse_type() {
-                                self.skip_newlines();
-                                if self.eat(&TokenKind::RParen) {
-                                    let pre_arrow = self.save();
-                                    self.skip_newlines();
-                                    if self.eat(&TokenKind::FatArrow) {
-                                        constraints.push(Constraint::ImplicitField { field, ty });
-                                        continue;
-                                    }
-                                    self.restore(pre_arrow);
-                                }
-                            }
+                        // Legacy `(^field : Type)` — REMOVED. Type-first form:
+                        // `(Type  ^field)` (`^` prefixes the name).
+                        if self.at(&TokenKind::Colon) {
+                            self.error(
+                                "`:` constraints were removed: write the constraint \
+                                 type-first, `(Type  ^field)` (e.g. `(a -> a -> Int 1  ^compare)`)",
+                            );
+                            return None;
                         }
                     }
                 }
@@ -1214,19 +1305,21 @@ impl Parser {
                     if let TokenKind::Lower(field) = self.peek().clone() {
                         self.advance();
                         self.skip_newlines();
-                        // Optional `: Type` annotation.
-                        let ty = if self.eat(&TokenKind::Colon) {
-                            self.skip_newlines();
-                            self.parse_type()
-                        } else {
-                            None
-                        };
+                        // Legacy `(<>field : Type)` — REMOVED. Type-first form:
+                        // `(Type  <>field)`. Name-only `(<>field)` still works.
+                        if self.at(&TokenKind::Colon) {
+                            self.error(
+                                "`:` constraints were removed: write the constraint \
+                                 type-first, `(Type  <>field)`",
+                            );
+                            return None;
+                        }
                         self.skip_newlines();
                         if self.eat(&TokenKind::RParen) {
                             let pre_arrow = self.save();
                             self.skip_newlines();
                             if self.eat(&TokenKind::FatArrow) {
-                                constraints.push(Constraint::CollectField { field, ty });
+                                constraints.push(Constraint::CollectField { field, ty: None });
                                 continue;
                             }
                             self.restore(pre_arrow);
@@ -1286,20 +1379,14 @@ impl Parser {
 impl Parser {
     fn parse_expr(&mut self) -> Option<Expr> {
         let expr = self.parse_expr_head()?;
-        // Postfix type annotation: `expr : Type` (without the surrounding
-        // parens that `(expr : Type)` requires). Consumed greedily so a
-        // trailing annotation binds to whatever expression just parsed.
+        // Postfix type annotation `expr : Type` — REMOVED. Annotations use the
+        // keyword form `the (Type) expr`. Reject with a migration hint.
         if self.at(&TokenKind::Colon) {
-            self.advance();
-            let ty = self.parse_type()?;
-            let span = Span::new(expr.span.start, ty.span.end);
-            return Some(Spanned::new(
-                ExprKind::Annot {
-                    expr: Box::new(expr),
-                    ty,
-                },
-                span,
-            ));
+            self.error(
+                "`:` annotations were removed: use `the (Type) expr` \
+                 (e.g. `(the (Int Ms) 250)`)",
+            );
+            return None;
         }
         Some(expr)
     }
@@ -2029,6 +2116,27 @@ impl Parser {
     fn parse_atom_inner(&mut self) -> Option<Expr> {
         let start = self.span();
         match self.peek() {
+            // `the (Type) expr` — the inline type annotation. `the` is a
+            // keyword (its first argument is a *type*, which no knot function
+            // type can express); it produces the same `Annot` node as a
+            // declaration signature.
+            TokenKind::The => {
+                self.advance(); // consume `the`
+                self.skip_newlines();
+                self.expect(&TokenKind::LParen, "expected '(' after `the` — write `the (Type) expr`").ok()?;
+                let ty = self.parse_type()?;
+                self.expect(&TokenKind::RParen, "expected ')' after the type in `the (Type) expr`").ok()?;
+                self.skip_newlines();
+                let expr = self.parse_atom()?;
+                let span = Span::new(start.start, expr.span.end);
+                Some(Spanned::new(
+                    ExprKind::Annot {
+                        expr: Box::new(expr),
+                        ty,
+                    },
+                    span,
+                ))
+            }
             TokenKind::Int(_) => {
                 let tok = self.advance();
                 let TokenKind::Int(n) = tok.kind else { unreachable!() };
@@ -2164,30 +2272,14 @@ impl Parser {
                     return None;
                 };
                 self.skip_newlines();
-                // Check for type annotation: `(expr : Type)`
-                if self.eat(&TokenKind::Colon) {
-                    let ty = match self.parse_type() {
-                        Some(t) => t,
-                        None => {
-                            self.delimiter_depth -= 1;
-                            return None;
-                        }
-                    };
-                    let end_tok = self
-                        .expect(
-                            &TokenKind::RParen,
-                            "unclosed '(' — expected matching ')' after type annotation",
-                        );
+                // Type annotation `(expr : Type)` — REMOVED. Use `the (Type) expr`.
+                if self.at(&TokenKind::Colon) {
                     self.delimiter_depth -= 1;
-                    let end_tok = end_tok.ok()?;
-                    let span = Span::new(start.start, end_tok.span.end);
-                    return Some(Spanned::new(
-                        ExprKind::Annot {
-                            expr: Box::new(inner),
-                            ty,
-                        },
-                        span,
-                    ));
+                    self.error(
+                        "`:` annotations were removed: use `the (Type) expr` \
+                         (e.g. `(the (Int Ms) 250)`)",
+                    );
+                    return None;
                 }
                 let end_tok = self
                     .expect(
@@ -2497,37 +2589,12 @@ impl Parser {
                     continue;
                 }
 
-                if self.eat(&TokenKind::Colon) {
-                    self.skip_newlines();
-                    let saved_flag = self.record_value_sig_type;
-                    self.record_value_sig_type = true;
-                    let sty = self.parse_type();
-                    self.record_value_sig_type = saved_flag;
-                    let Some(sty) = sty else {
-                        self.error("expected type after ':' in record source declaration");
-                        return None;
-                    };
-                    // Source: optional migration clauses hanging off the field:
-                    // `*todos : [Todo] migrate from A to B using f …`. Mirrors
-                    // top-level `migrate` decls (cumulative).
-                    let mut migrations = Vec::new();
-                    while let Some(m) = self.parse_source_field_migration() {
-                        migrations.push(m);
-                    }
-                    fields.push(RecordField {
-                        name: sname.clone(),
-                        value: Spanned::new(
-                            ExprKind::SourceDecl {
-                                name: bare_name,
-                                ty: sty,
-                                migrations,
-                            },
-                            sspan,
-                        ),
-                        sig: None,
-                        doc: pending_doc.take(),
-                    });
-                    continue;
+                if self.at(&TokenKind::Colon) {
+                    self.error(
+                        "`:` annotations were removed: declare a source type-first, \
+                         `Rel T  *name` (e.g. `Rel {name Text}  *people`)",
+                    );
+                    return None;
                 }
 
                 // `*name = ...` was a view; views were removed. A source is
@@ -2540,24 +2607,98 @@ impl Parser {
                 self.error("expected ':' after record source field name");
                 return None;
             }
-            // Signature line: `name : Type`. The value for `name` is supplied by
-            // a later `name value` field. Parse the type with
-            // `record_value_sig_type` set so a `Lower` on the next line (the
-            // field's value) is not absorbed as a type argument.
+            // Signature line: `name : Type` — REMOVED. Signatures are type-first
+            // (`Type  name`). Reject the colon form with a migration hint.
             if self.at_field_signature() {
-                let (sname, _) = self.expect_lower("expected field name in record").ok()?;
-                self.expect(&TokenKind::Colon, "expected ':' after field name").ok()?;
-                self.skip_newlines();
+                self.error(
+                    "`:` signatures were removed: write the signature type-first, \
+                     `Type  name` (e.g. `Int 1 -> Int 1  addOne`); a tyvar-led \
+                     signature uses `the`",
+                );
+                return None;
+            }
+            // Type-first signature: `Type  name` — a type (which stops at a
+            // tall gap), then a tall whitespace, then the annotated name.
+            // Detected by tentatively parsing a type; if a tall gap and a name
+            // follow, it's a sig. Otherwise backtrack to a normal field. Runs
+            // before the bare-`Upper` type-import branch below so
+            // `Rel Person  *todos` is a sig, not the `Rel` marker.
+            //
+            // Only speculate when the field opens with a token that
+            // UNAMBIGUOUSLY starts a type — uppercase, `{`, `<`, `forall`, `_`.
+            // A lowercase-led field is a value binding (`x 1`, `textToBytes
+            // {…}`), never a type-first sig: a lowercase type-variable-led sig
+            // (`a -> a  f`) would be ambiguous with a binding, so those are
+            // written with `the` instead.
+            // `(` covers a parenthesised-constraint-led type `(<>ctx) => …`;
+            // a field can never open with `(` as a value binding (field names
+            // are lowercase idents or `*sources`), so it's unambiguous.
+            if matches!(
+                self.peek(),
+                TokenKind::Upper(_)
+                    | TokenKind::LBrace
+                    | TokenKind::Lt
+                    | TokenKind::LParen
+                    | TokenKind::Forall
+                    | TokenKind::Underscore
+            ) {
+                let saved = self.save();
+                let diag_len = self.diagnostics.len();
                 let saved_flag = self.record_value_sig_type;
                 self.record_value_sig_type = true;
-                let sty = self.parse_type_scheme();
+                let ty = self.parse_type_scheme();
                 self.record_value_sig_type = saved_flag;
-                let Some(sty) = sty else {
-                    self.error("expected type after ':' in record field signature");
-                    return None;
-                };
-                pending_sigs.push((sname, sty));
-                continue;
+                // The type↔name separator is a tall gap: 2+ spaces (checked via
+                // `tall_gap_before_current`) or a newline. Skip the newline so
+                // `Type\n  name` resolves the name after the break.
+                let had_gap = self.tall_gap_before_current()
+                    || matches!(self.peek(), TokenKind::Newline);
+                if had_gap {
+                    self.skip_newlines();
+                }
+                let is_sig = ty.is_some() && had_gap
+                    && matches!(self.peek(), TokenKind::Lower(_) | TokenKind::StarIdent(_));
+                if is_sig {
+                    let ty = ty.unwrap();
+                    if matches!(self.peek(), TokenKind::StarIdent(_)) {
+                        // Type-first source declaration: `Rel T  *name` (with
+                        // optional `migrate from … to … using …` clauses). The
+                        // source IS the declaration — emit a SourceDecl field
+                        // directly, mirroring the `*name : Rel T` colon path.
+                        let t = self.advance();
+                        let TokenKind::StarIdent(n) = t.kind else { unreachable!() };
+                        let bare = n.trim_start_matches('*').to_string();
+                        let mut migrations = Vec::new();
+                        while let Some(m) = self.parse_source_field_migration() {
+                            migrations.push(m);
+                        }
+                        // A source type is a plain Type; the sig branch parsed a
+                        // TypeScheme. Unwrap the (here always unquantified)
+                        // scheme to the underlying type.
+                        let ty_inner = ty.ty.clone();
+                        fields.push(RecordField {
+                            name: bare.clone(),
+                            value: Spanned::new(
+                                ExprKind::SourceDecl {
+                                    name: bare,
+                                    ty: ty_inner,
+                                    migrations,
+                                },
+                                t.span,
+                            ),
+                            sig: None,
+                            doc: pending_doc.take(),
+                        });
+                        continue;
+                    }
+                    let (sname, _) = self.expect_lower("expected field name in record").unwrap();
+                    pending_sigs.push((sname, ty));
+                    continue;
+                }
+                // Not a sig — roll back the speculative type parse AND any
+                // diagnostics it emitted.
+                self.restore(saved);
+                self.diagnostics.truncate(diag_len);
             }
             // Type-import marker: a bare uppercase name (`Maybe` in
             // `with {Maybe} body`) brings that data type's constructors into
@@ -2746,22 +2887,29 @@ impl Parser {
         }
         let is_upper = |k: &TokenKind| matches!(k, TokenKind::Upper(_));
         let name_is = |k: &TokenKind, want: &str| matches!(k, TokenKind::Upper(n) if n == want);
-        is_upper(self.peek_ahead(1))
-            && matches!(self.peek_ahead(2), TokenKind::Colon)
-            && name_is(self.peek_ahead(3), "Type")
-            && matches!(self.peek_ahead(4), TokenKind::RParen)
+        // Type-first witness `(Type  T)`: `(`, `Type`, tall gap, Upper name, `)`.
+        if name_is(self.peek_ahead(1), "Type") && is_upper(self.peek_ahead(2)) {
+            // Peek the gap between `Type` and the name: token at +2 must start
+            // 2+ columns (or a line) after the end of the `Type` token at +1.
+            let ty_tok = &self.tokens[self.pos + 1];
+            let name_tok = &self.tokens[self.pos + 2];
+            let tall = name_tok.span.start >= ty_tok.span.end + 2;
+            return tall && matches!(self.peek_ahead(3), TokenKind::RParen);
+        }
+        false
     }
 
-    /// Parse a type-witness parameter `(T : Type)` — assumes `at_ty_param()`.
+    /// Parse a type-witness parameter `(Type  T)` (type-first) — assumes
+    /// `at_ty_param()`.
     fn parse_ty_param(&mut self) -> Option<crate::ast::TyParam> {
         let start = self.span();
         self.advance(); // (
+        self.advance(); // Type
+        self.skip_newlines();
         let name = match self.advance().kind {
             TokenKind::Upper(n) => n,
             _ => return None,
         };
-        self.advance(); // :
-        self.advance(); // Type
         let end = self.span();
         self.advance(); // )
         Some(crate::ast::TyParam {
@@ -3204,6 +3352,28 @@ impl Parser {
                 let tok = self.advance();
                 Some(Spanned::new(PatKind::Wildcard, tok.span))
             }
+            // Annotated pattern: `the (Type) pat`. The pattern-position form of
+            // the `the (Type) expr` annotation — enables lambda params like
+            // `\\(the (forall a. a -> a) f) -> …` with no `:`.
+            TokenKind::The => {
+                self.advance(); // consume `the`
+                self.skip_newlines();
+                self.expect(&TokenKind::LParen, "expected '(' after `the`")
+                    .ok()?;
+                let ty = self.parse_type()?;
+                self.expect(&TokenKind::RParen, "expected ')' after the type in `the (Type) pat`")
+                    .ok()?;
+                self.skip_newlines();
+                let inner = self.parse_pat()?;
+                let end = inner.span;
+                Some(Spanned::new(
+                    PatKind::Annot {
+                        pat: Box::new(inner),
+                        ty: Box::new(ty),
+                    },
+                    Span::new(start.start, end.end),
+                ))
+            }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
                 let TokenKind::Lower(name) = tok.kind else { unreachable!() };
@@ -3319,20 +3489,13 @@ impl Parser {
                     ));
                 }
                 let inner = self.parse_pat()?;
-                // Optional type annotation: `(pat : Type)`. Enables rank-N
-                // lambda params like `\(f : (forall a. a -> a)) -> …`.
-                if self.eat(&TokenKind::Colon) {
-                    let ty = self.parse_type()?;
-                    let end_tok = self
-                        .expect(&TokenKind::RParen, "expected ')' after pattern type annotation")
-                        .ok()?;
-                    return Some(Spanned::new(
-                        PatKind::Annot {
-                            pat: Box::new(inner),
-                            ty: Box::new(ty),
-                        },
-                        Span::new(start.start, end_tok.span.end),
-                    ));
+                // Pattern annotation `(pat : Type)` — REMOVED. Use `the (Type) pat`.
+                if self.at(&TokenKind::Colon) {
+                    self.error(
+                        "`:` annotations were removed: use `the (Type) pat` \
+                         (e.g. `\\(the (forall a. a -> a) f) -> …`)",
+                    );
+                    return None;
                 }
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
@@ -3408,6 +3571,7 @@ impl Parser {
             TokenKind::Lower(_)
                 | TokenKind::Upper(_)
                 | TokenKind::Underscore
+                | TokenKind::The
                 | TokenKind::LBrace
                 | TokenKind::LBracket
                 | TokenKind::LParen
@@ -3480,20 +3644,13 @@ impl Parser {
                     ));
                 }
                 let inner = self.parse_pat()?;
-                // Optional type annotation: `(pat : Type)`. Enables rank-N
-                // lambda params like `\(f : (forall a. a -> a)) -> …`.
-                if self.eat(&TokenKind::Colon) {
-                    let ty = self.parse_type()?;
-                    let end_tok = self
-                        .expect(&TokenKind::RParen, "expected ')' after pattern type annotation")
-                        .ok()?;
-                    return Some(Spanned::new(
-                        PatKind::Annot {
-                            pat: Box::new(inner),
-                            ty: Box::new(ty),
-                        },
-                        Span::new(start.start, end_tok.span.end),
-                    ));
+                // Pattern annotation `(pat : Type)` — REMOVED. Use `the (Type) pat`.
+                if self.at(&TokenKind::Colon) {
+                    self.error(
+                        "`:` annotations were removed: use `the (Type) pat` \
+                         (e.g. `\\(the (forall a. a -> a) f) -> …`)",
+                    );
+                    return None;
                 }
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
@@ -3726,6 +3883,12 @@ impl Parser {
         }
 
         loop {
+            // A tall gap (2+ spaces / newline) ends the type: in a signature
+            // `Type  name` it separates the type from the annotated name, so a
+            // type-application spine must not consume across it.
+            if self.tall_gap_before_current() {
+                break;
+            }
             if self.can_start_type_atom() {
                 let arg = match self.parse_type_atom() {
                     Some(arg) => arg,

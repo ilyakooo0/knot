@@ -5,7 +5,7 @@
 -- builtins (the Functor/Applicative/Monad impls were removed with the trait
 -- system). Errors short-circuit through bind.
 with {
--- Test: basic do-block chaining with Result
+-- Test basic do-block chaining with Result
 safeDivide (\x y -> case y == 0 of
   Bool.True {} -> Result.Err {error "division by zero"}
   Bool.False {} -> Result.Ok {value (x / y)})
@@ -22,7 +22,7 @@ result2 (do
   c <- safeDivide a b
   yield c)
 
--- Test: error propagation — first Err short-circuits the rest
+-- Test error propagation — first Err short-circuits the rest
 result3 (do
   a <- Result.Err {error "no input"}
   b <- Result.Ok {value 42}

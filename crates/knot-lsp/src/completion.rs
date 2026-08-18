@@ -328,7 +328,7 @@ pub(crate) fn handle_completion(
     // Context detection: if the cursor is in a type annotation position,
     // only suggest types and type constructors. The trigger characters
     // (`:`, `[`, `->`) are each ambiguous in Knot — `\x -> `, case-arm
-    // `->`, record-literal `{name: `, and list literals `[` are all
+    // `->`, record-literal `{name `, and list literals `[` are all
     // expression positions — so a token scanner over the current
     // declaration decides (see `cursor_in_type_context` for the rules).
     let in_type_context = {
@@ -1372,12 +1372,12 @@ fn extract_fields_from_type_str_inner(
 ) -> Vec<String> {
     let type_str = type_str.trim();
 
-    // Direct record type: `{name: Text, age: Int 1}`
+    // Direct record type: `{name Text age (Int 1)}`
     if type_str.starts_with('{') && type_str.ends_with('}') {
         return extract_record_fields(type_str);
     }
 
-    // Relation type: `[{name: Text}]` or `[Person]` — extract inner type
+    // Relation type: `Rel {name Text}` or `Rel Person` — extract inner type
     if type_str.starts_with('[') && type_str.ends_with(']') {
         let inner = &type_str[1..type_str.len() - 1];
         return extract_fields_from_type_str_inner(inner, module, visited);
@@ -1538,10 +1538,10 @@ fn function_constraint_summary(module: &ast::Expr, name: &str) -> Option<String>
                             format!("`{} {}`", trait_name, args.join(" "))
                         }
                         knot::ast::Constraint::ImplicitField { field, ty } => {
-                            format!("`(^ {} : {})`", field, format_type_kind(&ty.node))
+                            format!("`({}  ^{})`", format_type_kind(&ty.node), field)
                         }
                         knot::ast::Constraint::CollectField { field, ty } => match ty {
-                            Some(ty) => format!("`(<> {} : {})`", field, format_type_kind(&ty.node)),
+                            Some(ty) => format!("`({}  <>{})`", format_type_kind(&ty.node), field),
                             None => format!("`(<> {})`", field),
                         }
                     })
@@ -1576,7 +1576,7 @@ fn data_constructor_summary(module: &ast::Expr, name: &str) -> Option<String> {
                     let fs: Vec<String> = ctor
                         .fields
                         .iter()
-                        .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+                        .map(|f| format!("{} {}", f.name, format_type_kind(&f.value.node)))
                         .collect();
                     out.push_str(&format!("\n- `{} {{{}}}`", ctor.name, fs.join(", ")));
                 }

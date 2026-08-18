@@ -84,7 +84,7 @@ fn comprehension_equi_join() {
             d <- depts
             where e.dept == d.dname
             yield {name e.name floor d.floor}))",
-        "[{floor: 3, name: a}, {floor: 1, name: b}, {floor: 3, name: c}]",
+        "[{floor 3 name a}, {floor 1 name b}, {floor 3 name c}]",
     );
 }
 

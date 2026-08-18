@@ -83,7 +83,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                                 let fs: Vec<String> = ctor
                                     .fields
                                     .iter()
-                                    .map(|f| format!("{}: {}", f.name, format_type_kind(&f.value.node)))
+                                    .map(|f| format!("{} {}", f.name, format_type_kind(&f.value.node)))
                                     .collect();
                                 Some(format!("{{{}}}", fs.join(", ")))
                             },

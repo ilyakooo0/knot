@@ -10,7 +10,7 @@ fn derived_relation_reads_source() {
     assert_stdout(
         "drv_read",
         r#"with {
-*manages : Rel {manager Text report Text}
+Rel {manager Text report Text}  *manages
 directReports (do
   m <- *manages
   yield {manager m.manager report m.report})
@@ -30,7 +30,7 @@ fn derived_relation_recomputes_on_access() {
     assert_stdout(
         "drv_recompute",
         r#"with {
-*items : Rel {n (Int 1)}
+Rel {n (Int 1)}  *items
 doubled (do
   r <- *items
   yield {n (r.n * 2)})
@@ -43,7 +43,7 @@ doubled (do
   b <- base.run doubled
   base.println (base.show b)
   yield {})"#,
-        "\"[{n: 2}]\"\n\"[{n: 10}]\"\n{}",
+        "\"[{n 2}]\"\n\"[{n 10}]\"\n{}",
     );
 }
 
@@ -52,7 +52,7 @@ fn derived_relation_aggregates() {
     assert_stdout(
         "drv_agg",
         r#"with {
-*sales : Rel {region Text amount (Int 1)}
+Rel {region Text amount (Int 1)}  *sales
 amounts (do
   r <- *sales
   yield {amount r.amount})
@@ -62,6 +62,6 @@ amounts (do
   base.println (base.show {sum (base.sum (do r <- amounts; yield r.amount))})
   yield {})"#,
         // a query field iterated in an aggregate comprehension over the source
-        "\"{sum: 35}\"\n{}",
+        "\"{sum 35}\"\n{}",
     );
 }

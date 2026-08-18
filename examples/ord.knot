@@ -28,7 +28,7 @@ textOrd {
     Bool.False {} -> b)
 }
 
--- A different ordering for the same type: descending.
+-- A different ordering for the same type descending.
 intOrdDesc {
   compare (\a b -> case a < b of
     Bool.True {} -> 1
@@ -40,7 +40,7 @@ intOrdDesc {
     Bool.False {} -> b)
 }
 
--- `clamp lo hi ord x` is generic: pass any type's Ord dictionary.
+-- `clamp lo hi ord x` is generic pass any type's Ord dictionary.
 clamp (\lo hi ord x ->
   case ((ord.compare x lo) == (0 - 1)) of
     Bool.True {} -> lo

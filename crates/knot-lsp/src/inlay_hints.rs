@@ -104,11 +104,12 @@ pub(crate) fn handle_inlay_hint(
                 let full_sig = inferred.clone();
                 hints.push(InlayHint {
                     position: hint_pos,
-                    label: InlayHintLabel::String(format!(": {full_sig}")),
+                    label: InlayHintLabel::String(format!(" : {full_sig}")),
                     kind: Some(InlayHintKind::TYPE),
                     text_edits: Some(vec![TextEdit {
                         range: Range { start: edit_pos, end: edit_pos },
-                        new_text: format!("{name} : {full_sig}\n"),
+                        // Type-first signature line: `Sig  name`.
+                        new_text: format!("{full_sig}  {name}\n"),
                     }]),
                     tooltip: None,
                     padding_left: Some(true),
@@ -170,7 +171,7 @@ pub(crate) fn handle_inlay_hint(
         // Show inferred unit hints on numeric literals whose enclosing binding has
         // a unit-annotated type. The literals themselves don't carry explicit unit
         // syntax, so the user otherwise has to mentally trace the type — the hint
-        // shows e.g. `<M>` after `42` in `let distance : Float M = 42.0`.
+        // shows e.g. `<M>` after `42` in `let distance = the (Float M) 42.0`.
         add_unit_literal_hints(doc, range_start, range_end, &mut hints);
     }
 
@@ -434,7 +435,7 @@ fn add_record_pattern_field_hints(
                     record_field_name_spans(fields, pat.span, source),
                 ));
                 // Recurse into field sub-patterns so nested record
-                // destructures (`{addr: {city}}`) get hints too.
+                // destructures (`{addr {city}}`) get hints too.
                 for f in fields {
                     if let Some(p) = &f.pattern {
                         walk_pat_for_records(p, source, out);
@@ -979,7 +980,7 @@ fn function_param_tooltip(
     let params = parse_function_params(ty);
     let param_ty = params.get(index)?;
     Some(InlayHintTooltip::String(format!(
-        "{param_name} : {param_ty}\n\n`{func_name} : {ty}`"
+        "{param_ty}  {param_name}\n\n`{ty}  {func_name}`"
     )))
 }
 
@@ -1155,10 +1156,10 @@ fn add_constraint_hints(
                                 format!("{} {}", trait_name, args.join(" "))
                             }
                             knot::ast::Constraint::ImplicitField { field, ty } => {
-                                format!("(^ {} : {})", field, format_type_kind(&ty.node))
+                                format!("({}  ^{})", format_type_kind(&ty.node), field)
                             }
                             knot::ast::Constraint::CollectField { field, ty } => match ty {
-                                Some(ty) => format!("(<> {} : {})", field, format_type_kind(&ty.node)),
+                                Some(ty) => format!("({}  <>{})", format_type_kind(&ty.node), field),
                                 None => format!("(<> {})", field),
                             }
                         })

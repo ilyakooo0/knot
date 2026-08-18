@@ -5,10 +5,10 @@ use harness::{assert_compile_err, assert_show, assert_show_set};
 
 #[test]
 fn adt_construction_and_show() {
-    assert_show("Maybe.Just {value 5}", "Just {value: 5}");
+    assert_show("Maybe.Just {value 5}", "Just {value 5}");
     assert_show("Maybe.Nothing {}", "Nothing");
-    assert_show("Result.Ok {value 5}", "Ok {value: 5}");
-    assert_show("Result.Err {error \"bad\"}", "Err {error: bad}");
+    assert_show("Result.Ok {value 5}", "Ok {value 5}");
+    assert_show("Result.Err {error \"bad\"}", "Err {error bad}");
 }
 
 #[test]
@@ -47,7 +47,7 @@ fn custom_adt() {
 fn custom_adt_payload() {
     assert_show(
         "with {\ndata Shape = Circle {radius (Int 1)} | Rect {w (Int 1) h (Int 1)}\n}\n(Shape.Rect {w 3 h 4})",
-        "Rect {h: 4, w: 3}",
+        "Rect {h 4 w 3}",
     );
 }
 
@@ -78,7 +78,7 @@ fn adt_equality() {
 fn adt_in_relation() {
     assert_show_set(
         "[(Maybe.Just {value 1}) (Maybe.Nothing {}) (Maybe.Just {value 2})]",
-        &["Just {value: 1}", "Nothing", "Just {value: 2}"],
+        &["Just {value 1}", "Nothing", "Just {value 2}"],
     );
 }
 
@@ -88,7 +88,7 @@ fn match_filters_constructor() {
     assert_show_set(
         "with {\ndata Evt = Click {x (Int 1)} | Key {code (Int 1)}\n}\n\
          (base.match Evt.Click [(Evt.Click {x 1}) (Evt.Key {code 9}) (Evt.Click {x 2})])",
-        &["{x: 1}", "{x: 2}"],
+        &["{x 1}", "{x 2}"],
     );
 }
 
@@ -97,7 +97,7 @@ fn maybe_map_via_case() {
     // Maybe map, written structurally with case.
     assert_show(
         "(case Maybe.Just {value 3} of\n  Maybe.Just {value v} -> Maybe.Just {value (v * 2)}\n  Maybe.Nothing {} -> Maybe.Nothing {})",
-        "Just {value: 6}",
+        "Just {value 6}",
     );
 }
 

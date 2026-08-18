@@ -10,7 +10,7 @@ use harness::{assert_show, assert_show_set};
 fn nested_relation_construction() {
     assert_show(
         "{team \"eng\" members [{name \"a\"}]}",
-        "{members: [{name: a}], team: eng}",
+        "{members [{name a}] team eng}",
     );
 }
 
@@ -34,15 +34,15 @@ fn nested_relation_map() {
 fn deeply_nested() {
     assert_show(
         "{a {b {c [{x 1}]}}}.a.b.c",
-        "[{x: 1}]",
+        "[{x 1}]",
     );
 }
 
 #[test]
 fn nested_empty() {
     assert_show(
-        "{members ([] : Rel {name Text})}",
-        "{members: []}",
+        "{members (the (Rel {name Text}) [])}",
+        "{members []}",
     );
 }
 

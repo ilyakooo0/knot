@@ -92,9 +92,9 @@ fn floor_and_widen() {
 
 #[test]
 fn parse_numbers() {
-    assert_show("base.textToInt \"42\"", "Just {value: 42}");
+    assert_show("base.textToInt \"42\"", "Just {value 42}");
     assert_show("base.textToInt \"abc\"", "Nothing");
-    assert_show("base.textToFloat \"2.5\"", "Just {value: 2.5}");
+    assert_show("base.textToFloat \"2.5\"", "Just {value 2.5}");
 }
 
 #[test]
@@ -121,14 +121,14 @@ fn bool_logic() {
 
 #[test]
 fn bytes_roundtrip() {
-    assert_show("base.bytesToText (base.textToBytes \"hi\")", "Just {value: hi}");
+    assert_show("base.bytesToText (base.textToBytes \"hi\")", "Just {value hi}");
 }
 
 #[test]
 fn bytes_length_get() {
     assert_show("base.bytesLength (base.textToBytes \"abc\")", "3");
     // bytesGet is index-first: Int -> Bytes -> Maybe Int.
-    assert_show("base.bytesGet 0 (base.textToBytes \"abc\")", "Just {value: 97}");
+    assert_show("base.bytesGet 0 (base.textToBytes \"abc\")", "Just {value 97}");
     assert_show("base.bytesGet 9 (base.textToBytes \"abc\")", "Nothing");
 }
 
@@ -136,7 +136,7 @@ fn bytes_length_get() {
 fn bytes_hex() {
     assert_show("base.bytesToHex (base.textToBytes \"ab\")", "6162");
     // bytesFromHex returns Maybe Bytes; the Bytes payload shows as bare hex.
-    assert_show("base.bytesFromHex \"6162\"", "Just {value: 6162}");
+    assert_show("base.bytesFromHex \"6162\"", "Just {value 6162}");
 }
 
 #[test]
@@ -183,34 +183,34 @@ fn json_record() {
 
 #[test]
 fn json_parse_roundtrip() {
-    assert_show("base.parseJson \"42\" : Maybe (Int 1)", "Just {value: 42}");
+    assert_show("(the (Maybe (Int 1)) (base.parseJson \"42\"))", "Just {value 42}");
 }
 
 #[test]
 fn json_parse_invalid() {
-    assert_show("base.parseJson \"{bad\" : Maybe (Int 1)", "Nothing");
+    assert_show("(the (Maybe (Int 1)) (base.parseJson \"{bad\"))", "Nothing");
 }
 
 // ── Units of measure ─────────────────────────────────────────────────────
 
 #[test]
 fn strip_with_unit() {
-    assert_show("base.stripUnit (250 : Int Ms)", "250");
-    assert_show("base.stripFloatUnit (2.5 : Float Ms)", "2.5");
+    assert_show("base.stripUnit (the (Int Ms) 250)", "250");
+    assert_show("base.stripFloatUnit (the (Float Ms) 2.5)", "2.5");
 }
 
 #[test]
 fn unit_arithmetic_consistent() {
     // Same-unit arithmetic keeps the unit; show renders just the number here
     // (dimensionless check), but the point is it type-checks.
-    assert_show("(100 : Int Ms) + (50 : Int Ms)", "150");
+    assert_show("(the (Int Ms) 100) + (the (Int Ms) 50)", "150");
 }
 
 #[test]
 fn unit_mismatch_rejected() {
     // Adding incompatible units is a compile error.
     assert_compile_err(
-        "with { unit Ms unit Usd } ((100 : Int Ms) + (50 : Int Usd))",
+        "with { unit Ms unit Usd } ((the (Int Ms) 100) + (the (Int Usd) 50))",
         "",
     );
 }
@@ -221,6 +221,6 @@ fn unit_mismatch_rejected() {
 fn show_nested_structure() {
     assert_show(
         "{point {x 1 y 2} tags [\"a\" \"b\"]}",
-        "{point: {x: 1, y: 2}, tags: [a, b]}",
+        "{point {x 1 y 2} tags [a, b]}",
     );
 }

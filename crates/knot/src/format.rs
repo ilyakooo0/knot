@@ -370,7 +370,7 @@ fn render_constraint(c: &Constraint) -> String {
             s
         }
         // Type-first constraints: `(Type  ^field)` / `(Type  <>field)` — the
-        // `^`/`<>` prefixes the NAME; the type leads with a tall gap.
+        // `^`/`<>` prefixes the NAME; the type leads with a gap.
         Constraint::ImplicitField { field, ty } => {
             format!("({}  ^{field})", render_type(ty))
         }

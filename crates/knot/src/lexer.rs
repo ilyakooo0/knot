@@ -96,12 +96,11 @@ pub enum TokenKind {
     /// type can express that).
     The,
     Newline,
-    /// Tall whitespace: a run of two or more spaces/tabs within a line (a
-    /// newline is `Newline`, separately). This is the type-annotation
-    /// separator — `Type  name` (a sig) vs `name value` (a binding, single
-    /// spaces). Single whitespace collapses to nothing; a tall run is
-    /// significant.
-    TallWs,
+    /// Gap: a run of two or more spaces/tabs within a line (a newline is
+    /// `Newline`, separately). This is the type-annotation separator —
+    /// `Type  name` (a sig) vs `name value` (a binding, single spaces).
+    /// Single whitespace collapses to nothing; a gap is significant.
+    Gap,
     Semicolon,
     Eof,
 
@@ -178,7 +177,7 @@ impl TokenKind {
             TokenKind::Question => "'?'",
             TokenKind::The => "'the'",
             TokenKind::Newline => "newline",
-            TokenKind::TallWs => "tall whitespace",
+            TokenKind::Gap => "gap",
             TokenKind::Semicolon => "';'",
             TokenKind::Eof => "end of file",
             TokenKind::Doc(_) => "documentation comment",
@@ -282,11 +281,11 @@ impl<'src> Lexer<'src> {
         let mut in_doc_block = false;
 
         loop {
-            // Whitespace: a run of 2+ spaces/tabs within a line is a TALL
-            // whitespace — the type-annotation separator (`Type  name`). A
-            // single space/tab is insignificant and collapses away. Leading
-            // indentation (tall ws right after a newline / at file start) is
-            // layout, not an annotation separator, so it is not emitted.
+            // Whitespace: a run of 2+ spaces/tabs within a line is a gap — the
+            // type-annotation separator (`Type  name`). A single space/tab is
+            // insignificant and collapses away. Leading indentation (a gap right
+            // after a newline / at file start) is layout, not an annotation
+            // separator, so it is not emitted.
             {
                 let ws_start = self.pos;
                 let mut run = 0usize;
@@ -296,7 +295,7 @@ impl<'src> Lexer<'src> {
                 }
                 if run >= 2 && !last_was_newline && !tokens.is_empty() {
                     tokens.push(Token {
-                        kind: TokenKind::TallWs,
+                        kind: TokenKind::Gap,
                         span: self.span_from(ws_start),
                     });
                 }

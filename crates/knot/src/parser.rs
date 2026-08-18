@@ -77,27 +77,27 @@ pub struct Parser {
     token_cols: Vec<usize>,
     /// Display column at end-of-input, used when `pos` is past the last token.
     eof_col: usize,
-    /// Byte offsets where a tall whitespace (2+ spaces, or a newline) occurred
-    /// in the source. `TallWs` tokens are stripped from the stream; this set
-    /// lets signature detection ask "was there a tall gap before this token?"
-    tall_gaps: HashSet<usize>,
+    /// Byte offsets where a gap (2+ spaces, or a newline) occurred
+    /// in the source. `Gap` tokens are stripped from the stream; this set
+    /// lets signature detection ask "was there a gap before this token?"
+    gaps: HashSet<usize>,
 }
 
 // ── Public API ──────────────────────────────────────────────────────
 
 impl Parser {
     pub fn new(source: String, tokens: Vec<Token>) -> Self {
-        // Strip tall-whitespace tokens from the stream the parser walks, but
-        // record the byte offset each one occupied. A tall ws (2+ spaces, or a
+        // Strip gap tokens from the stream the parser walks, but
+        // record the byte offset each one occupied. A gap (2+ spaces, or a
         // newline — see the lexer) is the type-annotation separator; a
-        // signature `Type  name` is detected by checking for a tall gap
-        // between the type's last token and the name. Everywhere else tall ws
+        // signature `Type  name` is detected by checking for a gap
+        // between the type's last token and the name. Everywhere else gap
         // is layout and skipped.
-        let mut tall_gaps: HashSet<usize> = HashSet::new();
+        let mut gaps: HashSet<usize> = HashSet::new();
         let mut tokens_kept: Vec<Token> = Vec::with_capacity(tokens.len());
         for tok in tokens {
-            if matches!(tok.kind, TokenKind::TallWs) {
-                tall_gaps.insert(tok.span.start);
+            if matches!(tok.kind, TokenKind::Gap) {
+                gaps.insert(tok.span.start);
             } else {
                 tokens_kept.push(tok);
             }
@@ -106,7 +106,7 @@ impl Parser {
         Self {
             source,
             tokens: tokens_kept,
-            tall_gaps,
+            gaps,
             pos: 0,
             diagnostics: Vec::new(),
             context: Vec::new(),
@@ -460,26 +460,26 @@ impl Parser {
         tok
     }
 
-    /// Is there a tall whitespace (2+ spaces, or a newline) immediately before
+    /// Is there a gap (2+ spaces, or a newline) immediately before
     /// the current token? This is the type-annotation separator: in a
-    /// signature `Type  name` the tall gap ends the type and precedes the
-    /// name. `TallWs` tokens are stripped from the stream, so this consults
-    /// the `tall_gaps` side-set (and treats a `Newline` token as a tall gap).
-    fn tall_gap_before_current(&self) -> bool {
+    /// signature `Type  name` the gap ends the type and precedes the
+    /// name. `Gap` tokens are stripped from the stream, so this consults
+    /// the `gaps` side-set (and treats a `Newline` token as a gap).
+    fn gap_before_current(&self) -> bool {
         let cur_start = self.peek_token().span.start;
-        // A `Newline` token directly before the current token is a tall gap.
+        // A `Newline` token directly before the current token is a gap.
         if self.pos > 0
             && matches!(self.tokens.get(self.pos - 1).map(|t| &t.kind), Some(TokenKind::Newline))
         {
             return true;
         }
-        // Otherwise, a stripped `TallWs` occupied some offset in (prev_end, cur_start].
+        // Otherwise, a stripped `Gap` occupied some offset in (prev_end, cur_start].
         let prev_end = if self.pos > 0 {
             self.tokens.get(self.pos - 1).map(|t| t.span.end).unwrap_or(0)
         } else {
             0
         };
-        self.tall_gaps
+        self.gaps
             .iter()
             .any(|&g| g >= prev_end && g < cur_start)
     }
@@ -1229,8 +1229,8 @@ impl Parser {
                 self.advance(); // `(`
                 // Type-first constraint: `(Type  ^field) =>` or `(Type  <>field) =>`.
                 // The `^`/`<>` prefixes the NAME; the type leads, separated by a
-                // tall gap (2+ spaces or newline). Tentatively parse a type, then
-                // a tall gap, then the marker-prefixed field name.
+                // gap (2+ spaces or newline). Tentatively parse a type, then
+                // a gap, then the marker-prefixed field name.
                 if matches!(
                     self.peek(),
                     TokenKind::Upper(_)
@@ -1245,7 +1245,7 @@ impl Parser {
                     self.record_value_sig_type = true;
                     let ty = self.parse_type();
                     self.record_value_sig_type = saved_flag;
-                    let had_gap = self.tall_gap_before_current()
+                    let had_gap = self.gap_before_current()
                         || matches!(self.peek(), TokenKind::Newline);
                     if had_gap {
                         self.skip_newlines();
@@ -2618,8 +2618,8 @@ impl Parser {
                 return None;
             }
             // Type-first signature: `Type  name` — a type (which stops at a
-            // tall gap), then a tall whitespace, then the annotated name.
-            // Detected by tentatively parsing a type; if a tall gap and a name
+            // gap), then a gap, then the annotated name.
+            // Detected by tentatively parsing a type; if a gap and a name
             // follow, it's a sig. Otherwise backtrack to a normal field. Runs
             // before the bare-`Upper` type-import branch below so
             // `Rel Person  *todos` is a sig, not the `Rel` marker.
@@ -2648,10 +2648,10 @@ impl Parser {
                 self.record_value_sig_type = true;
                 let ty = self.parse_type_scheme();
                 self.record_value_sig_type = saved_flag;
-                // The type↔name separator is a tall gap: 2+ spaces (checked via
-                // `tall_gap_before_current`) or a newline. Skip the newline so
+                // The type↔name separator is a gap: 2+ spaces (checked via
+                // `gap_before_current`) or a newline. Skip the newline so
                 // `Type\n  name` resolves the name after the break.
-                let had_gap = self.tall_gap_before_current()
+                let had_gap = self.gap_before_current()
                     || matches!(self.peek(), TokenKind::Newline);
                 if had_gap {
                     self.skip_newlines();
@@ -2887,7 +2887,7 @@ impl Parser {
         }
         let is_upper = |k: &TokenKind| matches!(k, TokenKind::Upper(_));
         let name_is = |k: &TokenKind, want: &str| matches!(k, TokenKind::Upper(n) if n == want);
-        // Type-first witness `(Type  T)`: `(`, `Type`, tall gap, Upper name, `)`.
+        // Type-first witness `(Type  T)`: `(`, `Type`, gap, Upper name, `)`.
         if name_is(self.peek_ahead(1), "Type") && is_upper(self.peek_ahead(2)) {
             // Peek the gap between `Type` and the name: token at +2 must start
             // 2+ columns (or a line) after the end of the `Type` token at +1.
@@ -3883,10 +3883,10 @@ impl Parser {
         }
 
         loop {
-            // A tall gap (2+ spaces / newline) ends the type: in a signature
+            // A gap (2+ spaces / newline) ends the type: in a signature
             // `Type  name` it separates the type from the annotated name, so a
             // type-application spine must not consume across it.
-            if self.tall_gap_before_current() {
+            if self.gap_before_current() {
                 break;
             }
             if self.can_start_type_atom() {
@@ -3922,7 +3922,7 @@ impl Parser {
             // never a type argument — stop regardless of what follows it. A
             // lowercase token is the field's value (`name value`); `Rel` begins
             // a type-first source declaration (`Rel T  *name`), which the
-            // tall-gap source speculation in the field loop picks up.
+            // gap source speculation in the field loop picks up.
             let next_is_value_field = self.record_value_sig_type
                 && (matches!(self.peek(), TokenKind::Lower(_))
                     || matches!(&self.peek(), TokenKind::Upper(n) if n == "Rel"));

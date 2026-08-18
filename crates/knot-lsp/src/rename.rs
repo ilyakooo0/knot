@@ -942,8 +942,7 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::RecordField, source: &s
                 }
             }
         }
-        ast::ExprKind::RouteCompositeDecl { .. }
-        | ast::ExprKind::SubsetConstraint { .. } => {}
+        ast::ExprKind::SubsetConstraint { .. } => {}
         _ => {
             // A named function field: walk its body.
             field_sites_in_expr(&decl.value, source, f);

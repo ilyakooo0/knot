@@ -779,7 +779,7 @@ fn find_enclosing_route_decl_span(module: &ast::Expr, offset: usize) -> Option<S
         }
         if matches!(
             &decl.value.node,
-            ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. }
+            ast::ExprKind::RouteDecl { .. }
         ) {
             return Some(decl.value.span);
         }
@@ -875,8 +875,7 @@ fn find_enclosing_do_span(module: &ast::Expr, offset: usize) -> Option<Span> {
         }
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => walk(&decl.value, offset, &mut best),
         }
     }
@@ -908,8 +907,7 @@ fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -
         }
         let body: &ast::Expr = match &decl.value.node {
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => continue,
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => continue,
             _ => &decl.value,
         };
         if body.span.start <= offset && offset < body.span.end {

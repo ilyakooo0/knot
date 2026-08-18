@@ -10,7 +10,7 @@ use knot::ast::{self, Span};
 use crate::builtins::EFFECTFUL_BUILTINS;
 use crate::legend::{
     MOD_DECLARATION, MOD_EFFECTFUL, MOD_MUTATION, MOD_READONLY, TOK_ENUM_MEMBER, TOK_FUNCTION,
-    TOK_KEYWORD, TOK_NAMESPACE, TOK_NUMBER, TOK_PARAMETER, TOK_PROPERTY, TOK_STRING, TOK_STRUCT,
+    TOK_NAMESPACE, TOK_NUMBER, TOK_PARAMETER, TOK_PROPERTY, TOK_STRING, TOK_STRUCT,
     TOK_TYPE, TOK_VARIABLE,
 };
 use crate::state::ServerState;
@@ -368,11 +368,6 @@ impl<'a> TokenCollector<'a> {
                     }
                 }
             }
-            ast::ExprKind::RouteCompositeDecl { name, .. } => {
-                if let Some(s) = find_word_in_source(self.source, name, dspan.start, dspan.end) {
-                    self.add(s, TOK_TYPE, MOD_DECLARATION);
-                }
-            }
             ast::ExprKind::SubsetConstraint { .. } => {}
             _ => {
                 // A named function field. Search the whole declaration span
@@ -471,9 +466,6 @@ impl<'a> TokenCollector<'a> {
             }
             ast::ExprKind::Lit(ast::Literal::Text(_)) => {
                 self.add(self.strip_parens(expr.span), TOK_STRING, 0);
-            }
-            ast::ExprKind::Lit(ast::Literal::Bool(_)) => {
-                self.add(self.strip_parens(expr.span), TOK_KEYWORD, 0);
             }
             ast::ExprKind::Lit(ast::Literal::Bytes(_)) => {
                 self.add(self.strip_parens(expr.span), TOK_STRING, 0);
@@ -608,8 +600,6 @@ impl<'a> TokenCollector<'a> {
                     }
                 }
             }
-            ast::ExprKind::RouteCompositeDecl { .. } => {}
-            // A view field's annotation and body are highlighted.
         }
     }
 

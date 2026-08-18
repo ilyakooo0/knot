@@ -849,10 +849,6 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             }
             s
         }
-        ExprKind::RouteCompositeDecl { name, components } => {
-            // `route Name = A | rec.B | …` — components may be field paths.
-            format!("route {} = {}", name, components.join(" | "))
-        }
         ExprKind::Serve { api, handlers, .. } => {
             let mut s = format!("serve {} where", api);
             // The first handler follows `where` directly; `;` only separates
@@ -922,7 +918,6 @@ fn render_literal(l: &Literal) -> String {
         }
         Literal::Text(s) => format!("\"{}\"", escape_text(s)),
         Literal::Bytes(bytes) => format!("b\"{}\"", escape_bytes(bytes)),
-        Literal::Bool(b) => if *b { "Bool.True {}".into() } else { "Bool.False {}".into() },
     }
 }
 

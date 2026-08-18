@@ -424,7 +424,6 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
         let tok_type = match &token.kind {
             TokenKind::Data
             | TokenKind::Type
-            | TokenKind::Route
             | TokenKind::Migrate
             | TokenKind::Where
             | TokenKind::Do
@@ -433,7 +432,6 @@ pub fn collect_keyword_operator_positions(tokens: &[knot::lexer::Token]) -> Vec<
             | TokenKind::Not
             | TokenKind::Full
             | TokenKind::Atomic
-            | TokenKind::Deriving
             | TokenKind::With
             | TokenKind::Refine
             | TokenKind::Serve
@@ -553,8 +551,7 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
         | ast::ExprKind::DataCtor { .. }
         | ast::ExprKind::SourceDecl { .. }
         | ast::ExprKind::SubsetConstraint { .. }
-        | ast::ExprKind::RouteDecl { .. }
-        | ast::ExprKind::RouteCompositeDecl { .. } => {}
+        | ast::ExprKind::RouteDecl { .. } => {}
     }
 }
 

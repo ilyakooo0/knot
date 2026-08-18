@@ -39,7 +39,7 @@ pub(crate) fn build_workspace_symbol_entries(
                 (name.clone(), SymbolKind::TYPE_PARAMETER, container)
             }
             ExprKind::SourceDecl { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
-            ExprKind::RouteDecl { name, .. } | ExprKind::RouteCompositeDecl { name, .. } => {
+            ExprKind::RouteDecl { name, .. } => {
                 (format!("route {name}"), SymbolKind::MODULE, None)
             }
             ExprKind::SubsetConstraint { .. } => continue,

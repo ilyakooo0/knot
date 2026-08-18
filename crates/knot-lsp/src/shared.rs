@@ -277,23 +277,11 @@ fn route_is_listened_inner(
         recurse_expr(expr, |e| walk(e, route_name, found, depth + 1));
     }
     for decl in top_fields(program) {
-        match &decl.value.node {
-            // A composite `route Api = A | B` that is itself listened/served
-            // wires in every component route.
-            ExprKind::RouteCompositeDecl { name, components }
-                if components.iter().any(|c| c == route_name)
-                    && route_is_listened_inner(program, name, visiting)
-                => {
-                    return true;
-                }
-            _ => {
-                // A named function field: walk its body.
-                let mut found = false;
-                walk(&decl.value, route_name, &mut found, 0);
-                if found {
-                    return true;
-                }
-            }
+        // A named function field: walk its body.
+        let mut found = false;
+        walk(&decl.value, route_name, &mut found, 0);
+        if found {
+            return true;
         }
     }
     false
@@ -624,7 +612,6 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
                 ast::Literal::Int(s) => s.clone(),
                 ast::Literal::Float(f) => format!("{f}"),
                 ast::Literal::Text(t) => format!("{t:?}"),
-                ast::Literal::Bool(b) => b.to_string(),
                 ast::Literal::Bytes(_) => return None,
             },
             ast::ExprKind::Var(n) => n.as_str().to_string(),

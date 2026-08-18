@@ -95,7 +95,11 @@ fn translate_one(pred: &ast::Expr, var: &Dynamic, is_real: bool) -> Option<Bool>
 /// of `&&`/`||`/`!`/comparison).
 fn bool_expr(e: &ast::Expr, param: &str, var: &Dynamic, is_real: bool) -> Option<Bool> {
     match &e.node {
-        ast::ExprKind::Lit(ast::Literal::Bool(b)) => Some(Bool::from_bool(*b)),
+        // `Bool.True {}` / `Bool.False {}` — Bool's constructors are the
+        // user-facing boolean constants (Bool is a compiler-special primitive).
+        ast::ExprKind::Constructor(name) if name == "True" || name == "False" => {
+            Some(Bool::from_bool(name == "True"))
+        }
         ast::ExprKind::Annot { expr, .. } => bool_expr(expr, param, var, is_real),
         ast::ExprKind::UnaryOp { op: ast::UnaryOp::Not, operand, .. } => {
             Some(bool_expr(operand, param, var, is_real)?.not())

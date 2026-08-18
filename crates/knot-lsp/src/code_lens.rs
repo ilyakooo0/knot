@@ -25,8 +25,7 @@ pub(crate) fn handle_code_lens(
         let decl_name = match &decl.value.node {
             ExprKind::SourceDecl { name, .. }
             | ExprKind::DataCtor { name, .. }
-            | ExprKind::RouteDecl { name, .. }
-            | ExprKind::RouteCompositeDecl { name, .. } => name.as_str(),
+            | ExprKind::RouteDecl { name, .. } => name.as_str(),
             ExprKind::SubsetConstraint { .. } => continue,
             _ => decl.name.as_str(),
         };

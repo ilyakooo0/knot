@@ -204,7 +204,6 @@ fn top_fields(program: &Expr) -> Vec<&ast::RecordField> {
 fn field_key(field: &ast::RecordField, index: usize) -> String {
     match &field.value.node {
         ExprKind::SubsetConstraint { .. } => format!("__subset#{index}"),
-        ExprKind::RouteCompositeDecl { name, .. } => format!("__route_comp:{name}"),
         _ => field.name.clone(),
     }
 }
@@ -248,7 +247,7 @@ fn hash_field_signature(field: &ast::RecordField) -> u64 {
         }
         // Data / route / etc.: shape *is* the signature — full hash.
         ExprKind::DataCtor { .. } | ExprKind::TypeCtor { .. }
-        | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. }
+        | ExprKind::RouteDecl { .. }
         | ExprKind::SubsetConstraint { .. } => return hash_field(field),
         _ => {
             // A named function field: hash the sig when present, else the body.
@@ -365,12 +364,6 @@ fn collect_field_deps(field: &ast::RecordField) -> HashSet<String> {
                 if let Some(rate_limit) = &entry.rate_limit {
                     collect_expr_names(rate_limit, &mut deps);
                 }
-            }
-        }
-        ExprKind::RouteCompositeDecl { name, components } => {
-            deps.insert(name.clone());
-            for comp in components {
-                deps.insert(comp.clone());
             }
         }
         ExprKind::SubsetConstraint { sub, sup } => {

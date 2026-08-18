@@ -7227,11 +7227,6 @@ impl Infer {
                 }
                 Ty::Record(ns_fields, None)
             }
-            ast::ExprKind::RouteCompositeDecl { .. } => {
-                // A route composite contributes no constructors of its own; it
-                // merges other routes' endpoints. It carries no value namespace.
-                Ty::unit()
-            }
         }
     }
 
@@ -8306,7 +8301,6 @@ impl Infer {
             ast::Literal::Float(_) => Ty::float_with_unit(UnitTy::var(self.fresh_unit_var())),
             ast::Literal::Text(_) => Ty::Text,
             ast::Literal::Bytes(_) => Ty::Bytes,
-            ast::Literal::Bool(_) => Ty::Bool,
         }
     }
 
@@ -8580,21 +8574,12 @@ impl Infer {
         let mut covered: HashSet<&str> = HashSet::new();
         let mut partial: HashSet<&str> = HashSet::new();
         for arm in arms {
-            match &arm.pat.node {
-                ast::PatKind::Constructor { name, payload, .. } => {
-                    if Self::pattern_is_irrefutable(payload) {
-                        covered.insert(name.as_str());
-                    } else {
-                        partial.insert(name.as_str());
-                    }
+            if let ast::PatKind::Constructor { name, payload, .. } = &arm.pat.node {
+                if Self::pattern_is_irrefutable(payload) {
+                    covered.insert(name.as_str());
+                } else {
+                    partial.insert(name.as_str());
                 }
-                ast::PatKind::Lit(ast::Literal::Bool(true)) => {
-                    covered.insert("True");
-                }
-                ast::PatKind::Lit(ast::Literal::Bool(false)) => {
-                    covered.insert("False");
-                }
-                _ => {}
             }
         }
         (covered, partial)
@@ -9684,94 +9669,19 @@ impl Infer {
 
         // Routes: register by name/path.
         for_each_route_marker(program, &mut |name, entries| {
-            if let Some(entries) = entries {
-                self.route_types.insert(name.to_string());
-                self.route_entries_by_api
-                    .insert(name.to_string(), entries.to_vec());
-                for entry in entries {
-                    if let Some(ref resp_ty) = entry.response_ty {
-                        self.fetch_response_types
-                            .insert(entry.constructor.clone(), resp_ty.clone());
-                    }
-                    self.fetch_response_headers
-                        .insert(entry.constructor.clone(), entry.response_headers.clone());
+            self.route_types.insert(name.to_string());
+            self.route_entries_by_api
+                .insert(name.to_string(), entries.to_vec());
+            for entry in entries {
+                if let Some(ref resp_ty) = entry.response_ty {
+                    self.fetch_response_types
+                        .insert(entry.constructor.clone(), resp_ty.clone());
                 }
-            } else {
-                self.route_types.insert(name.to_string());
+                self.fetch_response_headers
+                    .insert(entry.constructor.clone(), entry.response_headers.clone());
             }
         });
 
-        // Resolve composite routes: flatten their components' entries into
-        // `route_entries_by_api` so `serve` can find them by composite name.
-        // Composites may reference other composites declared in any order,
-        // so resolve to a fixpoint: a composite is flattened once all of its
-        // components have entries. Anything left after the fixpoint either
-        // references an unknown route or participates in a cycle — both get
-        // a diagnostic instead of silently dropping endpoints.
-        let mut composites: Vec<(String, Vec<String>, Span)> = Vec::new();
-        for_each_route_composite(program, &mut |name, components, span| {
-            composites.push((name.to_string(), components.to_vec(), span));
-        });
-        let composite_names: HashSet<String> =
-            composites.iter().map(|(n, _, _)| n.clone()).collect();
-        let mut pending = composites;
-        loop {
-            let mut progressed = false;
-            let mut still_pending = Vec::new();
-            for (name, components, span) in pending {
-                if components
-                    .iter()
-                    .all(|c| self.route_entries_by_api.contains_key(c))
-                {
-                    let mut combined = Vec::new();
-                    for comp in &components {
-                        if let Some(entries) =
-                            self.route_entries_by_api.get(comp)
-                        {
-                            combined.extend(entries.iter().cloned());
-                        }
-                    }
-                    self.route_entries_by_api.insert(name, combined);
-                    progressed = true;
-                } else {
-                    still_pending.push((name, components, span));
-                }
-            }
-            pending = still_pending;
-            if !progressed || pending.is_empty() {
-                break;
-            }
-        }
-        for (name, components, span) in pending {
-            let mut combined = Vec::new();
-            for comp in &components {
-                match self.route_entries_by_api.get(comp) {
-                    Some(entries) => combined.extend(entries.iter().cloned()),
-                    None => {
-                        if composite_names.contains(comp) || *comp == name {
-                            self.error(
-                                format!(
-                                    "cyclic route composition: route '{}' refers to '{}', which (directly or indirectly) refers back to it",
-                                    name, comp
-                                ),
-                                span,
-                            );
-                        } else {
-                            self.error(
-                                format!(
-                                    "route '{}' refers to '{}', which is not a declared route",
-                                    name, comp
-                                ),
-                                span,
-                            );
-                        }
-                    }
-                }
-            }
-            // Register the entries we could resolve so downstream `serve`
-            // checks produce fewer cascading errors.
-            self.route_entries_by_api.insert(name, combined);
-        }
 
         // Re-bind toJson/parseJson as unconstrained after trait processing.
         // The ToJSON/FromJSON traits register these methods with constraints,
@@ -12195,12 +12105,10 @@ impl Infer {
 
         // Routes: check field collisions and rate-limit exprs.
         for_each_route_marker(program, &mut |_name, entries| {
-            if let Some(entries) = entries {
-                for entry in entries {
-                    self.check_route_field_collisions(entry);
-                    if let Some(rate_limit_expr) = &entry.rate_limit {
-                        self.check_rate_limit_expr(entry, rate_limit_expr);
-                    }
+            for entry in entries {
+                self.check_route_field_collisions(entry);
+                if let Some(rate_limit_expr) = &entry.rate_limit {
+                    self.check_rate_limit_expr(entry, rate_limit_expr);
                 }
             }
         });
@@ -13034,7 +12942,7 @@ fn value_references_source_inner(
         ast::ExprKind::Lit(_)
         | ast::ExprKind::Constructor(_) => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
-        ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
+        ast::ExprKind::RouteDecl { .. } => false,
         ast::ExprKind::Record(fields) => fields.iter().any(|f| {
             value_references_source_inner(
                 &f.value, source_name, aliases, let_bindings, visited,
@@ -14351,7 +14259,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
         Lit(_) | Var(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) => {}
         TypeHole => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
-        RouteDecl { .. } | RouteCompositeDecl { .. } => {}
+        RouteDecl { .. } => {}
         Record(fields) => {
             for fl in fields {
                 f(&mut fl.value);
@@ -14796,7 +14704,6 @@ fn for_each_named_fn<'a>(
                     | ast::ExprKind::TypeCtor { .. }
                     | ast::ExprKind::SourceDecl { .. }
                     | ast::ExprKind::RouteDecl { .. }
-                    | ast::ExprKind::RouteCompositeDecl { .. }
                     | ast::ExprKind::SubsetConstraint { .. }
             ) {
                 f(&fl.name, fl.sig.as_ref(), Some(&fl.value));
@@ -14805,32 +14712,14 @@ fn for_each_named_fn<'a>(
     }
 }
 
-/// Visit every route marker: `route Name = …` (with entries) and route
-/// composites (`route Name = A | B`, `entries` = `None`).
+/// Visit every route declaration `route Name where …`: `(name, entries)`.
 fn for_each_route_marker<'a>(
     program: &'a ast::Expr,
-    f: &mut impl FnMut(&'a str, Option<&'a [ast::RouteEntry]>),
-) {
-    walk_exprs_read(program, &mut |e| match &e.node {
-        ast::ExprKind::RouteDecl { name, entries } => {
-            f(name, Some(entries));
-        }
-        ast::ExprKind::RouteCompositeDecl { name, .. } => {
-            f(name, None);
-        }
-        _ => {}
-    });
-}
-
-/// Visit every route composite (`route Name = A | B`):
-/// `(name, components, span)`.
-fn for_each_route_composite<'a>(
-    program: &'a ast::Expr,
-    f: &mut impl FnMut(&'a str, &'a [String], Span),
+    f: &mut impl FnMut(&'a str, &'a [ast::RouteEntry]),
 ) {
     walk_exprs_read(program, &mut |e| {
-        if let ast::ExprKind::RouteCompositeDecl { name, components } = &e.node {
-            f(name, components, e.span);
+        if let ast::ExprKind::RouteDecl { name, entries } = &e.node {
+            f(name, entries);
         }
     });
 }

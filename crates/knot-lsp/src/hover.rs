@@ -413,7 +413,6 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
 fn is_route_decl_name(program: &knot::ast::Expr, name: &str) -> bool {
     crate::utils::top_fields(program).iter().any(|decl| match &decl.value.node {
         knot::ast::ExprKind::RouteDecl { name: rn, .. } => rn == name,
-        knot::ast::ExprKind::RouteCompositeDecl { name: rn, .. } => rn == name,
         _ => false,
     })
 }

@@ -15,7 +15,6 @@ pub enum TokenKind {
     Float(f64),
     Text(String),
     Bytes(Vec<u8>),
-    Bool(bool),
 
     // Identifiers
     Lower(String),
@@ -24,7 +23,6 @@ pub enum TokenKind {
     // Keywords
     Data,
     Type,
-    Route,
     Serve,
     Migrate,
     Where,
@@ -34,7 +32,6 @@ pub enum TokenKind {
     Not,
     Full,
     Atomic,
-    Deriving,
     With,
     Refine,
     Forall,
@@ -85,8 +82,6 @@ pub enum TokenKind {
     Colon,
     Pipe,
     Backslash,
-    /// `\\/` — effect-row union in IO type syntax.
-    BackslashSlash,
     Ampersand,
     At,
     Underscore,
@@ -117,13 +112,10 @@ impl TokenKind {
             TokenKind::Float(_) => "float literal",
             TokenKind::Text(_) => "string literal",
             TokenKind::Bytes(_) => "byte string literal",
-            TokenKind::Bool(true) => "'true'",
-            TokenKind::Bool(false) => "'false'",
             TokenKind::Lower(_) => "identifier",
             TokenKind::Upper(_) => "type name",
             TokenKind::Data => "'data'",
             TokenKind::Type => "'type'",
-            TokenKind::Route => "'route'",
             TokenKind::Serve => "'serve'",
             TokenKind::Migrate => "'migrate'",
             TokenKind::Where => "'where'",
@@ -133,7 +125,6 @@ impl TokenKind {
             TokenKind::Not => "'not'",
             TokenKind::Full => "'full'",
             TokenKind::Atomic => "'atomic'",
-            TokenKind::Deriving => "'deriving'",
             TokenKind::With => "'with'",
             TokenKind::Refine => "'refine'",
             TokenKind::Forall => "'forall'",
@@ -170,7 +161,6 @@ impl TokenKind {
             TokenKind::Colon => "':'",
             TokenKind::Pipe => "'|'",
             TokenKind::Backslash => "'\\'",
-            TokenKind::BackslashSlash => "'\\/'",
             TokenKind::Ampersand => "'&'",
             TokenKind::At => "'@'",
             TokenKind::Underscore => "'_'",
@@ -189,7 +179,6 @@ impl TokenKind {
         match self {
             TokenKind::Data => Some("data"),
             TokenKind::Type => Some("type"),
-            TokenKind::Route => Some("route"),
             TokenKind::Serve => Some("serve"),
             TokenKind::Migrate => Some("migrate"),
             TokenKind::Where => Some("where"),
@@ -199,7 +188,6 @@ impl TokenKind {
             TokenKind::Not => Some("not"),
             TokenKind::Full => Some("full"),
             TokenKind::Atomic => Some("atomic"),
-            TokenKind::Deriving => Some("deriving"),
             TokenKind::With => Some("with"),
             TokenKind::Refine => Some("refine"),
             TokenKind::Forall => Some("forall"),
@@ -234,7 +222,6 @@ fn follows_prefix_minus(prev: &[Token]) -> bool {
                 | TokenKind::Float(_)
                 | TokenKind::Text(_)
                 | TokenKind::Bytes(_)
-                | TokenKind::Bool(_)
                 | TokenKind::Lower(_)
                 | TokenKind::Upper(_)
                 | TokenKind::RParen
@@ -619,13 +606,10 @@ impl<'src> Lexer<'src> {
                 "not" => return TokenKind::Not,
                 "full" => return TokenKind::Full,
                 "atomic" => return TokenKind::Atomic,
-                "deriving" => return TokenKind::Deriving,
                 "with" => return TokenKind::With,
                 "refine" => return TokenKind::Refine,
                 "forall" => return TokenKind::Forall,
                 "the" => return TokenKind::The,
-                "true" => return TokenKind::Bool(true),
-                "false" => return TokenKind::Bool(false),
                 _ => {}
             }
             TokenKind::Lower(text.to_owned())
@@ -1169,13 +1153,7 @@ impl<'src> Lexer<'src> {
             b'.' => TokenKind::Dot,
             b',' => TokenKind::Comma,
             b':' => TokenKind::Colon,
-            b'\\' => {
-                if self.eat(b'/') {
-                    TokenKind::BackslashSlash
-                } else {
-                    TokenKind::Backslash
-                }
-            }
+            b'\\' => TokenKind::Backslash,
             b'@' => TokenKind::At,
             b';' => TokenKind::Semicolon,
             b'?' => TokenKind::Question,

@@ -444,8 +444,7 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
         | ExprKind::DataCtor { .. }
         | ExprKind::SourceDecl { .. }
         | ExprKind::SubsetConstraint { .. }
-        | ExprKind::RouteDecl { .. }
-        | ExprKind::RouteCompositeDecl { .. } => {}
+        | ExprKind::RouteDecl { .. } => {}
     }
 }
 
@@ -1325,7 +1324,16 @@ fn synth_field(e: Expr, field: &str) -> Expr {
     )
 }
 
-/// `\v -> case v of Ctor {field: f} -> pred f | _ -> true`
+/// `Bool.True {}` / `Bool.False {}` — Bool's constructors are compiler-special
+/// boolean constants (codegen recognises the bare `True`/`False` constructor).
+fn synth_bool(truthy: bool, span: Span) -> Expr {
+    Spanned::new(
+        ExprKind::Constructor(if truthy { "True".into() } else { "False".into() }),
+        span,
+    )
+}
+
+/// `\v -> case v of Ctor {field: f} -> pred f | _ -> Bool.True {}`
 fn synth_ctor_field_case(ctor: &str, field: &str, pred: Expr, span: Span) -> Expr {
     let scrut_param = synth_fresh_name();
     let payload_param = synth_fresh_name();
@@ -1352,7 +1360,7 @@ fn synth_ctor_field_case(ctor: &str, field: &str, pred: Expr, span: Span) -> Exp
     };
     let pass_arm = CaseArm {
         pat: Spanned::new(PatKind::Wildcard, span),
-        body: Spanned::new(ExprKind::Lit(Literal::Bool(true)), span),
+        body: synth_bool(true, span),
     };
     let case = Spanned::new(
         ExprKind::Case {

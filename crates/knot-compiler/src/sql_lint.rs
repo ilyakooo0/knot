@@ -181,7 +181,7 @@ fn lint_expr(
         | ExprKind::ImplicitRef(_)
         | ExprKind::CollectFold(_)
         | ExprKind::TypeHole => {}
-        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
+        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } => {}
     }
 }
 
@@ -941,7 +941,7 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         | ExprKind::ImplicitRef(_)
         | ExprKind::CollectFold(_)
         | ExprKind::TypeHole => false,
-        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => false,
+        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } | ExprKind::RouteDecl { .. } => false,
         ExprKind::Record(fields) => fields.iter().any(|f| references_source(&f.value, source_name)),
         ExprKind::FieldAccess { expr, .. } => references_source(expr, source_name),
         ExprKind::List(elems) => elems.iter().any(|e| references_source(e, source_name)),
@@ -1177,7 +1177,7 @@ fn try_sql_column_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> 
             None
         }
         ExprKind::Lit(
-            Literal::Int(_) | Literal::Float(_) | Literal::Text(_) | Literal::Bool(_),
+            Literal::Int(_) | Literal::Float(_) | Literal::Text(_),
         ) => Some(()),
         ExprKind::Lit(_) => None,
         ExprKind::BinOp { op, lhs, rhs } => {

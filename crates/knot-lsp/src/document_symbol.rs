@@ -231,18 +231,6 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                     },
                 });
             }
-            ExprKind::RouteCompositeDecl { name, .. } => {
-                symbols.push(DocumentSymbol {
-                    name: format!("route {name}"),
-                    detail: Some("composite".into()),
-                    kind: SymbolKind::MODULE,
-                    tags: None,
-                    deprecated: None,
-                    range,
-                    selection_range,
-                    children: None,
-                });
-            }
             _ => {
                 // A named function field.
                 let name = &decl.name;

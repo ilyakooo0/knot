@@ -8,7 +8,7 @@
 //! - The `main` function (program entry point).
 //! - Names beginning with `_` (intentionally-unused convention).
 //! - Signature-only `Fun` decls (no body — interface stubs).
-//! - Trait, Impl, Route, RouteComposite, Migrate, SubsetConstraint
+//! - Trait, Impl, Route, Migrate, SubsetConstraint
 //!   (skipped because their "use" is implicit in the runtime, not a name reference).
 //!
 //! Operate on the user's parsed `&[Decl]` slice — call this *before* prelude
@@ -144,7 +144,6 @@ fn walk_decl(decl: &DeclView, r: &mut Refs) {
                 walk_route_entry(e, r);
             }
         }
-        DeclViewKind::RouteComposite { .. } => {}
         DeclViewKind::Subset { sub, sup } => {
             r.sources.insert(sub.relation.clone());
             r.sources.insert(sup.relation.clone());
@@ -221,7 +220,7 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         ExprKind::CollectFold(_) => {}
         ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
-        ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
+        ExprKind::RouteDecl { .. } => {}
         ExprKind::Var(name) => {
             r.values.insert(name.as_str().to_string());
         }

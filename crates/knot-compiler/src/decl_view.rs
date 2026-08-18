@@ -38,8 +38,6 @@ pub enum DeclViewKind<'a> {
     },
     /// `route Name where …`
     Route { entries: &'a [ast::RouteEntry] },
-    /// `route Name = A | B`
-    RouteComposite { components: &'a [String] },
     /// `*a <= *b` — a subset constraint.
     Subset {
         sub: &'a ast::RelationPath,
@@ -128,11 +126,6 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
                     name: fl.name.as_str(),
                     span: fl.value.span,
                     kind: DeclViewKind::Route { entries },
-                }),
-                RouteCompositeDecl { components, .. } => out.push(DeclView {
-                    name: fl.name.as_str(),
-                    span: fl.value.span,
-                    kind: DeclViewKind::RouteComposite { components },
                 }),
                 SubsetConstraint { sub, sup } => out.push(DeclView {
                     name: fl.name.as_str(),

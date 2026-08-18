@@ -344,17 +344,6 @@ pub enum ExprKind {
         entries: Vec<RouteEntry>,
     },
 
-    /// A `route Name = A | B` composite embedded in a record value literal
-    /// (`{route Api = TodoApi | AdminApi, …}`). Mirrors a top-level
-    /// route composite declaration; components may themselves be field paths
-    /// (e.g. `other.TodoApi`). The field is a pure marker, resolved to a
-    /// fixpoint during inference/codegen exactly like top-level composites.
-    RouteCompositeDecl {
-        /// Route name (e.g. `Api`), also the record field name.
-        name: Name,
-        /// Component route references, each a dotted path (`Api` or `rec.Api`).
-        components: Vec<String>,
-    },
 
     /// `serve Api where E1 = expr1; E2 = expr2; ...` — typed server value.
     /// Each handler is bound to a route endpoint constructor; the whole
@@ -396,7 +385,6 @@ pub enum Literal {
     Float(f64),
     Text(String),
     Bytes(Vec<u8>),
-    Bool(bool),
 }
 
 // ── Operators ──────────────────────────────────────────────────────

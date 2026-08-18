@@ -124,9 +124,6 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
                     }
                 }
             }
-            ExprKind::RouteCompositeDecl { name, .. } => {
-                resolver.define(name, name_span(name));
-            }
             _ => {
                 // A named function field: register its name and any extra
                 // signature/body-line occurrences.
@@ -205,26 +202,6 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
                     // used inside it so goto/find-references reach them.
                     if let Some(rl) = &entry.rate_limit {
                         resolver.resolve_expr(rl);
-                    }
-                }
-            }
-            ExprKind::RouteCompositeDecl { components, .. } => {
-                // `route Api = A | B` — each component names another route.
-                // Register each as a reference so goto/rename/highlight reach
-                // the composed routes. Start after `=` so the composite's own
-                // name token isn't mistaken for a component, and advance the
-                // cursor so repeated names each resolve to their own span.
-                let mut search_from = source
-                    .get(dspan.start..dspan.end.min(source.len()))
-                    .and_then(|t| t.find('='))
-                    .map(|p| dspan.start + p + 1)
-                    .unwrap_or(dspan.start);
-                for comp in components {
-                    if let Some(span) =
-                        find_word_in_source(source, comp, search_from, dspan.end)
-                    {
-                        search_from = span.end;
-                        resolver.add_ref(span, comp);
                     }
                 }
             }
@@ -545,7 +522,6 @@ impl<'a> DefResolver<'a> {
                     ast::Literal::Int(_) => "Int",
                     ast::Literal::Float(_) => "Float",
                     ast::Literal::Text(_) => "Text",
-                    ast::Literal::Bool(_) => "Bool",
                     ast::Literal::Bytes(_) => "Bytes",
                 };
                 self.literals.push((expr.span, ty.to_string()));
@@ -610,8 +586,6 @@ impl<'a> DefResolver<'a> {
                     }
                 }
             }
-            ast::ExprKind::RouteCompositeDecl { .. } => {}
-            // A view field's annotation and body are both navigable.
         }
     }
 }
@@ -682,9 +656,6 @@ pub fn build_details(program: &Expr) -> HashMap<String, String> {
             }
             ExprKind::RouteDecl { name, .. } => {
                 details.insert(name.clone(), format!("route {name}"));
-            }
-            ExprKind::RouteCompositeDecl { name, components, .. } => {
-                details.insert(name.clone(), format!("route {name} = {}", components.join(" | ")));
             }
             _ => {
                 // A named function field, type-first: `Sig  name`.

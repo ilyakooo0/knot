@@ -46,8 +46,7 @@ fn build_selection_range(program: &ast::Expr, source: &str, offset: usize) -> Se
             spans.push(dspan);
             match &decl.value.node {
                 ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-                | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-                | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+                | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
                 _ => {
                     // A named function field.
                     collect_containing_spans(&decl.value, offset, &mut spans);

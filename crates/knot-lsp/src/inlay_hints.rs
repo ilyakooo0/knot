@@ -70,8 +70,7 @@ pub(crate) fn handle_inlay_hint(
         // Classify the field: marker vs named-function, and whether it has a sig.
         let (fname, fsig, is_relation_marker) = match &decl.value.node {
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => continue,
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => continue,
             _ => (decl.name.as_str(), decl.sig.as_ref(), false),
         };
         if let (name, None, marker) = (fname, fsig, is_relation_marker)
@@ -337,8 +336,7 @@ fn add_closing_label_hints(
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => collect(&decl.value, &doc.source, &mut spans),
         }
     }
@@ -511,8 +509,7 @@ fn add_record_pattern_field_hints(
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => walk_expr(&decl.value, &doc.source, &mut record_pats),
         }
     }
@@ -691,8 +688,7 @@ fn add_unit_literal_hints(
     fn collect_literals_in_decl(decl: &ast::RecordField, out: &mut Vec<(Span, ast::Expr)>) {
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => {
                 walk_for_unit_bindings(&decl.value, out);
             }
@@ -835,8 +831,7 @@ fn add_parameter_name_hints(
     ) {
         let body = match &decl.value.node {
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
             _ => &decl.value,
         };
         let mut shadowed = std::collections::HashSet::new();
@@ -1073,8 +1068,7 @@ fn add_monad_context_hints(
     ) {
         let body = match &decl.value.node {
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
             _ => &decl.value,
         };
         walk(body, doc, range_start, range_end, hints);
@@ -1181,8 +1175,7 @@ fn add_constraint_hints(
     ) {
         let body = match &decl.value.node {
             ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. }
-            | ast::ExprKind::RouteCompositeDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
+            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
             _ => &decl.value,
         };
         walk(body, doc, range_start, range_end, hints);

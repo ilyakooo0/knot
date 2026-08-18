@@ -33,8 +33,7 @@ pub(crate) fn handle_folding_range(
         // Fold sub-expressions within declarations
         match &decl.value.node {
             ExprKind::SourceDecl { .. } | ExprKind::DataCtor { .. }
-            | ExprKind::TypeCtor { .. } | ExprKind::RouteDecl { .. }
-            | ExprKind::RouteCompositeDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
+            | ExprKind::TypeCtor { .. } | ExprKind::RouteDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
             _ => {
                 // A named function field.
                 collect_folding_ranges_expr(&decl.value, &doc.source, &mut ranges);

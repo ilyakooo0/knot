@@ -701,7 +701,6 @@ fn format_literal_display(lit: &ast::Literal) -> Option<String> {
             let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
             Some(format!("\"{}\"", escaped))
         }
-        ast::Literal::Bool(b) => Some(if *b { "true" } else { "false" }.to_string()),
         ast::Literal::Bytes(_) => None,
     }
 }
@@ -2586,10 +2585,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             self.global_fns.insert("base".to_string(), (func_id, 0));
         }
 
-        // Composite route declarations (`route Name = A | B`), resolved to a
-        // fixpoint after the declaration loop (see below).
-        let mut composite_routes: Vec<(String, Vec<String>)> = Vec::new();
-
         for decl in decl_views(program) {
             let name = decl.name;
             match decl.kind {
@@ -2660,50 +2655,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             .insert(entry.constructor.clone(), entry.clone());
                     }
                 }
-                DeclViewKind::RouteComposite { components } => {
-                    // Deferred: resolved to a fixpoint after the loop so
-                    // composition is order-independent (a composite may
-                    // reference a route declared later in the file).
-                    composite_routes.push((name.to_string(), components.to_vec()));
-                }
                 _ => {}
             }
-        }
-
-        // Resolve composite routes to a fixpoint. The type checker already
-        // rejects unknown components and cycles; the bounded loop below
-        // simply stops when no further composite can be expanded.
-        let mut passes = composite_routes.len() + 1;
-        while !composite_routes.is_empty() && passes > 0 {
-            passes -= 1;
-            let mut still_pending = Vec::new();
-            for (name, components) in composite_routes {
-                if components
-                    .iter()
-                    .all(|c| self.route_entries.contains_key(c))
-                {
-                    let mut all = Vec::new();
-                    for comp in &components {
-                        all.extend_from_slice(&self.route_entries[comp]);
-                    }
-                    self.route_entries.insert(name, all);
-                } else {
-                    still_pending.push((name, components));
-                }
-            }
-            composite_routes = still_pending;
-        }
-        // Anything left references unknown or cyclic routes (already
-        // diagnosed by inference) — register what resolves so downstream
-        // lookups don't panic.
-        for (name, components) in composite_routes {
-            let mut all = Vec::new();
-            for comp in &components {
-                if let Some(entries) = self.route_entries.get(comp) {
-                    all.extend_from_slice(entries);
-                }
-            }
-            self.route_entries.insert(name, all);
         }
 
         // Detect user functions that produce IO values (fixed-point iteration)
@@ -5992,7 +5945,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.call_rt(builder, "knot_value_unit", &[])
             }
 
-            ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {
+            ast::ExprKind::RouteDecl { .. } => {
                 // An embedded route declaration is a static marker: the
                 // route's entries are registered statically (path-keyed) and
                 // the serving table is built in `main` from the registered
@@ -6107,7 +6060,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             CollectFold(_) => true,
             TypeHole => true,
             // A route declaration marker carries no value and never writes.
-            RouteDecl { .. } | RouteCompositeDecl { .. } => true,
+            RouteDecl { .. } => true,
             Atomic(inner) | Refine(inner) => {
                 self.collect_direct_write_targets(inner, out)
             }
@@ -12605,10 +12558,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let (ptr, len) = self.bytes_ptr(builder, b);
                 self.call_rt(builder, "knot_value_bytes", &[ptr, len])
             }
-            ast::Literal::Bool(b) => {
-                let val = builder.ins().iconst(types::I32, *b as i64);
-                self.call_rt(builder, "knot_value_bool", &[val])
-            }
         }
     }
 
@@ -12918,7 +12867,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             | ast::ExprKind::Var(_)
             | ast::ExprKind::Constructor(_) => false,
             ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
-            ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
+            ast::ExprKind::RouteDecl { .. } => false,
             ast::ExprKind::Record(fields) => {
                 fields.iter().any(|f| Self::references_source(&f.value, source_name))
             }
@@ -14127,7 +14076,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             return match lit {
                 ast::Literal::Int(s) => Some(s.clone()),
                 ast::Literal::Float(f) => Some(format!("{}", f)),
-                ast::Literal::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
                 ast::Literal::Text(t) => Some(format!("'{}'", t.replace('\'', "''"))),
                 ast::Literal::Bytes(_) => None,
             };
@@ -16082,10 +16030,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let one = builder.ins().iconst(types::I32, 1);
                 builder.ins().isub(one, inner)
             }
-            // Bool literal: return constant i32 directly, no allocation
-            ast::ExprKind::Lit(ast::Literal::Bool(b)) => {
-                builder.ins().iconst(types::I32, *b as i64)
-            }
             // Fall back: compile as boxed Value, then unbox
             _ => {
                 let val = self.compile_expr(builder, expr, env, db);
@@ -16118,7 +16062,6 @@ fn expr_is_promote_safe(expr: &ast::Expr) -> bool {
             ast::Literal::Int(s) => {
                 s.parse::<i64>().is_ok_and(|n| (-128..=127).contains(&n))
             }
-            ast::Literal::Bool(_) => true,
             ast::Literal::Float(f) => {
                 f.to_bits() == 0.0_f64.to_bits() || *f == 1.0
             }
@@ -17582,7 +17525,7 @@ fn beta_reduce_inner(
         }
         ImplicitRef(_) | CollectFold(_) | TypeHole => expr.node.clone(),
         SubsetConstraint { .. } => expr.node.clone(),
-        RouteDecl { .. } | RouteCompositeDecl { .. } => expr.node.clone(),
+        RouteDecl { .. } => expr.node.clone(),
         With { record, body, types } => {
             let r = beta_reduce_inner(record, fun_bodies, let_bindings, visited, fuel);
             let b = beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel);
@@ -17713,7 +17656,7 @@ fn substitute_inner(
     let new_node = match &expr.node {
         Var(name) if name == var => return Some(value.clone()),
         Var(_) | Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {
+        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } => {
             return Some(expr.clone())
         }
         Lambda { params, ty_params, body, .. } => {
@@ -17816,7 +17759,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     match &expr.node {
         Var(name) => name == var,
         Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => false,
+        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } => false,
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
         FieldAccess { expr: e, .. } => expr_mentions_var(e, var),
         List(items) => items.iter().any(|e| expr_mentions_var(e, var)),
@@ -17864,7 +17807,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             }
         }
         Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } | RouteCompositeDecl { .. } => {}
+        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } => {}
         Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
             for p in params {
@@ -18206,7 +18149,6 @@ fn try_sql_arithmetic_expr(
             ast::Literal::Int(n) => Some(n.to_string()),
             ast::Literal::Float(f) => Some(f.to_string()),
             ast::Literal::Text(s) => Some(format!("'{}'", s.replace('\'', "''"))),
-            ast::Literal::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
             _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
@@ -18385,7 +18327,6 @@ pub(crate) fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str
             // A bool literal is emitted as SQL `1`/`0`; it must be typed
             // `bool` (not `int`) so the column reads back through
             // `ColType::Bool` -> `Value::Bool`, matching the bool-column path.
-            ast::Literal::Bool(_) => Some("bool".to_string()),
             _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
@@ -18449,7 +18390,6 @@ fn try_multi_table_arithmetic_expr(
             ast::Literal::Int(n) => Some(n.to_string()),
             ast::Literal::Float(f) => Some(f.to_string()),
             ast::Literal::Text(s) => Some(format!("'{}'", s.replace('\'', "''"))),
-            ast::Literal::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
             _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
@@ -18505,7 +18445,6 @@ fn infer_multi_table_sql_expr_type(
             // A bool literal is emitted as SQL `1`/`0`; it must be typed
             // `bool` (not `int`) so the column reads back through
             // `ColType::Bool` -> `Value::Bool`, matching the bool-column path.
-            ast::Literal::Bool(_) => Some("bool".to_string()),
             _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
@@ -18934,7 +18873,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::SourceRef { .. } => {}
         ast::ExprKind::SourceDecl { .. } => {}
         ast::ExprKind::SubsetConstraint { .. } => {}
-        ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => {}
+        ast::ExprKind::RouteDecl { .. } => {}
         ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::CollectFold(_) => {}
         ast::ExprKind::TypeHole => {}
@@ -19093,7 +19032,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::TypeHole => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
-        ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
+        ast::ExprKind::RouteDecl { .. } => false,
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
         ast::ExprKind::With { record, body, .. } => {
@@ -19182,7 +19121,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::TypeHole => false,
         ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
-        ast::ExprKind::RouteDecl { .. } | ast::ExprKind::RouteCompositeDecl { .. } => false,
+        ast::ExprKind::RouteDecl { .. } => false,
         // `var.field` is a ROW use, not a value use — the whole point of this
         // walker. A field access on anything else still recurses (`f x . name`
         // may well pass `var` to `f`), as does a nested base (`var.a.b` has
@@ -19519,7 +19458,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
             };
             format!("{} <= {}", path(sub), path(sup))
         }
-        ast::ExprKind::RouteDecl { name, .. } | ast::ExprKind::RouteCompositeDecl { name, .. } => {
+        ast::ExprKind::RouteDecl { name, .. } => {
             format!("route {}", name)
         }
         ast::ExprKind::SourceRef { name, .. } => format!("*{}", name),
@@ -19657,7 +19596,6 @@ fn pretty_lit(lit: &ast::Literal) -> String {
             let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
             format!("b\"{}\"", hex)
         }
-        ast::Literal::Bool(b) => if *b { "true" } else { "false" }.to_string(),
     }
 }
 
@@ -20028,7 +19966,6 @@ pub(crate) enum CompileLit {
     Int(i64),
     Float(f64),
     Text(String),
-    Bool(bool),
 }
 
 impl CompileLit {
@@ -20037,7 +19974,6 @@ impl CompileLit {
             CompileLit::Int(n) => n.to_string(),
             CompileLit::Float(f) => f.to_string(),
             CompileLit::Text(s) => format!("{:?}", s),
-            CompileLit::Bool(b) => b.to_string(),
         }
     }
 }
@@ -20048,7 +19984,6 @@ pub(crate) fn extract_literal(expr: &ast::Expr) -> Option<CompileLit> {
         ast::ExprKind::Lit(ast::Literal::Int(s)) => s.parse::<i64>().ok().map(CompileLit::Int),
         ast::ExprKind::Lit(ast::Literal::Float(f)) => Some(CompileLit::Float(*f)),
         ast::ExprKind::Lit(ast::Literal::Text(s)) => Some(CompileLit::Text(s.clone())),
-        ast::ExprKind::Lit(ast::Literal::Bool(b)) => Some(CompileLit::Bool(*b)),
         ast::ExprKind::Annot { expr, .. } => extract_literal(expr),
         _ => None,
     }
@@ -20119,7 +20054,6 @@ pub(crate) fn eval_refine_predicate_pub(pred: &ast::Expr, lit: &CompileLit) -> O
 /// evaluated (e.g. references a variable other than `param_name`).
 fn eval_expr_bool(expr: &ast::Expr, lit: &CompileLit, param_name: &str) -> Option<bool> {
     match &expr.node {
-        ast::ExprKind::Lit(ast::Literal::Bool(b)) => Some(*b),
         ast::ExprKind::BinOp { op, lhs, rhs, .. } => {
             // Boolean connectives operate on booleans, not numbers — handle
             // them before the numeric comparison path so `x >= 0 && x <= 10`

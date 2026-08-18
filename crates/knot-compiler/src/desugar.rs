@@ -532,7 +532,7 @@ fn elaborate_implicit_dicts(body: &mut Expr, ty: &mut Option<TypeScheme>) -> Vec
     }
     for (field, _, _) in implicit.iter().rev() {
         let dict = dict_param_name(field);
-        let placeholder = Spanned::new(ExprKind::Lit(Literal::Bool(false)), span);
+        let placeholder = Spanned::new(ExprKind::Record(vec![]), span);
         let old_body = std::mem::replace(body, placeholder);
         *body = Spanned::new(
             ExprKind::Lambda {
@@ -723,7 +723,7 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
         | ExprKind::SourceRef { .. } | ExprKind::ImplicitRef(_) | ExprKind::CollectFold(_) | ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
         ExprKind::SubsetConstraint { .. } => {}
-        ExprKind::RouteDecl { .. } | ExprKind::RouteCompositeDecl { .. } => {}
+        ExprKind::RouteDecl { .. } => {}
         ExprKind::Record(fields) => {
             for f in fields {
                 desugar_expr(&mut f.value, io_fns, source_vars);
@@ -1418,17 +1418,27 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
         }
 
         StmtKind::Where { cond } => {
-            // App(App(__bind, \_ -> rest), case cond of true -> __yield({}); false -> __empty)
+            // App(App(__bind, \_ -> rest), case cond of Bool.True {} -> __yield({}); Bool.False {} -> __empty)
+            let bool_pat = |truthy: bool| {
+                spanned(
+                    PatKind::Constructor {
+                        name: if truthy { "True".into() } else { "False".into() },
+                        payload: Box::new(spanned(PatKind::Record(vec![]), span)),
+                        qualifier: Some("Bool".into()),
+                    },
+                    span,
+                )
+            };
             let guard = spanned(
                 ExprKind::Case {
                     scrutinee: Box::new(cond.clone()),
                     arms: vec![
                         CaseArm {
-                            pat: spanned(PatKind::Lit(Literal::Bool(true)), span),
+                            pat: bool_pat(true),
                             body: mk_yield(spanned(ExprKind::Record(vec![]), span), span),
                         },
                         CaseArm {
-                            pat: spanned(PatKind::Lit(Literal::Bool(false)), span),
+                            pat: bool_pat(false),
                             body: mk_empty(span),
                         },
                     ],

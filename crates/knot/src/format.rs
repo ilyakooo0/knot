@@ -108,10 +108,10 @@ fn render_constructor(c: &ConstructorDef) -> String {
     s.push_str(" {");
     for (i, f) in c.fields.iter().enumerate() {
         if i > 0 {
-            s.push_str(", ");
+            s.push(' ');
         }
         s.push_str(&f.name);
-        s.push_str(": ");
+        s.push(' ');
         s.push_str(&render_type(&f.value));
     }
     s.push('}');
@@ -124,10 +124,10 @@ fn render_route_entry(p: &mut Printer, e: &RouteEntry) {
         p.write(" {");
         for (i, f) in e.body_fields.iter().enumerate() {
             if i > 0 {
-                p.write(", ");
+                p.write(" ");
             }
             p.write(&f.name);
-            p.write(": ");
+            p.write(" ");
             p.write(&render_type(&f.value));
         }
         p.write("}");
@@ -143,7 +143,7 @@ fn render_route_entry(p: &mut Printer, e: &RouteEntry) {
                 PathSegment::Param { name, ty } => {
                     p.write("{");
                     p.write(name);
-                    p.write(": ");
+                    p.write(" ");
                     p.write(&render_type(ty));
                     p.write("}");
                 }
@@ -154,10 +154,10 @@ fn render_route_entry(p: &mut Printer, e: &RouteEntry) {
         p.write("?{");
         for (i, f) in e.query_params.iter().enumerate() {
             if i > 0 {
-                p.write(", ");
+                p.write(" ");
             }
             p.write(&f.name);
-            p.write(": ");
+            p.write(" ");
             p.write(&render_type(&f.value));
         }
         p.write("}");
@@ -166,10 +166,10 @@ fn render_route_entry(p: &mut Printer, e: &RouteEntry) {
         p.write(" headers {");
         for (i, f) in e.request_headers.iter().enumerate() {
             if i > 0 {
-                p.write(", ");
+                p.write(" ");
             }
             p.write(&f.name);
-            p.write(": ");
+            p.write(" ");
             p.write(&render_type(&f.value));
         }
         p.write("}");
@@ -182,10 +182,10 @@ fn render_route_entry(p: &mut Printer, e: &RouteEntry) {
         p.write(" headers {");
         for (i, f) in e.response_headers.iter().enumerate() {
             if i > 0 {
-                p.write(", ");
+                p.write(" ");
             }
             p.write(&f.name);
-            p.write(": ");
+            p.write(" ");
             p.write(&render_type(&f.value));
         }
         p.write("}");
@@ -568,13 +568,22 @@ fn forces_multiline(e: &Expr) -> bool {
         ExprKind::Lambda { body, .. } => forces_multiline(body),
         ExprKind::App { func, arg } => forces_multiline(func) || forces_multiline(arg),
         ExprKind::Set { value, .. } | ExprKind::FullSet { value, .. } => forces_multiline(value),
-        // A record field with an explicit type signature must render as a
-        // separate type-first sig line (`Type  name`) above the `name value`
-        // field — collapsing it inline merges the sig and the value into an
-        // ambiguous single line. Force block layout.
+        // A record carrying an embedded declaration — a type-first sig
+        // (`Type  name`), a source decl (`Rel T  *name`), or a `type`/`data`
+        // alias — must render as a block: inline, the declaration merges with
+        // the surrounding fields into an ambiguous single line that fails to
+        // reparse. Force block layout.
         ExprKind::Record(fields) => {
-            fields.iter().any(|f| f.sig.is_some())
-                || fields.iter().any(|f| forces_multiline(&f.value))
+            fields.iter().any(|f| {
+                f.sig.is_some()
+                    || matches!(
+                        f.value.node,
+                        ExprKind::SourceDecl { .. }
+                            | ExprKind::TypeCtor { .. }
+                            | ExprKind::DataCtor { .. }
+                    )
+                    || forces_multiline(&f.value)
+            })
         }
         ExprKind::With { record, body, .. } => {
             forces_multiline(record) || forces_multiline(body)
@@ -1176,13 +1185,39 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
                 p.write(")");
             }
         }
-        // `with {record} body` forced multiline (e.g. a sig'd field): render the
-        // record as a block so each `Type  name` sig line gets its own line.
-        ExprKind::With { record, body, .. } => {
+        // `with {record} body` forced multiline (a sig'd/source/alias field):
+        // render the record as a block so each declaration gets its own line.
+        ExprKind::With { record, body, types } => {
+            let need_parens = parent > Prec::Lowest;
+            if need_parens {
+                p.write("(");
+            }
             p.write("with ");
-            render_expr(p, record, Prec::Atom);
+            match &record.node {
+                ExprKind::Record(fields) => {
+                    // Re-emit any type imports (`with {Maybe}`) as leading bare
+                    // type names inside the block record.
+                    if !types.is_empty() {
+                        p.write("{");
+                        for (i, t) in types.iter().enumerate() {
+                            if i > 0 {
+                                p.write(" ");
+                            }
+                            p.write(t);
+                        }
+                        p.write(" ");
+                        render_record_block(p, fields);
+                    } else {
+                        render_record_block(p, fields);
+                    }
+                }
+                _ => render_expr(p, record, Prec::Atom),
+            }
             p.write(" ");
             render_expr(p, body, Prec::Lowest);
+            if need_parens {
+                p.write(")");
+            }
         }
         _ => p.write(&render_expr_inline(e, parent)),
     }

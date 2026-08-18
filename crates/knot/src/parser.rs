@@ -3917,12 +3917,15 @@ impl Parser {
             // extend the type application and silently swallow the next decl.
             let next_starts_decl = matches!(self.peek(), TokenKind::Lower(_))
                 && matches!(self.peek_ahead(1), TokenKind::Eq | TokenKind::Colon);
-            // While parsing a record VALUE literal's `name : Type` sig line, a
-            // lowercase token on the next line is the field's value
-            // (`name value`), never a type argument — stop regardless of what
-            // follows it.
+            // While parsing a record VALUE literal's sig line or a `type` alias
+            // body, a token on the NEXT line that begins a following field is
+            // never a type argument — stop regardless of what follows it. A
+            // lowercase token is the field's value (`name value`); `Rel` begins
+            // a type-first source declaration (`Rel T  *name`), which the
+            // tall-gap source speculation in the field loop picks up.
             let next_is_value_field = self.record_value_sig_type
-                && matches!(self.peek(), TokenKind::Lower(_));
+                && (matches!(self.peek(), TokenKind::Lower(_))
+                    || matches!(&self.peek(), TokenKind::Upper(n) if n == "Rel"));
             // While parsing an `api` route's response type, a leading `Upper`
             // on the next line is the next route's constructor name, never a
             // type argument — stop regardless of indentation.

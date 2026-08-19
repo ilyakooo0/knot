@@ -2415,6 +2415,25 @@ impl Parser {
                     self.error("expected type after '=' in record type alias");
                     return None;
                 };
+                // A single-constructor variant `type X = Ctor {…}` (no `|`):
+                // the body parses as `App(Named(Upper), Record)` (a type
+                // application), but the alias name `X` anchors the variant
+                // reading, so reinterpret it as a one-constructor `Variant`.
+                // Multi-constructor `A {} | B {}` is already a `Variant` from
+                // `parse_type_union`. Other bodies (records, applications like
+                // `Maybe (Int 1)`) are untouched.
+                let ty = match spine_as_constructor(&ty) {
+                    Some(ctor) if !matches!(ty.node, TypeKind::Variant { .. }) => {
+                        Spanned::new(
+                            TypeKind::Variant {
+                                constructors: vec![ctor],
+                                rest: None,
+                            },
+                            ty.span,
+                        )
+                    }
+                    _ => ty,
+                };
                 let ty_end = ty.span.end;
                 fields.push(RecordField {
                     name: tname.clone(),

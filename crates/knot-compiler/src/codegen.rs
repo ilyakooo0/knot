@@ -2644,20 +2644,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // a representation mismatch with null-encoded in-memory values
                     // that breaks equality and pattern matching.
                 }
-                DeclViewKind::TypeAlias { params: [], ty } => {
-                    // A structural variant alias (`type X = A {} | B {}`) needs
-                    // its constructors registered exactly like a `data` decl so
-                    // `X.Ctor` / bare-ctor FieldAccess arms route correctly. The
-                    // type is erased (no runtime `X` value), same as `data`.
-                    if let ast::TypeKind::Variant { constructors, .. } = &ty.node {
-                        let ctor_names: Vec<String> =
-                            constructors.iter().map(|c| c.name.clone()).collect();
-                        self.data_constructors.insert(name.to_string(), ctor_names);
-                        for c in constructors {
-                            self.embedded_ctors.insert(c.name.clone());
-                        }
-                    }
-                }
                 DeclViewKind::Route { entries } => {
                     self.route_entries.insert(name.to_string(), entries.to_vec());
                     // Last route entry (in source declaration order) with a
@@ -5927,9 +5913,21 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.compile_serve(builder, api, handlers, expr.span, env, db)
             }
 
-            ast::ExprKind::TypeCtor { .. } => {
+            ast::ExprKind::TypeCtor { name, ty, .. } => {
                 // A first-class type constructor is fully erased at runtime:
-                // it has no value content, so it compiles to unit.
+                // it has no value content, so it compiles to unit. But a
+                // variant alias (`type X = A {} | B {}`) keeps its constructors
+                // reachable through field access (`X.Ctor`), exactly like an
+                // embedded `data` decl — register them so the FieldAccess /
+                // compile_app arms emit the constructor value directly.
+                if let ast::TypeKind::Variant { constructors, .. } = &ty.node {
+                    let ctor_names: Vec<String> =
+                        constructors.iter().map(|c| c.name.clone()).collect();
+                    self.data_constructors.insert(name.clone(), ctor_names);
+                    for c in constructors {
+                        self.embedded_ctors.insert(c.name.clone());
+                    }
+                }
                 self.call_rt(builder, "knot_value_unit", &[])
             }
 

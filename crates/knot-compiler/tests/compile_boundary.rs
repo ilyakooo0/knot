@@ -1,7 +1,7 @@
 //! Compile-boundary ADT subsumption: `base.compile`'s expected-type check,
 //! driven through the public `check_with_expected` / `take_subsumption_verdict`
 //! seam the JIT uses. Each test parses a snippet program and subsumes its body
-//! type against an expected payload (host `data` decls + a trailing type),
+//! type against an expected payload (host `type` decls + a trailing type),
 //! asserting the verdict.
 //!
 //! Verdict: `Some(true)` accept, `Some(false)` reject, `None` no-check
@@ -79,8 +79,8 @@ fn polymorphic_lambda_subsumes_identity() {
 fn adt_fieldless_identical_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\n}\n(Priority.High {})",
-            "data Priority = Low {} | High {}\nPriority"
+            "with {\ntype Priority = Low {} | High {}\n}\n(Priority.High {})",
+            "type Priority = Low {} | High {}\nPriority"
         ),
         Some(true)
     );
@@ -92,8 +92,8 @@ fn adt_fieldless_identical_accepted() {
 fn adt_fieldless_extra_snippet_ctor_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {} | Medium {}\n}\n(Priority.Medium {})",
-            "data Priority = Low {} | High {}\nPriority"
+            "with {\ntype Priority = Low {} | High {} | Medium {}\n}\n(Priority.Medium {})",
+            "type Priority = Low {} | High {}\nPriority"
         ),
         Some(false)
     );
@@ -105,23 +105,23 @@ fn adt_fieldless_extra_snippet_ctor_rejected() {
 fn adt_fieldless_narrower_snippet_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {}\n}\n(Priority.Low {})",
-            "data Priority = Low {} | High {}\nPriority"
+            "with {\ntype Priority = Low {}\n}\n(Priority.Low {})",
+            "type Priority = Low {} | High {}\nPriority"
         ),
         Some(true)
     );
 }
 
 // ── Nested ADT (ADT with an ADT payload field) ──────────────────────────────
-// The host's `data Task` decl references `Priority`; both decls must travel so
+// The host's `type Task` decl references `Priority`; both decls must travel so
 // the JIT can resolve the payload and recurse the ctor-set check into it.
 
 #[test]
 fn adt_nested_identical_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Task = Todo {pri Priority}\n}\n(Task.Todo {pri (Priority.High {})})",
-            "data Priority = Low {} | High {}\ndata Task = Todo {pri Priority}\nTask"
+            "with {\ntype Priority = Low {} | High {}\ntype Task = Todo {pri Priority}\n}\n(Task.Todo {pri (Priority.High {})})",
+            "type Priority = Low {} | High {}\ntype Task = Todo {pri Priority}\nTask"
         ),
         Some(true)
     );
@@ -133,8 +133,8 @@ fn adt_nested_identical_accepted() {
 fn adt_nested_extra_inner_ctor_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {} | Medium {}\ndata Task = Todo {pri Priority}\n}\n(Task.Todo {pri (Priority.Medium {})})",
-            "data Priority = Low {} | High {}\ndata Task = Todo {pri Priority}\nTask"
+            "with {\ntype Priority = Low {} | High {} | Medium {}\ntype Task = Todo {pri Priority}\n}\n(Task.Todo {pri (Priority.Medium {})})",
+            "type Priority = Low {} | High {}\ntype Task = Todo {pri Priority}\nTask"
         ),
         Some(false)
     );
@@ -146,8 +146,8 @@ fn adt_nested_extra_inner_ctor_rejected() {
 fn adt_nested_narrower_inner_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {}\ndata Task = Todo {pri Priority}\n}\n(Task.Todo {pri (Priority.Low {})})",
-            "data Priority = Low {} | High {}\ndata Task = Todo {pri Priority}\nTask"
+            "with {\ntype Priority = Low {}\ntype Task = Todo {pri Priority}\n}\n(Task.Todo {pri (Priority.Low {})})",
+            "type Priority = Low {} | High {}\ntype Task = Todo {pri Priority}\nTask"
         ),
         Some(true)
     );
@@ -159,8 +159,8 @@ fn adt_nested_narrower_inner_accepted() {
 fn adt_scalar_payload_match_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {n (Int 1)}\n}\n(Wrap.W {n 7})",
-            "data Wrap = W {n (Int 1)}\nWrap"
+            "with {\ntype Priority = Low {} | High {}\ntype Wrap = W {n (Int 1)}\n}\n(Wrap.W {n 7})",
+            "type Wrap = W {n (Int 1)}\nWrap"
         ),
         Some(true)
     );
@@ -170,8 +170,8 @@ fn adt_scalar_payload_match_accepted() {
 fn adt_scalar_payload_mismatch_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {n Text}\n}\n(Wrap.W {n \"x\"})",
-            "data Wrap = W {n (Int 1)}\nWrap"
+            "with {\ntype Priority = Low {} | High {}\ntype Wrap = W {n Text}\n}\n(Wrap.W {n \"x\"})",
+            "type Wrap = W {n (Int 1)}\nWrap"
         ),
         Some(false)
     );
@@ -187,8 +187,8 @@ fn adt_contravariant_host_wider_rejected() {
     // Host may pass {Low, High, Medium}; the snippet matches only {Low, High}.
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\n}\n(\\p -> case p of\n  Priority.Low {} -> \"l\"\n  Priority.High {} -> \"h\")",
-            "data Priority = Low {} | High {} | Medium {}\nPriority -> Text"
+            "with {\ntype Priority = Low {} | High {}\n}\n(\\p -> case p of\n  Priority.Low {} -> \"l\"\n  Priority.High {} -> \"h\")",
+            "type Priority = Low {} | High {} | Medium {}\nPriority -> Text"
         ),
         Some(false)
     );
@@ -199,8 +199,8 @@ fn adt_contravariant_snippet_wider_accepted() {
     // Snippet matches {Low, High, Medium}; the host passes only {Low, High}.
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {} | Medium {}\n}\n(\\p -> case p of\n  Priority.Low {} -> \"l\"\n  Priority.High {} -> \"h\"\n  Priority.Medium {} -> \"m\")",
-            "data Priority = Low {} | High {}\nPriority -> Text"
+            "with {\ntype Priority = Low {} | High {} | Medium {}\n}\n(\\p -> case p of\n  Priority.Low {} -> \"l\"\n  Priority.High {} -> \"h\"\n  Priority.Medium {} -> \"m\")",
+            "type Priority = Low {} | High {}\nPriority -> Text"
         ),
         Some(true)
     );
@@ -210,8 +210,8 @@ fn adt_contravariant_snippet_wider_accepted() {
 fn adt_contravariant_identical_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\n}\n(\\p -> case p of\n  Priority.Low {} -> \"l\"\n  Priority.High {} -> \"h\")",
-            "data Priority = Low {} | High {}\nPriority -> Text"
+            "with {\ntype Priority = Low {} | High {}\n}\n(\\p -> case p of\n  Priority.Low {} -> \"l\"\n  Priority.High {} -> \"h\")",
+            "type Priority = Low {} | High {}\nPriority -> Text"
         ),
         Some(true)
     );
@@ -225,8 +225,8 @@ fn adt_contravariant_identical_accepted() {
 fn adt_inside_maybe_narrower_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\n}\n(Maybe.Just {value (Priority.Low {})})",
-            "data Priority = Low {} | High {} | Medium {}\nMaybe Priority"
+            "with {\ntype Priority = Low {} | High {}\n}\n(Maybe.Just {value (Priority.Low {})})",
+            "type Priority = Low {} | High {} | Medium {}\nMaybe Priority"
         ),
         Some(true)
     );
@@ -236,8 +236,8 @@ fn adt_inside_maybe_narrower_accepted() {
 fn adt_inside_maybe_wider_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {} | Medium {}\n}\n(Maybe.Just {value (Priority.Medium {})})",
-            "data Priority = Low {} | High {}\nMaybe Priority"
+            "with {\ntype Priority = Low {} | High {} | Medium {}\n}\n(Maybe.Just {value (Priority.Medium {})})",
+            "type Priority = Low {} | High {}\nMaybe Priority"
         ),
         Some(false)
     );
@@ -247,8 +247,8 @@ fn adt_inside_maybe_wider_rejected() {
 fn adt_inside_relation_narrower_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {}\n}\nRel (Priority.Low {})",
-            "data Priority = Low {} | High {}\nRel Priority"
+            "with {\ntype Priority = Low {}\n}\nRel (Priority.Low {})",
+            "type Priority = Low {} | High {}\nRel Priority"
         ),
         Some(true)
     );
@@ -258,8 +258,8 @@ fn adt_inside_relation_narrower_accepted() {
 fn adt_inside_relation_wider_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {} | Medium {}\n}\nRel (Priority.Medium {})",
-            "data Priority = Low {} | High {}\nRel Priority"
+            "with {\ntype Priority = Low {} | High {} | Medium {}\n}\nRel (Priority.Medium {})",
+            "type Priority = Low {} | High {}\nRel Priority"
         ),
         Some(false)
     );
@@ -273,8 +273,8 @@ fn adt_inside_relation_wider_rejected() {
 fn adt_invariant_identical_accepted() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\n}\n(\\p -> case p of\n  Priority.Low {} -> (Priority.Low {})\n  Priority.High {} -> (Priority.High {}))",
-            "data Priority = Low {} | High {}\nPriority -> Priority"
+            "with {\ntype Priority = Low {} | High {}\n}\n(\\p -> case p of\n  Priority.Low {} -> (Priority.Low {})\n  Priority.High {} -> (Priority.High {}))",
+            "type Priority = Low {} | High {}\nPriority -> Priority"
         ),
         Some(true)
     );
@@ -284,8 +284,8 @@ fn adt_invariant_identical_accepted() {
 fn adt_invariant_narrower_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {}\n}\n(\\p -> case p of\n  Priority.Low {} -> (Priority.Low {}))",
-            "data Priority = Low {} | High {}\nPriority -> Priority"
+            "with {\ntype Priority = Low {}\n}\n(\\p -> case p of\n  Priority.Low {} -> (Priority.Low {}))",
+            "type Priority = Low {} | High {}\nPriority -> Priority"
         ),
         Some(false)
     );
@@ -301,8 +301,8 @@ fn adt_invariant_narrower_rejected() {
 fn adt_field_name_mismatch_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {count (Int 1)}\n}\n(Wrap.W {count 7})",
-            "data Wrap = W {n (Int 1)}\nWrap"
+            "with {\ntype Priority = Low {} | High {}\ntype Wrap = W {count (Int 1)}\n}\n(Wrap.W {count 7})",
+            "type Wrap = W {n (Int 1)}\nWrap"
         ),
         Some(false)
     );
@@ -313,8 +313,8 @@ fn adt_field_name_mismatch_rejected() {
 fn adt_field_missing_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Wrap = W {n (Int 1)}\n}\n(Wrap.W {n 7})",
-            "data Wrap = W {n (Int 1) extra Text}\nWrap"
+            "with {\ntype Priority = Low {} | High {}\ntype Wrap = W {n (Int 1)}\n}\n(Wrap.W {n 7})",
+            "type Wrap = W {n (Int 1) extra Text}\nWrap"
         ),
         Some(false)
     );
@@ -326,8 +326,8 @@ fn adt_field_missing_rejected() {
 fn adt_payload_multi_ctor_field_mismatch_rejected() {
     assert_eq!(
         subsumes(
-            "with {\ndata Priority = Low {} | High {}\ndata Shape = Circle {r Text} | Square {}\n}\n(Shape.Circle {r \"x\"})",
-            "data Shape = Circle {r (Int 1)} | Square {}\nShape"
+            "with {\ntype Priority = Low {} | High {}\ntype Shape = Circle {r Text} | Square {}\n}\n(Shape.Circle {r \"x\"})",
+            "type Shape = Circle {r (Int 1)} | Square {}\nShape"
         ),
         Some(false)
     );

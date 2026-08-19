@@ -13228,10 +13228,12 @@ fn split_host_data_decls(
     let mut rest = src;
     loop {
         let trimmed = rest.trim_start();
-        if !trimmed.starts_with("data ") {
+        // Host ADTs are declared with `type Name = Ctor {} | Ctor {f: T} | ...`
+        // (the `data` keyword is gone; `type` covers variants).
+        if !trimmed.starts_with("type ") {
             return (sets, trimmed.to_string());
         }
-        // Consume one line: `data Name = Ctor {} | Ctor {f: T} | ...`.
+        // Consume one line: `type Name = Ctor {} | Ctor {f: T} | ...`.
         let (line, next) = match trimmed.find('\n') {
             Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
             None => (trimmed, ""),
@@ -13246,15 +13248,15 @@ fn split_host_data_decls(
     }
 }
 
-/// Parse `data Name = Ctor1 {f: T, ..} | Ctor2 {..}` into
+/// Parse `type Name = Ctor1 {f: T, ..} | Ctor2 {..}` into
 /// `(Name, [(Ctor, [(field, field_src)])])`. Field types are kept as source
 /// substrings (e.g. `Int 1`, `Text`) so the JIT can re-parse them into real
 /// `Ty`s and unify against the snippet's payload types. Returns `None` if the
-/// line isn't a well-formed `data` decl.
+/// line isn't a well-formed variant decl.
 fn parse_data_decl_ctors(
     line: &str,
 ) -> Option<(String, CtorList)> {
-    let body = line.strip_prefix("data ")?.trim();
+    let body = line.strip_prefix("type ")?.trim();
     let (name, rhs) = body.split_once('=')?;
     let name = name.trim().to_string();
     if name.is_empty() {

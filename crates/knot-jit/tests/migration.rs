@@ -45,7 +45,7 @@ Rel PersonV1  *people
         &dir,
         "mig_count",
         r#"with {
-data Active = Yes {} | No {}
+type Active = Yes {} | No {}
 type PersonV1 = {name Text}
 type PersonV2 = {name Text active Active}
 Rel PersonV2  *people
@@ -82,7 +82,7 @@ Rel PersonV1  *people
         &dir,
         "mig_show",
         r#"with {
-data Active = Yes {} | No {}
+type Active = Yes {} | No {}
 type PersonV1 = {name Text}
 type PersonV2 = {name Text active Active}
 Rel PersonV2  *people
@@ -108,7 +108,7 @@ fn migrate_lockfile_roundtrip() {
     // parser skips newlines after `migrate`.
     let dir = dir_for("mig_lock");
     let src = r#"with {
-data Active = Yes {} | No {}
+type Active = Yes {} | No {}
 type PersonV1 = {name Text}
 type PersonV2 = {name Text active Active}
 Rel PersonV2  *people

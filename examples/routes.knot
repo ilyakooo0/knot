@@ -1,7 +1,7 @@
 with {
-type Priority = Low {} | Medium {} | High {} | Critical {}
+Priority  Low {}  Medium {}  High {}  Critical {}
 
-type Todo = {title Text owner Text priority Priority}
+Todo  {title Text owner Text priority Priority}
 
 Rel Todo  *todos
 

@@ -10,7 +10,7 @@ fn persisted_relation_groupby() {
     assert_stdout(
         "groupby",
         r#"with {
-type Todo = {owner Text done (Int 1)}
+Todo  {owner Text done (Int 1)}
 Rel Todo  *todos
 }
 (do
@@ -33,7 +33,7 @@ fn persisted_relation_read_write() {
     assert_stdout(
         "persist",
         r#"with {
-type C = {n (Int 1)}
+C  {n (Int 1)}
 Rel C  *cs
 }
 (do
@@ -132,7 +132,7 @@ fn atomic_transfer() {
     assert_stdout(
         "atomic",
         r#"with {
-type Account = {name Text balance (Int 1)}
+Account  {name Text balance (Int 1)}
 Rel Account  *accounts
 }
 (do

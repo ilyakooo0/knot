@@ -11,7 +11,7 @@ use harness::assert_show;
 #[test]
 fn refine_accepts_valid() {
     assert_show(
-        "with { type Nat = Int 1 where \\x -> x >= 0 }
+        "with { Nat  Int 1 where \\x -> x >= 0}
          (case refine (the (Int 1) 5) of
             Result.Ok {value n} -> n
             Result.Err {error _} -> (0 - 1))",
@@ -22,7 +22,7 @@ fn refine_accepts_valid() {
 #[test]
 fn refine_rejects_invalid() {
     assert_show(
-        "with { type Nat = Int 1 where \\x -> x >= 0 }
+        "with { Nat  Int 1 where \\x -> x >= 0}
          (case refine (the (Int 1) (0 - 3)) of
             Result.Ok {value n} -> 1
             Result.Err {error _} -> 0)",
@@ -33,13 +33,13 @@ fn refine_rejects_invalid() {
 #[test]
 fn refine_per_field_record() {
     // `refine` targets a record alias whose refinement lives on a field
-    // (`type VP = {age (Int 1 where …)}`). The alias is registered with a
+    // (`VP  {age (Int 1 where …)}`). The alias is registered with a
     // synthesized whole-record predicate (`\r -> r.age >= 0 && r.age <= 150`),
     // so a valid record yields Ok and an out-of-range field yields Err.
     assert_stdout(
         "refine_field_ok",
         r#"with {
-type VP = {age (Int 1 where \x -> x >= 0 && x <= 150)}
+VP  {age (Int 1 where \x -> x >= 0 && x <= 150)}
 {age (Int 1)} -> Result {typeName Text violations (Rel {field (Maybe Text) message Text})} VP  asVP
 asVP (\r -> refine r)
 }
@@ -51,7 +51,7 @@ asVP (\r -> refine r)
     assert_stdout(
         "refine_field_bad",
         r#"with {
-type VP = {age (Int 1 where \x -> x >= 0 && x <= 150)}
+VP  {age (Int 1 where \x -> x >= 0 && x <= 150)}
 {age (Int 1)} -> Result {typeName Text violations (Rel {field (Maybe Text) message Text})} VP  asVP
 asVP (\r -> refine r)
 }
@@ -68,7 +68,7 @@ fn refine_cross_field() {
     assert_stdout(
         "refine_cross",
         r#"with {
-type R = {lo (Int 1) hi (Int 1)} where \r -> r.lo <= r.hi
+R  {lo (Int 1) hi (Int 1)} where \r -> r.lo <= r.hi
 {lo (Int 1) hi (Int 1)} -> Result {typeName Text violations (Rel {field (Maybe Text) message Text})} R  asR
 asR (\r -> refine r)
 }
@@ -94,7 +94,7 @@ fn write_validation_rejects_violation() {
     e2e::build_in_dir(
         "refine_write",
         r#"with {
-type Nat = Int 1 where \x -> x >= 0
+Nat  Int 1 where \x -> x >= 0
 Rel {name Text age Nat}  *people
 }
 (do
@@ -121,7 +121,7 @@ fn write_validation_accepts_valid() {
     assert_stdout(
         "refine_ok",
         r#"with {
-type Nat = Int 1 where \x -> x >= 0
+Nat  Int 1 where \x -> x >= 0
 Rel {name Text age Nat}  *people
 }
 (do

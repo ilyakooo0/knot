@@ -29,7 +29,7 @@ fn migrate_backfills_new_field_count() {
         &dir,
         "mig_count",
         r#"with {
-type PersonV1 = {name Text}
+PersonV1  {name Text}
 Rel PersonV1  *people
 }
 (do
@@ -45,9 +45,9 @@ Rel PersonV1  *people
         &dir,
         "mig_count",
         r#"with {
-type Active = Yes {} | No {}
-type PersonV1 = {name Text}
-type PersonV2 = {name Text active Active}
+Active  Yes {}  No {}
+PersonV1  {name Text}
+PersonV2  {name Text active Active}
 Rel PersonV2  *people
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 }
@@ -71,7 +71,7 @@ fn migrate_backfilled_adt_field_renders_constructor() {
         &dir,
         "mig_show",
         r#"with {
-type PersonV1 = {name Text}
+PersonV1  {name Text}
 Rel PersonV1  *people
 }
 (do
@@ -82,9 +82,9 @@ Rel PersonV1  *people
         &dir,
         "mig_show",
         r#"with {
-type Active = Yes {} | No {}
-type PersonV1 = {name Text}
-type PersonV2 = {name Text active Active}
+Active  Yes {}  No {}
+PersonV1  {name Text}
+PersonV2  {name Text active Active}
 Rel PersonV2  *people
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 }
@@ -108,9 +108,9 @@ fn migrate_lockfile_roundtrip() {
     // parser skips newlines after `migrate`.
     let dir = dir_for("mig_lock");
     let src = r#"with {
-type Active = Yes {} | No {}
-type PersonV1 = {name Text}
-type PersonV2 = {name Text active Active}
+Active  Yes {}  No {}
+PersonV1  {name Text}
+PersonV2  {name Text active Active}
 Rel PersonV2  *people
   migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
 }

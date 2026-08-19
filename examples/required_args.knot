@@ -1,5 +1,5 @@
 with {
-type Port = Int 1 where \p -> p > 0 && p < 65536
+Port  Int 1 where \p -> p > 0 && p < 65536
 
 Port  port
 Text  host

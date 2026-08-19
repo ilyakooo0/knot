@@ -1,5 +1,5 @@
 with {
-type Person = {name Text age (Int 1)}
+Person  {name Text age (Int 1)}
 
 Rel Person  *people
 }

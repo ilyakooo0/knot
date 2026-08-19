@@ -5,37 +5,37 @@ with {
 
 -- ── Types ────────────────────────────────────────────────────────
 
-type Priority = Low {} | Medium {} | High {} | Critical {}
+Priority  Low {}  Medium {}  High {}  Critical {}
 
-type Status = Open {} | InProgress {assignee Text} | Done {} | Blocked {reason Text}
+Status  Open {}  InProgress {assignee Text}  Done {}  Blocked {reason Text}
 
-type Department = Engineering {} | Design {} | Marketing {} | Sales {} | Support {}
+Department  Engineering {}  Design {}  Marketing {}  Sales {}  Support {}
 
-type Active = Yes {} | No {}
+Active  Yes {}  No {}
 
-type Employee = {name Text age (Int 1) salary (Float 1) dept Department active Active}
+Employee  {name Text age (Int 1) salary (Float 1) dept Department active Active}
 
-type Project = {name Text lead Text budget (Float 1) priority Priority}
+Project  {name Text lead Text budget (Float 1) priority Priority}
 
-type Ticket = {title Text project Text status Status priority Priority points (Int 1)}
+Ticket  {title Text project Text status Status priority Priority points (Int 1)}
 
-type Customer = {name Text email Text tier Tier}
+Customer  {name Text email Text tier Tier}
 
-type Tier = Free {} | Pro {} | Enterprise {}
+Tier  Free {}  Pro {}  Enterprise {}
 
-type Order = {customer Text product Text quantity (Int 1) total (Float 1)}
+Order  {customer Text product Text quantity (Int 1) total (Float 1)}
 
-type Product = {name Text price (Float 1) category Category inStock Active}
+Product  {name Text price (Float 1) category Category inStock Active}
 
-type Category = Electronics {} | Books {} | Clothing {} | Food {} | Software {}
+Category  Electronics {}  Books {}  Clothing {}  Food {}  Software {}
 
-type Team = {name Text members (Rel {name Text role Text})}
+Team  {name Text members (Rel {name Text role Text})}
 
-type LogEntry = {timestamp (Int 1) level Level message Text source Text}
+LogEntry  {timestamp (Int 1) level Level message Text source Text}
 
-type Level = Debug {} | Info {} | Warn {} | Error {}
+Level  Debug {}  Info {}  Warn {}  Error {}
 
-type Metric = {name Text value (Float 1) tags Text}
+Metric  {name Text value (Float 1) tags Text}
 
 -- ── Sources ──────────────────────────────────────────────────────
 

@@ -820,15 +820,25 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             paren_if(parent > Prec::Lowest, s)
         }
         ExprKind::TypeCtor { name, params, ty } => {
-            // Renders the embedded `type` alias line. When this is a record
+            // Renders the keyword-free type declaration `Name params…  Body`.
+            // A variant body renders its constructors gap-separated (`Ctor {}
+            // Ctor2 {}`); any other body renders as-is. When this is a record
             // field's value, the record renderers emit the field-name line
-            // before it, so here we emit only the `type Name … = <type>` part.
+            // before it, so here we emit only the `Name …  Body` part.
             let params = if params.is_empty() {
                 String::new()
             } else {
                 format!(" {}", params.join(" "))
             };
-            format!("type {}{} = {}", name, params, render_type(ty))
+            let body = match &ty.node {
+                TypeKind::Variant { constructors, rest: None } => constructors
+                    .iter()
+                    .map(render_constructor)
+                    .collect::<Vec<_>>()
+                    .join("  "),
+                _ => render_type(ty),
+            };
+            format!("{}{}  {}", name, params, body)
         }
 
         ExprKind::SourceDecl {

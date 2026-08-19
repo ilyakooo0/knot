@@ -1,5 +1,5 @@
 with {
-type Todo = {title Text owner Text done (Int 1)}
+Todo  {title Text owner Text done (Int 1)}
 
 Rel Todo  *todos
 }

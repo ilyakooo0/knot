@@ -2,7 +2,7 @@
 -- Each pattern below stores its rewrite in a local `with` record first; the
 -- compiler inlines the bound body when matching the set/replace shape.
 with {
-type Item = {name Text price (Int 1)}
+Item  {name Text price (Int 1)}
 
 Rel Item  *items
 

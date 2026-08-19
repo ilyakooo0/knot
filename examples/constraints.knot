@@ -1,6 +1,6 @@
 -- Example: subset constraints
 with {
-type Person = {name Text age (Int 1) email Text}
+Person  {name Text age (Int 1) email Text}
 
 Rel Person  *people
 Rel {customer Text amount (Int 1)}  *orders

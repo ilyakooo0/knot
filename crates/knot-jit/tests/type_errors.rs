@@ -86,7 +86,7 @@ fn unit_mismatch() {
 fn record_unify_wrong_field_type() {
     // unify replacing a field with an incompatible type on a typed record.
     assert_compile_err(
-        "with {\ntype P = {x (Int 1)}\np (the (P) {})\n}\n(base.unify {x 1} {x \"s\"})",
+        "with {\nP  {x (Int 1)}\np (the (P) {})\n}\n(base.unify {x 1} {x \"s\"})",
         "",
     );
 }

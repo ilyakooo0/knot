@@ -13122,19 +13122,21 @@ fn split_host_data_decls(src: &str) -> (CtorSets, String) {
     let mut rest = src;
     loop {
         let trimmed = rest.trim_start();
-        // Host ADTs are declared with `type Name = Ctor {} | Ctor {f: T} | ...`
-        // (the `data` keyword is gone; `type` covers variants).
-        if !trimmed.starts_with("type ") {
+        // Host ADTs are declared `Name  Ctor {}  Ctor {f T}` — a leading
+        // uppercase name, a gap, then whitespace-separated constructors.
+        if !trimmed.starts_with(|c: char| c.is_uppercase()) {
             return (sets, trimmed.to_string());
         }
-        // Consume one line: `type Name = Ctor {} | Ctor {f: T} | ...`.
         let (line, next) = match trimmed.find('\n') {
             Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
             None => (trimmed, ""),
         };
-        if let Some((name, ctors)) = parse_data_decl_ctors(line) {
-            sets.insert(name, ctors);
-        }
+        // Only treat the line as a decl if it parses as `Name  Ctor {…} …`;
+        // a bare `Priority` (the type to check) is not a decl.
+        let Some((name, ctors)) = parse_data_decl_ctors(line) else {
+            return (sets, trimmed.to_string());
+        };
+        sets.insert(name, ctors);
         rest = next;
         if rest.trim().is_empty() {
             return (sets, String::new());
@@ -13142,38 +13144,91 @@ fn split_host_data_decls(src: &str) -> (CtorSets, String) {
     }
 }
 
-/// Parse `type Name = Ctor1 {f: T, ..} | Ctor2 {..}` into
-/// `(Name, [(Ctor, [(field, field_src)])])`. Field types are kept as source
-/// substrings (e.g. `Int 1`, `Text`) so the JIT can re-parse them into real
-/// `Ty`s and unify against the snippet's payload types. Returns `None` if the
-/// line isn't a well-formed variant decl.
+/// Parse `Name  Ctor1 {f T}  Ctor2 {}` into `(Name, [(Ctor, [(field,
+/// field_src)])])`. Constructors are whitespace-separated (no `=` or `|`).
+/// Field types are kept as source substrings (e.g. `Int 1`, `Text`) so the JIT
+/// can re-parse them into real `Ty`s and unify against the snippet's payload
+/// types. Returns `None` if the line isn't a well-formed variant decl.
 fn parse_data_decl_ctors(line: &str) -> Option<(String, CtorList)> {
-    let body = line.strip_prefix("type ")?.trim();
-    let (name, rhs) = body.split_once('=')?;
-    let name = name.trim().to_string();
+    // `Name` then a gap, then the constructor arms.
+    let mut it = line.trim().splitn(2, char::is_whitespace);
+    let name = it.next()?.trim().to_string();
+    let rhs = it.next()?;
     if name.is_empty() {
         return None;
     }
-    let ctors = rhs
-        .split('|')
-        .map(|arm| {
-            let arm = arm.trim();
-            // `Ctor {}` or `Ctor {f: T, g: U}` — split ctor name from the
-            // brace body (space-separated, not comma, per knot's ctor syntax).
-            let cname = arm.split_whitespace().next().unwrap_or("").to_string();
-            let fields = match (arm.find('{'), arm.rfind('}')) {
-                (Some(open), Some(close)) if close > open => {
-                    // Record-type fields: whitespace-separated `name Type` pairs.
-                    // The field type is one atom — a bare name/var, or a
-                    // parenthesized compound (`(Int 1)`, `(Rel Person)`).
-                    split_ctor_fields(&arm[open + 1..close])
-                }
-                _ => Vec::new(),
-            };
-            (cname, fields)
-        })
-        .collect();
+    // A decl body must contain a `{` (a constructor with a payload record);
+    // a bare `Int 1` / `Priority` (the type to check) has none — not a decl.
+    if !rhs.contains('{') {
+        return None;
+    }
+    let ctors = split_ctor_arms(rhs);
+    if ctors.is_empty() {
+        return None;
+    }
     Some((name, ctors))
+}
+
+/// Split a variant body (`Low {}  InProgress {assignee Text}  Done {}`) into
+/// per-constructor `(name, fields)` pairs. A new constructor starts at an
+/// uppercase identifier that immediately precedes a `{` at brace-depth 0.
+fn split_ctor_arms(rhs: &str) -> CtorList {
+    let mut arms = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    let bytes: Vec<char> = rhs.chars().collect();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Detect the start of a new constructor arm: at depth 0, whitespace,
+        // then an uppercase letter whose token is followed by `{`.
+        if depth == 0 && c.is_whitespace() {
+            // Look ahead past whitespace for `Upper ... {`.
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j].is_uppercase() {
+                // Find the end of this uppercase token and check for `{`.
+                let mut k = j;
+                while k < bytes.len() && (bytes[k].is_alphanumeric() || bytes[k] == '_' || bytes[k] == '\'') {
+                    k += 1;
+                }
+                // Skip spaces to the `{`.
+                let mut m = k;
+                while m < bytes.len() && bytes[m] == ' ' {
+                    m += 1;
+                }
+                if m < bytes.len() && bytes[m] == '{' && !cur.trim().is_empty() {
+                    arms.push(parse_one_ctor_arm(cur.trim()));
+                    cur.clear();
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            depth -= 1;
+        }
+        cur.push(c);
+        i += 1;
+    }
+    if !cur.trim().is_empty() {
+        arms.push(parse_one_ctor_arm(cur.trim()));
+    }
+    arms
+}
+
+/// Parse one constructor arm `Ctor {f T  g U}` into `(Ctor, [(field, src)])`.
+fn parse_one_ctor_arm(arm: &str) -> (String, Vec<(String, String)>) {
+    let cname = arm.split_whitespace().next().unwrap_or("").to_string();
+    let fields = match (arm.find('{'), arm.rfind('}')) {
+        (Some(open), Some(close)) if close > open => split_ctor_fields(&arm[open + 1..close]),
+        _ => Vec::new(),
+    };
+    (cname, fields)
 }
 
 /// Split a record-type field body (`n (Int 1) extra Text`) into

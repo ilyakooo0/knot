@@ -1,7 +1,7 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 with {
-type Account = {id: Int 1, balance: Int 1}
-*accounts : [Account]
+Account  {id (Int 1) balance (Int 1)}
+Rel Account  *accounts
 }
 (main)

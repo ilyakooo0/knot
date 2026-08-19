@@ -9,7 +9,7 @@ use harness::assert_show;
 #[test]
 fn nested_adt_pattern() {
     assert_show(
-        "with { type M = J {v (Int 1)} | N {} }
+        "with { M  J {v (Int 1)}  N {} }
          (case (M.J {v 5}) of
             M.J {v n} -> n
             M.N {} -> 0)",

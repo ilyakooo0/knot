@@ -8,7 +8,7 @@ fn subset_constraint_accepts_valid() {
     assert_stdout(
         "subset_ok",
         r#"with {
-type Person = {name Text age (Int 1) email Text}
+Person  {name Text age (Int 1) email Text}
 Rel Person  *people
 Rel {customer Text amount (Int 1)}  *orders
 *orders.customer <= *people.name
@@ -29,7 +29,7 @@ fn subset_constraint_rejects_orphan() {
     e2e::build_in_dir(
         "subset_orphan",
         r#"with {
-type Person = {name Text age (Int 1) email Text}
+Person  {name Text age (Int 1) email Text}
 Rel Person  *people
 Rel {customer Text amount (Int 1)}  *orders
 *orders.customer <= *people.name
@@ -61,7 +61,7 @@ fn uniqueness_constraint_rejects_duplicate() {
     e2e::build_in_dir(
         "subset_uniq",
         r#"with {
-type Person = {name Text email Text}
+Person  {name Text email Text}
 Rel Person  *people
 *people <= *people.email
 }

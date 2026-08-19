@@ -1,7 +1,7 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 with {
-type Person = {name: Text, age: Int 1}
-*teams : [{name: Text, members: [Person]}]
+Person  {name Text age (Int 1)}
+Rel {name Text members [Person]}  *teams
 }
 (main)

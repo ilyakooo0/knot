@@ -620,7 +620,6 @@ impl Parser {
             | TokenKind::Full
             | TokenKind::Atomic
             | TokenKind::With
-            | TokenKind::Type
             | TokenKind::Serve
             | TokenKind::Migrate
             | TokenKind::Refine
@@ -2388,69 +2387,6 @@ impl Parser {
             if self.at_layout_boundary() {
                 break;
             }
-            // `type Name p1 p2 … = <type>` — an embedded type-alias line. It
-            // contributes a field named `Name` whose value is the (erased) type
-            // constructor itself; the alias is also brought into type scope.
-            if self.at(&TokenKind::Type) {
-                let type_kw = self.advance(); // consume `type`
-                let (tname, _tspan) = self.expect_upper("expected type name after 'type'").ok()?;
-                let mut params = Vec::new();
-                while matches!(self.peek(), TokenKind::Lower(_)) {
-                    let tok = self.advance();
-                    let TokenKind::Lower(p) = tok.kind else {
-                        unreachable!()
-                    };
-                    params.push(p);
-                }
-                self.expect(&TokenKind::Eq, "expected '=' in type alias")
-                    .ok()?;
-                // Parse the alias body with `record_value_sig_type` set so a
-                // `Lower` on the next line (a following record field) is not
-                // absorbed as a type argument of the alias body.
-                let saved_flag = self.record_value_sig_type;
-                self.record_value_sig_type = true;
-                let ty = self.parse_type();
-                self.record_value_sig_type = saved_flag;
-                let Some(ty) = ty else {
-                    self.error("expected type after '=' in record type alias");
-                    return None;
-                };
-                // A single-constructor variant `type X = Ctor {…}` (no `|`):
-                // the body parses as `App(Named(Upper), Record)` (a type
-                // application), but the alias name `X` anchors the variant
-                // reading, so reinterpret it as a one-constructor `Variant`.
-                // Multi-constructor `A {} | B {}` is already a `Variant` from
-                // `parse_type_union`. Other bodies (records, applications like
-                // `Maybe (Int 1)`) are untouched.
-                let ty = match spine_as_constructor(&ty) {
-                    Some(ctor) if !matches!(ty.node, TypeKind::Variant { .. }) => Spanned::new(
-                        TypeKind::Variant {
-                            constructors: vec![ctor],
-                            rest: None,
-                        },
-                        ty.span,
-                    ),
-                    _ => ty,
-                };
-                let ty_end = ty.span.end;
-                fields.push(RecordField {
-                    name: tname.clone(),
-                    value: Spanned::new(
-                        ExprKind::TypeCtor {
-                            name: tname,
-                            params,
-                            ty,
-                        },
-                        Span {
-                            start: type_kw.span.start,
-                            end: ty_end,
-                        },
-                    ),
-                    sig: None,
-                    doc: pending_doc.take(),
-                });
-                continue;
-            }
             // `route Name where …` / `route Name = A | B` — an embedded route
             // declaration. Contributes a field named `Name` whose value is a
             // pure marker (erased like a data decl): the route's entries are
@@ -2659,6 +2595,19 @@ impl Parser {
                 self.restore(saved);
                 self.diagnostics.truncate(diag_len);
             }
+            // Type declaration, keyword-free: `Name params…  Body`, where a gap
+            // (2+ spaces or newline) separates the head from the body. The body
+            // is a variant (one or more gap-separated `Ctor {…}` constructors,
+            // which may span indented continuation lines) or an alias (any
+            // other type: a record `{…}`, a primitive `Int 1`, …). Tried before
+            // the bare-Upper import below; a bare `Upper` with no gap+body
+            // (e.g. `Maybe` in `with {Maybe}`) is not a decl.
+            if matches!(self.peek(), TokenKind::Upper(_))
+                && let Some(field) = self.try_parse_type_decl_field(pending_doc.take())
+            {
+                fields.push(field);
+                continue;
+            }
             // Type-import marker: a bare uppercase name (`Maybe` in
             // `with {Maybe} body`) brings that data type's constructors into
             // scope unqualified inside the body. Parsed as a field whose value
@@ -2739,6 +2688,139 @@ impl Parser {
             .ok()?;
         let full_span = Span::new(start.start, end_tok.span.end);
         Some(Spanned::new(ExprKind::Record(fields), full_span))
+    }
+
+    /// Speculatively parse a keyword-free type declaration `Name params…
+    /// Body` occupying the current field position. Returns `Some(field)` on
+    /// success, `None` (with parser state and diagnostics restored) when the
+    /// line is not a type declaration — e.g. a bare `Upper` import (`Maybe`)
+    /// or a route/value field.
+    ///
+    /// Grammar: an `Upper` head, optional lowercase type params, then a **gap**
+    /// (2+ spaces or a newline), then the body. The body is a variant — one or
+    /// more gap-separated `Ctor {…}` constructor spines, which may continue on
+    /// more-deeply-indented lines — or an alias (any other type: a record
+    /// `{…}`, `Int 1`, …). The gap is what distinguishes a decl from a bare
+    /// `Upper` import: `Maybe` has no gap+body, `Active  Yes {}` does.
+    fn try_parse_type_decl_field(&mut self, doc: Option<String>) -> Option<RecordField> {
+        let saved = self.save();
+        let diag_len = self.diagnostics.len();
+
+        let start = self.span();
+        // The head's column: continuation constructors must be indented deeper
+        // than this; an `Upper` at the head's column starts a new field.
+        let head_col = self.cur_column();
+        // Head: `Upper` name + optional lowercase params.
+        let TokenKind::Upper(tname) = self.peek().clone() else {
+            return None;
+        };
+        self.advance();
+        let mut params = Vec::new();
+        while matches!(self.peek(), TokenKind::Lower(_)) {
+            let tok = self.advance();
+            let TokenKind::Lower(p) = tok.kind else { unreachable!() };
+            params.push(p);
+        }
+
+        // A gap must separate the head from the body. A newline also counts
+        // (indented continuation). No gap → not a decl (bare import / route).
+        let had_gap = self.gap_before_current() || matches!(self.peek(), TokenKind::Newline);
+        if !had_gap {
+            self.restore(saved);
+            self.diagnostics.truncate(diag_len);
+            return None;
+        }
+        self.skip_newlines();
+
+        // A variant body opens with `Ctor {` — an uppercase name immediately
+        // followed by a record literal. Anything else is an alias body.
+        let is_variant = matches!(self.peek(), TokenKind::Upper(_))
+            && matches!(self.peek_ahead(1), TokenKind::LBrace);
+
+        let ty = if is_variant {
+            // Collect gap-separated constructors (which may continue on
+            // indented lines).
+            let body_start = self.span().start;
+            let mut constructors = Vec::new();
+            loop {
+                self.skip_newlines();
+                let Some(ctor) = self.parse_ctor_def() else {
+                    break;
+                };
+                constructors.push(ctor);
+                // Another constructor follows only across a gap (2+ spaces or
+                // a newline) before an `Upper`.
+                let next_gap =
+                    self.gap_before_current() || matches!(self.peek(), TokenKind::Newline);
+                let saved2 = self.save();
+                let d2 = self.diagnostics.len();
+                self.skip_newlines();
+                // A continuation constructor is either inline (same line as the
+                // previous one) or indented deeper than the decl head. An
+                // `Upper` at the head's own column starts a new field — stop.
+                let on_new_line = matches!(self.peek(), TokenKind::Upper(_))
+                    && self.cur_column() <= head_col
+                    && self.gap_before_current() // crossed a newline
+                    && self.tokens.get(self.pos.wrapping_sub(1)).map(|t| &t.kind).is_some_and(|k| matches!(k, TokenKind::Newline));
+                let more = next_gap
+                    && matches!(self.peek(), TokenKind::Upper(_))
+                    && matches!(self.peek_ahead(1), TokenKind::LBrace)
+                    && !on_new_line;
+                if !more {
+                    self.restore(saved2);
+                    self.diagnostics.truncate(d2);
+                    break;
+                }
+            }
+            let end = self.prev_span().end;
+            Spanned::new(
+                TypeKind::Variant { constructors, rest: None },
+                Span::new(body_start, end),
+            )
+        } else {
+            // Alias: parse the body type. Set the record-sig flag so a
+            // following field on the next line isn't absorbed as a type arg.
+            let saved_flag = self.record_value_sig_type;
+            self.record_value_sig_type = true;
+            let first = self.parse_type();
+            self.record_value_sig_type = saved_flag;
+            let Some(first) = first else {
+                self.restore(saved);
+                self.diagnostics.truncate(diag_len);
+                return None;
+            };
+            first
+        };
+
+        let ty_end = ty.span.end;
+        Some(RecordField {
+            name: tname.clone(),
+            value: Spanned::new(
+                ExprKind::TypeCtor { name: tname, params, ty },
+                Span { start: start.start, end: ty_end },
+            ),
+            sig: None,
+            doc,
+        })
+    }
+
+    /// Parse one variant constructor `Ctor {fields…}`. The `{` must immediately
+    /// follow the constructor name. Returns `None` (consuming nothing) when the
+    /// current position is not `Upper {`.
+    fn parse_ctor_def(&mut self) -> Option<crate::ast::ConstructorDef> {
+        let TokenKind::Upper(name) = self.peek().clone() else {
+            return None;
+        };
+        self.advance();
+        if !self.at(&TokenKind::LBrace) {
+            return None;
+        }
+        let lbrace = self.advance().span;
+        let record = self.parse_record_type(lbrace)?;
+        let crate::ast::TypeKind::Record { fields, .. } = record.node else {
+            return None;
+        };
+        Some(crate::ast::ConstructorDef { name, fields })
     }
 
     /// Parse an optional `migrate from T to U using f` clause hanging off a

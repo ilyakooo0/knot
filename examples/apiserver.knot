@@ -11,11 +11,11 @@
 --   curl localhost:8080/summary
 with {
 
-type Priority = Low {} | Medium {} | High {} | Critical {}
+Priority  Low {}  Medium {}  High {}  Critical {}
 
-type Active = Yes {} | No {}
+Active  Yes {}  No {}
 
-type Task = {id (Int 1) title Text owner Text priority Priority done Active}
+Task  {id (Int 1) title Text owner Text priority Priority done Active}
 
 Rel Task  *tasks
 

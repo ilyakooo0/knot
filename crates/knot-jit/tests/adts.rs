@@ -38,7 +38,7 @@ fn case_bool() {
 #[test]
 fn custom_adt() {
     assert_show(
-        "with {\ntype Color = Red {} | Green {} | Blue {}\n}\n(Color.Red {})",
+        "with {\nColor  Red {}  Green {}  Blue {}\n}\n(Color.Red {})",
         "Red",
     );
 }
@@ -46,7 +46,7 @@ fn custom_adt() {
 #[test]
 fn custom_adt_payload() {
     assert_show(
-        "with {\ntype Shape = Circle {radius (Int 1)} | Rect {w (Int 1) h (Int 1)}\n}\n(Shape.Rect {w 3 h 4})",
+        "with {\nShape  Circle {radius (Int 1)}  Rect {w (Int 1) h (Int 1)}\n}\n(Shape.Rect {w 3 h 4})",
         "Rect {h 4 w 3}",
     );
 }
@@ -54,7 +54,7 @@ fn custom_adt_payload() {
 #[test]
 fn case_on_custom_adt() {
     assert_show(
-        "with {\ntype Shape = Circle {radius (Int 1)} | Rect {w (Int 1) h (Int 1)}\n}\n\
+        "with {\nShape  Circle {radius (Int 1)}  Rect {w (Int 1) h (Int 1)}\n}\n\
          (case Shape.Rect {w 3 h 4} of\n  Shape.Circle {radius r} -> r * r\n  Shape.Rect {w ww h hh} -> ww * hh)",
         "12",
     );
@@ -86,7 +86,7 @@ fn adt_in_relation() {
 fn match_filters_constructor() {
     // base.match keeps only rows of the given constructor, returning payloads.
     assert_show_set(
-        "with {\ntype Evt = Click {x (Int 1)} | Key {code (Int 1)}\n}\n\
+        "with {\nEvt  Click {x (Int 1)}  Key {code (Int 1)}\n}\n\
          (base.match Evt.Click [(Evt.Click {x 1}) (Evt.Key {code 9}) (Evt.Click {x 2})])",
         &["{x 1}", "{x 2}"],
     );

@@ -1,10 +1,9 @@
 //! Standard prelude: ordinary polymorphic functions injected into every program.
 //!
-//! The user-facing trait/typeclass system has been removed; the prelude is now
-//! a small set of plain functions. Builtin operator semantics (`+`, `<`, `++`,
-//! unary `-`, `==`) are enforced intrinsically by the type checker and code
-//! generator, and monadic do-blocks dispatch structurally, so no trait
-//! declarations are needed here.
+//! The prelude is a small set of plain functions. Builtin operator semantics
+//! (`+`, `<`, `++`, unary `-`, `==`) are enforced intrinsically by the type
+//! checker and code generator, and monadic do-blocks dispatch structurally, so
+//! no trait declarations are needed here.
 //!
 //! A `.knot` file is a single expression, so the prelude is injected by
 //! wrapping the program: `with { …prelude record… } <program>`. The program's
@@ -71,21 +70,6 @@ warn (\msg -> emitLog (Level.Warn {}) msg ^logCtx)
 
 (<>logCtx) => Text -> IO {}  error
 error (\msg -> emitLog (Level.Error {}) msg ^logCtx)
-
--- Deprecated renames of the level wrappers above (the pre-`base.<level>` API).
--- Each threads the caller's `logCtx` exactly like its modern counterpart; kept
--- for source compatibility. Prefer `base.debug`/`info`/`warn`/`error`.
-(<>logCtx) => Text -> IO {}  logDebug
-logDebug (\msg -> emitLog (Level.Debug {}) msg ^logCtx)
-
-(<>logCtx) => Text -> IO {}  logInfo
-logInfo (\msg -> emitLog (Level.Info {}) msg ^logCtx)
-
-(<>logCtx) => Text -> IO {}  logWarn
-logWarn (\msg -> emitLog (Level.Warn {}) msg ^logCtx)
-
-(<>logCtx) => Text -> IO {}  logError
-logError (\msg -> emitLog (Level.Error {}) msg ^logCtx)
 
 -- List ADT namespace (`base.list.*`). Each field is a codegen builtin
 -- (`Var(listX)` resolves to the registered knot_list_* function value), so
@@ -253,8 +237,6 @@ pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     "sum",
     "bind",
     // Console IO builtins (registered as stdlib function values in codegen).
-    // `logInfo`/`logWarn`/`logError`/`logDebug` are deliberately NOT here — they
-    // are deprecated prelude `base` record fields threading `<>logCtx`.
     "println",
     "print",
     "putLine",

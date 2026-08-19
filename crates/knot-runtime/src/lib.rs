@@ -8689,30 +8689,6 @@ pub extern "C-unwind" fn knot_println(v: *mut Value) -> *mut Value {
     alloc(Value::Unit)
 }
 
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_log_info(v: *mut Value) -> *mut Value {
-    log::log_info(&format_value(v));
-    alloc(Value::Unit)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_log_warn(v: *mut Value) -> *mut Value {
-    log::log_warn(&format_value(v));
-    alloc(Value::Unit)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_log_error(v: *mut Value) -> *mut Value {
-    log::log_error(&format_value(v));
-    alloc(Value::Unit)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_log_debug(v: *mut Value) -> *mut Value {
-    log::log_debug(&format_value(v));
-    alloc(Value::Unit)
-}
-
 thread_local! {
     /// Per-request auto-context for structured logging. The HTTP serve loop
     /// sets this to a `{requestId, method, path}` record before invoking a
@@ -10148,41 +10124,6 @@ pub extern "C-unwind" fn knot_print_io(v: *mut Value) -> *mut Value {
     alloc_io_leaf(thunk as *const u8, env, "print", true)
 }
 
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_log_info_io(v: *mut Value) -> *mut Value {
-    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
-        let _ = db;
-        knot_log_info(env)
-    }
-    alloc_io_leaf(thunk as *const u8, v, "logInfo", true)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_log_warn_io(v: *mut Value) -> *mut Value {
-    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
-        let _ = db;
-        knot_log_warn(env)
-    }
-    alloc_io_leaf(thunk as *const u8, v, "logWarn", true)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_log_error_io(v: *mut Value) -> *mut Value {
-    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
-        let _ = db;
-        knot_log_error(env)
-    }
-    alloc_io_leaf(thunk as *const u8, v, "logError", true)
-}
-
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_log_debug_io(v: *mut Value) -> *mut Value {
-    extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
-        let _ = db;
-        knot_log_debug(env)
-    }
-    alloc_io_leaf(thunk as *const u8, v, "logDebug", true)
-}
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_read_line_io() -> *mut Value {

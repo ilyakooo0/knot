@@ -1889,10 +1889,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // IO wrappers for effectful builtins
         self.declare_rt("knot_println_io", &[p], &[p]);
         self.declare_rt("knot_print_io", &[p], &[p]);
-        self.declare_rt("knot_log_info_io", &[p], &[p]);
-        self.declare_rt("knot_log_warn_io", &[p], &[p]);
-        self.declare_rt("knot_log_error_io", &[p], &[p]);
-        self.declare_rt("knot_log_debug_io", &[p], &[p]);
         // Unified structured-log sink: (db, level, msg, ctx) -> unit. Called by the
         // `base.log` special form after folding the caller's logCtx scopes.
         self.declare_rt("knot_emit_log", &[p, p, p, p], &[p]);
@@ -2259,7 +2255,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// resolve it everywhere — including decl bodies and nested `with` field
     /// values, which compile in fresh envs that never see the injected prelude
     /// `with`. This is what makes the hard gate (option A) viable: `base.X`
-    /// works everywhere bare names used to.
+    /// resolves everywhere.
     ///
     /// Field values: stdlib functions become trampoline function values (the
     /// same shape the bare-`Var` path emits); the 0-arg IO builtins (`now`,
@@ -2629,10 +2625,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             "println",
             "print",
             "putLine",
-            // `logInfo`/`logWarn`/`logError`/`logDebug` are deprecated prelude
-            // `base` record fields (with a `(<>logCtx)` constraint), NOT stdlib
-            // fns — registering them here would declare a `knot_user_logInfo`
-            // that is never defined.
             // `base.log`'s runtime target (level + msg + merged ctx). Registered
             // here so the prelude `log`/`info`/… bodies' bare `emitLog` resolves
             // to a fn value, but NOT in `BASE_STDLIB_FNS` — it is prelude-internal,
@@ -3405,9 +3397,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.define_stdlib_fn_1("println", "knot_println_io");
         self.define_stdlib_fn_1("print", "knot_print_io");
         self.define_stdlib_fn_1("putLine", "knot_println_io");
-        // `logInfo`/`logWarn`/`logError`/`logDebug` are now deprecated prelude
-        // `base` record fields threading `<>logCtx` (not stdlib fns); the old
-        // `knot_log_*_io` runtime fns stay linked but unregistered.
         // `base.log`'s runtime target: level + msg + merged ctx record.
         self.define_stdlib_fn_3("emitLog", "knot_emit_log");
 
@@ -8400,7 +8389,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         }
 
         // Special case: takeRelation N (sortBy f *source) → SQL ORDER BY + LIMIT
-        // Special case: take/takeRelation N <source> → SQL LIMIT (legacy path).
+        // Special case: take/takeRelation N <source> → SQL LIMIT.
         if let ast::ExprKind::Var(name) = &func_expr.node
             && (name == "takeRelation" || name == "take")
             && args.len() == 2

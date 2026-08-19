@@ -573,8 +573,8 @@ pub enum Constraint {
     /// callsite must SUPPLY a `field` value, produced by an explicit `<>` fold
     /// (`<>field folder init`) passed as the dict argument. No type annotation:
     /// the dict's type is inferred at the CALLSITE from the fold, not declared
-    /// here. An optional legacy `: Type` annotation (`ty`) fixes the dict type
-    /// instead of deriving it. Used by `base.log` to merge all `logCtx` scopes.
+    /// here. `ty` is currently always `None` (the dict type is derived at the
+    /// callsite). Used by `base.log` to merge all `logCtx` scopes.
     CollectField { field: Name, ty: Option<Type> },
 }
 

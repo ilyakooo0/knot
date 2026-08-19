@@ -547,13 +547,6 @@ impl Parser {
         }
     }
 
-    /// Is the cursor at the start of a `field:` signature (a lowercase
-    /// identifier immediately followed by a colon)? Used to tell a new record
-    /// field apart from a wrapped field type when scanning a multiline record.
-    fn at_field_signature(&self) -> bool {
-        matches!(self.peek(), TokenKind::Lower(_)) && matches!(self.peek_ahead(1), TokenKind::Colon)
-    }
-
     fn at_eof(&self) -> bool {
         matches!(self.peek(), TokenKind::Eof)
     }
@@ -1296,35 +1289,15 @@ impl Parser {
                     if let TokenKind::Lower(_field) = self.peek().clone() {
                         self.advance();
                         self.skip_newlines();
-                        // Legacy `(^field : Type)` — REMOVED. Type-first form:
-                        // `(Type  ^field)` (`^` prefixes the name).
-                        if self.at(&TokenKind::Colon) {
-                            self.error(
-                                "`:` constraints were removed: write the constraint \
-                                 type-first, `(Type  ^field)` (e.g. `(a -> a -> Int 1  ^compare)`)",
-                            );
-                            return None;
-                        }
                     }
                 }
-                // Implicit-field FOLD constraint: `(<>field)` (annotation-free)
-                // or legacy `(<>field : Type)`. The annotation is OPTIONAL: the
-                // dict type is normally derived at the callsite from the
+                // Implicit-field FOLD constraint: `(<>field)`. The annotation is
+                // omitted: the dict type is derived at the callsite from the
                 // explicit `<>` fold, so a name-only constraint is the norm.
                 if matches!(self.peek(), TokenKind::Collect) {
                     self.advance(); // `<>`
                     if let TokenKind::Lower(field) = self.peek().clone() {
                         self.advance();
-                        self.skip_newlines();
-                        // Legacy `(<>field : Type)` — REMOVED. Type-first form:
-                        // `(Type  <>field)`. Name-only `(<>field)` still works.
-                        if self.at(&TokenKind::Colon) {
-                            self.error(
-                                "`:` constraints were removed: write the constraint \
-                                 type-first, `(Type  <>field)`",
-                            );
-                            return None;
-                        }
                         self.skip_newlines();
                         if self.eat(&TokenKind::RParen) {
                             let pre_arrow = self.save();
@@ -1391,17 +1364,7 @@ impl Parser {
 
 impl Parser {
     fn parse_expr(&mut self) -> Option<Expr> {
-        let expr = self.parse_expr_head()?;
-        // Postfix type annotation `expr : Type` — REMOVED. Annotations use the
-        // keyword form `the (Type) expr`. Reject with a migration hint.
-        if self.at(&TokenKind::Colon) {
-            self.error(
-                "`:` annotations were removed: use `the (Type) expr` \
-                 (e.g. `(the (Int Ms) 250)`)",
-            );
-            return None;
-        }
-        Some(expr)
+        self.parse_expr_head()
     }
 
     fn parse_expr_head(&mut self) -> Option<Expr> {
@@ -1485,9 +1448,8 @@ impl Parser {
                     self.skip_newlines();
                     self.parse_set_with_start(true, replace_start)
                 } else if next == &TokenKind::Star || matches!(next, TokenKind::StarIdent(_)) {
-                    // `full` before a source is only valid as a write
-                    // (`full *rel = expr`). A bare `full *rel` read-marker was
-                    // removed — reads are written `*rel`.
+                    // `full` before a source marks a write (`full *rel = expr`).
+                    // A read is a bare `*rel` with no `full`.
                     let past = if matches!(next, TokenKind::StarIdent(_)) {
                         offset + 1 // `*rel` is one token
                     } else {
@@ -2337,15 +2299,6 @@ impl Parser {
                     return None;
                 };
                 self.skip_newlines();
-                // Type annotation `(expr : Type)` — REMOVED. Use `the (Type) expr`.
-                if self.at(&TokenKind::Colon) {
-                    self.delimiter_depth -= 1;
-                    self.error(
-                        "`:` annotations were removed: use `the (Type) expr` \
-                         (e.g. `(the (Int Ms) 250)`)",
-                    );
-                    return None;
-                }
                 let end_tok =
                     self.expect(&TokenKind::RParen, "unclosed '(' — expected matching ')'");
                 self.delimiter_depth -= 1;
@@ -2401,9 +2354,7 @@ impl Parser {
         // `,`. A field value is a single atom / postfix chain / parenthesized
         // (or list / nested-record) compound — i.e. `parse_postfix`, which never
         // consumes a following bare identifier as an application argument. A bare
-        // `Lower` after a value therefore always opens the next field. (Record
-        // UPDATE syntax `{base | name value, …}` was removed: use `unify base
-        // {name value, …}`.)
+        // `Lower` after a value therefore always opens the next field.
         // Named fields: `name value name2 value2 …`
         //
         // A field may carry a standalone type-signature line, written like a
@@ -2625,32 +2576,7 @@ impl Parser {
                     continue;
                 }
 
-                if self.at(&TokenKind::Colon) {
-                    self.error(
-                        "`:` annotations were removed: declare a source type-first, \
-                         `Rel T  *name` (e.g. `Rel {name Text}  *people`)",
-                    );
-                    return None;
-                }
-
-                // `*name = ...` was a view; views were removed. A source is
-                // declared `*name : Type` (with a type, no body).
-                if self.at(&TokenKind::Eq) {
-                    self.error("views were removed: declare a source as `*name : Type`; a computed query is a plain field");
-                    return None;
-                }
-
-                self.error("expected ':' after record source field name");
-                return None;
-            }
-            // Signature line: `name : Type` — REMOVED. Signatures are type-first
-            // (`Type  name`). Reject the colon form with a migration hint.
-            if self.at_field_signature() {
-                self.error(
-                    "`:` signatures were removed: write the signature type-first, \
-                     `Type  name` (e.g. `Int 1 -> Int 1  addOne`); a tyvar-led \
-                     signature uses `the`",
-                );
+                self.error("expected a source declaration or subset constraint after `*` field name");
                 return None;
             }
             // Type-first signature: `Type  name` — a type (which stops at a
@@ -3550,14 +3476,6 @@ impl Parser {
                     ));
                 }
                 let inner = self.parse_pat()?;
-                // Pattern annotation `(pat : Type)` — REMOVED. Use `the (Type) pat`.
-                if self.at(&TokenKind::Colon) {
-                    self.error(
-                        "`:` annotations were removed: use `the (Type) pat` \
-                         (e.g. `\\(the (forall a. a -> a) f) -> …`)",
-                    );
-                    return None;
-                }
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
                     .ok()?;
@@ -3711,14 +3629,6 @@ impl Parser {
                     ));
                 }
                 let inner = self.parse_pat()?;
-                // Pattern annotation `(pat : Type)` — REMOVED. Use `the (Type) pat`.
-                if self.at(&TokenKind::Colon) {
-                    self.error(
-                        "`:` annotations were removed: use `the (Type) pat` \
-                         (e.g. `\\(the (forall a. a -> a) f) -> …`)",
-                    );
-                    return None;
-                }
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
                     .ok()?;

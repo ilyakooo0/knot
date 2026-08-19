@@ -9938,11 +9938,6 @@ impl Infer {
             ),
         );
 
-        // `logInfo`/`logWarn`/`logError`/`logDebug` are deprecated prelude
-        // `base` record fields with a `(<>logCtx)` constraint — NOT top-level
-        // polymorphic stdlib fns. No binding here; the prelude record supplies
-        // them (and threads the caller's logCtx).
-
         // emitLog : ∀c. Level -> Text -> c -> IO {console} {} — `base.log`'s
         // runtime target. `c` is the (already merged) logCtx record; kept
         // polymorphic since the merged shape is callsite-dependent.

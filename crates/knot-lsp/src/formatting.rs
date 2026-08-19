@@ -196,11 +196,7 @@ pub(crate) fn handle_range_formatting(
         }
     }
 
-    if edits.is_empty() {
-        None
-    } else {
-        Some(edits)
-    }
+    if edits.is_empty() { None } else { Some(edits) }
 }
 
 // ── On-Type Formatting ──────────────────────────────────────────────
@@ -284,5 +280,3 @@ pub(crate) fn handle_on_type_formatting(
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
-
-

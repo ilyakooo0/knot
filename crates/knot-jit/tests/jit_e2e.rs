@@ -24,8 +24,8 @@ fn db() -> *mut std::ffi::c_void {
 fn jit_compiles_and_runs_pure_int() {
     init_compile_rt();
     let db = db();
-    let out = compile_and_run("base.println (base.show (40 + 2))", db, None)
-        .expect("JIT compile failed");
+    let out =
+        compile_and_run("base.println (base.show (40 + 2))", db, None).expect("JIT compile failed");
     assert!(!out.value.is_null(), "JIT produced a null Value");
 }
 

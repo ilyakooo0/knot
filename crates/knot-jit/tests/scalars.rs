@@ -121,14 +121,20 @@ fn bool_logic() {
 
 #[test]
 fn bytes_roundtrip() {
-    assert_show("base.bytesToText (base.textToBytes \"hi\")", "Just {value hi}");
+    assert_show(
+        "base.bytesToText (base.textToBytes \"hi\")",
+        "Just {value hi}",
+    );
 }
 
 #[test]
 fn bytes_length_get() {
     assert_show("base.bytesLength (base.textToBytes \"abc\")", "3");
     // bytesGet is index-first: Int -> Bytes -> Maybe Int.
-    assert_show("base.bytesGet 0 (base.textToBytes \"abc\")", "Just {value 97}");
+    assert_show(
+        "base.bytesGet 0 (base.textToBytes \"abc\")",
+        "Just {value 97}",
+    );
     assert_show("base.bytesGet 9 (base.textToBytes \"abc\")", "Nothing");
 }
 
@@ -178,12 +184,18 @@ fn json_scalars() {
 
 #[test]
 fn json_record() {
-    assert_show("base.toJson {name \"a\" age 3}", "{\"age\":3,\"name\":\"a\"}");
+    assert_show(
+        "base.toJson {name \"a\" age 3}",
+        "{\"age\":3,\"name\":\"a\"}",
+    );
 }
 
 #[test]
 fn json_parse_roundtrip() {
-    assert_show("(the (Maybe (Int 1)) (base.parseJson \"42\"))", "Just {value 42}");
+    assert_show(
+        "(the (Maybe (Int 1)) (base.parseJson \"42\"))",
+        "Just {value 42}",
+    );
 }
 
 #[test]

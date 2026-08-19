@@ -85,5 +85,3 @@ pub(crate) fn handle_document_highlight(
         Some(highlights)
     }
 }
-
-

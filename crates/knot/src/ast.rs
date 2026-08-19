@@ -227,7 +227,11 @@ pub enum ExprKind {
     /// record (`with {Maybe} body`). Their constructors are in scope
     /// UNQUALIFIED inside `body` (`Just {value v}` instead of `Maybe.Just
     /// {value v}`). Empty for an ordinary value-only `with`.
-    With { record: Box<Expr>, body: Box<Expr>, types: Vec<String> },
+    With {
+        record: Box<Expr>,
+        body: Box<Expr>,
+        types: Vec<String>,
+    },
 
     /// `a + b`, `x == y`, `xs |> filter f`
     BinOp {
@@ -262,16 +266,10 @@ pub enum ExprKind {
     /// inference/codegen treat it identically to that multiplication);
     /// `unit_name` preserves the original unit word so the formatter can
     /// re-render the surface syntax instead of the raw multiplication.
-    TimeUnitLit {
-        value: Box<Expr>,
-        unit_name: Name,
-    },
+    TimeUnitLit { value: Box<Expr>, unit_name: Name },
 
     /// `the (Type) expr` — type annotation on expression.
-    Annot {
-        expr: Box<Expr>,
-        ty: Type,
-    },
+    Annot { expr: Box<Expr>, ty: Type },
 
     /// `refine expr` — runtime refinement check, returns Result.
     Refine(Box<Expr>),
@@ -344,7 +342,6 @@ pub enum ExprKind {
         entries: Vec<RouteEntry>,
     },
 
-
     /// `serve Api where E1 = expr1; E2 = expr2; ...` — typed server value.
     /// Each handler is bound to a route endpoint constructor; the whole
     /// expression has type `Server Api _` (a row variable when no handler
@@ -370,9 +367,10 @@ impl ExprKind {
     pub fn as_yield_arg(&self) -> Option<&Expr> {
         if let ExprKind::App { func, arg } = self
             && let ExprKind::Var(name) = &func.node
-                && name.is_user("yield") {
-                    return Some(arg);
-                }
+            && name.is_user("yield")
+        {
+            return Some(arg);
+        }
         None
     }
 }
@@ -522,10 +520,7 @@ pub enum TypeKind {
     Relation(Box<Type>),
 
     /// `a -> b` — function type.
-    Function {
-        param: Box<Type>,
-        result: Box<Type>,
-    },
+    Function { param: Box<Type>, result: Box<Type> },
 
     /// `<Open {} | InProgress {assignee: Text}>` — inline variant type.
     Variant {
@@ -534,9 +529,7 @@ pub enum TypeKind {
     },
 
     /// `IO a` — IO monad type. Effects are untracked.
-    IO {
-        ty: Box<Type>,
-    },
+    IO { ty: Box<Type> },
 
     /// `_` — type hole, inferred by the type checker.
     Hole,
@@ -559,10 +552,7 @@ pub enum TypeKind {
     /// Kept as a dedicated node (rather than desugared to `App(Named "Float",
     /// Unit u)`) so inference can recognise the shape without peeling
     /// application spines. The `base` is `Named "Int"`/`Named "Float"`.
-    UnitAnnotated {
-        base: Box<Type>,
-        unit: UnitExpr,
-    },
+    UnitAnnotated { base: Box<Type>, unit: UnitExpr },
 
     /// `T where \x -> predicate` — refined type.
     Refined {

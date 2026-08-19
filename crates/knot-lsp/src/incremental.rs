@@ -246,7 +246,8 @@ fn hash_field_signature(field: &ast::RecordField) -> u64 {
             strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
         }
         // Data / route / etc.: shape *is* the signature — full hash.
-        ExprKind::DataCtor { .. } | ExprKind::TypeCtor { .. }
+        ExprKind::DataCtor { .. }
+        | ExprKind::TypeCtor { .. }
         | ExprKind::RouteDecl { .. }
         | ExprKind::SubsetConstraint { .. } => return hash_field(field),
         _ => {
@@ -278,7 +279,9 @@ fn hash_structure(program: &Expr) -> u64 {
                 ("source", name).hash(&mut h);
                 strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
             }
-            ExprKind::DataCtor { name, constructors, .. } => {
+            ExprKind::DataCtor {
+                name, constructors, ..
+            } => {
                 ("data", name).hash(&mut h);
                 for c in constructors {
                     c.name.hash(&mut h);
@@ -394,7 +397,6 @@ fn utf8_char_len(first: u8) -> usize {
     }
 }
 
-
 fn span_marker_len(b: &[u8]) -> Option<usize> {
     let lit_at = |i: usize, lit: &[u8]| -> Option<usize> {
         if b.len() >= i + lit.len() && b[i..i + lit.len()] == *lit {
@@ -416,7 +418,6 @@ fn span_marker_len(b: &[u8]) -> Option<usize> {
     let i = digits_at(i)?;
     lit_at(i, b" }".as_slice())
 }
-
 
 fn strip_spans(s: &str) -> String {
     // Walk the string, dropping only *complete* span markers. Matching the
@@ -478,7 +479,6 @@ fn strip_spans(s: &str) -> String {
     out
 }
 
-
 /// Collect named type references from a type AST node (or a slice of them).
 fn collect_type_names(ty: &ast::Type, out: &mut HashSet<String>) {
     match &ty.node {
@@ -508,7 +508,7 @@ fn collect_type_names(ty: &ast::Type, out: &mut HashSet<String>) {
             }
         }
         ast::TypeKind::IO { ty, .. } => collect_type_names(ty, out),
-        ast::TypeKind::Unit(_) => {},
+        ast::TypeKind::Unit(_) => {}
         ast::TypeKind::UnitAnnotated { base, .. } => collect_type_names(base, out),
         ast::TypeKind::Refined { base, .. } => collect_type_names(base, out),
         ast::TypeKind::Forall { ty, .. } => collect_type_names(ty, out),
@@ -533,4 +533,3 @@ fn collect_expr_names(expr: &ast::Expr, out: &mut HashSet<String>) {
     }
     crate::utils::recurse_expr(expr, |e| collect_expr_names(e, out));
 }
-

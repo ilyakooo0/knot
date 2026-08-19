@@ -13,13 +13,13 @@
 pub mod log;
 mod tui;
 
-use rusqlite::types::ValueRef;
-use rusqlite::Connection;
 use dashmap::DashMap;
+use rusqlite::Connection;
+use rusqlite::types::ValueRef;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Bound;
 use std::ffi::c_void;
+use std::ops::Bound;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
@@ -92,7 +92,9 @@ impl Chunk {
     }
 
     #[inline]
-    fn is_full(&self) -> bool { self.len >= CHUNK_CAP }
+    fn is_full(&self) -> bool {
+        self.len >= CHUNK_CAP
+    }
 
     /// Bump-allocate a value, returning a stable pointer.
     #[inline]
@@ -100,7 +102,9 @@ impl Chunk {
         debug_assert!(!self.is_full());
         let slot = &mut self.data.0[self.len];
         let ptr = slot.as_mut_ptr();
-        unsafe { ptr.write(v); }
+        unsafe {
+            ptr.write(v);
+        }
         self.len += 1;
         ptr
     }
@@ -108,7 +112,9 @@ impl Chunk {
     /// Check whether `val` points into this chunk's live region.
     #[inline]
     fn contains(&self, val: *mut Value) -> bool {
-        if self.len == 0 { return false; }
+        if self.len == 0 {
+            return false;
+        }
         let base = self.data.0.as_ptr() as usize;
         let end = unsafe { self.data.0.as_ptr().add(self.len) as usize };
         let addr = val as usize;
@@ -132,11 +138,20 @@ impl Chunk {
         // SAFETY: addr/len describe a valid, owned allocation; madvise
         // is non-destructive — it only affects paging behaviour.
         #[cfg(target_os = "linux")]
-        unsafe { libc::madvise(addr, len, libc::MADV_DONTNEED); }
-        #[cfg(any(target_os = "macos", target_os = "ios",
-                  target_os = "freebsd", target_os = "openbsd",
-                  target_os = "netbsd", target_os = "dragonfly"))]
-        unsafe { libc::madvise(addr, len, libc::MADV_FREE); }
+        unsafe {
+            libc::madvise(addr, len, libc::MADV_DONTNEED);
+        }
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        unsafe {
+            libc::madvise(addr, len, libc::MADV_FREE);
+        }
     }
 
     #[cfg(not(unix))]
@@ -191,7 +206,9 @@ impl Frame {
 
     /// Flat position across `chunks` (chunk_index * CHUNK_CAP + slot).
     fn mark_chunks(&self) -> usize {
-        if self.chunks.is_empty() { return 0; }
+        if self.chunks.is_empty() {
+            return 0;
+        }
         (self.chunks.len() - 1) * CHUNK_CAP + self.chunks.last().unwrap().len
     }
 
@@ -243,9 +260,9 @@ impl Frame {
                 let addr = val as usize;
                 // Find the chunk whose base is the largest one ≤ addr.
                 let pos = match self.chunk_index.binary_search_by_key(&addr, |&(b, _)| b) {
-                    Ok(p) => p,        // addr == base of chunk `p`
-                    Err(0) => return false,  // addr precedes all chunks
-                    Err(p) => p - 1,   // chunk p-1 is the greatest base ≤ addr
+                    Ok(p) => p,             // addr == base of chunk `p`
+                    Err(0) => return false, // addr precedes all chunks
+                    Err(p) => p - 1,        // chunk p-1 is the greatest base ≤ addr
                 };
                 let (_, chunk_idx) = self.chunk_index[pos];
                 self.chunks[chunk_idx as usize].contains(val)
@@ -263,7 +280,10 @@ impl Frame {
             1 => self.pinned_chunks[0].contains(val),
             _ => {
                 let addr = val as usize;
-                let pos = match self.pinned_chunk_index.binary_search_by_key(&addr, |&(b, _)| b) {
+                let pos = match self
+                    .pinned_chunk_index
+                    .binary_search_by_key(&addr, |&(b, _)| b)
+                {
                     Ok(p) => p,
                     Err(0) => return false,
                     Err(p) => p - 1,
@@ -279,7 +299,9 @@ impl Frame {
     /// traversed graph is a deep-pinned spine promoted across prior
     /// iterations — the pinned-chunk range check typically hits fast.
     fn owns_pinned_first(&self, val: *mut Value) -> bool {
-        if self.owns_in_pinned_chunks(val) { return true; }
+        if self.owns_in_pinned_chunks(val) {
+            return true;
+        }
         self.owns_in_chunks(val)
     }
 
@@ -289,7 +311,9 @@ impl Frame {
     fn drop_chunks(&mut self) {
         for chunk in &mut self.chunks {
             for si in 0..chunk.len {
-                unsafe { std::ptr::drop_in_place(chunk.data.0[si].as_mut_ptr()); }
+                unsafe {
+                    std::ptr::drop_in_place(chunk.data.0[si].as_mut_ptr());
+                }
             }
             chunk.len = 0;
         }
@@ -300,12 +324,13 @@ impl Frame {
     fn drop_pinned_chunks(&mut self) {
         for chunk in &mut self.pinned_chunks {
             for si in 0..chunk.len {
-                unsafe { std::ptr::drop_in_place(chunk.data.0[si].as_mut_ptr()); }
+                unsafe {
+                    std::ptr::drop_in_place(chunk.data.0[si].as_mut_ptr());
+                }
             }
             chunk.len = 0;
         }
     }
-
 }
 
 impl Drop for Frame {
@@ -524,11 +549,23 @@ impl GcStats {
 
     fn snapshot(&self) -> GcStatsSnapshot {
         GcStatsSnapshot {
-            allocs: 0, chunks_allocated: 0, chunks_pool_hits: 0, chunks_returned: 0,
-            chunks_dropped: 0, promotes: 0, promote_cache_hits: 0, clone_into_pinned: 0,
-            frame_pushes: 0, frame_pops: 0, peak_frame_depth: 0, relation_pool_hits: 0,
-            relation_pool_misses: 0, text_cache_hits: 0, text_cache_misses: 0,
-            pinned_allocs: 0, resets: 0,
+            allocs: 0,
+            chunks_allocated: 0,
+            chunks_pool_hits: 0,
+            chunks_returned: 0,
+            chunks_dropped: 0,
+            promotes: 0,
+            promote_cache_hits: 0,
+            clone_into_pinned: 0,
+            frame_pushes: 0,
+            frame_pops: 0,
+            peak_frame_depth: 0,
+            relation_pool_hits: 0,
+            relation_pool_misses: 0,
+            text_cache_hits: 0,
+            text_cache_misses: 0,
+            pinned_allocs: 0,
+            resets: 0,
         }
     }
 }
@@ -547,8 +584,12 @@ static GC_STATS: GcStats = GcStats::new();
 /// overwritten without being dropped.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn knot_gc_stats_snapshot(out: *mut GcStatsSnapshot) {
-    if out.is_null() { return; }
-    unsafe { std::ptr::write(out, GC_STATS.snapshot()); }
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        std::ptr::write(out, GC_STATS.snapshot());
+    }
 }
 
 /// Print a human-readable dump of the current GC counters to stderr.
@@ -556,15 +597,30 @@ pub unsafe extern "C-unwind" fn knot_gc_stats_snapshot(out: *mut GcStatsSnapshot
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_gc_stats_dump() {
     let s = GC_STATS.snapshot();
-    eprintln!("[gc] allocs={} pinned_allocs={} resets={}", s.allocs, s.pinned_allocs, s.resets);
-    eprintln!("[gc] chunks: allocated={} pool_hits={} returned={} dropped={}",
-        s.chunks_allocated, s.chunks_pool_hits, s.chunks_returned, s.chunks_dropped);
-    eprintln!("[gc] promote: calls={} cache_hits={} clone_into_pinned={}",
-        s.promotes, s.promote_cache_hits, s.clone_into_pinned);
-    eprintln!("[gc] frames: pushes={} pops={} peak_depth={}",
-        s.frame_pushes, s.frame_pops, s.peak_frame_depth);
-    eprintln!("[gc] relation_pool: hits={} misses={}", s.relation_pool_hits, s.relation_pool_misses);
-    eprintln!("[gc] text_cache: hits={} misses={}", s.text_cache_hits, s.text_cache_misses);
+    eprintln!(
+        "[gc] allocs={} pinned_allocs={} resets={}",
+        s.allocs, s.pinned_allocs, s.resets
+    );
+    eprintln!(
+        "[gc] chunks: allocated={} pool_hits={} returned={} dropped={}",
+        s.chunks_allocated, s.chunks_pool_hits, s.chunks_returned, s.chunks_dropped
+    );
+    eprintln!(
+        "[gc] promote: calls={} cache_hits={} clone_into_pinned={}",
+        s.promotes, s.promote_cache_hits, s.clone_into_pinned
+    );
+    eprintln!(
+        "[gc] frames: pushes={} pops={} peak_depth={}",
+        s.frame_pushes, s.frame_pops, s.peak_frame_depth
+    );
+    eprintln!(
+        "[gc] relation_pool: hits={} misses={}",
+        s.relation_pool_hits, s.relation_pool_misses
+    );
+    eprintln!(
+        "[gc] text_cache: hits={} misses={}",
+        s.text_cache_hits, s.text_cache_misses
+    );
 }
 
 /// Cap the chunk pool so the arena doesn't hoard memory after a transient
@@ -820,7 +876,9 @@ impl Arena {
                 let chunk = &mut frame.chunks[ci];
                 let start = if ci == mark_chunk { mark_slot } else { 0 };
                 for si in (start..chunk.len).rev() {
-                    unsafe { std::ptr::drop_in_place(chunk.data.0[si].as_mut_ptr()); }
+                    unsafe {
+                        std::ptr::drop_in_place(chunk.data.0[si].as_mut_ptr());
+                    }
                 }
                 chunk.len = start;
             }
@@ -944,27 +1002,44 @@ impl Arena {
     /// pure overhead in the common "already-safe value reached via
     /// recursion" case.
     fn promote_children(&mut self, val: *mut Value) -> *mut Value {
-        if val.is_null() { return val; }
+        if val.is_null() {
+            return val;
+        }
         // Tagged pointers encode leaf values inline; they have no
         // heap-resident payload, so there's nothing to walk.
-        if is_tagged(val) { return val; }
+        if is_tagged(val) {
+            return val;
+        }
         match unsafe { &*val } {
-            Value::Int(_) | Value::Float(_) | Value::Text(_)
-            | Value::Bool(_) | Value::Bytes(_) | Value::Unit => val,
+            Value::Int(_)
+            | Value::Float(_)
+            | Value::Text(_)
+            | Value::Bool(_)
+            | Value::Bytes(_)
+            | Value::Unit => val,
 
             Value::Record(fields) => {
                 let mut new_fields: Option<Vec<RecordField>> = None;
                 for (i, f) in fields.iter().enumerate() {
                     let nv = self.promote_value(f.value);
                     if let Some(vec) = new_fields.as_mut() {
-                        vec.push(RecordField { name: f.name.clone(), value: nv });
+                        vec.push(RecordField {
+                            name: f.name.clone(),
+                            value: nv,
+                        });
                     } else if nv != f.value {
                         // First divergence: materialize, copy prefix.
                         let mut vec = take_record_vec(fields.len());
                         for prev in &fields[..i] {
-                            vec.push(RecordField { name: prev.name.clone(), value: prev.value });
+                            vec.push(RecordField {
+                                name: prev.name.clone(),
+                                value: prev.value,
+                            });
                         }
-                        vec.push(RecordField { name: f.name.clone(), value: nv });
+                        vec.push(RecordField {
+                            name: f.name.clone(),
+                            value: nv,
+                        });
                         new_fields = Some(vec);
                     }
                 }
@@ -995,7 +1070,9 @@ impl Arena {
                 let ni = self.promote_value(*inner);
                 if ni != *inner {
                     self.alloc_pinned(Value::Constructor(tag.clone(), ni))
-                } else { val }
+                } else {
+                    val
+                }
             }
             Value::Function(f) => {
                 let ne = self.promote_value(f.env);
@@ -1006,22 +1083,30 @@ impl Arena {
                         source: f.source.clone(),
                         extract_source: f.extract_source.clone(),
                     })))
-                } else { val }
+                } else {
+                    val
+                }
             }
             Value::IO(io) => {
                 let ne = self.promote_value(io.env);
                 if ne != io.env {
                     self.alloc_pinned(Value::IO(Box::new(IOInner {
-                        fn_ptr: io.fn_ptr, env: ne, source: io.source.clone(),
+                        fn_ptr: io.fn_ptr,
+                        env: ne,
+                        source: io.source.clone(),
                     })))
-                } else { val }
+                } else {
+                    val
+                }
             }
             Value::Pair(a, b) => {
                 let na = self.promote_value(*a);
                 let nb = self.promote_value(*b);
                 if na != *a || nb != *b {
                     self.alloc_pinned(Value::Pair(na, nb))
-                } else { val }
+                } else {
+                    val
+                }
             }
         }
     }
@@ -1032,7 +1117,9 @@ impl Arena {
     /// a child pointer, we clone the child once and both parents reference
     /// the same promoted pointer afterward.
     fn promote_value(&mut self, val: *mut Value) -> *mut Value {
-        if val.is_null() { return val; }
+        if val.is_null() {
+            return val;
+        }
         GC_STATS.bump(&GC_STATS.promotes);
         if let Some(&cached) = self.promote_cache.get(&val) {
             GC_STATS.bump(&GC_STATS.promote_cache_hits);
@@ -1064,10 +1151,14 @@ impl Arena {
     /// Deep-clone a chunk-resident value into the pinned set.
     /// Children are processed with `promote_value` (selective).
     fn clone_into_pinned(&mut self, val: *mut Value) -> *mut Value {
-        if val.is_null() { return val; }
+        if val.is_null() {
+            return val;
+        }
         // Tagged pointers carry their full payload inline — they're
         // already safe from any arena reset.  No pinned clone needed.
-        if is_tagged(val) { return val; }
+        if is_tagged(val) {
+            return val;
+        }
         GC_STATS.bump(&GC_STATS.clone_into_pinned);
         let cloned = match unsafe { &*val } {
             Value::Int(n) => Value::Int(*n),
@@ -1098,14 +1189,23 @@ impl Arena {
                 let frame_idx = self.frames.len() - 1;
                 let mut new_rows = take_relation_vec(rows.len());
                 let all_identity = rows.iter().all(|&r| {
-                    if r.is_null() { return true; }
+                    if r.is_null() {
+                        return true;
+                    }
                     // Tagged pointers carry leaf values inline —
                     // always identity-copyable, never chunk-owned.
-                    if is_tagged(r) { return true; }
-                    let is_leaf = matches!(unsafe { &*r },
-                        Value::Int(_) | Value::Float(_)
-                        | Value::Bool(_) | Value::Unit | Value::Text(_)
-                        | Value::Bytes(_));
+                    if is_tagged(r) {
+                        return true;
+                    }
+                    let is_leaf = matches!(
+                        unsafe { &*r },
+                        Value::Int(_)
+                            | Value::Float(_)
+                            | Value::Bool(_)
+                            | Value::Unit
+                            | Value::Text(_)
+                            | Value::Bytes(_)
+                    );
                     is_leaf && !self.frames[frame_idx].owns_in_chunks(r)
                 });
                 if all_identity {
@@ -1120,22 +1220,18 @@ impl Arena {
             Value::Constructor(tag, inner) => {
                 Value::Constructor(tag.clone(), self.promote_value(*inner))
             }
-            Value::Function(f) => {
-                Value::Function(Box::new(FunctionInner {
-                    fn_ptr: f.fn_ptr,
-                    env: self.promote_value(f.env),
-                    source: f.source.clone(),
-                    extract_source: f.extract_source.clone(),
-                }))
-            }
-            Value::IO(io) => {
-                Value::IO(Box::new(IOInner {
-                    fn_ptr: io.fn_ptr, env: self.promote_value(io.env), source: io.source.clone(),
-                }))
-            }
-            Value::Pair(a, b) => {
-                Value::Pair(self.promote_value(*a), self.promote_value(*b))
-            }
+            Value::Function(f) => Value::Function(Box::new(FunctionInner {
+                fn_ptr: f.fn_ptr,
+                env: self.promote_value(f.env),
+                source: f.source.clone(),
+                extract_source: f.extract_source.clone(),
+            })),
+            Value::IO(io) => Value::IO(Box::new(IOInner {
+                fn_ptr: io.fn_ptr,
+                env: self.promote_value(io.env),
+                source: io.source.clone(),
+            })),
+            Value::Pair(a, b) => Value::Pair(self.promote_value(*a), self.promote_value(*b)),
         };
         self.alloc_pinned(cloned)
     }
@@ -1170,7 +1266,9 @@ impl Arena {
     /// by `child`.  Uses chunk-range + pinned checks (no HashSet).
     /// Consults `promote_cache` to share cloned subtrees.
     fn clone_from_child(&mut self, val: *mut Value, child: &Frame) -> *mut Value {
-        if val.is_null() { return val; }
+        if val.is_null() {
+            return val;
+        }
         // Use pinned-first ownership to short-circuit on the deep-pinned
         // spine that dominates values promoted across frame boundaries.
         if !child.owns_pinned_first(val) {
@@ -1206,25 +1304,21 @@ impl Arena {
             Value::Constructor(tag, inner) => {
                 Value::Constructor(tag.clone(), self.clone_from_child(*inner, child))
             }
-            Value::Function(f) => {
-                Value::Function(Box::new(FunctionInner {
-                    fn_ptr: f.fn_ptr,
-                    env: self.clone_from_child(f.env, child),
-                    source: f.source.clone(),
-                    extract_source: f.extract_source.clone(),
-                }))
-            }
-            Value::IO(io) => {
-                Value::IO(Box::new(IOInner {
-                    fn_ptr: io.fn_ptr, env: self.clone_from_child(io.env, child), source: io.source.clone(),
-                }))
-            }
-            Value::Pair(a, b) => {
-                Value::Pair(
-                    self.clone_from_child(*a, child),
-                    self.clone_from_child(*b, child),
-                )
-            }
+            Value::Function(f) => Value::Function(Box::new(FunctionInner {
+                fn_ptr: f.fn_ptr,
+                env: self.clone_from_child(f.env, child),
+                source: f.source.clone(),
+                extract_source: f.extract_source.clone(),
+            })),
+            Value::IO(io) => Value::IO(Box::new(IOInner {
+                fn_ptr: io.fn_ptr,
+                env: self.clone_from_child(io.env, child),
+                source: io.source.clone(),
+            })),
+            Value::Pair(a, b) => Value::Pair(
+                self.clone_from_child(*a, child),
+                self.clone_from_child(*b, child),
+            ),
         };
         let out = self.alloc(cloned);
         self.promote_cache.insert(val, out);
@@ -1300,7 +1394,11 @@ impl CancelToken {
         // slot here BEFORE checking `is_cancelled()` — so either we see the
         // registered slot (and wake it), or the waiter's check sees the flag
         // (the `stm_slot` mutex orders the two paths).
-        let slot = self.stm_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let slot = self
+            .stm_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(slot) = slot.and_then(|w| w.upgrade()) {
             slot.wake();
         }
@@ -1744,10 +1842,9 @@ fn cmp_for_col(a: &SqlVal, b: &SqlVal, text_col: bool) -> Option<std::cmp::Order
     // Genuine TEXT column (BINARY collation): compare byte-wise to match
     // SQLite, NOT via the numeric-parse heuristic (correct only for
     // `KNOT_INT`-collated Int columns stored as TEXT). See `TEXT_COLUMNS`.
-    if text_col
-        && let (SqlVal::Text(x), SqlVal::Text(y)) = (a, b) {
-            return Some(x.cmp(y));
-        }
+    if text_col && let (SqlVal::Text(x), SqlVal::Text(y)) = (a, b) {
+        return Some(x.cmp(y));
+    }
     sql_partial_cmp(a, b)
 }
 
@@ -1765,9 +1862,7 @@ fn col_pred_matches(row_val: &SqlVal, pred: &ColPred, text_col: bool) -> bool {
         ColPred::Cmp(CmpOp::Eq, target) => {
             !matches!(cmp(row_val, target), Some(o) if o != Ordering::Equal)
         }
-        ColPred::Cmp(CmpOp::Neq, target) => {
-            !matches!(cmp(row_val, target), Some(Ordering::Equal))
-        }
+        ColPred::Cmp(CmpOp::Neq, target) => !matches!(cmp(row_val, target), Some(Ordering::Equal)),
         ColPred::Cmp(op, target) => match cmp(row_val, target) {
             Some(ord) => match op {
                 CmpOp::Lt => ord == Ordering::Less,
@@ -1811,15 +1906,23 @@ struct EventRows {
 fn headers_compatible(a: &Arc<[ColName]>, b: &Arc<[ColName]>) -> bool {
     Arc::ptr_eq(a, b)
         || (a.len() == b.len()
-            && a.iter().zip(b.iter()).all(|(x, y)| Arc::ptr_eq(x, y) || x == y))
+            && a.iter()
+                .zip(b.iter())
+                .all(|(x, y)| Arc::ptr_eq(x, y) || x == y))
 }
 
 impl EventRows {
     fn new(columns: Arc<[ColName]>) -> Self {
-        EventRows { columns, rows: Vec::new() }
+        EventRows {
+            columns,
+            rows: Vec::new(),
+        }
     }
     fn with_capacity(columns: Arc<[ColName]>, cap: usize) -> Self {
-        EventRows { columns, rows: Vec::with_capacity(cap) }
+        EventRows {
+            columns,
+            rows: Vec::with_capacity(cap),
+        }
     }
     fn push(&mut self, vals: Vec<SqlVal>) {
         debug_assert_eq!(
@@ -1945,9 +2048,7 @@ impl WriteEvent {
                             // heuristic used for `KNOT_INT`-stored Int columns.
                             let preds_with_idx: Vec<(Option<usize>, &ColPred, bool)> = preds
                                 .iter()
-                                .map(|(c, p)| {
-                                    (rows.col_index(c), p, col_is_text(table, c))
-                                })
+                                .map(|(c, p)| (rows.col_index(c), p, col_is_text(table, c)))
                                 .collect();
                             for row in &rows.rows {
                                 if row_matches_preds_indexed(row, &preds_with_idx) {
@@ -1981,7 +2082,11 @@ static COL_INTERN: std::sync::LazyLock<RwLock<HashMap<String, Arc<str>>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
 fn intern_col(name: &str) -> Arc<str> {
-    if let Some(v) = COL_INTERN.read().unwrap_or_else(|e| e.into_inner()).get(name) {
+    if let Some(v) = COL_INTERN
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+    {
         return v.clone();
     }
     let mut w = COL_INTERN.write().unwrap_or_else(|e| e.into_inner());
@@ -2008,7 +2113,11 @@ fn register_source_schema(name: &str, schema: Arc<RecordSchema>) {
 }
 
 fn get_source_schema(name: &str) -> Option<Arc<RecordSchema>> {
-    SOURCE_SCHEMAS.read().unwrap_or_else(|e| e.into_inner()).get(name).cloned()
+    SOURCE_SCHEMAS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .cloned()
 }
 
 /// Registry of columns stored as genuine TEXT (BINARY collation in SQLite) —
@@ -2022,8 +2131,9 @@ fn get_source_schema(name: &str) -> Option<Arc<RecordSchema>> {
 /// which columns are genuinely text, the wake path can't tell — so it is
 /// resolved once (at `knot_source_init`) and consulted by the filter
 /// comparison (`col_pred_matches`) and watcher routing (`classify_filter`).
-static TEXT_COLUMNS: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<(String, String)>>> =
-    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+static TEXT_COLUMNS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::HashSet<(String, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
 
 fn register_text_column(source: &str, col: &str) {
     TEXT_COLUMNS
@@ -2062,7 +2172,11 @@ enum FilterReg {
     Eq { col: String, keys: Vec<SqlValKey> },
     /// Register under `RANGE_WATCHERS[(table, col)]` with a threshold compared
     /// at wake time against the write event's row values.
-    Range { col: String, op: CmpOp, threshold: SqlVal },
+    Range {
+        col: String,
+        op: CmpOp,
+        threshold: SqlVal,
+    },
 }
 
 /// Selectivity rank for choosing the cheapest indexable predicate from a
@@ -2105,9 +2219,10 @@ fn classify_filter(table: &str, filter: &ReadFilter) -> FilterReg {
             continue;
         }
         if let Some(rank) = pred_selectivity(pred)
-            && best.is_none_or(|(_, br)| rank < br) {
-                best = Some((i, rank));
-            }
+            && best.is_none_or(|(_, br)| rank < br)
+        {
+            best = Some((i, rank));
+        }
     }
     let Some((idx, _)) = best else {
         return FilterReg::Broad;
@@ -2123,11 +2238,13 @@ fn classify_filter(table: &str, filter: &ReadFilter) -> FilterReg {
             col: col_str,
             keys: vals.iter().map(SqlVal::to_key).collect(),
         },
-        ColPred::Cmp(op @ (CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge), val) => FilterReg::Range {
-            col: col_str,
-            op: *op,
-            threshold: val.clone(),
-        },
+        ColPred::Cmp(op @ (CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge), val) => {
+            FilterReg::Range {
+                col: col_str,
+                op: *op,
+                threshold: val.clone(),
+            }
+        }
         _ => FilterReg::Broad,
     }
 }
@@ -2168,7 +2285,9 @@ impl WakeSlot {
         if *guard {
             return;
         }
-        let _ = self.cvar.wait_timeout_while(guard, timeout, |woken| !*woken);
+        let _ = self
+            .cvar
+            .wait_timeout_while(guard, timeout, |woken| !*woken);
     }
     /// Decide whether a write event on `table` should wake this slot.
     /// Returns true if the slot has no filter for `table` (defensive — shouldn't
@@ -2596,18 +2715,17 @@ fn wake_matching_watchers(name: &str, event: &WriteEvent) {
     // notify path) and `knot_stm_wait` (between registration and the version
     // re-check), at least one side always observes the other.
     let event: &WriteEvent = match event {
-        WriteEvent::Rows(rows) if filter_cols_missing_from_payload(name, rows) => {
-            &WriteEvent::Bulk
-        }
+        WriteEvent::Rows(rows) if filter_cols_missing_from_payload(name, rows) => &WriteEvent::Bulk,
         e => e,
     };
     // 1) Broad watchers — All filters and non-indexable Cols.
     if let Some(slots) = TABLE_WATCHERS.get(name) {
         for weak in slots.iter() {
             if let Some(slot) = weak.upgrade()
-                && slot.matches(name, event) {
-                    slot.wake();
-                }
+                && slot.matches(name, event)
+            {
+                slot.wake();
+            }
         }
     }
     // 2) Indexed watchers.
@@ -2817,7 +2935,9 @@ fn wake_range_index(idx: &RangeIndex, row_val: &SqlVal) {
             .parse::<i64>()
             .ok()
             .map(|n| SqlValKey::RealBits((n as f64).to_bits())),
-        SqlVal::Real(f) if f.is_finite() && *f >= i64::MIN as f64 && *f < 9_223_372_036_854_775_808.0 => {
+        SqlVal::Real(f)
+            if f.is_finite() && *f >= i64::MIN as f64 && *f < 9_223_372_036_854_775_808.0 =>
+        {
             // For Real rows probing Int thresholds, exact float-int comparison
             // boundaries depend on op direction. Use `floor` for "less" probes
             // (wakes Int thresholds strictly above the floor) and rely on the
@@ -2882,7 +3002,10 @@ fn wake_range_keyed_cross(idx: &RangeIndex, row_val: &SqlVal, alt: &SqlValKey) {
     } else {
         (Bound::Excluded(alt.clone()), Bound::Included(alt.clone()))
     };
-    for (_, v) in idx.lt.range((Bound::Excluded(alt.clone()), Bound::Unbounded)) {
+    for (_, v) in idx
+        .lt
+        .range((Bound::Excluded(alt.clone()), Bound::Unbounded))
+    {
         wake_weaks(v);
     }
     for (_, v) in idx.le.range((le_low, Bound::Unbounded)) {
@@ -2891,7 +3014,10 @@ fn wake_range_keyed_cross(idx: &RangeIndex, row_val: &SqlVal, alt: &SqlValKey) {
     for (_, v) in idx.gt.range((Bound::Unbounded, gt_high)) {
         wake_weaks(v);
     }
-    for (_, v) in idx.ge.range((Bound::Unbounded, Bound::Included(alt.clone()))) {
+    for (_, v) in idx
+        .ge
+        .range((Bound::Unbounded, Bound::Included(alt.clone())))
+    {
         wake_weaks(v);
     }
 }
@@ -2999,13 +3125,24 @@ type SpecCacheMap = HashMap<(usize, usize), Option<Arc<ParsedSpec>>>;
 static SPEC_CACHE: std::sync::LazyLock<RwLock<SpecCacheMap>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
-fn lookup_or_parse_spec(spec_ptr: *const u8, spec_len: usize, spec: &str) -> Option<Arc<ParsedSpec>> {
+fn lookup_or_parse_spec(
+    spec_ptr: *const u8,
+    spec_len: usize,
+    spec: &str,
+) -> Option<Arc<ParsedSpec>> {
     let key = (spec_ptr as usize, spec_len);
-    if let Some(entry) = SPEC_CACHE.read().unwrap_or_else(|e| e.into_inner()).get(&key) {
+    if let Some(entry) = SPEC_CACHE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
         return entry.clone();
     }
     let parsed = parse_spec_structure(spec).map(Arc::new);
-    SPEC_CACHE.write().unwrap_or_else(|e| e.into_inner()).insert(key, parsed.clone());
+    SPEC_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, parsed.clone());
     parsed
 }
 
@@ -3108,10 +3245,9 @@ fn stm_specialize_read_pred(name: &str, preds: Vec<(Arc<str>, ColPred)>) {
         let mut t = t.borrow_mut();
         t.reads.entry(name.to_string()).or_insert((arc, ver));
         let v = t.filters.entry(name.to_string()).or_default();
-        if fresh
-            && let Some(pos) = v.iter().rposition(|f| matches!(f, ReadFilter::All)) {
-                v.remove(pos);
-            }
+        if fresh && let Some(pos) = v.iter().rposition(|f| matches!(f, ReadFilter::All)) {
+            v.remove(pos);
+        }
         v.push(ReadFilter::Cols(preds));
     });
 }
@@ -3219,8 +3355,11 @@ fn select_rows_with_rowid(
     let selected: Vec<&ColumnSpec> = match project {
         Some(cols) => {
             let set: std::collections::HashSet<&str> = cols.iter().map(String::as_str).collect();
-            let v: Vec<&ColumnSpec> =
-                rec.columns.iter().filter(|c| set.contains(c.name.as_str())).collect();
+            let v: Vec<&ColumnSpec> = rec
+                .columns
+                .iter()
+                .filter(|c| set.contains(c.name.as_str()))
+                .collect();
             if v.is_empty() {
                 rec.columns.iter().collect()
             } else {
@@ -3370,7 +3509,11 @@ pub extern "C-unwind" fn knot_override_lookup(
     let flag = format!("--{}", name);
 
     // Tags 4-7 are Maybe variants of 0-3
-    let base_tag = if type_tag >= 4 { type_tag - 4 } else { type_tag };
+    let base_tag = if type_tag >= 4 {
+        type_tag - 4
+    } else {
+        type_tag
+    };
     let wrap_maybe = type_tag >= 4;
     let is_bool = base_tag == 3;
 
@@ -3899,7 +4042,9 @@ pub(crate) fn encode_smallint(n: i64) -> Option<*mut Value> {
     // i61 range: −2^60 .. 2^60 − 1
     const MIN: i64 = -(1i64 << 60);
     const MAX: i64 = (1i64 << 60) - 1;
-    if !(MIN..=MAX).contains(&n) { return None; }
+    if !(MIN..=MAX).contains(&n) {
+        return None;
+    }
     let raw = ((n as usize) << 3) | TAG_SMALLINT;
     Some(raw as *mut Value)
 }
@@ -3943,7 +4088,10 @@ pub(crate) fn decode_tagged(p: *mut Value) -> Value {
         }
         TAG_BOOL => Value::Bool((raw >> 3) & 1 == 1),
         TAG_UNIT => Value::Unit,
-        _ => panic!("knot runtime: decode_tagged on untagged pointer 0x{:x}", raw),
+        _ => panic!(
+            "knot runtime: decode_tagged on untagged pointer 0x{:x}",
+            raw
+        ),
     }
 }
 
@@ -4082,7 +4230,12 @@ impl KnotDb {
                 // without this — surface it under --debug so a bogus column
                 // (e.g. a subquery over-match) or a real SQLite error shows
                 // up alongside the [SQL] trace instead of being swallowed.
-                log_debug!("[SQL] index creation failed for {}.{}: {}", table, column, e);
+                log_debug!(
+                    "[SQL] index creation failed for {}.{}: {}",
+                    table,
+                    column,
+                    e
+                );
             }
         }
     }
@@ -4562,7 +4715,11 @@ fn alloc(v: Value) -> *mut Value {
 
 /// Allocate an IO thunk with its producing source text (for `extract`).
 fn alloc_io(fn_ptr: *const u8, env: *mut Value, source: Arc<str>) -> *mut Value {
-    alloc(Value::IO(Box::new(IOInner { fn_ptr, env, source })))
+    alloc(Value::IO(Box::new(IOInner {
+        fn_ptr,
+        env,
+        source,
+    })))
 }
 
 /// Allocate a leaf builtin IO whose source is `base.<name> <extract env>`
@@ -4616,7 +4773,6 @@ fn alloc_int(n: i64) -> *mut Value {
     alloc(Value::Int(n))
 }
 
-
 /// Return a tagged Bool pointer.  The tag encoding (`0b010` in the
 /// low 3 bits, payload in bit 3) produces two globally-unique bit
 /// patterns for `true` / `false` — no thread-local lookup, no heap
@@ -4662,7 +4818,11 @@ pub extern "C-unwind" fn knot_arena_pop_frame() {
         ARENA.with(|a| {
             let arena = a.borrow();
             let depth = arena.frames.len();
-            log_debug!("[ARENA] pop_frame: depth {} → {}", depth, depth.saturating_sub(1));
+            log_debug!(
+                "[ARENA] pop_frame: depth {} → {}",
+                depth,
+                depth.saturating_sub(1)
+            );
         });
     }
     ARENA.with(|a| a.borrow_mut().pop_frame());
@@ -4755,7 +4915,10 @@ unsafe fn str_from_raw(ptr: *const u8, len: usize) -> &'static str {
     let bytes = unsafe { slice::from_raw_parts(ptr, len) };
     match std::str::from_utf8(bytes) {
         Ok(s) => unsafe { &*(s as *const str) },
-        Err(e) => panic!("knot runtime: invalid UTF-8 from compiled code at byte {}", e.valid_up_to()),
+        Err(e) => panic!(
+            "knot runtime: invalid UTF-8 from compiled code at byte {}",
+            e.valid_up_to()
+        ),
     }
 }
 
@@ -4831,7 +4994,9 @@ pub(crate) fn quote_ident(name: &str) -> String {
         let mut s = String::with_capacity(name.len() + 2);
         s.push('"');
         for ch in name.chars() {
-            if ch == '"' { s.push('"'); }
+            if ch == '"' {
+                s.push('"');
+            }
             s.push(ch);
         }
         s.push('"');
@@ -4863,7 +5028,9 @@ struct ValueSingletons {
 impl Drop for ValueSingletons {
     fn drop(&mut self) {
         for &ptr in &self.small_ints {
-            unsafe { let _ = Box::from_raw(ptr); }
+            unsafe {
+                let _ = Box::from_raw(ptr);
+            }
         }
         unsafe {
             let _ = Box::from_raw(self.unit);
@@ -5002,7 +5169,9 @@ impl Drop for TextLiteralCache {
         // Iterate the map (not entries) so we skip freed slots.
         for &idx in self.map.values() {
             let val = self.entries[idx as usize].val;
-            unsafe { let _ = Box::from_raw(val); }
+            unsafe {
+                let _ = Box::from_raw(val);
+            }
         }
     }
 }
@@ -5029,7 +5198,9 @@ pub extern "C-unwind" fn knot_value_int(n: i64) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_value_int_from_str(ptr: *const u8, len: usize) -> *mut Value {
     let s = unsafe { str_from_raw(ptr, len) };
-    let n = s.parse::<i64>().unwrap_or_else(|e| panic!("knot runtime: invalid integer literal '{}': {}", s, e));
+    let n = s
+        .parse::<i64>()
+        .unwrap_or_else(|e| panic!("knot runtime: invalid integer literal '{}': {}", s, e));
     alloc_int(n)
 }
 
@@ -5129,7 +5300,8 @@ pub unsafe extern "C-unwind" fn knot_value_text_intern(
     // we detect that case and fall back to the per-thread LRU cache, which
     // doesn't require any alignment from the caller.  Same observable result,
     // just gives up the inline-slot fast path.
-    if !(slot as usize).is_multiple_of(std::mem::align_of::<std::sync::atomic::AtomicPtr<Value>>()) {
+    if !(slot as usize).is_multiple_of(std::mem::align_of::<std::sync::atomic::AtomicPtr<Value>>())
+    {
         return knot_value_text_cached(ptr, len);
     }
     let atomic = unsafe { &*(slot as *const std::sync::atomic::AtomicPtr<Value>) };
@@ -5150,7 +5322,9 @@ pub unsafe extern "C-unwind" fn knot_value_text_intern(
         Ok(_) => val,
         Err(winner) => {
             // Lost the race; drop our box and use the winner's value.
-            unsafe { drop(Box::from_raw(val)); }
+            unsafe {
+                drop(Box::from_raw(val));
+            }
             winner
         }
     }
@@ -5297,10 +5471,19 @@ pub extern "C-unwind" fn knot_record_set_field(
             // Maintain sorted order by field name for O(log n) lookup
             match fields.binary_search_by(|f| (*f.name).cmp(name_str)) {
                 Ok(idx) => fields[idx].value = value,
-                Err(idx) => fields.insert(idx, RecordField { name: intern_str(name_str), value }),
+                Err(idx) => fields.insert(
+                    idx,
+                    RecordField {
+                        name: intern_str(name_str),
+                        value,
+                    },
+                ),
             }
         }
-        _ => panic!("knot runtime: expected Record in set_field, got {}", type_name(record)),
+        _ => panic!(
+            "knot runtime: expected Record in set_field, got {}",
+            type_name(record)
+        ),
     }
 }
 
@@ -5342,7 +5525,10 @@ pub extern "C-unwind" fn knot_record_field(
 ) -> *mut Value {
     if record.is_null() {
         let name = unsafe { str_from_raw(key_ptr, key_len) };
-        panic!("knot runtime: field '{}' access on null (nullable none variant)", name);
+        panic!(
+            "knot runtime: field '{}' access on null (nullable none variant)",
+            name
+        );
     }
     let name = unsafe { str_from_raw(key_ptr, key_len) };
     match unsafe { as_ref(record) } {
@@ -5357,7 +5543,11 @@ pub extern "C-unwind" fn knot_record_field(
             panic!(
                 "knot runtime: field '{}' not found in record\n  available fields: {}",
                 name,
-                if available.is_empty() { "(none)".to_string() } else { available.join(", ") }
+                if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                }
             )
         }
         Value::Constructor(_, payload) => {
@@ -5382,16 +5572,26 @@ pub extern "C-unwind" fn knot_record_field(
 /// Direct index-based field access for closure environments.
 /// Index corresponds to the field's position in sorted order.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_record_field_by_index(record: *mut Value, index: usize) -> *mut Value {
+pub extern "C-unwind" fn knot_record_field_by_index(
+    record: *mut Value,
+    index: usize,
+) -> *mut Value {
     match unsafe { as_ref(record) } {
         Value::Record(fields) => {
             if index < fields.len() {
                 fields[index].value
             } else {
-                panic!("knot runtime: field_by_index out of bounds (index {} >= len {})", index, fields.len())
+                panic!(
+                    "knot runtime: field_by_index out of bounds (index {} >= len {})",
+                    index,
+                    fields.len()
+                )
             }
         }
-        _ => panic!("knot runtime: expected Record in field_by_index, got {}", type_name(record)),
+        _ => panic!(
+            "knot runtime: expected Record in field_by_index, got {}",
+            type_name(record)
+        ),
     }
 }
 
@@ -5544,7 +5744,9 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
                 // A null row can't be materialized by adt_row_to_params — bail
                 // to the safe in-memory path rather than skip it (matches the
                 // Record branch's null handling).
-                if row.is_null() { return None; }
+                if row.is_null() {
+                    return None;
+                }
                 let (tag, payload) = match unsafe { as_ref(*row) } {
                     Value::Constructor(tag, payload) => (tag, payload),
                     _ => return None,
@@ -5557,9 +5759,7 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
                 };
                 let this_fields: Vec<(&str, *mut Value)> = match payload_ref {
                     Value::Unit => Vec::new(),
-                    Value::Record(fields) => {
-                        fields.iter().map(|f| (&*f.name, f.value)).collect()
-                    }
+                    Value::Record(fields) => fields.iter().map(|f| (&*f.name, f.value)).collect(),
                     _ => return None,
                 };
 
@@ -5635,7 +5835,10 @@ fn infer_temp_schema(rows: &[*mut Value]) -> Option<TempSchema> {
                 }
                 ctors.push((tag.clone(), cf));
             }
-            Some(TempSchema::Adt { constructors: ctors, all_fields })
+            Some(TempSchema::Adt {
+                constructors: ctors,
+                all_fields,
+            })
         }
         Value::Unit => Some(TempSchema::Unit),
         Value::Int(_) => Some(TempSchema::Scalar(ColType::Int)),
@@ -5702,7 +5905,12 @@ fn temp_insert_sql(name: &str, schema: &TempSchema) -> String {
         TempSchema::Unit => ("\"_dummy\"".to_string(), 1),
     };
     let placeholders: Vec<String> = (1..=n_cols).map(|i| format!("?{}", i)).collect();
-    format!("INSERT INTO {} ({}) VALUES ({});", table, col_names, placeholders.join(", "))
+    format!(
+        "INSERT INTO {} ({}) VALUES ({});",
+        table,
+        col_names,
+        placeholders.join(", ")
+    )
 }
 
 /// Convert a Value to SQL params for temp table insertion.
@@ -5714,7 +5922,10 @@ fn temp_row_to_params(v: *mut Value, schema: &TempSchema) -> Vec<rusqlite::types
             }
             let fields = match unsafe { as_ref(v) } {
                 Value::Record(fields) => fields,
-                _ => panic!("knot runtime: expected Record for temp table insert, got {}", type_name(v)),
+                _ => panic!(
+                    "knot runtime: expected Record for temp table insert, got {}",
+                    type_name(v)
+                ),
             };
             cols.iter()
                 .map(|(name, ty)| {
@@ -5727,35 +5938,37 @@ fn temp_row_to_params(v: *mut Value, schema: &TempSchema) -> Vec<rusqlite::types
                 .collect()
         }
         TempSchema::Scalar(ty) => vec![value_to_sqlite(v, *ty)],
-        TempSchema::Adt { all_fields, constructors } => {
-            match unsafe { as_ref(v) } {
-                Value::Constructor(tag, payload) => {
-                    let mut params = vec![rusqlite::types::Value::Text(ctor_leaf(tag).to_string())];
-                    let ctor = constructors.iter().find(|(t, _)| t.as_str() == ctor_leaf(tag));
-                    for (fname, fty) in all_fields {
-                        let has_field = ctor.is_some_and(|(_, fields)| {
-                            fields.iter().any(|(n, _)| n == fname)
-                        });
-                        if has_field {
-                            match unsafe { as_ref(*payload) } {
-                                Value::Record(fields) => {
-                                    let field = fields.iter().find(|f| &*f.name == fname.as_str());
-                                    params.push(match field {
-                                        Some(f) => value_to_sqlite(f.value, *fty),
-                                        None => rusqlite::types::Value::Null,
-                                    });
-                                }
-                                _ => params.push(rusqlite::types::Value::Null),
+        TempSchema::Adt {
+            all_fields,
+            constructors,
+        } => match unsafe { as_ref(v) } {
+            Value::Constructor(tag, payload) => {
+                let mut params = vec![rusqlite::types::Value::Text(ctor_leaf(tag).to_string())];
+                let ctor = constructors
+                    .iter()
+                    .find(|(t, _)| t.as_str() == ctor_leaf(tag));
+                for (fname, fty) in all_fields {
+                    let has_field =
+                        ctor.is_some_and(|(_, fields)| fields.iter().any(|(n, _)| n == fname));
+                    if has_field {
+                        match unsafe { as_ref(*payload) } {
+                            Value::Record(fields) => {
+                                let field = fields.iter().find(|f| &*f.name == fname.as_str());
+                                params.push(match field {
+                                    Some(f) => value_to_sqlite(f.value, *fty),
+                                    None => rusqlite::types::Value::Null,
+                                });
                             }
-                        } else {
-                            params.push(rusqlite::types::Value::Null);
+                            _ => params.push(rusqlite::types::Value::Null),
                         }
+                    } else {
+                        params.push(rusqlite::types::Value::Null);
                     }
-                    params
                 }
-                _ => panic!("knot runtime: expected Constructor for ADT temp table"),
+                params
             }
-        }
+            _ => panic!("knot runtime: expected Constructor for ADT temp table"),
+        },
         TempSchema::Unit => vec![rusqlite::types::Value::Integer(0)],
     }
 }
@@ -5776,15 +5989,21 @@ fn read_temp_row(row: &rusqlite::Row, schema: &TempSchema) -> *mut Value {
             record
         }
         TempSchema::Scalar(ty) => read_sql_column(row, 0, *ty),
-        TempSchema::Adt { constructors, all_fields } => {
+        TempSchema::Adt {
+            constructors,
+            all_fields,
+        } => {
             let tag: String = row.get(0).unwrap_or_default();
             let ctor = constructors.iter().find(|(t, _)| t == &tag);
             let payload = if let Some((_, fields)) = ctor {
                 if fields.is_empty() {
                     alloc(Value::Unit)
                 } else {
-                    let field_idx: HashMap<&str, usize> = all_fields.iter().enumerate()
-                        .map(|(i, (n, _))| (n.as_str(), i)).collect();
+                    let field_idx: HashMap<&str, usize> = all_fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (n, _))| (n.as_str(), i))
+                        .collect();
                     let record = knot_record_empty(fields.len());
                     for (fname, fty) in fields {
                         let col_idx = *field_idx.get(fname.as_str()).unwrap_or_else(|| {
@@ -5844,7 +6063,13 @@ const MAX_VALUES_PARAMS: usize = 10_000;
 /// Number of SQL columns in a TempSchema.
 fn schema_col_count(schema: &TempSchema) -> usize {
     match schema {
-        TempSchema::Record(cols) => if cols.is_empty() { 1 } else { cols.len() },
+        TempSchema::Record(cols) => {
+            if cols.is_empty() {
+                1
+            } else {
+                cols.len()
+            }
+        }
         TempSchema::Scalar(_) => 1,
         TempSchema::Adt { all_fields, .. } => 1 + all_fields.len(),
         TempSchema::Unit => 1,
@@ -5912,8 +6137,10 @@ fn read_query_rows_params(
     let mut stmt = conn
         .prepare_cached(sql)
         .unwrap_or_else(|e| panic!("knot runtime: query error: {}\n  SQL: {}", e, sql));
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
     let mut result_rows = stmt
         .query(param_refs.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: query exec error: {}\n  SQL: {}", e, sql));
@@ -5940,8 +6167,10 @@ fn materialize_relation(conn: &Connection, rows: &[*mut Value], schema: &TempSch
             .unwrap_or_else(|e| panic!("knot runtime: temp insert prepare error: {}", e));
         for row in rows {
             let params = temp_row_to_params(*row, schema);
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
             stmt.execute(param_refs.as_slice())
                 .unwrap_or_else(|e| panic!("knot runtime: temp table insert error: {}", e));
         }
@@ -6070,7 +6299,10 @@ fn sql_set_op(
     let schema = infer_temp_schema(&combined)?;
     let n_cols = schema_col_count(&schema);
 
-    if !a.is_empty() && !b.is_empty() && (a.len().saturating_add(b.len())).saturating_mul(n_cols) <= MAX_VALUES_PARAMS {
+    if !a.is_empty()
+        && !b.is_empty()
+        && (a.len().saturating_add(b.len())).saturating_mul(n_cols) <= MAX_VALUES_PARAMS
+    {
         let col_names = schema_col_names(&schema);
         let col_str = col_names.join(", ");
         let (values_a, params_a) = build_values_clause(a, &schema, 0);
@@ -6080,7 +6312,10 @@ fn sql_set_op(
         let sql = format!(
             "WITH _t1({c}) AS ({v1}), _t2({c}) AS ({v2}) \
              SELECT * FROM _t1 {op} SELECT * FROM _t2",
-            c = col_str, v1 = values_a, v2 = values_b, op = op
+            c = col_str,
+            v1 = values_a,
+            v2 = values_b,
+            op = op
         );
         return Some(read_query_rows_params(conn, &sql, &all_params, &schema));
     }
@@ -6167,11 +6402,15 @@ fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) ->
                UNION ALL \
                (SELECT * FROM _t2 EXCEPT SELECT * FROM _t1)\
              ) LIMIT 1",
-            c = col_str, v1 = values_a, v2 = values_b
+            c = col_str,
+            v1 = values_a,
+            v2 = values_b
         );
         debug_sql(&sql);
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            all_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
         return match conn
             .prepare(&sql)
             .and_then(|mut s| s.query_row(param_refs.as_slice(), |_| Ok(true)))
@@ -6188,7 +6427,10 @@ fn sql_relations_equal(conn: &Connection, a: &[*mut Value], b: &[*mut Value]) ->
     // Check symmetric difference: (a EXCEPT b) UNION ALL (b EXCEPT a) should be empty
     let sql = format!(
         "SELECT 1 FROM ((SELECT * FROM {} EXCEPT SELECT * FROM {}) UNION ALL (SELECT * FROM {} EXCEPT SELECT * FROM {})) LIMIT 1",
-        quote_ident(&t1), quote_ident(&t2), quote_ident(&t2), quote_ident(&t1)
+        quote_ident(&t1),
+        quote_ident(&t2),
+        quote_ident(&t2),
+        quote_ident(&t1)
     );
     debug_sql(&sql);
     let result = conn
@@ -6266,9 +6508,10 @@ pub extern "C-unwind" fn knot_scalar_source_unwrap(rel: *mut Value) -> *mut Valu
 /// Wrap a scalar value as a singleton relation with a `_value` field: [{_value: val}]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_scalar_source_wrap(val: *mut Value) -> *mut Value {
-    let record = alloc(Value::Record(vec![
-        RecordField { name: "_value".into(), value: val },
-    ]));
+    let record = alloc(Value::Record(vec![RecordField {
+        name: "_value".into(),
+        value: val,
+    }]));
     alloc(Value::Relation(vec![record]))
 }
 
@@ -6280,7 +6523,10 @@ pub extern "C-unwind" fn knot_relation_push(rel: *mut Value, row: *mut Value) {
     let r = unsafe { &mut *rel };
     match r {
         Value::Relation(rows) => rows.push(row),
-        _ => panic!("knot runtime: expected Relation in push, got {}", type_name(rel)),
+        _ => panic!(
+            "knot runtime: expected Relation in push, got {}",
+            type_name(rel)
+        ),
     }
 }
 
@@ -6299,7 +6545,10 @@ pub extern "C-unwind" fn knot_relation_extend(rel: *mut Value, src: *mut Value) 
     };
     match unsafe { &mut *rel } {
         Value::Relation(dst) => dst.extend(rows),
-        _ => panic!("knot runtime: expected Relation in extend, got {}", type_name(rel)),
+        _ => panic!(
+            "knot runtime: expected Relation in extend, got {}",
+            type_name(rel)
+        ),
     }
 }
 
@@ -6321,7 +6570,10 @@ pub extern "C-unwind" fn knot_ensure_relation(v: *mut Value) -> *mut Value {
 pub extern "C-unwind" fn knot_relation_len(rel: *mut Value) -> usize {
     match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows.len(),
-        _ => panic!("knot runtime: expected Relation in len, got {}", type_name(rel)),
+        _ => panic!(
+            "knot runtime: expected Relation in len, got {}",
+            type_name(rel)
+        ),
     }
 }
 
@@ -6342,10 +6594,7 @@ pub extern "C-unwind" fn knot_relation_run_io(rel: *mut Value) -> *mut Value {
 
 /// Take the first `n` elements from a relation.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_relation_take(
-    n_val: *mut Value,
-    rel: *mut Value,
-) -> *mut Value {
+pub extern "C-unwind" fn knot_relation_take(n_val: *mut Value, rel: *mut Value) -> *mut Value {
     let n = match unsafe { as_ref(n_val) } {
         Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
         _ => 0,
@@ -6361,10 +6610,7 @@ pub extern "C-unwind" fn knot_relation_take(
 
 /// Drop the first `n` elements from a relation.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_relation_drop(
-    n_val: *mut Value,
-    rel: *mut Value,
-) -> *mut Value {
+pub extern "C-unwind" fn knot_relation_drop(n_val: *mut Value, rel: *mut Value) -> *mut Value {
     let n = match unsafe { as_ref(n_val) } {
         Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
         _ => 0,
@@ -6464,7 +6710,10 @@ pub extern "C-unwind" fn knot_relation_tail(rel: *mut Value) -> *mut Value {
                 alloc(Value::Relation(rows[1..].to_vec()))
             }
         }
-        _ => panic!("knot runtime: expected Relation in tail, got {}", type_name(rel)),
+        _ => panic!(
+            "knot runtime: expected Relation in tail, got {}",
+            type_name(rel)
+        ),
     }
 }
 
@@ -6478,7 +6727,10 @@ pub extern "C-unwind" fn knot_relation_get(rel: *mut Value, index: usize) -> *mu
                 alloc(Value::Unit)
             }
         }
-        _ => panic!("knot runtime: expected Relation in get, got {}", type_name(rel)),
+        _ => panic!(
+            "knot runtime: expected Relation in get, got {}",
+            type_name(rel)
+        ),
     }
 }
 
@@ -6492,12 +6744,18 @@ pub extern "C-unwind" fn knot_relation_union(
     let rows_a = match unsafe { as_ref(a) } {
         Value::Relation(rows) => rows,
         Value::Unit => &empty,
-        _ => panic!("knot runtime: expected Relation in union, got {}", type_name(a)),
+        _ => panic!(
+            "knot runtime: expected Relation in union, got {}",
+            type_name(a)
+        ),
     };
     let rows_b = match unsafe { as_ref(b) } {
         Value::Relation(rows) => rows,
         Value::Unit => &empty,
-        _ => panic!("knot runtime: expected Relation in union, got {}", type_name(b)),
+        _ => panic!(
+            "knot runtime: expected Relation in union, got {}",
+            type_name(b)
+        ),
     };
 
     if rows_a.is_empty() && rows_b.is_empty() {
@@ -6639,16 +6897,17 @@ pub extern "C-unwind" fn knot_relation_group_by(
     };
 
     // Find key column specs in the schema via HashMap lookup
-    let col_map: HashMap<&str, &ColumnSpec> = schema.columns.iter().map(|c| (c.name.as_str(), c)).collect();
+    let col_map: HashMap<&str, &ColumnSpec> = schema
+        .columns
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
     let key_specs: Vec<&ColumnSpec> = key_col_names
         .iter()
         .map(|kc| {
-            *col_map.get(kc).unwrap_or_else(|| {
-                panic!(
-                    "knot runtime: key column '{}' not found in schema",
-                    kc
-                )
-            })
+            *col_map
+                .get(kc)
+                .unwrap_or_else(|| panic!("knot runtime: key column '{}' not found in schema", kc))
         })
         .collect();
 
@@ -6685,21 +6944,31 @@ pub extern "C-unwind" fn knot_relation_group_by(
     order_cols.push("\"_idx\"".to_string());
 
     // Extract key params from each row (shared by both paths)
-    let extract_key_params = |row_ptr: &*mut Value, key_specs: &[&ColumnSpec]| -> Vec<rusqlite::types::Value> {
-        let fields = match unsafe { as_ref(*row_ptr) } {
-            Value::Record(fields) => fields,
-            _ => panic!("knot runtime: groupby rows must be Records"),
+    let extract_key_params =
+        |row_ptr: &*mut Value, key_specs: &[&ColumnSpec]| -> Vec<rusqlite::types::Value> {
+            let fields = match unsafe { as_ref(*row_ptr) } {
+                Value::Record(fields) => fields,
+                _ => panic!("knot runtime: groupby rows must be Records"),
+            };
+            key_specs
+                .iter()
+                .map(|ks| {
+                    let value = fields
+                        .iter()
+                        .find(|f| &*f.name == ks.name.as_str())
+                        .unwrap_or_else(|| {
+                            panic!("knot runtime: missing field '{}' in record", ks.name)
+                        });
+                    value_to_sqlite(value.value, ks.ty)
+                })
+                .collect()
         };
-        key_specs.iter().map(|ks| {
-            let value = fields.iter().find(|f| &*f.name == ks.name.as_str())
-                .unwrap_or_else(|| panic!("knot runtime: missing field '{}' in record", ks.name));
-            value_to_sqlite(value.value, ks.ty)
-        }).collect()
-    };
 
     // Only key columns are params (_idx is a literal); check if VALUES is feasible
     let n_key_params = rows.len().saturating_mul(key_specs.len());
-    let (select_sql, sql_params, temp_to_drop) = if n_key_params <= MAX_VALUES_PARAMS && !key_specs.is_empty() {
+    let (select_sql, sql_params, temp_to_drop) = if n_key_params <= MAX_VALUES_PARAMS
+        && !key_specs.is_empty()
+    {
         // VALUES CTE path: _idx is a literal integer, key columns are params
         let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(n_key_params);
         let mut row_clauses = Vec::with_capacity(rows.len());
@@ -6718,11 +6987,17 @@ pub extern "C-unwind" fn knot_relation_group_by(
 
         let values_sql = format!("VALUES {}", row_clauses.join(", "));
         let sql = if order_cols.is_empty() {
-            format!("WITH _t({}) AS ({}) SELECT {} FROM _t", col_str, values_sql, col_str)
+            format!(
+                "WITH _t({}) AS ({}) SELECT {} FROM _t",
+                col_str, values_sql, col_str
+            )
         } else {
             format!(
                 "WITH _t({}) AS ({}) SELECT {} FROM _t ORDER BY {}",
-                col_str, values_sql, col_str, order_cols.join(", ")
+                col_str,
+                values_sql,
+                col_str,
+                order_cols.join(", ")
             )
         };
         (sql, params, None)
@@ -6731,7 +7006,9 @@ pub extern "C-unwind" fn knot_relation_group_by(
         let temp_name = next_temp_name();
         let temp = quote_ident(&temp_name);
 
-        let _ = db_ref.conn.execute_batch(&format!("DROP TABLE IF EXISTS {};", temp));
+        let _ = db_ref
+            .conn
+            .execute_batch(&format!("DROP TABLE IF EXISTS {};", temp));
 
         let mut col_defs = vec!["_idx INTEGER".to_string()];
         for ks in &key_specs {
@@ -6739,26 +7016,35 @@ pub extern "C-unwind" fn knot_relation_group_by(
         }
         let create_sql = format!("CREATE TEMP TABLE {} ({});", temp, col_defs.join(", "));
         debug_sql(&create_sql);
-        db_ref.conn.execute_batch(&create_sql)
+        db_ref
+            .conn
+            .execute_batch(&create_sql)
             .expect("knot runtime: failed to create groupby temp table");
 
         let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
         let insert_sql = format!(
             "INSERT INTO {} ({}) VALUES ({});",
-            temp, col_str, placeholders.join(", ")
+            temp,
+            col_str,
+            placeholders.join(", ")
         );
         debug_sql(&insert_sql);
 
         {
-            let mut insert_stmt = db_ref.conn.prepare_cached(&insert_sql)
+            let mut insert_stmt = db_ref
+                .conn
+                .prepare_cached(&insert_sql)
                 .expect("knot runtime: failed to prepare groupby insert");
             for (idx, row_ptr) in rows.iter().enumerate() {
                 let mut params: Vec<rusqlite::types::Value> =
                     vec![rusqlite::types::Value::Integer(idx as i64)];
                 params.extend(extract_key_params(row_ptr, &key_specs));
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                insert_stmt.execute(param_refs.as_slice())
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                    .iter()
+                    .map(|p| p as &dyn rusqlite::types::ToSql)
+                    .collect();
+                insert_stmt
+                    .execute(param_refs.as_slice())
                     .expect("knot runtime: groupby insert error");
             }
         }
@@ -6766,7 +7052,12 @@ pub extern "C-unwind" fn knot_relation_group_by(
         let sql = if order_cols.is_empty() {
             format!("SELECT {} FROM {}", col_str, temp)
         } else {
-            format!("SELECT {} FROM {} ORDER BY {}", col_str, temp, order_cols.join(", "))
+            format!(
+                "SELECT {} FROM {} ORDER BY {}",
+                col_str,
+                temp,
+                order_cols.join(", ")
+            )
         };
         (sql, Vec::new(), Some(temp_name))
     };
@@ -6775,11 +7066,16 @@ pub extern "C-unwind" fn knot_relation_group_by(
 
     // Execute query and group consecutive rows by key values
     let groups = {
-        let mut stmt = db_ref.conn.prepare(&select_sql)
+        let mut stmt = db_ref
+            .conn
+            .prepare(&select_sql)
             .expect("knot runtime: failed to prepare groupby select");
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-        let mut result_rows = stmt.query(param_refs.as_slice())
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut result_rows = stmt
+            .query(param_refs.as_slice())
             .expect("knot runtime: groupby select error");
 
         let mut groups: Vec<Vec<*mut Value>> = Vec::new();
@@ -6802,24 +7098,23 @@ pub extern "C-unwind" fn knot_relation_group_by(
                 if a.len() != b.len() {
                     return false;
                 }
-                a.iter().zip(b.iter()).all(|(x, y)| {
-                    match (x, y) {
-                        (rusqlite::types::Value::Real(fa), rusqlite::types::Value::Real(fb)) => {
-                            if fa.is_nan() && fb.is_nan() {
-                                true
-                            } else {
-                                x == y
-                            }
+                a.iter().zip(b.iter()).all(|(x, y)| match (x, y) {
+                    (rusqlite::types::Value::Real(fa), rusqlite::types::Value::Real(fb)) => {
+                        if fa.is_nan() && fb.is_nan() {
+                            true
+                        } else {
+                            x == y
                         }
-                        _ => x == y,
                     }
+                    _ => x == y,
                 })
             }
 
             if let Some(ref prev) = prev_keys
-                && !keys_equal(&keys, prev) {
-                    groups.push(std::mem::take(&mut current_group));
-                }
+                && !keys_equal(&keys, prev)
+            {
+                groups.push(std::mem::take(&mut current_group));
+            }
 
             if let Some(row) = rows.get(idx as usize) {
                 current_group.push(*row);
@@ -6836,9 +7131,9 @@ pub extern "C-unwind" fn knot_relation_group_by(
 
     // Clean up temp table if used
     if let Some(ref temp_name) = temp_to_drop {
-        let _ = db_ref.conn.execute_batch(
-            &format!("DROP TABLE IF EXISTS {};", quote_ident(temp_name))
-        );
+        let _ = db_ref
+            .conn
+            .execute_batch(&format!("DROP TABLE IF EXISTS {};", quote_ident(temp_name)));
     }
 
     // Convert to a relation of relations
@@ -6899,7 +7194,11 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                             buf.push(1);
                             // Raw bits otherwise; canonicalize NaN so all NaN
                             // bit patterns hash the same.
-                            let bits = if f.is_nan() { f64::NAN.to_bits() } else { f.to_bits() };
+                            let bits = if f.is_nan() {
+                                f64::NAN.to_bits()
+                            } else {
+                                f.to_bits()
+                            };
                             buf.extend_from_slice(&bits.to_le_bytes());
                         }
                     }
@@ -7026,8 +7325,6 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
         }
     }
 }
-
-
 
 /// Hex BLAKE3 hash of a full record value, used as the parent-identity key for
 /// record tables that have nested children. `value_to_hash_bytes` canonicalizes
@@ -7163,16 +7460,22 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
                 // Set semantics: compare unique elements (consistent with SQL
                 // paths). `value_to_hash_bytes` is iterative, so this adds no
                 // call-stack growth.
-                let set_a: HashSet<Vec<u8>> = ra.iter().map(|r| {
-                    let mut buf = Vec::new();
-                    value_to_hash_bytes(*r, &mut buf);
-                    buf
-                }).collect();
-                let set_b: HashSet<Vec<u8>> = rb.iter().map(|r| {
-                    let mut buf = Vec::new();
-                    value_to_hash_bytes(*r, &mut buf);
-                    buf
-                }).collect();
+                let set_a: HashSet<Vec<u8>> = ra
+                    .iter()
+                    .map(|r| {
+                        let mut buf = Vec::new();
+                        value_to_hash_bytes(*r, &mut buf);
+                        buf
+                    })
+                    .collect();
+                let set_b: HashSet<Vec<u8>> = rb
+                    .iter()
+                    .map(|r| {
+                        let mut buf = Vec::new();
+                        value_to_hash_bytes(*r, &mut buf);
+                        buf
+                    })
+                    .collect();
                 if set_a != set_b {
                     return false;
                 }
@@ -7228,7 +7531,11 @@ pub extern "C-unwind" fn knot_value_add(a: *mut Value, b: *mut Value) -> *mut Va
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => alloc_float(x + y),
         (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(x as f64 + y),
         (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x + y as f64),
-        _ => panic!("knot runtime: cannot add {} + {}", type_name(a), type_name(b)),
+        _ => panic!(
+            "knot runtime: cannot add {} + {}",
+            type_name(a),
+            type_name(b)
+        ),
     }
 }
 
@@ -7244,7 +7551,11 @@ pub extern "C-unwind" fn knot_value_sub(a: *mut Value, b: *mut Value) -> *mut Va
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => alloc_float(x - y),
         (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(x as f64 - y),
         (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x - y as f64),
-        _ => panic!("knot runtime: cannot subtract {} - {}", type_name(a), type_name(b)),
+        _ => panic!(
+            "knot runtime: cannot subtract {} - {}",
+            type_name(a),
+            type_name(b)
+        ),
     }
 }
 
@@ -7260,7 +7571,11 @@ pub extern "C-unwind" fn knot_value_mul(a: *mut Value, b: *mut Value) -> *mut Va
         (Some(NumView::Float(x)), Some(NumView::Float(y))) => alloc_float(x * y),
         (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(x as f64 * y),
         (Some(NumView::Float(x)), Some(NumView::Int(y))) => alloc_float(x * y as f64),
-        _ => panic!("knot runtime: cannot multiply {} * {}", type_name(a), type_name(b)),
+        _ => panic!(
+            "knot runtime: cannot multiply {} * {}",
+            type_name(a),
+            type_name(b)
+        ),
     }
 }
 
@@ -7283,9 +7598,7 @@ pub extern "C-unwind" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Va
             // not a panic. Only integer division by zero panics.
             alloc_float(x / y)
         }
-        (Some(NumView::Int(x)), Some(NumView::Float(y))) => {
-            alloc_float(x as f64 / y)
-        }
+        (Some(NumView::Int(x)), Some(NumView::Float(y))) => alloc_float(x as f64 / y),
         (Some(NumView::Float(x)), Some(NumView::Int(y))) => {
             // IEEE 754 float division: `x / 0.0` already yields the correct
             // result for every x (NaN/0 = NaN, +x/0 = +inf, -x/0 = -inf,
@@ -7293,7 +7606,11 @@ pub extern "C-unwind" fn knot_value_div(a: *mut Value, b: *mut Value) -> *mut Va
             // -inf, so defer to the hardware division.
             alloc_float(x / (y as f64))
         }
-        _ => panic!("knot runtime: cannot divide {} / {}", type_name(a), type_name(b)),
+        _ => panic!(
+            "knot runtime: cannot divide {} / {}",
+            type_name(a),
+            type_name(b)
+        ),
     }
 }
 
@@ -7335,7 +7652,11 @@ pub extern "C-unwind" fn knot_value_mod(a: *mut Value, b: *mut Value) -> *mut Va
             }
             alloc_float(x % (y as f64))
         }
-        _ => panic!("knot runtime: cannot modulo {} % {}", type_name(a), type_name(b)),
+        _ => panic!(
+            "knot runtime: cannot modulo {} % {}",
+            type_name(a),
+            type_name(b)
+        ),
     }
 }
 
@@ -7419,7 +7740,11 @@ pub extern "C-unwind" fn knot_value_ge_i32(a: *mut Value, b: *mut Value) -> i32 
 pub extern "C-unwind" fn knot_value_and_i32(a: *mut Value, b: *mut Value) -> i32 {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Bool(x), Value::Bool(y)) => (*x && *y) as i32,
-        _ => panic!("knot runtime: && requires Bool operands, got {} && {}", type_name(a), type_name(b)),
+        _ => panic!(
+            "knot runtime: && requires Bool operands, got {} && {}",
+            type_name(a),
+            type_name(b)
+        ),
     }
 }
 
@@ -7427,7 +7752,11 @@ pub extern "C-unwind" fn knot_value_and_i32(a: *mut Value, b: *mut Value) -> i32
 pub extern "C-unwind" fn knot_value_or_i32(a: *mut Value, b: *mut Value) -> i32 {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Bool(x), Value::Bool(y)) => (*x || *y) as i32,
-        _ => panic!("knot runtime: || requires Bool operands, got {} || {}", type_name(a), type_name(b)),
+        _ => panic!(
+            "knot runtime: || requires Bool operands, got {} || {}",
+            type_name(a),
+            type_name(b)
+        ),
     }
 }
 
@@ -7435,7 +7764,11 @@ pub extern "C-unwind" fn knot_value_or_i32(a: *mut Value, b: *mut Value) -> i32 
 pub extern "C-unwind" fn knot_value_and(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Bool(x), Value::Bool(y)) => alloc_bool(*x && *y),
-        _ => panic!("knot runtime: && requires Bool operands, got {} && {}", type_name(a), type_name(b)),
+        _ => panic!(
+            "knot runtime: && requires Bool operands, got {} && {}",
+            type_name(a),
+            type_name(b)
+        ),
     }
 }
 
@@ -7443,7 +7776,11 @@ pub extern "C-unwind" fn knot_value_and(a: *mut Value, b: *mut Value) -> *mut Va
 pub extern "C-unwind" fn knot_value_or(a: *mut Value, b: *mut Value) -> *mut Value {
     match (unsafe { as_ref(a) }, unsafe { as_ref(b) }) {
         (Value::Bool(x), Value::Bool(y)) => alloc_bool(*x || *y),
-        _ => panic!("knot runtime: || requires Bool operands, got {} || {}", type_name(a), type_name(b)),
+        _ => panic!(
+            "knot runtime: || requires Bool operands, got {} || {}",
+            type_name(a),
+            type_name(b)
+        ),
     }
 }
 
@@ -7472,7 +7809,11 @@ pub extern "C-unwind" fn knot_value_concat(a: *mut Value, b: *mut Value) -> *mut
             }
             alloc(Value::Relation(result))
         }
-        _ => panic!("knot runtime: ++ requires Text or Relation operands, got {} ++ {}", type_name(a), type_name(b)),
+        _ => panic!(
+            "knot runtime: ++ requires Text or Relation operands, got {} ++ {}",
+            type_name(a),
+            type_name(b)
+        ),
     }
 }
 
@@ -7489,10 +7830,7 @@ pub extern "C-unwind" fn knot_value_compare(a: *mut Value, b: *mut Value) -> *mu
         std::cmp::Ordering::Equal => "EQ",
         std::cmp::Ordering::Greater => "GT",
     };
-    alloc(Value::Constructor(
-        intern_str(tag),
-        alloc(Value::Unit),
-    ))
+    alloc(Value::Constructor(intern_str(tag), alloc(Value::Unit)))
 }
 
 /// Compare two values and return a raw i32: -1 (LT), 0 (EQ), 1 (GT).
@@ -7622,26 +7960,25 @@ fn compare_keys(db: *mut c_void, a: *mut Value, b: *mut Value) -> std::cmp::Orde
 /// both tags.
 type CtorOrderMap = HashMap<Arc<str>, Vec<(Arc<str>, u32)>>;
 
-static CTOR_ORDER: std::sync::LazyLock<RwLock<CtorOrderMap>> =
-    std::sync::LazyLock::new(|| {
-        let mut map: CtorOrderMap = HashMap::new();
-        // ADTs the runtime constructs itself (`race`/`fetch` results, `compare`
-        // results, nullable decoding). Compiled programs never declare these,
-        // so nothing else would register them.
-        for (ty, ctors) in [
-            ("Maybe", &["Nothing", "Just"][..]),
-            ("Result", &["Err", "Ok"][..]),
-            ("Ordering", &["LT", "EQ", "GT"][..]),
-        ] {
-            let ty = intern_str(ty);
-            for (i, ctor) in ctors.iter().enumerate() {
-                map.entry(intern_str(ctor))
-                    .or_default()
-                    .push((ty.clone(), i as u32));
-            }
+static CTOR_ORDER: std::sync::LazyLock<RwLock<CtorOrderMap>> = std::sync::LazyLock::new(|| {
+    let mut map: CtorOrderMap = HashMap::new();
+    // ADTs the runtime constructs itself (`race`/`fetch` results, `compare`
+    // results, nullable decoding). Compiled programs never declare these,
+    // so nothing else would register them.
+    for (ty, ctors) in [
+        ("Maybe", &["Nothing", "Just"][..]),
+        ("Result", &["Err", "Ok"][..]),
+        ("Ordering", &["LT", "EQ", "GT"][..]),
+    ] {
+        let ty = intern_str(ty);
+        for (i, ctor) in ctors.iter().enumerate() {
+            map.entry(intern_str(ctor))
+                .or_default()
+                .push((ty.clone(), i as u32));
         }
-        RwLock::new(map)
-    });
+    }
+    RwLock::new(map)
+});
 
 /// Record the constructors of one `data` declaration, in declaration order.
 /// Re-registering a type replaces its previous entries, so a program that
@@ -7702,9 +8039,12 @@ fn wrap_user_ctor_decl(tag: &str, applied: &str) -> String {
     let type_name: Option<Arc<str>> = {
         let order = CTOR_ORDER.read().unwrap_or_else(|e| e.into_inner());
         let decls = DATA_DECLS.read().unwrap_or_else(|e| e.into_inner());
-        order
-            .get(leaf)
-            .and_then(|entries| entries.iter().map(|(t, _)| t.clone()).find(|t| decls.contains_key(t)))
+        order.get(leaf).and_then(|entries| {
+            entries
+                .iter()
+                .map(|(t, _)| t.clone())
+                .find(|t| decls.contains_key(t))
+        })
     };
     let Some(ty) = type_name else {
         return applied.to_string();
@@ -7956,7 +8296,10 @@ pub extern "C-unwind" fn knot_ordering_tag_i32(v: *mut Value) -> i32 {
             "GT" => 2,
             _ => panic!("knot runtime: expected Ordering constructor, got {}", tag),
         },
-        _ => panic!("knot runtime: expected Ordering Constructor, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: expected Ordering Constructor, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -7997,7 +8340,10 @@ pub extern "C-unwind" fn knot_value_call(
                 unsafe { std::mem::transmute(f.fn_ptr) };
             fun(db, f.env, arg)
         }
-        _ => panic!("knot runtime: cannot call {}, expected Function", brief_value(func)),
+        _ => panic!(
+            "knot runtime: cannot call {}, expected Function",
+            brief_value(func)
+        ),
     }
 }
 
@@ -8052,7 +8398,11 @@ fn show_function(f: &FunctionInner) -> String {
 }
 
 fn show_io(io: &IOInner) -> String {
-    if io.source.is_empty() { "<<IO>>".to_string() } else { io.source.to_string() }
+    if io.source.is_empty() {
+        "<<IO>>".to_string()
+    } else {
+        io.source.to_string()
+    }
 }
 
 fn format_value_iter(v: *mut Value, escape_text: bool) -> String {
@@ -8307,7 +8657,6 @@ fn extract_source(v: *mut Value) -> String {
 pub extern "C-unwind" fn knot_value_extract(v: *mut Value) -> *mut Value {
     alloc(Value::Text(Arc::from(extract_source(v))))
 }
-
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_read_line() -> *mut Value {
@@ -8674,7 +9023,11 @@ fn component_source(v: *mut Value) -> String {
     }
     match unsafe { as_ref(v) } {
         Value::IO(io) => {
-            if io.source.is_empty() { "<<IO>>".to_string() } else { io.source.to_string() }
+            if io.source.is_empty() {
+                "<<IO>>".to_string()
+            } else {
+                io.source.to_string()
+            }
         }
         Value::Function(f) => match &f.extract_source {
             Some(x) => x.to_string(),
@@ -8690,7 +9043,11 @@ fn component_source(v: *mut Value) -> String {
 /// Source: `<io> >>= <f>` so `extract` reproduces the composed action.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_io_bind(io: *mut Value, f: *mut Value) -> *mut Value {
-    let source = intern_str(&format!("({} >>= {})", component_source(io), component_source(f)));
+    let source = intern_str(&format!(
+        "({} >>= {})",
+        component_source(io),
+        component_source(f)
+    ));
     let env = alloc(Value::Pair(io, f));
 
     extern "C-unwind" fn bind_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
@@ -8707,7 +9064,11 @@ pub extern "C-unwind" fn knot_io_bind(io: *mut Value, f: *mut Value) -> *mut Val
 /// Source: `<io1> >> <io2>`.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut Value {
-    let source = intern_str(&format!("({} >> {})", component_source(io1), component_source(io2)));
+    let source = intern_str(&format!(
+        "({} >> {})",
+        component_source(io1),
+        component_source(io2)
+    ));
     let env = alloc(Value::Pair(io1, io2));
 
     extern "C-unwind" fn then_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
@@ -8723,7 +9084,11 @@ pub extern "C-unwind" fn knot_io_then(io1: *mut Value, io2: *mut Value) -> *mut 
 /// Source: `base.map <f> <io>`.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Value {
-    let source = intern_str(&format!("(base.map {} {})", component_source(f), component_source(io)));
+    let source = intern_str(&format!(
+        "(base.map {} {})",
+        component_source(f),
+        component_source(io)
+    ));
     let env = alloc(Value::Pair(io, f));
 
     extern "C-unwind" fn map_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
@@ -8734,7 +9099,6 @@ pub extern "C-unwind" fn knot_io_map(f: *mut Value, io: *mut Value) -> *mut Valu
 
     alloc_io(map_thunk as *const u8, env, source)
 }
-
 
 /// Deep-clone a Value tree so it can be sent to another thread.
 /// Uses Box::new (not the thread-local arena) so values survive arena resets.
@@ -8763,8 +9127,12 @@ fn deep_clone_into_arena(val: *mut Value) -> *mut Value {
 }
 
 fn deep_clone_with(val: *mut Value, mut alloc_node: impl FnMut(Value) -> *mut Value) -> *mut Value {
-    if val.is_null() { return val; }
-    if is_tagged(val) { return val; }
+    if val.is_null() {
+        return val;
+    }
+    if is_tagged(val) {
+        return val;
+    }
 
     // src → dst map.  Shared subtrees (DAGs) are cloned exactly once.
     let mut map: HashMap<*mut Value, *mut Value> = HashMap::new();
@@ -8874,7 +9242,7 @@ fn deep_clone_with(val: *mut Value, mut alloc_node: impl FnMut(Value) -> *mut Va
                 *dst_a = lookup_or_identity(&map, *src_a);
                 *dst_b = lookup_or_identity(&map, *src_b);
             }
-            _ => {}  // leaf: nothing to patch
+            _ => {} // leaf: nothing to patch
         }
     }
 
@@ -8947,7 +9315,9 @@ unsafe fn deep_drop_value(val: *mut Value) {
         // SAFETY: each `v` was allocated by `Box::into_raw` in
         // `deep_clone_value`; `visited` ensures we reconstruct the
         // Box exactly once per unique pointer.
-        unsafe { drop(Box::from_raw(v)); }
+        unsafe {
+            drop(Box::from_raw(v));
+        }
     }
 }
 
@@ -9000,7 +9370,9 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
             struct IoDropGuard(*mut Value);
             impl Drop for IoDropGuard {
                 fn drop(&mut self) {
-                    unsafe { deep_drop_value(self.0); }
+                    unsafe {
+                        deep_drop_value(self.0);
+                    }
                 }
             }
             let io_guard = IoDropGuard(io);
@@ -9017,7 +9389,9 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
             impl Drop for CleanupGuard {
                 fn drop(&mut self) {
                     knot_db_close(self.db);
-                    unsafe { deep_drop_value(self.io); }
+                    unsafe {
+                        deep_drop_value(self.io);
+                    }
                 }
             }
             let _guard = CleanupGuard { db, io };
@@ -9048,7 +9422,9 @@ pub extern "C-unwind" fn knot_fork_io(io_val: *mut Value) -> *mut Value {
                 let _g = ACTIVE_FORKS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
                 ACTIVE_FORKS_CVAR.notify_all();
             }
-            unsafe { deep_drop_value(cloned_io as *mut u8 as *mut Value); }
+            unsafe {
+                deep_drop_value(cloned_io as *mut u8 as *mut Value);
+            }
         }
 
         alloc(Value::Unit)
@@ -9152,48 +9528,52 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                 // side was already cancelled); db/io are freed by CleanupGuard as
                 // the closure scope ends, before we touch shared state.
                 let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let io = io_raw as *mut u8 as *mut Value;
-                // Guard the deep-cloned IO tree before knot_db_open, which can
-                // panic (`.expect` on open/pragma failures) and unwind past
-                // the CleanupGuard below — without this the whole IO subtree
-                // leaks. `forget`ten once CleanupGuard takes ownership.
-                struct IoDropGuard(*mut Value);
-                impl Drop for IoDropGuard {
-                    fn drop(&mut self) {
-                        unsafe { deep_drop_value(self.0); }
+                    let io = io_raw as *mut u8 as *mut Value;
+                    // Guard the deep-cloned IO tree before knot_db_open, which can
+                    // panic (`.expect` on open/pragma failures) and unwind past
+                    // the CleanupGuard below — without this the whole IO subtree
+                    // leaks. `forget`ten once CleanupGuard takes ownership.
+                    struct IoDropGuard(*mut Value);
+                    impl Drop for IoDropGuard {
+                        fn drop(&mut self) {
+                            unsafe {
+                                deep_drop_value(self.0);
+                            }
+                        }
                     }
-                }
-                let io_guard = IoDropGuard(io);
+                    let io_guard = IoDropGuard(io);
 
-                let db_path = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                let db = knot_db_open(db_path.as_ptr(), db_path.len());
+                    let db_path = DB_PATH.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let db = knot_db_open(db_path.as_ptr(), db_path.len());
 
-                struct CleanupGuard {
-                    db: *mut c_void,
-                    io: *mut Value,
-                }
-                impl Drop for CleanupGuard {
-                    fn drop(&mut self) {
-                        knot_db_close(self.db);
-                        unsafe { deep_drop_value(self.io); }
-                        CANCEL_FLAG.with(|c| *c.borrow_mut() = None);
+                    struct CleanupGuard {
+                        db: *mut c_void,
+                        io: *mut Value,
                     }
-                }
-                let _guard = CleanupGuard { db, io };
-                // CleanupGuard now owns `io`; release the early-panic guard so
-                // it is not freed a second time when this scope ends.
-                std::mem::forget(io_guard);
+                    impl Drop for CleanupGuard {
+                        fn drop(&mut self) {
+                            knot_db_close(self.db);
+                            unsafe {
+                                deep_drop_value(self.io);
+                            }
+                            CANCEL_FLAG.with(|c| *c.borrow_mut() = None);
+                        }
+                    }
+                    let _guard = CleanupGuard { db, io };
+                    // CleanupGuard now owns `io`; release the early-panic guard so
+                    // it is not freed a second time when this scope ends.
+                    std::mem::forget(io_guard);
 
-                let result = knot_io_run(db, io);
+                    let result = knot_io_run(db, io);
 
-                // If cancellation already fired, drop the result silently.
-                if my_cancel.is_cancelled() {
-                    return None;
-                }
+                    // If cancellation already fired, drop the result silently.
+                    if my_cancel.is_cancelled() {
+                        return None;
+                    }
 
-                // Deep-clone the winning value into Box-allocated storage
-                // so it outlives this thread's arena.
-                Some(deep_clone_value(result) as *mut u8 as usize)
+                    // Deep-clone the winning value into Box-allocated storage
+                    // so it outlives this thread's arena.
+                    Some(deep_clone_value(result) as *mut u8 as usize)
                 }));
 
                 let cloned = match run {
@@ -9238,8 +9618,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                         // a winner do we report "both panicked".
                         let both_dead = g.outcome.is_none() && g.panic_msgs.len() >= 2;
                         if both_dead {
-                            g.outcome =
-                                Some(RaceOutcome::BothPanicked(g.panic_msgs.join("; ")));
+                            g.outcome = Some(RaceOutcome::BothPanicked(g.panic_msgs.join("; ")));
                         }
                         drop(g);
                         if both_dead {
@@ -9259,7 +9638,9 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                 } else {
                     // Lost the race after producing a value — discard it.
                     drop(g);
-                    unsafe { deep_drop_value(cloned as *mut u8 as *mut Value); }
+                    unsafe {
+                        deep_drop_value(cloned as *mut u8 as *mut Value);
+                    }
                 }
             });
 
@@ -9272,7 +9653,9 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                     let _g = ACTIVE_FORKS_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
                     ACTIVE_FORKS_CVAR.notify_all();
                 }
-                unsafe { deep_drop_value(io_raw as *mut u8 as *mut Value); }
+                unsafe {
+                    deep_drop_value(io_raw as *mut u8 as *mut Value);
+                }
 
                 // Unlike `fork`, the race parent waits on an outcome, so a
                 // dead side must publish a loss — otherwise the parent parks
@@ -9286,8 +9669,7 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
                 ));
                 let both_dead = g.outcome.is_none() && g.panic_msgs.len() >= 2;
                 if both_dead {
-                    g.outcome =
-                        Some(RaceOutcome::BothPanicked(g.panic_msgs.join("; ")));
+                    g.outcome = Some(RaceOutcome::BothPanicked(g.panic_msgs.join("; ")));
                 }
                 drop(g);
                 if both_dead {
@@ -9383,7 +9765,9 @@ pub extern "C-unwind" fn knot_race_io(io_a: *mut Value, io_b: *mut Value) -> *mu
         // Clone succeeded — disarm the guard (forget it so Drop doesn't fire)
         // and manually drop the Box tree exactly once.
         std::mem::forget(guard);
-        unsafe { deep_drop_value(winner_box); }
+        unsafe {
+            deep_drop_value(winner_box);
+        }
         let field_name = if is_left { "error" } else { "value" };
         let ctor_name = if is_left { "Err" } else { "Ok" };
         let record = alloc(Value::Record(vec![RecordField {
@@ -9529,9 +9913,9 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
     // DashMap shard lookup.
     let already_changed = STM_TRACK.with(|t| {
         let t = t.borrow();
-        t.reads.iter().any(|(_, (arc, ver))| {
-            arc.load(Ordering::Acquire) > *ver
-        })
+        t.reads
+            .iter()
+            .any(|(_, (arc, ver))| arc.load(Ordering::Acquire) > *ver)
     });
     if already_changed {
         // Yield before returning so other threads (e.g. pollHeartbeat)
@@ -9551,7 +9935,10 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
     // post-register re-check below is a memory load, not a DashMap lookup.
     // Snapshot of the tracked reads (`table`, cached version `Arc`, version at
     // read time) paired with the per-table read filters.
-    type StmSnapshot = (Vec<(String, Arc<AtomicU64>, u64)>, HashMap<String, Vec<ReadFilter>>);
+    type StmSnapshot = (
+        Vec<(String, Arc<AtomicU64>, u64)>,
+        HashMap<String, Vec<ReadFilter>>,
+    );
     let (read_versions, filter_map): StmSnapshot = STM_TRACK.with(|t| {
         let mut t = t.borrow_mut();
         (
@@ -9594,9 +9981,10 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
             }
             for (table, col) in &self.cols {
                 if let Some(mut state) = TABLE_FILTER_COLS.get_mut(table)
-                    && let Some(c) = state.cols.get_mut(col.as_str()) {
-                        *c = c.saturating_sub(1);
-                    }
+                    && let Some(c) = state.cols.get_mut(col.as_str())
+                {
+                    *c = c.saturating_sub(1);
+                }
             }
         }
     }
@@ -9674,7 +10062,10 @@ pub extern "C-unwind" fn knot_stm_wait(_snapshot: i64) {
             .push(Arc::downgrade(&slot));
     }
     for key in eq_registrations {
-        EQ_WATCHERS.entry(key).or_default().push(Arc::downgrade(&slot));
+        EQ_WATCHERS
+            .entry(key)
+            .or_default()
+            .push(Arc::downgrade(&slot));
     }
     for (key, op, threshold) in range_registrations {
         let weak = Arc::downgrade(&slot);
@@ -9813,10 +10204,19 @@ pub extern "C-unwind" fn knot_fs_read_file_io(path: *mut Value) -> *mut Value {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_fs_write_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_write_file_io(
+    path: *mut Value,
+    contents: *mut Value,
+) -> *mut Value {
     let env = alloc(Value::Record(vec![
-        RecordField { name: "_c".into(), value: contents },
-        RecordField { name: "_p".into(), value: path },
+        RecordField {
+            name: "_c".into(),
+            value: contents,
+        },
+        RecordField {
+            name: "_p".into(),
+            value: path,
+        },
     ]));
     extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
@@ -9828,10 +10228,19 @@ pub extern "C-unwind" fn knot_fs_write_file_io(path: *mut Value, contents: *mut 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_fs_append_file_io(path: *mut Value, contents: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_fs_append_file_io(
+    path: *mut Value,
+    contents: *mut Value,
+) -> *mut Value {
     let env = alloc(Value::Record(vec![
-        RecordField { name: "_c".into(), value: contents },
-        RecordField { name: "_p".into(), value: path },
+        RecordField {
+            name: "_c".into(),
+            value: contents,
+        },
+        RecordField {
+            name: "_p".into(),
+            value: path,
+        },
     ]));
     extern "C-unwind" fn thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let _ = db;
@@ -9962,8 +10371,7 @@ fn render_todo_with_vals(
         return out;
     }
     // Each name entry is two pointer-sized slots: [ptr, len].
-    let name_slots =
-        unsafe { std::slice::from_raw_parts(names as *const usize, count * 2) };
+    let name_slots = unsafe { std::slice::from_raw_parts(names as *const usize, count * 2) };
     let val_slots = unsafe { std::slice::from_raw_parts(vals, count) };
     out.push_str("\n  values in scope:");
     for i in 0..count {
@@ -10116,7 +10524,6 @@ pub extern "C-unwind" fn knot_random_uuid_io() -> *mut Value {
 
 // ── Standard library: relation operations ─────────────────────────
 
-
 /// filter(pred, rel) — keep rows where pred returns true
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_relation_filter(
@@ -10182,10 +10589,7 @@ pub extern "C-unwind" fn knot_relation_upsert_by(
 
 /// match(ctor, rel) — filter relation to rows matching a constructor tag, extract payloads
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_relation_match(
-    ctor: *mut Value,
-    rel: *mut Value,
-) -> *mut Value {
+pub extern "C-unwind" fn knot_relation_match(ctor: *mut Value, rel: *mut Value) -> *mut Value {
     let tag = match unsafe { as_ref(ctor) } {
         Value::Constructor(t, _) => &**t,
         _ => panic!(
@@ -10345,7 +10749,11 @@ pub extern "C-unwind" fn knot_source_fold(
     let cols: Vec<String> = rec.columns.iter().map(|c| quote_ident(&c.name)).collect();
     let sql = format!(
         "SELECT {} FROM {}",
-        if cols.is_empty() { "1".to_string() } else { cols.join(", ") },
+        if cols.is_empty() {
+            "1".to_string()
+        } else {
+            cols.join(", ")
+        },
         table
     );
     debug_sql(&sql);
@@ -10354,9 +10762,12 @@ pub extern "C-unwind" fn knot_source_fold(
         .conn
         .prepare_cached(&sql)
         .unwrap_or_else(|e| panic!("knot runtime: source_fold error: {}\n  SQL: {}", e, sql));
-    let mut result_rows = stmt
-        .query([])
-        .unwrap_or_else(|e| panic!("knot runtime: source_fold exec error: {}\n  SQL: {}", e, sql));
+    let mut result_rows = stmt.query([]).unwrap_or_else(|e| {
+        panic!(
+            "knot runtime: source_fold exec error: {}\n  SQL: {}",
+            e, sql
+        )
+    });
 
     let mut acc = init;
     while let Some(row) = result_rows
@@ -10400,8 +10811,10 @@ pub extern "C-unwind" fn knot_source_query_fold(
             type_name(params)
         ),
     };
-    let sql_params: Vec<rusqlite::types::Value> =
-        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let sql_params: Vec<rusqlite::types::Value> = param_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
         .iter()
         .map(|p| p as &dyn rusqlite::types::ToSql)
@@ -10414,13 +10827,18 @@ pub extern "C-unwind" fn knot_source_query_fold(
 
     let rec = parse_record_schema(result_schema);
 
-    let mut stmt = db_ref
-        .conn
-        .prepare_cached(sql)
-        .unwrap_or_else(|e| panic!("knot runtime: source_query_fold error: {}\n  SQL: {}", e, sql));
-    let mut result_rows = stmt
-        .query(param_refs.as_slice())
-        .unwrap_or_else(|e| panic!("knot runtime: source_query_fold exec error: {}\n  SQL: {}", e, sql));
+    let mut stmt = db_ref.conn.prepare_cached(sql).unwrap_or_else(|e| {
+        panic!(
+            "knot runtime: source_query_fold error: {}\n  SQL: {}",
+            e, sql
+        )
+    });
+    let mut result_rows = stmt.query(param_refs.as_slice()).unwrap_or_else(|e| {
+        panic!(
+            "knot runtime: source_query_fold exec error: {}\n  SQL: {}",
+            e, sql
+        )
+    });
 
     let mut acc = init;
     while let Some(row) = result_rows
@@ -10639,7 +11057,10 @@ fn traverse_sequence_maybe(maybes: Vec<*mut Value>) -> *mut Value {
             Value::Constructor(tag, inner) if ctor_leaf(tag) == "Just" => {
                 values.push(extract_value_field(*inner));
             }
-            _ => panic!("knot runtime: traverse expected Maybe, got {}", type_name(m)),
+            _ => panic!(
+                "knot runtime: traverse expected Maybe, got {}",
+                type_name(m)
+            ),
         }
     }
     wrap_ok_or_just("Just", values)
@@ -10654,7 +11075,10 @@ fn traverse_sequence_result(results: Vec<*mut Value>) -> *mut Value {
             Value::Constructor(tag, inner) if ctor_leaf(tag) == "Ok" => {
                 values.push(extract_value_field(*inner));
             }
-            _ => panic!("knot runtime: traverse expected Result, got {}", type_name(r)),
+            _ => panic!(
+                "knot runtime: traverse expected Result, got {}",
+                type_name(r)
+            ),
         }
     }
     wrap_ok_or_just("Ok", values)
@@ -10666,7 +11090,10 @@ fn traverse_sequence_relation(rels: Vec<*mut Value>) -> *mut Value {
     for &rel in &rels {
         let rows = match unsafe { as_ref(rel) } {
             Value::Relation(rows) => rows,
-            _ => panic!("knot runtime: traverse expected Relation, got {}", type_name(rel)),
+            _ => panic!(
+                "knot runtime: traverse expected Relation, got {}",
+                type_name(rel)
+            ),
         };
         let mut next = Vec::new();
         for prefix in &current {
@@ -10777,7 +11204,10 @@ pub extern "C-unwind" fn knot_relation_single(rel: *mut Value) -> *mut Value {
         ),
     };
     if rows.len() == 1 {
-        let record = alloc(Value::Record(vec![RecordField { name: "value".into(), value: rows[0] }]));
+        let record = alloc(Value::Record(vec![RecordField {
+            name: "value".into(),
+            value: rows[0],
+        }]));
         alloc(Value::Constructor("Just".into(), record))
     } else {
         alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit)))
@@ -10795,8 +11225,14 @@ pub extern "C-unwind" fn knot_relation_single(rel: *mut Value) -> *mut Value {
 /// Build `Cons {head, tail}`. Record fields are kept sorted ("head" < "tail").
 fn list_cons(head: *mut Value, tail: *mut Value) -> *mut Value {
     let record = alloc(Value::Record(vec![
-        RecordField { name: intern_str("head"), value: head },
-        RecordField { name: intern_str("tail"), value: tail },
+        RecordField {
+            name: intern_str("head"),
+            value: head,
+        },
+        RecordField {
+            name: intern_str("tail"),
+            value: tail,
+        },
     ]));
     alloc(Value::Constructor(intern_str("Cons"), record))
 }
@@ -10815,13 +11251,19 @@ fn list_uncons(v: *mut Value) -> Option<(*mut Value, *mut Value)> {
             let tail = knot_record_field(*payload, b"tail".as_ptr(), 4);
             Some((head, tail))
         }
-        _ => panic!("knot runtime: expected List (Nil/Cons), got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: expected List (Nil/Cons), got {}",
+            type_name(v)
+        ),
     }
 }
 
 /// Wrap a value in `Just {value}`.
 fn maybe_just(v: *mut Value) -> *mut Value {
-    let record = alloc(Value::Record(vec![RecordField { name: intern_str("value"), value: v }]));
+    let record = alloc(Value::Record(vec![RecordField {
+        name: intern_str("value"),
+        value: v,
+    }]));
     alloc(Value::Constructor(intern_str("Just"), record))
 }
 
@@ -10832,13 +11274,19 @@ fn maybe_nothing() -> *mut Value {
 
 /// The `Ok {value}` constructor (built-in `data Result e a = Err {error: e} | Ok {value: a}`).
 fn result_ok(v: *mut Value) -> *mut Value {
-    let record = alloc(Value::Record(vec![RecordField { name: intern_str("value"), value: v }]));
+    let record = alloc(Value::Record(vec![RecordField {
+        name: intern_str("value"),
+        value: v,
+    }]));
     alloc(Value::Constructor(intern_str("Ok"), record))
 }
 
 /// The `Err {error}` constructor.
 fn result_err(e: *mut Value) -> *mut Value {
-    let record = alloc(Value::Record(vec![RecordField { name: intern_str("error"), value: e }]));
+    let record = alloc(Value::Record(vec![RecordField {
+        name: intern_str("error"),
+        value: e,
+    }]));
     alloc(Value::Constructor(intern_str("Err"), record))
 }
 
@@ -10888,7 +11336,6 @@ fn compile_impl() -> Option<CompileImpl> {
         Some(unsafe { std::mem::transmute::<*mut c_void, CompileImpl>(p) })
     }
 }
-
 
 /// Shared JIT compile+run for `base.compile`. On success returns the forced
 /// value and the snippet's body-type descriptor (freed by the caller). On any
@@ -11026,7 +11473,10 @@ fn compile_result(value: *mut Value, err: Option<String>) -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_builtin_compile(src: *mut Value) -> *mut Value {
     let Value::Text(source) = (unsafe { as_ref(src) }) else {
-        return result_err(knot_value_text("compile expects a Text source".as_ptr(), 28));
+        return result_err(knot_value_text(
+            "compile expects a Text source".as_ptr(),
+            28,
+        ));
     };
     let (value, _ty, err) = compile_run(source.as_bytes(), None);
     compile_result(value, err)
@@ -11046,7 +11496,10 @@ pub extern "C-unwind" fn knot_builtin_compile_typed(
     expected_len: usize,
 ) -> *mut Value {
     let Value::Text(source) = (unsafe { as_ref(src) }) else {
-        return result_err(knot_value_text("compile expects a Text source".as_ptr(), 28));
+        return result_err(knot_value_text(
+            "compile expects a Text source".as_ptr(),
+            28,
+        ));
     };
     let expected = if expected_ptr.is_null() || expected_len == 0 {
         None
@@ -11245,17 +11698,25 @@ pub extern "C-unwind" fn knot_relation_diff(
     let empty_a;
     let rows_a = match unsafe { as_ref(a) } {
         Value::Relation(rows) => rows,
-        Value::Unit => { empty_a = Vec::new(); &empty_a }
+        Value::Unit => {
+            empty_a = Vec::new();
+            &empty_a
+        }
         _ => panic!("knot runtime: diff expected Relation, got {}", type_name(a)),
     };
     let empty_b;
     let rows_b = match unsafe { as_ref(b) } {
         Value::Relation(rows) => rows,
-        Value::Unit => { empty_b = Vec::new(); &empty_b }
+        Value::Unit => {
+            empty_b = Vec::new();
+            &empty_b
+        }
         _ => panic!("knot runtime: diff expected Relation, got {}", type_name(b)),
     };
 
-    if rows_a.is_empty() { return alloc(Value::Relation(Vec::new())); }
+    if rows_a.is_empty() {
+        return alloc(Value::Relation(Vec::new()));
+    }
     if rows_b.is_empty() {
         // Dedup a for set semantics (SQL EXCEPT would dedup)
         let mut seen = HashSet::new();
@@ -11277,11 +11738,14 @@ pub extern "C-unwind" fn knot_relation_diff(
     }
 
     // Fallback: in-memory — hash-based O(n), with dedup for set semantics
-    let set_b: HashSet<Vec<u8>> = rows_b.iter().map(|r| {
-        let mut buf = Vec::new();
-        value_to_hash_bytes(*r, &mut buf);
-        buf
-    }).collect();
+    let set_b: HashSet<Vec<u8>> = rows_b
+        .iter()
+        .map(|r| {
+            let mut buf = Vec::new();
+            value_to_hash_bytes(*r, &mut buf);
+            buf
+        })
+        .collect();
     let mut seen = HashSet::new();
     let mut buf = Vec::new();
     let result: Vec<*mut Value> = rows_a
@@ -11306,7 +11770,10 @@ pub extern "C-unwind" fn knot_relation_inter(
     let empty_a;
     let rows_a = match unsafe { as_ref(a) } {
         Value::Relation(rows) => rows,
-        Value::Unit => { empty_a = Vec::new(); &empty_a }
+        Value::Unit => {
+            empty_a = Vec::new();
+            &empty_a
+        }
         _ => panic!(
             "knot runtime: inter expected Relation, got {}",
             type_name(a)
@@ -11315,7 +11782,10 @@ pub extern "C-unwind" fn knot_relation_inter(
     let empty_b;
     let rows_b = match unsafe { as_ref(b) } {
         Value::Relation(rows) => rows,
-        Value::Unit => { empty_b = Vec::new(); &empty_b }
+        Value::Unit => {
+            empty_b = Vec::new();
+            &empty_b
+        }
         _ => panic!(
             "knot runtime: inter expected Relation, got {}",
             type_name(b)
@@ -11332,11 +11802,14 @@ pub extern "C-unwind" fn knot_relation_inter(
     }
 
     // Fallback: in-memory — hash-based O(n), with dedup for set semantics
-    let set_b: HashSet<Vec<u8>> = rows_b.iter().map(|r| {
-        let mut buf = Vec::new();
-        value_to_hash_bytes(*r, &mut buf);
-        buf
-    }).collect();
+    let set_b: HashSet<Vec<u8>> = rows_b
+        .iter()
+        .map(|r| {
+            let mut buf = Vec::new();
+            value_to_hash_bytes(*r, &mut buf);
+            buf
+        })
+        .collect();
     let mut seen = HashSet::new();
     let mut buf = Vec::new();
     let result: Vec<*mut Value> = rows_a
@@ -11383,12 +11856,7 @@ pub extern "C-unwind" fn knot_relation_sum_typed(
     relation_sum(db, f, rel, is_float != 0)
 }
 
-fn relation_sum(
-    db: *mut c_void,
-    f: *mut Value,
-    rel: *mut Value,
-    is_float: bool,
-) -> *mut Value {
+fn relation_sum(db: *mut c_void, f: *mut Value, rel: *mut Value, is_float: bool) -> *mut Value {
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
         _ => panic!(
@@ -11399,7 +11867,11 @@ fn relation_sum(
     // Only the zero carries the type when the relation is empty: for non-empty
     // input `Int 0 + Float x` already promotes to Float, so seeding with the
     // Float zero changes nothing there.
-    let mut acc = if is_float { alloc_float(0.0) } else { alloc_int(0) };
+    let mut acc = if is_float {
+        alloc_float(0.0)
+    } else {
+        alloc_int(0)
+    };
     for &row in rows {
         let val = knot_value_call(db, f, row);
         acc = knot_value_add(acc, val);
@@ -11426,7 +11898,11 @@ pub extern "C-unwind" fn knot_relation_sum_direct(
             type_name(rel)
         ),
     };
-    let mut acc = if is_float != 0 { alloc_float(0.0) } else { alloc_int(0) };
+    let mut acc = if is_float != 0 {
+        alloc_float(0.0)
+    } else {
+        alloc_int(0)
+    };
     for &row in rows {
         acc = knot_value_add(acc, row);
     }
@@ -11588,14 +12064,20 @@ pub extern "C-unwind" fn knot_text_take(n: *mut Value, text: *mut Value) -> *mut
     // Clamp negative counts to 0, matching `knot_relation_take`.
     let n_idx = match unsafe { as_ref(n) } {
         Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
-        _ => panic!("knot runtime: take expected Int as first arg, got {}", type_name(n)),
+        _ => panic!(
+            "knot runtime: take expected Int as first arg, got {}",
+            type_name(n)
+        ),
     };
     match unsafe { as_ref(text) } {
         Value::Text(s) => {
             let result: String = s.chars().take(n_idx).collect();
             alloc(Value::Text(Arc::from(result)))
         }
-        _ => panic!("knot runtime: take expected Text as second arg, got {}", type_name(text)),
+        _ => panic!(
+            "knot runtime: take expected Text as second arg, got {}",
+            type_name(text)
+        ),
     }
 }
 
@@ -11605,14 +12087,20 @@ pub extern "C-unwind" fn knot_text_drop(n: *mut Value, text: *mut Value) -> *mut
     // Clamp negative counts to 0, matching `knot_relation_drop`.
     let n_idx = match unsafe { as_ref(n) } {
         Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
-        _ => panic!("knot runtime: drop expected Int as first arg, got {}", type_name(n)),
+        _ => panic!(
+            "knot runtime: drop expected Int as first arg, got {}",
+            type_name(n)
+        ),
     };
     match unsafe { as_ref(text) } {
         Value::Text(s) => {
             let result: String = s.chars().skip(n_idx).collect();
             alloc(Value::Text(Arc::from(result)))
         }
-        _ => panic!("knot runtime: drop expected Text as second arg, got {}", type_name(text)),
+        _ => panic!(
+            "knot runtime: drop expected Text as second arg, got {}",
+            type_name(text)
+        ),
     }
 }
 
@@ -11682,14 +12170,10 @@ pub extern "C-unwind" fn knot_int_clamp(
     hi: *mut Value,
     x: *mut Value,
 ) -> *mut Value {
-    match (
-        unsafe { as_ref(lo) },
-        unsafe { as_ref(hi) },
-        unsafe { as_ref(x) },
-    ) {
-        (Value::Int(lo), Value::Int(hi), Value::Int(x)) => {
-            knot_value_int((*x).clamp(*lo, *hi))
-        }
+    match (unsafe { as_ref(lo) }, unsafe { as_ref(hi) }, unsafe {
+        as_ref(x)
+    }) {
+        (Value::Int(lo), Value::Int(hi), Value::Int(x)) => knot_value_int((*x).clamp(*lo, *hi)),
         _ => panic!("knot runtime: clamp expected Int arguments"),
     }
 }
@@ -11740,7 +12224,10 @@ pub extern "C-unwind" fn knot_text_trim_ascii(v: *mut Value) -> *mut Value {
         Value::Text(s) => alloc(Value::Text(Arc::from(
             s.trim_matches(|c| ASCII_WS.contains(&c)),
         ))),
-        _ => panic!("knot runtime: trimAscii expected Text, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: trimAscii expected Text, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -11751,7 +12238,10 @@ pub extern "C-unwind" fn knot_text_ltrim_ascii(v: *mut Value) -> *mut Value {
         Value::Text(s) => alloc(Value::Text(Arc::from(
             s.trim_start_matches(|c| ASCII_WS.contains(&c)),
         ))),
-        _ => panic!("knot runtime: ltrimAscii expected Text, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: ltrimAscii expected Text, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -11762,7 +12252,10 @@ pub extern "C-unwind" fn knot_text_rtrim_ascii(v: *mut Value) -> *mut Value {
         Value::Text(s) => alloc(Value::Text(Arc::from(
             s.trim_end_matches(|c| ASCII_WS.contains(&c)),
         ))),
-        _ => panic!("knot runtime: rtrimAscii expected Text, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: rtrimAscii expected Text, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -11772,7 +12265,10 @@ pub extern "C-unwind" fn knot_text_rtrim_ascii(v: *mut Value) -> *mut Value {
 pub extern "C-unwind" fn knot_text_byte_length(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => alloc(Value::Int(s.len() as i64)),
-        _ => panic!("knot runtime: byteLength expected Text, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: byteLength expected Text, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -11782,7 +12278,10 @@ pub extern "C-unwind" fn knot_text_byte_length(v: *mut Value) -> *mut Value {
 pub extern "C-unwind" fn knot_text_to_ascii_lower(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => alloc(Value::Text(Arc::from(s.to_ascii_lowercase()))),
-        _ => panic!("knot runtime: toAsciiLower expected Text, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: toAsciiLower expected Text, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -11792,13 +12291,19 @@ pub extern "C-unwind" fn knot_text_to_ascii_lower(v: *mut Value) -> *mut Value {
 pub extern "C-unwind" fn knot_text_to_ascii_upper(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => alloc(Value::Text(Arc::from(s.to_ascii_uppercase()))),
-        _ => panic!("knot runtime: toAsciiUpper expected Text, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: toAsciiUpper expected Text, got {}",
+            type_name(v)
+        ),
     }
 }
 
 /// contains(needle, haystack) — check if text contains a substring
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_text_contains(needle: *mut Value, haystack: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_text_contains(
+    needle: *mut Value,
+    haystack: *mut Value,
+) -> *mut Value {
     let needle: &str = match unsafe { as_ref(needle) } {
         Value::Text(s) => s,
         _ => panic!("knot runtime: contains expected Text as first arg"),
@@ -11892,7 +12397,10 @@ pub extern "C-unwind" fn knot_text_chars(v: *mut Value) -> *mut Value {
 pub extern "C-unwind" fn knot_bytes_length(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Bytes(b) => knot_value_int(b.len() as i64),
-        _ => panic!("knot runtime: bytesLength expected Bytes, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: bytesLength expected Bytes, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -11901,11 +12409,17 @@ pub extern "C-unwind" fn knot_bytes_length(v: *mut Value) -> *mut Value {
 pub extern "C-unwind" fn knot_bytes_concat(a: *mut Value, b: *mut Value) -> *mut Value {
     let a_bytes = match unsafe { as_ref(a) } {
         Value::Bytes(b) => b,
-        _ => panic!("knot runtime: bytesConcat expected Bytes as first arg, got {}", type_name(a)),
+        _ => panic!(
+            "knot runtime: bytesConcat expected Bytes as first arg, got {}",
+            type_name(a)
+        ),
     };
     let b_bytes = match unsafe { as_ref(b) } {
         Value::Bytes(b) => b,
-        _ => panic!("knot runtime: bytesConcat expected Bytes as second arg, got {}", type_name(b)),
+        _ => panic!(
+            "knot runtime: bytesConcat expected Bytes as second arg, got {}",
+            type_name(b)
+        ),
     };
     let mut result = Vec::with_capacity(a_bytes.len() + b_bytes.len());
     result.extend_from_slice(a_bytes);
@@ -11926,11 +12440,17 @@ pub extern "C-unwind" fn knot_bytes_slice(
     // negative offset/length means "from the start"/"empty" rather than a crash.
     let start = match unsafe { as_ref(start) } {
         Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
-        _ => panic!("knot runtime: bytesSlice expected Int as first arg, got {}", type_name(start)),
+        _ => panic!(
+            "knot runtime: bytesSlice expected Int as first arg, got {}",
+            type_name(start)
+        ),
     };
     let len = match unsafe { as_ref(len) } {
         Value::Int(i) => (*i).max(0).try_into().unwrap_or(usize::MAX),
-        _ => panic!("knot runtime: bytesSlice expected Int as second arg, got {}", type_name(len)),
+        _ => panic!(
+            "knot runtime: bytesSlice expected Int as second arg, got {}",
+            type_name(len)
+        ),
     };
     match unsafe { as_ref(bytes) } {
         Value::Bytes(b) => {
@@ -11938,7 +12458,10 @@ pub extern "C-unwind" fn knot_bytes_slice(
             let s = start.min(b.len());
             alloc(Value::Bytes(Arc::from(&b[s..end])))
         }
-        _ => panic!("knot runtime: bytesSlice expected Bytes as third arg, got {}", type_name(bytes)),
+        _ => panic!(
+            "knot runtime: bytesSlice expected Bytes as third arg, got {}",
+            type_name(bytes)
+        ),
     }
 }
 
@@ -11947,7 +12470,10 @@ pub extern "C-unwind" fn knot_bytes_slice(
 pub extern "C-unwind" fn knot_text_to_bytes(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Text(s) => alloc(Value::Bytes(Arc::from(s.as_bytes()))),
-        _ => panic!("knot runtime: textToBytes expected Text, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: textToBytes expected Text, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -11965,7 +12491,10 @@ pub extern "C-unwind" fn knot_floor(v: *mut Value) -> *mut Value {
 pub extern "C-unwind" fn knot_int_to_float(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
         Value::Int(n) => alloc(Value::Float(*n as f64)),
-        _ => panic!("knot runtime: intToFloat expected Int, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: intToFloat expected Int, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -11977,7 +12506,10 @@ pub extern "C-unwind" fn knot_text_to_int(v: *mut Value) -> *mut Value {
             Ok(n) => make_just(alloc(Value::Int(n))),
             Err(_) => make_nothing(),
         },
-        _ => panic!("knot runtime: textToInt expected Text, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: textToInt expected Text, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -11989,7 +12521,10 @@ pub extern "C-unwind" fn knot_text_to_float(v: *mut Value) -> *mut Value {
             Ok(f) => make_just(alloc(Value::Float(f))),
             Err(_) => make_nothing(),
         },
-        _ => panic!("knot runtime: textToFloat expected Text, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: textToFloat expected Text, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -12021,7 +12556,10 @@ pub extern "C-unwind" fn knot_bytes_to_text(v: *mut Value) -> *mut Value {
             Ok(s) => make_just(alloc(Value::Text(Arc::from(s)))),
             Err(_) => make_nothing(),
         },
-        _ => panic!("knot runtime: bytesToText expected Bytes, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: bytesToText expected Bytes, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -12037,7 +12575,10 @@ pub extern "C-unwind" fn knot_bytes_to_hex(v: *mut Value) -> *mut Value {
             }
             alloc(Value::Text(Arc::from(hex)))
         }
-        _ => panic!("knot runtime: bytesToHex expected Bytes, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: bytesToHex expected Bytes, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -12064,7 +12605,10 @@ pub extern "C-unwind" fn knot_bytes_from_hex(v: *mut Value) -> *mut Value {
             }
             make_just(alloc(Value::Bytes(Arc::from(bytes))))
         }
-        _ => panic!("knot runtime: bytesFromHex expected Text, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: bytesFromHex expected Text, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -12098,14 +12642,20 @@ pub extern "C-unwind" fn knot_bytes_get(index: *mut Value, bytes: *mut Value) ->
         Value::Int(n) if *n >= 0 => *n as usize,
         // A negative index is out of bounds, not index 0.
         Value::Int(_) => return make_nothing(),
-        _ => panic!("knot runtime: bytesGet expected Int as first arg, got {}", type_name(index)),
+        _ => panic!(
+            "knot runtime: bytesGet expected Int as first arg, got {}",
+            type_name(index)
+        ),
     };
     match unsafe { as_ref(bytes) } {
         Value::Bytes(b) => match b.get(i) {
             Some(byte) => make_just(knot_value_int(*byte as i64)),
             None => make_nothing(),
         },
-        _ => panic!("knot runtime: bytesGet expected Bytes as second arg, got {}", type_name(bytes)),
+        _ => panic!(
+            "knot runtime: bytesGet expected Bytes as second arg, got {}",
+            type_name(bytes)
+        ),
     }
 }
 
@@ -12162,8 +12712,7 @@ fn estimate_relation_json_size(db: *mut c_void, v: *mut Value) -> Option<u64> {
     let sample_n = rows.len().min(SAMPLE_ROWS);
     let mut sample_bytes: u64 = 0;
     for row in rows.iter().take(sample_n) {
-        sample_bytes =
-            sample_bytes.saturating_add(json_encode_value(db, *row).len() as u64);
+        sample_bytes = sample_bytes.saturating_add(json_encode_value(db, *row).len() as u64);
     }
     // Round the per-row average up so the estimate never undershoots the
     // true size purely from integer truncation (ceil division; sample_n ≥ 1).
@@ -12191,7 +12740,9 @@ pub extern "C-unwind" fn knot_json_encode_with(
     v: *mut Value,
     to_json_fn: *const u8,
 ) -> *mut Value {
-    alloc(Value::Text(Arc::from(value_to_json_with(db, v, to_json_fn))))
+    alloc(Value::Text(Arc::from(value_to_json_with(
+        db, v, to_json_fn,
+    ))))
 }
 
 /// parseJson(text) — parse a JSON string into a Knot value
@@ -12206,13 +12757,14 @@ pub extern "C-unwind" fn knot_json_encode_with(
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_json_decode(v: *mut Value) -> *mut Value {
     match unsafe { as_ref(v) } {
-        Value::Text(s) => {
-            match serde_json::from_str::<serde_json::Value>(s) {
-                Ok(json) => json_to_value(&json),
-                Err(e) => panic!("knot runtime: parseJson failed: {}", e),
-            }
-        }
-        _ => panic!("knot runtime: parseJson expected Text, got {}", type_name(v)),
+        Value::Text(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(json) => json_to_value(&json),
+            Err(e) => panic!("knot runtime: parseJson failed: {}", e),
+        },
+        _ => panic!(
+            "knot runtime: parseJson expected Text, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -12255,13 +12807,15 @@ fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
                 // Only reachable with serde's `arbitrary_precision` feature
                 // (not enabled here): a number too large even for f64. Surface
                 // it instead of silently collapsing the value to 0.
-                panic!("knot runtime: JSON number {} is not representable as Int or Float", n)
+                panic!(
+                    "knot runtime: JSON number {} is not representable as Int or Float",
+                    n
+                )
             }
         }
         serde_json::Value::String(s) => alloc(Value::Text(Arc::from(s.as_str()))),
         serde_json::Value::Array(arr) => {
-            let items: Vec<*mut Value> =
-                arr.iter().map(|v| json_to_value_impl(v, wire)).collect();
+            let items: Vec<*mut Value> = arr.iter().map(|v| json_to_value_impl(v, wire)).collect();
             alloc(Value::Relation(items))
         }
         serde_json::Value::Object(obj) => {
@@ -12278,36 +12832,38 @@ fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
             // silently corrupted into a Bytes value. Mirrors the structural
             // guard the `__knot_ctor` marker below already uses.
             if obj.len() == 1
-                && let Some(serde_json::Value::String(b64)) = obj.get("__knot_bytes") {
-                    // `base64_decode` now returns `None` on malformed input
-                    // (non-alphabet bytes, bad tail) instead of silently
-                    // dropping them; a `None` falls through to the record
-                    // path below, matching the existing round-trip rejection.
-                    if let Some(decoded) = base64_decode(b64)
-                        && base64_encode(&decoded) == *b64 {
-                        return alloc(Value::Bytes(Arc::from(decoded)));
-                    }
+                && let Some(serde_json::Value::String(b64)) = obj.get("__knot_bytes")
+            {
+                // `base64_decode` now returns `None` on malformed input
+                // (non-alphabet bytes, bad tail) instead of silently
+                // dropping them; a `None` falls through to the record
+                // path below, matching the existing round-trip rejection.
+                if let Some(decoded) = base64_decode(b64)
+                    && base64_encode(&decoded) == *b64
+                {
+                    return alloc(Value::Bytes(Arc::from(decoded)));
                 }
+            }
             // Reconstruct Constructor from the `__knot_ctor` marker shape
             // emitted by value_to_serde_json. Using a `__knot_`-prefixed key
             // (like `__knot_bytes`/`__knot_bigint`) avoids colliding with
             // legitimate user records that happen to have `tag`/`value` fields.
             if obj.len() == 1
                 && let Some(serde_json::Value::Object(inner)) = obj.get("__knot_ctor")
-                    && let (Some(serde_json::Value::String(tag)), Some(val)) =
-                        (inner.get("tag"), inner.get("value"))
-                    {
-                        // A nullary constructor's payload is `Unit`, encoded as
-                        // JSON `null`. A `null` in the `__knot_ctor` value slot is
-                        // always that `Unit`, never a Maybe `Nothing` — otherwise
-                        // `Red` != `parseJson (toJson Red)`. Any other payload keeps
-                        // wire semantics so nested Maybe fields still round-trip.
-                        let payload = match val {
-                            serde_json::Value::Null => alloc(Value::Unit),
-                            other => json_to_value_impl(other, wire),
-                        };
-                        return alloc(Value::Constructor(intern_str(tag), payload));
-                    }
+                && let (Some(serde_json::Value::String(tag)), Some(val)) =
+                    (inner.get("tag"), inner.get("value"))
+            {
+                // A nullary constructor's payload is `Unit`, encoded as
+                // JSON `null`. A `null` in the `__knot_ctor` value slot is
+                // always that `Unit`, never a Maybe `Nothing` — otherwise
+                // `Red` != `parseJson (toJson Red)`. Any other payload keeps
+                // wire semantics so nested Maybe fields still round-trip.
+                let payload = match val {
+                    serde_json::Value::Null => alloc(Value::Unit),
+                    other => json_to_value_impl(other, wire),
+                };
+                return alloc(Value::Constructor(intern_str(tag), payload));
+            }
             let mut fields: Vec<RecordField> = obj
                 .iter()
                 .map(|(k, v)| RecordField {
@@ -12382,7 +12938,10 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
                         name: f.name.clone(),
                         value: apply_wire_type_checked(f.value, fty)?,
                     }),
-                    None => out.push(RecordField { name: f.name.clone(), value: f.value }),
+                    None => out.push(RecordField {
+                        name: f.name.clone(),
+                        value: f.value,
+                    }),
                 }
             }
             // Fields named in the schema but absent from the payload: a Maybe
@@ -12390,7 +12949,10 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
             for (n, fty) in &descs {
                 if !fields.iter().any(|f| &*f.name == n.as_str()) {
                     if fty.starts_with('?') {
-                        out.push(RecordField { name: intern_str(n), value: make_nothing() });
+                        out.push(RecordField {
+                            name: intern_str(n),
+                            value: make_nothing(),
+                        });
                     } else {
                         return None;
                     }
@@ -12436,10 +12998,7 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
             Value::Int(_) => true,
             Value::Float(f) => {
                 const I64_MAX_PLUS_ONE: f64 = 9_223_372_036_854_775_808.0; // 2^63
-                f.fract() == 0.0
-                    && f.is_finite()
-                    && *f >= i64::MIN as f64
-                    && *f < I64_MAX_PLUS_ONE
+                f.fract() == 0.0 && f.is_finite() && *f >= i64::MIN as f64 && *f < I64_MAX_PLUS_ONE
             }
             _ => false,
         },
@@ -12605,10 +13164,15 @@ pub extern "C-unwind" fn knot_fs_append_file(path: *mut Value, contents: *mut Va
             type_name(contents)
         ),
     };
-    match std::fs::OpenOptions::new().create(true).append(true).open(p) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+    {
         Ok(mut f) => {
-            f.write_all(c.as_bytes())
-                .unwrap_or_else(|e| panic!("knot runtime: appendFile write failed for {:?}: {}", p, e));
+            f.write_all(c.as_bytes()).unwrap_or_else(|e| {
+                panic!("knot runtime: appendFile write failed for {:?}: {}", p, e)
+            });
             alloc(Value::Unit)
         }
         Err(e) => panic!("knot runtime: appendFile failed for {:?}: {}", p, e),
@@ -12650,7 +13214,11 @@ pub extern "C-unwind" fn knot_fs_list_dir(path: *mut Value) -> *mut Value {
             let entries: Vec<*mut Value> = match std::fs::read_dir(&**p) {
                 Ok(rd) => rd
                     .filter_map(|entry| entry.ok())
-                    .map(|entry| alloc(Value::Text(Arc::from(entry.file_name().to_string_lossy().as_ref()))))
+                    .map(|entry| {
+                        alloc(Value::Text(Arc::from(
+                            entry.file_name().to_string_lossy().as_ref(),
+                        )))
+                    })
                     .collect(),
                 Err(e) => panic!("knot runtime: listDir failed for {:?}: {}", p, e),
             };
@@ -12688,8 +13256,10 @@ pub extern "C-unwind" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *
         }
     })
     .expect("knot runtime: failed to create KNOT_INT collation");
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;")
-        .expect("knot runtime: failed to set pragmas");
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;",
+    )
+    .expect("knot runtime: failed to set pragmas");
     let db = Box::new(KnotDb {
         conn,
         atomic_depth: std::cell::Cell::new(0),
@@ -12852,120 +13422,128 @@ pub extern "C-unwind" fn knot_source_migrate(
     // half-dropped/half-rebuilt on a connection a `catch_unwind` site keeps
     // using — and the savepoint isn't left dangling.
     with_savepoint_rollback(db_ref, "knot_migrate", || {
-    // Drop old child tables (for nested relation fields) before dropping parent.
-    // Recurse to handle grandchild+ tables (deepest first).
-    fn drop_nested_tables(conn: &rusqlite::Connection, parent_table: &str, nested: &[NestedField]) {
-        for nf in nested {
-            let child = child_table_name(parent_table, &nf.name);
-            // Drop grandchildren first (depth-first)
-            drop_nested_tables(conn, &child, &nf.nested);
-            let drop_child = format!("DROP TABLE IF EXISTS {};", quote_ident(&child));
-            debug_sql(&drop_child);
-            let _ = conn.execute_batch(&drop_child);
-        }
-    }
-    if !is_adt_schema(old_schema) {
-        let old_rec = parse_record_schema(old_schema);
-        drop_nested_tables(&db_ref.conn, &table_name, &old_rec.nested);
-    }
-
-    let drop_sql = format!("DROP TABLE IF EXISTS {};", table);
-    debug_sql(&drop_sql);
-    db_ref
-        .conn
-        .execute_batch(&drop_sql)
-        .expect("knot runtime: failed to drop table during migration");
-
-    if is_adt_schema(new_schema) {
-        // ADT schema: recreate using the same logic as knot_source_init
-        let adt = parse_adt_schema(new_schema);
-        let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
-        let mut col_names = vec![quote_ident("_tag")];
-        for f in &adt.all_fields {
-            col_defs.push(format!("{} {}", quote_ident(&f.name), adt.col_sql_type(f)));
-            col_names.push(quote_ident(&f.name));
-        }
-
-        let create_sql = format!("CREATE TABLE {} ({});", table, col_defs.join(", "));
-        debug_sql(&create_sql);
-        db_ref
-            .conn
-            .execute_batch(&create_sql)
-            .expect("knot runtime: failed to create table during migration");
-
-        // Unique index with COALESCE for NULLs (same as knot_source_init)
-        let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
-            .chain(adt.all_fields.iter().map(|f| {
-                null_safe_coalesce(&quote_ident(&f.name), f.ty)
-            }))
-            .collect();
-        let idx_sql = format!(
-            "CREATE UNIQUE INDEX {} ON {} ({});",
-            quote_ident(&format!("_knot_{}_unique", name)),
-            table,
-            coalesced.join(", ")
-        );
-        debug_sql(&idx_sql);
-        if let Err(e) = db_ref.conn.execute_batch(&idx_sql) {
-            log::log_warn(&format!(
-                "knot runtime: failed to create unique index during migration for {}: {}",
-                name,
-                json_escape(&e.to_string())
-            ));
-        }
-
-        // Insert transformed rows (ADT: constructor values)
-        if !new_rows.is_empty() {
-            let placeholders: Vec<String> = col_names
-                .iter()
-                .enumerate()
-                .map(|(i, _)| format!("?{}", i + 1))
-                .collect();
-            let insert_sql = format!(
-                "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-                table,
-                col_names.join(", "),
-                placeholders.join(", ")
-            );
-            debug_sql(&insert_sql);
-
-            let mut stmt = db_ref
-                .conn
-                .prepare_cached(&insert_sql)
-                .expect("knot runtime: failed to prepare insert during migration");
-
-            for row_ptr in &new_rows {
-                // Type-aware serialization via adt_row_to_params — the same
-                // path every other ADT write uses. The previous type-blind
-                // value_to_sql_param serialized payload-bearing constructor
-                // fields (json columns) as their bare tag string, permanently
-                // discarding the payload, and skipped the nested-relation
-                // set-semantics dedup that value_to_sqlite performs.
-                let params = adt_row_to_params(*row_ptr, &adt);
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                stmt.execute(param_refs.as_slice())
-                    .expect("knot runtime: failed to insert row during migration");
+        // Drop old child tables (for nested relation fields) before dropping parent.
+        // Recurse to handle grandchild+ tables (deepest first).
+        fn drop_nested_tables(
+            conn: &rusqlite::Connection,
+            parent_table: &str,
+            nested: &[NestedField],
+        ) {
+            for nf in nested {
+                let child = child_table_name(parent_table, &nf.name);
+                // Drop grandchildren first (depth-first)
+                drop_nested_tables(conn, &child, &nf.nested);
+                let drop_child = format!("DROP TABLE IF EXISTS {};", quote_ident(&child));
+                debug_sql(&drop_child);
+                let _ = conn.execute_batch(&drop_child);
             }
         }
-    } else {
-        // Record schema — use init_record_table + write_record_rows so that
-        // nested relation fields (child tables) and _id AUTOINCREMENT are
-        // handled correctly, and value_to_sqlite is used for type-aware
-        // serialization.
-        let new_rec = parse_record_schema(new_schema);
-        init_record_table(&db_ref.conn, &table_name, &new_rec);
-        write_record_rows(&db_ref.conn, &table_name, &new_rec, &new_rows);
-    }
+        if !is_adt_schema(old_schema) {
+            let old_rec = parse_record_schema(old_schema);
+            drop_nested_tables(&db_ref.conn, &table_name, &old_rec.nested);
+        }
 
-    // 5. Update stored schema
-    db_ref
-        .conn
-        .execute(
-            "INSERT OR REPLACE INTO _knot_schema (name, schema) VALUES (?1, ?2);",
-            rusqlite::params![name, new_schema],
-        )
-        .expect("knot runtime: failed to update schema after migration");
+        let drop_sql = format!("DROP TABLE IF EXISTS {};", table);
+        debug_sql(&drop_sql);
+        db_ref
+            .conn
+            .execute_batch(&drop_sql)
+            .expect("knot runtime: failed to drop table during migration");
+
+        if is_adt_schema(new_schema) {
+            // ADT schema: recreate using the same logic as knot_source_init
+            let adt = parse_adt_schema(new_schema);
+            let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
+            let mut col_names = vec![quote_ident("_tag")];
+            for f in &adt.all_fields {
+                col_defs.push(format!("{} {}", quote_ident(&f.name), adt.col_sql_type(f)));
+                col_names.push(quote_ident(&f.name));
+            }
+
+            let create_sql = format!("CREATE TABLE {} ({});", table, col_defs.join(", "));
+            debug_sql(&create_sql);
+            db_ref
+                .conn
+                .execute_batch(&create_sql)
+                .expect("knot runtime: failed to create table during migration");
+
+            // Unique index with COALESCE for NULLs (same as knot_source_init)
+            let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
+                .chain(
+                    adt.all_fields
+                        .iter()
+                        .map(|f| null_safe_coalesce(&quote_ident(&f.name), f.ty)),
+                )
+                .collect();
+            let idx_sql = format!(
+                "CREATE UNIQUE INDEX {} ON {} ({});",
+                quote_ident(&format!("_knot_{}_unique", name)),
+                table,
+                coalesced.join(", ")
+            );
+            debug_sql(&idx_sql);
+            if let Err(e) = db_ref.conn.execute_batch(&idx_sql) {
+                log::log_warn(&format!(
+                    "knot runtime: failed to create unique index during migration for {}: {}",
+                    name,
+                    json_escape(&e.to_string())
+                ));
+            }
+
+            // Insert transformed rows (ADT: constructor values)
+            if !new_rows.is_empty() {
+                let placeholders: Vec<String> = col_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| format!("?{}", i + 1))
+                    .collect();
+                let insert_sql = format!(
+                    "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+                    table,
+                    col_names.join(", "),
+                    placeholders.join(", ")
+                );
+                debug_sql(&insert_sql);
+
+                let mut stmt = db_ref
+                    .conn
+                    .prepare_cached(&insert_sql)
+                    .expect("knot runtime: failed to prepare insert during migration");
+
+                for row_ptr in &new_rows {
+                    // Type-aware serialization via adt_row_to_params — the same
+                    // path every other ADT write uses. The previous type-blind
+                    // value_to_sql_param serialized payload-bearing constructor
+                    // fields (json columns) as their bare tag string, permanently
+                    // discarding the payload, and skipped the nested-relation
+                    // set-semantics dedup that value_to_sqlite performs.
+                    let params = adt_row_to_params(*row_ptr, &adt);
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                        .iter()
+                        .map(|p| p as &dyn rusqlite::types::ToSql)
+                        .collect();
+                    stmt.execute(param_refs.as_slice())
+                        .expect("knot runtime: failed to insert row during migration");
+                }
+            }
+        } else {
+            // Record schema — use init_record_table + write_record_rows so that
+            // nested relation fields (child tables) and _id AUTOINCREMENT are
+            // handled correctly, and value_to_sqlite is used for type-aware
+            // serialization.
+            let new_rec = parse_record_schema(new_schema);
+            init_record_table(&db_ref.conn, &table_name, &new_rec);
+            write_record_rows(&db_ref.conn, &table_name, &new_rec, &new_rows);
+        }
+
+        // 5. Update stored schema
+        db_ref
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO _knot_schema (name, schema) VALUES (?1, ?2);",
+                rusqlite::params![name, new_schema],
+            )
+            .expect("knot runtime: failed to update schema after migration");
     });
 
     db_ref
@@ -12979,7 +13557,11 @@ pub extern "C-unwind" fn knot_source_migrate(
         notify_relation_changed(name);
     }
 
-    log::log_info(&format!("Migrated source '{}': {} rows", name, old_rows.len()));
+    log::log_info(&format!(
+        "Migrated source '{}': {} rows",
+        name,
+        old_rows.len()
+    ));
 }
 
 /// Compute a source's migrated rows *without* persisting them, so the compiler
@@ -13254,7 +13836,10 @@ fn parse_col_type(s: &str) -> ColType {
 
 fn parse_record_schema(spec: &str) -> RecordSchema {
     if spec.is_empty() {
-        return RecordSchema { columns: Vec::new(), nested: Vec::new() };
+        return RecordSchema {
+            columns: Vec::new(),
+            nested: Vec::new(),
+        };
     }
     let mut columns = Vec::new();
     let mut nested = Vec::new();
@@ -13278,7 +13863,10 @@ fn parse_record_schema(spec: &str) -> RecordSchema {
                 nested: child.nested,
             });
         } else {
-            columns.push(ColumnSpec { name, ty: parse_col_type(type_str) });
+            columns.push(ColumnSpec {
+                name,
+                ty: parse_col_type(type_str),
+            });
         }
     }
     RecordSchema { columns, nested }
@@ -13385,11 +13973,16 @@ fn sql_text_literal(s: &str) -> String {
 /// out-of-range, the panic message names the column so the cause is
 /// identifiable in `panic = "abort"` builds.
 fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
-    let mismatch = || format!(
-        "knot runtime: schema mismatch reading column {} (type {:?}) — possible migration drift",
-        i, ty
-    );
-    if matches!(row.get_ref(i).unwrap_or_else(|_| panic!("{}", mismatch())), ValueRef::Null) {
+    let mismatch = || {
+        format!(
+            "knot runtime: schema mismatch reading column {} (type {:?}) — possible migration drift",
+            i, ty
+        )
+    };
+    if matches!(
+        row.get_ref(i).unwrap_or_else(|_| panic!("{}", mismatch())),
+        ValueRef::Null
+    ) {
         return sql_null_default(ty).unwrap_or_else(|| {
             let col = row.as_ref().column_name(i).unwrap_or("<unknown>");
             panic!(
@@ -13402,28 +13995,35 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
         });
     }
     match ty {
-        ColType::Int => {
-            match row.get_ref(i).unwrap_or_else(|_| panic!("{}", mismatch())) {
-                ValueRef::Integer(n) => alloc_int(n),
-                ValueRef::Text(s) => {
-                    let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in int column");
-                    let n: i64 = s.parse().unwrap_or_else(|_| panic!(
+        ColType::Int => match row.get_ref(i).unwrap_or_else(|_| panic!("{}", mismatch())) {
+            ValueRef::Integer(n) => alloc_int(n),
+            ValueRef::Text(s) => {
+                let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in int column");
+                let n: i64 = s.parse().unwrap_or_else(|_| panic!(
                         "knot runtime: integer value '{}' in column {} does not fit in a 64-bit Int. \
                          This database was likely written by an older Knot build with unbounded \
                          integers; values beyond ±9223372036854775807 cannot be read.",
                         s, i
                     ));
-                    alloc_int(n)
-                }
-                other => panic!("knot runtime: unexpected SQLite type for Int column {}: {:?}", i, other),
+                alloc_int(n)
             }
-        }
-        ColType::Float => knot_value_float(row.get::<_, f64>(i).unwrap_or_else(|_| panic!("{}", mismatch()))),
+            other => panic!(
+                "knot runtime: unexpected SQLite type for Int column {}: {:?}",
+                i, other
+            ),
+        },
+        ColType::Float => knot_value_float(
+            row.get::<_, f64>(i)
+                .unwrap_or_else(|_| panic!("{}", mismatch())),
+        ),
         ColType::Text => {
             let s: String = row.get(i).unwrap_or_else(|_| panic!("{}", mismatch()));
             alloc(Value::Text(Arc::from(s)))
         }
-        ColType::Bool => knot_value_bool(row.get::<_, i32>(i).unwrap_or_else(|_| panic!("{}", mismatch()))),
+        ColType::Bool => knot_value_bool(
+            row.get::<_, i32>(i)
+                .unwrap_or_else(|_| panic!("{}", mismatch())),
+        ),
         ColType::Bytes => {
             let b: Vec<u8> = row.get(i).unwrap_or_else(|_| panic!("{}", mismatch()));
             alloc(Value::Bytes(Arc::from(b)))
@@ -13492,10 +14092,17 @@ fn init_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &Rec
         unique_cols.push(quote_ident("_dummy"));
     }
 
-    let sql = format!("CREATE TABLE IF NOT EXISTS {} ({});", table, col_defs.join(", "));
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {} ({});",
+        table,
+        col_defs.join(", ")
+    );
     debug_sql(&sql);
     conn.execute_batch(&sql).unwrap_or_else(|e| {
-        panic!("knot runtime: failed to create table '{}': {}", table_name, e)
+        panic!(
+            "knot runtime: failed to create table '{}': {}",
+            table_name, e
+        )
     });
 
     if !unique_cols.is_empty() {
@@ -13572,10 +14179,17 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
         unique_cols.push(quote_ident("_content_hash"));
     }
 
-    let sql = format!("CREATE TABLE IF NOT EXISTS {} ({});", child_table, col_defs.join(", "));
+    let sql = format!(
+        "CREATE TABLE IF NOT EXISTS {} ({});",
+        child_table,
+        col_defs.join(", ")
+    );
     debug_sql(&sql);
     conn.execute_batch(&sql).unwrap_or_else(|e| {
-        panic!("knot runtime: failed to create child table '{}': {}", child_table_name, e)
+        panic!(
+            "knot runtime: failed to create child table '{}': {}",
+            child_table_name, e
+        )
     });
 
     // Unique index for set semantics within each parent row: (_parent_id,
@@ -13636,12 +14250,7 @@ fn add_column_backfilled(conn: &Connection, table: &str, col: &ColumnSpec) -> bo
 
 /// Try to auto-apply a safe schema change (e.g. adding ADT constructors).
 /// Returns true if the change was applied, false if it's a breaking change.
-fn auto_apply_schema_change(
-    conn: &Connection,
-    name: &str,
-    stored: &str,
-    compiled: &str,
-) -> bool {
+fn auto_apply_schema_change(conn: &Connection, name: &str, stored: &str, compiled: &str) -> bool {
     let table = format!("_knot_{}", name);
     let stored_is_adt = is_adt_schema(stored);
     let compiled_is_adt = is_adt_schema(compiled);
@@ -13669,7 +14278,11 @@ fn auto_apply_adt_change(
 
     // Every old constructor must exist in new with identical fields
     for old_ctor in &old_adt.constructors {
-        match new_adt.constructors.iter().find(|c| c.name == old_ctor.name) {
+        match new_adt
+            .constructors
+            .iter()
+            .find(|c| c.name == old_ctor.name)
+        {
             Some(new_ctor) => {
                 if old_ctor.fields.len() != new_ctor.fields.len() {
                     return false;
@@ -13679,7 +14292,9 @@ fn auto_apply_adt_change(
                 // breaking change (mirrors `auto_apply_record_change`).
                 for of in &old_ctor.fields {
                     match new_ctor.fields.iter().find(|nf| nf.name == of.name) {
-                        Some(nf) if std::mem::discriminant(&of.ty) == std::mem::discriminant(&nf.ty) => {}
+                        Some(nf)
+                            if std::mem::discriminant(&of.ty) == std::mem::discriminant(&nf.ty) => {
+                        }
                         _ => return false,
                     }
                 }
@@ -13699,9 +14314,10 @@ fn auto_apply_adt_change(
     // instead of corrupting the relation.
     for nf in &new_adt.all_fields {
         if let Some(of) = old_adt.all_fields.iter().find(|f| f.name == nf.name)
-            && old_adt.col_sql_type(of) != new_adt.col_sql_type(nf) {
-                return false;
-            }
+            && old_adt.col_sql_type(of) != new_adt.col_sql_type(nf)
+        {
+            return false;
+        }
     }
 
     // Add new columns for new constructor fields. Unlike the record and child
@@ -13713,7 +14329,8 @@ fn auto_apply_adt_change(
     // relies on. (Adding a field to an *existing* constructor is rejected as
     // breaking by the loop above, which is what sends the user to a `migrate`
     // block.)
-    let old_field_names: HashSet<&str> = old_adt.all_fields.iter().map(|f| f.name.as_str()).collect();
+    let old_field_names: HashSet<&str> =
+        old_adt.all_fields.iter().map(|f| f.name.as_str()).collect();
     for f in &new_adt.all_fields {
         if !old_field_names.contains(f.name.as_str()) {
             let sql = format!(
@@ -13738,9 +14355,12 @@ fn auto_apply_adt_change(
     let _ = conn.execute_batch(&drop_idx);
 
     let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
-        .chain(new_adt.all_fields.iter().map(|f| {
-            null_safe_coalesce(&quote_ident(&f.name), f.ty)
-        }))
+        .chain(
+            new_adt
+                .all_fields
+                .iter()
+                .map(|f| null_safe_coalesce(&quote_ident(&f.name), f.ty)),
+        )
         .collect();
     let idx_sql = format!(
         "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
@@ -13805,8 +14425,7 @@ fn auto_apply_child_change(
     // Add new columns to the child table, backfilling existing child rows
     let old_col_names: HashSet<&str> = old_nf.columns.iter().map(|c| c.name.as_str()).collect();
     for c in &new_nf.columns {
-        if !old_col_names.contains(c.name.as_str())
-            && !add_column_backfilled(conn, &child_table, c)
+        if !old_col_names.contains(c.name.as_str()) && !add_column_backfilled(conn, &child_table, c)
         {
             return false;
         }
@@ -13848,9 +14467,10 @@ fn auto_apply_child_change(
     // Recurse into nested-within-nested fields
     for new_sub in &new_nf.nested {
         if let Some(old_sub) = old_nf.nested.iter().find(|n| n.name == new_sub.name)
-            && !auto_apply_child_change(conn, &child_table, old_sub, new_sub) {
-                return false;
-            }
+            && !auto_apply_child_change(conn, &child_table, old_sub, new_sub)
+        {
+            return false;
+        }
     }
 
     // Initialize any brand-new nested sub-tables
@@ -13947,9 +14567,10 @@ fn auto_apply_record_change(
     let old_nested_names: HashSet<&str> = old_rec.nested.iter().map(|n| n.name.as_str()).collect();
     for new_nf in &new_rec.nested {
         if let Some(old_nf) = old_rec.nested.iter().find(|n| n.name == new_nf.name)
-            && !auto_apply_child_change(conn, table, old_nf, new_nf) {
-                return false;
-            }
+            && !auto_apply_child_change(conn, table, old_nf, new_nf)
+        {
+            return false;
+        }
     }
 
     // Initialize any new child tables for nested relations
@@ -14003,15 +14624,18 @@ pub extern "C-unwind" fn knot_source_init(
             col_defs.join(", ")
         );
         debug_sql(&sql);
-        db_ref.conn.execute_batch(&sql).unwrap_or_else(|e| {
-            panic!("knot runtime: failed to create table '{}': {}", name, e)
-        });
+        db_ref
+            .conn
+            .execute_batch(&sql)
+            .unwrap_or_else(|e| panic!("knot runtime: failed to create table '{}': {}", name, e));
 
         // Unique index using COALESCE to treat NULLs as equal
         let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
-            .chain(adt.all_fields.iter().map(|f| {
-                null_safe_coalesce(&quote_ident(&f.name), f.ty)
-            }))
+            .chain(
+                adt.all_fields
+                    .iter()
+                    .map(|f| null_safe_coalesce(&quote_ident(&f.name), f.ty)),
+            )
             .collect();
         let idx_sql = format!(
             "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
@@ -14046,28 +14670,31 @@ pub extern "C-unwind" fn knot_source_init(
     }
 
     // Check stored schema against compiled schema
-    let stored: Option<String> =
-        match db_ref.conn.query_row(
-            "SELECT schema FROM _knot_schema WHERE name = ?1;",
-            rusqlite::params![name],
-            |row| row.get(0),
-        ) {
-            Ok(schema) => Some(schema),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => panic!("knot runtime: error reading schema for source '*{}': {}", name, e),
-        };
+    let stored: Option<String> = match db_ref.conn.query_row(
+        "SELECT schema FROM _knot_schema WHERE name = ?1;",
+        rusqlite::params![name],
+        |row| row.get(0),
+    ) {
+        Ok(schema) => Some(schema),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => panic!(
+            "knot runtime: error reading schema for source '*{}': {}",
+            name, e
+        ),
+    };
 
     if let Some(ref stored_schema) = stored
         && stored_schema != schema
-            && !auto_apply_schema_change(&db_ref.conn, name, stored_schema, schema) {
-                panic!(
-                    "knot runtime: schema mismatch for source '*{}'.\n\
+        && !auto_apply_schema_change(&db_ref.conn, name, stored_schema, schema)
+    {
+        panic!(
+            "knot runtime: schema mismatch for source '*{}'.\n\
                      Stored:   {}\n\
                      Compiled: {}\n\
                      Add a `migrate *{} from {{...}} to {{...}} using (\\old -> ...)` block to your source.",
-                    name, stored_schema, schema, name
-                );
-            }
+            name, stored_schema, schema, name
+        );
+    }
 
     // Record current schema
     db_ref
@@ -14121,10 +14748,12 @@ pub extern "C-unwind" fn knot_source_drop(db: *mut c_void, name_ptr: *const u8, 
 
     let sql = format!("DROP TABLE IF EXISTS {};", quote_ident(&table_name));
     debug_sql(&sql);
-    db_ref
-        .conn
-        .execute_batch(&sql)
-        .unwrap_or_else(|e| panic!("knot runtime: failed to drop removed source '*{}': {}", name, e));
+    db_ref.conn.execute_batch(&sql).unwrap_or_else(|e| {
+        panic!(
+            "knot runtime: failed to drop removed source '*{}': {}",
+            name, e
+        )
+    });
 
     db_ref
         .conn
@@ -14157,8 +14786,12 @@ pub extern "C-unwind" fn knot_source_read(
     if is_adt_schema(schema) {
         let adt = parse_adt_schema(schema);
         // Build field name → index map for O(1) lookups
-        let field_idx: HashMap<&str, usize> = adt.all_fields.iter().enumerate()
-            .map(|(i, f)| (f.name.as_str(), i)).collect();
+        let field_idx: HashMap<&str, usize> = adt
+            .all_fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.as_str(), i))
+            .collect();
         // SELECT _tag + all fields from the wide table
         let mut select_cols = vec![quote_ident("_tag")];
         for f in &adt.all_fields {
@@ -14248,10 +14881,14 @@ pub extern "C-unwind" fn knot_source_query_count(
             type_name(params)
         ),
     };
-    let sql_params: Vec<rusqlite::types::Value> =
-        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let sql_params: Vec<rusqlite::types::Value> = param_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     debug_sql_params(sql, &sql_params);
     db_ref.ensure_indexes_for_sql(sql);
@@ -14284,10 +14921,14 @@ pub extern "C-unwind" fn knot_source_query_exists(
             type_name(params)
         ),
     };
-    let sql_params: Vec<rusqlite::types::Value> =
-        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let sql_params: Vec<rusqlite::types::Value> = param_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     debug_sql_params(sql, &sql_params);
     db_ref.ensure_indexes_for_sql(sql);
@@ -14319,10 +14960,14 @@ pub extern "C-unwind" fn knot_source_query_float(
             type_name(params)
         ),
     };
-    let sql_params: Vec<rusqlite::types::Value> =
-        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let sql_params: Vec<rusqlite::types::Value> = param_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     debug_sql_params(sql, &sql_params);
     db_ref.ensure_indexes_for_sql(sql);
@@ -14356,10 +15001,14 @@ pub extern "C-unwind" fn knot_source_query_sum(
             type_name(params)
         ),
     };
-    let sql_params: Vec<rusqlite::types::Value> =
-        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let sql_params: Vec<rusqlite::types::Value> = param_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     debug_sql_params(sql, &sql_params);
     db_ref.ensure_indexes_for_sql(sql);
@@ -14378,7 +15027,10 @@ pub extern "C-unwind" fn knot_source_query_sum(
         if f.fract() == 0.0 && f >= i64::MIN as f64 && f < 9_223_372_036_854_775_808.0 {
             alloc_int(f as i64)
         } else {
-            panic!("knot runtime: integer SUM result {} is outside the i64 range", f);
+            panic!(
+                "knot runtime: integer SUM result {} is outside the i64 range",
+                f
+            );
         }
     };
 
@@ -14390,16 +15042,27 @@ pub extern "C-unwind" fn knot_source_query_sum(
                 // Keep the statically expected numeric type: a Float column
                 // must produce Float 0.0, not Int 0, or downstream Float
                 // arithmetic / show / JSON mismatches.
-                ValueRef::Null => Ok(if is_float != 0 { alloc_float(0.0) } else { alloc_int(0) }),
+                ValueRef::Null => Ok(if is_float != 0 {
+                    alloc_float(0.0)
+                } else {
+                    alloc_int(0)
+                }),
                 // A Float column must stay Float even when SUM happens to be
                 // integral (downstream Float arithmetic / show / JSON would
                 // otherwise mismatch), mirroring the Null/default branches.
-                ValueRef::Integer(n) => {
-                    Ok(if is_float != 0 { alloc_float(n as f64) } else { alloc_int(n) })
-                }
-                ValueRef::Real(f) => Ok(if is_float != 0 { alloc_float(f) } else { int_from_real(f) }),
+                ValueRef::Integer(n) => Ok(if is_float != 0 {
+                    alloc_float(n as f64)
+                } else {
+                    alloc_int(n)
+                }),
+                ValueRef::Real(f) => Ok(if is_float != 0 {
+                    alloc_float(f)
+                } else {
+                    int_from_real(f)
+                }),
                 ValueRef::Text(s) => {
-                    let s = std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in sum result");
+                    let s =
+                        std::str::from_utf8(s).expect("knot runtime: invalid UTF-8 in sum result");
                     if is_float != 0 {
                         match s.parse::<f64>() {
                             Ok(f) => Ok(alloc_float(f)),
@@ -14415,10 +15078,17 @@ pub extern "C-unwind" fn knot_source_query_sum(
                         // overflow case as the REAL branch above.
                         Ok(int_from_real(f))
                     } else {
-                        panic!("knot runtime: non-numeric SUM result {:?} for an Int column", s);
+                        panic!(
+                            "knot runtime: non-numeric SUM result {:?} for an Int column",
+                            s
+                        );
                     }
                 }
-                _ => Ok(if is_float != 0 { alloc_float(0.0) } else { alloc_int(0) }),
+                _ => Ok(if is_float != 0 {
+                    alloc_float(0.0)
+                } else {
+                    alloc_int(0)
+                }),
             }
         })
         .unwrap_or_else(|e| panic!("knot runtime: query_sum error: {}\n  SQL: {}", e, sql))
@@ -14445,10 +15115,14 @@ pub extern "C-unwind" fn knot_source_query_value(
             type_name(params)
         ),
     };
-    let sql_params: Vec<rusqlite::types::Value> =
-        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let sql_params: Vec<rusqlite::types::Value> = param_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     debug_sql_params(sql, &sql_params);
     db_ref.ensure_indexes_for_sql(sql);
@@ -14552,15 +15226,23 @@ pub extern "C-unwind" fn knot_source_read_where(
             type_name(params)
         ),
     };
-    let sql_params: Vec<rusqlite::types::Value> =
-        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let sql_params: Vec<rusqlite::types::Value> = param_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     if is_adt_schema(schema) {
         let adt = parse_adt_schema(schema);
-        let field_idx: HashMap<&str, usize> = adt.all_fields.iter().enumerate()
-            .map(|(i, f)| (f.name.as_str(), i)).collect();
+        let field_idx: HashMap<&str, usize> = adt
+            .all_fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.as_str(), i))
+            .collect();
         let mut select_cols = vec![quote_ident("_tag")];
         for f in &adt.all_fields {
             select_cols.push(quote_ident(&f.name));
@@ -14617,7 +15299,11 @@ pub extern "C-unwind" fn knot_source_read_where(
                         has_fields = true;
                     }
                 }
-                if has_fields { record } else { alloc(Value::Unit) }
+                if has_fields {
+                    record
+                } else {
+                    alloc(Value::Unit)
+                }
             };
             rows.push(alloc(Value::Constructor(intern_str(&tag), payload)));
         }
@@ -14637,7 +15323,11 @@ pub extern "C-unwind" fn knot_source_read_where(
 
         let sql = format!(
             "SELECT {} FROM {} WHERE {}",
-            if select_cols.is_empty() { "1".to_string() } else { select_cols.join(", ") },
+            if select_cols.is_empty() {
+                "1".to_string()
+            } else {
+                select_cols.join(", ")
+            },
             table_q,
             where_clause
         );
@@ -14709,10 +15399,14 @@ pub extern "C-unwind" fn knot_source_query(
             type_name(params)
         ),
     };
-    let sql_params: Vec<rusqlite::types::Value> =
-        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let sql_params: Vec<rusqlite::types::Value> = param_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     debug_sql_params(sql, &sql_params);
     db_ref.ensure_indexes_for_sql(sql);
@@ -14724,9 +15418,12 @@ pub extern "C-unwind" fn knot_source_query(
         .prepare_cached(sql)
         .unwrap_or_else(|e| panic!("knot runtime: source_query error: {}\n  SQL: {}", e, sql));
     let mut rows: Vec<*mut Value> = Vec::new();
-    let mut result_rows = stmt
-        .query(param_refs.as_slice())
-        .unwrap_or_else(|e| panic!("knot runtime: source_query exec error: {}\n  SQL: {}", e, sql));
+    let mut result_rows = stmt.query(param_refs.as_slice()).unwrap_or_else(|e| {
+        panic!(
+            "knot runtime: source_query exec error: {}\n  SQL: {}",
+            e, sql
+        )
+    });
 
     while let Some(row) = result_rows
         .next()
@@ -14801,8 +15498,7 @@ pub extern "C-unwind" fn knot_source_match(
         }
         alloc(Value::Relation(rows))
     } else {
-        let select_cols: Vec<String> =
-            ctor.fields.iter().map(|f| quote_ident(&f.name)).collect();
+        let select_cols: Vec<String> = ctor.fields.iter().map(|f| quote_ident(&f.name)).collect();
         let sql = format!(
             "SELECT {} FROM {} WHERE {} = ?1",
             select_cols.join(", "),
@@ -14856,7 +15552,11 @@ fn read_record_table(
 
     let sql = format!(
         "SELECT {} FROM {}",
-        if select_cols.is_empty() { "1".to_string() } else { select_cols.join(", ") },
+        if select_cols.is_empty() {
+            "1".to_string()
+        } else {
+            select_cols.join(", ")
+        },
         table
     );
     debug_sql(&sql);
@@ -14921,7 +15621,11 @@ fn read_child_table(
 
     let sql = format!(
         "SELECT {} FROM {} WHERE _parent_id = ?1",
-        if select_cols.is_empty() { "1".to_string() } else { select_cols.join(", ") },
+        if select_cols.is_empty() {
+            "1".to_string()
+        } else {
+            select_cols.join(", ")
+        },
         table
     );
     debug_sql(&sql);
@@ -14966,10 +15670,7 @@ fn read_child_table(
 
 /// Serialize a Constructor value into SQL params for an ADT wide table.
 /// Returns params for [_tag, field1, field2, ...] columns.
-fn adt_row_to_params(
-    row_ptr: *mut Value,
-    adt: &AdtSpec,
-) -> Vec<rusqlite::types::Value> {
+fn adt_row_to_params(row_ptr: *mut Value, adt: &AdtSpec) -> Vec<rusqlite::types::Value> {
     let row = unsafe { as_ref(row_ptr) };
     match row {
         Value::Constructor(tag, payload) => {
@@ -14992,8 +15693,11 @@ fn adt_row_to_params(
             // Constructor whose tag is the whole JSON blob, and a record pushed
             // through a scalar encoder panics. The read path already decodes
             // with the declaring constructor's type, so write must match it.
-            let ctor_field_tys: HashMap<&str, ColType> =
-                ctor.fields.iter().map(|f| (f.name.as_str(), f.ty)).collect();
+            let ctor_field_tys: HashMap<&str, ColType> = ctor
+                .fields
+                .iter()
+                .map(|f| (f.name.as_str(), f.ty))
+                .collect();
 
             // For each field in the wide table
             for field in &adt.all_fields {
@@ -15033,7 +15737,8 @@ fn delete_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &R
     }
     let sql = format!("DELETE FROM {};", quote_ident(table_name));
     debug_sql(&sql);
-    conn.execute_batch(&sql).expect("knot runtime: failed to delete rows");
+    conn.execute_batch(&sql)
+        .expect("knot runtime: failed to delete rows");
 }
 
 fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &NestedField) {
@@ -15044,14 +15749,23 @@ fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nest
     }
     let sql = format!("DELETE FROM {};", quote_ident(&child_table));
     debug_sql(&sql);
-    conn.execute_batch(&sql).expect("knot runtime: failed to delete child rows");
+    conn.execute_batch(&sql)
+        .expect("knot runtime: failed to delete child rows");
 }
 
 /// Delete child rows for a specific parent _id, recursing for deeper nesting.
-fn delete_child_rows_for_parent(conn: &rusqlite::Connection, child_table: &str, parent_id: i64, nf: &NestedField) {
+fn delete_child_rows_for_parent(
+    conn: &rusqlite::Connection,
+    child_table: &str,
+    parent_id: i64,
+    nf: &NestedField,
+) {
     // If this child has its own children, collect its _ids first and recurse
     if !nf.nested.is_empty() {
-        let select_sql = format!("SELECT _id FROM {} WHERE _parent_id = ?1;", quote_ident(child_table));
+        let select_sql = format!(
+            "SELECT _id FROM {} WHERE _parent_id = ?1;",
+            quote_ident(child_table)
+        );
         if let Ok(mut stmt) = conn.prepare(&select_sql) {
             let ids: Vec<i64> = stmt
                 .query_map([parent_id], |row| row.get::<_, i64>(0))
@@ -15067,9 +15781,13 @@ fn delete_child_rows_for_parent(conn: &rusqlite::Connection, child_table: &str, 
             }
         }
     }
-    let sql = format!("DELETE FROM {} WHERE _parent_id = ?1;", quote_ident(child_table));
+    let sql = format!(
+        "DELETE FROM {} WHERE _parent_id = ?1;",
+        quote_ident(child_table)
+    );
     debug_sql(&sql);
-    conn.execute(&sql, [parent_id]).expect("knot runtime: failed to delete child rows for parent");
+    conn.execute(&sql, [parent_id])
+        .expect("knot runtime: failed to delete child rows for parent");
 }
 
 /// Insert rows into a record table and its child tables.
@@ -15087,15 +15805,21 @@ fn write_record_rows(
     let has_children = !schema.nested.is_empty();
 
     // Build INSERT for scalar columns only
-    let col_names: Vec<String> = schema.columns.iter().map(|c| quote_ident(&c.name)).collect();
+    let col_names: Vec<String> = schema
+        .columns
+        .iter()
+        .map(|c| quote_ident(&c.name))
+        .collect();
     if col_names.is_empty() && !has_children {
         // Unit-type relation: a set of `{}`, so at most one row. INSERT OR
         // IGNORE against the unique `_dummy` index dedups repeated `{}` writes.
         let sql = format!("INSERT OR IGNORE INTO {} (\"_dummy\") VALUES (0);", table);
-        let mut stmt = conn.prepare_cached(&sql)
+        let mut stmt = conn
+            .prepare_cached(&sql)
             .expect("knot runtime: prepare unit insert failed");
         for _ in rows.iter() {
-            stmt.execute([]).expect("knot runtime: failed to insert unit row");
+            stmt.execute([])
+                .expect("knot runtime: failed to insert unit row");
         }
         return;
     }
@@ -15116,7 +15840,9 @@ fn write_record_rows(
     // `_content_hash`.
     let insert_sql = format!(
         "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-        table, insert_cols.join(", "), placeholders.join(", ")
+        table,
+        insert_cols.join(", "),
+        placeholders.join(", ")
     );
     debug_sql(&insert_sql);
 
@@ -15136,42 +15862,52 @@ fn write_record_rows(
         None
     };
 
-    let mut stmt = conn.prepare_cached(&insert_sql).expect("knot runtime: failed to prepare insert");
+    let mut stmt = conn
+        .prepare_cached(&insert_sql)
+        .expect("knot runtime: failed to prepare insert");
 
     for row_ptr in rows {
         let row = unsafe { as_ref(*row_ptr) };
         let fields = match row {
             Value::Record(fields) => fields,
-            _ => panic!("knot runtime: relation rows must be Records, got {}", type_name(*row_ptr)),
+            _ => panic!(
+                "knot runtime: relation rows must be Records, got {}",
+                type_name(*row_ptr)
+            ),
         };
 
         // Build field lookup map for O(1) access
-        let field_map: HashMap<&str, *mut Value> = fields.iter().map(|f| (&*f.name, f.value)).collect();
+        let field_map: HashMap<&str, *mut Value> =
+            fields.iter().map(|f| (&*f.name, f.value)).collect();
 
         // Build scalar params, then the `_content_hash` of the whole record
         // (last param) for tables with children.
-        let mut params: Vec<rusqlite::types::Value> = schema.columns
+        let mut params: Vec<rusqlite::types::Value> = schema
+            .columns
             .iter()
             .map(|col| {
-                let value = field_map.get(col.name.as_str())
-                    .unwrap_or_else(|| panic!("knot runtime: missing field '{}' in record", col.name));
+                let value = field_map.get(col.name.as_str()).unwrap_or_else(|| {
+                    panic!("knot runtime: missing field '{}' in record", col.name)
+                });
                 value_to_sqlite(*value, col.ty)
             })
             .collect();
         if has_children {
-            params.push(rusqlite::types::Value::Text(record_content_hash_hex(*row_ptr)));
+            params.push(rusqlite::types::Value::Text(record_content_hash_hex(
+                *row_ptr,
+            )));
         }
 
         if !params.is_empty() {
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-            stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
-                panic!("knot runtime: insert error: {}", e)
-            });
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
+            stmt.execute(param_refs.as_slice())
+                .unwrap_or_else(|e| panic!("knot runtime: insert error: {}", e));
         } else {
-            stmt.execute([]).unwrap_or_else(|e| {
-                panic!("knot runtime: insert error: {}", e)
-            });
+            stmt.execute([])
+                .unwrap_or_else(|e| panic!("knot runtime: insert error: {}", e));
         }
 
         // Write nested relation fields to child tables
@@ -15179,8 +15915,10 @@ fn write_record_rows(
             let parent_id = if conn.changes() == 0 {
                 // INSERT OR IGNORE skipped this row (duplicate) — look up existing _id
                 if let Some(ref sql) = select_id_sql {
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                        .iter()
+                        .map(|p| p as &dyn rusqlite::types::ToSql)
+                        .collect();
                     conn.query_row(sql, param_refs.as_slice(), |row| row.get::<_, i64>(0))
                         .expect("knot runtime: failed to look up existing parent _id")
                 } else {
@@ -15192,13 +15930,15 @@ fn write_record_rows(
             };
             for nf in &schema.nested {
                 let child_table = child_table_name(table_name, &nf.name);
-                let child_val = field_map.get(nf.name.as_str())
+                let child_val = field_map
+                    .get(nf.name.as_str())
                     .copied()
                     .unwrap_or(std::ptr::null_mut());
                 if !child_val.is_null()
-                    && let Value::Relation(child_rows) = unsafe { as_ref(child_val) } {
-                        write_child_rows(conn, &child_table, nf, parent_id, child_rows);
-                    }
+                    && let Value::Relation(child_rows) = unsafe { as_ref(child_val) }
+                {
+                    write_child_rows(conn, &child_table, nf, parent_id, child_rows);
+                }
             }
         }
     }
@@ -15250,7 +15990,9 @@ fn write_child_rows(
 
     let insert_sql = format!(
         "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-        table, col_names.join(", "), placeholders.join(", ")
+        table,
+        col_names.join(", "),
+        placeholders.join(", ")
     );
     debug_sql(&insert_sql);
 
@@ -15273,7 +16015,9 @@ fn write_child_rows(
         None
     };
 
-    let mut stmt = conn.prepare_cached(&insert_sql).expect("knot runtime: failed to prepare child insert");
+    let mut stmt = conn
+        .prepare_cached(&insert_sql)
+        .expect("knot runtime: failed to prepare child insert");
 
     for row_ptr in rows {
         let row = unsafe { as_ref(*row_ptr) };
@@ -15282,33 +16026,39 @@ fn write_child_rows(
             _ => panic!("knot runtime: child rows must be Records"),
         };
 
-        let field_map: HashMap<&str, *mut Value> = fields.iter().map(|f| (&*f.name, f.value)).collect();
+        let field_map: HashMap<&str, *mut Value> =
+            fields.iter().map(|f| (&*f.name, f.value)).collect();
 
-        let mut params: Vec<rusqlite::types::Value> = vec![
-            rusqlite::types::Value::Integer(parent_id),
-        ];
+        let mut params: Vec<rusqlite::types::Value> =
+            vec![rusqlite::types::Value::Integer(parent_id)];
         for col in &nf.columns {
-            let value = field_map.get(col.name.as_str())
-                .unwrap_or_else(|| panic!("knot runtime: missing field '{}' in child record", col.name));
+            let value = field_map.get(col.name.as_str()).unwrap_or_else(|| {
+                panic!("knot runtime: missing field '{}' in child record", col.name)
+            });
             params.push(value_to_sqlite(*value, col.ty));
         }
         if has_children {
-            params.push(rusqlite::types::Value::Text(record_content_hash_hex(*row_ptr)));
+            params.push(rusqlite::types::Value::Text(record_content_hash_hex(
+                *row_ptr,
+            )));
         }
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-        stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
-            panic!("knot runtime: child insert error: {}", e)
-        });
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
+        stmt.execute(param_refs.as_slice())
+            .unwrap_or_else(|e| panic!("knot runtime: child insert error: {}", e));
 
         // Recurse for deeper nesting
         if has_children {
             let child_id = if conn.changes() == 0 {
                 // INSERT OR IGNORE skipped this row (duplicate) — look up existing _id
                 if let Some(ref sql) = select_id_sql {
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                        .iter()
+                        .map(|p| p as &dyn rusqlite::types::ToSql)
+                        .collect();
                     conn.query_row(sql, param_refs.as_slice(), |row| row.get::<_, i64>(0))
                         .expect("knot runtime: failed to look up existing child _id")
                 } else {
@@ -15319,13 +16069,15 @@ fn write_child_rows(
             };
             for grandchild in &nf.nested {
                 let gc_table = child_table_name(table_name, &grandchild.name);
-                let gc_val = field_map.get(grandchild.name.as_str())
+                let gc_val = field_map
+                    .get(grandchild.name.as_str())
                     .copied()
                     .unwrap_or(std::ptr::null_mut());
                 if !gc_val.is_null()
-                    && let Value::Relation(gc_rows) = unsafe { as_ref(gc_val) } {
-                        write_child_rows(conn, &gc_table, grandchild, child_id, gc_rows);
-                    }
+                    && let Value::Relation(gc_rows) = unsafe { as_ref(gc_val) }
+                {
+                    write_child_rows(conn, &gc_table, grandchild, child_id, gc_rows);
+                }
             }
         }
     }
@@ -15343,9 +16095,9 @@ fn with_savepoint_rollback<T>(db_ref: &KnotDb, sp: &str, f: impl FnOnce() -> T) 
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => v,
         Err(payload) => {
-            let _ = db_ref
-                .conn
-                .execute_batch(&format!("ROLLBACK TO SAVEPOINT {sp}; RELEASE SAVEPOINT {sp};"));
+            let _ = db_ref.conn.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {sp}; RELEASE SAVEPOINT {sp};"
+            ));
             std::panic::resume_unwind(payload);
         }
     }
@@ -15383,7 +16135,11 @@ fn parse_del_trigger(sql: &str) -> Option<(String, String, String)> {
     if sub_table.is_empty() || sub_col.is_empty() || sup_col.is_empty() {
         return None;
     }
-    Some((sub_table.to_string(), sub_col.to_string(), sup_col.to_string()))
+    Some((
+        sub_table.to_string(),
+        sub_col.to_string(),
+        sup_col.to_string(),
+    ))
 }
 
 /// Suspend (drop) every referential `BEFORE DELETE` trigger guarding `table` and
@@ -15422,7 +16178,12 @@ fn suspend_del_triggers(conn: &Connection, table: &str) -> Vec<SuspendedDelTrigg
         let drop_sql = format!("DROP TRIGGER IF EXISTS {};", quote_ident(&name));
         debug_sql(&drop_sql);
         if conn.execute_batch(&drop_sql).is_ok() {
-            suspended.push(SuspendedDelTrigger { create_sql: sql, sub_table, sub_col, sup_col });
+            suspended.push(SuspendedDelTrigger {
+                create_sql: sql,
+                sub_table,
+                sub_col,
+                sup_col,
+            });
         }
     }
     suspended
@@ -15494,7 +16255,10 @@ pub extern "C-unwind" fn knot_source_write(
 
     let rows = match unsafe { as_ref(relation) } {
         Value::Relation(rows) => rows,
-        _ => panic!("knot runtime: source_write expects a Relation, got {}", type_name(relation)),
+        _ => panic!(
+            "knot runtime: source_write expects a Relation, got {}",
+            type_name(relation)
+        ),
     };
 
     // Delete all existing rows and insert new ones in a transaction
@@ -15519,7 +16283,9 @@ pub extern "C-unwind" fn knot_source_write(
             let table = quote_ident(&table_name);
             let delete_sql = format!("DELETE FROM {};", table);
             debug_sql(&delete_sql);
-            db_ref.conn.execute_batch(&delete_sql)
+            db_ref
+                .conn
+                .execute_batch(&delete_sql)
                 .expect("knot runtime: failed to delete rows");
 
             let adt = parse_adt_schema(schema);
@@ -15528,9 +16294,8 @@ pub extern "C-unwind" fn knot_source_write(
                 for f in &adt.all_fields {
                     col_names.push(quote_ident(&f.name));
                 }
-                let placeholders: Vec<String> = (1..=col_names.len())
-                    .map(|i| format!("?{}", i))
-                    .collect();
+                let placeholders: Vec<String> =
+                    (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
                 let insert_sql = format!(
                     "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
                     table,
@@ -15546,11 +16311,12 @@ pub extern "C-unwind" fn knot_source_write(
 
                 for row_ptr in rows {
                     let params = adt_row_to_params(*row_ptr, &adt);
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                    stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
-                        panic!("knot runtime: insert error: {}", e)
-                    });
+                    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                        .iter()
+                        .map(|p| p as &dyn rusqlite::types::ToSql)
+                        .collect();
+                    stmt.execute(param_refs.as_slice())
+                        .unwrap_or_else(|e| panic!("knot runtime: insert error: {}", e));
                 }
             }
         } else {
@@ -15623,9 +16389,8 @@ pub extern "C-unwind" fn knot_source_append(
             for f in &adt.all_fields {
                 col_names.push(quote_ident(&f.name));
             }
-            let placeholders: Vec<String> = (1..=col_names.len())
-                .map(|i| format!("?{}", i))
-                .collect();
+            let placeholders: Vec<String> =
+                (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
             let insert_sql = format!(
                 "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
                 table,
@@ -15658,11 +16423,12 @@ pub extern "C-unwind" fn knot_source_append(
             };
             for row_ptr in rows {
                 let params = adt_row_to_params(*row_ptr, &adt);
-                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                stmt.execute(param_refs.as_slice()).unwrap_or_else(|e| {
-                    panic!("knot runtime: insert error: {}", e)
-                });
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                    .iter()
+                    .map(|p| p as &dyn rusqlite::types::ToSql)
+                    .collect();
+                stmt.execute(param_refs.as_slice())
+                    .unwrap_or_else(|e| panic!("knot runtime: insert error: {}", e));
                 if want_rows_event {
                     let mut vals = Vec::with_capacity(event_header.len());
                     for p in params.iter().take(event_header.len()) {
@@ -15749,277 +16515,372 @@ pub extern "C-unwind" fn knot_source_diff_write(
     // instead of leaving it dangling on a connection that recoverable contexts
     // (HTTP workers, `race` losers, `atomic` retry) keep reusing.
     with_savepoint_rollback(db_ref, "knot_diff_write", || {
-    if is_adt_schema(schema) {
-        let adt = parse_adt_schema(schema);
-        let mut col_names = vec![quote_ident("_tag")];
-        for f in &adt.all_fields {
-            col_names.push(quote_ident(&f.name));
-        }
-        let col_str = col_names.join(", ");
-        let n_cols = col_names.len();
-
-        // Build match conditions: _tag equality + IS for NULL-safe field comparison
-        let build_adt_match = |src: &str| -> Vec<String> {
-            std::iter::once(
-                format!("{s}.{c} = {t}.{c}", s = src, t = table, c = quote_ident("_tag"))
-            ).chain(adt.all_fields.iter().map(|f| {
-                let c = quote_ident(&f.name);
-                format!("{}.{} IS {}.{}", src, c, table, c)
-            })).collect()
-        };
-
-        if !rows.is_empty() && rows.len().saturating_mul(n_cols) <= MAX_VALUES_PARAMS {
-            // VALUES CTE path
-            let mut all_params = Vec::with_capacity(rows.len().saturating_mul(n_cols));
-            let mut row_clauses = Vec::with_capacity(rows.len());
-            let mut pidx = 1usize;
-            for row_ptr in rows {
-                let rp = adt_row_to_params(*row_ptr, &adt);
-                let ph: Vec<String> = rp.iter()
-                    .map(|_| { let p = format!("?{}", pidx); pidx += 1; p })
-                    .collect();
-                row_clauses.push(format!("({})", ph.join(", ")));
-                all_params.extend(rp);
-            }
-            let values_sql = format!("VALUES {}", row_clauses.join(", "));
-            let match_conds = build_adt_match("_new");
-
-            let delete_sql = format!(
-                "WITH _new({c}) AS ({v}) \
-                 DELETE FROM {t} WHERE NOT EXISTS (SELECT 1 FROM _new WHERE {m});",
-                c = col_str, v = values_sql, t = table, m = match_conds.join(" AND ")
-            );
-            debug_sql(&delete_sql);
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                all_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-            db_ref.conn.prepare(&delete_sql)
-                .and_then(|mut s| s.execute(param_refs.as_slice()))
-                .expect("knot runtime: failed to delete removed rows");
-
-            let insert_sql = format!(
-                "WITH _new({c}) AS ({v}) \
-                 INSERT OR IGNORE INTO {t} ({c}) SELECT * FROM _new;",
-                c = col_str, v = values_sql, t = table
-            );
-            debug_sql(&insert_sql);
-            db_ref.conn.prepare(&insert_sql)
-                .and_then(|mut s| s.execute(param_refs.as_slice()))
-                .expect("knot runtime: failed to insert new rows");
-        } else {
-            // Temp table fallback (handles empty rows and large datasets)
-            let match_conds = build_adt_match(&temp);
-
-            let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
+        if is_adt_schema(schema) {
+            let adt = parse_adt_schema(schema);
+            let mut col_names = vec![quote_ident("_tag")];
             for f in &adt.all_fields {
-                col_defs.push(format!("{} {}", quote_ident(&f.name), adt.col_sql_type(f)));
+                col_names.push(quote_ident(&f.name));
             }
-            let create_temp = format!(
-                "DROP TABLE IF EXISTS {t}; CREATE TEMP TABLE {t} ({});",
-                col_defs.join(", "),
-                t = temp
-            );
-            debug_sql(&create_temp);
-            db_ref.conn.execute_batch(&create_temp)
-                .expect("knot runtime: failed to create temp table");
+            let col_str = col_names.join(", ");
+            let n_cols = col_names.len();
 
-            if !rows.is_empty() {
-                let placeholders: Vec<String> = (1..=n_cols).map(|i| format!("?{}", i)).collect();
+            // Build match conditions: _tag equality + IS for NULL-safe field comparison
+            let build_adt_match = |src: &str| -> Vec<String> {
+                std::iter::once(format!(
+                    "{s}.{c} = {t}.{c}",
+                    s = src,
+                    t = table,
+                    c = quote_ident("_tag")
+                ))
+                .chain(adt.all_fields.iter().map(|f| {
+                    let c = quote_ident(&f.name);
+                    format!("{}.{} IS {}.{}", src, c, table, c)
+                }))
+                .collect()
+            };
+
+            if !rows.is_empty() && rows.len().saturating_mul(n_cols) <= MAX_VALUES_PARAMS {
+                // VALUES CTE path
+                let mut all_params = Vec::with_capacity(rows.len().saturating_mul(n_cols));
+                let mut row_clauses = Vec::with_capacity(rows.len());
+                let mut pidx = 1usize;
+                for row_ptr in rows {
+                    let rp = adt_row_to_params(*row_ptr, &adt);
+                    let ph: Vec<String> = rp
+                        .iter()
+                        .map(|_| {
+                            let p = format!("?{}", pidx);
+                            pidx += 1;
+                            p
+                        })
+                        .collect();
+                    row_clauses.push(format!("({})", ph.join(", ")));
+                    all_params.extend(rp);
+                }
+                let values_sql = format!("VALUES {}", row_clauses.join(", "));
+                let match_conds = build_adt_match("_new");
+
+                let delete_sql = format!(
+                    "WITH _new({c}) AS ({v}) \
+                 DELETE FROM {t} WHERE NOT EXISTS (SELECT 1 FROM _new WHERE {m});",
+                    c = col_str,
+                    v = values_sql,
+                    t = table,
+                    m = match_conds.join(" AND ")
+                );
+                debug_sql(&delete_sql);
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params
+                    .iter()
+                    .map(|p| p as &dyn rusqlite::types::ToSql)
+                    .collect();
+                db_ref
+                    .conn
+                    .prepare(&delete_sql)
+                    .and_then(|mut s| s.execute(param_refs.as_slice()))
+                    .expect("knot runtime: failed to delete removed rows");
+
                 let insert_sql = format!(
-                    "INSERT INTO {} ({}) VALUES ({});", temp, col_str, placeholders.join(", ")
+                    "WITH _new({c}) AS ({v}) \
+                 INSERT OR IGNORE INTO {t} ({c}) SELECT * FROM _new;",
+                    c = col_str,
+                    v = values_sql,
+                    t = table
                 );
                 debug_sql(&insert_sql);
-                let mut stmt = db_ref.conn.prepare_cached(&insert_sql)
-                    .expect("knot runtime: failed to prepare temp insert");
-                for row_ptr in rows {
-                    let params = adt_row_to_params(*row_ptr, &adt);
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                    stmt.execute(param_refs.as_slice())
-                        .unwrap_or_else(|e| panic!("knot runtime: temp insert error: {}", e));
+                db_ref
+                    .conn
+                    .prepare(&insert_sql)
+                    .and_then(|mut s| s.execute(param_refs.as_slice()))
+                    .expect("knot runtime: failed to insert new rows");
+            } else {
+                // Temp table fallback (handles empty rows and large datasets)
+                let match_conds = build_adt_match(&temp);
+
+                let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
+                for f in &adt.all_fields {
+                    col_defs.push(format!("{} {}", quote_ident(&f.name), adt.col_sql_type(f)));
                 }
+                let create_temp = format!(
+                    "DROP TABLE IF EXISTS {t}; CREATE TEMP TABLE {t} ({});",
+                    col_defs.join(", "),
+                    t = temp
+                );
+                debug_sql(&create_temp);
+                db_ref
+                    .conn
+                    .execute_batch(&create_temp)
+                    .expect("knot runtime: failed to create temp table");
+
+                if !rows.is_empty() {
+                    let placeholders: Vec<String> =
+                        (1..=n_cols).map(|i| format!("?{}", i)).collect();
+                    let insert_sql = format!(
+                        "INSERT INTO {} ({}) VALUES ({});",
+                        temp,
+                        col_str,
+                        placeholders.join(", ")
+                    );
+                    debug_sql(&insert_sql);
+                    let mut stmt = db_ref
+                        .conn
+                        .prepare_cached(&insert_sql)
+                        .expect("knot runtime: failed to prepare temp insert");
+                    for row_ptr in rows {
+                        let params = adt_row_to_params(*row_ptr, &adt);
+                        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                            .iter()
+                            .map(|p| p as &dyn rusqlite::types::ToSql)
+                            .collect();
+                        stmt.execute(param_refs.as_slice())
+                            .unwrap_or_else(|e| panic!("knot runtime: temp insert error: {}", e));
+                    }
+                }
+
+                let delete_sql = format!(
+                    "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
+                    table,
+                    temp,
+                    match_conds.join(" AND ")
+                );
+                debug_sql(&delete_sql);
+                db_ref
+                    .conn
+                    .execute_batch(&delete_sql)
+                    .expect("knot runtime: failed to delete removed rows");
+
+                let insert_new_sql = format!(
+                    "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {};",
+                    table, col_str, col_str, temp
+                );
+                debug_sql(&insert_new_sql);
+                db_ref
+                    .conn
+                    .execute_batch(&insert_new_sql)
+                    .expect("knot runtime: failed to insert new rows");
+
+                let drop_sql = format!("DROP TABLE IF EXISTS {};", temp);
+                debug_sql(&drop_sql);
+                db_ref
+                    .conn
+                    .execute_batch(&drop_sql)
+                    .expect("knot runtime: failed to drop temp table");
+            }
+        } else {
+            let rec_schema = parse_record_schema(schema);
+
+            // If there are nested relation fields, fall back to full clear + rewrite
+            // since the diff logic only handles scalar columns.
+            if !rec_schema.nested.is_empty() {
+                let table_name = format!("_knot_{}", name);
+                // Full clear + rewrite: suspend the per-row referential BEFORE
+                // DELETE triggers so they don't abort on the transient missing-key
+                // state, then restore them (which runs a whole-relation orphan
+                // scan) — mirrors knot_source_write (bug B24).
+                let suspended = suspend_del_triggers(&db_ref.conn, &table_name);
+                delete_record_table(&db_ref.conn, &table_name, &rec_schema);
+                write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
+                restore_del_triggers(&db_ref.conn, &table_name, &suspended);
+
+                // Return from the closure only; the shared RELEASE SAVEPOINT +
+                // relation-change notify after the guard runs exactly once.
+                return;
             }
 
-            let delete_sql = format!(
-                "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
-                table, temp, match_conds.join(" AND ")
-            );
-            debug_sql(&delete_sql);
-            db_ref.conn.execute_batch(&delete_sql)
-                .expect("knot runtime: failed to delete removed rows");
+            // Zero-column records have nothing to diff — fall back to clear + rewrite
+            if rec_schema.columns.is_empty() {
+                let table_name = format!("_knot_{}", name);
+                let suspended = suspend_del_triggers(&db_ref.conn, &table_name);
+                delete_record_table(&db_ref.conn, &table_name, &rec_schema);
+                write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
+                restore_del_triggers(&db_ref.conn, &table_name, &suspended);
 
-            let insert_new_sql = format!(
-                "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {};",
-                table, col_str, col_str, temp
-            );
-            debug_sql(&insert_new_sql);
-            db_ref.conn.execute_batch(&insert_new_sql)
-                .expect("knot runtime: failed to insert new rows");
-
-            let drop_sql = format!("DROP TABLE IF EXISTS {};", temp);
-            debug_sql(&drop_sql);
-            db_ref.conn.execute_batch(&drop_sql)
-                .expect("knot runtime: failed to drop temp table");
-        }
-    } else {
-        let rec_schema = parse_record_schema(schema);
-
-        // If there are nested relation fields, fall back to full clear + rewrite
-        // since the diff logic only handles scalar columns.
-        if !rec_schema.nested.is_empty() {
-            let table_name = format!("_knot_{}", name);
-            // Full clear + rewrite: suspend the per-row referential BEFORE
-            // DELETE triggers so they don't abort on the transient missing-key
-            // state, then restore them (which runs a whole-relation orphan
-            // scan) — mirrors knot_source_write (bug B24).
-            let suspended = suspend_del_triggers(&db_ref.conn, &table_name);
-            delete_record_table(&db_ref.conn, &table_name, &rec_schema);
-            write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
-            restore_del_triggers(&db_ref.conn, &table_name, &suspended);
-
-            // Return from the closure only; the shared RELEASE SAVEPOINT +
-            // relation-change notify after the guard runs exactly once.
-            return;
-        }
-
-        // Zero-column records have nothing to diff — fall back to clear + rewrite
-        if rec_schema.columns.is_empty() {
-            let table_name = format!("_knot_{}", name);
-            let suspended = suspend_del_triggers(&db_ref.conn, &table_name);
-            delete_record_table(&db_ref.conn, &table_name, &rec_schema);
-            write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
-            restore_del_triggers(&db_ref.conn, &table_name, &suspended);
-
-            return;
-        }
-
-        let cols = rec_schema.columns;
-        let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
-        let col_str = col_names.join(", ");
-        let n_cols = cols.len();
-
-        // Build NULL-safe match conditions
-        let build_rec_match = |src: &str| -> Vec<String> {
-            cols.iter().map(|c| {
-                let cq = quote_ident(&c.name);
-                format!(
-                    "({s}.{c} = {t}.{c} OR ({s}.{c} IS NULL AND {t}.{c} IS NULL))",
-                    s = src, t = table, c = cq
-                )
-            }).collect()
-        };
-
-        // Extract record row to SQL params
-        let rec_row_to_params = |row_ptr: *mut Value| -> Vec<rusqlite::types::Value> {
-            match unsafe { as_ref(row_ptr) } {
-                Value::Record(fields) => cols.iter().map(|col| {
-                    let field = fields.iter().find(|f| &*f.name == col.name.as_str())
-                        .unwrap_or_else(|| panic!("knot runtime: missing field '{}' in record", col.name));
-                    value_to_sqlite(field.value, col.ty)
-                }).collect(),
-                _ => panic!("knot runtime: relation rows must be Records, got {}", type_name(row_ptr)),
+                return;
             }
-        };
 
-        if !rows.is_empty() && rows.len().saturating_mul(n_cols) <= MAX_VALUES_PARAMS {
-            // VALUES CTE path
-            let mut all_params = Vec::with_capacity(rows.len().saturating_mul(n_cols));
-            let mut row_clauses = Vec::with_capacity(rows.len());
-            let mut pidx = 1usize;
-            for row_ptr in rows {
-                let rp = rec_row_to_params(*row_ptr);
-                let ph: Vec<String> = rp.iter()
-                    .map(|_| { let p = format!("?{}", pidx); pidx += 1; p })
-                    .collect();
-                row_clauses.push(format!("({})", ph.join(", ")));
-                all_params.extend(rp);
-            }
-            let values_sql = format!("VALUES {}", row_clauses.join(", "));
-            let match_conds = build_rec_match("_new");
+            let cols = rec_schema.columns;
+            let col_names: Vec<String> = cols.iter().map(|c| quote_ident(&c.name)).collect();
+            let col_str = col_names.join(", ");
+            let n_cols = cols.len();
 
-            let delete_sql = format!(
-                "WITH _new({c}) AS ({v}) \
+            // Build NULL-safe match conditions
+            let build_rec_match = |src: &str| -> Vec<String> {
+                cols.iter()
+                    .map(|c| {
+                        let cq = quote_ident(&c.name);
+                        format!(
+                            "({s}.{c} = {t}.{c} OR ({s}.{c} IS NULL AND {t}.{c} IS NULL))",
+                            s = src,
+                            t = table,
+                            c = cq
+                        )
+                    })
+                    .collect()
+            };
+
+            // Extract record row to SQL params
+            let rec_row_to_params = |row_ptr: *mut Value| -> Vec<rusqlite::types::Value> {
+                match unsafe { as_ref(row_ptr) } {
+                    Value::Record(fields) => cols
+                        .iter()
+                        .map(|col| {
+                            let field = fields
+                                .iter()
+                                .find(|f| &*f.name == col.name.as_str())
+                                .unwrap_or_else(|| {
+                                    panic!("knot runtime: missing field '{}' in record", col.name)
+                                });
+                            value_to_sqlite(field.value, col.ty)
+                        })
+                        .collect(),
+                    _ => panic!(
+                        "knot runtime: relation rows must be Records, got {}",
+                        type_name(row_ptr)
+                    ),
+                }
+            };
+
+            if !rows.is_empty() && rows.len().saturating_mul(n_cols) <= MAX_VALUES_PARAMS {
+                // VALUES CTE path
+                let mut all_params = Vec::with_capacity(rows.len().saturating_mul(n_cols));
+                let mut row_clauses = Vec::with_capacity(rows.len());
+                let mut pidx = 1usize;
+                for row_ptr in rows {
+                    let rp = rec_row_to_params(*row_ptr);
+                    let ph: Vec<String> = rp
+                        .iter()
+                        .map(|_| {
+                            let p = format!("?{}", pidx);
+                            pidx += 1;
+                            p
+                        })
+                        .collect();
+                    row_clauses.push(format!("({})", ph.join(", ")));
+                    all_params.extend(rp);
+                }
+                let values_sql = format!("VALUES {}", row_clauses.join(", "));
+                let match_conds = build_rec_match("_new");
+
+                let delete_sql = format!(
+                    "WITH _new({c}) AS ({v}) \
                  DELETE FROM {t} WHERE NOT EXISTS (SELECT 1 FROM _new WHERE {m});",
-                c = col_str, v = values_sql, t = table, m = match_conds.join(" AND ")
-            );
-            debug_sql(&delete_sql);
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                all_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-            db_ref.conn.prepare(&delete_sql)
-                .and_then(|mut s| s.execute(param_refs.as_slice()))
-                .expect("knot runtime: failed to delete removed rows");
+                    c = col_str,
+                    v = values_sql,
+                    t = table,
+                    m = match_conds.join(" AND ")
+                );
+                debug_sql(&delete_sql);
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params
+                    .iter()
+                    .map(|p| p as &dyn rusqlite::types::ToSql)
+                    .collect();
+                db_ref
+                    .conn
+                    .prepare(&delete_sql)
+                    .and_then(|mut s| s.execute(param_refs.as_slice()))
+                    .expect("knot runtime: failed to delete removed rows");
 
-            // INSERT rows not in main. Use NOT EXISTS to avoid duplicates
-            // when writing through a projected view.
-            let insert_sql = format!(
-                "WITH _new({c}) AS ({v}) \
+                // INSERT rows not in main. Use NOT EXISTS to avoid duplicates
+                // when writing through a projected view.
+                let insert_sql = format!(
+                    "WITH _new({c}) AS ({v}) \
                  INSERT OR IGNORE INTO {t} ({c}) SELECT * FROM _new \
                  WHERE NOT EXISTS (SELECT 1 FROM {t} WHERE {m});",
-                c = col_str, v = values_sql, t = table, m = match_conds.join(" AND ")
-            );
-            debug_sql(&insert_sql);
-            db_ref.conn.prepare(&insert_sql)
-                .and_then(|mut s| s.execute(param_refs.as_slice()))
-                .expect("knot runtime: failed to insert new rows");
-        } else {
-            // Temp table fallback (handles empty rows and large datasets)
-            let match_conds = build_rec_match(&temp);
-
-            let col_defs: Vec<String> = cols.iter()
-                .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
-                .collect();
-            let create_temp = format!(
-                "DROP TABLE IF EXISTS {t}; CREATE TEMP TABLE {t} ({});",
-                col_defs.join(", "),
-                t = temp
-            );
-            debug_sql(&create_temp);
-            db_ref.conn.execute_batch(&create_temp)
-                .expect("knot runtime: failed to create temp table");
-
-            if !rows.is_empty() {
-                let placeholders: Vec<String> = (1..=n_cols).map(|i| format!("?{}", i)).collect();
-                let insert_sql = format!(
-                    "INSERT INTO {} ({}) VALUES ({});", temp, col_str, placeholders.join(", ")
+                    c = col_str,
+                    v = values_sql,
+                    t = table,
+                    m = match_conds.join(" AND ")
                 );
                 debug_sql(&insert_sql);
-                let mut stmt = db_ref.conn.prepare_cached(&insert_sql)
-                    .expect("knot runtime: failed to prepare temp insert");
-                for row_ptr in rows {
-                    let params = rec_row_to_params(*row_ptr);
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
-                    stmt.execute(param_refs.as_slice())
-                        .unwrap_or_else(|e| panic!("knot runtime: temp insert error: {}", e));
+                db_ref
+                    .conn
+                    .prepare(&insert_sql)
+                    .and_then(|mut s| s.execute(param_refs.as_slice()))
+                    .expect("knot runtime: failed to insert new rows");
+            } else {
+                // Temp table fallback (handles empty rows and large datasets)
+                let match_conds = build_rec_match(&temp);
+
+                let col_defs: Vec<String> = cols
+                    .iter()
+                    .map(|c| format!("{} {}", quote_ident(&c.name), sql_type(c.ty)))
+                    .collect();
+                let create_temp = format!(
+                    "DROP TABLE IF EXISTS {t}; CREATE TEMP TABLE {t} ({});",
+                    col_defs.join(", "),
+                    t = temp
+                );
+                debug_sql(&create_temp);
+                db_ref
+                    .conn
+                    .execute_batch(&create_temp)
+                    .expect("knot runtime: failed to create temp table");
+
+                if !rows.is_empty() {
+                    let placeholders: Vec<String> =
+                        (1..=n_cols).map(|i| format!("?{}", i)).collect();
+                    let insert_sql = format!(
+                        "INSERT INTO {} ({}) VALUES ({});",
+                        temp,
+                        col_str,
+                        placeholders.join(", ")
+                    );
+                    debug_sql(&insert_sql);
+                    let mut stmt = db_ref
+                        .conn
+                        .prepare_cached(&insert_sql)
+                        .expect("knot runtime: failed to prepare temp insert");
+                    for row_ptr in rows {
+                        let params = rec_row_to_params(*row_ptr);
+                        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
+                            .iter()
+                            .map(|p| p as &dyn rusqlite::types::ToSql)
+                            .collect();
+                        stmt.execute(param_refs.as_slice())
+                            .unwrap_or_else(|e| panic!("knot runtime: temp insert error: {}", e));
+                    }
                 }
-            }
 
-            let delete_sql = format!(
-                "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
-                table, temp, match_conds.join(" AND ")
-            );
-            debug_sql(&delete_sql);
-            db_ref.conn.execute_batch(&delete_sql)
-                .expect("knot runtime: failed to delete removed rows");
+                let delete_sql = format!(
+                    "DELETE FROM {} WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
+                    table,
+                    temp,
+                    match_conds.join(" AND ")
+                );
+                debug_sql(&delete_sql);
+                db_ref
+                    .conn
+                    .execute_batch(&delete_sql)
+                    .expect("knot runtime: failed to delete removed rows");
 
-            let insert_new_sql = format!(
-                "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {} \
+                let insert_new_sql = format!(
+                    "INSERT OR IGNORE INTO {} ({}) SELECT {} FROM {} \
                  WHERE NOT EXISTS (SELECT 1 FROM {} WHERE {});",
-                table, col_str, col_str, temp, table, match_conds.join(" AND ")
-            );
-            debug_sql(&insert_new_sql);
-            db_ref.conn.execute_batch(&insert_new_sql)
-                .expect("knot runtime: failed to insert new rows");
+                    table,
+                    col_str,
+                    col_str,
+                    temp,
+                    table,
+                    match_conds.join(" AND ")
+                );
+                debug_sql(&insert_new_sql);
+                db_ref
+                    .conn
+                    .execute_batch(&insert_new_sql)
+                    .expect("knot runtime: failed to insert new rows");
 
-            let drop_sql = format!("DROP TABLE IF EXISTS {};", temp);
-            debug_sql(&drop_sql);
-            db_ref.conn.execute_batch(&drop_sql)
-                .expect("knot runtime: failed to drop temp table");
+                let drop_sql = format!("DROP TABLE IF EXISTS {};", temp);
+                debug_sql(&drop_sql);
+                db_ref
+                    .conn
+                    .execute_batch(&drop_sql)
+                    .expect("knot runtime: failed to drop temp table");
+            }
         }
-    }
-
     });
 
-    db_ref.conn.execute_batch("RELEASE SAVEPOINT knot_diff_write;")
+    db_ref
+        .conn
+        .execute_batch("RELEASE SAVEPOINT knot_diff_write;")
         .expect("knot runtime: failed to commit transaction");
     if db_ref.atomic_depth.get() > 0 {
         stm_track_write(name);
@@ -16037,9 +16898,10 @@ fn table_has_column(conn: &rusqlite::Connection, table: &str, col: &str) -> bool
 fn table_column_names(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
     let sql = format!("PRAGMA table_info({})", quote_ident(table));
     if let Ok(mut stmt) = conn.prepare(&sql)
-        && let Ok(names) = stmt.query_map([], |row| row.get::<_, String>(1)) {
-            return names.flatten().collect();
-        }
+        && let Ok(names) = stmt.query_map([], |row| row.get::<_, String>(1))
+    {
+        return names.flatten().collect();
+    }
     Vec::new()
 }
 
@@ -16072,10 +16934,14 @@ pub extern "C-unwind" fn knot_source_delete_where(
         ),
     };
 
-    let sql_params: Vec<rusqlite::types::Value> =
-        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let sql_params: Vec<rusqlite::types::Value> = param_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     // Run the child-table cascade and the parent DELETE in a single
     // savepoint (like every sibling write path) so a parent DELETE failure
@@ -16103,13 +16969,17 @@ pub extern "C-unwind" fn knot_source_delete_where(
     let qt = quote_ident(&table);
     let mut descendant_tables: Vec<String> = {
         let prefix = format!("{}__", table);
-        let mut stmt = match db_ref.conn.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?1"
-        ) {
+        let mut stmt = match db_ref
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?1")
+        {
             Ok(s) => s,
             Err(e) => {
                 rollback_delete_where(db_ref);
-                panic!("knot runtime: failed to prepare descendant table query: {}", e);
+                panic!(
+                    "knot runtime: failed to prepare descendant table query: {}",
+                    e
+                );
             }
         };
         stmt.query_map([format!("{}%", prefix)], |row| row.get::<_, String>(0))
@@ -16193,10 +17063,7 @@ pub extern "C-unwind" fn knot_source_delete_where(
     descendant_tables.sort_by_key(|t| depth_of(t));
     if !descendant_tables.is_empty() {
         // Collect _ids of parent rows that will be deleted
-        let id_sql = format!(
-            "SELECT _id FROM {} WHERE NOT ({});",
-            qt, where_clause
-        );
+        let id_sql = format!("SELECT _id FROM {} WHERE NOT ({});", qt, where_clause);
         debug_sql(&id_sql);
         {
             // Collect the _ids of parent rows that will be deleted. A failure
@@ -16230,7 +17097,10 @@ pub extern "C-unwind" fn knot_source_delete_where(
                         format!(
                             "DELETE FROM {} WHERE _parent_id IN ({})",
                             quote_ident(ct),
-                            ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(",")
+                            ids.iter()
+                                .map(|id| id.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
                         )
                     } else {
                         // Deeper descendant: its intermediate parent rows are
@@ -16244,22 +17114,23 @@ pub extern "C-unwind" fn knot_source_delete_where(
                     debug_sql(&del);
                     if let Err(e) = db_ref.conn.execute_batch(&del) {
                         rollback_delete_where(db_ref);
-                        panic!("knot runtime: delete_where cascade error: {}\n  SQL: {}", e, del);
+                        panic!(
+                            "knot runtime: delete_where cascade error: {}\n  SQL: {}",
+                            e, del
+                        );
                     }
                 }
             }
         }
     }
 
-    let sql = format!(
-        "DELETE FROM {} WHERE NOT ({});",
-        qt,
-        where_clause
-    );
+    let sql = format!("DELETE FROM {} WHERE NOT ({});", qt, where_clause);
     debug_sql_params(&sql, &sql_params);
     // Rebuild param_refs (moved above)
-    let param_refs2: Vec<&dyn rusqlite::types::ToSql> =
-        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let param_refs2: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     // Capture the pre-image of rows about to be deleted so STM watchers
     // filtering on column values can decide whether they need to wake.
@@ -16365,11 +17236,15 @@ pub extern "C-unwind" fn knot_source_update_where(
         where_clause
     );
 
-    let sql_params: Vec<rusqlite::types::Value> =
-        param_values.iter().map(|v| value_to_sql_param(*v)).collect();
+    let sql_params: Vec<rusqlite::types::Value> = param_values
+        .iter()
+        .map(|v| value_to_sql_param(*v))
+        .collect();
     debug_sql_params(&sql, &sql_params);
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        sql_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = sql_params
+        .iter()
+        .map(|p| p as &dyn rusqlite::types::ToSql)
+        .collect();
 
     // Pre-image: snapshot affected rows before the UPDATE so STM watchers
     // filtering on column values can decide whether to wake. The combined
@@ -16554,9 +17429,7 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
         Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
         Value::Bytes(b) => rusqlite::types::Value::Blob((**b).to_vec()),
         Value::Constructor(tag, _) => rusqlite::types::Value::Text(ctor_leaf(tag).to_string()),
-        Value::Relation(_) | Value::Record(_) => {
-            rusqlite::types::Value::Text(value_to_json_db(v))
-        }
+        Value::Relation(_) | Value::Record(_) => rusqlite::types::Value::Text(value_to_json_db(v)),
         _ => panic!(
             "knot runtime: cannot use {} as SQL parameter",
             brief_value(v)
@@ -16605,9 +17478,7 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
             });
             rusqlite::types::Value::Text(value_to_json_db(alloc(Value::Relation(deduped))))
         }
-        (Value::Record(_), ColType::Json) => {
-            rusqlite::types::Value::Text(value_to_json_db(v))
-        }
+        (Value::Record(_), ColType::Json) => rusqlite::types::Value::Text(value_to_json_db(v)),
         _ => panic!("knot runtime: cannot convert {} to SQL", brief_value(v)),
     }
 }
@@ -16627,7 +17498,9 @@ pub extern "C-unwind" fn knot_now() -> *mut Value {
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_sleep(ms_val: *mut Value) -> *mut Value {
     let ms: u64 = match unsafe { as_ref(ms_val) } {
-        Value::Int(i) => u64::try_from(*i).expect("knot runtime: sleep duration must be non-negative"),
+        Value::Int(i) => {
+            u64::try_from(*i).expect("knot runtime: sleep duration must be non-negative")
+        }
         _ => panic!("knot runtime: sleep expects Int argument"),
     };
     let ms = ms.min(Duration::MAX.as_millis() as u64);
@@ -16748,9 +17621,10 @@ pub extern "C-unwind" fn knot_maybe_bind(
 /// Wraps value in Just {value: a}
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_maybe_yield(value: *mut Value) -> *mut Value {
-    let rec = alloc(Value::Record(vec![
-        RecordField { name: "value".into(), value },
-    ]));
+    let rec = alloc(Value::Record(vec![RecordField {
+        name: "value".into(),
+        value,
+    }]));
     alloc(Value::Constructor("Just".into(), rec))
 }
 
@@ -16805,9 +17679,10 @@ pub extern "C-unwind" fn knot_result_bind(
 /// Wraps value in Ok {value: a}
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_result_yield(value: *mut Value) -> *mut Value {
-    let rec = alloc(Value::Record(vec![
-        RecordField { name: "value".into(), value },
-    ]));
+    let rec = alloc(Value::Record(vec![RecordField {
+        name: "value".into(),
+        value,
+    }]));
     alloc(Value::Constructor("Ok".into(), rec))
 }
 
@@ -16817,12 +17692,19 @@ pub extern "C-unwind" fn knot_result_yield(value: *mut Value) -> *mut Value {
 pub extern "C-unwind" fn knot_result_empty() -> *mut Value {
     let violations = alloc(Value::Relation(Vec::new()));
     let error_rec = alloc(Value::Record(vec![
-        RecordField { name: "typeName".into(), value: alloc(Value::Text(Arc::from(""))) },
-        RecordField { name: "violations".into(), value: violations },
+        RecordField {
+            name: "typeName".into(),
+            value: alloc(Value::Text(Arc::from(""))),
+        },
+        RecordField {
+            name: "violations".into(),
+            value: violations,
+        },
     ]));
-    let err_rec = alloc(Value::Record(vec![
-        RecordField { name: "error".into(), value: error_rec },
-    ]));
+    let err_rec = alloc(Value::Record(vec![RecordField {
+        name: "error".into(),
+        value: error_rec,
+    }]));
     alloc(Value::Constructor("Err".into(), err_rec))
 }
 
@@ -17228,7 +18110,9 @@ fn check_rate_limit(
                 "[HTTP] rate limiter: bucket read failed ({}); allowing request without accounting",
                 e
             );
-            let _ = db.conn.execute_batch("ROLLBACK TO SAVEPOINT knot_rate_limit; RELEASE SAVEPOINT knot_rate_limit;");
+            let _ = db.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT knot_rate_limit; RELEASE SAVEPOINT knot_rate_limit;",
+            );
             return Ok(());
         }
     };
@@ -17248,10 +18132,13 @@ fn check_rate_limit(
             "INSERT OR REPLACE INTO _knot_rate_limits (route, key, tokens, last_refill) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![route, key, tokens, now],
         );
-        let result = write.and_then(|_| db.conn.execute_batch("RELEASE SAVEPOINT knot_rate_limit;"));
+        let result =
+            write.and_then(|_| db.conn.execute_batch("RELEASE SAVEPOINT knot_rate_limit;"));
         if let Err(e) = result {
             log_warn!("[HTTP] rate limiter: bucket write failed ({})", e);
-            let _ = db.conn.execute_batch("ROLLBACK TO SAVEPOINT knot_rate_limit; RELEASE SAVEPOINT knot_rate_limit;");
+            let _ = db.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT knot_rate_limit; RELEASE SAVEPOINT knot_rate_limit;",
+            );
         }
     };
     if tokens_before >= 1.0 {
@@ -17259,8 +18146,7 @@ fn check_rate_limit(
         Ok(())
     } else {
         let needed = 1.0 - tokens_before;
-        let retry_after_ms =
-            (needed * (window_ms as f64) / capacity).ceil() as i64;
+        let retry_after_ms = (needed * (window_ms as f64) / capacity).ceil() as i64;
         write_bucket(tokens_before);
         Err(retry_after_ms.max(1))
     }
@@ -17285,10 +18171,9 @@ fn rate_limit_key_for_request(
     match unsafe { as_ref(result) } {
         Value::Constructor(tag, payload) if ctor_leaf(tag) == "Just" => {
             let value_field = match unsafe { as_ref(*payload) } {
-                Value::Record(fields) => fields
-                    .iter()
-                    .find(|f| &*f.name == "value")
-                    .map(|f| f.value),
+                Value::Record(fields) => {
+                    fields.iter().find(|f| &*f.name == "value").map(|f| f.value)
+                }
                 _ => None,
             };
             value_field.and_then(|v| {
@@ -17354,7 +18239,8 @@ pub extern "C-unwind" fn knot_constraint_register(
             let msg = format!(
                 "uniqueness constraint violated: *{} <= *{}.{}",
                 sub_rel, sup_rel, sf
-            ).replace('\'', "''");
+            )
+            .replace('\'', "''");
             // A set-semantics re-append (`set *rel = union *rel [...]`)
             // re-inserts rows that already exist verbatim. `write_record_rows`
             // uses INSERT OR IGNORE, so such a duplicate is silently deduped by
@@ -17402,7 +18288,9 @@ pub extern "C-unwind" fn knot_constraint_register(
                 dup_guard = dup_guard,
             );
             debug_sql(&trigger_sql);
-            db_ref.conn.execute_batch(&trigger_sql)
+            db_ref
+                .conn
+                .execute_batch(&trigger_sql)
                 .expect("knot runtime: failed to create uniqueness trigger");
 
             // Trigger: reject UPDATE if new value already exists
@@ -17418,7 +18306,9 @@ pub extern "C-unwind" fn knot_constraint_register(
                 msg = msg,
             );
             debug_sql(&upd_trigger_sql);
-            db_ref.conn.execute_batch(&upd_trigger_sql)
+            db_ref
+                .conn
+                .execute_batch(&upd_trigger_sql)
                 .expect("knot runtime: failed to create uniqueness update trigger");
         }
         // Referential integrity: *sub.sf <= *sup.spf — indexes + triggers
@@ -17449,7 +18339,8 @@ pub extern "C-unwind" fn knot_constraint_register(
             let msg = format!(
                 "subset constraint violated: *{}.{} <= *{}.{}",
                 sub_rel, sf, sup_rel, spf
-            ).replace('\'', "''");
+            )
+            .replace('\'', "''");
 
             // Trigger names encode BOTH endpoints of the constraint, so two
             // constraints sharing a sub field (ins/upd) or a superset field
@@ -17471,7 +18362,9 @@ pub extern "C-unwind" fn knot_constraint_register(
                 msg = msg,
             );
             debug_sql(&insert_trigger);
-            db_ref.conn.execute_batch(&insert_trigger)
+            db_ref
+                .conn
+                .execute_batch(&insert_trigger)
                 .expect("knot runtime: failed to create insert trigger");
 
             // Trigger: reject UPDATE on sub if new value doesn't exist in sup
@@ -17489,14 +18382,17 @@ pub extern "C-unwind" fn knot_constraint_register(
                 msg = msg,
             );
             debug_sql(&update_trigger);
-            db_ref.conn.execute_batch(&update_trigger)
+            db_ref
+                .conn
+                .execute_batch(&update_trigger)
                 .expect("knot runtime: failed to create update trigger");
 
             // Trigger: reject DELETE from sup if sub still references the value
             let delete_msg = format!(
                 "subset constraint violated: cannot delete from *{}.{} while referenced by *{}.{}",
                 sup_rel, spf, sub_rel, sf
-            ).replace('\'', "''");
+            )
+            .replace('\'', "''");
             let delete_trigger = format!(
                 "CREATE TRIGGER IF NOT EXISTS {trg} \
                  BEFORE DELETE ON {sup_table} \
@@ -17512,7 +18408,9 @@ pub extern "C-unwind" fn knot_constraint_register(
                 msg = delete_msg,
             );
             debug_sql(&delete_trigger);
-            db_ref.conn.execute_batch(&delete_trigger)
+            db_ref
+                .conn
+                .execute_batch(&delete_trigger)
                 .expect("knot runtime: failed to create delete trigger");
 
             // Trigger: reject in-place UPDATE of the superset key column if
@@ -17539,7 +18437,9 @@ pub extern "C-unwind" fn knot_constraint_register(
                 msg = delete_msg,
             );
             debug_sql(&sup_update_trigger);
-            db_ref.conn.execute_batch(&sup_update_trigger)
+            db_ref
+                .conn
+                .execute_batch(&sup_update_trigger)
                 .expect("knot runtime: failed to create superset update trigger");
         }
         _ => {}
@@ -17572,7 +18472,10 @@ pub extern "C-unwind" fn knot_atomic_commit(db: *mut c_void) {
     let _guard = WriteLockGuard;
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get();
-    assert!(depth > 0, "knot runtime: atomic commit without matching begin");
+    assert!(
+        depth > 0,
+        "knot runtime: atomic commit without matching begin"
+    );
     // Execute SQL first, then decrement depth. If SQL panics, depth is
     // still > 0, so WriteLockGuard's drop can safely call write_lock_release
     // without hitting the depth > 0 assertion.
@@ -17609,7 +18512,9 @@ pub extern "C-unwind" fn knot_atomic_commit(db: *mut c_void) {
                 let event_clone = event.clone();
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     wake_matching_watchers(&table_clone, &event_clone);
-                })).is_err() {
+                }))
+                .is_err()
+                {
                     log::log_error(&format!(
                         "knot runtime: watcher notification panicked for table '{}', event {:?}",
                         table, event
@@ -17627,7 +18532,10 @@ pub extern "C-unwind" fn knot_atomic_rollback(db: *mut c_void) {
     let _guard = WriteLockGuard;
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let depth = db_ref.atomic_depth.get();
-    assert!(depth > 0, "knot runtime: atomic rollback without matching begin");
+    assert!(
+        depth > 0,
+        "knot runtime: atomic rollback without matching begin"
+    );
     // ROLLBACK TO undoes changes but keeps the savepoint alive.
     // RELEASE then removes it so the next begin creates a clean one.
     // Execute SQL first, then decrement depth (same rationale as commit).
@@ -17664,7 +18572,10 @@ pub extern "C-unwind" fn knot_record_update(base: *mut Value) -> *mut Value {
                 .collect();
             alloc(Value::Record(new_fields))
         }
-        _ => panic!("knot runtime: record update requires a Record base, got {}", type_name(base)),
+        _ => panic!(
+            "knot runtime: record update requires a Record base, got {}",
+            type_name(base)
+        ),
     }
 }
 
@@ -17825,12 +18736,7 @@ pub extern "C-unwind" fn knot_relation_add_fields(
             let updated = knot_record_update(*row_ptr);
             for field in extra {
                 let name_bytes = field.name.as_bytes();
-                knot_record_set_field(
-                    updated,
-                    name_bytes.as_ptr(),
-                    name_bytes.len(),
-                    field.value,
-                );
+                knot_record_set_field(updated, name_bytes.as_ptr(), name_bytes.len(), field.value);
             }
             updated
         })
@@ -17880,12 +18786,7 @@ pub extern "C-unwind" fn knot_relation_rename_columns(
                     .map(|(_, new)| *new)
                     .unwrap_or(field_name_str);
                 let name_bytes = new_name.as_bytes();
-                knot_record_set_field(
-                    new_rec,
-                    name_bytes.as_ptr(),
-                    name_bytes.len(),
-                    field.value,
-                );
+                knot_record_set_field(new_rec, name_bytes.as_ptr(), name_bytes.len(), field.value);
             }
             new_rec
         })
@@ -17970,7 +18871,10 @@ pub extern "C-unwind" fn knot_view_write(
                 .iter()
                 .map(|p| p as &dyn rusqlite::types::ToSql)
                 .collect();
-            let mut stmt = db_ref.conn.prepare(&select_sql).expect("knot runtime: view_write select _id failed");
+            let mut stmt = db_ref
+                .conn
+                .prepare(&select_sql)
+                .expect("knot runtime: view_write select _id failed");
             let ids: Vec<i64> = stmt
                 .query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))
                 .expect("knot runtime: view_write query _id failed")
@@ -18081,7 +18985,11 @@ pub extern "C-unwind" fn knot_constructor_tag_ptr(v: *mut Value) -> *const u8 {
         Value::Constructor(t, _) => ctor_leaf(t).as_ptr(),
         // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
         Value::Text(s) => s.as_ptr(),
-        _ => panic!("knot runtime: expected Constructor in tag_ptr, got {} = {}", type_name(v), brief_value(v)),
+        _ => panic!(
+            "knot runtime: expected Constructor in tag_ptr, got {} = {}",
+            type_name(v),
+            brief_value(v)
+        ),
     }
 }
 
@@ -18093,7 +19001,10 @@ pub extern "C-unwind" fn knot_constructor_tag_len(v: *mut Value) -> usize {
         Value::Constructor(t, _) => ctor_leaf(t).len(),
         // Text values can appear as implicit nullary constructors (e.g. from JSON deserialization)
         Value::Text(s) => s.len(),
-        _ => panic!("knot runtime: expected Constructor in tag_len, got {}", type_name(v)),
+        _ => panic!(
+            "knot runtime: expected Constructor in tag_len, got {}",
+            type_name(v)
+        ),
     }
 }
 
@@ -18398,10 +19309,7 @@ fn parse_query_string(qs: &str) -> HashMap<String, String> {
             let mut split = pair.splitn(2, '=');
             let key = split.next()?;
             let val = split.next().unwrap_or("");
-            Some((
-                url_decode(key, true),
-                url_decode(val, true),
-            ))
+            Some((url_decode(key, true), url_decode(val, true)))
         })
         .collect()
 }
@@ -18414,12 +19322,14 @@ fn url_decode(s: &str, plus_as_space: bool) -> String {
     let raw = s.as_bytes();
     let mut i = 0;
     while i < raw.len() {
-        if raw[i] == b'%' && i + 2 < raw.len()
-            && let (Some(h), Some(l)) = (hex_val(raw[i + 1]), hex_val(raw[i + 2])) {
-                bytes.push(h * 16 + l);
-                i += 3;
-                continue;
-            }
+        if raw[i] == b'%'
+            && i + 2 < raw.len()
+            && let (Some(h), Some(l)) = (hex_val(raw[i + 1]), hex_val(raw[i + 2]))
+        {
+            bytes.push(h * 16 + l);
+            i += 3;
+            continue;
+        }
         if raw[i] == b'+' && plus_as_space {
             bytes.push(b' ');
         } else {
@@ -18438,8 +19348,6 @@ fn hex_val(b: u8) -> Option<u8> {
         _ => None,
     }
 }
-
-
 
 /// The constructors an enum-like (all-nullary ADT) wire descriptor declares.
 /// The compiler emits `tag(Low|Medium|High|Critical)` for such a route field,
@@ -18506,7 +19414,11 @@ fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
         // silently empties every ordered comparison, and storing NaN to a
         // SQLite REAL column collapses it to NULL. Match the int arm's
         // strictness and reply 400 / return `Err` instead of coercing.
-        "float" => s.parse::<f64>().ok().filter(|f| f.is_finite()).map(alloc_float),
+        "float" => s
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .map(alloc_float),
         "bool" => match s {
             "true" | "True" | "1" => Some(alloc_bool(true)),
             "false" | "False" | "0" => Some(alloc_bool(false)),
@@ -18515,8 +19427,9 @@ fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
         // Only a declared constructor may become a `Value::Constructor` — an
         // unknown tag is a malformed param (400), not a forged constructor
         // handed to the handler (see `tag_is_known`).
-        t if is_tag_type(t) => tag_is_known(s, t)
-            .then(|| alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)))),
+        t if is_tag_type(t) => {
+            tag_is_known(s, t).then(|| alloc(Value::Constructor(intern_str(s), alloc(Value::Unit))))
+        }
         "text" => Some(alloc(Value::Text(Arc::from(s)))),
         // A uuid arrives as a string, but accepting any string would let a
         // malformed value masquerade as a Uuid. Require the canonical
@@ -18542,17 +19455,19 @@ fn try_string_to_value(s: &str, ty: &str) -> Option<*mut Value> {
 /// the failure channel this infallible coercion lacks.
 fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
     if is_tag_type(ty)
-        && let Value::Text(s) = unsafe { as_ref(v) } {
-            return alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)));
-        }
+        && let Value::Text(s) = unsafe { as_ref(v) }
+    {
+        return alloc(Value::Constructor(intern_str(s), alloc(Value::Unit)));
+    }
     // A bare JSON integer (`5`) decodes to `Value::Int`, but a field declared
     // `Float` must hold a `Value::Float` — otherwise `show`/`toJson` re-emit it
     // as an integer and Float-specific logic sees the wrong tag. Non-Knot peers
     // routinely send integer-valued JSON for float fields, so promote here.
     if ty == "float"
-        && let Value::Int(i) = unsafe { as_ref(v) } {
-            return alloc_float(*i as f64);
-        }
+        && let Value::Int(i) = unsafe { as_ref(v) }
+    {
+        return alloc_float(*i as f64);
+    }
     // The mirror case: a field declared `Int` must hold a `Value::Int`, but a
     // peer that writes an integer with a decimal point (`30.0`) fails the
     // `as_i64()` probe in `json_to_value_impl` and decodes to `Value::Float`.
@@ -18561,16 +19476,17 @@ fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
     // corrupting numeric ordering/comparison in that column. Demote integral
     // floats back to `Int` here.
     if ty == "int"
-        && let Value::Float(f) = unsafe { as_ref(v) } {
-            // `i64::MAX as f64` rounds up to 2^63, so `*f <= i64::MAX as f64`
-            // would accept values in (i64::MAX, 2^63] and silently saturate them
-            // to i64::MAX on `as i64`. The representable integral range is
-            // [-2^63, 2^63); guard with the exclusive upper bound.
-            const I64_MAX_PLUS_ONE: f64 = 9_223_372_036_854_775_808.0; // 2^63
-            if f.fract() == 0.0 && f.is_finite() && *f >= i64::MIN as f64 && *f < I64_MAX_PLUS_ONE {
-                return alloc_int(*f as i64);
-            }
+        && let Value::Float(f) = unsafe { as_ref(v) }
+    {
+        // `i64::MAX as f64` rounds up to 2^63, so `*f <= i64::MAX as f64`
+        // would accept values in (i64::MAX, 2^63] and silently saturate them
+        // to i64::MAX on `as i64`. The representable integral range is
+        // [-2^63, 2^63); guard with the exclusive upper bound.
+        const I64_MAX_PLUS_ONE: f64 = 9_223_372_036_854_775_808.0; // 2^63
+        if f.fract() == 0.0 && f.is_finite() && *f >= i64::MIN as f64 && *f < I64_MAX_PLUS_ONE {
+            return alloc_int(*f as i64);
         }
+    }
     v
 }
 
@@ -18650,8 +19566,12 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
         let triple = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
         out.push(((triple >> 16) & 0xFF) as u8);
-        if chunk.len() > 2 { out.push(((triple >> 8) & 0xFF) as u8); }
-        if chunk.len() > 3 { out.push((triple & 0xFF) as u8); }
+        if chunk.len() > 2 {
+            out.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push((triple & 0xFF) as u8);
+        }
     }
     Some(out)
 }
@@ -18884,7 +19804,9 @@ fn value_to_json_with(db: *mut c_void, v: *mut Value, to_json_fn: *const u8) -> 
         Value::Record(fields) => {
             let mut json = String::from("{");
             for (i, f) in fields.iter().enumerate() {
-                if i > 0 { json.push(','); }
+                if i > 0 {
+                    json.push(',');
+                }
                 // Use serde to properly escape the field name
                 json.push_str(&serde_json::to_string(&*f.name).unwrap());
                 json.push(':');
@@ -18896,7 +19818,9 @@ fn value_to_json_with(db: *mut c_void, v: *mut Value, to_json_fn: *const u8) -> 
         Value::Relation(rows) => {
             let mut json = String::from("[");
             for (i, r) in rows.iter().enumerate() {
-                if i > 0 { json.push(','); }
+                if i > 0 {
+                    json.push(',');
+                }
                 json.push_str(&call_to_json_dispatcher(db, *r, to_json_fn));
             }
             json.push(']');
@@ -19043,10 +19967,7 @@ pub extern "C-unwind" fn knot_http_config_init() {
             if let Some(v) = rest.strip_prefix('=') {
                 value = Some(v.to_string());
                 break;
-            } else if rest.is_empty()
-                && i + 1 < args.len()
-                && !args[i + 1].starts_with("--")
-            {
+            } else if rest.is_empty() && i + 1 < args.len() && !args[i + 1].starts_with("--") {
                 value = Some(args[i + 1].clone());
                 break;
             }
@@ -19104,7 +20025,10 @@ pub extern "C-unwind" fn knot_http_listen_io(
     handler: *mut Value,
 ) -> *mut Value {
     let table_addr = alloc(Value::Int(route_table as usize as i64));
-    let env = alloc(Value::Pair(port_val, alloc(Value::Pair(table_addr, handler))));
+    let env = alloc(Value::Pair(
+        port_val,
+        alloc(Value::Pair(table_addr, handler)),
+    ));
 
     extern "C-unwind" fn listen_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
         let (port_val, rest) = pair_unpack(env);
@@ -19131,7 +20055,10 @@ pub extern "C-unwind" fn knot_http_listen_on_io(
     let table_addr = alloc(Value::Int(route_table as usize as i64));
     let env = alloc(Value::Pair(
         host_val,
-        alloc(Value::Pair(port_val, alloc(Value::Pair(table_addr, handler)))),
+        alloc(Value::Pair(
+            port_val,
+            alloc(Value::Pair(table_addr, handler)),
+        )),
     ));
 
     extern "C-unwind" fn listen_on_thunk(db: *mut c_void, env: *mut Value) -> *mut Value {
@@ -19177,11 +20104,7 @@ pub extern "C-unwind" fn knot_http_listen_on(
 
 /// Shared body for `knot_http_listen` / `knot_http_listen_on`: bind, log,
 /// then run the request-accept loop forever.
-fn http_serve_loop(
-    addr: String,
-    route_table: *mut c_void,
-    handler: *mut Value,
-) -> *mut Value {
+fn http_serve_loop(addr: String, route_table: *mut c_void, handler: *mut Value) -> *mut Value {
     // The route table is built once per `listen` expression and intentionally
     // leaked (see `knot_http_listen_io`). Never take ownership here: the
     // `listen` IO value is first-class — it can be bound to a name and run
@@ -19192,8 +20115,12 @@ fn http_serve_loop(
     // set_rate_limit), before any serve loop starts, so a shared reference
     // is sound here.
     let table: &'static RouteTable = unsafe { &*(route_table as *const RouteTable) };
-    let server = Arc::new(tiny_http::Server::http(&addr)
-        .unwrap_or_else(|e| panic!("knot runtime: failed to start HTTP server on {}: {}", addr, e)));
+    let server = Arc::new(tiny_http::Server::http(&addr).unwrap_or_else(|e| {
+        panic!(
+            "knot runtime: failed to start HTTP server on {}: {}",
+            addr, e
+        )
+    }));
     log::log_info(&format!("Knot HTTP server listening on http://{}", addr));
 
     loop {
@@ -19234,7 +20161,11 @@ fn http_serve_loop(
             Some((p, q)) => (p.to_string(), q.to_string()),
             None => (url.clone(), String::new()),
         };
-        let path_segments: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        let path_segments: Vec<String> = path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
 
         let path_seg_refs: Vec<&str> = path_segments.iter().map(|s| s.as_str()).collect();
         let matched = match_route(&table.entries, &method, &path_seg_refs);
@@ -19251,8 +20182,15 @@ fn http_serve_loop(
                     && !entry.method.eq_ignore_ascii_case("HEAD");
 
                 // Collect request headers as owned strings
-                let req_headers: Vec<(String, String)> = request.headers().iter()
-                    .map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string()))
+                let req_headers: Vec<(String, String)> = request
+                    .headers()
+                    .iter()
+                    .map(|h| {
+                        (
+                            h.field.as_str().as_str().to_string(),
+                            h.value.as_str().to_string(),
+                        )
+                    })
                     .collect();
 
                 // Capture the client IP for the rate limiter's `RequestCtx`.
@@ -19280,7 +20218,8 @@ fn http_serve_loop(
                 // `knot_emit_log` while the handler runs.
                 let req_method = method.clone();
                 let req_path = path.clone();
-                let entry_refinements: Vec<FieldRefinement> = table.field_refinements
+                let entry_refinements: Vec<FieldRefinement> = table
+                    .field_refinements
                     .iter()
                     .filter(|r| r.constructor == entry_constructor)
                     .cloned()
@@ -20117,7 +21056,9 @@ fn http_serve_loop(
                         // The request was moved into the closure which was
                         // dropped on spawn failure — the client will see a
                         // connection reset. Clean up the deep-cloned handler.
-                        unsafe { deep_drop_value(handler_cloned as *mut Value); }
+                        unsafe {
+                            deep_drop_value(handler_cloned as *mut Value);
+                        }
                     }
                 }
             }
@@ -20163,42 +21104,72 @@ pub extern "C-unwind" fn knot_http_fetch_io(
     resp_hdrs_ptr: *const u8,
     resp_hdrs_len: usize,
 ) -> *mut Value {
-    let method = alloc(Value::Text(Arc::from(
-        unsafe { str_from_raw(method_ptr, method_len) },
-    )));
-    let path = alloc(Value::Text(Arc::from(
-        unsafe { str_from_raw(path_ptr, path_len) },
-    )));
-    let body_desc = alloc(Value::Text(Arc::from(
-        unsafe { str_from_raw(body_ptr, body_len) },
-    )));
-    let query_desc = alloc(Value::Text(Arc::from(
-        unsafe { str_from_raw(query_ptr, query_len) },
-    )));
-    let resp_desc = alloc(Value::Text(Arc::from(
-        unsafe { str_from_raw(resp_ptr, resp_len) },
-    )));
-    let req_hdrs_desc = alloc(Value::Text(Arc::from(
-        unsafe { str_from_raw(req_hdrs_ptr, req_hdrs_len) },
-    )));
-    let resp_hdrs_desc = alloc(Value::Text(Arc::from(
-        unsafe { str_from_raw(resp_hdrs_ptr, resp_hdrs_len) },
-    )));
+    let method = alloc(Value::Text(Arc::from(unsafe {
+        str_from_raw(method_ptr, method_len)
+    })));
+    let path = alloc(Value::Text(Arc::from(unsafe {
+        str_from_raw(path_ptr, path_len)
+    })));
+    let body_desc = alloc(Value::Text(Arc::from(unsafe {
+        str_from_raw(body_ptr, body_len)
+    })));
+    let query_desc = alloc(Value::Text(Arc::from(unsafe {
+        str_from_raw(query_ptr, query_len)
+    })));
+    let resp_desc = alloc(Value::Text(Arc::from(unsafe {
+        str_from_raw(resp_ptr, resp_len)
+    })));
+    let req_hdrs_desc = alloc(Value::Text(Arc::from(unsafe {
+        str_from_raw(req_hdrs_ptr, req_hdrs_len)
+    })));
+    let resp_hdrs_desc = alloc(Value::Text(Arc::from(unsafe {
+        str_from_raw(resp_hdrs_ptr, resp_hdrs_len)
+    })));
 
     // Env record — fields sorted alphabetically for index-based access
     // 0: base_url, 1: body_desc, 2: headers, 3: method, 4: path, 5: payload,
     // 6: query_desc, 7: req_hdrs_desc, 8: resp_desc, 9: resp_hdrs_desc
     let env = alloc(Value::Record(vec![
-        RecordField { name: "base_url".into(), value: base_url },
-        RecordField { name: "body_desc".into(), value: body_desc },
-        RecordField { name: "headers".into(), value: headers },
-        RecordField { name: "method".into(), value: method },
-        RecordField { name: "path".into(), value: path },
-        RecordField { name: "payload".into(), value: payload },
-        RecordField { name: "query_desc".into(), value: query_desc },
-        RecordField { name: "req_hdrs_desc".into(), value: req_hdrs_desc },
-        RecordField { name: "resp_desc".into(), value: resp_desc },
-        RecordField { name: "resp_hdrs_desc".into(), value: resp_hdrs_desc },
+        RecordField {
+            name: "base_url".into(),
+            value: base_url,
+        },
+        RecordField {
+            name: "body_desc".into(),
+            value: body_desc,
+        },
+        RecordField {
+            name: "headers".into(),
+            value: headers,
+        },
+        RecordField {
+            name: "method".into(),
+            value: method,
+        },
+        RecordField {
+            name: "path".into(),
+            value: path,
+        },
+        RecordField {
+            name: "payload".into(),
+            value: payload,
+        },
+        RecordField {
+            name: "query_desc".into(),
+            value: query_desc,
+        },
+        RecordField {
+            name: "req_hdrs_desc".into(),
+            value: req_hdrs_desc,
+        },
+        RecordField {
+            name: "resp_desc".into(),
+            value: resp_desc,
+        },
+        RecordField {
+            name: "resp_hdrs_desc".into(),
+            value: resp_hdrs_desc,
+        },
     ]));
 
     extern "C-unwind" fn fetch_thunk(_db: *mut c_void, env: *mut Value) -> *mut Value {
@@ -20231,8 +21202,10 @@ pub extern "C-unwind" fn knot_http_fetch_io(
 
         // Build body JSON from body field descriptor (skip for GET/HEAD)
         let body_json = match unsafe { as_ref(body_desc) } {
-            Value::Text(s) if !s.is_empty()
-                && method_str.as_str() != "GET" && method_str.as_str() != "HEAD" =>
+            Value::Text(s)
+                if !s.is_empty()
+                    && method_str.as_str() != "GET"
+                    && method_str.as_str() != "HEAD" =>
             {
                 Some(fetch_build_body(s, payload))
             }
@@ -20261,7 +21234,9 @@ pub extern "C-unwind" fn knot_http_fetch_io(
         let mut has_content_type = false;
         if !req_hdrs_str.is_empty() {
             for field_desc in req_hdrs_str.split(',') {
-                if field_desc.is_empty() { continue; }
+                if field_desc.is_empty() {
+                    continue;
+                }
                 let (name, _ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
                 let http_name = camel_to_header_case(name);
                 let field_val = knot_record_field(payload, name.as_ptr(), name.len());
@@ -20291,13 +21266,14 @@ pub extern "C-unwind" fn knot_http_fetch_io(
 
         // Ad-hoc headers from fetchWith options (override route-declared headers)
         if !headers.is_null()
-            && let Value::Relation(rows) = unsafe { as_ref(headers) } {
-                for row in rows {
-                    let n = fetch_record_text_field(*row, "name");
-                    let v = fetch_record_text_field(*row, "value");
-                    req_headers.push((n, v));
-                }
+            && let Value::Relation(rows) = unsafe { as_ref(headers) }
+        {
+            for row in rows {
+                let n = fetch_record_text_field(*row, "name");
+                let v = fetch_record_text_field(*row, "value");
+                req_headers.push((n, v));
             }
+        }
 
         // Deduplicate headers case-insensitively, last value wins. ureq 3's
         // `RequestBuilder::header` APPENDS rather than replaces, so without
@@ -20309,7 +21285,10 @@ pub extern "C-unwind" fn knot_http_fetch_io(
             let mut deduped: Vec<(String, String)> = Vec::with_capacity(req_headers.len());
             for (k, v) in req_headers {
                 let lk = k.to_ascii_lowercase();
-                match deduped.iter_mut().find(|(ek, _)| ek.eq_ignore_ascii_case(&lk)) {
+                match deduped
+                    .iter_mut()
+                    .find(|(ek, _)| ek.eq_ignore_ascii_case(&lk))
+                {
                     Some(slot) => slot.1 = v,
                     None => deduped.push((k, v)),
                 }
@@ -20331,7 +21310,7 @@ pub extern "C-unwind" fn knot_http_fetch_io(
             ureq::config::Config::builder()
                 .http_status_as_error(false)
                 .timeout_global(Some(std::time::Duration::from_secs(30)))
-                .build()
+                .build(),
         );
 
         // Send request — split by method type since ureq 3 uses different
@@ -20396,12 +21375,16 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                 let parsed_headers = if has_resp_hdrs && status < 400 {
                     let mut hdr_fields = Vec::new();
                     for field_desc in resp_hdrs_str.split(',') {
-                        if field_desc.is_empty() { continue; }
+                        if field_desc.is_empty() {
+                            continue;
+                        }
                         let (name, ty) = field_desc.split_once(':').unwrap_or((field_desc, "text"));
                         let is_maybe = ty.starts_with('?');
                         let inner_ty = if is_maybe { &ty[1..] } else { ty };
                         let http_name = camel_to_header_case(name);
-                        let raw_val = response.headers().get(&http_name)
+                        let raw_val = response
+                            .headers()
+                            .get(&http_name)
                             .and_then(|v| v.to_str().ok())
                             .map(|s| s.to_string());
                         // Decode strictly, mirroring the response-body path
@@ -20417,22 +21400,27 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                                         // response: report status 0 (a sentinel
                                         // for "not a real HTTP error status")
                                         // rather than the misleading upstream 2xx.
-                                        None => return fetch_build_err(
-                                            0,
-                                            &format!(
-                                                "response header '{}' does not match the declared type",
-                                                http_name
-                                            ),
-                                        ),
+                                        None => {
+                                            return fetch_build_err(
+                                                0,
+                                                &format!(
+                                                    "response header '{}' does not match the declared type",
+                                                    http_name
+                                                ),
+                                            );
+                                        }
                                     };
                                     alloc(Value::Constructor(
                                         "Just".into(),
-                                        alloc(Value::Record(vec![
-                                            RecordField { name: "value".into(), value: inner },
-                                        ])),
+                                        alloc(Value::Record(vec![RecordField {
+                                            name: "value".into(),
+                                            value: inner,
+                                        }])),
                                     ))
                                 }
-                                None => alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit))),
+                                None => {
+                                    alloc(Value::Constructor("Nothing".into(), alloc(Value::Unit)))
+                                }
                             }
                         } else {
                             // A required (non-Maybe) response header must be
@@ -20442,25 +21430,29 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                                 Some(v) => v,
                                 // Client-side decode failure on a 2xx response:
                                 // status 0 sentinel, not the upstream 2xx.
-                                None => return fetch_build_err(
-                                    0,
-                                    &format!(
-                                        "required response header '{}' is missing",
-                                        http_name
-                                    ),
-                                ),
+                                None => {
+                                    return fetch_build_err(
+                                        0,
+                                        &format!(
+                                            "required response header '{}' is missing",
+                                            http_name
+                                        ),
+                                    );
+                                }
                             };
                             match try_string_to_value(&v, inner_ty) {
                                 Some(val) => val,
                                 // Client-side decode failure on a 2xx response:
                                 // status 0 sentinel, not the upstream 2xx.
-                                None => return fetch_build_err(
-                                    0,
-                                    &format!(
-                                        "response header '{}' does not match the declared type",
-                                        http_name
-                                    ),
-                                ),
+                                None => {
+                                    return fetch_build_err(
+                                        0,
+                                        &format!(
+                                            "response header '{}' does not match the declared type",
+                                            http_name
+                                        ),
+                                    );
+                                }
                             }
                         };
                         hdr_fields.push(RecordField {
@@ -20479,10 +21471,7 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                     // For a genuine HTTP error (>= 400) keep the real status; for
                     // a 2xx this is a client-side decode/cap failure, so report
                     // the status 0 sentinel rather than the misleading success.
-                    Err(e) => return fetch_build_err(
-                        if status >= 400 { status } else { 0 },
-                        &e,
-                    ),
+                    Err(e) => return fetch_build_err(if status >= 400 { status } else { 0 }, &e),
                 };
 
                 if status >= 400 {
@@ -20499,24 +21488,27 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                             // values → Just. A required field receiving `null`
                             // or a value of the wrong shape is a response decode
                             // error, surfaced as `Err` rather than a mistyped Ok.
-                            Ok(json) => match apply_wire_type_checked(
-                                json_to_value(&json),
-                                &resp_schema,
-                            ) {
-                                Some(decoded) => decoded,
-                                // Client-side decode failure on a 2xx response:
-                                // status 0 sentinel, not the upstream 2xx.
-                                None => return fetch_build_err(
-                                    0,
-                                    "response body does not match the declared response type",
-                                ),
-                            },
+                            Ok(json) => {
+                                match apply_wire_type_checked(json_to_value(&json), &resp_schema) {
+                                    Some(decoded) => decoded,
+                                    // Client-side decode failure on a 2xx response:
+                                    // status 0 sentinel, not the upstream 2xx.
+                                    None => {
+                                        return fetch_build_err(
+                                            0,
+                                            "response body does not match the declared response type",
+                                        );
+                                    }
+                                }
+                            }
                             // Invalid JSON on a 2xx response is likewise a
                             // client-side decode failure — status 0 sentinel.
-                            Err(e) => return fetch_build_err(
-                                0,
-                                &format!("invalid JSON in response: {}", e),
-                            ),
+                            Err(e) => {
+                                return fetch_build_err(
+                                    0,
+                                    &format!("invalid JSON in response: {}", e),
+                                );
+                            }
                         }
                     } else {
                         alloc(Value::Text(Arc::from(body_text)))
@@ -20525,8 +21517,14 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                     // Wrap with headers if response headers declared
                     let ok_value = match parsed_headers {
                         Some(hdrs) => alloc(Value::Record(vec![
-                            RecordField { name: "body".into(), value: parsed_body },
-                            RecordField { name: "headers".into(), value: hdrs },
+                            RecordField {
+                                name: "body".into(),
+                                value: parsed_body,
+                            },
+                            RecordField {
+                                name: "headers".into(),
+                                value: hdrs,
+                            },
                         ])),
                         None => parsed_body,
                     };
@@ -20534,9 +21532,10 @@ pub extern "C-unwind" fn knot_http_fetch_io(
                     // Ok {value: ok_value}
                     alloc(Value::Constructor(
                         "Ok".into(),
-                        alloc(Value::Record(vec![
-                            RecordField { name: "value".into(), value: ok_value },
-                        ])),
+                        alloc(Value::Record(vec![RecordField {
+                            name: "value".into(),
+                            value: ok_value,
+                        }])),
                     ))
                 }
             }
@@ -20695,7 +21694,11 @@ fn fetch_build_query(query_desc: &str, payload: *mut Value) -> String {
             Some(s) => s,
             None => continue,
         };
-        parts.push(format!("{}={}", percent_encode(&name), percent_encode(&val_str)));
+        parts.push(format!(
+            "{}={}",
+            percent_encode(&name),
+            percent_encode(&val_str)
+        ));
     }
     parts.join("&")
 }
@@ -20720,11 +21723,7 @@ fn fetch_value_to_text_opt(v: *mut Value) -> Option<String> {
                 return None;
             }
             if ctor_leaf(tag) == "Just" {
-                return fetch_value_to_text_opt(knot_record_field(
-                    *payload,
-                    "value".as_ptr(),
-                    5,
-                ));
+                return fetch_value_to_text_opt(knot_record_field(*payload, "value".as_ptr(), 5));
             }
             let nullary = (*payload).is_null()
                 || match unsafe { as_ref(*payload) } {
@@ -20803,7 +21802,10 @@ pub extern "C-unwind" fn knot_api_register(
     // not a leak to fix.
     let table_ref = unsafe { &*(table as *const RouteTable) };
     let cloned = Box::into_raw(Box::new(table_ref.clone())) as *mut c_void;
-    API_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push((name, SendPtr(cloned)));
+    API_REGISTRY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name, SendPtr(cloned)));
 }
 
 // ── Documentation comments (`---`) ─────────────────────────────────────────
@@ -20823,7 +21825,10 @@ pub extern "C-unwind" fn knot_doc_add(
 ) {
     let name = unsafe { str_from_raw(name_ptr, name_len) }.to_string();
     let md = unsafe { str_from_raw(md_ptr, md_len) }.to_string();
-    DOC_REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push((name, md));
+    DOC_REGISTRY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((name, md));
 }
 
 /// Render one line of markdown with light terminal syntax highlighting.
@@ -20848,7 +21853,10 @@ fn highlight_md_line(line: &str, out: &mut String) {
         return;
     }
     // List bullets — color the marker, keep the text.
-    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
         let indent = &line[..line.len() - trimmed.len()];
         let _ = write!(out, "{indent}{CYAN}-{RESET} ");
         highlight_inline(rest, out);
@@ -20871,23 +21879,29 @@ fn highlight_inline(text: &str, out: &mut String) {
     while i < n {
         // `code span`
         if bytes[i] == b'`'
-            && let Some(end) = text[i + 1..].find('`') {
+            && let Some(end) = text[i + 1..].find('`')
+        {
             let code = &text[i + 1..i + 1 + end];
             let _ = write!(out, "{CYAN}{code}{RESET}");
             i += 1 + end + 1;
             continue;
         }
         // **bold**
-        if bytes[i] == b'*' && i + 1 < n && bytes[i + 1] == b'*'
-            && let Some(end) = text[i + 2..].find("**") {
+        if bytes[i] == b'*'
+            && i + 1 < n
+            && bytes[i + 1] == b'*'
+            && let Some(end) = text[i + 2..].find("**")
+        {
             let inner = &text[i + 2..i + 2 + end];
             let _ = write!(out, "{BOLD}{inner}{RESET}");
             i += 2 + end + 2;
             continue;
         }
         // *em* (single star, not followed by another star)
-        if bytes[i] == b'*' && (i + 1 >= n || bytes[i + 1] != b'*')
-            && let Some(end) = text[i + 1..].find('*') {
+        if bytes[i] == b'*'
+            && (i + 1 >= n || bytes[i + 1] != b'*')
+            && let Some(end) = text[i + 1..].find('*')
+        {
             let inner = &text[i + 1..i + 1 + end];
             let _ = write!(out, "{ITALIC}{inner}{RESET}");
             i += 1 + end + 1;
@@ -21046,7 +22060,8 @@ fn generate_openapi(name: &str, table: &RouteTable) -> String {
     out.push_str("  \"paths\": {\n");
 
     // Group entries by path (BTreeMap for deterministic, sorted ordering)
-    let mut path_map: std::collections::BTreeMap<String, Vec<&RouteTableEntry>> = std::collections::BTreeMap::new();
+    let mut path_map: std::collections::BTreeMap<String, Vec<&RouteTableEntry>> =
+        std::collections::BTreeMap::new();
     for entry in &table.entries {
         let path_str = openapi_path(&entry.path_parts);
         path_map.entry(path_str).or_default().push(entry);
@@ -21237,7 +22252,10 @@ fn type_to_openapi_schema(ty: &str) -> String {
                     .split('|')
                     .map(|c| format!("\"{}\"", json_escape(c)))
                     .collect();
-                format!("{{ \"type\": \"string\", \"enum\": [{}] }}", vals.join(", "))
+                format!(
+                    "{{ \"type\": \"string\", \"enum\": [{}] }}",
+                    vals.join(", ")
+                )
             }
             None => "{ \"type\": \"string\" }".to_string(),
         },
@@ -21377,7 +22395,10 @@ pub extern "C-unwind" fn knot_relation_build_index(
     let field_name = unsafe { str_from_raw(field_ptr, field_len) };
     let rows = match unsafe { as_ref(rel) } {
         Value::Relation(rows) => rows,
-        _ => panic!("knot runtime: build_index expected Relation, got {}", type_name(rel)),
+        _ => panic!(
+            "knot runtime: build_index expected Relation, got {}",
+            type_name(rel)
+        ),
     };
 
     let mut map: HashMap<Vec<u8>, Vec<*mut Value>> = HashMap::new();
@@ -21439,9 +22460,19 @@ pub extern "C-unwind" fn knot_crypto_generate_key_pair() -> *mut Value {
 
     let record = knot_record_empty(2);
     let k = b"privateKey";
-    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(Arc::from(secret_bytes.to_vec()))));
+    knot_record_set_field(
+        record,
+        k.as_ptr(),
+        k.len(),
+        alloc(Value::Bytes(Arc::from(secret_bytes.to_vec()))),
+    );
     let k = b"publicKey";
-    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(Arc::from(public.as_bytes().to_vec()))));
+    knot_record_set_field(
+        record,
+        k.as_ptr(),
+        k.len(),
+        alloc(Value::Bytes(Arc::from(public.as_bytes().to_vec()))),
+    );
     record
 }
 
@@ -21456,9 +22487,19 @@ pub extern "C-unwind" fn knot_crypto_generate_signing_key_pair() -> *mut Value {
 
     let record = knot_record_empty(2);
     let k = b"privateKey";
-    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(Arc::from(signing_key.to_bytes().to_vec()))));
+    knot_record_set_field(
+        record,
+        k.as_ptr(),
+        k.len(),
+        alloc(Value::Bytes(Arc::from(signing_key.to_bytes().to_vec()))),
+    );
     let k = b"publicKey";
-    knot_record_set_field(record, k.as_ptr(), k.len(), alloc(Value::Bytes(Arc::from(verifying_key.to_bytes().to_vec()))));
+    knot_record_set_field(
+        record,
+        k.as_ptr(),
+        k.len(),
+        alloc(Value::Bytes(Arc::from(verifying_key.to_bytes().to_vec()))),
+    );
     record
 }
 
@@ -21493,17 +22534,26 @@ fn derive_sealed_box_key(
 /// key off the wire), so a bad one is a value the caller handles, not an abort.
 /// Format: [ephemeral_pub: 32][nonce: 12][encrypted + tag: len+16]
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: *mut Value) -> *mut Value {
-    use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+pub extern "C-unwind" fn knot_crypto_encrypt(
+    public_key: *mut Value,
+    plaintext: *mut Value,
+) -> *mut Value {
     use chacha20poly1305::aead::Aead;
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 
     let pub_bytes = match unsafe { as_ref(public_key) } {
         Value::Bytes(b) => b,
-        _ => panic!("knot runtime: encrypt expected Bytes for publicKey, got {}", type_name(public_key)),
+        _ => panic!(
+            "knot runtime: encrypt expected Bytes for publicKey, got {}",
+            type_name(public_key)
+        ),
     };
     let plain = match unsafe { as_ref(plaintext) } {
         Value::Bytes(b) => b,
-        _ => panic!("knot runtime: encrypt expected Bytes for plaintext, got {}", type_name(plaintext)),
+        _ => panic!(
+            "knot runtime: encrypt expected Bytes for plaintext, got {}",
+            type_name(plaintext)
+        ),
     };
 
     let Ok(recipient_pub) = <[u8; 32]>::try_from(&**pub_bytes) else {
@@ -21553,17 +22603,26 @@ pub extern "C-unwind" fn knot_crypto_encrypt(public_key: *mut Value, plaintext: 
 /// body failing the Poly1305 tag check. Ciphertext is untrusted by definition,
 /// so a forged one must not be able to take the process down.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext: *mut Value) -> *mut Value {
-    use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
+pub extern "C-unwind" fn knot_crypto_decrypt(
+    private_key: *mut Value,
+    ciphertext: *mut Value,
+) -> *mut Value {
     use chacha20poly1305::aead::Aead;
+    use chacha20poly1305::{ChaCha20Poly1305, KeyInit};
 
     let priv_bytes = match unsafe { as_ref(private_key) } {
         Value::Bytes(b) => b,
-        _ => panic!("knot runtime: decrypt expected Bytes for privateKey, got {}", type_name(private_key)),
+        _ => panic!(
+            "knot runtime: decrypt expected Bytes for privateKey, got {}",
+            type_name(private_key)
+        ),
     };
     let ct = match unsafe { as_ref(ciphertext) } {
         Value::Bytes(b) => b,
-        _ => panic!("knot runtime: decrypt expected Bytes for ciphertext, got {}", type_name(ciphertext)),
+        _ => panic!(
+            "knot runtime: decrypt expected Bytes for ciphertext, got {}",
+            type_name(ciphertext)
+        ),
     };
 
     if ct.len() < 32 + 12 + 16 {
@@ -21608,16 +22667,25 @@ pub extern "C-unwind" fn knot_crypto_decrypt(private_key: *mut Value, ciphertext
 /// `Maybe Bytes` — `Just {value: signature}` on success, `Nothing {}` if the
 /// private key isn't 32 bytes.
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_crypto_sign(private_key: *mut Value, message: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_crypto_sign(
+    private_key: *mut Value,
+    message: *mut Value,
+) -> *mut Value {
     use ed25519_dalek::Signer;
 
     let priv_bytes = match unsafe { as_ref(private_key) } {
         Value::Bytes(b) => b,
-        _ => panic!("knot runtime: sign expected Bytes for privateKey, got {}", type_name(private_key)),
+        _ => panic!(
+            "knot runtime: sign expected Bytes for privateKey, got {}",
+            type_name(private_key)
+        ),
     };
     let msg = match unsafe { as_ref(message) } {
         Value::Bytes(b) => b,
-        _ => panic!("knot runtime: sign expected Bytes for message, got {}", type_name(message)),
+        _ => panic!(
+            "knot runtime: sign expected Bytes for message, got {}",
+            type_name(message)
+        ),
     };
 
     let Ok(secret_bytes) = <[u8; 32]>::try_from(&**priv_bytes) else {
@@ -21625,7 +22693,9 @@ pub extern "C-unwind" fn knot_crypto_sign(private_key: *mut Value, message: *mut
     };
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_bytes);
     let signature = signing_key.sign(msg);
-    make_just(alloc(Value::Bytes(Arc::from(signature.to_bytes().to_vec()))))
+    make_just(alloc(Value::Bytes(Arc::from(
+        signature.to_bytes().to_vec(),
+    ))))
 }
 
 /// Ed25519 verification. Takes (db, publicKey: Bytes, message: Bytes, signature: Bytes), returns Bool.
@@ -21640,15 +22710,24 @@ pub extern "C-unwind" fn knot_crypto_verify(
 
     let pub_bytes = match unsafe { as_ref(public_key) } {
         Value::Bytes(b) => b,
-        _ => panic!("knot runtime: verify expected Bytes for publicKey, got {}", type_name(public_key)),
+        _ => panic!(
+            "knot runtime: verify expected Bytes for publicKey, got {}",
+            type_name(public_key)
+        ),
     };
     let msg = match unsafe { as_ref(message) } {
         Value::Bytes(b) => b,
-        _ => panic!("knot runtime: verify expected Bytes for message, got {}", type_name(message)),
+        _ => panic!(
+            "knot runtime: verify expected Bytes for message, got {}",
+            type_name(message)
+        ),
     };
     let sig_bytes = match unsafe { as_ref(signature) } {
         Value::Bytes(b) => b,
-        _ => panic!("knot runtime: verify expected Bytes for signature, got {}", type_name(signature)),
+        _ => panic!(
+            "knot runtime: verify expected Bytes for signature, got {}",
+            type_name(signature)
+        ),
     };
 
     // `verify` validates untrusted data: a malformed signature or public key is
@@ -21689,7 +22768,10 @@ pub extern "C-unwind" fn knot_crypto_generate_signing_key_pair_io() -> *mut Valu
 }
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_crypto_encrypt_io(public_key: *mut Value, plaintext: *mut Value) -> *mut Value {
+pub extern "C-unwind" fn knot_crypto_encrypt_io(
+    public_key: *mut Value,
+    plaintext: *mut Value,
+) -> *mut Value {
     let env = knot_record_empty(2);
     let k = b"a";
     knot_record_set_field(env, k.as_ptr(), k.len(), public_key);
@@ -21704,12 +22786,6 @@ pub extern "C-unwind" fn knot_crypto_encrypt_io(public_key: *mut Value, plaintex
     }
     alloc_io_leaf2(thunk as *const u8, env, "encrypt", public_key, plaintext)
 }
-
-
-
-
-
-
 
 // ── Regression: a field added without a migrate block must not read back NULL ──
 //
@@ -21890,7 +22966,10 @@ mod extract_source_tests {
         alloc(Value::Record(
             fields
                 .iter()
-                .map(|(n, v)| RecordField { name: intern_str(n), value: *v })
+                .map(|(n, v)| RecordField {
+                    name: intern_str(n),
+                    value: *v,
+                })
                 .collect(),
         ))
     }
@@ -21941,7 +23020,10 @@ mod extract_source_tests {
     }
     #[test]
     fn bytes() {
-        assert_eq!(extract_source(alloc(Value::Bytes(Arc::from(&[1u8, 2][..])))), "b\"0102\"");
+        assert_eq!(
+            extract_source(alloc(Value::Bytes(Arc::from(&[1u8, 2][..])))),
+            "b\"0102\""
+        );
     }
 
     // ── collections ─────────────────────────────────────────────────
@@ -22015,7 +23097,10 @@ mod extract_source_tests {
     #[test]
     fn curried_builtin_positional_record_env() {
         // fn_3 middle/inner capture a {0,1}-keyed record.
-        let env = record(&[("0", func("\\a -> \\b -> a", std::ptr::null_mut())), ("1", alloc_int(0))]);
+        let env = record(&[
+            ("0", func("\\a -> \\b -> a", std::ptr::null_mut())),
+            ("1", alloc_int(0)),
+        ]);
         let f = func("fold", env);
         assert_eq!(extract_source(f), "(base.fold (\\a -> \\b -> a) (0))");
     }
@@ -22081,7 +23166,10 @@ mod show_tests {
         alloc(Value::Record(
             fields
                 .iter()
-                .map(|(n, v)| RecordField { name: intern_str(n), value: *v })
+                .map(|(n, v)| RecordField {
+                    name: intern_str(n),
+                    value: *v,
+                })
                 .collect(),
         ))
     }
@@ -22121,7 +23209,10 @@ mod show_tests {
     }
     #[test]
     fn curried_builtin_positional_record_shows_reapplied() {
-        let env = record(&[("0", func("\\a -> \\b -> a", std::ptr::null_mut())), ("1", alloc_int(0))]);
+        let env = record(&[
+            ("0", func("\\a -> \\b -> a", std::ptr::null_mut())),
+            ("1", alloc_int(0)),
+        ]);
         let f = func("fold", env);
         assert_eq!(format_value(f), "(base.fold (\\a -> \\b -> a) (0))");
     }
@@ -22152,7 +23243,10 @@ mod show_tests {
     }
     #[test]
     fn io_multiarg_shows_source() {
-        assert_eq!(format_value(io("base.writeFile (\"/tmp/x\") (\"hi\")")), "base.writeFile (\"/tmp/x\") (\"hi\")");
+        assert_eq!(
+            format_value(io("base.writeFile (\"/tmp/x\") (\"hi\")")),
+            "base.writeFile (\"/tmp/x\") (\"hi\")"
+        );
     }
     #[test]
     fn io_unknown_source_still_placeholder() {
@@ -22166,23 +23260,3 @@ mod show_tests {
         assert_eq!(format_value(alloc(Value::Unit)), "{}");
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

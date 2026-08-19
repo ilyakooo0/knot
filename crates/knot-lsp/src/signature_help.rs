@@ -4,9 +4,7 @@ use lsp_types::*;
 
 use knot::ast::Span;
 
-use crate::shared::{
-    extract_param_names, find_enclosing_application, parse_function_params,
-};
+use crate::shared::{extract_param_names, find_enclosing_application, parse_function_params};
 use crate::state::{DocumentState, ServerState};
 use crate::utils::position_to_offset;
 
@@ -87,8 +85,7 @@ pub(crate) fn handle_signature_help(
     // otherwise attach a name to the return-type slot).
     param_names.truncate(arity);
     if param_names.len() < arity {
-        let mut existing: std::collections::HashSet<String> =
-            param_names.iter().cloned().collect();
+        let mut existing: std::collections::HashSet<String> = param_names.iter().cloned().collect();
         for i in param_names.len()..arity {
             // Walk `a`, `b`, … `z`, `a1`, `b1`, … skipping any that collide.
             let mut k = i;
@@ -203,9 +200,10 @@ fn lookup_local_binding_type(
         // sibling decl that merely precedes the call is not in scope and must
         // not be treated as a shadowing binding.
         if let Some(enc) = enclosing
-            && (span.start < enc.start || span.end > enc.end) {
-                continue;
-            }
+            && (span.start < enc.start || span.end > enc.end)
+        {
+            continue;
+        }
         // Char-boundary-safe: a stale span could land mid-multibyte-char.
         let name = crate::utils::safe_slice(&doc.source, *span);
         if name != func_name {
@@ -285,5 +283,3 @@ fn param_doc(
     }
     None
 }
-
-

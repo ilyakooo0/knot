@@ -52,7 +52,13 @@ fn get(base: &str, path: &str) -> String {
 fn send(base: &str, method: &str, path: &str, json: &str) -> String {
     let out = Command::new("curl")
         .args([
-            "-s", "-X", method, "-H", "Content-Type: application/json", "-d", json,
+            "-s",
+            "-X",
+            method,
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            json,
             &format!("{base}{path}"),
         ])
         .output()
@@ -62,7 +68,14 @@ fn send(base: &str, method: &str, path: &str, json: &str) -> String {
 
 fn status(base: &str, path: &str) -> String {
     let out = Command::new("curl")
-        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", &format!("{base}{path}")])
+        .args([
+            "-s",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            &format!("{base}{path}"),
+        ])
         .output()
         .expect("curl failed");
     String::from_utf8_lossy(&out.stdout).trim().to_string()

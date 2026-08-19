@@ -57,21 +57,16 @@ pub(crate) fn handle_linked_editing_range(
         // Text}`) — mirror `rename.rs::field_sites_in_decl`, which walks both
         // the scheme and the body. Without this a live-rename desyncs them.
         if let Some(scheme) = &decl.sig {
-            collect_type_field_name_spans(
-                &scheme.ty,
-                word,
-                &doc.source,
-                &mut linked_spans,
-            );
+            collect_type_field_name_spans(&scheme.ty, word, &doc.source, &mut linked_spans);
         }
-            // A named function field: walk its body.
-            collect_field_name_spans(
-                &decl.value,
-                word,
-                &doc.source,
-                &mut linked_spans,
-                &mut pun_seen,
-            );
+        // A named function field: walk its body.
+        collect_field_name_spans(
+            &decl.value,
+            word,
+            &doc.source,
+            &mut linked_spans,
+            &mut pun_seen,
+        );
         if pun_seen {
             return None;
         }
@@ -213,14 +208,11 @@ fn collect_type_field_name_spans(
             let mut search_start = ty.span.start;
             for fld in fields {
                 if fld.name == field_name
-                    && let Some(span) = find_word_in_source(
-                        source,
-                        field_name,
-                        search_start,
-                        fld.value.span.start,
-                    ) {
-                        ranges.push(span);
-                    }
+                    && let Some(span) =
+                        find_word_in_source(source, field_name, search_start, fld.value.span.start)
+                {
+                    ranges.push(span);
+                }
                 collect_type_field_name_spans(&fld.value, field_name, source, ranges);
                 search_start = fld.value.span.end;
             }
@@ -235,9 +227,10 @@ fn collect_type_field_name_spans(
                             field_name,
                             search_start,
                             fld.value.span.start,
-                        ) {
-                            ranges.push(span);
-                        }
+                        )
+                    {
+                        ranges.push(span);
+                    }
                     collect_type_field_name_spans(&fld.value, field_name, source, ranges);
                     search_start = fld.value.span.end;
                 }
@@ -296,9 +289,10 @@ fn collect_pat_field_spans(
                                 field_name,
                                 search_start,
                                 sub.span.start,
-                            ) {
-                                ranges.push(span);
-                            }
+                            )
+                        {
+                            ranges.push(span);
+                        }
                         search_start = sub.span.end;
                     }
                     None => {
@@ -336,5 +330,3 @@ fn collect_pat_field_spans(
         _ => {}
     }
 }
-
-

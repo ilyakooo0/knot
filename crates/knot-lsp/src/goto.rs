@@ -3,14 +3,13 @@
 
 use lsp_types::*;
 
-use knot::ast::{self, ExprKind};
 use crate::utils::top_fields;
+use knot::ast::{self, ExprKind};
 
 use crate::shared::extract_principal_type_name;
 use crate::state::ServerState;
 use crate::utils::{
-    find_word_in_source, ident_lookup_offset, position_to_offset, span_to_range,
-    word_at_position,
+    find_word_in_source, ident_lookup_offset, position_to_offset, span_to_range, word_at_position,
 };
 
 /// Find the span of a type *declaration's* name token (`data T = …` /
@@ -27,8 +26,7 @@ fn type_decl_name_span(program: &ast::Expr, source: &str, type_name: &str) -> Op
         };
         if is_match {
             return Some(
-                find_word_in_source(source, type_name, dspan.start, dspan.end)
-                    .unwrap_or(dspan),
+                find_word_in_source(source, type_name, dspan.start, dspan.end).unwrap_or(dspan),
             );
         }
     }
@@ -176,5 +174,3 @@ pub(crate) fn handle_goto_type_definition(
 
     None
 }
-
-

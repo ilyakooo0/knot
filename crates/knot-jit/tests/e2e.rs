@@ -20,11 +20,7 @@ pub struct TempDir(pub PathBuf);
 
 impl TempDir {
     pub fn fresh(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "knot_e2e_{}_{}",
-            name,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("knot_e2e_{}_{}", name, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir); // clear any stale same-pid dir
         std::fs::create_dir_all(&dir).unwrap();
         Self(dir)

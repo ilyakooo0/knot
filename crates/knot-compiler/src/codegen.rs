@@ -5,20 +5,19 @@
 //! values (managed by the runtime). The generated code calls into runtime
 //! functions for value construction, operations, and SQLite persistence.
 
+use crate::decl_view::{DeclViewKind, decl_views};
 use crate::infer::{MonadInfo, MonadKind};
 use crate::types::{ResolvedType, TypeEnv};
+use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::types;
 use cranelift_codegen::ir::{AbiParam, InstBuilder, StackSlotData, StackSlotKind, Value};
 use cranelift_codegen::settings::{self, Configurable};
-use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage};
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use crate::decl_view::{decl_views, DeclViewKind};
 use knot::ast;
 use std::collections::{HashMap, HashSet};
-
 
 // ── Codegen state ─────────────────────────────────────────────────
 
@@ -608,12 +607,8 @@ fn classify_required_constant_type(
         ast::TypeKind::Refined { base, predicate } => {
             // Inline refinement: `name : Int 1 where \x -> x > 0`. The refined type
             // has no name of its own, so we use the constant's name as the label.
-            let (base_type, _) = classify_required_constant_type(
-                base,
-                const_name,
-                type_aliases,
-                refined_types,
-            )?;
+            let (base_type, _) =
+                classify_required_constant_type(base, const_name, type_aliases, refined_types)?;
             Some((
                 base_type,
                 Some(RequiredRefinement {
@@ -656,16 +651,17 @@ fn classify_required_constant_type(
 fn format_default_value_display(expr: &ast::Expr) -> Option<String> {
     match &expr.node {
         ast::ExprKind::Lit(lit) => format_literal_display(lit),
-        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand } => {
+        ast::ExprKind::UnaryOp {
+            op: ast::UnaryOp::Neg,
+            operand,
+        } => {
             if let ast::ExprKind::Lit(lit) = &operand.node {
                 format_literal_display(lit).map(|s| format!("-{}", s))
             } else {
                 None
             }
         }
-        ast::ExprKind::Constructor(name) if name == "Nothing" => {
-            Some("Nothing".to_string())
-        }
+        ast::ExprKind::Constructor(name) if name == "Nothing" => Some("Nothing".to_string()),
         ast::ExprKind::Constructor(name) if name == "True" => Some("true".to_string()),
         ast::ExprKind::Constructor(name) if name == "False" => Some("false".to_string()),
         ast::ExprKind::App { func, arg } => {
@@ -675,16 +671,19 @@ fn format_default_value_display(expr: &ast::Expr) -> Option<String> {
                 }
                 if (name == "True" || name == "False")
                     && let ast::ExprKind::Record(fields) = &arg.node
-                        && fields.is_empty() {
-                            return Some(if name == "True" { "true" } else { "false" }.to_string());
-                        }
+                    && fields.is_empty()
+                {
+                    return Some(if name == "True" { "true" } else { "false" }.to_string());
+                }
                 if name == "Just" {
                     // `Just {value: <lit>}` — Knot constructors take a record.
                     if let ast::ExprKind::Record(fields) = &arg.node
-                        && fields.len() == 1 && fields[0].name == "value" {
-                            return format_default_value_display(&fields[0].value)
-                                .map(|s| format!("Just {}", s));
-                        }
+                        && fields.len() == 1
+                        && fields[0].name == "value"
+                    {
+                        return format_default_value_display(&fields[0].value)
+                            .map(|s| format!("Just {}", s));
+                    }
                 }
             }
             None
@@ -918,10 +917,8 @@ fn compile_inner<M: cranelift_module::Module>(
     cg.migrate_schemas = type_env.migrate_schemas.clone();
     // Sources the codebase no longer declares but the schema lockfile still
     // tracks: emit a startup DROP for each so removed relations don't linger.
-    cg.dropped_sources = crate::lockfile::dropped_sources(
-        std::path::Path::new(source_file),
-        type_env,
-    );
+    cg.dropped_sources =
+        crate::lockfile::dropped_sources(std::path::Path::new(source_file), type_env);
     cg.type_aliases = type_env.aliases.clone();
     cg.subset_constraints = type_env.subset_constraints.clone();
     cg.monad_info = monad_info.clone();
@@ -932,9 +929,7 @@ fn compile_inner<M: cranelift_module::Module>(
     cg.alias_ast = decl_views(program)
         .iter()
         .filter_map(|d| match d.kind {
-            DeclViewKind::TypeAlias { params: [], ty } => {
-                Some((d.name.to_string(), ty.clone()))
-            }
+            DeclViewKind::TypeAlias { params: [], ty } => Some((d.name.to_string(), ty.clone())),
             _ => None,
         })
         .collect();
@@ -964,7 +959,11 @@ fn compile_inner<M: cranelift_module::Module>(
     // Each becomes a 0-param user_fn whose body reads --<name>=value at startup,
     // exits if missing, and runs any attached refinement predicate.
     for decl in decl_views(program) {
-        if let DeclViewKind::Fun { body: None, ty: Some(ts) } = decl.kind {
+        if let DeclViewKind::Fun {
+            body: None,
+            ty: Some(ts),
+        } = decl.kind
+        {
             let name = decl.name;
             if name == "main" {
                 continue;
@@ -973,12 +972,8 @@ fn compile_inner<M: cranelift_module::Module>(
             if cg.global_fns.contains_key(name) {
                 continue;
             }
-            let classified = classify_required_constant_type(
-                &ts.ty,
-                name,
-                &cg.type_aliases,
-                &cg.refined_types,
-            );
+            let classified =
+                classify_required_constant_type(&ts.ty, name, &cg.type_aliases, &cg.refined_types);
             let (base_type, refinement) = match classified {
                 Some(v) => v,
                 None => {
@@ -1002,7 +997,8 @@ fn compile_inner<M: cranelift_module::Module>(
                 .declare_function(&func_name, Linkage::Local, &sig)
                 .unwrap();
             cg.global_fns.insert(name.to_string(), (func_id, 0));
-            cg.overridable_constants.insert(name.to_string(), base_type.clone());
+            cg.overridable_constants
+                .insert(name.to_string(), base_type.clone());
             cg.required_constants.push(RequiredConstant {
                 name: name.to_string(),
                 base_type,
@@ -1012,7 +1008,10 @@ fn compile_inner<M: cranelift_module::Module>(
     }
     // Compute overridable constants: 0-param Fun declarations with scalar types
     for decl in decl_views(program) {
-        if let DeclViewKind::Fun { body: Some(body), .. } = decl.kind {
+        if let DeclViewKind::Fun {
+            body: Some(body), ..
+        } = decl.kind
+        {
             let name = decl.name;
             if name == "main" {
                 continue;
@@ -1045,35 +1044,43 @@ fn compile_inner<M: cranelift_module::Module>(
                     _ => continue,
                 };
                 match base_type {
-                    "Int"
-                        if val.parse::<i64>().is_err() => {
-                            cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
-                                format!("invalid compile-time override '{}' for --{} (expected Int)", val, name),
-                            ));
-                            continue;
-                        }
-                    "Float"
-                        if val.parse::<f64>().is_err() => {
-                            cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
-                                format!("invalid compile-time override '{}' for --{} (expected Float)", val, name),
-                            ));
-                            continue;
-                        }
+                    "Int" if val.parse::<i64>().is_err() => {
+                        cg.diagnostics
+                            .push(knot::diagnostic::Diagnostic::error(format!(
+                                "invalid compile-time override '{}' for --{} (expected Int)",
+                                val, name
+                            )));
+                        continue;
+                    }
+                    "Float" if val.parse::<f64>().is_err() => {
+                        cg.diagnostics
+                            .push(knot::diagnostic::Diagnostic::error(format!(
+                                "invalid compile-time override '{}' for --{} (expected Float)",
+                                val, name
+                            )));
+                        continue;
+                    }
                     "Bool"
-                        if !matches!(val.as_str(), "true" | "True" | "false" | "False" | "0" | "1") => {
-                            cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                        if !matches!(
+                            val.as_str(),
+                            "true" | "True" | "false" | "False" | "0" | "1"
+                        ) =>
+                    {
+                        cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
                                 format!("invalid compile-time override '{}' for --{} (expected true or false)", val, name),
                             ));
-                            continue;
-                        }
+                        continue;
+                    }
                     _ => {} // Text always valid
                 }
             }
             cg.compile_time_overrides.insert(name.clone(), val.clone());
         } else {
-            cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
-                format!("unknown constant '{}' for compile-time override", name),
-            ));
+            cg.diagnostics
+                .push(knot::diagnostic::Diagnostic::error(format!(
+                    "unknown constant '{}' for compile-time override",
+                    name
+                )));
         }
     }
     // Bail out before codegen if declaration collection (or override
@@ -1157,8 +1164,7 @@ fn build_isa(pic: bool) -> std::sync::Arc<dyn cranelift_codegen::isa::TargetIsa>
         .set("is_pic", if pic { "true" } else { "false" })
         .unwrap();
     flag_builder.set("opt_level", "speed").unwrap();
-    let mut isa_builder =
-        cranelift_native::builder().expect("failed to detect host CPU");
+    let mut isa_builder = cranelift_native::builder().expect("failed to detect host CPU");
     // cranelift-native enables return-address signing (PAC) on Apple Silicon.
     // The resulting RA_SIGN_STATE DWARF expressions in our .eh_frame are
     // rejected by Apple's libunwind when it steps through generated frames,
@@ -1208,10 +1214,8 @@ impl Codegen<cranelift_jit::JITModule> {
         // `with_isa` supplies the maximally-optimizing host ISA (build_isa);
         // the default `new` would use opt_level=none. Then install the custom
         // lookup (with_isa defaults to dlsym anyway, but be explicit).
-        let mut builder = JITBuilder::with_isa(
-            build_isa(false),
-            cranelift_module::default_libcall_names(),
-        );
+        let mut builder =
+            JITBuilder::with_isa(build_isa(false), cranelift_module::default_libcall_names());
         builder.symbol_lookup_fn(Box::new(|name: &str| {
             let Ok(cname) = std::ffi::CString::new(name) else {
                 return None;
@@ -1652,7 +1656,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // Schema tracking
         self.declare_rt("knot_schema_init", &[p], &[]);
         self.declare_rt("knot_source_migrate", &[p, p, p, p, p, p, p, p], &[]);
-        self.declare_rt("knot_source_migrate_preview", &[p, p, p, p, p, p, p, p], &[p]);
+        self.declare_rt(
+            "knot_source_migrate_preview",
+            &[p, p, p, p, p, p, p, p],
+            &[p],
+        );
 
         // Debug
         self.declare_rt("knot_debug_init", &[], &[]);
@@ -1663,7 +1671,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // CLI constant overrides
         self.declare_rt("knot_override_lookup", &[p, p, types::I32], &[p]);
         self.declare_rt("knot_override_required_lookup", &[p, p, types::I32], &[p]);
-        self.declare_rt("knot_override_refinement_check", &[p, p, p, p, p, p, p], &[p]);
+        self.declare_rt(
+            "knot_override_refinement_check",
+            &[p, p, p, p, p, p, p],
+            &[p],
+        );
         self.declare_rt("knot_override_check_help", &[p, p], &[]);
 
         // STM tracking
@@ -1714,7 +1726,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_now", &[], &[p]);
 
         // Subset constraints
-        self.declare_rt("knot_constraint_register", &[p, p, p, p, p, p, p, p, p], &[]);
+        self.declare_rt(
+            "knot_constraint_register",
+            &[p, p, p, p, p, p, p, p, p],
+            &[],
+        );
         // Refinement validation
         // Result monad
         self.declare_rt("knot_result_bind", &[p, p, p], &[p]);
@@ -1725,8 +1741,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.declare_rt("knot_maybe_yield", &[p], &[p]);
         self.declare_rt("knot_maybe_map", &[p, p, p], &[p]);
         self.declare_rt("knot_maybe_empty", &[], &[p]);
-        self.declare_rt("knot_refinement_validate_relation", &[p, p, p, p, p, p, p], &[]);
-        self.declare_rt("knot_route_set_field_refinement", &[p, p, p, p, p, p, p, p], &[]);
+        self.declare_rt(
+            "knot_refinement_validate_relation",
+            &[p, p, p, p, p, p, p],
+            &[],
+        );
+        self.declare_rt(
+            "knot_route_set_field_refinement",
+            &[p, p, p, p, p, p, p, p],
+            &[],
+        );
         self.declare_rt("knot_route_set_rate_limit", &[p, p, p, p], &[]);
 
         // Monadic bind for relations (do-desugaring)
@@ -2072,9 +2096,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     ) -> cranelift_codegen::ir::Value {
         if name == "True" || name == "False" {
             let val = if name == "True" { 1i64 } else { 0i64 };
-            let arg = builder
-                .ins()
-                .iconst(cranelift_codegen::ir::types::I32, val);
+            let arg = builder.ins().iconst(cranelift_codegen::ir::types::I32, val);
             self.call_rt(builder, "knot_value_bool", &[arg])
         } else {
             match self.nullable_ctors.get(name).cloned() {
@@ -2152,7 +2174,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// Reads the stdlib fn from its flattened `base.<name>` key (unshadowable).
     fn define_stdlib_fn_1(&mut self, name: &str, rt_name: &str) {
         let rt_name_owned = rt_name.to_string();
-        let func_id = { let (func_id, _) = self.global_fns[&Self::stdlib_key(name)]; func_id };
+        let func_id = {
+            let (func_id, _) = self.global_fns[&Self::stdlib_key(name)];
+            func_id
+        };
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
         sig.params.push(AbiParam::new(self.ptr_type)); // arg
@@ -2286,12 +2311,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// Define a 2-param stdlib function using currying:
     /// outer(db, arg1) -> Function(inner, arg1, name)  — arg1 passed directly as env
     /// inner(db, env=arg1, arg2) -> rt_fn(db, arg1, arg2)
-    fn define_stdlib_fn_2(
-        &mut self,
-        name: &str,
-        rt_name: &str,
-        rt_needs_db: bool,
-    ) {
+    fn define_stdlib_fn_2(&mut self, name: &str, rt_name: &str, rt_needs_db: bool) {
         // Stdlib fns are always under the flattened `base.<name>` key — no
         // shadow branch; the bare name is the user's alone.
         let inner_id = self.declare_closure_fn(&format!("__stdlib_{}_apply", name));
@@ -2311,8 +2331,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let inner_ref = cg.module.declare_func_in_func(inner_id, builder.func);
             let fn_addr = builder.ins().func_addr(cg.ptr_type, inner_ref);
             let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
-            let result =
-                cg.call_rt(builder, "knot_value_function", &[fn_addr, arg1, src_ptr, src_len]);
+            let result = cg.call_rt(
+                builder,
+                "knot_value_function",
+                &[fn_addr, arg1, src_ptr, src_len],
+            );
             builder.ins().return_(&[result]);
         });
 
@@ -2342,11 +2365,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// outer(db, arg1) -> Function(middle, {arg1})
     /// middle(db, {arg1}, arg2) -> Function(inner, {arg1, arg2})
     /// inner(db, {arg1, arg2}, arg3) -> rt_fn(db, arg1, arg2, arg3)
-    fn define_stdlib_fn_3(
-        &mut self,
-        name: &str,
-        rt_name: &str,
-    ) {
+    fn define_stdlib_fn_3(&mut self, name: &str, rt_name: &str) {
         // Stdlib fns are always under the flattened `base.<name>` key — no
         // shadow branch; the bare name is the user's alone.
         let middle_id = self.declare_closure_fn(&format!("__stdlib_{}_mid", name));
@@ -2359,7 +2378,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         outer_sig.returns.push(AbiParam::new(self.ptr_type));
 
         let fn_name = name.to_string();
-        let outer_id = { let (func_id, _) = self.global_fns[&Self::stdlib_key(name)]; func_id };
+        let outer_id = {
+            let (func_id, _) = self.global_fns[&Self::stdlib_key(name)];
+            func_id
+        };
         self.build_function(outer_id, outer_sig, |cg, builder, entry| {
             let arg1 = builder.block_params(entry)[1];
 
@@ -2367,8 +2389,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let mid_ref = cg.module.declare_func_in_func(middle_id, builder.func);
             let fn_addr = builder.ins().func_addr(cg.ptr_type, mid_ref);
             let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
-            let result =
-                cg.call_rt(builder, "knot_value_function", &[fn_addr, arg1, src_ptr, src_len]);
+            let result = cg.call_rt(
+                builder,
+                "knot_value_function",
+                &[fn_addr, arg1, src_ptr, src_len],
+            );
             builder.ins().return_(&[result]);
         });
 
@@ -2386,9 +2411,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             // Build new env with both args (keys "0","1" are pre-sorted)
             let ptr_bytes = cg.ptr_type.bytes() as i32;
-            let slot = builder.create_sized_stack_slot(
-                StackSlotData::new(StackSlotKind::ExplicitSlot, (6 * ptr_bytes) as u32, 3),
-            );
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                (6 * ptr_bytes) as u32,
+                3,
+            ));
             let (k0_ptr, k0_len) = cg.string_ptr(builder, "0");
             builder.ins().stack_store(k0_ptr, slot, 0);
             builder.ins().stack_store(k0_len, slot, ptr_bytes);
@@ -2404,8 +2431,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let inner_ref = cg.module.declare_func_in_func(inner_id, builder.func);
             let fn_addr = builder.ins().func_addr(cg.ptr_type, inner_ref);
             let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
-            let result =
-                cg.call_rt(builder, "knot_value_function", &[fn_addr, env, src_ptr, src_len]);
+            let result = cg.call_rt(
+                builder,
+                "knot_value_function",
+                &[fn_addr, env, src_ptr, src_len],
+            );
             builder.ins().return_(&[result]);
         });
 
@@ -2466,26 +2496,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // `register_builtins` in infer.rs), so they don't appear as user-source
         // `data` decls. Without this, `impl Functor Maybe` etc. would be silently
         // dropped from the dispatcher lookup at codegen time.
-        self.data_constructors.insert(
-            "Maybe".into(),
-            vec!["Nothing".into(), "Just".into()],
-        );
-        self.data_constructors.insert(
-            "Result".into(),
-            vec!["Err".into(), "Ok".into()],
-        );
-        self.data_constructors.insert(
-            "Bool".into(),
-            vec!["True".into(), "False".into()],
-        );
+        self.data_constructors
+            .insert("Maybe".into(), vec!["Nothing".into(), "Just".into()]);
+        self.data_constructors
+            .insert("Result".into(), vec!["Err".into(), "Ok".into()]);
+        self.data_constructors
+            .insert("Bool".into(), vec!["True".into(), "False".into()]);
         self.data_constructors.insert(
             "Level".into(),
             vec!["Debug".into(), "Info".into(), "Warn".into(), "Error".into()],
         );
-        self.data_constructors.insert(
-            "List".into(),
-            vec!["Nil".into(), "Cons".into()],
-        );
+        self.data_constructors
+            .insert("List".into(), vec!["Nil".into(), "Cons".into()]);
 
         // __bind/__yield/__empty are desugared do-block operations that dispatch
         // through Monad/Applicative/Alternative trait impls (see compile_app,
@@ -2512,32 +2534,101 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // Builtin relation/list operations and helpers, defined via the
         // knot_relation_*/knot_text_* runtime functions below.
         let stdlib_names = [
-            "filter", "map", "fold", "forEach", "match", "single", "any", "all", "diff", "inter", "sum", "avg",
-            "minOn", "maxOn", "countWhere", "head", "findFirst", "distinct",
+            "filter",
+            "map",
+            "fold",
+            "forEach",
+            "match",
+            "single",
+            "any",
+            "all",
+            "diff",
+            "inter",
+            "sum",
+            "avg",
+            "minOn",
+            "maxOn",
+            "countWhere",
+            "head",
+            "findFirst",
+            "distinct",
             // Relation query forms, registered as first-class function values
             // so they can live as fields of the `base` record (`base.count`,
             // `base.union`, `base.bind`). `sum` is already registered above.
-            "count", "union", "bind",
-            "toUpper", "toLower", "sortBy", "sortByDesc",
-            "length", "trim", "trimAscii", "ltrimAscii", "rtrimAscii", "byteLength", "toAsciiLower", "toAsciiUpper", "contains", "startsWith", "endsWith", "elem", "reverse",
-            "chars", "id", "not", "toJson", "parseJson",
-            "traverse", "take", "drop",
-            "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
-            "strip", "dress",
-            "bytesLength", "bytesSlice", "bytesConcat",
-            "textToBytes", "bytesToText", "bytesToHex", "bytesFromHex", "hexDecode",
-            "bytesGet", "hash",
-            "floor", "intToFloat", "textToInt", "textToFloat",
-            "abs", "intMin", "intMax", "clamp", "unify",
-            "readFile", "writeFile", "appendFile",
+            "count",
+            "union",
+            "bind",
+            "toUpper",
+            "toLower",
+            "sortBy",
+            "sortByDesc",
+            "length",
+            "trim",
+            "trimAscii",
+            "ltrimAscii",
+            "rtrimAscii",
+            "byteLength",
+            "toAsciiLower",
+            "toAsciiUpper",
+            "contains",
+            "startsWith",
+            "endsWith",
+            "elem",
+            "reverse",
+            "chars",
+            "id",
+            "not",
+            "toJson",
+            "parseJson",
+            "traverse",
+            "take",
+            "drop",
+            "stripUnit",
+            "withUnit",
+            "stripFloatUnit",
+            "withFloatUnit",
+            "strip",
+            "dress",
+            "bytesLength",
+            "bytesSlice",
+            "bytesConcat",
+            "textToBytes",
+            "bytesToText",
+            "bytesToHex",
+            "bytesFromHex",
+            "hexDecode",
+            "bytesGet",
+            "hash",
+            "floor",
+            "intToFloat",
+            "textToInt",
+            "textToFloat",
+            "abs",
+            "intMin",
+            "intMax",
+            "clamp",
+            "unify",
+            "readFile",
+            "writeFile",
+            "appendFile",
             "run",
-            "fileExists", "removeFile", "listDir",
-            "randomInt", "sleep", "fork", "race",
-            "encrypt", "decrypt", "sign", "verify",
+            "fileExists",
+            "removeFile",
+            "listDir",
+            "randomInt",
+            "sleep",
+            "fork",
+            "race",
+            "encrypt",
+            "decrypt",
+            "sign",
+            "verify",
             "upsertBy",
             // Console IO builtins, registered so they become first-class
             // function values living as fields of the `base` record.
-            "println", "print", "putLine",
+            "println",
+            "print",
+            "putLine",
             // `logInfo`/`logWarn`/`logError`/`logDebug` are deprecated prelude
             // `base` record fields (with a `(<>logCtx)` constraint), NOT stdlib
             // fns — registering them here would declare a `knot_user_logInfo`
@@ -2557,9 +2648,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // List ADT builtins (`base.list.*`), exposed nested under the
             // `list` namespace in the prelude record. Runtime-implemented
             // (knot_list_*) since the prelude record can't self-reference.
-            "listNil", "listCons", "listIsNil", "listHead", "listTail",
-            "listLength", "listMap", "listFilter", "listFold", "listReverse",
-            "listAppend", "listFromRelation", "listToRelation",
+            "listNil",
+            "listCons",
+            "listIsNil",
+            "listHead",
+            "listTail",
+            "listLength",
+            "listMap",
+            "listFilter",
+            "listFold",
+            "listReverse",
+            "listAppend",
+            "listFromRelation",
+            "listToRelation",
             // Vec data-op builtins (`base.vec.*`), the `Vec` overloads resolved
             // via `^count` etc. Internal-only (bare keys): user code reaches
             // them only through the `vec` namespace record.
@@ -2588,15 +2689,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
         for decl in decl_views(program) {
             let name = decl.name;
             match decl.kind {
-                DeclViewKind::Fun { body: Some(body), .. } => {
+                DeclViewKind::Fun {
+                    body: Some(body), ..
+                } => {
                     {
                         // A self-referential relation query field is a fixpoint,
                         // handled by the `With` arm — NOT registered as a plain
                         // global fn (its body would self-call the global fn and
                         // diverge). Skip registration entirely.
-                        if self.expr_is_known_relation(body)
-                            && expr_mentions_free_var(body, name)
-                        {
+                        if self.expr_is_known_relation(body) && expr_mentions_free_var(body, name) {
                             continue;
                         }
                         // Skip user functions that shadow stdlib builtins —
@@ -2619,13 +2720,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             .module
                             .declare_function(&func_name, Linkage::Local, &sig)
                             .unwrap();
-                        self.global_fns.insert(name.to_string(), (func_id, n_params));
+                        self.global_fns
+                            .insert(name.to_string(), (func_id, n_params));
                         self.fun_bodies.insert(name.to_string(), body.clone());
                     }
                 }
                 DeclViewKind::Data { ctors, .. } => {
-                    let ctor_names: Vec<String> =
-                        ctors.iter().map(|c| c.name.clone()).collect();
+                    let ctor_names: Vec<String> = ctors.iter().map(|c| c.name.clone()).collect();
                     self.data_constructors.insert(name.to_string(), ctor_names);
 
                     // Qualified constructors: `Name.Ctor` (and the bare
@@ -2645,7 +2746,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // that breaks equality and pattern matching.
                 }
                 DeclViewKind::Route { entries } => {
-                    self.route_entries.insert(name.to_string(), entries.to_vec());
+                    self.route_entries
+                        .insert(name.to_string(), entries.to_vec());
                     // Last route entry (in source declaration order) with a
                     // given constructor name wins, matching infer's fetch
                     // metadata resolution so typecheck and codegen agree on
@@ -2865,33 +2967,39 @@ impl<M: cranelift_module::Module> Codegen<M> {
         });
 
         // Applicative_Relation_yield(db, x) → knot_relation_singleton(x)
-        define_if_registered!("Applicative_Relation_yield", |cg: &mut Self, func_id: FuncId| {
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.params.push(AbiParam::new(cg.ptr_type)); // x
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            cg.build_function(func_id, sig, |cg, builder, entry| {
-                let x = builder.block_params(entry)[1];
-                let result = cg.call_rt(builder, "knot_relation_singleton", &[x]);
-                builder.ins().return_(&[result]);
-            });
-        });
+        define_if_registered!(
+            "Applicative_Relation_yield",
+            |cg: &mut Self, func_id: FuncId| {
+                let mut sig = cg.module.make_signature();
+                sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                sig.params.push(AbiParam::new(cg.ptr_type)); // x
+                sig.returns.push(AbiParam::new(cg.ptr_type));
+                cg.build_function(func_id, sig, |cg, builder, entry| {
+                    let x = builder.block_params(entry)[1];
+                    let result = cg.call_rt(builder, "knot_relation_singleton", &[x]);
+                    builder.ins().return_(&[result]);
+                });
+            }
+        );
 
         // Applicative_Relation_ap(db, fs, xs) → knot_relation_ap(db, fs, xs)
-        define_if_registered!("Applicative_Relation_ap", |cg: &mut Self, func_id: FuncId| {
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.params.push(AbiParam::new(cg.ptr_type)); // fs
-            sig.params.push(AbiParam::new(cg.ptr_type)); // xs
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            cg.build_function(func_id, sig, |cg, builder, entry| {
-                let db = builder.block_params(entry)[0];
-                let fs = builder.block_params(entry)[1];
-                let xs = builder.block_params(entry)[2];
-                let result = cg.call_rt(builder, "knot_relation_ap", &[db, fs, xs]);
-                builder.ins().return_(&[result]);
-            });
-        });
+        define_if_registered!(
+            "Applicative_Relation_ap",
+            |cg: &mut Self, func_id: FuncId| {
+                let mut sig = cg.module.make_signature();
+                sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                sig.params.push(AbiParam::new(cg.ptr_type)); // fs
+                sig.params.push(AbiParam::new(cg.ptr_type)); // xs
+                sig.returns.push(AbiParam::new(cg.ptr_type));
+                cg.build_function(func_id, sig, |cg, builder, entry| {
+                    let db = builder.block_params(entry)[0];
+                    let fs = builder.block_params(entry)[1];
+                    let xs = builder.block_params(entry)[2];
+                    let result = cg.call_rt(builder, "knot_relation_ap", &[db, fs, xs]);
+                    builder.ins().return_(&[result]);
+                });
+            }
+        );
 
         // Monad_Relation_bind(db, f, rel) → knot_relation_bind(db, f, rel)
         define_if_registered!("Monad_Relation_bind", |cg: &mut Self, func_id: FuncId| {
@@ -2910,111 +3018,132 @@ impl<M: cranelift_module::Module> Codegen<M> {
         });
 
         // Alternative_Relation_empty(db) → knot_relation_empty()
-        define_if_registered!("Alternative_Relation_empty", |cg: &mut Self, func_id: FuncId| {
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            cg.build_function(func_id, sig, |cg, builder, _entry| {
-                let result = cg.call_rt(builder, "knot_relation_empty", &[]);
-                builder.ins().return_(&[result]);
-            });
-        });
+        define_if_registered!(
+            "Alternative_Relation_empty",
+            |cg: &mut Self, func_id: FuncId| {
+                let mut sig = cg.module.make_signature();
+                sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                sig.returns.push(AbiParam::new(cg.ptr_type));
+                cg.build_function(func_id, sig, |cg, builder, _entry| {
+                    let result = cg.call_rt(builder, "knot_relation_empty", &[]);
+                    builder.ins().return_(&[result]);
+                });
+            }
+        );
 
         // Alternative_Relation_alt(db, a, b) → knot_relation_union(db, a, b)
-        define_if_registered!("Alternative_Relation_alt", |cg: &mut Self, func_id: FuncId| {
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.params.push(AbiParam::new(cg.ptr_type)); // a
-            sig.params.push(AbiParam::new(cg.ptr_type)); // b
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            cg.build_function(func_id, sig, |cg, builder, entry| {
-                let db = builder.block_params(entry)[0];
-                let a = builder.block_params(entry)[1];
-                let b = builder.block_params(entry)[2];
-                let result = cg.call_rt(builder, "knot_relation_union", &[db, a, b]);
-                builder.ins().return_(&[result]);
-            });
-        });
+        define_if_registered!(
+            "Alternative_Relation_alt",
+            |cg: &mut Self, func_id: FuncId| {
+                let mut sig = cg.module.make_signature();
+                sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                sig.params.push(AbiParam::new(cg.ptr_type)); // a
+                sig.params.push(AbiParam::new(cg.ptr_type)); // b
+                sig.returns.push(AbiParam::new(cg.ptr_type));
+                cg.build_function(func_id, sig, |cg, builder, entry| {
+                    let db = builder.block_params(entry)[0];
+                    let a = builder.block_params(entry)[1];
+                    let b = builder.block_params(entry)[2];
+                    let result = cg.call_rt(builder, "knot_relation_union", &[db, a, b]);
+                    builder.ins().return_(&[result]);
+                });
+            }
+        );
 
         // Foldable_Relation_fold(db, f, init, rel) → knot_relation_fold(db, f, init, rel)
-        define_if_registered!("Foldable_Relation_fold", |cg: &mut Self, func_id: FuncId| {
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.params.push(AbiParam::new(cg.ptr_type)); // f
-            sig.params.push(AbiParam::new(cg.ptr_type)); // init
-            sig.params.push(AbiParam::new(cg.ptr_type)); // rel
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            cg.build_function(func_id, sig, |cg, builder, entry| {
-                let db = builder.block_params(entry)[0];
-                let f = builder.block_params(entry)[1];
-                let init = builder.block_params(entry)[2];
-                let rel = builder.block_params(entry)[3];
-                let result = cg.call_rt(builder, "knot_relation_fold", &[db, f, init, rel]);
-                builder.ins().return_(&[result]);
-            });
-        });
+        define_if_registered!(
+            "Foldable_Relation_fold",
+            |cg: &mut Self, func_id: FuncId| {
+                let mut sig = cg.module.make_signature();
+                sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                sig.params.push(AbiParam::new(cg.ptr_type)); // f
+                sig.params.push(AbiParam::new(cg.ptr_type)); // init
+                sig.params.push(AbiParam::new(cg.ptr_type)); // rel
+                sig.returns.push(AbiParam::new(cg.ptr_type));
+                cg.build_function(func_id, sig, |cg, builder, entry| {
+                    let db = builder.block_params(entry)[0];
+                    let f = builder.block_params(entry)[1];
+                    let init = builder.block_params(entry)[2];
+                    let rel = builder.block_params(entry)[3];
+                    let result = cg.call_rt(builder, "knot_relation_fold", &[db, f, init, rel]);
+                    builder.ins().return_(&[result]);
+                });
+            }
+        );
 
         // Traversable_Relation_traverse(db, f, rel) → knot_relation_traverse(db, f, rel)
-        define_if_registered!("Traversable_Relation_traverse", |cg: &mut Self, func_id: FuncId| {
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.params.push(AbiParam::new(cg.ptr_type)); // f
-            sig.params.push(AbiParam::new(cg.ptr_type)); // rel
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            cg.build_function(func_id, sig, |cg, builder, entry| {
-                let db = builder.block_params(entry)[0];
-                let f = builder.block_params(entry)[1];
-                let rel = builder.block_params(entry)[2];
-                let result = cg.call_rt(builder, "knot_relation_traverse", &[db, f, rel]);
-                builder.ins().return_(&[result]);
-            });
-        });
+        define_if_registered!(
+            "Traversable_Relation_traverse",
+            |cg: &mut Self, func_id: FuncId| {
+                let mut sig = cg.module.make_signature();
+                sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                sig.params.push(AbiParam::new(cg.ptr_type)); // f
+                sig.params.push(AbiParam::new(cg.ptr_type)); // rel
+                sig.returns.push(AbiParam::new(cg.ptr_type));
+                cg.build_function(func_id, sig, |cg, builder, entry| {
+                    let db = builder.block_params(entry)[0];
+                    let f = builder.block_params(entry)[1];
+                    let rel = builder.block_params(entry)[2];
+                    let result = cg.call_rt(builder, "knot_relation_traverse", &[db, f, rel]);
+                    builder.ins().return_(&[result]);
+                });
+            }
+        );
 
         // Semigroup_Relation_append(db, a, b) → knot_relation_union(db, a, b)
-        define_if_registered!("Semigroup_Relation_append", |cg: &mut Self, func_id: FuncId| {
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.params.push(AbiParam::new(cg.ptr_type)); // a
-            sig.params.push(AbiParam::new(cg.ptr_type)); // b
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            cg.build_function(func_id, sig, |cg, builder, entry| {
-                let db = builder.block_params(entry)[0];
-                let a = builder.block_params(entry)[1];
-                let b = builder.block_params(entry)[2];
-                let result = cg.call_rt(builder, "knot_relation_union", &[db, a, b]);
-                builder.ins().return_(&[result]);
-            });
-        });
+        define_if_registered!(
+            "Semigroup_Relation_append",
+            |cg: &mut Self, func_id: FuncId| {
+                let mut sig = cg.module.make_signature();
+                sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                sig.params.push(AbiParam::new(cg.ptr_type)); // a
+                sig.params.push(AbiParam::new(cg.ptr_type)); // b
+                sig.returns.push(AbiParam::new(cg.ptr_type));
+                cg.build_function(func_id, sig, |cg, builder, entry| {
+                    let db = builder.block_params(entry)[0];
+                    let a = builder.block_params(entry)[1];
+                    let b = builder.block_params(entry)[2];
+                    let result = cg.call_rt(builder, "knot_relation_union", &[db, a, b]);
+                    builder.ins().return_(&[result]);
+                });
+            }
+        );
 
         // Sequence_Relation_take(db, n, rel) → knot_relation_take(n, rel)
-        define_if_registered!("Sequence_Relation_take", |cg: &mut Self, func_id: FuncId| {
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.params.push(AbiParam::new(cg.ptr_type)); // n
-            sig.params.push(AbiParam::new(cg.ptr_type)); // rel
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            cg.build_function(func_id, sig, |cg, builder, entry| {
-                let n = builder.block_params(entry)[1];
-                let rel = builder.block_params(entry)[2];
-                let result = cg.call_rt(builder, "knot_relation_take", &[n, rel]);
-                builder.ins().return_(&[result]);
-            });
-        });
+        define_if_registered!(
+            "Sequence_Relation_take",
+            |cg: &mut Self, func_id: FuncId| {
+                let mut sig = cg.module.make_signature();
+                sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                sig.params.push(AbiParam::new(cg.ptr_type)); // n
+                sig.params.push(AbiParam::new(cg.ptr_type)); // rel
+                sig.returns.push(AbiParam::new(cg.ptr_type));
+                cg.build_function(func_id, sig, |cg, builder, entry| {
+                    let n = builder.block_params(entry)[1];
+                    let rel = builder.block_params(entry)[2];
+                    let result = cg.call_rt(builder, "knot_relation_take", &[n, rel]);
+                    builder.ins().return_(&[result]);
+                });
+            }
+        );
 
         // Sequence_Relation_drop(db, n, rel) → knot_relation_drop(n, rel)
-        define_if_registered!("Sequence_Relation_drop", |cg: &mut Self, func_id: FuncId| {
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.params.push(AbiParam::new(cg.ptr_type)); // n
-            sig.params.push(AbiParam::new(cg.ptr_type)); // rel
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            cg.build_function(func_id, sig, |cg, builder, entry| {
-                let n = builder.block_params(entry)[1];
-                let rel = builder.block_params(entry)[2];
-                let result = cg.call_rt(builder, "knot_relation_drop", &[n, rel]);
-                builder.ins().return_(&[result]);
-            });
-        });
+        define_if_registered!(
+            "Sequence_Relation_drop",
+            |cg: &mut Self, func_id: FuncId| {
+                let mut sig = cg.module.make_signature();
+                sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                sig.params.push(AbiParam::new(cg.ptr_type)); // n
+                sig.params.push(AbiParam::new(cg.ptr_type)); // rel
+                sig.returns.push(AbiParam::new(cg.ptr_type));
+                cg.build_function(func_id, sig, |cg, builder, entry| {
+                    let n = builder.block_params(entry)[1];
+                    let rel = builder.block_params(entry)[2];
+                    let result = cg.call_rt(builder, "knot_relation_drop", &[n, rel]);
+                    builder.ins().return_(&[result]);
+                });
+            }
+        );
     }
 
     /// Define Cranelift IR bodies for built-in IO impls of HKT traits.
@@ -3100,17 +3229,20 @@ impl<M: cranelift_module::Module> Codegen<M> {
         });
 
         // Applicative_Maybe_yield(db, x) → knot_maybe_yield(x)
-        define_if_registered!("Applicative_Maybe_yield", |cg: &mut Self, func_id: FuncId| {
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.params.push(AbiParam::new(cg.ptr_type)); // x
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            cg.build_function(func_id, sig, |cg, builder, entry| {
-                let x = builder.block_params(entry)[1];
-                let result = cg.call_rt(builder, "knot_maybe_yield", &[x]);
-                builder.ins().return_(&[result]);
-            });
-        });
+        define_if_registered!(
+            "Applicative_Maybe_yield",
+            |cg: &mut Self, func_id: FuncId| {
+                let mut sig = cg.module.make_signature();
+                sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                sig.params.push(AbiParam::new(cg.ptr_type)); // x
+                sig.returns.push(AbiParam::new(cg.ptr_type));
+                cg.build_function(func_id, sig, |cg, builder, entry| {
+                    let x = builder.block_params(entry)[1];
+                    let result = cg.call_rt(builder, "knot_maybe_yield", &[x]);
+                    builder.ins().return_(&[result]);
+                });
+            }
+        );
 
         // Monad_Maybe_bind(db, f, m) → knot_maybe_bind(db, f, m)
         define_if_registered!("Monad_Maybe_bind", |cg: &mut Self, func_id: FuncId| {
@@ -3129,15 +3261,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
         });
 
         // Alternative_Maybe_empty(db) → knot_maybe_empty()
-        define_if_registered!("Alternative_Maybe_empty", |cg: &mut Self, func_id: FuncId| {
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            cg.build_function(func_id, sig, |cg, builder, _entry| {
-                let result = cg.call_rt(builder, "knot_maybe_empty", &[]);
-                builder.ins().return_(&[result]);
-            });
-        });
+        define_if_registered!(
+            "Alternative_Maybe_empty",
+            |cg: &mut Self, func_id: FuncId| {
+                let mut sig = cg.module.make_signature();
+                sig.params.push(AbiParam::new(cg.ptr_type)); // db
+                sig.returns.push(AbiParam::new(cg.ptr_type));
+                cg.build_function(func_id, sig, |cg, builder, _entry| {
+                    let result = cg.call_rt(builder, "knot_maybe_empty", &[]);
+                    builder.ins().return_(&[result]);
+                });
+            }
+        );
     }
 
     /// Define Cranelift IR bodies for built-in primitive impls (Eq, Ord, Num).
@@ -3403,7 +3538,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         for decl in decl_views(program) {
             let name = decl.name;
-            if let DeclViewKind::Fun { body: Some(body), .. } = decl.kind {
+            if let DeclViewKind::Fun {
+                body: Some(body), ..
+            } = decl.kind
+            {
                 {
                     // A self-referential relation query field (a recursive
                     // query / fixpoint) is NOT a plain 0-param function —
@@ -3411,8 +3549,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // body whose self-reference resolves to the global fn
                     // itself (infinite recursion). The `With` arm routes it
                     // to `knot_relation_fixpoint` instead. Skip it here.
-                    let is_recursive_query = self.expr_is_known_relation(body)
-                        && expr_mentions_free_var(body, name);
+                    let is_recursive_query =
+                        self.expr_is_known_relation(body) && expr_mentions_free_var(body, name);
                     if is_recursive_query {
                         continue;
                     }
@@ -3459,18 +3597,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
             for (key, body, field_name) in fixpoints {
                 self.define_query_fixpoint(&key, &body, &field_name);
             }
-            let lambdas: Vec<PendingLambda> =
-                std::mem::take(&mut self.pending_lambdas);
+            let lambdas: Vec<PendingLambda> = std::mem::take(&mut self.pending_lambdas);
             for lambda in lambdas {
                 self.define_lambda_function(&lambda);
             }
-            let thunks: Vec<PendingIoThunk> =
-                std::mem::take(&mut self.pending_io_thunks);
+            let thunks: Vec<PendingIoThunk> = std::mem::take(&mut self.pending_io_thunks);
             for thunk in thunks {
                 self.define_io_thunk_function(&thunk);
             }
-            let trampolines: Vec<PendingTrampoline> =
-                std::mem::take(&mut self.pending_trampolines);
+            let trampolines: Vec<PendingTrampoline> = std::mem::take(&mut self.pending_trampolines);
             for tramp in &trampolines {
                 self.define_trampoline(tramp);
             }
@@ -3490,8 +3625,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         F: FnOnce(&mut Self, &mut FunctionBuilder, cranelift_codegen::ir::Block),
     {
         let mut ctx = std::mem::replace(&mut self.ctx, self.module.make_context());
-        let mut fb_ctx =
-            std::mem::replace(&mut self.builder_ctx, FunctionBuilderContext::new());
+        let mut fb_ctx = std::mem::replace(&mut self.builder_ctx, FunctionBuilderContext::new());
         // Block references never cross function boundaries — clear the
         // per-function loop-skip target for the new builder context.
         let prev_io_loop_skip = self.io_loop_skip_block.take();
@@ -3519,12 +3653,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.io_loop_skip_block = prev_io_loop_skip;
     }
 
-    fn define_user_function(
-        &mut self,
-        name: &str,
-        params: &[ast::Pat],
-        body: &ast::Expr,
-    ) {
+    fn define_user_function(&mut self, name: &str, params: &[ast::Pat], body: &ast::Expr) {
         let (func_id, _) = self.global_fns[name];
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(self.ptr_type)); // db
@@ -3591,7 +3720,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let default_block = builder.create_block();
                     let override_block = builder.create_block();
                     let is_null = builder.ins().icmp_imm(IntCC::Equal, override_val, 0);
-                    builder.ins().brif(is_null, default_block, &[], override_block, &[]);
+                    builder
+                        .ins()
+                        .brif(is_null, default_block, &[], override_block, &[]);
 
                     builder.switch_to_block(override_block);
                     builder.seal_block(override_block);
@@ -3630,11 +3761,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let val = cg.emit_override_literal(builder, val_str, &base_type);
                 if let Some(refine) = &refinement {
                     let mut env = Env::new();
-                    let pred_fn =
-                        cg.compile_expr(builder, &refine.predicate, &mut env, db);
+                    let pred_fn = cg.compile_expr(builder, &refine.predicate, &mut env, db);
                     let (name_ptr, name_len) = cg.string_ptr(builder, &name_owned);
-                    let (label_ptr, label_len) =
-                        cg.string_ptr(builder, &refine.type_label);
+                    let (label_ptr, label_len) = cg.string_ptr(builder, &refine.type_label);
                     let checked = cg.call_rt(
                         builder,
                         "knot_override_refinement_check",
@@ -3665,10 +3794,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             if let Some(refine) = &refinement {
                 let mut env = Env::new();
-                let pred_fn =
-                    cg.compile_expr(builder, &refine.predicate, &mut env, db);
-                let (label_ptr, label_len) =
-                    cg.string_ptr(builder, &refine.type_label);
+                let pred_fn = cg.compile_expr(builder, &refine.predicate, &mut env, db);
+                let (label_ptr, label_len) = cg.string_ptr(builder, &refine.type_label);
                 let checked = cg.call_rt(
                     builder,
                     "knot_override_refinement_check",
@@ -3704,13 +3831,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let body_owned = body.clone();
         let field_name_owned = field_name.to_string();
         self.build_function(body_func_id, body_sig, |cg, builder, entry| {
-        let mut env = Env::new();
+            let mut env = Env::new();
             let db = builder.block_params(entry)[0];
             let self_val = builder.block_params(entry)[1];
             // Bind the field's own name to the accumulator so the body's
             // `Var(field)` self-reference reads it (the `Var` arm's env lookup
             // wins over the fixpoint route inside this fn).
-            env.set(crate::infer::Binding::User(field_name_owned.clone()), self_val);
+            env.set(
+                crate::infer::Binding::User(field_name_owned.clone()),
+                self_val,
+            );
             // The accumulator IS a relation: mark it so a `r <- field` bind in
             // the body iterates it per-row (including across the deferred
             // comprehension-lambda boundary via `closure_relation_vars`).
@@ -3735,11 +3865,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let initial = cg.call_rt(builder, "knot_relation_empty", &[]);
             let body_ref = cg.module.declare_func_in_func(body_func_id, builder.func);
             let body_addr = builder.ins().func_addr(cg.ptr_type, body_ref);
-            let result = cg.call_rt(
-                builder,
-                "knot_relation_fixpoint",
-                &[db, body_addr, initial],
-            );
+            let result = cg.call_rt(builder, "knot_relation_fixpoint", &[db, body_addr, initial]);
             builder.ins().return_(&[result]);
         });
     }
@@ -3787,7 +3913,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // Bind parameter — use the original pattern for destructuring
             if let Some(ref pat) = param_pat {
                 match &pat.node {
-                    ast::PatKind::Var(name) => env.set(crate::infer::Binding::User(name.clone()), arg),
+                    ast::PatKind::Var(name) => {
+                        env.set(crate::infer::Binding::User(name.clone()), arg)
+                    }
                     _ => cg.bind_io_pattern(builder, pat, arg, &mut env, None),
                 }
             } else if params.len() == 1 {
@@ -3837,10 +3965,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.closure_relation_vars.extend(captured_rel_vars);
         // Restore the recursive query-field fixpoint frames so a recursive
         // field referenced in this thunk routes to its fixpoint wrapper.
-        let prev_fixpoint_rel_fields = std::mem::replace(
-            &mut self.fixpoint_rel_fields,
-            captured_fixpoint_fields,
-        );
+        let prev_fixpoint_rel_fields =
+            std::mem::replace(&mut self.fixpoint_rel_fields, captured_fixpoint_fields);
 
         self.build_function(func_id, sig, |cg, builder, entry| {
             let mut env = Env::new();
@@ -3923,7 +4049,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
             });
         }
 
-        self.user_fn_trampolines.insert(name.to_string(), trampoline_id);
+        self.user_fn_trampolines
+            .insert(name.to_string(), trampoline_id);
         trampoline_id
     }
 
@@ -3964,8 +4091,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let next_ref = cg.module.declare_func_in_func(next_stage_id, builder.func);
                 let fn_addr = builder.ins().func_addr(cg.ptr_type, next_ref);
                 let (src_ptr, src_len) = cg.string_ptr(builder, &fn_name);
-                let result =
-                    cg.call_rt(builder, "knot_value_function", &[fn_addr, arg1, src_ptr, src_len]);
+                let result = cg.call_rt(
+                    builder,
+                    "knot_value_function",
+                    &[fn_addr, arg1, src_ptr, src_len],
+                );
                 builder.ins().return_(&[result]);
             });
         }
@@ -3974,7 +4104,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         for stage_idx in 0..stage_ids.len() {
             let stage_fn_id = stage_ids[stage_idx];
             let is_last = stage_idx == stage_ids.len() - 1;
-            let next_stage_id = if !is_last { Some(stage_ids[stage_idx + 1]) } else { None };
+            let next_stage_id = if !is_last {
+                Some(stage_ids[stage_idx + 1])
+            } else {
+                None
+            };
             let fn_name = fn_name.clone();
 
             let mut sig = self.module.make_signature();
@@ -4001,18 +4135,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         // env is a record of previous args
                         for i in 0..total_args - 1 {
                             let idx = builder.ins().iconst(cg.ptr_type, i as i64);
-                            let arg_val = cg.call_rt(
-                                builder,
-                                "knot_record_field_by_index",
-                                &[env, idx],
-                            );
+                            let arg_val =
+                                cg.call_rt(builder, "knot_record_field_by_index", &[env, idx]);
                             call_args.push(arg_val);
                         }
                     }
                     call_args.push(new_arg);
 
-                    let func_ref =
-                        cg.module.declare_func_in_func(user_fn_id, builder.func);
+                    let func_ref = cg.module.declare_func_in_func(user_fn_id, builder.func);
                     let call = builder.ins().call(func_ref, &call_args);
                     let result = builder.inst_results(call)[0];
                     builder.ins().return_(&[result]);
@@ -4023,9 +4153,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let new_env = if total_args == 2 {
                         // Going from 1 captured arg (env=arg1) + new_arg to record of 2
                         let ptr_bytes = cg.ptr_type.bytes() as i32;
-                        let slot = builder.create_sized_stack_slot(
-                            StackSlotData::new(StackSlotKind::ExplicitSlot, (6 * ptr_bytes) as u32, 3),
-                        );
+                        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            (6 * ptr_bytes) as u32,
+                            3,
+                        ));
                         let (k0_ptr, k0_len) = cg.string_ptr(builder, &tramp_arg_key(0));
                         builder.ins().stack_store(k0_ptr, slot, 0);
                         builder.ins().stack_store(k0_len, slot, ptr_bytes);
@@ -4046,17 +4178,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             .checked_mul(new_count as u32)
                             .and_then(|n| n.checked_mul(ptr_bytes as u32))
                             .expect("knot codegen: trampoline slot size overflow");
-                        let slot = builder.create_sized_stack_slot(
-                            StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
-                        );
+                        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                            StackSlotKind::ExplicitSlot,
+                            slot_size,
+                            3,
+                        ));
                         // Copy existing fields
                         for i in 0..prev_count {
                             let idx = builder.ins().iconst(cg.ptr_type, i as i64);
-                            let val = cg.call_rt(
-                                builder,
-                                "knot_record_field_by_index",
-                                &[env, idx],
-                            );
+                            let val =
+                                cg.call_rt(builder, "knot_record_field_by_index", &[env, idx]);
                             let key_str = tramp_arg_key(i);
                             let (kp, kl) = cg.string_ptr(builder, &key_str);
                             let base = (i as i32) * (3 * ptr_bytes);
@@ -4070,7 +4201,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         let base = (prev_count as i32) * (3 * ptr_bytes);
                         builder.ins().stack_store(kp, slot, base);
                         builder.ins().stack_store(kl, slot, base + ptr_bytes);
-                        builder.ins().stack_store(new_arg, slot, base + 2 * ptr_bytes);
+                        builder
+                            .ins()
+                            .stack_store(new_arg, slot, base + 2 * ptr_bytes);
                         let data_ptr = builder.ins().stack_addr(cg.ptr_type, slot, 0);
                         let count = builder.ins().iconst(cg.ptr_type, new_count as i64);
                         cg.call_rt(builder, "knot_record_from_pairs", &[data_ptr, count])
@@ -4127,8 +4260,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             });
             (fid, 0)
         });
-        let all_routes: Vec<(String, Vec<ast::RouteEntry>)> =
-            self.route_entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let all_routes: Vec<(String, Vec<ast::RouteEntry>)> = self
+            .route_entries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         let alias_ast = self.alias_ast.clone();
         // Attached `---` doc comments (`(decl_name, markdown)`), embedded into
         // the binary so the `docs` subcommand can print them without running
@@ -4173,27 +4309,46 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         ast::HttpMethod::Patch => "PATCH",
                     };
                     let (method_ptr, method_len) = cg.string_ptr(builder, method_str);
-                    let path_pattern = path_segments_to_pattern(&route_entry.path, &cg.type_aliases);
+                    let path_pattern =
+                        path_segments_to_pattern(&route_entry.path, &cg.type_aliases);
                     let (path_ptr, path_len) = cg.string_ptr(builder, &path_pattern);
                     let (ctor_ptr, ctor_len) = cg.string_ptr(builder, &route_entry.constructor);
-                    let body_desc = fields_to_descriptor(&route_entry.body_fields, &cg.type_aliases);
+                    let body_desc =
+                        fields_to_descriptor(&route_entry.body_fields, &cg.type_aliases);
                     let (body_ptr, body_len) = cg.string_ptr(builder, &body_desc);
-                    let query_desc = fields_to_descriptor(&route_entry.query_params, &cg.type_aliases);
+                    let query_desc =
+                        fields_to_descriptor(&route_entry.query_params, &cg.type_aliases);
                     let (query_ptr, query_len) = cg.string_ptr(builder, &query_desc);
-                    let resp_desc = response_type_descriptor(&route_entry.response_ty, &cg.type_aliases);
+                    let resp_desc =
+                        response_type_descriptor(&route_entry.response_ty, &cg.type_aliases);
                     let (resp_ptr, resp_len) = cg.string_ptr(builder, &resp_desc);
-                    let req_hdrs_desc = fields_to_descriptor(&route_entry.request_headers, &cg.type_aliases);
+                    let req_hdrs_desc =
+                        fields_to_descriptor(&route_entry.request_headers, &cg.type_aliases);
                     let (req_hdrs_ptr, req_hdrs_len) = cg.string_ptr(builder, &req_hdrs_desc);
-                    let resp_hdrs_desc = fields_to_descriptor(&route_entry.response_headers, &cg.type_aliases);
+                    let resp_hdrs_desc =
+                        fields_to_descriptor(&route_entry.response_headers, &cg.type_aliases);
                     let (resp_hdrs_ptr, resp_hdrs_len) = cg.string_ptr(builder, &resp_hdrs_desc);
                     cg.call_rt_void(
                         builder,
                         "knot_route_table_add",
                         &[
-                            table, method_ptr, method_len, path_ptr, path_len,
-                            ctor_ptr, ctor_len, body_ptr, body_len, query_ptr,
-                            query_len, resp_ptr, resp_len,
-                            req_hdrs_ptr, req_hdrs_len, resp_hdrs_ptr, resp_hdrs_len,
+                            table,
+                            method_ptr,
+                            method_len,
+                            path_ptr,
+                            path_len,
+                            ctor_ptr,
+                            ctor_len,
+                            body_ptr,
+                            body_len,
+                            query_ptr,
+                            query_len,
+                            resp_ptr,
+                            resp_len,
+                            req_hdrs_ptr,
+                            req_hdrs_len,
+                            resp_hdrs_ptr,
+                            resp_hdrs_len,
                         ],
                     );
                 }
@@ -4212,7 +4367,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             let normal_block = builder.create_block();
             let api_exit_block = builder.create_block();
-            builder.ins().brif(api_result, api_exit_block, &[], normal_block, &[]);
+            builder
+                .ins()
+                .brif(api_result, api_exit_block, &[], normal_block, &[]);
 
             builder.switch_to_block(api_exit_block);
             builder.seal_block(api_exit_block);
@@ -4228,13 +4385,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let db_result = {
                 let func_id = cg.runtime_fns["knot_db_handle"];
                 let func_ref = cg.module.declare_func_in_func(func_id, builder.func);
-                let call = builder.ins().call(func_ref, &[argc, argv, db_path_ptr_pre, db_path_len_pre]);
+                let call = builder
+                    .ins()
+                    .call(func_ref, &[argc, argv, db_path_ptr_pre, db_path_len_pre]);
                 builder.inst_results(call)[0]
             };
 
             let normal_block2 = builder.create_block();
             let db_exit_block = builder.create_block();
-            builder.ins().brif(db_result, db_exit_block, &[], normal_block2, &[]);
+            builder
+                .ins()
+                .brif(db_result, db_exit_block, &[], normal_block2, &[]);
 
             builder.switch_to_block(db_exit_block);
             builder.seal_block(db_exit_block);
@@ -4255,7 +4416,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             let normal_block3 = builder.create_block();
             let docs_exit_block = builder.create_block();
-            builder.ins().brif(docs_result, docs_exit_block, &[], normal_block3, &[]);
+            builder
+                .ins()
+                .brif(docs_result, docs_exit_block, &[], normal_block3, &[]);
 
             builder.switch_to_block(docs_exit_block);
             builder.seal_block(docs_exit_block);
@@ -4288,7 +4451,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .map(|c| c.name.clone())
                 .collect();
             let descriptor = {
-                let mut entries: Vec<String> = cg.overridable_constants.iter()
+                let mut entries: Vec<String> = cg
+                    .overridable_constants
+                    .iter()
                     .filter(|(name, _)| !cg.compile_time_overrides.contains_key(*name))
                     .map(|(name, ty)| {
                         if required_names.contains(name) {
@@ -4311,8 +4476,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let db_path = cg.db_path.clone();
             let (db_path_ptr, db_path_len) = cg.string_ptr(builder, &db_path);
             let db_open_ref = cg.import_rt(builder, "knot_db_open");
-            let db_open_call =
-                builder.ins().call(db_open_ref, &[db_path_ptr, db_path_len]);
+            let db_open_call = builder.ins().call(db_open_ref, &[db_path_ptr, db_path_len]);
             let db = builder.inst_results(db_open_call)[0];
 
             // Initialize schema tracking
@@ -4375,7 +4539,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // bare relation name in `migrate_schemas`.
             let mut migrate_sites: Vec<(String, ast::Expr)> = Vec::new();
             for decl in &decls {
-                if let DeclViewKind::Fun { body: Some(body), .. } = decl.kind {
+                if let DeclViewKind::Fun {
+                    body: Some(body), ..
+                } = decl.kind
+                {
                     collect_record_migrations(body, &mut migrate_sites);
                 }
                 // Top-level `with`-block sources carry their `migrate` clauses
@@ -4394,58 +4561,63 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let relation = relation.clone();
                 let using_fn = using_fn.clone();
                 if let Some(migrations) = migrate_schemas.get(&relation) {
-                        let idx = migrate_counters.entry(relation.clone()).or_insert(0);
-                        if let Some((old_schema, new_schema)) = migrations.get(*idx) {
-                            let (name_ptr, name_len) = cg.string_ptr(builder, &relation);
-                            let (old_ptr, old_len) = cg.string_ptr(builder, old_schema);
-                            let (new_ptr, new_len) = cg.string_ptr(builder, new_schema);
+                    let idx = migrate_counters.entry(relation.clone()).or_insert(0);
+                    if let Some((old_schema, new_schema)) = migrations.get(*idx) {
+                        let (name_ptr, name_len) = cg.string_ptr(builder, &relation);
+                        let (old_ptr, old_len) = cg.string_ptr(builder, old_schema);
+                        let (new_ptr, new_len) = cg.string_ptr(builder, new_schema);
 
-                            // Compile the using expression (typically a lambda)
-                            let mut env = Env::new();
-                            let migrate_fn_val =
-                                cg.compile_expr(builder, &using_fn, &mut env, db);
+                        // Compile the using expression (typically a lambda)
+                        let mut env = Env::new();
+                        let migrate_fn_val = cg.compile_expr(builder, &using_fn, &mut env, db);
 
-                            // Validate refinements on the transformed rows
-                            // before committing the migration. Every other
-                            // write path (set/replace/append/view/scalar)
-                            // calls emit_refinement_checks; migrate was the
-                            // sole exception, so a `migrate … using` could
-                            // persist values violating a refined type (e.g.
-                            // negative into a Nat column). The runtime's
-                            // knot_source_migrate_preview returns the
-                            // transformed rows without writing, in the same
-                            // value shape set/replace validate; if there are
-                            // no refinements on this source the check is a
-                            // no-op.
-                            if cg.source_refinements.contains_key(&relation) {
-                                let preview = cg.call_rt(
-                                    builder,
-                                    "knot_source_migrate_preview",
-                                    &[
-                                        db, name_ptr, name_len, old_ptr, old_len,
-                                        new_ptr, new_len, migrate_fn_val,
-                                    ],
-                                );
-                                cg.emit_refinement_checks(
-                                    builder,
-                                    &relation,
-                                    preview,
-                                    &mut env,
-                                    db,
-                                );
-                            }
-
-                            cg.call_rt_void(
+                        // Validate refinements on the transformed rows
+                        // before committing the migration. Every other
+                        // write path (set/replace/append/view/scalar)
+                        // calls emit_refinement_checks; migrate was the
+                        // sole exception, so a `migrate … using` could
+                        // persist values violating a refined type (e.g.
+                        // negative into a Nat column). The runtime's
+                        // knot_source_migrate_preview returns the
+                        // transformed rows without writing, in the same
+                        // value shape set/replace validate; if there are
+                        // no refinements on this source the check is a
+                        // no-op.
+                        if cg.source_refinements.contains_key(&relation) {
+                            let preview = cg.call_rt(
                                 builder,
-                                "knot_source_migrate",
+                                "knot_source_migrate_preview",
                                 &[
-                                    db, name_ptr, name_len, old_ptr, old_len, new_ptr,
-                                    new_len, migrate_fn_val,
+                                    db,
+                                    name_ptr,
+                                    name_len,
+                                    old_ptr,
+                                    old_len,
+                                    new_ptr,
+                                    new_len,
+                                    migrate_fn_val,
                                 ],
                             );
-                            *idx += 1;
+                            cg.emit_refinement_checks(builder, &relation, preview, &mut env, db);
                         }
+
+                        cg.call_rt_void(
+                            builder,
+                            "knot_source_migrate",
+                            &[
+                                db,
+                                name_ptr,
+                                name_len,
+                                old_ptr,
+                                old_len,
+                                new_ptr,
+                                new_len,
+                                migrate_fn_val,
+                            ],
+                        );
+                        *idx += 1;
                     }
+                }
             }
 
             // Drop sources removed from the codebase (still tracked by the
@@ -4463,18 +4635,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // source gets its table created.
             let source_names: Vec<String> = cg.source_schemas.keys().cloned().collect();
             for name in source_names {
-                let schema = cg
-                    .source_schemas
-                    .get(&name)
-                    .cloned()
-                    .unwrap_or_default();
+                let schema = cg.source_schemas.get(&name).cloned().unwrap_or_default();
                 let (name_ptr, name_len) = cg.string_ptr(builder, &name);
                 let (schema_ptr, schema_len) = cg.string_ptr(builder, &schema);
                 let init_ref = cg.import_rt(builder, "knot_source_init");
-                builder.ins().call(
-                    init_ref,
-                    &[db, name_ptr, name_len, schema_ptr, schema_len],
-                );
+                builder
+                    .ins()
+                    .call(init_ref, &[db, name_ptr, name_len, schema_ptr, schema_len]);
             }
 
             // Register subset constraints
@@ -4490,8 +4657,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     builder,
                     "knot_constraint_register",
                     &[
-                        db, sub_rel_ptr, sub_rel_len, sub_field_ptr, sub_field_len,
-                        sup_rel_ptr, sup_rel_len, sup_field_ptr, sup_field_len,
+                        db,
+                        sub_rel_ptr,
+                        sub_rel_len,
+                        sub_field_ptr,
+                        sub_field_len,
+                        sup_rel_ptr,
+                        sup_rel_len,
+                        sup_field_ptr,
+                        sup_field_len,
                     ],
                 );
             }
@@ -4519,7 +4693,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             cg.call_rt_void(
                                 builder,
                                 "knot_route_set_field_refinement",
-                                &[*table, ctor_ptr, ctor_len, fn_ptr, fn_len, pred_fn, tn_ptr, tn_len],
+                                &[
+                                    *table, ctor_ptr, ctor_len, fn_ptr, fn_len, pred_fn, tn_ptr,
+                                    tn_len,
+                                ],
                             );
                         }
                     }
@@ -4556,8 +4733,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if n_params == 0 {
                     cg.call_rt_void(builder, "knot_arena_push_frame", &[]);
 
-                    let user_main_ref =
-                        cg.module.declare_func_in_func(main_fn_id, builder.func);
+                    let user_main_ref = cg.module.declare_func_in_func(main_fn_id, builder.func);
                     let call = builder.ins().call(user_main_ref, &[db]);
                     let result = builder.inst_results(call)[0];
 
@@ -4574,11 +4750,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // so we don't need to promote anything up.
                     cg.call_rt_void(builder, "knot_arena_pop_frame", &[]);
                 } else {
-                    cg.diagnostics.push(
-                        knot::diagnostic::Diagnostic::error(
-                            "'main' must be a zero-parameter declaration, but it takes arguments"
-                        )
-                    );
+                    cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                        "'main' must be a zero-parameter declaration, but it takes arguments",
+                    ));
                 }
             }
 
@@ -4633,8 +4807,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         && !env.bindings.contains_key(name)
                         && let Some((func_id, 0)) = self.global_fns.get(fn_key).copied()
                     {
-                        let func_ref =
-                            self.module.declare_func_in_func(func_id, builder.func);
+                        let func_ref = self.module.declare_func_in_func(func_id, builder.func);
                         let call = builder.ins().call(func_ref, &[db]);
                         return builder.inst_results(call)[0];
                     }
@@ -4690,20 +4863,24 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if let Some((func_id, n_params)) = self.global_fns.get(fn_name).copied() {
                     if n_params == 0 {
                         // 0-param function is a constant — call it directly
-                        let func_ref =
-                            self.module.declare_func_in_func(func_id, builder.func);
+                        let func_ref = self.module.declare_func_in_func(func_id, builder.func);
                         let call = builder.ins().call(func_ref, &[db]);
                         return builder.inst_results(call)[0];
                     } else {
                         // Create a trampoline that bridges (db, env, arg) calling
                         // convention to the user function's (db, arg1, ...) convention.
                         let trampoline_id = self.get_or_create_trampoline(fn_name, n_params);
-                        let func_ref =
-                            self.module.declare_func_in_func(trampoline_id, builder.func);
+                        let func_ref = self
+                            .module
+                            .declare_func_in_func(trampoline_id, builder.func);
                         let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
                         let null = builder.ins().iconst(self.ptr_type, 0);
                         let (src_ptr, src_len) = self.string_ptr(builder, fn_name);
-                        return self.call_rt(builder, "knot_value_function", &[fn_addr, null, src_ptr, src_len]);
+                        return self.call_rt(
+                            builder,
+                            "knot_value_function",
+                            &[fn_addr, null, src_ptr, src_len],
+                        );
                     }
                 }
                 // 0-arg IO builtins. The prelude's base-record fields reference
@@ -4768,13 +4945,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // SQL-pushdown matcher — it loads the whole relation into
                 // memory via `knot_source_read`. Track it for the build-time
                 // INFO diagnostic naming full in-memory reads.
-                self.in_memory_source_reads
-                    .insert(name.clone(), expr.span);
-                let schema = self
-                    .source_schemas
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_default();
+                self.in_memory_source_reads.insert(name.clone(), expr.span);
+                let schema = self.source_schemas.get(name).cloned().unwrap_or_default();
                 let (name_ptr, name_len) = self.string_ptr(builder, name);
                 let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
                 let rel = self.call_rt(
@@ -4808,9 +4980,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
                     let ptr_bytes = self.ptr_type.bytes() as i32;
                     let slot_size = (3 * n as u32) * ptr_bytes as u32;
-                    let slot = builder.create_sized_stack_slot(
-                        StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
-                    );
+                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        slot_size,
+                        3,
+                    ));
                     for (i, (name, val)) in compiled.iter().enumerate() {
                         let (key_ptr, key_len) = self.string_ptr(builder, name);
                         let base = (i as i32) * (3 * ptr_bytes);
@@ -4877,7 +5051,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // User ctors are handled by `embedded_ctors` above; this case
                 // only fires for the built-in types (never in `embedded_ctors`).
                 if let ast::ExprKind::Constructor(type_name) = &expr.node
-                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Bool" | "Ordering" | "List" | "Level")
+                    && matches!(
+                        type_name.as_str(),
+                        "Maybe" | "Result" | "Bool" | "Ordering" | "List" | "Level"
+                    )
                     && self
                         .data_constructors
                         .get(type_name.as_str())
@@ -5024,9 +5201,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         }
                     }
                 }
-                let record_val = if let ast::ExprKind::Record(field_exprs) =
-                    &record.node
-                {
+                let record_val = if let ast::ExprKind::Record(field_exprs) = &record.node {
                     let mut compiled_fields: Vec<(&String, Value)> =
                         Vec::with_capacity(field_exprs.len());
                     for f in field_exprs {
@@ -5074,20 +5249,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         // field aliases never appear in a field value's free
                         // vars — they're `Binding::Internal`, not a user name —
                         // so only the bare name needs removal.)
-                        if field_env.bindings.contains_key(&crate::infer::Binding::User(f.name.clone()))
+                        if field_env
+                            .bindings
+                            .contains_key(&crate::infer::Binding::User(f.name.clone()))
                             && self
                                 .with_fields
                                 .values()
                                 .any(|fs| fs.iter().any(|n| n == &f.name))
                         {
-                            field_env.bindings.remove(&crate::infer::Binding::User(f.name.clone()));
+                            field_env
+                                .bindings
+                                .remove(&crate::infer::Binding::User(f.name.clone()));
                         }
-                        let v = self.compile_expr(
-                            builder,
-                            &f.value,
-                            &mut field_env,
-                            db,
-                        );
+                        let v = self.compile_expr(builder, &f.value, &mut field_env, db);
                         compiled_fields.push((&f.name, v));
                     }
                     // Assemble the record from the compiled field values,
@@ -5098,9 +5272,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let n = compiled_sorted.len();
                     let ptr_bytes = self.ptr_type.bytes() as i32;
                     let slot_size = (3 * n as u32) * ptr_bytes as u32;
-                    let slot = builder.create_sized_stack_slot(
-                        StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
-                    );
+                    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        slot_size,
+                        3,
+                    ));
                     for (i, (name, val)) in compiled_sorted.iter().enumerate() {
                         let (key_ptr, key_len) = self.string_ptr(builder, name);
                         let base = (i as i32) * (3 * ptr_bytes);
@@ -5183,9 +5359,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // Bind the whole `with` record under a per-site alias so an
                     // implicit dictionary resolved to this `with` frame (an
                     // `with-record alias` root) projects it.
-                    let rec_alias = crate::infer::Binding::Internal(
-                        crate::infer::InternalName::WithRecord { span_start: expr.span.start },
-                    );
+                    let rec_alias =
+                        crate::infer::Binding::Internal(crate::infer::InternalName::WithRecord {
+                            span_start: expr.span.start,
+                        });
                     body_env.set(rec_alias.clone(), record_val);
                     for field in fields {
                         // Lazy relation query fields (source-reading queries)
@@ -5211,10 +5388,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         // blocks projecting the same field name no longer
                         // collide on the shared bare-name slot.
                         body_env.set(
-                            crate::infer::Binding::Internal(crate::infer::InternalName::WithField {
-                                span_start: expr.span.start,
-                                field: field.clone(),
-                            }),
+                            crate::infer::Binding::Internal(
+                                crate::infer::InternalName::WithField {
+                                    span_start: expr.span.start,
+                                    field: field.clone(),
+                                },
+                            ),
                             field_val,
                         );
                     }
@@ -5228,7 +5407,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // start outside the `with`.
                 // Names of pure (non-IO) fields, captured before `io_scope` is
                 // moved by the push below.
-                let pure_field_names: Vec<String> = if let ast::ExprKind::Record(fes) = &record.node {
+                let pure_field_names: Vec<String> = if let ast::ExprKind::Record(fes) = &record.node
+                {
                     fes.iter()
                         .filter(|f| !io_scope.get(&f.name).copied().unwrap_or(false))
                         .map(|f| f.name.clone())
@@ -5314,37 +5494,39 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // builtin instead of the local value. When shadowed, fall
                     // through to `try_compile_pipe_sql`/`compile_app` below, which
                     // resolve the shadowing name correctly.
-                    if let ast::ExprKind::App { func: match_fn, arg: match_arg } = &rhs.node
-                        && let (ast::ExprKind::Var(fn_name), ast::ExprKind::Constructor(ctor_name)) = (&match_fn.node, &match_arg.node)
-                            && fn_name == "match"
-                            && !env.bindings.contains_key(fn_name)
-                            && !(self.top_fn_names.contains(fn_name.as_str()) && self.global_fns.contains_key(fn_name.as_str())) {
-                                if let ast::ExprKind::SourceRef { name: source_name, .. } = &lhs.node
-                                    && let Some(schema) = self.source_schemas.get(source_name).cloned() {
-                                        let (name_ptr, name_len) =
-                                            self.string_ptr(builder, source_name);
-                                        let (schema_ptr, schema_len) =
-                                            self.string_ptr(builder, &schema);
-                                        let (tag_ptr, tag_len) =
-                                            self.string_ptr(builder, ctor_name);
-                                        return self.call_rt(
-                                            builder,
-                                            "knot_source_match",
-                                            &[
-                                                db, name_ptr, name_len, schema_ptr,
-                                                schema_len, tag_ptr, tag_len,
-                                            ],
-                                        );
-                                    }
-                                // Non-source: value-level match
-                                let rel = self.compile_expr(builder, lhs, env, db);
-                                let ctor = self.compile_expr(builder, match_arg, env, db);
-                                return self.call_rt(
-                                    builder,
-                                    "knot_relation_match",
-                                    &[ctor, rel],
-                                );
-                            }
+                    if let ast::ExprKind::App {
+                        func: match_fn,
+                        arg: match_arg,
+                    } = &rhs.node
+                        && let (ast::ExprKind::Var(fn_name), ast::ExprKind::Constructor(ctor_name)) =
+                            (&match_fn.node, &match_arg.node)
+                        && fn_name == "match"
+                        && !env.bindings.contains_key(fn_name)
+                        && !(self.top_fn_names.contains(fn_name.as_str())
+                            && self.global_fns.contains_key(fn_name.as_str()))
+                    {
+                        if let ast::ExprKind::SourceRef {
+                            name: source_name, ..
+                        } = &lhs.node
+                            && let Some(schema) = self.source_schemas.get(source_name).cloned()
+                        {
+                            let (name_ptr, name_len) = self.string_ptr(builder, source_name);
+                            let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                            let (tag_ptr, tag_len) = self.string_ptr(builder, ctor_name);
+                            return self.call_rt(
+                                builder,
+                                "knot_source_match",
+                                &[
+                                    db, name_ptr, name_len, schema_ptr, schema_len, tag_ptr,
+                                    tag_len,
+                                ],
+                            );
+                        }
+                        // Non-source: value-level match
+                        let rel = self.compile_expr(builder, lhs, env, db);
+                        let ctor = self.compile_expr(builder, match_arg, env, db);
+                        return self.call_rt(builder, "knot_relation_match", &[ctor, rel]);
+                    }
                     // Try to compile the entire pipe chain to a single SQL query
                     if let Some(val) = self.try_compile_pipe_sql(builder, expr, env, db) {
                         return val;
@@ -5365,7 +5547,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 } else if matches!(op, ast::BinOp::And | ast::BinOp::Or) {
                     // Short-circuit boolean ops: don't evaluate RHS if LHS determines result
                     let l = self.compile_expr(builder, lhs, env, db);
-                    let l_bool = self.call_rt_typed(builder, "knot_value_get_bool", &[l], types::I32);
+                    let l_bool =
+                        self.call_rt_typed(builder, "knot_value_get_bool", &[l], types::I32);
                     let l_true = builder.ins().icmp_imm(IntCC::NotEqual, l_bool, 0);
 
                     let rhs_block = builder.create_block();
@@ -5374,10 +5557,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
                     if matches!(op, ast::BinOp::And) {
                         // &&: if l is false, short-circuit with l (false)
-                        builder.ins().brif(l_true, rhs_block, &[], merge_block, &[l.into()]);
+                        builder
+                            .ins()
+                            .brif(l_true, rhs_block, &[], merge_block, &[l.into()]);
                     } else {
                         // ||: if l is true, short-circuit with l (true)
-                        builder.ins().brif(l_true, merge_block, &[l.into()], rhs_block, &[]);
+                        builder
+                            .ins()
+                            .brif(l_true, merge_block, &[l.into()], rhs_block, &[]);
                     }
 
                     builder.switch_to_block(rhs_block);
@@ -5393,24 +5580,44 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let r = self.compile_expr(builder, rhs, env, db);
                     match op {
                         // Arithmetic: dispatch through Num trait
-                        ast::BinOp::Add => self.compile_trait_binop(builder, "add", l, r, db, "knot_value_add"),
-                        ast::BinOp::Sub => self.compile_trait_binop(builder, "sub", l, r, db, "knot_value_sub"),
-                        ast::BinOp::Mul => self.compile_trait_binop(builder, "mul", l, r, db, "knot_value_mul"),
-                        ast::BinOp::Div => self.compile_trait_binop(builder, "div", l, r, db, "knot_value_div"),
-                        ast::BinOp::Mod => self.compile_trait_binop(builder, "mod", l, r, db, "knot_value_mod"),
+                        ast::BinOp::Add => {
+                            self.compile_trait_binop(builder, "add", l, r, db, "knot_value_add")
+                        }
+                        ast::BinOp::Sub => {
+                            self.compile_trait_binop(builder, "sub", l, r, db, "knot_value_sub")
+                        }
+                        ast::BinOp::Mul => {
+                            self.compile_trait_binop(builder, "mul", l, r, db, "knot_value_mul")
+                        }
+                        ast::BinOp::Div => {
+                            self.compile_trait_binop(builder, "div", l, r, db, "knot_value_div")
+                        }
+                        ast::BinOp::Mod => {
+                            self.compile_trait_binop(builder, "mod", l, r, db, "knot_value_mod")
+                        }
                         // Equality: dispatch through Eq trait
-                        ast::BinOp::Eq => self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq"),
+                        ast::BinOp::Eq => {
+                            self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq")
+                        }
                         ast::BinOp::Neq => {
-                            let eq_result = self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq");
+                            let eq_result =
+                                self.compile_trait_binop(builder, "eq", l, r, db, "knot_value_eq");
                             self.call_rt(builder, "knot_value_not", &[eq_result])
-                        },
+                        }
                         // Comparison: dispatch through Ord trait (compare → Ordering)
                         ast::BinOp::Lt => self.compile_comparison(builder, l, r, db, "LT", false),
                         ast::BinOp::Gt => self.compile_comparison(builder, l, r, db, "GT", false),
                         ast::BinOp::Le => self.compile_comparison(builder, l, r, db, "GT", true),
                         ast::BinOp::Ge => self.compile_comparison(builder, l, r, db, "LT", true),
                         // Semigroup: dispatch through Semigroup trait
-                        ast::BinOp::Concat => self.compile_trait_binop(builder, "append", l, r, db, "knot_value_concat"),
+                        ast::BinOp::Concat => self.compile_trait_binop(
+                            builder,
+                            "append",
+                            l,
+                            r,
+                            db,
+                            "knot_value_concat",
+                        ),
                         ast::BinOp::And | ast::BinOp::Or => unreachable!(),
                         ast::BinOp::Pipe => unreachable!(),
                     }
@@ -5421,7 +5628,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let val = self.compile_expr(builder, operand, env, db);
                 match op {
                     // Negation: dispatch through Num trait
-                    ast::UnaryOp::Neg => self.compile_trait_unop(builder, "negate", val, db, "knot_value_negate"),
+                    ast::UnaryOp::Neg => {
+                        self.compile_trait_unop(builder, "negate", val, db, "knot_value_negate")
+                    }
                     // Boolean not: no trait dispatch
                     ast::UnaryOp::Not => self.call_rt(builder, "knot_value_not", &[val]),
                 }
@@ -5437,15 +5646,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // keyed by the `<>` head's span; unroll to a left-nested fold
                 // `folder (folder … init proj1 …) projN`, outermost-first so
                 // a right-biased folder lets the innermost fragment win.
-                if let ast::ExprKind::App { func: f0, arg: folder } = &func.node
+                if let ast::ExprKind::App {
+                    func: f0,
+                    arg: folder,
+                } = &func.node
                     && let ast::ExprKind::CollectFold(_) = &f0.node
                 {
                     let init = arg;
-                    let cands = self
-                        .collect_refs
-                        .get(&f0.span)
-                        .cloned()
-                        .unwrap_or_default();
+                    let cands = self.collect_refs.get(&f0.span).cloned().unwrap_or_default();
                     let ast::ExprKind::CollectFold(cf_name) = &f0.node else {
                         unreachable!()
                     };
@@ -5495,13 +5703,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
                 // Check for monadic yield: __yield(e) or yield(e)
                 if let ast::ExprKind::Var(name) = &func.node
-                    && (name == "__yield" || name == "yield") {
-                        let val = self.compile_expr(builder, arg, env, db);
-                        if self.in_io_eager {
-                            return val;
-                        }
-                        return self.compile_monadic_yield(builder, val, func.span, db);
+                    && (name == "__yield" || name == "yield")
+                {
+                    let val = self.compile_expr(builder, arg, env, db);
+                    if self.in_io_eager {
+                        return val;
                     }
+                    return self.compile_monadic_yield(builder, val, func.span, db);
+                }
                 self.compile_app(builder, expr, env, db)
             }
 
@@ -5513,7 +5722,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 } else if self.is_io_do_block(stmts) {
                     self.compile_io_do(builder, stmts, env, db)
                 } else if self.in_io_eager
-                    && !stmts.iter().any(|s| matches!(&s.node, ast::StmtKind::Bind { .. }))
+                    && !stmts
+                        .iter()
+                        .any(|s| matches!(&s.node, ast::StmtKind::Bind { .. }))
                 {
                     // Pure do-block with no binds (no loops) nested inside
                     // an IO eager context: compile eagerly so that `yield`
@@ -5530,18 +5741,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::Set { target, value } => {
                 // target should be a SourceRef (source or view)
                 if let ast::ExprKind::SourceRef { name, .. } = &target.node {
-                    let schema = self
-                        .source_schemas
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_default();
+                    let schema = self.source_schemas.get(name).cloned().unwrap_or_default();
 
                     // Scalar source: wrap value as [{_value: val}] and do a full write
                     if self.scalar_sources.contains(name) {
                         let val = self.compile_set_value_expr(builder, value, env, db);
                         // Validate refinements on the raw value (wrap as [val] for the check)
                         if self.source_refinements.contains_key(name) {
-                            let singleton = self.call_rt(builder, "knot_relation_singleton", &[val]);
+                            let singleton =
+                                self.call_rt(builder, "knot_relation_singleton", &[val]);
                             self.emit_refinement_checks(builder, name, singleton, env, db);
                         }
                         let wrapped = self.call_rt(builder, "knot_scalar_source_wrap", &[val]);
@@ -5559,8 +5767,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // running shape matchers, so a let-bound `union`,
                     // filter-only do-block, or conditional update is
                     // recognised even when the value is a bare `Var`.
-                    let inlined =
-                        beta_reduce(value, &self.fun_bodies, &self.let_bindings);
+                    let inlined = beta_reduce(value, &self.fun_bodies, &self.let_bindings);
                     let match_value: &ast::Expr = &inlined;
 
                     if let Some(new_rows_expr) = self.match_union_append(name, match_value) {
@@ -5583,8 +5790,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         }
                         self.emit_refinement_checks(builder, name, new_rows, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
-                        let (schema_ptr, schema_len) =
-                            self.string_ptr(builder, &schema);
+                        let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
                         self.call_rt_void(
                             builder,
                             "knot_source_append",
@@ -5595,8 +5801,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         let val = self.compile_set_value_expr(builder, value, env, db);
                         self.emit_refinement_checks(builder, name, val, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
-                        let (schema_ptr, schema_len) =
-                            self.string_ptr(builder, &schema);
+                        let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
                         self.call_rt_void(
                             builder,
                             "knot_source_write",
@@ -5612,8 +5817,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             let mut frags = Vec::new();
                             let mut all_ok = true;
                             for cond in &conditions {
-                                if let Some(f) =
-                                    self.try_compile_sql_expr(&bind_var, cond, &schema)
+                                if let Some(f) = self.try_compile_sql_expr(&bind_var, cond, &schema)
                                 {
                                     frags.push(f);
                                 } else {
@@ -5627,10 +5831,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                     .map(|f| format!("({})", f.sql))
                                     .collect::<Vec<_>>()
                                     .join(" AND ");
-                                let params: Vec<SqlParamSource> = frags
-                                    .into_iter()
-                                    .flat_map(|f| f.params)
-                                    .collect();
+                                let params: Vec<SqlParamSource> =
+                                    frags.into_iter().flat_map(|f| f.params).collect();
                                 Some(SqlFragment { sql, params })
                             } else {
                                 None
@@ -5643,8 +5845,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 self.compile_sql_params(builder, &frag.params, env, db);
                             let (name_ptr, name_len) = self.string_ptr(builder, name);
                             let where_sql = frag.sql;
-                            let (where_ptr, where_len) =
-                                self.string_ptr(builder, &where_sql);
+                            let (where_ptr, where_len) = self.string_ptr(builder, &where_sql);
                             self.call_rt_void(
                                 builder,
                                 "knot_source_delete_where",
@@ -5655,8 +5856,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             let val = self.compile_set_value_expr(builder, value, env, db);
                             self.emit_refinement_checks(builder, name, val, env, db);
                             let (name_ptr, name_len) = self.string_ptr(builder, name);
-                            let (schema_ptr, schema_len) =
-                                self.string_ptr(builder, &schema);
+                            let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
                             self.call_rt_void(
                                 builder,
                                 "knot_source_diff_write",
@@ -5669,8 +5869,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         let val = self.compile_set_value_expr(builder, value, env, db);
                         self.emit_refinement_checks(builder, name, val, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
-                        let (schema_ptr, schema_len) =
-                            self.string_ptr(builder, &schema);
+                        let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
                         self.call_rt_void(
                             builder,
                             "knot_source_write",
@@ -5681,8 +5880,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         let val = self.compile_set_value_expr(builder, value, env, db);
                         self.emit_refinement_checks(builder, name, val, env, db);
                         let (name_ptr, name_len) = self.string_ptr(builder, name);
-                        let (schema_ptr, schema_len) =
-                            self.string_ptr(builder, &schema);
+                        let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
                         self.call_rt_void(
                             builder,
                             "knot_source_diff_write",
@@ -5701,18 +5899,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             ast::ExprKind::FullSet { target, value } => {
                 if let ast::ExprKind::SourceRef { name, .. } = &target.node {
-                    let schema = self
-                        .source_schemas
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_default();
+                    let schema = self.source_schemas.get(name).cloned().unwrap_or_default();
 
                     // Scalar source: wrap value as [{_value: val}] and do a full write
                     if self.scalar_sources.contains(name) {
                         let val = self.compile_set_value_expr(builder, value, env, db);
                         // Validate refinements on the raw value (wrap as [val] for the check)
                         if self.source_refinements.contains_key(name) {
-                            let singleton = self.call_rt(builder, "knot_relation_singleton", &[val]);
+                            let singleton =
+                                self.call_rt(builder, "knot_relation_singleton", &[val]);
                             self.emit_refinement_checks(builder, name, singleton, env, db);
                         }
                         let wrapped = self.call_rt(builder, "knot_scalar_source_wrap", &[val]);
@@ -5729,8 +5924,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let val = self.compile_set_value_expr(builder, value, env, db);
                     self.emit_refinement_checks(builder, name, val, env, db);
                     let (name_ptr, name_len) = self.string_ptr(builder, name);
-                    let (schema_ptr, schema_len) =
-                        self.string_ptr(builder, &schema);
+                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
                     self.call_rt_void(
                         builder,
                         "knot_source_write",
@@ -5835,7 +6029,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let retry_flag = self.call_rt(builder, "knot_stm_check_and_clear", &[]);
                 let post_retry_block = builder.create_block();
                 builder.append_block_param(post_retry_block, self.ptr_type);
-                builder.ins().brif(retry_flag, retry_block, &[], post_retry_block, &[val.into()]);
+                builder.ins().brif(
+                    retry_flag,
+                    retry_block,
+                    &[],
+                    post_retry_block,
+                    &[val.into()],
+                );
 
                 // (1) Retry path
                 builder.switch_to_block(retry_block);
@@ -5855,7 +6055,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let skip_flag = self.call_rt(builder, "knot_stm_check_skip_and_clear", &[]);
                 let skip_block = builder.create_block();
                 let commit_block = builder.create_block();
-                builder.ins().brif(skip_flag, skip_block, &[], commit_block, &[]);
+                builder
+                    .ins()
+                    .brif(skip_flag, skip_block, &[], commit_block, &[]);
 
                 // (2) Skip path: rollback the savepoint (no commit), pop arena,
                 // jump to done with unit so the surrounding IO continues.
@@ -5891,23 +6093,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 result
             }
 
-            ast::ExprKind::Case {
-                scrutinee,
-                arms,
-            } => self.compile_case(builder, scrutinee, arms, env, db),
+            ast::ExprKind::Case { scrutinee, arms } => {
+                self.compile_case(builder, scrutinee, arms, env, db)
+            }
 
             // `2 seconds` compiles exactly like its desugared `2 * 1000`.
-            ast::ExprKind::TimeUnitLit { value, .. } => {
-                self.compile_expr(builder, value, env, db)
-            }
+            ast::ExprKind::TimeUnitLit { value, .. } => self.compile_expr(builder, value, env, db),
 
-            ast::ExprKind::Annot { expr, .. } => {
-                self.compile_expr(builder, expr, env, db)
-            }
+            ast::ExprKind::Annot { expr, .. } => self.compile_expr(builder, expr, env, db),
 
-            ast::ExprKind::Refine(inner) => {
-                self.compile_refine(builder, inner, expr.span, env, db)
-            }
+            ast::ExprKind::Refine(inner) => self.compile_refine(builder, inner, expr.span, env, db),
 
             ast::ExprKind::Serve { api, handlers, .. } => {
                 self.compile_serve(builder, api, handlers, expr.span, env, db)
@@ -6006,8 +6201,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// rebinds that happened inside the scope must still kill matching
     /// outer-scope entries.
     fn replay_source_bind_invalidations_since(&mut self, mark: usize) {
-        let suffix: Vec<SourceBindInvalidation> =
-            self.source_bind_invalidations[mark..].to_vec();
+        let suffix: Vec<SourceBindInvalidation> = self.source_bind_invalidations[mark..].to_vec();
         for inv in &suffix {
             Self::replay_source_bind_invalidation(
                 inv,
@@ -6022,12 +6216,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// previous source, so SQL pushdown must not re-query the table for it.
     fn invalidate_rebound_pattern(&mut self, pat: &ast::Pat) {
         for name in pat_bound_names(pat) {
-            if self.source_var_binds.contains_key(&name)
-                || self.let_bindings.contains_key(&name)
-            {
-                self.apply_source_bind_invalidation(
-                    SourceBindInvalidation::Rebind(name),
-                );
+            if self.source_var_binds.contains_key(&name) || self.let_bindings.contains_key(&name) {
+                self.apply_source_bind_invalidation(SourceBindInvalidation::Rebind(name));
             }
         }
     }
@@ -6040,11 +6230,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// reports "may write" for a reason other than a direct
     /// `Set`/`FullSet`, this returns `false` so the caller invalidates
     /// every source binding.
-    fn collect_direct_write_targets(
-        &self,
-        expr: &ast::Expr,
-        out: &mut Vec<String>,
-    ) -> bool {
+    fn collect_direct_write_targets(&self, expr: &ast::Expr, out: &mut Vec<String>) -> bool {
         use ast::ExprKind::*;
         let name_is_known_write_free = |name: &str| -> bool {
             !self.write_functions.contains(name)
@@ -6073,9 +6259,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             TypeHole => true,
             // A route declaration marker carries no value and never writes.
             RouteDecl { .. } => true,
-            Atomic(inner) | Refine(inner) => {
-                self.collect_direct_write_targets(inner, out)
-            }
+            Atomic(inner) | Refine(inner) => self.collect_direct_write_targets(inner, out),
             UnaryOp { operand, .. } => self.collect_direct_write_targets(operand, out),
             TimeUnitLit { value, .. } => self.collect_direct_write_targets(value, out),
             Annot { expr: e, .. } => self.collect_direct_write_targets(e, out),
@@ -6120,12 +6304,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     );
                     !unknown_io && self.collect_direct_write_targets(expr, out)
                 }
-                ast::StmtKind::Where { cond } => {
-                    self.collect_direct_write_targets(cond, out)
-                }
-                ast::StmtKind::GroupBy { key } => {
-                    self.collect_direct_write_targets(key, out)
-                }
+                ast::StmtKind::Where { cond } => self.collect_direct_write_targets(cond, out),
+                ast::StmtKind::GroupBy { key } => self.collect_direct_write_targets(key, out),
             }),
             Record(fields) => fields
                 .iter()
@@ -6150,15 +6330,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// SQL pushdown optimization — the general in-memory path stays
     /// correct — so being conservative here is safe.
     fn invalidate_after_possible_writes(&mut self, expr: &ast::Expr) {
-        if !Self::expr_contains_writes(expr, &self.write_functions, &self.top_fn_names, &self.passthrough_functions) {
+        if !Self::expr_contains_writes(
+            expr,
+            &self.write_functions,
+            &self.top_fn_names,
+            &self.passthrough_functions,
+        ) {
             return;
         }
         let mut direct: Vec<String> = Vec::new();
         if self.collect_direct_write_targets(expr, &mut direct) {
             for name in direct {
-                self.apply_source_bind_invalidation(
-                    SourceBindInvalidation::SourceWrite(name),
-                );
+                self.apply_source_bind_invalidation(SourceBindInvalidation::SourceWrite(name));
             }
         } else {
             self.apply_source_bind_invalidation(SourceBindInvalidation::AllSources);
@@ -6191,7 +6374,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         match &expr.node {
             // Bottom: a source, an existing pipe, or a do-block — used as-is.
             ast::ExprKind::SourceRef { .. }
-            | ast::ExprKind::BinOp { op: ast::BinOp::Pipe, .. }
+            | ast::ExprKind::BinOp {
+                op: ast::BinOp::Pipe,
+                ..
+            }
             | ast::ExprKind::Do(_) => Some(expr.clone()),
             ast::ExprKind::Var(name) if self.source_var_binds.contains_key(name.as_str()) => {
                 Some(expr.clone())
@@ -6207,8 +6393,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let op_name = Self::query_form_name(head)?;
                 if !matches!(
                     op_name,
-                    "filter" | "map" | "sortBy" | "take" | "takeRelation" | "drop"
-                        | "dropRelation" | "count" | "sum"
+                    "filter"
+                        | "map"
+                        | "sortBy"
+                        | "take"
+                        | "takeRelation"
+                        | "drop"
+                        | "dropRelation"
+                        | "count"
+                        | "sum"
                 ) {
                     return None;
                 }
@@ -6235,33 +6428,52 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// in-memory).
     fn peel_map_projection(&self, expr: &ast::Expr) -> Option<(String, String)> {
         let reduced = beta_reduce(expr, &self.fun_bodies, &self.let_bindings);
-        if let ast::ExprKind::App { func, arg: source_expr } = &reduced.node
-            && let ast::ExprKind::App { func: inner_func, arg: map_lambda } = &func.node
-                && Self::query_form_name(inner_func) == Some("map") {
-                        let source_name = self.resolve_source(source_expr)?;
-                        let (bind_var, body) = extract_single_param_lambda(map_lambda, &self.fun_bodies, &self.let_bindings)?;
-                        let body: &ast::Expr = &body;
-                        if let ast::ExprKind::FieldAccess { expr: rec, field } = &body.node
-                            && let ast::ExprKind::Var(v) = &rec.node
-                                && v == &bind_var {
-                                    return Some((source_name, field.clone()));
-                                }
-                    }
+        if let ast::ExprKind::App {
+            func,
+            arg: source_expr,
+        } = &reduced.node
+            && let ast::ExprKind::App {
+                func: inner_func,
+                arg: map_lambda,
+            } = &func.node
+            && Self::query_form_name(inner_func) == Some("map")
+        {
+            let source_name = self.resolve_source(source_expr)?;
+            let (bind_var, body) =
+                extract_single_param_lambda(map_lambda, &self.fun_bodies, &self.let_bindings)?;
+            let body: &ast::Expr = &body;
+            if let ast::ExprKind::FieldAccess { expr: rec, field } = &body.node
+                && let ast::ExprKind::Var(v) = &rec.node
+                && v == &bind_var
+            {
+                return Some((source_name, field.clone()));
+            }
+        }
         // Pipe form: `source |> map (\r -> r.<field>)`. beta_reduce does NOT
         // collapse pipes, so match the BinOp::Pipe shape directly: lhs is the
         // source, rhs is `map (\r -> r.<field>)`.
-        if let ast::ExprKind::BinOp { op: ast::BinOp::Pipe, lhs, rhs } = &reduced.node
-            && let ast::ExprKind::App { func: map_head, arg: map_lambda } = &rhs.node
-                && Self::query_form_name(map_head) == Some("map") {
-                    let source_name = self.resolve_source(lhs)?;
-                    let (bind_var, body) = extract_single_param_lambda(map_lambda, &self.fun_bodies, &self.let_bindings)?;
-                    let body: &ast::Expr = &body;
-                    if let ast::ExprKind::FieldAccess { expr: rec, field } = &body.node
-                        && let ast::ExprKind::Var(v) = &rec.node
-                            && v == &bind_var {
-                                return Some((source_name, field.clone()));
-                            }
-                }
+        if let ast::ExprKind::BinOp {
+            op: ast::BinOp::Pipe,
+            lhs,
+            rhs,
+        } = &reduced.node
+            && let ast::ExprKind::App {
+                func: map_head,
+                arg: map_lambda,
+            } = &rhs.node
+            && Self::query_form_name(map_head) == Some("map")
+        {
+            let source_name = self.resolve_source(lhs)?;
+            let (bind_var, body) =
+                extract_single_param_lambda(map_lambda, &self.fun_bodies, &self.let_bindings)?;
+            let body: &ast::Expr = &body;
+            if let ast::ExprKind::FieldAccess { expr: rec, field } = &body.node
+                && let ast::ExprKind::Var(v) = &rec.node
+                && v == &bind_var
+            {
+                return Some((source_name, field.clone()));
+            }
+        }
         None
     }
 
@@ -6292,141 +6504,167 @@ impl<M: cranelift_module::Module> Codegen<M> {
             && !base_schema.contains('[')
             && let Some(type_str) = lookup_col_type_from_schema(&base_schema, map_field)
         {
-                let select_columns = vec![SqlSelectColumn {
-                    result_field: map_field.clone(),
+            let select_columns = vec![SqlSelectColumn {
+                result_field: map_field.clone(),
+                alias: String::new(),
+                source_col: map_field.clone(),
+                type_str: type_str.clone(),
+                sql_expr: None,
+            }];
+            let proj_schema = format!("{}:{}", map_field, type_str);
+            let plan = SqlQueryPlan {
+                tables: vec![SqlTable {
+                    source_name: map_src.clone(),
                     alias: String::new(),
-                    source_col: map_field.clone(),
-                    type_str: type_str.clone(),
-                    sql_expr: None,
-                }];
-                let proj_schema = format!("{}:{}", map_field, type_str);
-                let plan = SqlQueryPlan {
-                    tables: vec![SqlTable {
-                        source_name: map_src.clone(),
-                        alias: String::new(),
-                        subquery: None,
-                    }],
-                    conditions: Vec::new(),
-                    params: Vec::new(),
-                    select_columns,
-                    order_by: Vec::new(),
-                    limit: Some(SqlParamSource::Literal(ast::Literal::Int("1".to_string()))),
-                    offset: None,
-                    distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                };
-                let query = Query { plan, terminal: QueryTerminal::Rows };
-                return Some(self.emit_query(builder, &query, &proj_schema, env, db, None, Some(rel_expr.span)));
+                    subquery: None,
+                }],
+                conditions: Vec::new(),
+                params: Vec::new(),
+                select_columns,
+                order_by: Vec::new(),
+                limit: Some(SqlParamSource::Literal(ast::Literal::Int("1".to_string()))),
+                offset: None,
+                distinct: false,
+                group_by: Vec::new(),
+                having: Vec::new(),
+            };
+            let query = Query {
+                plan,
+                terminal: QueryTerminal::Rows,
+            };
+            return Some(self.emit_query(
+                builder,
+                &query,
+                &proj_schema,
+                env,
+                db,
+                None,
+                Some(rel_expr.span),
+            ));
         }
         // Resolve the source to (plan, schema). Two shapes: a bare/`filter`
         // source (single table, optional WHERE) or a do-block plan.
-        let (mut plan, schema): (SqlQueryPlan, String) =
-            if let ast::ExprKind::Do(stmts) = &rel_expr.node {
-                let plan = self.analyze_sql_plan(stmts, env)?;
-                if plan.tables.len() != 1 || plan.limit.is_some() || plan.offset.is_some() {
-                    return None;
-                }
-                let schema =
-                    self.source_schemas.get(&plan.tables[0].source_name)?.clone();
-                (plan, schema)
-            } else {
-                // Bare `*src`, `filter p *src`, or `sortBy k *src`. Peel a
-                // leading `sortBy` into ORDER BY (the key must be a single
-                // column access, matching the standalone sortBy pushdown's
-                // pushability rule), then treat the remainder as a bare or
-                // filtered source.
-                let reduced = beta_reduce(rel_expr, &self.fun_bodies, &self.let_bindings);
-                let (order_by, base): (Vec<String>, ast::Expr) =
-                    match peel_sort_by(&reduced, &self.fun_bodies, &self.let_bindings) {
-                        Some((key_lam, inner, desc)) => {
-                            let (key_bind, key_body) = extract_single_param_lambda(
-                                &key_lam, &self.fun_bodies, &self.let_bindings,
-                            )?;
-                            let key_body: &ast::Expr = &key_body;
-                            // Resolve the inner source's schema for the key
-                            // column; sortBy over a filter keeps the filter's
-                            // source. Use the inner source's own schema.
-                            let inner_src = match extract_filter_on_source(
-                                &inner, &self.source_var_binds, &self.fun_bodies,
-                                &self.let_bindings,
-                            ) {
-                                Some((s, _, _)) => s,
-                                None => self.resolve_source(&inner)?,
-                            };
-                            let inner_schema =
-                                self.source_schemas.get(&inner_src)?.clone();
-                            if !sortby_projection_pushable(&key_bind, key_body, &inner_schema) {
-                                return None;
-                            }
-                            let col_sql =
-                                extract_sql_field_access(&key_bind, key_body, "", &inner_schema)?;
-                            let col_sql = if desc { format!("{} DESC", col_sql) } else { col_sql };
-                            (vec![col_sql], inner)
+        let (mut plan, schema): (SqlQueryPlan, String) = if let ast::ExprKind::Do(stmts) =
+            &rel_expr.node
+        {
+            let plan = self.analyze_sql_plan(stmts, env)?;
+            if plan.tables.len() != 1 || plan.limit.is_some() || plan.offset.is_some() {
+                return None;
+            }
+            let schema = self
+                .source_schemas
+                .get(&plan.tables[0].source_name)?
+                .clone();
+            (plan, schema)
+        } else {
+            // Bare `*src`, `filter p *src`, or `sortBy k *src`. Peel a
+            // leading `sortBy` into ORDER BY (the key must be a single
+            // column access, matching the standalone sortBy pushdown's
+            // pushability rule), then treat the remainder as a bare or
+            // filtered source.
+            let reduced = beta_reduce(rel_expr, &self.fun_bodies, &self.let_bindings);
+            let (order_by, base): (Vec<String>, ast::Expr) =
+                match peel_sort_by(&reduced, &self.fun_bodies, &self.let_bindings) {
+                    Some((key_lam, inner, desc)) => {
+                        let (key_bind, key_body) = extract_single_param_lambda(
+                            &key_lam,
+                            &self.fun_bodies,
+                            &self.let_bindings,
+                        )?;
+                        let key_body: &ast::Expr = &key_body;
+                        // Resolve the inner source's schema for the key
+                        // column; sortBy over a filter keeps the filter's
+                        // source. Use the inner source's own schema.
+                        let inner_src = match extract_filter_on_source(
+                            &inner,
+                            &self.source_var_binds,
+                            &self.fun_bodies,
+                            &self.let_bindings,
+                        ) {
+                            Some((s, _, _)) => s,
+                            None => self.resolve_source(&inner)?,
+                        };
+                        let inner_schema = self.source_schemas.get(&inner_src)?.clone();
+                        if !sortby_projection_pushable(&key_bind, key_body, &inner_schema) {
+                            return None;
                         }
-                        None => (Vec::new(), rel_expr.clone()),
-                    };
-                let reduced_base =
-                    beta_reduce(&base, &self.fun_bodies, &self.let_bindings);
-                // Peel a leading take/drop around the source. `head (drop N …)`
-                // becomes `LIMIT 1 OFFSET N`. `head (take N …)` must keep the
-                // take's bound as the LIMIT: `take 0`/negative yields an empty
-                // page (so head → Nothing), and a positive take keeps at least
-                // the first row — head then reads the first of the ≤N rows.
-                let (offset, take, base_no_take): (Option<ast::Expr>, Option<ast::Expr>, ast::Expr) =
-                    match peel_take_drop(&reduced_base, &self.fun_bodies, &self.let_bindings) {
-                        Some((true, n, inner)) => (Some(n), None, inner),
-                        Some((false, n, inner)) => (None, Some(n), inner),
-                        None => (None, None, reduced_base.clone()),
-                    };
-                let offset_param = match &offset {
-                    Some(n) => Some(expr_to_sql_param(n)?),
-                    None => None,
+                        let col_sql =
+                            extract_sql_field_access(&key_bind, key_body, "", &inner_schema)?;
+                        let col_sql = if desc {
+                            format!("{} DESC", col_sql)
+                        } else {
+                            col_sql
+                        };
+                        (vec![col_sql], inner)
+                    }
+                    None => (Vec::new(), rel_expr.clone()),
                 };
-                let take_param = match &take {
-                    Some(n) => Some(expr_to_sql_param(n)?),
-                    None => None,
+            let reduced_base = beta_reduce(&base, &self.fun_bodies, &self.let_bindings);
+            // Peel a leading take/drop around the source. `head (drop N …)`
+            // becomes `LIMIT 1 OFFSET N`. `head (take N …)` must keep the
+            // take's bound as the LIMIT: `take 0`/negative yields an empty
+            // page (so head → Nothing), and a positive take keeps at least
+            // the first row — head then reads the first of the ≤N rows.
+            let (offset, take, base_no_take): (Option<ast::Expr>, Option<ast::Expr>, ast::Expr) =
+                match peel_take_drop(&reduced_base, &self.fun_bodies, &self.let_bindings) {
+                    Some((true, n, inner)) => (Some(n), None, inner),
+                    Some((false, n, inner)) => (None, Some(n), inner),
+                    None => (None, None, reduced_base.clone()),
                 };
-                let base_reduced =
-                    beta_reduce(&base_no_take, &self.fun_bodies, &self.let_bindings);
-                let (source_name, filter): (String, Option<(String, ast::Expr)>) =
-                    match extract_filter_on_source(
-                        &base_reduced, &self.source_var_binds, &self.fun_bodies, &self.let_bindings,
-                    ) {
-                        Some((src, bind, body)) => (src, Some((bind, body))),
-                        None => (self.resolve_source(&base_reduced)?, None),
-                    };
-                let schema = self.source_schemas.get(&source_name)?.clone();
-                if schema.starts_with('#') || schema.contains('[') {
-                    return None;
-                }
-                let alias = String::new(); // bare FROM, unqualified cols
-                let mut conditions = Vec::new();
-                let mut params = Vec::new();
-                if let Some((bind, body)) = filter {
-                    let body: &ast::Expr = &body;
-                    let frag = self.try_compile_sql_expr(&bind, body, &schema)?;
-                    conditions.push(frag.sql);
-                    params.extend(frag.params);
-                }
-                (
-                    SqlQueryPlan {
-                        tables: vec![SqlTable { source_name, alias, subquery: None }],
-                        conditions,
-                        params,
-                        select_columns: schema_select_columns(&schema, ""),
-                        order_by,
-                        // A peeled `take N` sets the page bound (`take 0` →
-                        // empty → Nothing); otherwise head uses LIMIT 1 below.
-                        limit: take_param,
-                        offset: offset_param,
-                        distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                    },
-                    schema,
-                )
+            let offset_param = match &offset {
+                Some(n) => Some(expr_to_sql_param(n)?),
+                None => None,
             };
+            let take_param = match &take {
+                Some(n) => Some(expr_to_sql_param(n)?),
+                None => None,
+            };
+            let base_reduced = beta_reduce(&base_no_take, &self.fun_bodies, &self.let_bindings);
+            let (source_name, filter): (String, Option<(String, ast::Expr)>) =
+                match extract_filter_on_source(
+                    &base_reduced,
+                    &self.source_var_binds,
+                    &self.fun_bodies,
+                    &self.let_bindings,
+                ) {
+                    Some((src, bind, body)) => (src, Some((bind, body))),
+                    None => (self.resolve_source(&base_reduced)?, None),
+                };
+            let schema = self.source_schemas.get(&source_name)?.clone();
+            if schema.starts_with('#') || schema.contains('[') {
+                return None;
+            }
+            let alias = String::new(); // bare FROM, unqualified cols
+            let mut conditions = Vec::new();
+            let mut params = Vec::new();
+            if let Some((bind, body)) = filter {
+                let body: &ast::Expr = &body;
+                let frag = self.try_compile_sql_expr(&bind, body, &schema)?;
+                conditions.push(frag.sql);
+                params.extend(frag.params);
+            }
+            (
+                SqlQueryPlan {
+                    tables: vec![SqlTable {
+                        source_name,
+                        alias,
+                        subquery: None,
+                    }],
+                    conditions,
+                    params,
+                    select_columns: schema_select_columns(&schema, ""),
+                    order_by,
+                    // A peeled `take N` sets the page bound (`take 0` →
+                    // empty → Nothing); otherwise head uses LIMIT 1 below.
+                    limit: take_param,
+                    offset: offset_param,
+                    distinct: false,
+                    group_by: Vec::new(),
+                    having: Vec::new(),
+                },
+                schema,
+            )
+        };
 
         // AND findFirst's predicate into the WHERE (single table → alias t0).
         if let Some(lam) = pred_lambda {
@@ -6444,7 +6682,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         if plan.limit.is_none() {
             plan.limit = Some(SqlParamSource::Literal(ast::Literal::Int("1".to_string())));
         }
-        let query = Query { plan, terminal: QueryTerminal::Rows };
+        let query = Query {
+            plan,
+            terminal: QueryTerminal::Rows,
+        };
         Some(self.emit_query(builder, &query, &schema, env, db, None, Some(rel_expr.span)))
     }
 
@@ -6500,8 +6741,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let mut i = 0;
         while i < flat.len() {
             let e = flat[i];
-            if matches!(&e.node, ast::ExprKind::Constructor(_) | ast::ExprKind::TypeHole)
-                && self.type_arg_spans.contains(&e.span)
+            if matches!(
+                &e.node,
+                ast::ExprKind::Constructor(_) | ast::ExprKind::TypeHole
+            ) && self.type_arg_spans.contains(&e.span)
             {
                 i += 1;
             } else {
@@ -6580,9 +6823,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn server_form_name(func_expr: &ast::Expr) -> Option<&str> {
         match &func_expr.node {
             ast::ExprKind::Var(name) => Some(name.as_str()),
-            ast::ExprKind::FieldAccess { expr, field }
-                if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") =>
-            {
+            ast::ExprKind::FieldAccess { expr, field } if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") => {
                 Some(field.as_str())
             }
             _ => None,
@@ -6639,7 +6880,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let (nptr, nlen) = self.string_ptr(builder, name);
             let noff = (i as i32) * (2 * ptr_bytes);
             builder.ins().stack_store(nptr, names_slot, noff);
-            builder.ins().stack_store(nlen, names_slot, noff + ptr_bytes);
+            builder
+                .ins()
+                .stack_store(nlen, names_slot, noff + ptr_bytes);
             builder
                 .ins()
                 .stack_store(*val, vals_slot, (i as i32) * ptr_bytes);
@@ -6673,8 +6916,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// Appends the expected type and the names/types of every local binding in
     /// scope; the runtime appends their values (unknown at compile time).
     fn render_todo_context(&self, span: ast::Span, ty_str: Option<&str>) -> String {
-        let mut msg =
-            String::from("reached a `todo` hole — this code path is not implemented yet");
+        let mut msg = String::from("reached a `todo` hole — this code path is not implemented yet");
         if let Some(t) = ty_str {
             msg.push_str(&format!("\n  expected to produce a value of type: {t}"));
         }
@@ -6740,7 +6982,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let (nptr, nlen) = self.string_ptr(builder, name);
             let noff = (i as i32) * (2 * ptr_bytes);
             builder.ins().stack_store(nptr, names_slot, noff);
-            builder.ins().stack_store(nlen, names_slot, noff + ptr_bytes);
+            builder
+                .ins()
+                .stack_store(nlen, names_slot, noff + ptr_bytes);
             builder
                 .ins()
                 .stack_store(*val, vals_slot, (i as i32) * ptr_bytes);
@@ -6859,9 +7103,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn query_form_name(func_expr: &ast::Expr) -> Option<&str> {
         match &func_expr.node {
             ast::ExprKind::Var(name) => Some(name.as_str()),
-            ast::ExprKind::FieldAccess { expr, field }
-                if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") =>
-            {
+            ast::ExprKind::FieldAccess { expr, field } if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") => {
                 Some(field.as_str())
             }
             _ => None,
@@ -6874,8 +7116,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// builtin. `false` when the span was not classified (a form inference did
     /// not visit) — callers must then fall back to conservative behaviour.
     fn resolves_to_stdlib(&self, func_expr: &ast::Expr, f: crate::infer::StdlibFn) -> bool {
-        self.resolved_calls.get(&func_expr.span)
-            == Some(&crate::infer::FnIdentity::Stdlib(f))
+        self.resolved_calls.get(&func_expr.span) == Some(&crate::infer::FnIdentity::Stdlib(f))
     }
 
     /// Did inference resolve this call-site head to a USER binding (top-level
@@ -6936,37 +7177,34 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // `\count -> count xs` (shadowing the stdlib `count`) would call the
         // global instead of the local value.
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && env.bindings.contains_key(name) {
-                // Implicit dictionary: a `with`-field function with a
-                // `(^field : T) =>` constraint is called through the local
-                // env binding (the `with` frame binds it). Inference recorded
-                // the dictionary splice keyed by this callsite's span; prepend
-                // the resolved dictionary record as the leading argument (the
-                // elaborated function takes it first), exactly like the
-                // top-level call path below.
-                let mut compiled_args: Vec<Value> = Vec::new();
-                if self.fold_dict_args.contains_key(&expr.span) {
-                    let dict_val = self.compile_fold_dict(builder, expr.span, env);
-                    compiled_args.push(dict_val);
-                } else if let Some((root, path)) = self.implicit_dict_args.get(&expr.span).cloned() {
-                    let dict_val =
-                        self.compile_root_path(builder, &root, &path, expr.span, env);
-                    compiled_args.push(dict_val);
-                }
-                compiled_args.extend(
-                    args.iter().map(|a| self.compile_arg_expr(builder, a, env, db)),
-                );
-                let func_val = self.compile_expr(builder, func_expr, env, db);
-                let mut result = func_val;
-                for arg in &compiled_args {
-                    result = self.call_rt(
-                        builder,
-                        "knot_value_call",
-                        &[db, result, *arg],
-                    );
-                }
-                return result;
+            && env.bindings.contains_key(name)
+        {
+            // Implicit dictionary: a `with`-field function with a
+            // `(^field : T) =>` constraint is called through the local
+            // env binding (the `with` frame binds it). Inference recorded
+            // the dictionary splice keyed by this callsite's span; prepend
+            // the resolved dictionary record as the leading argument (the
+            // elaborated function takes it first), exactly like the
+            // top-level call path below.
+            let mut compiled_args: Vec<Value> = Vec::new();
+            if self.fold_dict_args.contains_key(&expr.span) {
+                let dict_val = self.compile_fold_dict(builder, expr.span, env);
+                compiled_args.push(dict_val);
+            } else if let Some((root, path)) = self.implicit_dict_args.get(&expr.span).cloned() {
+                let dict_val = self.compile_root_path(builder, &root, &path, expr.span, env);
+                compiled_args.push(dict_val);
             }
+            compiled_args.extend(
+                args.iter()
+                    .map(|a| self.compile_arg_expr(builder, a, env, db)),
+            );
+            let func_val = self.compile_expr(builder, func_expr, env, db);
+            let mut result = func_val;
+            for arg in &compiled_args {
+                result = self.call_rt(builder, "knot_value_call", &[db, result, *arg]);
+            }
+            return result;
+        }
 
         // `base.compile src` whose context pins the expected type `a`: pass
         // the descriptor to the typed extern so the runtime can reject the
@@ -6987,11 +7225,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             {
                 let src = self.compile_arg_expr(builder, args[0], env, db);
                 let (eptr, elen) = self.string_ptr(builder, &expected);
-                return self.call_rt(
-                    builder,
-                    "knot_builtin_compile_typed",
-                    &[src, eptr, elen],
-                );
+                return self.call_rt(builder, "knot_builtin_compile_typed", &[src, eptr, elen]);
             }
         }
 
@@ -7004,13 +7238,25 @@ impl<M: cranelift_module::Module> Codegen<M> {
             && !args.is_empty()
             && matches!(
                 Self::query_form_name(func_expr),
-                Some("filter" | "map" | "sortBy" | "take" | "takeRelation" | "drop"
-                    | "dropRelation" | "count" | "sum")
+                Some(
+                    "filter"
+                        | "map"
+                        | "sortBy"
+                        | "take"
+                        | "takeRelation"
+                        | "drop"
+                        | "dropRelation"
+                        | "count"
+                        | "sum"
+                )
             )
             && matches!(
                 args[args.len() - 1].node,
                 ast::ExprKind::App { .. }
-                    | ast::ExprKind::BinOp { op: ast::BinOp::Pipe, .. }
+                    | ast::ExprKind::BinOp {
+                        op: ast::BinOp::Pipe,
+                        ..
+                    }
             )
             && let Some(piped) = self.call_chain_to_pipe(expr)
             && let Some(v) = self.try_compile_pipe_sql(builder, &piped, env, db)
@@ -7023,7 +7269,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // build-time Advice) and wraps the materialized relation as
         // `IO (Vec a)` via `knot_relation_run_io`.
         if Self::query_form_name(func_expr) == Some("run")
-            && args.len() == 1 && !user_shadows_special
+            && args.len() == 1
+            && !user_shadows_special
             && let Some(source_name) = self.resolve_source(args[0])
             && let Some(schema) = self.source_schemas.get(&source_name).cloned()
         {
@@ -7042,346 +7289,401 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // Special case: count *rel → SQL COUNT(*)  (bare `count` or `base.count`)
         if Self::query_form_name(func_expr) == Some("count")
-            && args.len() == 1 && !user_shadows_special {
-                if let Some(source_name) = self.resolve_source(args[0]) {
-                    // Only for actual sources, not views
-                    if self.source_schemas.contains_key(&source_name)
-                    {
-                        self.emit_stm_track_read(builder, &source_name);
-                        let (name_ptr, name_len) =
-                            self.string_ptr(builder, &source_name);
-                        return self.call_rt(
-                            builder,
-                            "knot_source_count",
-                            &[db, name_ptr, name_len],
-                        );
-                    }
+            && args.len() == 1
+            && !user_shadows_special
+        {
+            if let Some(source_name) = self.resolve_source(args[0]) {
+                // Only for actual sources, not views
+                if self.source_schemas.contains_key(&source_name) {
+                    self.emit_stm_track_read(builder, &source_name);
+                    let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
+                    return self.call_rt(builder, "knot_source_count", &[db, name_ptr, name_len]);
                 }
-
-                // count (filter f *source) → SELECT COUNT(*) FROM ... WHERE ...
-                if let Some((source_name, filter_bind, filter_body)) =
-                    extract_filter_on_source(args[0], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
-                {
-                    let source_name: &str = &source_name;
-                    let filter_body: &ast::Expr = &filter_body;
-                    if let Some(schema) = self.source_schemas.get(source_name).cloned()
-                            && !schema.starts_with('#') && !schema.contains('[')
-                                && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
-                                    let query = Query {
-                                        plan: SqlQueryPlan {
-                                            tables: vec![SqlTable {
-                                                source_name: source_name.to_string(),
-                                                alias: String::new(),
-                                                subquery: None,
-                                            }],
-                                            conditions: vec![frag.sql],
-                                            params: frag.params,
-                                            select_columns: Vec::new(),
-                                            order_by: Vec::new(),
-                                            limit: None,
-                                            offset: None,
-                                            distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                                        },
-                                        terminal: QueryTerminal::Count,
-                                    };
-                                    return self.emit_query(builder, &query, &schema, env, db, None, Some(expr.span));
-                                }
-                }
-
-                // count (take N *source) / count (drop N *source) →
-                // SELECT COUNT(*) over a LIMIT/OFFSET subquery. `take`
-                // bounds the page (LIMIT MAX(CAST(? AS INTEGER),0)); `drop`
-                // skips N rows (LIMIT -1 OFFSET ?). Both are exact for any N.
-                if let Some((is_drop, n, inner)) =
-                    peel_take_drop(&beta_reduce(args[0], &self.fun_bodies, &self.let_bindings),
-                                   &self.fun_bodies, &self.let_bindings)
-                    && let Some(source_name) = self.resolve_source(&inner)
-                    && let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                    && !schema.starts_with('#') && !schema.contains('[')
-                    && let Some(n_param) = expr_to_sql_param(&n) {
-                        self.emit_stm_track_read(builder, &source_name);
-                        let page = if is_drop {
-                            "LIMIT -1 OFFSET ?".to_string()
-                        } else {
-                            "LIMIT MAX(CAST(? AS INTEGER), 0)".to_string()
-                        };
-                        let sql = format!(
-                            "SELECT COUNT(*) FROM (SELECT 1 FROM {} {})",
-                            quote_sql_ident(&format!("_knot_{}", source_name)),
-                            page
-                        );
-                        let params_rel = self.compile_sql_params(builder, &[n_param], env, db);
-                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                        return self.call_rt(
-                            builder,
-                            "knot_source_query_count",
-                            &[db, sql_ptr, sql_len, params_rel],
-                        );
-                    }
-
-                // count (map (\r -> r.<field>) *source) → SELECT COUNT(*) —
-                // the projection is irrelevant to COUNT(*), so strip it and
-                // count the underlying source. Also covers the pipe form
-                // `*source |> map ...` (beta_reduce collapses the pipe to
-                // `map ... source`).
-                if let Some((source_name, _field)) = self.peel_map_projection(args[0])
-                        && self.source_schemas.contains_key(&source_name) {
-                            self.emit_stm_track_read(builder, &source_name);
-                            let (name_ptr, name_len) =
-                                self.string_ptr(builder, &source_name);
-                            return self.call_rt(
-                                builder,
-                                "knot_source_count",
-                                &[db, name_ptr, name_len],
-                            );
-                        }
-
-                // count (*source |> ops) → delegate to the pipe-chain
-                // pushdown with an appended terminal `count`. Synthesizes
-                // `(*source |> ops) |> count` and runs the same plan builder
-                // that handles `*source |> ops |> count` directly.
-                if matches!(&args[0].node, ast::ExprKind::BinOp { op: ast::BinOp::Pipe, .. }) {
-                    let count_rhs = ast::Expr {
-                        node: ast::ExprKind::Var(crate::infer::Binding::User("count".to_string())),
-                        span: args[0].span,
-                    };
-                    let piped = ast::Expr {
-                        node: ast::ExprKind::BinOp {
-                            op: ast::BinOp::Pipe,
-                            lhs: Box::new(args[0].clone()),
-                            rhs: Box::new(count_rhs),
-                        },
-                        span: args[0].span,
-                    };
-                    if let Some(v) = self.try_compile_pipe_sql(builder, &piped, env, db) {
-                        return v;
-                    }
-                }
-
-                // count (do { x <- *source; where ...; yield x }) → SELECT COUNT(*) FROM ... WHERE ...
-                if let ast::ExprKind::Do(stmts) = &args[0].node
-                    && let Some(plan) = self.analyze_sql_plan(stmts, env) {
-                        let result_schema = plan.build_result_schema();
-                        let query = Query {
-                            plan: SqlQueryPlan {
-                                tables: plan.tables,
-                                conditions: plan.conditions,
-                                params: plan.params,
-                                select_columns: Vec::new(),
-                                order_by: Vec::new(),
-                                limit: None,
-                                offset: None,
-                                distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                            },
-                            terminal: QueryTerminal::Count,
-                        };
-                        return self.emit_query(builder, &query, &result_schema, env, db, None, Some(expr.span));
-                    }
             }
+
+            // count (filter f *source) → SELECT COUNT(*) FROM ... WHERE ...
+            if let Some((source_name, filter_bind, filter_body)) = extract_filter_on_source(
+                args[0],
+                &self.source_var_binds,
+                &self.fun_bodies,
+                &self.let_bindings,
+            ) {
+                let source_name: &str = &source_name;
+                let filter_body: &ast::Expr = &filter_body;
+                if let Some(schema) = self.source_schemas.get(source_name).cloned()
+                    && !schema.starts_with('#')
+                    && !schema.contains('[')
+                    && let Some(frag) =
+                        self.try_compile_sql_expr(&filter_bind, filter_body, &schema)
+                {
+                    let query = Query {
+                        plan: SqlQueryPlan {
+                            tables: vec![SqlTable {
+                                source_name: source_name.to_string(),
+                                alias: String::new(),
+                                subquery: None,
+                            }],
+                            conditions: vec![frag.sql],
+                            params: frag.params,
+                            select_columns: Vec::new(),
+                            order_by: Vec::new(),
+                            limit: None,
+                            offset: None,
+                            distinct: false,
+                            group_by: Vec::new(),
+                            having: Vec::new(),
+                        },
+                        terminal: QueryTerminal::Count,
+                    };
+                    return self.emit_query(
+                        builder,
+                        &query,
+                        &schema,
+                        env,
+                        db,
+                        None,
+                        Some(expr.span),
+                    );
+                }
+            }
+
+            // count (take N *source) / count (drop N *source) →
+            // SELECT COUNT(*) over a LIMIT/OFFSET subquery. `take`
+            // bounds the page (LIMIT MAX(CAST(? AS INTEGER),0)); `drop`
+            // skips N rows (LIMIT -1 OFFSET ?). Both are exact for any N.
+            if let Some((is_drop, n, inner)) = peel_take_drop(
+                &beta_reduce(args[0], &self.fun_bodies, &self.let_bindings),
+                &self.fun_bodies,
+                &self.let_bindings,
+            ) && let Some(source_name) = self.resolve_source(&inner)
+                && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                && !schema.starts_with('#')
+                && !schema.contains('[')
+                && let Some(n_param) = expr_to_sql_param(&n)
+            {
+                self.emit_stm_track_read(builder, &source_name);
+                let page = if is_drop {
+                    "LIMIT -1 OFFSET ?".to_string()
+                } else {
+                    "LIMIT MAX(CAST(? AS INTEGER), 0)".to_string()
+                };
+                let sql = format!(
+                    "SELECT COUNT(*) FROM (SELECT 1 FROM {} {})",
+                    quote_sql_ident(&format!("_knot_{}", source_name)),
+                    page
+                );
+                let params_rel = self.compile_sql_params(builder, &[n_param], env, db);
+                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                return self.call_rt(
+                    builder,
+                    "knot_source_query_count",
+                    &[db, sql_ptr, sql_len, params_rel],
+                );
+            }
+
+            // count (map (\r -> r.<field>) *source) → SELECT COUNT(*) —
+            // the projection is irrelevant to COUNT(*), so strip it and
+            // count the underlying source. Also covers the pipe form
+            // `*source |> map ...` (beta_reduce collapses the pipe to
+            // `map ... source`).
+            if let Some((source_name, _field)) = self.peel_map_projection(args[0])
+                && self.source_schemas.contains_key(&source_name)
+            {
+                self.emit_stm_track_read(builder, &source_name);
+                let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
+                return self.call_rt(builder, "knot_source_count", &[db, name_ptr, name_len]);
+            }
+
+            // count (*source |> ops) → delegate to the pipe-chain
+            // pushdown with an appended terminal `count`. Synthesizes
+            // `(*source |> ops) |> count` and runs the same plan builder
+            // that handles `*source |> ops |> count` directly.
+            if matches!(
+                &args[0].node,
+                ast::ExprKind::BinOp {
+                    op: ast::BinOp::Pipe,
+                    ..
+                }
+            ) {
+                let count_rhs = ast::Expr {
+                    node: ast::ExprKind::Var(crate::infer::Binding::User("count".to_string())),
+                    span: args[0].span,
+                };
+                let piped = ast::Expr {
+                    node: ast::ExprKind::BinOp {
+                        op: ast::BinOp::Pipe,
+                        lhs: Box::new(args[0].clone()),
+                        rhs: Box::new(count_rhs),
+                    },
+                    span: args[0].span,
+                };
+                if let Some(v) = self.try_compile_pipe_sql(builder, &piped, env, db) {
+                    return v;
+                }
+            }
+
+            // count (do { x <- *source; where ...; yield x }) → SELECT COUNT(*) FROM ... WHERE ...
+            if let ast::ExprKind::Do(stmts) = &args[0].node
+                && let Some(plan) = self.analyze_sql_plan(stmts, env)
+            {
+                let result_schema = plan.build_result_schema();
+                let query = Query {
+                    plan: SqlQueryPlan {
+                        tables: plan.tables,
+                        conditions: plan.conditions,
+                        params: plan.params,
+                        select_columns: Vec::new(),
+                        order_by: Vec::new(),
+                        limit: None,
+                        offset: None,
+                        distinct: false,
+                        group_by: Vec::new(),
+                        having: Vec::new(),
+                    },
+                    terminal: QueryTerminal::Count,
+                };
+                return self.emit_query(
+                    builder,
+                    &query,
+                    &result_schema,
+                    env,
+                    db,
+                    None,
+                    Some(expr.span),
+                );
+            }
+        }
 
         // Special case: distinct (map f *rel) → SELECT DISTINCT. Relations are
         // already sets, so `distinct` is only meaningful over a projection that
         // collapses rows; push it to SELECT DISTINCT over the projected column
         // (scalar map) or columns (record map). Other shapes fall back to the
         // in-memory dedup runtime fn.
-        if Self::query_form_name(func_expr) == Some("distinct") && args.len() == 1 && !user_shadows_special {
-                // Scalar projection: distinct (map (\r -> r.f) *src) →
-                // SELECT DISTINCT "f" FROM _knot_src.
-                if let Some((source_name, field)) = self.peel_map_projection(args[0])
-                        && let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                            && !schema.starts_with('#') && !schema.contains('[')
-                                && let Some(type_str) = lookup_col_type_from_schema(&schema, &field) {
-                                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                    let sql = format!(
-                                        "SELECT DISTINCT {} FROM {}",
-                                        quote_sql_ident(&field), table
-                                    );
-                                    let result_schema = format!("{}:{}", field, type_str);
-                                    self.emit_stm_track_read(builder, &source_name);
-                                    let params_rel = self.compile_sql_params(builder, &[], env, db);
-                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-                                    return self.call_rt(
-                                        builder,
-                                        "knot_source_query",
-                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                    );
-                                }
-                // Record projection: distinct (map (\r -> {a: r.x, ...}) *src) →
-                // SELECT DISTINCT "x" AS "a", ... FROM _knot_src.
-                let red = beta_reduce(args[0], &self.fun_bodies, &self.let_bindings);
-                if let ast::ExprKind::App { func: mf, arg: msrc } = &red.node
-                    && let ast::ExprKind::App { func: mhead, arg: map_lambda } = &mf.node
-                        && Self::query_form_name(mhead) == Some("map")
-                            && let Some(source_name) = self.resolve_source(msrc)
-                    && let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                        && !schema.starts_with('#') && !schema.contains('[')
-                            && let Some((bind_var, body)) = extract_single_param_lambda(map_lambda, &self.fun_bodies, &self.let_bindings) {
-                                let body: &ast::Expr = &body;
-                                if let Some(select_cols) =
-                                    analyze_map_select(&bind_var, body, "", &schema)
-                                        && !select_cols.is_empty() {
-                                            let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                            let col_list = select_cols.iter()
-                                                .map(|c| {
-                                                    let e = c.sql_expr.clone().unwrap_or_else(|| {
-                                                        if c.alias.is_empty() { quote_sql_ident(&c.source_col) }
-                                                        else { format!("{}.{}", c.alias, quote_sql_ident(&c.source_col)) }
-                                                    });
-                                                    format!("{} AS {}", e, quote_sql_ident(&c.result_field))
-                                                })
-                                                .collect::<Vec<_>>()
-                                                .join(", ");
-                                            let result_schema = select_cols.iter()
-                                                .map(|c| format!("{}:{}", c.result_field, c.type_str))
-                                                .collect::<Vec<_>>()
-                                                .join(", ");
-                                            let sql = format!("SELECT DISTINCT {} FROM {}", col_list, table);
-                                            self.emit_stm_track_read(builder, &source_name);
-                                            let params_rel = self.compile_sql_params(builder, &[], env, db);
-                                            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                            let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-                                            return self.call_rt(
-                                                builder,
-                                                "knot_source_query",
-                                                &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                            );
-                                        }
-                            }
+        if Self::query_form_name(func_expr) == Some("distinct")
+            && args.len() == 1
+            && !user_shadows_special
+        {
+            // Scalar projection: distinct (map (\r -> r.f) *src) →
+            // SELECT DISTINCT "f" FROM _knot_src.
+            if let Some((source_name, field)) = self.peel_map_projection(args[0])
+                && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                && !schema.starts_with('#')
+                && !schema.contains('[')
+                && let Some(type_str) = lookup_col_type_from_schema(&schema, &field)
+            {
+                let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                let sql = format!("SELECT DISTINCT {} FROM {}", quote_sql_ident(&field), table);
+                let result_schema = format!("{}:{}", field, type_str);
+                self.emit_stm_track_read(builder, &source_name);
+                let params_rel = self.compile_sql_params(builder, &[], env, db);
+                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                return self.call_rt(
+                    builder,
+                    "knot_source_query",
+                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                );
             }
+            // Record projection: distinct (map (\r -> {a: r.x, ...}) *src) →
+            // SELECT DISTINCT "x" AS "a", ... FROM _knot_src.
+            let red = beta_reduce(args[0], &self.fun_bodies, &self.let_bindings);
+            if let ast::ExprKind::App {
+                func: mf,
+                arg: msrc,
+            } = &red.node
+                && let ast::ExprKind::App {
+                    func: mhead,
+                    arg: map_lambda,
+                } = &mf.node
+                && Self::query_form_name(mhead) == Some("map")
+                && let Some(source_name) = self.resolve_source(msrc)
+                && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                && !schema.starts_with('#')
+                && !schema.contains('[')
+                && let Some((bind_var, body)) =
+                    extract_single_param_lambda(map_lambda, &self.fun_bodies, &self.let_bindings)
+            {
+                let body: &ast::Expr = &body;
+                if let Some(select_cols) = analyze_map_select(&bind_var, body, "", &schema)
+                    && !select_cols.is_empty()
+                {
+                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                    let col_list = select_cols
+                        .iter()
+                        .map(|c| {
+                            let e = c.sql_expr.clone().unwrap_or_else(|| {
+                                if c.alias.is_empty() {
+                                    quote_sql_ident(&c.source_col)
+                                } else {
+                                    format!("{}.{}", c.alias, quote_sql_ident(&c.source_col))
+                                }
+                            });
+                            format!("{} AS {}", e, quote_sql_ident(&c.result_field))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let result_schema = select_cols
+                        .iter()
+                        .map(|c| format!("{}:{}", c.result_field, c.type_str))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!("SELECT DISTINCT {} FROM {}", col_list, table);
+                    self.emit_stm_track_read(builder, &source_name);
+                    let params_rel = self.compile_sql_params(builder, &[], env, db);
+                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                    let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                    return self.call_rt(
+                        builder,
+                        "knot_source_query",
+                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                    );
+                }
+            }
+        }
 
         // Special case: single *rel / single (filter f *rel) / single (do {...}) → LIMIT 2
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && name == "single" && args.len() == 1 && !user_shadows_special {
-                // single *source → SELECT ... LIMIT 2 then knot_relation_single
-                if let Some(source_name) = self.resolve_source(args[0])
-                        && let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                            && !schema.starts_with('#') && !schema.contains('[') {
-                                let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                let cols = parse_schema_columns(&schema).iter()
-                                    .map(|(name, _)| quote_sql_ident(name))
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                let sql = format!("SELECT {} FROM {} LIMIT 2", cols, table);
-                                let params_rel = self.compile_sql_params(builder, &[], env, db);
-                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                                let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
-                                self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
-                                let rel = self.call_rt(
-                                    builder,
-                                    "knot_source_query",
-                                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                );
-                                return self.call_rt(builder, "knot_relation_single", &[rel]);
-                            }
+            && name == "single"
+            && args.len() == 1
+            && !user_shadows_special
+        {
+            // single *source → SELECT ... LIMIT 2 then knot_relation_single
+            if let Some(source_name) = self.resolve_source(args[0])
+                && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                && !schema.starts_with('#')
+                && !schema.contains('[')
+            {
+                let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                let cols = parse_schema_columns(&schema)
+                    .iter()
+                    .map(|(name, _)| quote_sql_ident(name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!("SELECT {} FROM {} LIMIT 2", cols, table);
+                let params_rel = self.compile_sql_params(builder, &[], env, db);
+                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
+                self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                let rel = self.call_rt(
+                    builder,
+                    "knot_source_query",
+                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                );
+                return self.call_rt(builder, "knot_relation_single", &[rel]);
+            }
 
-                // single (filter f *source) → SELECT ... WHERE ... LIMIT 2
-                if let Some((source_name, filter_bind, filter_body)) =
-                    extract_filter_on_source(args[0], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
+            // single (filter f *source) → SELECT ... WHERE ... LIMIT 2
+            if let Some((source_name, filter_bind, filter_body)) = extract_filter_on_source(
+                args[0],
+                &self.source_var_binds,
+                &self.fun_bodies,
+                &self.let_bindings,
+            ) {
+                let filter_body: &ast::Expr = &filter_body;
+                if let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                    && !schema.starts_with('#')
+                    && !schema.contains('[')
+                    && let Some(frag) =
+                        self.try_compile_sql_expr(&filter_bind, filter_body, &schema)
                 {
-                    let filter_body: &ast::Expr = &filter_body;
-                    if let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                            && !schema.starts_with('#') && !schema.contains('[')
-                                && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
-                                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                    let cols = parse_schema_columns(&schema).iter()
-                                        .map(|(name, _)| quote_sql_ident(name))
-                                        .collect::<Vec<_>>()
-                                        .join(", ");
-                                    let sql = format!("SELECT {} FROM {} WHERE {} LIMIT 2", cols, table, frag.sql);
-                                    let preds = try_extract_field_preds(&filter_bind, filter_body);
-                                    let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
-                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                                    let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
-                                    self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
-                                    self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
-                                    let rel = self.call_rt(
-                                        builder,
-                                        "knot_source_query",
-                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                    );
-                                    return self.call_rt(builder, "knot_relation_single", &[rel]);
-                                }
+                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                    let cols = parse_schema_columns(&schema)
+                        .iter()
+                        .map(|(name, _)| quote_sql_ident(name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!("SELECT {} FROM {} WHERE {} LIMIT 2", cols, table, frag.sql);
+                    let preds = try_extract_field_preds(&filter_bind, filter_body);
+                    let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
+                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                    let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
+                    self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                    self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
+                    let rel = self.call_rt(
+                        builder,
+                        "knot_source_query",
+                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                    );
+                    return self.call_rt(builder, "knot_relation_single", &[rel]);
                 }
+            }
 
-                // single (do { x <- *source; where ...; yield x }) → SQL plan + LIMIT 2
-                // See through a `with {lim: e, …} (do …)` wrapper: the fields are
-                // pure bindings (old `let`) that the SQL planner resolves as
-                // params, so register them in `let_bindings` around the plan.
-                let single_arg = &args[0];
-                let (plan_stmts, with_overlay): (&[ast::Stmt], Vec<(String, ast::Expr)>) =
-                    match &single_arg.node {
-                        ast::ExprKind::Do(stmts) => (stmts, Vec::new()),
-                        ast::ExprKind::With { record, body, .. }
-                            if matches!(&body.node, ast::ExprKind::Do(_)) =>
-                        {
-                            let overlay = if let ast::ExprKind::Record(fes) = &record.node {
-                                fes.iter().map(|f| (f.name.clone(), f.value.clone())).collect()
-                            } else {
-                                Vec::new()
-                            };
-                            if let ast::ExprKind::Do(stmts) = &body.node {
-                                (stmts, overlay)
-                            } else {
-                                unreachable!()
-                            }
+            // single (do { x <- *source; where ...; yield x }) → SQL plan + LIMIT 2
+            // See through a `with {lim: e, …} (do …)` wrapper: the fields are
+            // pure bindings (old `let`) that the SQL planner resolves as
+            // params, so register them in `let_bindings` around the plan.
+            let single_arg = &args[0];
+            let (plan_stmts, with_overlay): (&[ast::Stmt], Vec<(String, ast::Expr)>) =
+                match &single_arg.node {
+                    ast::ExprKind::Do(stmts) => (stmts, Vec::new()),
+                    ast::ExprKind::With { record, body, .. }
+                        if matches!(&body.node, ast::ExprKind::Do(_)) =>
+                    {
+                        let overlay = if let ast::ExprKind::Record(fes) = &record.node {
+                            fes.iter()
+                                .map(|f| (f.name.clone(), f.value.clone()))
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        if let ast::ExprKind::Do(stmts) = &body.node {
+                            (stmts, overlay)
+                        } else {
+                            unreachable!()
                         }
-                        _ => (&[], Vec::new()),
-                    };
-                let mut overlay_added: Vec<String> = Vec::new();
-                for (n, v) in &with_overlay {
-                    if !self.let_bindings.contains_key(n) {
-                        self.let_bindings.insert(n.clone(), v.clone());
-                        overlay_added.push(n.clone());
                     }
-                    // Also bind the field's VALUE into `env` so SQL params that
-                    // reference it (`where t.a == lim`) resolve at runtime — the
-                    // old `let lim = 1` bound `lim` as an ordinary local.
-                    let val = self.compile_expr(builder, v, env, db);
-                    env.set(crate::infer::Binding::User(n.clone()), val);
-                }
-                let plan_result = if !plan_stmts.is_empty() {
-                    self.analyze_sql_plan(plan_stmts, env)
-                } else {
-                    None
+                    _ => (&[], Vec::new()),
                 };
-                if let Some(plan) = plan_result {
-                        let mut sql = plan.build_sql();
-                        sql.push_str(" LIMIT 2");
-                        self.debug_sql(Some(expr.span), &sql);
-                        let result_schema = plan.build_result_schema();
-                        let preds = try_extract_preds_for_single_table_plan(plan_stmts, &plan);
-                        let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
-                        for table in &plan.tables {
-                            let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
-                            self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
-                            if plan.tables.len() == 1 {
-                                self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
-                            }
-                        }
-                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                        let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-                        let rel = self.call_rt(
-                            builder,
-                            "knot_source_query",
-                            &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                        );
-                        let out = self.call_rt(builder, "knot_relation_single", &[rel]);
-                        for n in &overlay_added {
-                            self.let_bindings.remove(n);
-                        }
-                        return out;
+            let mut overlay_added: Vec<String> = Vec::new();
+            for (n, v) in &with_overlay {
+                if !self.let_bindings.contains_key(n) {
+                    self.let_bindings.insert(n.clone(), v.clone());
+                    overlay_added.push(n.clone());
+                }
+                // Also bind the field's VALUE into `env` so SQL params that
+                // reference it (`where t.a == lim`) resolve at runtime — the
+                // old `let lim = 1` bound `lim` as an ordinary local.
+                let val = self.compile_expr(builder, v, env, db);
+                env.set(crate::infer::Binding::User(n.clone()), val);
+            }
+            let plan_result = if !plan_stmts.is_empty() {
+                self.analyze_sql_plan(plan_stmts, env)
+            } else {
+                None
+            };
+            if let Some(plan) = plan_result {
+                let mut sql = plan.build_sql();
+                sql.push_str(" LIMIT 2");
+                self.debug_sql(Some(expr.span), &sql);
+                let result_schema = plan.build_result_schema();
+                let preds = try_extract_preds_for_single_table_plan(plan_stmts, &plan);
+                let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
+                for table in &plan.tables {
+                    let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
+                    self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                    if plan.tables.len() == 1 {
+                        self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
                     }
+                }
+                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                let rel = self.call_rt(
+                    builder,
+                    "knot_source_query",
+                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                );
+                let out = self.call_rt(builder, "knot_relation_single", &[rel]);
                 for n in &overlay_added {
                     self.let_bindings.remove(n);
                 }
+                return out;
             }
+            for n in &overlay_added {
+                self.let_bindings.remove(n);
+            }
+        }
 
         // head / findFirst over a source relation → SELECT … LIMIT 1, then take
         // the first row as a `Maybe`. Without this the whole relation is
@@ -7414,20 +7716,20 @@ impl<M: cranelift_module::Module> Codegen<M> {
             _ => None,
         };
         if let Some(name) = head_pushdown_name {
-                // Normalize to (source_expr, Option<predicate_lambda>). head has
-                // no predicate; findFirst's second arg is the predicate.
-                let normalized: Option<(&ast::Expr, Option<&ast::Expr>)> = match name {
-                    "head" if args.len() == 1 => Some((args[0], None)),
-                    "findFirst" if args.len() == 2 => Some((args[0], Some(args[1]))),
-                    _ => None, // arity mismatch: fall through to the generic call path
-                };
-                if let Some((rel_expr, pred_lambda)) = normalized
-                    && let Some(query) =
-                        self.build_first_row_query(rel_expr, pred_lambda, env, builder, db)
-                {
-                    return self.call_rt(builder, "knot_relation_head", &[query]);
-                }
+            // Normalize to (source_expr, Option<predicate_lambda>). head has
+            // no predicate; findFirst's second arg is the predicate.
+            let normalized: Option<(&ast::Expr, Option<&ast::Expr>)> = match name {
+                "head" if args.len() == 1 => Some((args[0], None)),
+                "findFirst" if args.len() == 2 => Some((args[0], Some(args[1]))),
+                _ => None, // arity mismatch: fall through to the generic call path
+            };
+            if let Some((rel_expr, pred_lambda)) = normalized
+                && let Some(query) =
+                    self.build_first_row_query(rel_expr, pred_lambda, env, builder, db)
+            {
+                return self.call_rt(builder, "knot_relation_head", &[query]);
             }
+        }
 
         // Special case: fold f init <relation expression> → stream rows from SQLite
         // one-by-one through the fold function instead of materializing the whole
@@ -7438,113 +7740,130 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // streaming would do a redundant SQL pass.  The wins are in the filter
         // and do-block paths, which would otherwise build an intermediate Vec.
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && name == "fold" && args.len() == 3 && !user_shadows_special {
-                // fold f init *source → SELECT cols FROM table; stream
-                if let ast::ExprKind::SourceRef { name: source_name, .. } = &args[2].node
-                        && let Some(schema) = self.source_schemas.get(source_name).cloned()
-                            && !schema.starts_with('#') && !schema.contains('[') {
-                                let source_name = source_name.clone();
-                                let f = self.compile_expr(builder, args[0], env, db);
-                                let init = self.compile_expr(builder, args[1], env, db);
-                                let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
-                                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                                return self.call_rt(
-                                    builder,
-                                    "knot_source_fold",
-                                    &[db, f, init, name_ptr, name_len, schema_ptr, schema_len],
-                                );
-                            }
-
-                // fold f init (filter g *source) → SELECT cols FROM table WHERE ...; stream
-                if let Some((source_name, filter_bind, filter_body)) =
-                    extract_filter_on_source(args[2], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
-                {
-                    let filter_body: &ast::Expr = &filter_body;
-                    if let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                            && !schema.starts_with('#') && !schema.contains('[')
-                                && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
-                                    let f = self.compile_expr(builder, args[0], env, db);
-                                    let init = self.compile_expr(builder, args[1], env, db);
-                                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                    let cols = parse_schema_columns(&schema).iter()
-                                        .map(|(name, _)| quote_sql_ident(name))
-                                        .collect::<Vec<_>>()
-                                        .join(", ");
-                                    let sql = format!("SELECT {} FROM {} WHERE {}", cols, table, frag.sql);
-                                    let preds = try_extract_field_preds(&filter_bind, filter_body);
-                                    let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
-                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
-                                    let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
-                                    self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
-                                    self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
-                                    return self.call_rt(
-                                        builder,
-                                        "knot_source_query_fold",
-                                        &[db, f, init, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                    );
-                                }
-                }
-
-                // fold f init (do { ... }) → SQL plan; stream
-                if let ast::ExprKind::Do(stmts) = &args[2].node
-                    && let Some(plan) = self.analyze_sql_plan(stmts, env) {
-                        let f = self.compile_expr(builder, args[0], env, db);
-                        let init = self.compile_expr(builder, args[1], env, db);
-                        let sql = plan.build_sql();
-                        self.debug_sql(stmts.first().map(|s| s.span), &sql);
-                        let result_schema = plan.build_result_schema();
-                        let preds = try_extract_preds_for_single_table_plan(stmts, &plan);
-                        let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
-                        for table in &plan.tables {
-                            let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
-                            self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
-                            if plan.tables.len() == 1 {
-                                self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
-                            }
-                        }
-                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                        let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-                        return self.call_rt(
-                            builder,
-                            "knot_source_query_fold",
-                            &[db, f, init, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                        );
-                    }
+            && name == "fold"
+            && args.len() == 3
+            && !user_shadows_special
+        {
+            // fold f init *source → SELECT cols FROM table; stream
+            if let ast::ExprKind::SourceRef {
+                name: source_name, ..
+            } = &args[2].node
+                && let Some(schema) = self.source_schemas.get(source_name).cloned()
+                && !schema.starts_with('#')
+                && !schema.contains('[')
+            {
+                let source_name = source_name.clone();
+                let f = self.compile_expr(builder, args[0], env, db);
+                let init = self.compile_expr(builder, args[1], env, db);
+                let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
+                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                return self.call_rt(
+                    builder,
+                    "knot_source_fold",
+                    &[db, f, init, name_ptr, name_len, schema_ptr, schema_len],
+                );
             }
+
+            // fold f init (filter g *source) → SELECT cols FROM table WHERE ...; stream
+            if let Some((source_name, filter_bind, filter_body)) = extract_filter_on_source(
+                args[2],
+                &self.source_var_binds,
+                &self.fun_bodies,
+                &self.let_bindings,
+            ) {
+                let filter_body: &ast::Expr = &filter_body;
+                if let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                    && !schema.starts_with('#')
+                    && !schema.contains('[')
+                    && let Some(frag) =
+                        self.try_compile_sql_expr(&filter_bind, filter_body, &schema)
+                {
+                    let f = self.compile_expr(builder, args[0], env, db);
+                    let init = self.compile_expr(builder, args[1], env, db);
+                    let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                    let cols = parse_schema_columns(&schema)
+                        .iter()
+                        .map(|(name, _)| quote_sql_ident(name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!("SELECT {} FROM {} WHERE {}", cols, table, frag.sql);
+                    let preds = try_extract_field_preds(&filter_bind, filter_body);
+                    let params_rel = self.compile_sql_params(builder, &frag.params, env, db);
+                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                    let (tn_ptr, tn_len) = self.string_ptr(builder, &source_name);
+                    self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                    self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
+                    return self.call_rt(
+                        builder,
+                        "knot_source_query_fold",
+                        &[
+                            db, f, init, sql_ptr, sql_len, schema_ptr, schema_len, params_rel,
+                        ],
+                    );
+                }
+            }
+
+            // fold f init (do { ... }) → SQL plan; stream
+            if let ast::ExprKind::Do(stmts) = &args[2].node
+                && let Some(plan) = self.analyze_sql_plan(stmts, env)
+            {
+                let f = self.compile_expr(builder, args[0], env, db);
+                let init = self.compile_expr(builder, args[1], env, db);
+                let sql = plan.build_sql();
+                self.debug_sql(stmts.first().map(|s| s.span), &sql);
+                let result_schema = plan.build_result_schema();
+                let preds = try_extract_preds_for_single_table_plan(stmts, &plan);
+                let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
+                for table in &plan.tables {
+                    let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
+                    self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                    if plan.tables.len() == 1 {
+                        self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
+                    }
+                }
+                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                return self.call_rt(
+                    builder,
+                    "knot_source_query_fold",
+                    &[
+                        db, f, init, sql_ptr, sql_len, schema_ptr, schema_len, params_rel,
+                    ],
+                );
+            }
+        }
 
         // Special case: match Constructor SourceRef → SQL-level filtered read
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && name == "match" && args.len() == 2 && !user_shadows_special
-                && let ast::ExprKind::Constructor(ctor_name) = &args[0].node {
-                    if let ast::ExprKind::SourceRef { name: source_name, .. } = &args[1].node
-                        && let Some(schema) = self.source_schemas.get(source_name).cloned() {
-                            let source_name = source_name.clone();
-                            self.emit_stm_track_read(builder, &source_name);
-                            let (name_ptr, name_len) =
-                                self.string_ptr(builder, &source_name);
-                            let (schema_ptr, schema_len) =
-                                self.string_ptr(builder, &schema);
-                            let (tag_ptr, tag_len) =
-                                self.string_ptr(builder, ctor_name);
-                            return self.call_rt(
-                                builder,
-                                "knot_source_match",
-                                &[
-                                    db, name_ptr, name_len, schema_ptr,
-                                    schema_len, tag_ptr, tag_len,
-                                ],
-                            );
-                        }
-                    // Non-source relation: compile and use value-level match
-                    let rel = self.compile_expr(builder, args[1], env, db);
-                    let ctor = self.compile_expr(builder, args[0], env, db);
-                    return self.call_rt(
-                        builder,
-                        "knot_relation_match",
-                        &[ctor, rel],
-                    );
-                }
+            && name == "match"
+            && args.len() == 2
+            && !user_shadows_special
+            && let ast::ExprKind::Constructor(ctor_name) = &args[0].node
+        {
+            if let ast::ExprKind::SourceRef {
+                name: source_name, ..
+            } = &args[1].node
+                && let Some(schema) = self.source_schemas.get(source_name).cloned()
+            {
+                let source_name = source_name.clone();
+                self.emit_stm_track_read(builder, &source_name);
+                let (name_ptr, name_len) = self.string_ptr(builder, &source_name);
+                let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                let (tag_ptr, tag_len) = self.string_ptr(builder, ctor_name);
+                return self.call_rt(
+                    builder,
+                    "knot_source_match",
+                    &[
+                        db, name_ptr, name_len, schema_ptr, schema_len, tag_ptr, tag_len,
+                    ],
+                );
+            }
+            // Non-source relation: compile and use value-level match
+            let rel = self.compile_expr(builder, args[1], env, db);
+            let ctor = self.compile_expr(builder, args[0], env, db);
+            return self.call_rt(builder, "knot_relation_match", &[ctor, rel]);
+        }
 
         // Special case: filter/sum/avg with lambda on source → SQL.
         //
@@ -7573,407 +7892,494 @@ impl<M: cranelift_module::Module> Codegen<M> {
             _ => None,
         };
         if let Some(name) = aggregate_pushdown_name {
-                if let Some(source_name) = self.resolve_source(args[1])
-                        && let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                            && !schema.starts_with('#') && !schema.contains('[')
-                                && let Some(result) = self.try_compile_app_sql(
-                                    builder, name, args[0], &source_name, &schema, env, db, expr.span,
-                                ) {
-                                    return result;
-                                }
+            if let Some(source_name) = self.resolve_source(args[1])
+                && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                && !schema.starts_with('#')
+                && !schema.contains('[')
+                && let Some(result) = self.try_compile_app_sql(
+                    builder,
+                    name,
+                    args[0],
+                    &source_name,
+                    &schema,
+                    env,
+                    db,
+                    expr.span,
+                )
+            {
+                return result;
+            }
 
-                // sum/avg/min/max lambda (filter f *source) → SQL aggregate with WHERE
-                if let Some((sql_func, _)) = aggregate_sql_func_runtime(name) {
-                    if let Some((source_name, filter_bind, filter_body)) =
-                        extract_filter_on_source(args[1], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
+            // sum/avg/min/max lambda (filter f *source) → SQL aggregate with WHERE
+            if let Some((sql_func, _)) = aggregate_sql_func_runtime(name) {
+                if let Some((source_name, filter_bind, filter_body)) = extract_filter_on_source(
+                    args[1],
+                    &self.source_var_binds,
+                    &self.fun_bodies,
+                    &self.let_bindings,
+                ) {
+                    let source_name: &str = &source_name;
+                    let filter_body: &ast::Expr = &filter_body;
+                    if let Some(schema) = self.source_schemas.get(source_name).cloned()
+                        && !schema.starts_with('#')
+                        && !schema.contains('[')
+                        && let Some((agg_bind, agg_body)) = extract_single_param_lambda(
+                            args[0],
+                            &self.fun_bodies,
+                            &self.let_bindings,
+                        )
                     {
-                        let source_name: &str = &source_name;
-                        let filter_body: &ast::Expr = &filter_body;
-                        if let Some(schema) = self.source_schemas.get(source_name).cloned()
-                                && !schema.starts_with('#') && !schema.contains('[')
-                                    && let Some((agg_bind, agg_body)) = extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings) {
-                                        let agg_body: &ast::Expr = &agg_body;
-                                        // MIN/MAX over non-numeric columns must
-                                        // stay in memory (see minmax_pushdown_type_ok).
-                                        let minmax_ok = !matches!(name, "minOn" | "maxOn")
-                                            || minmax_pushdown_type_ok(&agg_bind, agg_body, &schema);
-                                        if let (true, Some(col_sql)) = (minmax_ok, extract_sql_field_access(&agg_bind, agg_body, "", &schema))
-                                            && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
-                                                let arg_sql = if matches!(name, "minOn" | "maxOn") {
-                                                    col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
-                                                } else {
-                                                    col_sql
-                                                };
-                                                let result_flag = if matches!(name, "minOn" | "maxOn") {
-                                                    minmax_result_is_text(&agg_bind, agg_body, &schema)
-                                                } else {
-                                                    sum_result_is_float(&agg_bind, agg_body, &schema)
-                                                };
-                                                let query = Query {
-                                                    plan: SqlQueryPlan {
-                                                        tables: vec![SqlTable {
-                                                            source_name: source_name.to_string(),
-                                                            alias: String::new(),
-                                                            subquery: None,
-                                                        }],
-                                                        conditions: vec![frag.sql],
-                                                        params: frag.params,
-                                                        select_columns: Vec::new(),
-                                                        order_by: Vec::new(),
-                                                        limit: None,
-                                                        offset: None,
-                                                        distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                                                    },
-                                                    terminal: QueryTerminal::Aggregate {
-                                                        func: sql_func,
-                                                        col_sql: arg_sql,
-                                                        result_flag,
-                                                    },
-                                                };
-                                                return self.emit_query(builder, &query, &schema, env, db, None, Some(expr.span));
-                                            }
-                                    }
+                        let agg_body: &ast::Expr = &agg_body;
+                        // MIN/MAX over non-numeric columns must
+                        // stay in memory (see minmax_pushdown_type_ok).
+                        let minmax_ok = !matches!(name, "minOn" | "maxOn")
+                            || minmax_pushdown_type_ok(&agg_bind, agg_body, &schema);
+                        if let (true, Some(col_sql)) = (
+                            minmax_ok,
+                            extract_sql_field_access(&agg_bind, agg_body, "", &schema),
+                        ) && let Some(frag) =
+                            self.try_compile_sql_expr(&filter_bind, filter_body, &schema)
+                        {
+                            let arg_sql = if matches!(name, "minOn" | "maxOn") {
+                                col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
+                            } else {
+                                col_sql
+                            };
+                            let result_flag = if matches!(name, "minOn" | "maxOn") {
+                                minmax_result_is_text(&agg_bind, agg_body, &schema)
+                            } else {
+                                sum_result_is_float(&agg_bind, agg_body, &schema)
+                            };
+                            let query = Query {
+                                plan: SqlQueryPlan {
+                                    tables: vec![SqlTable {
+                                        source_name: source_name.to_string(),
+                                        alias: String::new(),
+                                        subquery: None,
+                                    }],
+                                    conditions: vec![frag.sql],
+                                    params: frag.params,
+                                    select_columns: Vec::new(),
+                                    order_by: Vec::new(),
+                                    limit: None,
+                                    offset: None,
+                                    distinct: false,
+                                    group_by: Vec::new(),
+                                    having: Vec::new(),
+                                },
+                                terminal: QueryTerminal::Aggregate {
+                                    func: sql_func,
+                                    col_sql: arg_sql,
+                                    result_flag,
+                                },
+                            };
+                            return self.emit_query(
+                                builder,
+                                &query,
+                                &schema,
+                                env,
+                                db,
+                                None,
+                                Some(expr.span),
+                            );
+                        }
                     }
-
-                    // sum/avg/min/max lambda (do { ... }) → SQL aggregate from plan.
-                    // The lambda sees the do-block's *projected* rows, so its
-                    // field must be resolved through the yield projection —
-                    // `sum (\x -> x.amt) (do i <- *t; yield {amt: i.qty})`
-                    // aggregates the underlying `qty` column. Computed or
-                    // unmappable projections fall back to in-memory.
-                    if let ast::ExprKind::Do(stmts) = &args[1].node
-                        && let Some(plan) = self.analyze_sql_plan(stmts, env)
-                            && let Some((agg_bind, agg_body)) = extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings) {
-                                let agg_body: &ast::Expr = &agg_body;
-                                // Resolve the aggregate column: a plain
-                                // `\x -> x.field` maps through the projection;
-                                // arithmetic bodies are only allowed when the
-                                // projection is the identity (single table).
-                                let col_info: Option<(String, String)> = match &agg_body.node {
-                                    ast::ExprKind::FieldAccess { expr: fa_inner, field }
-                                        if matches!(&fa_inner.node, ast::ExprKind::Var(v) if v == &agg_bind) =>
-                                    {
-                                        plan_projection_column(&plan, field)
-                                    }
-                                    _ if plan.tables.len() == 1
-                                        && plan_projection_is_identity(&plan) =>
-                                    {
-                                        let alias = &plan.tables[0].alias;
-                                        let schema = self
-                                            .source_schemas
-                                            .get(&plan.tables[0].source_name)
-                                            .cloned()
-                                            .unwrap_or_default();
-                                        // MIN/MAX over an Int-typed CASE loses
-                                        // the KNOT_INT collation, and Float
-                                        // MIN/MAX diverges from total_cmp —
-                                        // keep both in memory (see
-                                        // minmax_pushdown_type_ok).
-                                        let case_ok = !matches!(name, "minOn" | "maxOn")
-                                            || minmax_pushdown_type_ok(&agg_bind, agg_body, &schema);
-                                        if case_ok {
-                                            extract_sql_field_access(&agg_bind, agg_body, alias, &schema)
-                                                .map(|col_sql| {
-                                                    let ty = infer_sql_expr_type(&agg_bind, agg_body, &schema)
-                                                        .unwrap_or_else(|| "float".to_string());
-                                                    (col_sql, ty)
-                                                })
-                                        } else {
-                                            None
-                                        }
-                                    }
-                                    _ => None,
-                                };
-                                let col_info = col_info.filter(|(_, col_ty)| {
-                                    // MIN/MAX over Float projected columns must
-                                    // stay in memory (total_cmp divergence, see
-                                    // minmax_pushdown_type_ok): SQLite stores NaN
-                                    // as NULL and skips it, and conflates ±0.0,
-                                    // both diverging from Knot's `total_cmp`. Only
-                                    // Int and Text push down — the runtime's
-                                    // `is_text` flag keeps Text results from being
-                                    // re-parsed as Int.
-                                    !matches!(name, "minOn" | "maxOn")
-                                        || col_ty == "int"
-                                        || col_ty == "text"
-                                });
-                                if let Some((col_sql, col_ty)) = col_info {
-                                    let col_is_text = col_ty == "text";
-                                    let arg_sql = if matches!(name, "minOn" | "maxOn")
-                                        && col_ty == "int"
-                                    {
-                                        format!("{} COLLATE KNOT_INT", col_sql)
-                                    } else {
-                                        col_sql
-                                    };
-                                    let result_flag = if matches!(name, "minOn" | "maxOn") {
-                                        col_is_text
-                                    } else {
-                                        col_ty == "float"
-                                    };
-                                    let result_schema = plan.build_result_schema();
-                                    let query = Query {
-                                        plan: SqlQueryPlan {
-                                            tables: plan.tables,
-                                            conditions: plan.conditions,
-                                            params: plan.params,
-                                            select_columns: Vec::new(),
-                                            order_by: Vec::new(),
-                                            limit: None,
-                                            offset: None,
-                                            distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                                        },
-                                        terminal: QueryTerminal::Aggregate {
-                                            func: sql_func,
-                                            col_sql: arg_sql,
-                                            result_flag,
-                                        },
-                                    };
-                                    return self.emit_query(builder, &query, &result_schema, env, db, None, Some(expr.span));
-                                }
-                            }
                 }
 
-                // countWhere predicate (filter f *source) → SELECT COUNT(*) FROM ... WHERE pred AND filter
-                if name == "countWhere" {
-                    if let Some((source_name, filter_bind, filter_body)) =
-                        extract_filter_on_source(args[1], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
-                    {
-                        let source_name: &str = &source_name;
-                        let filter_body: &ast::Expr = &filter_body;
-                        if let Some(schema) = self.source_schemas.get(source_name).cloned()
-                                && !schema.starts_with('#') && !schema.contains('[')
-                                    && let Some((pred_bind, pred_body)) = extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings) {
-                                        let pred_body: &ast::Expr = &pred_body;
-                                        if let Some(pred_frag) = self.try_compile_sql_expr(&pred_bind, pred_body, &schema)
-                                            && let Some(filter_frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
-                                                let table = quote_sql_ident(&format!("_knot_{}", source_name));
-                                                let sql = format!(
-                                                    "SELECT COUNT(*) FROM {} WHERE ({}) AND ({})",
-                                                    table, filter_frag.sql, pred_frag.sql,
-                                                );
-                                                let mut all_params = filter_frag.params;
-                                                all_params.extend(pred_frag.params);
-                                                self.emit_stm_track_read(builder, source_name);
-                                                let params_rel = self.compile_sql_params(builder, &all_params, env, db);
-                                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                                return self.call_rt(
-                                                    builder,
-                                                    "knot_source_query_count",
-                                                    &[db, sql_ptr, sql_len, params_rel],
-                                                );
-                                            }
-                                    }
-                    }
-
-                    // countWhere predicate (do { ... }) → SELECT COUNT(*) FROM plan WHERE pred.
-                    // The predicate sees the do-block's *projected* rows, so
-                    // its field references must be rewritten through the
-                    // yield projection before compiling against the base
-                    // table; multi-table plans and computed projections fall
-                    // back to in-memory evaluation.
-                    if let ast::ExprKind::Do(stmts) = &args[1].node
-                        && let Some(plan) = self.analyze_sql_plan(stmts, env)
-                            && plan.tables.len() == 1
-                                && let Some((pred_bind, pred_body)) = extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings) {
-                                    let pred_body: &ast::Expr = &pred_body;
-                                    if let Some(rewritten) =
-                                        rewrite_body_through_projection(&plan, &pred_bind, pred_body)
-                                    {
-                                        let mut bind_aliases: HashMap<String, String> = HashMap::new();
-                                        bind_aliases.insert(pred_bind.clone(), plan.tables[0].alias.clone());
-                                        let mut bind_schemas: HashMap<String, String> = HashMap::new();
-                                        if let Some(schema) =
-                                            self.source_schemas.get(&plan.tables[0].source_name)
-                                        {
-                                            bind_schemas.insert(pred_bind.clone(), schema.clone());
-                                        }
-                                        if let Some(pred_frag) = Self::try_compile_multi_table_sql_expr(
-                                            &bind_aliases, &bind_schemas, &rewritten, env, &HashMap::new(),
-                                        ) {
-                                            let tables_sql: Vec<String> = plan.tables.iter().map(|t| {
-                                                format!("{} AS {}", quote_sql_ident(&format!("_knot_{}", t.source_name)), t.alias)
-                                            }).collect();
-                                            let from = tables_sql.join(", ");
-                                            let mut all_conditions = plan.conditions.clone();
-                                            all_conditions.push(pred_frag.sql);
-                                            let sql = format!(
-                                                "SELECT COUNT(*) FROM {} WHERE {}",
-                                                from,
-                                                join_sql_conditions(&all_conditions),
-                                            );
-                                            self.emit_stm_track_reads_for_plan(builder, &plan);
-                                            let mut all_params = plan.params.clone();
-                                            all_params.extend(pred_frag.params);
-                                            let params_rel = self.compile_sql_params(builder, &all_params, env, db);
-                                            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                            return self.call_rt(
-                                                builder,
-                                                "knot_source_query_count",
-                                                &[db, sql_ptr, sql_len, params_rel],
-                                            );
-                                        }
-                                    }
-                                }
-                }
-
-                // any/all/elem over a source relation → SELECT EXISTS(…).
-                // Only existence is needed, so the relation never leaves
-                // SQLite. `any pred rel` → EXISTS(… WHERE pred);
-                // `all pred rel` → NOT EXISTS(… WHERE NOT pred);
-                // `elem val rel`  → EXISTS(… WHERE <sole col> = val).
-                // Any shape we can't translate falls through to in-memory.
-                if matches!(name, "any" | "all" | "elem") && args.len() == 2 {
-                    // (WHERE conditions, params, negated, source_name, schema)
-                    type ExistsParts = (Vec<String>, Vec<SqlParamSource>, bool, String, String);
-                    let built: Option<ExistsParts> = (|| {
-                        // Resolve the table + (for `elem`) the projected column.
-                        // `elem val (map (\r -> r.f) *src)` peels the map; the other
-                        // ops take a bare `*src`. For any/all, a `filter q *src`
-                        // source is peeled too: its condition is AND-ed into the
-                        // EXISTS WHERE below (`any p (filter q *src)` →
-                        // EXISTS(… WHERE q AND p)).
-                        let mut filter_cond: Option<(String, ast::Expr)> = None;
-                        let (source_name, map_col): (String, Option<String>) = if name == "elem" {
-                            match self.peel_map_projection(args[1]) {
-                                Some((src, col)) => (src, Some(col)),
-                                None => (self.resolve_source(args[1])?, None),
+                // sum/avg/min/max lambda (do { ... }) → SQL aggregate from plan.
+                // The lambda sees the do-block's *projected* rows, so its
+                // field must be resolved through the yield projection —
+                // `sum (\x -> x.amt) (do i <- *t; yield {amt: i.qty})`
+                // aggregates the underlying `qty` column. Computed or
+                // unmappable projections fall back to in-memory.
+                if let ast::ExprKind::Do(stmts) = &args[1].node
+                    && let Some(plan) = self.analyze_sql_plan(stmts, env)
+                    && let Some((agg_bind, agg_body)) =
+                        extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings)
+                {
+                    let agg_body: &ast::Expr = &agg_body;
+                    // Resolve the aggregate column: a plain
+                    // `\x -> x.field` maps through the projection;
+                    // arithmetic bodies are only allowed when the
+                    // projection is the identity (single table).
+                    let col_info: Option<(String, String)> = match &agg_body.node {
+                        ast::ExprKind::FieldAccess {
+                            expr: fa_inner,
+                            field,
+                        } if matches!(&fa_inner.node, ast::ExprKind::Var(v) if v == &agg_bind) => {
+                            plan_projection_column(&plan, field)
+                        }
+                        _ if plan.tables.len() == 1 && plan_projection_is_identity(&plan) => {
+                            let alias = &plan.tables[0].alias;
+                            let schema = self
+                                .source_schemas
+                                .get(&plan.tables[0].source_name)
+                                .cloned()
+                                .unwrap_or_default();
+                            // MIN/MAX over an Int-typed CASE loses
+                            // the KNOT_INT collation, and Float
+                            // MIN/MAX diverges from total_cmp —
+                            // keep both in memory (see
+                            // minmax_pushdown_type_ok).
+                            let case_ok = !matches!(name, "minOn" | "maxOn")
+                                || minmax_pushdown_type_ok(&agg_bind, agg_body, &schema);
+                            if case_ok {
+                                extract_sql_field_access(&agg_bind, agg_body, alias, &schema).map(
+                                    |col_sql| {
+                                        let ty = infer_sql_expr_type(&agg_bind, agg_body, &schema)
+                                            .unwrap_or_else(|| "float".to_string());
+                                        (col_sql, ty)
+                                    },
+                                )
+                            } else {
+                                None
                             }
+                        }
+                        _ => None,
+                    };
+                    let col_info = col_info.filter(|(_, col_ty)| {
+                        // MIN/MAX over Float projected columns must
+                        // stay in memory (total_cmp divergence, see
+                        // minmax_pushdown_type_ok): SQLite stores NaN
+                        // as NULL and skips it, and conflates ±0.0,
+                        // both diverging from Knot's `total_cmp`. Only
+                        // Int and Text push down — the runtime's
+                        // `is_text` flag keeps Text results from being
+                        // re-parsed as Int.
+                        !matches!(name, "minOn" | "maxOn") || col_ty == "int" || col_ty == "text"
+                    });
+                    if let Some((col_sql, col_ty)) = col_info {
+                        let col_is_text = col_ty == "text";
+                        let arg_sql = if matches!(name, "minOn" | "maxOn") && col_ty == "int" {
+                            format!("{} COLLATE KNOT_INT", col_sql)
                         } else {
-                            match extract_filter_on_source(
-                                args[1], &self.source_var_binds, &self.fun_bodies, &self.let_bindings,
-                            ) {
-                                Some((src, bind, body)) => {
-                                    filter_cond = Some((bind, body));
-                                    (src, None)
-                                }
-                                None => (self.resolve_source(args[1])?, None),
-                            }
+                            col_sql
                         };
-                        let schema = self.source_schemas.get(&source_name)?.clone();
-                        if schema.starts_with('#') || schema.contains('[') { return None; }
-                        let (conditions, params, negated) = match name {
-                            "any" | "all" => {
-                                let (pb, pbody) = extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings)?;
-                                let pbody: &ast::Expr = &pbody;
-                                let frag = self.try_compile_sql_expr(&pb, pbody, &schema)?;
-                                // A peeled `filter q *src` source contributes its
-                                // condition first (textually before the predicate's
-                                // params in the WHERE), then the predicate.
-                                let (mut conds, mut prms) = (Vec::new(), Vec::new());
-                                if let Some((fb, fbody)) = &filter_cond {
-                                    let fbody: &ast::Expr = fbody;
-                                    let ffrag = self.try_compile_sql_expr(fb, fbody, &schema)?;
-                                    conds.push(ffrag.sql);
-                                    prms.extend(ffrag.params);
-                                }
-                                if name == "all" {
-                                    // all pred rel  ⇔  no row *fails* pred.
-                                    conds.push(format!("NOT ({})", frag.sql));
-                                    prms.extend(frag.params);
-                                    (conds, prms, true)
-                                } else {
-                                    conds.push(frag.sql);
-                                    prms.extend(frag.params);
-                                    (conds, prms, false)
-                                }
-                            }
-                            _ => {
-                                let needle = expr_to_sql_param(args[0])?;
-                                let col_sql = match map_col {
-                                    Some(c) => quote_sql_ident(&c),
-                                    None => {
-                                        // Bare source: only valid when it has one column.
-                                        let cols = schema_select_columns(&schema, "");
-                                        if cols.len() != 1 { return None; }
-                                        quote_sql_ident(&cols[0].result_field)
-                                    }
-                                };
-                                (vec![format!("{} = ?", col_sql)], vec![needle], false)
-                            }
+                        let result_flag = if matches!(name, "minOn" | "maxOn") {
+                            col_is_text
+                        } else {
+                            col_ty == "float"
                         };
-                        Some((conditions, params, negated, source_name, schema))
-                    })();
-                    if let Some((conditions, params, negated, source_name, schema)) = built {
+                        let result_schema = plan.build_result_schema();
                         let query = Query {
                             plan: SqlQueryPlan {
-                                tables: vec![SqlTable {
-                                    source_name: source_name.clone(),
-                                    alias: String::new(),
-                                    subquery: None,
-                                }],
-                                conditions,
-                                params,
+                                tables: plan.tables,
+                                conditions: plan.conditions,
+                                params: plan.params,
                                 select_columns: Vec::new(),
                                 order_by: Vec::new(),
                                 limit: None,
                                 offset: None,
                                 distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
+                                group_by: Vec::new(),
+                                having: Vec::new(),
                             },
-                            terminal: QueryTerminal::Exists { negated },
+                            terminal: QueryTerminal::Aggregate {
+                                func: sql_func,
+                                col_sql: arg_sql,
+                                result_flag,
+                            },
                         };
-                        return self.emit_query(builder, &query, &schema, env, db, None, Some(expr.span));
+                        return self.emit_query(
+                            builder,
+                            &query,
+                            &result_schema,
+                            env,
+                            db,
+                            None,
+                            Some(expr.span),
+                        );
+                    }
+                }
+            }
+
+            // countWhere predicate (filter f *source) → SELECT COUNT(*) FROM ... WHERE pred AND filter
+            if name == "countWhere" {
+                if let Some((source_name, filter_bind, filter_body)) = extract_filter_on_source(
+                    args[1],
+                    &self.source_var_binds,
+                    &self.fun_bodies,
+                    &self.let_bindings,
+                ) {
+                    let source_name: &str = &source_name;
+                    let filter_body: &ast::Expr = &filter_body;
+                    if let Some(schema) = self.source_schemas.get(source_name).cloned()
+                        && !schema.starts_with('#')
+                        && !schema.contains('[')
+                        && let Some((pred_bind, pred_body)) = extract_single_param_lambda(
+                            args[0],
+                            &self.fun_bodies,
+                            &self.let_bindings,
+                        )
+                    {
+                        let pred_body: &ast::Expr = &pred_body;
+                        if let Some(pred_frag) =
+                            self.try_compile_sql_expr(&pred_bind, pred_body, &schema)
+                            && let Some(filter_frag) =
+                                self.try_compile_sql_expr(&filter_bind, filter_body, &schema)
+                        {
+                            let table = quote_sql_ident(&format!("_knot_{}", source_name));
+                            let sql = format!(
+                                "SELECT COUNT(*) FROM {} WHERE ({}) AND ({})",
+                                table, filter_frag.sql, pred_frag.sql,
+                            );
+                            let mut all_params = filter_frag.params;
+                            all_params.extend(pred_frag.params);
+                            self.emit_stm_track_read(builder, source_name);
+                            let params_rel = self.compile_sql_params(builder, &all_params, env, db);
+                            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                            return self.call_rt(
+                                builder,
+                                "knot_source_query_count",
+                                &[db, sql_ptr, sql_len, params_rel],
+                            );
+                        }
                     }
                 }
 
-                // filter/sortBy lambda (do { ... }) → merge into SQL plan.
-                // The lambda sees the do-block's *projected* rows, so its
-                // field references are rewritten through the yield
-                // projection before being compiled against the base table;
-                // computed projections fall back to in-memory evaluation.
-                if matches!(name, "filter" | "sortBy")
-                    && let ast::ExprKind::Do(stmts) = &args[1].node
-                        && let Some(mut plan) = self.analyze_sql_plan(stmts, env)
-                            && let Some((bind_var, body)) = extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings) {
-                                let body: &ast::Expr = &body;
-                                match name {
-                                    "filter" => {
-                                        // For single-table plans, the bind var maps to the table alias
-                                        if plan.tables.len() == 1
-                                            && let Some(rewritten) =
-                                                rewrite_body_through_projection(&plan, &bind_var, body)
-                                            {
-                                                let mut ba = HashMap::new();
-                                                ba.insert(bind_var.clone(), plan.tables[0].alias.clone());
-                                                let mut bs = HashMap::new();
-                                                if let Some(schema) =
-                                                    self.source_schemas.get(&plan.tables[0].source_name)
-                                                {
-                                                    bs.insert(bind_var.clone(), schema.clone());
-                                                }
-                                                if let Some(frag) = Self::try_compile_multi_table_sql_expr(
-                                                    &ba, &bs, &rewritten, env, &HashMap::new(),
-                                                ) {
-                                                    plan.conditions.push(frag.sql);
-                                                    plan.params.extend(frag.params);
-                                                    let sql = plan.build_sql();
-                                                    let result_schema = plan.build_result_schema();
-                                                    self.emit_stm_track_reads_for_plan(builder, &plan);
-                                                    let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
-                                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-                                                    return self.call_rt(
-                                                        builder,
-                                                        "knot_source_query",
-                                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                                    );
-                                                }
-                                            }
+                // countWhere predicate (do { ... }) → SELECT COUNT(*) FROM plan WHERE pred.
+                // The predicate sees the do-block's *projected* rows, so
+                // its field references must be rewritten through the
+                // yield projection before compiling against the base
+                // table; multi-table plans and computed projections fall
+                // back to in-memory evaluation.
+                if let ast::ExprKind::Do(stmts) = &args[1].node
+                    && let Some(plan) = self.analyze_sql_plan(stmts, env)
+                    && plan.tables.len() == 1
+                    && let Some((pred_bind, pred_body)) =
+                        extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings)
+                {
+                    let pred_body: &ast::Expr = &pred_body;
+                    if let Some(rewritten) =
+                        rewrite_body_through_projection(&plan, &pred_bind, pred_body)
+                    {
+                        let mut bind_aliases: HashMap<String, String> = HashMap::new();
+                        bind_aliases.insert(pred_bind.clone(), plan.tables[0].alias.clone());
+                        let mut bind_schemas: HashMap<String, String> = HashMap::new();
+                        if let Some(schema) = self.source_schemas.get(&plan.tables[0].source_name) {
+                            bind_schemas.insert(pred_bind.clone(), schema.clone());
+                        }
+                        if let Some(pred_frag) = Self::try_compile_multi_table_sql_expr(
+                            &bind_aliases,
+                            &bind_schemas,
+                            &rewritten,
+                            env,
+                            &HashMap::new(),
+                        ) {
+                            let tables_sql: Vec<String> = plan
+                                .tables
+                                .iter()
+                                .map(|t| {
+                                    format!(
+                                        "{} AS {}",
+                                        quote_sql_ident(&format!("_knot_{}", t.source_name)),
+                                        t.alias
+                                    )
+                                })
+                                .collect();
+                            let from = tables_sql.join(", ");
+                            let mut all_conditions = plan.conditions.clone();
+                            all_conditions.push(pred_frag.sql);
+                            let sql = format!(
+                                "SELECT COUNT(*) FROM {} WHERE {}",
+                                from,
+                                join_sql_conditions(&all_conditions),
+                            );
+                            self.emit_stm_track_reads_for_plan(builder, &plan);
+                            let mut all_params = plan.params.clone();
+                            all_params.extend(pred_frag.params);
+                            let params_rel = self.compile_sql_params(builder, &all_params, env, db);
+                            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                            return self.call_rt(
+                                builder,
+                                "knot_source_query_count",
+                                &[db, sql_ptr, sql_len, params_rel],
+                            );
+                        }
+                    }
+                }
+            }
+
+            // any/all/elem over a source relation → SELECT EXISTS(…).
+            // Only existence is needed, so the relation never leaves
+            // SQLite. `any pred rel` → EXISTS(… WHERE pred);
+            // `all pred rel` → NOT EXISTS(… WHERE NOT pred);
+            // `elem val rel`  → EXISTS(… WHERE <sole col> = val).
+            // Any shape we can't translate falls through to in-memory.
+            if matches!(name, "any" | "all" | "elem") && args.len() == 2 {
+                // (WHERE conditions, params, negated, source_name, schema)
+                type ExistsParts = (Vec<String>, Vec<SqlParamSource>, bool, String, String);
+                let built: Option<ExistsParts> = (|| {
+                    // Resolve the table + (for `elem`) the projected column.
+                    // `elem val (map (\r -> r.f) *src)` peels the map; the other
+                    // ops take a bare `*src`. For any/all, a `filter q *src`
+                    // source is peeled too: its condition is AND-ed into the
+                    // EXISTS WHERE below (`any p (filter q *src)` →
+                    // EXISTS(… WHERE q AND p)).
+                    let mut filter_cond: Option<(String, ast::Expr)> = None;
+                    let (source_name, map_col): (String, Option<String>) = if name == "elem" {
+                        match self.peel_map_projection(args[1]) {
+                            Some((src, col)) => (src, Some(col)),
+                            None => (self.resolve_source(args[1])?, None),
+                        }
+                    } else {
+                        match extract_filter_on_source(
+                            args[1],
+                            &self.source_var_binds,
+                            &self.fun_bodies,
+                            &self.let_bindings,
+                        ) {
+                            Some((src, bind, body)) => {
+                                filter_cond = Some((bind, body));
+                                (src, None)
+                            }
+                            None => (self.resolve_source(args[1])?, None),
+                        }
+                    };
+                    let schema = self.source_schemas.get(&source_name)?.clone();
+                    if schema.starts_with('#') || schema.contains('[') {
+                        return None;
+                    }
+                    let (conditions, params, negated) = match name {
+                        "any" | "all" => {
+                            let (pb, pbody) = extract_single_param_lambda(
+                                args[0],
+                                &self.fun_bodies,
+                                &self.let_bindings,
+                            )?;
+                            let pbody: &ast::Expr = &pbody;
+                            let frag = self.try_compile_sql_expr(&pb, pbody, &schema)?;
+                            // A peeled `filter q *src` source contributes its
+                            // condition first (textually before the predicate's
+                            // params in the WHERE), then the predicate.
+                            let (mut conds, mut prms) = (Vec::new(), Vec::new());
+                            if let Some((fb, fbody)) = &filter_cond {
+                                let fbody: &ast::Expr = fbody;
+                                let ffrag = self.try_compile_sql_expr(fb, fbody, &schema)?;
+                                conds.push(ffrag.sql);
+                                prms.extend(ffrag.params);
+                            }
+                            if name == "all" {
+                                // all pred rel  ⇔  no row *fails* pred.
+                                conds.push(format!("NOT ({})", frag.sql));
+                                prms.extend(frag.params);
+                                (conds, prms, true)
+                            } else {
+                                conds.push(frag.sql);
+                                prms.extend(frag.params);
+                                (conds, prms, false)
+                            }
+                        }
+                        _ => {
+                            let needle = expr_to_sql_param(args[0])?;
+                            let col_sql = match map_col {
+                                Some(c) => quote_sql_ident(&c),
+                                None => {
+                                    // Bare source: only valid when it has one column.
+                                    let cols = schema_select_columns(&schema, "");
+                                    if cols.len() != 1 {
+                                        return None;
                                     }
-                                    "sortBy"
-                                        if plan.tables.len() == 1 => {
-                                            let alias = plan.tables[0].alias.clone();
-                                            let schema = self.source_schemas
-                                                .get(&plan.tables[0].source_name)
-                                                .cloned()
-                                                .unwrap_or_default();
-                                            if let Some(rewritten) =
+                                    quote_sql_ident(&cols[0].result_field)
+                                }
+                            };
+                            (vec![format!("{} = ?", col_sql)], vec![needle], false)
+                        }
+                    };
+                    Some((conditions, params, negated, source_name, schema))
+                })();
+                if let Some((conditions, params, negated, source_name, schema)) = built {
+                    let query = Query {
+                        plan: SqlQueryPlan {
+                            tables: vec![SqlTable {
+                                source_name: source_name.clone(),
+                                alias: String::new(),
+                                subquery: None,
+                            }],
+                            conditions,
+                            params,
+                            select_columns: Vec::new(),
+                            order_by: Vec::new(),
+                            limit: None,
+                            offset: None,
+                            distinct: false,
+                            group_by: Vec::new(),
+                            having: Vec::new(),
+                        },
+                        terminal: QueryTerminal::Exists { negated },
+                    };
+                    return self.emit_query(
+                        builder,
+                        &query,
+                        &schema,
+                        env,
+                        db,
+                        None,
+                        Some(expr.span),
+                    );
+                }
+            }
+
+            // filter/sortBy lambda (do { ... }) → merge into SQL plan.
+            // The lambda sees the do-block's *projected* rows, so its
+            // field references are rewritten through the yield
+            // projection before being compiled against the base table;
+            // computed projections fall back to in-memory evaluation.
+            if matches!(name, "filter" | "sortBy")
+                && let ast::ExprKind::Do(stmts) = &args[1].node
+                && let Some(mut plan) = self.analyze_sql_plan(stmts, env)
+                && let Some((bind_var, body)) =
+                    extract_single_param_lambda(args[0], &self.fun_bodies, &self.let_bindings)
+            {
+                let body: &ast::Expr = &body;
+                match name {
+                    "filter" => {
+                        // For single-table plans, the bind var maps to the table alias
+                        if plan.tables.len() == 1
+                            && let Some(rewritten) =
+                                rewrite_body_through_projection(&plan, &bind_var, body)
+                        {
+                            let mut ba = HashMap::new();
+                            ba.insert(bind_var.clone(), plan.tables[0].alias.clone());
+                            let mut bs = HashMap::new();
+                            if let Some(schema) =
+                                self.source_schemas.get(&plan.tables[0].source_name)
+                            {
+                                bs.insert(bind_var.clone(), schema.clone());
+                            }
+                            if let Some(frag) = Self::try_compile_multi_table_sql_expr(
+                                &ba,
+                                &bs,
+                                &rewritten,
+                                env,
+                                &HashMap::new(),
+                            ) {
+                                plan.conditions.push(frag.sql);
+                                plan.params.extend(frag.params);
+                                let sql = plan.build_sql();
+                                let result_schema = plan.build_result_schema();
+                                self.emit_stm_track_reads_for_plan(builder, &plan);
+                                let params_rel =
+                                    self.compile_sql_params(builder, &plan.params, env, db);
+                                let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                                let (schema_ptr, schema_len) =
+                                    self.string_ptr(builder, &result_schema);
+                                return self.call_rt(
+                                    builder,
+                                    "knot_source_query",
+                                    &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                                );
+                            }
+                        }
+                    }
+                    "sortBy" if plan.tables.len() == 1 => {
+                        let alias = plan.tables[0].alias.clone();
+                        let schema = self
+                            .source_schemas
+                            .get(&plan.tables[0].source_name)
+                            .cloned()
+                            .unwrap_or_default();
+                        if let Some(rewritten) =
                                                 rewrite_body_through_projection(&plan, &bind_var, body)
                                                 // Same ORDER BY guards as every other sortBy path:
                                                 // no Int CASE (KNOT_INT collation is lost through CASE)
@@ -7983,217 +8389,283 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                                 && sortby_projection_pushable(&bind_var, &rewritten, &schema)
                                                 && let Some(col_sql) = extract_sql_field_access(
                                                     &bind_var, &rewritten, &alias, &schema,
-                                                ) {
-                                                    plan.order_by.push(col_sql);
-                                                    let sql = plan.build_sql();
-                                                    let result_schema = plan.build_result_schema();
-                                                    self.emit_stm_track_reads_for_plan(builder, &plan);
-                                                    let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
-                                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-                                                    return self.call_rt(
-                                                        builder,
-                                                        "knot_source_query",
-                                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                                    );
-                                                }
-                                        }
-                                    _ => {}
-                                }
-                            }
+                                                )
+                        {
+                            plan.order_by.push(col_sql);
+                            let sql = plan.build_sql();
+                            let result_schema = plan.build_result_schema();
+                            self.emit_stm_track_reads_for_plan(builder, &plan);
+                            let params_rel =
+                                self.compile_sql_params(builder, &plan.params, env, db);
+                            let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                            let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                            return self.call_rt(
+                                builder,
+                                "knot_source_query",
+                                &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                            );
+                        }
+                    }
+                    _ => {}
+                }
             }
+        }
 
         // Special case: takeRelation N (sortBy f *source) → SQL ORDER BY + LIMIT
         // Special case: take/takeRelation N <source> → SQL LIMIT (legacy path).
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && (name == "takeRelation" || name == "take") && args.len() == 2 && !user_shadows_special {
-                // args[0] = N, args[1] = sortBy f *source (or just *source)
-                if let ast::ExprKind::App { func: sort_func, arg: sort_source } = &args[1].node
-                    && let ast::ExprKind::App { func: sort_name_expr, arg: sort_lambda } = &sort_func.node
-                        && let ast::ExprKind::Var(sort_name) = &sort_name_expr.node
-                            && sort_name == "sortBy"
-                                && let Some((sort_bind, sort_body)) = extract_single_param_lambda(sort_lambda, &self.fun_bodies, &self.let_bindings) {
-                                    let sort_body: &ast::Expr = &sort_body;
-                                    // Case 1: sortBy f *source → SQL ORDER BY + LIMIT
-                                    if let ast::ExprKind::SourceRef { name: source_name, .. } = &sort_source.node
-                                            && let Some(schema) = self.source_schemas.get(source_name).cloned()
-                                                && !schema.starts_with('#') && !schema.contains('[') {
-                                                    // Same ORDER BY guards as the other sortBy paths:
-                                                    // no Int CASE (collation loss), no Float (total_cmp
-                                                    // divergence) — fall back to in-memory otherwise.
-                                                    if sortby_projection_pushable(&sort_bind, sort_body, &schema)
-                                                    && let Some(col_sql) = extract_sql_field_access(&sort_bind, sort_body, "", &schema) {
-                                                        let source_name = source_name.clone();
-                                                        let n_val = self.compile_expr(builder, args[0], env, db);
-                                                        let query = Query {
-                                                            plan: SqlQueryPlan {
-                                                                tables: vec![SqlTable {
-                                                                    source_name,
-                                                                    alias: String::new(),
-                                                                    subquery: None,
-                                                                }],
-                                                                conditions: Vec::new(),
-                                                                params: Vec::new(),
-                                                                select_columns: schema_select_columns(&schema, ""),
-                                                                order_by: vec![col_sql],
-                                                                limit: Some(SqlParamSource::Var("__limit__".into())),
-                                                                offset: None,
-                                                                distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                                                            },
-                                                            terminal: QueryTerminal::Rows,
-                                                        };
-                                                        return self.emit_query(builder, &query, &schema, env, db, Some(n_val), Some(expr.span));
-                                                    }
-                                                }
-                                    // Case 2: sortBy f (do { m <- *source; where ...; yield m })
-                                    // → SQL WHERE + ORDER BY + LIMIT
-                                    if let ast::ExprKind::Do(do_stmts) = &sort_source.node
-                                        && let Some(mut plan) = self.analyze_sql_plan(do_stmts, env)
-                                            && plan.tables.len() == 1 {
-                                                let alias = plan.tables[0].alias.clone();
-                                                let schema = self.source_schemas
-                                                    .get(&plan.tables[0].source_name)
-                                                    .cloned()
-                                                    .unwrap_or_default();
-                                                // Sort lambda sees projected rows: map its field
-                                                // refs through the yield projection (fall back on
-                                                // computed projections).
-                                                let rewritten_sort =
-                                                    rewrite_body_through_projection(&plan, &sort_bind, sort_body);
-                                                if let Some(col_sql) = rewritten_sort.as_ref().and_then(|rb| {
-                                                    // Same ORDER BY guards as the other sortBy paths:
-                                                    // no Int CASE collation loss, no Float total_cmp
-                                                    // divergence.
-                                                    if !sortby_projection_pushable(&sort_bind, rb, &schema) {
-                                                        return None;
-                                                    }
-                                                    extract_sql_field_access(&sort_bind, rb, &alias, &schema)
-                                                }) {
-                                                    plan.order_by.push(col_sql);
-                                                    let n_param = SqlParamSource::Var("__limit__".into());
-                                                    plan.limit = Some(n_param);
-                                                    let sql = plan.build_sql();
-                                                    let result_schema = plan.build_result_schema();
-                                                    let preds = try_extract_preds_for_single_table_plan(do_stmts, &plan);
-                                                    // Track reads for STM (so retry wakes on changes)
-                                                    for table in &plan.tables {
-                                                        let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
-                                                        self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
-                                                        self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
-                                                    }
-                                                    // Compile SQL params + the limit value
-                                                    let n_val = self.compile_expr(builder, args[0], env, db);
-                                                    let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
-                                                    // Append limit to the params relation
-                                                    self.call_rt_void(builder, "knot_relation_push", &[params_rel, n_val]);
-                                                    let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
-                                                    let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
-                                                    return self.call_rt(
-                                                        builder,
-                                                        "knot_source_query",
-                                                        &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
-                                                    );
-                                                }
-                                            }
-                                }
-
-                // takeRelation N *source → SQL LIMIT (no ORDER BY)
-                if let Some(source_name) = self.resolve_source(args[1])
-                        && let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                            && !schema.starts_with('#') && !schema.contains('[') {
-                                let n_val = self.compile_expr(builder, args[0], env, db);
-                                let query = Query {
-                                    plan: SqlQueryPlan {
-                                        tables: vec![SqlTable {
-                                            source_name: source_name.clone(),
-                                            alias: String::new(),
-                                            subquery: None,
-                                        }],
-                                        conditions: Vec::new(),
-                                        params: Vec::new(),
-                                        select_columns: schema_select_columns(&schema, ""),
-                                        order_by: Vec::new(),
-                                        limit: Some(SqlParamSource::Var("__limit__".into())),
-                                        offset: None,
-                                        distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                                    },
-                                    terminal: QueryTerminal::Rows,
-                                };
-                                return self.emit_query(builder, &query, &schema, env, db, Some(n_val), Some(expr.span));
-                            }
-
-                // takeRelation N (filter f *source) → SQL WHERE + LIMIT
-                if let Some((source_name, filter_bind, filter_body)) =
-                    extract_filter_on_source(args[1], &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
+            && (name == "takeRelation" || name == "take")
+            && args.len() == 2
+            && !user_shadows_special
+        {
+            // args[0] = N, args[1] = sortBy f *source (or just *source)
+            if let ast::ExprKind::App {
+                func: sort_func,
+                arg: sort_source,
+            } = &args[1].node
+                && let ast::ExprKind::App {
+                    func: sort_name_expr,
+                    arg: sort_lambda,
+                } = &sort_func.node
+                && let ast::ExprKind::Var(sort_name) = &sort_name_expr.node
+                && sort_name == "sortBy"
+                && let Some((sort_bind, sort_body)) =
+                    extract_single_param_lambda(sort_lambda, &self.fun_bodies, &self.let_bindings)
+            {
+                let sort_body: &ast::Expr = &sort_body;
+                // Case 1: sortBy f *source → SQL ORDER BY + LIMIT
+                if let ast::ExprKind::SourceRef {
+                    name: source_name, ..
+                } = &sort_source.node
+                    && let Some(schema) = self.source_schemas.get(source_name).cloned()
+                    && !schema.starts_with('#')
+                    && !schema.contains('[')
                 {
-                    let source_name: &str = &source_name;
-                    let filter_body: &ast::Expr = &filter_body;
-                    if let Some(schema) = self.source_schemas.get(source_name).cloned()
-                            && !schema.starts_with('#') && !schema.contains('[')
-                                && let Some(frag) = self.try_compile_sql_expr(&filter_bind, filter_body, &schema) {
-                                    let n_val = self.compile_expr(builder, args[0], env, db);
-                                    let query = Query {
-                                        plan: SqlQueryPlan {
-                                            tables: vec![SqlTable {
-                                                source_name: source_name.to_string(),
-                                                alias: String::new(),
-                                                subquery: None,
-                                            }],
-                                            conditions: vec![frag.sql],
-                                            params: frag.params,
-                                            select_columns: schema_select_columns(&schema, ""),
-                                            order_by: Vec::new(),
-                                            limit: Some(SqlParamSource::Var("__limit__".into())),
-                                            offset: None,
-                                            distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                                        },
-                                        terminal: QueryTerminal::Rows,
-                                    };
-                                    return self.emit_query(builder, &query, &schema, env, db, Some(n_val), Some(expr.span));
-                                }
+                    // Same ORDER BY guards as the other sortBy paths:
+                    // no Int CASE (collation loss), no Float (total_cmp
+                    // divergence) — fall back to in-memory otherwise.
+                    if sortby_projection_pushable(&sort_bind, sort_body, &schema)
+                        && let Some(col_sql) =
+                            extract_sql_field_access(&sort_bind, sort_body, "", &schema)
+                    {
+                        let source_name = source_name.clone();
+                        let n_val = self.compile_expr(builder, args[0], env, db);
+                        let query = Query {
+                            plan: SqlQueryPlan {
+                                tables: vec![SqlTable {
+                                    source_name,
+                                    alias: String::new(),
+                                    subquery: None,
+                                }],
+                                conditions: Vec::new(),
+                                params: Vec::new(),
+                                select_columns: schema_select_columns(&schema, ""),
+                                order_by: vec![col_sql],
+                                limit: Some(SqlParamSource::Var("__limit__".into())),
+                                offset: None,
+                                distinct: false,
+                                group_by: Vec::new(),
+                                having: Vec::new(),
+                            },
+                            terminal: QueryTerminal::Rows,
+                        };
+                        return self.emit_query(
+                            builder,
+                            &query,
+                            &schema,
+                            env,
+                            db,
+                            Some(n_val),
+                            Some(expr.span),
+                        );
+                    }
+                }
+                // Case 2: sortBy f (do { m <- *source; where ...; yield m })
+                // → SQL WHERE + ORDER BY + LIMIT
+                if let ast::ExprKind::Do(do_stmts) = &sort_source.node
+                    && let Some(mut plan) = self.analyze_sql_plan(do_stmts, env)
+                    && plan.tables.len() == 1
+                {
+                    let alias = plan.tables[0].alias.clone();
+                    let schema = self
+                        .source_schemas
+                        .get(&plan.tables[0].source_name)
+                        .cloned()
+                        .unwrap_or_default();
+                    // Sort lambda sees projected rows: map its field
+                    // refs through the yield projection (fall back on
+                    // computed projections).
+                    let rewritten_sort =
+                        rewrite_body_through_projection(&plan, &sort_bind, sort_body);
+                    if let Some(col_sql) = rewritten_sort.as_ref().and_then(|rb| {
+                        // Same ORDER BY guards as the other sortBy paths:
+                        // no Int CASE collation loss, no Float total_cmp
+                        // divergence.
+                        if !sortby_projection_pushable(&sort_bind, rb, &schema) {
+                            return None;
+                        }
+                        extract_sql_field_access(&sort_bind, rb, &alias, &schema)
+                    }) {
+                        plan.order_by.push(col_sql);
+                        let n_param = SqlParamSource::Var("__limit__".into());
+                        plan.limit = Some(n_param);
+                        let sql = plan.build_sql();
+                        let result_schema = plan.build_result_schema();
+                        let preds = try_extract_preds_for_single_table_plan(do_stmts, &plan);
+                        // Track reads for STM (so retry wakes on changes)
+                        for table in &plan.tables {
+                            let (tn_ptr, tn_len) = self.string_ptr(builder, &table.source_name);
+                            self.call_rt_void(builder, "knot_stm_track_read", &[tn_ptr, tn_len]);
+                            self.emit_stm_track_pred(builder, tn_ptr, tn_len, &preds, env, db);
+                        }
+                        // Compile SQL params + the limit value
+                        let n_val = self.compile_expr(builder, args[0], env, db);
+                        let params_rel = self.compile_sql_params(builder, &plan.params, env, db);
+                        // Append limit to the params relation
+                        self.call_rt_void(builder, "knot_relation_push", &[params_rel, n_val]);
+                        let (sql_ptr, sql_len) = self.string_ptr(builder, &sql);
+                        let (schema_ptr, schema_len) = self.string_ptr(builder, &result_schema);
+                        return self.call_rt(
+                            builder,
+                            "knot_source_query",
+                            &[db, sql_ptr, sql_len, schema_ptr, schema_len, params_rel],
+                        );
+                    }
                 }
             }
+
+            // takeRelation N *source → SQL LIMIT (no ORDER BY)
+            if let Some(source_name) = self.resolve_source(args[1])
+                && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                && !schema.starts_with('#')
+                && !schema.contains('[')
+            {
+                let n_val = self.compile_expr(builder, args[0], env, db);
+                let query = Query {
+                    plan: SqlQueryPlan {
+                        tables: vec![SqlTable {
+                            source_name: source_name.clone(),
+                            alias: String::new(),
+                            subquery: None,
+                        }],
+                        conditions: Vec::new(),
+                        params: Vec::new(),
+                        select_columns: schema_select_columns(&schema, ""),
+                        order_by: Vec::new(),
+                        limit: Some(SqlParamSource::Var("__limit__".into())),
+                        offset: None,
+                        distinct: false,
+                        group_by: Vec::new(),
+                        having: Vec::new(),
+                    },
+                    terminal: QueryTerminal::Rows,
+                };
+                return self.emit_query(
+                    builder,
+                    &query,
+                    &schema,
+                    env,
+                    db,
+                    Some(n_val),
+                    Some(expr.span),
+                );
+            }
+
+            // takeRelation N (filter f *source) → SQL WHERE + LIMIT
+            if let Some((source_name, filter_bind, filter_body)) = extract_filter_on_source(
+                args[1],
+                &self.source_var_binds,
+                &self.fun_bodies,
+                &self.let_bindings,
+            ) {
+                let source_name: &str = &source_name;
+                let filter_body: &ast::Expr = &filter_body;
+                if let Some(schema) = self.source_schemas.get(source_name).cloned()
+                    && !schema.starts_with('#')
+                    && !schema.contains('[')
+                    && let Some(frag) =
+                        self.try_compile_sql_expr(&filter_bind, filter_body, &schema)
+                {
+                    let n_val = self.compile_expr(builder, args[0], env, db);
+                    let query = Query {
+                        plan: SqlQueryPlan {
+                            tables: vec![SqlTable {
+                                source_name: source_name.to_string(),
+                                alias: String::new(),
+                                subquery: None,
+                            }],
+                            conditions: vec![frag.sql],
+                            params: frag.params,
+                            select_columns: schema_select_columns(&schema, ""),
+                            order_by: Vec::new(),
+                            limit: Some(SqlParamSource::Var("__limit__".into())),
+                            offset: None,
+                            distinct: false,
+                            group_by: Vec::new(),
+                            having: Vec::new(),
+                        },
+                        terminal: QueryTerminal::Rows,
+                    };
+                    return self.emit_query(
+                        builder,
+                        &query,
+                        &schema,
+                        env,
+                        db,
+                        Some(n_val),
+                        Some(expr.span),
+                    );
+                }
+            }
+        }
 
         // Special case: dropRelation N *source → SQL OFFSET (no ORDER BY).
         // Mirrors the bare-`take` LIMIT path: the row set is the same as
         // in-memory `drop` (unordered), just computed in SQL.
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && (name == "dropRelation" || name == "drop") && args.len() == 2 && !user_shadows_special
-                && let Some(source_name) = self.resolve_source(args[1])
-                        && let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                            && !schema.starts_with('#') && !schema.contains('[') {
-                                let query = Query {
-                                    plan: SqlQueryPlan {
-                                        tables: vec![SqlTable {
-                                            source_name: source_name.clone(),
-                                            alias: String::new(),
-                                            subquery: None,
-                                        }],
-                                        conditions: Vec::new(),
-                                        params: Vec::new(),
-                                        select_columns: schema_select_columns(&schema, ""),
-                                        order_by: Vec::new(),
-                                        limit: None,
-                                        offset: Some(SqlParamSource::Var("__offset__".into())),
-                                        distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                                    },
-                                    terminal: QueryTerminal::Rows,
-                                };
-                                let n_val = self.compile_expr(builder, args[0], env, db);
-                                return self.emit_query(builder, &query, &schema, env, db, Some(n_val), Some(expr.span));
-                            }
+            && (name == "dropRelation" || name == "drop")
+            && args.len() == 2
+            && !user_shadows_special
+            && let Some(source_name) = self.resolve_source(args[1])
+            && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+            && !schema.starts_with('#')
+            && !schema.contains('[')
+        {
+            let query = Query {
+                plan: SqlQueryPlan {
+                    tables: vec![SqlTable {
+                        source_name: source_name.clone(),
+                        alias: String::new(),
+                        subquery: None,
+                    }],
+                    conditions: Vec::new(),
+                    params: Vec::new(),
+                    select_columns: schema_select_columns(&schema, ""),
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: Some(SqlParamSource::Var("__offset__".into())),
+                    distinct: false,
+                    group_by: Vec::new(),
+                    having: Vec::new(),
+                },
+                terminal: QueryTerminal::Rows,
+            };
+            let n_val = self.compile_expr(builder, args[0], env, db);
+            return self.emit_query(
+                builder,
+                &query,
+                &schema,
+                env,
+                db,
+                Some(n_val),
+                Some(expr.span),
+            );
+        }
 
         // SQL set operations: diff/inter/union on two source relations
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && !user_shadows_special {
+            && !user_shadows_special
+        {
             let sql_op = match name.as_str() {
                 "diff" => Some("EXCEPT"),
                 "inter" => Some("INTERSECT"),
@@ -8201,48 +8673,56 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 _ => None,
             };
             if let Some(sql_op) = sql_op
-                && args.len() == 2 {
-                    // Try to compile each side to a SQL subquery
-                    if let (Some(sub_a), Some(sub_b)) = (
-                        self.try_set_op_subquery(args[0], env),
-                        self.try_set_op_subquery(args[1], env),
-                    ) {
-                        let result_schema = sub_a.schema.clone();
-                        let query = Query {
-                            // The plan is a sentinel — each SetOpSubquery side
-                            // carries its own sql/params/tables (a do-block
-                            // subquery's build_sql output isn't reconstructible
-                            // from a single SqlQueryPlan).
-                            plan: SqlQueryPlan {
-                                tables: Vec::new(),
-                                conditions: Vec::new(),
-                                params: Vec::new(),
-                                select_columns: Vec::new(),
-                                order_by: Vec::new(),
-                                limit: None,
-                                offset: None,
-                                distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                            },
-                            terminal: QueryTerminal::SetOp {
-                                op: sql_op,
-                                left: sub_a,
-                                right: sub_b,
-                            },
-                        };
-                        return self.emit_query(builder, &query, &result_schema, env, db, None, Some(expr.span));
-                    }
+                && args.len() == 2
+            {
+                // Try to compile each side to a SQL subquery
+                if let (Some(sub_a), Some(sub_b)) = (
+                    self.try_set_op_subquery(args[0], env),
+                    self.try_set_op_subquery(args[1], env),
+                ) {
+                    let result_schema = sub_a.schema.clone();
+                    let query = Query {
+                        // The plan is a sentinel — each SetOpSubquery side
+                        // carries its own sql/params/tables (a do-block
+                        // subquery's build_sql output isn't reconstructible
+                        // from a single SqlQueryPlan).
+                        plan: SqlQueryPlan {
+                            tables: Vec::new(),
+                            conditions: Vec::new(),
+                            params: Vec::new(),
+                            select_columns: Vec::new(),
+                            order_by: Vec::new(),
+                            limit: None,
+                            offset: None,
+                            distinct: false,
+                            group_by: Vec::new(),
+                            having: Vec::new(),
+                        },
+                        terminal: QueryTerminal::SetOp {
+                            op: sql_op,
+                            left: sub_a,
+                            right: sub_b,
+                        },
+                    };
+                    return self.emit_query(
+                        builder,
+                        &query,
+                        &result_schema,
+                        env,
+                        db,
+                        None,
+                        Some(expr.span),
+                    );
                 }
+            }
         }
 
         // Special case: fetch/fetchWith
         if let Some(name) = Self::server_form_name(func_expr)
-            && ((name == "fetch" && args.len() == 2)
-                || (name == "fetchWith" && args.len() == 3))
-            {
-                return self.compile_fetch(builder, &args, name == "fetchWith", env, db);
-            }
+            && ((name == "fetch" && args.len() == 2) || (name == "fetchWith" && args.len() == 3))
+        {
+            return self.compile_fetch(builder, &args, name == "fetchWith", env, db);
+        }
 
         // Special case: `traverse f rel` over a relation with a statically
         // known applicative — pass the kind so an EMPTY input produces
@@ -8254,24 +8734,27 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // names skip this and use normal dispatch.
         if let ast::ExprKind::Var(name) = &func_expr.node
             && name == "traverse"
-                && args.len() == 2
-                && !env.bindings.contains_key(&crate::infer::Binding::User("traverse".to_string()))
-                && !self.top_fn_names.contains("traverse")
-                && let Some(kind) = self.monad_info.get(&expr.span).cloned() {
-                    let kind_str = match &kind {
-                        MonadKind::IO => "io".to_string(),
-                        MonadKind::Relation => "relation".to_string(),
-                        MonadKind::Adt(n) => n.clone(),
-                    };
-                    let f_val = self.compile_expr(builder, args[0], env, db);
-                    let rel_val = self.compile_expr(builder, args[1], env, db);
-                    let (k_ptr, k_len) = self.string_ptr(builder, &kind_str);
-                    return self.call_rt(
-                        builder,
-                        "knot_relation_traverse_kind",
-                        &[db, f_val, rel_val, k_ptr, k_len],
-                    );
-                }
+            && args.len() == 2
+            && !env
+                .bindings
+                .contains_key(&crate::infer::Binding::User("traverse".to_string()))
+            && !self.top_fn_names.contains("traverse")
+            && let Some(kind) = self.monad_info.get(&expr.span).cloned()
+        {
+            let kind_str = match &kind {
+                MonadKind::IO => "io".to_string(),
+                MonadKind::Relation => "relation".to_string(),
+                MonadKind::Adt(n) => n.clone(),
+            };
+            let f_val = self.compile_expr(builder, args[0], env, db);
+            let rel_val = self.compile_expr(builder, args[1], env, db);
+            let (k_ptr, k_len) = self.string_ptr(builder, &kind_str);
+            return self.call_rt(
+                builder,
+                "knot_relation_traverse_kind",
+                &[db, f_val, rel_val, k_ptr, k_len],
+            );
+        }
 
         // Special case: `sum rel` that did not push down to SQL above — pass
         // the statically inferred element type so an EMPTY relation sums to the
@@ -8281,68 +8764,78 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // the column type). Inference records the span only when the result is
         // a Float; a user-defined `sum` skips this and dispatches normally.
         if Self::query_form_name(func_expr) == Some("sum")
-                && args.len() == 1
-                && !user_shadows_special {
-                    // sum (map (\r -> r.<numCol>) *source) → SELECT SUM(col):
-                    // fuse the projection into the aggregate instead of
-                    // materializing the projected column. Also covers the pipe
-                    // form `*source |> map ...` (beta_reduce collapses it).
-                    if let Some((source_name, field)) = self.peel_map_projection(args[0])
-                            && let Some(schema) = self.source_schemas.get(&source_name).cloned()
-                                && !schema.starts_with('#') && !schema.contains('[') {
-                                    let bind_var = "x".to_string();
-                                    let body = ast::Expr {
-                                        node: ast::ExprKind::FieldAccess {
-                                            expr: Box::new(ast::Expr {
-                                                node: ast::ExprKind::Var(crate::infer::Binding::User(bind_var.clone())),
-                                                span: args[0].span,
-                                            }),
-                                            field: field.clone(),
-                                        },
-                                        span: args[0].span,
-                                    };
-                                    if let Some(col_sql) =
-                                        extract_sql_field_access(&bind_var, &body, "", &schema)
-                                        && let Some((func, _rt)) = aggregate_sql_func_runtime("sum") {
-                                        let result_flag = sum_result_is_float(&bind_var, &body, &schema);
-                                        let query = Query {
-                                            plan: SqlQueryPlan {
-                                                tables: vec![SqlTable {
-                                                    source_name: source_name.to_string(),
-                                                    alias: String::new(),
-                                                    subquery: None,
-                                                }],
-                                                conditions: Vec::new(),
-                                                params: Vec::new(),
-                                                select_columns: Vec::new(),
-                                                order_by: Vec::new(),
-                                                limit: None,
-                                                offset: None,
-                                                distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
-                                            },
-                                            terminal: QueryTerminal::Aggregate {
-                                                func,
-                                                col_sql,
-                                                result_flag,
-                                            },
-                                        };
-                                        return self.emit_query(builder, &query, &schema, env, db, None, Some(expr.span));
-                                    }
-                                }
-
-                    let rel_val = self.compile_expr(builder, args[0], env, db);
-                    let is_float = builder.ins().iconst(
-                        types::I64,
-                        self.sum_float_spans.contains(&expr.span) as i64,
-                    );
-                    return self.call_rt(
+            && args.len() == 1
+            && !user_shadows_special
+        {
+            // sum (map (\r -> r.<numCol>) *source) → SELECT SUM(col):
+            // fuse the projection into the aggregate instead of
+            // materializing the projected column. Also covers the pipe
+            // form `*source |> map ...` (beta_reduce collapses it).
+            if let Some((source_name, field)) = self.peel_map_projection(args[0])
+                && let Some(schema) = self.source_schemas.get(&source_name).cloned()
+                && !schema.starts_with('#')
+                && !schema.contains('[')
+            {
+                let bind_var = "x".to_string();
+                let body = ast::Expr {
+                    node: ast::ExprKind::FieldAccess {
+                        expr: Box::new(ast::Expr {
+                            node: ast::ExprKind::Var(crate::infer::Binding::User(bind_var.clone())),
+                            span: args[0].span,
+                        }),
+                        field: field.clone(),
+                    },
+                    span: args[0].span,
+                };
+                if let Some(col_sql) = extract_sql_field_access(&bind_var, &body, "", &schema)
+                    && let Some((func, _rt)) = aggregate_sql_func_runtime("sum")
+                {
+                    let result_flag = sum_result_is_float(&bind_var, &body, &schema);
+                    let query = Query {
+                        plan: SqlQueryPlan {
+                            tables: vec![SqlTable {
+                                source_name: source_name.to_string(),
+                                alias: String::new(),
+                                subquery: None,
+                            }],
+                            conditions: Vec::new(),
+                            params: Vec::new(),
+                            select_columns: Vec::new(),
+                            order_by: Vec::new(),
+                            limit: None,
+                            offset: None,
+                            distinct: false,
+                            group_by: Vec::new(),
+                            having: Vec::new(),
+                        },
+                        terminal: QueryTerminal::Aggregate {
+                            func,
+                            col_sql,
+                            result_flag,
+                        },
+                    };
+                    return self.emit_query(
                         builder,
-                        "knot_relation_sum_direct",
-                        &[db, rel_val, is_float],
+                        &query,
+                        &schema,
+                        env,
+                        db,
+                        None,
+                        Some(expr.span),
                     );
                 }
+            }
+
+            let rel_val = self.compile_expr(builder, args[0], env, db);
+            let is_float = builder
+                .ins()
+                .iconst(types::I64, self.sum_float_spans.contains(&expr.span) as i64);
+            return self.call_rt(
+                builder,
+                "knot_relation_sum_direct",
+                &[db, rel_val, is_float],
+            );
+        }
 
         // Implicit dictionary: prepend the record resolved during inference as
         // the leading argument (the function was elaborated to take it first).
@@ -8353,12 +8846,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let dict_val = self.compile_fold_dict(builder, expr.span, env);
             compiled_args.push(dict_val);
         } else if let Some((root, path)) = self.implicit_dict_args.get(&expr.span).cloned() {
-            let dict_val =
-                self.compile_root_path(builder, &root, &path, expr.span, env);
+            let dict_val = self.compile_root_path(builder, &root, &path, expr.span, env);
             compiled_args.push(dict_val);
         }
         compiled_args.extend(
-            args.iter().map(|a| self.compile_arg_expr(builder, a, env, db)),
+            args.iter()
+                .map(|a| self.compile_arg_expr(builder, a, env, db)),
         );
 
         match &func_expr.node {
@@ -8381,13 +8874,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                     let bind_fn = format!("Monad_{}_bind", type_name);
                     if let Some(&(func_id, _)) = self.global_fns.get(&bind_fn) {
-                        let func_ref = self
-                            .module
-                            .declare_func_in_func(func_id, builder.func);
-                        let call = builder.ins().call(
-                            func_ref,
-                            &[db, compiled_args[0], compiled_args[1]],
-                        );
+                        let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+                        let call = builder
+                            .ins()
+                            .call(func_ref, &[db, compiled_args[0], compiled_args[1]]);
                         return builder.inst_results(call)[0];
                     }
                 }
@@ -8406,13 +8896,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if let Some(type_name) = target.as_ref().and_then(|t| t.type_name.as_deref()) {
                     let impl_fn = format!("FromJSON_{}_parseJson", type_name);
                     if let Some(&(func_id, _)) = self.global_fns.get(&impl_fn) {
-                        let func_ref = self
-                            .module
-                            .declare_func_in_func(func_id, builder.func);
-                        let call = builder.ins().call(
-                            func_ref,
-                            &[db, compiled_args[0]],
-                        );
+                        let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+                        let call = builder.ins().call(func_ref, &[db, compiled_args[0]]);
                         return builder.inst_results(call)[0];
                     }
                 }
@@ -8431,41 +8916,31 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
                 // Fall through to generic parseJson (dispatcher or runtime)
                 if let Some(&(func_id, expected_params)) = self.global_fns.get("parseJson")
-                    && compiled_args.len() == expected_params {
-                        let func_ref = self
-                            .module
-                            .declare_func_in_func(func_id, builder.func);
-                        let call = builder.ins().call(func_ref, &[db, compiled_args[0]]);
-                        return builder.inst_results(call)[0];
-                    }
+                    && compiled_args.len() == expected_params
+                {
+                    let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+                    let call = builder.ins().call(func_ref, &[db, compiled_args[0]]);
+                    return builder.inst_results(call)[0];
+                }
                 self.call_rt(builder, "knot_json_decode_maybe", &[compiled_args[0]])
             }
 
             // Direct call to a known user function
-            ast::ExprKind::Var(name)
-                if self.global_fns.contains_key(name.as_str()) =>
-            {
+            ast::ExprKind::Var(name) if self.global_fns.contains_key(name.as_str()) => {
                 let fn_name: &str = name.as_str();
                 let (func_id, expected_params) = self.global_fns[fn_name];
                 if compiled_args.len() == expected_params {
-                    let func_ref = self
-                        .module
-                        .declare_func_in_func(func_id, builder.func);
+                    let func_ref = self.module.declare_func_in_func(func_id, builder.func);
                     let mut call_args = vec![db];
                     call_args.extend(&compiled_args);
                     let call = builder.ins().call(func_ref, &call_args);
                     builder.inst_results(call)[0]
                 } else {
                     // Partial application or over-application — use dynamic call
-                    let func_val =
-                        self.compile_expr(builder, func_expr, env, db);
+                    let func_val = self.compile_expr(builder, func_expr, env, db);
                     let mut result = func_val;
                     for arg in &compiled_args {
-                        result = self.call_rt(
-                            builder,
-                            "knot_value_call",
-                            &[db, result, *arg],
-                        );
+                        result = self.call_rt(builder, "knot_value_call", &[db, result, *arg]);
                     }
                     result
                 }
@@ -8521,8 +8996,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::Var(name) if name == "count" => {
                 if compiled_args.len() == 1 {
                     // knot_relation_len returns raw usize, pass directly to knot_value_int
-                    let len =
-                        self.call_rt(builder, "knot_relation_len", &[compiled_args[0]]);
+                    let len = self.call_rt(builder, "knot_relation_len", &[compiled_args[0]]);
                     self.call_rt(builder, "knot_value_int", &[len])
                 } else {
                     self.call_rt(builder, "knot_value_unit", &[])
@@ -8552,11 +9026,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // `serve Api where ...` or a name resolving to one.
                     let server_arg = &args[expected_arity - 1];
                     let served_api: Option<String> = {
-                        let reduced = beta_reduce(
-                            server_arg,
-                            &self.fun_bodies,
-                            &self.let_bindings,
-                        );
+                        let reduced = beta_reduce(server_arg, &self.fun_bodies, &self.let_bindings);
                         match &strip_expr_wrappers(&reduced).node {
                             ast::ExprKind::Serve { api, .. } => Some(api.clone()),
                             _ => None,
@@ -8603,33 +9073,32 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             ast::HttpMethod::Delete => "DELETE",
                             ast::HttpMethod::Patch => "PATCH",
                         };
-                        let (method_ptr, method_len) =
-                            self.string_ptr(builder, method_str);
+                        let (method_ptr, method_len) = self.string_ptr(builder, method_str);
 
-                        let path_pattern = path_segments_to_pattern(&entry.path, &self.type_aliases);
-                        let (path_ptr, path_len) =
-                            self.string_ptr(builder, &path_pattern);
+                        let path_pattern =
+                            path_segments_to_pattern(&entry.path, &self.type_aliases);
+                        let (path_ptr, path_len) = self.string_ptr(builder, &path_pattern);
 
-                        let (ctor_ptr, ctor_len) =
-                            self.string_ptr(builder, &entry.constructor);
+                        let (ctor_ptr, ctor_len) = self.string_ptr(builder, &entry.constructor);
 
-                        let body_desc = fields_to_descriptor(&entry.body_fields, &self.type_aliases);
-                        let (body_ptr, body_len) =
-                            self.string_ptr(builder, &body_desc);
+                        let body_desc =
+                            fields_to_descriptor(&entry.body_fields, &self.type_aliases);
+                        let (body_ptr, body_len) = self.string_ptr(builder, &body_desc);
 
-                        let query_desc = fields_to_descriptor(&entry.query_params, &self.type_aliases);
-                        let (query_ptr, query_len) =
-                            self.string_ptr(builder, &query_desc);
+                        let query_desc =
+                            fields_to_descriptor(&entry.query_params, &self.type_aliases);
+                        let (query_ptr, query_len) = self.string_ptr(builder, &query_desc);
 
-                        let resp_desc = response_type_descriptor(&entry.response_ty, &self.type_aliases);
-                        let (resp_ptr, resp_len) =
-                            self.string_ptr(builder, &resp_desc);
+                        let resp_desc =
+                            response_type_descriptor(&entry.response_ty, &self.type_aliases);
+                        let (resp_ptr, resp_len) = self.string_ptr(builder, &resp_desc);
 
-                        let req_hdrs_desc = fields_to_descriptor(&entry.request_headers, &self.type_aliases);
-                        let (req_hdrs_ptr, req_hdrs_len) =
-                            self.string_ptr(builder, &req_hdrs_desc);
+                        let req_hdrs_desc =
+                            fields_to_descriptor(&entry.request_headers, &self.type_aliases);
+                        let (req_hdrs_ptr, req_hdrs_len) = self.string_ptr(builder, &req_hdrs_desc);
 
-                        let resp_hdrs_desc = fields_to_descriptor(&entry.response_headers, &self.type_aliases);
+                        let resp_hdrs_desc =
+                            fields_to_descriptor(&entry.response_headers, &self.type_aliases);
                         let (resp_hdrs_ptr, resp_hdrs_len) =
                             self.string_ptr(builder, &resp_hdrs_desc);
 
@@ -8637,10 +9106,23 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             builder,
                             "knot_route_table_add",
                             &[
-                                table, method_ptr, method_len, path_ptr, path_len,
-                                ctor_ptr, ctor_len, body_ptr, body_len, query_ptr,
-                                query_len, resp_ptr, resp_len,
-                                req_hdrs_ptr, req_hdrs_len, resp_hdrs_ptr, resp_hdrs_len,
+                                table,
+                                method_ptr,
+                                method_len,
+                                path_ptr,
+                                path_len,
+                                ctor_ptr,
+                                ctor_len,
+                                body_ptr,
+                                body_len,
+                                query_ptr,
+                                query_len,
+                                resp_ptr,
+                                resp_len,
+                                req_hdrs_ptr,
+                                req_hdrs_len,
+                                resp_hdrs_ptr,
+                                resp_hdrs_len,
                             ],
                         );
                     }
@@ -8652,8 +9134,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // registered here for the HTTP 400 auto-validation to
                     // fire.
                     for entry in &entries {
-                        let (ctor_ptr, ctor_len) =
-                            self.string_ptr(builder, &entry.constructor);
+                        let (ctor_ptr, ctor_len) = self.string_ptr(builder, &entry.constructor);
                         for field in &entry.body_fields {
                             let mut found = Vec::new();
                             collect_type_refinements(
@@ -8673,8 +9154,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                     builder,
                                     "knot_route_set_field_refinement",
                                     &[
-                                        table, ctor_ptr, ctor_len, fn_ptr, fn_len,
-                                        pred_fn, tn_ptr, tn_len,
+                                        table, ctor_ptr, ctor_len, fn_ptr, fn_len, pred_fn, tn_ptr,
+                                        tn_len,
                                     ],
                                 );
                             }
@@ -8686,8 +9167,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // `{key, limit}` that the runtime unpacks.
                     for entry in &entries {
                         if let Some(rate_limit_expr) = &entry.rate_limit {
-                            let (ctor_ptr, ctor_len) =
-                                self.string_ptr(builder, &entry.constructor);
+                            let (ctor_ptr, ctor_len) = self.string_ptr(builder, &entry.constructor);
                             let mut rl_env = Env::new();
                             let rl_val =
                                 self.compile_expr(builder, rate_limit_expr, &mut rl_env, db);
@@ -8709,7 +9189,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         self.call_rt(
                             builder,
                             "knot_http_listen_on_io",
-                            &[db, compiled_args[0], compiled_args[1], table, compiled_args[2]],
+                            &[
+                                db,
+                                compiled_args[0],
+                                compiled_args[1],
+                                table,
+                                compiled_args[2],
+                            ],
                         )
                     } else {
                         self.call_rt(
@@ -8745,7 +9231,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // stores the leaf (`Just`).
             ast::ExprKind::FieldAccess { expr, field }
                 if let ast::ExprKind::Constructor(type_name) = &expr.node
-                    && matches!(type_name.as_str(), "Maybe" | "Result" | "Ordering" | "List" | "Level")
+                    && matches!(
+                        type_name.as_str(),
+                        "Maybe" | "Result" | "Ordering" | "List" | "Level"
+                    )
                     && self
                         .data_constructors
                         .get(type_name)
@@ -8778,9 +9267,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // `data` decl: the data field is erased to unit, so build the
             // constructor value directly (same as a `Constructor` head)
             // rather than a runtime `knot_record_field` on unit.
-            ast::ExprKind::FieldAccess { field, .. }
-                if self.embedded_ctors.contains(field) =>
-            {
+            ast::ExprKind::FieldAccess { field, .. } if self.embedded_ctors.contains(field) => {
                 let (tag_ptr, tag_len) = self.string_ptr(builder, field);
                 let payload = if compiled_args.len() == 1 {
                     compiled_args[0]
@@ -8826,15 +9313,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             // Dynamic call through a function value
             _ => {
-                let func_val =
-                    self.compile_expr(builder, func_expr, env, db);
+                let func_val = self.compile_expr(builder, func_expr, env, db);
                 let mut result = func_val;
                 for arg in &compiled_args {
-                    result = self.call_rt(
-                        builder,
-                        "knot_value_call",
-                        &[db, result, *arg],
-                    );
+                    result = self.call_rt(builder, "knot_value_call", &[db, result, *arg]);
                 }
                 result
             }
@@ -8858,8 +9340,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // fetchWith url opts (Ctor {..})
             let opts = self.compile_expr(builder, args[1], env, db);
             let (h_ptr, h_len) = self.string_ptr(builder, "headers");
-            let headers =
-                self.call_rt(builder, "knot_record_field", &[opts, h_ptr, h_len]);
+            let headers = self.call_rt(builder, "knot_record_field", &[opts, h_ptr, h_len]);
             (headers, args[2])
         } else {
             // fetch url (Ctor {..})
@@ -8912,7 +9393,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 return self.push_codegen_error(
                     builder,
                     ctor_expr.span,
-                    format!("fetch: no route entry found for constructor '{}'", ctor_name),
+                    format!(
+                        "fetch: no route entry found for constructor '{}'",
+                        ctor_name
+                    ),
                 );
             }
         };
@@ -8927,8 +9411,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let path_pattern = path_segments_to_pattern(&entry.path, &self.type_aliases);
         let body_desc = fields_to_descriptor(&entry.body_fields, &self.type_aliases);
         let query_desc = fields_to_descriptor(&entry.query_params, &self.type_aliases);
-        let resp_desc =
-            response_type_descriptor(&entry.response_ty, &self.type_aliases);
+        let resp_desc = response_type_descriptor(&entry.response_ty, &self.type_aliases);
         let req_hdrs_desc = fields_to_descriptor(&entry.request_headers, &self.type_aliases);
         let resp_hdrs_desc = fields_to_descriptor(&entry.response_headers, &self.type_aliases);
 
@@ -8944,9 +9427,23 @@ impl<M: cranelift_module::Module> Codegen<M> {
             builder,
             "knot_http_fetch_io",
             &[
-                base_url, method_ptr, method_len, path_ptr, path_len, payload,
-                body_ptr, body_len, query_ptr, query_len, resp_ptr, resp_len,
-                headers, req_hdrs_ptr, req_hdrs_len, resp_hdrs_ptr, resp_hdrs_len,
+                base_url,
+                method_ptr,
+                method_len,
+                path_ptr,
+                path_len,
+                payload,
+                body_ptr,
+                body_len,
+                query_ptr,
+                query_len,
+                resp_ptr,
+                resp_len,
+                headers,
+                req_hdrs_ptr,
+                req_hdrs_len,
+                resp_hdrs_ptr,
+                resp_hdrs_len,
             ],
         )
     }
@@ -8976,10 +9473,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let arms: Vec<ast::CaseArm> = handlers
             .iter()
             .map(|h| {
-                let payload_pat = ast::Spanned::new(
-                    ast::PatKind::Var(payload_name.clone()),
-                    h.endpoint_span,
-                );
+                let payload_pat =
+                    ast::Spanned::new(ast::PatKind::Var(payload_name.clone()), h.endpoint_span);
                 let arm_pat = ast::Spanned::new(
                     ast::PatKind::Constructor {
                         name: h.endpoint.clone(),
@@ -8999,11 +9494,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     },
                     h.body.span,
                 );
-                ast::CaseArm { pat: arm_pat, body: arm_body }
+                ast::CaseArm {
+                    pat: arm_pat,
+                    body: arm_body,
+                }
             })
             .collect();
 
-        let req_var = ast::Spanned::new(ast::ExprKind::Var(crate::infer::Binding::User(req_name.clone())), span);
+        let req_var = ast::Spanned::new(
+            ast::ExprKind::Var(crate::infer::Binding::User(req_name.clone())),
+            span,
+        );
         let case_expr = ast::Spanned::new(
             ast::ExprKind::Case {
                 scrutinee: Box::new(req_var),
@@ -9052,13 +9553,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
                 Some(false) => {
                     self.diagnostics.push(
-                        knot::diagnostic::Diagnostic::error(
-                            format!(
-                                "refine: value {} does not satisfy predicate for type `{}`",
-                                lit.display(),
-                                type_name
-                            ),
-                        ).label(span, "refinement predicate fails at compile time"),
+                        knot::diagnostic::Diagnostic::error(format!(
+                            "refine: value {} does not satisfy predicate for type `{}`",
+                            lit.display(),
+                            type_name
+                        ))
+                        .label(span, "refinement predicate fails at compile time"),
                     );
                     let _ = self.compile_expr(builder, inner, env, db);
                     return self.build_refinement_err(builder, &type_name);
@@ -9156,7 +9656,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let cap = builder.ins().iconst(self.ptr_type, 1);
         let rec = self.call_rt(builder, "knot_record_empty", &[cap]);
         let (key_ptr, key_len) = self.string_ptr(builder, "value");
-        self.call_rt_void(builder, "knot_record_set_field", &[rec, key_ptr, key_len, val]);
+        self.call_rt_void(
+            builder,
+            "knot_record_set_field",
+            &[rec, key_ptr, key_len, val],
+        );
         let (tag_ptr, tag_len) = self.string_ptr(builder, "Ok");
         self.call_rt(builder, "knot_value_constructor", &[tag_ptr, tag_len, rec])
     }
@@ -9255,7 +9759,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let (tn_key_ptr, tn_key_len) = self.string_ptr(builder, "typeName");
         let (tn_val_ptr, tn_val_len) = self.string_ptr(builder, type_name);
         let type_name_val = self.call_rt(builder, "knot_value_text", &[tn_val_ptr, tn_val_len]);
-        self.call_rt_void(builder, "knot_record_set_field", &[error_rec, tn_key_ptr, tn_key_len, type_name_val]);
+        self.call_rt_void(
+            builder,
+            "knot_record_set_field",
+            &[error_rec, tn_key_ptr, tn_key_len, type_name_val],
+        );
 
         // Build violation record
         let violation_rec = self.call_rt(builder, "knot_record_empty", &[cap2]);
@@ -9267,15 +9775,27 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let (nptr, nlen) = self.string_ptr(builder, name);
                 let text = self.call_rt(builder, "knot_value_text", &[nptr, nlen]);
                 let (just_tag_ptr, just_tag_len) = self.string_ptr(builder, "Just");
-                self.call_rt(builder, "knot_value_constructor", &[just_tag_ptr, just_tag_len, text])
+                self.call_rt(
+                    builder,
+                    "knot_value_constructor",
+                    &[just_tag_ptr, just_tag_len, text],
+                )
             }
             None => {
                 let (nothing_tag_ptr, nothing_tag_len) = self.string_ptr(builder, "Nothing");
                 let nothing_unit = self.call_rt(builder, "knot_value_unit", &[]);
-                self.call_rt(builder, "knot_value_constructor", &[nothing_tag_ptr, nothing_tag_len, nothing_unit])
+                self.call_rt(
+                    builder,
+                    "knot_value_constructor",
+                    &[nothing_tag_ptr, nothing_tag_len, nothing_unit],
+                )
             }
         };
-        self.call_rt_void(builder, "knot_record_set_field", &[violation_rec, f_key_ptr, f_key_len, field_val]);
+        self.call_rt_void(
+            builder,
+            "knot_record_set_field",
+            &[violation_rec, f_key_ptr, f_key_len, field_val],
+        );
 
         let (m_key_ptr, m_key_len) = self.string_ptr(builder, "message");
         let msg_str = match field {
@@ -9284,19 +9804,35 @@ impl<M: cranelift_module::Module> Codegen<M> {
         };
         let (msg_ptr, msg_len) = self.string_ptr(builder, &msg_str);
         let msg_val = self.call_rt(builder, "knot_value_text", &[msg_ptr, msg_len]);
-        self.call_rt_void(builder, "knot_record_set_field", &[violation_rec, m_key_ptr, m_key_len, msg_val]);
+        self.call_rt_void(
+            builder,
+            "knot_record_set_field",
+            &[violation_rec, m_key_ptr, m_key_len, msg_val],
+        );
 
         let violations = self.call_rt(builder, "knot_relation_singleton", &[violation_rec]);
         let (v_key_ptr, v_key_len) = self.string_ptr(builder, "violations");
-        self.call_rt_void(builder, "knot_record_set_field", &[error_rec, v_key_ptr, v_key_len, violations]);
+        self.call_rt_void(
+            builder,
+            "knot_record_set_field",
+            &[error_rec, v_key_ptr, v_key_len, violations],
+        );
 
         // Wrap in Err {error: error_rec}
         let cap1 = builder.ins().iconst(self.ptr_type, 1);
         let err_wrapper = self.call_rt(builder, "knot_record_empty", &[cap1]);
         let (err_key_ptr, err_key_len) = self.string_ptr(builder, "error");
-        self.call_rt_void(builder, "knot_record_set_field", &[err_wrapper, err_key_ptr, err_key_len, error_rec]);
+        self.call_rt_void(
+            builder,
+            "knot_record_set_field",
+            &[err_wrapper, err_key_ptr, err_key_len, error_rec],
+        );
         let (err_tag_ptr, err_tag_len) = self.string_ptr(builder, "Err");
-        self.call_rt(builder, "knot_value_constructor", &[err_tag_ptr, err_tag_len, err_wrapper])
+        self.call_rt(
+            builder,
+            "knot_value_constructor",
+            &[err_tag_ptr, err_tag_len, err_wrapper],
+        )
     }
 
     // ── Case expression compilation ───────────────────────────────
@@ -9316,21 +9852,23 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // Count non-nullable constructor arms to decide whether to extract tag once.
         // Exclude True/False — they compile to Value::Bool, not Value::Constructor,
         // so calling knot_constructor_tag_ptr on them would panic.
-        let non_nullable_ctor_count = arms.iter().filter(|a| {
-            if let ast::PatKind::Constructor { name, .. } = &a.pat.node {
-                !self.nullable_ctors.contains_key(name) && name != "True" && name != "False"
-            } else {
-                false
-            }
-        }).count();
+        let non_nullable_ctor_count = arms
+            .iter()
+            .filter(|a| {
+                if let ast::PatKind::Constructor { name, .. } = &a.pat.node {
+                    !self.nullable_ctors.contains_key(name) && name != "True" && name != "False"
+                } else {
+                    false
+                }
+            })
+            .count();
 
         // Only cache the tag when there are no wildcard/var catch-all arms.
         // With a catch-all, the scrutinee could (defensively) be a non-Constructor
         // value, and calling knot_constructor_tag_ptr would panic.
-        let has_catchall = arms.iter().any(|a| matches!(
-            &a.pat.node,
-            ast::PatKind::Wildcard | ast::PatKind::Var(_)
-        ));
+        let has_catchall = arms
+            .iter()
+            .any(|a| matches!(&a.pat.node, ast::PatKind::Wildcard | ast::PatKind::Var(_)));
 
         // Extract constructor tag pointer+length once if multiple constructor arms
         let cached_tag = if non_nullable_ctor_count >= 2 && !has_catchall {
@@ -9365,130 +9903,83 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     builder.ins().jump(arm_block, &[]);
                 }
                 ast::PatKind::Constructor { name, .. } if name == "True" || name == "False" => {
-                    let bool_val = self.call_rt_typed(builder, "knot_value_get_bool", &[scrut], types::I32);
+                    let bool_val =
+                        self.call_rt_typed(builder, "knot_value_get_bool", &[scrut], types::I32);
                     let expected = if name == "True" { 1i64 } else { 0i64 };
                     let is_match = builder.ins().icmp_imm(IntCC::Equal, bool_val, expected);
-                    builder.ins().brif(
-                        is_match,
-                        arm_block,
-                        &[],
-                        next_block,
-                        &[],
-                    );
+                    builder
+                        .ins()
+                        .brif(is_match, arm_block, &[], next_block, &[]);
                 }
                 ast::PatKind::Constructor { name, .. } => {
                     match self.nullable_ctors.get(name).cloned() {
                         Some(NullableRole::None) => {
                             // Nullable none: check if scrutinee is null
-                            let is_null = builder.ins().icmp_imm(
-                                IntCC::Equal,
-                                scrut,
-                                0,
-                            );
-                            builder.ins().brif(
-                                is_null,
-                                arm_block,
-                                &[],
-                                next_block,
-                                &[],
-                            );
+                            let is_null = builder.ins().icmp_imm(IntCC::Equal, scrut, 0);
+                            builder.ins().brif(is_null, arm_block, &[], next_block, &[]);
                         }
                         Some(NullableRole::Some) => {
                             // Nullable some: check if scrutinee is non-null
-                            let is_some = builder.ins().icmp_imm(
-                                IntCC::NotEqual,
-                                scrut,
-                                0,
-                            );
-                            builder.ins().brif(
-                                is_some,
-                                arm_block,
-                                &[],
-                                next_block,
-                                &[],
-                            );
+                            let is_some = builder.ins().icmp_imm(IntCC::NotEqual, scrut, 0);
+                            builder.ins().brif(is_some, arm_block, &[], next_block, &[]);
                         }
                         None => {
                             if let Some((tag_ptr, tag_len)) = cached_tag {
                                 // Use pre-extracted tag for fast string comparison
-                                let (expected_ptr, expected_len) =
-                                    self.string_ptr(builder, name);
+                                let (expected_ptr, expected_len) = self.string_ptr(builder, name);
                                 let matches = self.call_rt_typed(
                                     builder,
                                     "knot_str_eq",
                                     &[tag_ptr, tag_len, expected_ptr, expected_len],
                                     types::I32,
                                 );
-                                let is_match = builder
+                                let is_match = builder.ins().icmp_imm(IntCC::NotEqual, matches, 0);
+                                builder
                                     .ins()
-                                    .icmp_imm(IntCC::NotEqual, matches, 0);
-                                builder.ins().brif(
-                                    is_match,
-                                    arm_block,
-                                    &[],
-                                    next_block,
-                                    &[],
-                                );
+                                    .brif(is_match, arm_block, &[], next_block, &[]);
                             } else {
-                                let (tag_ptr, tag_len) =
-                                    self.string_ptr(builder, name);
+                                let (tag_ptr, tag_len) = self.string_ptr(builder, name);
                                 let matches = self.call_rt_typed(
                                     builder,
                                     "knot_constructor_matches",
                                     &[scrut, tag_ptr, tag_len],
                                     types::I32,
                                 );
-                                let is_match = builder
+                                let is_match = builder.ins().icmp_imm(IntCC::NotEqual, matches, 0);
+                                builder
                                     .ins()
-                                    .icmp_imm(IntCC::NotEqual, matches, 0);
-                                builder.ins().brif(
-                                    is_match,
-                                    arm_block,
-                                    &[],
-                                    next_block,
-                                    &[],
-                                );
+                                    .brif(is_match, arm_block, &[], next_block, &[]);
                             }
                         }
                     }
                 }
                 ast::PatKind::Lit(lit) => {
                     let lit_val = self.compile_lit(builder, lit);
-                    let eq_i32 =
-                        self.call_rt_typed(builder, "knot_value_eq_i32", &[scrut, lit_val], types::I32);
-                    let is_eq =
-                        builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
-                    builder
-                        .ins()
-                        .brif(is_eq, arm_block, &[], next_block, &[]);
+                    let eq_i32 = self.call_rt_typed(
+                        builder,
+                        "knot_value_eq_i32",
+                        &[scrut, lit_val],
+                        types::I32,
+                    );
+                    let is_eq = builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
+                    builder.ins().brif(is_eq, arm_block, &[], next_block, &[]);
                 }
                 ast::PatKind::List(pats) => {
                     // Check if relation length matches the number of patterns
                     let len = self.call_rt(builder, "knot_relation_len", &[scrut]);
-                    let expected =
-                        builder.ins().iconst(self.ptr_type, pats.len() as i64);
-                    let is_match =
-                        builder.ins().icmp(IntCC::Equal, len, expected);
-                    builder.ins().brif(
-                        is_match,
-                        arm_block,
-                        &[],
-                        next_block,
-                        &[],
-                    );
+                    let expected = builder.ins().iconst(self.ptr_type, pats.len() as i64);
+                    let is_match = builder.ins().icmp(IntCC::Equal, len, expected);
+                    builder
+                        .ins()
+                        .brif(is_match, arm_block, &[], next_block, &[]);
                 }
                 ast::PatKind::Cons { .. } => {
                     // Match any non-empty relation: len > 0.
                     let len = self.call_rt(builder, "knot_relation_len", &[scrut]);
-                    let is_match =
-                        builder.ins().icmp_imm(IntCC::NotEqual, len, 0);
-                    builder.ins().brif(
-                        is_match,
-                        arm_block,
-                        &[],
-                        next_block,
-                        &[],
-                    );
+                    let is_match = builder.ins().icmp_imm(IntCC::NotEqual, len, 0);
+                    builder
+                        .ins()
+                        .brif(is_match, arm_block, &[], next_block, &[]);
                 }
                 ast::PatKind::Record(_) => {
                     // Record patterns always match (no top-level guard)
@@ -9516,9 +10007,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             if is_unconditional {
                 self.bind_case_pattern(builder, &arm.pat, scrut, &mut arm_env);
             } else {
-                self.bind_case_pattern_checked(
-                    builder, &arm.pat, scrut, &mut arm_env, next_block,
-                );
+                self.bind_case_pattern_checked(builder, &arm.pat, scrut, &mut arm_env, next_block);
             }
 
             let arm_val = if self.in_io_eager {
@@ -9533,7 +10022,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 builder.switch_to_block(next_block);
                 builder.seal_block(next_block);
                 self.call_rt_void(builder, "knot_guard_failed", &[]);
-                builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                builder
+                    .ins()
+                    .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
             } else if !is_last {
                 builder.switch_to_block(next_block);
                 builder.seal_block(next_block);
@@ -9593,17 +10084,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::PatKind::List(pats) => {
                 for (idx, elem_pat) in pats.iter().enumerate() {
                     let index = builder.ins().iconst(self.ptr_type, idx as i64);
-                    let elem =
-                        self.call_rt(builder, "knot_relation_get", &[val, index]);
+                    let elem = self.call_rt(builder, "knot_relation_get", &[val, index]);
                     self.bind_case_pattern(builder, elem_pat, elem, env);
                 }
             }
             ast::PatKind::Cons { head, tail } => {
                 let zero = builder.ins().iconst(self.ptr_type, 0);
-                let head_val =
-                    self.call_rt(builder, "knot_relation_get", &[val, zero]);
-                let tail_val =
-                    self.call_rt(builder, "knot_relation_tail", &[val]);
+                let head_val = self.call_rt(builder, "knot_relation_get", &[val, zero]);
+                let tail_val = self.call_rt(builder, "knot_relation_tail", &[val]);
                 self.bind_case_pattern(builder, head, head_val, env);
                 self.bind_case_pattern(builder, tail, tail_val, env);
             }
@@ -9679,18 +10167,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // Length already tested at top level — test+bind elements.
                 for (idx, elem_pat) in pats.iter().enumerate() {
                     let index = builder.ins().iconst(self.ptr_type, idx as i64);
-                    let elem =
-                        self.call_rt(builder, "knot_relation_get", &[val, index]);
+                    let elem = self.call_rt(builder, "knot_relation_get", &[val, index]);
                     self.test_and_bind_case_subpattern(builder, elem_pat, elem, env, fail_block);
                 }
             }
             ast::PatKind::Cons { head, tail } => {
                 // Non-emptiness already tested at top level.
                 let zero = builder.ins().iconst(self.ptr_type, 0);
-                let head_val =
-                    self.call_rt(builder, "knot_relation_get", &[val, zero]);
-                let tail_val =
-                    self.call_rt(builder, "knot_relation_tail", &[val]);
+                let head_val = self.call_rt(builder, "knot_relation_get", &[val, zero]);
+                let tail_val = self.call_rt(builder, "knot_relation_tail", &[val]);
                 self.test_and_bind_case_subpattern(builder, head, head_val, env, fail_block);
                 self.test_and_bind_case_subpattern(builder, tail, tail_val, env, fail_block);
             }
@@ -9723,33 +10208,21 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::PatKind::Wildcard => {}
             ast::PatKind::Lit(lit) => {
                 let lit_val = self.compile_lit(builder, lit);
-                let eq_i32 = self.call_rt_typed(
-                    builder,
-                    "knot_value_eq_i32",
-                    &[val, lit_val],
-                    types::I32,
-                );
+                let eq_i32 =
+                    self.call_rt_typed(builder, "knot_value_eq_i32", &[val, lit_val], types::I32);
                 let is_eq = builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
                 branch_on(builder, is_eq);
             }
             ast::PatKind::Constructor { name, payload, .. } => {
                 let is_match = if name == "True" || name == "False" {
-                    let bool_val = self.call_rt_typed(
-                        builder,
-                        "knot_value_get_bool",
-                        &[val],
-                        types::I32,
-                    );
+                    let bool_val =
+                        self.call_rt_typed(builder, "knot_value_get_bool", &[val], types::I32);
                     let expected = if name == "True" { 1i64 } else { 0i64 };
                     builder.ins().icmp_imm(IntCC::Equal, bool_val, expected)
                 } else {
                     match self.nullable_ctors.get(name).cloned() {
-                        Some(NullableRole::None) => {
-                            builder.ins().icmp_imm(IntCC::Equal, val, 0)
-                        }
-                        Some(NullableRole::Some) => {
-                            builder.ins().icmp_imm(IntCC::NotEqual, val, 0)
-                        }
+                        Some(NullableRole::None) => builder.ins().icmp_imm(IntCC::Equal, val, 0),
+                        Some(NullableRole::Some) => builder.ins().icmp_imm(IntCC::NotEqual, val, 0),
                         None => {
                             let (tag_ptr, tag_len) = self.string_ptr(builder, name);
                             let matches = self.call_rt_typed(
@@ -9787,8 +10260,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 branch_on(builder, is_match);
                 for (idx, elem_pat) in pats.iter().enumerate() {
                     let index = builder.ins().iconst(self.ptr_type, idx as i64);
-                    let elem =
-                        self.call_rt(builder, "knot_relation_get", &[val, index]);
+                    let elem = self.call_rt(builder, "knot_relation_get", &[val, index]);
                     self.test_and_bind_case_subpattern(builder, elem_pat, elem, env, fail_block);
                 }
             }
@@ -9797,10 +10269,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let is_match = builder.ins().icmp_imm(IntCC::NotEqual, len, 0);
                 branch_on(builder, is_match);
                 let zero = builder.ins().iconst(self.ptr_type, 0);
-                let head_val =
-                    self.call_rt(builder, "knot_relation_get", &[val, zero]);
-                let tail_val =
-                    self.call_rt(builder, "knot_relation_tail", &[val]);
+                let head_val = self.call_rt(builder, "knot_relation_get", &[val, zero]);
+                let tail_val = self.call_rt(builder, "knot_relation_tail", &[val]);
                 self.test_and_bind_case_subpattern(builder, head, head_val, env, fail_block);
                 self.test_and_bind_case_subpattern(builder, tail, tail_val, env, fail_block);
             }
@@ -9835,9 +10305,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         }
         let yield_fn = format!("Applicative_{}_yield", type_name);
         if let Some(&(func_id, _)) = self.global_fns.get(&yield_fn) {
-            let func_ref = self
-                .module
-                .declare_func_in_func(func_id, builder.func);
+            let func_ref = self.module.declare_func_in_func(func_id, builder.func);
             let call = builder.ins().call(func_ref, &[db, val]);
             return builder.inst_results(call)[0];
         }
@@ -9863,9 +10331,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         }
         let empty_fn = format!("Alternative_{}_empty", type_name);
         if let Some(&(func_id, _)) = self.global_fns.get(&empty_fn) {
-            let func_ref = self
-                .module
-                .declare_func_in_func(func_id, builder.func);
+            let func_ref = self.module.declare_func_in_func(func_id, builder.func);
             let call = builder.ins().call(func_ref, &[db]);
             return builder.inst_results(call)[0];
         }
@@ -9895,9 +10361,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             | ast::ExprKind::Annot { expr: inner, .. } => {
                 self.compile_set_value_expr(builder, inner, env, db)
             }
-            ast::ExprKind::Refine(inner) => {
-                self.compile_set_value_expr(builder, inner, env, db)
-            }
+            ast::ExprKind::Refine(inner) => self.compile_set_value_expr(builder, inner, env, db),
             // `if`/`case` in set-value position: each branch is itself a
             // set value, so a do-block in a branch is a relational
             // comprehension too. The branches are compiled by the generic
@@ -9937,7 +10401,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // even if they contain IO-like expressions, because groupBy requires
         // the loop-based collection/grouping phase that compile_io_do_eager
         // cannot provide.
-        if stmts.iter().any(|s| matches!(&s.node, ast::StmtKind::GroupBy { .. })) {
+        if stmts
+            .iter()
+            .any(|s| matches!(&s.node, ast::StmtKind::GroupBy { .. }))
+        {
             return false;
         }
         stmts.iter().any(|stmt| match &stmt.node {
@@ -9961,7 +10428,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
         for decl in decl_views(program) {
             match decl.kind {
-                DeclViewKind::Fun { body: Some(body), ty: Some(ts), .. } => {
+                DeclViewKind::Fun {
+                    body: Some(body),
+                    ty: Some(ts),
+                    ..
+                } => {
                     // Seed IO functions from type annotations (same as desugar's fun_sig_io).
                     // Functions like `forEach` whose IO comes from trait-method calls
                     // (yield) are not detected by body scan alone.
@@ -9970,7 +10441,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                     fun_bodies.push((decl.name.to_string(), body));
                 }
-                DeclViewKind::Fun { body: Some(body), .. } => {
+                DeclViewKind::Fun {
+                    body: Some(body), ..
+                } => {
                     fun_bodies.push((decl.name.to_string(), body));
                 }
                 _ => {}
@@ -10006,9 +10479,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
     }
 
     /// Check if an expression contains IO calls (builtins or known IO user functions).
-    fn expr_contains_io(expr: &ast::Expr, builtins: &HashSet<&str>, io_fns: &HashSet<String>) -> bool {
+    fn expr_contains_io(
+        expr: &ast::Expr,
+        builtins: &HashSet<&str>,
+        io_fns: &HashSet<String>,
+    ) -> bool {
         match &expr.node {
-            ast::ExprKind::Var(name) => builtins.contains(name.as_str()) || io_fns.contains(name.as_str()),
+            ast::ExprKind::Var(name) => {
+                builtins.contains(name.as_str()) || io_fns.contains(name.as_str())
+            }
             // A query over a source/derived is a pure, lazy `[T]` — NOT IO.
             // Only writes (`set`/`full =`) and `atomic` are effects. `full`
             // is a viewer-only tag with no semantic effect.
@@ -10026,25 +10505,29 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::UnaryOp { operand, .. } => {
                 Self::expr_contains_io(operand, builtins, io_fns)
             }
-            ast::ExprKind::Do(stmts) => {
-                stmts.iter().any(|s| match &s.node {
-                    ast::StmtKind::Bind { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
-                    ast::StmtKind::Expr(expr) => Self::expr_contains_io(expr, builtins, io_fns),
-                    ast::StmtKind::Where { cond } => Self::expr_contains_io(cond, builtins, io_fns),
-                    ast::StmtKind::GroupBy { key } => Self::expr_contains_io(key, builtins, io_fns),
-                })
-            }
+            ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
+                ast::StmtKind::Bind { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
+                ast::StmtKind::Expr(expr) => Self::expr_contains_io(expr, builtins, io_fns),
+                ast::StmtKind::Where { cond } => Self::expr_contains_io(cond, builtins, io_fns),
+                ast::StmtKind::GroupBy { key } => Self::expr_contains_io(key, builtins, io_fns),
+            }),
             ast::ExprKind::Lambda { body, .. } => Self::expr_contains_io(body, builtins, io_fns),
             ast::ExprKind::With { body, .. } => Self::expr_contains_io(body, builtins, io_fns),
-            ast::ExprKind::Case { scrutinee, arms, .. } => {
+            ast::ExprKind::Case {
+                scrutinee, arms, ..
+            } => {
                 Self::expr_contains_io(scrutinee, builtins, io_fns)
-                    || arms.iter().any(|arm| Self::expr_contains_io(&arm.body, builtins, io_fns))
+                    || arms
+                        .iter()
+                        .any(|arm| Self::expr_contains_io(&arm.body, builtins, io_fns))
             }
             // Records, lists, field access are data constructors/accessors —
             // they don't produce IO even if they contain IO values as
             // subexpressions. A function like `f x = {result: println x}`
             // returns a record, not IO.
-            ast::ExprKind::TimeUnitLit { value, .. } => Self::expr_contains_io(value, builtins, io_fns),
+            ast::ExprKind::TimeUnitLit { value, .. } => {
+                Self::expr_contains_io(value, builtins, io_fns)
+            }
             ast::ExprKind::Annot { expr, .. } => Self::expr_contains_io(expr, builtins, io_fns),
             ast::ExprKind::Refine(inner) => Self::expr_contains_io(inner, builtins, io_fns),
             // `base.<io-builtin>` — the namespaced form of an IO-producing
@@ -10073,7 +10556,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn detect_passthrough_functions(&mut self, program: &ast::Expr) {
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
         for decl in decl_views(program) {
-            if let DeclViewKind::Fun { body: Some(body), .. } = decl.kind {
+            if let DeclViewKind::Fun {
+                body: Some(body), ..
+            } = decl.kind
+            {
                 fun_bodies.push((decl.name.to_string(), body));
             }
         }
@@ -10087,7 +10573,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // whether the innermost body returns one of them unapplied.
                 let mut params: HashSet<String> = HashSet::new();
                 let mut cur = strip_expr_wrappers(body);
-                while let ast::ExprKind::Lambda { params: ps, body: inner, .. } = &cur.node {
+                while let ast::ExprKind::Lambda {
+                    params: ps,
+                    body: inner,
+                    ..
+                } = &cur.node
+                {
                     for p in ps {
                         collect_pat_var_names(p, &mut params);
                     }
@@ -10125,10 +10616,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // of our params passed unapplied → we forward that param onward.
                 let (head, spine_args) = uncurry_app(expr);
                 match &strip_expr_wrappers(head).node {
-                    ast::ExprKind::Var(hname) if passthrough_fns.contains(hname.as_str()) => spine_args
-                        .iter()
-                        .any(|a| matches!(&strip_expr_wrappers(a).node,
-                            ast::ExprKind::Var(n) if params.contains(n.as_str()))),
+                    ast::ExprKind::Var(hname) if passthrough_fns.contains(hname.as_str()) => {
+                        spine_args.iter().any(|a| {
+                            matches!(&strip_expr_wrappers(a).node,
+                            ast::ExprKind::Var(n) if params.contains(n.as_str()))
+                        })
+                    }
                     _ => false,
                 }
             }
@@ -10139,7 +10632,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn detect_write_functions(&mut self, program: &ast::Expr) {
         let mut fun_bodies: Vec<(String, &ast::Expr)> = Vec::new();
         for decl in decl_views(program) {
-            if let DeclViewKind::Fun { body: Some(body), .. } = decl.kind {
+            if let DeclViewKind::Fun {
+                body: Some(body), ..
+            } = decl.kind
+            {
                 fun_bodies.push((decl.name.to_string(), body));
             }
         }
@@ -10150,7 +10646,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 if self.write_functions.contains(name.as_str()) {
                     continue;
                 }
-                if Self::expr_contains_writes(body, &self.write_functions, &self.top_fn_names, &self.passthrough_functions) {
+                if Self::expr_contains_writes(
+                    body,
+                    &self.write_functions,
+                    &self.top_fn_names,
+                    &self.passthrough_functions,
+                ) {
                     self.write_functions.insert(name.clone());
                     changed = true;
                 }
@@ -10201,7 +10702,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
         };
         match &expr.node {
             ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } => true,
-            ast::ExprKind::Atomic(inner) => Self::expr_contains_writes(inner, write_fns, known_fns, passthrough_fns),
+            ast::ExprKind::Atomic(inner) => {
+                Self::expr_contains_writes(inner, write_fns, known_fns, passthrough_fns)
+            }
             ast::ExprKind::Var(name) => write_fns.contains(name.as_str()),
             ast::ExprKind::App { func, arg } => {
                 // Conservatively treat applications of unknown callees as
@@ -10236,7 +10739,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 Self::expr_contains_writes(lhs, write_fns, known_fns, passthrough_fns)
                     || Self::expr_contains_writes(rhs, write_fns, known_fns, passthrough_fns)
             }
-            ast::ExprKind::UnaryOp { operand, .. } => Self::expr_contains_writes(operand, write_fns, known_fns, passthrough_fns),
+            ast::ExprKind::UnaryOp { operand, .. } => {
+                Self::expr_contains_writes(operand, write_fns, known_fns, passthrough_fns)
+            }
             ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
                 // Bind/expression statements RUN their value when it is an
                 // IO action — a bare `io` of unknown provenance may write.
@@ -10244,26 +10749,42 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     unknown_io_value(expr)
                         || Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns)
                 }
-                ast::StmtKind::Where { cond } => Self::expr_contains_writes(cond, write_fns, known_fns, passthrough_fns),
-                ast::StmtKind::GroupBy { key } => Self::expr_contains_writes(key, write_fns, known_fns, passthrough_fns),
+                ast::StmtKind::Where { cond } => {
+                    Self::expr_contains_writes(cond, write_fns, known_fns, passthrough_fns)
+                }
+                ast::StmtKind::GroupBy { key } => {
+                    Self::expr_contains_writes(key, write_fns, known_fns, passthrough_fns)
+                }
             }),
-            ast::ExprKind::Lambda { body, .. } => Self::expr_contains_writes(body, write_fns, known_fns, passthrough_fns),
-            ast::ExprKind::Case { scrutinee, arms, .. } => {
-                Self::expr_contains_writes(scrutinee, write_fns, known_fns, passthrough_fns)
-                    || arms.iter().any(|arm| Self::expr_contains_writes(&arm.body, write_fns, known_fns, passthrough_fns))
+            ast::ExprKind::Lambda { body, .. } => {
+                Self::expr_contains_writes(body, write_fns, known_fns, passthrough_fns)
             }
-            ast::ExprKind::TimeUnitLit { value, .. } => Self::expr_contains_writes(value, write_fns, known_fns, passthrough_fns),
-            ast::ExprKind::Annot { expr, .. } => Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns),
-            ast::ExprKind::Refine(inner) => Self::expr_contains_writes(inner, write_fns, known_fns, passthrough_fns),
-            ast::ExprKind::Record(fields) => fields
-                .iter()
-                .any(|f| Self::expr_contains_writes(&f.value, write_fns, known_fns, passthrough_fns)),
+            ast::ExprKind::Case {
+                scrutinee, arms, ..
+            } => {
+                Self::expr_contains_writes(scrutinee, write_fns, known_fns, passthrough_fns)
+                    || arms.iter().any(|arm| {
+                        Self::expr_contains_writes(&arm.body, write_fns, known_fns, passthrough_fns)
+                    })
+            }
+            ast::ExprKind::TimeUnitLit { value, .. } => {
+                Self::expr_contains_writes(value, write_fns, known_fns, passthrough_fns)
+            }
+            ast::ExprKind::Annot { expr, .. } => {
+                Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns)
+            }
+            ast::ExprKind::Refine(inner) => {
+                Self::expr_contains_writes(inner, write_fns, known_fns, passthrough_fns)
+            }
+            ast::ExprKind::Record(fields) => fields.iter().any(|f| {
+                Self::expr_contains_writes(&f.value, write_fns, known_fns, passthrough_fns)
+            }),
             ast::ExprKind::FieldAccess { expr, .. } => {
                 Self::expr_contains_writes(expr, write_fns, known_fns, passthrough_fns)
             }
-            ast::ExprKind::List(items) => {
-                items.iter().any(|e| Self::expr_contains_writes(e, write_fns, known_fns, passthrough_fns))
-            }
+            ast::ExprKind::List(items) => items
+                .iter()
+                .any(|e| Self::expr_contains_writes(e, write_fns, known_fns, passthrough_fns)),
             _ => false,
         }
     }
@@ -10286,7 +10807,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// conservative behaviour for unknown records. Returns `None` when the
     /// `with` binds nothing (no inference info), in which case no scope
     /// should be pushed.
-    fn with_io_scope_for(&self, with_span: knot::ast::Span, record: &ast::Expr) -> Option<HashMap<String, bool>> {
+    fn with_io_scope_for(
+        &self,
+        with_span: knot::ast::Span,
+        record: &ast::Expr,
+    ) -> Option<HashMap<String, bool>> {
         let field_names = self.with_fields.get(&with_span)?;
         let mut scope = HashMap::new();
         if let ast::ExprKind::Record(field_exprs) = &record.node {
@@ -10323,11 +10848,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             ast::ExprKind::Var(name) => {
                 crate::builtins::is_io_builtin(name.as_str())
-                || matches!(
-                    name.as_str(),
-                    "fork" | "race"
-                ) || self.io_functions.contains(name.as_str())
-                || Self::io_scopes_lookup(scopes, name.as_str())
+                    || matches!(name.as_str(), "fork" | "race")
+                    || self.io_functions.contains(name.as_str())
+                    || Self::io_scopes_lookup(scopes, name.as_str())
             }
             // A query over a source/derived is a pure, lazy `[T]` — NOT IO.
             // `full` is a viewer-only tag with no semantic effect.
@@ -10338,18 +10861,20 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.expr_is_io_scoped(lhs, scopes) || self.expr_is_io_scoped(rhs, scopes)
             }
             ast::ExprKind::UnaryOp { operand, .. } => self.expr_is_io_scoped(operand, scopes),
-            ast::ExprKind::Case { scrutinee, arms, .. } => {
+            ast::ExprKind::Case {
+                scrutinee, arms, ..
+            } => {
                 self.expr_is_io_scoped(scrutinee, scopes)
-                    || arms.iter().any(|arm| self.expr_is_io_scoped(&arm.body, scopes))
+                    || arms
+                        .iter()
+                        .any(|arm| self.expr_is_io_scoped(&arm.body, scopes))
             }
-            ast::ExprKind::Do(stmts) => {
-                stmts.iter().any(|s| match &s.node {
-                    ast::StmtKind::Bind { expr, .. } => self.expr_is_io_scoped(expr, scopes),
-                    ast::StmtKind::Expr(expr) => self.expr_is_io_scoped(expr, scopes),
-                    ast::StmtKind::Where { cond } => self.expr_is_io_scoped(cond, scopes),
-                    ast::StmtKind::GroupBy { key } => self.expr_is_io_scoped(key, scopes),
-                })
-            }
+            ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
+                ast::StmtKind::Bind { expr, .. } => self.expr_is_io_scoped(expr, scopes),
+                ast::StmtKind::Expr(expr) => self.expr_is_io_scoped(expr, scopes),
+                ast::StmtKind::Where { cond } => self.expr_is_io_scoped(cond, scopes),
+                ast::StmtKind::GroupBy { key } => self.expr_is_io_scoped(key, scopes),
+            }),
             // `base.<io-builtin>` — with the standard library namespaced under
             // the `base` record, an IO-producing call is a FieldAccess on
             // `base` rather than a bare `Var`. Recognize it here (mirroring
@@ -10407,8 +10932,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             && init.iter().all(|s| {
                 matches!(
                     &s.node,
-                    ast::StmtKind::Bind { .. }
-                        | ast::StmtKind::Where { .. }
+                    ast::StmtKind::Bind { .. } | ast::StmtKind::Where { .. }
                 )
             })
     }
@@ -10435,7 +10959,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                 }
                 ast::StmtKind::Bind { pat, .. }
-                    if pat_bound_names(pat).iter().any(|n| n == name) => {
+                    if pat_bound_names(pat).iter().any(|n| n == name) =>
+                {
                     return false;
                 }
                 _ => {}
@@ -10477,18 +11002,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.expr_has_external_io(lhs) || self.expr_has_external_io(rhs)
             }
             ast::ExprKind::UnaryOp { operand, .. } => self.expr_has_external_io(operand),
-            ast::ExprKind::Case { scrutinee, arms, .. } => {
+            ast::ExprKind::Case {
+                scrutinee, arms, ..
+            } => {
                 self.expr_has_external_io(scrutinee)
                     || arms.iter().any(|arm| self.expr_has_external_io(&arm.body))
             }
-            ast::ExprKind::Do(stmts) => {
-                stmts.iter().any(|s| match &s.node {
-                    ast::StmtKind::Bind { expr, .. } => self.expr_has_external_io(expr),
-                    ast::StmtKind::Expr(expr) => self.expr_has_external_io(expr),
-                    ast::StmtKind::Where { cond } => self.expr_has_external_io(cond),
-                    ast::StmtKind::GroupBy { key } => self.expr_has_external_io(key),
-                })
-            }
+            ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
+                ast::StmtKind::Bind { expr, .. } => self.expr_has_external_io(expr),
+                ast::StmtKind::Expr(expr) => self.expr_has_external_io(expr),
+                ast::StmtKind::Where { cond } => self.expr_has_external_io(cond),
+                ast::StmtKind::GroupBy { key } => self.expr_has_external_io(key),
+            }),
             ast::ExprKind::Lambda { body, .. } => self.expr_has_external_io(body),
             ast::ExprKind::With { body, .. } => self.expr_has_external_io(body),
             ast::ExprKind::TimeUnitLit { value, .. } => self.expr_has_external_io(value),
@@ -10550,7 +11075,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // unshadowed globals/builtins, resolved inside the thunk body.
         let free_vars: Vec<String> = find_free_vars(&do_expr, &[])
             .into_iter()
-            .filter(|v| env.bindings.contains_key(&crate::infer::Binding::User(v.clone())))
+            .filter(|v| {
+                env.bindings
+                    .contains_key(&crate::infer::Binding::User(v.clone()))
+            })
             .collect();
         // Relation-valued locals captured into this thunk must stay
         // per-row-iterable inside it. The thunk body is compiled later
@@ -10599,15 +11127,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             let ptr_bytes = self.ptr_type.bytes() as i32;
             let slot_size = (3 * n as u32) * ptr_bytes as u32;
-            let slot = builder.create_sized_stack_slot(
-                StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
-            );
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                slot_size,
+                3,
+            ));
             for (i, var_name) in sorted_vars.iter().enumerate() {
                 let val = match env.get(&crate::infer::Binding::User(var_name.to_string())) {
                     Some(v) => v,
                     None => {
-                        let msg =
-                            format!("codegen: undefined captured variable '{}'", var_name);
+                        let msg = format!("codegen: undefined captured variable '{}'", var_name);
                         self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
                     }
                 };
@@ -10629,7 +11158,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             stmts.iter().map(pretty_stmt).collect::<Vec<_>>().join(" ")
         );
         let (src_ptr, src_len) = self.string_ptr(builder, &src);
-        self.call_rt(builder, "knot_io_new", &[fn_addr, env_val, src_ptr, src_len])
+        self.call_rt(
+            builder,
+            "knot_io_new",
+            &[fn_addr, env_val, src_ptr, src_len],
+        )
     }
 
     /// Compile an expression in *argument* position, where the value is handed
@@ -10742,10 +11275,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             | ast::PatKind::Cons { .. }
                             | ast::PatKind::Lit(_)
                     );
-                    let rhs_is_io_relation_source = matches!(
-                        &expr.node,
-                        ast::ExprKind::SourceRef { .. }
-                    );
+                    let rhs_is_io_relation_source =
+                        matches!(&expr.node, ast::ExprKind::SourceRef { .. });
                     // A comprehension TAIL inside a sequential IO block:
                     //
                     //   full *people = [...]      -- IO statement
@@ -10803,12 +11334,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                     ast::ExprKind::Do(stmts[stmt_idx + 1..].to_vec()),
                                     stmt.span,
                                 );
-                                (expr_refs_var(&tail, name)
-                                    && !expr_uses_var_as_value(&tail, name))
-                                    || Self::where_filters_row_fields(
-                                        &stmts[stmt_idx + 1..],
-                                        name,
-                                    )
+                                (expr_refs_var(&tail, name) && !expr_uses_var_as_value(&tail, name))
+                                    || Self::where_filters_row_fields(&stmts[stmt_idx + 1..], name)
                             }
                             _ => false,
                         };
@@ -10816,8 +11343,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         && (matches!(&expr.node, ast::ExprKind::List(_))
                             || self.expr_is_known_relation(expr)
                             || self.expr_is_relation_var(expr)
-                            || self.desugared_monad_kind(expr)
-                                == Some(MonadKind::Relation)))
+                            || self.desugared_monad_kind(expr) == Some(MonadKind::Relation)))
                         || (pat_filters_rows && rhs_is_io_relation_source)
                         || comprehension_tail;
                     // Names (re)bound by this pattern are rows from here on,
@@ -10843,9 +11369,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // `x <- *source` records x → source so inner do-blocks
                     // like `do { m <- x; where ...; yield m }` can compile to SQL.
                     if let ast::PatKind::Var(var_name) = &pat.node
-                        && let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node {
-                            self.source_var_binds.insert(var_name.clone(), source_name.clone());
-                        }
+                        && let ast::ExprKind::SourceRef {
+                            name: source_name, ..
+                        } = &expr.node
+                    {
+                        self.source_var_binds
+                            .insert(var_name.clone(), source_name.clone());
+                    }
                     // A comprehension over relation sources (`xs <- do { r <-
                     // *rel; where …; yield … }`) is IO only because of the
                     // relation reads, and inference types it as the relation
@@ -10876,8 +11406,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // Bind the result to the pattern. Inside a bind-loop's
                     // rest, a mismatch skips the current row instead of
                     // pushing unit into the loop result.
-                    let mismatch_target =
-                        self.io_loop_skip_block.unwrap_or(done_block);
+                    let mismatch_target = self.io_loop_skip_block.unwrap_or(done_block);
                     self.bind_io_pattern(builder, pat, result, env, Some(mismatch_target));
                     // Running the bound action may have written relations —
                     // variables bound from those sources are now stale.
@@ -10893,11 +11422,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // unit value is pushed into the loop's result. Inside
                     // an atomic body, also signal skip so the surrounding
                     // `atomic` rolls back.
-                    let cond_i32 =
-                        self.compile_condition(builder, cond, env, db);
+                    let cond_i32 = self.compile_condition(builder, cond, env, db);
                     self.invalidate_after_possible_writes(cond);
-                    let is_true =
-                        builder.ins().icmp_imm(IntCC::NotEqual, cond_i32, 0);
+                    let is_true = builder.ins().icmp_imm(IntCC::NotEqual, cond_i32, 0);
                     let pass_block = builder.create_block();
                     let fail_block = builder.create_block();
                     builder
@@ -10914,8 +11441,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         self.call_rt(builder, "knot_stm_skip", &[]);
                     }
                     let unit = self.call_rt(builder, "knot_value_unit", &[]);
-                    let guard_target =
-                        self.io_loop_skip_block.unwrap_or(done_block);
+                    let guard_target = self.io_loop_skip_block.unwrap_or(done_block);
                     builder.ins().jump(guard_target, &[unit.into()]);
                     builder.switch_to_block(pass_block);
                     builder.seal_block(pass_block);
@@ -11077,15 +11603,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
             return self.compile_expr(builder, inner, env, db);
         }
         if let ast::ExprKind::Do(stmts) = &expr.node
-            && self.is_io_do_block(stmts) {
-                // A fresh nested do-block has its own guard semantics
-                // (where false returns unit from THIS block) — its guards
-                // must not skip the enclosing bind-loop's row.
-                let prev_skip = self.io_loop_skip_block.take();
-                let val = self.compile_io_do_eager(builder, stmts, env, db);
-                self.io_loop_skip_block = prev_skip;
-                return val;
-            }
+            && self.is_io_do_block(stmts)
+        {
+            // A fresh nested do-block has its own guard semantics
+            // (where false returns unit from THIS block) — its guards
+            // must not skip the enclosing bind-loop's row.
+            let prev_skip = self.io_loop_skip_block.take();
+            let val = self.compile_io_do_eager(builder, stmts, env, db);
+            self.io_loop_skip_block = prev_skip;
+            return val;
+        }
         // General case: compile and run knot_io_run — safe for non-IO
         // values (returns as-is), necessary for higher-order functions
         // whose IO callbacks aren't detectable by expr_is_io.
@@ -11106,21 +11633,20 @@ impl<M: cranelift_module::Module> Codegen<M> {
     ) {
         match &pat.node {
             ast::PatKind::Var(name) => {
-                env.bindings.insert(crate::infer::Binding::User(name.clone()), val);
+                env.bindings
+                    .insert(crate::infer::Binding::User(name.clone()), val);
             }
             ast::PatKind::Wildcard => {}
             ast::PatKind::Record(fields) => {
                 for f in fields {
                     let (field_ptr, field_len) = self.string_ptr(builder, &f.name);
-                    let field_val = self.call_rt(
-                        builder,
-                        "knot_record_field",
-                        &[val, field_ptr, field_len],
-                    );
+                    let field_val =
+                        self.call_rt(builder, "knot_record_field", &[val, field_ptr, field_len]);
                     if let Some(ref inner_pat) = f.pattern {
                         self.bind_io_pattern(builder, inner_pat, field_val, env, done_block);
                     } else {
-                        env.bindings.insert(crate::infer::Binding::User(f.name.clone()), field_val);
+                        env.bindings
+                            .insert(crate::infer::Binding::User(f.name.clone()), field_val);
                     }
                 }
             }
@@ -11135,12 +11661,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     builder.ins().icmp_imm(IntCC::Equal, bool_val, expected)
                 } else {
                     match self.nullable_ctors.get(name).cloned() {
-                        Some(NullableRole::None) => {
-                            builder.ins().icmp_imm(IntCC::Equal, val, 0)
-                        }
-                        Some(NullableRole::Some) => {
-                            builder.ins().icmp_imm(IntCC::NotEqual, val, 0)
-                        }
+                        Some(NullableRole::None) => builder.ins().icmp_imm(IntCC::Equal, val, 0),
+                        Some(NullableRole::Some) => builder.ins().icmp_imm(IntCC::NotEqual, val, 0),
                         None => {
                             let (tag_ptr, tag_len) = self.string_ptr(builder, name);
                             let matches = self.call_rt_typed(
@@ -11156,7 +11678,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
                 let then_block = builder.create_block();
                 let fail_block = builder.create_block();
-                builder.ins().brif(is_match, then_block, &[], fail_block, &[]);
+                builder
+                    .ins()
+                    .brif(is_match, then_block, &[], fail_block, &[]);
 
                 builder.switch_to_block(fail_block);
                 builder.seal_block(fail_block);
@@ -11176,7 +11700,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     builder.ins().jump(done, &[unit.into()]);
                 } else {
                     self.call_rt_void(builder, "knot_guard_failed", &[]);
-                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                    builder
+                        .ins()
+                        .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
                 }
 
                 builder.switch_to_block(then_block);
@@ -11191,17 +11717,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // mismatched value must skip (like the do/case paths), not be
                 // silently accepted. Mirror the constructor arm's fail/skip.
                 let lit_val = self.compile_lit(builder, lit);
-                let eq_i32 = self.call_rt_typed(
-                    builder,
-                    "knot_value_eq_i32",
-                    &[val, lit_val],
-                    types::I32,
-                );
+                let eq_i32 =
+                    self.call_rt_typed(builder, "knot_value_eq_i32", &[val, lit_val], types::I32);
                 let is_match = builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
 
                 let then_block = builder.create_block();
                 let fail_block = builder.create_block();
-                builder.ins().brif(is_match, then_block, &[], fail_block, &[]);
+                builder
+                    .ins()
+                    .brif(is_match, then_block, &[], fail_block, &[]);
 
                 builder.switch_to_block(fail_block);
                 builder.seal_block(fail_block);
@@ -11217,7 +11741,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     builder.ins().jump(done, &[unit.into()]);
                 } else {
                     self.call_rt_void(builder, "knot_guard_failed", &[]);
-                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                    builder
+                        .ins()
+                        .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
                 }
 
                 builder.switch_to_block(then_block);
@@ -11234,7 +11760,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
                 let then_block = builder.create_block();
                 let fail_block = builder.create_block();
-                builder.ins().brif(is_match, then_block, &[], fail_block, &[]);
+                builder
+                    .ins()
+                    .brif(is_match, then_block, &[], fail_block, &[]);
 
                 builder.switch_to_block(fail_block);
                 builder.seal_block(fail_block);
@@ -11250,7 +11778,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     builder.ins().jump(done, &[unit.into()]);
                 } else {
                     self.call_rt_void(builder, "knot_guard_failed", &[]);
-                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                    builder
+                        .ins()
+                        .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
                 }
 
                 builder.switch_to_block(then_block);
@@ -11258,8 +11788,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
                 for (idx, elem_pat) in pats.iter().enumerate() {
                     let index = builder.ins().iconst(self.ptr_type, idx as i64);
-                    let elem =
-                        self.call_rt(builder, "knot_relation_get", &[val, index]);
+                    let elem = self.call_rt(builder, "knot_relation_get", &[val, index]);
                     self.bind_io_pattern(builder, elem_pat, elem, env, done_block);
                 }
             }
@@ -11273,7 +11802,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
                 let then_block = builder.create_block();
                 let fail_block = builder.create_block();
-                builder.ins().brif(is_match, then_block, &[], fail_block, &[]);
+                builder
+                    .ins()
+                    .brif(is_match, then_block, &[], fail_block, &[]);
 
                 builder.switch_to_block(fail_block);
                 builder.seal_block(fail_block);
@@ -11289,17 +11820,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     builder.ins().jump(done, &[unit.into()]);
                 } else {
                     self.call_rt_void(builder, "knot_guard_failed", &[]);
-                    builder.ins().trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                    builder
+                        .ins()
+                        .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
                 }
 
                 builder.switch_to_block(then_block);
                 builder.seal_block(then_block);
 
                 let zero = builder.ins().iconst(self.ptr_type, 0);
-                let head_val =
-                    self.call_rt(builder, "knot_relation_get", &[val, zero]);
-                let tail_val =
-                    self.call_rt(builder, "knot_relation_tail", &[val]);
+                let head_val = self.call_rt(builder, "knot_relation_get", &[val, zero]);
+                let tail_val = self.call_rt(builder, "knot_relation_tail", &[val]);
                 self.bind_io_pattern(builder, head, head_val, env, done_block);
                 self.bind_io_pattern(builder, tail, tail_val, env, done_block);
             }
@@ -11346,25 +11877,26 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 ast::StmtKind::Bind { expr, .. } => Some(expr),
             };
             if let Some(e) = expr_to_check
-                && let Some(name) = live.iter().find(|n| expr_refs_var(e, n)).cloned() {
-                    let grouped = primary
-                        .as_ref()
-                        .map(|p| format!(" '{}'", p))
-                        .unwrap_or_default();
-                    return Some(
-                        knot::diagnostic::Diagnostic::error(format!(
-                            "variable '{}' cannot be referenced after groupBy: \
+                && let Some(name) = live.iter().find(|n| expr_refs_var(e, n)).cloned()
+            {
+                let grouped = primary
+                    .as_ref()
+                    .map(|p| format!(" '{}'", p))
+                    .unwrap_or_default();
+                return Some(
+                    knot::diagnostic::Diagnostic::error(format!(
+                        "variable '{}' cannot be referenced after groupBy: \
                              only the grouped binding{} is rebound to each group",
-                            name, grouped
-                        ))
-                        .label(stmt.span, format!("'{}' refers to a pre-groupBy row", name))
-                        .note(
-                            "yield the needed values into an intermediate relation \
+                        name, grouped
+                    ))
+                    .label(stmt.span, format!("'{}' refers to a pre-groupBy row", name))
+                    .note(
+                        "yield the needed values into an intermediate relation \
                              before grouping, or group directly on the relation that \
                              contains them",
-                        ),
-                    );
-                }
+                    ),
+                );
+            }
             // A post-group bind/let rebinding a loop-local name shadows it
             // for the remaining statements.
             if let ast::StmtKind::Bind { pat, .. } = &stmt.node {
@@ -11401,10 +11933,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         if let Some(pos) = stmts
             .iter()
             .position(|s| matches!(&s.node, ast::StmtKind::GroupBy { .. }))
-            && let Some(diag) = Self::validate_group_by_references(stmts, pos) {
-                self.diagnostics.push(diag);
-                return self.call_rt(builder, "knot_relation_empty", &[]);
-            }
+            && let Some(diag) = Self::validate_group_by_references(stmts, pos)
+        {
+            self.diagnostics.push(diag);
+            return self.call_rt(builder, "knot_relation_empty", &[]);
+        }
 
         // Save let_bindings for restoration on exit; new entries inserted
         // below are visible only inside this do-block's scope.
@@ -11449,9 +11982,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // Pre-scan: if there's a groupBy, create a temp relation to collect
         // pre-group rows. This must be allocated before any loops start.
-        let group_by_pos = stmts.iter().position(|s| {
-            matches!(&s.node, ast::StmtKind::GroupBy { .. })
-        });
+        let group_by_pos = stmts
+            .iter()
+            .position(|s| matches!(&s.node, ast::StmtKind::GroupBy { .. }));
         let temp = if group_by_pos.is_some() {
             self.call_rt(builder, "knot_relation_empty", &[])
         } else {
@@ -11486,9 +12019,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             .enumerate()
             .filter_map(|(i, s)| {
                 if let ast::StmtKind::Bind { pat, expr } = &s.node
-                    && let ast::PatKind::Var(name) = &pat.node {
-                        return Some((i, name.as_str(), expr));
-                    }
+                    && let ast::PatKind::Var(name) = &pat.node
+                {
+                    return Some((i, name.as_str(), expr));
+                }
                 None
             })
             .collect();
@@ -11525,8 +12059,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
                 // Inner expr must be hoistable (source, derived, var, or list).
                 let hoistable = match &inner_expr.node {
-                    ast::ExprKind::SourceRef { .. }
-                    | ast::ExprKind::List(_) => true,
+                    ast::ExprKind::SourceRef { .. } | ast::ExprKind::List(_) => true,
                     // A `Var` is only hoistable when it resolves OUTSIDE this
                     // do-block. A var bound by another Bind in this block is
                     // loop-local: its SSA value is defined inside a loop body
@@ -11534,9 +12067,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // compiling it there is invalid IR (undefined-variable
                     // panic) or silently captures a stale outer binding of the
                     // same name. Only hoist vars from the enclosing scope.
-                    ast::ExprKind::Var(name) => {
-                        !bind_stmts.iter().any(|(_, bv, _)| bv == name)
-                    }
+                    ast::ExprKind::Var(name) => !bind_stmts.iter().any(|(_, bv, _)| bv == name),
                     _ => false,
                 };
                 if !hoistable {
@@ -11549,8 +12080,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     .position(|s| {
                         matches!(
                             &s.node,
-                            ast::StmtKind::Bind { .. }
-                                | ast::StmtKind::GroupBy { .. }
+                            ast::StmtKind::Bind { .. } | ast::StmtKind::GroupBy { .. }
                         )
                     })
                     .map_or(stmts.len(), |p| inner_idx + 1 + p);
@@ -11563,23 +12093,23 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     if let ast::StmtKind::Where { cond } = &stmt.node
                         && let Some((ov, of, iv, inf)) =
                             Self::match_equi_join(cond, outer_var, inner_var)
-                        {
-                            // Ensure the matched vars are the correct pair
-                            if ov == outer_var && iv == inner_var {
-                                consumed_wheres.insert(wi);
-                                hash_join_plans.insert(
-                                    inner_idx,
-                                    HashJoinPlan {
-                                        outer_var: ov.to_string(),
-                                        outer_field: of.to_string(),
-                                        inner_field: inf.to_string(),
-                                        _where_idx: wi,
-                                    },
-                                );
-                                planned_for_inner = true;
-                                break; // one join per bind pair
-                            }
+                    {
+                        // Ensure the matched vars are the correct pair
+                        if ov == outer_var && iv == inner_var {
+                            consumed_wheres.insert(wi);
+                            hash_join_plans.insert(
+                                inner_idx,
+                                HashJoinPlan {
+                                    outer_var: ov.to_string(),
+                                    outer_field: of.to_string(),
+                                    inner_field: inf.to_string(),
+                                    _where_idx: wi,
+                                },
+                            );
+                            planned_for_inner = true;
+                            break; // one join per bind pair
                         }
+                    }
                 }
             }
         }
@@ -11594,8 +12124,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         for (&stmt_idx, plan) in &hash_join_plans {
             if let ast::StmtKind::Bind { expr, .. } = &stmts[stmt_idx].node {
                 let inner_rel = self.compile_expr(builder, expr, env, db);
-                let (field_ptr, field_len) =
-                    self.string_ptr(builder, &plan.inner_field);
+                let (field_ptr, field_len) = self.string_ptr(builder, &plan.inner_field);
                 let idx_val = self.call_rt(
                     builder,
                     "knot_relation_build_index",
@@ -11618,18 +12147,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         let idx_val = prebuilt_indices[&stmt_idx];
 
                         // Look up matching rows via the pre-built hash index
-                        let outer_val = match env.get(&crate::infer::Binding::User(plan.outer_var.clone())) {
-                            Some(v) => v,
-                            None => {
-                                let msg = format!(
-                                    "codegen: undefined join variable '{}'",
-                                    plan.outer_var
-                                );
-                                self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
-                            }
-                        };
-                        let (fptr, flen) =
-                            self.string_ptr(builder, &plan.outer_field);
+                        let outer_val =
+                            match env.get(&crate::infer::Binding::User(plan.outer_var.clone())) {
+                                Some(v) => v,
+                                None => {
+                                    let msg = format!(
+                                        "codegen: undefined join variable '{}'",
+                                        plan.outer_var
+                                    );
+                                    self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
+                                }
+                            };
+                        let (fptr, flen) = self.string_ptr(builder, &plan.outer_field);
                         let key =
                             self.call_rt(builder, "knot_record_field", &[outer_val, fptr, flen]);
                         let rel =
@@ -11667,12 +12196,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                     primary_source = Some(name.clone());
                                     primary_schema = self.source_schemas.get(name).cloned();
                                 }
-                                ast::ExprKind::FieldAccess { expr: target, field } => {
+                                ast::ExprKind::FieldAccess {
+                                    expr: target,
+                                    field,
+                                } => {
                                     primary_schema = None;
                                     if let ast::ExprKind::Var(parent_var) = &target.node
-                                        && let Some(parent_schema) = var_schemas.get(parent_var.as_str()) {
-                                            primary_schema = extract_child_schema(parent_schema, field);
-                                        }
+                                        && let Some(parent_schema) =
+                                            var_schemas.get(parent_var.as_str())
+                                    {
+                                        primary_schema = extract_child_schema(parent_schema, field);
+                                    }
                                     primary_source = None;
                                 }
                                 ast::ExprKind::Var(name) => {
@@ -11687,9 +12221,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 }
                             }
                             if let Some(ref schema) = primary_schema
-                                && let Some(ref var_name) = primary_var {
-                                    var_schemas.insert(var_name.clone(), schema.clone());
-                                }
+                                && let Some(ref var_name) = primary_var
+                            {
+                                var_schemas.insert(var_name.clone(), schema.clone());
+                            }
                         }
 
                         loop_stack.push(LoopInfo {
@@ -11705,9 +12240,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
                     // ── Filter pushdown: try to push Where clauses into SQL ──
                     let use_filter_pushdown = if let ast::PatKind::Var(bind_var) = &pat.node {
-                        if let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node {
-                            if self.source_schemas.contains_key(source_name)
-                            {
+                        if let ast::ExprKind::SourceRef {
+                            name: source_name, ..
+                        } = &expr.node
+                        {
+                            if self.source_schemas.contains_key(source_name) {
                                 // Look ahead at subsequent Where stmts
                                 let mut sql_fragments: Vec<(usize, SqlFragment)> = Vec::new();
                                 let search_end = stmts[stmt_idx + 1..]
@@ -11730,17 +12267,27 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                     }
                                     if let ast::StmtKind::Where { cond } = &stmt.node {
                                         // Check all param sources are in scope
-                                        if let Some(frag) =
-                                            self.source_schemas.get(source_name).and_then(
-                                                |schema| self.try_compile_sql_expr(bind_var, cond, schema))
+                                        if let Some(frag) = self
+                                            .source_schemas
+                                            .get(source_name)
+                                            .and_then(|schema| {
+                                                self.try_compile_sql_expr(bind_var, cond, schema)
+                                            })
                                         {
                                             let params_ok = frag.params.iter().all(|p| match p {
-                                                SqlParamSource::Literal(_) | SqlParamSource::Expr(_) => true,
+                                                SqlParamSource::Literal(_)
+                                                | SqlParamSource::Expr(_) => true,
                                                 SqlParamSource::Var(v) => {
-                                                    v != bind_var && env.bindings.contains_key(&crate::infer::Binding::User(v.clone()))
+                                                    v != bind_var
+                                                        && env.bindings.contains_key(
+                                                            &crate::infer::Binding::User(v.clone()),
+                                                        )
                                                 }
                                                 SqlParamSource::FieldAccess(v, _) => {
-                                                    v != bind_var && env.bindings.contains_key(&crate::infer::Binding::User(v.clone()))
+                                                    v != bind_var
+                                                        && env.bindings.contains_key(
+                                                            &crate::infer::Binding::User(v.clone()),
+                                                        )
                                                 }
                                             });
                                             if params_ok {
@@ -11775,9 +12322,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                         builder,
                                         "knot_source_read_where",
                                         &[
-                                            db, name_ptr, name_len, schema_ptr,
-                                            schema_len, where_ptr, where_len,
-                                            params_rel,
+                                            db, name_ptr, name_len, schema_ptr, schema_len,
+                                            where_ptr, where_len, params_rel,
                                         ],
                                     );
                                     Some(val)
@@ -11859,8 +12405,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
                     builder.switch_to_block(header);
                     let i = builder.append_block_param(header, self.ptr_type);
-                    let cond =
-                        builder.ins().icmp(IntCC::UnsignedLessThan, i, len);
+                    let cond = builder.ins().icmp(IntCC::UnsignedLessThan, i, len);
                     builder.ins().brif(cond, body, &[], exit, &[]);
 
                     builder.switch_to_block(body);
@@ -11887,14 +12432,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 primary_source = Some(name.clone());
                                 primary_schema = self.source_schemas.get(name).cloned();
                             }
-                            ast::ExprKind::FieldAccess { expr: target, field } => {
+                            ast::ExprKind::FieldAccess {
+                                expr: target,
+                                field,
+                            } => {
                                 // Nested relation bind (e.g. `item <- t.children`):
                                 // extract the child field schema from the parent's schema.
                                 primary_schema = None;
                                 if let ast::ExprKind::Var(parent_var) = &target.node
-                                    && let Some(parent_schema) = var_schemas.get(parent_var.as_str()) {
-                                        primary_schema = extract_child_schema(parent_schema, field);
-                                    }
+                                    && let Some(parent_schema) =
+                                        var_schemas.get(parent_var.as_str())
+                                {
+                                    primary_schema = extract_child_schema(parent_schema, field);
+                                }
                                 primary_source = None;
                             }
                             ast::ExprKind::Var(name) => {
@@ -11910,9 +12460,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         }
                         // Record the bound variable's schema for downstream FieldAccess lookups.
                         if let Some(ref schema) = primary_schema
-                            && let Some(ref var_name) = primary_var {
-                                var_schemas.insert(var_name.clone(), schema.clone());
-                            }
+                            && let Some(ref var_name) = primary_var
+                        {
+                            var_schemas.insert(var_name.clone(), schema.clone());
+                        }
                     }
 
                     loop_stack.push(LoopInfo {
@@ -11932,8 +12483,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
 
                     let cond_i32 = self.compile_condition(builder, cond, env, db);
-                    let is_true =
-                        builder.ins().icmp_imm(IntCC::NotEqual, cond_i32, 0);
+                    let is_true = builder.ins().icmp_imm(IntCC::NotEqual, cond_i32, 0);
 
                     let then_block = builder.create_block();
                     let skip_block = builder.create_block();
@@ -11956,7 +12506,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         pre_bind_where_skips.push(skip_block);
                     }
                 }
-
 
                 ast::StmtKind::GroupBy { key } => {
                     // ── Phase transition: pre-group → post-group ──
@@ -11996,12 +12545,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             // the merge block param so `promoted` dominates.
                             if !pre_bind_where_skips.is_empty() {
                                 let do_exit = builder.create_block();
-                                let result_param = builder.append_block_param(do_exit, self.ptr_type);
+                                let result_param =
+                                    builder.append_block_param(do_exit, self.ptr_type);
                                 builder.ins().jump(do_exit, &[promoted.into()]);
                                 for skip in &pre_bind_where_skips {
                                     builder.switch_to_block(*skip);
                                     builder.seal_block(*skip);
-                                    let skip_empty = self.call_rt(builder, "knot_relation_empty", &[]);
+                                    let skip_empty =
+                                        self.call_rt(builder, "knot_relation_empty", &[]);
                                     let skip_promoted = self.call_rt(
                                         builder,
                                         "knot_arena_pop_frame_promote",
@@ -12031,11 +12582,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     } else {
                         var_val
                     };
-                    self.call_rt_void(
-                        builder,
-                        "knot_relation_push",
-                        &[temp, var_val],
-                    );
+                    self.call_rt_void(builder, "knot_relation_push", &[temp, var_val]);
 
                     // 2. Close all pre-group loops
                     while let Some(info) = loop_stack.pop() {
@@ -12058,7 +12605,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
                     // 3. Extract schema and key column names for SQLite grouping
                     let schema = match primary_schema.clone().or_else(|| {
-                        primary_source.as_ref()
+                        primary_source
+                            .as_ref()
                             .and_then(|name| self.source_schemas.get(name).cloned())
                     }) {
                         Some(s) => s,
@@ -12080,8 +12628,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                     .to_string()
                             };
                             self.diagnostics.push(
-                                knot::diagnostic::Diagnostic::error(hint)
-                                    .label(key.span, "groupBy over a relation with no known schema"),
+                                knot::diagnostic::Diagnostic::error(hint).label(
+                                    key.span,
+                                    "groupBy over a relation with no known schema",
+                                ),
                             );
                             // Pre-group loops are already closed here; still tear
                             // down the do-block scope so the leaked arena frame /
@@ -12102,12 +12652,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             // the merge block param so `promoted` dominates.
                             if !pre_bind_where_skips.is_empty() {
                                 let do_exit = builder.create_block();
-                                let result_param = builder.append_block_param(do_exit, self.ptr_type);
+                                let result_param =
+                                    builder.append_block_param(do_exit, self.ptr_type);
                                 builder.ins().jump(do_exit, &[promoted.into()]);
                                 for skip in &pre_bind_where_skips {
                                     builder.switch_to_block(*skip);
                                     builder.seal_block(*skip);
-                                    let skip_empty = self.call_rt(builder, "knot_relation_empty", &[]);
+                                    let skip_empty =
+                                        self.call_rt(builder, "knot_relation_empty", &[]);
                                     let skip_promoted = self.call_rt(
                                         builder,
                                         "knot_arena_pop_frame_promote",
@@ -12133,7 +12685,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         ast::ExprKind::Record(fields) => fields
                             .iter()
                             .map(|f| match &f.value.node {
-                                ast::ExprKind::FieldAccess { expr: key_base, field } => {
+                                ast::ExprKind::FieldAccess {
+                                    expr: key_base,
+                                    field,
+                                } => {
                                     // The key column is read from the grouped
                                     // rows (the primary bind), so the field
                                     // access base must BE the primary bind —
@@ -12212,31 +12767,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     };
                     let key_cols_str = key_cols.join(",");
 
-                    let (schema_ptr, schema_len) =
-                        self.string_ptr(builder, &schema);
-                    let (key_cols_ptr, key_cols_len) =
-                        self.string_ptr(builder, &key_cols_str);
+                    let (schema_ptr, schema_len) = self.string_ptr(builder, &schema);
+                    let (key_cols_ptr, key_cols_len) = self.string_ptr(builder, &key_cols_str);
 
                     // 4. Call runtime groupBy (SQLite-based)
                     let groups = self.call_rt(
                         builder,
                         "knot_relation_group_by",
-                        &[
-                            db,
-                            temp,
-                            schema_ptr,
-                            schema_len,
-                            key_cols_ptr,
-                            key_cols_len,
-                        ],
+                        &[db, temp, schema_ptr, schema_len, key_cols_ptr, key_cols_len],
                     );
 
                     // 5. Start a new loop over the groups
-                    let groups_len = self.call_rt(
-                        builder,
-                        "knot_relation_len",
-                        &[groups],
-                    );
+                    let groups_len = self.call_rt(builder, "knot_relation_len", &[groups]);
 
                     let g_header = builder.create_block();
                     let g_body = builder.create_block();
@@ -12248,12 +12790,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
                     builder.switch_to_block(g_header);
                     let g_i = builder.append_block_param(g_header, self.ptr_type);
-                    let g_cond = builder
-                        .ins()
-                        .icmp(IntCC::UnsignedLessThan, g_i, groups_len);
-                    builder
-                        .ins()
-                        .brif(g_cond, g_body, &[], g_exit, &[]);
+                    let g_cond = builder.ins().icmp(IntCC::UnsignedLessThan, g_i, groups_len);
+                    builder.ins().brif(g_cond, g_body, &[], g_exit, &[]);
 
                     builder.switch_to_block(g_body);
                     builder.seal_block(g_body);
@@ -12262,11 +12800,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let g_arena_mark = self.call_rt(builder, "knot_arena_mark", &[]);
 
                     // 6. Rebind the primary variable to the current group
-                    let group = self.call_rt(
-                        builder,
-                        "knot_relation_get",
-                        &[groups, g_i],
-                    );
+                    let group = self.call_rt(builder, "knot_relation_get", &[groups, g_i]);
                     if let Some(var_name) = primary_var.as_ref() {
                         env.set(crate::infer::Binding::User(var_name.clone()), group);
                     }
@@ -12284,8 +12818,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 ast::StmtKind::Expr(expr) => {
                     let is_last = stmt_idx == stmts.len() - 1;
                     if let Some(inner) = expr.node.as_yield_arg() {
-                        let val =
-                            self.compile_expr(builder, inner, env, db);
+                        let val = self.compile_expr(builder, inner, env, db);
                         // Arena GC: promote yielded value so it survives
                         // per-iteration reset in the continue block.
                         // Escape-analysis hint: if the yielded value is
@@ -12298,28 +12831,22 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         } else {
                             val
                         };
-                        self.call_rt_void(
-                            builder,
-                            "knot_relation_push",
-                            &[result, val],
-                        );
-                    } else if matches!(&expr.node, ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. }) {
+                        self.call_rt_void(builder, "knot_relation_push", &[result, val]);
+                    } else if matches!(
+                        &expr.node,
+                        ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. }
+                    ) {
                         // Compile set inside do block
                         let _ = self.compile_expr(builder, expr, env, db);
                         // Variables bound from the written source are stale now.
                         self.invalidate_after_possible_writes(expr);
                     } else {
-                        let val =
-                            self.compile_expr(builder, expr, env, db);
+                        let val = self.compile_expr(builder, expr, env, db);
                         self.invalidate_after_possible_writes(expr);
                         if is_last && loop_stack.is_empty() {
                             // Last expression in a non-looping do block
                             // — push as result
-                            self.call_rt_void(
-                                builder,
-                                "knot_relation_push",
-                                &[result, val],
-                            );
+                            self.call_rt_void(builder, "knot_relation_push", &[result, val]);
                         }
                     }
                 }
@@ -12429,7 +12956,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 body.span,
             );
             return self.compile_lambda_inner(
-                builder, &params[0..1], &inner_lambda, env, _db,
+                builder,
+                &params[0..1],
+                &inner_lambda,
+                env,
+                _db,
                 Some(source_text),
             );
         }
@@ -12439,10 +12970,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // Determine free variables — extract ALL names bound by patterns,
         // not just top-level Var patterns (handles destructuring like \{x, y} -> ...)
-        let param_names: Vec<String> = params
-            .iter()
-            .flat_map(pat_bound_names)
-            .collect();
+        let param_names: Vec<String> = params.iter().flat_map(pat_bound_names).collect();
         // Capture decisions respect lexical scope: a name bound in the
         // enclosing local scope (env) shadows any same-named top-level
         // function/constant or builtin and MUST be captured; only
@@ -12454,9 +12982,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // capture it only when the enclosing body actually provides it,
                 // never via the "unshadowed local" fallback (it has no global).
                 if v.starts_with("__derived_self_") {
-                    return env.bindings.contains_key(&crate::infer::Binding::User(v.clone()));
+                    return env
+                        .bindings
+                        .contains_key(&crate::infer::Binding::User(v.clone()));
                 }
-                env.bindings.contains_key(&crate::infer::Binding::User(v.clone()))
+                env.bindings
+                    .contains_key(&crate::infer::Binding::User(v.clone()))
                     || (!self.global_fns.contains_key(v) && !is_builtin_name(v))
             })
             .collect();
@@ -12485,7 +13016,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.pending_lambdas.push(PendingLambda {
             func_id,
             params: param_names.clone(),
-            param_pat: if params.len() == 1 { Some(params[0].clone()) } else { None },
+            param_pat: if params.len() == 1 {
+                Some(params[0].clone())
+            } else {
+                None
+            },
             body: body.clone(),
             free_vars: free_vars.clone(),
             captured_rel_vars,
@@ -12508,15 +13043,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             let ptr_bytes = self.ptr_type.bytes() as i32;
             let slot_size = (3 * n as u32) * ptr_bytes as u32;
-            let slot = builder.create_sized_stack_slot(
-                StackSlotData::new(StackSlotKind::ExplicitSlot, slot_size, 3),
-            );
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                slot_size,
+                3,
+            ));
             for (i, var_name) in sorted_vars.iter().enumerate() {
                 let val = match env.get(&crate::infer::Binding::User(var_name.to_string())) {
                     Some(v) => v,
                     None => {
-                        let msg =
-                            format!("codegen: undefined captured variable '{}'", var_name);
+                        let msg = format!("codegen: undefined captured variable '{}'", var_name);
                         self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
                     }
                 };
@@ -12537,16 +13073,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
             format!("\\{} -> {}", ps.join(" "), pretty_expr(body))
         });
         let (src_ptr, src_len) = self.string_ptr(builder, &source_text);
-        self.call_rt(builder, "knot_value_function", &[fn_addr, env_val, src_ptr, src_len])
+        self.call_rt(
+            builder,
+            "knot_value_function",
+            &[fn_addr, env_val, src_ptr, src_len],
+        )
     }
 
     // ── Literal compilation ───────────────────────────────────────
 
-    fn compile_lit(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        lit: &ast::Literal,
-    ) -> Value {
+    fn compile_lit(&mut self, builder: &mut FunctionBuilder, lit: &ast::Literal) -> Value {
         match lit {
             ast::Literal::Int(n) => {
                 if let Ok(small) = n.parse::<i64>() {
@@ -12602,12 +13138,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // harmless unit value so codegen can keep going (the error aborts the
         // build before linking, via `compile()`'s diagnostics check).
         let mut bad = |expected: &str| -> Value {
-            self.diagnostics.push(knot::diagnostic::Diagnostic::error(
-                format!(
+            self.diagnostics
+                .push(knot::diagnostic::Diagnostic::error(format!(
                     "override value '{}' is not a valid {} for this constant",
                     val_str, expected
-                ),
-            ));
+                )));
             self.call_rt(builder, "knot_value_unit", &[])
         };
         let inner = match type_str {
@@ -12647,12 +13182,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
             }
             _ => {
-                self.diagnostics.push(knot::diagnostic::Diagnostic::error(
-                    format!(
+                self.diagnostics
+                    .push(knot::diagnostic::Diagnostic::error(format!(
                         "constant of type '{}' cannot be supplied as a compile-time override",
                         type_str
-                    ),
-                ));
+                    )));
                 self.call_rt(builder, "knot_value_unit", &[])
             }
         };
@@ -12664,7 +13198,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let cap = builder.ins().iconst(self.ptr_type, 1);
             let rec = self.call_rt(builder, "knot_record_empty", &[cap]);
             let (key_ptr, key_len) = self.string_ptr(builder, "value");
-            self.call_rt_void(builder, "knot_record_set_field", &[rec, key_ptr, key_len, inner]);
+            self.call_rt_void(
+                builder,
+                "knot_record_set_field",
+                &[rec, key_ptr, key_len, inner],
+            );
             let (tag_ptr, tag_len) = self.string_ptr(builder, "Just");
             self.call_rt(builder, "knot_value_constructor", &[tag_ptr, tag_len, rec])
         } else {
@@ -12695,12 +13233,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     // ── Runtime call helpers ──────────────────────────────────────
 
     /// Call a runtime function that returns a pointer-typed value.
-    fn call_rt(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        name: &str,
-        args: &[Value],
-    ) -> Value {
+    fn call_rt(&mut self, builder: &mut FunctionBuilder, name: &str, args: &[Value]) -> Value {
         let func_id = self.runtime_fns[name];
         let func_ref = self.module.declare_func_in_func(func_id, builder.func);
         let call = builder.ins().call(func_ref, args);
@@ -12722,12 +13255,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     }
 
     /// Call a runtime function that returns void.
-    fn call_rt_void(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        name: &str,
-        args: &[Value],
-    ) {
+    fn call_rt_void(&mut self, builder: &mut FunctionBuilder, name: &str, args: &[Value]) {
         let func_id = self.runtime_fns[name];
         let func_ref = self.module.declare_func_in_func(func_id, builder.func);
         builder.ins().call(func_ref, args);
@@ -12765,30 +13293,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
     }
 
     /// Get the pointer and length of a string constant as Cranelift Values.
-    fn string_ptr(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        s: &str,
-    ) -> (Value, Value) {
+    fn string_ptr(&mut self, builder: &mut FunctionBuilder, s: &str) -> (Value, Value) {
         let data_id = self.ensure_string(s);
-        let gv = self
-            .module
-            .declare_data_in_func(data_id, builder.func);
+        let gv = self.module.declare_data_in_func(data_id, builder.func);
         let ptr = builder.ins().global_value(self.ptr_type, gv);
         let len = builder.ins().iconst(self.ptr_type, s.len() as i64);
         (ptr, len)
     }
 
     /// Get the pointer and length of a byte string constant as Cranelift Values.
-    fn bytes_ptr(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        b: &[u8],
-    ) -> (Value, Value) {
+    fn bytes_ptr(&mut self, builder: &mut FunctionBuilder, b: &[u8]) -> (Value, Value) {
         let data_id = self.ensure_bytes(b);
-        let gv = self
-            .module
-            .declare_data_in_func(data_id, builder.func);
+        let gv = self.module.declare_data_in_func(data_id, builder.func);
         let ptr = builder.ins().global_value(self.ptr_type, gv);
         let len = builder.ins().iconst(self.ptr_type, b.len() as i64);
         (ptr, len)
@@ -12798,11 +13314,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     /// zero-initialized slot dedicated to caching the interned `Value*`
     /// for `s`.  On first use the slot is null and the runtime's
     /// `knot_value_text_intern` fills it; subsequent uses load directly.
-    fn text_literal_slot(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        s: &str,
-    ) -> Value {
+    fn text_literal_slot(&mut self, builder: &mut FunctionBuilder, s: &str) -> Value {
         let data_id = if let Some(id) = self.text_literal_slots.get(s) {
             *id
         } else {
@@ -12825,9 +13337,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             self.text_literal_slots.insert(s.to_string(), id);
             id
         };
-        let gv = self
-            .module
-            .declare_data_in_func(data_id, builder.func);
+        let gv = self.module.declare_data_in_func(data_id, builder.func);
         builder.ins().global_value(self.ptr_type, gv)
     }
 
@@ -12863,9 +13373,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let ast::ExprKind::Record(fields) = &body.node else {
             return false;
         };
-        fields.iter().any(|f| {
-            matches!(&f.value.node, ast::ExprKind::SourceDecl { name, .. } if name == src_name)
-        })
+        fields.iter().any(
+            |f| matches!(&f.value.node, ast::ExprKind::SourceDecl { name, .. } if name == src_name),
+        )
     }
 
     /// Check whether an expression references `*<source_name>` anywhere.
@@ -12875,18 +13385,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::ImplicitRef(_) => false,
             ast::ExprKind::CollectFold(_) => false,
             ast::ExprKind::TypeHole => false,
-            ast::ExprKind::Lit(_)
-            | ast::ExprKind::Var(_)
-            | ast::ExprKind::Constructor(_) => false,
-            ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
+            ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_) => false,
+            ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => false,
             ast::ExprKind::RouteDecl { .. } => false,
-            ast::ExprKind::Record(fields) => {
-                fields.iter().any(|f| Self::references_source(&f.value, source_name))
-            }
+            ast::ExprKind::Record(fields) => fields
+                .iter()
+                .any(|f| Self::references_source(&f.value, source_name)),
             ast::ExprKind::FieldAccess { expr, .. } => Self::references_source(expr, source_name),
-            ast::ExprKind::List(elems) => {
-                elems.iter().any(|e| Self::references_source(e, source_name))
-            }
+            ast::ExprKind::List(elems) => elems
+                .iter()
+                .any(|e| Self::references_source(e, source_name)),
             ast::ExprKind::Lambda { body, .. } => Self::references_source(body, source_name),
             ast::ExprKind::App { func, arg } => {
                 Self::references_source(func, source_name)
@@ -12900,12 +13411,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 Self::references_source(lhs, source_name)
                     || Self::references_source(rhs, source_name)
             }
-            ast::ExprKind::UnaryOp { operand, .. } => {
-                Self::references_source(operand, source_name)
-            }
+            ast::ExprKind::UnaryOp { operand, .. } => Self::references_source(operand, source_name),
             ast::ExprKind::Case { scrutinee, arms } => {
                 Self::references_source(scrutinee, source_name)
-                    || arms.iter().any(|a| Self::references_source(&a.body, source_name))
+                    || arms
+                        .iter()
+                        .any(|a| Self::references_source(&a.body, source_name))
             }
             ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
                 ast::StmtKind::Bind { expr, .. } => Self::references_source(expr, source_name),
@@ -12913,8 +13424,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 ast::StmtKind::GroupBy { key } => Self::references_source(key, source_name),
                 ast::StmtKind::Expr(e) => Self::references_source(e, source_name),
             }),
-            ast::ExprKind::Set { target, value }
-            | ast::ExprKind::FullSet { target, value } => {
+            ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
                 Self::references_source(target, source_name)
                     || Self::references_source(value, source_name)
             }
@@ -12942,16 +13452,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 func: inner_func,
                 arg: arg1,
             } = &func.node
-                && Self::query_form_name(inner_func) == Some("union") {
-                        // union *rel <new_rows>
-                        if Self::expr_is_source(&arg1.node, source_name, &self.source_var_binds) {
-                            return Some(arg2);
-                        }
-                        // union <new_rows> *rel
-                        if Self::expr_is_source(&arg2.node, source_name, &self.source_var_binds) {
-                            return Some(arg1);
-                        }
-                    }
+            && Self::query_form_name(inner_func) == Some("union")
+        {
+            // union *rel <new_rows>
+            if Self::expr_is_source(&arg1.node, source_name, &self.source_var_binds) {
+                return Some(arg2);
+            }
+            // union <new_rows> *rel
+            if Self::expr_is_source(&arg2.node, source_name, &self.source_var_binds) {
+                return Some(arg1);
+            }
+        }
         None
     }
 
@@ -13003,7 +13514,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
         if self.sql_pushdown_disabled_by_user_impls() {
             return None;
         }
-        let (bind_var, body) = extract_single_param_lambda(lambda_arg, &self.fun_bodies, &self.let_bindings)?;
+        let (bind_var, body) =
+            extract_single_param_lambda(lambda_arg, &self.fun_bodies, &self.let_bindings)?;
         let body: &ast::Expr = &body;
 
         match fn_name {
@@ -13017,7 +13529,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 Some(self.call_rt(
                     builder,
                     "knot_source_read_where",
-                    &[db, name_ptr, name_len, schema_ptr, schema_len, where_ptr, where_len, params_rel],
+                    &[
+                        db, name_ptr, name_len, schema_ptr, schema_len, where_ptr, where_len,
+                        params_rel,
+                    ],
                 ))
             }
             "sum" | "avg" | "minOn" | "maxOn" => {
@@ -13056,8 +13571,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         limit: None,
                         offset: None,
                         distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
+                        group_by: Vec::new(),
+                        having: Vec::new(),
                     },
                     terminal: QueryTerminal::Aggregate {
                         func,
@@ -13083,8 +13598,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         limit: None,
                         offset: None,
                         distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
+                        group_by: Vec::new(),
+                        having: Vec::new(),
                     },
                     terminal: QueryTerminal::Count,
                 };
@@ -13100,25 +13615,25 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // A record-literal key `{k1: r.c1, k2: r.c2}` decomposes to a
                 // multi-column ORDER BY; per-column guard inside the helper.
                 let desc = fn_name == "sortByDesc";
-                let order_by: Vec<String> =
-                    if let Some(cols) = extract_sql_multi_key_columns(&bind_var, body, "", schema)
-                    {
-                        if desc {
-                            cols.into_iter().map(|c| format!("{} DESC", c)).collect()
-                        } else {
-                            cols
-                        }
+                let order_by: Vec<String> = if let Some(cols) =
+                    extract_sql_multi_key_columns(&bind_var, body, "", schema)
+                {
+                    if desc {
+                        cols.into_iter().map(|c| format!("{} DESC", c)).collect()
                     } else {
-                        if !sortby_projection_pushable(&bind_var, body, schema) {
-                            return None;
-                        }
-                        let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
-                        if desc {
-                            vec![format!("{} DESC", col_sql)]
-                        } else {
-                            vec![col_sql]
-                        }
-                    };
+                        cols
+                    }
+                } else {
+                    if !sortby_projection_pushable(&bind_var, body, schema) {
+                        return None;
+                    }
+                    let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
+                    if desc {
+                        vec![format!("{} DESC", col_sql)]
+                    } else {
+                        vec![col_sql]
+                    }
+                };
                 let query = Query {
                     plan: SqlQueryPlan {
                         tables: vec![SqlTable {
@@ -13133,8 +13648,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         limit: None,
                         offset: None,
                         distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
+                        group_by: Vec::new(),
+                        having: Vec::new(),
                     },
                     terminal: QueryTerminal::Rows,
                 };
@@ -13183,7 +13698,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // split into a pushable prefix (compiled to a FROM (…)) and the
         // remaining suffix ops (the outer query over that subquery).
         if !pipe_ops_order_pushable(&ops)
-            && let Some(v) = self.try_compile_staged_pipe(builder, &source_name, &schema, &ops, env, db, expr.span)
+            && let Some(v) = self.try_compile_staged_pipe(
+                builder,
+                &source_name,
+                &schema,
+                &ops,
+                env,
+                db,
+                expr.span,
+            )
         {
             return Some(v);
         }
@@ -13218,7 +13741,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     bind_schemas.insert(bind_var.clone(), schema.clone());
                     let frag = Self::try_compile_multi_table_sql_expr(
-                        &bind_aliases, &bind_schemas, body, env, &HashMap::new(),
+                        &bind_aliases,
+                        &bind_schemas,
+                        body,
+                        env,
+                        &HashMap::new(),
                     )?;
                     conditions.push(frag.sql);
                     params.extend(frag.params);
@@ -13228,8 +13755,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         return None;
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
-                    let cols =
-                        analyze_map_select(bind_var, body, &alias, &schema)?;
+                    let cols = analyze_map_select(bind_var, body, &alias, &schema)?;
                     // A non-record body yields bare values, not records.
                     map_is_scalar = !matches!(&body.node, ast::ExprKind::Record(_));
                     select_override = Some(cols);
@@ -13272,7 +13798,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
-                    aggregate = Some(("SUM", col_sql, sum_result_is_float(bind_var, body, &schema)));
+                    aggregate =
+                        Some(("SUM", col_sql, sum_result_is_float(bind_var, body, &schema)));
                 }
                 PipeOp::SumDirect => {
                     // Direct `rel |> sum`. For `rel |> map f |> sum` the prior
@@ -13340,7 +13867,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     bind_schemas.insert(bind_var.clone(), schema.clone());
                     let frag = Self::try_compile_multi_table_sql_expr(
-                        &bind_aliases, &bind_schemas, body, env, &HashMap::new(),
+                        &bind_aliases,
+                        &bind_schemas,
+                        body,
+                        env,
+                        &HashMap::new(),
                     )?;
                     conditions.push(frag.sql);
                     params.extend(frag.params);
@@ -13362,7 +13893,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             let query = Query {
                 plan: SqlQueryPlan {
-                    tables: vec![SqlTable { source_name, alias, subquery: None }],
+                    tables: vec![SqlTable {
+                        source_name,
+                        alias,
+                        subquery: None,
+                    }],
                     conditions,
                     params,
                     select_columns: Vec::new(),
@@ -13370,10 +13905,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     limit: None,
                     offset: None,
                     distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
+                    group_by: Vec::new(),
+                    having: Vec::new(),
                 },
-                terminal: QueryTerminal::Aggregate { func, col_sql, result_flag },
+                terminal: QueryTerminal::Aggregate {
+                    func,
+                    col_sql,
+                    result_flag,
+                },
             };
             Some(self.emit_query(builder, &query, &schema, env, db, None, Some(expr.span)))
         } else if is_count {
@@ -13384,10 +13923,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             // Quirk preserved: bare `FROM t` when no conditions (no qualified
             // column refs), `FROM t AS alias` when conditions reference t0.*.
-            let alias = if conditions.is_empty() { String::new() } else { alias };
+            let alias = if conditions.is_empty() {
+                String::new()
+            } else {
+                alias
+            };
             let query = Query {
                 plan: SqlQueryPlan {
-                    tables: vec![SqlTable { source_name, alias, subquery: None }],
+                    tables: vec![SqlTable {
+                        source_name,
+                        alias,
+                        subquery: None,
+                    }],
                     conditions,
                     params,
                     select_columns: Vec::new(),
@@ -13395,8 +13942,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     limit: None,
                     offset: None,
                     distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
+                    group_by: Vec::new(),
+                    having: Vec::new(),
                 },
                 terminal: QueryTerminal::Count,
             };
@@ -13418,8 +13965,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let full_col_count = parse_schema_columns(&schema).len();
             let mut distinct = false;
             let select_columns = if let Some(cols) = select_override {
-                distinct = cols.len() < full_col_count
-                    || cols.iter().any(|c| c.sql_expr.is_some());
+                distinct = cols.len() < full_col_count || cols.iter().any(|c| c.sql_expr.is_some());
                 cols
             } else {
                 // SELECT * — all columns from schema
@@ -13563,7 +14109,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 expr_span,
             );
         };
-        Some(self.emit_query(builder, &suffix_query, &result_schema, env, db, None, Some(expr_span)))
+        Some(self.emit_query(
+            builder,
+            &suffix_query,
+            &result_schema,
+            env,
+            db,
+            None,
+            Some(expr_span),
+        ))
     }
 
     /// Recursive helper for `try_compile_staged_pipe` when the suffix is itself
@@ -13636,7 +14190,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 expr_span,
             );
         };
-        Some(self.emit_query(builder, &suffix_query, &result_schema, env, db, None, Some(expr_span)))
+        Some(self.emit_query(
+            builder,
+            &suffix_query,
+            &result_schema,
+            env,
+            db,
+            None,
+            Some(expr_span),
+        ))
     }
 
     /// Build a `Query` for a canonical-order op list over a single table (a
@@ -13679,7 +14241,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     bind_schemas.insert(bind_var.clone(), schema.clone());
                     let frag = Self::try_compile_multi_table_sql_expr(
-                        &bind_aliases, &bind_schemas, body, env, &HashMap::new(),
+                        &bind_aliases,
+                        &bind_schemas,
+                        body,
+                        env,
+                        &HashMap::new(),
                     )?;
                     conditions.push(frag.sql);
                     params.extend(frag.params);
@@ -13728,7 +14294,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
-                    aggregate = Some(("SUM", col_sql, sum_result_is_float(bind_var, body, &schema)));
+                    aggregate =
+                        Some(("SUM", col_sql, sum_result_is_float(bind_var, body, &schema)));
                 }
                 PipeOp::SumDirect => {
                     if is_count || aggregate.is_some() {
@@ -13786,7 +14353,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     bind_schemas.insert(bind_var.clone(), schema.clone());
                     let frag = Self::try_compile_multi_table_sql_expr(
-                        &bind_aliases, &bind_schemas, body, env, &HashMap::new(),
+                        &bind_aliases,
+                        &bind_schemas,
+                        body,
+                        env,
+                        &HashMap::new(),
                     )?;
                     conditions.push(frag.sql);
                     params.extend(frag.params);
@@ -13809,10 +14380,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     limit: None,
                     offset: None,
                     distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
+                    group_by: Vec::new(),
+                    having: Vec::new(),
                 },
-                terminal: QueryTerminal::Aggregate { func, col_sql, result_flag },
+                terminal: QueryTerminal::Aggregate {
+                    func,
+                    col_sql,
+                    result_flag,
+                },
             };
             let result_schema = schema.clone();
             Some((query, result_schema))
@@ -13830,8 +14405,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     limit: None,
                     offset: None,
                     distinct: false,
-            group_by: Vec::new(),
-            having: Vec::new(),
+                    group_by: Vec::new(),
+                    having: Vec::new(),
                 },
                 terminal: QueryTerminal::Count,
             };
@@ -13844,8 +14419,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let full_col_count = parse_schema_columns(&schema).len();
             let mut distinct = false;
             let select_columns = if let Some(cols) = select_override {
-                distinct = cols.len() < full_col_count
-                    || cols.iter().any(|c| c.sql_expr.is_some());
+                distinct = cols.len() < full_col_count || cols.iter().any(|c| c.sql_expr.is_some());
                 cols
             } else {
                 parse_schema_columns(&schema)
@@ -13872,17 +14446,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 having: Vec::new(),
             };
             let result_schema = plan.build_result_schema();
-            Some((Query { plan, terminal: QueryTerminal::Rows }, result_schema))
+            Some((
+                Query {
+                    plan,
+                    terminal: QueryTerminal::Rows,
+                },
+                result_schema,
+            ))
         }
     }
 
     /// Try to compile a set-op argument (one side of diff/inter/union) to a SQL subquery.
     /// Handles: bare *source, bound variable, filter f *source, and do-block SQL plans.
-    fn try_set_op_subquery(
-        &self,
-        expr: &ast::Expr,
-        env: &Env,
-    ) -> Option<SetOpSubquery> {
+    fn try_set_op_subquery(&self, expr: &ast::Expr, env: &Env) -> Option<SetOpSubquery> {
         // Case 1: bare *source or bound variable
         if let Some(source_name) = self.resolve_source(expr) {
             let schema = self.source_schemas.get(&source_name)?;
@@ -13890,7 +14466,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 return None;
             }
             let table = quote_sql_ident(&format!("_knot_{}", source_name));
-            let cols = parse_schema_columns(schema).iter()
+            let cols = parse_schema_columns(schema)
+                .iter()
                 .map(|(name, _)| quote_sql_ident(name))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -13903,9 +14480,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
         }
 
         // Case 2: filter f *source
-        if let Some((source_name, filter_bind, filter_body)) =
-            extract_filter_on_source(expr, &self.source_var_binds, &self.fun_bodies, &self.let_bindings)
-        {
+        if let Some((source_name, filter_bind, filter_body)) = extract_filter_on_source(
+            expr,
+            &self.source_var_binds,
+            &self.fun_bodies,
+            &self.let_bindings,
+        ) {
             let source_name: &str = &source_name;
             let filter_body: &ast::Expr = &filter_body;
             let schema = self.source_schemas.get(source_name)?;
@@ -13914,7 +14494,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             let frag = self.try_compile_sql_expr(&filter_bind, filter_body, schema)?;
             let table = quote_sql_ident(&format!("_knot_{}", source_name));
-            let cols = parse_schema_columns(schema).iter()
+            let cols = parse_schema_columns(schema)
+                .iter()
                 .map(|(name, _)| quote_sql_ident(name))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -13972,8 +14553,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             // `sum rel` where rel is `map (\r->r.f) v` (1 arg).
             "sum" if args.len() == 1 => {
-                let lambda =
-                    peel_group_map(&args[0], gvar, &self.fun_bodies, &self.let_bindings)?;
+                let lambda = peel_group_map(&args[0], gvar, &self.fun_bodies, &self.let_bindings)?;
                 let (pb, body) =
                     extract_single_param_lambda(&lambda, &self.fun_bodies, &self.let_bindings)?;
                 let col = extract_sql_field_access(&pb, &body, alias, schema)?;
@@ -14037,8 +14617,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         Some(format!("({} {} {})", l, kw, r))
                     }
                     B::Eq | B::Neq | B::Lt | B::Gt | B::Le | B::Ge => {
-                        let l = self.having_operand_sql(gvar, alias, schema, group_keys, lhs, env)?;
-                        let r = self.having_operand_sql(gvar, alias, schema, group_keys, rhs, env)?;
+                        let l =
+                            self.having_operand_sql(gvar, alias, schema, group_keys, lhs, env)?;
+                        let r =
+                            self.having_operand_sql(gvar, alias, schema, group_keys, rhs, env)?;
                         let sym = match op {
                             B::Eq => "=",
                             B::Neq => "!=",
@@ -14053,9 +14635,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     _ => None,
                 }
             }
-            ast::ExprKind::UnaryOp { op: ast::UnaryOp::Not, operand } => {
-                let inner =
-                    self.translate_having(gvar, alias, schema, group_keys, operand, env)?;
+            ast::ExprKind::UnaryOp {
+                op: ast::UnaryOp::Not,
+                operand,
+            } => {
+                let inner = self.translate_having(gvar, alias, schema, group_keys, operand, env)?;
                 Some(format!("(NOT {})", inner))
             }
             _ => None,
@@ -14074,7 +14658,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         env: &Env,
     ) -> Option<String> {
         // Group-key column reference `v.col`.
-        if let ast::ExprKind::FieldAccess { expr: e, field: col } = &expr.node
+        if let ast::ExprKind::FieldAccess {
+            expr: e,
+            field: col,
+        } = &expr.node
             && let ast::ExprKind::Var(v) = &e.node
             && v == gvar
         {
@@ -14102,11 +14689,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         None
     }
 
-    fn analyze_sql_plan(
-        &self,
-        stmts: &[ast::Stmt],
-        env: &Env,
-    ) -> Option<SqlQueryPlan> {
+    fn analyze_sql_plan(&self, stmts: &[ast::Stmt], env: &Env) -> Option<SqlQueryPlan> {
         if stmts.is_empty() {
             return None;
         }
@@ -14178,13 +14761,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         let gvar = group_var.clone().unwrap();
                         let alias = bind_to_alias.get(&gvar)?.clone();
                         let gschema = bind_to_schema.get(&gvar)?.clone();
-                        let h = self.translate_having(
-                            &gvar, &alias, &gschema, &group_keys, cond, env,
-                        )?;
+                        let h =
+                            self.translate_having(&gvar, &alias, &gschema, &group_keys, cond, env)?;
                         having_conditions.push(h);
                     } else {
                         let frag = Self::try_compile_multi_table_sql_expr(
-                            &bind_to_alias, &bind_to_schema, cond, env, &let_binds,
+                            &bind_to_alias,
+                            &bind_to_schema,
+                            cond,
+                            env,
+                            &let_binds,
                         )?;
                         conditions.push(frag.sql);
                         params.extend(frag.params);
@@ -14228,9 +14814,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // Parse the yield statement
         let yield_expr = match &stmts.last()?.node {
-            ast::StmtKind::Expr(e) => {
-                e.node.as_yield_arg()?
-            }
+            ast::StmtKind::Expr(e) => e.node.as_yield_arg()?,
             _ => return None,
         };
 
@@ -14251,8 +14835,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         && let ast::ExprKind::Var(v) = &expr.node
                         && *v == gvar
                     {
-                        if let Some((_, csql, cty)) =
-                            group_keys.iter().find(|(n, _, _)| n == col || n == &field.name)
+                        if let Some((_, csql, cty)) = group_keys
+                            .iter()
+                            .find(|(n, _, _)| n == col || n == &field.name)
                         {
                             select_columns.push(SqlSelectColumn {
                                 result_field: field.name.clone(),
@@ -14280,27 +14865,32 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::Record(fields) => {
                 for field in fields {
                     // Try simple field access first: var.column
-                    if let ast::ExprKind::FieldAccess { expr, field: col_name } = &field.value.node
+                    if let ast::ExprKind::FieldAccess {
+                        expr,
+                        field: col_name,
+                    } = &field.value.node
                         && let ast::ExprKind::Var(var_name) = &expr.node
-                            && let Some(alias) = bind_to_alias.get(var_name.as_str())
-                                && let Some(schema) = bind_to_schema.get(var_name.as_str())
-                                    && let Some(type_str) = lookup_col_type_from_schema(schema, col_name) {
-                                        select_columns.push(SqlSelectColumn {
-                                            result_field: field.name.clone(),
-                                            alias: alias.clone(),
-                                            source_col: col_name.clone(),
-                                            type_str,
-                                            sql_expr: None,
-                                        });
-                                        continue;
-                                    }
+                        && let Some(alias) = bind_to_alias.get(var_name.as_str())
+                        && let Some(schema) = bind_to_schema.get(var_name.as_str())
+                        && let Some(type_str) = lookup_col_type_from_schema(schema, col_name)
+                    {
+                        select_columns.push(SqlSelectColumn {
+                            result_field: field.name.clone(),
+                            alias: alias.clone(),
+                            source_col: col_name.clone(),
+                            type_str,
+                            sql_expr: None,
+                        });
+                        continue;
+                    }
                     // Fallback: try computed expression (arithmetic, CASE WHEN)
                     let sql_expr = try_multi_table_arithmetic_expr(
-                        &bind_to_alias, &bind_to_schema, &field.value,
+                        &bind_to_alias,
+                        &bind_to_schema,
+                        &field.value,
                     )?;
-                    let type_str = infer_multi_table_sql_expr_type(
-                        &bind_to_schema, &field.value,
-                    ).unwrap_or_else(|| "float".to_string());
+                    let type_str = infer_multi_table_sql_expr_type(&bind_to_schema, &field.value)
+                        .unwrap_or_else(|| "float".to_string());
                     select_columns.push(SqlSelectColumn {
                         result_field: field.name.clone(),
                         alias: String::new(),
@@ -14331,8 +14921,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // A grouped query projects exactly its keys + aggregates (enforced by
         // the grouped-yield arm above). Populate GROUP BY from the key columns.
-        let group_by: Vec<String> =
-            group_keys.iter().map(|(_, csql, _)| csql.clone()).collect();
+        let group_by: Vec<String> = group_keys.iter().map(|(_, csql, _)| csql.clone()).collect();
 
         Some(SqlQueryPlan {
             tables,
@@ -14390,8 +14979,20 @@ impl<M: cranelift_module::Module> Codegen<M> {
         match &expr.node {
             ast::ExprKind::BinOp { op, lhs, rhs } => match op {
                 ast::BinOp::And => {
-                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, lhs, env, let_binds)?;
-                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, rhs, env, let_binds)?;
+                    let l = Self::try_compile_multi_table_sql_expr(
+                        bind_aliases,
+                        bind_schemas,
+                        lhs,
+                        env,
+                        let_binds,
+                    )?;
+                    let r = Self::try_compile_multi_table_sql_expr(
+                        bind_aliases,
+                        bind_schemas,
+                        rhs,
+                        env,
+                        let_binds,
+                    )?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -14400,8 +15001,20 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     })
                 }
                 ast::BinOp::Or => {
-                    let l = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, lhs, env, let_binds)?;
-                    let r = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, rhs, env, let_binds)?;
+                    let l = Self::try_compile_multi_table_sql_expr(
+                        bind_aliases,
+                        bind_schemas,
+                        lhs,
+                        env,
+                        let_binds,
+                    )?;
+                    let r = Self::try_compile_multi_table_sql_expr(
+                        bind_aliases,
+                        bind_schemas,
+                        rhs,
+                        env,
+                        let_binds,
+                    )?;
                     let mut params = l.params;
                     params.extend(r.params);
                     Some(SqlFragment {
@@ -14409,8 +15022,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         params,
                     })
                 }
-                ast::BinOp::Eq | ast::BinOp::Neq | ast::BinOp::Lt
-                | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge => {
+                ast::BinOp::Eq
+                | ast::BinOp::Neq
+                | ast::BinOp::Lt
+                | ast::BinOp::Gt
+                | ast::BinOp::Le
+                | ast::BinOp::Ge => {
                     let sql_op = match op {
                         ast::BinOp::Eq => "=",
                         ast::BinOp::Neq => "!=",
@@ -14420,23 +15037,41 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         ast::BinOp::Ge => ">=",
                         _ => unreachable!(),
                     };
-                    Self::try_compile_multi_table_comparison(bind_aliases, bind_schemas, lhs, rhs, sql_op, env, let_binds)
-                        .or_else(|| {
-                            let rev = match sql_op {
-                                "=" | "!=" => sql_op,
-                                "<" => ">",
-                                ">" => "<",
-                                "<=" => ">=",
-                                ">=" => "<=",
-                                _ => return None,
-                            };
-                            Self::try_compile_multi_table_comparison(
-                                bind_aliases, bind_schemas, rhs, lhs, rev, env, let_binds,
-                            )
-                        })
+                    Self::try_compile_multi_table_comparison(
+                        bind_aliases,
+                        bind_schemas,
+                        lhs,
+                        rhs,
+                        sql_op,
+                        env,
+                        let_binds,
+                    )
+                    .or_else(|| {
+                        let rev = match sql_op {
+                            "=" | "!=" => sql_op,
+                            "<" => ">",
+                            ">" => "<",
+                            "<=" => ">=",
+                            ">=" => "<=",
+                            _ => return None,
+                        };
+                        Self::try_compile_multi_table_comparison(
+                            bind_aliases,
+                            bind_schemas,
+                            rhs,
+                            lhs,
+                            rev,
+                            env,
+                            let_binds,
+                        )
+                    })
                 }
-                ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul | ast::BinOp::Div
-                | ast::BinOp::Mod | ast::BinOp::Concat => {
+                ast::BinOp::Add
+                | ast::BinOp::Sub
+                | ast::BinOp::Mul
+                | ast::BinOp::Div
+                | ast::BinOp::Mod
+                | ast::BinOp::Concat => {
                     // Arithmetic/concat in WHERE: try to compile both sides as SQL atoms.
                     // `/` and `%` only push down with a provably-nonzero literal
                     // divisor (matching every other arithmetic site): SQLite yields
@@ -14467,7 +15102,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 op: ast::UnaryOp::Not,
                 operand,
             } => {
-                let inner = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, operand, env, let_binds)?;
+                let inner = Self::try_compile_multi_table_sql_expr(
+                    bind_aliases,
+                    bind_schemas,
+                    operand,
+                    env,
+                    let_binds,
+                )?;
                 Some(SqlFragment {
                     sql: format!("NOT ({})", inner.sql),
                     params: inner.params,
@@ -14476,27 +15117,39 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // `not expr` function application form → NOT (...)
             ast::ExprKind::App { func, arg } => {
                 if let ast::ExprKind::Var(name) = &func.node
-                    && name == "not" {
-                        let inner = Self::try_compile_multi_table_sql_expr(bind_aliases, bind_schemas, arg, env, let_binds)?;
-                        return Some(SqlFragment {
-                            sql: format!("NOT ({})", inner.sql),
-                            params: inner.params,
-                        });
-                    }
+                    && name == "not"
+                {
+                    let inner = Self::try_compile_multi_table_sql_expr(
+                        bind_aliases,
+                        bind_schemas,
+                        arg,
+                        env,
+                        let_binds,
+                    )?;
+                    return Some(SqlFragment {
+                        sql: format!("NOT ({})", inner.sql),
+                        params: inner.params,
+                    });
+                }
                 // Two-arg builtins: App(App(<head>, arg1), arg2). Accept both
                 // `contains` and the `base.`-qualified form.
-                if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node
-                    && Self::query_form_name(inner_func) == Some("contains") {
-                            // contains needle haystack → INSTR(haystack, needle) > 0
-                            let needle = Self::try_compile_sql_atom(bind_aliases, first_arg, env, let_binds)?;
-                            let haystack = Self::try_compile_sql_atom(bind_aliases, arg, env, let_binds)?;
-                            let mut params = haystack.params;
-                            params.extend(needle.params);
-                            return Some(SqlFragment {
-                                sql: format!("INSTR({}, {}) > 0", haystack.sql, needle.sql),
-                                params,
-                            });
-                        }
+                if let ast::ExprKind::App {
+                    func: inner_func,
+                    arg: first_arg,
+                } = &func.node
+                    && Self::query_form_name(inner_func) == Some("contains")
+                {
+                    // contains needle haystack → INSTR(haystack, needle) > 0
+                    let needle =
+                        Self::try_compile_sql_atom(bind_aliases, first_arg, env, let_binds)?;
+                    let haystack = Self::try_compile_sql_atom(bind_aliases, arg, env, let_binds)?;
+                    let mut params = haystack.params;
+                    params.extend(needle.params);
+                    return Some(SqlFragment {
+                        sql: format!("INSTR({}, {}) > 0", haystack.sql, needle.sql),
+                        params,
+                    });
+                }
                 None
             }
             _ => None,
@@ -14707,31 +15360,77 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 use ast::BinOp as B;
                 match op {
                     B::And | B::Or => {
-                        let l = self.translate_correlated_pred(inner_var, inner_schema, outer_var, outer_src, lhs)?;
-                        let r = self.translate_correlated_pred(inner_var, inner_schema, outer_var, outer_src, rhs)?;
+                        let l = self.translate_correlated_pred(
+                            inner_var,
+                            inner_schema,
+                            outer_var,
+                            outer_src,
+                            lhs,
+                        )?;
+                        let r = self.translate_correlated_pred(
+                            inner_var,
+                            inner_schema,
+                            outer_var,
+                            outer_src,
+                            rhs,
+                        )?;
                         let kw = if matches!(op, B::And) { "AND" } else { "OR" };
                         let mut params = l.params;
                         params.extend(r.params);
-                        Some(SqlFragment { sql: format!("({} {} {})", l.sql, kw, r.sql), params })
+                        Some(SqlFragment {
+                            sql: format!("({} {} {})", l.sql, kw, r.sql),
+                            params,
+                        })
                     }
                     B::Eq | B::Neq | B::Lt | B::Gt | B::Le | B::Ge => {
-                        let l = self.correlated_operand(inner_var, inner_schema, outer_var, outer_src, lhs)?;
-                        let r = self.correlated_operand(inner_var, inner_schema, outer_var, outer_src, rhs)?;
+                        let l = self.correlated_operand(
+                            inner_var,
+                            inner_schema,
+                            outer_var,
+                            outer_src,
+                            lhs,
+                        )?;
+                        let r = self.correlated_operand(
+                            inner_var,
+                            inner_schema,
+                            outer_var,
+                            outer_src,
+                            rhs,
+                        )?;
                         let sym = match op {
-                            B::Eq => "=", B::Neq => "!=", B::Lt => "<",
-                            B::Gt => ">", B::Le => "<=", B::Ge => ">=",
+                            B::Eq => "=",
+                            B::Neq => "!=",
+                            B::Lt => "<",
+                            B::Gt => ">",
+                            B::Le => "<=",
+                            B::Ge => ">=",
                             _ => unreachable!(),
                         };
                         let mut params = l.params;
                         params.extend(r.params);
-                        Some(SqlFragment { sql: format!("({} {} {})", l.sql, sym, r.sql), params })
+                        Some(SqlFragment {
+                            sql: format!("({} {} {})", l.sql, sym, r.sql),
+                            params,
+                        })
                     }
                     _ => None,
                 }
             }
-            ast::ExprKind::UnaryOp { op: ast::UnaryOp::Not, operand } => {
-                let inner = self.translate_correlated_pred(inner_var, inner_schema, outer_var, outer_src, operand)?;
-                Some(SqlFragment { sql: format!("(NOT {})", inner.sql), params: inner.params })
+            ast::ExprKind::UnaryOp {
+                op: ast::UnaryOp::Not,
+                operand,
+            } => {
+                let inner = self.translate_correlated_pred(
+                    inner_var,
+                    inner_schema,
+                    outer_var,
+                    outer_src,
+                    operand,
+                )?;
+                Some(SqlFragment {
+                    sql: format!("(NOT {})", inner.sql),
+                    params: inner.params,
+                })
             }
             _ => None,
         }
@@ -14747,12 +15446,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
         outer_src: &str,
         expr: &ast::Expr,
     ) -> Option<SqlFragment> {
-        if let ast::ExprKind::FieldAccess { expr: e, field: col } = &expr.node
+        if let ast::ExprKind::FieldAccess {
+            expr: e,
+            field: col,
+        } = &expr.node
             && let ast::ExprKind::Var(v) = &e.node
         {
             if v == inner_var {
                 lookup_col_type_from_schema(inner_schema, col)?;
-                return Some(SqlFragment { sql: quote_sql_ident(col), params: vec![] });
+                return Some(SqlFragment {
+                    sql: quote_sql_ident(col),
+                    params: vec![],
+                });
             }
             if v == outer_var {
                 return Some(SqlFragment {
@@ -14808,8 +15513,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         params,
                     })
                 }
-                ast::BinOp::Eq | ast::BinOp::Neq | ast::BinOp::Lt
-                | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge => {
+                ast::BinOp::Eq
+                | ast::BinOp::Neq
+                | ast::BinOp::Lt
+                | ast::BinOp::Gt
+                | ast::BinOp::Le
+                | ast::BinOp::Ge => {
                     let sql_op = match op {
                         ast::BinOp::Eq => "=",
                         ast::BinOp::Neq => "!=",
@@ -14906,13 +15615,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // `contains needle haystack` → INSTR(haystack, needle) > 0
             ast::ExprKind::App { func, arg } => {
                 if let ast::ExprKind::Var(name) = &func.node
-                    && name == "not" {
-                        let inner = self.try_compile_sql_expr(bind_var, arg, schema)?;
-                        return Some(SqlFragment {
-                            sql: format!("NOT ({})", inner.sql),
-                            params: inner.params,
-                        });
-                    }
+                    && name == "not"
+                {
+                    let inner = self.try_compile_sql_expr(bind_var, arg, schema)?;
+                    return Some(SqlFragment {
+                        sql: format!("NOT ({})", inner.sql),
+                        params: inner.params,
+                    });
+                }
                 // Correlated EXISTS: `any pred *other` / `all pred *other`
                 // where pred references BOTH the inner row (its lambda param)
                 // and the current (outer) row `bind_var`. Emits
@@ -14921,7 +15631,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // a same-named inner column; the inner columns are
                 // unqualified (innermost scope). Byte-identical: the EXISTS
                 // row set equals the in-memory any/all over the same rows.
-                if let ast::ExprKind::App { func: inner_func, arg: pred_lambda } = &func.node
+                if let ast::ExprKind::App {
+                    func: inner_func,
+                    arg: pred_lambda,
+                } = &func.node
                     && let Some(fname) = Self::query_form_name(inner_func)
                     && matches!(fname, "any" | "all")
                 {
@@ -14930,7 +15643,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         && !sub_schema.starts_with('#')
                         && !sub_schema.contains('[')
                         && let Some((inner_var, inner_body)) = extract_single_param_lambda(
-                            pred_lambda, &self.fun_bodies, &self.let_bindings,
+                            pred_lambda,
+                            &self.fun_bodies,
+                            &self.let_bindings,
                         )
                     {
                         // Reverse-lookup the outer source name from its schema
@@ -14943,7 +15658,11 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             .map(|(n, _)| n.clone())?;
                         let inner_body: &ast::Expr = &inner_body;
                         let frag = self.translate_correlated_pred(
-                            &inner_var, &sub_schema, bind_var, &outer_src, inner_body,
+                            &inner_var,
+                            &sub_schema,
+                            bind_var,
+                            &outer_src,
+                            inner_body,
                         )?;
                         // all pred rel  ⇔  no row FAILS pred  ⇔
                         // NOT EXISTS(SELECT 1 WHERE NOT pred). Negate both the
@@ -14959,170 +15678,173 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             quote_sql_ident(&format!("_knot_{}", sub_src)),
                             where_sql,
                         );
-                        return Some(SqlFragment { sql: sub_sql, params: frag.params });
+                        return Some(SqlFragment {
+                            sql: sub_sql,
+                            params: frag.params,
+                        });
                     }
                     return None;
                 }
                 // Two-arg builtins: App(App(<head>, arg1), arg2). Accept both
                 // `contains`/`elem` and the `base.`-qualified forms.
-                if let ast::ExprKind::App { func: inner_func, arg: first_arg } = &func.node
-                    && let Some(name) = Self::query_form_name(inner_func) {
-                        // `startsWith prefix col` / `endsWith suffix col` →
-                        // `col GLOB '<pat>*'` / `col GLOB '*<pat>'`. GLOB (not
-                        // LIKE) because Rust's starts_with/ends_with are
-                        // case-sensitive and GLOB matches case-sensitively,
-                        // whereas SQLite LIKE is ASCII-case-insensitive by
-                        // default — so LIKE would NOT be byte-identical. The
-                        // column must be the bind var's Text field; the
-                        // pattern must be a Text literal with every GLOB
-                        // metacharacter (`* ? [ ]`) and the escape char
-                        // escaped, otherwise the in-memory and SQL results
-                        // diverge → fall back.
-                        if matches!(name, "startsWith" | "endsWith") {
-                            let col_frag = Self::try_compile_single_table_atom(bind_var, arg)?;
-                            if !col_frag.params.is_empty() {
-                                // Column must be a plain field access, not a param.
-                                return None;
-                            }
-                            // Pattern must be a Text literal we can escape.
-                            if let ast::ExprKind::Lit(ast::Literal::Text(pat)) = &first_arg.node {
-                                let escaped = escape_glob_pattern(pat);
-                                let glob = if name == "startsWith" {
-                                    format!("'{}*'", escaped)
-                                } else {
-                                    format!("'*{}'", escaped)
-                                };
+                if let ast::ExprKind::App {
+                    func: inner_func,
+                    arg: first_arg,
+                } = &func.node
+                    && let Some(name) = Self::query_form_name(inner_func)
+                {
+                    // `startsWith prefix col` / `endsWith suffix col` →
+                    // `col GLOB '<pat>*'` / `col GLOB '*<pat>'`. GLOB (not
+                    // LIKE) because Rust's starts_with/ends_with are
+                    // case-sensitive and GLOB matches case-sensitively,
+                    // whereas SQLite LIKE is ASCII-case-insensitive by
+                    // default — so LIKE would NOT be byte-identical. The
+                    // column must be the bind var's Text field; the
+                    // pattern must be a Text literal with every GLOB
+                    // metacharacter (`* ? [ ]`) and the escape char
+                    // escaped, otherwise the in-memory and SQL results
+                    // diverge → fall back.
+                    if matches!(name, "startsWith" | "endsWith") {
+                        let col_frag = Self::try_compile_single_table_atom(bind_var, arg)?;
+                        if !col_frag.params.is_empty() {
+                            // Column must be a plain field access, not a param.
+                            return None;
+                        }
+                        // Pattern must be a Text literal we can escape.
+                        if let ast::ExprKind::Lit(ast::Literal::Text(pat)) = &first_arg.node {
+                            let escaped = escape_glob_pattern(pat);
+                            let glob = if name == "startsWith" {
+                                format!("'{}*'", escaped)
+                            } else {
+                                format!("'*{}'", escaped)
+                            };
+                            return Some(SqlFragment {
+                                sql: format!("{} GLOB {}", col_frag.sql, glob),
+                                params: vec![],
+                            });
+                        }
+                        return None;
+                    }
+                    if name == "contains" {
+                        let needle = Self::try_compile_single_table_atom(bind_var, first_arg)?;
+                        let haystack = Self::try_compile_single_table_atom(bind_var, arg)?;
+                        let mut params = haystack.params;
+                        params.extend(needle.params);
+                        return Some(SqlFragment {
+                            sql: format!("INSTR({}, {}) > 0", haystack.sql, needle.sql),
+                            params,
+                        });
+                    }
+                    if name == "elem" {
+                        let needle = Self::try_compile_single_table_atom(bind_var, first_arg)?;
+                        // (a) Literal list: emit `IN (?, ?, …)` directly so
+                        //     SQLite can compare each element by type
+                        //     affinity without going through json_each.
+                        if let ast::ExprKind::List(elems) = &arg.node {
+                            if elems.is_empty() {
                                 return Some(SqlFragment {
-                                    sql: format!("{} GLOB {}", col_frag.sql, glob),
+                                    sql: "0".to_string(),
                                     params: vec![],
                                 });
                             }
-                            return None;
-                        }
-                        if name == "contains" {
-                            let needle = Self::try_compile_single_table_atom(bind_var, first_arg)?;
-                            let haystack = Self::try_compile_single_table_atom(bind_var, arg)?;
-                            let mut params = haystack.params;
-                            params.extend(needle.params);
+                            // `IN` is equality under the hood, so — like the
+                            // dynamic path below — only push down when
+                            // inference marked the haystack's element type a
+                            // SQL-pushable scalar. This excludes floats
+                            // (total_cmp treats -0.0 ≠ +0.0 and NaN as
+                            // comparable, SQL doesn't), regardless of whether
+                            // the needle is a column, a computed value, or a
+                            // literal. Non-pushable → fall back to memory.
+                            if !self.elem_pushdown_ok.literal.contains(&arg.span) {
+                                return None;
+                            }
+                            // An arithmetic needle (e.g. `x.a + x.b`)
+                            // evaluates to an INTEGER in SQLite, but Int list
+                            // elements bind as TEXT, so a raw `8 IN ('10','20')`
+                            // is a storage-class mismatch that never matches.
+                            // Cast both the needle and every element to
+                            // NUMERIC (mirrors the comparison path's CastInt
+                            // handling). A bare-column needle keeps its TEXT
+                            // affinity/collation, so only arithmetic needs it.
+                            let needle_arith = cast_arithmetic_for_where(&needle.sql) != needle.sql;
+                            let mut parts = Vec::with_capacity(elems.len());
+                            let mut params = needle.params;
+                            for e in elems {
+                                let frag = Self::try_compile_single_table_atom(bind_var, e)?;
+                                parts.push(if needle_arith {
+                                    format!("CAST({} AS NUMERIC)", frag.sql)
+                                } else {
+                                    frag.sql
+                                });
+                                params.extend(frag.params);
+                            }
+                            let needle_sql = if needle_arith {
+                                format!("CAST({} AS NUMERIC)", needle.sql)
+                            } else {
+                                needle.sql
+                            };
                             return Some(SqlFragment {
-                                sql: format!("INSTR({}, {}) > 0", haystack.sql, needle.sql),
+                                sql: format!("{} IN ({})", needle_sql, parts.join(", ")),
                                 params,
                             });
                         }
-                        if name == "elem" {
-                            let needle = Self::try_compile_single_table_atom(bind_var, first_arg)?;
-                            // (a) Literal list: emit `IN (?, ?, …)` directly so
-                            //     SQLite can compare each element by type
-                            //     affinity without going through json_each.
-                            if let ast::ExprKind::List(elems) = &arg.node {
-                                if elems.is_empty() {
-                                    return Some(SqlFragment {
-                                        sql: "0".to_string(),
-                                        params: vec![],
-                                    });
-                                }
-                                // `IN` is equality under the hood, so — like the
-                                // dynamic path below — only push down when
-                                // inference marked the haystack's element type a
-                                // SQL-pushable scalar. This excludes floats
-                                // (total_cmp treats -0.0 ≠ +0.0 and NaN as
-                                // comparable, SQL doesn't), regardless of whether
-                                // the needle is a column, a computed value, or a
-                                // literal. Non-pushable → fall back to memory.
-                                if !self.elem_pushdown_ok.literal.contains(&arg.span) {
-                                    return None;
-                                }
-                                // An arithmetic needle (e.g. `x.a + x.b`)
-                                // evaluates to an INTEGER in SQLite, but Int list
-                                // elements bind as TEXT, so a raw `8 IN ('10','20')`
-                                // is a storage-class mismatch that never matches.
-                                // Cast both the needle and every element to
-                                // NUMERIC (mirrors the comparison path's CastInt
-                                // handling). A bare-column needle keeps its TEXT
-                                // affinity/collation, so only arithmetic needs it.
-                                let needle_arith =
-                                    cast_arithmetic_for_where(&needle.sql) != needle.sql;
-                                let mut parts = Vec::with_capacity(elems.len());
-                                let mut params = needle.params;
-                                for e in elems {
-                                    let frag = Self::try_compile_single_table_atom(bind_var, e)?;
-                                    parts.push(if needle_arith {
-                                        format!("CAST({} AS NUMERIC)", frag.sql)
-                                    } else {
-                                        frag.sql
-                                    });
-                                    params.extend(frag.params);
-                                }
-                                let needle_sql = if needle_arith {
-                                    format!("CAST({} AS NUMERIC)", needle.sql)
-                                } else {
-                                    needle.sql
-                                };
-                                return Some(SqlFragment {
-                                    sql: format!("{} IN ({})", needle_sql, parts.join(", ")),
-                                    params,
-                                });
-                            }
-                            // (c) Relation-derived haystack: `elem x (*src |>
-                            //     map (\u -> u.col))` (or the un-piped
-                            //     `map (\u -> u.col) *src`). Emit a real
-                            //     sub-select `x IN (SELECT col FROM src)`. The
-                            //     column keeps its own affinity/collation, so
-                            //     this is byte-identical for Text/Bool/Uuid
-                            //     columns (the same scalars the dynamic set
-                            //     allows). Int/Float stay in memory: an Int
-                            //     column is TEXT-stored, and a sub-select
-                            //     comparing it to an INTEGER-affinity needle
-                            //     hits the same storage-class mismatch as
-                            //     json_each. Runs before the dynamic branch
-                            //     since a real sub-select is strictly better
-                            //     (no JSON round-trip) when it applies. Gated
-                            //     on the projected column's own schema type,
-                            //     NOT the `dynamic` span set (which is for the
-                            //     json_each form and doesn't cover relation
-                            //     projections).
-                            if !Self::expr_refs_var(arg, bind_var)
-                                && let Some((sub_src, sub_col)) = self.peel_map_projection(arg)
-                                && let Some(sub_schema) = self.source_schemas.get(&sub_src).cloned()
-                                && let Some(sub_ty) = lookup_col_type_from_schema(&sub_schema, &sub_col)
-                                && matches!(sub_ty.as_str(), "text" | "bool" | "uuid")
-                            {
-                                let sub_sql = format!(
-                                    "SELECT {} FROM {}",
-                                    quote_sql_ident(&sub_col),
-                                    quote_sql_ident(&format!("_knot_{}", sub_src)),
-                                );
-                                let params = needle.params;
-                                return Some(SqlFragment {
-                                    sql: format!("{} IN ({})", needle.sql, sub_sql),
-                                    params,
-                                });
-                            }
-                            // (b) Dynamic haystack: bind the whole list as a
-                            //     single JSON-encoded param (value_to_sql_param
-                            //     auto-encodes Relations) and expand via
-                            //     json_each. Gated by inference's `dynamic` set
-                            //     (Text/Bool/Uuid only — Int and Float excluded,
-                            //     since json_each yields JSON storage classes that
-                            //     don't match the TEXT-stored Int column).
-                            //     Param can't reference the bind var since the
-                            //     haystack is evaluated outside the SQL row scope.
-                            if self.elem_pushdown_ok.dynamic.contains(&arg.span)
-                                && !Self::expr_refs_var(arg, bind_var)
-                            {
-                                let mut params = needle.params;
-                                params.push(SqlParamSource::Expr((**arg).clone()));
-                                return Some(SqlFragment {
-                                    sql: format!(
-                                        "{} IN (SELECT value FROM json_each(?))",
-                                        needle.sql,
-                                    ),
-                                    params,
-                                });
-                            }
-                            return None;
+                        // (c) Relation-derived haystack: `elem x (*src |>
+                        //     map (\u -> u.col))` (or the un-piped
+                        //     `map (\u -> u.col) *src`). Emit a real
+                        //     sub-select `x IN (SELECT col FROM src)`. The
+                        //     column keeps its own affinity/collation, so
+                        //     this is byte-identical for Text/Bool/Uuid
+                        //     columns (the same scalars the dynamic set
+                        //     allows). Int/Float stay in memory: an Int
+                        //     column is TEXT-stored, and a sub-select
+                        //     comparing it to an INTEGER-affinity needle
+                        //     hits the same storage-class mismatch as
+                        //     json_each. Runs before the dynamic branch
+                        //     since a real sub-select is strictly better
+                        //     (no JSON round-trip) when it applies. Gated
+                        //     on the projected column's own schema type,
+                        //     NOT the `dynamic` span set (which is for the
+                        //     json_each form and doesn't cover relation
+                        //     projections).
+                        if !Self::expr_refs_var(arg, bind_var)
+                            && let Some((sub_src, sub_col)) = self.peel_map_projection(arg)
+                            && let Some(sub_schema) = self.source_schemas.get(&sub_src).cloned()
+                            && let Some(sub_ty) = lookup_col_type_from_schema(&sub_schema, &sub_col)
+                            && matches!(sub_ty.as_str(), "text" | "bool" | "uuid")
+                        {
+                            let sub_sql = format!(
+                                "SELECT {} FROM {}",
+                                quote_sql_ident(&sub_col),
+                                quote_sql_ident(&format!("_knot_{}", sub_src)),
+                            );
+                            let params = needle.params;
+                            return Some(SqlFragment {
+                                sql: format!("{} IN ({})", needle.sql, sub_sql),
+                                params,
+                            });
                         }
+                        // (b) Dynamic haystack: bind the whole list as a
+                        //     single JSON-encoded param (value_to_sql_param
+                        //     auto-encodes Relations) and expand via
+                        //     json_each. Gated by inference's `dynamic` set
+                        //     (Text/Bool/Uuid only — Int and Float excluded,
+                        //     since json_each yields JSON storage classes that
+                        //     don't match the TEXT-stored Int column).
+                        //     Param can't reference the bind var since the
+                        //     haystack is evaluated outside the SQL row scope.
+                        if self.elem_pushdown_ok.dynamic.contains(&arg.span)
+                            && !Self::expr_refs_var(arg, bind_var)
+                        {
+                            let mut params = needle.params;
+                            params.push(SqlParamSource::Expr((**arg).clone()));
+                            return Some(SqlFragment {
+                                sql: format!("{} IN (SELECT value FROM json_each(?))", needle.sql,),
+                                params,
+                            });
+                        }
+                        return None;
                     }
+                }
                 None
             }
             _ => None,
@@ -15237,7 +15959,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             "byteLength" => format!("LENGTH(CAST({} AS BLOB))", col.sql),
             _ => return None,
         };
-        Some(SqlFragment { sql, params: vec![] })
+        Some(SqlFragment {
+            sql,
+            params: vec![],
+        })
     }
 
     /// Compile a scalar Int function application in a WHERE atom to SQL:
@@ -15275,17 +16000,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ("intMin", [a, b]) => format!("min({}, {})", compile(a)?, compile(b)?),
             ("intMax", [a, b]) => format!("max({}, {})", compile(a)?, compile(b)?),
             ("clamp", [lo, hi, x]) => {
-                format!("min(max({}, {}), {})", compile(x)?, compile(lo)?, compile(hi)?)
+                format!(
+                    "min(max({}, {}), {})",
+                    compile(x)?,
+                    compile(lo)?,
+                    compile(hi)?
+                )
             }
             _ => return None,
         };
         Some(SqlFragment { sql, params })
     }
 
-    fn try_compile_single_table_atom(
-        bind_var: &str,
-        expr: &ast::Expr,
-    ) -> Option<SqlFragment> {
+    fn try_compile_single_table_atom(bind_var: &str, expr: &ast::Expr) -> Option<SqlFragment> {
         match &expr.node {
             ast::ExprKind::FieldAccess { expr: inner, field } => {
                 if let ast::ExprKind::Var(name) = &inner.node {
@@ -15298,7 +16025,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     // Field access on other variable → parameter
                     return Some(SqlFragment {
                         sql: "?".to_string(),
-                        params: vec![SqlParamSource::FieldAccess(name.as_str().to_string(), field.clone())],
+                        params: vec![SqlParamSource::FieldAccess(
+                            name.as_str().to_string(),
+                            field.clone(),
+                        )],
                     });
                 }
                 None
@@ -15369,10 +16099,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
     }
 
     /// Check if an expression refers to a specific source (directly or via a bound variable).
-    fn expr_is_source(node: &ast::ExprKind, source_name: &str, var_binds: &HashMap<String, String>) -> bool {
+    fn expr_is_source(
+        node: &ast::ExprKind,
+        source_name: &str,
+        var_binds: &HashMap<String, String>,
+    ) -> bool {
         match node {
             ast::ExprKind::SourceRef { name, .. } => name == source_name,
-            ast::ExprKind::Var(name) => var_binds.get(name.as_str()).is_some_and(|s| s == source_name),
+            ast::ExprKind::Var(name) => var_binds
+                .get(name.as_str())
+                .is_some_and(|s| s == source_name),
             _ => false,
         }
     }
@@ -15395,14 +16131,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
             rhs,
         } = &cond.node
         {
-            let extract_field_access =
-                |e: &'a ast::Expr| -> Option<(&'a str, &'a str)> {
-                    if let ast::ExprKind::FieldAccess { expr, field } = &e.node
-                        && let ast::ExprKind::Var(name) = &expr.node {
-                            return Some((name.as_str(), field.as_str()));
-                        }
-                    None
-                };
+            let extract_field_access = |e: &'a ast::Expr| -> Option<(&'a str, &'a str)> {
+                if let ast::ExprKind::FieldAccess { expr, field } = &e.node
+                    && let ast::ExprKind::Var(name) = &expr.node
+                {
+                    return Some((name.as_str(), field.as_str()));
+                }
+                None
+            };
 
             let (lv, lf) = extract_field_access(lhs)?;
             let (rv, rf) = extract_field_access(rhs)?;
@@ -15426,12 +16162,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn match_map_no_filter(source_name: &str, value: &ast::Expr) -> bool {
         if let ast::ExprKind::Do(stmts) = &value.node
             && stmts.len() == 2
-                && let ast::StmtKind::Bind { expr, .. } = &stmts[0].node
-                    && let ast::ExprKind::SourceRef { name, .. } = &expr.node
-                        && name == source_name
-                            && let ast::StmtKind::Expr(e) = &stmts[1].node {
-                                return e.node.as_yield_arg().is_some();
-                            }
+            && let ast::StmtKind::Bind { expr, .. } = &stmts[0].node
+            && let ast::ExprKind::SourceRef { name, .. } = &expr.node
+            && name == source_name
+            && let ast::StmtKind::Expr(e) = &stmts[1].node
+        {
+            return e.node.as_yield_arg().is_some();
+        }
         false
     }
 
@@ -15531,7 +16268,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             self.compile_expr(builder, &let_expr, env, db)
                         } else {
                             let var_expr = ast::Spanned::new(
-                                ast::ExprKind::Var(crate::infer::Binding::User(name.as_str().to_string())),
+                                ast::ExprKind::Var(crate::infer::Binding::User(
+                                    name.as_str().to_string(),
+                                )),
                                 ast::Span::new(0, 0),
                             );
                             self.compile_expr(builder, &var_expr, env, db)
@@ -15540,7 +16279,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
                 SqlParamSource::FieldAccess(var, field) => {
                     let let_expr = self.let_bindings.get(var).cloned();
-                    let record = if let Some(&v) = env.bindings.get(&crate::infer::Binding::User(var.clone())) {
+                    let record = if let Some(&v) =
+                        env.bindings.get(&crate::infer::Binding::User(var.clone()))
+                    {
                         v
                     } else if let Some(let_expr) = let_expr {
                         self.compile_expr(builder, &let_expr, env, db)
@@ -15733,7 +16474,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let resolvable = value_sources.iter().all(|p| match p {
             SqlParamSource::Literal(_) | SqlParamSource::Expr(_) => true,
             SqlParamSource::Var(v) | SqlParamSource::FieldAccess(v, _) => {
-                env.bindings.contains_key(&crate::infer::Binding::User(v.clone())) || self.global_fns.contains_key(v)
+                env.bindings
+                    .contains_key(&crate::infer::Binding::User(v.clone()))
+                    || self.global_fns.contains_key(v)
             }
         });
         if !resolvable {
@@ -15797,7 +16540,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
     fn expr_is_known_relation(&self, expr: &ast::Expr) -> bool {
         match &expr.node {
             // Pipe into filter/map/take/drop/diff/inter/union always yields a relation
-            ast::ExprKind::BinOp { op: ast::BinOp::Pipe, .. } => true,
+            ast::ExprKind::BinOp {
+                op: ast::BinOp::Pipe,
+                ..
+            } => true,
             // A nested-relation field (`t.members` where `members : [{who: Text}]`).
             // Inference recorded which field accesses are relation-typed; a
             // scalar field (`t.status`) is not in the set, so `InProgress ip <-
@@ -15808,9 +16554,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // Head of the application spine — a bare `union …` or a
                 // namespaced `base.union …` (FieldAccess). Both return a relation.
                 let rel_fn = |n: &str| {
-                    matches!(n,
-                        "filter" | "map" | "take" | "drop" | "diff" | "inter"
-                        | "union" | "reverse" | "chars" | "sort" | "sortBy"
+                    matches!(
+                        n,
+                        "filter"
+                            | "map"
+                            | "take"
+                            | "drop"
+                            | "diff"
+                            | "inter"
+                            | "union"
+                            | "reverse"
+                            | "chars"
+                            | "sort"
+                            | "sortBy"
                     )
                 };
                 let mut head = expr;
@@ -15998,7 +16754,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         merge_block_param(builder, merge_block, types::I32);
 
                         let zero = builder.ins().iconst(types::I32, 0);
-                        builder.ins().brif(l_true, rhs_block, &[], merge_block, &[zero.into()]);
+                        builder
+                            .ins()
+                            .brif(l_true, rhs_block, &[], merge_block, &[zero.into()]);
 
                         builder.switch_to_block(rhs_block);
                         builder.seal_block(rhs_block);
@@ -16019,7 +16777,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         merge_block_param(builder, merge_block, types::I32);
 
                         let one = builder.ins().iconst(types::I32, 1);
-                        builder.ins().brif(l_true, merge_block, &[one.into()], rhs_block, &[]);
+                        builder
+                            .ins()
+                            .brif(l_true, merge_block, &[one.into()], rhs_block, &[]);
 
                         builder.switch_to_block(rhs_block);
                         builder.seal_block(rhs_block);
@@ -16037,7 +16797,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                 }
             }
-            ast::ExprKind::UnaryOp { op: ast::UnaryOp::Not, operand } => {
+            ast::ExprKind::UnaryOp {
+                op: ast::UnaryOp::Not,
+                operand,
+            } => {
                 let inner = self.compile_condition(builder, operand, env, db);
                 let one = builder.ins().iconst(types::I32, 1);
                 builder.ins().isub(one, inner)
@@ -16071,12 +16834,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
 fn expr_is_promote_safe(expr: &ast::Expr) -> bool {
     match &expr.node {
         ast::ExprKind::Lit(lit) => match lit {
-            ast::Literal::Int(s) => {
-                s.parse::<i64>().is_ok_and(|n| (-128..=127).contains(&n))
-            }
-            ast::Literal::Float(f) => {
-                f.to_bits() == 0.0_f64.to_bits() || *f == 1.0
-            }
+            ast::Literal::Int(s) => s.parse::<i64>().is_ok_and(|n| (-128..=127).contains(&n)),
+            ast::Literal::Float(f) => f.to_bits() == 0.0_f64.to_bits() || *f == 1.0,
             // Text/Bytes are freshly allocated on each evaluation and
             // need promotion.  (Text literals can be cached, but the
             // compiler doesn't currently emit the cached path for
@@ -16127,11 +16886,13 @@ fn expr_has_user_calls(expr: &ast::Expr, global_fns: &HashMap<String, (FuncId, u
         ast::ExprKind::UnaryOp { operand, .. } => expr_has_user_calls(operand, global_fns),
         ast::ExprKind::Case { scrutinee, arms } => {
             expr_has_user_calls(scrutinee, global_fns)
-                || arms.iter().any(|a| expr_has_user_calls(&a.body, global_fns))
+                || arms
+                    .iter()
+                    .any(|a| expr_has_user_calls(&a.body, global_fns))
         }
-        ast::ExprKind::Record(fields) => {
-            fields.iter().any(|f| expr_has_user_calls(&f.value, global_fns))
-        }
+        ast::ExprKind::Record(fields) => fields
+            .iter()
+            .any(|f| expr_has_user_calls(&f.value, global_fns)),
         ast::ExprKind::FieldAccess { expr, .. } => expr_has_user_calls(expr, global_fns),
         ast::ExprKind::Lambda { body, .. } => expr_has_user_calls(body, global_fns),
         ast::ExprKind::Annot { expr, .. } => expr_has_user_calls(expr, global_fns),
@@ -16157,9 +16918,9 @@ fn expr_has_user_calls(expr: &ast::Expr, global_fns: &HashMap<String, (FuncId, u
 fn expr_references_var(expr: &ast::Expr, var_name: &str) -> bool {
     match &expr.node {
         ast::ExprKind::Var(name) => name == var_name,
-        ast::ExprKind::Lit(_)
-        | ast::ExprKind::Constructor(_)
-        | ast::ExprKind::SourceRef { .. } => false,
+        ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) | ast::ExprKind::SourceRef { .. } => {
+            false
+        }
         ast::ExprKind::Record(fields) => fields
             .iter()
             .any(|f| expr_references_var(&f.value, var_name)),
@@ -16222,11 +16983,7 @@ fn aggregate_sql_func_runtime(name: &str) -> Option<(&'static str, &'static str)
 /// a bare Text, whereas Knot's derived `Ord` compares by declaration order and
 /// expects a reconstructed `Constructor` — both diverge, so tags fall back to
 /// in-memory evaluation. Float ordering is handled by the per-path filters.
-pub(crate) fn minmax_pushdown_type_ok(
-    bind_var: &str,
-    body: &ast::Expr,
-    schema: &str,
-) -> bool {
+pub(crate) fn minmax_pushdown_type_ok(bind_var: &str, body: &ast::Expr, schema: &str) -> bool {
     matches!(
         infer_sql_expr_type(bind_var, body, schema).as_deref(),
         Some("int") | Some("text")
@@ -16237,11 +16994,7 @@ pub(crate) fn minmax_pushdown_type_ok(
 /// Knot `Text` column (stored as SQLite TEXT). When true the compiler passes
 /// `is_text = 1` to `knot_source_query_value` so the runtime returns the value
 /// as `Text` instead of parsing numeric-looking strings back to `Int`/`Float`.
-pub(crate) fn minmax_result_is_text(
-    bind_var: &str,
-    body: &ast::Expr,
-    schema: &str,
-) -> bool {
+pub(crate) fn minmax_result_is_text(bind_var: &str, body: &ast::Expr, schema: &str) -> bool {
     matches!(
         infer_sql_expr_type(bind_var, body, schema).as_deref(),
         Some("text")
@@ -16252,11 +17005,7 @@ pub(crate) fn minmax_result_is_text(
 /// `knot_source_query_sum` as `is_float` so that an empty/all-NULL Float
 /// column yields `Float 0.0` instead of `Int 0`, preserving the statically
 /// expected numeric type for downstream float arithmetic / `show` / JSON.
-pub(crate) fn sum_result_is_float(
-    bind_var: &str,
-    body: &ast::Expr,
-    schema: &str,
-) -> bool {
+pub(crate) fn sum_result_is_float(bind_var: &str, body: &ast::Expr, schema: &str) -> bool {
     matches!(
         infer_sql_expr_type(bind_var, body, schema).as_deref(),
         Some("float")
@@ -16272,11 +17021,7 @@ pub(crate) fn sum_result_is_float(
 /// match the declared `Ord` for those types — the same reason
 /// `minmax_pushdown_type_ok` and `try_compile_sql_comparison` treat tag/bool
 /// ordering as unsound and keep it in memory.
-pub(crate) fn sortby_projection_pushable(
-    bind_var: &str,
-    body: &ast::Expr,
-    schema: &str,
-) -> bool {
+pub(crate) fn sortby_projection_pushable(bind_var: &str, body: &ast::Expr, schema: &str) -> bool {
     !matches!(
         infer_sql_expr_type(bind_var, body, schema).as_deref(),
         Some("float") | Some("tag") | Some("bool")
@@ -16290,19 +17035,15 @@ pub(crate) fn sortby_projection_pushable(
 /// explicitly when the projection is a simple Int field access. For
 /// Float/Text columns and arithmetic expressions, the expression is
 /// returned unchanged.
-fn col_sql_for_minmax(
-    col_sql: &str,
-    bind_var: &str,
-    body: &ast::Expr,
-    schema: &str,
-) -> String {
+fn col_sql_for_minmax(col_sql: &str, bind_var: &str, body: &ast::Expr, schema: &str) -> String {
     if let ast::ExprKind::FieldAccess { expr, field } = &body.node
         && let ast::ExprKind::Var(name) = &expr.node
-            && name == bind_var
-                && let Some(ty) = lookup_col_type_from_schema(schema, field)
-                    && ty == "int" {
-                        return format!("{} COLLATE KNOT_INT", col_sql);
-                    }
+        && name == bind_var
+        && let Some(ty) = lookup_col_type_from_schema(schema, field)
+        && ty == "int"
+    {
+        return format!("{} COLLATE KNOT_INT", col_sql);
+    }
     col_sql.to_string()
 }
 
@@ -16367,10 +17108,7 @@ impl StmCmpOp {
 /// FieldAccess-on-another-var (cheap to re-evaluate as a tracking param).
 /// Returns `None` if the body contains any OR/NOT/arithmetic/function call —
 /// the caller falls back to the broad `All` filter in that case.
-fn try_extract_field_preds(
-    bind_var: &str,
-    expr: &ast::Expr,
-) -> Option<Vec<StmFieldPred>> {
+fn try_extract_field_preds(bind_var: &str, expr: &ast::Expr) -> Option<Vec<StmFieldPred>> {
     let mut out: Vec<StmFieldPred> = Vec::new();
     extract_preds_walk(bind_var, expr, &mut out)?;
     if out.is_empty() { None } else { Some(out) }
@@ -16403,13 +17141,13 @@ fn try_extract_field_preds_from_where_stmts(
     if out.is_empty() { None } else { Some(out) }
 }
 
-fn extract_preds_walk(
-    bv: &str,
-    e: &ast::Expr,
-    out: &mut Vec<StmFieldPred>,
-) -> Option<()> {
+fn extract_preds_walk(bv: &str, e: &ast::Expr, out: &mut Vec<StmFieldPred>) -> Option<()> {
     match &e.node {
-        ast::ExprKind::BinOp { op: ast::BinOp::And, lhs, rhs } => {
+        ast::ExprKind::BinOp {
+            op: ast::BinOp::And,
+            lhs,
+            rhs,
+        } => {
             extract_preds_walk(bv, lhs, out)?;
             extract_preds_walk(bv, rhs, out)?;
             Some(())
@@ -16426,34 +17164,53 @@ fn extract_preds_walk(
             };
             if let Some(col) = field_access_of(bv, lhs) {
                 let v = simple_value_param(bv, rhs)?;
-                out.push(StmFieldPred { col, op: stm_op, values: vec![v] });
+                out.push(StmFieldPred {
+                    col,
+                    op: stm_op,
+                    values: vec![v],
+                });
                 return Some(());
             }
             if let Some(col) = field_access_of(bv, rhs) {
                 let v = simple_value_param(bv, lhs)?;
-                out.push(StmFieldPred { col, op: reverse_stm_op(stm_op), values: vec![v] });
+                out.push(StmFieldPred {
+                    col,
+                    op: reverse_stm_op(stm_op),
+                    values: vec![v],
+                });
                 return Some(());
             }
             None
         }
         // `elem needle haystack` ↦ IN
-        ast::ExprKind::App { func: outer, arg: haystack } => {
-            if let ast::ExprKind::App { func: inner, arg: needle } = &outer.node
+        ast::ExprKind::App {
+            func: outer,
+            arg: haystack,
+        } => {
+            if let ast::ExprKind::App {
+                func: inner,
+                arg: needle,
+            } = &outer.node
                 && let ast::ExprKind::Var(name) = &inner.node
-                    && name == "elem" {
-                        let col = field_access_of(bv, needle)?;
-                        if let ast::ExprKind::List(elems) = &haystack.node {
-                            if elems.is_empty() {
-                                return None;
-                            }
-                            let mut values = Vec::with_capacity(elems.len());
-                            for el in elems {
-                                values.push(simple_value_param(bv, el)?);
-                            }
-                            out.push(StmFieldPred { col, op: StmCmpOp::In, values });
-                            return Some(());
-                        }
+                && name == "elem"
+            {
+                let col = field_access_of(bv, needle)?;
+                if let ast::ExprKind::List(elems) = &haystack.node {
+                    if elems.is_empty() {
+                        return None;
                     }
+                    let mut values = Vec::with_capacity(elems.len());
+                    for el in elems {
+                        values.push(simple_value_param(bv, el)?);
+                    }
+                    out.push(StmFieldPred {
+                        col,
+                        op: StmCmpOp::In,
+                        values,
+                    });
+                    return Some(());
+                }
+            }
             None
         }
         _ => None,
@@ -16463,9 +17220,10 @@ fn extract_preds_walk(
 fn field_access_of(bv: &str, e: &ast::Expr) -> Option<String> {
     if let ast::ExprKind::FieldAccess { expr, field } = &e.node
         && let ast::ExprKind::Var(name) = &expr.node
-            && name == bv {
-                return Some(field.clone());
-            }
+        && name == bv
+    {
+        return Some(field.clone());
+    }
     None
 }
 
@@ -16476,12 +17234,18 @@ fn field_access_of(bv: &str, e: &ast::Expr) -> Option<String> {
 fn simple_value_param(bv: &str, e: &ast::Expr) -> Option<SqlParamSource> {
     match &e.node {
         ast::ExprKind::Lit(lit) => Some(SqlParamSource::Literal(lit.clone())),
-        ast::ExprKind::Var(name) if !name.is_user(bv) => Some(SqlParamSource::Var(name.as_str().to_string())),
+        ast::ExprKind::Var(name) if !name.is_user(bv) => {
+            Some(SqlParamSource::Var(name.as_str().to_string()))
+        }
         ast::ExprKind::FieldAccess { expr, field } => {
             if let ast::ExprKind::Var(name) = &expr.node
-                && name != bv {
-                    return Some(SqlParamSource::FieldAccess(name.as_str().to_string(), field.clone()));
-                }
+                && name != bv
+            {
+                return Some(SqlParamSource::FieldAccess(
+                    name.as_str().to_string(),
+                    field.clone(),
+                ));
+            }
             None
         }
         _ => None,
@@ -16517,12 +17281,13 @@ fn try_extract_preds_for_single_table_plan(
     let mut bind_var: Option<String> = None;
     for stmt in &stmts[..last] {
         if let ast::StmtKind::Bind { pat, .. } = &stmt.node
-            && let ast::PatKind::Var(name) = &pat.node {
-                if bind_var.is_some() {
-                    return None;
-                }
-                bind_var = Some(name.clone());
+            && let ast::PatKind::Var(name) = &pat.node
+        {
+            if bind_var.is_some() {
+                return None;
             }
+            bind_var = Some(name.clone());
+        }
     }
     let bv = bind_var?;
     try_extract_field_preds_from_where_stmts(&bv, stmts)
@@ -16694,7 +17459,11 @@ impl SqlQueryPlan {
         }
         let mut s = format!(
             " LIMIT {}",
-            if self.limit.is_some() { "MAX(CAST(? AS INTEGER), 0)" } else { "-1" }
+            if self.limit.is_some() {
+                "MAX(CAST(? AS INTEGER), 0)"
+            } else {
+                "-1"
+            }
         );
         if self.offset.is_some() {
             s.push_str(" OFFSET ?");
@@ -16983,19 +17752,20 @@ fn rewrite_body_through_projection(
         match &e.node {
             ast::ExprKind::FieldAccess { expr: inner, field } => {
                 if let ast::ExprKind::Var(v) = &inner.node
-                    && v == bind_var {
-                        let c = plan
-                            .select_columns
-                            .iter()
-                            .find(|c| c.result_field == *field)?;
-                        if c.sql_expr.is_some() {
-                            return None; // computed column — fall back
-                        }
-                        return Some(mk(ast::ExprKind::FieldAccess {
-                            expr: inner.clone(),
-                            field: c.source_col.clone(),
-                        }));
+                    && v == bind_var
+                {
+                    let c = plan
+                        .select_columns
+                        .iter()
+                        .find(|c| c.result_field == *field)?;
+                    if c.sql_expr.is_some() {
+                        return None; // computed column — fall back
                     }
+                    return Some(mk(ast::ExprKind::FieldAccess {
+                        expr: inner.clone(),
+                        field: c.source_col.clone(),
+                    }));
+                }
                 let new_inner = rewrite(plan, bind_var, inner)?;
                 Some(mk(ast::ExprKind::FieldAccess {
                     expr: Box::new(new_inner),
@@ -17049,9 +17819,10 @@ pub(crate) fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Optio
             };
             for field in fields.split(';') {
                 if let Some((name, ty)) = field.split_once('=')
-                    && name == col_name {
-                        return Some(ty.to_string());
-                    }
+                    && name == col_name
+                {
+                    return Some(ty.to_string());
+                }
             }
         }
         return None;
@@ -17059,7 +17830,9 @@ pub(crate) fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Optio
     for part in split_schema_fields(schema) {
         // A field part lacking a `:` (malformed/unexpected) must be skipped,
         // not abort the whole lookup — `?` here would poison every later column.
-        let Some(colon) = part.find(':') else { continue };
+        let Some(colon) = part.find(':') else {
+            continue;
+        };
         let name = &part[..colon];
         let ty = &part[colon + 1..];
         if name == col_name {
@@ -17101,7 +17874,6 @@ fn parse_schema_columns(schema: &str) -> Vec<(String, String)> {
 }
 
 // ── Pipe chain analysis ───────────────────────────────────────────
-
 
 /// Check that a pipe chain's operations appear in an order that is
 /// equivalent to a single SQL query's fixed clause order
@@ -17165,23 +17937,53 @@ fn pipe_ops_order_pushable(ops: &[PipeOp]) -> bool {
 }
 
 enum PipeOp {
-    Filter { bind_var: String, body: ast::Expr },
-    Map { bind_var: String, body: ast::Expr },
+    Filter {
+        bind_var: String,
+        body: ast::Expr,
+    },
+    Map {
+        bind_var: String,
+        body: ast::Expr,
+    },
     Count,
-    CountWhere { bind_var: String, body: ast::Expr },
-    Take { n: ast::Expr },
-    Drop { n: ast::Expr },
+    CountWhere {
+        bind_var: String,
+        body: ast::Expr,
+    },
+    Take {
+        n: ast::Expr,
+    },
+    Drop {
+        n: ast::Expr,
+    },
     #[allow(dead_code)] // sum-pipe not yet wired
-    Sum { bind_var: String, body: ast::Expr },
+    Sum {
+        bind_var: String,
+        body: ast::Expr,
+    },
     /// Direct `sum rel` (no projection): the relation's own elements are the
     /// summands. Distinguished from `Sum` so the SQL lowering aggregates the
     /// (already-mapped) column directly.
     SumDirect,
-    Avg { bind_var: String, body: ast::Expr },
-    Min { bind_var: String, body: ast::Expr },
-    Max { bind_var: String, body: ast::Expr },
-    SortBy { bind_var: String, body: ast::Expr },
-    TakeRelation { n: ast::Expr },
+    Avg {
+        bind_var: String,
+        body: ast::Expr,
+    },
+    Min {
+        bind_var: String,
+        body: ast::Expr,
+    },
+    Max {
+        bind_var: String,
+        body: ast::Expr,
+    },
+    SortBy {
+        bind_var: String,
+        body: ast::Expr,
+    },
+    TakeRelation {
+        n: ast::Expr,
+    },
 }
 
 /// Flatten a nested pipe chain `a |> f |> g |> h` into `(a, [f, g, h])`.
@@ -17215,9 +18017,7 @@ fn flatten_pipe_chain<'a>(
 fn query_form_head(expr: &ast::Expr) -> Option<&str> {
     match &expr.node {
         ast::ExprKind::Var(name) => Some(name.as_str()),
-        ast::ExprKind::FieldAccess { expr, field }
-            if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") =>
-        {
+        ast::ExprKind::FieldAccess { expr, field } if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") => {
             Some(field.as_str())
         }
         _ => None,
@@ -17243,30 +18043,23 @@ fn analyze_pipe_op(
             // so `rel |> base.map f` never pushed down.
             if let Some(name) = query_form_head(func) {
                 match name {
-                    "filter" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
-                        PipeOp::Filter { bind_var, body }
-                    }),
-                    "map" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
-                        PipeOp::Map { bind_var, body }
-                    }),
+                    "filter" => extract_single_param_lambda(arg, fun_bodies, let_bindings)
+                        .map(|(bind_var, body)| PipeOp::Filter { bind_var, body }),
+                    "map" => extract_single_param_lambda(arg, fun_bodies, let_bindings)
+                        .map(|(bind_var, body)| PipeOp::Map { bind_var, body }),
                     "take" => Some(PipeOp::Take { n: (**arg).clone() }),
                     "takeRelation" => Some(PipeOp::TakeRelation { n: (**arg).clone() }),
                     "drop" => Some(PipeOp::Drop { n: (**arg).clone() }),
-                    "sortBy" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
-                        PipeOp::SortBy { bind_var, body }
-                    }),
-                    "avg" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
-                        PipeOp::Avg { bind_var, body }
-                    }),
-                    "minOn" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
-                        PipeOp::Min { bind_var, body }
-                    }),
-                    "maxOn" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
-                        PipeOp::Max { bind_var, body }
-                    }),
-                    "countWhere" => extract_single_param_lambda(arg, fun_bodies, let_bindings).map(|(bind_var, body)| {
-                        PipeOp::CountWhere { bind_var, body }
-                    }),
+                    "sortBy" => extract_single_param_lambda(arg, fun_bodies, let_bindings)
+                        .map(|(bind_var, body)| PipeOp::SortBy { bind_var, body }),
+                    "avg" => extract_single_param_lambda(arg, fun_bodies, let_bindings)
+                        .map(|(bind_var, body)| PipeOp::Avg { bind_var, body }),
+                    "minOn" => extract_single_param_lambda(arg, fun_bodies, let_bindings)
+                        .map(|(bind_var, body)| PipeOp::Min { bind_var, body }),
+                    "maxOn" => extract_single_param_lambda(arg, fun_bodies, let_bindings)
+                        .map(|(bind_var, body)| PipeOp::Max { bind_var, body }),
+                    "countWhere" => extract_single_param_lambda(arg, fun_bodies, let_bindings)
+                        .map(|(bind_var, body)| PipeOp::CountWhere { bind_var, body }),
                     _ => None,
                 }
             } else {
@@ -17289,9 +18082,10 @@ fn extract_single_param_lambda(
     let reduced = beta_reduce(expr, fun_bodies, let_bindings);
     if let ast::ExprKind::Lambda { params, body, .. } = reduced.node
         && params.len() == 1
-            && let ast::PatKind::Var(name) = &params[0].node {
-                return Some((name.clone(), *body));
-            }
+        && let ast::PatKind::Var(name) = &params[0].node
+    {
+        return Some((name.clone(), *body));
+    }
     None
 }
 
@@ -17312,9 +18106,7 @@ fn peel_take_drop(
         match &e.node {
             ast::ExprKind::Var(n) if n == "take" => Some(false),
             ast::ExprKind::Var(n) if n == "drop" => Some(true),
-            ast::ExprKind::FieldAccess { expr, field }
-                if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") =>
-            {
+            ast::ExprKind::FieldAccess { expr, field } if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") => {
                 match field.as_str() {
                     "take" => Some(false),
                     "drop" => Some(true),
@@ -17326,16 +18118,28 @@ fn peel_take_drop(
     };
     // Call form: `take N source` → App { App { take, N }, source }.
     if let ast::ExprKind::App { func, arg: source } = &reduced.node
-        && let ast::ExprKind::App { func: name_expr, arg: n } = &func.node
-            && let Some(is_drop) = is_take_drop(name_expr) {
-                return Some((is_drop, (**n).clone(), (**source).clone()));
-            }
+        && let ast::ExprKind::App {
+            func: name_expr,
+            arg: n,
+        } = &func.node
+        && let Some(is_drop) = is_take_drop(name_expr)
+    {
+        return Some((is_drop, (**n).clone(), (**source).clone()));
+    }
     // Pipe form: `source |> take N` → BinOp::Pipe { source, App { take, N } }.
-    if let ast::ExprKind::BinOp { op: ast::BinOp::Pipe, lhs, rhs } = &reduced.node
-        && let ast::ExprKind::App { func: name_expr, arg: n } = &rhs.node
-            && let Some(is_drop) = is_take_drop(name_expr) {
-                return Some((is_drop, (**n).clone(), (**lhs).clone()));
-            }
+    if let ast::ExprKind::BinOp {
+        op: ast::BinOp::Pipe,
+        lhs,
+        rhs,
+    } = &reduced.node
+        && let ast::ExprKind::App {
+            func: name_expr,
+            arg: n,
+        } = &rhs.node
+        && let Some(is_drop) = is_take_drop(name_expr)
+    {
+        return Some((is_drop, (**n).clone(), (**lhs).clone()));
+    }
     None
 }
 
@@ -17351,13 +18155,14 @@ fn peel_sort_by(
 ) -> Option<(ast::Expr, ast::Expr, bool)> {
     let reduced = beta_reduce(expr, fun_bodies, let_bindings);
     if let ast::ExprKind::App { func, arg: source } = reduced.node
-        && let ast::ExprKind::App { func: name_expr, arg: key_lambda } = func.node
+        && let ast::ExprKind::App {
+            func: name_expr,
+            arg: key_lambda,
+        } = func.node
     {
         let name = match &name_expr.node {
             ast::ExprKind::Var(n) => Some(n.as_str()),
-            ast::ExprKind::FieldAccess { expr, field }
-                if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") =>
-            {
+            ast::ExprKind::FieldAccess { expr, field } if matches!(&expr.node, ast::ExprKind::Var(n) if n == "base") => {
                 Some(field.as_str())
             }
             _ => None,
@@ -17380,7 +18185,11 @@ fn extract_filter_on_source(
     let_bindings: &HashMap<String, ast::Expr>,
 ) -> Option<(String, String, ast::Expr)> {
     let reduced = beta_reduce(expr, fun_bodies, let_bindings);
-    if let ast::ExprKind::App { func, arg: source_expr } = &reduced.node {
+    if let ast::ExprKind::App {
+        func,
+        arg: source_expr,
+    } = &reduced.node
+    {
         let resolve_source = |se: &ast::Expr| -> Option<String> {
             match &se.node {
                 ast::ExprKind::SourceRef { name, .. } => Some(name.clone()),
@@ -17389,15 +18198,18 @@ fn extract_filter_on_source(
             }
         };
 
-        if let ast::ExprKind::App { func: inner_func, arg: filter_lambda } = &func.node
+        if let ast::ExprKind::App {
+            func: inner_func,
+            arg: filter_lambda,
+        } = &func.node
             && let ast::ExprKind::Var(fn_name) = &inner_func.node
-                && fn_name == "filter"
-                    && let Some(source_name) = resolve_source(source_expr)
-                        && let Some((bind_var, body)) =
-                            extract_single_param_lambda(filter_lambda, fun_bodies, let_bindings)
-                        {
-                            return Some((source_name, bind_var, body));
-                        }
+            && fn_name == "filter"
+            && let Some(source_name) = resolve_source(source_expr)
+            && let Some((bind_var, body)) =
+                extract_single_param_lambda(filter_lambda, fun_bodies, let_bindings)
+        {
+            return Some((source_name, bind_var, body));
+        }
     }
     None
 }
@@ -17524,11 +18336,12 @@ fn beta_reduce_inner(
                 // inside a do-block introduces a fresh name in scope,
                 // and the matchers see the do-block AST so the local
                 // definition is the relevant one.
-                let body = let_bindings.get(name.as_str()).or_else(|| fun_bodies.get(name.as_str()));
+                let body = let_bindings
+                    .get(name.as_str())
+                    .or_else(|| fun_bodies.get(name.as_str()));
                 if let Some(body) = body {
                     visited.insert(name.as_str().to_string());
-                    let result =
-                        beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel);
+                    let result = beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel);
                     visited.remove(name.as_str());
                     return result;
                 }
@@ -17538,10 +18351,18 @@ fn beta_reduce_inner(
         ImplicitRef(_) | CollectFold(_) | TypeHole => expr.node.clone(),
         SubsetConstraint { .. } => expr.node.clone(),
         RouteDecl { .. } => expr.node.clone(),
-        With { record, body, types } => {
+        With {
+            record,
+            body,
+            types,
+        } => {
             let r = beta_reduce_inner(record, fun_bodies, let_bindings, visited, fuel);
             let b = beta_reduce_inner(body, fun_bodies, let_bindings, visited, fuel);
-            With { record: Box::new(r), body: Box::new(b), types: types.clone() }
+            With {
+                record: Box::new(r),
+                body: Box::new(b),
+                types: types.clone(),
+            }
         }
         App { func, arg } => {
             let f = beta_reduce_inner(func, fun_bodies, let_bindings, visited, fuel);
@@ -17560,27 +18381,38 @@ fn beta_reduce_inner(
                         // out in that case; SQL pushdown then falls back to
                         // in-memory evaluation rather than emitting wrong SQL.
                         && !multi_param_would_capture(&params[1..], &a)
-                        && let Some(substituted) = substitute(body, name, &a) {
-                            if params.len() == 1 {
-                                return beta_reduce_inner(
-                                    &substituted, fun_bodies, let_bindings, visited, fuel,
-                                );
-                            }
-                            let new_lambda = ast::Spanned {
-                                node: Lambda {
-                                    params: params[1..].to_vec(),
-                                    ty_params: ty_params.clone(),
-                                    body: Box::new(substituted),
-                                },
-                                span: f.span,
-                            };
-                            return beta_reduce_inner(
-                                &new_lambda, fun_bodies, let_bindings, visited, fuel,
-                            );
-                        }
-            App { func: Box::new(f), arg: Box::new(a) }
+                        && let Some(substituted) = substitute(body, name, &a)
+            {
+                if params.len() == 1 {
+                    return beta_reduce_inner(
+                        &substituted,
+                        fun_bodies,
+                        let_bindings,
+                        visited,
+                        fuel,
+                    );
+                }
+                let new_lambda = ast::Spanned {
+                    node: Lambda {
+                        params: params[1..].to_vec(),
+                        ty_params: ty_params.clone(),
+                        body: Box::new(substituted),
+                    },
+                    span: f.span,
+                };
+                return beta_reduce_inner(&new_lambda, fun_bodies, let_bindings, visited, fuel);
+            }
+            App {
+                func: Box::new(f),
+                arg: Box::new(a),
+            }
         }
-        Lambda { params, ty_params, body, .. } => {
+        Lambda {
+            params,
+            ty_params,
+            body,
+            ..
+        } => {
             // A lambda parameter shadows any same-named do-local let or
             // top-level binding for the body: mask those names out of the
             // expansion maps so `\q -> q.value` is NOT rewritten to the
@@ -17596,7 +18428,11 @@ fn beta_reduce_inner(
                     params: params.clone(),
                     ty_params: ty_params.clone(),
                     body: Box::new(beta_reduce_inner(
-                        body, &masked_funs, &masked_lets, visited, fuel,
+                        body,
+                        &masked_funs,
+                        &masked_lets,
+                        visited,
+                        fuel,
                     )),
                 }
             } else {
@@ -17604,22 +18440,50 @@ fn beta_reduce_inner(
                     params: params.clone(),
                     ty_params: ty_params.clone(),
                     body: Box::new(beta_reduce_inner(
-                        body, fun_bodies, let_bindings, visited, fuel,
+                        body,
+                        fun_bodies,
+                        let_bindings,
+                        visited,
+                        fuel,
                     )),
                 }
             }
         }
         BinOp { op, lhs, rhs } => BinOp {
             op: *op,
-            lhs: Box::new(beta_reduce_inner(lhs, fun_bodies, let_bindings, visited, fuel)),
-            rhs: Box::new(beta_reduce_inner(rhs, fun_bodies, let_bindings, visited, fuel)),
+            lhs: Box::new(beta_reduce_inner(
+                lhs,
+                fun_bodies,
+                let_bindings,
+                visited,
+                fuel,
+            )),
+            rhs: Box::new(beta_reduce_inner(
+                rhs,
+                fun_bodies,
+                let_bindings,
+                visited,
+                fuel,
+            )),
         },
         UnaryOp { op, operand } => UnaryOp {
             op: *op,
-            operand: Box::new(beta_reduce_inner(operand, fun_bodies, let_bindings, visited, fuel)),
+            operand: Box::new(beta_reduce_inner(
+                operand,
+                fun_bodies,
+                let_bindings,
+                visited,
+                fuel,
+            )),
         },
         FieldAccess { expr: e, field } => FieldAccess {
-            expr: Box::new(beta_reduce_inner(e, fun_bodies, let_bindings, visited, fuel)),
+            expr: Box::new(beta_reduce_inner(
+                e,
+                fun_bodies,
+                let_bindings,
+                visited,
+                fuel,
+            )),
             field: field.clone(),
         },
         Record(fields) => Record(
@@ -17642,11 +18506,26 @@ fn beta_reduce_inner(
         // For constructs that bind names (Case arms, Do statements, Set, etc.)
         // we keep them unchanged: SQL pushdown never sees these inside the
         // expressions it analyzes (lambda bodies of filter/map/aggregate).
-        Lit(_) | Constructor(_) | SourceRef { .. } | Case { .. } | Do(_)
-        | Set { .. } | FullSet { .. } | Atomic(_) | TimeUnitLit { .. }
-        | Annot { .. } | Refine(_) | Serve { .. } | TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } => return expr.clone(),
+        Lit(_)
+        | Constructor(_)
+        | SourceRef { .. }
+        | Case { .. }
+        | Do(_)
+        | Set { .. }
+        | FullSet { .. }
+        | Atomic(_)
+        | TimeUnitLit { .. }
+        | Annot { .. }
+        | Refine(_)
+        | Serve { .. }
+        | TypeCtor { .. }
+        | DataCtor { .. }
+        | SourceDecl { .. } => return expr.clone(),
     };
-    ast::Spanned { node: new_node, span }
+    ast::Spanned {
+        node: new_node,
+        span,
+    }
 }
 
 /// Capture-avoiding substitution `expr[var := value]`. Returns `None` if
@@ -17667,11 +18546,24 @@ fn substitute_inner(
     let span = expr.span;
     let new_node = match &expr.node {
         Var(name) if name == var => return Some(value.clone()),
-        Var(_) | Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } => {
-            return Some(expr.clone())
-        }
-        Lambda { params, ty_params, body, .. } => {
+        Var(_)
+        | Lit(_)
+        | Constructor(_)
+        | SourceRef { .. }
+        | ImplicitRef(_)
+        | CollectFold(_)
+        | TypeHole
+        | TypeCtor { .. }
+        | DataCtor { .. }
+        | SourceDecl { .. }
+        | SubsetConstraint { .. }
+        | RouteDecl { .. } => return Some(expr.clone()),
+        Lambda {
+            params,
+            ty_params,
+            body,
+            ..
+        } => {
             if params.iter().any(|p| pat_binds(p, var)) {
                 return Some(expr.clone());
             }
@@ -17684,7 +18576,11 @@ fn substitute_inner(
                 body: Box::new(substitute_inner(body, var, value, value_fv)?),
             }
         }
-        With { record, body, types } => With {
+        With {
+            record,
+            body,
+            types,
+        } => With {
             record: Box::new(substitute_inner(record, var, value, value_fv)?),
             body: Box::new(substitute_inner(body, var, value, value_fv)?),
             types: types.clone(),
@@ -17725,7 +18621,10 @@ fn substitute_inner(
                 .map(|e| substitute_inner(e, var, value, value_fv))
                 .collect::<Option<Vec<_>>>()?,
         ),
-        TimeUnitLit { value: v, unit_name } => TimeUnitLit {
+        TimeUnitLit {
+            value: v,
+            unit_name,
+        } => TimeUnitLit {
             value: Box::new(substitute_inner(v, var, value, value_fv)?),
             unit_name: unit_name.clone(),
         },
@@ -17743,15 +18642,17 @@ fn substitute_inner(
         // matchers then compiled the broken AST, panicking with
         // "codegen: undefined variable" or silently capturing a same-named
         // in-scope variable.
-        Case { .. } | Do(_) | Set { .. } | FullSet { .. } | Atomic(_)
-        | Serve { .. } => {
+        Case { .. } | Do(_) | Set { .. } | FullSet { .. } | Atomic(_) | Serve { .. } => {
             if expr_mentions_var(expr, var) {
                 return None;
             }
             return Some(expr.clone());
         }
     };
-    Some(ast::Spanned { node: new_node, span })
+    Some(ast::Spanned {
+        node: new_node,
+        span,
+    })
 }
 
 /// Conservative occurs check: does `var` appear as a `Var` node anywhere
@@ -17762,29 +18663,33 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
     use ast::ExprKind::*;
     let in_stmts = |stmts: &[ast::Stmt]| -> bool {
         stmts.iter().any(|s| match &s.node {
-            ast::StmtKind::Bind { expr, .. }
-            | ast::StmtKind::Expr(expr) => expr_mentions_var(expr, var),
+            ast::StmtKind::Bind { expr, .. } | ast::StmtKind::Expr(expr) => {
+                expr_mentions_var(expr, var)
+            }
             ast::StmtKind::Where { cond } => expr_mentions_var(cond, var),
             ast::StmtKind::GroupBy { key } => expr_mentions_var(key, var),
         })
     };
     match &expr.node {
         Var(name) => name == var,
-        Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } => false,
+        Lit(_)
+        | Constructor(_)
+        | SourceRef { .. }
+        | ImplicitRef(_)
+        | CollectFold(_)
+        | TypeHole
+        | TypeCtor { .. }
+        | DataCtor { .. }
+        | SourceDecl { .. }
+        | SubsetConstraint { .. }
+        | RouteDecl { .. } => false,
         Record(fields) => fields.iter().any(|f| expr_mentions_var(&f.value, var)),
         FieldAccess { expr: e, .. } => expr_mentions_var(e, var),
         List(items) => items.iter().any(|e| expr_mentions_var(e, var)),
         Lambda { body, .. } => expr_mentions_var(body, var),
-        App { func, arg } => {
-            expr_mentions_var(func, var) || expr_mentions_var(arg, var)
-        }
-        With { record, body, .. } => {
-            expr_mentions_var(record, var) || expr_mentions_var(body, var)
-        }
-        BinOp { lhs, rhs, .. } => {
-            expr_mentions_var(lhs, var) || expr_mentions_var(rhs, var)
-        }
+        App { func, arg } => expr_mentions_var(func, var) || expr_mentions_var(arg, var),
+        With { record, body, .. } => expr_mentions_var(record, var) || expr_mentions_var(body, var),
+        BinOp { lhs, rhs, .. } => expr_mentions_var(lhs, var) || expr_mentions_var(rhs, var),
         UnaryOp { operand, .. } => expr_mentions_var(operand, var),
         Case { scrutinee, arms } => {
             expr_mentions_var(scrutinee, var)
@@ -17797,9 +18702,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
         Atomic(inner) | Refine(inner) => expr_mentions_var(inner, var),
         TimeUnitLit { value, .. } => expr_mentions_var(value, var),
         Annot { expr: e, .. } => expr_mentions_var(e, var),
-        Serve { handlers, .. } => {
-            handlers.iter().any(|h| expr_mentions_var(&h.body, var))
-        }
+        Serve { handlers, .. } => handlers.iter().any(|h| expr_mentions_var(&h.body, var)),
     }
 }
 
@@ -17818,8 +18721,17 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
                 free.insert(name.as_str().to_string());
             }
         }
-        Lit(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole | TypeCtor { .. }
-        | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } | RouteDecl { .. } => {}
+        Lit(_)
+        | Constructor(_)
+        | SourceRef { .. }
+        | ImplicitRef(_)
+        | CollectFold(_)
+        | TypeHole
+        | TypeCtor { .. }
+        | DataCtor { .. }
+        | SourceDecl { .. }
+        | SubsetConstraint { .. }
+        | RouteDecl { .. } => {}
         Lambda { params, body, .. } => {
             let mut new_bound = bound.clone();
             for p in params {
@@ -18120,13 +19032,17 @@ fn extract_sql_field_access(
     alias: &str,
     schema: &str,
 ) -> Option<String> {
-    if let ast::ExprKind::FieldAccess { expr, field: col_name } = &body.node
+    if let ast::ExprKind::FieldAccess {
+        expr,
+        field: col_name,
+    } = &body.node
         && let ast::ExprKind::Var(name) = &expr.node
-            && name == bind_var {
-                // Verify column exists in schema
-                lookup_col_type_from_schema(schema, col_name)?;
-                return Some(sql_col_ref(alias, col_name));
-            }
+        && name == bind_var
+    {
+        // Verify column exists in schema
+        lookup_col_type_from_schema(schema, col_name)?;
+        return Some(sql_col_ref(alias, col_name));
+    }
     // Also handle arithmetic expressions like `\x -> x.price * x.qty`
     try_sql_arithmetic_expr(bind_var, body, alias, schema)
 }
@@ -18149,12 +19065,16 @@ fn try_sql_arithmetic_expr(
     schema: &str,
 ) -> Option<String> {
     match &expr.node {
-        ast::ExprKind::FieldAccess { expr: inner, field: col_name } => {
+        ast::ExprKind::FieldAccess {
+            expr: inner,
+            field: col_name,
+        } => {
             if let ast::ExprKind::Var(name) = &inner.node
-                && name == bind_var {
-                    lookup_col_type_from_schema(schema, col_name)?;
-                    return Some(sql_col_ref(alias, col_name));
-                }
+                && name == bind_var
+            {
+                lookup_col_type_from_schema(schema, col_name)?;
+                return Some(sql_col_ref(alias, col_name));
+            }
             None
         }
         ast::ExprKind::Lit(lit) => match lit {
@@ -18197,9 +19117,10 @@ fn int_fn_app_head(func: &ast::Expr) -> Option<&str> {
         ast::ExprKind::Var(name) => Some(name.as_str()),
         ast::ExprKind::FieldAccess { expr, field } => {
             if let ast::ExprKind::Var(ns) = &expr.node
-                && ns == "base" {
-                    return Some(field.as_str());
-                }
+                && ns == "base"
+            {
+                return Some(field.as_str());
+            }
             None
         }
         _ => None,
@@ -18231,7 +19152,10 @@ fn try_sql_int_fn_app(
     // lexicographic). Cast each argument to INTEGER so both the ordering and
     // the result type match the Int runtime exactly.
     let arg_sql = |e: &ast::Expr| -> Option<String> {
-        Some(format!("CAST({} AS INTEGER)", try_sql_arithmetic_expr(bind_var, e, alias, schema)?))
+        Some(format!(
+            "CAST({} AS INTEGER)",
+            try_sql_arithmetic_expr(bind_var, e, alias, schema)?
+        ))
     };
     match (name, args.as_slice()) {
         ("abs", [x]) => Some(format!("ABS({})", arg_sql(x)?)),
@@ -18264,17 +19188,18 @@ fn analyze_map_select(
                 field: col_name,
             } = &field.value.node
                 && let ast::ExprKind::Var(name) = &expr.node
-                    && name == bind_var {
-                        let type_str = lookup_col_type_from_schema(schema, col_name)?;
-                        cols.push(SqlSelectColumn {
-                            result_field: field.name.clone(),
-                            alias: alias.to_string(),
-                            source_col: col_name.clone(),
-                            type_str,
-                            sql_expr: None,
-                        });
-                        continue;
-                    }
+                && name == bind_var
+            {
+                let type_str = lookup_col_type_from_schema(schema, col_name)?;
+                cols.push(SqlSelectColumn {
+                    result_field: field.name.clone(),
+                    alias: alias.to_string(),
+                    source_col: col_name.clone(),
+                    type_str,
+                    sql_expr: None,
+                });
+                continue;
+            }
             // Try arithmetic expression
             let sql_expr = try_sql_arithmetic_expr(bind_var, &field.value, alias, schema)?;
             // Infer result type from the expression (default to float for arithmetic)
@@ -18295,21 +19220,25 @@ fn analyze_map_select(
         // named after the field (or a fixed `_val` for computed exprs). This
         // lets `rel |> map (\p -> p.x) |> sum` and `rel |> map (\p -> p.dept)`
         // push down instead of shipping every row.
-        if let ast::ExprKind::FieldAccess { expr, field: col_name } = &body.node
+        if let ast::ExprKind::FieldAccess {
+            expr,
+            field: col_name,
+        } = &body.node
             && let ast::ExprKind::Var(name) = &expr.node
-                && name == bind_var {
-                    let type_str = lookup_col_type_from_schema(schema, col_name)?;
-                    return Some(vec![SqlSelectColumn {
-                        result_field: col_name.clone(),
-                        alias: alias.to_string(),
-                        source_col: col_name.clone(),
-                        type_str,
-                        sql_expr: None,
-                    }]);
-                }
+            && name == bind_var
+        {
+            let type_str = lookup_col_type_from_schema(schema, col_name)?;
+            return Some(vec![SqlSelectColumn {
+                result_field: col_name.clone(),
+                alias: alias.to_string(),
+                source_col: col_name.clone(),
+                type_str,
+                sql_expr: None,
+            }]);
+        }
         if let Some(sql_expr) = try_sql_arithmetic_expr(bind_var, body, alias, schema) {
-            let type_str = infer_sql_expr_type(bind_var, body, schema)
-                .unwrap_or_else(|| "float".to_string());
+            let type_str =
+                infer_sql_expr_type(bind_var, body, schema).unwrap_or_else(|| "float".to_string());
             return Some(vec![SqlSelectColumn {
                 result_field: "_val".to_string(),
                 alias: alias.to_string(),
@@ -18323,13 +19252,21 @@ fn analyze_map_select(
 }
 
 /// Infer the SQL type of an arithmetic expression by examining its leaf types.
-pub(crate) fn infer_sql_expr_type(bind_var: &str, expr: &ast::Expr, schema: &str) -> Option<String> {
+pub(crate) fn infer_sql_expr_type(
+    bind_var: &str,
+    expr: &ast::Expr,
+    schema: &str,
+) -> Option<String> {
     match &expr.node {
-        ast::ExprKind::FieldAccess { expr: inner, field: col_name } => {
+        ast::ExprKind::FieldAccess {
+            expr: inner,
+            field: col_name,
+        } => {
             if let ast::ExprKind::Var(name) = &inner.node
-                && name == bind_var {
-                    return lookup_col_type_from_schema(schema, col_name);
-                }
+                && name == bind_var
+            {
+                return lookup_col_type_from_schema(schema, col_name);
+            }
             None
         }
         ast::ExprKind::Lit(lit) => match lit {
@@ -18389,13 +19326,17 @@ fn try_multi_table_arithmetic_expr(
     expr: &ast::Expr,
 ) -> Option<String> {
     match &expr.node {
-        ast::ExprKind::FieldAccess { expr: inner, field: col_name } => {
+        ast::ExprKind::FieldAccess {
+            expr: inner,
+            field: col_name,
+        } => {
             if let ast::ExprKind::Var(name) = &inner.node
-                && let Some(alias) = bind_to_alias.get(name.as_str()) {
-                    let schema = bind_to_schema.get(name.as_str())?;
-                    lookup_col_type_from_schema(schema, col_name)?;
-                    return Some(format!("{}.{}", alias, quote_sql_ident(col_name)));
-                }
+                && let Some(alias) = bind_to_alias.get(name.as_str())
+            {
+                let schema = bind_to_schema.get(name.as_str())?;
+                lookup_col_type_from_schema(schema, col_name)?;
+                return Some(format!("{}.{}", alias, quote_sql_ident(col_name)));
+            }
             None
         }
         ast::ExprKind::Lit(lit) => match lit {
@@ -18443,11 +19384,15 @@ fn infer_multi_table_sql_expr_type(
     expr: &ast::Expr,
 ) -> Option<String> {
     match &expr.node {
-        ast::ExprKind::FieldAccess { expr: inner, field: col_name } => {
+        ast::ExprKind::FieldAccess {
+            expr: inner,
+            field: col_name,
+        } => {
             if let ast::ExprKind::Var(name) = &inner.node
-                && let Some(schema) = bind_to_schema.get(name.as_str()) {
-                    return lookup_col_type_from_schema(schema, col_name);
-                }
+                && let Some(schema) = bind_to_schema.get(name.as_str())
+            {
+                return lookup_col_type_from_schema(schema, col_name);
+            }
             None
         }
         ast::ExprKind::Lit(lit) => match lit {
@@ -18561,11 +19506,9 @@ fn pat_primary_var(pat: &ast::PatKind) -> Option<String> {
 fn case_pattern_is_irrefutable(pat: &ast::Pat) -> bool {
     match &pat.node {
         ast::PatKind::Wildcard | ast::PatKind::Var(_) => true,
-        ast::PatKind::Record(fields) => fields.iter().all(|fp| {
-            fp.pattern
-                .as_ref()
-                .is_none_or(case_pattern_is_irrefutable)
-        }),
+        ast::PatKind::Record(fields) => fields
+            .iter()
+            .all(|fp| fp.pattern.as_ref().is_none_or(case_pattern_is_irrefutable)),
         ast::PatKind::Lit(_)
         | ast::PatKind::Constructor { .. }
         | ast::PatKind::List(_)
@@ -18588,8 +19531,7 @@ fn bind_do_pattern<M: cranelift_module::Module>(
         ast::PatKind::Record(fields) => {
             for fp in fields {
                 let (key_ptr, key_len) = cg.string_ptr(builder, &fp.name);
-                let field_val =
-                    cg.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len]);
+                let field_val = cg.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len]);
                 if let Some(inner_pat) = &fp.pattern {
                     bind_do_pattern(builder, cg, inner_pat, field_val, env, skips);
                 } else {
@@ -18604,18 +19546,13 @@ fn bind_do_pattern<M: cranelift_module::Module>(
                 // Bool is represented as Value::Bool, not Value::Constructor —
                 // knot_constructor_matches would always return 0. Test the bool
                 // value directly, mirroring compile_case.
-                let bool_val =
-                    cg.call_rt_typed(builder, "knot_value_get_bool", &[val], types::I32);
+                let bool_val = cg.call_rt_typed(builder, "knot_value_get_bool", &[val], types::I32);
                 let expected = if name == "True" { 1i64 } else { 0i64 };
                 builder.ins().icmp_imm(IntCC::Equal, bool_val, expected)
             } else {
                 match cg.nullable_ctors.get(name).cloned() {
-                    Some(NullableRole::None) => {
-                        builder.ins().icmp_imm(IntCC::Equal, val, 0)
-                    }
-                    Some(NullableRole::Some) => {
-                        builder.ins().icmp_imm(IntCC::NotEqual, val, 0)
-                    }
+                    Some(NullableRole::None) => builder.ins().icmp_imm(IntCC::Equal, val, 0),
+                    Some(NullableRole::Some) => builder.ins().icmp_imm(IntCC::NotEqual, val, 0),
                     None => {
                         let (tag_ptr, tag_len) = cg.string_ptr(builder, name);
                         let matches = cg.call_rt_typed(
@@ -18631,7 +19568,9 @@ fn bind_do_pattern<M: cranelift_module::Module>(
 
             let then_block = builder.create_block();
             let skip_block = builder.create_block();
-            builder.ins().brif(is_match, then_block, &[], skip_block, &[]);
+            builder
+                .ins()
+                .brif(is_match, then_block, &[], skip_block, &[]);
 
             builder.switch_to_block(then_block);
             builder.seal_block(then_block);
@@ -18644,17 +19583,15 @@ fn bind_do_pattern<M: cranelift_module::Module>(
         ast::PatKind::Lit(lit) => {
             // Filter: only rows matching the literal value continue
             let lit_val = cg.compile_lit(builder, lit);
-            let eq_i32 = cg.call_rt_typed(
-                builder,
-                "knot_value_eq_i32",
-                &[val, lit_val],
-                types::I32,
-            );
+            let eq_i32 =
+                cg.call_rt_typed(builder, "knot_value_eq_i32", &[val, lit_val], types::I32);
             let is_match = builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
 
             let then_block = builder.create_block();
             let skip_block = builder.create_block();
-            builder.ins().brif(is_match, then_block, &[], skip_block, &[]);
+            builder
+                .ins()
+                .brif(is_match, then_block, &[], skip_block, &[]);
 
             builder.switch_to_block(then_block);
             builder.seal_block(then_block);
@@ -18673,7 +19610,9 @@ fn bind_do_pattern<M: cranelift_module::Module>(
 
             let then_block = builder.create_block();
             let skip_block = builder.create_block();
-            builder.ins().brif(is_match, then_block, &[], skip_block, &[]);
+            builder
+                .ins()
+                .brif(is_match, then_block, &[], skip_block, &[]);
 
             builder.switch_to_block(then_block);
             builder.seal_block(then_block);
@@ -18692,7 +19631,9 @@ fn bind_do_pattern<M: cranelift_module::Module>(
 
             let then_block = builder.create_block();
             let skip_block = builder.create_block();
-            builder.ins().brif(is_match, then_block, &[], skip_block, &[]);
+            builder
+                .ins()
+                .brif(is_match, then_block, &[], skip_block, &[]);
 
             builder.switch_to_block(then_block);
             builder.seal_block(then_block);
@@ -18788,7 +19729,13 @@ fn collect_docs_expr(expr: &ast::Expr, out: &mut Vec<(String, String)>) {
 fn value_lambda_chain(expr: &ast::Expr) -> (Vec<ast::Pat>, &ast::Expr) {
     let mut cur = expr;
     // Skip leading witness-only layers.
-    while let ast::ExprKind::Lambda { params, ty_params, body, .. } = &cur.node {
+    while let ast::ExprKind::Lambda {
+        params,
+        ty_params,
+        body,
+        ..
+    } = &cur.node
+    {
         if params.is_empty() && !ty_params.is_empty() {
             cur = body;
         } else {
@@ -18832,7 +19779,6 @@ fn collect_pat_var_names(pat: &ast::Pat, out: &mut HashSet<String>) {
         ast::PatKind::Annot { pat, .. } => collect_pat_var_names(pat, out),
     }
 }
-
 
 /// Extract all variable names bound by a pattern (handles destructuring).
 fn pat_bound_names(pat: &ast::Pat) -> Vec<String> {
@@ -18963,8 +19909,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
                 }
             }
         }
-        ast::ExprKind::Set { target, value }
-        | ast::ExprKind::FullSet { target, value } => {
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
             collect_free_vars(target, bound, free);
             collect_free_vars(value, bound, free);
         }
@@ -18990,7 +19935,9 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
 
 fn collect_pat_bindings_set<'a>(pat: &'a ast::Pat, bound: &mut HashSet<&'a str>) {
     match &pat.node {
-        ast::PatKind::Var(name) => { bound.insert(name.as_str()); }
+        ast::PatKind::Var(name) => {
+            bound.insert(name.as_str());
+        }
         ast::PatKind::Wildcard => {}
         ast::PatKind::Constructor { payload, .. } => {
             collect_pat_bindings_set(payload, bound);
@@ -19043,7 +19990,10 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::TypeHole => false,
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
+        ast::ExprKind::TypeCtor { .. }
+        | ast::ExprKind::DataCtor { .. }
+        | ast::ExprKind::SourceDecl { .. }
+        | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } => false,
         ast::ExprKind::FieldAccess { expr: e, .. } => expr_refs_var(e, var),
         ast::ExprKind::App { func, arg } => expr_refs_var(func, var) || expr_refs_var(arg, var),
@@ -19061,9 +20011,9 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         }
         ast::ExprKind::Case { scrutinee, arms } => {
             expr_refs_var(scrutinee, var)
-                || arms.iter().any(|arm| {
-                    !pat_binds_var(&arm.pat) && expr_refs_var(&arm.body, var)
-                })
+                || arms
+                    .iter()
+                    .any(|arm| !pat_binds_var(&arm.pat) && expr_refs_var(&arm.body, var))
         }
         ast::ExprKind::Record(fields) => fields.iter().any(|f| expr_refs_var(&f.value, var)),
         ast::ExprKind::List(elems) => elems.iter().any(|e| expr_refs_var(e, var)),
@@ -19132,7 +20082,10 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::TypeHole => false,
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
+        ast::ExprKind::TypeCtor { .. }
+        | ast::ExprKind::DataCtor { .. }
+        | ast::ExprKind::SourceDecl { .. }
+        | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } => false,
         // `var.field` is a ROW use, not a value use — the whole point of this
         // walker. A field access on anything else still recurses (`f x . name`
@@ -19164,18 +20117,16 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         }
         ast::ExprKind::Case { scrutinee, arms } => {
             expr_uses_var_as_value(scrutinee, var)
-                || arms.iter().any(|arm| {
-                    !pat_binds_var(&arm.pat) && expr_uses_var_as_value(&arm.body, var)
-                })
+                || arms
+                    .iter()
+                    .any(|arm| !pat_binds_var(&arm.pat) && expr_uses_var_as_value(&arm.body, var))
         }
         ast::ExprKind::Record(fields) => {
             fields.iter().any(|f| expr_uses_var_as_value(&f.value, var))
         }
         // `{p | age: 1}` rebuilds the whole record `p`, so the base is a value
         // use even though field names appear next to it.
-        ast::ExprKind::List(elems) => {
-            elems.iter().any(|e| expr_uses_var_as_value(e, var))
-        }
+        ast::ExprKind::List(elems) => elems.iter().any(|e| expr_uses_var_as_value(e, var)),
         ast::ExprKind::Do(stmts) => {
             for stmt in stmts {
                 match &stmt.node {
@@ -19212,13 +20163,11 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => {
             expr_uses_var_as_value(inner, var)
         }
-        ast::ExprKind::TimeUnitLit { value, .. } => {
-            expr_uses_var_as_value(value, var)
-        }
+        ast::ExprKind::TimeUnitLit { value, .. } => expr_uses_var_as_value(value, var),
         ast::ExprKind::Annot { expr: e, .. } => expr_uses_var_as_value(e, var),
-        ast::ExprKind::Serve { handlers, .. } => {
-            handlers.iter().any(|h| expr_uses_var_as_value(&h.body, var))
-        }
+        ast::ExprKind::Serve { handlers, .. } => handlers
+            .iter()
+            .any(|h| expr_uses_var_as_value(&h.body, var)),
     }
 }
 
@@ -19270,9 +20219,10 @@ fn strip_expr_wrappers(expr: &ast::Expr) -> &ast::Expr {
 fn int_literal_divisor_value(expr: &ast::Expr) -> Option<i64> {
     let e = strip_expr_wrappers(expr);
     match &e.node {
-        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand } => {
-            int_literal_divisor_value(operand).and_then(i64::checked_neg)
-        }
+        ast::ExprKind::UnaryOp {
+            op: ast::UnaryOp::Neg,
+            operand,
+        } => int_literal_divisor_value(operand).and_then(i64::checked_neg),
         ast::ExprKind::Lit(ast::Literal::Int(n)) => n.parse::<i64>().ok(),
         _ => None,
     }
@@ -19282,9 +20232,10 @@ fn int_literal_divisor_value(expr: &ast::Expr) -> Option<i64> {
 fn float_literal_divisor_nonzero(expr: &ast::Expr) -> bool {
     let e = strip_expr_wrappers(expr);
     match &e.node {
-        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand } => {
-            float_literal_divisor_nonzero(operand)
-        }
+        ast::ExprKind::UnaryOp {
+            op: ast::UnaryOp::Neg,
+            operand,
+        } => float_literal_divisor_nonzero(operand),
         ast::ExprKind::Lit(ast::Literal::Float(f)) => *f != 0.0,
         _ => false,
     }
@@ -19359,15 +20310,15 @@ pub(crate) fn sql_scalar_kind(
             _ => SqlScalarKind::Other,
         })),
         ast::ExprKind::Var(_) => Ok(None),
-        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand } => {
-            sql_scalar_kind(operand, col_ty)
-        }
+        ast::ExprKind::UnaryOp {
+            op: ast::UnaryOp::Neg,
+            operand,
+        } => sql_scalar_kind(operand, col_ty),
         ast::ExprKind::BinOp { op, lhs, rhs } => match op {
             ast::BinOp::Concat => Ok(Some(SqlScalarKind::Text)),
-            ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul => join_sql_kinds(
-                sql_scalar_kind(lhs, col_ty)?,
-                sql_scalar_kind(rhs, col_ty)?,
-            ),
+            ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul => {
+                join_sql_kinds(sql_scalar_kind(lhs, col_ty)?, sql_scalar_kind(rhs, col_ty)?)
+            }
             ast::BinOp::Div => {
                 if !divisor_is_nonzero_literal(rhs) {
                     return Err(());
@@ -19379,10 +20330,7 @@ pub(crate) fn sql_scalar_kind(
                     return Err(());
                 }
                 join_sql_kinds(
-                    join_sql_kinds(
-                        sql_scalar_kind(lhs, col_ty)?,
-                        sql_scalar_kind(rhs, col_ty)?,
-                    )?,
+                    join_sql_kinds(sql_scalar_kind(lhs, col_ty)?, sql_scalar_kind(rhs, col_ty)?)?,
                     Some(SqlScalarKind::Int),
                 )
             }
@@ -19541,11 +20489,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
             format!("{} = {}", pretty_expr(target), pretty_expr(value))
         }
         ast::ExprKind::FullSet { target, value } => {
-            format!(
-                "full {} = {}",
-                pretty_expr(target),
-                pretty_expr(value)
-            )
+            format!("full {} = {}", pretty_expr(target), pretty_expr(value))
         }
         ast::ExprKind::Atomic(e) => format!("atomic ({})", pretty_expr(e)),
         ast::ExprKind::TimeUnitLit { value, .. } => pretty_expr(value),
@@ -19709,8 +20653,7 @@ fn collect_type_refinements(
         // `Maybe T` — the only type application whose payload the JSON decoder
         // unwraps positionally. Everything else (`Result e a`, user ADTs) is
         // tagged and has no single "the value" to refine.
-        ast::TypeKind::App { func, arg }
-            if matches!(&func.node, ast::TypeKind::Named(n) if n == "Maybe") =>
+        ast::TypeKind::App { func, arg } if matches!(&func.node, ast::TypeKind::Named(n) if n == "Maybe") =>
         {
             let sub = format!("{}?", path);
             collect_type_refinements(arg, &sub, alias_ast, visiting, out);
@@ -19726,7 +20669,10 @@ fn collect_type_refinements(
 fn collect_record_migrations(body: &ast::Expr, out: &mut Vec<(String, ast::Expr)>) {
     if let ast::ExprKind::Record(fields) = &body.node {
         for f in fields {
-            if let ast::ExprKind::SourceDecl { name, migrations, .. } = &f.value.node {
+            if let ast::ExprKind::SourceDecl {
+                name, migrations, ..
+            } = &f.value.node
+            {
                 for m in migrations {
                     out.push((name.clone(), m.using_fn.clone()));
                 }
@@ -19734,7 +20680,6 @@ fn collect_record_migrations(body: &ast::Expr, out: &mut Vec<(String, ast::Expr)
         }
     }
 }
-
 
 /// Convert route path segments to a pattern string like "/todos/{owner:text}".
 fn path_segments_to_pattern(
@@ -19811,9 +20756,11 @@ fn ast_type_to_descriptor_type(
                 // and aliased `Maybe` positions lose their `?` marker (so `null`
                 // fails to decode to `Nothing`). The response side already
                 // resolves these via `resolve_type_for_descriptor`; mirror it.
-                Some(resolved @ (ResolvedType::Record(_)
-                | ResolvedType::Relation(_)
-                | ResolvedType::Adt(_))) => resolved_type_to_descriptor(resolved),
+                Some(
+                    resolved @ (ResolvedType::Record(_)
+                    | ResolvedType::Relation(_)
+                    | ResolvedType::Adt(_)),
+                ) => resolved_type_to_descriptor(resolved),
                 _ => "text".to_string(),
             },
         },
@@ -19830,7 +20777,13 @@ fn ast_type_to_descriptor_type(
         ast::TypeKind::Record { fields, .. } => {
             let inner: Vec<String> = fields
                 .iter()
-                .map(|f| format!("{}:{}", f.name, ast_type_to_descriptor_type(&f.value, aliases)))
+                .map(|f| {
+                    format!(
+                        "{}:{}",
+                        f.name,
+                        ast_type_to_descriptor_type(&f.value, aliases)
+                    )
+                })
                 .collect();
             format!("{{{}}}", inner.join(","))
         }
@@ -19885,15 +20838,16 @@ fn resolve_type_for_descriptor(
             let resolved: Vec<(String, ResolvedType)> = fields
                 .iter()
                 .map(|f| {
-                    (f.name.clone(), resolve_type_for_descriptor(&f.value, aliases))
+                    (
+                        f.name.clone(),
+                        resolve_type_for_descriptor(&f.value, aliases),
+                    )
                 })
                 .collect();
             ResolvedType::Record(resolved)
         }
         ast::TypeKind::Relation(inner) => {
-            ResolvedType::Relation(Box::new(
-                resolve_type_for_descriptor(inner, aliases),
-            ))
+            ResolvedType::Relation(Box::new(resolve_type_for_descriptor(inner, aliases)))
         }
         ast::TypeKind::App { func, arg } => {
             // Inline `Maybe T` — resolve to the built-in Maybe ADT shape so
@@ -19946,9 +20900,10 @@ fn resolved_type_to_descriptor(ty: &ResolvedType) -> String {
                 };
                 if let Some(just_fields) = maybe_inner
                     && let [(fname, fty)] = just_fields.as_slice()
-                        && fname == "value" {
-                            return format!("?{}", resolved_type_to_descriptor(fty));
-                        }
+                    && fname == "value"
+                {
+                    return format!("?{}", resolved_type_to_descriptor(fty));
+                }
             }
             // Represent ADT as object with _tag + all constructor fields.
             // Seed `seen` with the synthetic `_tag` so a constructor field
@@ -20025,7 +20980,9 @@ fn eval_refine_predicate(pred: &ast::Expr, lit: &CompileLit) -> Option<bool> {
     // other variable the predicate may reference (e.g. a top-level constant).
     let (param_name, body) = match &pred.node {
         ast::ExprKind::Lambda { params, body, .. } => {
-            if params.len() != 1 { return None; }
+            if params.len() != 1 {
+                return None;
+            }
             let name = match &params[0].node {
                 ast::PatKind::Var(n) => n.clone(),
                 _ => return None,
@@ -20073,10 +21030,16 @@ fn eval_expr_bool(expr: &ast::Expr, lit: &CompileLit, param_name: &str) -> Optio
             // to None by `eval_expr_num`.
             match op {
                 ast::BinOp::And => {
-                    return Some(eval_expr_bool(lhs, lit, param_name)? && eval_expr_bool(rhs, lit, param_name)?);
+                    return Some(
+                        eval_expr_bool(lhs, lit, param_name)?
+                            && eval_expr_bool(rhs, lit, param_name)?,
+                    );
                 }
                 ast::BinOp::Or => {
-                    return Some(eval_expr_bool(lhs, lit, param_name)? || eval_expr_bool(rhs, lit, param_name)?);
+                    return Some(
+                        eval_expr_bool(lhs, lit, param_name)?
+                            || eval_expr_bool(rhs, lit, param_name)?,
+                    );
                 }
                 _ => {}
             }
@@ -20092,9 +21055,11 @@ fn eval_expr_bool(expr: &ast::Expr, lit: &CompileLit, param_name: &str) -> Optio
                 _ => None,
             }
         }
-        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Not, operand, .. } => {
-            Some(!eval_expr_bool(operand, lit, param_name)?)
-        }
+        ast::ExprKind::UnaryOp {
+            op: ast::UnaryOp::Not,
+            operand,
+            ..
+        } => Some(!eval_expr_bool(operand, lit, param_name)?),
         _ => None,
     }
 }
@@ -20134,6 +21099,3 @@ fn eval_expr_num(expr: &ast::Expr, lit: &CompileLit, param_name: &str) -> Option
         _ => None,
     }
 }
-
-
-

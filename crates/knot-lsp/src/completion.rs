@@ -17,7 +17,7 @@ use crate::shared::{
     resolve_var_to_source,
 };
 use crate::state::{
-    builtins as state_builtins, DocumentState, ServerState, SnippetContext, KEYWORDS, SNIPPETS,
+    DocumentState, KEYWORDS, SNIPPETS, ServerState, SnippetContext, builtins as state_builtins,
 };
 use crate::type_format::format_type_kind;
 use crate::utils::{offset_to_position, position_to_offset, recurse_expr, top_fields, uri_to_path};
@@ -208,14 +208,18 @@ pub(crate) fn handle_completion(
         if inside_string_or_comment(latest_source, offset.saturating_sub(1)) {
             return None;
         }
-        let line_start = latest_source[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let line_start = latest_source[..offset]
+            .rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
         let line_text = &latest_source[line_start..offset];
         if line_text.trim_start().starts_with("import ") {
             if let Some(source_path) = uri_to_path(uri)
-                && let Some(base_dir) = source_path.parent() {
-                    let partial = line_text.trim_start().strip_prefix("import ").unwrap_or("");
-                    items.extend(complete_import_path(base_dir, partial));
-                }
+                && let Some(base_dir) = source_path.parent()
+            {
+                let partial = line_text.trim_start().strip_prefix("import ").unwrap_or("");
+                items.extend(complete_import_path(base_dir, partial));
+            }
             return Some(CompletionResponse::Array(items));
         }
     }
@@ -237,7 +241,10 @@ pub(crate) fn handle_completion(
         // access: suggest import paths (as the `/` trigger does) rather than
         // falling through to the all-known-fields fallback, which would pop up
         // every record field name after `import .`.
-        let line_start = latest_source[..offset].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let line_start = latest_source[..offset]
+            .rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
         let line_text = &latest_source[line_start..offset];
         if line_text.trim_start().starts_with("import ") {
             if let Some(source_path) = uri_to_path(uri)
@@ -270,16 +277,16 @@ pub(crate) fn handle_completion(
                 if let Some(src) = owner_source.as_deref()
                     && let Some((type_label, predicate)) =
                         find_field_refinement(&doc.source_refinements, src, &name)
-                    {
-                        let pred_src = predicate_to_source(predicate, &doc.source);
-                        item.detail = Some(format!("refined `{type_label}` — {pred_src}"));
-                        item.documentation = Some(Documentation::MarkupContent(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: format!(
-                                "Field `{name}` of `*{src}` is refined; values must satisfy `{pred_src}`."
-                            ),
-                        }));
-                    }
+                {
+                    let pred_src = predicate_to_source(predicate, &doc.source);
+                    item.detail = Some(format!("refined `{type_label}` — {pred_src}"));
+                    item.documentation = Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format!(
+                            "Field `{name}` of `*{src}` is refined; values must satisfy `{pred_src}`."
+                        ),
+                    }));
+                }
                 items.push(item);
             }
             return Some(CompletionResponse::Array(items));
@@ -526,22 +533,21 @@ pub(crate) fn handle_completion(
     // `doc.module` and `doc.monad_info` spans index `doc.source`, so use the
     // analyzed-source offset (not the mid-debounce `offset`).
     if let Some(do_span) = find_enclosing_do_span(&doc.module, analyzed_offset)
-        && let Some(monad) = monad_for_do_span(&doc.monad_info, do_span, analyzed_offset) {
-            for item in items.iter_mut() {
-                let label = item.label.trim_start_matches(['*', '&']);
-                if let Some(ty) = doc.type_info.get(label)
-                    && type_matches_monad(ty, &monad) {
-                        // Prefix the existing sort_text (or label fallback) so
-                        // matching items rank ahead of everything else but keep
-                        // their relative order from the original list.
-                        let base = item
-                            .sort_text
-                            .clone()
-                            .unwrap_or_else(|| item.label.clone());
-                        item.sort_text = Some(format!("aaa_{base}"));
-                    }
+        && let Some(monad) = monad_for_do_span(&doc.monad_info, do_span, analyzed_offset)
+    {
+        for item in items.iter_mut() {
+            let label = item.label.trim_start_matches(['*', '&']);
+            if let Some(ty) = doc.type_info.get(label)
+                && type_matches_monad(ty, &monad)
+            {
+                // Prefix the existing sort_text (or label fallback) so
+                // matching items rank ahead of everything else but keep
+                // their relative order from the original list.
+                let base = item.sort_text.clone().unwrap_or_else(|| item.label.clone());
+                item.sort_text = Some(format!("aaa_{base}"));
             }
         }
+    }
 
     // Type-aware ranking: when the cursor sits at an argument position in a
     // function call we know the expected parameter type. Push candidates
@@ -610,8 +616,7 @@ fn rank_by_type_alignment(
             continue;
         }
         let label = item.label.trim_start_matches(['*', '&']);
-        let Some(ty) = doc.type_info.get(label).or(item.detail.as_ref())
-        else {
+        let Some(ty) = doc.type_info.get(label).or(item.detail.as_ref()) else {
             continue;
         };
         let candidate_params = crate::shared::parse_function_params(ty);
@@ -636,10 +641,7 @@ fn rank_by_type_alignment(
         let candidate_arity = candidate_params.len().saturating_sub(1);
         let arity_ok = candidate_arity == 0 || candidate_arity <= arity_remaining;
         if aligns {
-            let base = item
-                .sort_text
-                .clone()
-                .unwrap_or_else(|| item.label.clone());
+            let base = item.sort_text.clone().unwrap_or_else(|| item.label.clone());
             let prefix = if arity_ok { "aab_" } else { "aac_" };
             item.sort_text = Some(format!("{prefix}{base}"));
         }
@@ -725,11 +727,8 @@ fn lookup_local_binding_type(doc: &DocumentState, name: &str, offset: usize) -> 
 /// Within a category items keep their original alphabetical order (the
 /// editor sorts on `sort_text`, falling back to `label`).
 fn apply_default_category_ranking(items: &mut [CompletionItem], doc: &DocumentState) {
-    let local_names: std::collections::HashSet<&str> = doc
-        .definitions
-        .keys()
-        .map(String::as_str)
-        .collect();
+    let local_names: std::collections::HashSet<&str> =
+        doc.definitions.keys().map(String::as_str).collect();
     for item in items.iter_mut() {
         // Skip items that already carry a contextual prefix — those bumps are
         // signals about *this* completion request, stronger than category.
@@ -777,10 +776,7 @@ fn find_enclosing_route_decl_span(module: &ast::Expr, offset: usize) -> Option<S
         if !in_span {
             continue;
         }
-        if matches!(
-            &decl.value.node,
-            ast::ExprKind::RouteDecl { .. }
-        ) {
+        if matches!(&decl.value.node, ast::ExprKind::RouteDecl { .. }) {
             return Some(decl.value.span);
         }
     }
@@ -795,9 +791,11 @@ fn offset_in_route_rate_limit(module: &ast::Expr, offset: usize) -> bool {
         if let ast::ExprKind::RouteDecl { entries, .. } = &decl.value.node {
             for entry in entries {
                 if let Some(rl) = &entry.rate_limit
-                    && rl.span.start <= offset && offset < rl.span.end {
-                        return true;
-                    }
+                    && rl.span.start <= offset
+                    && offset < rl.span.end
+                {
+                    return true;
+                }
             }
         }
     }
@@ -874,8 +872,11 @@ fn find_enclosing_do_span(module: &ast::Expr, offset: usize) -> Option<Span> {
             continue;
         }
         match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => walk(&decl.value, offset, &mut best),
         }
     }
@@ -906,8 +907,11 @@ fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -
             continue;
         }
         let body: &ast::Expr = match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => continue,
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => continue,
             _ => &decl.value,
         };
         if body.span.start <= offset && offset < body.span.end {
@@ -983,9 +987,10 @@ fn type_matches_monad(ty: &str, monad: &MonadKind) -> bool {
     // but should still rank into a Maybe context.
     let params = crate::shared::parse_function_params(t);
     if params.len() > 1
-        && let Some(ret) = params.last() {
-            return monad_head_matches(ret.trim(), monad);
-        }
+        && let Some(ret) = params.last()
+    {
+        return monad_head_matches(ret.trim(), monad);
+    }
     false
 }
 
@@ -1086,9 +1091,10 @@ fn cursor_in_type_context(before: &str) -> bool {
             && matches!(
                 &text[ws..i],
                 "case" | "of" | "if" | "then" | "else" | "do" | "yield" | "where"
-            ) {
-                ty = false;
-            }
+            )
+        {
+            ty = false;
+        }
         match c {
             b'"' => {
                 // Skip string literal (with escapes).
@@ -1335,20 +1341,22 @@ fn find_type_for_name(doc: &DocumentState, name: &str, offset: usize) -> Option<
     }
     // Check if any reference at this offset points to a local binding with a known type
     for (usage_span, def_span) in &doc.references {
-        if usage_span.start <= offset && offset < usage_span.end
-            && let Some(ty) = doc.local_type_info.get(def_span) {
-                // Guard that the pointed-at definition is actually named `name`,
-                // mirroring the `local_type_info` branch above. Without it a
-                // stale or mismatched reference span covering the receiver
-                // offset hands back an unrelated binding's type, offering the
-                // wrong fields after `.`.
-                if def_span.end <= doc.source.len()
-                    && def_span.start <= def_span.end
-                    && &doc.source[def_span.start..def_span.end] == name
-                {
-                    return Some(ty.clone());
-                }
+        if usage_span.start <= offset
+            && offset < usage_span.end
+            && let Some(ty) = doc.local_type_info.get(def_span)
+        {
+            // Guard that the pointed-at definition is actually named `name`,
+            // mirroring the `local_type_info` branch above. Without it a
+            // stale or mismatched reference span covering the receiver
+            // offset hands back an unrelated binding's type, offering the
+            // wrong fields after `.`.
+            if def_span.end <= doc.source.len()
+                && def_span.start <= def_span.end
+                && &doc.source[def_span.start..def_span.end] == name
+            {
+                return Some(ty.clone());
             }
+        }
     }
     // Check global type info
     doc.type_info.get(name).cloned()
@@ -1428,10 +1436,15 @@ fn extract_fields_from_type_str_inner(
                 }
             }
             // Data type with a single constructor — expose its fields
-            ast::ExprKind::DataCtor { name, constructors, .. } if name == type_str
-                && constructors.len() == 1 => {
-                    return constructors[0].fields.iter().map(|f| f.name.clone()).collect();
-                }
+            ast::ExprKind::DataCtor {
+                name, constructors, ..
+            } if name == type_str && constructors.len() == 1 => {
+                return constructors[0]
+                    .fields
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .collect();
+            }
             _ => {}
         }
     }
@@ -1463,13 +1476,15 @@ pub(crate) fn handle_resolve_completion_item(
 
     for doc in state.documents.values() {
         if detail.is_none()
-            && let Some(ty) = doc.type_info.get(label.as_str()) {
-                detail = Some(ty.clone());
-            }
+            && let Some(ty) = doc.type_info.get(label.as_str())
+        {
+            detail = Some(ty.clone());
+        }
         if doc_md.is_none()
-            && let Some(d) = doc.doc_comments.get(label.as_str()) {
-                doc_md = Some(d.clone());
-            }
+            && let Some(d) = doc.doc_comments.get(label.as_str())
+        {
+            doc_md = Some(d.clone());
+        }
         if let Some(predicate) = doc.refined_types.get(label.as_str()) {
             let pred_src = predicate_to_source(predicate, &doc.source);
             push_unique(
@@ -1523,29 +1538,28 @@ fn function_constraint_summary(module: &ast::Expr, name: &str) -> Option<String>
     for decl in top_fields(module) {
         if decl.name == name
             && let Some(scheme) = &decl.sig
-            && !scheme.constraints.is_empty() {
-                let cs: Vec<String> = scheme
-                    .constraints
-                    .iter()
-                    .map(|c| match c {
-                        knot::ast::Constraint::Trait { trait_name, args } => {
-                            let args: Vec<String> = args
-                                .iter()
-                                .map(|t| format_type_kind(&t.node))
-                                .collect();
-                            format!("`{} {}`", trait_name, args.join(" "))
-                        }
-                        knot::ast::Constraint::ImplicitField { field, ty } => {
-                            format!("`({}  ^{})`", format_type_kind(&ty.node), field)
-                        }
-                        knot::ast::Constraint::CollectField { field, ty } => match ty {
-                            Some(ty) => format!("`({}  <>{})`", format_type_kind(&ty.node), field),
-                            None => format!("`(<> {})`", field),
-                        }
-                    })
-                    .collect();
-                return Some(format!("*Constraints:* {}", cs.join(", ")));
-            }
+            && !scheme.constraints.is_empty()
+        {
+            let cs: Vec<String> = scheme
+                .constraints
+                .iter()
+                .map(|c| match c {
+                    knot::ast::Constraint::Trait { trait_name, args } => {
+                        let args: Vec<String> =
+                            args.iter().map(|t| format_type_kind(&t.node)).collect();
+                        format!("`{} {}`", trait_name, args.join(" "))
+                    }
+                    knot::ast::Constraint::ImplicitField { field, ty } => {
+                        format!("`({}  ^{})`", format_type_kind(&ty.node), field)
+                    }
+                    knot::ast::Constraint::CollectField { field, ty } => match ty {
+                        Some(ty) => format!("`({}  <>{})`", format_type_kind(&ty.node), field),
+                        None => format!("`(<> {})`", field),
+                    },
+                })
+                .collect();
+            return Some(format!("*Constraints:* {}", cs.join(", ")));
+        }
     }
     None
 }
@@ -1715,7 +1729,11 @@ fn complete_import_path(base_dir: &Path, partial: &str) -> Vec<CompletionItem> {
                 });
             }
         } else if path.extension().and_then(|e| e.to_str()) == Some("knot") {
-            let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let stem = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             if stem.to_lowercase().starts_with(&prefix.to_lowercase()) {
                 items.push(CompletionItem {
                     label: stem.clone(),
@@ -1729,4 +1747,3 @@ fn complete_import_path(base_dir: &Path, partial: &str) -> Vec<CompletionItem> {
 
     items
 }
-

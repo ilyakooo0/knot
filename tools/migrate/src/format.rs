@@ -205,11 +205,7 @@ pub fn format_module_inner(source: &str, module: &Module) -> String {
         for (j, c) in leading_comments.iter().enumerate() {
             if j > 0 {
                 out.push('\n');
-                if has_blank_lines_between(
-                    source,
-                    leading_comments[j - 1].span.end,
-                    c.span.start,
-                ) {
+                if has_blank_lines_between(source, leading_comments[j - 1].span.end, c.span.start) {
                     out.push('\n');
                 }
             }
@@ -262,22 +258,14 @@ pub fn format_module_inner(source: &str, module: &Module) -> String {
                 for (j, c) in between.iter().enumerate() {
                     if j > 0 {
                         out.push('\n');
-                        if has_blank_lines_between(
-                            source,
-                            between[j - 1].span.end,
-                            c.span.start,
-                        ) {
+                        if has_blank_lines_between(source, between[j - 1].span.end, c.span.start) {
                             out.push('\n');
                         }
                     }
                     out.push_str(c.text);
                 }
                 out.push('\n');
-                if has_blank_lines_between(
-                    source,
-                    between.last().unwrap().span.end,
-                    block_start,
-                ) {
+                if has_blank_lines_between(source, between.last().unwrap().span.end, block_start) {
                     out.push('\n');
                 }
             } else if has_blank_lines_between(source, prev_end, block_start) {
@@ -351,7 +339,11 @@ fn has_blank_lines_between(source: &str, from: usize, to: usize) -> bool {
             }
             b'\r' => {
                 breaks += 1;
-                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
             }
             _ => i += 1,
         }
@@ -490,7 +482,11 @@ fn line_of(source: &str, byte: usize) -> usize {
             i += 1;
         } else if b == b'\r' {
             line += 1;
-            i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+            i += if bytes.get(i + 1) == Some(&b'\n') {
+                2
+            } else {
+                1
+            };
         } else {
             i += 1;
         }
@@ -509,7 +505,6 @@ fn trailing_line_comment<'a>(
         .iter()
         .find(|c| c.line == line && !c.standalone && c.span.start >= after)
 }
-
 
 // ── Imports ─────────────────────────────────────────────────────────
 
@@ -688,7 +683,12 @@ fn render_decl(p: &mut Printer, d: &Decl) {
         p.write("export ");
     }
     match &d.node {
-        DeclKind::Data { name, params, constructors, deriving } => {
+        DeclKind::Data {
+            name,
+            params,
+            constructors,
+            deriving,
+        } => {
             render_data(p, name, params, constructors, deriving);
         }
         DeclKind::TypeAlias { name, params, ty } => {
@@ -706,10 +706,20 @@ fn render_decl(p: &mut Printer, d: &Decl) {
         DeclKind::Fun { name, ty, body } => {
             render_fun(p, name, ty.as_ref(), body.as_ref());
         }
-        DeclKind::Trait { name, params, supertraits, items } => {
+        DeclKind::Trait {
+            name,
+            params,
+            supertraits,
+            items,
+        } => {
             render_trait(p, name, params, supertraits, items);
         }
-        DeclKind::Impl { trait_name, args, constraints, items } => {
+        DeclKind::Impl {
+            trait_name,
+            args,
+            constraints,
+            items,
+        } => {
             render_impl(p, trait_name, args, constraints, items);
         }
         DeclKind::Route { name, entries } => {
@@ -726,7 +736,12 @@ fn render_decl(p: &mut Printer, d: &Decl) {
                 p.write(c);
             }
         }
-        DeclKind::Migrate { relation, from_ty, to_ty, using_fn } => {
+        DeclKind::Migrate {
+            relation,
+            from_ty,
+            to_ty,
+            using_fn,
+        } => {
             // Always use the multi-line layout: on a single line,
             // `parse_type_app` would greedily consume the `to`/`using` clause
             // keywords as type-variable applications. With each clause on its
@@ -994,7 +1009,13 @@ fn render_trait(
 
 fn render_trait_item(p: &mut Printer, it: &TraitItem) {
     match it {
-        TraitItem::Method { name, ty, default_params, default_body, .. } => {
+        TraitItem::Method {
+            name,
+            ty,
+            default_params,
+            default_body,
+            ..
+        } => {
             // The parser emits one TraitItem per syntactic line: a signature
             // (`describe : a -> Text`) is one item; a default body
             // (`describe x = ...`) is another with a Hole type. Render each
@@ -1068,7 +1089,9 @@ fn render_impl(
 
 fn render_impl_item(p: &mut Printer, it: &ImplItem) {
     match it {
-        ImplItem::Method { name, params, body, .. } => {
+        ImplItem::Method {
+            name, params, body, ..
+        } => {
             p.write(name);
             for prm in params {
                 p.write(" ");
@@ -1217,7 +1240,11 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
         TypeKind::Named(n) => n.clone(),
         TypeKind::Var(n) => n.clone(),
         TypeKind::App { func, arg } => {
-            let s = format!("{} {}", render_type_prec(func, TyPrec::App), render_type_atom(arg));
+            let s = format!(
+                "{} {}",
+                render_type_prec(func, TyPrec::App),
+                render_type_atom(arg)
+            );
             if ctx > TyPrec::App {
                 format!("({})", s)
             } else {
@@ -1247,7 +1274,11 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
         }
         TypeKind::Relation(inner) => format!("[{}]", render_type(inner)),
         TypeKind::Function { param, result } => {
-            let s = format!("{} -> {}", render_type_prec(param, TyPrec::App), render_type_prec(result, TyPrec::Function));
+            let s = format!(
+                "{} -> {}",
+                render_type_prec(param, TyPrec::App),
+                render_type_prec(result, TyPrec::Function)
+            );
             if ctx > TyPrec::Function {
                 format!("({})", s)
             } else {
@@ -1325,7 +1356,11 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
         TypeKind::Unit(u) => render_unit_type_arg(u),
         TypeKind::Refined { base, predicate } => {
             // `T where \x -> ...` — predicate is always a lambda.
-            let s = format!("{} where {}", render_type_prec(base, TyPrec::App), render_expr_inline(predicate, Prec::Lowest));
+            let s = format!(
+                "{} where {}",
+                render_type_prec(base, TyPrec::App),
+                render_expr_inline(predicate, Prec::Lowest)
+            );
             if ctx > TyPrec::App {
                 format!("({})", s)
             } else {
@@ -1372,11 +1407,12 @@ fn render_effects_coalesced(effects: &[Effect]) -> Vec<String> {
     let mut i = 0;
     while i < effects.len() {
         if let Effect::Reads(n) = &effects[i]
-            && matches!(effects.get(i + 1), Some(Effect::Writes(m)) if m == n) {
-                out.push(format!("rw *{}", n));
-                i += 2;
-                continue;
-            }
+            && matches!(effects.get(i + 1), Some(Effect::Writes(m)) if m == n)
+        {
+            out.push(format!("rw *{}", n));
+            i += 2;
+            continue;
+        }
         out.push(render_effect(&effects[i]));
         i += 1;
     }
@@ -1416,11 +1452,19 @@ fn render_unit_expr_prec(u: &UnitExpr, ctx: u8) -> String {
         UnitExpr::Dimensionless => "1".into(),
         UnitExpr::Named(n) => n.clone(),
         UnitExpr::Mul(a, b) => {
-            let s = format!("{} * {}", render_unit_expr_prec(a, 1), render_unit_expr_prec(b, 2));
+            let s = format!(
+                "{} * {}",
+                render_unit_expr_prec(a, 1),
+                render_unit_expr_prec(b, 2)
+            );
             if ctx > 1 { format!("({})", s) } else { s }
         }
         UnitExpr::Div(a, b) => {
-            let s = format!("{} / {}", render_unit_expr_prec(a, 1), render_unit_expr_prec(b, 2));
+            let s = format!(
+                "{} / {}",
+                render_unit_expr_prec(a, 1),
+                render_unit_expr_prec(b, 2)
+            );
             if ctx > 1 { format!("({})", s) } else { s }
         }
         UnitExpr::Pow(a, n) => {
@@ -1556,14 +1600,16 @@ fn binop_str(op: BinOp) -> &'static str {
 /// so either rendering reparses identically).
 fn as_let_in(e: &Expr) -> Option<(&Pat, Option<&Type>, &Expr, &Expr)> {
     if let ExprKind::App { func, arg } = &e.node
-        && arg.span.end < func.span.end && arg.span.start > func.span.start
-            && let ExprKind::Lambda { params, body } = &func.node
-                && params.len() == 1 {
-                    if let ExprKind::Annot { expr, ty } = &arg.node {
-                        return Some((&params[0], Some(ty), expr, body));
-                    }
-                    return Some((&params[0], None, arg, body));
-                }
+        && arg.span.end < func.span.end
+        && arg.span.start > func.span.start
+        && let ExprKind::Lambda { params, body } = &func.node
+        && params.len() == 1
+    {
+        if let ExprKind::Annot { expr, ty } = &arg.node {
+            return Some((&params[0], Some(ty), expr, body));
+        }
+        return Some((&params[0], None, arg, body));
+    }
     None
 }
 
@@ -1801,7 +1847,11 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
 fn render_stmt_inline(s: &Stmt) -> String {
     match &s.node {
         StmtKind::Bind { pat, expr } => {
-            format!("{} <- {}", render_pat(pat), render_expr_inline(expr, Prec::Lowest))
+            format!(
+                "{} <- {}",
+                render_pat(pat),
+                render_expr_inline(expr, Prec::Lowest)
+            )
         }
         StmtKind::Where { cond } => {
             format!("where {}", render_expr_inline(cond, Prec::Lowest))
@@ -1814,11 +1864,7 @@ fn render_stmt_inline(s: &Stmt) -> String {
 }
 
 fn paren_if(cond: bool, s: String) -> String {
-    if cond {
-        format!("({})", s)
-    } else {
-        s
-    }
+    if cond { format!("({})", s) } else { s }
 }
 
 fn render_literal(l: &Literal) -> String {
@@ -1849,7 +1895,13 @@ fn render_literal(l: &Literal) -> String {
         }
         Literal::Text(s) => format!("\"{}\"", escape_text(s)),
         Literal::Bytes(bytes) => format!("b\"{}\"", escape_bytes(bytes)),
-        Literal::Bool(b) => if *b { "true".into() } else { "false".into() },
+        Literal::Bool(b) => {
+            if *b {
+                "true".into()
+            } else {
+                "false".into()
+            }
+        }
     }
 }
 
@@ -2358,13 +2410,21 @@ mod tests {
 
     fn assert_fmt(input: &str, expected: &str) {
         let got = fmt(input);
-        assert_eq!(got, expected, "\n--- got ---\n{}\n--- want ---\n{}\n", got, expected);
+        assert_eq!(
+            got, expected,
+            "\n--- got ---\n{}\n--- want ---\n{}\n",
+            got, expected
+        );
     }
 
     fn assert_idempotent(input: &str) {
         let once = fmt(input);
         let twice = fmt(&once);
-        assert_eq!(once, twice, "formatter is not idempotent:\n--- once ---\n{}\n--- twice ---\n{}\n", once, twice);
+        assert_eq!(
+            once, twice,
+            "formatter is not idempotent:\n--- once ---\n{}\n--- twice ---\n{}\n",
+            once, twice
+        );
     }
 
     // B50: A multi-line `do`/`case` block in argument position is rendered
@@ -2393,7 +2453,9 @@ mod tests {
         let (tokens, _) = lexer.tokenize();
         let (module, diags) = Parser::new(src.to_string(), tokens).parse_module();
         assert!(
-            !diags.iter().any(|d| d.severity == crate::diagnostic::Severity::Error),
+            !diags
+                .iter()
+                .any(|d| d.severity == crate::diagnostic::Severity::Error),
             "unexpected parse errors: {:?}",
             diags
         );
@@ -2404,12 +2466,19 @@ mod tests {
                 _ => None,
             }
         }
-        let DeclKind::Fun { body: Some(body), .. } = &module.decls[0].node else {
+        let DeclKind::Fun {
+            body: Some(body), ..
+        } = &module.decls[0].node
+        else {
             panic!("expected a function declaration");
         };
         let stmts = find_do(body).expect("expected a do-block argument");
         assert_eq!(stmts.len(), 2, "statements glued together: {:?}", stmts);
-        assert!(matches!(&stmts[0].node, StmtKind::Bind { .. }), "{:?}", stmts[0]);
+        assert!(
+            matches!(&stmts[0].node, StmtKind::Bind { .. }),
+            "{:?}",
+            stmts[0]
+        );
     }
 
     #[test]
@@ -2422,11 +2491,16 @@ mod tests {
         let (tokens, _) = lexer.tokenize();
         let (module, diags) = Parser::new(src.to_string(), tokens).parse_module();
         assert!(
-            !diags.iter().any(|d| d.severity == crate::diagnostic::Severity::Error),
+            !diags
+                .iter()
+                .any(|d| d.severity == crate::diagnostic::Severity::Error),
             "unexpected parse errors: {:?}",
             diags
         );
-        let DeclKind::Fun { body: Some(body), .. } = &module.decls[0].node else {
+        let DeclKind::Fun {
+            body: Some(body), ..
+        } = &module.decls[0].node
+        else {
             panic!("expected a function declaration");
         };
         assert!(
@@ -2483,10 +2557,7 @@ mod tests {
 
     #[test]
     fn function_with_lambda_body() {
-        assert_fmt(
-            "add = \\x y -> x + y",
-            "add = \\x y -> x + y\n",
-        );
+        assert_fmt("add = \\x y -> x + y", "add = \\x y -> x + y\n");
     }
 
     /// The tool intentionally formats OLD syntax into NEW syntax that the

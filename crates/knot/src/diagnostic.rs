@@ -56,7 +56,10 @@ impl Diagnostic {
     }
 
     pub fn label(mut self, span: Span, msg: impl Into<String>) -> Self {
-        self.labels.push(Label { span, message: msg.into() });
+        self.labels.push(Label {
+            span,
+            message: msg.into(),
+        });
         self
     }
 
@@ -94,7 +97,11 @@ pub fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
                 // at the `\r` and `before.get(i+1)` returns `None`,
                 // wrongly treating the `\r` as a lone CR.
                 let full = source.as_bytes();
-                i += if full.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                i += if full.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
                 line_start = i;
             }
             _ => i += 1,
@@ -132,7 +139,11 @@ pub fn get_line(source: &str, line: usize) -> &str {
             }
             b'\r' => {
                 current_line += 1;
-                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
                 start = i;
             }
             _ => i += 1,
@@ -150,7 +161,9 @@ pub fn get_line(source: &str, line: usize) -> &str {
 
 impl Diagnostic {
     pub fn render(&self, source: &str, filename: &str) -> String {
-        use ariadne::{CharSet, Config, ColorGenerator, Label as ALabel, Report, ReportKind, Source};
+        use ariadne::{
+            CharSet, ColorGenerator, Config, Label as ALabel, Report, ReportKind, Source,
+        };
 
         let kind = match self.severity {
             Severity::Error => ReportKind::Error,
@@ -201,14 +214,10 @@ impl Diagnostic {
         let report = builder.finish();
 
         let mut buf = Vec::new();
-        report.write(
-            (filename.to_string(), Source::from(source)),
-            &mut buf,
-        ).expect("write to Vec cannot fail");
+        report
+            .write((filename.to_string(), Source::from(source)), &mut buf)
+            .expect("write to Vec cannot fail");
 
-        String::from_utf8(buf)
-            .expect("ariadne output is always UTF-8")
+        String::from_utf8(buf).expect("ariadne output is always UTF-8")
     }
 }
-
-

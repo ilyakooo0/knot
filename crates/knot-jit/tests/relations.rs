@@ -113,12 +113,18 @@ fn avg_floats() {
 fn min_on() {
     // minOn/maxOn return the bare projected key (b), NOT Maybe — and panic on
     // an empty relation (see the note at the bottom of this file).
-    assert_show("base.minOn (\\p -> p.age) [{name \"a\" age 30} {name \"b\" age 25}]", "25");
+    assert_show(
+        "base.minOn (\\p -> p.age) [{name \"a\" age 30} {name \"b\" age 25}]",
+        "25",
+    );
 }
 
 #[test]
 fn max_on_basic() {
-    assert_show("base.maxOn (\\p -> p.age) [{name \"a\" age 30} {name \"b\" age 25}]", "30");
+    assert_show(
+        "base.maxOn (\\p -> p.age) [{name \"a\" age 30} {name \"b\" age 25}]",
+        "30",
+    );
 }
 
 #[test]
@@ -272,10 +278,7 @@ fn comprehension_filter() {
 
 #[test]
 fn comprehension_map() {
-    assert_show_set(
-        "(do\n  n <- [1 2 3]\n  yield (n * n))",
-        &["1", "4", "9"],
-    );
+    assert_show_set("(do\n  n <- [1 2 3]\n  yield (n * n))", &["1", "4", "9"]);
 }
 
 #[test]

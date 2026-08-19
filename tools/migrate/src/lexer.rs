@@ -415,7 +415,8 @@ impl<'src> Lexer<'src> {
         // identifier start (`café`, `α`) too — the byte-level gate uses the
         // lead byte, and the full multi-byte character is then consumed by
         // `is_ident_continue`.
-        if ch.is_ascii_alphabetic() || (ch >= 0x80 && char::from(ch).is_alphabetic()) || ch == b'_' {
+        if ch.is_ascii_alphabetic() || (ch >= 0x80 && char::from(ch).is_alphabetic()) || ch == b'_'
+        {
             return Some(self.lex_identifier());
         }
 
@@ -511,12 +512,11 @@ impl<'src> Lexer<'src> {
                 let next_ok = i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
                 if !prev_ok || !next_ok {
                     let span = Span::new(start + i, start + i + 1);
-                    self.diagnostics.push(
-                        Diagnostic::error("misplaced digit separator").label(
+                    self.diagnostics
+                        .push(Diagnostic::error("misplaced digit separator").label(
                             span,
                             "`_` in a numeric literal must appear between two digits",
-                        ),
-                    );
+                        ));
                     return;
                 }
             }
@@ -538,13 +538,12 @@ impl<'src> Lexer<'src> {
         if magnitude == I64_MIN_MAGNITUDE && follows_prefix_minus(prev) {
             return;
         }
-        self.diagnostics.push(
-            Diagnostic::error("integer literal is out of range").label(
+        self.diagnostics
+            .push(Diagnostic::error("integer literal is out of range").label(
                 span,
                 "does not fit in a 64-bit signed integer \
                  (-9223372036854775808 to 9223372036854775807)",
-            ),
-        );
+            ));
     }
 
     fn lex_number(&mut self) -> TokenKind {
@@ -722,7 +721,13 @@ impl<'src> Lexer<'src> {
                                 // consumes those, so they must not be underlined.
                                 let bad_end = match self.peek() {
                                     Some(b'"') | Some(b'\n') | Some(b'\r') | None => self.pos,
-                                    Some(_) => self.pos + self.source[self.pos..].chars().next().map_or(1, |c| c.len_utf8()),
+                                    Some(_) => {
+                                        self.pos
+                                            + self.source[self.pos..]
+                                                .chars()
+                                                .next()
+                                                .map_or(1, |c| c.len_utf8())
+                                    }
                                 };
                                 let span = Span::new(self.pos - 2, bad_end);
                                 self.diagnostics.push(
@@ -864,7 +869,13 @@ impl<'src> Lexer<'src> {
                                 // consumes those, so they must not be underlined.
                                 let bad_end = match self.peek() {
                                     Some(b'"') | Some(b'\n') | Some(b'\r') | None => self.pos,
-                                    Some(_) => self.pos + self.source[self.pos..].chars().next().map_or(1, |c| c.len_utf8()),
+                                    Some(_) => {
+                                        self.pos
+                                            + self.source[self.pos..]
+                                                .chars()
+                                                .next()
+                                                .map_or(1, |c| c.len_utf8())
+                                    }
                                 };
                                 let span = Span::new(self.pos - 2, bad_end);
                                 self.diagnostics.push(
@@ -966,8 +977,7 @@ impl<'src> Lexer<'src> {
                 } else {
                     let span = Span::new(self.pos - 1, self.pos);
                     self.diagnostics.push(
-                        Diagnostic::error("unexpected character '!'")
-                            .label(span, "unexpected"),
+                        Diagnostic::error("unexpected character '!'").label(span, "unexpected"),
                     );
                     return None;
                 }
@@ -1025,7 +1035,10 @@ impl<'src> Lexer<'src> {
                     self.pos += 1;
                 }
                 let span = Span::new(char_start, self.pos);
-                let c = self.source[char_start..self.pos].chars().next().unwrap_or('?');
+                let c = self.source[char_start..self.pos]
+                    .chars()
+                    .next()
+                    .unwrap_or('?');
                 self.diagnostics.push(
                     Diagnostic::error(format!("unexpected character '{c}'"))
                         .label(span, "unexpected"),
@@ -1062,7 +1075,10 @@ mod tests {
 
     #[test]
     fn integers() {
-        assert_eq!(kinds("42"), vec![TokenKind::Int("42".into()), TokenKind::Eof]);
+        assert_eq!(
+            kinds("42"),
+            vec![TokenKind::Int("42".into()), TokenKind::Eof]
+        );
         assert_eq!(
             kinds("1_000_000"),
             vec![TokenKind::Int("1000000".into()), TokenKind::Eof],

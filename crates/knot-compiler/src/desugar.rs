@@ -69,14 +69,14 @@ pub(crate) fn elaborate_all_implicit_dicts(expr: &mut Expr) {
     walk_expr_children(expr, &mut |child| elaborate_all_implicit_dicts(child));
     if let ExprKind::Record(fields) = &mut expr.node {
         for field in fields {
-            let has_implicit = field
-                .sig
-                .as_ref()
-                .is_some_and(|ts| {
-                    ts.constraints
-                        .iter()
-                        .any(|c| matches!(c, Constraint::ImplicitField { .. } | Constraint::CollectField { .. }))
-                });
+            let has_implicit = field.sig.as_ref().is_some_and(|ts| {
+                ts.constraints.iter().any(|c| {
+                    matches!(
+                        c,
+                        Constraint::ImplicitField { .. } | Constraint::CollectField { .. }
+                    )
+                })
+            });
             if has_implicit && matches!(field.value.node, ExprKind::Lambda { .. }) {
                 elaborate_implicit_dicts(&mut field.value, &mut field.sig);
             }
@@ -105,9 +105,7 @@ fn collect_source_fields_in_expr(
         let names: Vec<(String, RecordRelKind)> = fields
             .iter()
             .filter_map(|f| match &f.value.node {
-                ExprKind::SourceDecl { name, .. } => {
-                    Some((name.clone(), RecordRelKind::Source))
-                }
+                ExprKind::SourceDecl { name, .. } => Some((name.clone(), RecordRelKind::Source)),
                 _ => None,
             })
             .collect();
@@ -211,14 +209,14 @@ fn rewrite_source_refs_in_expr(
         && let ExprKind::Var(rec) = &base.node
         && let Some(names) = map.get(rec.as_str())
     {
-        let stripped = field
-            .strip_prefix('*')
-            .map(|n| (n, RecordRelKind::Source));
+        let stripped = field.strip_prefix('*').map(|n| (n, RecordRelKind::Source));
         if let Some((bare, kind)) = stripped
             && names.iter().any(|(n, k)| n == bare && *k == kind)
         {
             expr.node = match kind {
-                RecordRelKind::Source => ExprKind::SourceRef { name: bare.to_string() },
+                RecordRelKind::Source => ExprKind::SourceRef {
+                    name: bare.to_string(),
+                },
             };
             return;
         }
@@ -295,9 +293,7 @@ fn collect_fun_bodies<'a>(
             collect_fun_bodies(lhs, fun_bodies, fun_sig_io);
             collect_fun_bodies(rhs, fun_bodies, fun_sig_io);
         }
-        ExprKind::UnaryOp { operand, .. } => {
-            collect_fun_bodies(operand, fun_bodies, fun_sig_io)
-        }
+        ExprKind::UnaryOp { operand, .. } => collect_fun_bodies(operand, fun_bodies, fun_sig_io),
         ExprKind::Case { scrutinee, arms } => {
             collect_fun_bodies(scrutinee, fun_bodies, fun_sig_io);
             for arm in arms {
@@ -307,15 +303,9 @@ fn collect_fun_bodies<'a>(
         ExprKind::Do(stmts) => {
             for s in stmts {
                 match &s.node {
-                    StmtKind::Bind { expr: e, .. } => {
-                        collect_fun_bodies(e, fun_bodies, fun_sig_io)
-                    }
-                    StmtKind::Where { cond } => {
-                        collect_fun_bodies(cond, fun_bodies, fun_sig_io)
-                    }
-                    StmtKind::GroupBy { key } => {
-                        collect_fun_bodies(key, fun_bodies, fun_sig_io)
-                    }
+                    StmtKind::Bind { expr: e, .. } => collect_fun_bodies(e, fun_bodies, fun_sig_io),
+                    StmtKind::Where { cond } => collect_fun_bodies(cond, fun_bodies, fun_sig_io),
+                    StmtKind::GroupBy { key } => collect_fun_bodies(key, fun_bodies, fun_sig_io),
                     StmtKind::Expr(e) => collect_fun_bodies(e, fun_bodies, fun_sig_io),
                 }
             }
@@ -324,12 +314,8 @@ fn collect_fun_bodies<'a>(
             collect_fun_bodies(target, fun_bodies, fun_sig_io);
             collect_fun_bodies(value, fun_bodies, fun_sig_io);
         }
-        ExprKind::Atomic(e) | ExprKind::Refine(e) => {
-            collect_fun_bodies(e, fun_bodies, fun_sig_io)
-        }
-        ExprKind::TimeUnitLit { value, .. } => {
-            collect_fun_bodies(value, fun_bodies, fun_sig_io)
-        }
+        ExprKind::Atomic(e) | ExprKind::Refine(e) => collect_fun_bodies(e, fun_bodies, fun_sig_io),
+        ExprKind::TimeUnitLit { value, .. } => collect_fun_bodies(value, fun_bodies, fun_sig_io),
         ExprKind::Record(fields) => {
             for fl in fields {
                 collect_fun_bodies(&fl.value, fun_bodies, fun_sig_io);
@@ -424,32 +410,29 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
         ExprKind::Annot { expr, .. } => expr_contains_io(expr, builtins, io_fns),
         ExprKind::Refine(inner) => expr_contains_io(inner, builtins, io_fns),
         ExprKind::App { func, arg } => {
-            expr_contains_io(func, builtins, io_fns)
-                || expr_contains_io(arg, builtins, io_fns)
+            expr_contains_io(func, builtins, io_fns) || expr_contains_io(arg, builtins, io_fns)
         }
         ExprKind::With { record, body, .. } => {
-            expr_contains_io(record, builtins, io_fns)
-                || expr_contains_io(body, builtins, io_fns)
+            expr_contains_io(record, builtins, io_fns) || expr_contains_io(body, builtins, io_fns)
         }
         ExprKind::BinOp { lhs, rhs, .. } => {
-            expr_contains_io(lhs, builtins, io_fns)
-                || expr_contains_io(rhs, builtins, io_fns)
+            expr_contains_io(lhs, builtins, io_fns) || expr_contains_io(rhs, builtins, io_fns)
         }
-        ExprKind::UnaryOp { operand, .. } => {
-            expr_contains_io(operand, builtins, io_fns)
-        }
-        ExprKind::Do(stmts) => {
-            stmts.iter().any(|s| match &s.node {
-                StmtKind::Bind { expr, .. } => expr_contains_io(expr, builtins, io_fns),
-                StmtKind::Expr(expr) => expr_contains_io(expr, builtins, io_fns),
-                StmtKind::Where { cond } => expr_contains_io(cond, builtins, io_fns),
-                StmtKind::GroupBy { key } => expr_contains_io(key, builtins, io_fns),
-            })
-        }
+        ExprKind::UnaryOp { operand, .. } => expr_contains_io(operand, builtins, io_fns),
+        ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
+            StmtKind::Bind { expr, .. } => expr_contains_io(expr, builtins, io_fns),
+            StmtKind::Expr(expr) => expr_contains_io(expr, builtins, io_fns),
+            StmtKind::Where { cond } => expr_contains_io(cond, builtins, io_fns),
+            StmtKind::GroupBy { key } => expr_contains_io(key, builtins, io_fns),
+        }),
         ExprKind::Lambda { body, .. } => expr_contains_io(body, builtins, io_fns),
-        ExprKind::Case { scrutinee, arms, .. } => {
+        ExprKind::Case {
+            scrutinee, arms, ..
+        } => {
             expr_contains_io(scrutinee, builtins, io_fns)
-                || arms.iter().any(|arm| expr_contains_io(&arm.body, builtins, io_fns))
+                || arms
+                    .iter()
+                    .any(|arm| expr_contains_io(&arm.body, builtins, io_fns))
         }
         // Records, lists, field access are data constructors/accessors —
         // they don't produce IO even if they contain IO values as
@@ -474,8 +457,6 @@ fn expr_contains_io(expr: &Expr, builtins: &HashSet<&str>, io_fns: &HashSet<Stri
         }
     }
 }
-
-
 
 /// Name of the hidden dictionary parameter introduced for a `^field`
 /// constraint: `__dict_<field>`.
@@ -513,9 +494,9 @@ fn elaborate_implicit_dicts(body: &mut Expr, ty: &mut Option<TypeScheme>) -> Vec
                         // No annotation → dict type is a `_` HOLE (fresh
                         // inference var), grounded at the callsite by the
                         // caller's explicit `<>` fold.
-                        let fty = ty.clone().unwrap_or_else(|| {
-                            Spanned::new(TypeKind::Hole, Span::new(0, 0))
-                        });
+                        let fty = ty
+                            .clone()
+                            .unwrap_or_else(|| Spanned::new(TypeKind::Hole, Span::new(0, 0)));
                         Some((field.clone(), fty, true))
                     }
                     _ => None,
@@ -586,7 +567,10 @@ fn rewrite_implicit_refs(expr: &mut Expr, field: &str, is_fold: bool) {
         && name == field
     {
         let span = expr.span;
-        let dict_var = Spanned::new(ExprKind::Var(crate::infer::Binding::User(dict_param_name(field))), span);
+        let dict_var = Spanned::new(
+            ExprKind::Var(crate::infer::Binding::User(dict_param_name(field))),
+            span,
+        );
         expr.node = if is_fold {
             dict_var.node
         } else {
@@ -597,7 +581,9 @@ fn rewrite_implicit_refs(expr: &mut Expr, field: &str, is_fold: bool) {
         };
         return;
     }
-    walk_expr_children(expr, &mut |child| rewrite_implicit_refs(child, field, is_fold));
+    walk_expr_children(expr, &mut |child| {
+        rewrite_implicit_refs(child, field, is_fold)
+    });
 }
 
 /// Recurse over all direct child expressions of `expr`.
@@ -660,7 +646,6 @@ fn walk_expr_children(expr: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
     }
 }
 
-
 /// Recursively desugar expressions. The `Do` nodes that qualify as
 /// pure comprehensions are replaced with nested App/Lambda/Yield nodes.
 ///
@@ -707,20 +692,24 @@ fn desugar_expr(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) 
         // recurse_into_children above.
         return;
     }
-    if pure_comp
-        && let ExprKind::Do(stmts) = &expr.node {
-            let span = expr.span;
-            let desugared = desugar_stmts(stmts, span);
-            *expr = desugared;
-        }
+    if pure_comp && let ExprKind::Do(stmts) = &expr.node {
+        let span = expr.span;
+        let desugared = desugar_stmts(stmts, span);
+        *expr = desugared;
+    }
 }
 
 /// Recurse into all child expressions of a node (except Do blocks handled
 /// by the caller).
 fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<String>) {
     match &mut expr.node {
-        ExprKind::Lit(_) | ExprKind::Var(_) | ExprKind::Constructor(_)
-        | ExprKind::SourceRef { .. } | ExprKind::ImplicitRef(_) | ExprKind::CollectFold(_) | ExprKind::TypeHole => {}
+        ExprKind::Lit(_)
+        | ExprKind::Var(_)
+        | ExprKind::Constructor(_)
+        | ExprKind::SourceRef { .. }
+        | ExprKind::ImplicitRef(_)
+        | ExprKind::CollectFold(_)
+        | ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
         ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } => {}
@@ -822,13 +811,12 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
 fn unwrap_wrappers_mut(expr: &mut Expr) -> &mut Expr {
     if matches!(
         &expr.node,
-        ExprKind::Annot { .. }
-            | ExprKind::TimeUnitLit { .. }
-            | ExprKind::Refine(_)
+        ExprKind::Annot { .. } | ExprKind::TimeUnitLit { .. } | ExprKind::Refine(_)
     ) {
         let inner = match &mut expr.node {
-            ExprKind::Annot { expr: inner, .. }
-            | ExprKind::TimeUnitLit { value: inner, .. } => inner.as_mut(),
+            ExprKind::Annot { expr: inner, .. } | ExprKind::TimeUnitLit { value: inner, .. } => {
+                inner.as_mut()
+            }
             ExprKind::Refine(inner) => inner.as_mut(),
             _ => unreachable!(),
         };
@@ -967,7 +955,9 @@ fn is_sql_compilable(stmts: &[Stmt], source_vars: &HashSet<String>) -> bool {
                 match &inner.node {
                     ExprKind::Record(fields) => {
                         !fields.is_empty()
-                            && fields.iter().all(|f| is_bound_field_access(&f.value, &bind_vars))
+                            && fields
+                                .iter()
+                                .all(|f| is_bound_field_access(&f.value, &bind_vars))
                     }
                     ExprKind::Var(name) => bind_vars.contains(name.as_str()),
                     _ => false,
@@ -1003,17 +993,20 @@ fn is_sql_where_expr(expr: &Expr, bind_vars: &std::collections::HashSet<&str>) -
         // (codegen emits INSTR/IN for them). Accept when at least one argument
         // is a bound field access, matching the codegen pattern.
         ExprKind::App { func, arg } => {
-            if let ExprKind::App { func: inner, arg: first_arg } = &func.node
+            if let ExprKind::App {
+                func: inner,
+                arg: first_arg,
+            } = &func.node
                 && let ExprKind::Var(name) = &inner.node
-                    && (name == "contains" || name == "elem") {
-                        let a_bound = is_bound_field_access(first_arg, bind_vars)
-                            || is_sql_atom(first_arg);
-                        let b_bound = is_bound_field_access(arg, bind_vars)
-                            || is_sql_atom(arg);
-                        return a_bound && b_bound
-                            && (is_bound_field_access(first_arg, bind_vars)
-                                || is_bound_field_access(arg, bind_vars));
-                    }
+                && (name == "contains" || name == "elem")
+            {
+                let a_bound = is_bound_field_access(first_arg, bind_vars) || is_sql_atom(first_arg);
+                let b_bound = is_bound_field_access(arg, bind_vars) || is_sql_atom(arg);
+                return a_bound
+                    && b_bound
+                    && (is_bound_field_access(first_arg, bind_vars)
+                        || is_bound_field_access(arg, bind_vars));
+            }
             false
         }
         _ => false,
@@ -1029,9 +1022,10 @@ fn is_sql_atom(expr: &Expr) -> bool {
 
 fn is_bound_field_access(expr: &Expr, bind_vars: &std::collections::HashSet<&str>) -> bool {
     if let ExprKind::FieldAccess { expr, .. } = &expr.node
-        && let ExprKind::Var(name) = &expr.node {
-            return bind_vars.contains(name.as_str());
-        }
+        && let ExprKind::Var(name) = &expr.node
+    {
+        return bind_vars.contains(name.as_str());
+    }
     false
 }
 
@@ -1053,12 +1047,9 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     // `[value]` and be serialized as a relation). Routing it through `__yield`
     // lets it dispatch on the resolved monad (`knot_io_pure` for IO, `Just`
     // for Maybe, singleton for `[]`), which is correct in every monad.
-    let has_bind_or_where = stmts.iter().any(|s| {
-        matches!(
-            &s.node,
-            StmtKind::Bind { .. } | StmtKind::Where { .. }
-        )
-    });
+    let has_bind_or_where = stmts
+        .iter()
+        .any(|s| matches!(&s.node, StmtKind::Bind { .. } | StmtKind::Where { .. }));
     if !has_bind_or_where && stmts.len() < 2 {
         let lone_yield = matches!(
             stmts.first().map(|s| &s.node),
@@ -1070,7 +1061,10 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     }
 
     // GroupBy requires loop-based codegen — not eligible for desugaring
-    if stmts.iter().any(|s| matches!(&s.node, StmtKind::GroupBy { .. })) {
+    if stmts
+        .iter()
+        .any(|s| matches!(&s.node, StmtKind::GroupBy { .. }))
+    {
         return false;
     }
 
@@ -1098,14 +1092,15 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     // from a relation/Maybe would force a different monad and make the
     // desugared chain ill-typed).
     let has_trait_only_io = stmts.iter().any(|s| match &s.node {
-        StmtKind::Bind { expr, .. } | StmtKind::Expr(expr) => {
-            expr_is_io(expr, io_all)
-        }
+        StmtKind::Bind { expr, .. } | StmtKind::Expr(expr) => expr_is_io(expr, io_all),
         StmtKind::Where { cond } => expr_is_io(cond, io_all),
         _ => false,
     });
     if has_trait_only_io {
-        if stmts.iter().any(|s| matches!(&s.node, StmtKind::Where { .. })) {
+        if stmts
+            .iter()
+            .any(|s| matches!(&s.node, StmtKind::Where { .. }))
+        {
             return false;
         }
         // The desugared IO chain requires every `Bind` source and every
@@ -1137,10 +1132,12 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
     // (aborting the process on the first non-matching element). Direct codegen
     // (`compile_do` / `bind_do_pattern`) handles both cases correctly, so
     // leave these do-blocks un-desugared.
-    if stmts.iter().any(|s| matches!(
-        &s.node,
-        StmtKind::Bind { pat, .. } if pat_is_refutable(&pat.node)
-    )) {
+    if stmts.iter().any(|s| {
+        matches!(
+            &s.node,
+            StmtKind::Bind { pat, .. } if pat_is_refutable(&pat.node)
+        )
+    }) {
         return false;
     }
 
@@ -1165,13 +1162,14 @@ fn is_pure_comprehension(stmts: &[Stmt], io_fns: &IoFns) -> bool {
 fn pat_is_refutable(pat: &PatKind) -> bool {
     match pat {
         PatKind::Var(_) | PatKind::Wildcard => false,
-        PatKind::Constructor { .. }
-        | PatKind::Lit(_)
-        | PatKind::List(_)
-        | PatKind::Cons { .. } => true,
-        PatKind::Record(fields) => fields
-            .iter()
-            .any(|f| f.pattern.as_ref().is_some_and(|p| pat_is_refutable(&p.node))),
+        PatKind::Constructor { .. } | PatKind::Lit(_) | PatKind::List(_) | PatKind::Cons { .. } => {
+            true
+        }
+        PatKind::Record(fields) => fields.iter().any(|f| {
+            f.pattern
+                .as_ref()
+                .is_some_and(|p| pat_is_refutable(&p.node))
+        }),
         PatKind::Annot { pat, .. } => pat_is_refutable(&pat.node),
     }
 }
@@ -1203,17 +1201,14 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
         ExprKind::SourceRef { .. } => true,
         ExprKind::Set { .. } | ExprKind::FullSet { .. } => true,
         ExprKind::Atomic(_) => true,
-        ExprKind::BinOp { lhs, rhs, .. } => {
-            expr_is_io(lhs, io_fns) || expr_is_io(rhs, io_fns)
-        }
+        ExprKind::BinOp { lhs, rhs, .. } => expr_is_io(lhs, io_fns) || expr_is_io(rhs, io_fns),
         ExprKind::UnaryOp { operand, .. } => expr_is_io(operand, io_fns),
         ExprKind::TimeUnitLit { value, .. } => expr_is_io(value, io_fns),
         ExprKind::Annot { expr, .. } => expr_is_io(expr, io_fns),
         ExprKind::Refine(inner) => expr_is_io(inner, io_fns),
-        ExprKind::Case { scrutinee, arms, .. } => {
-            expr_is_io(scrutinee, io_fns)
-                || arms.iter().any(|arm| expr_is_io(&arm.body, io_fns))
-        }
+        ExprKind::Case {
+            scrutinee, arms, ..
+        } => expr_is_io(scrutinee, io_fns) || arms.iter().any(|arm| expr_is_io(&arm.body, io_fns)),
         // Recurse into the lambda body to mirror codegen's `expr_is_io`
         // (codegen.rs: `Lambda { body, .. } => self.expr_is_io(body)`). The
         // two classifiers MUST agree: if they diverge on a bare IO-bodied
@@ -1223,14 +1218,12 @@ fn expr_is_io(expr: &Expr, io_fns: &HashSet<String>) -> bool {
         // — the App-arm `applied_lambda_body_is_io`/`lambda_chain_body_is_io`
         // helpers become redundant but stay as a belt-and-braces guard.
         ExprKind::Lambda { body, .. } => expr_is_io(body, io_fns),
-        ExprKind::Do(stmts) => {
-            stmts.iter().any(|s| match &s.node {
-                StmtKind::Bind { expr, .. } => expr_is_io(expr, io_fns),
-                StmtKind::Expr(expr) => expr_is_io(expr, io_fns),
-                StmtKind::Where { cond } => expr_is_io(cond, io_fns),
-                StmtKind::GroupBy { key } => expr_is_io(key, io_fns),
-            })
-        }
+        ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
+            StmtKind::Bind { expr, .. } => expr_is_io(expr, io_fns),
+            StmtKind::Expr(expr) => expr_is_io(expr, io_fns),
+            StmtKind::Where { cond } => expr_is_io(cond, io_fns),
+            StmtKind::GroupBy { key } => expr_is_io(key, io_fns),
+        }),
         // Records, lists, field access are data constructors/accessors —
         // they don't produce IO even if they contain IO values as
         // subexpressions. Only direct IO-producing expressions (calls to
@@ -1288,8 +1281,7 @@ fn applied_lambda_body_is_io(func: &Expr, io_fns: &HashSet<String>) -> bool {
 // ── Core desugaring ──────────────────────────────────────────────
 
 /// Counter for generating unique temporary variable names.
-static DESUGAR_COUNTER: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static DESUGAR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn fresh_var() -> String {
     let n = DESUGAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1325,12 +1317,9 @@ static SYNTH_SPAN_ORIGINS: std::sync::Mutex<Option<std::collections::HashMap<usi
 const MAX_SYNTH_SPANS: usize = 1 << 16;
 
 fn fresh_monad_span(origin: Span) -> Span {
-    let n = DESUGAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        as usize;
+    let n = DESUGAR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as usize;
     let span = Span::new(SYNTH_SPAN_BASE + n, SYNTH_SPAN_BASE + n + 1);
-    let mut guard = SYNTH_SPAN_ORIGINS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut guard = SYNTH_SPAN_ORIGINS.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(std::collections::HashMap::new);
     map.insert(span.start, origin);
     // Reclaim memory in long-running processes. Keys are the monotonic
@@ -1422,7 +1411,11 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
             let bool_pat = |truthy: bool| {
                 spanned(
                     PatKind::Constructor {
-                        name: if truthy { "True".into() } else { "False".into() },
+                        name: if truthy {
+                            "True".into()
+                        } else {
+                            "False".into()
+                        },
                         payload: Box::new(spanned(PatKind::Record(vec![]), span)),
                         qualifier: Some("Bool".into()),
                     },
@@ -1497,7 +1490,10 @@ fn desugar_stmts(stmts: &[Stmt], span: Span) -> Expr {
 /// `__bind (\__tmp -> case __tmp of { Ctor pat -> rest; _ -> [] }) expr`
 fn desugar_ctor_bind(pat: &Pat, expr: &Expr, rest: &Expr, span: Span) -> Expr {
     let tmp = fresh_var();
-    let tmp_var = spanned(ExprKind::Var(crate::infer::Binding::User(tmp.clone())), span);
+    let tmp_var = spanned(
+        ExprKind::Var(crate::infer::Binding::User(tmp.clone())),
+        span,
+    );
 
     let case_expr = spanned(
         ExprKind::Case {
@@ -1573,7 +1569,10 @@ pub(crate) const RESULT_MARKER: &str = "__result";
 /// Build `Var("__empty")` with a unique synthesized span (see
 /// `fresh_monad_span`).
 fn mk_empty(span: Span) -> Expr {
-    spanned(ExprKind::Var(crate::infer::Binding::User("__empty".into())), fresh_monad_span(span))
+    spanned(
+        ExprKind::Var(crate::infer::Binding::User("__empty".into())),
+        fresh_monad_span(span),
+    )
 }
 
 /// Build `App(App(Var("__bind"), func), collection)`
@@ -1598,5 +1597,3 @@ fn mk_bind(func: Expr, collection: Expr, span: Span) -> Expr {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
-
-

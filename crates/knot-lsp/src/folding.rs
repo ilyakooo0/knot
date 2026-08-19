@@ -2,8 +2,8 @@
 
 use lsp_types::*;
 
-use knot::ast::{self, ExprKind};
 use crate::utils::top_fields;
+use knot::ast::{self, ExprKind};
 
 use crate::state::ServerState;
 use crate::utils::span_to_range;
@@ -32,8 +32,11 @@ pub(crate) fn handle_folding_range(
 
         // Fold sub-expressions within declarations
         match &decl.value.node {
-            ExprKind::SourceDecl { .. } | ExprKind::DataCtor { .. }
-            | ExprKind::TypeCtor { .. } | ExprKind::RouteDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
+            ExprKind::SourceDecl { .. }
+            | ExprKind::DataCtor { .. }
+            | ExprKind::TypeCtor { .. }
+            | ExprKind::RouteDecl { .. }
+            | ExprKind::SubsetConstraint { .. } => {}
             _ => {
                 // A named function field.
                 collect_folding_ranges_expr(&decl.value, &doc.source, &mut ranges);
@@ -46,14 +49,7 @@ pub(crate) fn handle_folding_range(
     // a branch is a foldable container (do/case/lambda/atomic/record), so the
     // identical span can be pushed twice. Drop exact-duplicate ranges.
     let mut seen = std::collections::HashSet::new();
-    ranges.retain(|r| {
-        seen.insert((
-            r.start_line,
-            r.start_character,
-            r.end_line,
-            r.end_character,
-        ))
-    });
+    ranges.retain(|r| seen.insert((r.start_line, r.start_character, r.end_line, r.end_character)));
 
     Some(ranges)
 }
@@ -68,16 +64,17 @@ fn collect_folding_ranges_expr(expr: &ast::Expr, source: &str, ranges: &mut Vec<
         | ast::ExprKind::Atomic { .. }
         | ast::ExprKind::Record(_)
         | ast::ExprKind::Serve { .. }
-            if range.end.line > range.start.line => {
-                ranges.push(FoldingRange {
-                    start_line: range.start.line,
-                    start_character: Some(range.start.character),
-                    end_line: range.end.line,
-                    end_character: Some(range.end.character),
-                    kind: Some(FoldingRangeKind::Region),
-                    ..Default::default()
-                });
-            }
+            if range.end.line > range.start.line =>
+        {
+            ranges.push(FoldingRange {
+                start_line: range.start.line,
+                start_character: Some(range.start.character),
+                end_line: range.end.line,
+                end_character: Some(range.end.character),
+                kind: Some(FoldingRangeKind::Region),
+                ..Default::default()
+            });
+        }
         _ => {}
     }
 

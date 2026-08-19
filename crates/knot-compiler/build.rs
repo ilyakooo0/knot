@@ -10,9 +10,10 @@ fn is_valid_lib(p: &Path) -> bool {
 fn runtime_src_mtime(workspace_root: &Path) -> Option<std::time::SystemTime> {
     fn consider(p: &Path, newest: &mut Option<std::time::SystemTime>) {
         if let Ok(m) = std::fs::metadata(p).and_then(|m| m.modified())
-            && newest.map(|n| m > n).unwrap_or(true) {
-                *newest = Some(m);
-            }
+            && newest.map(|n| m > n).unwrap_or(true)
+        {
+            *newest = Some(m);
+        }
     }
     fn walk(dir: &Path, newest: &mut Option<std::time::SystemTime>) {
         if let Ok(rd) = std::fs::read_dir(dir) {
@@ -28,7 +29,10 @@ fn runtime_src_mtime(workspace_root: &Path) -> Option<std::time::SystemTime> {
     }
     let mut newest = None;
     walk(&workspace_root.join("crates/knot-runtime/src"), &mut newest);
-    consider(&workspace_root.join("crates/knot-runtime/Cargo.toml"), &mut newest);
+    consider(
+        &workspace_root.join("crates/knot-runtime/Cargo.toml"),
+        &mut newest,
+    );
     newest
 }
 
@@ -131,8 +135,7 @@ fn main() {
                     .find(|p| is_valid_lib(p))
             });
         if let Some(src) = crt_src {
-            std::fs::copy(&src, &crt_dest)
-                .expect("failed to copy libknot_compile_rt.a to OUT_DIR");
+            std::fs::copy(&src, &crt_dest).expect("failed to copy libknot_compile_rt.a to OUT_DIR");
             println!("cargo:rustc-cfg=has_embedded_compile_rt");
         }
     }

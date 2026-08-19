@@ -3,8 +3,8 @@
 
 use lsp_types::*;
 
-use knot::ast::ExprKind;
 use crate::utils::top_fields;
+use knot::ast::ExprKind;
 
 use crate::shared::{format_route_path, http_method_str, route_is_listened};
 use crate::state::ServerState;
@@ -36,11 +36,7 @@ pub(crate) fn handle_code_lens(
         // can't be located in source), so compare against the span stored in
         // `doc.definitions` rather than `decl.span` — the latter never
         // matches and would show "0 references" for everything.
-        let def_span = doc
-            .definitions
-            .get(decl_name)
-            .copied()
-            .unwrap_or(dspan);
+        let def_span = doc.definitions.get(decl_name).copied().unwrap_or(dspan);
         // Filter out self-references the way `references.rs` and
         // `call_hierarchy.rs` do: the declaration's own name token (and, for
         // multi-line decls, the definition-line name token recorded by

@@ -32,18 +32,12 @@ fn nested_relation_map() {
 
 #[test]
 fn deeply_nested() {
-    assert_show(
-        "{a {b {c [{x 1}]}}}.a.b.c",
-        "[{x 1}]",
-    );
+    assert_show("{a {b {c [{x 1}]}}}.a.b.c", "[{x 1}]");
 }
 
 #[test]
 fn nested_empty() {
-    assert_show(
-        "{members (the (Rel {name Text}) [])}",
-        "{members []}",
-    );
+    assert_show("{members (the (Rel {name Text}) [])}", "{members []}");
 }
 
 // ── base.hash ────────────────────────────────────────────────────────────

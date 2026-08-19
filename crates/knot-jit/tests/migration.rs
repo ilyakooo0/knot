@@ -9,7 +9,7 @@
 //! upgraded.
 
 mod e2e;
-use e2e::{build_in_dir, knot_bin, run_bin, TempDir};
+use e2e::{TempDir, build_in_dir, knot_bin, run_bin};
 
 fn dir_for(name: &str) -> TempDir {
     TempDir::fresh(name)
@@ -119,7 +119,10 @@ Rel PersonV2  *people
   base.println (base.show (base.count *people))
   yield {})"#;
     build_and_run(&dir, "mig_lock", src);
-    assert!(dir.join("mig_lock.schema.lock").exists(), "lockfile written");
+    assert!(
+        dir.join("mig_lock.schema.lock").exists(),
+        "lockfile written"
+    );
 
     // Rebuild the same source: must succeed and still read the migrated row.
     let build = std::process::Command::new(knot_bin())

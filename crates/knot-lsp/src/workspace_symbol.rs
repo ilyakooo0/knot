@@ -10,7 +10,7 @@ use knot::ast::{Expr, ExprKind};
 
 use crate::analysis::get_or_parse_file_shared;
 use crate::shared::scan_knot_files_in_roots;
-use crate::state::{content_hash, ServerState, WorkspaceSymbolEntry};
+use crate::state::{ServerState, WorkspaceSymbolEntry, content_hash};
 use crate::utils::{path_to_uri, span_to_range, top_fields, uri_to_path};
 
 // ── Workspace Symbols ───────────────────────────────────────────────
@@ -39,9 +39,7 @@ pub(crate) fn build_workspace_symbol_entries(
                 (name.clone(), SymbolKind::TYPE_PARAMETER, container)
             }
             ExprKind::SourceDecl { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
-            ExprKind::RouteDecl { name, .. } => {
-                (format!("route {name}"), SymbolKind::MODULE, None)
-            }
+            ExprKind::RouteDecl { name, .. } => (format!("route {name}"), SymbolKind::MODULE, None),
             ExprKind::SubsetConstraint { .. } => continue,
             _ => (decl.name.clone(), SymbolKind::FUNCTION, None),
         };
@@ -65,26 +63,25 @@ pub(crate) fn handle_workspace_symbol(
     let mut symbols: Vec<SymbolInformation> = Vec::new();
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
 
-    let push_matching = |entries: &[WorkspaceSymbolEntry],
-                         query: &str,
-                         out: &mut Vec<SymbolInformation>| {
-        for e in entries {
-            if !query.is_empty() && !e.name.to_lowercase().contains(query) {
-                continue;
+    let push_matching =
+        |entries: &[WorkspaceSymbolEntry], query: &str, out: &mut Vec<SymbolInformation>| {
+            for e in entries {
+                if !query.is_empty() && !e.name.to_lowercase().contains(query) {
+                    continue;
+                }
+                out.push(SymbolInformation {
+                    name: e.name.clone(),
+                    kind: e.kind,
+                    tags: None,
+                    deprecated: None,
+                    location: Location {
+                        uri: e.uri.clone(),
+                        range: e.range,
+                    },
+                    container_name: e.container.clone(),
+                });
             }
-            out.push(SymbolInformation {
-                name: e.name.clone(),
-                kind: e.kind,
-                tags: None,
-                deprecated: None,
-                location: Location {
-                    uri: e.uri.clone(),
-                    range: e.range,
-                },
-                container_name: e.container.clone(),
-            });
-        }
-    };
+        };
 
     // Phase 1: collect from open documents. Always recompute (the user may be
     // mid-edit), and refresh the cache for that path so that the next time
@@ -112,10 +109,8 @@ pub(crate) fn handle_workspace_symbol(
     // Phase 2: closed workspace files. Use the cache when the on-disk hash
     // matches; otherwise re-parse and update the cache.
     {
-        let entries = scan_knot_files_in_roots(
-            &state.workspace_roots,
-            state.workspace_root.as_deref(),
-        );
+        let entries =
+            scan_knot_files_in_roots(&state.workspace_roots, state.workspace_root.as_deref());
         if !entries.is_empty() {
             // Keep only paths that still exist on disk to avoid the cache
             // ballooning over time.
@@ -143,17 +138,16 @@ pub(crate) fn handle_workspace_symbol(
                     .ok()
                     .and_then(|m| m.modified().ok());
                 if let Some(disk_mtime) = on_disk_mtime {
-                    let cached_hit = state
-                        .workspace_symbol_cache
-                        .lock()
-                        .ok()
-                        .and_then(|c| match c.by_path.get(&canonical) {
-                            Some((Some(cached_mtime), _, cached_entries))
-                                if *cached_mtime == disk_mtime =>
-                            {
-                                Some(cached_entries.clone())
+                    let cached_hit =
+                        state.workspace_symbol_cache.lock().ok().and_then(|c| {
+                            match c.by_path.get(&canonical) {
+                                Some((Some(cached_mtime), _, cached_entries))
+                                    if *cached_mtime == disk_mtime =>
+                                {
+                                    Some(cached_entries.clone())
+                                }
+                                _ => None,
                             }
-                            _ => None,
                         });
                     if let Some(entries) = cached_hit {
                         push_matching(&entries, &query, &mut symbols);

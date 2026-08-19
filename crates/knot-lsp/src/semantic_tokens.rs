@@ -10,8 +10,8 @@ use knot::ast::{self, Span};
 use crate::builtins::EFFECTFUL_BUILTINS;
 use crate::legend::{
     MOD_DECLARATION, MOD_EFFECTFUL, MOD_MUTATION, MOD_READONLY, TOK_ENUM_MEMBER, TOK_FUNCTION,
-    TOK_NAMESPACE, TOK_NUMBER, TOK_PARAMETER, TOK_PROPERTY, TOK_STRING, TOK_STRUCT,
-    TOK_TYPE, TOK_VARIABLE,
+    TOK_NAMESPACE, TOK_NUMBER, TOK_PARAMETER, TOK_PROPERTY, TOK_STRING, TOK_STRUCT, TOK_TYPE,
+    TOK_VARIABLE,
 };
 use crate::state::ServerState;
 use crate::utils::{find_word_in_source, position_to_offset, top_fields};
@@ -27,9 +27,10 @@ pub(crate) fn handle_semantic_tokens_full(
     let encoded = delta_encode_tokens(&raw_tokens, &doc.source);
 
     let result_id = next_result_id(state);
-    state
-        .semantic_token_cache
-        .insert(params.text_document.uri.clone(), (result_id.clone(), encoded.clone()));
+    state.semantic_token_cache.insert(
+        params.text_document.uri.clone(),
+        (result_id.clone(), encoded.clone()),
+    );
     crate::state::enforce_uri_cache_cap(
         &mut state.semantic_token_cache,
         &state.documents,
@@ -78,10 +79,12 @@ pub(crate) fn handle_semantic_tokens_full_delta(
                 &state.documents,
                 crate::state::MAX_SEMANTIC_TOKEN_CACHE,
             );
-            Some(SemanticTokensFullDeltaResult::TokensDelta(SemanticTokensDelta {
-                result_id: Some(result_id),
-                edits,
-            }))
+            Some(SemanticTokensFullDeltaResult::TokensDelta(
+                SemanticTokensDelta {
+                    result_id: Some(result_id),
+                    edits,
+                },
+            ))
         }
         None => {
             state
@@ -111,18 +114,12 @@ fn next_result_id(state: &mut ServerState) -> String {
 /// strip a common prefix and a common suffix and emit a single replace edit
 /// covering the divergent middle — sufficient for typical edits while
 /// staying within the spec.
-fn diff_token_lists(
-    prev: &[SemanticToken],
-    new: &[SemanticToken],
-) -> Vec<SemanticTokensEdit> {
+fn diff_token_lists(prev: &[SemanticToken], new: &[SemanticToken]) -> Vec<SemanticTokensEdit> {
     if prev == new {
         return Vec::new();
     }
     let mut start = 0usize;
-    while start < prev.len()
-        && start < new.len()
-        && tokens_equal(&prev[start], &new[start])
-    {
+    while start < prev.len() && start < new.len() && tokens_equal(&prev[start], &new[start]) {
         start += 1;
     }
     let mut prev_end = prev.len();
@@ -195,9 +192,10 @@ fn collect_tokens(
         // requested range. Fine-grained per-token filtering still happens
         // below, but this avoids walking unrelated subtrees.
         if let Some((rs, re)) = range
-            && (decl.value.span.end < rs || decl.value.span.start > re) {
-                continue;
-            }
+            && (decl.value.span.end < rs || decl.value.span.start > re)
+        {
+            continue;
+        }
         collector.visit_decl(decl);
     }
 
@@ -277,8 +275,7 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::DataCtor {
                 name, constructors, ..
             } => {
-                let name_span =
-                    find_word_in_source(self.source, name, dspan.start, dspan.end);
+                let name_span = find_word_in_source(self.source, name, dspan.start, dspan.end);
                 if let Some(s) = name_span {
                     self.add(s, TOK_STRUCT, MOD_DECLARATION);
                 }
@@ -308,7 +305,8 @@ impl<'a> TokenCollector<'a> {
                         .first()
                         .map(|f| f.value.span.start)
                         .unwrap_or(dspan.end);
-                    let found = find_word_in_source(self.source, &ctor.name, search_from, search_end);
+                    let found =
+                        find_word_in_source(self.source, &ctor.name, search_from, search_end);
                     if let Some(s) = found {
                         self.add(s, TOK_ENUM_MEMBER, MOD_DECLARATION);
                     }
@@ -373,7 +371,9 @@ impl<'a> TokenCollector<'a> {
                 // A named function field. Search the whole declaration span
                 // (rather than an arbitrary `name.len() + 20` byte window that
                 // could end mid-codepoint, e.g. `f : Café -> Int`).
-                if let Some(s) = find_word_in_source(self.source, &decl.name, dspan.start, dspan.end) {
+                if let Some(s) =
+                    find_word_in_source(self.source, &decl.name, dspan.start, dspan.end)
+                {
                     self.add(s, TOK_FUNCTION, MOD_DECLARATION);
                 }
                 self.visit_expr(&decl.value);
@@ -391,12 +391,16 @@ impl<'a> TokenCollector<'a> {
         let bytes = self.source.as_bytes();
         loop {
             while span.start < span.end
-                && bytes.get(span.start).is_some_and(|b| b.is_ascii_whitespace())
+                && bytes
+                    .get(span.start)
+                    .is_some_and(|b| b.is_ascii_whitespace())
             {
                 span.start += 1;
             }
             while span.end > span.start
-                && bytes.get(span.end - 1).is_some_and(|b| b.is_ascii_whitespace())
+                && bytes
+                    .get(span.end - 1)
+                    .is_some_and(|b| b.is_ascii_whitespace())
             {
                 span.end -= 1;
             }
@@ -528,7 +532,9 @@ impl<'a> TokenCollector<'a> {
                         // occurrence of the field name before the value start.
                         let search_end = val_start;
                         let search_start = search_end.saturating_sub(f.name.len() + 1);
-                        if let Some(name_start) = self.source[search_start..search_end].rfind(f.name.as_str()) {
+                        if let Some(name_start) =
+                            self.source[search_start..search_end].rfind(f.name.as_str())
+                        {
                             let abs_start = search_start + name_start;
                             let abs_end = abs_start + f.name.len();
                             if self.source.get(abs_start..abs_end) == Some(f.name.as_str()) {
@@ -551,7 +557,9 @@ impl<'a> TokenCollector<'a> {
                 self.visit_expr(inner);
                 self.visit_type(ty);
             }
-            ast::ExprKind::Serve { api_span, handlers, .. } => {
+            ast::ExprKind::Serve {
+                api_span, handlers, ..
+            } => {
                 // The API type name, each endpoint constructor, and every
                 // handler body need tokens — otherwise a whole `serve` block
                 // renders unhighlighted. (Mirrors defs/rename/folding, which
@@ -610,7 +618,8 @@ impl<'a> TokenCollector<'a> {
     fn visit_type(&mut self, ty: &ast::Type) {
         match &ty.node {
             ast::TypeKind::Named(name) => {
-                if let Some(s) = find_word_in_source(self.source, name, ty.span.start, ty.span.end) {
+                if let Some(s) = find_word_in_source(self.source, name, ty.span.start, ty.span.end)
+                {
                     self.add(s, TOK_TYPE, 0);
                 }
             }
@@ -644,7 +653,7 @@ impl<'a> TokenCollector<'a> {
             ast::TypeKind::IO { ty: inner, .. } => {
                 self.visit_type(inner);
             }
-            ast::TypeKind::Unit(_) => {},
+            ast::TypeKind::Unit(_) => {}
             ast::TypeKind::UnitAnnotated { base, .. } => {
                 self.visit_type(base);
             }
@@ -658,7 +667,11 @@ impl<'a> TokenCollector<'a> {
     fn visit_pat(&mut self, pat: &ast::Pat, is_param: bool) {
         match &pat.node {
             ast::PatKind::Var(_) => {
-                let tok = if is_param { TOK_PARAMETER } else { TOK_VARIABLE };
+                let tok = if is_param {
+                    TOK_PARAMETER
+                } else {
+                    TOK_VARIABLE
+                };
                 self.add(pat.span, tok, MOD_DECLARATION);
             }
             ast::PatKind::Constructor { name, payload, .. } => {
@@ -669,8 +682,9 @@ impl<'a> TokenCollector<'a> {
                 // `find_word_in_source` — the name does NOT lead `pat.span`
                 // for parenthesized patterns `(Circle c)`, where `pat.span`
                 // starts at `(`.
-                let name_span = find_word_in_source(self.source, name, pat.span.start, pat.span.end)
-                    .unwrap_or_else(|| Span::new(pat.span.start, pat.span.start + name.len()));
+                let name_span =
+                    find_word_in_source(self.source, name, pat.span.start, pat.span.end)
+                        .unwrap_or_else(|| Span::new(pat.span.start, pat.span.start + name.len()));
                 // Guard against mid-codepoint slice: if the fallback span
                 // doesn't align to a char boundary, skip emitting the token
                 // rather than panicking on `&source[start..end]`.
@@ -699,8 +713,6 @@ impl<'a> TokenCollector<'a> {
         }
     }
 }
-
-
 
 fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> {
     // Tokens arrive in source order. A naive implementation calls
@@ -759,9 +771,10 @@ fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> 
                     next += 1;
                 }
                 if let Some(s) = source.get(byte_cursor..next)
-                    && let Some(c) = s.chars().next() {
-                        col_utf16 += c.len_utf16() as u32;
-                    }
+                    && let Some(c) = s.chars().next()
+                {
+                    col_utf16 += c.len_utf16() as u32;
+                }
                 byte_cursor = next;
             }
         }
@@ -806,4 +819,3 @@ fn delta_encode_tokens(tokens: &[RawToken], source: &str) -> Vec<SemanticToken> 
 }
 
 // Regression tests for the 2026-06 LSP bug-fix batch (semantic tokens).
-

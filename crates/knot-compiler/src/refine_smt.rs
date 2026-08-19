@@ -71,7 +71,10 @@ fn translate_all(preds: &[ast::Expr], is_real: bool) -> Option<Vec<Bool>> {
     } else {
         Int::new_const("x").into()
     };
-    preds.iter().map(|p| translate_one(p, &var, is_real)).collect()
+    preds
+        .iter()
+        .map(|p| translate_one(p, &var, is_real))
+        .collect()
 }
 
 /// Translate `\param -> body` into a Z3 formula over the shared constant `var`
@@ -101,9 +104,11 @@ fn bool_expr(e: &ast::Expr, param: &str, var: &Dynamic, is_real: bool) -> Option
             Some(Bool::from_bool(name == "True"))
         }
         ast::ExprKind::Annot { expr, .. } => bool_expr(expr, param, var, is_real),
-        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Not, operand, .. } => {
-            Some(bool_expr(operand, param, var, is_real)?.not())
-        }
+        ast::ExprKind::UnaryOp {
+            op: ast::UnaryOp::Not,
+            operand,
+            ..
+        } => Some(bool_expr(operand, param, var, is_real)?.not()),
         ast::ExprKind::BinOp { op, lhs, rhs, .. } => match op {
             ast::BinOp::And => Some(Bool::and(&[
                 &bool_expr(lhs, param, var, is_real)?,
@@ -114,8 +119,12 @@ fn bool_expr(e: &ast::Expr, param: &str, var: &Dynamic, is_real: bool) -> Option
                 &bool_expr(rhs, param, var, is_real)?,
             ])),
             // Comparisons and (in)equality over arithmetic operands.
-            ast::BinOp::Lt | ast::BinOp::Gt | ast::BinOp::Le | ast::BinOp::Ge
-            | ast::BinOp::Eq | ast::BinOp::Neq => {
+            ast::BinOp::Lt
+            | ast::BinOp::Gt
+            | ast::BinOp::Le
+            | ast::BinOp::Ge
+            | ast::BinOp::Eq
+            | ast::BinOp::Neq => {
                 let l = arith_expr(lhs, param, var, is_real)?;
                 let r = arith_expr(rhs, param, var, is_real)?;
                 cmp_expr(*op, &l, &r, is_real)
@@ -176,9 +185,17 @@ fn arith_expr(e: &ast::Expr, param: &str, var: &Dynamic, is_real: bool) -> Optio
             Some(real_from_f64(*f)?.into())
         }
         ast::ExprKind::Annot { expr, .. } => arith_expr(expr, param, var, is_real),
-        ast::ExprKind::UnaryOp { op: ast::UnaryOp::Neg, operand, .. } => {
+        ast::ExprKind::UnaryOp {
+            op: ast::UnaryOp::Neg,
+            operand,
+            ..
+        } => {
             let v = arith_expr(operand, param, var, is_real)?;
-            if is_real { Some(v.as_real()?.unary_minus().into()) } else { Some(v.as_int()?.unary_minus().into()) }
+            if is_real {
+                Some(v.as_real()?.unary_minus().into())
+            } else {
+                Some(v.as_int()?.unary_minus().into())
+            }
         }
         ast::ExprKind::BinOp { op, lhs, rhs, .. } => {
             let l = arith_expr(lhs, param, var, is_real)?;

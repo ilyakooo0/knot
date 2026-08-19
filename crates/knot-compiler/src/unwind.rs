@@ -12,12 +12,14 @@
 
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::Endianness;
-use cranelift_codegen::isa::{unwind::UnwindInfo, TargetIsa};
 use cranelift_codegen::Context;
+use cranelift_codegen::ir::Endianness;
+use cranelift_codegen::isa::{TargetIsa, unwind::UnwindInfo};
 use cranelift_module::{DataId, FuncId};
 use cranelift_object::ObjectProduct;
-use gimli::write::{Address, CieId, EhFrame, EndianVec, FrameTable, Result as WriteResult, Section, Writer};
+use gimli::write::{
+    Address, CieId, EhFrame, EndianVec, FrameTable, Result as WriteResult, Section, Writer,
+};
 use gimli::{RunTimeEndian, SectionId};
 use object::write::{Relocation, StandardSection};
 use object::{RelocationEncoding, RelocationFlags};
@@ -25,7 +27,10 @@ use object::{RelocationEncoding, RelocationFlags};
 fn address_for_func(func_id: FuncId) -> Address {
     let symbol = func_id.as_u32();
     assert!(symbol & (1u32 << 31) == 0, "function symbol bit 31 set");
-    Address::Symbol { symbol: symbol as usize, addend: 0 }
+    Address::Symbol {
+        symbol: symbol as usize,
+        addend: 0,
+    }
 }
 
 pub(crate) struct UnwindContext {
@@ -54,18 +59,17 @@ impl UnwindContext {
             None
         };
 
-        UnwindContext { endian, frame_table, cie_id }
+        UnwindContext {
+            endian,
+            frame_table,
+            cie_id,
+        }
     }
 
     /// Record the unwind info for a just-defined function. Must be called
     /// after `Module::define_function`, while `context` still holds the
     /// compiled code.
-    pub(crate) fn add_function(
-        &mut self,
-        isa: &dyn TargetIsa,
-        func_id: FuncId,
-        context: &Context,
-    ) {
+    pub(crate) fn add_function(&mut self, isa: &dyn TargetIsa, func_id: FuncId, context: &Context) {
         let unwind_info = match context
             .compiled_code()
             .expect("add_function called before compilation")
@@ -109,19 +113,25 @@ impl UnwindContext {
         // section-relative.
         let use_section_symbol = product.object.format() != object::BinaryFormat::MachO;
         for reloc in &eh_frame.0.relocs {
-            add_debug_reloc(product, &section_map, &section_id, reloc, use_section_symbol);
+            add_debug_reloc(
+                product,
+                &section_map,
+                &section_id,
+                reloc,
+                use_section_symbol,
+            );
         }
     }
 }
 
 type ObjSectionId = (object::write::SectionId, object::write::SymbolId);
 
-fn add_debug_section(
-    product: &mut ObjectProduct,
-    id: SectionId,
-    data: Vec<u8>,
-) -> ObjSectionId {
-    assert_eq!(id, SectionId::EhFrame, "only .eh_frame emission is supported");
+fn add_debug_section(product: &mut ObjectProduct, id: SectionId, data: Vec<u8>) -> ObjSectionId {
+    assert_eq!(
+        id,
+        SectionId::EhFrame,
+        "only .eh_frame emission is supported"
+    );
     let section_id = product.object.section_id(StandardSection::EhFrame);
     product.object.section_mut(section_id).set_data(data, 8);
     let symbol_id = product.object.section_symbol(section_id);
@@ -196,7 +206,10 @@ struct WriterRelocate {
 
 impl WriterRelocate {
     fn new(endian: RunTimeEndian) -> Self {
-        WriterRelocate { relocs: Vec::new(), writer: EndianVec::new(endian) }
+        WriterRelocate {
+            relocs: Vec::new(),
+            writer: EndianVec::new(endian),
+        }
     }
 }
 
@@ -265,7 +278,12 @@ impl Writer for WriterRelocate {
         self.write_udata_at(offset, 0, size)
     }
 
-    fn write_eh_pointer(&mut self, address: Address, eh_pe: gimli::DwEhPe, size: u8) -> WriteResult<()> {
+    fn write_eh_pointer(
+        &mut self,
+        address: Address,
+        eh_pe: gimli::DwEhPe,
+        size: u8,
+    ) -> WriteResult<()> {
         match address {
             // Address::Constant arm copied from gimli
             Address::Constant(val) => {

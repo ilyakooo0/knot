@@ -110,10 +110,7 @@ pub enum DeclKind {
     },
 
     /// `*people : [Person]` — persisted, mutable, no body.
-    Source {
-        name: Name,
-        ty: Type,
-    },
+    Source { name: Name, ty: Type },
 
     /// `*openTodos = expr` — query over sources, settable.
     View {
@@ -160,10 +157,7 @@ pub enum DeclKind {
     },
 
     /// `route Api = TodoApi | AdminApi`
-    RouteComposite {
-        name: Name,
-        components: Vec<Name>,
-    },
+    RouteComposite { name: Name, components: Vec<Name> },
 
     /// `migrate *rel from T1 to T2 using f`
     Migrate {
@@ -215,10 +209,7 @@ pub enum ExprKind {
     List(Vec<Expr>),
 
     /// `\x -> expr` or `\x y -> expr`
-    Lambda {
-        params: Vec<Pat>,
-        body: Box<Expr>,
-    },
+    Lambda { params: Vec<Pat>, body: Box<Expr> },
 
     /// `f x` — function application.
     App { func: Box<Expr>, arg: Box<Expr> },
@@ -261,16 +252,10 @@ pub enum ExprKind {
     /// inference/codegen treat it identically to that multiplication);
     /// `unit_name` preserves the original unit word so the formatter can
     /// re-render the surface syntax instead of the raw multiplication.
-    TimeUnitLit {
-        value: Box<Expr>,
-        unit_name: Name,
-    },
+    TimeUnitLit { value: Box<Expr>, unit_name: Name },
 
     /// `(expr : Type)` — type annotation on expression.
-    Annot {
-        expr: Box<Expr>,
-        ty: Type,
-    },
+    Annot { expr: Box<Expr>, ty: Type },
 
     /// `refine expr` — runtime refinement check, returns Result.
     Refine(Box<Expr>),
@@ -300,9 +285,10 @@ impl ExprKind {
     pub fn as_yield_arg(&self) -> Option<&Expr> {
         if let ExprKind::App { func, arg } = self
             && let ExprKind::Var(name) = &func.node
-                && name == "yield" {
-                    return Some(arg);
-                }
+            && name == "yield"
+        {
+            return Some(arg);
+        }
         None
     }
 }
@@ -433,10 +419,7 @@ pub enum TypeKind {
     Relation(Box<Type>),
 
     /// `a -> b` — function type.
-    Function {
-        param: Box<Type>,
-        result: Box<Type>,
-    },
+    Function { param: Box<Type>, result: Box<Type> },
 
     /// `<Open {} | InProgress {assignee: Text}>` — inline variant type.
     Variant {
@@ -445,10 +428,7 @@ pub enum TypeKind {
     },
 
     /// `{rw *people} Text -> {}` — effectful type.
-    Effectful {
-        effects: Vec<Effect>,
-        ty: Box<Type>,
-    },
+    Effectful { effects: Vec<Effect>, ty: Box<Type> },
 
     /// `IO {effects} a` or `IO {effects | r} a` — IO monad type with effect set.
     /// `rest` is the row-variable tail. Empty Vec = closed row. One element =
@@ -474,10 +454,7 @@ pub enum TypeKind {
     /// Kept as a dedicated node (rather than desugared to `App(Named "Float",
     /// Unit u)`) so inference can recognise the shape without peeling
     /// application spines. The `base` is `Named "Int"`/`Named "Float"`.
-    UnitAnnotated {
-        base: Box<Type>,
-        unit: UnitExpr,
-    },
+    UnitAnnotated { base: Box<Type>, unit: UnitExpr },
 
     /// `T where \x -> predicate` — refined type.
     Refined {

@@ -26,7 +26,6 @@ pub fn format_expr(_source: &str, expr: &Expr) -> String {
 
 // ── Printer ────────────────────────────────────────────────────────
 
-
 // ── Type printing ───────────────────────────────────────────────────
 
 // ── Printer ────────────────────────────────────────────────────────
@@ -237,7 +236,11 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
         TypeKind::Named(n) => n.clone(),
         TypeKind::Var(n) => n.clone(),
         TypeKind::App { func, arg } => {
-            let s = format!("{} {}", render_type_prec(func, TyPrec::App), render_type_atom(arg));
+            let s = format!(
+                "{} {}",
+                render_type_prec(func, TyPrec::App),
+                render_type_atom(arg)
+            );
             if ctx > TyPrec::App {
                 format!("({})", s)
             } else {
@@ -279,7 +282,11 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             }
         }
         TypeKind::Function { param, result } => {
-            let s = format!("{} -> {}", render_type_prec(param, TyPrec::App), render_type_prec(result, TyPrec::Function));
+            let s = format!(
+                "{} -> {}",
+                render_type_prec(param, TyPrec::App),
+                render_type_prec(result, TyPrec::Function)
+            );
             if ctx > TyPrec::Function {
                 format!("({})", s)
             } else {
@@ -333,7 +340,11 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
         TypeKind::Unit(u) => render_unit_type_arg(u),
         TypeKind::Refined { base, predicate } => {
             // `T where \x -> ...` — predicate is always a lambda.
-            let s = format!("{} where {}", render_type_prec(base, TyPrec::App), render_expr_inline(predicate, Prec::Lowest));
+            let s = format!(
+                "{} where {}",
+                render_type_prec(base, TyPrec::App),
+                render_expr_inline(predicate, Prec::Lowest)
+            );
             if ctx > TyPrec::App {
                 format!("({})", s)
             } else {
@@ -403,11 +414,19 @@ fn render_unit_expr_prec(u: &UnitExpr, ctx: u8) -> String {
         UnitExpr::Dimensionless => "1".into(),
         UnitExpr::Named(n) => n.clone(),
         UnitExpr::Mul(a, b) => {
-            let s = format!("{} * {}", render_unit_expr_prec(a, 1), render_unit_expr_prec(b, 2));
+            let s = format!(
+                "{} * {}",
+                render_unit_expr_prec(a, 1),
+                render_unit_expr_prec(b, 2)
+            );
             if ctx > 1 { format!("({})", s) } else { s }
         }
         UnitExpr::Div(a, b) => {
-            let s = format!("{} / {}", render_unit_expr_prec(a, 1), render_unit_expr_prec(b, 2));
+            let s = format!(
+                "{} / {}",
+                render_unit_expr_prec(a, 1),
+                render_unit_expr_prec(b, 2)
+            );
             if ctx > 1 { format!("({})", s) } else { s }
         }
         UnitExpr::Pow(a, n) => {
@@ -543,14 +562,16 @@ fn binop_str(op: BinOp) -> &'static str {
 /// so either rendering reparses identically).
 fn as_let_in(e: &Expr) -> Option<(&Pat, Option<&Type>, &Expr, &Expr)> {
     if let ExprKind::App { func, arg } = &e.node
-        && arg.span.end < func.span.end && arg.span.start > func.span.start
-            && let ExprKind::Lambda { params, body, .. } = &func.node
-                && params.len() == 1 {
-                    if let ExprKind::Annot { expr, ty } = &arg.node {
-                        return Some((&params[0], Some(ty), expr, body));
-                    }
-                    return Some((&params[0], None, arg, body));
-                }
+        && arg.span.end < func.span.end
+        && arg.span.start > func.span.start
+        && let ExprKind::Lambda { params, body, .. } = &func.node
+        && params.len() == 1
+    {
+        if let ExprKind::Annot { expr, ty } = &arg.node {
+            return Some((&params[0], Some(ty), expr, body));
+        }
+        return Some((&params[0], None, arg, body));
+    }
     None
 }
 
@@ -581,21 +602,17 @@ fn forces_multiline(e: &Expr) -> bool {
         // alias — must render as a block: inline, the declaration merges with
         // the surrounding fields into an ambiguous single line that fails to
         // reparse. Force block layout.
-        ExprKind::Record(fields) => {
-            fields.iter().any(|f| {
-                f.sig.is_some()
-                    || matches!(
-                        f.value.node,
-                        ExprKind::SourceDecl { .. }
-                            | ExprKind::TypeCtor { .. }
-                            | ExprKind::DataCtor { .. }
-                    )
-                    || forces_multiline(&f.value)
-            })
-        }
-        ExprKind::With { record, body, .. } => {
-            forces_multiline(record) || forces_multiline(body)
-        }
+        ExprKind::Record(fields) => fields.iter().any(|f| {
+            f.sig.is_some()
+                || matches!(
+                    f.value.node,
+                    ExprKind::SourceDecl { .. }
+                        | ExprKind::TypeCtor { .. }
+                        | ExprKind::DataCtor { .. }
+                )
+                || forces_multiline(&f.value)
+        }),
+        ExprKind::With { record, body, .. } => forces_multiline(record) || forces_multiline(body),
         _ => false,
     }
 }
@@ -632,7 +649,11 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
         ExprKind::FieldAccess { expr, field } => {
             format!("{}.{}", render_expr_inline(expr, Prec::Atom), field)
         }
-        ExprKind::With { record, body, types } => {
+        ExprKind::With {
+            record,
+            body,
+            types,
+        } => {
             // Never pun the `with` record: its field NAMES are the bindings,
             // so `{lo: p.lo}` must stay explicit — `{p.lo}` would bind nothing.
             // Type imports (`with {Maybe}`) are re-emitted as bare type names
@@ -667,7 +688,11 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             s.push(']');
             s
         }
-        ExprKind::Lambda { params, ty_params, body } => {
+        ExprKind::Lambda {
+            params,
+            ty_params,
+            body,
+        } => {
             let mut s = String::from("\\");
             for tp in ty_params {
                 s.push_str(&format!("(Type  {})", tp.name));
@@ -807,7 +832,11 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             };
             format!("type {}{} = {}", name, params, render_type(ty))
         }
-        ExprKind::DataCtor { name, params, constructors } => {
+        ExprKind::DataCtor {
+            name,
+            params,
+            constructors,
+        } => {
             // Renders the embedded `data` line. As with `TypeCtor`, the record
             // renderers emit the field-name line first, so here we emit only
             // the `data Name … = Ctor {…} | …` part.
@@ -823,7 +852,11 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
                 .join(" | ");
             format!("data {}{} = {}", name, params, ctors)
         }
-        ExprKind::SourceDecl { name, ty, migrations } => {
+        ExprKind::SourceDecl {
+            name,
+            ty,
+            migrations,
+        } => {
             // Renders the embedded source line. The field is literally named
             // `*name`; here we emit the type-first `Type  *name` declaration,
             // plus any attached migration clauses.
@@ -878,7 +911,11 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
 fn render_stmt_inline(s: &Stmt) -> String {
     match &s.node {
         StmtKind::Bind { pat, expr } => {
-            format!("{} <- {}", render_pat(pat), render_expr_inline(expr, Prec::Lowest))
+            format!(
+                "{} <- {}",
+                render_pat(pat),
+                render_expr_inline(expr, Prec::Lowest)
+            )
         }
         StmtKind::Where { cond } => {
             format!("where {}", render_expr_inline(cond, Prec::Lowest))
@@ -891,11 +928,7 @@ fn render_stmt_inline(s: &Stmt) -> String {
 }
 
 fn paren_if(cond: bool, s: String) -> String {
-    if cond {
-        format!("({})", s)
-    } else {
-        s
-    }
+    if cond { format!("({})", s) } else { s }
 }
 
 fn render_literal(l: &Literal) -> String {
@@ -1072,7 +1105,11 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
     match &e.node {
         ExprKind::Do(stmts) => render_do_block(p, stmts, parent),
         ExprKind::Case { scrutinee, arms } => render_case_block(p, scrutinee, arms, parent),
-        ExprKind::Lambda { params, ty_params, body } => {
+        ExprKind::Lambda {
+            params,
+            ty_params,
+            body,
+        } => {
             // `\\(Type  T) \\x y -> body` where body is multiline
             let need_parens = parent > Prec::Lowest;
             if need_parens {
@@ -1190,7 +1227,11 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
         }
         // `with {record} body` forced multiline (a sig'd/source/alias field):
         // render the record as a block so each declaration gets its own line.
-        ExprKind::With { record, body, types } => {
+        ExprKind::With {
+            record,
+            body,
+            types,
+        } => {
             let need_parens = parent > Prec::Lowest;
             if need_parens {
                 p.write("(");
@@ -1488,5 +1529,3 @@ fn render_pat_atom(p: &Pat) -> String {
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
-
-

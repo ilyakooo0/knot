@@ -194,7 +194,11 @@ pub fn compile_and_run(
         unsafe { std::mem::transmute(entry) };
     let value = entry_fn(db);
 
-    Ok(CompiledValue { value, ty: body_ty, relations })
+    Ok(CompiledValue {
+        value,
+        ty: body_ty,
+        relations,
+    })
 }
 
 /// Render a list of diagnostics into a single message string.

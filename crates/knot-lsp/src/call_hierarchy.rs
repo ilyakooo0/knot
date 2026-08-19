@@ -8,8 +8,8 @@ use knot::ast::{self, ExprKind, Span};
 
 use crate::state::ServerState;
 use crate::utils::{
-    find_word_in_source, ident_lookup_offset, position_to_offset, recurse_expr,
-    span_to_range, top_fields, word_at_position,
+    find_word_in_source, ident_lookup_offset, position_to_offset, recurse_expr, span_to_range,
+    top_fields, word_at_position,
 };
 
 /// A (name, kind-tag, value, span) view of a top-level declaration field.
@@ -60,15 +60,12 @@ pub(crate) fn handle_call_hierarchy_prepare(
         // span, which `defs.rs` itself uses when the name token can't be
         // found) — comparing to the whole `decl.span` never matches, which
         // made prepare fail from every call site.
-        let def_span = doc
-            .definitions
-            .get(name)
-            .copied()
-            .unwrap_or(dspan);
+        let def_span = doc.definitions.get(name).copied().unwrap_or(dspan);
         let on_def = dspan.start <= offset && offset < dspan.end;
-        let on_ref = doc.references.iter().any(|(usage, def)| {
-            usage.start <= offset && offset < usage.end && *def == def_span
-        });
+        let on_ref = doc
+            .references
+            .iter()
+            .any(|(usage, def)| usage.start <= offset && offset < usage.end && *def == def_span);
         if !on_def && !on_ref {
             continue;
         }
@@ -144,9 +141,10 @@ pub(crate) fn handle_call_hierarchy_incoming(
     let mut result = Vec::new();
     for (name, (decl_span, sites)) in &calls {
         let range = span_to_range(*decl_span, &doc.source);
-        let selection_range = find_word_in_source(&doc.source, name, decl_span.start, decl_span.end)
-            .map(|s| span_to_range(s, &doc.source))
-            .unwrap_or(range);
+        let selection_range =
+            find_word_in_source(&doc.source, name, decl_span.start, decl_span.end)
+                .map(|s| span_to_range(s, &doc.source))
+                .unwrap_or(range);
 
         let kind = top_fields(&doc.module)
             .iter()
@@ -169,11 +167,18 @@ pub(crate) fn handle_call_hierarchy_incoming(
                 selection_range,
                 data: None,
             },
-            from_ranges: sites.iter().map(|s| span_to_range(*s, &doc.source)).collect(),
+            from_ranges: sites
+                .iter()
+                .map(|s| span_to_range(*s, &doc.source))
+                .collect(),
         });
     }
 
-    if result.is_empty() { None } else { Some(result) }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 pub(crate) fn handle_call_hierarchy_outgoing(
@@ -185,12 +190,10 @@ pub(crate) fn handle_call_hierarchy_outgoing(
     let doc = state.documents.get(source_uri)?;
 
     // Find the declaration for the source item
-    let source_decl = top_fields(&doc.module)
-        .into_iter()
-        .find(|d| {
-            let (n, tag, _, _) = decl_info(d);
-            matches!(tag, "fn" | "view" | "derived") && n == source_name
-        })?;
+    let source_decl = top_fields(&doc.module).into_iter().find(|d| {
+        let (n, tag, _, _) = decl_info(d);
+        matches!(tag, "fn" | "view" | "derived") && n == source_name
+    })?;
     let source_dspan = source_decl.value.span;
 
     // Higher-order call sites: a `Var(name)` that appears as the *argument* of
@@ -200,9 +203,10 @@ pub(crate) fn handle_call_hierarchy_outgoing(
     let mut higher_order_arg_spans: HashSet<Span> = HashSet::new();
     fn collect_higher_order_args(expr: &ast::Expr, out: &mut HashSet<Span>) {
         if let ast::ExprKind::App { arg, .. } = &expr.node
-            && matches!(&arg.node, ast::ExprKind::Var(_)) {
-                out.insert(arg.span);
-            }
+            && matches!(&arg.node, ast::ExprKind::Var(_))
+        {
+            out.insert(arg.span);
+        }
         recurse_expr(expr, |e| collect_higher_order_args(e, out));
     }
     // A named function field.
@@ -279,5 +283,9 @@ pub(crate) fn handle_call_hierarchy_outgoing(
         });
     }
 
-    if result.is_empty() { None } else { Some(result) }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }

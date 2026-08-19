@@ -9,7 +9,6 @@ use knot::ast::{self, Expr, ExprKind, Span};
 use crate::type_format::format_type_kind;
 use crate::utils::{find_word_in_source, recurse_expr, safe_slice, top_fields};
 
-
 // ── Type-string parsing ─────────────────────────────────────────────
 
 /// Extract the principal named type from a type string.
@@ -27,9 +26,10 @@ pub(crate) fn extract_principal_type_name(type_str: &str) -> Option<String> {
     // Strip IO wrapper: IO {effects} T -> T
     if let Some(rest) = s.strip_prefix("IO ") {
         if rest.starts_with('{')
-            && let Some(close) = rest.find('}') {
-                return extract_principal_type_name(rest[close + 1..].trim());
-            }
+            && let Some(close) = rest.find('}')
+        {
+            return extract_principal_type_name(rest[close + 1..].trim());
+        }
         return extract_principal_type_name(rest);
     }
 
@@ -153,9 +153,7 @@ pub(crate) fn scan_knot_files_recursive(
                     return Ok(());
                 }
             }
-        } else if file_type.is_file()
-            && path.extension().and_then(|e| e.to_str()) == Some("knot")
-        {
+        } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("knot") {
             files.push(path);
             if files.len() >= MAX_SCAN_FILES {
                 return Ok(());
@@ -215,11 +213,7 @@ pub(crate) fn format_route_path(entry: &ast::RouteEntry) -> String {
             }
         }
     }
-    if out.is_empty() {
-        "/".to_string()
-    } else {
-        out
-    }
+    if out.is_empty() { "/".to_string() } else { out }
 }
 
 /// Returns true if the given route is wired into a server. Used by the
@@ -258,10 +252,11 @@ fn route_is_listened_inner(
         }
         // `serve Api where …` — the api is a plain Name on the Serve node.
         if let ast::ExprKind::Serve { api, .. } = &expr.node
-            && api == route_name {
-                *found = true;
-                return;
-            }
+            && api == route_name
+        {
+            *found = true;
+            return;
+        }
         if let ast::ExprKind::App { func, arg } = &expr.node {
             // Detect `listen port handler` where one argument references the route.
             // The handler's body typically destructures the route ADT, so any reference
@@ -423,7 +418,9 @@ fn find_app_in_expr_at(
     // Recurse into sub-expressions. `recurse_expr` covers every non-leaf
     // ExprKind — including `Serve` handler bodies, which the old manual
     // match here omitted (signature help was dead inside serve handlers).
-    recurse_expr(expr, |e| find_app_in_expr_at(e, source, offset, best, depth + 1));
+    recurse_expr(expr, |e| {
+        find_app_in_expr_at(e, source, offset, best, depth + 1)
+    });
 }
 
 /// Split a Knot type string like `Int -> Text -> Bool` into the rendered
@@ -526,11 +523,13 @@ pub(crate) fn find_enclosing_atomic_expr(
 /// to pretty-printing the AST, which is always correct.
 pub(crate) fn predicate_to_source(expr: &ast::Expr, source: &str) -> String {
     let span = expr.span;
-    if span.start < span.end && span.end <= source.len()
+    if span.start < span.end
+        && span.end <= source.len()
         && let Some(text) = source.get(span.start..span.end)
-            && slice_matches_predicate(text, expr) {
-                return text.to_string();
-            }
+        && slice_matches_predicate(text, expr)
+    {
+        return text.to_string();
+    }
     render_predicate_expr(expr)
 }
 
@@ -638,8 +637,7 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
                 });
             }
             ast::ExprKind::BinOp { op, lhs, rhs } => {
-                let rendered =
-                    format!("{} {} {}", go(lhs, true)?, bin_op(*op), go(rhs, true)?);
+                let rendered = format!("{} {} {}", go(lhs, true)?, bin_op(*op), go(rhs, true)?);
                 return Some(if nested {
                     format!("({rendered})")
                 } else {
@@ -700,7 +698,10 @@ pub(crate) fn render_route_entry(entry: &ast::RouteEntry) -> String {
             .iter()
             .map(|f| format!("{} {}", f.name, format_type_kind(&f.value.node)))
             .collect();
-        out.push_str(&format!("\n\n**Request headers:** `{{{}}}`", fields.join(", ")));
+        out.push_str(&format!(
+            "\n\n**Request headers:** `{{{}}}`",
+            fields.join(", ")
+        ));
     }
     if let Some(resp) = &entry.response_ty {
         out.push_str(&format!(
@@ -742,9 +743,7 @@ pub(crate) fn extract_record_fields(type_str: &str) -> Vec<String> {
 /// Used by signature_help and parameter-name inlay hints.
 pub(crate) fn extract_param_names(program: &Expr, func_name: &str) -> Vec<String> {
     for decl in top_fields(program) {
-        if decl.name == func_name
-            && matches!(decl.value.node, ExprKind::Lambda { .. })
-        {
+        if decl.name == func_name && matches!(decl.value.node, ExprKind::Lambda { .. }) {
             return collect_lambda_param_names(&decl.value);
         }
     }
@@ -789,7 +788,11 @@ pub(crate) fn pat_to_simple_name(pat: &ast::PatKind) -> String {
             format!("[{}]", parts.join(", "))
         }
         ast::PatKind::Cons { head, tail } => {
-            format!("Cons {} {}", pat_to_simple_name(&head.node), pat_to_simple_name(&tail.node))
+            format!(
+                "Cons {} {}",
+                pat_to_simple_name(&head.node),
+                pat_to_simple_name(&tail.node)
+            )
         }
         ast::PatKind::Annot { pat, .. } => pat_to_simple_name(&pat.node),
         ast::PatKind::Lit(_) => "_".into(),
@@ -862,9 +865,11 @@ pub(crate) fn find_field_access_at_offset(
         if depth > MAX_WALK_DEPTH {
             return;
         }
-        if let ast::ExprKind::FieldAccess { expr: receiver, field } = &expr.node
-            && let Some(tok) =
-                find_word_in_source(source, field, receiver.span.end, expr.span.end)
+        if let ast::ExprKind::FieldAccess {
+            expr: receiver,
+            field,
+        } = &expr.node
+            && let Some(tok) = find_word_in_source(source, field, receiver.span.end, expr.span.end)
             && tok.start <= offset
             && offset < tok.end
         {
@@ -943,9 +948,11 @@ pub(crate) fn resolve_var_to_source(
             }
             // Pipe: `*src |> filter f` puts the source on the LHS of pipe,
             // which desugars to `filter f *src`. Walk both sides.
-            ast::ExprKind::BinOp { op: ast::BinOp::Pipe, lhs, rhs } => {
-                rhs_source_name(lhs).or_else(|| rhs_source_name(rhs))
-            }
+            ast::ExprKind::BinOp {
+                op: ast::BinOp::Pipe,
+                lhs,
+                rhs,
+            } => rhs_source_name(lhs).or_else(|| rhs_source_name(rhs)),
             _ => None,
         }
     }
@@ -956,13 +963,13 @@ pub(crate) fn resolve_var_to_source(
         }
         if let ast::ExprKind::Do(stmts) = &expr.node {
             for stmt in stmts {
-                if let ast::StmtKind::Bind { pat, expr: rhs } = &stmt.node
-                {
+                if let ast::StmtKind::Bind { pat, expr: rhs } = &stmt.node {
                     if pat_binds_var(pat, var_name)
-                        && let Some(name) = rhs_source_name(rhs) {
-                            *found = Some(name);
-                            return;
-                        }
+                        && let Some(name) = rhs_source_name(rhs)
+                    {
+                        *found = Some(name);
+                        return;
+                    }
                     walk(rhs, var_name, found, depth + 1);
                     if found.is_some() {
                         return;
@@ -989,8 +996,8 @@ pub(crate) fn resolve_var_to_source(
         if !(dspan.start <= cursor_offset && cursor_offset < dspan.end) {
             continue;
         }
-            // A named function field.
-            walk(&decl.value, var_name, &mut found, 0);
+        // A named function field.
+        walk(&decl.value, var_name, &mut found, 0);
         if found.is_some() {
             break;
         }
@@ -1032,16 +1039,18 @@ fn type_contains_offset(ty: &ast::Type, offset: usize) -> bool {
         ast::TypeKind::App { func, arg } => {
             type_contains_offset(func, offset) || type_contains_offset(arg, offset)
         }
-        ast::TypeKind::Record { fields, .. } => {
-            fields.iter().any(|f| type_contains_offset(&f.value, offset))
-        }
+        ast::TypeKind::Record { fields, .. } => fields
+            .iter()
+            .any(|f| type_contains_offset(&f.value, offset)),
         ast::TypeKind::Relation(inner) => type_contains_offset(inner, offset),
         ast::TypeKind::Function { param, result } => {
             type_contains_offset(param, offset) || type_contains_offset(result, offset)
         }
-        ast::TypeKind::Variant { constructors, .. } => constructors
-            .iter()
-            .any(|c| c.fields.iter().any(|f| type_contains_offset(&f.value, offset))),
+        ast::TypeKind::Variant { constructors, .. } => constructors.iter().any(|c| {
+            c.fields
+                .iter()
+                .any(|f| type_contains_offset(&f.value, offset))
+        }),
         ast::TypeKind::IO { ty, .. } => type_contains_offset(ty, offset),
         ast::TypeKind::UnitAnnotated { base, .. } => type_contains_offset(base, offset),
         ast::TypeKind::Refined { base, .. } => type_contains_offset(base, offset),
@@ -1092,9 +1101,9 @@ pub(crate) fn constraints_for_type_var<'a>(
                 args.iter().any(|t| type_mentions_var(t, var_name))
             }
             ast::Constraint::ImplicitField { ty, .. } => type_mentions_var(ty, var_name),
-            ast::Constraint::CollectField { ty, .. } => {
-                ty.as_ref().is_some_and(|ty| type_mentions_var(ty, var_name))
-            }
+            ast::Constraint::CollectField { ty, .. } => ty
+                .as_ref()
+                .is_some_and(|ty| type_mentions_var(ty, var_name)),
         })
         .collect()
 }
@@ -1126,14 +1135,9 @@ fn type_mentions_var(ty: &ast::Type, var: &str) -> bool {
     }
 }
 
-
 // ── Tests ───────────────────────────────────────────────────────────
-
-
 
 // Regression tests for the walker/scan fix batch (atomic-in-lambda, serve
 // awareness, depth caps, resilient workspace scanning).
 
-
 // Regression tests for the 2026-06 LSP bug-fix batch (shared helpers).
-

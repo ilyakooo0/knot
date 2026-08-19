@@ -69,9 +69,7 @@ fn prepend_host_data_decls(
     // Resolve a name to its `data` decl text, for either storage form.
     let decl_of = |name: &str| -> Option<String> {
         match aliases.get(name) {
-            Some(types::ResolvedType::Adt(ctors)) => {
-                Some(types::adt_to_data_decl(name, ctors))
-            }
+            Some(types::ResolvedType::Adt(ctors)) => Some(types::adt_to_data_decl(name, ctors)),
             Some(types::ResolvedType::Record(fields)) => {
                 let ctor = ctor_of_record.get(name)?;
                 Some(single_variant_to_data_decl(name, ctor, fields))
@@ -98,10 +96,7 @@ fn prepend_host_data_decls(
         };
         // Enqueue any ADT this decl's payload fields reference.
         for other in aliases.keys() {
-            if !seen.contains(other)
-                && decl_of(other).is_some()
-                && references_name(&decl, other)
-            {
+            if !seen.contains(other) && decl_of(other).is_some() && references_name(&decl, other) {
                 worklist.push(other.clone());
             }
         }
@@ -356,9 +351,15 @@ fn print_usage() {
     eprintln!("Knot compiler");
     eprintln!();
     eprintln!("Usage:");
-    eprintln!("  knot build <file.knot> [-o <path>] [--debug] [--name=value ...]  Compile with optional output path and constant overrides");
-    eprintln!("      --debug   Print each expression that generates SQL with the SQL it pushed down");
-    eprintln!("  knot fmt [--check] [--stdout] <file.knot>              Format a source file in place ('-' reads stdin, writes stdout)");
+    eprintln!(
+        "  knot build <file.knot> [-o <path>] [--debug] [--name=value ...]  Compile with optional output path and constant overrides"
+    );
+    eprintln!(
+        "      --debug   Print each expression that generates SQL with the SQL it pushed down"
+    );
+    eprintln!(
+        "  knot fmt [--check] [--stdout] <file.knot>              Format a source file in place ('-' reads stdin, writes stdout)"
+    );
     eprintln!("  knot help                                              Show this help message");
 }
 
@@ -375,7 +376,9 @@ fn cmd_fmt(args: &[String]) {
             "-" => paths.push("-"),
             other if other.starts_with("--") => {
                 eprintln!("Error: unknown fmt flag '{}'", other);
-                eprintln!("Usage: knot fmt [--check] [--stdout] <file.knot>... (use '-' for stdin)");
+                eprintln!(
+                    "Usage: knot fmt [--check] [--stdout] <file.knot>... (use '-' for stdin)"
+                );
                 process::exit(2);
             }
             other => paths.push(other),
@@ -494,7 +497,12 @@ fn same_file_path(a: &std::path::Path, b: &std::path::Path) -> bool {
     normalize(a) == normalize(b)
 }
 
-fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overrides: &HashMap<String, String>, debug: bool) {
+fn cmd_build(
+    source_file: &str,
+    output_override: Option<&std::path::Path>,
+    overrides: &HashMap<String, String>,
+    debug: bool,
+) {
     let source_path = PathBuf::from(source_file);
 
     // Read source
@@ -548,7 +556,10 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
         for diag in &lex_diags {
             eprintln!("{}", diag.render(&source, &filename));
         }
-        if lex_diags.iter().any(|d| d.severity == knot::diagnostic::Severity::Error) {
+        if lex_diags
+            .iter()
+            .any(|d| d.severity == knot::diagnostic::Severity::Error)
+        {
             process::exit(1);
         }
     }
@@ -608,7 +619,33 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     let type_env = types::TypeEnv::from_program(&program);
 
     // Type inference
-    let infer::CheckOutput { diagnostics: infer_diags, monad_info, type_info, local_type_info: _local_types, refine_targets, refined_type_info: refined_types, from_json_targets, elem_pushdown_ok, show_unit_strings, sum_float_spans, relation_field_spans: relation_fields, with_fields, type_arg_spans, implicit_refs, implicit_dict_args, fold_dict_args, collect_refs, resolved_calls, todo_types, todo_bindings, trace_types, trace_bindings, compile_expected_types, file_body_type: _file_body_type, refined_field_preds } = infer::check(&mut program);
+    let infer::CheckOutput {
+        diagnostics: infer_diags,
+        monad_info,
+        type_info,
+        local_type_info: _local_types,
+        refine_targets,
+        refined_type_info: refined_types,
+        from_json_targets,
+        elem_pushdown_ok,
+        show_unit_strings,
+        sum_float_spans,
+        relation_field_spans: relation_fields,
+        with_fields,
+        type_arg_spans,
+        implicit_refs,
+        implicit_dict_args,
+        fold_dict_args,
+        collect_refs,
+        resolved_calls,
+        todo_types,
+        todo_bindings,
+        trace_types,
+        trace_bindings,
+        compile_expected_types,
+        file_body_type: _file_body_type,
+        refined_field_preds,
+    } = infer::check(&mut program);
     // The expected-type descriptor of each `compile` call is knot source-type
     // syntax (from `display_ty_clean`). For ADTs the bare NAME alone is
     // insufficient — the JIT must compare constructor sets, and `Priority` says
@@ -619,7 +656,12 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     // and compares ctor sets structurally.
     let compile_expected_types: infer::CompileExpectedTypes = compile_expected_types
         .into_iter()
-        .map(|(span, desc)| (span, prepend_host_data_decls(&desc, &type_env.aliases, &type_env.constructors)))
+        .map(|(span, desc)| {
+            (
+                span,
+                prepend_host_data_decls(&desc, &type_env.aliases, &type_env.constructors),
+            )
+        })
         .collect();
     if !infer_diags.is_empty() {
         for diag in &infer_diags {
@@ -697,7 +739,36 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     }
 
     // Code generation
-    let obj_bytes = match codegen::compile(&program, &type_env, source_file, &monad_info, &refine_targets, &refined_types, &refined_field_preds, &from_json_targets, &type_info, &elem_pushdown_ok, &show_unit_strings, &sum_float_spans, &compile_expected_types, &relation_fields, &with_fields, &implicit_refs, &type_arg_spans, &implicit_dict_args, &fold_dict_args, &collect_refs, &resolved_calls, &todo_types, &todo_bindings, &trace_types, &trace_bindings, &source, overrides, debug) {
+    let obj_bytes = match codegen::compile(
+        &program,
+        &type_env,
+        source_file,
+        &monad_info,
+        &refine_targets,
+        &refined_types,
+        &refined_field_preds,
+        &from_json_targets,
+        &type_info,
+        &elem_pushdown_ok,
+        &show_unit_strings,
+        &sum_float_spans,
+        &compile_expected_types,
+        &relation_fields,
+        &with_fields,
+        &implicit_refs,
+        &type_arg_spans,
+        &implicit_dict_args,
+        &fold_dict_args,
+        &collect_refs,
+        &resolved_calls,
+        &todo_types,
+        &todo_bindings,
+        &trace_types,
+        &trace_bindings,
+        &source,
+        overrides,
+        debug,
+    ) {
         Ok(bytes) => bytes,
         Err(diags) => {
             for diag in &diags {
@@ -727,7 +798,12 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
     };
 
     // Link (output path computed and collision-checked above)
-    if let Err(e) = linker::link(&obj_path, &runtime_path, compile_rt_path.as_deref(), &output_path) {
+    if let Err(e) = linker::link(
+        &obj_path,
+        &runtime_path,
+        compile_rt_path.as_deref(),
+        &output_path,
+    ) {
         eprintln!("Link error: {}", e);
         let _ = std::fs::remove_file(&obj_path);
         if is_extracted_temp_runtime(&runtime_path) {
@@ -765,16 +841,20 @@ fn cmd_build(source_file: &str, output_override: Option<&std::path::Path>, overr
 /// libknot_runtime.a into OUT_DIR; we include those bytes so the
 /// compiler binary is fully self-contained after `cargo install`.
 #[cfg(has_embedded_runtime)]
-const EMBEDDED_RUNTIME: Option<&[u8]> =
-    Some(include_bytes!(concat!(env!("OUT_DIR"), "/libknot_runtime.a")));
+const EMBEDDED_RUNTIME: Option<&[u8]> = Some(include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/libknot_runtime.a"
+)));
 #[cfg(not(has_embedded_runtime))]
 const EMBEDDED_RUNTIME: Option<&[u8]> = None;
 
 /// JIT compile-runtime archive (knot-compile-rt), embedded at build time and
 /// always linked into compiled programs so `base.compile` works in-process.
 #[cfg(has_embedded_compile_rt)]
-const EMBEDDED_COMPILE_RT: Option<&[u8]> =
-    Some(include_bytes!(concat!(env!("OUT_DIR"), "/libknot_compile_rt.a")));
+const EMBEDDED_COMPILE_RT: Option<&[u8]> = Some(include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/libknot_compile_rt.a"
+)));
 #[cfg(not(has_embedded_compile_rt))]
 const EMBEDDED_COMPILE_RT: Option<&[u8]> = None;
 
@@ -783,12 +863,9 @@ const EMBEDDED_COMPILE_RT: Option<&[u8]> = None;
 fn is_extracted_temp_runtime(p: &std::path::Path) -> bool {
     let tmp_dir = std::env::temp_dir();
     p.parent() == Some(tmp_dir.as_path())
-        && p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| {
-                n.starts_with(&format!("libknot_runtime_{}_", std::process::id()))
-                    && n.ends_with(".a")
-            })
+        && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n.starts_with(&format!("libknot_runtime_{}_", std::process::id())) && n.ends_with(".a")
+        })
 }
 
 /// The blake3 content hash of the runtime archive this compiler embeds (set by
@@ -825,7 +902,8 @@ fn rebuild_runtime_at_exe(stale: &std::path::Path) -> Option<std::path::PathBuf>
         .and_then(|n| n.to_str())
         .unwrap_or("debug")
         .to_string();
-    let mut cmd = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+    let mut cmd =
+        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
     cmd.arg("build")
         .arg("-p")
         .arg("knot-runtime")
@@ -883,36 +961,37 @@ fn find_runtime() -> PathBuf {
 
     // 2. Same directory as the compiler executable
     if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent() {
-            let candidate = exe_dir.join("libknot_runtime.a");
-            if candidate.exists() {
-                // Freshness check: if the archive's content differs from the
-                // runtime this compiler embeds (e.g. only knot-compiler was
-                // rebuilt, or knot-runtime sources changed), the archive is
-                // stale. Rather than just warn, try to rebuild it in place —
-                // the compiler knows its own workspace (exe at
-                // <ws>/target/<profile>/knot), so it can refresh the archive
-                // the moment it detects staleness. This removes the recurring
-                // "run cargo build -p knot-runtime" manual step: the first
-                // compile after a runtime change rebuilds, and every compile
-                // after that is fresh.
-                if is_runtime_stale(&candidate) {
-                    if let Some(fresh) = rebuild_runtime_at_exe(&candidate) {
-                        return fresh;
-                    }
-                    // Couldn't rebuild (no workspace found, or build failed) —
-                    // fall back to the embedded runtime with the warning.
-                    eprintln!(
-                        "Warning: {} content differs from the embedded runtime \
+        && let Some(exe_dir) = exe.parent()
+    {
+        let candidate = exe_dir.join("libknot_runtime.a");
+        if candidate.exists() {
+            // Freshness check: if the archive's content differs from the
+            // runtime this compiler embeds (e.g. only knot-compiler was
+            // rebuilt, or knot-runtime sources changed), the archive is
+            // stale. Rather than just warn, try to rebuild it in place —
+            // the compiler knows its own workspace (exe at
+            // <ws>/target/<profile>/knot), so it can refresh the archive
+            // the moment it detects staleness. This removes the recurring
+            // "run cargo build -p knot-runtime" manual step: the first
+            // compile after a runtime change rebuilds, and every compile
+            // after that is fresh.
+            if is_runtime_stale(&candidate) {
+                if let Some(fresh) = rebuild_runtime_at_exe(&candidate) {
+                    return fresh;
+                }
+                // Couldn't rebuild (no workspace found, or build failed) —
+                // fall back to the embedded runtime with the warning.
+                eprintln!(
+                    "Warning: {} content differs from the embedded runtime \
                          — skipping stale archive, falling back to embedded \
                          runtime. Run `cargo build -p knot-runtime` to refresh.",
-                        candidate.display()
-                    );
-                } else {
-                    return candidate;
-                }
+                    candidate.display()
+                );
+            } else {
+                return candidate;
             }
         }
+    }
 
     // 3. Extract embedded runtime to a temp file. The name includes the
     //    pid plus a nanosecond nonce and attempt counter, and the file is
@@ -967,12 +1046,10 @@ fn find_runtime() -> PathBuf {
 fn is_extracted_temp_compile_rt(p: &std::path::Path) -> bool {
     let tmp_dir = std::env::temp_dir();
     p.parent() == Some(tmp_dir.as_path())
-        && p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| {
-                n.starts_with(&format!("libknot_compile_rt_{}_", std::process::id()))
-                    && n.ends_with(".a")
-            })
+        && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            n.starts_with(&format!("libknot_compile_rt_{}_", std::process::id()))
+                && n.ends_with(".a")
+        })
 }
 
 /// Locate the knot-compile-rt archive (JIT compile-runtime), always linked

@@ -1,7 +1,7 @@
 //! Higher-order functions, control flow, dictionaries, higher-rank types.
 
-mod harness;
 mod e2e;
+mod harness;
 use e2e::assert_stdout;
 use harness::{assert_compile_err, assert_show, assert_show_set};
 

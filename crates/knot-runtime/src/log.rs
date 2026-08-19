@@ -238,7 +238,10 @@ pub fn emit(level_tag: &str, msg: &str, ctx: Vec<CtxField>) {
             .unwrap_or_default()
             .as_secs_f64();
         let mut obj = serde_json::Map::new();
-        obj.insert("level".into(), serde_json::Value::String(level.as_str().into()));
+        obj.insert(
+            "level".into(),
+            serde_json::Value::String(level.as_str().into()),
+        );
         obj.insert("msg".into(), serde_json::Value::String(msg.into()));
         for f in &ctx {
             // The json fragment was rendered by write_value_json; parse it back

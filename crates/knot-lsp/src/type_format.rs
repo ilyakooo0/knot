@@ -15,17 +15,20 @@ pub fn format_type_scheme(ts: &TypeScheme) -> String {
     for c in &ts.constraints {
         match c {
             ast::Constraint::Trait { trait_name, args } => {
-                let args: Vec<String> =
-                    args.iter().map(|a| format_type_kind(&a.node)).collect();
+                let args: Vec<String> = args.iter().map(|a| format_type_kind(&a.node)).collect();
                 s.push_str(&format!("{} {} => ", trait_name, args.join(" ")));
             }
             ast::Constraint::ImplicitField { field, ty } => {
                 s.push_str(&format!("({}  ^{}) => ", format_type_kind(&ty.node), field));
             }
             ast::Constraint::CollectField { field, ty } => match ty {
-                Some(ty) => s.push_str(&format!("({}  <>{}) => ", format_type_kind(&ty.node), field)),
+                Some(ty) => s.push_str(&format!(
+                    "({}  <>{}) => ",
+                    format_type_kind(&ty.node),
+                    field
+                )),
                 None => s.push_str(&format!("(<> {}) => ", field)),
-            }
+            },
         }
     }
     s.push_str(&format_type_kind(&ts.ty.node));
@@ -50,7 +53,10 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
             // `Maybe Maybe Int`, nor `Maybe (Int -> Text)` as
             // `Maybe Int -> Text` (mirrors the compiler's Ty::App display).
             let f = format_type_kind_d(&func.node, d);
-            let f = if matches!(func.node, TypeKind::Function { .. } | TypeKind::Forall { .. }) {
+            let f = if matches!(
+                func.node,
+                TypeKind::Function { .. } | TypeKind::Forall { .. }
+            ) {
                 format!("({f})")
             } else {
                 f
@@ -145,7 +151,11 @@ fn format_type_kind_d(ty: &TypeKind, depth: usize) -> String {
             )
         }
         TypeKind::Forall { vars, ty } => {
-            format!("forall {}. {}", vars.join(" "), format_type_kind_d(&ty.node, d))
+            format!(
+                "forall {}. {}",
+                vars.join(" "),
+                format_type_kind_d(&ty.node, d)
+            )
         }
     }
 }
@@ -163,13 +173,23 @@ fn format_expr_brief_d(expr: &ast::ExprKind, depth: usize) -> String {
         ast::ExprKind::Lit(ast::Literal::Text(s)) => format!("\"{}\"", s),
         ast::ExprKind::Lit(ast::Literal::Bytes(_)) => "b\"…\"".into(),
         ast::ExprKind::Lambda { params, body, .. } => {
-            let ps: Vec<String> = params.iter().map(|p| format_pat_brief_d(&p.node, d)).collect();
-            format!("\\{} -> {}", ps.join(" "), format_expr_brief_d(&body.node, d))
+            let ps: Vec<String> = params
+                .iter()
+                .map(|p| format_pat_brief_d(&p.node, d))
+                .collect();
+            format!(
+                "\\{} -> {}",
+                ps.join(" "),
+                format_expr_brief_d(&body.node, d)
+            )
         }
         ast::ExprKind::App { func, arg } => {
             let f = format_expr_brief_d(&func.node, d);
             let a = format_expr_brief_d(&arg.node, d);
-            if matches!(arg.node, ast::ExprKind::App { .. } | ast::ExprKind::BinOp { .. }) {
+            if matches!(
+                arg.node,
+                ast::ExprKind::App { .. } | ast::ExprKind::BinOp { .. }
+            ) {
                 format!("{f} ({a})")
             } else {
                 format!("{f} {a}")
@@ -203,13 +223,21 @@ fn format_expr_brief_d(expr: &ast::ExprKind, depth: usize) -> String {
 
 fn bin_op_str(op: ast::BinOp) -> &'static str {
     match op {
-        ast::BinOp::Add => "+", ast::BinOp::Sub => "-",
-        ast::BinOp::Mul => "*", ast::BinOp::Div => "/", ast::BinOp::Mod => "%",
-        ast::BinOp::Eq => "==", ast::BinOp::Neq => "!=",
-        ast::BinOp::Lt => "<", ast::BinOp::Gt => ">",
-        ast::BinOp::Le => "<=", ast::BinOp::Ge => ">=",
-        ast::BinOp::And => "&&", ast::BinOp::Or => "||",
-        ast::BinOp::Concat => "++", ast::BinOp::Pipe => "|>",
+        ast::BinOp::Add => "+",
+        ast::BinOp::Sub => "-",
+        ast::BinOp::Mul => "*",
+        ast::BinOp::Div => "/",
+        ast::BinOp::Mod => "%",
+        ast::BinOp::Eq => "==",
+        ast::BinOp::Neq => "!=",
+        ast::BinOp::Lt => "<",
+        ast::BinOp::Gt => ">",
+        ast::BinOp::Le => "<=",
+        ast::BinOp::Ge => ">=",
+        ast::BinOp::And => "&&",
+        ast::BinOp::Or => "||",
+        ast::BinOp::Concat => "++",
+        ast::BinOp::Pipe => "|>",
     }
 }
 
@@ -232,7 +260,12 @@ fn bin_op_prec(op: ast::BinOp) -> u8 {
 
 /// Render a BinOp operand, adding parens when the child would re-associate
 /// differently on re-parse.
-fn format_binop_operand(expr: &ast::ExprKind, depth: usize, parent_prec: u8, is_rhs: bool) -> String {
+fn format_binop_operand(
+    expr: &ast::ExprKind,
+    depth: usize,
+    parent_prec: u8,
+    is_rhs: bool,
+) -> String {
     let rendered = format_expr_brief_d(expr, depth);
     let needs_parens = match expr {
         ast::ExprKind::BinOp { op, .. } => {
@@ -278,7 +311,10 @@ fn format_pat_brief_d(pat: &ast::PatKind, depth: usize) -> String {
             format!("{{{}}}", parts.join(", "))
         }
         ast::PatKind::List(pats) => {
-            let parts: Vec<String> = pats.iter().map(|p| format_pat_brief_d(&p.node, d)).collect();
+            let parts: Vec<String> = pats
+                .iter()
+                .map(|p| format_pat_brief_d(&p.node, d))
+                .collect();
             format!("[{}]", parts.join(", "))
         }
         ast::PatKind::Cons { head, tail } => {
@@ -312,4 +348,3 @@ fn format_unit_expr_d(u: &ast::UnitExpr, depth: usize) -> String {
 }
 
 // Regression tests for the 2026-06 LSP bug-fix batch (type-format group).
-

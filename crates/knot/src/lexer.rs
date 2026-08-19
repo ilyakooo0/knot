@@ -323,10 +323,11 @@ impl<'src> Lexer<'src> {
             // `--` line (handled above, so this branch just skips content).
             if in_block_comment {
                 if self.at_end() {
-                    self.diagnostics.push(
-                        Diagnostic::error("unterminated block comment")
-                            .label(self.span_from(self.pos), "block comment opened here never closed"),
-                    );
+                    self.diagnostics
+                        .push(Diagnostic::error("unterminated block comment").label(
+                            self.span_from(self.pos),
+                            "block comment opened here never closed",
+                        ));
                     break;
                 }
                 self.advance();
@@ -338,8 +339,10 @@ impl<'src> Lexer<'src> {
             if in_doc_block {
                 if self.at_end() {
                     self.diagnostics.push(
-                        Diagnostic::error("unterminated documentation block")
-                            .label(self.span_from(self.pos), "doc block opened here never closed"),
+                        Diagnostic::error("unterminated documentation block").label(
+                            self.span_from(self.pos),
+                            "doc block opened here never closed",
+                        ),
                     );
                     break;
                 }
@@ -557,7 +560,8 @@ impl<'src> Lexer<'src> {
         // identifier start (`café`, `α`) too — the byte-level gate uses the
         // lead byte, and the full multi-byte character is then consumed by
         // `is_ident_continue`.
-        if ch.is_ascii_alphabetic() || (ch >= 0x80 && char::from(ch).is_alphabetic()) || ch == b'_' {
+        if ch.is_ascii_alphabetic() || (ch >= 0x80 && char::from(ch).is_alphabetic()) || ch == b'_'
+        {
             return Some(self.lex_identifier());
         }
 
@@ -644,12 +648,11 @@ impl<'src> Lexer<'src> {
                 let next_ok = i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
                 if !prev_ok || !next_ok {
                     let span = Span::new(start + i, start + i + 1);
-                    self.diagnostics.push(
-                        Diagnostic::error("misplaced digit separator").label(
+                    self.diagnostics
+                        .push(Diagnostic::error("misplaced digit separator").label(
                             span,
                             "`_` in a numeric literal must appear between two digits",
-                        ),
-                    );
+                        ));
                     return;
                 }
             }
@@ -671,13 +674,12 @@ impl<'src> Lexer<'src> {
         if magnitude == I64_MIN_MAGNITUDE && follows_prefix_minus(prev) {
             return;
         }
-        self.diagnostics.push(
-            Diagnostic::error("integer literal is out of range").label(
+        self.diagnostics
+            .push(Diagnostic::error("integer literal is out of range").label(
                 span,
                 "does not fit in a 64-bit signed integer \
                  (-9223372036854775808 to 9223372036854775807)",
-            ),
-        );
+            ));
     }
 
     fn lex_number(&mut self) -> TokenKind {
@@ -855,7 +857,13 @@ impl<'src> Lexer<'src> {
                                 // consumes those, so they must not be underlined.
                                 let bad_end = match self.peek() {
                                     Some(b'"') | Some(b'\n') | Some(b'\r') | None => self.pos,
-                                    Some(_) => self.pos + self.source[self.pos..].chars().next().map_or(1, |c| c.len_utf8()),
+                                    Some(_) => {
+                                        self.pos
+                                            + self.source[self.pos..]
+                                                .chars()
+                                                .next()
+                                                .map_or(1, |c| c.len_utf8())
+                                    }
                                 };
                                 let span = Span::new(self.pos - 2, bad_end);
                                 self.diagnostics.push(
@@ -997,7 +1005,13 @@ impl<'src> Lexer<'src> {
                                 // consumes those, so they must not be underlined.
                                 let bad_end = match self.peek() {
                                     Some(b'"') | Some(b'\n') | Some(b'\r') | None => self.pos,
-                                    Some(_) => self.pos + self.source[self.pos..].chars().next().map_or(1, |c| c.len_utf8()),
+                                    Some(_) => {
+                                        self.pos
+                                            + self.source[self.pos..]
+                                                .chars()
+                                                .next()
+                                                .map_or(1, |c| c.len_utf8())
+                                    }
                                 };
                                 let span = Span::new(self.pos - 2, bad_end);
                                 self.diagnostics.push(
@@ -1101,8 +1115,7 @@ impl<'src> Lexer<'src> {
                 } else {
                     let span = Span::new(self.pos - 1, self.pos);
                     self.diagnostics.push(
-                        Diagnostic::error("unexpected character '!'")
-                            .label(span, "unexpected"),
+                        Diagnostic::error("unexpected character '!'").label(span, "unexpected"),
                     );
                     return None;
                 }
@@ -1171,7 +1184,10 @@ impl<'src> Lexer<'src> {
                     self.pos += 1;
                 }
                 let span = Span::new(char_start, self.pos);
-                let c = self.source[char_start..self.pos].chars().next().unwrap_or('?');
+                let c = self.source[char_start..self.pos]
+                    .chars()
+                    .next()
+                    .unwrap_or('?');
                 self.diagnostics.push(
                     Diagnostic::error(format!("unexpected character '{c}'"))
                         .label(span, "unexpected"),
@@ -1191,18 +1207,29 @@ mod tests {
     use super::*;
 
     fn kinds(src: &str) -> Vec<TokenKind> {
-        Lexer::new(src).tokenize().0.into_iter().map(|t| t.kind).collect()
+        Lexer::new(src)
+            .tokenize()
+            .0
+            .into_iter()
+            .map(|t| t.kind)
+            .collect()
     }
 
     fn has_doc(kinds: &[TokenKind], needle: &str) -> bool {
-        kinds.iter().any(|k| matches!(k, TokenKind::Doc(d) if d.contains(needle)))
+        kinds
+            .iter()
+            .any(|k| matches!(k, TokenKind::Doc(d) if d.contains(needle)))
     }
 
     #[test]
     fn line_comment_skipped() {
         let k = kinds("x -- a comment\ny");
         assert!(k.iter().all(|t| !matches!(t, TokenKind::Doc(_))));
-        assert!(kinds("x -- a comment\ny").iter().any(|t| matches!(t, TokenKind::Lower(n) if n == "y")));
+        assert!(
+            kinds("x -- a comment\ny")
+                .iter()
+                .any(|t| matches!(t, TokenKind::Lower(n) if n == "y"))
+        );
     }
 
     #[test]
@@ -1215,9 +1242,18 @@ mod tests {
     fn block_comment_toggle() {
         // bare `--` opens and closes; the middle is swallowed entirely.
         let k = kinds("a\n--\nthis is hidden\nso is this\n--\nb");
-        assert!(k.iter().any(|t| matches!(t, TokenKind::Lower(n) if n == "a")));
-        assert!(k.iter().any(|t| matches!(t, TokenKind::Lower(n) if n == "b")));
-        assert!(k.iter().all(|t| !matches!(t, TokenKind::Lower(n) if n == "this" || n == "hidden")));
+        assert!(
+            k.iter()
+                .any(|t| matches!(t, TokenKind::Lower(n) if n == "a"))
+        );
+        assert!(
+            k.iter()
+                .any(|t| matches!(t, TokenKind::Lower(n) if n == "b"))
+        );
+        assert!(
+            k.iter()
+                .all(|t| !matches!(t, TokenKind::Lower(n) if n == "this" || n == "hidden"))
+        );
     }
 
     #[test]
@@ -1231,10 +1267,13 @@ mod tests {
     fn doc_block_multiline_single_token() {
         let k = kinds("---\nline one\nline two\n---\nadd");
         // One merged Doc token containing both lines.
-        let docs: Vec<_> = k.iter().filter_map(|t| match t {
-            TokenKind::Doc(d) => Some(d.clone()),
-            _ => None,
-        }).collect();
+        let docs: Vec<_> = k
+            .iter()
+            .filter_map(|t| match t {
+                TokenKind::Doc(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(docs.len(), 1);
         assert!(docs[0].contains("line one") && docs[0].contains("line two"));
     }
@@ -1251,10 +1290,15 @@ mod tests {
     fn marker_with_text_is_not_a_toggle() {
         // `-- text` is a line comment, NOT a block opener.
         let k = kinds("-- just a comment\nfoo");
-        assert!(k.iter().any(|t| matches!(t, TokenKind::Lower(n) if n == "foo")));
+        assert!(
+            k.iter()
+                .any(|t| matches!(t, TokenKind::Lower(n) if n == "foo"))
+        );
         // `--- text` is a doc line, NOT a doc-block opener.
         let k2 = kinds("--- a doc line\nbar");
-        assert!(k2.iter().any(|t| matches!(t, TokenKind::Lower(n) if n == "bar")));
+        assert!(
+            k2.iter()
+                .any(|t| matches!(t, TokenKind::Lower(n) if n == "bar"))
+        );
     }
 }
-

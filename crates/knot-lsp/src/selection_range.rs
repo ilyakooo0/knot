@@ -45,8 +45,11 @@ fn build_selection_range(program: &ast::Expr, source: &str, offset: usize) -> Se
         if dspan.start <= offset && offset < dspan.end {
             spans.push(dspan);
             match &decl.value.node {
-                ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-                | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+                ast::ExprKind::SourceDecl { .. }
+                | ast::ExprKind::DataCtor { .. }
+                | ast::ExprKind::TypeCtor { .. }
+                | ast::ExprKind::RouteDecl { .. }
+                | ast::ExprKind::SubsetConstraint { .. } => {}
                 _ => {
                     // A named function field.
                     collect_containing_spans(&decl.value, offset, &mut spans);

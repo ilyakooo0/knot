@@ -6,13 +6,16 @@
 use std::io::{self, stdout};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    event::{self, Event, KeyCode, KeyEventKind},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap},
+    widgets::{
+        Block, Borders, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Row,
+        Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
+    },
 };
 use rusqlite::Connection;
 use unicode_width::UnicodeWidthStr;
@@ -48,7 +51,9 @@ fn parse_schema_kind(schema: &str) -> SchemaKind {
     if let Some(body) = schema.strip_prefix('#') {
         let mut ctors = Vec::new();
         for ctor_part in crate::split_respecting_brackets(body, '|') {
-            if ctor_part.is_empty() { continue; }
+            if ctor_part.is_empty() {
+                continue;
+            }
             let mut parts = ctor_part.splitn(2, ':');
             let name = parts.next().unwrap().to_string();
             let fields = if let Some(field_spec) = parts.next() {
@@ -266,8 +271,7 @@ fn load_rows(conn: &Connection, rel: &RelationInfo) -> Vec<Vec<String>> {
                                 // constructor field that wasn't merged into
                                 // all_fields), skip the field rather than
                                 // panicking the TUI.
-                                let col_idx =
-                                    all_fields.iter().position(|(n, _)| n == fname)?;
+                                let col_idx = all_fields.iter().position(|(n, _)| n == fname)?;
                                 let cell = format_cell(row, col_idx + 1, fty);
                                 Some(format!("{}: {}", fname, cell))
                             })
@@ -295,59 +299,49 @@ fn format_cell(row: &rusqlite::Row, idx: usize, ty: &str) -> String {
             // Could be stored as INTEGER or TEXT (for big ints)
             match row.get_ref(idx) {
                 Ok(rusqlite::types::ValueRef::Integer(n)) => n.to_string(),
-                Ok(rusqlite::types::ValueRef::Text(t)) => {
-                    String::from_utf8_lossy(t).to_string()
-                }
+                Ok(rusqlite::types::ValueRef::Text(t)) => String::from_utf8_lossy(t).to_string(),
                 Ok(rusqlite::types::ValueRef::Null) => "null".to_string(),
                 _ => "?".to_string(),
             }
         }
-        "float" => {
-            match row.get_ref(idx) {
-                Ok(rusqlite::types::ValueRef::Real(f)) => {
-                    if f.is_nan() || f.is_infinite() {
-                        format!("{}", f)
-                    } else if f == (f as i64) as f64 {
-                        format!("{:.1}", f)
-                    } else {
-                        f.to_string()
-                    }
+        "float" => match row.get_ref(idx) {
+            Ok(rusqlite::types::ValueRef::Real(f)) => {
+                if f.is_nan() || f.is_infinite() {
+                    format!("{}", f)
+                } else if f == (f as i64) as f64 {
+                    format!("{:.1}", f)
+                } else {
+                    f.to_string()
                 }
-                Ok(rusqlite::types::ValueRef::Null) => "null".to_string(),
-                _ => "?".to_string(),
             }
-        }
-        "bool" => {
-            match row.get::<_, Option<i32>>(idx) {
-                Ok(Some(1)) => "True".to_string(),
-                Ok(Some(0)) => "False".to_string(),
-                Ok(None) => "null".to_string(),
-                _ => "?".to_string(),
-            }
-        }
-        "text" | "tag" => {
-            match row.get::<_, Option<String>>(idx) {
-                Ok(Some(s)) => {
-                    if ty == "tag" {
-                        format!("{} {{}}", s)
-                    } else {
-                        format!("\"{}\"", s)
-                    }
+            Ok(rusqlite::types::ValueRef::Null) => "null".to_string(),
+            _ => "?".to_string(),
+        },
+        "bool" => match row.get::<_, Option<i32>>(idx) {
+            Ok(Some(1)) => "True".to_string(),
+            Ok(Some(0)) => "False".to_string(),
+            Ok(None) => "null".to_string(),
+            _ => "?".to_string(),
+        },
+        "text" | "tag" => match row.get::<_, Option<String>>(idx) {
+            Ok(Some(s)) => {
+                if ty == "tag" {
+                    format!("{} {{}}", s)
+                } else {
+                    format!("\"{}\"", s)
                 }
-                Ok(None) => "null".to_string(),
-                Err(_) => "?".to_string(),
             }
-        }
-        "bytes" => {
-            match row.get::<_, Option<Vec<u8>>>(idx) {
-                Ok(Some(b)) => {
-                    let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
-                    format!("0x{}", hex)
-                }
-                Ok(None) => "null".to_string(),
-                Err(_) => "?".to_string(),
+            Ok(None) => "null".to_string(),
+            Err(_) => "?".to_string(),
+        },
+        "bytes" => match row.get::<_, Option<Vec<u8>>>(idx) {
+            Ok(Some(b)) => {
+                let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
+                format!("0x{}", hex)
             }
-        }
+            Ok(None) => "null".to_string(),
+            Err(_) => "?".to_string(),
+        },
         _ => {
             // Nested relation or unknown - show raw
             match row.get::<_, Option<String>>(idx) {
@@ -404,11 +398,15 @@ impl App {
     }
 
     fn selected_relation(&self) -> Option<&RelationInfo> {
-        self.relation_state.selected().and_then(|i| self.relations.get(i))
+        self.relation_state
+            .selected()
+            .and_then(|i| self.relations.get(i))
     }
 
     fn selected_schema(&self) -> Option<&SchemaKind> {
-        self.relation_state.selected().and_then(|i| self.parsed_schemas.get(i))
+        self.relation_state
+            .selected()
+            .and_then(|i| self.parsed_schemas.get(i))
     }
 
     fn load_data(&mut self, conn: &Connection) {
@@ -427,9 +425,15 @@ impl App {
     }
 
     fn expand_selected_row(&mut self) {
-        let Some(schema) = self.selected_schema().cloned() else { return };
-        let Some(row_idx) = self.data_state.selected() else { return };
-        let Some(row) = self.data_rows.get(row_idx) else { return };
+        let Some(schema) = self.selected_schema().cloned() else {
+            return;
+        };
+        let Some(row_idx) = self.data_state.selected() else {
+            return;
+        };
+        let Some(row) = self.data_rows.get(row_idx) else {
+            return;
+        };
 
         let text = match &schema {
             SchemaKind::Unit => "{}".to_string(),
@@ -465,7 +469,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
             let line = Line::from(vec![
                 Span::styled("*", Style::default().fg(Color::DarkGray)),
                 Span::raw(r.name.to_string()),
-                Span::styled(format!(" ({})", r.row_count), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!(" ({})", r.row_count),
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]);
             ListItem::new(line)
         })
@@ -564,7 +571,10 @@ fn ui(frame: &mut Frame, app: &mut App) {
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
             .end_symbol(None);
-        let scrollbar_area = chunks[1].inner(Margin { vertical: 1, horizontal: 0 });
+        let scrollbar_area = chunks[1].inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        });
         app.data_scroll = app
             .data_scroll
             .position(app.data_state.selected().unwrap_or(0));
@@ -639,9 +649,8 @@ impl Drop for TerminalRestoreGuard {
 }
 
 pub fn run_db_explorer(db_path: &str) -> io::Result<()> {
-    let conn = Connection::open(db_path).map_err(|e| {
-        io::Error::other(format!("Failed to open database: {}", e))
-    })?;
+    let conn = Connection::open(db_path)
+        .map_err(|e| io::Error::other(format!("Failed to open database: {}", e)))?;
 
     let mut app = App::new(&conn);
     app.load_data(&conn);

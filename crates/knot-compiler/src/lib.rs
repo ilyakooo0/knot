@@ -11,5 +11,5 @@ pub mod refine_smt;
 pub mod sql_lint;
 pub mod stack;
 pub mod types;
-pub(crate) mod unwind;
 pub mod unused;
+pub(crate) mod unwind;

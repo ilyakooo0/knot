@@ -4,7 +4,7 @@
 //! tracking persisted relation schemas and migration history.
 //! The lockfile is valid Knot syntax, parsed by the same frontend.
 
-use crate::decl_view::{decl_views, DeclViewKind};
+use crate::decl_view::{DeclViewKind, decl_views};
 use crate::types::TypeEnv;
 use knot::ast::*;
 use knot::diagnostic::{Diagnostic, Severity};
@@ -454,8 +454,10 @@ pub fn check(source_path: &Path, program: &Expr, type_env: &TypeEnv) -> Vec<Diag
                                 let first_from = &migrations[0].0;
                                 let last_to = &migrations[migrations.len() - 1].1;
 
-                                if classify_schema_change(first_from, old_schema) != SchemaChange::Identical
-                                    || classify_schema_change(last_to, new_schema) != SchemaChange::Identical
+                                if classify_schema_change(first_from, old_schema)
+                                    != SchemaChange::Identical
+                                    || classify_schema_change(last_to, new_schema)
+                                        != SchemaChange::Identical
                                 {
                                     let first_span = find_migrate_span(program, name);
                                     diags.push(
@@ -473,7 +475,11 @@ pub fn check(source_path: &Path, program: &Expr, type_env: &TypeEnv) -> Vec<Diag
 
                                 // Validate chain contiguity
                                 for i in 1..migrations.len() {
-                                    if classify_schema_change(&migrations[i - 1].1, &migrations[i].0) != SchemaChange::Identical {
+                                    if classify_schema_change(
+                                        &migrations[i - 1].1,
+                                        &migrations[i].0,
+                                    ) != SchemaChange::Identical
+                                    {
                                         diags.push(
                                             Diagnostic::error(format!(
                                                 "migration chain for '*{}' is not contiguous: step {} 'to' doesn't match step {} 'from'",
@@ -562,11 +568,7 @@ pub fn dropped_sources(source_path: &Path, type_env: &TypeEnv) -> Vec<String> {
 
 /// Write the lockfile after a successful compile.
 /// Only writes if there are source declarations to track.
-pub fn update(
-    source_path: &Path,
-    source_text: &str,
-    program: &Expr,
-) -> Result<(), String> {
+pub fn update(source_path: &Path, source_text: &str, program: &Expr) -> Result<(), String> {
     let has_sources = decl_views(program)
         .iter()
         .any(|d| matches!(d.kind, DeclViewKind::Source { .. }))
@@ -590,8 +592,14 @@ pub fn update(
     let tmp_path = lock_path.with_extension("lock.tmp");
     std::fs::write(&tmp_path, &content)
         .map_err(|e| format!("cannot write {}: {}", tmp_path.display(), e))?;
-    std::fs::rename(&tmp_path, &lock_path)
-        .map_err(|e| format!("cannot rename {} to {}: {}", tmp_path.display(), lock_path.display(), e))
+    std::fs::rename(&tmp_path, &lock_path).map_err(|e| {
+        format!(
+            "cannot rename {} to {}: {}",
+            tmp_path.display(),
+            lock_path.display(),
+            e
+        )
+    })
 }
 
 /// Collect the record-embedded `*name : <ty>` source declarations from a
@@ -689,7 +697,12 @@ fn collect_record_migrations(e: &Expr, out: &mut String) {
     match &e.node {
         ExprKind::Record(fields) => {
             for f in fields {
-                if let ExprKind::SourceDecl { name: _, migrations, .. } = &f.value.node {
+                if let ExprKind::SourceDecl {
+                    name: _,
+                    migrations,
+                    ..
+                } = &f.value.node
+                {
                     for m in migrations {
                         // The lockfile is re-parsed by parse_file_expr, whose
                         // migration clause (parse_source_field_migration) has
@@ -715,5 +728,3 @@ fn collect_record_migrations(e: &Expr, out: &mut String) {
         _ => {}
     }
 }
-
-

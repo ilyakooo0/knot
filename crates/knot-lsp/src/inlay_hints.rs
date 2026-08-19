@@ -8,9 +8,7 @@ use knot_compiler::infer::MonadKind;
 
 use crate::shared::{extract_param_names, flatten_app_chain, parse_function_params};
 use crate::state::{DocumentState, ServerState};
-use crate::utils::{
-    offset_to_position, position_to_offset, recurse_expr, safe_slice, top_fields,
-};
+use crate::utils::{offset_to_position, position_to_offset, recurse_expr, safe_slice, top_fields};
 
 // ── Inlay Hints ─────────────────────────────────────────────────────
 
@@ -69,53 +67,60 @@ pub(crate) fn handle_inlay_hint(
 
         // Classify the field: marker vs named-function, and whether it has a sig.
         let (fname, fsig, is_relation_marker) = match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => continue,
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => continue,
             _ => (decl.name.as_str(), decl.sig.as_ref(), false),
         };
         if let (name, None, marker) = (fname, fsig, is_relation_marker)
-            && let Some(inferred) = doc.type_info.get(name) {
-                let decl_text = safe_slice(&doc.source, dspan);
-                // View/derived markers begin with a `*`/`&` sigil that
-                // `dspan.start` points at; skip it before scanning for the
-                // end of the name so the hint doesn't land on the sigil.
-                let sigil_len = if marker {
-                    decl_text
-                        .chars()
-                        .next()
-                        .filter(|c| *c == '*' || *c == '&')
-                        .map_or(0, char::len_utf8)
-                } else {
-                    0
-                };
-                // `'` continues identifiers in the lexer (`x'` is one
-                // token), so the hint anchor must skip it too — otherwise
-                // `x' = 1` renders as `x : Int' = 1`.
-                let name_end = decl_text[sigil_len..]
-                    .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
-                    .map(|p| sigil_len + p)
-                    .unwrap_or(decl_text.len());
-                let hint_offset = dspan.start + name_end;
-                let hint_pos = offset_to_position(&doc.source, hint_offset);
-                // Text edit emits the signature as a separate statement above the
-                // function, so anchor it at the declaration start, not at the hint.
-                let edit_pos = offset_to_position(&doc.source, dspan.start);
-                let full_sig = inferred.clone();
-                hints.push(InlayHint {
-                    position: hint_pos,
-                    label: InlayHintLabel::String(format!(" : {full_sig}")),
-                    kind: Some(InlayHintKind::TYPE),
-                    text_edits: Some(vec![TextEdit {
-                        range: Range { start: edit_pos, end: edit_pos },
-                        // Type-first signature line: `Sig  name`.
-                        new_text: format!("{full_sig}  {name}\n"),
-                    }]),
-                    tooltip: None,
-                    padding_left: Some(true),
-                    padding_right: Some(true),
-                    data: None,
-                });
-            }
+            && let Some(inferred) = doc.type_info.get(name)
+        {
+            let decl_text = safe_slice(&doc.source, dspan);
+            // View/derived markers begin with a `*`/`&` sigil that
+            // `dspan.start` points at; skip it before scanning for the
+            // end of the name so the hint doesn't land on the sigil.
+            let sigil_len = if marker {
+                decl_text
+                    .chars()
+                    .next()
+                    .filter(|c| *c == '*' || *c == '&')
+                    .map_or(0, char::len_utf8)
+            } else {
+                0
+            };
+            // `'` continues identifiers in the lexer (`x'` is one
+            // token), so the hint anchor must skip it too — otherwise
+            // `x' = 1` renders as `x : Int' = 1`.
+            let name_end = decl_text[sigil_len..]
+                .find(|c: char| !c.is_alphanumeric() && c != '_' && c != '\'')
+                .map(|p| sigil_len + p)
+                .unwrap_or(decl_text.len());
+            let hint_offset = dspan.start + name_end;
+            let hint_pos = offset_to_position(&doc.source, hint_offset);
+            // Text edit emits the signature as a separate statement above the
+            // function, so anchor it at the declaration start, not at the hint.
+            let edit_pos = offset_to_position(&doc.source, dspan.start);
+            let full_sig = inferred.clone();
+            hints.push(InlayHint {
+                position: hint_pos,
+                label: InlayHintLabel::String(format!(" : {full_sig}")),
+                kind: Some(InlayHintKind::TYPE),
+                text_edits: Some(vec![TextEdit {
+                    range: Range {
+                        start: edit_pos,
+                        end: edit_pos,
+                    },
+                    // Type-first signature line: `Sig  name`.
+                    new_text: format!("{full_sig}  {name}\n"),
+                }]),
+                tooltip: None,
+                padding_left: Some(true),
+                padding_right: Some(true),
+                data: None,
+            });
+        }
     }
 
     // Show inferred types for local bindings (let/bind in do blocks). Reads
@@ -298,11 +303,7 @@ fn add_closing_label_hints(
         lines
     }
 
-    fn collect(
-        expr: &ast::Expr,
-        source: &str,
-        out: &mut Vec<(Span, String)>,
-    ) {
+    fn collect(expr: &ast::Expr, source: &str, out: &mut Vec<(Span, String)>) {
         match &expr.node {
             ast::ExprKind::Do(_) => {
                 if count_lines(source, expr.span) >= MIN_LINES {
@@ -335,8 +336,11 @@ fn add_closing_label_hints(
     let mut spans: Vec<(Span, String)> = Vec::new();
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => collect(&decl.value, &doc.source, &mut spans),
         }
     }
@@ -401,12 +405,9 @@ fn add_record_pattern_field_hints(
                 }
                 None => {
                     // Pun: the token both names the field and binds the var.
-                    if let Some(s) = crate::utils::find_word_in_source(
-                        source,
-                        &f.name,
-                        search_start,
-                        window.end,
-                    ) {
+                    if let Some(s) =
+                        crate::utils::find_word_in_source(source, &f.name, search_start, window.end)
+                    {
                         out.push((f.name.clone(), s));
                         search_start = s.end;
                     }
@@ -508,8 +509,11 @@ fn add_record_pattern_field_hints(
     let mut record_pats: Vec<RecordPat> = Vec::new();
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => walk_expr(&decl.value, &doc.source, &mut record_pats),
         }
     }
@@ -528,7 +532,12 @@ fn add_record_pattern_field_hints(
         let mut tooltip_source = String::from("destructured record");
         if let Some(ctor_name) = ctor_opt.as_deref() {
             'ctor_lookup: for d in top_fields(&doc.module) {
-                if let ast::ExprKind::DataCtor { constructors, name: data_name, .. } = &d.value.node {
+                if let ast::ExprKind::DataCtor {
+                    constructors,
+                    name: data_name,
+                    ..
+                } = &d.value.node
+                {
                     for c in constructors {
                         if c.name == ctor_name {
                             tooltip_source = format!("{ctor_name} (constructor of {data_name})");
@@ -558,9 +567,7 @@ fn add_record_pattern_field_hints(
                     fields_str.push((n.clone(), t.render()));
                 }
                 tooltip_source = parent_ty.clone();
-            } else if let Some(fs) =
-                extract_variant_ctor_fields(stripped, &doc.source, span)
-            {
+            } else if let Some(fs) = extract_variant_ctor_fields(stripped, &doc.source, span) {
                 for (n, t) in fs {
                     fields_str.push((n, t.render()));
                 }
@@ -576,10 +583,7 @@ fn add_record_pattern_field_hints(
             // Anchor each hint on the field-NAME token position parsed
             // structurally from the pattern — not on the first same-named
             // token, which could be an earlier field's binder.
-            if let Some((_, name_span)) = field_name_spans
-                .iter()
-                .find(|(n, _)| *n == field_name)
-            {
+            if let Some((_, name_span)) = field_name_spans.iter().find(|(n, _)| *n == field_name) {
                 let abs_end = name_span.end;
                 if abs_end > span.end {
                     continue;
@@ -634,9 +638,10 @@ fn extract_variant_ctor_fields(
     for (name, payload) in ctors {
         if name == ctor_name
             && let Some(p) = payload
-                && let Some(fields) = p.record_fields() {
-                    return Some(fields.to_vec());
-                }
+            && let Some(fields) = p.record_fields()
+        {
+            return Some(fields.to_vec());
+        }
     }
     None
 }
@@ -687,8 +692,11 @@ fn add_unit_literal_hints(
 
     fn collect_literals_in_decl(decl: &ast::RecordField, out: &mut Vec<(Span, ast::Expr)>) {
         match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => {
                 walk_for_unit_bindings(&decl.value, out);
             }
@@ -830,8 +838,11 @@ fn add_parameter_name_hints(
         hints: &mut Vec<InlayHint>,
     ) {
         let body = match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => return,
             _ => &decl.value,
         };
         let mut shadowed = std::collections::HashSet::new();
@@ -937,9 +948,10 @@ fn emit_arg_hints(
         // Suppress hint for bare-name args that already match the parameter
         // name — `transfer(amount, from, to)` doesn't need `amount: amount`.
         if let ast::ExprKind::Var(arg_name) = &arg.node
-            && arg_name == name {
-                continue;
-            }
+            && arg_name == name
+        {
+            continue;
+        }
         // Don't hint trivial/anonymous parameter names (`_`, single letters
         // synthesized by the fallback). Single-letter ASCII params from real
         // code (`\x -> ...`) are kept — the hint is still useful there.
@@ -1024,38 +1036,39 @@ fn add_monad_context_hints(
         hints: &mut Vec<InlayHint>,
     ) {
         if let ast::ExprKind::Do(_) = &expr.node
-            && expr.span.start >= range_start && expr.span.start < range_end
-                && let Some(monad) = doc.monad_info.get(&expr.span) {
-                    let label = match monad {
-                        MonadKind::Relation => "[Relation]".to_string(),
-                        MonadKind::IO => "[IO]".to_string(),
-                        MonadKind::Adt(name) => format!("[{name}]"),
-                    };
-                    let pos = offset_to_position(&doc.source, expr.span.start);
-                    // Anchor the hint just past the `do` keyword. The span does
-                    // NOT always begin at `do`: a parenthesized do used as an
-                    // argument (`f (do ...)`) keeps the inner `Do` node but
-                    // widens its span to include the surrounding parens, so
-                    // `span.start` points at `(`. A blind `+ 2` would then land
-                    // mid-keyword (between `d` and `o`). Scan forward from the
-                    // span start for the actual `do` token and anchor after it;
-                    // fall back to the span start if none is found.
-                    let do_pos = match find_do_keyword(&doc.source, expr.span.start, expr.span.end)
-                    {
-                        Some(do_start) => offset_to_position(&doc.source, do_start + 2),
-                        None => pos,
-                    };
-                    hints.push(InlayHint {
-                        position: do_pos,
-                        label: InlayHintLabel::String(label),
-                        kind: None,
-                        text_edits: None,
-                        tooltip: Some(InlayHintTooltip::String(monad_tooltip(monad))),
-                        padding_left: Some(true),
-                        padding_right: Some(true),
-                        data: None,
-                    });
-                }
+            && expr.span.start >= range_start
+            && expr.span.start < range_end
+            && let Some(monad) = doc.monad_info.get(&expr.span)
+        {
+            let label = match monad {
+                MonadKind::Relation => "[Relation]".to_string(),
+                MonadKind::IO => "[IO]".to_string(),
+                MonadKind::Adt(name) => format!("[{name}]"),
+            };
+            let pos = offset_to_position(&doc.source, expr.span.start);
+            // Anchor the hint just past the `do` keyword. The span does
+            // NOT always begin at `do`: a parenthesized do used as an
+            // argument (`f (do ...)`) keeps the inner `Do` node but
+            // widens its span to include the surrounding parens, so
+            // `span.start` points at `(`. A blind `+ 2` would then land
+            // mid-keyword (between `d` and `o`). Scan forward from the
+            // span start for the actual `do` token and anchor after it;
+            // fall back to the span start if none is found.
+            let do_pos = match find_do_keyword(&doc.source, expr.span.start, expr.span.end) {
+                Some(do_start) => offset_to_position(&doc.source, do_start + 2),
+                None => pos,
+            };
+            hints.push(InlayHint {
+                position: do_pos,
+                label: InlayHintLabel::String(label),
+                kind: None,
+                text_edits: None,
+                tooltip: Some(InlayHintTooltip::String(monad_tooltip(monad))),
+                padding_left: Some(true),
+                padding_right: Some(true),
+                data: None,
+            });
+        }
         recurse_expr(expr, |e| walk(e, doc, range_start, range_end, hints));
     }
 
@@ -1067,8 +1080,11 @@ fn add_monad_context_hints(
         hints: &mut Vec<InlayHint>,
     ) {
         let body = match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => return,
             _ => &decl.value,
         };
         walk(body, doc, range_start, range_end, hints);
@@ -1105,23 +1121,25 @@ fn add_constraint_hints(
         if matches!(expr.node, ast::ExprKind::App { .. }) {
             let (callee, args) = flatten_app_chain(expr);
             if let ast::ExprKind::Var(name) = &callee.node
-                && callee.span.start >= range_start && callee.span.end <= range_end
-                    && let Some(constraints) = constraints_for_callee(&doc.module, name.as_str())
-                        && !constraints.is_empty() {
-                            let label = format!("[{}]", constraints.join(", "));
-                            hints.push(InlayHint {
-                                position: offset_to_position(&doc.source, callee.span.end),
-                                label: InlayHintLabel::String(label),
-                                kind: None,
-                                text_edits: None,
-                                tooltip: Some(InlayHintTooltip::String(format!(
-                                    "Call site brings in trait constraints from `{name}`'s declaration"
-                                ))),
-                                padding_left: Some(true),
-                                padding_right: None,
-                                data: None,
-                            });
-                        }
+                && callee.span.start >= range_start
+                && callee.span.end <= range_end
+                && let Some(constraints) = constraints_for_callee(&doc.module, name.as_str())
+                && !constraints.is_empty()
+            {
+                let label = format!("[{}]", constraints.join(", "));
+                hints.push(InlayHint {
+                    position: offset_to_position(&doc.source, callee.span.end),
+                    label: InlayHintLabel::String(label),
+                    kind: None,
+                    text_edits: None,
+                    tooltip: Some(InlayHintTooltip::String(format!(
+                        "Call site brings in trait constraints from `{name}`'s declaration"
+                    ))),
+                    padding_left: Some(true),
+                    padding_right: None,
+                    data: None,
+                });
+            }
             // Recurse into the head too — it can be a non-Var expression
             // (`(if c then f else g) a b`, lambda/case heads) containing
             // further call chains. The head is non-App, so no re-processing.
@@ -1143,19 +1161,19 @@ fn add_constraint_hints(
                         .iter()
                         .map(|c| match c {
                             knot::ast::Constraint::Trait { trait_name, args } => {
-                                let args: Vec<String> = args
-                                    .iter()
-                                    .map(|t| format_type_kind(&t.node))
-                                    .collect();
+                                let args: Vec<String> =
+                                    args.iter().map(|t| format_type_kind(&t.node)).collect();
                                 format!("{} {}", trait_name, args.join(" "))
                             }
                             knot::ast::Constraint::ImplicitField { field, ty } => {
                                 format!("({}  ^{})", format_type_kind(&ty.node), field)
                             }
                             knot::ast::Constraint::CollectField { field, ty } => match ty {
-                                Some(ty) => format!("({}  <>{})", format_type_kind(&ty.node), field),
+                                Some(ty) => {
+                                    format!("({}  <>{})", format_type_kind(&ty.node), field)
+                                }
                                 None => format!("(<> {})", field),
-                            }
+                            },
                         })
                         .collect();
                     return Some(cs);
@@ -1174,8 +1192,11 @@ fn add_constraint_hints(
         hints: &mut Vec<InlayHint>,
     ) {
         let body = match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => return,
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => return,
             _ => &decl.value,
         };
         walk(body, doc, range_start, range_end, hints);
@@ -1191,11 +1212,9 @@ fn add_constraint_hints(
 
 fn monad_tooltip(monad: &MonadKind) -> String {
     match monad {
-        MonadKind::Relation => {
-            "Relation comprehension. `<-` iterates rows, `where` filters, \
+        MonadKind::Relation => "Relation comprehension. `<-` iterates rows, `where` filters, \
              `yield` collects, `groupBy` aggregates."
-                .into()
-        }
+            .into(),
         MonadKind::IO => "IO action sequencing. Each statement is an effectful \
                           action; the final yield/expression is the result."
             .into(),
@@ -1204,5 +1223,3 @@ fn monad_tooltip(monad: &MonadKind) -> String {
         }
     }
 }
-
-

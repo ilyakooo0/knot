@@ -7,8 +7,7 @@
 
 /// Builtins that perform a console effect (`println`, `print`, `logInfo`, ...).
 pub const CONSOLE_BUILTINS: &[&str] = &[
-    "println", "putLine", "print", "readLine",
-    "logInfo", "logWarn", "logError", "logDebug",
+    "println", "putLine", "print", "readLine", "logInfo", "logWarn", "logError", "logDebug",
 ];
 
 /// Builtins that read/manipulate the wall clock or sleep.
@@ -16,8 +15,12 @@ pub const CLOCK_BUILTINS: &[&str] = &["now", "sleep"];
 
 /// Builtins that consume randomness.
 pub const RANDOM_BUILTINS: &[&str] = &[
-    "randomInt", "randomFloat", "randomUuid",
-    "generateKeyPair", "generateSigningKeyPair", "encrypt",
+    "randomInt",
+    "randomFloat",
+    "randomUuid",
+    "generateKeyPair",
+    "generateSigningKeyPair",
+    "encrypt",
 ];
 
 /// Builtins that perform network IO.
@@ -25,8 +28,12 @@ pub const NETWORK_BUILTINS: &[&str] = &["listen", "listenOn", "fetch", "fetchWit
 
 /// Builtins that touch the filesystem.
 pub const FS_BUILTINS: &[&str] = &[
-    "readFile", "writeFile", "appendFile",
-    "fileExists", "removeFile", "listDir",
+    "readFile",
+    "writeFile",
+    "appendFile",
+    "fileExists",
+    "removeFile",
+    "listDir",
 ];
 
 /// Concurrency builtins (`fork`, `retry`, `race`). These do not contribute IO
@@ -39,18 +46,54 @@ pub const CONCURRENCY_BUILTINS: &[&str] = &["fork", "retry", "race"];
 /// Pure builtins. These are listed so the LSP can recognize them as user-callable
 /// and so they sort sensibly in completion lists. They have no effects.
 pub const PURE_BUILTINS: &[&str] = &[
-    "show", "union", "count", "filter", "match", "map",
-    "fold", "single", "any", "all", "diff", "inter", "sum", "avg",
-    "head", "findFirst",
-    "toUpper", "toLower", "take", "drop",
-    "length", "trim", "contains", "elem", "reverse", "chars",
-    "id", "not", "toJson", "parseJson",
-    "decrypt", "sign", "verify",
+    "show",
+    "union",
+    "count",
+    "filter",
+    "match",
+    "map",
+    "fold",
+    "single",
+    "any",
+    "all",
+    "diff",
+    "inter",
+    "sum",
+    "avg",
+    "head",
+    "findFirst",
+    "toUpper",
+    "toLower",
+    "take",
+    "drop",
+    "length",
+    "trim",
+    "contains",
+    "elem",
+    "reverse",
+    "chars",
+    "id",
+    "not",
+    "toJson",
+    "parseJson",
+    "decrypt",
+    "sign",
+    "verify",
     "upsertBy",
-    "countWhere", "minOn", "maxOn", "sortBy",
-    "floor", "intToFloat", "textToInt", "textToFloat",
-    "stripUnit", "withUnit", "stripFloatUnit", "withFloatUnit",
-    "strip", "dress",
+    "countWhere",
+    "minOn",
+    "maxOn",
+    "sortBy",
+    "floor",
+    "intToFloat",
+    "textToInt",
+    "textToFloat",
+    "stripUnit",
+    "withUnit",
+    "stripFloatUnit",
+    "withFloatUnit",
+    "strip",
+    "dress",
     // The unimplemented hole: polymorphic `∀a. a`, aborts at runtime with a
     // full source-context report. Effect-free in the type system (like
     // `retry`); dispatch-only at codegen, never a real `base` record field.
@@ -66,20 +109,40 @@ pub const PURE_BUILTINS: &[&str] = &[
 /// them out of atomic-context completions.
 pub const EFFECTFUL_BUILTINS: &[&str] = &[
     // console
-    "println", "putLine", "print", "readLine",
-    "logInfo", "logWarn", "logError", "logDebug",
+    "println",
+    "putLine",
+    "print",
+    "readLine",
+    "logInfo",
+    "logWarn",
+    "logError",
+    "logDebug",
     // clock
-    "now", "sleep",
+    "now",
+    "sleep",
     // random
-    "randomInt", "randomFloat", "randomUuid",
-    "generateKeyPair", "generateSigningKeyPair", "encrypt",
+    "randomInt",
+    "randomFloat",
+    "randomUuid",
+    "generateKeyPair",
+    "generateSigningKeyPair",
+    "encrypt",
     // network
-    "listen", "listenOn", "fetch", "fetchWith",
+    "listen",
+    "listenOn",
+    "fetch",
+    "fetchWith",
     // fs
-    "readFile", "writeFile", "appendFile",
-    "fileExists", "removeFile", "listDir",
+    "readFile",
+    "writeFile",
+    "appendFile",
+    "fileExists",
+    "removeFile",
+    "listDir",
     // concurrency
-    "fork", "retry", "race",
+    "fork",
+    "retry",
+    "race",
 ];
 
 /// Zero-argument IO builtins: referencing the bare name *is* the IO action,
@@ -87,8 +150,14 @@ pub const EFFECTFUL_BUILTINS: &[&str] = &[
 /// other effectful builtin takes arguments and performs no IO until applied —
 /// a bare reference to it (e.g. `let f = println`, never called) is pure, and
 /// its effects must only manifest at the call site.
-pub const NULLARY_IO_BUILTINS: &[&str] =
-    &["now", "readLine", "randomFloat", "randomUuid", "generateKeyPair", "generateSigningKeyPair"];
+pub const NULLARY_IO_BUILTINS: &[&str] = &[
+    "now",
+    "readLine",
+    "randomFloat",
+    "randomUuid",
+    "generateKeyPair",
+    "generateSigningKeyPair",
+];
 
 /// Builtins whose effects cannot be rolled back by the savepoint-based atomic
 /// machinery. The effect checker rejects any of these inside an `atomic` block;
@@ -99,31 +168,54 @@ pub const NULLARY_IO_BUILTINS: &[&str] =
 /// happens on its own connection), and `retry` is the STM primitive used inside
 /// atomic to trigger a retry.
 pub const ATOMIC_DISALLOWED_BUILTINS: &[&str] = &[
-    "println", "putLine", "print", "readLine",
-    "logInfo", "logWarn", "logError", "logDebug",
-    "now", "sleep",
-    "randomInt", "randomFloat", "randomUuid",
-    "generateKeyPair", "generateSigningKeyPair", "encrypt",
-    "listen", "listenOn", "fetch", "fetchWith",
-    "readFile", "writeFile", "appendFile",
-    "fileExists", "removeFile", "listDir",
+    "println",
+    "putLine",
+    "print",
+    "readLine",
+    "logInfo",
+    "logWarn",
+    "logError",
+    "logDebug",
+    "now",
+    "sleep",
+    "randomInt",
+    "randomFloat",
+    "randomUuid",
+    "generateKeyPair",
+    "generateSigningKeyPair",
+    "encrypt",
+    "listen",
+    "listenOn",
+    "fetch",
+    "fetchWith",
+    "readFile",
+    "writeFile",
+    "appendFile",
+    "fileExists",
+    "removeFile",
+    "listDir",
     "race",
 ];
 
 /// Built-in trait method names (Eq.eq, Ord.compare, Num.add, etc.). Resolved
 /// at codegen time via runtime tag dispatch.
 pub const TRAIT_METHOD_BUILTINS: &[&str] = &[
-    "eq", "compare", "ap", "bind", "alt", "empty",
-    "add", "sub", "mul", "div", "negate", "append",
+    "eq", "compare", "ap", "bind", "alt", "empty", "add", "sub", "mul", "div", "negate", "append",
     "yield", "display",
 ];
 
 /// Bytes builtins. Pure but kept separate so the LSP/codegen can recognize
 /// them as user-callable and they sort sensibly in completion lists.
 pub const BYTES_BUILTINS: &[&str] = &[
-    "bytesLength", "bytesSlice", "bytesConcat",
-    "textToBytes", "bytesToText", "bytesToHex",
-    "bytesFromHex", "hexDecode", "bytesGet",
+    "bytesLength",
+    "bytesSlice",
+    "bytesConcat",
+    "textToBytes",
+    "bytesToText",
+    "bytesToHex",
+    "bytesFromHex",
+    "hexDecode",
+    "bytesGet",
     "hash",
 ];
 

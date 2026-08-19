@@ -26,8 +26,8 @@ fn floor_rounds_toward_neg_inf() {
 #[test]
 fn clamp_bounds() {
     // clamp lo hi x
-    assert_show("base.clamp 1 10 5", "5");   // in range
-    assert_show("base.clamp 1 10 0", "1");   // below lo
+    assert_show("base.clamp 1 10 5", "5"); // in range
+    assert_show("base.clamp 1 10 0", "1"); // below lo
     assert_show("base.clamp 1 10 99", "10"); // above hi
 }
 

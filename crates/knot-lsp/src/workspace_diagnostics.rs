@@ -25,7 +25,7 @@ use knot::diagnostic;
 use crate::analysis::get_or_parse_file_shared;
 use crate::diagnostics::to_lsp_diagnostic;
 use crate::shared::scan_knot_files_in_roots;
-use crate::state::{content_hash, ServerState};
+use crate::state::{ServerState, content_hash};
 use crate::utils::{path_to_uri, uri_to_path};
 
 // ── Document Diagnostics (Pull Model, per-doc) ──────────────────────
@@ -78,9 +78,9 @@ pub(crate) fn handle_document_diagnostics(
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(_) => {
-                return DocumentDiagnosticReportResult::Report(
-                    DocumentDiagnosticReport::Full(empty_full_report()),
-                );
+                return DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+                    empty_full_report(),
+                ));
             }
         };
         let hash = content_hash(&source);
@@ -114,8 +114,7 @@ pub(crate) fn handle_document_diagnostics(
     };
     // Honor the `warnUnusedImports` config knob at the emission boundary —
     // the pipeline (and the caches) always carry the full list.
-    let items =
-        crate::diagnostics::filter_unused_warnings(items, state.config.warn_unused_imports);
+    let items = crate::diagnostics::filter_unused_warnings(items, state.config.warn_unused_imports);
 
     DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
         RelatedFullDocumentDiagnosticReport {
@@ -212,8 +211,7 @@ pub(crate) fn handle_workspace_diagnostics(
     // re-emitted with an empty list — clients treat absent URIs in a workspace
     // report as unchanged, so a fix that clears errors stays visible until the
     // server explicitly emits the empty list.
-    let prev_reported: HashSet<Uri> =
-        std::mem::take(&mut state.workspace_diag_reported);
+    let prev_reported: HashSet<Uri> = std::mem::take(&mut state.workspace_diag_reported);
     let mut now_reported: HashSet<Uri> = HashSet::new();
 
     for (uri, doc) in &state.documents {
@@ -222,10 +220,8 @@ pub(crate) fn handle_workspace_diagnostics(
             .iter()
             .filter_map(|d| to_lsp_diagnostic(d, &doc.source, uri))
             .collect();
-        let lsp_diags = crate::diagnostics::filter_unused_warnings(
-            lsp_diags,
-            state.config.warn_unused_imports,
-        );
+        let lsp_diags =
+            crate::diagnostics::filter_unused_warnings(lsp_diags, state.config.warn_unused_imports);
 
         if !lsp_diags.is_empty() {
             now_reported.insert(uri.clone());
@@ -237,10 +233,7 @@ pub(crate) fn handle_workspace_diagnostics(
                     // The LSP spec reserves `version: null` for documents
                     // that are NOT open — open docs must report the version
                     // their diagnostics were computed against.
-                    version: state
-                        .document_versions
-                        .get(uri)
-                        .map(|v| i64::from(*v)),
+                    version: state.document_versions.get(uri).map(|v| i64::from(*v)),
                     full_document_diagnostic_report: FullDocumentDiagnosticReport {
                         result_id: None,
                         items: lsp_diags,
@@ -265,10 +258,8 @@ pub(crate) fn handle_workspace_diagnostics(
         let parser = knot::parser::Parser::new(pending.source.clone(), tokens);
         let (module, _) = parser.parse_file_expr();
         let lsp_diags = analyze_unopened_file(&module, &pending.source, &path, uri);
-        let lsp_diags = crate::diagnostics::filter_unused_warnings(
-            lsp_diags,
-            state.config.warn_unused_imports,
-        );
+        let lsp_diags =
+            crate::diagnostics::filter_unused_warnings(lsp_diags, state.config.warn_unused_imports);
         if !lsp_diags.is_empty() {
             now_reported.insert(uri.clone());
         }
@@ -307,10 +298,8 @@ pub(crate) fn handle_workspace_diagnostics(
             .filter_map(|p| p.canonicalize().ok())
             .collect();
 
-        let files = scan_knot_files_in_roots(
-            &state.workspace_roots,
-            state.workspace_root.as_deref(),
-        );
+        let files =
+            scan_knot_files_in_roots(&state.workspace_roots, state.workspace_root.as_deref());
         if !files.is_empty() {
             // Phase A: cheaply collect the work list — paths to analyze, their
             // current source/module, content hash, and any cached diagnostics.
@@ -358,14 +347,11 @@ pub(crate) fn handle_workspace_diagnostics(
                 if let Some(dm) = disk_mtime
                     && let Some((_, cached, _, Some(cached_mtime))) =
                         state.workspace_diag_cache.get(&canonical)
-                        && *cached_mtime == dm {
-                            cached_results.push((
-                                file_uri,
-                                cached.clone(),
-                                canonical.clone(),
-                            ));
-                            continue;
-                        }
+                    && *cached_mtime == dm
+                {
+                    cached_results.push((file_uri, cached.clone(), canonical.clone()));
+                    continue;
+                }
 
                 // Mtime missing or moved — fall through to read+hash.
                 let (module, source) =
@@ -374,9 +360,7 @@ pub(crate) fn handle_workspace_diagnostics(
                         None => continue,
                     };
                 let hash = content_hash(&source);
-                if let Some((cached_h, cached, _, _)) =
-                    state.workspace_diag_cache.get(&canonical)
-                {
+                if let Some((cached_h, cached, _, _)) = state.workspace_diag_cache.get(&canonical) {
                     if *cached_h == hash {
                         // Content is unchanged but the mtime moved (typical
                         // after `jj` / `git` checkouts). Schedule a mtime
@@ -582,9 +566,10 @@ pub(crate) fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
     for (path, (cached_h, _, _, cached_mtime)) in &state.workspace_diag_cache {
         let disk_mtime = current_mtime(path);
         if let (Some(cm), Some(dm)) = (cached_mtime, disk_mtime)
-            && *cm == dm {
-                continue;
-            }
+            && *cm == dm
+        {
+            continue;
+        }
         // Mtime missing or moved — verify by hash. A content match here means
         // the bytes were untouched but mtime was bumped (`jj`/`git` checkout):
         // refresh the recorded mtime so the fast path applies next time.
@@ -607,7 +592,9 @@ pub(crate) fn prune_stale_workspace_diag_cache(state: &mut ServerState) {
 
     // Evict the changed files' own cache entries; their diagnostics are
     // stale now.
-    state.workspace_diag_cache.retain(|path, _| !changed.contains(path));
+    state
+        .workspace_diag_cache
+        .retain(|path, _| !changed.contains(path));
 
     enforce_workspace_diag_cap(state);
 }
@@ -693,8 +680,10 @@ fn analyze_unopened_file_inner(
         // surface as phantom errors at unrelated locations (or relocate to
         // 0:0). We keep only diagnostics anchored within this file's own
         // declarations.
-        let own_ranges: Vec<(usize, usize)> =
-            crate::utils::top_fields(module).iter().map(|d| (d.value.span.start, d.value.span.end)).collect();
+        let own_ranges: Vec<(usize, usize)> = crate::utils::top_fields(module)
+            .iter()
+            .map(|d| (d.value.span.start, d.value.span.end))
+            .collect();
 
         let mut analysis_module = module.clone();
 
@@ -708,9 +697,11 @@ fn analyze_unopened_file_inner(
 
         knot_compiler::desugar::desugar(&mut analysis_module);
 
-        let knot_compiler::infer::CheckOutput { diagnostics: infer_diags, .. } = knot_compiler::infer::check(&mut analysis_module);
+        let knot_compiler::infer::CheckOutput {
+            diagnostics: infer_diags,
+            ..
+        } = knot_compiler::infer::check(&mut analysis_module);
         all_diags.extend(infer_diags.into_iter().filter(anchored_in_importer));
-
 
         // Unused-definition warnings: use pre-prelude decls so prelude/imported
         // names are not flagged.
@@ -729,5 +720,3 @@ fn analyze_unopened_file_inner(
         .filter_map(|d| to_lsp_diagnostic(d, source, uri))
         .collect()
 }
-
-

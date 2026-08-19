@@ -137,7 +137,10 @@ impl Parser {
 
     /// Display column of the current token (O(1); see `token_cols`).
     fn cur_column(&self) -> usize {
-        self.token_cols.get(self.pos).copied().unwrap_or(self.eof_col)
+        self.token_cols
+            .get(self.pos)
+            .copied()
+            .unwrap_or(self.eof_col)
     }
 
     /// After a newline was crossed mid-expression, decide whether the current
@@ -317,8 +320,7 @@ impl Parser {
     /// Without the latter two, `import ./time (ms)` then `g = f 2 ms` would
     /// silently parse as `f (2 * 1)`, dropping the `ms` argument.
     fn scan_top_level_names(&self, imports: &[Import]) -> HashSet<String> {
-        const TIME_UNITS: &[&str] =
-            &["ms", "seconds", "minutes", "hours", "days", "weeks"];
+        const TIME_UNITS: &[&str] = &["ms", "seconds", "minutes", "hours", "days", "weeks"];
         let mut names = HashSet::new();
 
         // Selectively imported item names shadow the built-in units in this
@@ -375,8 +377,7 @@ impl Parser {
             // A trait/impl method name: the first token on its line (preceded
             // by a layout newline) inside a trait/impl block body.
             if in_trait_impl_body {
-                let at_line_start =
-                    i == 0 || matches!(self.tokens[i - 1].kind, TokenKind::Newline);
+                let at_line_start = i == 0 || matches!(self.tokens[i - 1].kind, TokenKind::Newline);
                 if at_line_start {
                     names.insert(s.clone());
                 }
@@ -471,7 +472,6 @@ impl Parser {
         self.delimiter_depth = saved.1;
         self.recursion_depth = saved.2;
     }
-
 }
 
 // ── Context & error helpers ─────────────────────────────────────────
@@ -489,7 +489,11 @@ impl Parser {
     /// Push a parser context, run `f`, and always pop the context — even on
     /// early `?` returns inside `f`.  This prevents stale "while parsing …"
     /// notes from leaking into later diagnostics.
-    fn in_context<T>(&mut self, ctx: &'static str, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+    fn in_context<T>(
+        &mut self,
+        ctx: &'static str,
+        f: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<T> {
         self.push_context(ctx);
         let result = f(self);
         self.pop_context();
@@ -575,7 +579,9 @@ impl Parser {
         match self.peek() {
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(n) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(n) = tok.kind else {
+                    unreachable!()
+                };
                 Ok((n, tok.span))
             }
             TokenKind::Where
@@ -618,7 +624,9 @@ impl Parser {
         match self.peek() {
             TokenKind::Upper(_) => {
                 let tok = self.advance();
-                let TokenKind::Upper(n) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(n) = tok.kind else {
+                    unreachable!()
+                };
                 Ok((n, tok.span))
             }
             _ => {
@@ -888,10 +896,7 @@ impl Parser {
             if self.delimiter_depth > 0
                 && matches!(
                     self.peek(),
-                    TokenKind::RParen
-                        | TokenKind::RBracket
-                        | TokenKind::RBrace
-                        | TokenKind::Comma
+                    TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace | TokenKind::Comma
                 )
             {
                 break;
@@ -982,7 +987,9 @@ impl Parser {
             match self.peek() {
                 TokenKind::Int(_) => {
                     let tok = self.advance();
-                    let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                    let TokenKind::Int(n) = tok.kind else {
+                        unreachable!()
+                    };
                     let exp: i32 = match n.parse() {
                         Ok(e) => e,
                         Err(_) => {
@@ -1006,12 +1013,16 @@ impl Parser {
         match self.peek() {
             TokenKind::Upper(_) => {
                 let tok = self.advance();
-                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(UnitExpr::Named(name))
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(UnitExpr::Named(name))
             }
             TokenKind::Int(n) if n == "1" => {
@@ -1025,7 +1036,8 @@ impl Parser {
             TokenKind::LParen => {
                 self.advance();
                 let inner = self.parse_unit_expr()?;
-                self.expect(&TokenKind::RParen, "expected ')' in unit expression").ok()?;
+                self.expect(&TokenKind::RParen, "expected ')' in unit expression")
+                    .ok()?;
                 Some(inner)
             }
             _ => {
@@ -1064,7 +1076,8 @@ impl Parser {
             TokenKind::LParen => {
                 self.advance();
                 let inner = self.parse_unit_expr()?;
-                self.expect(&TokenKind::RParen, "expected ')' in unit argument").ok()?;
+                self.expect(&TokenKind::RParen, "expected ')' in unit argument")
+                    .ok()?;
                 Some(inner)
             }
             _ => self.parse_unit_atom(),
@@ -1084,12 +1097,15 @@ impl Parser {
             let mut params = Vec::new();
             while matches!(this.peek(), TokenKind::Lower(_)) {
                 let tok = this.advance();
-                let TokenKind::Lower(p) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(p) = tok.kind else {
+                    unreachable!()
+                };
                 params.push(p);
             }
 
             this.skip_newlines();
-            this.expect(&TokenKind::Eq, "expected '=' in data declaration").ok()?;
+            this.expect(&TokenKind::Eq, "expected '=' in data declaration")
+                .ok()?;
             this.skip_newlines();
 
             let mut constructors = vec![this.parse_constructor_def()?];
@@ -1121,11 +1137,14 @@ impl Parser {
             this.skip_newlines();
             let mut deriving = Vec::new();
             if this.eat(&TokenKind::Deriving) {
-                this.expect(&TokenKind::LParen, "expected '(' after 'deriving'").ok()?;
+                this.expect(&TokenKind::LParen, "expected '(' after 'deriving'")
+                    .ok()?;
                 loop {
                     if matches!(this.peek(), TokenKind::Upper(_)) {
                         let tok = this.advance();
-                        let TokenKind::Upper(n) = tok.kind else { unreachable!() };
+                        let TokenKind::Upper(n) = tok.kind else {
+                            unreachable!()
+                        };
                         deriving.push(n);
                     } else {
                         break;
@@ -1161,9 +1180,14 @@ impl Parser {
             if !self.at(&TokenKind::RBrace) {
                 loop {
                     self.skip_newlines();
-                    let (fname, _) = self.expect_lower("expected field name in constructor").ok()?;
-                    self.expect(&TokenKind::Colon, "expected ':' after field name in constructor")
+                    let (fname, _) = self
+                        .expect_lower("expected field name in constructor")
                         .ok()?;
+                    self.expect(
+                        &TokenKind::Colon,
+                        "expected ':' after field name in constructor",
+                    )
+                    .ok()?;
                     let ty = self.parse_type()?;
                     fields.push(Field {
                         name: fname,
@@ -1179,8 +1203,11 @@ impl Parser {
                     }
                 }
             }
-            self.expect(&TokenKind::RBrace, "expected '}' to close constructor fields")
-                .ok()?;
+            self.expect(
+                &TokenKind::RBrace,
+                "expected '}' to close constructor fields",
+            )
+            .ok()?;
         }
         Some(ConstructorDef { name, fields })
     }
@@ -1197,11 +1224,14 @@ impl Parser {
             let mut params = Vec::new();
             while matches!(this.peek(), TokenKind::Lower(_)) {
                 let tok = this.advance();
-                let TokenKind::Lower(p) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(p) = tok.kind else {
+                    unreachable!()
+                };
                 params.push(p);
             }
 
-            this.expect(&TokenKind::Eq, "expected '=' in type alias").ok()?;
+            this.expect(&TokenKind::Eq, "expected '=' in type alias")
+                .ok()?;
             let ty = this.parse_type()?;
 
             let end = this.prev_span();
@@ -1292,11 +1322,15 @@ impl Parser {
                 None
             };
 
-            this.expect(&TokenKind::Le, "expected '<=' in subset constraint").ok()?;
+            this.expect(&TokenKind::Le, "expected '<=' in subset constraint")
+                .ok()?;
 
             // Parse right side: *relation.field or *relation
-            this.expect(&TokenKind::Star, "expected '*' before relation name in subset constraint")
-                .ok()?;
+            this.expect(
+                &TokenKind::Star,
+                "expected '*' before relation name in subset constraint",
+            )
+            .ok()?;
             let (right_relation, _) = this
                 .expect_lower("expected relation name after '*' in subset constraint")
                 .ok()?;
@@ -1309,17 +1343,17 @@ impl Parser {
             };
 
             let end = this.prev_span();
-        Some(Decl {
-            node: DeclKind::SubsetConstraint {
-                sub: RelationPath {
-                    relation: left_relation,
-                    field: left_field,
+            Some(Decl {
+                node: DeclKind::SubsetConstraint {
+                    sub: RelationPath {
+                        relation: left_relation,
+                        field: left_field,
+                    },
+                    sup: RelationPath {
+                        relation: right_relation,
+                        field: right_field,
+                    },
                 },
-                sup: RelationPath {
-                    relation: right_relation,
-                    field: right_field,
-                },
-            },
                 span: Span::new(start.start, end.end),
                 exported: false,
             })
@@ -1483,7 +1517,9 @@ impl Parser {
                     params.push(TraitParam { name: pname, kind });
                 } else if matches!(this.peek(), TokenKind::Lower(_)) {
                     let tok = this.advance();
-                    let TokenKind::Lower(pname) = tok.kind else { unreachable!() };
+                    let TokenKind::Lower(pname) = tok.kind else {
+                        unreachable!()
+                    };
                     params.push(TraitParam {
                         name: pname,
                         kind: None,
@@ -1525,7 +1561,9 @@ impl Parser {
             let mut assoc_params = Vec::new();
             while matches!(self.peek(), TokenKind::Lower(_)) {
                 let tok = self.advance();
-                let TokenKind::Lower(p) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(p) = tok.kind else {
+                    unreachable!()
+                };
                 assoc_params.push(p);
             }
             return Some(TraitItem::AssociatedType {
@@ -1543,7 +1581,6 @@ impl Parser {
             }
         };
         if let Some((name, name_span)) = method_name {
-
             if self.at(&TokenKind::Colon) {
                 self.advance();
                 let ts = self.parse_type_scheme()?;
@@ -1709,7 +1746,12 @@ impl Parser {
             let body = self.parse_expr();
             self.bound_vars.truncate(scope_mark);
             let body = body?;
-            return Some(ImplItem::Method { name, name_span, params, body });
+            return Some(ImplItem::Method {
+                name,
+                name_span,
+                params,
+                body,
+            });
         }
 
         None
@@ -1741,8 +1783,11 @@ impl Parser {
                 });
             }
 
-            this.expect(&TokenKind::Where, "expected 'where' or '=' after route name")
-                .ok()?;
+            this.expect(
+                &TokenKind::Where,
+                "expected 'where' or '=' after route name",
+            )
+            .ok()?;
 
             let no_prefix: Vec<PathSegment> = vec![];
             let entries = this.parse_route_entries_with_prefix(&no_prefix, 0);
@@ -1846,7 +1891,8 @@ impl Parser {
                 "PATCH" => Some(HttpMethod::Patch),
                 _ => {
                     self.error(format!(
-                        "expected HTTP method (GET, POST, PUT, DELETE, PATCH), found '{}'", m
+                        "expected HTTP method (GET, POST, PUT, DELETE, PATCH), found '{}'",
+                        m
                     ));
                     None
                 }
@@ -1871,8 +1917,11 @@ impl Parser {
             if !self.at(&TokenKind::RBrace) {
                 loop {
                     self.skip_newlines();
-                    let (fname, _) = self.expect_lower("expected field name in route body").ok()?;
-                    self.expect(&TokenKind::Colon, "expected ':' after field name").ok()?;
+                    let (fname, _) = self
+                        .expect_lower("expected field name in route body")
+                        .ok()?;
+                    self.expect(&TokenKind::Colon, "expected ':' after field name")
+                        .ok()?;
                     let ty = self.parse_type()?;
                     body_fields.push(Field {
                         name: fname,
@@ -1888,8 +1937,11 @@ impl Parser {
                     }
                 }
             }
-            self.expect(&TokenKind::RBrace, "expected '}' to close route body fields")
-                .ok()?;
+            self.expect(
+                &TokenKind::RBrace,
+                "expected '}' to close route body fields",
+            )
+            .ok()?;
         }
 
         // Parse path: /segment/{param: Type}/...
@@ -1900,13 +1952,13 @@ impl Parser {
         self.skip_newlines();
         let mut query_params = Vec::new();
         if self.eat(&TokenKind::Question) {
-            self.expect(&TokenKind::LBrace, "expected '{' after '?'").ok()?;
+            self.expect(&TokenKind::LBrace, "expected '{' after '?'")
+                .ok()?;
             self.skip_newlines();
             if !self.at(&TokenKind::RBrace) {
                 loop {
                     self.skip_newlines();
-                    let (qname, _) =
-                        self.expect_lower("expected query param name").ok()?;
+                    let (qname, _) = self.expect_lower("expected query param name").ok()?;
                     self.expect(&TokenKind::Colon, "expected ':' after query param name")
                         .ok()?;
                     let ty = self.parse_type()?;
@@ -2005,14 +2057,18 @@ impl Parser {
                     && !matches!(self.peek_ahead(1), TokenKind::LBrace))
             {
                 let tok = self.advance();
-                let TokenKind::Lower(s) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(s) = tok.kind else {
+                    unreachable!()
+                };
                 let mut seg = s;
                 self.consume_route_dashed_suffix(&mut seg);
                 segments.push(PathSegment::Literal(seg));
             } else if matches!(self.peek(), TokenKind::Upper(_)) {
                 // uppercase segment like /api/v1 — unlikely but handle
                 let tok = self.advance();
-                let TokenKind::Upper(s) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(s) = tok.kind else {
+                    unreachable!()
+                };
                 let mut seg = s;
                 self.consume_route_dashed_suffix(&mut seg);
                 segments.push(PathSegment::Literal(seg));
@@ -2071,7 +2127,10 @@ impl Parser {
                         Ok(v) => v,
                         Err(_) => break,
                     };
-                    if self.expect(&TokenKind::Colon, "expected ':' after header field name").is_err() {
+                    if self
+                        .expect(&TokenKind::Colon, "expected ':' after header field name")
+                        .is_err()
+                    {
                         break;
                     }
                     let ty = match self.parse_type() {
@@ -2105,8 +2164,11 @@ impl Parser {
             this.advance(); // consume `migrate`
 
             // Expect `*name`
-            this.expect(&TokenKind::Star, "expected '*' before relation name in migrate")
-                .ok()?;
+            this.expect(
+                &TokenKind::Star,
+                "expected '*' before relation name in migrate",
+            )
+            .ok()?;
             let (relation, _) = this
                 .expect_lower("expected relation name after '*' in migrate")
                 .ok()?;
@@ -2195,7 +2257,9 @@ impl Parser {
             self.skip_newlines();
             if matches!(self.peek(), TokenKind::Upper(_)) {
                 let tok = self.advance();
-                let TokenKind::Upper(trait_name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(trait_name) = tok.kind else {
+                    unreachable!()
+                };
                 let mut args = Vec::new();
                 while self.can_start_type_atom()
                     && !self.at(&TokenKind::FatArrow)
@@ -2213,10 +2277,7 @@ impl Parser {
                 let pre_arrow = self.save();
                 self.skip_newlines();
                 if self.eat(&TokenKind::FatArrow) {
-                    constraints.push(Constraint {
-                        trait_name,
-                        args,
-                    });
+                    constraints.push(Constraint { trait_name, args });
                     continue;
                 }
                 self.restore(pre_arrow);
@@ -2323,7 +2384,9 @@ impl Parser {
                 }
             }
             TokenKind::Atomic => {
-                if !self.enter_recursion() { return None; }
+                if !self.enter_recursion() {
+                    return None;
+                }
                 let start = self.span();
                 self.advance();
                 let e = self.parse_expr();
@@ -2336,7 +2399,9 @@ impl Parser {
                 ))
             }
             TokenKind::Refine => {
-                if !self.enter_recursion() { return None; }
+                if !self.enter_recursion() {
+                    return None;
+                }
                 let start = self.span();
                 self.advance();
                 let e = self.parse_expr();
@@ -2401,8 +2466,7 @@ impl Parser {
                 let star_span = self.peek_token().span;
                 let right_adjacent = match self.tokens.get(self.pos + 1) {
                     Some(next) => {
-                        matches!(next.kind, TokenKind::Lower(_))
-                            && next.span.start == star_span.end
+                        matches!(next.kind, TokenKind::Lower(_)) && next.span.start == star_span.end
                     }
                     None => false,
                 };
@@ -2494,7 +2558,10 @@ impl Parser {
             // instead of overflowing the stack. The `parse_atom` cost is
             // released before this point, so without this guard the depth
             // counter never accumulates here.
-            if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
+            if !self.enter_recursion() {
+                self.recursion_depth -= spine_charged;
+                return None;
+            }
             let rhs = if matches!(
                 self.peek(),
                 TokenKind::Let
@@ -2511,12 +2578,18 @@ impl Parser {
             self.recursion_depth -= 1;
             let rhs = match rhs {
                 Some(rhs) => rhs,
-                None => { self.recursion_depth -= spine_charged; return None; }
+                None => {
+                    self.recursion_depth -= spine_charged;
+                    return None;
+                }
             };
 
             // Charge one depth unit for the spine node we're about to build and
             // hold it until return (see the comment at the top of this fn).
-            if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
+            if !self.enter_recursion() {
+                self.recursion_depth -= spine_charged;
+                return None;
+            }
             spine_charged += 1;
 
             let span = Span::new(lhs.span.start, rhs.span.end);
@@ -2543,7 +2616,9 @@ impl Parser {
             TokenKind::Minus if matches!(self.peek_ahead(1), TokenKind::Int(_)) => {
                 let minus_tok = self.advance();
                 let tok = self.advance();
-                let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                let TokenKind::Int(n) = tok.kind else {
+                    unreachable!()
+                };
                 let span = Span::new(minus_tok.span.start, tok.span.end);
                 let lit = Spanned::new(ExprKind::Lit(Literal::Int(format!("-{}", n))), span);
                 // Feed the folded literal through the postfix and application
@@ -2554,7 +2629,9 @@ impl Parser {
                 self.parse_application_from(lit)
             }
             TokenKind::Minus => {
-                if !self.enter_recursion() { return None; }
+                if !self.enter_recursion() {
+                    return None;
+                }
                 let start = self.span();
                 self.advance();
                 let operand = self.parse_unary();
@@ -2570,7 +2647,9 @@ impl Parser {
                 ))
             }
             TokenKind::Not => {
-                if !self.enter_recursion() { return None; }
+                if !self.enter_recursion() {
+                    return None;
+                }
                 let start = self.span();
                 self.advance();
                 let operand = self.parse_unary();
@@ -2618,7 +2697,9 @@ impl Parser {
                     Some(arg) => arg,
                     None => fail!(),
                 };
-                if !self.enter_recursion() { fail!() }
+                if !self.enter_recursion() {
+                    fail!()
+                }
                 spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
@@ -2653,7 +2734,9 @@ impl Parser {
                     Some(arg) => arg,
                     None => fail!(),
                 };
-                if !self.enter_recursion() { fail!() }
+                if !self.enter_recursion() {
+                    fail!()
+                }
                 spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
@@ -2711,8 +2794,7 @@ impl Parser {
                 let star_span = self.peek_token().span;
                 let right_adjacent = match self.tokens.get(self.pos + 1) {
                     Some(next) => {
-                        matches!(next.kind, TokenKind::Lower(_))
-                            && next.span.start == star_span.end
+                        matches!(next.kind, TokenKind::Lower(_)) && next.span.start == star_span.end
                     }
                     None => false,
                 };
@@ -2748,7 +2830,9 @@ impl Parser {
     fn parse_constructor_or_atom(&mut self) -> Option<Expr> {
         let expr = self.parse_atom()?;
         if matches!(expr.node, ExprKind::Constructor(_)) && self.can_start_atom() {
-            if !self.enter_recursion() { return None; }
+            if !self.enter_recursion() {
+                return None;
+            }
             let arg = self.parse_postfix();
             self.recursion_depth -= 1;
             let arg = arg?;
@@ -2783,9 +2867,15 @@ impl Parser {
                 self.advance();
                 let (field, field_span) = match self.expect_lower("expected field name after '.'") {
                     Ok(pair) => pair,
-                    Err(_) => { self.recursion_depth -= spine_charged; return None; }
+                    Err(_) => {
+                        self.recursion_depth -= spine_charged;
+                        return None;
+                    }
                 };
-                if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
+                if !self.enter_recursion() {
+                    self.recursion_depth -= spine_charged;
+                    return None;
+                }
                 spine_charged += 1;
                 let span = Span::new(expr.span.start, field_span.end);
                 expr = Spanned::new(
@@ -2853,10 +2943,7 @@ impl Parser {
                     ExprKind::BinOp {
                         op: BinOp::Mul,
                         lhs: Box::new(lit),
-                        rhs: Box::new(Spanned::new(
-                            ExprKind::Lit(factor_lit),
-                            unit_span,
-                        )),
+                        rhs: Box::new(Spanned::new(ExprKind::Lit(factor_lit), unit_span)),
                     },
                     span,
                 );
@@ -2890,39 +2977,53 @@ impl Parser {
         match self.peek() {
             TokenKind::Int(_) => {
                 let tok = self.advance();
-                let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                let TokenKind::Int(n) = tok.kind else {
+                    unreachable!()
+                };
                 let lit = Spanned::new(ExprKind::Lit(Literal::Int(n)), tok.span);
                 self.maybe_time_unit(lit)
             }
             TokenKind::Float(_) => {
                 let tok = self.advance();
-                let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                let TokenKind::Float(f) = tok.kind else {
+                    unreachable!()
+                };
                 let lit = Spanned::new(ExprKind::Lit(Literal::Float(f)), tok.span);
                 self.maybe_time_unit(lit)
             }
             TokenKind::Text(_) => {
                 let tok = self.advance();
-                let TokenKind::Text(s) = tok.kind else { unreachable!() };
+                let TokenKind::Text(s) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(ExprKind::Lit(Literal::Text(s)), tok.span))
             }
             TokenKind::Bytes(_) => {
                 let tok = self.advance();
-                let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
+                let TokenKind::Bytes(b) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(ExprKind::Lit(Literal::Bytes(b)), tok.span))
             }
             TokenKind::Bool(_) => {
                 let tok = self.advance();
-                let TokenKind::Bool(b) = tok.kind else { unreachable!() };
+                let TokenKind::Bool(b) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(ExprKind::Lit(Literal::Bool(b)), tok.span))
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(ExprKind::Var(name), tok.span))
             }
             TokenKind::Upper(_) => {
                 let tok = self.advance();
-                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(ExprKind::Constructor(name), tok.span))
             }
             TokenKind::Full => {
@@ -2935,7 +3036,9 @@ impl Parser {
                 match self.peek() {
                     TokenKind::Lower(_) => {
                         let tok = self.advance();
-                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                        let TokenKind::Lower(name) = tok.kind else {
+                            unreachable!()
+                        };
                         Some(Spanned::new(
                             ExprKind::SourceRef(name),
                             Span::new(start.start, tok.span.end),
@@ -2953,7 +3056,9 @@ impl Parser {
                 match self.peek() {
                     TokenKind::Lower(_) => {
                         let tok = self.advance();
-                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                        let TokenKind::Lower(name) = tok.kind else {
+                            unreachable!()
+                        };
                         Some(Spanned::new(
                             ExprKind::DerivedRef(name),
                             Span::new(start.start, tok.span.end),
@@ -2990,11 +3095,10 @@ impl Parser {
                             return None;
                         }
                     };
-                    let end_tok = self
-                        .expect(
-                            &TokenKind::RParen,
-                            "unclosed '(' — expected matching ')' after type annotation",
-                        );
+                    let end_tok = self.expect(
+                        &TokenKind::RParen,
+                        "unclosed '(' — expected matching ')' after type annotation",
+                    );
                     self.delimiter_depth -= 1;
                     let end_tok = end_tok.ok()?;
                     let span = Span::new(start.start, end_tok.span.end);
@@ -3006,11 +3110,8 @@ impl Parser {
                         span,
                     ));
                 }
-                let end_tok = self
-                    .expect(
-                        &TokenKind::RParen,
-                        "unclosed '(' — expected matching ')'",
-                    );
+                let end_tok =
+                    self.expect(&TokenKind::RParen, "unclosed '(' — expected matching ')'");
                 self.delimiter_depth -= 1;
                 let end_tok = end_tok.ok()?;
                 // Keep the inner expression but update span to include parens.
@@ -3131,14 +3232,13 @@ impl Parser {
                 // The old restore+reparse doubled work at every nesting level,
                 // causing exponential-time parsing of nested record literals
                 // like `{{{...}}}`.
-                let field_name =
-                    self.extract_pun_name(&first_expr).unwrap_or_else(|| {
-                        self.error_at(
-                            first_expr.span,
-                            "cannot determine field name for punned record field",
-                        );
-                        "?".into()
-                    });
+                let field_name = self.extract_pun_name(&first_expr).unwrap_or_else(|| {
+                    self.error_at(
+                        first_expr.span,
+                        "cannot determine field name for punned record field",
+                    );
+                    "?".into()
+                });
                 fields.push(Field {
                     name: field_name,
                     value: first_expr,
@@ -3185,7 +3285,9 @@ impl Parser {
                 if matches!(self.peek_ahead(1), TokenKind::Colon) {
                     // Record literal field: name: expr
                     let tok = self.advance(); // consume name
-                    let TokenKind::Lower(fname) = tok.kind else { unreachable!() };
+                    let TokenKind::Lower(fname) = tok.kind else {
+                        unreachable!()
+                    };
                     self.advance(); // consume `:`
                     match self.parse_expr() {
                         Some(val) => fields.push(Field {
@@ -3315,7 +3417,9 @@ impl Parser {
             let mut params = Vec::new();
             while !this.at(&TokenKind::Arrow) && !this.at_eof() {
                 this.skip_newlines();
-                if this.at(&TokenKind::Arrow) { break; }
+                if this.at(&TokenKind::Arrow) {
+                    break;
+                }
                 // Stop consuming params if we've crossed back to column 0 outside
                 // any delimiter — this prevents eating into the next declaration
                 // when `->` is missing.
@@ -3359,8 +3463,11 @@ impl Parser {
 
             let scrutinee = this.parse_expr()?;
             this.skip_newlines();
-            this.expect(&TokenKind::Of, "expected 'of' after scrutinee in 'case' expression")
-                .ok()?;
+            this.expect(
+                &TokenKind::Of,
+                "expected 'of' after scrutinee in 'case' expression",
+            )
+            .ok()?;
 
             let arms = this.parse_block(|p| p.parse_case_arm());
 
@@ -3383,11 +3490,8 @@ impl Parser {
             return None;
         }
         let pat = self.parse_pat()?;
-        self.expect(
-            &TokenKind::Arrow,
-            "expected '->' after pattern in case arm",
-        )
-        .ok()?;
+        self.expect(&TokenKind::Arrow, "expected '->' after pattern in case arm")
+            .ok()?;
         let scope_mark = self.bound_vars.len();
         self.push_pat_vars(&pat);
         let body = self.parse_expr();
@@ -3439,10 +3543,15 @@ impl Parser {
         }
         let result = self.in_context("serve expression", |this| {
             this.advance(); // consume `serve`
-            let (api, api_span) = this.expect_upper("expected route name after 'serve'").ok()?;
-            this.skip_newlines();
-            this.expect(&TokenKind::Where, "expected 'where' after API name in 'serve'")
+            let (api, api_span) = this
+                .expect_upper("expected route name after 'serve'")
                 .ok()?;
+            this.skip_newlines();
+            this.expect(
+                &TokenKind::Where,
+                "expected 'where' after API name in 'serve'",
+            )
+            .ok()?;
             let handlers = this.parse_block(|p| p.parse_serve_handler());
             let end = this.prev_span();
             Some(Spanned::new(
@@ -3463,9 +3572,11 @@ impl Parser {
         if self.at_eof() {
             return None;
         }
-        let (endpoint, endpoint_span) =
-            self.expect_upper("expected endpoint constructor name").ok()?;
-        self.expect(&TokenKind::Eq, "expected '=' after endpoint name").ok()?;
+        let (endpoint, endpoint_span) = self
+            .expect_upper("expected endpoint constructor name")
+            .ok()?;
+        self.expect(&TokenKind::Eq, "expected '=' after endpoint name")
+            .ok()?;
         let body = self.parse_expr()?;
         Some(ServeHandler {
             endpoint,
@@ -3607,20 +3718,21 @@ impl Parser {
         let diag_count = self.diagnostics.len();
 
         if let Some(pat) = self.try_parse_pat()
-            && self.eat(&TokenKind::LArrow) {
-                // Committed to a bind statement — `<-` was consumed.
-                // If the expression fails, return None without trying
-                // to re-parse as an expression statement.
-                let expr = self.parse_expr()?;
-                let end_sp = expr.span;
-                // Names bound by this bind are in scope for the rest of the
-                // do-block (popped by `parse_do_expr`).
-                self.push_pat_vars(&pat);
-                return Some(Spanned::new(
-                    StmtKind::Bind { pat, expr },
-                    Span::new(start.start, end_sp.end),
-                ));
-            }
+            && self.eat(&TokenKind::LArrow)
+        {
+            // Committed to a bind statement — `<-` was consumed.
+            // If the expression fails, return None without trying
+            // to re-parse as an expression statement.
+            let expr = self.parse_expr()?;
+            let end_sp = expr.span;
+            // Names bound by this bind are in scope for the rest of the
+            // do-block (popped by `parse_do_expr`).
+            self.push_pat_vars(&pat);
+            return Some(Spanned::new(
+                StmtKind::Bind { pat, expr },
+                Span::new(start.start, end_sp.end),
+            ));
+        }
 
         // Not a bind — restore and parse as expression statement.
         self.restore(saved);
@@ -3679,7 +3791,9 @@ impl Parser {
         // (parens, record fields, list elements) flows through this entry
         // point, so guarding it alone prevents stack overflow on pathological
         // input like `((((x))))`.
-        if !self.enter_recursion() { return None; }
+        if !self.enter_recursion() {
+            return None;
+        }
         let result = self.parse_pat_inner();
         self.recursion_depth -= 1;
         result
@@ -3694,12 +3808,16 @@ impl Parser {
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Var(name), tok.span))
             }
             TokenKind::Upper(_) => {
                 let tok = self.advance();
-                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(name) = tok.kind else {
+                    unreachable!()
+                };
                 // `Cons head tail` — non-empty relation pattern (reserved name).
                 // The built-in form has exactly TWO atom sub-patterns; a single
                 // atom after `Cons` (e.g. `Cons {head: h, tail: t}` or `Cons c`)
@@ -3766,21 +3884,28 @@ impl Parser {
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
                     .ok()?;
-                Some(Spanned::new(inner.node, Span::new(start.start, end_tok.span.end)))
+                Some(Spanned::new(
+                    inner.node,
+                    Span::new(start.start, end_tok.span.end),
+                ))
             }
             TokenKind::Minus => {
                 let minus_tok = self.advance();
                 match self.peek() {
                     TokenKind::Int(_) => {
                         let tok = self.advance();
-                        let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                        let TokenKind::Int(n) = tok.kind else {
+                            unreachable!()
+                        };
                         let neg = format!("-{}", n);
                         let span = Span::new(minus_tok.span.start, tok.span.end);
                         Some(Spanned::new(PatKind::Lit(Literal::Int(neg)), span))
                     }
                     TokenKind::Float(_) => {
                         let tok = self.advance();
-                        let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                        let TokenKind::Float(f) = tok.kind else {
+                            unreachable!()
+                        };
                         let span = Span::new(minus_tok.span.start, tok.span.end);
                         Some(Spanned::new(PatKind::Lit(Literal::Float(-f)), span))
                     }
@@ -3792,27 +3917,37 @@ impl Parser {
             }
             TokenKind::Int(_) => {
                 let tok = self.advance();
-                let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                let TokenKind::Int(n) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Int(n)), tok.span))
             }
             TokenKind::Float(_) => {
                 let tok = self.advance();
-                let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                let TokenKind::Float(f) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Float(f)), tok.span))
             }
             TokenKind::Text(_) => {
                 let tok = self.advance();
-                let TokenKind::Text(s) = tok.kind else { unreachable!() };
+                let TokenKind::Text(s) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Text(s)), tok.span))
             }
             TokenKind::Bytes(_) => {
                 let tok = self.advance();
-                let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
+                let TokenKind::Bytes(b) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
             }
             TokenKind::Bool(_) => {
                 let tok = self.advance();
-                let TokenKind::Bool(b) = tok.kind else { unreachable!() };
+                let TokenKind::Bool(b) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Bool(b)), tok.span))
             }
             _ => {
@@ -3851,7 +3986,9 @@ impl Parser {
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Var(name), tok.span))
             }
             TokenKind::Upper(_) => {
@@ -3860,7 +3997,9 @@ impl Parser {
                 // NOT consume a further payload atom here, so a constructor with
                 // arguments still requires parentheses.
                 let tok = self.advance();
-                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(
                     PatKind::Constructor {
                         name,
@@ -3889,21 +4028,28 @@ impl Parser {
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
                     .ok()?;
-                Some(Spanned::new(inner.node, Span::new(start.start, end_tok.span.end)))
+                Some(Spanned::new(
+                    inner.node,
+                    Span::new(start.start, end_tok.span.end),
+                ))
             }
             TokenKind::Minus => {
                 let minus_tok = self.advance();
                 match self.peek() {
                     TokenKind::Int(_) => {
                         let tok = self.advance();
-                        let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                        let TokenKind::Int(n) = tok.kind else {
+                            unreachable!()
+                        };
                         let neg = format!("-{}", n);
                         let span = Span::new(minus_tok.span.start, tok.span.end);
                         Some(Spanned::new(PatKind::Lit(Literal::Int(neg)), span))
                     }
                     TokenKind::Float(_) => {
                         let tok = self.advance();
-                        let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                        let TokenKind::Float(f) = tok.kind else {
+                            unreachable!()
+                        };
                         let span = Span::new(minus_tok.span.start, tok.span.end);
                         Some(Spanned::new(PatKind::Lit(Literal::Float(-f)), span))
                     }
@@ -3915,27 +4061,37 @@ impl Parser {
             }
             TokenKind::Int(_) => {
                 let tok = self.advance();
-                let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                let TokenKind::Int(n) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Int(n)), tok.span))
             }
             TokenKind::Float(_) => {
                 let tok = self.advance();
-                let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                let TokenKind::Float(f) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Float(f)), tok.span))
             }
             TokenKind::Text(_) => {
                 let tok = self.advance();
-                let TokenKind::Text(s) = tok.kind else { unreachable!() };
+                let TokenKind::Text(s) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Text(s)), tok.span))
             }
             TokenKind::Bytes(_) => {
                 let tok = self.advance();
-                let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
+                let TokenKind::Bytes(b) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
             }
             TokenKind::Bool(_) => {
                 let tok = self.advance();
-                let TokenKind::Bool(b) = tok.kind else { unreachable!() };
+                let TokenKind::Bool(b) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Bool(b)), tok.span))
             }
             _ => {
@@ -3952,8 +4108,9 @@ impl Parser {
         if !self.at(&TokenKind::RBrace) {
             loop {
                 self.skip_newlines();
-                let (fname, fname_span) =
-                    self.expect_lower("expected field name in record pattern").ok()?;
+                let (fname, fname_span) = self
+                    .expect_lower("expected field name in record pattern")
+                    .ok()?;
                 let pattern = if self.eat(&TokenKind::Colon) {
                     self.skip_newlines();
                     Some(self.parse_pat()?)
@@ -4031,7 +4188,8 @@ impl Parser {
                 self.error("expected one or more type variables after 'forall'");
                 return None;
             }
-            self.expect(&TokenKind::Dot, "expected '.' after forall variables").ok()?;
+            self.expect(&TokenKind::Dot, "expected '.' after forall variables")
+                .ok()?;
             self.skip_newlines();
             // Guard the recursive body parse: `forall a. forall a. …` would
             // otherwise recurse unbounded and overflow the stack (every other
@@ -4044,7 +4202,10 @@ impl Parser {
             let body = body?;
             let span = Span::new(start.start, body.span.end);
             return Some(Spanned::new(
-                TypeKind::Forall { vars, ty: Box::new(body) },
+                TypeKind::Forall {
+                    vars,
+                    ty: Box::new(body),
+                },
                 span,
             ));
         }
@@ -4057,7 +4218,10 @@ impl Parser {
         let saved = self.save();
         self.skip_newlines();
         if self.eat(&TokenKind::Arrow) {
-            if !self.enter_recursion() { self.restore(saved); return None; }
+            if !self.enter_recursion() {
+                self.restore(saved);
+                return None;
+            }
             self.skip_newlines();
             let rhs = self.parse_type_function(); // right-associative
             self.recursion_depth -= 1;
@@ -4125,7 +4289,9 @@ impl Parser {
                     Some(arg) => arg,
                     None => fail!(),
                 };
-                if !self.enter_recursion() { fail!() }
+                if !self.enter_recursion() {
+                    fail!()
+                }
                 spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
@@ -4157,7 +4323,9 @@ impl Parser {
                     Some(arg) => arg,
                     None => fail!(),
                 };
-                if !self.enter_recursion() { fail!() }
+                if !self.enter_recursion() {
+                    fail!()
+                }
                 spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
@@ -4178,13 +4346,15 @@ impl Parser {
 
     fn can_start_type_atom(&self) -> bool {
         if self.stop_type_at_headers
-            && matches!(self.peek(), TokenKind::Lower(s) if s == "headers" || s == "rateLimit") {
-                return false;
-            }
+            && matches!(self.peek(), TokenKind::Lower(s) if s == "headers" || s == "rateLimit")
+        {
+            return false;
+        }
         if self.stop_type_at_migrate_clauses
-            && matches!(self.peek(), TokenKind::Lower(s) if s == "to" || s == "using") {
-                return false;
-            }
+            && matches!(self.peek(), TokenKind::Lower(s) if s == "to" || s == "using")
+        {
+            return false;
+        }
         matches!(
             self.peek(),
             TokenKind::Upper(_)
@@ -4214,7 +4384,9 @@ impl Parser {
         match self.peek() {
             TokenKind::Upper(_) => {
                 let tok = self.advance();
-                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(name) = tok.kind else {
+                    unreachable!()
+                };
                 if name == "IO" && matches!(self.peek(), TokenKind::LBrace) {
                     // Parse `IO {effects} Type`, `IO {effects | r} Type`,
                     // `IO {| r} Type`, or `IO {effects | r1 \/ r2} Type`.
@@ -4236,13 +4408,24 @@ impl Parser {
                     self.skip_newlines();
                     self.expect(&TokenKind::RBrace, "expected '}' to close IO effect set")
                         .ok()?;
-                    if !self.enter_recursion() { return None; }
+                    if !self.enter_recursion() {
+                        return None;
+                    }
                     let inner = self.parse_type_atom();
                     self.recursion_depth -= 1;
                     let inner = inner?;
                     let span = Span::new(tok.span.start, inner.span.end);
-                    Some(Spanned::new(TypeKind::IO { effects, rest, ty: Box::new(inner) }, span))
-                } else if name == "IO" && matches!(self.peek(), TokenKind::Lower(_) | TokenKind::Underscore) {
+                    Some(Spanned::new(
+                        TypeKind::IO {
+                            effects,
+                            rest,
+                            ty: Box::new(inner),
+                        },
+                        span,
+                    ))
+                } else if name == "IO"
+                    && matches!(self.peek(), TokenKind::Lower(_) | TokenKind::Underscore)
+                {
                     // Shorthand: `IO e Type` desugars to `IO {| e} Type`.
                     // `IO _ Type` is the wildcard form — effects are inferred.
                     // Also support `IO r1 \/ r2 Type` as shorthand for
@@ -4259,7 +4442,9 @@ impl Parser {
                         match self.peek() {
                             TokenKind::Lower(_) => {
                                 let tok = self.advance();
-                                let TokenKind::Lower(n) = tok.kind else { unreachable!() };
+                                let TokenKind::Lower(n) = tok.kind else {
+                                    unreachable!()
+                                };
                                 rest.push(n);
                             }
                             TokenKind::Underscore => {
@@ -4272,7 +4457,9 @@ impl Parser {
                             }
                         }
                     }
-                    if !self.enter_recursion() { return None; }
+                    if !self.enter_recursion() {
+                        return None;
+                    }
                     let inner = self.parse_type_atom();
                     self.recursion_depth -= 1;
                     let inner = inner?;
@@ -4285,9 +4472,7 @@ impl Parser {
                         },
                         span,
                     ))
-                } else if (name == "Float" || name == "Int")
-                    && self.can_start_unit_type_arg()
-                {
+                } else if (name == "Float" || name == "Int") && self.can_start_unit_type_arg() {
                     // `Float M`, `Float u`, `Float (M / S^2)` — the unit is a
                     // regular type-argument position parsed as a unit
                     // expression. A bare Upper/Lower identifier is a unit
@@ -4312,7 +4497,9 @@ impl Parser {
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(TypeKind::Var(name), tok.span))
             }
             TokenKind::Underscore => {
@@ -4438,9 +4625,14 @@ impl Parser {
             if self.at(&TokenKind::RBrace) || self.at(&TokenKind::Pipe) {
                 break;
             }
-            let (fname, _) = self.expect_lower("expected field name in record type").ok()?;
-            self.expect(&TokenKind::Colon, "expected ':' after field name in record type")
+            let (fname, _) = self
+                .expect_lower("expected field name in record type")
                 .ok()?;
+            self.expect(
+                &TokenKind::Colon,
+                "expected ':' after field name in record type",
+            )
+            .ok()?;
             self.skip_newlines();
             let ty = self.parse_type()?;
             fields.push(Field {
@@ -4455,7 +4647,9 @@ impl Parser {
 
         self.skip_newlines();
         let rest = if self.eat(&TokenKind::Pipe) {
-            let (rname, _) = self.expect_lower("expected row variable after '|' in record type").ok()?;
+            let (rname, _) = self
+                .expect_lower("expected row variable after '|' in record type")
+                .ok()?;
             Some(rname)
         } else {
             None
@@ -4479,7 +4673,9 @@ impl Parser {
         match self.peek() {
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(n) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(n) = tok.kind else {
+                    unreachable!()
+                };
                 rest.push(n);
             }
             TokenKind::Underscore => {
@@ -4496,7 +4692,9 @@ impl Parser {
             match self.peek() {
                 TokenKind::Lower(_) => {
                     let tok = self.advance();
-                    let TokenKind::Lower(n) = tok.kind else { unreachable!() };
+                    let TokenKind::Lower(n) = tok.kind else {
+                        unreachable!()
+                    };
                     rest.push(n);
                 }
                 TokenKind::Underscore => {
@@ -4525,7 +4723,10 @@ impl Parser {
                 // surrounding type-row parse.
                 TokenKind::Lower(s) if s == "r" => {
                     self.advance();
-                    if self.expect(&TokenKind::Star, "expected '*' after 'r'").is_err() {
+                    if self
+                        .expect(&TokenKind::Star, "expected '*' after 'r'")
+                        .is_err()
+                    {
                         break;
                     }
                     let Some((name, _)) =
@@ -4537,7 +4738,10 @@ impl Parser {
                 }
                 TokenKind::Lower(s) if s == "w" => {
                     self.advance();
-                    if self.expect(&TokenKind::Star, "expected '*' after 'w'").is_err() {
+                    if self
+                        .expect(&TokenKind::Star, "expected '*' after 'w'")
+                        .is_err()
+                    {
                         break;
                     }
                     let Some((name, _)) =
@@ -4549,11 +4753,15 @@ impl Parser {
                 }
                 TokenKind::Lower(s) if s == "rw" => {
                     self.advance();
-                    if self.expect(&TokenKind::Star, "expected '*' after 'rw'").is_err() {
+                    if self
+                        .expect(&TokenKind::Star, "expected '*' after 'rw'")
+                        .is_err()
+                    {
                         break;
                     }
-                    let Some((name, _)) =
-                        self.expect_lower("expected relation name after 'rw *'").ok()
+                    let Some((name, _)) = self
+                        .expect_lower("expected relation name after 'rw *'")
+                        .ok()
                     else {
                         break;
                     };
@@ -4643,7 +4851,9 @@ impl Parser {
                     // Check if this is followed by `>` — if so, it's a rest variable.
                     if matches!(self.peek_ahead(1), TokenKind::Gt) {
                         let tok = self.advance();
-                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                        let TokenKind::Lower(name) = tok.kind else {
+                            unreachable!()
+                        };
                         rest = Some(name);
                         break;
                     }
@@ -4655,7 +4865,9 @@ impl Parser {
             } else if matches!(self.peek(), TokenKind::Lower(_)) {
                 // Rest variable.
                 let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(name) = tok.kind else {
+                    unreachable!()
+                };
                 rest = Some(name);
                 break;
             } else {
@@ -4734,7 +4946,11 @@ mod tests {
         assert!(diags.is_empty(), "diags: {:?}", diags);
         assert_eq!(module.decls.len(), 1);
         match &module.decls[0].node {
-            DeclKind::Fun { name, body: Some(body), .. } => {
+            DeclKind::Fun {
+                name,
+                body: Some(body),
+                ..
+            } => {
                 assert_eq!(name, "x");
                 assert!(matches!(&body.node, ExprKind::Lit(Literal::Int(n)) if n == "42"));
             }
@@ -4760,7 +4976,9 @@ mod tests {
         assert!(diags.is_empty(), "diags: {:?}", diags);
         // Should parse as a + (b * c) due to precedence.
         match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => match &body.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            } => match &body.node {
                 ExprKind::BinOp {
                     op: BinOp::Add,
                     lhs,
@@ -4796,9 +5014,7 @@ mod tests {
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
             DeclKind::Data {
-                name,
-                constructors,
-                ..
+                name, constructors, ..
             } => {
                 assert_eq!(name, "Bool");
                 assert_eq!(constructors.len(), 2);
@@ -4849,7 +5065,9 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
+            DeclKind::Fun {
+                body: Some(body), ..
+            } => {
                 assert!(matches!(&body.node, ExprKind::Lambda { .. }));
             }
             other => panic!("expected Fun with lambda body, got {:?}", other),
@@ -4877,7 +5095,9 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => match &body.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            } => match &body.node {
                 ExprKind::Record(fields) => {
                     assert_eq!(fields.len(), 2);
                     assert_eq!(fields[0].name, "name");
@@ -4934,7 +5154,9 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
+            DeclKind::Fun {
+                body: Some(body), ..
+            } => {
                 // g x y => App(App(g, x), y)
                 match &body.node {
                     ExprKind::App { func, arg } => {
@@ -4963,8 +5185,12 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
-                assert!(matches!(&body.node, ExprKind::FieldAccess { field, .. } if field == "name"));
+            DeclKind::Fun {
+                body: Some(body), ..
+            } => {
+                assert!(
+                    matches!(&body.node, ExprKind::FieldAccess { field, .. } if field == "name")
+                );
             }
             other => panic!("expected Fun, got {:?}", other),
         }
@@ -4973,17 +5199,12 @@ mod tests {
     #[test]
     fn expect_lower_rejects_keywords() {
         let source = "where".to_string();
-        let tokens = toks(vec![
-            (TokenKind::Where, 0, 5),
-            (TokenKind::Eof, 5, 5),
-        ]);
+        let tokens = toks(vec![(TokenKind::Where, 0, 5), (TokenKind::Eof, 5, 5)]);
         let mut parser = Parser::new(source, tokens);
         let result = parser.expect_lower("expected identifier");
         assert!(result.is_err());
         assert!(!parser.diagnostics.is_empty());
-        assert!(parser.diagnostics[0]
-            .message
-            .contains("keyword"));
+        assert!(parser.diagnostics[0].message.contains("keyword"));
     }
 
     #[test]
@@ -5027,7 +5248,9 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => match &body.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            } => match &body.node {
                 ExprKind::List(elems) => {
                     assert_eq!(elems.len(), 3);
                 }
@@ -5051,7 +5274,9 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
+            DeclKind::Fun {
+                body: Some(body), ..
+            } => {
                 assert!(matches!(
                     &body.node,
                     ExprKind::UnaryOp {
@@ -5078,7 +5303,9 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => {
+            DeclKind::Fun {
+                body: Some(body), ..
+            } => {
                 assert!(matches!(&body.node, ExprKind::SourceRef(n) if n == "people"));
             }
             other => panic!("expected Fun, got {:?}", other),
@@ -5104,7 +5331,9 @@ mod tests {
         let (module, diags) = Parser::new(source, tokens).parse_module();
         assert!(diags.is_empty(), "diags: {:?}", diags);
         match &module.decls[0].node {
-            DeclKind::Fun { body: Some(body), .. } => match &body.node {
+            DeclKind::Fun {
+                body: Some(body), ..
+            } => match &body.node {
                 ExprKind::RecordUpdate { base, fields } => {
                     assert!(matches!(&base.node, ExprKind::Var(n) if n == "t"));
                     assert_eq!(fields.len(), 1);

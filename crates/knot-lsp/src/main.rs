@@ -71,8 +71,8 @@ use crate::semantic_tokens::{
 };
 use crate::signature_help::handle_signature_help;
 use crate::state::{
-    send_internal_error, send_invalid_params, send_method_not_found, send_response,
     AnalysisResult, AnalysisTask, PendingSource, ServerConfig, ServerState, WorkspaceSymbolCache,
+    send_internal_error, send_invalid_params, send_method_not_found, send_response,
 };
 use crate::utils::{offset_to_position, position_to_offset, uri_to_path};
 use crate::workspace_diagnostics::{
@@ -134,16 +134,16 @@ fn main() {
         code_lens_provider: Some(CodeLensOptions {
             resolve_provider: Some(false),
         }),
-        semantic_tokens_provider: Some(
-            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
                 legend: semantic_token_legend(),
                 // Advertise range, full, and full/delta — the delta path
                 // lets editors re-fetch only changed tokens after edits.
                 full: Some(SemanticTokensFullOptions::Delta { delta: Some(true) }),
                 range: Some(true),
                 work_done_progress_options: Default::default(),
-            }),
-        ),
+            },
+        )),
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
         call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
@@ -156,9 +156,7 @@ fn main() {
             more_trigger_character: None,
         }),
         workspace_symbol_provider: Some(OneOf::Left(true)),
-        linked_editing_range_provider: Some(
-            LinkedEditingRangeServerCapabilities::Simple(true),
-        ),
+        linked_editing_range_provider: Some(LinkedEditingRangeServerCapabilities::Simple(true)),
         diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
             identifier: Some("knot".into()),
             inter_file_dependencies: true,
@@ -276,9 +274,10 @@ fn main() {
     // log it so we don't silently lose cross-file invalidation if the
     // connection has gone bad.
     if let Some(register_request) = build_file_watcher_registration()
-        && let Err(e) = connection.sender.send(Message::Request(register_request)) {
-            eprintln!("knot-lsp: failed to register file watcher: {e}");
-        }
+        && let Err(e) = connection.sender.send(Message::Request(register_request))
+    {
+        eprintln!("knot-lsp: failed to register file watcher: {e}");
+    }
 
     // Pre-warm the workspace-symbol cache in the background. The first
     // `workspace/symbol` query then sees a populated cache instead of having
@@ -406,9 +405,7 @@ fn prune_caches_outside_roots(state: &mut ServerState) {
         roots.iter().any(|r| p.starts_with(r))
     };
 
-    state
-        .workspace_diag_cache
-        .retain(|p, _| in_scope(p));
+    state.workspace_diag_cache.retain(|p, _| in_scope(p));
     if let Ok(mut cache) = state.import_cache.lock() {
         cache.retain(|p, _| in_scope(p));
     }
@@ -418,12 +415,12 @@ fn prune_caches_outside_roots(state: &mut ServerState) {
     // Also drop the "previously reported" tracking set so a re-added folder
     // doesn't get a one-shot empty-diagnostic flush for files that no longer
     // exist in this session.
-    state
-        .workspace_diag_reported
-        .retain(|uri| match uri_to_path(uri).and_then(|p| p.canonicalize().ok()) {
+    state.workspace_diag_reported.retain(|uri| {
+        match uri_to_path(uri).and_then(|p| p.canonicalize().ok()) {
             Some(p) => in_scope(&p),
             None => false,
-        });
+        }
+    });
 }
 
 /// Walk every `.knot` file under the given workspace roots and populate the
@@ -549,9 +546,10 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
             // against its own buffer) would be applied to the wrong text —
             // persistent corruption. Drop it instead.
             if let Some(current) = state.documents.get(&result.uri)
-                && current.source != result.doc.source {
-                    return;
-                }
+                && current.source != result.doc.source
+            {
+                return;
+            }
         }
     }
 
@@ -567,10 +565,8 @@ fn apply_analysis_result(state: &mut ServerState, conn: &Connection, result: Ana
         .collect();
     // Honor the `warnUnusedImports` config knob at the publish boundary (the
     // analysis pipeline emits the warnings unconditionally).
-    let lsp_diags = crate::diagnostics::filter_unused_warnings(
-        lsp_diags,
-        state.config.warn_unused_imports,
-    );
+    let lsp_diags =
+        crate::diagnostics::filter_unused_warnings(lsp_diags, state.config.warn_unused_imports);
 
     // Update `state.documents` *before* publishing or sending the diagnostic
     // refresh. Pull-mode clients (JetBrains) react to the refresh by
@@ -682,36 +678,93 @@ macro_rules! try_handle {
 }
 
 fn handle_request(state: &mut ServerState, conn: &Connection, req: Request) {
-    try_handle!(&req, conn, request::DocumentSymbolRequest, |p| handle_document_symbol(state, &p));
-    try_handle!(&req, conn, request::GotoDefinition, |p| handle_goto_definition(state, &p));
-    try_handle!(&req, conn, request::GotoTypeDefinition, |p| handle_goto_type_definition(state, &p));
-    try_handle!(&req, conn, request::HoverRequest, |p| handle_hover(state, &p));
-    try_handle!(&req, conn, request::Completion, |p| handle_completion(state, &p));
-    try_handle!(&req, conn, request::References, |p| handle_references(state, &p));
-    try_handle!(&req, conn, request::PrepareRenameRequest, |p| handle_prepare_rename(state, &p));
+    try_handle!(&req, conn, request::DocumentSymbolRequest, |p| {
+        handle_document_symbol(state, &p)
+    });
+    try_handle!(&req, conn, request::GotoDefinition, |p| {
+        handle_goto_definition(state, &p)
+    });
+    try_handle!(&req, conn, request::GotoTypeDefinition, |p| {
+        handle_goto_type_definition(state, &p)
+    });
+    try_handle!(&req, conn, request::HoverRequest, |p| handle_hover(
+        state, &p
+    ));
+    try_handle!(&req, conn, request::Completion, |p| handle_completion(
+        state, &p
+    ));
+    try_handle!(&req, conn, request::References, |p| handle_references(
+        state, &p
+    ));
+    try_handle!(&req, conn, request::PrepareRenameRequest, |p| {
+        handle_prepare_rename(state, &p)
+    });
     try_handle!(&req, conn, request::Rename, |p| handle_rename(state, &p));
-    try_handle!(&req, conn, request::InlayHintRequest, |p| handle_inlay_hint(state, &p));
-    try_handle!(&req, conn, request::SignatureHelpRequest, |p| handle_signature_help(state, &p));
-    try_handle!(&req, conn, request::CodeLensRequest, |p| handle_code_lens(state, &p));
-    try_handle!(&req, conn, request::SemanticTokensFullRequest, |p| handle_semantic_tokens_full(state, &p));
-    try_handle!(&req, conn, request::SemanticTokensFullDeltaRequest, |p| handle_semantic_tokens_full_delta(state, &p));
-    try_handle!(&req, conn, request::SemanticTokensRangeRequest, |p| handle_semantic_tokens_range(state, &p));
-    try_handle!(&req, conn, request::FoldingRangeRequest, |p| handle_folding_range(state, &p));
-    try_handle!(&req, conn, request::SelectionRangeRequest, |p| handle_selection_range(state, &p));
-    try_handle!(&req, conn, request::Formatting, |p| handle_formatting(state, &p));
-    try_handle!(&req, conn, request::RangeFormatting, |p| handle_range_formatting(state, &p));
-    try_handle!(&req, conn, request::OnTypeFormatting, |p| handle_on_type_formatting(state, &p));
-    try_handle!(&req, conn, request::DocumentHighlightRequest, |p| handle_document_highlight(state, &p));
-    try_handle!(&req, conn, request::CodeActionRequest, |p| handle_code_action(state, &p));
+    try_handle!(
+        &req,
+        conn,
+        request::InlayHintRequest,
+        |p| handle_inlay_hint(state, &p)
+    );
+    try_handle!(&req, conn, request::SignatureHelpRequest, |p| {
+        handle_signature_help(state, &p)
+    });
+    try_handle!(&req, conn, request::CodeLensRequest, |p| handle_code_lens(
+        state, &p
+    ));
+    try_handle!(&req, conn, request::SemanticTokensFullRequest, |p| {
+        handle_semantic_tokens_full(state, &p)
+    });
+    try_handle!(&req, conn, request::SemanticTokensFullDeltaRequest, |p| {
+        handle_semantic_tokens_full_delta(state, &p)
+    });
+    try_handle!(&req, conn, request::SemanticTokensRangeRequest, |p| {
+        handle_semantic_tokens_range(state, &p)
+    });
+    try_handle!(&req, conn, request::FoldingRangeRequest, |p| {
+        handle_folding_range(state, &p)
+    });
+    try_handle!(&req, conn, request::SelectionRangeRequest, |p| {
+        handle_selection_range(state, &p)
+    });
+    try_handle!(&req, conn, request::Formatting, |p| handle_formatting(
+        state, &p
+    ));
+    try_handle!(&req, conn, request::RangeFormatting, |p| {
+        handle_range_formatting(state, &p)
+    });
+    try_handle!(&req, conn, request::OnTypeFormatting, |p| {
+        handle_on_type_formatting(state, &p)
+    });
+    try_handle!(&req, conn, request::DocumentHighlightRequest, |p| {
+        handle_document_highlight(state, &p)
+    });
+    try_handle!(&req, conn, request::CodeActionRequest, |p| {
+        handle_code_action(state, &p)
+    });
     // Keep workspace_symbol_cache from growing unbounded — pruning happens
     // inside the handler via the on-disk scan.
-    try_handle!(&req, conn, request::WorkspaceSymbolRequest, |p| handle_workspace_symbol(state, &p));
-    try_handle!(&req, conn, request::CallHierarchyPrepare, |p| handle_call_hierarchy_prepare(state, &p));
-    try_handle!(&req, conn, request::CallHierarchyIncomingCalls, |p| handle_call_hierarchy_incoming(state, &p));
-    try_handle!(&req, conn, request::CallHierarchyOutgoingCalls, |p| handle_call_hierarchy_outgoing(state, &p));
-    try_handle!(&req, conn, request::ResolveCompletionItem, |p| handle_resolve_completion_item(state, p));
-    try_handle!(&req, conn, request::LinkedEditingRange, |p| handle_linked_editing_range(state, &p));
-    try_handle!(&req, conn, request::DocumentDiagnosticRequest, |p| handle_document_diagnostics(state, &p));
+    try_handle!(&req, conn, request::WorkspaceSymbolRequest, |p| {
+        handle_workspace_symbol(state, &p)
+    });
+    try_handle!(&req, conn, request::CallHierarchyPrepare, |p| {
+        handle_call_hierarchy_prepare(state, &p)
+    });
+    try_handle!(&req, conn, request::CallHierarchyIncomingCalls, |p| {
+        handle_call_hierarchy_incoming(state, &p)
+    });
+    try_handle!(&req, conn, request::CallHierarchyOutgoingCalls, |p| {
+        handle_call_hierarchy_outgoing(state, &p)
+    });
+    try_handle!(&req, conn, request::ResolveCompletionItem, |p| {
+        handle_resolve_completion_item(state, p)
+    });
+    try_handle!(&req, conn, request::LinkedEditingRange, |p| {
+        handle_linked_editing_range(state, &p)
+    });
+    try_handle!(&req, conn, request::DocumentDiagnosticRequest, |p| {
+        handle_document_diagnostics(state, &p)
+    });
     // Workspace-diagnostic results piggyback a cache prune so deleted files
     // don't leave stale entries; bundle that side-effect into the handler
     // call here rather than splitting it out across the macro.
@@ -783,9 +836,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         );
         queue_analysis(state, uri, params.text_document.text, version);
     } else if not.method == notification::DidChangeTextDocument::METHOD {
-        let Some(params) =
-            decode::<DidChangeTextDocumentParams>(&not.method, not.params)
-        else {
+        let Some(params) = decode::<DidChangeTextDocumentParams>(&not.method, not.params) else {
             return;
         };
         let uri = params.text_document.uri.clone();
@@ -818,35 +869,32 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         // primary range and the related-info locations, so "click to navigate"
         // targets stay correct during the debounce window before the next full
         // analysis.
-        let mut diag_byte_ranges: Option<DiagByteRanges> =
-            cached_diags
-                .as_ref()
-                .map(|ds| {
-                    ds.iter()
-                        .map(|d| {
-                            let primary = (
-                                position_to_offset(&source, d.range.start),
-                                position_to_offset(&source, d.range.end),
-                            );
-                            let related = d
-                                .related_information
-                                .as_ref()
-                                .map(|ris| {
-                                    ris.iter()
-                                        .filter(|ri| ri.location.uri == uri)
-                                        .map(|ri| {
-                                            (
-                                                position_to_offset(&source, ri.location.range.start),
-                                                position_to_offset(&source, ri.location.range.end),
-                                            )
-                                        })
-                                        .collect::<Vec<_>>()
+        let mut diag_byte_ranges: Option<DiagByteRanges> = cached_diags.as_ref().map(|ds| {
+            ds.iter()
+                .map(|d| {
+                    let primary = (
+                        position_to_offset(&source, d.range.start),
+                        position_to_offset(&source, d.range.end),
+                    );
+                    let related = d
+                        .related_information
+                        .as_ref()
+                        .map(|ris| {
+                            ris.iter()
+                                .filter(|ri| ri.location.uri == uri)
+                                .map(|ri| {
+                                    (
+                                        position_to_offset(&source, ri.location.range.start),
+                                        position_to_offset(&source, ri.location.range.end),
+                                    )
                                 })
-                                .unwrap_or_default();
-                            (primary.0, primary.1, related)
+                                .collect::<Vec<_>>()
                         })
-                        .collect()
-                });
+                        .unwrap_or_default();
+                    (primary.0, primary.1, related)
+                })
+                .collect()
+        });
 
         for change in params.content_changes {
             if let Some(range) = change.range {
@@ -863,8 +911,9 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                     for (ps, pe, related) in diag_ranges {
                         // Shift the primary and all related-info ranges in one
                         // pass so they move consistently with the edit.
-                        let mut all: Vec<(usize, usize)> =
-                            std::iter::once((*ps, *pe)).chain(related.iter().copied()).collect();
+                        let mut all: Vec<(usize, usize)> = std::iter::once((*ps, *pe))
+                            .chain(related.iter().copied())
+                            .collect();
                         shift_byte_ranges_for_edit(&mut all, start, end, new_len);
                         *ps = all[0].0;
                         *pe = all[0].1;
@@ -919,7 +968,8 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                             if ri.location.uri != uri {
                                 shifted_related.push(ri.clone());
                             } else if let Some(&(rs, re)) = rel_iter.next()
-                                && rs != usize::MAX && re <= source.len()
+                                && rs != usize::MAX
+                                && re <= source.len()
                             {
                                 shifted_related.push(lsp_types::DiagnosticRelatedInformation {
                                     location: lsp_types::Location {
@@ -947,11 +997,8 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             // didChange after a publish typically happens before any cached
             // diagnostic's position drifted.
             if rebased != cached {
-                let params = lsp_types::PublishDiagnosticsParams::new(
-                    uri.clone(),
-                    rebased.clone(),
-                    version,
-                );
+                let params =
+                    lsp_types::PublishDiagnosticsParams::new(uri.clone(), rebased.clone(), version);
                 let not = Notification::new(
                     lsp_types::notification::PublishDiagnostics::METHOD.into(),
                     params,
@@ -959,9 +1006,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
                 if let Err(e) = conn.sender.send(Message::Notification(not)) {
                     eprintln!("knot-lsp: failed to publish rebased diagnostics: {e}");
                 }
-                state
-                    .published_lsp_diagnostics
-                    .insert(uri.clone(), rebased);
+                state.published_lsp_diagnostics.insert(uri.clone(), rebased);
                 crate::state::enforce_uri_cache_cap(
                     &mut state.published_lsp_diagnostics,
                     &state.documents,
@@ -1030,9 +1075,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         // handles them once the changed file's analysis completes, filtered by
         // the per-decl change set so unrelated dependents stay quiet.
     } else if not.method == notification::DidChangeWatchedFiles::METHOD {
-        let Some(params) =
-            decode::<DidChangeWatchedFilesParams>(&not.method, not.params)
-        else {
+        let Some(params) = decode::<DidChangeWatchedFilesParams>(&not.method, not.params) else {
             return;
         };
         // Track deletions separately: a deleted path needs its entries flushed
@@ -1044,14 +1087,15 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         let mut deleted_paths: HashSet<PathBuf> = HashSet::new();
         for c in &params.changes {
             if matches!(c.typ, FileChangeType::DELETED)
-                && let Some(p) = uri_to_path(&c.uri) {
-                    // `canonicalize` fails on paths the OS no longer knows
-                    // about, so fall back to the lexical path. Either form is
-                    // acceptable here — the cache keys are canonical paths
-                    // captured when the file was first analyzed, and we'll
-                    // try both shapes when evicting.
-                    deleted_paths.insert(p.canonicalize().unwrap_or(p));
-                }
+                && let Some(p) = uri_to_path(&c.uri)
+            {
+                // `canonicalize` fails on paths the OS no longer knows
+                // about, so fall back to the lexical path. Either form is
+                // acceptable here — the cache keys are canonical paths
+                // captured when the file was first analyzed, and we'll
+                // try both shapes when evicting.
+                deleted_paths.insert(p.canonicalize().unwrap_or(p));
+            }
         }
         let changed_paths: HashSet<PathBuf> = params
             .changes
@@ -1064,10 +1108,8 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             // Evict cached inference snapshots for the changed paths — the
             // on-disk bytes moved, so any prior snapshot is stale.
             if let Ok(mut cache) = state.inference_cache.lock() {
-                let affected: HashSet<&PathBuf> = changed_paths
-                    .iter()
-                    .chain(deleted_paths.iter())
-                    .collect();
+                let affected: HashSet<&PathBuf> =
+                    changed_paths.iter().chain(deleted_paths.iter()).collect();
                 cache.retain(|(p, _), _| !affected.contains(p));
             }
 
@@ -1103,9 +1145,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         // copy. Doesn't queue analysis — the source is already what we just
         // analyzed, save events carry no new content (we don't opt into
         // `includeText`).
-        let Some(params) =
-            decode::<DidSaveTextDocumentParams>(&not.method, not.params)
-        else {
+        let Some(params) = decode::<DidSaveTextDocumentParams>(&not.method, not.params) else {
             return;
         };
         let uri = params.text_document.uri;
@@ -1134,9 +1174,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
             request_workspace_diagnostic_refresh(state, conn);
         }
     } else if not.method == notification::DidCloseTextDocument::METHOD {
-        let Some(params) =
-            decode::<DidCloseTextDocumentParams>(&not.method, not.params)
-        else {
+        let Some(params) = decode::<DidCloseTextDocumentParams>(&not.method, not.params) else {
             return;
         };
         state.documents.remove(&params.text_document.uri);
@@ -1158,9 +1196,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
     } else if not.method == notification::DidChangeConfiguration::METHOD {
         // Apply runtime config changes (tab size, inlay-hint toggles, cache
         // bounds). Refresh inlay hints since their visibility may have flipped.
-        let Some(params) =
-            decode::<DidChangeConfigurationParams>(&not.method, not.params)
-        else {
+        let Some(params) = decode::<DidChangeConfigurationParams>(&not.method, not.params) else {
             return;
         };
         state.config.merge_from_json(&params.settings);
@@ -1173,8 +1209,7 @@ fn handle_notification(state: &mut ServerState, conn: &Connection, not: Notifica
         );
         let _ = conn.sender.send(Message::Request(refresh));
     } else if not.method == notification::DidChangeWorkspaceFolders::METHOD {
-        let Some(params) =
-            decode::<DidChangeWorkspaceFoldersParams>(&not.method, not.params)
+        let Some(params) = decode::<DidChangeWorkspaceFoldersParams>(&not.method, not.params)
         else {
             return;
         };
@@ -1274,7 +1309,10 @@ fn request_workspace_diagnostic_refresh(state: &mut ServerState, conn: &Connecti
     }
     state.diagnostic_refresh_counter = state.diagnostic_refresh_counter.wrapping_add(1);
     let req = Request::new(
-        RequestId::from(format!("knot-diag-refresh-{}", state.diagnostic_refresh_counter)),
+        RequestId::from(format!(
+            "knot-diag-refresh-{}",
+            state.diagnostic_refresh_counter
+        )),
         lsp_types::request::WorkspaceDiagnosticRefresh::METHOD.into(),
         serde_json::Value::Null,
     );
@@ -1345,7 +1383,11 @@ fn queue_analysis(state: &mut ServerState, uri: Uri, source: String, version: Op
     // task we're about to enqueue (and re-parked below if this one is
     // dropped too).
     state.dropped_analysis_retry.remove(&uri);
-    match state.analysis_tx.try_send(AnalysisTask { uri, source, version }) {
+    match state.analysis_tx.try_send(AnalysisTask {
+        uri,
+        source,
+        version,
+    }) {
         Ok(()) => {}
         Err(TrySendError::Full(task)) => {
             eprintln!(
@@ -1377,8 +1419,7 @@ fn retry_dropped_analysis(state: &mut ServerState) {
     if state.dropped_analysis_retry.is_empty() {
         return;
     }
-    let entries: Vec<(Uri, (String, Option<i32>))> =
-        state.dropped_analysis_retry.drain().collect();
+    let entries: Vec<(Uri, (String, Option<i32>))> = state.dropped_analysis_retry.drain().collect();
     for (uri, (source, version)) in entries {
         let (src, ver) = match state.pending_sources.get(&uri) {
             Some(p) => (p.source.clone(), p.version),
@@ -1400,6 +1441,3 @@ fn invalidate_workspace_diag_cache_for(state: &mut ServerState, changed: &HashSe
         .workspace_diag_cache
         .retain(|path, _| !changed.contains(path));
 }
-
-
-

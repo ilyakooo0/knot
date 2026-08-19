@@ -54,7 +54,11 @@ fn advance_past_field_block(source: &str, from: usize, end: usize) -> usize {
 
 /// Definition resolution result: name → def span, (use span, def span)
 /// references, and (literal span, type name) pairs.
-type Definitions = (HashMap<String, Span>, Vec<(Span, Span)>, Vec<(Span, String)>);
+type Definitions = (
+    HashMap<String, Span>,
+    Vec<(Span, Span)>,
+    Vec<(Span, String)>,
+);
 
 /// Resolve definitions: returns (name_map, span_references, literal_types).
 pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
@@ -68,10 +72,8 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
     // Phase 1: register all top-level declarations
     for decl in top_fields(program) {
         let dspan = decl.value.span;
-        let name_span = |name: &str| {
-            find_word_in_source(source, name, dspan.start, dspan.end)
-                .unwrap_or(dspan)
-        };
+        let name_span =
+            |name: &str| find_word_in_source(source, name, dspan.start, dspan.end).unwrap_or(dspan);
         match &decl.value.node {
             ExprKind::DataCtor {
                 name, constructors, ..
@@ -89,15 +91,13 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
                     .map(|p| dspan.start + p + 1)
                     .unwrap_or(dspan.start);
                 for ctor in constructors {
-                    let ctor_span =
-                        find_word_in_source(source, &ctor.name, search_from, dspan.end)
-                            .unwrap_or(dspan);
+                    let ctor_span = find_word_in_source(source, &ctor.name, search_from, dspan.end)
+                        .unwrap_or(dspan);
                     resolver.define(&ctor.name, ctor_span);
                     // Skip past this constructor's `{…}` field block so a type
                     // name reused inside the fields (`data T = A {x: B} | B {}`)
                     // can't be mistaken for the next constructor's token.
-                    search_from =
-                        advance_past_field_block(source, ctor_span.end, dspan.end);
+                    search_from = advance_past_field_block(source, ctor_span.end, dspan.end);
                 }
             }
             ExprKind::TypeCtor { name, .. } => {
@@ -142,9 +142,7 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
         let resolve_scheme = |resolver: &mut DefResolver, scheme: &knot::ast::TypeScheme| {
             resolver.resolve_trait_names(
                 scheme.constraints.iter().filter_map(|c| match c {
-                    knot::ast::Constraint::Trait { trait_name, .. } => {
-                        Some(trait_name.as_str())
-                    }
+                    knot::ast::Constraint::Trait { trait_name, .. } => Some(trait_name.as_str()),
                     knot::ast::Constraint::ImplicitField { .. } => None,
                     knot::ast::Constraint::CollectField { .. } => None,
                 }),
@@ -214,9 +212,7 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
                 // both sides — including `*users <= *users.email` — resolve.
                 let mut search_from = dspan.start;
                 for rel in [&sub.relation, &sup.relation] {
-                    if let Some(span) =
-                        find_word_in_source(source, rel, search_from, dspan.end)
-                    {
+                    if let Some(span) = find_word_in_source(source, rel, search_from, dspan.end) {
                         search_from = span.end;
                         resolver.add_ref(span, rel);
                     }
@@ -232,7 +228,6 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
     let name_map = resolver.scopes[0].clone();
     (name_map, resolver.refs, resolver.literals)
 }
-
 
 struct DefResolver<'a> {
     source: &'a str,
@@ -318,10 +313,7 @@ impl<'a> DefResolver<'a> {
             let rest = &line[cand.min(line.len())..];
             if rest.starts_with(name) {
                 let tok_end = cand + name.len();
-                let boundary_ok = line
-                    .as_bytes()
-                    .get(tok_end)
-                    .is_none_or(|b| !is_ident(*b));
+                let boundary_ok = line.as_bytes().get(tok_end).is_none_or(|b| !is_ident(*b));
                 if boundary_ok {
                     let span = Span::new(start + rel + cand, start + rel + tok_end);
                     if span != primary {
@@ -367,7 +359,7 @@ impl<'a> DefResolver<'a> {
                 }
             }
             TypeKind::IO { ty, .. } => self.resolve_type(ty, source),
-            TypeKind::Unit(_) => {},
+            TypeKind::Unit(_) => {}
             TypeKind::UnitAnnotated { base, .. } => self.resolve_type(base, source),
             TypeKind::Refined { base, predicate } => {
                 self.resolve_type(base, source);
@@ -398,8 +390,9 @@ impl<'a> DefResolver<'a> {
                 // name. Locate the actual token via word search, falling back
                 // to the leading-name form only for unparenthesized patterns.
                 // (Mirrors `rename.rs::walk_pat_ctors`.)
-                let name_span = find_word_in_source(self.source, name, pat.span.start, pat.span.end)
-                    .unwrap_or_else(|| Span::new(pat.span.start, pat.span.start + name.len()));
+                let name_span =
+                    find_word_in_source(self.source, name, pat.span.start, pat.span.end)
+                        .unwrap_or_else(|| Span::new(pat.span.start, pat.span.start + name.len()));
                 self.add_ref(name_span, name);
                 self.define_pat(payload);
             }
@@ -412,13 +405,9 @@ impl<'a> DefResolver<'a> {
                         self.define_pat(p);
                         search_start = p.span.end;
                     } else {
-                        let span = find_word_in_source(
-                            self.source,
-                            &f.name,
-                            search_start,
-                            pat.span.end,
-                        )
-                        .unwrap_or(pat.span);
+                        let span =
+                            find_word_in_source(self.source, &f.name, search_start, pat.span.end)
+                                .unwrap_or(pat.span);
                         self.define(&f.name, span);
                         // Self-reference for the pun binder token (see
                         // `PatKind::Var` above).
@@ -448,9 +437,9 @@ impl<'a> DefResolver<'a> {
             ast::ExprKind::SourceRef { name, .. } => self.add_ref(expr.span, name),
             // `^name` resolves to a record field at inference time; no single
             // binding site to reference here.
-            ast::ExprKind::ImplicitRef(_) => {},
-            ast::ExprKind::CollectFold(_) => {},
-            ast::ExprKind::TypeHole => {},
+            ast::ExprKind::ImplicitRef(_) => {}
+            ast::ExprKind::CollectFold(_) => {}
+            ast::ExprKind::TypeHole => {}
 
             ast::ExprKind::Lambda { params, body, .. } => {
                 self.push_scope();
@@ -532,7 +521,11 @@ impl<'a> DefResolver<'a> {
                 self.resolve_expr(inner);
             }
             ast::ExprKind::Refine(inner) => self.resolve_expr(inner),
-            ast::ExprKind::Serve { api, api_span, handlers } => {
+            ast::ExprKind::Serve {
+                api,
+                api_span,
+                handlers,
+            } => {
                 self.add_ref(*api_span, api);
                 for h in handlers {
                     // Each endpoint token references the route endpoint
@@ -632,12 +625,18 @@ pub fn build_details(program: &Expr) -> HashMap<String, String> {
                     let ctor_detail = if fields.is_empty() {
                         format!("{} — constructor of {name}", ctor.name)
                     } else {
-                        format!("{} {{{}}} — constructor of {name}", ctor.name, fields.join(", "))
+                        format!(
+                            "{} {{{}}} — constructor of {name}",
+                            ctor.name,
+                            fields.join(", ")
+                        )
                     };
                     details.insert(ctor.name.clone(), ctor_detail);
                 }
             }
-            ExprKind::TypeCtor { name, params, ty, .. } => {
+            ExprKind::TypeCtor {
+                name, params, ty, ..
+            } => {
                 let params_str = if params.is_empty() {
                     String::new()
                 } else {

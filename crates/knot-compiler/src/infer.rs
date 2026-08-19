@@ -4,11 +4,11 @@
 //! diagnostics. The runtime uses uniform pointer representation, so this
 //! pass is purely for error detection — it does not affect code generation.
 
+use indexmap::IndexMap;
 use knot::ast;
 use knot::ast::Span;
 use knot::diagnostic::Diagnostic;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use indexmap::IndexMap;
 
 /// Collect all variable names bound by a pattern, recursing into
 /// Constructor, Record, List, and Cons sub-patterns.
@@ -333,19 +333,28 @@ struct UnitTy {
 #[allow(dead_code)]
 impl UnitTy {
     fn dimensionless() -> Self {
-        UnitTy { bases: BTreeMap::new(), vars: BTreeMap::new() }
+        UnitTy {
+            bases: BTreeMap::new(),
+            vars: BTreeMap::new(),
+        }
     }
 
     fn named(name: &str) -> Self {
         let mut bases = BTreeMap::new();
         bases.insert(name.to_string(), 1);
-        UnitTy { bases, vars: BTreeMap::new() }
+        UnitTy {
+            bases,
+            vars: BTreeMap::new(),
+        }
     }
 
     fn var(v: UnitVar) -> Self {
         let mut vars = BTreeMap::new();
         vars.insert(v, 1);
-        UnitTy { bases: BTreeMap::new(), vars }
+        UnitTy {
+            bases: BTreeMap::new(),
+            vars,
+        }
     }
 
     fn is_dimensionless(&self) -> bool {
@@ -561,7 +570,9 @@ impl Ty {
     fn is_int_like(&self) -> bool {
         match self.peel_alias() {
             Ty::Int => true,
-            Ty::Con(name, args) => name == "Int" && args.len() == 1 && matches!(args[0].peel_alias(), Ty::Unit(_)),
+            Ty::Con(name, args) => {
+                name == "Int" && args.len() == 1 && matches!(args[0].peel_alias(), Ty::Unit(_))
+            }
             _ => false,
         }
     }
@@ -570,7 +581,9 @@ impl Ty {
     fn is_float_like(&self) -> bool {
         match self.peel_alias() {
             Ty::Float => true,
-            Ty::Con(name, args) => name == "Float" && args.len() == 1 && matches!(args[0].peel_alias(), Ty::Unit(_)),
+            Ty::Con(name, args) => {
+                name == "Float" && args.len() == 1 && matches!(args[0].peel_alias(), Ty::Unit(_))
+            }
             _ => false,
         }
     }
@@ -579,10 +592,7 @@ impl Ty {
     /// aliases. Returns `None` for plain `Int`/`Float` or anything else.
     fn unit_of(&self) -> Option<&UnitTy> {
         match self.peel_alias() {
-            Ty::Con(name, args)
-                if (name == "Int" || name == "Float")
-                    && args.len() == 1 =>
-            {
+            Ty::Con(name, args) if (name == "Int" || name == "Float") && args.len() == 1 => {
                 match args[0].peel_alias() {
                     Ty::Unit(u) => Some(u),
                     _ => None,
@@ -645,7 +655,10 @@ fn default_free_unit_vars(ty: &Ty) -> Ty {
             Box::new(default_free_unit_vars(r)),
         ),
         Ty::Record(fields, row) => Ty::Record(
-            fields.iter().map(|(n, t)| (n.clone(), default_free_unit_vars(t))).collect(),
+            fields
+                .iter()
+                .map(|(n, t)| (n.clone(), default_free_unit_vars(t)))
+                .collect(),
             *row,
         ),
         Ty::Relation(inner) => Ty::Relation(Box::new(default_free_unit_vars(inner))),
@@ -654,7 +667,10 @@ fn default_free_unit_vars(ty: &Ty) -> Ty {
             args.iter().map(default_free_unit_vars).collect(),
         ),
         Ty::Variant(ctors, row) => Ty::Variant(
-            ctors.iter().map(|(n, t)| (n.clone(), default_free_unit_vars(t))).collect(),
+            ctors
+                .iter()
+                .map(|(n, t)| (n.clone(), default_free_unit_vars(t)))
+                .collect(),
             *row,
         ),
         Ty::App(f, a) => Ty::App(
@@ -1310,18 +1326,19 @@ impl Infer {
             // at runtime, so it is SQL-pushable just like plain Int. (Unit-
             // bearing Float is excluded for the same total_cmp reason.)
             Ty::Con(name, args)
-                if name == "Int" && args.len() == 1 && matches!(args[0].peel_alias(), Ty::Unit(_)) =>
+                if name == "Int"
+                    && args.len() == 1
+                    && matches!(args[0].peel_alias(), Ty::Unit(_)) =>
             {
                 true
             }
             // Refined nominal alias `type Nat = Int where ...` shows up as
             // `Con(name, [])`; recurse to its base type.
-            Ty::Con(name, args) if args.is_empty() => {
-                self.refined_types
-                    .get(name)
-                    .map(|(base, _)| self.is_sql_pushable_scalar_for_elem(base))
-                    .unwrap_or(false)
-            }
+            Ty::Con(name, args) if args.is_empty() => self
+                .refined_types
+                .get(name)
+                .map(|(base, _)| self.is_sql_pushable_scalar_for_elem(base))
+                .unwrap_or(false),
             _ => false,
         }
     }
@@ -1346,12 +1363,11 @@ impl Infer {
             // (see the literal path, which binds Int elements as TEXT and works).
             // Float is excluded for the same total_cmp-vs-IEEE reason as above.
             Ty::Text | Ty::Bool | Ty::Uuid => true,
-            Ty::Con(name, args) if args.is_empty() => {
-                self.refined_types
-                    .get(name)
-                    .map(|(base, _)| self.is_dynamic_pushable_scalar_for_elem(base))
-                    .unwrap_or(false)
-            }
+            Ty::Con(name, args) if args.is_empty() => self
+                .refined_types
+                .get(name)
+                .map(|(base, _)| self.is_dynamic_pushable_scalar_for_elem(base))
+                .unwrap_or(false),
             _ => false,
         }
     }
@@ -1423,7 +1439,10 @@ impl Infer {
                 Ty::Con(n, args) if args.is_empty() && self.refined_types.contains_key(n) => {
                     if visited.iter().any(|v| v == n) {
                         self.error(
-                            format!("refined type alias '{}' has a cyclic definition", visited[0]),
+                            format!(
+                                "refined type alias '{}' has a cyclic definition",
+                                visited[0]
+                            ),
                             span,
                         );
                         return None;
@@ -1590,10 +1609,12 @@ impl Infer {
     /// `refine` the result wherever a refined type is required.
     fn degrade_refinement(&mut self, ty: Ty, span: Span) -> Ty {
         if let Ty::Con(name, args) = self.apply(&ty)
-            && args.is_empty() && self.refined_types.contains_key(&name)
-                && let Some(base) = self.resolve_refined_base(&name, span) {
-                    return base;
-                }
+            && args.is_empty()
+            && self.refined_types.contains_key(&name)
+            && let Some(base) = self.resolve_refined_base(&name, span)
+        {
+            return base;
+        }
         ty
     }
 
@@ -1621,7 +1642,10 @@ impl Infer {
             if current.vars.is_empty() {
                 return current;
             }
-            let mut next = UnitTy { bases: current.bases.clone(), vars: BTreeMap::new() };
+            let mut next = UnitTy {
+                bases: current.bases.clone(),
+                vars: BTreeMap::new(),
+            };
             let mut changed = false;
             for (&v, &exp) in &current.vars {
                 if let Some(resolved) = self.unit_subst.get(&v) {
@@ -1658,7 +1682,9 @@ impl Infer {
         let a = self.apply_unit(a);
         let b = self.apply_unit(b);
 
-        if a == b { return; }
+        if a == b {
+            return;
+        }
 
         // Reduce the two sides to a single equation: `a == b` iff the quotient
         // `diff = a / b` is dimensionless. Solving for one flexible variable in
@@ -1680,7 +1706,9 @@ impl Infer {
         // `Float M` (solve the exp-1 `v`, leaving `u` free) and `Float u`
         // unify with `Float (u^2)` (solve the shared `u` to dimensionless) — a
         // first-only greedy pick would wrongly reject both.
-        let mut candidates: Vec<UnitVar> = diff.vars.keys()
+        let mut candidates: Vec<UnitVar> = diff
+            .vars
+            .keys()
             .filter(|v| !self.unit_skolems.contains(v))
             .copied()
             .collect();
@@ -1692,14 +1720,18 @@ impl Infer {
             // solution (so no occurs-cycle for `apply_unit` to chase).
             let mut rest = diff.clone();
             rest.vars.remove(&v);
-            let clean = rest.bases.values().all(|x| x % e == 0)
-                && rest.vars.values().all(|x| x % e == 0);
+            let clean =
+                rest.bases.values().all(|x| x % e == 0) && rest.vars.values().all(|x| x % e == 0);
             if !clean {
                 continue;
             }
             // v = rest^(-1/e): negate and divide every exponent by e.
-            for x in rest.bases.values_mut() { *x = -(*x / e); }
-            for x in rest.vars.values_mut() { *x = -(*x / e); }
+            for x in rest.bases.values_mut() {
+                *x = -(*x / e);
+            }
+            for x in rest.vars.values_mut() {
+                *x = -(*x / e);
+            }
             rest.normalize();
             self.unit_subst.insert(v, rest);
             return;
@@ -1843,9 +1875,10 @@ impl Infer {
                     None => ty.clone(),
                 }
             }
-            Ty::Fun(p, r) => {
-                Ty::Fun(Box::new(self.apply_impl(p, excluded)), Box::new(self.apply_impl(r, excluded)))
-            }
+            Ty::Fun(p, r) => Ty::Fun(
+                Box::new(self.apply_impl(p, excluded)),
+                Box::new(self.apply_impl(r, excluded)),
+            ),
             Ty::Record(fields, row) => {
                 let mut applied: FieldMap = fields
                     .iter()
@@ -1888,9 +1921,7 @@ impl Infer {
                     Ty::Variant(applied, None)
                 }
             }
-            Ty::Relation(inner) => {
-                Ty::Relation(Box::new(self.apply_impl(inner, excluded)))
-            }
+            Ty::Relation(inner) => Ty::Relation(Box::new(self.apply_impl(inner, excluded))),
             Ty::Con(name, args) => {
                 let applied_args: Vec<Ty> =
                     args.iter().map(|a| self.apply_impl(a, excluded)).collect();
@@ -1901,18 +1932,20 @@ impl Infer {
                 // for the inner `Ty::Unit(u)`, so by the time we get here the
                 // arg may already be a substituted `Unit(u)` — but if the arg
                 // was something exotic we must not pretend it's a unit.
-                if (name == "Int" || name == "Float") && applied_args.len() == 1
-                    && let Ty::Unit(u) = &applied_args[0] {
-                        let u = self.apply_unit(u);
-                        if u.is_dimensionless() {
-                            return if name == "Int" { Ty::Int } else { Ty::Float };
-                        }
-                        return if name == "Int" {
-                            Ty::int_with_unit(u)
-                        } else {
-                            Ty::float_with_unit(u)
-                        };
+                if (name == "Int" || name == "Float")
+                    && applied_args.len() == 1
+                    && let Ty::Unit(u) = &applied_args[0]
+                {
+                    let u = self.apply_unit(u);
+                    if u.is_dimensionless() {
+                        return if name == "Int" { Ty::Int } else { Ty::Float };
                     }
+                    return if name == "Int" {
+                        Ty::int_with_unit(u)
+                    } else {
+                        Ty::float_with_unit(u)
+                    };
+                }
                 Ty::Con(name.clone(), applied_args)
             }
             Ty::TyCon(_) => ty.clone(),
@@ -1938,7 +1971,10 @@ impl Infer {
                 for v in vars.iter() {
                     new_excluded.push(*v);
                 }
-                Ty::Forall(vars.clone(), Box::new(self.apply_impl(inner, &new_excluded)))
+                Ty::Forall(
+                    vars.clone(),
+                    Box::new(self.apply_impl(inner, &new_excluded)),
+                )
             }
             Ty::Alias(name, inner) => {
                 Ty::Alias(name.clone(), Box::new(self.apply_impl(inner, excluded)))
@@ -1983,9 +2019,7 @@ impl Infer {
                     None => false,
                 }
             }
-            Ty::Fun(p, r) => {
-                self.occurs_in(var, p) || self.occurs_in(var, r)
-            }
+            Ty::Fun(p, r) => self.occurs_in(var, p) || self.occurs_in(var, r),
             Ty::Record(fields, row) => {
                 if fields.values().any(|v| self.occurs_in(var, v)) {
                     return true;
@@ -2017,9 +2051,7 @@ impl Infer {
             Ty::Relation(inner) => self.occurs_in(var, inner),
             Ty::Con(_, args) => args.iter().any(|a| self.occurs_in(var, a)),
             Ty::TyCon(_) => false,
-            Ty::App(f, a) => {
-                self.occurs_in(var, f) || self.occurs_in(var, a)
-            }
+            Ty::App(f, a) => self.occurs_in(var, f) || self.occurs_in(var, a),
             Ty::IO(inner) => self.occurs_in(var, inner),
             Ty::Forall(bound, inner) => {
                 if bound.contains(&var) {
@@ -2042,9 +2074,10 @@ impl Infer {
         if self.skolems.contains(&v) {
             // Allow self-binding (already handled by Var(a)==Var(b)).
             if let Ty::Var(other) = &ty
-                && *other == v {
-                    return;
-                }
+                && *other == v
+            {
+                return;
+            }
             self.error(
                 format!(
                     "rigid type variable would escape: cannot unify with {}",
@@ -2287,10 +2320,7 @@ impl Infer {
                 // A nominal `data` type unifies by name (`Con`); a structural
                 // variant alias (`type X = A {} | B {}`) unwraps to its
                 // constructor-set so two aliases with the same set unify.
-                let nominal = self
-                    .data_types
-                    .get(name)
-                    .is_some_and(|d| !d.structural);
+                let nominal = self.data_types.get(name).is_some_and(|d| !d.structural);
                 if nominal {
                     let nominal = Ty::Con(name.clone(), vec![]);
                     self.unify_dir(&nominal, &t2, span, t1_provided);
@@ -2300,10 +2330,7 @@ impl Infer {
                 }
             }
             (_, Ty::Alias(name, inner)) => {
-                let nominal = self
-                    .data_types
-                    .get(name)
-                    .is_some_and(|d| !d.structural);
+                let nominal = self.data_types.get(name).is_some_and(|d| !d.structural);
                 if nominal {
                     let nominal = Ty::Con(name.clone(), vec![]);
                     self.unify_dir(&t1, &nominal, span, t1_provided);
@@ -2332,8 +2359,7 @@ impl Infer {
                     let inst = self.instantiate_at(&scheme, span);
                     self.unify_dir(&inst, &t2, span, t1_provided);
                 } else {
-                    let (skolemised, fresh_skolems) =
-                        self.skolemise_forall_body(vars, body);
+                    let (skolemised, fresh_skolems) = self.skolemise_forall_body(vars, body);
                     self.unify_dir(&skolemised, &t2, span, t1_provided);
                     for s in fresh_skolems {
                         self.skolems.remove(&s);
@@ -2343,8 +2369,7 @@ impl Infer {
             (_, Ty::Forall(vars, body)) => {
                 if t1_provided {
                     // t2 is the required side — skolemise.
-                    let (skolemised, fresh_skolems) =
-                        self.skolemise_forall_body(vars, body);
+                    let (skolemised, fresh_skolems) = self.skolemise_forall_body(vars, body);
                     self.unify_dir(&t1, &skolemised, span, t1_provided);
                     for s in fresh_skolems {
                         self.skolems.remove(&s);
@@ -2435,9 +2460,7 @@ impl Infer {
                     );
                 }
             }
-            (Ty::Con(n1, a1), Ty::Con(n2, a2))
-                if n1 == n2 && a1.len() == a2.len() =>
-            {
+            (Ty::Con(n1, a1), Ty::Con(n2, a2)) if n1 == n2 && a1.len() == a2.len() => {
                 let a1 = a1.clone();
                 let a2 = a2.clone();
                 for (a, b) in a1.iter().zip(a2.iter()) {
@@ -2575,7 +2598,8 @@ impl Infer {
                 let b = (**b).clone();
                 self.unify_dir(&b, &t2, span, t1_provided);
             }
-            (Ty::Relation(_), Ty::Record(fields, None)) | (Ty::Record(fields, None), Ty::Relation(_))
+            (Ty::Relation(_), Ty::Record(fields, None))
+            | (Ty::Record(fields, None), Ty::Relation(_))
                 if self.in_io_do && fields.is_empty() => {}
 
             // ── Row-polymorphic variants ────────────────────────
@@ -2599,13 +2623,9 @@ impl Infer {
                 } else {
                     let d1 = self.display_ty(&t1);
                     let d2 = self.display_ty(&t2);
-                    let (exp, fnd) =
-                        if t1_provided { (d2, d1) } else { (d1, d2) };
+                    let (exp, fnd) = if t1_provided { (d2, d1) } else { (d1, d2) };
                     self.error(
-                        format!(
-                            "type mismatch: expected {}, found {}",
-                            exp, fnd
-                        ),
+                        format!("type mismatch: expected {}, found {}", exp, fnd),
                         span,
                     );
                 }
@@ -2622,13 +2642,9 @@ impl Infer {
                 } else {
                     let d1 = self.display_ty(&t1);
                     let d2 = self.display_ty(&t2);
-                    let (exp, fnd) =
-                        if t1_provided { (d2, d1) } else { (d1, d2) };
+                    let (exp, fnd) = if t1_provided { (d2, d1) } else { (d1, d2) };
                     self.error(
-                        format!(
-                            "type mismatch: expected {}, found {}",
-                            exp, fnd
-                        ),
+                        format!("type mismatch: expected {}, found {}", exp, fnd),
                         span,
                     );
                 }
@@ -2651,7 +2667,8 @@ impl Infer {
             // (`M`) does NOT unify — closing the laundering hole where
             // `x : Float 1; x = (1.5 : Float M)` silently dropped the unit.
             (Ty::Int, Ty::Con(name, args))
-                if name == "Int" && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
+                if name == "Int"
+                    && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
             {
                 if let Some(Ty::Unit(u)) = args.first() {
                     let u = u.clone();
@@ -2659,7 +2676,8 @@ impl Infer {
                 }
             }
             (Ty::Con(name, args), Ty::Int)
-                if name == "Int" && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
+                if name == "Int"
+                    && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
             {
                 if let Some(Ty::Unit(u)) = args.first() {
                     let u = u.clone();
@@ -2667,7 +2685,8 @@ impl Infer {
                 }
             }
             (Ty::Float, Ty::Con(name, args))
-                if name == "Float" && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
+                if name == "Float"
+                    && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
             {
                 if let Some(Ty::Unit(u)) = args.first() {
                     let u = u.clone();
@@ -2675,7 +2694,8 @@ impl Infer {
                 }
             }
             (Ty::Con(name, args), Ty::Float)
-                if name == "Float" && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
+                if name == "Float"
+                    && matches!(args.first(), Some(Ty::Unit(u)) if self.apply_unit(u).is_compatible_with_dimensionless()) =>
             {
                 if let Some(Ty::Unit(u)) = args.first() {
                     let u = u.clone();
@@ -2841,8 +2861,7 @@ impl Infer {
                 // `t1` is the provided/actual side when `t1_provided` (see
                 // `unify`), so the expected type is `t2` then — and vice
                 // versa after a contravariant flip or a check-mode call.
-                let (exp, fnd) =
-                    if t1_provided { (d2, d1) } else { (d1, d2) };
+                let (exp, fnd) = if t1_provided { (d2, d1) } else { (d1, d2) };
                 self.error(
                     format!("type mismatch: expected {}, found {}", exp, fnd),
                     span,
@@ -2941,8 +2960,7 @@ impl Infer {
         match (r1, r2) {
             (None, None) => {
                 if !only1.is_empty() || !only2.is_empty() {
-                    let extras: Vec<_> =
-                        only1.keys().chain(only2.keys()).cloned().collect();
+                    let extras: Vec<_> = only1.keys().chain(only2.keys()).cloned().collect();
                     self.error(
                         format!(
                             "record fields don't match: extra fields {{{}}}",
@@ -2956,10 +2974,7 @@ impl Infer {
                 if !only1.is_empty() {
                     let names: Vec<_> = only1.keys().cloned().collect();
                     self.error(
-                        format!(
-                            "record has unexpected fields: {{{}}}",
-                            names.join(", ")
-                        ),
+                        format!("record has unexpected fields: {{{}}}", names.join(", ")),
                         span,
                     );
                 }
@@ -2970,10 +2985,7 @@ impl Infer {
                 if !only2.is_empty() {
                     let names: Vec<_> = only2.keys().cloned().collect();
                     self.error(
-                        format!(
-                            "record has unexpected fields: {{{}}}",
-                            names.join(", ")
-                        ),
+                        format!("record has unexpected fields: {{{}}}", names.join(", ")),
                         span,
                     );
                 }
@@ -2983,10 +2995,7 @@ impl Infer {
             (Some(rv1), Some(rv2)) => {
                 if rv1 == rv2 {
                     if !only1.is_empty() || !only2.is_empty() {
-                        self.error(
-                            "record fields don't match".into(),
-                            span,
-                        );
+                        self.error("record fields don't match".into(), span);
                     }
                 } else if only1.is_empty() && only2.is_empty() {
                     // Both rows match exactly — link them via `unify` so
@@ -3091,8 +3100,7 @@ impl Infer {
         match (r1, r2) {
             (None, None) => {
                 if !only1.is_empty() || !only2.is_empty() {
-                    let extras: Vec<_> =
-                        only1.keys().chain(only2.keys()).cloned().collect();
+                    let extras: Vec<_> = only1.keys().chain(only2.keys()).cloned().collect();
                     self.error(
                         format!(
                             "variant constructors don't match: extra constructors {}",
@@ -3106,10 +3114,7 @@ impl Infer {
                 if !only1.is_empty() {
                     let names: Vec<_> = only1.keys().cloned().collect();
                     self.error(
-                        format!(
-                            "variant has unexpected constructors: {}",
-                            names.join(", ")
-                        ),
+                        format!("variant has unexpected constructors: {}", names.join(", ")),
                         span,
                     );
                 }
@@ -3120,10 +3125,7 @@ impl Infer {
                 if !only2.is_empty() {
                     let names: Vec<_> = only2.keys().cloned().collect();
                     self.error(
-                        format!(
-                            "variant has unexpected constructors: {}",
-                            names.join(", ")
-                        ),
+                        format!("variant has unexpected constructors: {}", names.join(", ")),
                         span,
                     );
                 }
@@ -3133,10 +3135,7 @@ impl Infer {
             (Some(rv1), Some(rv2)) => {
                 if rv1 == rv2 {
                     if !only1.is_empty() || !only2.is_empty() {
-                        self.error(
-                            "variant constructors don't match".into(),
-                            span,
-                        );
+                        self.error("variant constructors don't match".into(), span);
                     }
                 } else if only1.is_empty() && only2.is_empty() {
                     self.unify(&Ty::Var(rv1), &Ty::Var(rv2), span);
@@ -3166,11 +3165,7 @@ impl Infer {
     }
 
     /// Expand a nominal ADT (`Con(name, args)`) to a structural `Variant`.
-    fn con_to_variant(
-        &mut self,
-        name: &str,
-        args: &[Ty],
-    ) -> Option<Ty> {
+    fn con_to_variant(&mut self, name: &str, args: &[Ty]) -> Option<Ty> {
         let info = self.data_types.get(name)?.clone();
         // Save and restore annotation_vars so this doesn't corrupt
         // the enclosing declaration's type variable mapping.
@@ -3216,11 +3211,7 @@ impl Infer {
         {
             return scheme.ty.clone();
         }
-        let mapping: HashMap<TyVar, Ty> = scheme
-            .vars
-            .iter()
-            .map(|v| (*v, self.fresh()))
-            .collect();
+        let mapping: HashMap<TyVar, Ty> = scheme.vars.iter().map(|v| (*v, self.fresh())).collect();
         // Create deferred constraints for each constraint in the scheme.
         //
         // Most constraints reference a TyVar in `scheme.vars` (e.g.
@@ -3236,10 +3227,7 @@ impl Infer {
             let target_var = match mapping.get(&c.type_var) {
                 Some(Ty::Var(new_var)) => *new_var,
                 Some(_) => {
-                    debug_assert!(
-                        false,
-                        "instantiate_at: scheme constraint mapped to non-Var",
-                    );
+                    debug_assert!(false, "instantiate_at: scheme constraint mapped to non-Var",);
                     continue;
                 }
                 None => c.type_var,
@@ -3297,11 +3285,7 @@ impl Infer {
     /// be removed from `self.skolems` once the body check completes.
     /// Unit vars are freshened as in `instantiate_at` (no unit-skolem
     /// mechanism exists yet); deferred constraints follow the new skolems.
-    fn skolemise_scheme(
-        &mut self,
-        scheme: &Scheme,
-        span: Span,
-    ) -> (Ty, Vec<TyVar>, Vec<UnitVar>) {
+    fn skolemise_scheme(&mut self, scheme: &Scheme, span: Span) -> (Ty, Vec<TyVar>, Vec<UnitVar>) {
         if scheme.vars.is_empty() && scheme.unit_vars.is_empty() {
             return (scheme.ty.clone(), Vec::new(), Vec::new());
         }
@@ -3448,9 +3432,7 @@ impl Infer {
                 });
                 Ty::Variant(new_ctors, new_row)
             }
-            Ty::Relation(inner) => {
-                Ty::Relation(Box::new(self.subst_ty(inner, mapping)))
-            }
+            Ty::Relation(inner) => Ty::Relation(Box::new(self.subst_ty(inner, mapping))),
             Ty::Con(name, args) => Ty::Con(
                 name.clone(),
                 args.iter().map(|a| self.subst_ty(a, mapping)).collect(),
@@ -3467,10 +3449,7 @@ impl Infer {
                 for b in bound {
                     shadowed.remove(b);
                 }
-                Ty::Forall(
-                    bound.clone(),
-                    Box::new(self.subst_ty(inner, &shadowed)),
-                )
+                Ty::Forall(bound.clone(), Box::new(self.subst_ty(inner, &shadowed)))
             }
             // Aliases must be substituted through: `collect_free_vars`
             // descends into the alias body, so quantified vars can live
@@ -3478,10 +3457,9 @@ impl Infer {
             // share the original var across every instantiation — pinning
             // it at the first use site and falsely rejecting later uses
             // at other types.
-            Ty::Alias(name, inner) => Ty::Alias(
-                name.clone(),
-                Box::new(self.subst_ty(inner, mapping)),
-            ),
+            Ty::Alias(name, inner) => {
+                Ty::Alias(name.clone(), Box::new(self.subst_ty(inner, mapping)))
+            }
             Ty::Assoc(name, inner) => {
                 let inner = self.subst_ty(inner, mapping);
                 Ty::Assoc(name.clone(), Box::new(inner))
@@ -3498,22 +3476,28 @@ impl Infer {
                 Box::new(self.subst_unit_vars_in_ty(p, mapping)),
                 Box::new(self.subst_unit_vars_in_ty(r, mapping)),
             ),
-            Ty::Relation(inner) => Ty::Relation(Box::new(self.subst_unit_vars_in_ty(inner, mapping))),
+            Ty::Relation(inner) => {
+                Ty::Relation(Box::new(self.subst_unit_vars_in_ty(inner, mapping)))
+            }
             Ty::Record(fields, row) => {
-                let new_fields = fields.iter()
+                let new_fields = fields
+                    .iter()
                     .map(|(k, v)| (k.clone(), self.subst_unit_vars_in_ty(v, mapping)))
                     .collect();
                 Ty::Record(new_fields, *row)
             }
             Ty::Variant(ctors, row) => {
-                let new_ctors = ctors.iter()
+                let new_ctors = ctors
+                    .iter()
                     .map(|(k, v)| (k.clone(), self.subst_unit_vars_in_ty(v, mapping)))
                     .collect();
                 Ty::Variant(new_ctors, *row)
             }
             Ty::Con(name, args) => Ty::Con(
                 name.clone(),
-                args.iter().map(|a| self.subst_unit_vars_in_ty(a, mapping)).collect(),
+                args.iter()
+                    .map(|a| self.subst_unit_vars_in_ty(a, mapping))
+                    .collect(),
             ),
             Ty::App(f, a) => Ty::App(
                 Box::new(self.subst_unit_vars_in_ty(f, mapping)),
@@ -3541,11 +3525,18 @@ impl Infer {
         if u.vars.is_empty() {
             return u.clone();
         }
-        let new_vars = u.vars.iter().map(|(&v, &exp)| {
-            let new_v = mapping.get(&v).copied().unwrap_or(v);
-            (new_v, exp)
-        }).collect();
-        UnitTy { bases: u.bases.clone(), vars: new_vars }
+        let new_vars = u
+            .vars
+            .iter()
+            .map(|(&v, &exp)| {
+                let new_v = mapping.get(&v).copied().unwrap_or(v);
+                (new_v, exp)
+            })
+            .collect();
+        UnitTy {
+            bases: u.bases.clone(),
+            vars: new_vars,
+        }
     }
 
     /// Collect all free (unsolved) unit variables in a type.
@@ -3582,18 +3573,20 @@ impl Infer {
                     self.collect_free_unit_vars(v, out);
                 }
                 if let Some(rv) = row
-                    && let Some(resolved) = self.subst.get(rv) {
-                        self.collect_free_unit_vars(resolved, out);
-                    }
+                    && let Some(resolved) = self.subst.get(rv)
+                {
+                    self.collect_free_unit_vars(resolved, out);
+                }
             }
             Ty::Variant(ctors, row) => {
                 for v in ctors.values() {
                     self.collect_free_unit_vars(v, out);
                 }
                 if let Some(rv) = row
-                    && let Some(resolved) = self.subst.get(rv) {
-                        self.collect_free_unit_vars(resolved, out);
-                    }
+                    && let Some(resolved) = self.subst.get(rv)
+                {
+                    self.collect_free_unit_vars(resolved, out);
+                }
             }
             Ty::Con(_, args) => {
                 for a in args {
@@ -3624,8 +3617,7 @@ impl Infer {
         let applied = self.apply(ty);
         let env_fv = self.free_vars_in_env();
         let ty_fv = self.free_vars(&applied);
-        let gen_vars: Vec<TyVar> =
-            ty_fv.difference(&env_fv).copied().collect();
+        let gen_vars: Vec<TyVar> = ty_fv.difference(&env_fv).copied().collect();
         let gen_set: HashSet<TyVar> = gen_vars.iter().copied().collect();
         // B7: Track monad vars that are being let-generalized (quantified
         // into a local let-binding's scheme). At Phase 5, if such a var is
@@ -3685,9 +3677,7 @@ impl Infer {
                 // make `instantiate_at` fail to freshen this constraint (its
                 // `mapping` is keyed on the scheme's `vars`), silently dropping
                 // the trait obligation at the use site.
-                Ty::Var(v) if gen_set.contains(&v) => {
-                    kept.push(TyConstraint { type_var: v, ..c })
-                }
+                Ty::Var(v) if gen_set.contains(&v) => kept.push(TyConstraint { type_var: v, ..c }),
                 Ty::Var(_) => {} // env-bound var, not generalized
                 concrete => {
                     // Constraint resolved to a concrete type — check now
@@ -3769,9 +3759,7 @@ impl Infer {
                 }
                 if let Some(rv) = row {
                     match self.subst.get(rv) {
-                        Some(resolved) => {
-                            self.collect_free_vars(resolved, out)
-                        }
+                        Some(resolved) => self.collect_free_vars(resolved, out),
                         None => {
                             out.insert(*rv);
                         }
@@ -3784,9 +3772,7 @@ impl Infer {
                 }
                 if let Some(rv) = row {
                     match self.subst.get(rv) {
-                        Some(resolved) => {
-                            self.collect_free_vars(resolved, out)
-                        }
+                        Some(resolved) => self.collect_free_vars(resolved, out),
                         None => {
                             out.insert(*rv);
                         }
@@ -3898,8 +3884,12 @@ impl Infer {
     /// stdlib's internal `\a`.
     fn bind_at(&mut self, name: &str, scheme: Scheme, span: Span) {
         if span.start < crate::base::PRELUDE_SPAN_OFFSET {
-            let shadows_enclosing =
-                self.scopes.iter().rev().skip(1).any(|s| s.contains_key(name));
+            let shadows_enclosing = self
+                .scopes
+                .iter()
+                .rev()
+                .skip(1)
+                .any(|s| s.contains_key(name));
             if shadows_enclosing {
                 self.error(
                     format!(
@@ -3924,8 +3914,7 @@ impl Infer {
         // so a USER fn named `map` binds into `scopes` here and shadows
         // correctly via the scopes-only `lookup`.
         if self.in_register_builtins
-            && (crate::base::is_gated_stdlib(name)
-                || crate::base::is_gated_special_form(name))
+            && (crate::base::is_gated_stdlib(name) || crate::base::is_gated_special_form(name))
         {
             self.stdlib_schemes.insert(name.to_string(), scheme);
             return;
@@ -3981,11 +3970,7 @@ impl Infer {
             .any(|(_, fields)| fields.contains_key(name))
     }
 
-    fn lookup_instantiate_at(
-        &mut self,
-        name: &str,
-        span: Span,
-    ) -> Option<Ty> {
+    fn lookup_instantiate_at(&mut self, name: &str, span: Span) -> Option<Ty> {
         let scheme = self.lookup(name)?.clone();
         let inst = self.instantiate_at(&scheme, span);
         Some(inst)
@@ -4207,9 +4192,10 @@ impl Infer {
                     }
                     // Parameterized alias referenced bare (`Pair` with 0 args).
                     if self.param_aliases.contains_key(name)
-                        && let Some(t) = self.expand_param_alias(ty) {
-                            return t;
-                        }
+                        && let Some(t) = self.expand_param_alias(ty)
+                    {
+                        return t;
+                    }
                     if let Some(aliased) = self.aliases.get(name).cloned() {
                         // Freshen any free type variables in the alias body
                         // (e.g. the `a` in `type Box = {val: a}`): the body
@@ -4223,10 +4209,8 @@ impl Infer {
                         let aliased = if fv.is_empty() {
                             aliased
                         } else {
-                            let mapping: HashMap<TyVar, Ty> = fv
-                                .into_iter()
-                                .map(|v| (v, self.fresh()))
-                                .collect();
+                            let mapping: HashMap<TyVar, Ty> =
+                                fv.into_iter().map(|v| (v, self.fresh())).collect();
                             // These freshly-minted alias-body vars must be
                             // quantified in the enclosing annotation's scheme.
                             // Without registering them in `annotation_vars`,
@@ -4248,8 +4232,7 @@ impl Infer {
                             if self.in_type_annotation {
                                 for fresh in mapping.values() {
                                     if let Ty::Var(v) = fresh {
-                                        self.annotation_vars
-                                            .insert(format!("__alias_fv#{v}"), *v);
+                                        self.annotation_vars.insert(format!("__alias_fv#{v}"), *v);
                                         self.alias_free_vars.insert(*v);
                                     }
                                 }
@@ -4290,13 +4273,10 @@ impl Infer {
                     .iter()
                     .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
                     .collect();
-                let row_var =
-                    rest.as_ref().map(|name| self.annotation_var(name));
+                let row_var = rest.as_ref().map(|name| self.annotation_var(name));
                 Ty::Record(field_tys, row_var)
             }
-            ast::TypeKind::Relation(inner) => {
-                Ty::Relation(Box::new(self.ast_type_to_ty(inner)))
-            }
+            ast::TypeKind::Relation(inner) => Ty::Relation(Box::new(self.ast_type_to_ty(inner))),
             ast::TypeKind::Function { param, result } => Ty::Fun(
                 Box::new(self.ast_type_to_ty(param)),
                 Box::new(self.ast_type_to_ty(result)),
@@ -4329,33 +4309,22 @@ impl Infer {
             // the resolved `<>` fold. For now it unifies as a fresh var; the
             // per-callsite grounding is driven by the fold-constraint machinery.
             ast::TypeKind::Callsite => self.fresh(),
-            ast::TypeKind::Variant {
-                constructors,
-                rest,
-            } => {
+            ast::TypeKind::Variant { constructors, rest } => {
                 let ctor_tys: FieldMap = constructors
                     .iter()
                     .map(|c| {
                         let field_tys: FieldMap = c
                             .fields
                             .iter()
-                            .map(|f| {
-                                (
-                                    f.name.clone(),
-                                    self.ast_type_to_ty(&f.value),
-                                )
-                            })
+                            .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
                             .collect();
                         (c.name.clone(), Ty::Record(field_tys, None))
                     })
                     .collect();
-                let row_var =
-                    rest.as_ref().map(|name| self.annotation_var(name));
+                let row_var = rest.as_ref().map(|name| self.annotation_var(name));
                 Ty::Variant(ctor_tys, row_var)
             }
-            ast::TypeKind::IO { ty: inner_ty } => {
-                Ty::IO(Box::new(self.ast_type_to_ty(inner_ty)))
-            }
+            ast::TypeKind::IO { ty: inner_ty } => Ty::IO(Box::new(self.ast_type_to_ty(inner_ty))),
             ast::TypeKind::UnitAnnotated { base, unit } => {
                 // Convert the base (`Int`/`Float`) without the bare-numeric
                 // check — the unit is supplied right here.
@@ -4493,11 +4462,7 @@ impl Infer {
                     self.display_ty_inner(p, true),
                     self.display_ty_inner(r, false)
                 );
-                if in_fun {
-                    format!("({})", s)
-                } else {
-                    s
-                }
+                if in_fun { format!("({})", s) } else { s }
             }
             Ty::Record(fields, row) => {
                 if fields.is_empty() && row.is_none() {
@@ -4505,17 +4470,12 @@ impl Infer {
                 }
                 let mut parts: Vec<String> = fields
                     .iter()
-                    .map(|(n, t)| {
-                        format!("{} {}", n, self.display_ty_atom(t))
-                    })
+                    .map(|(n, t)| format!("{} {}", n, self.display_ty_atom(t)))
                     .collect();
                 if let Some(rv) = row {
                     match self.subst.get(rv) {
                         Some(resolved) => {
-                            parts.push(format!(
-                                "| {}",
-                                self.display_ty(resolved)
-                            ));
+                            parts.push(format!("| {}", self.display_ty(resolved)));
                         }
                         None => {
                             let idx = *rv as usize;
@@ -4542,19 +4502,20 @@ impl Infer {
             Ty::Con(name, args) => {
                 // Unit-bearing Int/Float: `Con("Int", [Unit(u)])` → `Int u`,
                 // collapsing to `Int`/`Float` when the unit is dimensionless.
-                if (name == "Int" || name == "Float") && args.len() == 1
-                    && let Ty::Unit(u) = args[0].peel_alias() {
-                        let u = self.apply_unit(u);
-                        if u.is_dimensionless() {
-                            return name.clone();
-                        }
-                        return format!("{} {}", name, u.display());
+                if (name == "Int" || name == "Float")
+                    && args.len() == 1
+                    && let Ty::Unit(u) = args[0].peel_alias()
+                {
+                    let u = self.apply_unit(u);
+                    if u.is_dimensionless() {
+                        return name.clone();
                     }
+                    return format!("{} {}", name, u.display());
+                }
                 if args.is_empty() {
                     name.clone()
                 } else {
-                    let args_str: Vec<String> =
-                        args.iter().map(|a| self.display_ty(a)).collect();
+                    let args_str: Vec<String> = args.iter().map(|a| self.display_ty(a)).collect();
                     format!("{} {}", name, args_str.join(" "))
                 }
             }
@@ -4562,8 +4523,7 @@ impl Infer {
                 let mut parts: Vec<String> = ctors
                     .iter()
                     .map(|(name, fields_ty)| {
-                        let fields_str =
-                            self.display_ty_inner(fields_ty, false);
+                        let fields_str = self.display_ty_inner(fields_ty, false);
                         format!("{} {}", name, fields_str)
                     })
                     .collect();
@@ -4587,11 +4547,7 @@ impl Infer {
             }
             Ty::TyCon(name) => name.clone(),
             Ty::App(f, a) => {
-                format!(
-                    "({} {})",
-                    self.display_ty(f),
-                    self.display_ty(a)
-                )
+                format!("({} {})", self.display_ty(f), self.display_ty(a))
             }
             Ty::IO(inner) => {
                 format!("IO {}", self.display_ty(inner))
@@ -4616,11 +4572,7 @@ impl Infer {
                         names.join(" "),
                         self.display_ty_inner(inner, false)
                     );
-                    if in_fun {
-                        format!("({})", s)
-                    } else {
-                        s
-                    }
+                    if in_fun { format!("({})", s) } else { s }
                 }
             }
             Ty::Alias(name, _) => name.clone(),
@@ -4696,11 +4648,7 @@ impl Infer {
         true
     }
 
-    fn instantiate_ctor(
-        &mut self,
-        name: &str,
-        _span: Span,
-    ) -> Option<(Ty, Ty)> {
+    fn instantiate_ctor(&mut self, name: &str, _span: Span) -> Option<(Ty, Ty)> {
         let infos = self.constructors.get(name)?.clone();
 
         // A constructor name shared by more than one ADT is genuinely
@@ -4752,18 +4700,9 @@ impl Infer {
     ///
     /// Returns `(data_ty, payload_record_ty)` like `instantiate_ctor`, or
     /// `None` when `data_name` is not a data type or has no such constructor.
-    fn instantiate_qualified_ctor(
-        &mut self,
-        data_name: &str,
-        ctor_name: &str,
-    ) -> Option<(Ty, Ty)> {
+    fn instantiate_qualified_ctor(&mut self, data_name: &str, ctor_name: &str) -> Option<(Ty, Ty)> {
         let info = self.data_types.get(data_name)?.clone();
-        let fields = info
-            .ctors
-            .iter()
-            .find(|(n, _)| n == ctor_name)?
-            .1
-            .clone();
+        let fields = info.ctors.iter().find(|(n, _)| n == ctor_name)?.1.clone();
 
         let saved_annotation_vars = self.annotation_vars.clone();
         self.annotation_vars.clear();
@@ -4874,7 +4813,11 @@ impl Infer {
             for a in &args {
                 let arg_ty = self.infer_expr(a);
                 let ret = self.fresh();
-                self.unify(&result, &Ty::Fun(Box::new(arg_ty), Box::new(ret.clone())), a.span);
+                self.unify(
+                    &result,
+                    &Ty::Fun(Box::new(arg_ty), Box::new(ret.clone())),
+                    a.span,
+                );
                 result = ret;
             }
             let fold_fields: Vec<String> = self
@@ -4929,7 +4872,11 @@ impl Infer {
         for a in &args {
             let arg_ty = self.infer_expr(a);
             let ret = self.fresh();
-            self.unify(&result, &Ty::Fun(Box::new(arg_ty), Box::new(ret.clone())), a.span);
+            self.unify(
+                &result,
+                &Ty::Fun(Box::new(arg_ty), Box::new(ret.clone())),
+                a.span,
+            );
             result = ret;
         }
         // Now the dictionary types are ground; resolve each against the
@@ -4973,9 +4920,7 @@ impl Infer {
     /// Peel an application spine whose head is `^name` into (name, args in
     /// application order, head span). Returns `None` when the expression is
     /// not a `^name` applied to at least one argument.
-    fn peel_implicit_ref_app(
-        expr: &ast::Expr,
-    ) -> Option<(&str, Vec<&ast::Expr>, Span)> {
+    fn peel_implicit_ref_app(expr: &ast::Expr) -> Option<(&str, Vec<&ast::Expr>, Span)> {
         let mut args: Vec<&ast::Expr> = Vec::new();
         let mut head = expr;
         while let ast::ExprKind::App { func, arg } = &head.node {
@@ -5041,7 +4986,12 @@ impl Infer {
     /// - A `with {compare …}` / `with intOrdDesc` frame resolves to the `with`
     ///   record value, bound by codegen under `with-record alias`; the path is
     ///   the field's nesting inside that record (minus the field itself).
-    fn resolve_dict(&mut self, field: &str, field_ty: &Ty, span: Span) -> Option<(Binding, Vec<String>)> {
+    fn resolve_dict(
+        &mut self,
+        field: &str,
+        field_ty: &Ty,
+        span: Span,
+    ) -> Option<(Binding, Vec<String>)> {
         // Candidate 0: an enclosing `with` frame that binds `field`. Snapshot
         // the frames first (immutable scan) so the speculative unify below can
         // borrow `self` mutably.
@@ -5102,7 +5052,11 @@ impl Infer {
                     let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
                     for (path, fty) in frontier {
                         if *path.last().expect("non-empty path") == field {
-                            candidates.push((Binding::User(bind_name.clone()), path.clone(), fty.clone()));
+                            candidates.push((
+                                Binding::User(bind_name.clone()),
+                                path.clone(),
+                                fty.clone(),
+                            ));
                         }
                         if let Ty::Record(sub, _) = self.apply(&fty).peel_alias().clone() {
                             for (f, t) in sub {
@@ -5169,7 +5123,8 @@ impl Infer {
             self.implicit_refs.insert(synth, (root, path));
             frag_spans.push(synth);
         }
-        self.fold_dict_args.insert(span, (field.to_string(), frag_spans));
+        self.fold_dict_args
+            .insert(span, (field.to_string(), frag_spans));
     }
 
     /// Speculatively unify `field_ty` against `expected` on a throwaway clone
@@ -5192,7 +5147,11 @@ impl Infer {
         self.unify(&field_ty.clone(), expected, span);
         std::mem::swap(&mut self.subst, &mut trial);
         std::mem::swap(&mut self.errors, &mut trial_errors);
-        if trial_errors.is_empty() { Some(trial) } else { None }
+        if trial_errors.is_empty() {
+            Some(trial)
+        } else {
+            None
+        }
     }
 
     /// then shallowest record-nesting depth (a binding's own fields beat
@@ -5220,12 +5179,7 @@ impl Infer {
         // don't collide). A direct NON-`with` binding keeps its historical
         // meaning — the BFS field projection off that binding.
         let mut with_candidate: Option<(Binding, Vec<String>, Ty)> = None;
-        for (with_frame, scope) in self
-            .with_scope_stack
-            .iter()
-            .zip(self.scopes.iter())
-            .rev()
-        {
+        for (with_frame, scope) in self.with_scope_stack.iter().zip(self.scopes.iter()).rev() {
             if let Some((with_span, field_schemes)) = with_frame
                 && let Some(scheme) = field_schemes.get(name)
             {
@@ -5269,7 +5223,9 @@ impl Infer {
         for scope in self.scopes.iter().rev() {
             for (bind_name, scheme) in scope {
                 let root_ty = self.apply(&scheme.ty);
-                let Ty::Record(fields, _) = root_ty.peel_alias() else { continue };
+                let Ty::Record(fields, _) = root_ty.peel_alias() else {
+                    continue;
+                };
                 let mut group: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
                 let mut frontier: Vec<(Vec<String>, Ty)> = fields
                     .iter()
@@ -5280,7 +5236,11 @@ impl Infer {
                     let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
                     for (path, field_ty) in frontier.drain(..) {
                         if *path.last().expect("non-empty path") == name {
-                            group.push((Binding::User(bind_name.clone()), path.clone(), field_ty.clone()));
+                            group.push((
+                                Binding::User(bind_name.clone()),
+                                path.clone(),
+                                field_ty.clone(),
+                            ));
                         }
                         if let Ty::Record(sub, _) = self.apply(&field_ty).peel_alias() {
                             for (f, t) in sub.iter().rev() {
@@ -5333,7 +5293,12 @@ impl Infer {
                 let options = winners
                     .iter()
                     .map(|(root, path, field_ty, _)| {
-                        format!("{}.{} : {}", root, path.join("."), self.display_ty(field_ty))
+                        format!(
+                            "{}.{} : {}",
+                            root,
+                            path.join("."),
+                            self.display_ty(field_ty)
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -5354,9 +5319,7 @@ impl Infer {
             format!("searched: {}", searched.join(", "))
         };
         self.error(
-            format!(
-                "no in-scope record field '{name}' matches the expected type ({detail})"
-            ),
+            format!("no in-scope record field '{name}' matches the expected type ({detail})"),
             span,
         );
         Ty::Error
@@ -5401,10 +5364,7 @@ impl Infer {
         // which stays lexically correct across nesting where the bare slot is
         // runtime-order-dependent. Codegen emits each candidate as an
         // `ImplicitRef` (the `^` path), which compiles `Var(root)` directly.
-        let innermost_with_idx = self
-            .with_scope_stack
-            .iter()
-            .rposition(Option::is_some);
+        let innermost_with_idx = self.with_scope_stack.iter().rposition(Option::is_some);
         for (idx, (with_frame, _scope)) in self
             .with_scope_stack
             .iter()
@@ -5497,11 +5457,19 @@ impl Infer {
                 // `with` field surfaced as a decl in the Phase-4z body pass
                 // (where the `with` frame is not on `with_scope_stack`).
                 if bind_name == name {
-                    candidates.push((Binding::User(bind_name.clone()), Vec::new(), root_ty.clone()));
+                    candidates.push((
+                        Binding::User(bind_name.clone()),
+                        Vec::new(),
+                        root_ty.clone(),
+                    ));
                 }
                 if let Ty::Record(fields, _) = root_ty.peel_alias() {
                     for (f, t) in fields.iter().rev() {
-                        frontier.push((Binding::User(bind_name.clone()), vec![f.clone()], t.clone()));
+                        frontier.push((
+                            Binding::User(bind_name.clone()),
+                            vec![f.clone()],
+                            t.clone(),
+                        ));
                     }
                 }
             }
@@ -5547,10 +5515,18 @@ impl Infer {
     /// same fold over the ORIGINAL spine.
     fn try_infer_collect_fold(&mut self, expr: &ast::Expr) -> Option<Ty> {
         // Peel `App(App(CollectFold(name), folder), init)`.
-        let ast::ExprKind::App { func: f1, arg: init } = &expr.node else {
+        let ast::ExprKind::App {
+            func: f1,
+            arg: init,
+        } = &expr.node
+        else {
             return None;
         };
-        let ast::ExprKind::App { func: f0, arg: folder } = &f1.node else {
+        let ast::ExprKind::App {
+            func: f0,
+            arg: folder,
+        } = &f1.node
+        else {
             return None;
         };
         let ast::ExprKind::CollectFold(name) = &f0.node else {
@@ -5671,15 +5647,13 @@ impl Infer {
         // shape; the recorded `Ty` is applied/displayed at extraction time.
         if expr_is_todo_ref(expr) {
             self.todo_types.push((expr.span, ty.clone()));
-            self.todo_scopes
-                .push((expr.span, self.visible_bindings()));
+            self.todo_scopes.push((expr.span, self.visible_bindings()));
         }
         // Same capture for `base.trace`: the traced value's type and the local
         // bindings in scope, so the runtime trace report mirrors `todo`'s.
         if expr_is_trace_ref(expr) {
             self.trace_types.push((expr.span, ty.clone()));
-            self.trace_scopes
-                .push((expr.span, self.visible_bindings()));
+            self.trace_scopes.push((expr.span, self.visible_bindings()));
         }
         ty
     }
@@ -5695,10 +5669,7 @@ impl Infer {
                 self.monad_vars.push((expr.span, m));
                 Ty::Fun(
                     Box::new(Ty::Var(a)),
-                    Box::new(Ty::App(
-                        Box::new(Ty::Var(m)),
-                        Box::new(Ty::Var(a)),
-                    )),
+                    Box::new(Ty::App(Box::new(Ty::Var(m)), Box::new(Ty::Var(a)))),
                 )
             }
 
@@ -5720,20 +5691,11 @@ impl Infer {
                 Ty::Fun(
                     Box::new(Ty::Fun(
                         Box::new(Ty::Var(a)),
-                        Box::new(Ty::App(
-                            Box::new(Ty::Var(m)),
-                            Box::new(Ty::Var(b)),
-                        )),
+                        Box::new(Ty::App(Box::new(Ty::Var(m)), Box::new(Ty::Var(b)))),
                     )),
                     Box::new(Ty::Fun(
-                        Box::new(Ty::App(
-                            Box::new(Ty::Var(m)),
-                            Box::new(Ty::Var(a)),
-                        )),
-                        Box::new(Ty::App(
-                            Box::new(Ty::Var(m)),
-                            Box::new(Ty::Var(b)),
-                        )),
+                        Box::new(Ty::App(Box::new(Ty::Var(m)), Box::new(Ty::Var(a)))),
+                        Box::new(Ty::App(Box::new(Ty::Var(m)), Box::new(Ty::Var(b)))),
                     )),
                 )
             }
@@ -5801,10 +5763,8 @@ impl Infer {
                     // Deeper `with` frames are restored before the body compiles
                     // and their aliases ARE present in the operand env's
                     // prototype, so they still redirect.
-                    let innermost_with_idx = self
-                        .with_scope_stack
-                        .iter()
-                        .rposition(Option::is_some);
+                    let innermost_with_idx =
+                        self.with_scope_stack.iter().rposition(Option::is_some);
                     for (idx, (with_frame, scope)) in self
                         .with_scope_stack
                         .iter()
@@ -5829,10 +5789,7 @@ impl Infer {
                     }
                     ty
                 } else {
-                    self.error(
-                        format!("undefined variable '{}'", name),
-                        expr.span,
-                    );
+                    self.error(format!("undefined variable '{}'", name), expr.span);
                     Ty::Error
                 }
             }
@@ -5845,16 +5802,15 @@ impl Infer {
                 if let Some(data_name) = self.resolve_with_imported_ctor(name)
                     && let Some((data_ty, record_ty)) =
                         self.instantiate_qualified_ctor(&data_name, name)
-                    {
-                        return Ty::Fun(Box::new(record_ty), Box::new(data_ty));
-                    }
+                {
+                    return Ty::Fun(Box::new(record_ty), Box::new(data_ty));
+                }
                 // A bare BUILT-IN constructor in user code must be qualified
                 // by its data type, exactly like a user constructor
                 // (`Maybe.Just`, `Result.Ok`, `Bool.True`, …). Prelude-internal
                 // uses (shifted spans) and pattern positions (which go through
                 // a different arm) are exempt.
-                if self.is_builtin_ctor(name)
-                    && expr.span.start < crate::base::PRELUDE_SPAN_OFFSET
+                if self.is_builtin_ctor(name) && expr.span.start < crate::base::PRELUDE_SPAN_OFFSET
                 {
                     let ty = self
                         .constructors
@@ -5863,9 +5819,7 @@ impl Infer {
                         .map(|i| i.data_type.as_str())
                         .unwrap_or("Type");
                     self.error(
-                        format!(
-                            "constructor '{name}' must be qualified (e.g. `{ty}.{name}`)"
-                        ),
+                        format!("constructor '{name}' must be qualified (e.g. `{ty}.{name}`)"),
                         expr.span,
                     );
                     Ty::Error
@@ -5881,9 +5835,7 @@ impl Infer {
                         expr.span,
                     );
                     Ty::Error
-                } else if let Some((data_ty, record_ty)) =
-                    self.instantiate_ctor(name, expr.span)
-                {
+                } else if let Some((data_ty, record_ty)) = self.instantiate_ctor(name, expr.span) {
                     // Every constructor — including nullary ones — is a
                     // function from its record payload to its data type:
                     // `True : {} -> Bool`, `Just : {value: a} -> Maybe a`,
@@ -5901,10 +5853,7 @@ impl Infer {
                     // A capitalized name that isn't a constructor. Units are
                     // no longer declared, so there's no table to consult for
                     // the old value-literal hint — just report it plainly.
-                    self.error(
-                        format!("unknown constructor '{}'", name),
-                        expr.span,
-                    );
+                    self.error(format!("unknown constructor '{}'", name), expr.span);
                     Ty::Error
                 }
             }
@@ -5948,10 +5897,7 @@ impl Infer {
                     // code viewer — it has no effect on the type or semantics.
                     ty
                 } else {
-                    self.error(
-                        format!("unknown source relation '*{}'", name),
-                        expr.span,
-                    );
+                    self.error(format!("unknown source relation '*{}'", name), expr.span);
                     Ty::Error
                 }
             }
@@ -6032,10 +5978,7 @@ impl Infer {
                         return ty;
                     }
                     self.error(
-                        format!(
-                            "data type '{}' has no constructor '{}'",
-                            type_name, field
-                        ),
+                        format!("data type '{}' has no constructor '{}'", type_name, field),
                         expr.span,
                     );
                     return Ty::Error;
@@ -6115,13 +6058,20 @@ impl Infer {
                     && n == "base"
                     && matches!(
                         field.as_str(),
-                        "fetch" | "fetchWith" | "listen" | "listenOn"
-                            | "count" | "union" | "sum" | "bind"
+                        "fetch"
+                            | "fetchWith"
+                            | "listen"
+                            | "listenOn"
+                            | "count"
+                            | "union"
+                            | "sum"
+                            | "bind"
                     )
                     && let Some(scheme) = self.lookup_stdlib(field).cloned()
                 {
                     if let Some(sf) = StdlibFn::from_name(field) {
-                        self.resolved_calls.insert(expr.span, FnIdentity::Stdlib(sf));
+                        self.resolved_calls
+                            .insert(expr.span, FnIdentity::Stdlib(sf));
                     }
                     let ty = self.instantiate_at(&scheme, expr.span);
                     self.field_accesses.push((expr.span, ty.clone()));
@@ -6146,7 +6096,8 @@ impl Infer {
                     && n == "base"
                     && let Some(sf) = StdlibFn::from_name(field)
                 {
-                    self.resolved_calls.insert(expr.span, FnIdentity::Stdlib(sf));
+                    self.resolved_calls
+                        .insert(expr.span, FnIdentity::Stdlib(sf));
                 }
                 let field_ty = self.fresh();
                 let rv = self.fresh_var();
@@ -6159,7 +6110,11 @@ impl Infer {
                 field_ty
             }
 
-            ast::ExprKind::With { record, body, types } => {
+            ast::ExprKind::With {
+                record,
+                body,
+                types,
+            } => {
                 // Infer the record, then resolve its type to a concrete record
                 // so the field names are known. Each field is bound as a local
                 // variable for the body; the result is the body's type.
@@ -6177,11 +6132,8 @@ impl Infer {
                 // (`with {ctor r.Pair}`, `with {xs (filter … xs)}` rebinding
                 // `xs` from its outer value) keep working. Non-`with` scopes
                 // are never masked, so ordinary locals stay visible too.
-                let record_ty = if let ast::ExprKind::Record(field_exprs) =
-                    &record.node
-                {
-                    let mut field_tys: Vec<(String, Ty)> =
-                        Vec::with_capacity(field_exprs.len());
+                let record_ty = if let ast::ExprKind::Record(field_exprs) = &record.node {
+                    let mut field_tys: Vec<(String, Ty)> = Vec::with_capacity(field_exprs.len());
                     for f in field_exprs {
                         // Required CLI constant (sig-only field, empty-record
                         // placeholder value): take the sig type as the field
@@ -6190,8 +6142,7 @@ impl Infer {
                             && matches!(&f.value.node, ast::ExprKind::Record(fs) if fs.is_empty())
                         {
                             let saved_flag = self.in_type_annotation;
-                            let saved_unit_vars =
-                                std::mem::take(&mut self.annotation_unit_vars);
+                            let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
                             self.in_type_annotation = true;
                             let sig_ty = self.ast_type_to_ty(&sig.ty);
                             self.in_type_annotation = saved_flag;
@@ -6218,22 +6169,16 @@ impl Infer {
                         // Save any enclosing `with` frame that binds this
                         // field's name (innermost-to-outermost), masking it
                         // only while THIS field's value is inferred.
-                        let mut masked: Vec<(
-                            usize,
-                            HashMap<String, Scheme>,
-                            _,
-                        )> = Vec::new();
+                        let mut masked: Vec<(usize, HashMap<String, Scheme>, _)> = Vec::new();
                         for idx in (0..self.scopes.len()).rev() {
                             let is_with = self.with_scope_stack[idx]
                                 .as_ref()
                                 .is_some_and(|(_, fs)| fs.contains_key(&f.name));
                             if is_with {
-                                let frame =
-                                    self.with_scope_stack[idx].take().expect(
-                                        "checked Some above",
-                                    );
-                                let scope =
-                                    std::mem::take(&mut self.scopes[idx]);
+                                let frame = self.with_scope_stack[idx]
+                                    .take()
+                                    .expect("checked Some above");
+                                let scope = std::mem::take(&mut self.scopes[idx]);
                                 masked.push((idx, scope, frame));
                             }
                         }
@@ -6304,8 +6249,7 @@ impl Infer {
                 // vanish when the body ends (one layer — nested `with` pushes
                 // its own frame).
                 if let ast::ExprKind::Record(field_exprs) = &record.node {
-                    let mut type_scope: HashMap<String, RecordTypeBinding> =
-                        HashMap::new();
+                    let mut type_scope: HashMap<String, RecordTypeBinding> = HashMap::new();
                     self.with_alias_saves.push(Vec::new());
                     for f in field_exprs {
                         match &f.value.node {
@@ -6325,10 +6269,7 @@ impl Infer {
                                         .push(save);
                                     self.aliases.insert(name.clone(), resolved);
                                 } else {
-                                    type_scope.insert(
-                                        name.clone(),
-                                        RecordTypeBinding::TyCon,
-                                    );
+                                    type_scope.insert(name.clone(), RecordTypeBinding::TyCon);
                                 }
                             }
                             ast::ExprKind::DataCtor { name, params, .. } => {
@@ -6351,8 +6292,7 @@ impl Infer {
                 let prev_let_bindings = self.let_bindings.clone();
                 if let ast::ExprKind::Record(field_exprs) = &record.node {
                     for f in field_exprs {
-                        self.let_bindings
-                            .insert(f.name.clone(), f.value.clone());
+                        self.let_bindings.insert(f.name.clone(), f.value.clone());
                     }
                 }
                 // Type imports (`with {Maybe …} body`): bring each named data
@@ -6406,7 +6346,11 @@ impl Infer {
                 Ty::Relation(Box::new(elem_ty))
             }
 
-            ast::ExprKind::Lambda { params, ty_params, body } => {
+            ast::ExprKind::Lambda {
+                params,
+                ty_params,
+                body,
+            } => {
                 self.push_scope();
                 // Type-witness params `\(T : Type)`: bind each to a rigid skolem
                 // and record it in a type-param scope so `x : T` annotations in
@@ -6445,10 +6389,7 @@ impl Infer {
                 // then bind the witness skolems in a `Forall` so the caller
                 // instantiates the exact witness var with the type argument.
                 for _ in &ty_skolems {
-                    result = Ty::Fun(
-                        Box::new(Ty::Con("Type".into(), vec![])),
-                        Box::new(result),
-                    );
+                    result = Ty::Fun(Box::new(Ty::Con("Type".into(), vec![])), Box::new(result));
                 }
                 if !ty_skolems.is_empty() {
                     // The skolems are bound by this lambda; quantify them so the
@@ -6535,10 +6476,7 @@ impl Infer {
                         arg_span: arg.span,
                         skolems: self.skolems.iter().copied().collect(),
                     });
-                    return Ty::App(
-                        Box::new(Ty::Var(m)),
-                        Box::new(Ty::Var(a)),
-                    );
+                    return Ty::App(Box::new(Ty::Var(m)), Box::new(Ty::Var(a)));
                 }
 
                 // Constructor application `Ctor {fields}`: type the argument
@@ -6561,10 +6499,10 @@ impl Infer {
                     if let Some(data_name) = self.resolve_with_imported_ctor(name)
                         && let Some((data_ty, record_ty)) =
                             self.instantiate_qualified_ctor(&data_name, name)
-                        {
-                            self.check_expr(arg, &record_ty);
-                            return data_ty;
-                        }
+                    {
+                        self.check_expr(arg, &record_ty);
+                        return data_ty;
+                    }
                     // An applied BUILT-IN constructor in user code must be
                     // qualified by its data type (`Maybe.Just {…}`).
                     if self.is_builtin_ctor(name)
@@ -6612,17 +6550,18 @@ impl Infer {
                 // language, and the bound name does not escape the body.
                 if let ast::ExprKind::Lambda { params, body, .. } = &func.node
                     && params.len() == 1
-                        && let ast::PatKind::Var(name) = &params[0].node {
-                            let arg_ty = self.infer_expr(arg);
-                            let applied = self.apply(&arg_ty);
-                            let scheme = self.generalize(&applied);
-                            self.push_scope();
-                            self.bind_at(name, scheme, params[0].span);
-                            self.binding_types.push((params[0].span, applied));
-                            let body_ty = self.infer_expr(body);
-                            self.pop_scope();
-                            return body_ty;
-                        }
+                    && let ast::PatKind::Var(name) = &params[0].node
+                {
+                    let arg_ty = self.infer_expr(arg);
+                    let applied = self.apply(&arg_ty);
+                    let scheme = self.generalize(&applied);
+                    self.push_scope();
+                    self.bind_at(name, scheme, params[0].span);
+                    self.binding_types.push((params[0].span, applied));
+                    let body_ty = self.infer_expr(body);
+                    self.pop_scope();
+                    return body_ty;
+                }
 
                 // Check lambda arguments LAST.
                 //
@@ -6638,7 +6577,10 @@ impl Infer {
                 // Restricted to a named head with a two-argument signature, so
                 // the shape is known before anything is inferred and there is
                 // no half-inferred state to unwind.
-                let lambda_last = if let ast::ExprKind::App { func: head, arg: lam } = &func.node
+                let lambda_last = if let ast::ExprKind::App {
+                    func: head,
+                    arg: lam,
+                } = &func.node
                     && matches!(&lam.node, ast::ExprKind::Lambda { .. })
                     && let ast::ExprKind::Var(head_name) = &head.node
                 {
@@ -6691,9 +6633,10 @@ impl Infer {
                             let result_ty = (**ret_ty).clone();
                             if let ast::ExprKind::Var(name) = &func.node
                                 && name == "parseJson"
-                                    && let Ty::Var(v) = &result_ty {
-                                        self.from_json_calls.push((expr.span, *v));
-                                    }
+                                && let Ty::Var(v) = &result_ty
+                            {
+                                self.from_json_calls.push((expr.span, *v));
+                            }
                             return result_ty;
                         }
                     }
@@ -6737,8 +6680,12 @@ impl Infer {
                                         _ => break,
                                     };
                                     let body_applied = self.apply(body);
-                                    let Some(witness_var) = vars.first().copied() else { break };
-                                    let Ty::Fun(_, rest) = &body_applied else { break };
+                                    let Some(witness_var) = vars.first().copied() else {
+                                        break;
+                                    };
+                                    let Ty::Fun(_, rest) = &body_applied else {
+                                        break;
+                                    };
                                     let Some(ty_ast) = first_ty.take() else { break };
                                     let arg_ty = self.ast_type_to_ty(&ty_ast);
                                     self.type_arg_spans.insert(ty_ast.span);
@@ -6797,10 +6744,8 @@ impl Infer {
                     } else {
                         let arg_ty = self.infer_expr(arg);
                         let result_ty = self.fresh();
-                        let expected = Ty::Fun(
-                            Box::new(arg_ty.clone()),
-                            Box::new(result_ty.clone()),
-                        );
+                        let expected =
+                            Ty::Fun(Box::new(arg_ty.clone()), Box::new(result_ty.clone()));
                         self.unify(&func_ty, &expected, arg.span);
                         (arg_ty, result_ty)
                     }
@@ -6808,9 +6753,10 @@ impl Infer {
                 // Track parseJson calls for compile-time FromJSON dispatch
                 if let ast::ExprKind::Var(name) = &func.node
                     && name == "parseJson"
-                        && let Ty::Var(v) = &result_ty {
-                            self.from_json_calls.push((expr.span, *v));
-                        }
+                    && let Ty::Var(v) = &result_ty
+                {
+                    self.from_json_calls.push((expr.span, *v));
+                }
 
                 // Track `show` calls so the argument's unit can be resolved
                 // once inference finishes and handed to codegen — the unit is
@@ -6818,20 +6764,22 @@ impl Infer {
                 // it. Recorded unresolved: `show (a * b)` may not know its unit
                 // until a later constraint solves the operands' unit vars.
                 if let ast::ExprKind::Var(name) = &func.node
-                    && name == "show" {
-                        self.show_calls.push((expr.span, arg_ty.clone()));
-                    }
+                    && name == "show"
+                {
+                    self.show_calls.push((expr.span, arg_ty.clone()));
+                }
 
                 // Track full `traverse f rel` applications: the resolved
                 // result type names the applicative, which codegen passes to
                 // the runtime to pick the right `pure []` for empty inputs.
                 if let ast::ExprKind::App { func: inner_f, .. } = &func.node
                     && matches!(&inner_f.node, ast::ExprKind::Var(n) if n == "traverse")
-                        && let Ty::Var(res_v) = &result_ty {
-                            let cont_v = self.fresh_var();
-                            self.unify(&arg_ty, &Ty::Var(cont_v), arg.span);
-                            self.traverse_calls.push((expr.span, *res_v, cont_v));
-                        }
+                    && let Ty::Var(res_v) = &result_ty
+                {
+                    let cont_v = self.fresh_var();
+                    self.unify(&arg_ty, &Ty::Var(cont_v), arg.span);
+                    self.traverse_calls.push((expr.span, *res_v, cont_v));
+                }
 
                 // Track full `sum rel` applications: the resolved result type
                 // says whether this is a Float sum, which codegen hands to the
@@ -6839,9 +6787,10 @@ impl Infer {
                 // there to infer the numeric type from).
                 if let ast::ExprKind::Var(n) = &func.node
                     && n == "sum"
-                        && let Ty::Var(res_v) = &result_ty {
-                            self.sum_calls.push((expr.span, *res_v));
-                        }
+                    && let Ty::Var(res_v) = &result_ty
+                {
+                    self.sum_calls.push((expr.span, *res_v));
+                }
 
                 // Track `compile src` applications: the result type is
                 // `Maybe a`; the inner `a` is the type the caller expects the
@@ -6860,12 +6809,13 @@ impl Infer {
                     _ => false,
                 };
                 if is_compile_app
-                        && let Ty::Con(mn, margs) = self.apply(&result_ty).peel_alias()
-                        && mn == "Result"
-                        && margs.len() == 2
-                        && let Ty::Var(inner_v) = self.apply(&margs[1]).peel_alias() {
-                            self.compile_calls.push((expr.span, *inner_v));
-                        }
+                    && let Ty::Con(mn, margs) = self.apply(&result_ty).peel_alias()
+                    && mn == "Result"
+                    && margs.len() == 2
+                    && let Ty::Var(inner_v) = self.apply(&margs[1]).peel_alias()
+                {
+                    self.compile_calls.push((expr.span, *inner_v));
+                }
 
                 // Track `elem needle haystack` haystack types for SQL pushdown.
                 // Curried: outer App's func is `App(Var("elem"), needle)`,
@@ -6873,22 +6823,21 @@ impl Infer {
                 // haystack's element type is a SQL-pushable scalar.
                 if let ast::ExprKind::App { func: inner_f, .. } = &func.node
                     && let ast::ExprKind::Var(name) = &inner_f.node
-                        && name == "elem" {
-                            let resolved = self.apply(&arg_ty);
-                            if self.is_elem_haystack_pushable(&resolved) {
-                                self.elem_pushdown_ok.literal.insert(arg.span);
-                                if self.is_elem_haystack_dynamic_pushable(&resolved) {
-                                    self.elem_pushdown_ok.dynamic.insert(arg.span);
-                                }
-                            }
+                    && name == "elem"
+                {
+                    let resolved = self.apply(&arg_ty);
+                    if self.is_elem_haystack_pushable(&resolved) {
+                        self.elem_pushdown_ok.literal.insert(arg.span);
+                        if self.is_elem_haystack_dynamic_pushable(&resolved) {
+                            self.elem_pushdown_ok.dynamic.insert(arg.span);
                         }
+                    }
+                }
 
                 result_ty
             }
 
-            ast::ExprKind::BinOp { op, lhs, rhs } => {
-                self.infer_binop(*op, lhs, rhs, expr.span)
-            }
+            ast::ExprKind::BinOp { op, lhs, rhs } => self.infer_binop(*op, lhs, rhs, expr.span),
 
             ast::ExprKind::UnaryOp { op, operand } => {
                 let operand_ty = self.infer_expr(operand);
@@ -6898,11 +6847,7 @@ impl Infer {
                         self.degrade_refinement(operand_ty, operand.span)
                     }
                     ast::UnaryOp::Not => {
-                        self.unify(
-                            &operand_ty,
-                            &Ty::Bool,
-                            operand.span,
-                        );
+                        self.unify(&operand_ty, &Ty::Bool, operand.span);
                         Ty::Bool
                     }
                 }
@@ -6945,8 +6890,7 @@ impl Infer {
                 // source itself carries (those the runtime validates), not for
                 // refined function parameters encountered inside the value.
                 let source_refined = self.refined_names_in(&target_inner);
-                let prev_suppress =
-                    self.suppress_refine_intro.replace(source_refined);
+                let prev_suppress = self.suppress_refine_intro.replace(source_refined);
                 self.check_expr(value, &target_inner);
                 self.suppress_refine_intro = prev_suppress;
                 if let ast::ExprKind::SourceRef { name, .. } = &target.node {
@@ -6966,10 +6910,7 @@ impl Infer {
                     // local alias `xs <- *rel`). Skip views and scalar
                     // sources where the distinction is meaningless.
                     let is_view = self.view_names.contains(name);
-                    let is_relation = matches!(
-                        self.source_types.get(name),
-                        Some(Ty::Relation(_))
-                    );
+                    let is_relation = matches!(self.source_types.get(name), Some(Ty::Relation(_)));
                     if !is_view && is_relation && !references {
                         self.error(
                             format!(
@@ -6997,8 +6938,7 @@ impl Infer {
                 // but only for the source's own refinements, not refined
                 // function parameters used inside the value.
                 let source_refined = self.refined_names_in(&target_inner);
-                let prev_suppress =
-                    self.suppress_refine_intro.replace(source_refined);
+                let prev_suppress = self.suppress_refine_intro.replace(source_refined);
                 self.check_expr(value, &target_inner);
                 self.suppress_refine_intro = prev_suppress;
                 if let ast::ExprKind::SourceRef { name, .. } = &target.node {
@@ -7009,10 +6949,7 @@ impl Infer {
                     // Skip views and scalar sources where the distinction
                     // is meaningless.
                     let is_view = self.view_names.contains(name);
-                    let is_relation = matches!(
-                        self.source_types.get(name),
-                        Some(Ty::Relation(_))
-                    );
+                    let is_relation = matches!(self.source_types.get(name), Some(Ty::Relation(_)));
                     if !is_view
                         && is_relation
                         && value_references_source(
@@ -7084,8 +7021,7 @@ impl Infer {
                 // stay out of the enclosing environment — mirroring the escape
                 // check `check_expr` performs for an expected `forall`.
                 if let Ty::Forall(vars, body) = self.apply(&annot_ty) {
-                    let (skolemised, fresh_skolems) =
-                        self.skolemise_forall_body(&vars, &body);
+                    let (skolemised, fresh_skolems) = self.skolemise_forall_body(&vars, &body);
                     self.unify(&inner_ty, &skolemised, inner.span);
                     let env_vars = self.free_vars_in_env();
                     if fresh_skolems.iter().any(|s| env_vars.contains(s)) {
@@ -7127,20 +7063,23 @@ impl Infer {
                 self.refine_vars.push((expr.span, alpha_var, inner_ty));
                 // Return Result RefinementError alpha
                 // Use the actual record type for RefinementError (not Con) so field access works
-                let refinement_error_ty = self.aliases.get("RefinementError")
+                let refinement_error_ty = self
+                    .aliases
+                    .get("RefinementError")
                     .cloned()
                     .unwrap_or_else(|| Ty::Con("RefinementError".into(), vec![]));
-                Ty::Con(
-                    "Result".into(),
-                    vec![refinement_error_ty, alpha],
-                )
+                Ty::Con("Result".into(), vec![refinement_error_ty, alpha])
             }
 
-            ast::ExprKind::Serve { api, api_span, handlers } => {
-                self.infer_serve(api, *api_span, handlers, expr.span)
-            }
+            ast::ExprKind::Serve {
+                api,
+                api_span,
+                handlers,
+            } => self.infer_serve(api, *api_span, handlers, expr.span),
 
-            ast::ExprKind::TypeCtor { name: _, params, .. } => {
+            ast::ExprKind::TypeCtor {
+                name: _, params, ..
+            } => {
                 // A first-class (erased) type-constructor value from an
                 // embedded `type` alias line. Statically its type is the alias's
                 // KIND: `Type` (0 params), `Type -> Type` (1 param), …, one
@@ -7152,16 +7091,17 @@ impl Infer {
                 // map. The alias name is reachable only via the record value
                 // (`rec.Name`) or a `with` peel (scoped type env), so it never
                 // leaks into the enclosing type namespace.
-                
+
                 (0..params.len()).fold(Ty::Con("Type".into(), vec![]), |acc, _| {
-                        Ty::Fun(
-                            Box::new(Ty::Con("Type".into(), vec![])),
-                            Box::new(acc),
-                        )
-                    })
+                    Ty::Fun(Box::new(Ty::Con("Type".into(), vec![])), Box::new(acc))
+                })
             }
 
-            ast::ExprKind::DataCtor { name, params, constructors } => {
+            ast::ExprKind::DataCtor {
+                name,
+                params,
+                constructors,
+            } => {
                 // A first-class (erased) `data` declaration embedded in a
                 // record value literal. The field is fully erased at runtime
                 // (compiles to unit), but statically its type is a RECORD of
@@ -7241,7 +7181,10 @@ impl Infer {
                 let mut ns_fields = IndexMap::new();
                 for entry in entries {
                     let input_ty = self.route_input_record_ty(entry);
-                    ns_fields.insert(entry.constructor.clone(), Ty::Fun(Box::new(input_ty), Box::new(Ty::Con(name.clone(), vec![]))));
+                    ns_fields.insert(
+                        entry.constructor.clone(),
+                        Ty::Fun(Box::new(input_ty), Box::new(Ty::Con(name.clone(), vec![]))),
+                    );
                 }
                 Ty::Record(ns_fields, None)
             }
@@ -7319,13 +7262,7 @@ impl Infer {
                 // ambiguous.
                 let (name, args, head_span) =
                     Self::peel_implicit_ref_app(expr).expect("matched above");
-                self.resolve_implicit_ref_app(
-                    name,
-                    &args,
-                    head_span,
-                    expr.span,
-                    expected.clone(),
-                );
+                self.resolve_implicit_ref_app(name, &args, head_span, expr.span, expected.clone());
             }
             ast::ExprKind::Annot { expr: inner, ty } => {
                 // See the infer-mode `Annot` arm: lowercase units in an inline
@@ -7339,7 +7276,11 @@ impl Infer {
                 self.check_expr(inner, &annot_ty);
                 self.unify(&annot_ty, expected, ty.span);
             }
-            ast::ExprKind::Lambda { params, ty_params, body } => {
+            ast::ExprKind::Lambda {
+                params,
+                ty_params,
+                body,
+            } => {
                 // Lambdas with type-witness params have an inherent
                 // `Fun(Con("Type"), …)` shape that `expected` may not supply
                 // (e.g. a bare fresh Var for an un-annotated top-level def).
@@ -7428,8 +7369,7 @@ impl Infer {
                         if is_required_const {
                             let sig = f.sig.as_ref().unwrap();
                             let saved_flag = self.in_type_annotation;
-                            let saved_unit_vars =
-                                std::mem::take(&mut self.annotation_unit_vars);
+                            let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
                             self.in_type_annotation = true;
                             let sig_ty = self.ast_type_to_ty(&sig.ty);
                             self.in_type_annotation = saved_flag;
@@ -7441,8 +7381,7 @@ impl Infer {
                         // first; the sig type then stands as the field's type.
                         if let Some(sig) = &f.sig {
                             let saved_flag = self.in_type_annotation;
-                            let saved_unit_vars =
-                                std::mem::take(&mut self.annotation_unit_vars);
+                            let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
                             self.in_type_annotation = true;
                             let sig_ty = self.ast_type_to_ty(&sig.ty);
                             self.in_type_annotation = saved_flag;
@@ -7590,10 +7529,7 @@ impl Infer {
                 Some(e) => e,
                 None => {
                     self.error(
-                        format!(
-                            "'{}' is not an endpoint of route {}",
-                            h.endpoint, api
-                        ),
+                        format!("'{}' is not an endpoint of route {}", h.endpoint, api),
                         h.endpoint_span,
                     );
                     let _ = self.infer_expr(&h.body);
@@ -7798,9 +7734,7 @@ impl Infer {
 
     /// Extract a record's field map and row tail (`None` = closed). The only
     /// error is a genuinely non-record argument.
-    fn record_fields(
-        ty: &Ty,
-    ) -> Result<(FieldMap, Option<TyVar>), String> {
+    fn record_fields(ty: &Ty) -> Result<(FieldMap, Option<TyVar>), String> {
         match ty.peel_alias() {
             Ty::Record(fields, tail) => Ok((fields.clone(), *tail)),
             other => Err(format!(
@@ -7870,17 +7804,11 @@ impl Infer {
         if is_fetch_with {
             let opts_ty = self.infer_expr(args[1]);
             let header_row = Ty::Record(
-                IndexMap::from([
-                    ("name".into(), Ty::Text),
-                    ("value".into(), Ty::Text),
-                ]),
+                IndexMap::from([("name".into(), Ty::Text), ("value".into(), Ty::Text)]),
                 None,
             );
             let expected_opts = Ty::Record(
-                IndexMap::from([(
-                    "headers".into(),
-                    Ty::Relation(Box::new(header_row)),
-                )]),
+                IndexMap::from([("headers".into(), Ty::Relation(Box::new(header_row)))]),
                 None,
             );
             self.unify(&opts_ty, &expected_opts, args[1].span);
@@ -7904,7 +7832,12 @@ impl Infer {
         // restore annotation_vars so fetch inference doesn't corrupt the
         // enclosing declaration's type variable mapping.
         let saved_annotation_vars = self.annotation_vars.clone();
-        if let Some(info) = self.constructors.get(ctor_name).and_then(|v| v.last()).cloned() {
+        if let Some(info) = self
+            .constructors
+            .get(ctor_name)
+            .and_then(|v| v.last())
+            .cloned()
+        {
             self.annotation_vars.clear();
             for p in &info.data_params {
                 let v = self.fresh_var();
@@ -7923,10 +7856,7 @@ impl Infer {
 
         // Build the return type: IO {network} (Result {status, message} ResponseTy)
         // When response headers are declared, wrap as {body: ResponseTy, headers: {h: T, ...}}
-        let resp_ty = self
-            .fetch_response_types
-            .get(ctor_name)
-            .cloned();
+        let resp_ty = self.fetch_response_types.get(ctor_name).cloned();
         let raw_body_ty = match resp_ty {
             Some(ref ty) => self.ast_type_to_ty(ty),
             None => Ty::Text,
@@ -7941,20 +7871,14 @@ impl Infer {
                     None,
                 );
                 Ty::Record(
-                    IndexMap::from([
-                        ("body".into(), raw_body_ty),
-                        ("headers".into(), headers_ty),
-                    ]),
+                    IndexMap::from([("body".into(), raw_body_ty), ("headers".into(), headers_ty)]),
                     None,
                 )
             }
             _ => raw_body_ty,
         };
         let err_ty = Ty::Record(
-            IndexMap::from([
-                ("message".into(), Ty::Text),
-                ("status".into(), Ty::Int),
-            ]),
+            IndexMap::from([("message".into(), Ty::Text), ("status".into(), Ty::Int)]),
             None,
         );
         let result_adt = Ty::Con("Result".into(), vec![err_ty, ok_ty]);
@@ -7988,13 +7912,7 @@ impl Infer {
         self.suppress_refine_intro = prev;
     }
 
-    fn infer_binop(
-        &mut self,
-        op: ast::BinOp,
-        lhs: &ast::Expr,
-        rhs: &ast::Expr,
-        span: Span,
-    ) -> Ty {
+    fn infer_binop(&mut self, op: ast::BinOp, lhs: &ast::Expr, rhs: &ast::Expr, span: Span) -> Ty {
         let lhs_ty = self.infer_expr(lhs);
         let rhs_ty = self.infer_expr(rhs);
 
@@ -8069,27 +7987,26 @@ impl Infer {
             // Pipe: a |> f  =  f a
             ast::BinOp::Pipe => {
                 let result_ty = self.fresh();
-                let fun_ty = Ty::Fun(
-                    Box::new(lhs_ty.clone()),
-                    Box::new(result_ty.clone()),
-                );
+                let fun_ty = Ty::Fun(Box::new(lhs_ty.clone()), Box::new(result_ty.clone()));
                 self.unify(&rhs_ty, &fun_ty, span);
                 // `rel |> sum` reaches codegen as an application carrying
                 // this pipe's span, so record it like the `sum rel` form.
                 if let ast::ExprKind::Var(n) = &rhs.node
                     && n == "sum"
-                        && let Ty::Var(res_v) = &result_ty {
-                            self.sum_calls.push((span, *res_v));
-                        }
+                    && let Ty::Var(res_v) = &result_ty
+                {
+                    self.sum_calls.push((span, *res_v));
+                }
                 // `x |> show` desugars to `show x` carrying this pipe's span
                 // (codegen.rs:4707-4713), so record the argument's unit like
                 // the direct `show x` form — otherwise the pipe form drops the
                 // unit suffix (`show (3.0 : Float M)` → "3.0 M" but
                 // `(3.0 : Float M) |> show` → "3.0").
                 if let ast::ExprKind::Var(name) = &rhs.node
-                    && name == "show" {
-                        self.show_calls.push((span, lhs_ty.clone()));
-                    }
+                    && name == "show"
+                {
+                    self.show_calls.push((span, lhs_ty.clone()));
+                }
                 result_ty
             }
         }
@@ -8114,38 +8031,71 @@ impl Infer {
     ) -> Ty {
         // Unit arithmetic uses helpers so it works for both plain and
         // unit-bearing numeric types.
-        let same_numeric_class =
-            |a: &Ty, b: &Ty| (a.is_int_like() && b.is_int_like()) || (a.is_float_like() && b.is_float_like());
+        let same_numeric_class = |a: &Ty, b: &Ty| {
+            (a.is_int_like() && b.is_int_like()) || (a.is_float_like() && b.is_float_like())
+        };
         // Both operands have a unit and are the same numeric class → compose.
         if let (Some(u1), Some(u2)) = (lhs_applied.unit_of(), rhs_applied.unit_of())
-            && same_numeric_class(lhs_applied, rhs_applied) {
-                let u1 = self.apply_unit(u1);
-                let u2 = self.apply_unit(u2);
-                let result_unit = if op == ast::BinOp::Mul {
-                    u1.mul(&u2)
+            && same_numeric_class(lhs_applied, rhs_applied)
+        {
+            let u1 = self.apply_unit(u1);
+            let u2 = self.apply_unit(u2);
+            let result_unit = if op == ast::BinOp::Mul {
+                u1.mul(&u2)
+            } else {
+                u1.div(&u2)
+            };
+            if result_unit.is_dimensionless() {
+                if lhs_applied.is_int_like() {
+                    return Ty::Int;
                 } else {
-                    u1.div(&u2)
-                };
-                if result_unit.is_dimensionless() {
-                    if lhs_applied.is_int_like() { return Ty::Int; } else { return Ty::Float; }
+                    return Ty::Float;
                 }
-                return if lhs_applied.is_int_like() {
-                    Ty::int_with_unit(result_unit)
-                } else {
-                    Ty::float_with_unit(result_unit)
-                };
             }
+            return if lhs_applied.is_int_like() {
+                Ty::int_with_unit(result_unit)
+            } else {
+                Ty::float_with_unit(result_unit)
+            };
+        }
         // One side carries a unit, the other is the plain form of the same
         // numeric class → preserve (and on `/`, invert the unit when the
         // *denominator* is the unit side).
-        let one_unit: Option<(&UnitTy, bool, bool)> =
-            match (lhs_applied, rhs_applied) {
-                (a, b) if a.unit_of().is_some() && b.is_int_like() && a.is_int_like() && matches!(b, Ty::Int) => Some((a.unit_of().unwrap(), true,  false)),
-                (a, b) if a.unit_of().is_some() && b.is_float_like() && a.is_float_like() && matches!(b, Ty::Float) => Some((a.unit_of().unwrap(), false, false)),
-                (a, b) if b.unit_of().is_some() && a.is_int_like() && b.is_int_like() && matches!(a, Ty::Int) => Some((b.unit_of().unwrap(), true,  true)),
-                (a, b) if b.unit_of().is_some() && a.is_float_like() && b.is_float_like() && matches!(a, Ty::Float) => Some((b.unit_of().unwrap(), false, true)),
-                _ => None,
-            };
+        let one_unit: Option<(&UnitTy, bool, bool)> = match (lhs_applied, rhs_applied) {
+            (a, b)
+                if a.unit_of().is_some()
+                    && b.is_int_like()
+                    && a.is_int_like()
+                    && matches!(b, Ty::Int) =>
+            {
+                Some((a.unit_of().unwrap(), true, false))
+            }
+            (a, b)
+                if a.unit_of().is_some()
+                    && b.is_float_like()
+                    && a.is_float_like()
+                    && matches!(b, Ty::Float) =>
+            {
+                Some((a.unit_of().unwrap(), false, false))
+            }
+            (a, b)
+                if b.unit_of().is_some()
+                    && a.is_int_like()
+                    && b.is_int_like()
+                    && matches!(a, Ty::Int) =>
+            {
+                Some((b.unit_of().unwrap(), true, true))
+            }
+            (a, b)
+                if b.unit_of().is_some()
+                    && a.is_float_like()
+                    && b.is_float_like()
+                    && matches!(a, Ty::Float) =>
+            {
+                Some((b.unit_of().unwrap(), false, true))
+            }
+            _ => None,
+        };
         if let Some((u, is_int, rhs_has_unit)) = one_unit {
             let u = self.apply_unit(u);
             if op == ast::BinOp::Div && rhs_has_unit {
@@ -8154,13 +8104,21 @@ impl Infer {
                 if inv.is_dimensionless() {
                     return if is_int { Ty::Int } else { Ty::Float };
                 }
-                return if is_int { Ty::int_with_unit(inv) } else { Ty::float_with_unit(inv) };
+                return if is_int {
+                    Ty::int_with_unit(inv)
+                } else {
+                    Ty::float_with_unit(inv)
+                };
             }
             // x<u> / y → x<u>; x<u> * y → x<u>; y * x<u> → x<u>
             if u.is_dimensionless() {
                 return if is_int { Ty::Int } else { Ty::Float };
             }
-            return if is_int { Ty::int_with_unit(u) } else { Ty::float_with_unit(u) };
+            return if is_int {
+                Ty::int_with_unit(u)
+            } else {
+                Ty::float_with_unit(u)
+            };
         }
         // No units involved → default behavior
         {
@@ -8193,21 +8151,40 @@ impl Infer {
                 }
                 _ => None,
             };
-                let lhs_is_var = matches!(lhs_applied, Ty::Var(_));
-                let rhs_is_var = matches!(rhs_applied, Ty::Var(_));
-                // BOTH operands unresolved: the composition can't be
-                // computed yet AND unifying them would be unsound (it
-                // types `w * h` as `w`'s unit instead of its square once
-                // units appear, and falsely rejects `Float M * Float S`).
-                // Defer the whole check and return a fresh result variable.
-                // If the surrounding binding is generalized, `generalize`
-                // captures this binop on the scheme so each instantiation
-                // resolves its own composition (keeping `\x -> x * x`
-                // unit-polymorphic); otherwise it is resolved once at
-                // end-of-inference. If no units ever appear, that resolution
-                // falls through to the plain `unify + Num` path below, so
-                // dimensionless code is unaffected.
-                if allow_defer && lhs_is_var && rhs_is_var {
+            let lhs_is_var = matches!(lhs_applied, Ty::Var(_));
+            let rhs_is_var = matches!(rhs_applied, Ty::Var(_));
+            // BOTH operands unresolved: the composition can't be
+            // computed yet AND unifying them would be unsound (it
+            // types `w * h` as `w`'s unit instead of its square once
+            // units appear, and falsely rejects `Float M * Float S`).
+            // Defer the whole check and return a fresh result variable.
+            // If the surrounding binding is generalized, `generalize`
+            // captures this binop on the scheme so each instantiation
+            // resolves its own composition (keeping `\x -> x * x`
+            // unit-polymorphic); otherwise it is resolved once at
+            // end-of-inference. If no units ever appear, that resolution
+            // falls through to the plain `unify + Num` path below, so
+            // dimensionless code is unaffected.
+            if allow_defer && lhs_is_var && rhs_is_var {
+                let result = self.fresh_var();
+                self.deferred_unit_binops.push(DeferredUnitBinop {
+                    op,
+                    lhs: lhs_applied.clone(),
+                    rhs: rhs_applied.clone(),
+                    result,
+                    span,
+                });
+                return Ty::Var(result);
+            }
+            let unit_side = if lhs_is_var {
+                concrete_unit(self, rhs_applied)
+            } else if rhs_is_var {
+                concrete_unit(self, lhs_applied)
+            } else {
+                None
+            };
+            if let Some(unit) = unit_side {
+                if allow_defer {
                     let result = self.fresh_var();
                     self.deferred_unit_binops.push(DeferredUnitBinop {
                         op,
@@ -8218,38 +8195,19 @@ impl Infer {
                     });
                     return Ty::Var(result);
                 }
-                let unit_side = if lhs_is_var {
-                    concrete_unit(self, rhs_applied)
-                } else if rhs_is_var {
-                    concrete_unit(self, lhs_applied)
-                } else {
-                    None
-                };
-                if let Some(unit) = unit_side {
-                    if allow_defer {
-                        let result = self.fresh_var();
-                        self.deferred_unit_binops.push(DeferredUnitBinop {
-                            op,
-                            lhs: lhs_applied.clone(),
-                            rhs: rhs_applied.clone(),
-                            result,
-                            span,
-                        });
-                        return Ty::Var(result);
-                    }
-                    let op_name = if op == ast::BinOp::Mul { "*" } else { "/" };
-                    self.error(
+                let op_name = if op == ast::BinOp::Mul { "*" } else { "/" };
+                self.error(
                         format!(
                             "cannot infer the unit of an operand of `{}`: one side has unit {} but the other side's type is not yet known — units compose under `{}`, so the unresolved operand needs an explicit annotation (e.g. `(x : Float ({}))`, or `(x : Float 1)` for a dimensionless value)",
                             op_name, unit, op_name, unit
                         ),
                         span,
                     );
-                    return Ty::Error;
-                }
-                self.unify(lhs_applied, rhs_applied, span);
-                self.require_trait("Num", lhs_applied, span);
-                lhs_applied.clone()
+                return Ty::Error;
+            }
+            self.unify(lhs_applied, rhs_applied, span);
+            self.require_trait("Num", lhs_applied, span);
+            lhs_applied.clone()
         }
     }
 
@@ -8287,10 +8245,7 @@ impl Infer {
         for d in &deferred {
             let left = self.apply(&d.left).clone();
             let right = self.apply(&d.right).clone();
-            match (
-                Self::record_fields(&left),
-                Self::record_fields(&right),
-            ) {
+            match (Self::record_fields(&left), Self::record_fields(&right)) {
                 (Ok((f1, tail1)), Ok((f2, tail2))) => {
                     let mut merged = f1;
                     for (k, v) in f2 {
@@ -8425,24 +8380,24 @@ impl Infer {
                             pat.span,
                         );
                     } else {
-                    // Qualified pattern `Color.Red`: resolve `Red` within the
-                    // nominal data type `Color` and unify the scrutinee with
-                    // `Color` directly — NO row-polymorphic open variant.
-                    match self.instantiate_qualified_ctor(q, name) {
-                        Some((data_ty, record_ty)) => {
-                            self.unify(&data_ty, expected, pat.span);
-                            self.check_pattern(payload, &record_ty);
+                        // Qualified pattern `Color.Red`: resolve `Red` within the
+                        // nominal data type `Color` and unify the scrutinee with
+                        // `Color` directly — NO row-polymorphic open variant.
+                        match self.instantiate_qualified_ctor(q, name) {
+                            Some((data_ty, record_ty)) => {
+                                self.unify(&data_ty, expected, pat.span);
+                                self.check_pattern(payload, &record_ty);
+                            }
+                            None => {
+                                self.error(
+                                    format!(
+                                        "data type '{}' has no constructor '{}' in pattern",
+                                        q, name
+                                    ),
+                                    pat.span,
+                                );
+                            }
                         }
-                        None => {
-                            self.error(
-                                format!(
-                                    "data type '{}' has no constructor '{}' in pattern",
-                                    q, name
-                                ),
-                                pat.span,
-                            );
-                        }
-                    }
                     }
                 } else if self.is_builtin_ctor(name) {
                     // Unqualified BUILT-IN constructor in a PATTERN. User code
@@ -8456,13 +8411,10 @@ impl Infer {
                             .map(|i| i.data_type.as_str())
                             .unwrap_or("Type");
                         self.error(
-                            format!(
-                                "constructor '{name}' must be qualified (e.g. `{ty}.{name}`)"
-                            ),
+                            format!("constructor '{name}' must be qualified (e.g. `{ty}.{name}`)"),
                             pat.span,
                         );
-                    } else if let Some((data_ty, record_ty)) =
-                        self.instantiate_ctor(name, pat.span)
+                    } else if let Some((data_ty, record_ty)) = self.instantiate_ctor(name, pat.span)
                     {
                         self.unify(&data_ty, expected, pat.span);
                         self.check_pattern(payload, &record_ty);
@@ -8549,9 +8501,10 @@ impl Infer {
                 // monomorphic `Int->Int` is then rejected. (Unifying instead
                 // would solve the skolems away and accept anything.)
                 if let Ty::Var(v) = self.apply(expected)
-                    && !self.skolems.contains(&v) {
-                        self.bind_var(v, annot_ty.clone(), ty.span);
-                    }
+                    && !self.skolems.contains(&v)
+                {
+                    self.bind_var(v, annot_ty.clone(), ty.span);
+                }
                 self.check_pattern(inner, &annot_ty);
             }
         }
@@ -8586,9 +8539,7 @@ impl Infer {
     /// constructor only when its payload pattern is irrefutable) and the
     /// constructors that are only *partially* matched (refutable payloads —
     /// e.g. `Circle {radius: 1.0}` — which must not count as coverage).
-    fn covered_constructors(
-        arms: &[ast::CaseArm],
-    ) -> (HashSet<&str>, HashSet<&str>) {
+    fn covered_constructors(arms: &[ast::CaseArm]) -> (HashSet<&str>, HashSet<&str>) {
         let mut covered: HashSet<&str> = HashSet::new();
         let mut partial: HashSet<&str> = HashSet::new();
         for arm in arms {
@@ -8623,24 +8574,16 @@ impl Infer {
     /// Check that a case expression covers all constructors of the
     /// scrutinee's type.  Emits an error listing missing patterns when
     /// the match is non-exhaustive.
-    fn check_exhaustiveness(
-        &mut self,
-        scrut_ty: &Ty,
-        arms: &[ast::CaseArm],
-        span: Span,
-    ) {
+    fn check_exhaustiveness(&mut self, scrut_ty: &Ty, arms: &[ast::CaseArm], span: Span) {
         // Resolve the scrutinee type through substitution and peel any
         // alias wrappers so exhaustiveness sees the underlying ADT shape.
         let resolved = self.apply(scrut_ty);
 
         // If any arm has an unconditional catch-all pattern (wildcard or
         // variable) at the top level, the match is trivially exhaustive.
-        let has_catchall = arms.iter().any(|arm| {
-            matches!(
-                &arm.pat.node,
-                ast::PatKind::Wildcard | ast::PatKind::Var(_)
-            )
-        });
+        let has_catchall = arms
+            .iter()
+            .any(|arm| matches!(&arm.pat.node, ast::PatKind::Wildcard | ast::PatKind::Var(_)));
         if has_catchall {
             return;
         }
@@ -8675,10 +8618,7 @@ impl Infer {
                     .collect();
 
                 if !missing.is_empty() {
-                    self.error(
-                        Self::non_exhaustive_msg(&missing, &partial),
-                        span,
-                    );
+                    self.error(Self::non_exhaustive_msg(&missing, &partial), span);
                 }
             }
             Ty::Variant(ctors, row) => {
@@ -8701,11 +8641,9 @@ impl Infer {
                             .data_types
                             .iter()
                             .filter(|(_, info)| {
-                                covered.iter().all(|c| {
-                                    info.ctors
-                                        .iter()
-                                        .any(|(n, _)| n.as_str() == *c)
-                                })
+                                covered
+                                    .iter()
+                                    .all(|c| info.ctors.iter().any(|(n, _)| n.as_str() == *c))
                             })
                             .map(|(name, _)| name.clone())
                             .collect();
@@ -8716,11 +8654,8 @@ impl Infer {
                                 Some(info) => info.clone(),
                                 None => continue,
                             };
-                            let all_ctors: HashSet<&str> = dt_info
-                                .ctors
-                                .iter()
-                                .map(|(n, _)| n.as_str())
-                                .collect();
+                            let all_ctors: HashSet<&str> =
+                                dt_info.ctors.iter().map(|(n, _)| n.as_str()).collect();
                             if covered == all_ctors {
                                 // All constructors of a known type are
                                 // covered — close the row var.  Use
@@ -8728,11 +8663,7 @@ impl Infer {
                                 // checks that every other binding site
                                 // enforces are applied here too.
                                 let rv = *rv;
-                                self.bind_var(
-                                    rv,
-                                    Ty::Variant(IndexMap::new(), None),
-                                    span,
-                                );
+                                self.bind_var(rv, Ty::Variant(IndexMap::new(), None), span);
                                 return;
                             }
                         }
@@ -8746,14 +8677,9 @@ impl Infer {
                                 let missing_count = dt_info
                                     .ctors
                                     .iter()
-                                    .filter(|(n, _)| {
-                                        !covered.contains(n.as_str())
-                                    })
+                                    .filter(|(n, _)| !covered.contains(n.as_str()))
                                     .count();
-                                if best
-                                    .map(|(c, _)| missing_count < c)
-                                    .unwrap_or(true)
-                                {
+                                if best.map(|(c, _)| missing_count < c).unwrap_or(true) {
                                     best = Some((missing_count, dt));
                                 }
                             }
@@ -8767,12 +8693,7 @@ impl Infer {
                                 .filter(|c| !covered.contains(c))
                                 .collect();
                             if !missing.is_empty() {
-                                self.error(
-                                    Self::non_exhaustive_msg(
-                                        &missing, &partial,
-                                    ),
-                                    span,
-                                );
+                                self.error(Self::non_exhaustive_msg(&missing, &partial), span);
                                 return;
                             }
                         }
@@ -8788,18 +8709,14 @@ impl Infer {
                     );
                 } else {
                     // Closed variant — check all constructors covered.
-                    let all: HashSet<&str> =
-                        ctors.keys().map(|s| s.as_str()).collect();
+                    let all: HashSet<&str> = ctors.keys().map(|s| s.as_str()).collect();
                     let missing: Vec<&str> = all
                         .iter()
                         .copied()
                         .filter(|c| !covered.contains(c))
                         .collect();
                     if !missing.is_empty() {
-                        self.error(
-                            Self::non_exhaustive_msg(&missing, &partial),
-                            span,
-                        );
+                        self.error(Self::non_exhaustive_msg(&missing, &partial), span);
                     }
                 }
             }
@@ -8816,10 +8733,7 @@ impl Infer {
                         .collect();
 
                     if !missing.is_empty() {
-                        self.error(
-                            Self::non_exhaustive_msg(&missing, &partial),
-                            span,
-                        );
+                        self.error(Self::non_exhaustive_msg(&missing, &partial), span);
                     }
                 }
             }
@@ -8828,16 +8742,20 @@ impl Infer {
             // starting with 1) are both covered (or a wildcard is
             // present, handled above).
             Ty::Relation(_) => {
-                let has_empty = arms.iter().any(|arm| matches!(
-                    &arm.pat.node,
-                    ast::PatKind::List(items) if items.is_empty()
-                ));
-                let has_cons = arms.iter().any(|arm| matches!(
-                    &arm.pat.node,
-                    ast::PatKind::Cons { head, tail }
-                        if Self::pattern_is_irrefutable(head)
-                            && Self::pattern_is_irrefutable(tail)
-                ));
+                let has_empty = arms.iter().any(|arm| {
+                    matches!(
+                        &arm.pat.node,
+                        ast::PatKind::List(items) if items.is_empty()
+                    )
+                });
+                let has_cons = arms.iter().any(|arm| {
+                    matches!(
+                        &arm.pat.node,
+                        ast::PatKind::Cons { head, tail }
+                            if Self::pattern_is_irrefutable(head)
+                                && Self::pattern_is_irrefutable(tail)
+                    )
+                });
                 let mut missing: Vec<&str> = Vec::new();
                 if !has_empty {
                     missing.push("Rel");
@@ -8896,17 +8814,17 @@ impl Infer {
             }
             ast::ExprKind::Var(name) => {
                 (crate::builtins::is_io_builtin(name.as_str()) || name == "fork" || name == "race")
-                || self.lookup(name.as_str()).is_some_and(|scheme| {
-                    fn returns_io(ty: &Ty) -> bool {
-                        match ty {
-                            Ty::IO(_) => true,
-                            Ty::Fun(_, ret) => returns_io(ret),
-                            _ => false,
+                    || self.lookup(name.as_str()).is_some_and(|scheme| {
+                        fn returns_io(ty: &Ty) -> bool {
+                            match ty {
+                                Ty::IO(_) => true,
+                                Ty::Fun(_, ret) => returns_io(ret),
+                                _ => false,
+                            }
                         }
-                    }
-                    let resolved = self.apply(&scheme.ty);
-                    returns_io(&resolved)
-                })
+                        let resolved = self.apply(&scheme.ty);
+                        returns_io(&resolved)
+                    })
             }
             // A query over a source/derived is a pure, lazy `[T]` — NOT IO.
             // Only writes (`set`/`full =`) and `atomic` are effects.
@@ -8917,18 +8835,18 @@ impl Infer {
                 self.expr_is_io_prescan(lhs) || self.expr_is_io_prescan(rhs)
             }
             ast::ExprKind::UnaryOp { operand, .. } => self.expr_is_io_prescan(operand),
-            ast::ExprKind::Case { scrutinee, arms, .. } => {
+            ast::ExprKind::Case {
+                scrutinee, arms, ..
+            } => {
                 self.expr_is_io_prescan(scrutinee)
                     || arms.iter().any(|arm| self.expr_is_io_prescan(&arm.body))
             }
-            ast::ExprKind::Do(stmts) => {
-                stmts.iter().any(|s| match &s.node {
-                    ast::StmtKind::Bind { expr, .. } => self.expr_is_io_prescan(expr),
-                    ast::StmtKind::Expr(expr) => self.expr_is_io_prescan(expr),
-                    ast::StmtKind::Where { cond } => self.expr_is_io_prescan(cond),
-                    ast::StmtKind::GroupBy { key } => self.expr_is_io_prescan(key),
-                })
-            }
+            ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
+                ast::StmtKind::Bind { expr, .. } => self.expr_is_io_prescan(expr),
+                ast::StmtKind::Expr(expr) => self.expr_is_io_prescan(expr),
+                ast::StmtKind::Where { cond } => self.expr_is_io_prescan(cond),
+                ast::StmtKind::GroupBy { key } => self.expr_is_io_prescan(key),
+            }),
             // `base.<io-builtin>` — the standard library now lives under the
             // `base` record, so an IO-producing call reaches us as a
             // FieldAccess on `base` rather than a bare `Var`. Treat it exactly
@@ -8972,8 +8890,7 @@ impl Infer {
                 ast::StmtKind::Bind { pat, expr } => {
                     let expr_ty = self.infer_expr(expr);
                     let resolved = self.apply(&expr_ty);
-                    let is_ctor_pat =
-                        matches!(&pat.node, ast::PatKind::Constructor { .. });
+                    let is_ctor_pat = matches!(&pat.node, ast::PatKind::Constructor { .. });
 
                     // `rows <- *rel` in an IO do-block loads the WHOLE relation
                     // into memory and binds it as a relation value `[T]` — it
@@ -8981,13 +8898,16 @@ impl Infer {
                     // same `i <- *rel` bind iterates per-row; the difference is
                     // the block's monad: `in_io_do` is set by the prescan when
                     // the block performs IO.)
-                    let is_full_read_bind = self.in_io_do
-                        && matches!(&expr.node, ast::ExprKind::SourceRef { .. });
+                    let is_full_read_bind =
+                        self.in_io_do && matches!(&expr.node, ast::ExprKind::SourceRef { .. });
                     if is_full_read_bind {
                         self.check_pattern(pat, &resolved);
                         // Track `rows <- *foo` for `set` detection too.
                         if let ast::PatKind::Var(var_name) = &pat.node
-                            && let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node {
+                            && let ast::ExprKind::SourceRef {
+                                name: source_name, ..
+                            } = &expr.node
+                        {
                             self.source_var_binds
                                 .insert(var_name.clone(), source_name.clone());
                         }
@@ -8999,28 +8919,25 @@ impl Infer {
                     // an IO-wrapped relation iterates its ELEMENTS, so peel
                     // the IO wrapper and fall through to the relation-bind
                     // path below instead of treating it as an IO bind.
-                    let (expr_ty, resolved) =
-                        if self.in_view_comprehension {
-                            match resolved {
-                                Ty::IO(inner) => {
-                                    let inner = (*inner).clone();
-                                    let applied = self.apply(&inner);
-                                    (inner, applied)
-                                }
-                                other => (expr_ty, other),
+                    let (expr_ty, resolved) = if self.in_view_comprehension {
+                        match resolved {
+                            Ty::IO(inner) => {
+                                let inner = (*inner).clone();
+                                let applied = self.apply(&inner);
+                                (inner, applied)
                             }
-                        } else {
-                            (expr_ty, resolved)
-                        };
+                            other => (expr_ty, other),
+                        }
+                    } else {
+                        (expr_ty, resolved)
+                    };
 
                     if let Ty::IO(ref inner) = resolved {
                         // IO bind: x <- ioAction
                         is_io = true;
                         let inner_applied = self.apply(inner);
                         if is_ctor_pat {
-                            if let Ty::Relation(elem) =
-                                inner_applied.peel_alias()
-                            {
+                            if let Ty::Relation(elem) = inner_applied.peel_alias() {
                                 // `Ctor pat <- *rel` filters the relation to
                                 // matching constructors and destructures each
                                 // element — the pattern matches ELEMENTS, not
@@ -9040,15 +8957,9 @@ impl Infer {
                         // assume IO so we don't incorrectly unify with Relation.
                         is_io = true;
                         let inner_ty = self.fresh();
-                        self.unify(
-                            &expr_ty,
-                            &Ty::IO(Box::new(inner_ty.clone())),
-                            expr.span,
-                        );
+                        self.unify(&expr_ty, &Ty::IO(Box::new(inner_ty.clone())), expr.span);
                         self.check_pattern(pat, &inner_ty);
-                    } else if is_ctor_pat
-                        && !matches!(&resolved, Ty::Relation(_) | Ty::Var(_))
-                    {
+                    } else if is_ctor_pat && !matches!(&resolved, Ty::Relation(_) | Ty::Var(_)) {
                         // Value pattern match: `Constructor pat <- value_expr`
                         // Filters the enclosing iteration (skip if no match)
                         self.check_pattern(pat, &expr_ty);
@@ -9066,10 +8977,13 @@ impl Infer {
 
                     // Track `x <- *foo` for `set` full-replacement detection.
                     if let ast::PatKind::Var(var_name) = &pat.node
-                        && let ast::ExprKind::SourceRef { name: source_name, .. } = &expr.node {
-                            self.source_var_binds
-                                .insert(var_name.clone(), source_name.clone());
-                        }
+                        && let ast::ExprKind::SourceRef {
+                            name: source_name, ..
+                        } = &expr.node
+                    {
+                        self.source_var_binds
+                            .insert(var_name.clone(), source_name.clone());
+                    }
                 }
                 ast::StmtKind::Where { cond } => {
                     let cond_ty = self.infer_expr(cond);
@@ -9181,10 +9095,10 @@ impl Infer {
             // `IO yield_ty`. IO blocks without comprehension binds keep
             // `yield = pure` semantics (the yield value IS the result).
             if let Some(ty) = &yield_ty
-                && (has_relation_bind || has_group_by) {
-                    return Ty::IO(Box::new(Ty::Relation(Box::new(ty.clone()))),
-                    );
-                }
+                && (has_relation_bind || has_group_by)
+            {
+                return Ty::IO(Box::new(Ty::Relation(Box::new(ty.clone()))));
+            }
             let inner = yield_ty.or(last_expr_ty).unwrap_or_else(Ty::unit);
             Ty::IO(Box::new(inner))
         } else {
@@ -9298,8 +9212,7 @@ impl Infer {
         // before the fixpoint loop: each iteration would wrap another
         // `Ty::Alias` layer and never converge (stack overflow). A name is
         // cyclic when it can reach itself through alias references.
-        let alias_names: HashSet<String> =
-            alias_decls.iter().map(|(n, _, _)| n.clone()).collect();
+        let alias_names: HashSet<String> = alias_decls.iter().map(|(n, _, _)| n.clone()).collect();
         let mut alias_deps: HashMap<String, HashSet<String>> = HashMap::new();
         for (name, ty, _) in &alias_decls {
             let mut refs = HashSet::new();
@@ -9311,8 +9224,7 @@ impl Infer {
             if cyclic_names.contains(name) {
                 continue;
             }
-            let mut stack: Vec<String> =
-                alias_deps[name].iter().cloned().collect();
+            let mut stack: Vec<String> = alias_deps[name].iter().cloned().collect();
             let mut visited: HashSet<String> = HashSet::new();
             let mut found = false;
             while let Some(n) = stack.pop() {
@@ -9321,9 +9233,10 @@ impl Infer {
                     break;
                 }
                 if visited.insert(n.clone())
-                    && let Some(ds) = alias_deps.get(&n) {
-                        stack.extend(ds.iter().cloned());
-                    }
+                    && let Some(ds) = alias_deps.get(&n)
+                {
+                    stack.extend(ds.iter().cloned());
+                }
             }
             if found {
                 cyclic_names.insert(name.clone());
@@ -9395,8 +9308,7 @@ impl Infer {
                 .iter()
                 .map(|(n, _, p)| (n.clone(), p.clone()))
                 .collect();
-            let mut data_ctor_decls: HashMap<String, Vec<ast::ConstructorDef>> =
-                HashMap::new();
+            let mut data_ctor_decls: HashMap<String, Vec<ast::ConstructorDef>> = HashMap::new();
             for_each_data_ctor(program, &mut |name, _params, ctors, _span| {
                 data_ctor_decls.insert(name.to_string(), ctors.to_vec());
             });
@@ -9467,7 +9379,8 @@ impl Infer {
                 // otherwise be silently accepted (last-write-wins for the
                 // variant row, confusing downstream errors).
                 {
-                    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                    let mut seen: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
                     for ctor in ctors {
                         if !seen.insert(ctor.name.clone()) {
                             self.error(
@@ -9542,18 +9455,11 @@ impl Infer {
                     let field_tys: FieldMap = ctors[0]
                         .fields
                         .iter()
-                        .map(|f| {
-                            (
-                                f.name.clone(),
-                                self.ast_type_to_ty(&f.value),
-                            )
-                        })
+                        .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
                         .collect();
                     if params.is_empty() {
-                        self.aliases.insert(
-                            name.to_string(),
-                            Ty::Record(field_tys, None),
-                        );
+                        self.aliases
+                            .insert(name.to_string(), Ty::Record(field_tys, None));
                     }
                 }
 
@@ -9572,13 +9478,11 @@ impl Infer {
     // ── Source/view collection (phase 2) ──────────────────────────
 
     fn collect_sources(&mut self, program: &ast::Expr) {
-        for_each_relation_marker(program, &mut |m| {
-            match m {
-                RelMarker::Source { name, ty } => {
-                    self.annotation_vars.clear();
-                    let resolved = self.ast_type_to_ty(ty);
-                    self.source_types.insert(name.to_string(), resolved);
-                }
+        for_each_relation_marker(program, &mut |m| match m {
+            RelMarker::Source { name, ty } => {
+                self.annotation_vars.clear();
+                let resolved = self.ast_type_to_ty(ty);
+                self.source_types.insert(name.to_string(), resolved);
             }
         });
     }
@@ -9711,10 +9615,8 @@ impl Infer {
                 }
                 let raw_ty = self.ast_type_to_ty(&scheme.ty);
                 self.in_type_annotation = false;
-                let mut vars: Vec<TyVar> =
-                    self.annotation_vars.values().copied().collect();
-                let unit_vars: Vec<UnitVar> =
-                    self.annotation_unit_vars.values().copied().collect();
+                let mut vars: Vec<TyVar> = self.annotation_vars.values().copied().collect();
+                let unit_vars: Vec<UnitVar> = self.annotation_unit_vars.values().copied().collect();
                 let ty = match raw_ty {
                     Ty::Forall(forall_vars, body) => {
                         vars.extend(forall_vars);
@@ -9724,7 +9626,13 @@ impl Infer {
                 };
                 self.bind_top(
                     name,
-                    Scheme { vars, unit_vars, constraints, unit_binops: vec![], ty },
+                    Scheme {
+                        vars,
+                        unit_vars,
+                        constraints,
+                        unit_binops: vec![],
+                        ty,
+                    },
                 );
             } else {
                 let var = self.fresh();
@@ -9746,7 +9654,6 @@ impl Infer {
                     .insert(entry.constructor.clone(), entry.response_headers.clone());
             }
         });
-
 
         // Re-bind toJson/parseJson as unconstrained after trait processing.
         // The ToJSON/FromJSON traits register these methods with constraints,
@@ -9826,7 +9733,13 @@ impl Infer {
                 params: vec!["a".into()],
                 ctors: vec![
                     ("Nothing".into(), vec![]),
-                    ("Just".into(), vec![("value".into(), ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span))]),
+                    (
+                        "Just".into(),
+                        vec![(
+                            "value".into(),
+                            ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span),
+                        )],
+                    ),
                 ],
                 structural: false,
             },
@@ -9852,10 +9765,7 @@ impl Infer {
             "Bool".into(),
             DataInfo {
                 params: vec![],
-                ctors: vec![
-                    ("True".into(), vec![]),
-                    ("False".into(), vec![]),
-                ],
+                ctors: vec![("True".into(), vec![]), ("False".into(), vec![])],
                 structural: false,
             },
         );
@@ -9913,8 +9823,20 @@ impl Infer {
             DataInfo {
                 params: vec!["e".into(), "a".into()],
                 ctors: vec![
-                    ("Err".into(), vec![("error".into(), ast::Type::new(ast::TypeKind::Var("e".into()), dummy_span))]),
-                    ("Ok".into(), vec![("value".into(), ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span))]),
+                    (
+                        "Err".into(),
+                        vec![(
+                            "error".into(),
+                            ast::Type::new(ast::TypeKind::Var("e".into()), dummy_span),
+                        )],
+                    ),
+                    (
+                        "Ok".into(),
+                        vec![(
+                            "value".into(),
+                            ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span),
+                        )],
+                    ),
                 ],
                 structural: false,
             },
@@ -9925,13 +9847,18 @@ impl Infer {
         // intrinsic (like `Maybe`/`Result`) because the prelude's `base` record
         // bypasses the desugar hoist that would otherwise lift a user
         // `with`-record's embedded `data` into the global type env.
-        let list_a_ty = || ast::Type::new(
-            ast::TypeKind::App {
-                func: Box::new(ast::Type::new(ast::TypeKind::Named("List".into()), dummy_span)),
-                arg: Box::new(ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span)),
-            },
-            dummy_span,
-        );
+        let list_a_ty = || {
+            ast::Type::new(
+                ast::TypeKind::App {
+                    func: Box::new(ast::Type::new(
+                        ast::TypeKind::Named("List".into()),
+                        dummy_span,
+                    )),
+                    arg: Box::new(ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span)),
+                },
+                dummy_span,
+            )
+        };
         let a_var = || ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span);
         self.constructors.insert(
             "Nil".into(),
@@ -9955,7 +9882,10 @@ impl Infer {
                 params: vec!["a".into()],
                 ctors: vec![
                     ("Nil".into(), vec![]),
-                    ("Cons".into(), vec![("head".into(), a_var()), ("tail".into(), list_a_ty())]),
+                    (
+                        "Cons".into(),
+                        vec![("head".into(), a_var()), ("tail".into(), list_a_ty())],
+                    ),
                 ],
                 structural: false,
             },
@@ -9967,13 +9897,16 @@ impl Infer {
             Ty::Record(
                 IndexMap::from([
                     ("typeName".into(), Ty::Text),
-                    ("violations".into(), Ty::Relation(Box::new(Ty::Record(
-                        IndexMap::from([
-                            ("field".into(), Ty::Con("Maybe".into(), vec![Ty::Text])),
-                            ("message".into(), Ty::Text),
-                        ]),
-                        None,
-                    )))),
+                    (
+                        "violations".into(),
+                        Ty::Relation(Box::new(Ty::Record(
+                            IndexMap::from([
+                                ("field".into(), Ty::Con("Maybe".into(), vec![Ty::Text])),
+                                ("message".into(), Ty::Text),
+                            ]),
+                            None,
+                        ))),
+                    ),
                 ]),
                 None,
             ),
@@ -9985,10 +9918,7 @@ impl Infer {
         self.aliases.insert(
             "HttpError".into(),
             Ty::Record(
-                IndexMap::from([
-                    ("status".into(), Ty::Int),
-                    ("message".into(), Ty::Text),
-                ]),
+                IndexMap::from([("status".into(), Ty::Int), ("message".into(), Ty::Text)]),
                 None,
             ),
         );
@@ -10035,7 +9965,10 @@ impl Infer {
             };
             let a_ty = Ty::Var(a);
             let method_ty = Ty::Fun(
-                Box::new(Ty::App(Box::new(a_ty.clone()), Box::new(Ty::Unit(arg_unit)))),
+                Box::new(Ty::App(
+                    Box::new(a_ty.clone()),
+                    Box::new(Ty::Unit(arg_unit)),
+                )),
                 Box::new(Ty::App(Box::new(a_ty), Box::new(Ty::Unit(res_unit)))),
             );
             self.bind_top(
@@ -10054,20 +9987,20 @@ impl Infer {
         let a = self.fresh_var();
         self.bind_top(
             "println",
-            Scheme::poly(vec![a], Ty::Fun(
-                Box::new(Ty::Var(a)),
-                Box::new(Ty::IO(Box::new(Ty::unit()))),
-            )),
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::IO(Box::new(Ty::unit())))),
+            ),
         );
 
         // print : ∀a. a -> IO {console} {}
         let a = self.fresh_var();
         self.bind_top(
             "print",
-            Scheme::poly(vec![a], Ty::Fun(
-                Box::new(Ty::Var(a)),
-                Box::new(Ty::IO(Box::new(Ty::unit()))),
-            )),
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::IO(Box::new(Ty::unit())))),
+            ),
         );
 
         // `logInfo`/`logWarn`/`logError`/`logDebug` are deprecated prelude
@@ -10081,22 +10014,23 @@ impl Infer {
         let c = self.fresh_var();
         self.bind_top(
             "emitLog",
-            Scheme::poly(vec![c], Ty::Fun(
-                Box::new(Ty::Con("Level".into(), vec![])),
-                Box::new(Ty::Fun(
-                    Box::new(Ty::Text),
+            Scheme::poly(
+                vec![c],
+                Ty::Fun(
+                    Box::new(Ty::Con("Level".into(), vec![])),
                     Box::new(Ty::Fun(
-                        Box::new(Ty::Var(c)),
-                        Box::new(Ty::IO(Box::new(Ty::unit()))),
+                        Box::new(Ty::Text),
+                        Box::new(Ty::Fun(
+                            Box::new(Ty::Var(c)),
+                            Box::new(Ty::IO(Box::new(Ty::unit()))),
+                        )),
                     )),
-                )),
-            )),
+                ),
+            ),
         );
 
         // readLine : IO {console} Text
-        self.bind_top("readLine", Scheme::mono(
-            Ty::IO(Box::new(Ty::Text)),
-        ));
+        self.bind_top("readLine", Scheme::mono(Ty::IO(Box::new(Ty::Text))));
 
         // show : ∀a. a -> Text
         let a = self.fresh_var();
@@ -10125,10 +10059,7 @@ impl Infer {
                 vec![a],
                 Ty::Fun(
                     Box::new(Ty::Text),
-                    Box::new(Ty::Con(
-                        "Result".into(),
-                        vec![Ty::Text, Ty::Var(a)],
-                    )),
+                    Box::new(Ty::Con("Result".into(), vec![Ty::Text, Ty::Var(a)])),
                 ),
             ),
         );
@@ -10184,10 +10115,7 @@ impl Infer {
                     unit_binops: vec![],
                     ty: Ty::Fun(
                         Box::new(Ty::Relation(Box::new(Ty::Var(a)))),
-                        Box::new(Ty::IO(Box::new(Ty::Con(
-                            "Vec".into(),
-                            vec![Ty::Var(a)],
-                        )))),
+                        Box::new(Ty::IO(Box::new(Ty::Con("Vec".into(), vec![Ty::Var(a)])))),
                     ),
                 },
             );
@@ -10244,10 +10172,10 @@ impl Infer {
         let a = self.fresh_var();
         self.bind_top(
             "putLine",
-            Scheme::poly(vec![a], Ty::Fun(
-                Box::new(Ty::Var(a)),
-                Box::new(Ty::IO(Box::new(Ty::unit()))),
-            )),
+            Scheme::poly(
+                vec![a],
+                Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::IO(Box::new(Ty::unit())))),
+            ),
         );
 
         // todo : a  — the unimplemented hole. Fully polymorphic so it unifies
@@ -10267,19 +10195,14 @@ impl Infer {
             let a = self.fresh_var();
             self.bind_top(
                 "trace",
-                Scheme::poly(
-                    vec![a],
-                    Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(a))),
-                ),
+                Scheme::poly(vec![a], Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(a)))),
             );
         }
 
         // now : IO {clock} Int Ms
         {
             let int_ms = Ty::int_with_unit(UnitTy::named("Ms"));
-            self.bind_top("now", Scheme::mono(
-                Ty::IO(Box::new(int_ms)),
-            ));
+            self.bind_top("now", Scheme::mono(Ty::IO(Box::new(int_ms))));
         }
 
         // sleep : Int Ms -> IO {clock} {}
@@ -10305,10 +10228,7 @@ impl Infer {
                     unit_vars: vec![u],
                     constraints: vec![],
                     unit_binops: vec![],
-                    ty: Ty::Fun(
-                        Box::new(int_u.clone()),
-                        Box::new(Ty::IO(Box::new(int_u))),
-                    ),
+                    ty: Ty::Fun(Box::new(int_u.clone()), Box::new(Ty::IO(Box::new(int_u)))),
                 },
             );
         }
@@ -10317,19 +10237,20 @@ impl Infer {
         {
             let u = self.fresh_unit_var();
             let float_u = Ty::float_with_unit(UnitTy::var(u));
-            self.bind_top("randomFloat", Scheme {
-                vars: vec![],
-                unit_vars: vec![u],
-                constraints: vec![],
-                unit_binops: vec![],
-                ty: Ty::IO(Box::new(float_u)),
-            });
+            self.bind_top(
+                "randomFloat",
+                Scheme {
+                    vars: vec![],
+                    unit_vars: vec![u],
+                    constraints: vec![],
+                    unit_binops: vec![],
+                    ty: Ty::IO(Box::new(float_u)),
+                },
+            );
         }
 
         // randomUuid : IO {random} Uuid (UUIDv7)
-        self.bind_top("randomUuid", Scheme::mono(
-            Ty::IO(Box::new(Ty::Uuid)),
-        ));
+        self.bind_top("randomUuid", Scheme::mono(Ty::IO(Box::new(Ty::Uuid))));
 
         // fork : ∀a r. IO r a -> IO r {}
         // Argument is any IO action (any effects, any result). The spawned
@@ -10454,10 +10375,7 @@ impl Infer {
             let a = self.fresh_var();
             let b = self.fresh_var();
             let err_ty = Ty::Record(
-                IndexMap::from([
-                    ("message".into(), Ty::Text),
-                    ("status".into(), Ty::Int),
-                ]),
+                IndexMap::from([("message".into(), Ty::Text), ("status".into(), Ty::Int)]),
                 None,
             );
             let result_ty = Ty::Con("Result".into(), vec![err_ty.clone(), Ty::Var(b)]);
@@ -10562,11 +10480,9 @@ impl Infer {
                         Box::new(Ty::Fun(
                             Box::new(Ty::Fun(
                                 Box::new(Ty::Var(a)),
-                                Box::new(Ty::IO(Box::new(Ty::unit()),
-                                )),
+                                Box::new(Ty::IO(Box::new(Ty::unit()))),
                             )),
-                            Box::new(Ty::IO(Box::new(Ty::unit()),
-                            )),
+                            Box::new(Ty::IO(Box::new(Ty::unit()))),
                         )),
                     ),
                 ),
@@ -11070,10 +10986,7 @@ impl Infer {
             let list_a = || Ty::Con("List".into(), vec![Ty::Var(a)]);
             self.bind_top(
                 "listReverse",
-                Scheme::poly(
-                    vec![a],
-                    Ty::Fun(Box::new(list_a()), Box::new(list_a())),
-                ),
+                Scheme::poly(vec![a], Ty::Fun(Box::new(list_a()), Box::new(list_a()))),
             );
         }
         // listAppend : ∀a. List a -> List a -> List a
@@ -11519,13 +11432,25 @@ impl Infer {
         );
 
         // abs : Int -> Int  (pushable to ABS)
-        self.bind_top("abs", Scheme::mono(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))));
+        self.bind_top(
+            "abs",
+            Scheme::mono(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))),
+        );
         // intMin / intMax : Int -> Int -> Int  (pushable to scalar min/max)
-        let int2 = Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))));
+        let int2 = Ty::Fun(
+            Box::new(Ty::Int),
+            Box::new(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))),
+        );
         self.bind_top("intMin", Scheme::mono(int2.clone()));
         self.bind_top("intMax", Scheme::mono(int2));
         // clamp : Int -> Int -> Int -> Int  (pushable to min(max(x,lo),hi))
-        let int3 = Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))))));
+        let int3 = Ty::Fun(
+            Box::new(Ty::Int),
+            Box::new(Ty::Fun(
+                Box::new(Ty::Int),
+                Box::new(Ty::Fun(Box::new(Ty::Int), Box::new(Ty::Int))),
+            )),
+        );
         self.bind_top("clamp", Scheme::mono(int3));
 
         // unify : {r1} -> {r2} -> {r1 ∪ r2} — record merge, right-biased. The
@@ -11632,14 +11557,16 @@ impl Infer {
             ]),
             None,
         );
-        self.bind_top("generateKeyPair", Scheme::mono(
-            Ty::IO(Box::new(key_pair_record.clone())),
-        ));
+        self.bind_top(
+            "generateKeyPair",
+            Scheme::mono(Ty::IO(Box::new(key_pair_record.clone()))),
+        );
 
         // generateSigningKeyPair : IO {random} {privateKey: Bytes, publicKey: Bytes}
-        self.bind_top("generateSigningKeyPair", Scheme::mono(
-            Ty::IO(Box::new(key_pair_record)),
-        ));
+        self.bind_top(
+            "generateSigningKeyPair",
+            Scheme::mono(Ty::IO(Box::new(key_pair_record))),
+        );
 
         // The three fallible crypto primitives return `Maybe Bytes` rather than a
         // bare `Bytes`. Keys and ciphertexts routinely arrive from untrusted
@@ -11656,8 +11583,7 @@ impl Infer {
                 Box::new(Ty::Bytes),
                 Box::new(Ty::Fun(
                     Box::new(Ty::Bytes),
-                    Box::new(Ty::IO(Box::new(maybe_bytes.clone()),
-                    )),
+                    Box::new(Ty::IO(Box::new(maybe_bytes.clone()))),
                 )),
             )),
         );
@@ -11762,10 +11688,12 @@ impl Infer {
                 self.annotation_vars = saved_av;
                 self.annotation_unit_vars = saved_auv;
                 if !implicit.is_empty() {
-                    self.implicit_dict_fns.insert(format!("base.{}", f.name), implicit);
+                    self.implicit_dict_fns
+                        .insert(format!("base.{}", f.name), implicit);
                 }
                 if !folds.is_empty() {
-                    self.fold_dict_fields.insert(format!("base.{}", f.name), folds);
+                    self.fold_dict_fields
+                        .insert(format!("base.{}", f.name), folds);
                 }
             }
         }
@@ -11786,7 +11714,6 @@ impl Infer {
         let scheme = self.generalize(&resolved);
         self.bind_top("base", scheme);
     }
-
 
     // ── Declaration inference (phase 4) ──────────────────────────
 
@@ -11834,17 +11761,13 @@ impl Infer {
             // body): there is no value to check against the sig. Skip — codegen
             // registers the startup `--name=value` lookup and the field's type
             // is the sig (set during pre-registration).
-            if ty.is_some()
-                && matches!(&body.node, ast::ExprKind::Record(fs) if fs.is_empty())
-            {
+            if ty.is_some() && matches!(&body.node, ast::ExprKind::Record(fs) if fs.is_empty()) {
                 return;
             }
             {
                 let scheme = self.lookup(name).cloned();
                 let (expected, fresh_skolems, fresh_unit_skolems) = match scheme {
-                    Some(scheme) => {
-                        self.skolemise_scheme(&scheme, body.span)
-                    }
+                    Some(scheme) => self.skolemise_scheme(&scheme, body.span),
                     None => (self.fresh(), Vec::new(), Vec::new()),
                 };
                 self.check_expr(body, &expected);
@@ -11859,8 +11782,7 @@ impl Infer {
                     && let ast::TypeKind::Refined { predicate, .. } = &ts.ty.node
                     && let Some(lit) =
                         crate::codegen::extract_literal_with_consts(body, &self.const_literals)
-                    && let Some(false) =
-                        crate::codegen::eval_refine_predicate_pub(predicate, &lit)
+                    && let Some(false) = crate::codegen::eval_refine_predicate_pub(predicate, &lit)
                 {
                     self.error(
                         format!(
@@ -11870,120 +11792,20 @@ impl Infer {
                         body.span,
                     );
                 }
-                        // Record-field funs with `^`-field constraints: register
-                        // each under its record path (`fns.greet`) so the
-                        // callsite resolver can find it through a field-access
-                        // head. The constraint field types are converted while
-                        // the body's annotation vars are live, so they share the
-                        // field's quantified vars.
-                        if let ast::ExprKind::Record(fields) = &body.node {
-                            for f in fields {
-                                if let Some(sig) = &f.sig {
-                                    let saved_flag = self.in_type_annotation;
-                                    let saved_av = std::mem::take(&mut self.annotation_vars);
-                                    let saved_auv = std::mem::take(&mut self.annotation_unit_vars);
-                                    self.in_type_annotation = true;
-                                    let fimplicit: Vec<(String, Ty)> = sig
-                                        .constraints
-                                        .iter()
-                                        .filter_map(|c| match c {
-                                            ast::Constraint::ImplicitField { field, ty } => {
-                                                Some((field.clone(), self.ast_type_to_ty(ty)))
-                                            }
-                                            ast::Constraint::CollectField { field, .. } => {
-                                                // `(<>field)` fold: dict collected+merged
-                                                // at the callsite; type is a fresh var.
-                                                Some((field.clone(), self.fresh()))
-                                            }
-                                            _ => None,
-                                        })
-                                        .collect();
-                                    let ffolds: Vec<String> = sig
-                                        .constraints
-                                        .iter()
-                                        .filter_map(|c| match c {
-                                            ast::Constraint::CollectField { field, .. } => {
-                                                Some(field.clone())
-                                            }
-                                            _ => None,
-                                        })
-                                        .collect();
-                                    self.in_type_annotation = saved_flag;
-                                    self.annotation_vars = saved_av;
-                                    self.annotation_unit_vars = saved_auv;
-                                    if !fimplicit.is_empty() {
-                                        self.implicit_dict_fns.insert(
-                                            format!("{name}.{}", f.name),
-                                            fimplicit,
-                                        );
-                                    }
-                                    if !ffolds.is_empty() {
-                                        self.fold_dict_fields
-                                            .insert(format!("{name}.{}", f.name), ffolds);
-                                    }
-                                }
-                            }
-                        }
-                        for s in &fresh_skolems {
-                            self.skolems.remove(s);
-                        }
-                        for u in &fresh_unit_skolems {
-                            self.unit_skolems.remove(u);
-                        }
-                        let inferred = self.apply(&expected);
-
-                        // Remove the old monomorphic binding before
-                        // generalizing, so its free variables don't block
-                        // quantification.
-                        if let Some(scope) = self.scopes.first_mut() {
-                            scope.remove(name);
-                        }
-
-                        // If the function has explicit constraints in its
-                        // annotation, rebuild the scheme from the annotation.
-                        // (We already verified the body matches via unification.)
-                        let has_constraints = ty
-                            .as_ref()
-                            .is_some_and(|ts| !ts.constraints.is_empty());
-                        if has_constraints {
-                            let ts = ty.as_ref().unwrap();
-                            self.annotation_vars.clear();
-                            self.annotation_unit_vars.clear();
+                // Record-field funs with `^`-field constraints: register
+                // each under its record path (`fns.greet`) so the
+                // callsite resolver can find it through a field-access
+                // head. The constraint field types are converted while
+                // the body's annotation vars are live, so they share the
+                // field's quantified vars.
+                if let ast::ExprKind::Record(fields) = &body.node {
+                    for f in fields {
+                        if let Some(sig) = &f.sig {
+                            let saved_flag = self.in_type_annotation;
+                            let saved_av = std::mem::take(&mut self.annotation_vars);
+                            let saved_auv = std::mem::take(&mut self.annotation_unit_vars);
                             self.in_type_annotation = true;
-                            let mut constraints = Vec::new();
-                            for c in &ts.constraints {
-                                match c {
-                                    ast::Constraint::Trait { trait_name, args } => {
-                                        for arg in args {
-                                            if let ast::TypeKind::Var(var_name) =
-                                                &arg.node
-                                            {
-                                                let v = self.annotation_var(var_name);
-                                                constraints.push(TyConstraint {
-                                                    trait_name: trait_name.clone(),
-                                                    type_var: v,
-                                                    span: arg.span,
-                                                });
-                                            }
-                                        }
-                                    }
-                                    ast::Constraint::ImplicitField { .. } => {
-                                        // Recorded into `implicit_dict_fns` below.
-                                    }
-                                    ast::Constraint::CollectField { .. } => {
-                                        // Recorded into `implicit_dict_fns` below
-                                        // (as a fold).
-                                    }
-                                }
-                            }
-                            let ann_ty = self.ast_type_to_ty(&ts.ty);
-                            // Record the implicit-field dictionaries this
-                            // function takes, in declared order, so each
-                            // callsite resolves them from scope. The field
-                            // types are converted NOW (while `annotation_vars`
-                            // is live) so they share the scheme's quantified
-                            // vars and unify with the body's dictionary use.
-                            let implicit: Vec<(String, Ty)> = ts
+                            let fimplicit: Vec<(String, Ty)> = sig
                                 .constraints
                                 .iter()
                                 .filter_map(|c| match c {
@@ -11991,24 +11813,14 @@ impl Infer {
                                         Some((field.clone(), self.ast_type_to_ty(ty)))
                                     }
                                     ast::Constraint::CollectField { field, .. } => {
-                                        // `(<>field)` fold constraint: the dict is
-                                        // collected+merged at the callsite from the
-                                        // in-scope `field` values (like `^` but
-                                        // merging all). Its type is a fresh var —
-                                        // the merged shape is callsite-dependent.
+                                        // `(<>field)` fold: dict collected+merged
+                                        // at the callsite; type is a fresh var.
                                         Some((field.clone(), self.fresh()))
                                     }
                                     _ => None,
                                 })
                                 .collect();
-                            if !implicit.is_empty() {
-                                self.implicit_dict_fns.insert(name.to_string(), implicit);
-                            }
-                            // Track which of this fn's dict fields are FOLDS
-                            // (`<>`) vs single-match (`^`), so the callsite splice
-                            // merges all fragments for a fold instead of resolving
-                            // a single match.
-                            let fold_fields: Vec<String> = ts
+                            let ffolds: Vec<String> = sig
                                 .constraints
                                 .iter()
                                 .filter_map(|c| match c {
@@ -12018,134 +11830,234 @@ impl Infer {
                                     _ => None,
                                 })
                                 .collect();
-                            if !fold_fields.is_empty() {
-                                self.fold_dict_fields.insert(name.to_string(), fold_fields);
+                            self.in_type_annotation = saved_flag;
+                            self.annotation_vars = saved_av;
+                            self.annotation_unit_vars = saved_auv;
+                            if !fimplicit.is_empty() {
+                                self.implicit_dict_fns
+                                    .insert(format!("{name}.{}", f.name), fimplicit);
                             }
-                            self.in_type_annotation = false;
-                            let mut vars: Vec<TyVar> = self
-                                .annotation_vars
-                                .values()
-                                .copied()
-                                .collect();
-                            let mut unit_vars: Vec<UnitVar> = self
-                                .annotation_unit_vars
-                                .values()
-                                .copied()
-                                .collect();
-                            // `(<>field)` fold constraints elaborate to a leading
-                            // dict param whose type is a fresh var (Hole/Callsite),
-                            // NOT a named annotation var — so it isn't in
-                            // `annotation_vars` and would otherwise stay
-                            // MONOMORPHIC across callsites (every call shares the
-                            // one dict var, so two calls with differently-shaped
-                            // contexts collide: "record fields don't match").
-                            // Quantify it (and any `_` hole in the signature) so
-                            // each callsite instantiates a fresh dict var. Only
-                            // quantify vars that are free in the rebuilt
-                            // annotation type but NOT free in the enclosing env
-                            // (outer-scope vars must stay shared) and not
-                            // skolems (rigid body-check vars).
-                            let env_free = self.free_vars_in_env();
-                            let mut extra: Vec<TyVar> = self
-                                .free_vars(&ann_ty)
-                                .into_iter()
-                                .filter(|v| {
-                                    !vars.contains(v)
-                                        && !self.skolems.contains(v)
-                                        && !env_free.contains(v)
-                                })
-                                .collect();
-                            extra.sort_unstable();
-                            vars.append(&mut extra);
-                            // Capture deferred `*`/`/` unit-composition checks
-                            // whose result var resolves to a skolemized
-                            // annotation variable, so each call-site
-                            // instantiation gets its own fresh composition
-                            // (mirrors `generalize`).
-                            //
-                            // The scheme's type was just rebuilt from the
-                            // annotation with *fresh* vars (`ann_ty`), so the
-                            // body-check skolems these binops reference no
-                            // longer occur anywhere in it. Build a
-                            // skolem→fresh-var map by walking the skolemised
-                            // body type (`inferred`) against `ann_ty` in
-                            // parallel — they share the annotation's structure
-                            // — and re-point each captured binop at the vars
-                            // that actually appear in the scheme. Without this
-                            // the binop's result floats free of the return type
-                            // at instantiation and end-of-inference resolution
-                            // degrades to a vacuous `unify`, silently
-                            // mis-typing e.g. `scale 3.0 M 4.0 M` as
-                            // `Float M` instead of the `Float (M^2)` that
-                            // contradicts the `a -> a -> a` signature. (B12)
-                            let skolem_set: HashSet<TyVar> = fresh_skolems.iter().copied().collect();
-                            let unit_skolem_set: HashSet<UnitVar> = fresh_unit_skolems.iter().copied().collect();
-                            let mut walk_ty: HashMap<TyVar, TyVar> = HashMap::new();
-                            let mut walk_unit: HashMap<UnitVar, UnitVar> = HashMap::new();
-                            correspond_vars(&inferred, &ann_ty, &mut walk_ty, &mut walk_unit);
-                            // Restrict the remaps to the body-check skolems: only
-                            // those vanish from the rebuilt type. Other vars in an
-                            // operand are outer-scope and must be left untouched.
-                            let skolem_ty_subst: HashMap<TyVar, Ty> = walk_ty
-                                .iter()
-                                .filter(|(k, _)| skolem_set.contains(k))
-                                .map(|(k, v)| (*k, Ty::Var(*v)))
-                                .collect();
-                            let skolem_unit_subst: HashMap<UnitVar, UnitVar> = walk_unit
-                                .iter()
-                                .filter(|(k, _)| unit_skolem_set.contains(k))
-                                .map(|(k, v)| (*k, *v))
-                                .collect();
-                            let remapped_unit_targets: HashSet<UnitVar> =
-                                skolem_unit_subst.values().copied().collect();
-                            let pending_binops = std::mem::take(&mut self.deferred_unit_binops);
-                            let mut captured_binops: Vec<DeferredUnitBinop> = Vec::new();
-                            for b in pending_binops {
-                                let resolved_result = self.apply(&Ty::Var(b.result));
-                                if let Ty::Var(v) = &resolved_result
-                                    && skolem_set.contains(v)
-                                    && let Some(Ty::Var(fresh_result)) =
-                                        skolem_ty_subst.get(v).cloned() {
-                                        let mut lhs = self.subst_ty(&self.apply(&b.lhs), &skolem_ty_subst);
-                                        let mut rhs = self.subst_ty(&self.apply(&b.rhs), &skolem_ty_subst);
-                                        if !skolem_unit_subst.is_empty() {
-                                            lhs = self.subst_unit_vars_in_ty(&lhs, &skolem_unit_subst);
-                                            rhs = self.subst_unit_vars_in_ty(&rhs, &skolem_unit_subst);
-                                        }
-                                        if !vars.contains(&fresh_result) {
-                                            vars.push(fresh_result);
-                                        }
-                                        let mut all_uv = Vec::new();
-                                        collect_unit_vars_ordered(&lhs, &mut all_uv);
-                                        collect_unit_vars_ordered(&rhs, &mut all_uv);
-                                        for uv in &all_uv {
-                                            if remapped_unit_targets.contains(uv) && !unit_vars.contains(uv) {
-                                                unit_vars.push(*uv);
-                                            }
-                                        }
-                                        captured_binops.push(DeferredUnitBinop {
-                                            op: b.op,
-                                            lhs,
-                                            rhs,
-                                            result: fresh_result,
-                                            span: b.span,
-                                        });
-                                        continue;
-                                    }
-                                self.deferred_unit_binops.push(b);
+                            if !ffolds.is_empty() {
+                                self.fold_dict_fields
+                                    .insert(format!("{name}.{}", f.name), ffolds);
                             }
-                            self.bind_top(
-                                name,
-                                Scheme { vars, unit_vars, constraints, unit_binops: captured_binops, ty: ann_ty },
-                            );
-                        } else {
-                            let applied = self.apply(&inferred);
-                            self.in_top_level_generalize = true;
-                            let scheme = self.generalize(&applied);
-                            self.in_top_level_generalize = false;
-                            self.bind_top(name, scheme);
                         }
                     }
+                }
+                for s in &fresh_skolems {
+                    self.skolems.remove(s);
+                }
+                for u in &fresh_unit_skolems {
+                    self.unit_skolems.remove(u);
+                }
+                let inferred = self.apply(&expected);
+
+                // Remove the old monomorphic binding before
+                // generalizing, so its free variables don't block
+                // quantification.
+                if let Some(scope) = self.scopes.first_mut() {
+                    scope.remove(name);
+                }
+
+                // If the function has explicit constraints in its
+                // annotation, rebuild the scheme from the annotation.
+                // (We already verified the body matches via unification.)
+                let has_constraints = ty.as_ref().is_some_and(|ts| !ts.constraints.is_empty());
+                if has_constraints {
+                    let ts = ty.as_ref().unwrap();
+                    self.annotation_vars.clear();
+                    self.annotation_unit_vars.clear();
+                    self.in_type_annotation = true;
+                    let mut constraints = Vec::new();
+                    for c in &ts.constraints {
+                        match c {
+                            ast::Constraint::Trait { trait_name, args } => {
+                                for arg in args {
+                                    if let ast::TypeKind::Var(var_name) = &arg.node {
+                                        let v = self.annotation_var(var_name);
+                                        constraints.push(TyConstraint {
+                                            trait_name: trait_name.clone(),
+                                            type_var: v,
+                                            span: arg.span,
+                                        });
+                                    }
+                                }
+                            }
+                            ast::Constraint::ImplicitField { .. } => {
+                                // Recorded into `implicit_dict_fns` below.
+                            }
+                            ast::Constraint::CollectField { .. } => {
+                                // Recorded into `implicit_dict_fns` below
+                                // (as a fold).
+                            }
+                        }
+                    }
+                    let ann_ty = self.ast_type_to_ty(&ts.ty);
+                    // Record the implicit-field dictionaries this
+                    // function takes, in declared order, so each
+                    // callsite resolves them from scope. The field
+                    // types are converted NOW (while `annotation_vars`
+                    // is live) so they share the scheme's quantified
+                    // vars and unify with the body's dictionary use.
+                    let implicit: Vec<(String, Ty)> = ts
+                        .constraints
+                        .iter()
+                        .filter_map(|c| match c {
+                            ast::Constraint::ImplicitField { field, ty } => {
+                                Some((field.clone(), self.ast_type_to_ty(ty)))
+                            }
+                            ast::Constraint::CollectField { field, .. } => {
+                                // `(<>field)` fold constraint: the dict is
+                                // collected+merged at the callsite from the
+                                // in-scope `field` values (like `^` but
+                                // merging all). Its type is a fresh var —
+                                // the merged shape is callsite-dependent.
+                                Some((field.clone(), self.fresh()))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if !implicit.is_empty() {
+                        self.implicit_dict_fns.insert(name.to_string(), implicit);
+                    }
+                    // Track which of this fn's dict fields are FOLDS
+                    // (`<>`) vs single-match (`^`), so the callsite splice
+                    // merges all fragments for a fold instead of resolving
+                    // a single match.
+                    let fold_fields: Vec<String> = ts
+                        .constraints
+                        .iter()
+                        .filter_map(|c| match c {
+                            ast::Constraint::CollectField { field, .. } => Some(field.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    if !fold_fields.is_empty() {
+                        self.fold_dict_fields.insert(name.to_string(), fold_fields);
+                    }
+                    self.in_type_annotation = false;
+                    let mut vars: Vec<TyVar> = self.annotation_vars.values().copied().collect();
+                    let mut unit_vars: Vec<UnitVar> =
+                        self.annotation_unit_vars.values().copied().collect();
+                    // `(<>field)` fold constraints elaborate to a leading
+                    // dict param whose type is a fresh var (Hole/Callsite),
+                    // NOT a named annotation var — so it isn't in
+                    // `annotation_vars` and would otherwise stay
+                    // MONOMORPHIC across callsites (every call shares the
+                    // one dict var, so two calls with differently-shaped
+                    // contexts collide: "record fields don't match").
+                    // Quantify it (and any `_` hole in the signature) so
+                    // each callsite instantiates a fresh dict var. Only
+                    // quantify vars that are free in the rebuilt
+                    // annotation type but NOT free in the enclosing env
+                    // (outer-scope vars must stay shared) and not
+                    // skolems (rigid body-check vars).
+                    let env_free = self.free_vars_in_env();
+                    let mut extra: Vec<TyVar> = self
+                        .free_vars(&ann_ty)
+                        .into_iter()
+                        .filter(|v| {
+                            !vars.contains(v) && !self.skolems.contains(v) && !env_free.contains(v)
+                        })
+                        .collect();
+                    extra.sort_unstable();
+                    vars.append(&mut extra);
+                    // Capture deferred `*`/`/` unit-composition checks
+                    // whose result var resolves to a skolemized
+                    // annotation variable, so each call-site
+                    // instantiation gets its own fresh composition
+                    // (mirrors `generalize`).
+                    //
+                    // The scheme's type was just rebuilt from the
+                    // annotation with *fresh* vars (`ann_ty`), so the
+                    // body-check skolems these binops reference no
+                    // longer occur anywhere in it. Build a
+                    // skolem→fresh-var map by walking the skolemised
+                    // body type (`inferred`) against `ann_ty` in
+                    // parallel — they share the annotation's structure
+                    // — and re-point each captured binop at the vars
+                    // that actually appear in the scheme. Without this
+                    // the binop's result floats free of the return type
+                    // at instantiation and end-of-inference resolution
+                    // degrades to a vacuous `unify`, silently
+                    // mis-typing e.g. `scale 3.0 M 4.0 M` as
+                    // `Float M` instead of the `Float (M^2)` that
+                    // contradicts the `a -> a -> a` signature. (B12)
+                    let skolem_set: HashSet<TyVar> = fresh_skolems.iter().copied().collect();
+                    let unit_skolem_set: HashSet<UnitVar> =
+                        fresh_unit_skolems.iter().copied().collect();
+                    let mut walk_ty: HashMap<TyVar, TyVar> = HashMap::new();
+                    let mut walk_unit: HashMap<UnitVar, UnitVar> = HashMap::new();
+                    correspond_vars(&inferred, &ann_ty, &mut walk_ty, &mut walk_unit);
+                    // Restrict the remaps to the body-check skolems: only
+                    // those vanish from the rebuilt type. Other vars in an
+                    // operand are outer-scope and must be left untouched.
+                    let skolem_ty_subst: HashMap<TyVar, Ty> = walk_ty
+                        .iter()
+                        .filter(|(k, _)| skolem_set.contains(k))
+                        .map(|(k, v)| (*k, Ty::Var(*v)))
+                        .collect();
+                    let skolem_unit_subst: HashMap<UnitVar, UnitVar> = walk_unit
+                        .iter()
+                        .filter(|(k, _)| unit_skolem_set.contains(k))
+                        .map(|(k, v)| (*k, *v))
+                        .collect();
+                    let remapped_unit_targets: HashSet<UnitVar> =
+                        skolem_unit_subst.values().copied().collect();
+                    let pending_binops = std::mem::take(&mut self.deferred_unit_binops);
+                    let mut captured_binops: Vec<DeferredUnitBinop> = Vec::new();
+                    for b in pending_binops {
+                        let resolved_result = self.apply(&Ty::Var(b.result));
+                        if let Ty::Var(v) = &resolved_result
+                            && skolem_set.contains(v)
+                            && let Some(Ty::Var(fresh_result)) = skolem_ty_subst.get(v).cloned()
+                        {
+                            let mut lhs = self.subst_ty(&self.apply(&b.lhs), &skolem_ty_subst);
+                            let mut rhs = self.subst_ty(&self.apply(&b.rhs), &skolem_ty_subst);
+                            if !skolem_unit_subst.is_empty() {
+                                lhs = self.subst_unit_vars_in_ty(&lhs, &skolem_unit_subst);
+                                rhs = self.subst_unit_vars_in_ty(&rhs, &skolem_unit_subst);
+                            }
+                            if !vars.contains(&fresh_result) {
+                                vars.push(fresh_result);
+                            }
+                            let mut all_uv = Vec::new();
+                            collect_unit_vars_ordered(&lhs, &mut all_uv);
+                            collect_unit_vars_ordered(&rhs, &mut all_uv);
+                            for uv in &all_uv {
+                                if remapped_unit_targets.contains(uv) && !unit_vars.contains(uv) {
+                                    unit_vars.push(*uv);
+                                }
+                            }
+                            captured_binops.push(DeferredUnitBinop {
+                                op: b.op,
+                                lhs,
+                                rhs,
+                                result: fresh_result,
+                                span: b.span,
+                            });
+                            continue;
+                        }
+                        self.deferred_unit_binops.push(b);
+                    }
+                    self.bind_top(
+                        name,
+                        Scheme {
+                            vars,
+                            unit_vars,
+                            constraints,
+                            unit_binops: captured_binops,
+                            ty: ann_ty,
+                        },
+                    );
+                } else {
+                    let applied = self.apply(&inferred);
+                    self.in_top_level_generalize = true;
+                    let scheme = self.generalize(&applied);
+                    self.in_top_level_generalize = false;
+                    self.bind_top(name, scheme);
+                }
+            }
         });
 
         // Refined-type predicates must be pure `base -> Bool` functions.
@@ -12244,17 +12156,13 @@ impl Infer {
             None,
         );
         let expected = Ty::Record(
-            IndexMap::from([
-                ("key".into(), key_ty),
-                ("limit".into(), limit_ty),
-            ]),
+            IndexMap::from([("key".into(), key_ty), ("limit".into(), limit_ty)]),
             None,
         );
         self.check_expr(expr, &expected);
         // The runtime serializes the key via `show`, which works for all
         // types, so no trait constraint is needed on the key value type.
     }
-
 
     // ── Constraint checking ─────────────────────────────────────
 
@@ -12343,9 +12251,7 @@ impl Infer {
     fn to_diagnostics(&self) -> Vec<Diagnostic> {
         self.errors
             .iter()
-            .map(|(msg, span)| {
-                Diagnostic::error(msg.clone()).label(*span, msg.clone())
-            })
+            .map(|(msg, span)| Diagnostic::error(msg.clone()).label(*span, msg.clone()))
             .collect()
     }
 
@@ -12367,7 +12273,11 @@ impl Infer {
             let applied = self.apply(ty);
             info.insert(
                 name.clone(),
-                display_ty_clean(&applied, &var_map_for(&applied), &unit_var_map_for(&applied)),
+                display_ty_clean(
+                    &applied,
+                    &var_map_for(&applied),
+                    &unit_var_map_for(&applied),
+                ),
             );
         }
 
@@ -12519,19 +12429,13 @@ fn do_result_span(stmts: &[ast::Stmt], fallback: Span) -> Span {
 fn var_map_for(ty: &Ty) -> HashMap<TyVar, usize> {
     let mut vars = Vec::new();
     collect_vars_ordered(ty, &mut vars);
-    vars.iter()
-        .enumerate()
-        .map(|(i, &v)| (v, i))
-        .collect()
+    vars.iter().enumerate().map(|(i, &v)| (v, i)).collect()
 }
 
 fn unit_var_map_for(ty: &Ty) -> HashMap<UnitVar, usize> {
     let mut vars = Vec::new();
     collect_unit_vars_ordered(ty, &mut vars);
-    vars.iter()
-        .enumerate()
-        .map(|(i, &v)| (v, i))
-        .collect()
+    vars.iter().enumerate().map(|(i, &v)| (v, i)).collect()
 }
 
 fn collect_unit_vars_ordered(ty: &Ty, out: &mut Vec<UnitVar>) {
@@ -12596,9 +12500,7 @@ fn correspond_vars(
             correspond_vars(p1, p2, ty_map, unit_map);
             correspond_vars(r1, r2, ty_map, unit_map);
         }
-        (Ty::Relation(a), Ty::Relation(b)) => {
-            correspond_vars(a, b, ty_map, unit_map)
-        }
+        (Ty::Relation(a), Ty::Relation(b)) => correspond_vars(a, b, ty_map, unit_map),
         (Ty::Con(_, a1), Ty::Con(_, a2)) => {
             for (x, y) in a1.iter().zip(a2) {
                 correspond_vars(x, y, ty_map, unit_map);
@@ -12634,22 +12536,12 @@ fn correspond_vars(
         (Ty::Unit(u1), Ty::Unit(u2)) => {
             correspond_unit_vars(u1, u2, unit_map);
         }
-        (Ty::Forall(_, i1), Ty::Forall(_, i2)) => {
-            correspond_vars(i1, i2, ty_map, unit_map)
-        }
-        (Ty::Alias(_, i1), Ty::Alias(_, i2)) => {
-            correspond_vars(i1, i2, ty_map, unit_map)
-        }
+        (Ty::Forall(_, i1), Ty::Forall(_, i2)) => correspond_vars(i1, i2, ty_map, unit_map),
+        (Ty::Alias(_, i1), Ty::Alias(_, i2)) => correspond_vars(i1, i2, ty_map, unit_map),
         // Look through a one-sided alias so shapes still line up.
-        (Ty::Alias(_, i1), other) => {
-            correspond_vars(i1, other, ty_map, unit_map)
-        }
-        (other, Ty::Alias(_, i2)) => {
-            correspond_vars(other, i2, ty_map, unit_map)
-        }
-        (Ty::Assoc(_, i1), Ty::Assoc(_, i2)) => {
-            correspond_vars(i1, i2, ty_map, unit_map)
-        }
+        (Ty::Alias(_, i1), other) => correspond_vars(i1, other, ty_map, unit_map),
+        (other, Ty::Alias(_, i2)) => correspond_vars(other, i2, ty_map, unit_map),
+        (Ty::Assoc(_, i1), Ty::Assoc(_, i2)) => correspond_vars(i1, i2, ty_map, unit_map),
         _ => {}
     }
 }
@@ -12658,11 +12550,7 @@ fn correspond_vars(
 /// (see `correspond_vars`). The common shape is a single variable per unit
 /// (`Float u`), which pairs unambiguously; ties within one exponent pair in
 /// `BTreeMap` iteration order.
-fn correspond_unit_vars(
-    from: &UnitTy,
-    to: &UnitTy,
-    unit_map: &mut HashMap<UnitVar, UnitVar>,
-) {
+fn correspond_unit_vars(from: &UnitTy, to: &UnitTy, unit_map: &mut HashMap<UnitVar, UnitVar>) {
     let mut targets_by_exp: BTreeMap<i32, Vec<UnitVar>> = BTreeMap::new();
     for (&v, &e) in &to.vars {
         targets_by_exp.entry(e).or_default().push(v);
@@ -12681,10 +12569,9 @@ fn correspond_unit_vars(
 
 fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
     match ty {
-        Ty::Var(v)
-            if !out.contains(v) => {
-                out.push(*v);
-            }
+        Ty::Var(v) if !out.contains(v) => {
+            out.push(*v);
+        }
         Ty::Fun(p, r) => {
             collect_vars_ordered(p, out);
             collect_vars_ordered(r, out);
@@ -12694,9 +12581,10 @@ fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
                 collect_vars_ordered(t, out);
             }
             if let Some(rv) = row
-                && !out.contains(rv) {
-                    out.push(*rv);
-                }
+                && !out.contains(rv)
+            {
+                out.push(*rv);
+            }
         }
         Ty::Relation(inner) => collect_vars_ordered(inner, out),
         Ty::Con(_, args) => {
@@ -12709,9 +12597,10 @@ fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
                 collect_vars_ordered(t, out);
             }
             if let Some(rv) = row
-                && !out.contains(rv) {
-                    out.push(*rv);
-                }
+                && !out.contains(rv)
+            {
+                out.push(*rv);
+            }
         }
         Ty::App(f, a) => {
             collect_vars_ordered(f, out);
@@ -12839,14 +12728,30 @@ fn display_ty_clean_inner(
         // Primitive `Int`/`Float` are dimensionless; on the wire render them
         // with the explicit `1` unit so they re-parse (bare `Int`/`Float` is a
         // unit-annotation error in the JIT's expected-type parser).
-        Ty::Int => if wire { "Int 1".into() } else { "Int".into() },
-        Ty::Float => if wire { "Float 1".into() } else { "Float".into() },
+        Ty::Int => {
+            if wire {
+                "Int 1".into()
+            } else {
+                "Int".into()
+            }
+        }
+        Ty::Float => {
+            if wire {
+                "Float 1".into()
+            } else {
+                "Float".into()
+            }
+        }
         Ty::Text => "Text".into(),
         Ty::Bool => "Bool".into(),
         Ty::Bytes => "Bytes".into(),
         Ty::Uuid => "Uuid".into(),
         Ty::Assoc(name, inner) => {
-            format!("{} {}", name, display_ty_clean_inner(inner, names, unit_names, true, wire))
+            format!(
+                "{} {}",
+                name,
+                display_ty_clean_inner(inner, names, unit_names, true, wire)
+            )
         }
         Ty::Fun(p, r) => {
             let s = format!(
@@ -12854,11 +12759,7 @@ fn display_ty_clean_inner(
                 display_ty_clean_inner(p, names, unit_names, true, wire),
                 display_ty_clean_inner(r, names, unit_names, false, wire)
             );
-            if in_fun {
-                format!("({})", s)
-            } else {
-                s
-            }
+            if in_fun { format!("({})", s) } else { s }
         }
         Ty::Record(fields, row) => {
             if fields.is_empty() && row.is_none() {
@@ -12879,35 +12780,55 @@ fn display_ty_clean_inner(
                 })
                 .collect();
             if let Some(rv) = row {
-                parts.push(format!("| {}", var_letter(names.get(rv).copied().unwrap_or(*rv as usize))));
+                parts.push(format!(
+                    "| {}",
+                    var_letter(names.get(rv).copied().unwrap_or(*rv as usize))
+                ));
             }
             format!("{{{}}}", parts.join(" "))
         }
-        Ty::Relation(inner) => format!("Rel {}", display_ty_clean_inner(inner, names, unit_names, true, wire)),
+        Ty::Relation(inner) => format!(
+            "Rel {}",
+            display_ty_clean_inner(inner, names, unit_names, true, wire)
+        ),
         Ty::Con(name, args) => {
             // Unit-bearing Int/Float → `Int u`/`Float u`, collapsing to
             // `Int`/`Float` when dimensionless. On the compile-expected WIRE
             // keep the dimensionless unit as `Int 1`/`Float 1` so the string
             // re-parses (bare `Int` has no unit and would become `Ty::Error`).
-            if (name == "Int" || name == "Float") && args.len() == 1
-                && let Ty::Unit(u) = args[0].peel_alias() {
-                    if u.is_dimensionless() {
-                        return if wire { format!("{} 1", name) } else { name.clone() };
-                    }
-                    return format!("{} {}", name, display_unit_clean(u, unit_names));
+            if (name == "Int" || name == "Float")
+                && args.len() == 1
+                && let Ty::Unit(u) = args[0].peel_alias()
+            {
+                if u.is_dimensionless() {
+                    return if wire {
+                        format!("{} 1", name)
+                    } else {
+                        name.clone()
+                    };
                 }
+                return format!("{} {}", name, display_unit_clean(u, unit_names));
+            }
             if args.is_empty() {
                 name.clone()
             } else {
-                let args_str: Vec<String> =
-                    args.iter().map(|a| display_ty_clean_inner(a, names, unit_names, false, wire)).collect();
+                let args_str: Vec<String> = args
+                    .iter()
+                    .map(|a| display_ty_clean_inner(a, names, unit_names, false, wire))
+                    .collect();
                 format!("{} {}", name, args_str.join(" "))
             }
         }
         Ty::Variant(ctors, row) => {
             let mut parts: Vec<String> = ctors
                 .iter()
-                .map(|(name, ft)| format!("{} {}", name, display_ty_clean_inner(ft, names, unit_names, false, wire)))
+                .map(|(name, ft)| {
+                    format!(
+                        "{} {}",
+                        name,
+                        display_ty_clean_inner(ft, names, unit_names, false, wire)
+                    )
+                })
                 .collect();
             if let Some(rv) = row {
                 parts.push(var_letter(names.get(rv).copied().unwrap_or(*rv as usize)));
@@ -12921,7 +12842,10 @@ fn display_ty_clean_inner(
             display_ty_clean_inner(a, names, unit_names, false, wire)
         ),
         Ty::IO(inner) => {
-            format!("IO {}", display_ty_clean_inner(inner, names, unit_names, false, wire))
+            format!(
+                "IO {}",
+                display_ty_clean_inner(inner, names, unit_names, false, wire)
+            )
         }
         Ty::Forall(vars, inner) => {
             if vars.is_empty() {
@@ -12936,11 +12860,7 @@ fn display_ty_clean_inner(
                     bound.join(" "),
                     display_ty_clean_inner(inner, names, unit_names, false, wire)
                 );
-                if in_fun {
-                    format!("({})", s)
-                } else {
-                    s
-                }
+                if in_fun { format!("({})", s) } else { s }
             }
         }
         Ty::Alias(name, _) => name.clone(),
@@ -12950,7 +12870,6 @@ fn display_ty_clean_inner(
         Ty::Error => "<error>".into(),
     }
 }
-
 
 // ── `set` full-replacement detection ──────────────────────────────
 
@@ -12992,100 +12911,94 @@ fn value_references_source_inner(
             // Fold through let bindings: `let foo = ...; *rel = foo`
             // counts as referencing the source if the body does.
             if visited.insert(name.as_str().to_string())
-                && let Some(body) = let_bindings.get(name.as_str()) {
-                    let result = value_references_source_inner(
-                        body, source_name, aliases, let_bindings, visited,
-                    );
-                    visited.remove(name.as_str());
-                    return result;
-                }
+                && let Some(body) = let_bindings.get(name.as_str())
+            {
+                let result = value_references_source_inner(
+                    body,
+                    source_name,
+                    aliases,
+                    let_bindings,
+                    visited,
+                );
+                visited.remove(name.as_str());
+                return result;
+            }
             false
         }
-        ast::ExprKind::Lit(_)
-        | ast::ExprKind::Constructor(_) => false,
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } | ast::ExprKind::SourceDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
+        ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => false,
+        ast::ExprKind::TypeCtor { .. }
+        | ast::ExprKind::DataCtor { .. }
+        | ast::ExprKind::SourceDecl { .. }
+        | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } => false,
         ast::ExprKind::Record(fields) => fields.iter().any(|f| {
-            value_references_source_inner(
-                &f.value, source_name, aliases, let_bindings, visited,
-            )
+            value_references_source_inner(&f.value, source_name, aliases, let_bindings, visited)
         }),
-        ast::ExprKind::FieldAccess { expr, .. } => value_references_source_inner(
-            expr, source_name, aliases, let_bindings, visited,
-        ),
-        ast::ExprKind::List(elems) => elems.iter().any(|e| {
-            value_references_source_inner(e, source_name, aliases, let_bindings, visited)
-        }),
-        ast::ExprKind::Lambda { body, .. } => value_references_source_inner(
-            body, source_name, aliases, let_bindings, visited,
-        ),
+        ast::ExprKind::FieldAccess { expr, .. } => {
+            value_references_source_inner(expr, source_name, aliases, let_bindings, visited)
+        }
+        ast::ExprKind::List(elems) => elems
+            .iter()
+            .any(|e| value_references_source_inner(e, source_name, aliases, let_bindings, visited)),
+        ast::ExprKind::Lambda { body, .. } => {
+            value_references_source_inner(body, source_name, aliases, let_bindings, visited)
+        }
         ast::ExprKind::App { func, arg } => {
             value_references_source_inner(func, source_name, aliases, let_bindings, visited)
-                || value_references_source_inner(
-                    arg, source_name, aliases, let_bindings, visited,
-                )
+                || value_references_source_inner(arg, source_name, aliases, let_bindings, visited)
         }
         ast::ExprKind::With { record, body, .. } => {
             value_references_source_inner(record, source_name, aliases, let_bindings, visited)
-                || value_references_source_inner(
-                    body, source_name, aliases, let_bindings, visited,
-                )
+                || value_references_source_inner(body, source_name, aliases, let_bindings, visited)
         }
         ast::ExprKind::BinOp { lhs, rhs, .. } => {
             value_references_source_inner(lhs, source_name, aliases, let_bindings, visited)
-                || value_references_source_inner(
-                    rhs, source_name, aliases, let_bindings, visited,
-                )
+                || value_references_source_inner(rhs, source_name, aliases, let_bindings, visited)
         }
-        ast::ExprKind::UnaryOp { operand, .. } => value_references_source_inner(
-            operand, source_name, aliases, let_bindings, visited,
-        ),
+        ast::ExprKind::UnaryOp { operand, .. } => {
+            value_references_source_inner(operand, source_name, aliases, let_bindings, visited)
+        }
         ast::ExprKind::Case { scrutinee, arms } => {
-            value_references_source_inner(
-                scrutinee, source_name, aliases, let_bindings, visited,
-            ) || arms.iter().any(|a| {
-                value_references_source_inner(
-                    &a.body, source_name, aliases, let_bindings, visited,
-                )
-            })
+            value_references_source_inner(scrutinee, source_name, aliases, let_bindings, visited)
+                || arms.iter().any(|a| {
+                    value_references_source_inner(
+                        &a.body,
+                        source_name,
+                        aliases,
+                        let_bindings,
+                        visited,
+                    )
+                })
         }
         ast::ExprKind::Do(stmts) => stmts.iter().any(|s| match &s.node {
-            ast::StmtKind::Bind { expr, .. } => value_references_source_inner(
-                expr, source_name, aliases, let_bindings, visited,
-            ),
-            ast::StmtKind::Where { cond } => value_references_source_inner(
-                cond, source_name, aliases, let_bindings, visited,
-            ),
-            ast::StmtKind::GroupBy { key } => value_references_source_inner(
-                key, source_name, aliases, let_bindings, visited,
-            ),
-            ast::StmtKind::Expr(e) => value_references_source_inner(
-                e, source_name, aliases, let_bindings, visited,
-            ),
+            ast::StmtKind::Bind { expr, .. } => {
+                value_references_source_inner(expr, source_name, aliases, let_bindings, visited)
+            }
+            ast::StmtKind::Where { cond } => {
+                value_references_source_inner(cond, source_name, aliases, let_bindings, visited)
+            }
+            ast::StmtKind::GroupBy { key } => {
+                value_references_source_inner(key, source_name, aliases, let_bindings, visited)
+            }
+            ast::StmtKind::Expr(e) => {
+                value_references_source_inner(e, source_name, aliases, let_bindings, visited)
+            }
         }),
-        ast::ExprKind::Set { target, value }
-        | ast::ExprKind::FullSet { target, value } => {
-            value_references_source_inner(
-                target, source_name, aliases, let_bindings, visited,
-            ) || value_references_source_inner(
-                value, source_name, aliases, let_bindings, visited,
-            )
+        ast::ExprKind::Set { target, value } | ast::ExprKind::FullSet { target, value } => {
+            value_references_source_inner(target, source_name, aliases, let_bindings, visited)
+                || value_references_source_inner(value, source_name, aliases, let_bindings, visited)
         }
         ast::ExprKind::Atomic(inner) | ast::ExprKind::Refine(inner) => {
-            value_references_source_inner(
-                inner, source_name, aliases, let_bindings, visited,
-            )
+            value_references_source_inner(inner, source_name, aliases, let_bindings, visited)
         }
-        ast::ExprKind::TimeUnitLit { value, .. } => value_references_source_inner(
-            value, source_name, aliases, let_bindings, visited,
-        ),
-        ast::ExprKind::Annot { expr, .. } => value_references_source_inner(
-            expr, source_name, aliases, let_bindings, visited,
-        ),
+        ast::ExprKind::TimeUnitLit { value, .. } => {
+            value_references_source_inner(value, source_name, aliases, let_bindings, visited)
+        }
+        ast::ExprKind::Annot { expr, .. } => {
+            value_references_source_inner(expr, source_name, aliases, let_bindings, visited)
+        }
         ast::ExprKind::Serve { handlers, .. } => handlers.iter().any(|h| {
-            value_references_source_inner(
-                &h.body, source_name, aliases, let_bindings, visited,
-            )
+            value_references_source_inner(&h.body, source_name, aliases, let_bindings, visited)
         }),
     }
 }
@@ -13173,7 +13086,10 @@ pub fn check_with_expected(program: &mut ast::Expr, expected_src: &str) -> Check
 /// `None` = the expected type failed to parse, or the snippet had no
 /// inferrable body type.
 pub fn take_subsumption_verdict() -> Option<bool> {
-    SUBSUMPTION_VERDICT.lock().unwrap_or_else(|e| e.into_inner()).take()
+    SUBSUMPTION_VERDICT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
 }
 
 /// Is this expression a reference to the `todo` hole, `base.todo`? Purely
@@ -13221,9 +13137,7 @@ type CtorList = Vec<(String, Vec<(String, String)>)>;
 /// constructor sets structurally. Returns `(name → ctor-name-set, type_src)`.
 /// With no leading `data` lines the set is empty and the whole string is the
 /// type.
-fn split_host_data_decls(
-    src: &str,
-) -> (CtorSets, String) {
+fn split_host_data_decls(src: &str) -> (CtorSets, String) {
     let mut sets: CtorSets = HashMap::new();
     let mut rest = src;
     loop {
@@ -13253,9 +13167,7 @@ fn split_host_data_decls(
 /// substrings (e.g. `Int 1`, `Text`) so the JIT can re-parse them into real
 /// `Ty`s and unify against the snippet's payload types. Returns `None` if the
 /// line isn't a well-formed variant decl.
-fn parse_data_decl_ctors(
-    line: &str,
-) -> Option<(String, CtorList)> {
+fn parse_data_decl_ctors(line: &str) -> Option<(String, CtorList)> {
     let body = line.strip_prefix("type ")?.trim();
     let (name, rhs) = body.split_once('=')?;
     let name = name.trim().to_string();
@@ -13417,8 +13329,7 @@ fn walk_expected(
             // `Int`/`Float` carry a Unit arg, not an ADT — skip the ctor check
             // for them, but still recurse (harmless; their args are Units).
             let is_numeric = (name == "Int" || name == "Float") && args.len() == 1;
-            let adt_ok = is_numeric
-                || check_adt_ctors(infer, name, var, host, snippet_data, span);
+            let adt_ok = is_numeric || check_adt_ctors(infer, name, var, host, snippet_data, span);
             adt_ok
                 && args
                     .iter()
@@ -13560,7 +13471,14 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
     // Phase 2b: Collect known trait implementations
     infer.collect_impls(program);
     // Phase 2c: Register builtin [] and Result impls for HKT traits
-    for trait_name in &["Functor", "Applicative", "Monad", "Alternative", "Foldable", "Traversable"] {
+    for trait_name in &[
+        "Functor",
+        "Applicative",
+        "Monad",
+        "Alternative",
+        "Foldable",
+        "Traversable",
+    ] {
         infer
             .known_impls
             .insert((trait_name.to_string(), "Rel".to_string()));
@@ -13590,19 +13508,33 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
     // `Bool` is deliberately not orderable): ADTs that opt in via
     // `deriving (Ord)` are registered by `collect_impls` and ordered through
     // the structural recursion in the runtime's `compare_values`.
-    for ty in &["Int", "Float", "Text", "Bool", "Bytes", "Uuid", "Record", "Variant", "Rel"] {
+    for ty in &[
+        "Int", "Float", "Text", "Bool", "Bytes", "Uuid", "Record", "Variant", "Rel",
+    ] {
         infer.known_impls.insert(("Eq".to_string(), ty.to_string()));
     }
     for ty in &["Int", "Float", "Text"] {
-        infer.known_impls.insert(("Ord".to_string(), ty.to_string()));
+        infer
+            .known_impls
+            .insert(("Ord".to_string(), ty.to_string()));
     }
     for ty in &["Int", "Float"] {
-        infer.known_impls.insert(("Num".to_string(), ty.to_string()));
+        infer
+            .known_impls
+            .insert(("Num".to_string(), ty.to_string()));
     }
-    infer.known_impls.insert(("Semigroup".to_string(), "Text".to_string()));
-    infer.known_impls.insert(("Semigroup".to_string(), "Rel".to_string()));
-    infer.known_impls.insert(("Sequence".to_string(), "Text".to_string()));
-    infer.known_impls.insert(("Sequence".to_string(), "Rel".to_string()));
+    infer
+        .known_impls
+        .insert(("Semigroup".to_string(), "Text".to_string()));
+    infer
+        .known_impls
+        .insert(("Semigroup".to_string(), "Rel".to_string()));
+    infer
+        .known_impls
+        .insert(("Sequence".to_string(), "Text".to_string()));
+    infer
+        .known_impls
+        .insert(("Sequence".to_string(), "Rel".to_string()));
 
     // Phase 3: Pre-register top-level names (builtins, functions, trait methods)
     infer.pre_register(program);
@@ -13645,36 +13577,37 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                             let val_ty = infer.infer_expr(&f.value);
                             field_tys.push((f.name.clone(), val_ty));
                         }
-                        infer.with_fields.push((
-                            cur.span,
-                            field_tys.iter().map(|(n, _)| n.clone()).collect(),
-                        ));
+                        infer
+                            .with_fields
+                            .push((cur.span, field_tys.iter().map(|(n, _)| n.clone()).collect()));
                         infer.push_scope();
                         for (name, ty) in &field_tys {
                             infer.bind_at(name, Scheme::mono(ty.clone()), record.span);
                         }
-                        *infer.with_scope_stack.last_mut().expect("just pushed") =
-                            Some((
-                                cur.span,
-                                field_tys
-                                    .iter()
-                                    .map(|(n, t)| (n.clone(), Scheme::mono(t.clone())))
-                                    .collect(),
-                            ));
+                        *infer.with_scope_stack.last_mut().expect("just pushed") = Some((
+                            cur.span,
+                            field_tys
+                                .iter()
+                                .map(|(n, t)| (n.clone(), Scheme::mono(t.clone())))
+                                .collect(),
+                        ));
                         collapsed_withs.push(cur.span);
                     }
                     cur = body;
                 }
-                ast::ExprKind::With { record, body, types } => {
+                ast::ExprKind::With {
+                    record,
+                    body,
+                    types,
+                } => {
                     if let ast::ExprKind::Record(fields) = &record.node {
                         // Literal-record `with`: the fields are decls already
                         // inferred by `infer_declarations`, so infer only the
                         // body (its field references resolve via the alias
                         // mechanism) and record the field names.
-                        infer.with_fields.push((
-                            cur.span,
-                            fields.iter().map(|f| f.name.clone()).collect(),
-                        ));
+                        infer
+                            .with_fields
+                            .push((cur.span, fields.iter().map(|f| f.name.clone()).collect()));
                         // The `With` inference arm is skipped here, so push its
                         // type-import scope (`with {Maybe …}`) around the body
                         // inference ourselves — else bare ctors never resolve.
@@ -13730,24 +13663,26 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
     for (span, var, inner_ty) in &refine_vars {
         let resolved = infer.apply(&Ty::Var(*var));
         if let Ty::Con(name, args) = &resolved
-            && args.is_empty() && infer.refined_types.contains_key(name) {
-                // Context named the refined type — check the refined value
-                // against its *fully-resolved* base type (walking any chain of
-                // refined aliases, e.g. Age → Nat → Int), then record the
-                // target. Resolving to the ultimate base (not the immediate
-                // one) matters now that subsumption is directional: the value
-                // here is a raw base being introduced via `refine`, so an
-                // immediate base that is itself refined (`Age = Nat where …`)
-                // would otherwise look like an unchecked Int→Nat and be
-                // rejected.
-                let name = name.clone();
-                match infer.resolve_refined_base(&name, *span) {
-                    Some(base) => infer.unify(inner_ty, &base, *span),
-                    None => continue, // cycle already reported
-                }
-                refine_targets.insert(*span, name);
-                continue;
+            && args.is_empty()
+            && infer.refined_types.contains_key(name)
+        {
+            // Context named the refined type — check the refined value
+            // against its *fully-resolved* base type (walking any chain of
+            // refined aliases, e.g. Age → Nat → Int), then record the
+            // target. Resolving to the ultimate base (not the immediate
+            // one) matters now that subsumption is directional: the value
+            // here is a raw base being introduced via `refine`, so an
+            // immediate base that is itself refined (`Age = Nat where …`)
+            // would otherwise look like an unchecked Int→Nat and be
+            // rejected.
+            let name = name.clone();
+            match infer.resolve_refined_base(&name, *span) {
+                Some(base) => infer.unify(inner_ty, &base, *span),
+                None => continue, // cycle already reported
             }
+            refine_targets.insert(*span, name);
+            continue;
+        }
         // Alpha is unconstrained or resolved to a base type (e.g. Int via
         // do-block subsumption). Match against refined types' base types.
         let key_ty = match &resolved {
@@ -13757,10 +13692,12 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         // The refined expression may itself already have the refined type
         // (e.g. `refine (x : Nat)`).
         if let Ty::Con(name, args) = &key_ty
-            && args.is_empty() && infer.refined_types.contains_key(name) {
-                refine_targets.insert(*span, name.clone());
-                continue;
-            }
+            && args.is_empty()
+            && infer.refined_types.contains_key(name)
+        {
+            refine_targets.insert(*span, name.clone());
+            continue;
+        }
         let mut candidates: Vec<String> = infer
             .refined_types
             .iter()
@@ -13863,16 +13800,19 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                 MonadKind::IO => Some("IO".to_string()),
             };
             if let Some(ty_name) = alt_ty
-                && !infer.known_impls.contains(&("Alternative".to_string(), ty_name.clone())) {
-                    infer.error(
-                        format!(
-                            "do-block uses a 'where' guard (or empty), which requires an \
+                && !infer
+                    .known_impls
+                    .contains(&("Alternative".to_string(), ty_name.clone()))
+            {
+                infer.error(
+                    format!(
+                        "do-block uses a 'where' guard (or empty), which requires an \
                              Alternative impl, but '{}' has no Alternative instance",
-                            ty_name
-                        ),
-                        *span,
-                    );
-                }
+                        ty_name
+                    ),
+                    *span,
+                );
+            }
         }
         // Synthesized helper spans (globally unique, see desugar.rs) also
         // alias their originating do-block's real span — LSP monad inlay
@@ -13900,14 +13840,12 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         // rather than the ADT — recognize the built-in Maybe/Result shapes.
         let kind = match resolved.peel_alias() {
             Ty::Variant(ctors, _)
-                if !ctors.is_empty()
-                    && ctors.keys().all(|k| k == "Just" || k == "Nothing") =>
+                if !ctors.is_empty() && ctors.keys().all(|k| k == "Just" || k == "Nothing") =>
             {
                 MonadKind::Adt("Maybe".into())
             }
             Ty::Variant(ctors, _)
-                if !ctors.is_empty()
-                    && ctors.keys().all(|k| k == "Ok" || k == "Err") =>
+                if !ctors.is_empty() && ctors.keys().all(|k| k == "Ok" || k == "Err") =>
             {
                 MonadKind::Adt("Result".into())
             }
@@ -13956,10 +13894,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         let unit_var_map = unit_var_map_for(&inner);
         // Render for the WIRE (round-trippable): dimensionless `Int`/`Float`
         // keep their `1` unit so the JIT's `parse_type_str` re-parses them.
-        compile_expected_types.insert(
-            *span,
-            display_ty_wire(&inner, &var_map, &unit_var_map),
-        );
+        compile_expected_types.insert(*span, display_ty_wire(&inner, &var_map, &unit_var_map));
     }
 
     // Phase 5d: Sieve the field accesses whose field turned out to be a
@@ -14002,10 +13937,15 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         // the parse instead of leaking a mistyped value into the `Just`. A bare
         // `*` (type var / non-record ADT) carries no schema, so ADT
         // round-tripping still flows through the schema-less decoder.
-        let wire_schema =
-            Some(ty_to_wire_descriptor(&inner)).filter(|d| d != "*");
+        let wire_schema = Some(ty_to_wire_descriptor(&inner)).filter(|d| d != "*");
         if type_name.is_some() || wire_schema.is_some() {
-            from_json_targets.insert(*span, FromJsonTarget { type_name, wire_schema });
+            from_json_targets.insert(
+                *span,
+                FromJsonTarget {
+                    type_name,
+                    wire_schema,
+                },
+            );
         }
     }
 
@@ -14023,9 +13963,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         // base (following stacked refined chains) before extracting the unit.
         let resolved_owned;
         let resolved = match resolved.peel_alias() {
-            Ty::Con(name, args)
-                if args.is_empty() && infer.refined_types.contains_key(name) =>
-            {
+            Ty::Con(name, args) if args.is_empty() && infer.refined_types.contains_key(name) => {
                 match infer.resolve_refined_base(name, span) {
                     Some(base) => {
                         resolved_owned = base;
@@ -14097,7 +14035,9 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
             }
             None => None,
         };
-        *SUBSUMPTION_VERDICT.lock().unwrap_or_else(|e| e.into_inner()) = verdict;
+        *SUBSUMPTION_VERDICT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = verdict;
     }
 
     let file_body_type = infer.file_body_ty.as_ref().map(|ty| {
@@ -14147,7 +14087,6 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         refined_field_preds: infer.refined_field_preds.clone(),
     }
 }
-
 
 /// Whether a scheme's type is a two-argument function — the shape the
 /// check-lambda-arguments-last path in `infer_expr`'s `App` arm relies on.
@@ -14211,9 +14150,7 @@ fn action_monad_of(ty: &Ty) -> Option<MonadKind> {
         // expression is a unit-bearing number (e.g. `do { …; (5.0 : Float M)
         // }`) would misclassify the number as an `Adt("Int")` action and
         // try to treat it as the block's monad instead of wrapping in `pure`.
-        Ty::Con(name, args)
-            if !(args.is_empty() || name == "Int" || name == "Float") =>
-        {
+        Ty::Con(name, args) if !(args.is_empty() || name == "Int" || name == "Float") => {
             Some(MonadKind::Adt(name.clone()))
         }
         Ty::App(f, _) => action_monad_of(f).or_else(|| match f.peel_alias() {
@@ -14279,10 +14216,7 @@ fn resolve_result_markers(infer: &mut Infer, program: &mut ast::Expr) {
         infer.skolems.extend(m.skolems.iter().copied());
 
         if is_action {
-            let action_ty = Ty::App(
-                Box::new(Ty::Var(m.monad)),
-                Box::new(Ty::Var(m.elem)),
-            );
+            let action_ty = Ty::App(Box::new(Ty::Var(m.monad)), Box::new(Ty::Var(m.elem)));
             infer.unify(&action_ty, &arg, m.arg_span);
         } else {
             pure_spans.insert(m.span);
@@ -14490,10 +14424,7 @@ fn collect_pat_names(pat: &ast::Pat, out: &mut Vec<String>) {
 /// A relation marker found in a record literal: a persisted source (`*name`),
 /// view, or derived (`&name`) relation.
 enum RelMarker<'a> {
-    Source {
-        name: &'a str,
-        ty: &'a ast::Type,
-    },
+    Source { name: &'a str, ty: &'a ast::Type },
 }
 
 /// Read-only recursion over every sub-expression.
@@ -14562,7 +14493,6 @@ fn for_each_type_ctor<'a>(
     program: &'a ast::Expr,
     f: &mut impl FnMut(&'a str, &'a [ast::Name], &'a ast::Type, Span),
 ) {
-
     walk_exprs_read(program, &mut |e| {
         if let ast::ExprKind::TypeCtor { name, params, ty } = &e.node {
             f(name, params, ty, e.span);
@@ -14578,17 +14508,14 @@ fn for_each_type_ctor<'a>(
 /// never compile at runtime, dropping cranelift+Z3 from the produced binary.
 pub fn uses_compile_builtin(program: &ast::Expr) -> bool {
     let mut found = false;
-    walk_exprs_read(program, &mut |e| {
-        match &e.node {
-            ast::ExprKind::Var(n) if n == "compile" => found = true,
-            ast::ExprKind::FieldAccess { expr: ns, field }
-                if field == "compile"
-                    && matches!(&ns.node, ast::ExprKind::Var(n) if n == "base") =>
-            {
-                found = true;
-            }
-            _ => {}
+    walk_exprs_read(program, &mut |e| match &e.node {
+        ast::ExprKind::Var(n) if n == "compile" => found = true,
+        ast::ExprKind::FieldAccess { expr: ns, field }
+            if field == "compile" && matches!(&ns.node, ast::ExprKind::Var(n) if n == "base") =>
+        {
+            found = true;
         }
+        _ => {}
     });
     found
 }
@@ -14617,7 +14544,12 @@ fn for_each_data_ctor<'a>(
     f: &mut impl FnMut(&'a str, &'a [ast::Name], &'a [ast::ConstructorDef], Span),
 ) {
     walk_exprs_read(program, &mut |e| {
-        if let ast::ExprKind::DataCtor { name, params, constructors } = &e.node {
+        if let ast::ExprKind::DataCtor {
+            name,
+            params,
+            constructors,
+        } = &e.node
+        {
             f(name, params, constructors, e.span);
         }
     });
@@ -14639,7 +14571,12 @@ fn for_each_data_ctor_scoped<'a>(
         f: &mut impl FnMut(&'a str, &'a [ast::Name], &'a [ast::ConstructorDef], Span, usize),
     ) {
         use ast::ExprKind::*;
-        if let DataCtor { name, params, constructors } = &e.node {
+        if let DataCtor {
+            name,
+            params,
+            constructors,
+        } = &e.node
+        {
             f(name, params, constructors, e.span, depth);
             return; // do not descend into the decl's own subexpressions
         }
@@ -14815,11 +14752,7 @@ fn monad_kind_of(resolved: &Ty) -> MonadKind {
 
 /// Collect the names of type aliases referenced by an AST type. Used for
 /// cyclic-alias detection: only names present in `alias_names` are recorded.
-fn collect_alias_refs(
-    ty: &ast::Type,
-    alias_names: &HashSet<String>,
-    out: &mut HashSet<String>,
-) {
+fn collect_alias_refs(ty: &ast::Type, alias_names: &HashSet<String>, out: &mut HashSet<String>) {
     match &ty.node {
         ast::TypeKind::Named(name) => {
             if alias_names.contains(name) {
@@ -14886,10 +14819,12 @@ fn ty_to_wire_descriptor(ty: &Ty) -> String {
         Ty::Variant(ctors, _)
             if !ctors.is_empty() && ctors.keys().all(|k| k == "Just" || k == "Nothing") =>
         {
-            let inner = ctors.get("Just").and_then(|payload| match payload.peel_alias() {
-                Ty::Record(fields, _) => fields.get("value").map(ty_to_wire_descriptor),
-                _ => None,
-            });
+            let inner = ctors
+                .get("Just")
+                .and_then(|payload| match payload.peel_alias() {
+                    Ty::Record(fields, _) => fields.get("value").map(ty_to_wire_descriptor),
+                    _ => None,
+                });
             format!("?{}", inner.unwrap_or_else(|| "*".to_string()))
         }
         Ty::Record(fields, _) => {
@@ -14932,7 +14867,9 @@ fn fetch_ctor_name(expr: &ast::Expr) -> Option<&str> {
     // (`rec.Api.Ctor`); the endpoint constructor is registered under its leaf
     // name, so a field path reduces to its final segment.
     let ctor_name = match &arg.node {
-        ast::ExprKind::App { func: ctor_func, .. } => match &ctor_func.node {
+        ast::ExprKind::App {
+            func: ctor_func, ..
+        } => match &ctor_func.node {
             ast::ExprKind::Constructor(name) => name.as_str(),
             ast::ExprKind::FieldAccess { field, .. } => field.as_str(),
             _ => return None,
@@ -14967,4 +14904,3 @@ fn uncurry_fetch(expr: &ast::Expr) -> (&ast::Expr, Vec<&ast::Expr>) {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
-

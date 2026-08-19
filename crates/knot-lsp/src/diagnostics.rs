@@ -74,13 +74,16 @@ pub fn to_lsp_diagnostic(
     }
 
     truncate_message(&mut message);
-    let code_description = code.as_deref().and_then(doc_url_for_code).map(|href| {
-        CodeDescription {
+    let code_description = code
+        .as_deref()
+        .and_then(doc_url_for_code)
+        .map(|href| CodeDescription {
             href: href.parse().ok().unwrap_or_else(|| {
-                "https://example.invalid/".parse().expect("static URI parses")
+                "https://example.invalid/"
+                    .parse()
+                    .expect("static URI parses")
             }),
-        }
-    });
+        });
 
     let msg_lower = diag.message.to_lowercase();
     let mut tags = Vec::new();
@@ -115,10 +118,7 @@ pub fn to_lsp_diagnostic(
 /// and the snapshot/workspace caches store the full list — so gating happens
 /// at every emission boundary (publish + pull handlers). That way a live
 /// config change takes effect without re-analysis or cache invalidation.
-pub(crate) fn filter_unused_warnings(
-    items: Vec<Diagnostic>,
-    warn_unused: bool,
-) -> Vec<Diagnostic> {
+pub(crate) fn filter_unused_warnings(items: Vec<Diagnostic>, warn_unused: bool) -> Vec<Diagnostic> {
     if warn_unused {
         return items;
     }
@@ -197,7 +197,9 @@ pub fn description_for_code(code: &str) -> Option<&'static str> {
         "E001" => "Type mismatch — two expressions have incompatible types.",
         "E002" => "Reference to an undefined name (variable, function, type, or relation).",
         "E003" => "A record literal or pattern is missing a required field.",
-        "E004" => "A `case` expression is not exhaustive — some constructor patterns are unmatched.",
+        "E004" => {
+            "A `case` expression is not exhaustive — some constructor patterns are unmatched."
+        }
         "E005" => "Occurs check failure — a type variable would have to contain itself.",
         "E006" => "Duplicate declaration — the same name is defined twice.",
         "E007" => "Import error — the module path does not resolve or has a cycle.",
@@ -219,5 +221,3 @@ pub fn description_for_code(code: &str) -> Option<&'static str> {
 fn doc_url_for_code(code: &str) -> Option<String> {
     Some(format!("https://knot-lang.org/errors/{code}"))
 }
-
-

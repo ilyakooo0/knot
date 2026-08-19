@@ -1,10 +1,10 @@
 //! Refined types: simple aliases, per-field, cross-field, ADT-constructor
 //! refinements, `refine expr` → Result, and write-validation on relations.
 
-mod harness;
 mod e2e;
-use harness::assert_show;
+mod harness;
 use e2e::assert_stdout;
+use harness::assert_show;
 
 // ── refine keyword (JIT, pure) ─────────────────────────────────────────────
 

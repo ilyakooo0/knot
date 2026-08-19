@@ -83,7 +83,11 @@ pub fn position_to_offset(source: &str, pos: Position) -> usize {
                 line_start = i;
             }
             b'\r' => {
-                i += if bytes.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
                 line += 1;
                 line_start = i;
             }
@@ -363,7 +367,12 @@ pub fn find_word_after_eq(source: &str, name: &str, start: usize, end: usize) ->
 /// window — e.g. a route field/param declaration `name: Type`, where the name
 /// sits immediately before its type, but an identical word (a path literal like
 /// `/name`) may appear earlier in the same window and must not be chosen.
-pub fn find_word_last_in_source(source: &str, name: &str, start: usize, end: usize) -> Option<Span> {
+pub fn find_word_last_in_source(
+    source: &str,
+    name: &str,
+    start: usize,
+    end: usize,
+) -> Option<Span> {
     let mut last = None;
     let mut from = start;
     while let Some(span) = find_word_in_source(source, name, from, end) {
@@ -556,7 +565,3 @@ pub fn recurse_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, mut f: F) {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
-
-
-
-

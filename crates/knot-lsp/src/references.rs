@@ -5,9 +5,7 @@ use std::collections::HashSet;
 use lsp_types::*;
 
 use crate::state::ServerState;
-use crate::utils::{
-    ident_lookup_offset, position_to_offset, span_to_range, word_at_position,
-};
+use crate::utils::{ident_lookup_offset, position_to_offset, span_to_range, word_at_position};
 
 /// Cap on the number of locations returned by a single `textDocument/references`
 /// request. Common identifier names (`x`, `i`, `name`) in a multi-file workspace
@@ -91,7 +89,10 @@ pub(crate) fn handle_references(
         .min_by_key(|(usage, _)| usage.end - usage.start)
         .map(|(_, def)| *def)
         .or_else(|| {
-            doc.definitions.values().find(|span| span.start <= offset && offset < span.end).copied()
+            doc.definitions
+                .values()
+                .find(|span| span.start <= offset && offset < span.end)
+                .copied()
         });
 
     // Nothing resolved: not a definition and not a local usage.
@@ -150,5 +151,3 @@ pub(crate) fn handle_references(
         Some(locations)
     }
 }
-
-

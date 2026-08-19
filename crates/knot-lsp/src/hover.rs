@@ -4,13 +4,12 @@
 use lsp_types::*;
 
 use knot::ast::TypeKind;
-use knot_compiler::decl_view::{decl_views, DeclViewKind};
+use knot_compiler::decl_view::{DeclViewKind, decl_views};
 
 use crate::shared::{
-    constraints_for_type_var, find_enclosing_application,
-    find_enclosing_type_scheme, find_field_access_at_offset, find_field_refinement,
-    format_route_constructor_hover, parse_function_params, predicate_to_source,
-    resolve_var_to_source, ReceiverKind,
+    ReceiverKind, constraints_for_type_var, find_enclosing_application, find_enclosing_type_scheme,
+    find_field_access_at_offset, find_field_refinement, format_route_constructor_hover,
+    parse_function_params, predicate_to_source, resolve_var_to_source,
 };
 use crate::state::ServerState;
 use crate::type_format::format_type_kind;
@@ -184,27 +183,28 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     if let Some((func_name, active_param)) =
         find_enclosing_application(&doc.module, &doc.source, lookup_offset)
         && func_name == word
-            && let Some(type_str) = doc.type_info.get(func_name.as_str()) {
-                let params_list = parse_function_params(type_str);
-                if params_list.len() > 1 {
-                    let highlighted: Vec<String> = params_list
-                        .iter()
-                        .enumerate()
-                        .map(|(i, p)| {
-                            if i == active_param && i < params_list.len() - 1 {
-                                format!("**{p}**")
-                            } else {
-                                p.clone()
-                            }
-                        })
-                        .collect();
-                    value.push_str(&format!(
-                        "\n\n*Signature:* `{}  {}`",
-                        highlighted.join(" → "),
-                        func_name
-                    ));
-                }
-            }
+        && let Some(type_str) = doc.type_info.get(func_name.as_str())
+    {
+        let params_list = parse_function_params(type_str);
+        if params_list.len() > 1 {
+            let highlighted: Vec<String> = params_list
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    if i == active_param && i < params_list.len() - 1 {
+                        format!("**{p}**")
+                    } else {
+                        p.clone()
+                    }
+                })
+                .collect();
+            value.push_str(&format!(
+                "\n\n*Signature:* `{}  {}`",
+                highlighted.join(" → "),
+                func_name
+            ));
+        }
+    }
 
     // For source/view/derived refs, show the relation schema. Suppressed on a
     // record-field token: hovering the `items` field of `rec.items` must not
@@ -284,17 +284,18 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // user knows which fields will be validated on `set`. Skip on a record-field
     // token (same wrong-info reason as the schema section above).
     if let Some(refinements) = doc.source_refinements.get(word).filter(|_| !on_field_token)
-        && !refinements.is_empty() {
-            value.push_str("\n\n**Refinements (validated on write):**");
-            for (field, type_name, predicate) in refinements {
-                let pred_src = predicate_to_source(predicate, &doc.source);
-                let label = match field {
-                    Some(f) => format!("`{f} {type_name}`"),
-                    None => format!("(whole element) `{type_name}`"),
-                };
-                value.push_str(&format!("\n- {label} — `{pred_src}`"));
-            }
+        && !refinements.is_empty()
+    {
+        value.push_str("\n\n**Refinements (validated on write):**");
+        for (field, type_name, predicate) in refinements {
+            let pred_src = predicate_to_source(predicate, &doc.source);
+            let label = match field {
+                Some(f) => format!("`{f} {type_name}`"),
+                None => format!("(whole element) `{type_name}`"),
+            };
+            value.push_str(&format!("\n- {label} — `{pred_src}`"));
         }
+    }
 
     // Trait-constraint hover: if the cursor lands on a generic type parameter
     // inside a function's type signature, list the trait constraints that
@@ -306,10 +307,8 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
             .iter()
             .map(|c| match c {
                 knot::ast::Constraint::Trait { trait_name, args } => {
-                    let args: Vec<String> = args
-                        .iter()
-                        .map(|t| format_type_kind(&t.node))
-                        .collect();
+                    let args: Vec<String> =
+                        args.iter().map(|t| format_type_kind(&t.node)).collect();
                     format!("`{} {}`", trait_name, args.join(" "))
                 }
                 knot::ast::Constraint::ImplicitField { field, ty } => {
@@ -318,7 +317,7 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
                 knot::ast::Constraint::CollectField { field, ty } => match ty {
                     Some(ty) => format!("`({}  <>{})`", format_type_kind(&ty.node), field),
                     None => format!("`(<> {})`", field),
-                }
+                },
             })
             .collect();
         if !value.is_empty() {
@@ -344,16 +343,16 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
         if let Some(source_name) = owner_source.as_deref()
             && let Some((type_label, predicate)) =
                 find_field_refinement(&doc.source_refinements, source_name, &field_at.field_name)
-            {
-                let pred_src = predicate_to_source(predicate, &doc.source);
-                if !value.is_empty() {
-                    value.push_str("\n\n");
-                }
-                value.push_str(&format!(
-                    "**Field refinement:** `{}.{}` must satisfy `{}` (refined `{}`)",
-                    source_name, field_at.field_name, pred_src, type_label
-                ));
+        {
+            let pred_src = predicate_to_source(predicate, &doc.source);
+            if !value.is_empty() {
+                value.push_str("\n\n");
             }
+            value.push_str(&format!(
+                "**Field refinement:** `{}.{}` must satisfy `{}` (refined `{}`)",
+                source_name, field_at.field_name, pred_src, type_label
+            ));
+        }
     }
 
     // Route hover (on the route declaration's name): list all of its
@@ -369,10 +368,11 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // conversion functions so users can spot dimensionality at a glance and
     // know how to drop into / out of unit-tagged numeric flows.
     if let Some(ref ty) = type_for_refinement_scan
-        && let Some(section) = unit_aware_section(ty) {
-            value.push_str("\n\n");
-            value.push_str(&section);
-        }
+        && let Some(section) = unit_aware_section(ty)
+    {
+        value.push_str("\n\n");
+        value.push_str(&section);
+    }
 
     // Constructor → parent type: hovering on a constructor surfaces the parent
     // data type and a link-style listing of sibling constructors.
@@ -385,11 +385,10 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
     // top-level decl names (fun/source/view/derived), which collide with
     // record-field names — so a field token like `rec.total` must not pick up
     // an unrelated top-level `total`'s doc comment.
-    if !on_field_token
-        && let Some(doc_comment) = doc.doc_comments.get(word) {
-            value.push_str("\n\n---\n\n");
-            value.push_str(doc_comment);
-        }
+    if !on_field_token && let Some(doc_comment) = doc.doc_comments.get(word) {
+        value.push_str("\n\n---\n\n");
+        value.push_str(doc_comment);
+    }
 
     // Every section above is conditional — e.g. `field_at_cursor` can be
     // `Some` without any refinement metadata to render. Don't ship an empty
@@ -411,10 +410,12 @@ pub(crate) fn handle_hover(state: &ServerState, params: &HoverParams) -> Option<
 /// declaration in this module. Used to keep route names from being dropped by
 /// the hover early-return guard, since they have no value-scope detail entry.
 fn is_route_decl_name(program: &knot::ast::Expr, name: &str) -> bool {
-    crate::utils::top_fields(program).iter().any(|decl| match &decl.value.node {
-        knot::ast::ExprKind::RouteDecl { name: rn, .. } => rn == name,
-        _ => false,
-    })
+    crate::utils::top_fields(program)
+        .iter()
+        .any(|decl| match &decl.value.node {
+            knot::ast::ExprKind::RouteDecl { name: rn, .. } => rn == name,
+            _ => false,
+        })
 }
 
 /// If `name` is a `route` declaration's name in this module, render a summary
@@ -433,10 +434,7 @@ fn route_decl_section(program: &knot::ast::Expr, name: &str) -> Option<String> {
             for entry in entries {
                 let method = http_method_str(entry.method);
                 let path = format_route_path(entry);
-                out.push_str(&format!(
-                    "\n- `{method} {path}` → `{}`",
-                    entry.constructor
-                ));
+                out.push_str(&format!("\n- `{method} {path}` → `{}`", entry.constructor));
             }
             return Some(out);
         }
@@ -485,18 +483,19 @@ fn unit_aware_section(ty: &str) -> Option<String> {
 fn constructor_parent_section(program: &knot::ast::Expr, name: &str) -> Option<String> {
     for decl in decl_views(program) {
         if let DeclViewKind::Data { ctors, .. } = decl.kind
-            && ctors.iter().any(|c| c.name == name) {
-                let siblings: Vec<String> = ctors
-                    .iter()
-                    .filter(|c| c.name != name)
-                    .map(|c| format!("`{}`", c.name))
-                    .collect();
-                let mut out = format!("**Constructor of:** `{}`", decl.name);
-                if !siblings.is_empty() {
-                    out.push_str(&format!("  \nSiblings: {}", siblings.join(", ")));
-                }
-                return Some(out);
+            && ctors.iter().any(|c| c.name == name)
+        {
+            let siblings: Vec<String> = ctors
+                .iter()
+                .filter(|c| c.name != name)
+                .map(|c| format!("`{}`", c.name))
+                .collect();
+            let mut out = format!("**Constructor of:** `{}`", decl.name);
+            if !siblings.is_empty() {
+                out.push_str(&format!("  \nSiblings: {}", siblings.join(", ")));
             }
+            return Some(out);
+        }
     }
     None
 }
@@ -546,4 +545,3 @@ fn format_schema_from_type(ty: &TypeKind) -> String {
         _ => String::new(),
     }
 }
-

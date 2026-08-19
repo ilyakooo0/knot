@@ -22,8 +22,8 @@ fn text_empty_edge_cases() {
     assert_show("base.length \"\"", "0");
     // Argument order is (needle, haystack). Empty needle is always found; an
     // empty haystack contains/has-as-prefix only the empty needle.
-    assert_show("base.contains \"\" \"abc\"", "True");   // empty needle
-    assert_show("base.contains \"abc\" \"\"", "False");  // empty haystack
+    assert_show("base.contains \"\" \"abc\"", "True"); // empty needle
+    assert_show("base.contains \"abc\" \"\"", "False"); // empty haystack
     assert_show("base.startsWith \"\" \"abc\"", "True"); // empty needle is a prefix
     assert_show("base.startsWith \"abc\" \"\"", "False");
     assert_show("base.endsWith \"\" \"abc\"", "True");

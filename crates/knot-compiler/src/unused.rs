@@ -15,8 +15,11 @@
 //! injection / import resolution / desugaring so that only user code is in
 //! scope. Imports and prelude can never reference user-defined names anyway.
 
-use crate::decl_view::{decl_views, DeclView, DeclViewKind};
-use knot::ast::{CaseArm, ConstructorDef, Constraint, Expr, ExprKind, Pat, PatKind, PathSegment, RouteEntry, Stmt, StmtKind, Type, TypeKind, TypeScheme};
+use crate::decl_view::{DeclView, DeclViewKind, decl_views};
+use knot::ast::{
+    CaseArm, Constraint, ConstructorDef, Expr, ExprKind, Pat, PatKind, PathSegment, RouteEntry,
+    Stmt, StmtKind, Type, TypeKind, TypeScheme,
+};
 use knot::diagnostic::Diagnostic;
 use std::collections::HashSet;
 
@@ -219,7 +222,10 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         // `<>x` is likewise a field projection resolved during inference.
         ExprKind::CollectFold(_) => {}
         ExprKind::TypeHole => {}
-        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } | ExprKind::SubsetConstraint { .. } => {}
+        ExprKind::TypeCtor { .. }
+        | ExprKind::DataCtor { .. }
+        | ExprKind::SourceDecl { .. }
+        | ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } => {}
         ExprKind::Var(name) => {
             r.values.insert(name.as_str().to_string());
@@ -390,5 +396,3 @@ fn walk_type(t: &Type, r: &mut Refs) {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
-
-

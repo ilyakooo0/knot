@@ -30,18 +30,18 @@ pub const MOD_MUTATION: u32 = 0b1000;
 pub fn semantic_token_legend() -> SemanticTokensLegend {
     SemanticTokensLegend {
         token_types: vec![
-            SemanticTokenType::NAMESPACE,    // 0
-            SemanticTokenType::TYPE,         // 1
-            SemanticTokenType::STRUCT,       // 2
-            SemanticTokenType::ENUM_MEMBER,  // 3
-            SemanticTokenType::PARAMETER,    // 4
-            SemanticTokenType::VARIABLE,     // 5
-            SemanticTokenType::PROPERTY,     // 6
-            SemanticTokenType::FUNCTION,     // 7
-            SemanticTokenType::KEYWORD,      // 8
-            SemanticTokenType::STRING,       // 9
-            SemanticTokenType::NUMBER,       // 10
-            SemanticTokenType::OPERATOR,     // 11
+            SemanticTokenType::NAMESPACE,   // 0
+            SemanticTokenType::TYPE,        // 1
+            SemanticTokenType::STRUCT,      // 2
+            SemanticTokenType::ENUM_MEMBER, // 3
+            SemanticTokenType::PARAMETER,   // 4
+            SemanticTokenType::VARIABLE,    // 5
+            SemanticTokenType::PROPERTY,    // 6
+            SemanticTokenType::FUNCTION,    // 7
+            SemanticTokenType::KEYWORD,     // 8
+            SemanticTokenType::STRING,      // 9
+            SemanticTokenType::NUMBER,      // 10
+            SemanticTokenType::OPERATOR,    // 11
         ],
         token_modifiers: vec![
             SemanticTokenModifier::DECLARATION,  // bit 0

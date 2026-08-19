@@ -35,7 +35,7 @@ use knot::ast::Span;
 use knot::diagnostic::Diagnostic;
 use std::collections::{HashMap, HashSet};
 
-use crate::decl_view::{decl_views, DeclViewKind};
+use crate::decl_view::{DeclViewKind, decl_views};
 
 /// A top-level definition relevant to the analysis.
 struct Def<'a> {
@@ -157,18 +157,19 @@ fn collect_unguarded_calls<'a>(
             // Peel the application spine to find the head and its arguments.
             let (head, args) = peel_app(expr);
             if let Var(name) = &head.node
-                && let Some(callee) = defs.get(name.as_str()) {
-                    // A param'd self-application that passes the caller's own
-                    // parameters unchanged makes no progress toward a base
-                    // case — it loops forever. Only such edges prove
-                    // divergence; changing or un-analyzable args do not.
-                    if name.as_str() == caller_name
-                        && callee.arity > 0
-                        && args_match_params(&args, &caller.params)
-                    {
-                        out.push(name.as_str().to_string());
-                    }
+                && let Some(callee) = defs.get(name.as_str())
+            {
+                // A param'd self-application that passes the caller's own
+                // parameters unchanged makes no progress toward a base
+                // case — it loops forever. Only such edges prove
+                // divergence; changing or un-analyzable args do not.
+                if name.as_str() == caller_name
+                    && callee.arity > 0
+                    && args_match_params(&args, &caller.params)
+                {
+                    out.push(name.as_str().to_string());
                 }
+            }
             // The head and every argument are still evaluated unconditionally.
             collect_unguarded_calls(head, defs, caller_name, caller, out);
             for a in args {
@@ -278,8 +279,16 @@ fn is_relation_query(body: &ast::Expr) -> bool {
             let rel_head = |n: &str| {
                 matches!(
                     n,
-                    "union" | "inter" | "difference" | "bind" | "__bind"
-                        | "__from" | "__yield" | "__select" | "filter" | "map"
+                    "union"
+                        | "inter"
+                        | "difference"
+                        | "bind"
+                        | "__bind"
+                        | "__from"
+                        | "__yield"
+                        | "__select"
+                        | "filter"
+                        | "map"
                 )
             };
             match &head.node {

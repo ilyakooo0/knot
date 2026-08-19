@@ -7,13 +7,11 @@ use lsp_types::*;
 
 use knot::ast::{self, Span, TypeKind};
 
-use crate::shared::{
-    extract_principal_type_name, find_enclosing_atomic_expr,
-};
-use crate::state::{builtins as state_builtins, DocumentState, ServerState};
+use crate::shared::{extract_principal_type_name, find_enclosing_atomic_expr};
+use crate::state::{DocumentState, ServerState, builtins as state_builtins};
 use crate::utils::{
-    edit_distance, offset_to_position, position_to_offset, safe_slice, span_to_range,
-    top_fields, word_at_position,
+    edit_distance, offset_to_position, position_to_offset, safe_slice, span_to_range, top_fields,
+    word_at_position,
 };
 
 // ── Code Actions ────────────────────────────────────────────────────
@@ -56,47 +54,51 @@ pub(crate) fn handle_code_action(
         // Action: Add type annotation to unannotated functions, using the
         // inferred type as the suggested signature.
         let is_unannotated_fn = decl.sig.is_none()
-            && !matches!(decl.value.node,
-                ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-                | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. });
-        if is_unannotated_fn
-            && let Some(inferred) = doc.type_info.get(&decl.name) {
-               let signature = inferred.clone();
-                // Signatures are type-first and live on their own line above the
-                // binding: insert `Sig  name\n` at the start of the decl's line,
-                // preserving the line's existing indentation.
-                let line_start = doc.source[..decl.value.span.start]
-                    .rfind('\n')
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                let indent: String = doc.source[line_start..decl.value.span.start]
-                    .chars()
-                    .take_while(|c| c.is_whitespace())
-                    .collect();
-                let insert_pos = offset_to_position(&doc.source, line_start);
+            && !matches!(
+                decl.value.node,
+                ast::ExprKind::SourceDecl { .. }
+                    | ast::ExprKind::DataCtor { .. }
+                    | ast::ExprKind::TypeCtor { .. }
+                    | ast::ExprKind::RouteDecl { .. }
+                    | ast::ExprKind::SubsetConstraint { .. }
+            );
+        if is_unannotated_fn && let Some(inferred) = doc.type_info.get(&decl.name) {
+            let signature = inferred.clone();
+            // Signatures are type-first and live on their own line above the
+            // binding: insert `Sig  name\n` at the start of the decl's line,
+            // preserving the line's existing indentation.
+            let line_start = doc.source[..decl.value.span.start]
+                .rfind('\n')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let indent: String = doc.source[line_start..decl.value.span.start]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect();
+            let insert_pos = offset_to_position(&doc.source, line_start);
 
-                let mut changes = HashMap::new();
-                changes.insert(
-                    uri.clone(),
-                    vec![TextEdit {
-                        range: Range {
-                            start: insert_pos,
-                            end: insert_pos,
-                        },
-                        new_text: format!("{indent}{signature}  {}\n", decl.name),
-                    }],
-                );
+            let mut changes = HashMap::new();
+            changes.insert(
+                uri.clone(),
+                vec![TextEdit {
+                    range: Range {
+                        start: insert_pos,
+                        end: insert_pos,
+                    },
+                    new_text: format!("{indent}{signature}  {}\n", decl.name),
+                }],
+            );
 
-                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                        title: format!("Add type annotation: {signature}"),
-                        kind: Some(CodeActionKind::QUICKFIX),
-                        edit: Some(WorkspaceEdit {
-                            changes: Some(changes),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }));
-            }
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Add type annotation: {signature}"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(WorkspaceEdit {
+                    changes: Some(changes),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+        }
     }
 
     // Diagnostic-attached quick fixes: suggest similar names for unknown identifiers
@@ -150,38 +152,39 @@ pub(crate) fn handle_code_action(
         // appropriate constructor. Cheaper than asking users to rewrite the
         // expression themselves.
         if msg.starts_with("type mismatch:")
-            && let Some((expected, found)) = parse_type_mismatch(msg) {
-                let diag_start = position_to_offset(&doc.source, diag.range.start);
-                let diag_end = position_to_offset(&doc.source, diag.range.end);
-                if diag_end > diag_start && diag_end <= doc.source.len() {
-                    let snippet = doc.source[diag_start..diag_end].trim();
-                    if !snippet.is_empty() {
-                        let refined_names: HashSet<&str> =
-                            doc.refined_types.keys().map(String::as_str).collect();
-                        for wrap in detect_wrap_suggestions(&expected, &found, &refined_names) {
-                            let mut changes = HashMap::new();
-                            let wrapped = wrap.format_wrapping(snippet);
-                            changes.insert(
-                                uri.clone(),
-                                vec![TextEdit {
-                                    range: diag.range,
-                                    new_text: wrapped,
-                                }],
-                            );
-                            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                                title: wrap.title.clone(),
-                                kind: Some(CodeActionKind::QUICKFIX),
-                                diagnostics: Some(vec![diag.clone()]),
-                                edit: Some(WorkspaceEdit {
-                                    changes: Some(changes),
-                                    ..Default::default()
-                                }),
+            && let Some((expected, found)) = parse_type_mismatch(msg)
+        {
+            let diag_start = position_to_offset(&doc.source, diag.range.start);
+            let diag_end = position_to_offset(&doc.source, diag.range.end);
+            if diag_end > diag_start && diag_end <= doc.source.len() {
+                let snippet = doc.source[diag_start..diag_end].trim();
+                if !snippet.is_empty() {
+                    let refined_names: HashSet<&str> =
+                        doc.refined_types.keys().map(String::as_str).collect();
+                    for wrap in detect_wrap_suggestions(&expected, &found, &refined_names) {
+                        let mut changes = HashMap::new();
+                        let wrapped = wrap.format_wrapping(snippet);
+                        changes.insert(
+                            uri.clone(),
+                            vec![TextEdit {
+                                range: diag.range,
+                                new_text: wrapped,
+                            }],
+                        );
+                        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                            title: wrap.title.clone(),
+                            kind: Some(CodeActionKind::QUICKFIX),
+                            diagnostics: Some(vec![diag.clone()]),
+                            edit: Some(WorkspaceEdit {
+                                changes: Some(changes),
                                 ..Default::default()
-                            }));
-                        }
+                            }),
+                            ..Default::default()
+                        }));
                     }
                 }
             }
+        }
 
         // Unit-mismatch quick fixes: when the inferred unit on a numeric
         // expression doesn't match what the surrounding context expects
@@ -206,8 +209,7 @@ pub(crate) fn handle_code_action(
                         }],
                     );
                     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
-                        title: "Wrap in `withFloatUnit (stripFloatUnit …)`"
-                            .to_string(),
+                        title: "Wrap in `withFloatUnit (stripFloatUnit …)`".to_string(),
                         kind: Some(CodeActionKind::QUICKFIX),
                         diagnostics: Some(vec![diag.clone()]),
                         edit: Some(WorkspaceEdit {
@@ -241,10 +243,13 @@ pub(crate) fn handle_code_action(
         }
 
         // Pattern: "Unknown variable/type/constructor" → suggest similar names
-        if msg.contains("nknown") || msg.contains("ndefined") || msg.contains("not found") || msg.contains("unresolved") {
+        if msg.contains("nknown")
+            || msg.contains("ndefined")
+            || msg.contains("not found")
+            || msg.contains("unresolved")
+        {
             // Extract the unknown name from the diagnostic range
-            let unknown_name = word_at_position(&doc.source, diag.range.start)
-                .unwrap_or("");
+            let unknown_name = word_at_position(&doc.source, diag.range.start).unwrap_or("");
             if !unknown_name.is_empty() {
                 // Find similar names using edit distance. Dedup across
                 // definitions and builtins (a name can appear in both) so we
@@ -298,8 +303,11 @@ pub(crate) fn handle_code_action(
     // Action: Fill case arms — check if cursor is inside a case expression
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => {
                 find_case_actions(&decl.value, doc, uri, range_start, range_end, &mut actions);
             }
@@ -318,8 +326,7 @@ pub(crate) fn handle_code_action(
         // declaration and breaking the layout-sensitive parse. The trimmed
         // offsets also keep the enclosing-decl / do-statement lookups below from
         // being thrown off by whitespace that spills past the node's span.
-        let sel_start =
-            range_start + (selected_text.len() - selected_text.trim_start().len());
+        let sel_start = range_start + (selected_text.len() - selected_text.trim_start().len());
         let sel_end = sel_start + trimmed.len();
         let sel_range = Range {
             start: offset_to_position(&doc.source, sel_start),
@@ -398,9 +405,8 @@ pub(crate) fn handle_code_action(
                 } else {
                     format!("({trimmed})")
                 };
-                let with_text = format!(
-                    "{prefix}with {{{let_name} {value_text}}} (do\n{reindented_body})"
-                );
+                let with_text =
+                    format!("{prefix}with {{{let_name} {value_text}}} (do\n{reindented_body})");
 
                 let mut changes = HashMap::new();
                 changes.insert(
@@ -497,8 +503,11 @@ pub(crate) fn handle_code_action(
             continue;
         }
         match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => {
                 find_inline_actions(&decl.value, doc, uri, range_start, &mut actions);
             }
@@ -689,9 +698,10 @@ fn find_add_wildcard_arm_at(
             let mut inner = None;
             crate::utils::recurse_expr(expr, |child| {
                 if inner.is_none()
-                    && let Some(hit) = walk(child, source, offset) {
-                        inner = Some(hit);
-                    }
+                    && let Some(hit) = walk(child, source, offset)
+                {
+                    inner = Some(hit);
+                }
             });
             if inner.is_some() {
                 return inner;
@@ -734,16 +744,20 @@ fn find_add_wildcard_arm_at(
         let mut found = None;
         crate::utils::recurse_expr(expr, |child| {
             if found.is_none()
-                && let Some(hit) = walk(child, source, offset) {
-                    found = Some(hit);
-                }
+                && let Some(hit) = walk(child, source, offset)
+            {
+                found = Some(hit);
+            }
         });
         found
     }
     for decl in top_fields(module) {
         match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => {
                 if let Some(hit) = walk(&decl.value, source, offset) {
                     return Some(hit);
@@ -775,7 +789,10 @@ fn find_alias_to_refine_at(
             // Refining records or functions at the top level isn't idiomatic.
             // Records use per-field refinements; functions can't be refined
             // by a value-level predicate.
-            if matches!(&ty.node, TypeKind::Record { .. } | TypeKind::Function { .. }) {
+            if matches!(
+                &ty.node,
+                TypeKind::Record { .. } | TypeKind::Function { .. }
+            ) {
                 return None;
             }
             // Insert at the end of the base type's span — that's where the
@@ -808,18 +825,19 @@ fn find_wrap_in_err_at(
         let mut inner = None;
         crate::utils::recurse_expr(expr, |child| {
             if inner.is_none()
-                && let Some(s) = walk(child, range_start, range_end) {
-                    inner = Some(s);
-                }
+                && let Some(s) = walk(child, range_start, range_end)
+            {
+                inner = Some(s);
+            }
         });
         if inner.is_some() {
             return inner;
         }
         // Skip wrapping bindings/lambdas/blocks — only wrap leaf-ish exprs.
         match &expr.node {
-            ast::ExprKind::Lambda { .. }
-            | ast::ExprKind::Do(_)
-            | ast::ExprKind::Case { .. } => None,
+            ast::ExprKind::Lambda { .. } | ast::ExprKind::Do(_) | ast::ExprKind::Case { .. } => {
+                None
+            }
             _ => Some(expr.span),
         }
     }
@@ -830,8 +848,11 @@ fn find_wrap_in_err_at(
     }
     for decl in top_fields(module) {
         match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => {
                 if let Some(span) = walk(&decl.value, range_start, range_end) {
                     let text = source.get(span.start..span.end)?;
@@ -922,11 +943,16 @@ fn selection_matches_expr_node(module: &ast::Expr, source: &str, lo: usize, hi: 
         });
         found
     }
-    top_fields(module).iter().any(|decl| match &decl.value.node {
-        ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-        | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => false,
-        _ => walk(&decl.value, source, target),
-    })
+    top_fields(module)
+        .iter()
+        .any(|decl| match &decl.value.node {
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => false,
+            _ => walk(&decl.value, source, target),
+        })
 }
 
 /// Locate the innermost `refine expr` containing the cursor, returning its full
@@ -958,12 +984,9 @@ fn find_case_actions(
         // remaining constructor — the case is exhaustive, and arms inserted
         // after the catch-all would be unreachable dead code. Suppress the
         // fill action entirely (recursion into sub-expressions still runs).
-        let has_catch_all_arm = arms.iter().any(|arm| {
-            matches!(
-                &arm.pat.node,
-                ast::PatKind::Wildcard | ast::PatKind::Var(_)
-            )
-        });
+        let has_catch_all_arm = arms
+            .iter()
+            .any(|arm| matches!(&arm.pat.node, ast::PatKind::Wildcard | ast::PatKind::Var(_)));
         // Try to find the ADT type of the scrutinee. Resolve the scrutinee
         // expression's *own span* against the local-type table (innermost
         // containing span, via the deterministic sorted vec) rather than
@@ -983,9 +1006,7 @@ fn find_case_actions(
                         doc.references
                             .iter()
                             .find(|(usage, _)| usage.start <= offset && offset < usage.end)
-                            .and_then(|(_, def_span)| {
-                                doc.local_type_info.get(def_span).cloned()
-                            })
+                            .and_then(|(_, def_span)| doc.local_type_info.get(def_span).cloned())
                     })
                     .or_else(|| doc.type_info.get(name.as_str()).cloned())
             }
@@ -1060,8 +1081,7 @@ fn find_case_actions(
                             }],
                         );
 
-                        let names: Vec<&str> =
-                            missing.iter().map(|c| c.name.as_str()).collect();
+                        let names: Vec<&str> = missing.iter().map(|c| c.name.as_str()).collect();
                         actions.push(CodeActionOrCommand::CodeAction(CodeAction {
                             title: format!("Add missing case arms: {}", names.join(", ")),
                             kind: Some(CodeActionKind::QUICKFIX),
@@ -1166,12 +1186,13 @@ fn detect_wrap_suggestions(
     let mut out = Vec::new();
     // `expected Maybe T, found T` → wrap in Just
     if let Some(inner) = expected.strip_prefix("Maybe ")
-        && inner.trim() == found.trim() {
-            out.push(WrapSuggestion {
-                title: "Wrap in `Just`".to_string(),
-                template: format!("Just {{value {WRAP_PLACEHOLDER}}}"),
-            });
-        }
+        && inner.trim() == found.trim()
+    {
+        out.push(WrapSuggestion {
+            title: "Wrap in `Just`".to_string(),
+            template: format!("Just {{value {WRAP_PLACEHOLDER}}}"),
+        });
+    }
     // `expected Maybe T, found {}` → suggest `Nothing {}`. The `{}` here is
     // the empty-record literal Knot uses for unit-like values; if the user
     // wrote `{}` where a `Maybe T` was expected, replacing with `Nothing {}`
@@ -1197,9 +1218,7 @@ fn detect_wrap_suggestions(
             // Verify there's at least one whitespace before the suffix so
             // `Result T` (one arg) is rejected.
             let prefix_len = trimmed.len().saturating_sub(found.trim().len());
-            if prefix_len > 0
-                && trimmed.as_bytes()[prefix_len - 1].is_ascii_whitespace()
-            {
+            if prefix_len > 0 && trimmed.as_bytes()[prefix_len - 1].is_ascii_whitespace() {
                 out.push(WrapSuggestion {
                     title: "Wrap in `Ok`".to_string(),
                     template: format!("Ok {{value {WRAP_PLACEHOLDER}}}"),
@@ -1239,7 +1258,9 @@ fn indent_for_expr_start(source: &str, span_start: usize) -> String {
         .unwrap_or(0);
     // Count CHARACTERS, not bytes — a byte count over-indents (and can corrupt
     // the layout-sensitive parse) when multibyte text precedes on the line.
-    let col = source[line_start..span_start.min(source.len())].chars().count();
+    let col = source[line_start..span_start.min(source.len())]
+        .chars()
+        .count();
     format!("\n{}", " ".repeat(col + 2))
 }
 
@@ -1330,11 +1351,7 @@ fn fresh_extract_name(doc: &DocumentState, base: &str) -> String {
     base.to_string()
 }
 
-fn find_free_vars_in_selection(
-    doc: &DocumentState,
-    start: usize,
-    end: usize,
-) -> Vec<String> {
+fn find_free_vars_in_selection(doc: &DocumentState, start: usize, end: usize) -> Vec<String> {
     let mut free_vars = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1357,13 +1374,12 @@ fn find_free_vars_in_selection(
                 //   (a) an entry in `local_type_info` before the selection, or
                 //   (b) a reference whose definition span sits before the
                 //       selection and is not this name's top-level definition.
-                let local_via_type_info = doc.local_type_info.keys().any(|span| {
-                    span.start < start && safe_slice(&doc.source, *span) == name
-                });
-                let resolves_to_top_level = doc
-                    .definitions
-                    .get(name)
-                    .is_some_and(|s| *s == *def_span);
+                let local_via_type_info = doc
+                    .local_type_info
+                    .keys()
+                    .any(|span| span.start < start && safe_slice(&doc.source, *span) == name);
+                let resolves_to_top_level =
+                    doc.definitions.get(name).is_some_and(|s| *s == *def_span);
                 let local_via_ref = def_span.end <= start && !resolves_to_top_level;
                 if local_via_type_info || local_via_ref {
                     seen.insert(name.to_string());
@@ -1495,13 +1511,12 @@ fn find_inline_actions(
             // want the bare body (`do …`). Strip one paren layer when the
             // body text is a fully-parenthesized wrapper.
             let body_text_raw = safe_slice(&doc.source, body.span);
-            let (body_start, body_end) = if body_text_raw.starts_with('(')
-                && body_text_raw.ends_with(')')
-            {
-                (body.span.start + 1, body.span.end - 1)
-            } else {
-                (body.span.start, body.span.end)
-            };
+            let (body_start, body_end) =
+                if body_text_raw.starts_with('(') && body_text_raw.ends_with(')') {
+                    (body.span.start + 1, body.span.end - 1)
+                } else {
+                    (body.span.start, body.span.end)
+                };
             let body_text = &doc.source[body_start..body_end];
 
             // Collect usages of the bound name inside the body. The old
@@ -1580,12 +1595,7 @@ pub(crate) fn enclosing_do_stmt_range(
     sel_start: usize,
     sel_end: usize,
 ) -> Option<(usize, usize)> {
-    fn walk(
-        expr: &ast::Expr,
-        sel_start: usize,
-        sel_end: usize,
-        best: &mut Option<(usize, usize)>,
-    ) {
+    fn walk(expr: &ast::Expr, sel_start: usize, sel_end: usize, best: &mut Option<(usize, usize)>) {
         if let ast::ExprKind::Do(stmts) = &expr.node {
             for stmt in stmts {
                 if stmt.span.start <= sel_start && sel_end <= stmt.span.end {
@@ -1604,8 +1614,11 @@ pub(crate) fn enclosing_do_stmt_range(
             continue;
         }
         match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => walk(&decl.value, sel_start, sel_end, &mut best),
         }
     }
@@ -1615,17 +1628,8 @@ pub(crate) fn enclosing_do_stmt_range(
 /// Locate the smallest commutative binary expression containing the cursor,
 /// returning the span and the operand-flipped source text. Limited to ops
 /// where flipping preserves semantics — `+`, `*`, `==`, `!=`, `&&`, `||`.
-fn find_flip_binary_at(
-    module: &ast::Expr,
-    source: &str,
-    offset: usize,
-) -> Option<(Span, String)> {
-    fn walk(
-        expr: &ast::Expr,
-        source: &str,
-        offset: usize,
-        best: &mut Option<(Span, String)>,
-    ) {
+fn find_flip_binary_at(module: &ast::Expr, source: &str, offset: usize) -> Option<(Span, String)> {
+    fn walk(expr: &ast::Expr, source: &str, offset: usize, best: &mut Option<(Span, String)>) {
         if expr.span.start > offset || offset >= expr.span.end {
             return;
         }
@@ -1691,8 +1695,11 @@ fn find_flip_binary_at(
     let mut best = None;
     for decl in top_fields(module) {
         match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => walk(&decl.value, source, offset, &mut best),
         }
     }
@@ -1788,20 +1795,20 @@ fn find_pipe_conversion_at(
                 walk(operand, source, offset, best, false, true);
             }
             _ => {
-                crate::utils::recurse_expr(expr, |e| {
-                    walk(e, source, offset, best, false, false)
-                });
+                crate::utils::recurse_expr(expr, |e| walk(e, source, offset, best, false, false));
             }
         }
     }
     let mut best = None;
     for decl in top_fields(module) {
         match &decl.value.node {
-            ast::ExprKind::SourceDecl { .. } | ast::ExprKind::DataCtor { .. }
-            | ast::ExprKind::TypeCtor { .. } | ast::ExprKind::RouteDecl { .. } | ast::ExprKind::SubsetConstraint { .. } => {}
+            ast::ExprKind::SourceDecl { .. }
+            | ast::ExprKind::DataCtor { .. }
+            | ast::ExprKind::TypeCtor { .. }
+            | ast::ExprKind::RouteDecl { .. }
+            | ast::ExprKind::SubsetConstraint { .. } => {}
             _ => walk(&decl.value, source, offset, &mut best, false, false),
         }
     }
     best
 }
-

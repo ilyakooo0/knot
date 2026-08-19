@@ -18,12 +18,10 @@ use knot_compiler::infer::MonadKind;
 use crate::defs::{build_details, resolve_definitions};
 use crate::incremental::ModuleFingerprint;
 use crate::state::{
-    content_hash, AnalysisResult, AnalysisTask, DocumentState, ImportCache, ImportCacheEntry,
-    InferenceCache, InferenceSnapshot, ANALYSIS_DEBOUNCE, ANALYSIS_MAX_WAIT,
+    ANALYSIS_DEBOUNCE, ANALYSIS_MAX_WAIT, AnalysisResult, AnalysisTask, DocumentState, ImportCache,
+    ImportCacheEntry, InferenceCache, InferenceSnapshot, content_hash,
 };
-use crate::utils::{
-    collect_keyword_operator_positions, extract_doc_comments, uri_to_path,
-};
+use crate::utils::{collect_keyword_operator_positions, extract_doc_comments, uri_to_path};
 
 /// Soft cap on cached inference snapshots — undo/redo and rapid file
 /// switching are well-served by even a small cache; we don't need to retain
@@ -303,11 +301,9 @@ pub fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
 /// depend on them degrade gracefully via existing `None` / empty-map paths.
 fn panic_recovery_state(source: &str, message: &str) -> DocumentState {
     let span = Span::new(0, 0);
-    let diag = Diagnostic::error(format!(
-        "internal LSP error during analysis: {message}"
-    ))
-    .label(span, "analysis aborted here")
-    .note("this is a bug in the language server; other files are unaffected");
+    let diag = Diagnostic::error(format!("internal LSP error during analysis: {message}"))
+        .label(span, "analysis aborted here")
+        .note("this is a bug in the language server; other files are unaffected");
 
     DocumentState {
         source: source.to_string(),
@@ -353,7 +349,8 @@ pub fn analyze_document(
     let mut monad_info: HashMap<Span, MonadKind> = HashMap::new();
     let mut unit_info: HashMap<Span, String> = HashMap::new();
     let mut changed_decl_names: Vec<String> = Vec::new();
-    let mut dirty_decl_closure: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dirty_decl_closure: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     let lexer = knot::lexer::Lexer::new(source);
     let (tokens, lex_diags) = lexer.tokenize();
@@ -440,9 +437,7 @@ pub fn analyze_document(
         // fingerprint groundwork built here, but additionally requires
         // changes to `infer.rs::pre_register` so cached schemes can replace
         // a body-checking pass for "clean" decls. That's a separate effort.
-        let cache_key = canonical_path
-            .as_ref()
-            .map(|p| (p.clone(), src_hash));
+        let cache_key = canonical_path.as_ref().map(|p| (p.clone(), src_hash));
         let new_fingerprint = ModuleFingerprint::from_module(&module);
 
         // Compute the per-decl diff between this run and the most recent
@@ -455,30 +450,30 @@ pub fn analyze_document(
                 .iter()
                 .filter(|(k, _)| k.0 == key.0)
                 .max_by_key(|(_, s)| s.access_clock)
-            {
-                let dirty = new_fingerprint.changed_decls(&latest.1.fingerprint);
-                // Compute the transitive in-file dirty closure too. Stored
-                // on `DocumentState` for selective re-check downstream of
-                // the inference pass once `infer.rs::check` learns to skip
-                // clean decls. Cheap to compute (linear in decl count).
-                dirty_decl_closure = new_fingerprint.dirty_closure(&dirty);
-                changed_decl_names = dirty.into_iter().collect();
-                changed_decl_names.sort();
+        {
+            let dirty = new_fingerprint.changed_decls(&latest.1.fingerprint);
+            // Compute the transitive in-file dirty closure too. Stored
+            // on `DocumentState` for selective re-check downstream of
+            // the inference pass once `infer.rs::check` learns to skip
+            // clean decls. Cheap to compute (linear in decl count).
+            dirty_decl_closure = new_fingerprint.dirty_closure(&dirty);
+            changed_decl_names = dirty.into_iter().collect();
+            changed_decl_names.sort();
 
-                if std::env::var("KNOT_LSP_TRACE_DIRTY").is_ok() && !changed_decl_names.is_empty() {
-                    eprintln!(
-                        "knot-lsp: {} dirty decls in {}: {}",
-                        changed_decl_names.len(),
-                        key.0.display(),
-                        changed_decl_names
-                            .iter()
-                            .take(8)
-                            .map(String::as_str)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    );
-                }
+            if std::env::var("KNOT_LSP_TRACE_DIRTY").is_ok() && !changed_decl_names.is_empty() {
+                eprintln!(
+                    "knot-lsp: {} dirty decls in {}: {}",
+                    changed_decl_names.len(),
+                    key.0.display(),
+                    changed_decl_names
+                        .iter()
+                        .take(8)
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
+        }
         if let Some(key) = &cache_key {
             // Exact content-hash match: reuse the cached snapshot verbatim.
             // Same source bytes ⇒ same spans, so every Span key in the
@@ -522,15 +517,17 @@ pub fn analyze_document(
         // inside one of the *user's* own decl spans (`module` is the
         // pre-injection parse of this file). Mirrors `workspace_diagnostics`'
         // `anchored_in_importer` filter.
-        let user_decl_spans: Vec<Span> = crate::utils::top_fields(&module).iter().map(|d| d.value.span).collect();
+        let user_decl_spans: Vec<Span> = crate::utils::top_fields(&module)
+            .iter()
+            .map(|d| d.value.span)
+            .collect();
         let in_user_decl = |s: &Span| {
             user_decl_spans
                 .iter()
                 .any(|d| d.start <= s.start && s.end <= d.end)
         };
-        let anchored_in_user = |d: &Diagnostic| -> bool {
-            d.labels.iter().any(|l| in_user_decl(&l.span))
-        };
+        let anchored_in_user =
+            |d: &Diagnostic| -> bool { d.labels.iter().any(|l| in_user_decl(&l.span)) };
 
         let knot_compiler::infer::CheckOutput {
             diagnostics: infer_diags,
@@ -561,7 +558,6 @@ pub fn analyze_document(
                 unit_info.insert(*span, unit);
             }
         }
-
 
         // Unused-definition warnings: run on the user's pre-prelude decls so
         // we don't flag prelude/imported names. Cached as part of
@@ -596,9 +592,9 @@ pub fn analyze_document(
                     .iter()
                     .min_by_key(|(_, s)| s.access_clock)
                     .map(|(k, s)| (k.clone(), s.access_clock))
-                {
-                    inference_cache.remove(&victim);
-                }
+            {
+                inference_cache.remove(&victim);
+            }
             let snapshot = InferenceSnapshot {
                 diagnostics: all_diags[pre_inference_len..].to_vec(),
                 type_info: type_info.clone(),
@@ -717,10 +713,11 @@ pub fn get_or_parse_file_shared(
         let mut guard = cache.lock().ok()?;
         let new_clock = next_import_clock(&guard);
         if let Some(entry) = guard.get_mut(path)
-            && entry.content_hash == hash {
-                entry.access_clock = new_clock;
-                return Some((entry.module.clone(), entry.source.clone()));
-            }
+            && entry.content_hash == hash
+        {
+            entry.access_clock = new_clock;
+            return Some((entry.module.clone(), entry.source.clone()));
+        }
     }
     let lexer = knot::lexer::Lexer::new(&source);
     let (tokens, _) = lexer.tokenize();
@@ -741,4 +738,3 @@ pub fn get_or_parse_file_shared(
     }
     Some((module, source))
 }
-

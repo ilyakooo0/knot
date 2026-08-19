@@ -483,10 +483,7 @@ impl ServerConfig {
         if let Some(b) = knot.get("inlayTypes").and_then(|v| v.as_bool()) {
             self.inlay_types = b;
         }
-        if let Some(n) = knot
-            .get("maxWorkspaceDiagCache")
-            .and_then(|v| v.as_u64())
-        {
+        if let Some(n) = knot.get("maxWorkspaceDiagCache").and_then(|v| v.as_u64()) {
             self.max_workspace_diag_cache = (n as usize).max(8);
         }
     }
@@ -500,9 +497,9 @@ impl ServerConfig {
 /// `true`/`false` lex as `Bool` literals and are included because renaming a
 /// symbol *to* them would re-lex as a literal.
 pub const KEYWORDS: &[&str] = &[
-    "data", "type", "route", "serve", "migrate", "where", "do",
-    "yield", "if", "then", "else", "case", "of", "not", "full", "atomic",
-    "deriving", "with", "unit", "refine", "forall", "true", "false",
+    "data", "type", "route", "serve", "migrate", "where", "do", "yield", "if", "then", "else",
+    "case", "of", "not", "full", "atomic", "deriving", "with", "unit", "refine", "forall", "true",
+    "false",
 ];
 
 /// Context tag for a snippet — used by `handle_completion` to filter snippets
@@ -760,11 +757,7 @@ pub fn content_hash(s: &str) -> u64 {
 /// Send a JSON-encoded LSP response. Logs but doesn't propagate JSON failures
 /// — those should never happen for `lsp_types`-defined results, but we don't
 /// want a malformed message to take down the server.
-pub fn send_response<T: serde::Serialize>(
-    conn: &Connection,
-    id: lsp_server::RequestId,
-    result: T,
-) {
+pub fn send_response<T: serde::Serialize>(conn: &Connection, id: lsp_server::RequestId, result: T) {
     let value = match serde_json::to_value(result) {
         Ok(v) => v,
         Err(e) => {
@@ -800,11 +793,7 @@ pub fn send_internal_error(
 /// Send an LSP `MethodNotFound` (-32601) response. Used by the request
 /// dispatcher's terminal fallback so clients don't hang on a request whose
 /// method we don't implement (or have misspelled in our routing).
-pub fn send_method_not_found(
-    conn: &Connection,
-    id: lsp_server::RequestId,
-    method: &str,
-) {
+pub fn send_method_not_found(conn: &Connection, id: lsp_server::RequestId, method: &str) {
     let resp = lsp_server::Response::new_err(
         id,
         lsp_server::ErrorCode::MethodNotFound as i32,

@@ -3,8 +3,8 @@
 
 use lsp_types::*;
 
-use knot::ast::{self, ExprKind};
 use crate::utils::top_fields;
+use knot::ast::{self, ExprKind};
 
 use crate::state::{DocumentState, ServerState};
 use crate::type_format::{format_type_kind, format_type_scheme};
@@ -65,7 +65,8 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                             .first()
                             .map(|f| f.value.span.start)
                             .unwrap_or(dspan.end);
-                        let ctor_span = find_word_in_source(source, &ctor.name, search_from, search_end)?;
+                        let ctor_span =
+                            find_word_in_source(source, &ctor.name, search_from, search_end)?;
                         // Advance past this ctor's last field type (or its name,
                         // if nullary) so its field types can't be matched as the
                         // next ctor's name.
@@ -83,7 +84,9 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                                 let fs: Vec<String> = ctor
                                     .fields
                                     .iter()
-                                    .map(|f| format!("{} {}", f.name, format_type_kind(&f.value.node)))
+                                    .map(|f| {
+                                        format!("{} {}", f.name, format_type_kind(&f.value.node))
+                                    })
                                     .collect();
                                 Some(format!("{{{}}}", fs.join(", ")))
                             },
@@ -131,9 +134,7 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
                             .span
                             .start
                             .checked_add(0)
-                            .and_then(|_| {
-                                doc.source.get(predicate.span.start..predicate.span.end)
-                            })
+                            .and_then(|_| doc.source.get(predicate.span.start..predicate.span.end))
                             .map(|s| s.trim().to_string())
                             .unwrap_or_else(|| "…".into());
                         Some(format!("refined {base_str} where {pred_src}"))
@@ -251,5 +252,3 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
 
     symbols
 }
-
-

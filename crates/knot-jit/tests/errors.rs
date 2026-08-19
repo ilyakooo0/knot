@@ -1,8 +1,8 @@
 //! Error handling: Result/Maybe do-block short-circuit, structured logging
 //! (base.error is a log, not an abort), base.todo, and base.trace.
 
-mod harness;
 mod e2e;
+mod harness;
 use harness::assert_show;
 
 #[test]

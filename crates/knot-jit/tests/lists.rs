@@ -8,7 +8,10 @@ use harness::{assert_show, assert_show_set};
 #[test]
 fn nil_and_cons() {
     assert_show("base.list.nil {}", "Nil");
-    assert_show("base.list.cons 1 (base.list.nil {})", "Cons {head 1 tail Nil}");
+    assert_show(
+        "base.list.cons 1 (base.list.nil {})",
+        "Cons {head 1 tail Nil}",
+    );
 }
 
 #[test]
@@ -22,12 +25,18 @@ fn cons_chain() {
 #[test]
 fn is_nil() {
     assert_show("base.list.isNil (base.list.nil {})", "True");
-    assert_show("base.list.isNil (base.list.cons 1 (base.list.nil {}))", "False");
+    assert_show(
+        "base.list.isNil (base.list.cons 1 (base.list.nil {}))",
+        "False",
+    );
 }
 
 #[test]
 fn head() {
-    assert_show("base.list.head (base.list.cons 1 (base.list.cons 2 (base.list.nil {})))", "Just {value 1}");
+    assert_show(
+        "base.list.head (base.list.cons 1 (base.list.cons 2 (base.list.nil {})))",
+        "Just {value 1}",
+    );
     assert_show("base.list.head (base.list.nil {})", "Nothing");
 }
 
@@ -44,7 +53,10 @@ fn tail() {
 #[test]
 fn length() {
     assert_show("base.list.length (base.list.nil {})", "0");
-    assert_show("base.list.length (base.list.cons 1 (base.list.cons 2 (base.list.nil {})))", "2");
+    assert_show(
+        "base.list.length (base.list.cons 1 (base.list.cons 2 (base.list.nil {})))",
+        "2",
+    );
 }
 
 #[test]

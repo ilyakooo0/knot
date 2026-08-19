@@ -6,11 +6,10 @@ use lsp_types::*;
 
 use knot::ast::{self, Span};
 
-use crate::state::{builtins, DocumentState, ServerState, KEYWORDS};
+use crate::state::{DocumentState, KEYWORDS, ServerState, builtins};
 use crate::utils::{
-    find_word_in_source, find_word_last_in_source, ident_lookup_offset,
-    position_to_offset, recurse_expr,
-    safe_slice, span_to_range, top_fields, word_at_position,
+    find_word_in_source, find_word_last_in_source, ident_lookup_offset, position_to_offset,
+    recurse_expr, safe_slice, span_to_range, top_fields, word_at_position,
 };
 
 // ── Rename ──────────────────────────────────────────────────────────
@@ -50,7 +49,10 @@ pub(crate) fn handle_prepare_rename(
         .references
         .iter()
         .any(|(usage, _)| usage.start <= offset && offset < usage.end);
-    let is_def = doc.definitions.values().any(|span| span.start <= offset && offset < span.end);
+    let is_def = doc
+        .definitions
+        .values()
+        .any(|span| span.start <= offset && offset < span.end);
     let is_field = is_at_record_field(&doc.module, &doc.source, offset);
 
     if !is_ref && !is_def && !is_field {
@@ -66,10 +68,7 @@ pub(crate) fn handle_prepare_rename(
     // def) — not by whether the cursor happens to sit on the definition
     // token, otherwise F2 on a *usage* of a user symbol that shadows a
     // builtin is refused even though `handle_rename` would succeed.
-    if builtins().any(|b| b == word)
-        && !is_ref
-        && !is_field
-        && !doc.definitions.contains_key(word)
+    if builtins().any(|b| b == word) && !is_ref && !is_field && !doc.definitions.contains_key(word)
     {
         return None;
     }
@@ -126,13 +125,13 @@ fn is_valid_identifier(name: &str) -> bool {
 /// name rather than a variable. Used to reject renames that would move an
 /// identifier across lexical namespaces.
 fn starts_uppercase(name: &str) -> bool {
-    name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)
+    name.chars()
+        .next()
+        .map(|c| c.is_uppercase())
+        .unwrap_or(false)
 }
 
-pub(crate) fn handle_rename(
-    state: &ServerState,
-    params: &RenameParams,
-) -> Option<WorkspaceEdit> {
+pub(crate) fn handle_rename(state: &ServerState, params: &RenameParams) -> Option<WorkspaceEdit> {
     let uri = &params.text_document_position.text_document.uri;
     let pos = params.text_document_position.position;
     let doc = state.documents.get(uri)?;
@@ -204,8 +203,7 @@ pub(crate) fn handle_rename(
     let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
 
     // Rename the declaration itself.
-    let name_span =
-        name_span_within(&doc.source, decl_span, &old_name).unwrap_or(owner_name_span);
+    let name_span = name_span_within(&doc.source, decl_span, &old_name).unwrap_or(owner_name_span);
     changes.entry(uri.clone()).or_default().push(TextEdit {
         range: span_to_range(name_span, &doc.source),
         new_text: pun_aware_new_text(&doc.module, &doc.source, name_span, &old_name, new_name),
@@ -275,7 +273,9 @@ pub(crate) fn handle_rename(
     collect_shadowed_names(&doc.module, &old_name, new_name, &mut conflicts);
     let has_edits = changes.values().any(|edits| !edits.is_empty());
     if has_edits && !conflicts.is_empty() {
-        return Some(workspace_edit_with_conflict_warning(changes, &old_name, new_name));
+        return Some(workspace_edit_with_conflict_warning(
+            changes, &old_name, new_name,
+        ));
     }
 
     Some(WorkspaceEdit {
@@ -343,11 +343,7 @@ fn workspace_edit_with_conflict_warning(
 /// Returns `(decl_span, name_span)` — the whole declaration span and the
 /// symbol's name-token span within it. Rename is confined to the current
 /// file, so we never look beyond `doc`.
-fn resolve_local_owner(
-    doc: &DocumentState,
-    offset: usize,
-    name: &str,
-) -> Option<(Span, Span)> {
+fn resolve_local_owner(doc: &DocumentState, offset: usize, name: &str) -> Option<(Span, Span)> {
     // Case A: the cursor is on a local def or usage that resolves locally.
     // Pick the *innermost* (smallest) covering usage span, matching
     // `references::find_local_def`, `goto`, and `document_highlight`. Using
@@ -392,7 +388,10 @@ fn name_span_within(source: &str, decl_span: Span, name: &str) -> Option<Span> {
             let left_ok = i == 0 || !is_ident(bytes[i - 1]);
             let right_ok = i + needle.len() >= bytes.len() || !is_ident(bytes[i + needle.len()]);
             if left_ok && right_ok {
-                return Some(Span::new(decl_span.start + i, decl_span.start + i + needle.len()));
+                return Some(Span::new(
+                    decl_span.start + i,
+                    decl_span.start + i + needle.len(),
+                ));
             }
         }
         i += 1;
@@ -468,12 +467,9 @@ fn span_is_record_pun(module: &ast::Expr, source: &str, span: Span) -> bool {
                         None => {
                             // Punned field: the token both names the field
                             // and binds the variable.
-                            if let Some(s) = find_word_in_source(
-                                source,
-                                &f.name,
-                                search_start,
-                                pat.span.end,
-                            ) {
+                            if let Some(s) =
+                                find_word_in_source(source, &f.name, search_start, pat.span.end)
+                            {
                                 if s == span {
                                     return true;
                                 }
@@ -502,8 +498,7 @@ fn span_is_record_pun(module: &ast::Expr, source: &str, span: Span) -> bool {
             let (name, value) = (f.field_name(), f.field_value());
             // A pun field's value span IS the field-name token; an explicit
             // field has its name token (in the window before the value).
-            let named = find_word_in_source(source, name, search_start, value.span.start)
-                .is_some();
+            let named = find_word_in_source(source, name, search_start, value.span.start).is_some();
             if !named
                 && value.span == span
                 && matches!(&value.node, ast::ExprKind::Var(n) if n == name)
@@ -520,27 +515,31 @@ fn span_is_record_pun(module: &ast::Expr, source: &str, span: Span) -> bool {
         }
         match &expr.node {
             ast::ExprKind::Record(fields)
-                if pun_field_in_fields(fields, expr.span.start, source, span) => {
-                    *found = true;
-                    return;
-                }
+                if pun_field_in_fields(fields, expr.span.start, source, span) =>
+            {
+                *found = true;
+                return;
+            }
             ast::ExprKind::Lambda { params, .. }
-                if params.iter().any(|p| pun_in_pat(p, source, span)) => {
-                    *found = true;
-                    return;
-                }
+                if params.iter().any(|p| pun_in_pat(p, source, span)) =>
+            {
+                *found = true;
+                return;
+            }
             ast::ExprKind::Case { arms, .. }
-                if arms.iter().any(|a| pun_in_pat(&a.pat, source, span)) => {
-                    *found = true;
-                    return;
-                }
+                if arms.iter().any(|a| pun_in_pat(&a.pat, source, span)) =>
+            {
+                *found = true;
+                return;
+            }
             ast::ExprKind::Do(stmts) => {
                 for stmt in stmts {
                     if let ast::StmtKind::Bind { pat, .. } = &stmt.node
-                        && pun_in_pat(pat, source, span) {
-                            *found = true;
-                            return;
-                        }
+                        && pun_in_pat(pat, source, span)
+                    {
+                        *found = true;
+                        return;
+                    }
                 }
             }
             _ => {}
@@ -554,8 +553,8 @@ fn span_is_record_pun(module: &ast::Expr, source: &str, span: Span) -> bool {
         if dspan.start > span.start || span.end > dspan.end {
             continue;
         }
-            // A named function field.
-            pun_in_expr(&decl.value, source, span, &mut found)
+        // A named function field.
+        pun_in_expr(&decl.value, source, span, &mut found)
     }
     found
 }
@@ -761,8 +760,8 @@ pub(crate) fn collect_shadowed_names(
     }
 
     for decl in top_fields(module) {
-            // A named function field.
-            walk(&decl.value, old_name, new_name, &mut Vec::new(), out);
+        // A named function field.
+        walk(&decl.value, old_name, new_name, &mut Vec::new(), out);
     }
 }
 
@@ -778,11 +777,7 @@ pub(crate) fn is_at_record_field(module: &ast::Expr, source: &str, offset: usize
 
 /// Find the field name (and its span) at `offset`. Returns `None` if the
 /// cursor isn't on a field-name token.
-fn field_position_at(
-    module: &ast::Expr,
-    source: &str,
-    offset: usize,
-) -> Option<(String, Span)> {
+fn field_position_at(module: &ast::Expr, source: &str, offset: usize) -> Option<(String, Span)> {
     let mut found: Option<(String, Span)> = None;
     for decl in top_fields(module) {
         if decl.value.span.start > offset || offset >= decl.value.span.end {
@@ -805,11 +800,7 @@ fn field_position_at(
 /// a wider net than strict type-aware rename, so users may need to review
 /// edits in a codebase where the same field name appears across multiple
 /// record types.
-fn collect_field_rename_sites(
-    module: &ast::Expr,
-    source: &str,
-    name: &str,
-) -> Vec<Span> {
+fn collect_field_rename_sites(module: &ast::Expr, source: &str, name: &str) -> Vec<Span> {
     let mut out: Vec<Span> = Vec::new();
     for decl in top_fields(module) {
         field_sites_in_decl(decl, source, &mut |n, span| {
@@ -859,12 +850,9 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::RecordField, source: &s
                 .unwrap_or(dspan.start);
             for ctor in constructors {
                 for fld in &ctor.fields {
-                    if let Some(span) = find_word_in_source(
-                        source,
-                        &fld.name,
-                        search_start,
-                        fld.value.span.start,
-                    ) {
+                    if let Some(span) =
+                        find_word_in_source(source, &fld.name, search_start, fld.value.span.start)
+                    {
                         f(&fld.name, span);
                     }
                     field_sites_in_type(&fld.value, source, f);
@@ -884,9 +872,7 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::RecordField, source: &s
             // (mirroring the `Data`/`Record` walks).
             for entry in entries {
                 let mut cursor = dspan.start;
-                let field_list = |flds: &[ast::Field<ast::Type>],
-                                  cursor: &mut usize,
-                                  f: &mut F| {
+                let field_list = |flds: &[ast::Field<ast::Type>], cursor: &mut usize, f: &mut F| {
                     for fld in flds {
                         // Use the *last* match before the type: the field name
                         // declaration sits immediately before `fld.value`, so a
@@ -1015,12 +1001,9 @@ fn field_sites_in_pat<F: FnMut(&str, Span)>(pat: &ast::Pat, source: &str, f: &mu
             for fp in fields {
                 match &fp.pattern {
                     Some(inner) => {
-                        if let Some(span) = find_word_in_source(
-                            source,
-                            &fp.name,
-                            search_start,
-                            inner.span.start,
-                        ) {
+                        if let Some(span) =
+                            find_word_in_source(source, &fp.name, search_start, inner.span.start)
+                        {
                             f(&fp.name, span);
                         }
                         field_sites_in_pat(inner, source, f);
@@ -1032,12 +1015,9 @@ fn field_sites_in_pat<F: FnMut(&str, Span)>(pat: &ast::Pat, source: &str, f: &mu
                         // silently rebind every use in the body, so it is
                         // not reported as a field site; the symbol-rename
                         // path owns it. Still advance the cursor past it.
-                        if let Some(span) = find_word_in_source(
-                            source,
-                            &fp.name,
-                            search_start,
-                            pat.span.end,
-                        ) {
+                        if let Some(span) =
+                            find_word_in_source(source, &fp.name, search_start, pat.span.end)
+                        {
                             search_start = span.end;
                         }
                     }
@@ -1076,12 +1056,9 @@ fn field_sites_in_type<F: FnMut(&str, Span)>(ty: &ast::Type, source: &str, f: &m
             let mut search_start = ty.span.start;
             for ctor in constructors {
                 for fld in &ctor.fields {
-                    if let Some(span) = find_word_in_source(
-                        source,
-                        &fld.name,
-                        search_start,
-                        fld.value.span.start,
-                    ) {
+                    if let Some(span) =
+                        find_word_in_source(source, &fld.name, search_start, fld.value.span.start)
+                    {
                         f(&fld.name, span);
                     }
                     field_sites_in_type(&fld.value, source, f);
@@ -1105,4 +1082,3 @@ fn field_sites_in_type<F: FnMut(&str, Span)>(ty: &ast::Type, source: &str, f: &m
         _ => {}
     }
 }
-

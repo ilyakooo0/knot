@@ -104,7 +104,11 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
     if let Record(fields) = &e.node {
         for fl in fields {
             match &fl.value.node {
-                DataCtor { params, constructors, .. } => out.push(DeclView {
+                DataCtor {
+                    params,
+                    constructors,
+                    ..
+                } => out.push(DeclView {
                     name: fl.name.as_str(),
                     span: fl.value.span,
                     kind: DeclViewKind::Data {
@@ -147,8 +151,8 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
                     // `Fun { body: None }` so codegen registers a startup
                     // `--name=value` lookup instead of checking the empty
                     // record against the sig (which fails to type-check).
-                    let is_required_const = fl.sig.is_some()
-                        && matches!(&fl.value.node, Record(fs) if fs.is_empty());
+                    let is_required_const =
+                        fl.sig.is_some() && matches!(&fl.value.node, Record(fs) if fs.is_empty());
                     out.push(DeclView {
                         name: fl.name.as_str(),
                         span: fl.value.span,

@@ -52,7 +52,9 @@ impl ParsedType {
     /// unparseable input — never panics, never returns `None`.
     pub fn parse(input: &str) -> Self {
         let mut parser = Parser::new(input);
-        parser.parse_top().unwrap_or_else(|| ParsedType::Unknown(input.to_string()))
+        parser
+            .parse_top()
+            .unwrap_or_else(|| ParsedType::Unknown(input.to_string()))
     }
 
     /// Number of curried parameters. `Int -> Text -> Bool` returns `2`.
@@ -415,7 +417,9 @@ impl<'a> Parser<'a> {
                 // Postfix unit argument: `Float M`, `Float (M / S^2)`.
                 // Only applies to numeric primitives (Int/Float).
                 self.skip_ws();
-                if type_takes_unit(&node) && self.peek().is_some_and(|c| c.is_alphabetic() || c == '(') {
+                if type_takes_unit(&node)
+                    && self.peek().is_some_and(|c| c.is_alphabetic() || c == '(')
+                {
                     let saved = self.pos;
                     if let Some(unit) = self.parse_unit_arg() {
                         node = ParsedType::UnitAnnotated {
@@ -486,12 +490,13 @@ impl<'a> Parser<'a> {
             // ident. Constructors are always uppercase, so a lowercase ident
             // here is unambiguously the row variable.
             if let Some(name) = self.peek_ident()
-                && first_lowercase(&name) {
-                    rest = self.consume_ident();
-                    self.skip_ws();
-                    self.eat_char('>');
-                    break;
-                }
+                && first_lowercase(&name)
+            {
+                rest = self.consume_ident();
+                self.skip_ws();
+                self.eat_char('>');
+                break;
+            }
             let name = self.consume_ident()?;
             self.skip_ws();
             // Optional payload — anything up to `|` or `>`.
@@ -595,11 +600,7 @@ impl<'a> Parser<'a> {
                 self.advance();
             }
             let unit = self.src[start..self.pos].trim().to_string();
-            if self.eat_char(')') {
-                Some(unit)
-            } else {
-                None
-            }
+            if self.eat_char(')') { Some(unit) } else { None }
         } else {
             // Bare name — read an identifier.
             let start = self.pos;
@@ -738,7 +739,5 @@ fn type_takes_unit(t: &ParsedType) -> bool {
         ParsedType::Named(name, _) if name == "Int" || name == "Float"
     )
 }
-
-
 
 // Regression tests for the 2026-06 LSP bug-fix batch (type-rendering group).

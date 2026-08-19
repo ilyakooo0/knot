@@ -159,28 +159,105 @@ boolToText  { Bool -> Text  into
 /// (`Just`/`Nothing`/`Ok`/`Err`/`True`/`False`) are routed separately by the
 /// compiler, not via this record.
 pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
-    "all", "any", "appendFile", "avg", "bytesConcat", "bytesFromHex",
-    "bytesGet", "bytesLength", "bytesSlice", "bytesToHex", "bytesToText",
-    "chars", "contains", "countWhere", "decrypt", "diff", "distinct", "dress", "drop", "endsWith",
-    "elem", "encrypt", "fileExists", "filter", "findFirst", "fold", "forEach",
-    "fork", "hash", "head", "hexDecode", "id", "inter", "length", "listDir",
-    "map", "match", "maxOn", "minOn", "not", "parseJson", "race", "randomInt",
-    "readFile", "removeFile", "reverse", "run", "sign", "single", "sleep", "sortBy", "sortByDesc",
-    "startsWith", "strip", "stripFloatUnit", "stripUnit", "take", "textToBytes", "toAsciiLower", "toAsciiUpper", "abs", "intMin", "intMax", "clamp", "unify", "toJson",
-    "toLower", "toUpper", "traverse", "trim", "trimAscii", "ltrimAscii", "rtrimAscii", "byteLength", "upsertBy", "verify",
-    "withFloatUnit", "withUnit", "writeFile",
+    "all",
+    "any",
+    "appendFile",
+    "avg",
+    "bytesConcat",
+    "bytesFromHex",
+    "bytesGet",
+    "bytesLength",
+    "bytesSlice",
+    "bytesToHex",
+    "bytesToText",
+    "chars",
+    "contains",
+    "countWhere",
+    "decrypt",
+    "diff",
+    "distinct",
+    "dress",
+    "drop",
+    "endsWith",
+    "elem",
+    "encrypt",
+    "fileExists",
+    "filter",
+    "findFirst",
+    "fold",
+    "forEach",
+    "fork",
+    "hash",
+    "head",
+    "hexDecode",
+    "id",
+    "inter",
+    "length",
+    "listDir",
+    "map",
+    "match",
+    "maxOn",
+    "minOn",
+    "not",
+    "parseJson",
+    "race",
+    "randomInt",
+    "readFile",
+    "removeFile",
+    "reverse",
+    "run",
+    "sign",
+    "single",
+    "sleep",
+    "sortBy",
+    "sortByDesc",
+    "startsWith",
+    "strip",
+    "stripFloatUnit",
+    "stripUnit",
+    "take",
+    "textToBytes",
+    "toAsciiLower",
+    "toAsciiUpper",
+    "abs",
+    "intMin",
+    "intMax",
+    "clamp",
+    "unify",
+    "toJson",
+    "toLower",
+    "toUpper",
+    "traverse",
+    "trim",
+    "trimAscii",
+    "ltrimAscii",
+    "rtrimAscii",
+    "byteLength",
+    "upsertBy",
+    "verify",
+    "withFloatUnit",
+    "withUnit",
+    "writeFile",
     // Numeric/text conversions.
-    "floor", "intToFloat", "textToInt", "textToFloat",
+    "floor",
+    "intToFloat",
+    "textToInt",
+    "textToFloat",
     // Relation query forms as first-class function values (`base.count`,
     // `base.union`, `base.sum`, `base.bind`). Each is registered as a curried
     // function value in codegen; the call-site SQL-pushdown optimization
     // recognizes both the bare (`count rel`) and namespaced (`base.count rel`)
     // application head. `bind` here is relation flatMap (`knot_relation_bind`).
-    "count", "union", "sum", "bind",
+    "count",
+    "union",
+    "sum",
+    "bind",
     // Console IO builtins (registered as stdlib function values in codegen).
     // `logInfo`/`logWarn`/`logError`/`logDebug` are deliberately NOT here — they
     // are deprecated prelude `base` record fields threading `<>logCtx`.
-    "println", "print", "putLine",
+    "println",
+    "print",
+    "putLine",
     "show",
     // Value → evaluable Knot source (dependency-collecting). Registered as a
     // stdlib function value in codegen.
@@ -192,8 +269,12 @@ pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     // 0-arg IO builtins. Each is a re-runnable IO thunk (`Value::IO(thunk, _)`)
     // produced fresh by the bare-`Var` dispatch, so holding the action as a
     // record field is safe — forcing `base.now` twice runs `knot_now` twice.
-    "now", "readLine", "randomFloat", "randomUuid",
-    "generateKeyPair", "generateSigningKeyPair",
+    "now",
+    "readLine",
+    "randomFloat",
+    "randomUuid",
+    "generateKeyPair",
+    "generateSigningKeyPair",
 ];
 
 /// Names a bare user-span `Var` may NOT reference directly; the hard gate
@@ -249,26 +330,27 @@ pub(crate) fn prelude_base_record() -> ast::Expr {
     let dummy_span = ast::Span::new(0, 0);
     let mut base_record = None;
     if let ast::ExprKind::Record(outer) = &mut prelude_record.node
-        && let Some(base_field) = outer.iter_mut().find(|f| f.name == "base") {
-            if let ast::ExprKind::Record(base_fields) = &mut base_field.value.node {
-                for name in BASE_STDLIB_FNS {
-                    base_fields.push(ast::RecordField {
-                        name: (*name).to_string(),
-                        // Reference the stdlib fn by its FLATTENED `base.<name>`
-                        // key — a `Var` string containing a dot, unutterable in
-                        // user source, so it always resolves to the stdlib fn and
-                        // is never shadowed by a user decl named `<name>`.
-                        value: ast::Spanned::new(
-                            ast::ExprKind::Var(crate::infer::Binding::User(format!("base.{}", name))),
-                            dummy_span,
-                        ),
-                        sig: None,
-                        doc: None,
-                    });
-                }
+        && let Some(base_field) = outer.iter_mut().find(|f| f.name == "base")
+    {
+        if let ast::ExprKind::Record(base_fields) = &mut base_field.value.node {
+            for name in BASE_STDLIB_FNS {
+                base_fields.push(ast::RecordField {
+                    name: (*name).to_string(),
+                    // Reference the stdlib fn by its FLATTENED `base.<name>`
+                    // key — a `Var` string containing a dot, unutterable in
+                    // user source, so it always resolves to the stdlib fn and
+                    // is never shadowed by a user decl named `<name>`.
+                    value: ast::Spanned::new(
+                        ast::ExprKind::Var(crate::infer::Binding::User(format!("base.{}", name))),
+                        dummy_span,
+                    ),
+                    sig: None,
+                    doc: None,
+                });
             }
-            base_record = Some(base_field.value.clone());
         }
+        base_record = Some(base_field.value.clone());
+    }
     let mut record = base_record.expect("prelude source has no `base` field");
     // Elaborate the constrained `base.*` fns (`log`, `info`, …): prepend the
     // hidden `__dict_<field>` parameter and rewrite the body's `^field` to it.
@@ -348,7 +430,9 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
             }
         }
         FieldAccess { expr, .. } | Annot { expr, .. } => shift_expr_spans(expr, offset),
-        Serve { api_span, handlers, .. } => {
+        Serve {
+            api_span, handlers, ..
+        } => {
             api_span.start += offset;
             api_span.end += offset;
             for h in handlers {
@@ -357,7 +441,13 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
                 shift_expr_spans(&mut h.body, offset);
             }
         }
-        Lit(_) | Var(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) | TypeHole => {}
+        Lit(_)
+        | Var(_)
+        | Constructor(_)
+        | SourceRef { .. }
+        | ImplicitRef(_)
+        | CollectFold(_)
+        | TypeHole => {}
         TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         RouteDecl { .. } => {}
     }
@@ -410,5 +500,3 @@ fn shift_pat_spans(p: &mut ast::Pat, offset: usize) {
         Annot { pat, .. } => shift_pat_spans(pat, offset),
     }
 }
-
-

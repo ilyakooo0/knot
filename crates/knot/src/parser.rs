@@ -171,7 +171,10 @@ impl Parser {
 
     /// Display column of the current token (O(1); see `token_cols`).
     fn cur_column(&self) -> usize {
-        self.token_cols.get(self.pos).copied().unwrap_or(self.eof_col)
+        self.token_cols
+            .get(self.pos)
+            .copied()
+            .unwrap_or(self.eof_col)
     }
 
     /// After a newline was crossed mid-expression, decide whether the current
@@ -232,10 +235,8 @@ impl Parser {
                     if !self.at_eof() {
                         let span = self.span();
                         self.diagnostics.push(
-                            Diagnostic::error(
-                                "unexpected tokens after the file's expression",
-                            )
-                            .label(span, "a .knot file is a single expression"),
+                            Diagnostic::error("unexpected tokens after the file's expression")
+                                .label(span, "a .knot file is a single expression"),
                         );
                     }
                     expr
@@ -263,7 +264,11 @@ impl Parser {
         if !self.at_eof() {
             return None; // trailing tokens — not a single clean type
         }
-        if self.diagnostics.iter().any(|d| d.severity == crate::diagnostic::Severity::Error) {
+        if self
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == crate::diagnostic::Severity::Error)
+        {
             return None;
         }
         Some(ty)
@@ -300,11 +305,15 @@ fn fold_rel_type_app(ty: Type) -> Type {
 fn spine_as_constructor(ty: &Type) -> Option<ConstructorDef> {
     match &ty.node {
         TypeKind::App { func, arg } => {
-            let TypeKind::Named(name) = &func.node else { return None };
+            let TypeKind::Named(name) = &func.node else {
+                return None;
+            };
             if !name.chars().next().is_some_and(|c| c.is_uppercase()) {
                 return None;
             }
-            let TypeKind::Record { fields, rest: None } = &arg.node else { return None };
+            let TypeKind::Record { fields, rest: None } = &arg.node else {
+                return None;
+            };
             Some(ConstructorDef {
                 name: name.clone(),
                 fields: fields.clone(),
@@ -319,7 +328,10 @@ fn spine_as_constructor(ty: &Type) -> Option<ConstructorDef> {
 pub fn parse_type_str(source: &str) -> Option<Type> {
     let lexer = crate::lexer::Lexer::new(source);
     let (tokens, lex_diags) = lexer.tokenize();
-    if lex_diags.iter().any(|d| d.severity == crate::diagnostic::Severity::Error) {
+    if lex_diags
+        .iter()
+        .any(|d| d.severity == crate::diagnostic::Severity::Error)
+    {
         return None;
     }
     Parser::new(source.to_string(), tokens).parse_type_annotation()
@@ -405,8 +417,7 @@ impl Parser {
     /// top-level declarations (column-0 `name =`/`name :`, optionally
     /// behind a `*`/`&`/`export` sigil).
     fn scan_top_level_names(&self) -> HashSet<String> {
-        const TIME_UNITS: &[&str] =
-            &["ms", "seconds", "minutes", "hours", "days", "weeks"];
+        const TIME_UNITS: &[&str] = &["ms", "seconds", "minutes", "hours", "days", "weeks"];
         let mut names = HashSet::new();
 
         let n = self.tokens.len();
@@ -493,19 +504,23 @@ impl Parser {
         let cur_start = self.peek_token().span.start;
         // A `Newline` token directly before the current token is a gap.
         if self.pos > 0
-            && matches!(self.tokens.get(self.pos - 1).map(|t| &t.kind), Some(TokenKind::Newline))
+            && matches!(
+                self.tokens.get(self.pos - 1).map(|t| &t.kind),
+                Some(TokenKind::Newline)
+            )
         {
             return true;
         }
         // Otherwise, a stripped `Gap` occupied some offset in (prev_end, cur_start].
         let prev_end = if self.pos > 0 {
-            self.tokens.get(self.pos - 1).map(|t| t.span.end).unwrap_or(0)
+            self.tokens
+                .get(self.pos - 1)
+                .map(|t| t.span.end)
+                .unwrap_or(0)
         } else {
             0
         };
-        self.gaps
-            .iter()
-            .any(|&g| g >= prev_end && g < cur_start)
+        self.gaps.iter().any(|&g| g >= prev_end && g < cur_start)
     }
 
     fn expect(&mut self, kind: &TokenKind, msg: &str) -> Result<Token, ()> {
@@ -536,8 +551,7 @@ impl Parser {
     /// identifier immediately followed by a colon)? Used to tell a new record
     /// field apart from a wrapped field type when scanning a multiline record.
     fn at_field_signature(&self) -> bool {
-        matches!(self.peek(), TokenKind::Lower(_))
-            && matches!(self.peek_ahead(1), TokenKind::Colon)
+        matches!(self.peek(), TokenKind::Lower(_)) && matches!(self.peek_ahead(1), TokenKind::Colon)
     }
 
     fn at_eof(&self) -> bool {
@@ -557,7 +571,6 @@ impl Parser {
         self.delimiter_depth = saved.1;
         self.recursion_depth = saved.2;
     }
-
 }
 
 // ── Context & error helpers ─────────────────────────────────────────
@@ -575,7 +588,11 @@ impl Parser {
     /// Push a parser context, run `f`, and always pop the context — even on
     /// early `?` returns inside `f`.  This prevents stale "while parsing …"
     /// notes from leaking into later diagnostics.
-    fn in_context<T>(&mut self, ctx: &'static str, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+    fn in_context<T>(
+        &mut self,
+        ctx: &'static str,
+        f: impl FnOnce(&mut Self) -> Option<T>,
+    ) -> Option<T> {
         self.push_context(ctx);
         let result = f(self);
         self.pop_context();
@@ -596,13 +613,14 @@ impl Parser {
         self.diagnostics.push(diag);
     }
 
-
     /// Expect a lower-case identifier, returning the name.
     fn expect_lower(&mut self, msg: &str) -> Result<(Name, Span), ()> {
         match self.peek() {
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(n) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(n) = tok.kind else {
+                    unreachable!()
+                };
                 Ok((n, tok.span))
             }
             TokenKind::Where
@@ -637,7 +655,9 @@ impl Parser {
         match self.peek() {
             TokenKind::Upper(_) => {
                 let tok = self.advance();
-                let TokenKind::Upper(n) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(n) = tok.kind else {
+                    unreachable!()
+                };
                 Ok((n, tok.span))
             }
             _ => {
@@ -754,10 +774,7 @@ impl Parser {
             if self.delimiter_depth > 0
                 && matches!(
                     self.peek(),
-                    TokenKind::RParen
-                        | TokenKind::RBracket
-                        | TokenKind::RBrace
-                        | TokenKind::Comma
+                    TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace | TokenKind::Comma
                 )
             {
                 break;
@@ -797,7 +814,6 @@ impl Parser {
 // ── Declarations ────────────────────────────────────────────────────
 
 impl Parser {
-
     /// Parse a unit expression: products, quotients, powers of named units.
     /// Grammar:
     ///   unit_expr    = unit_mul_div
@@ -828,7 +844,9 @@ impl Parser {
             match self.peek() {
                 TokenKind::Int(_) => {
                     let tok = self.advance();
-                    let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                    let TokenKind::Int(n) = tok.kind else {
+                        unreachable!()
+                    };
                     let exp: i32 = match n.parse() {
                         Ok(e) => e,
                         Err(_) => {
@@ -852,12 +870,16 @@ impl Parser {
         match self.peek() {
             TokenKind::Upper(_) => {
                 let tok = self.advance();
-                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(UnitExpr::Named(name))
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(UnitExpr::Named(name))
             }
             TokenKind::Int(n) if n == "1" => {
@@ -871,7 +893,8 @@ impl Parser {
             TokenKind::LParen => {
                 self.advance();
                 let inner = self.parse_unit_expr()?;
-                self.expect(&TokenKind::RParen, "expected ')' in unit expression").ok()?;
+                self.expect(&TokenKind::RParen, "expected ')' in unit expression")
+                    .ok()?;
                 Some(inner)
             }
             _ => {
@@ -910,7 +933,8 @@ impl Parser {
             TokenKind::LParen => {
                 self.advance();
                 let inner = self.parse_unit_expr()?;
-                self.expect(&TokenKind::RParen, "expected ')' in unit argument").ok()?;
+                self.expect(&TokenKind::RParen, "expected ')' in unit argument")
+                    .ok()?;
                 Some(inner)
             }
             _ => self.parse_unit_atom(),
@@ -918,7 +942,6 @@ impl Parser {
     }
 
     // ── data ─────────────────────────────────────────────────────────
-
 
     fn parse_constructor_def(&mut self) -> Option<ConstructorDef> {
         let (name, _) = self.expect_upper("expected constructor name").ok()?;
@@ -934,7 +957,9 @@ impl Parser {
                     if self.at(&TokenKind::RBrace) {
                         break;
                     }
-                    let (fname, _) = self.expect_lower("expected field name in constructor").ok()?;
+                    let (fname, _) = self
+                        .expect_lower("expected field name in constructor")
+                        .ok()?;
                     self.skip_newlines();
                     let ty = self.parse_type_atom()?;
                     fields.push(Field {
@@ -943,17 +968,18 @@ impl Parser {
                     });
                 }
             }
-            self.expect(&TokenKind::RBrace, "expected '}' to close constructor fields")
-                .ok()?;
+            self.expect(
+                &TokenKind::RBrace,
+                "expected '}' to close constructor fields",
+            )
+            .ok()?;
         }
         Some(ConstructorDef { name, fields })
     }
 
     // ── type alias ───────────────────────────────────────────────────
 
-
     // ── source / view ────────────────────────────────────────────────
-
 
     // ── subset constraint ────────────────────────────────────────────
 
@@ -964,9 +990,7 @@ impl Parser {
 
     // ── function / constant ──────────────────────────────────────────
 
-
     // ── route ────────────────────────────────────────────────────────
-
 
     /// Parse a possibly-dotted route component path: a bare route name or a
     /// path to a record-embedded route (`rec.Api`, `a.b.TodoApi`). Used by
@@ -1032,9 +1056,7 @@ impl Parser {
     /// `@{h: T}` headers, and `={..}` body fields merge into the route's request
     /// constructor fields.
     fn parse_api_route_entry(&mut self) -> Option<RouteEntry> {
-        let (constructor, _) = self
-            .expect_upper("expected route constructor name")
-            .ok()?;
+        let (constructor, _) = self.expect_upper("expected route constructor name").ok()?;
 
         // Method: lowercase verb (get, post, put, patch, delete), separated from
         // the constructor name by whitespace alone.
@@ -1094,8 +1116,11 @@ impl Parser {
 
         // Response type: `-> Type` (required — every route declares its response).
         self.skip_newlines();
-        self.expect(&TokenKind::Arrow, "expected '->' before route response type")
-            .ok()?;
+        self.expect(
+            &TokenKind::Arrow,
+            "expected '->' before route response type",
+        )
+        .ok()?;
         self.stop_type_at_headers = true;
         self.stop_type_app_at_route_entry = true;
         let response_ty = self.parse_type();
@@ -1158,8 +1183,13 @@ impl Parser {
                     break;
                 };
                 self.skip_newlines();
-                let Some(ty) = self.parse_type_atom() else { break };
-                fields.push(Field { name: fname, value: ty });
+                let Some(ty) = self.parse_type_atom() else {
+                    break;
+                };
+                fields.push(Field {
+                    name: fname,
+                    value: ty,
+                });
             }
         }
         let _ = self.expect(&TokenKind::RBrace, "expected '}' to close fields");
@@ -1192,14 +1222,18 @@ impl Parser {
                     && !matches!(self.peek_ahead(1), TokenKind::LBrace))
             {
                 let tok = self.advance();
-                let TokenKind::Lower(s) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(s) = tok.kind else {
+                    unreachable!()
+                };
                 let mut seg = s;
                 self.consume_route_dashed_suffix(&mut seg);
                 segments.push(PathSegment::Literal(seg));
             } else if matches!(self.peek(), TokenKind::Upper(_)) {
                 // uppercase segment like /api/v1 — unlikely but handle
                 let tok = self.advance();
-                let TokenKind::Upper(s) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(s) = tok.kind else {
+                    unreachable!()
+                };
                 let mut seg = s;
                 self.consume_route_dashed_suffix(&mut seg);
                 segments.push(PathSegment::Literal(seg));
@@ -1215,10 +1249,7 @@ impl Parser {
                 segments.push(PathSegment::Literal(seg));
             } else if matches!(
                 self.peek(),
-                TokenKind::Int(_)
-                    | TokenKind::Float(_)
-                    | TokenKind::Text(_)
-                    | TokenKind::Bytes(_)
+                TokenKind::Int(_) | TokenKind::Float(_) | TokenKind::Text(_) | TokenKind::Bytes(_)
             ) {
                 // A literal can't be a path segment. Report and consume it so
                 // the segment isn't silently dropped (the leading `/` was
@@ -1266,8 +1297,8 @@ impl Parser {
                     self.record_value_sig_type = true;
                     let ty = self.parse_type();
                     self.record_value_sig_type = saved_flag;
-                    let had_gap = self.gap_before_current()
-                        || matches!(self.peek(), TokenKind::Newline);
+                    let had_gap =
+                        self.gap_before_current() || matches!(self.peek(), TokenKind::Newline);
                     if had_gap {
                         self.skip_newlines();
                     }
@@ -1353,7 +1384,9 @@ impl Parser {
             }
             if matches!(self.peek(), TokenKind::Upper(_)) {
                 let tok = self.advance();
-                let TokenKind::Upper(trait_name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(trait_name) = tok.kind else {
+                    unreachable!()
+                };
                 let mut args = Vec::new();
                 while self.can_start_type_atom()
                     && !self.at(&TokenKind::FatArrow)
@@ -1509,7 +1542,9 @@ impl Parser {
                         self.skip_newlines();
                         self.parse_set_with_start(true, replace_start)
                     } else {
-                        self.error("`full` only marks a write (`full *rel = ...`); a read is just `*rel`");
+                        self.error(
+                            "`full` only marks a write (`full *rel = ...`); a read is just `*rel`",
+                        );
                         None
                     }
                 } else {
@@ -1519,7 +1554,9 @@ impl Parser {
                 }
             }
             TokenKind::Atomic => {
-                if !self.enter_recursion() { return None; }
+                if !self.enter_recursion() {
+                    return None;
+                }
                 let start = self.span();
                 self.advance();
                 let e = self.parse_expr();
@@ -1532,7 +1569,9 @@ impl Parser {
                 ))
             }
             TokenKind::Refine => {
-                if !self.enter_recursion() { return None; }
+                if !self.enter_recursion() {
+                    return None;
+                }
                 let start = self.span();
                 self.advance();
                 let e = self.parse_expr();
@@ -1686,7 +1725,10 @@ impl Parser {
             // instead of overflowing the stack. The `parse_atom` cost is
             // released before this point, so without this guard the depth
             // counter never accumulates here.
-            if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
+            if !self.enter_recursion() {
+                self.recursion_depth -= spine_charged;
+                return None;
+            }
             let rhs = if matches!(
                 self.peek(),
                 TokenKind::Case
@@ -1702,12 +1744,18 @@ impl Parser {
             self.recursion_depth -= 1;
             let rhs = match rhs {
                 Some(rhs) => rhs,
-                None => { self.recursion_depth -= spine_charged; return None; }
+                None => {
+                    self.recursion_depth -= spine_charged;
+                    return None;
+                }
             };
 
             // Charge one depth unit for the spine node we're about to build and
             // hold it until return (see the comment at the top of this fn).
-            if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
+            if !self.enter_recursion() {
+                self.recursion_depth -= spine_charged;
+                return None;
+            }
             spine_charged += 1;
 
             let span = Span::new(lhs.span.start, rhs.span.end);
@@ -1734,7 +1782,9 @@ impl Parser {
             TokenKind::Minus if matches!(self.peek_ahead(1), TokenKind::Int(_)) => {
                 let minus_tok = self.advance();
                 let tok = self.advance();
-                let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                let TokenKind::Int(n) = tok.kind else {
+                    unreachable!()
+                };
                 let span = Span::new(minus_tok.span.start, tok.span.end);
                 let lit = Spanned::new(ExprKind::Lit(Literal::Int(format!("-{}", n))), span);
                 // Feed the folded literal through the postfix and application
@@ -1745,7 +1795,9 @@ impl Parser {
                 self.parse_application_from(lit)
             }
             TokenKind::Minus => {
-                if !self.enter_recursion() { return None; }
+                if !self.enter_recursion() {
+                    return None;
+                }
                 let start = self.span();
                 self.advance();
                 let operand = self.parse_unary();
@@ -1761,7 +1813,9 @@ impl Parser {
                 ))
             }
             TokenKind::Not => {
-                if !self.enter_recursion() { return None; }
+                if !self.enter_recursion() {
+                    return None;
+                }
                 let start = self.span();
                 self.advance();
                 let operand = self.parse_unary();
@@ -1809,7 +1863,9 @@ impl Parser {
                     Some(arg) => arg,
                     None => fail!(),
                 };
-                if !self.enter_recursion() { fail!() }
+                if !self.enter_recursion() {
+                    fail!()
+                }
                 spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
@@ -1844,7 +1900,9 @@ impl Parser {
                     Some(arg) => arg,
                     None => fail!(),
                 };
-                if !self.enter_recursion() { fail!() }
+                if !self.enter_recursion() {
+                    fail!()
+                }
                 spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
@@ -1941,7 +1999,9 @@ impl Parser {
     fn parse_constructor_or_atom(&mut self) -> Option<Expr> {
         let expr = self.parse_atom()?;
         if matches!(expr.node, ExprKind::Constructor(_)) && self.can_start_atom() {
-            if !self.enter_recursion() { return None; }
+            if !self.enter_recursion() {
+                return None;
+            }
             let arg = self.parse_postfix();
             self.recursion_depth -= 1;
             let arg = arg?;
@@ -2010,9 +2070,14 @@ impl Parser {
                 // the leading `*`.
                 if matches!(self.peek(), TokenKind::StarIdent(_)) {
                     let tok = self.advance();
-                    let TokenKind::StarIdent(field) = tok.kind else { unreachable!() };
+                    let TokenKind::StarIdent(field) = tok.kind else {
+                        unreachable!()
+                    };
                     let field_span = tok.span;
-                    if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
+                    if !self.enter_recursion() {
+                        self.recursion_depth -= spine_charged;
+                        return None;
+                    }
                     spine_charged += 1;
                     let span = Span::new(expr.span.start, field_span.end);
                     expr = Spanned::new(
@@ -2031,9 +2096,15 @@ impl Parser {
                 };
                 let (field, field_span) = match field_result {
                     Ok(pair) => pair,
-                    Err(_) => { self.recursion_depth -= spine_charged; return None; }
+                    Err(_) => {
+                        self.recursion_depth -= spine_charged;
+                        return None;
+                    }
                 };
-                if !self.enter_recursion() { self.recursion_depth -= spine_charged; return None; }
+                if !self.enter_recursion() {
+                    self.recursion_depth -= spine_charged;
+                    return None;
+                }
                 spine_charged += 1;
                 let span = Span::new(expr.span.start, field_span.end);
                 expr = Spanned::new(
@@ -2101,10 +2172,7 @@ impl Parser {
                     ExprKind::BinOp {
                         op: BinOp::Mul,
                         lhs: Box::new(lit),
-                        rhs: Box::new(Spanned::new(
-                            ExprKind::Lit(factor_lit),
-                            unit_span,
-                        )),
+                        rhs: Box::new(Spanned::new(ExprKind::Lit(factor_lit), unit_span)),
                     },
                     span,
                 );
@@ -2143,9 +2211,17 @@ impl Parser {
             TokenKind::The => {
                 self.advance(); // consume `the`
                 self.skip_newlines();
-                self.expect(&TokenKind::LParen, "expected '(' after `the` — write `the (Type) expr`").ok()?;
+                self.expect(
+                    &TokenKind::LParen,
+                    "expected '(' after `the` — write `the (Type) expr`",
+                )
+                .ok()?;
                 let ty = self.parse_type()?;
-                self.expect(&TokenKind::RParen, "expected ')' after the type in `the (Type) expr`").ok()?;
+                self.expect(
+                    &TokenKind::RParen,
+                    "expected ')' after the type in `the (Type) expr`",
+                )
+                .ok()?;
                 self.skip_newlines();
                 let expr = self.parse_atom()?;
                 let span = Span::new(start.start, expr.span.end);
@@ -2159,46 +2235,65 @@ impl Parser {
             }
             TokenKind::Int(_) => {
                 let tok = self.advance();
-                let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                let TokenKind::Int(n) = tok.kind else {
+                    unreachable!()
+                };
                 let lit = Spanned::new(ExprKind::Lit(Literal::Int(n)), tok.span);
                 self.maybe_time_unit(lit)
             }
             TokenKind::Float(_) => {
                 let tok = self.advance();
-                let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                let TokenKind::Float(f) = tok.kind else {
+                    unreachable!()
+                };
                 let lit = Spanned::new(ExprKind::Lit(Literal::Float(f)), tok.span);
                 self.maybe_time_unit(lit)
             }
             TokenKind::Text(_) => {
                 let tok = self.advance();
-                let TokenKind::Text(s) = tok.kind else { unreachable!() };
+                let TokenKind::Text(s) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(ExprKind::Lit(Literal::Text(s)), tok.span))
             }
             TokenKind::Bytes(_) => {
                 let tok = self.advance();
-                let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
+                let TokenKind::Bytes(b) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(ExprKind::Lit(Literal::Bytes(b)), tok.span))
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(ExprKind::Var(Binding::User(name)), tok.span))
             }
             TokenKind::Upper(_) => {
                 let tok = self.advance();
-                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(ExprKind::Constructor(name), tok.span))
             }
             TokenKind::Full => {
                 let tok = self.advance();
-                Some(Spanned::new(ExprKind::Var(Binding::User("full".into())), tok.span))
+                Some(Spanned::new(
+                    ExprKind::Var(Binding::User("full".into())),
+                    tok.span,
+                ))
             }
             TokenKind::StarIdent(_) => {
                 // `*name` lexed as a single token — source reference.
                 let tok = self.advance();
-                let TokenKind::StarIdent(n) = tok.kind else { unreachable!() };
+                let TokenKind::StarIdent(n) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(
-                    ExprKind::SourceRef { name: n.trim_start_matches('*').to_string() },
+                    ExprKind::SourceRef {
+                        name: n.trim_start_matches('*').to_string(),
+                    },
                     Span::new(start.start, tok.span.end),
                 ))
             }
@@ -2208,7 +2303,9 @@ impl Parser {
                 match self.peek() {
                     TokenKind::Lower(_) => {
                         let tok = self.advance();
-                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                        let TokenKind::Lower(name) = tok.kind else {
+                            unreachable!()
+                        };
                         Some(Spanned::new(
                             ExprKind::SourceRef { name },
                             Span::new(start.start, tok.span.end),
@@ -2226,16 +2323,16 @@ impl Parser {
                 match self.peek() {
                     TokenKind::Lower(_) => {
                         let tok = self.advance();
-                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                        let TokenKind::Lower(name) = tok.kind else {
+                            unreachable!()
+                        };
                         Some(Spanned::new(
                             ExprKind::ImplicitRef(name),
                             Span::new(start.start, tok.span.end),
                         ))
                     }
                     _ => {
-                        self.error(
-                            "expected identifier after '^' for implicit field projection",
-                        );
+                        self.error("expected identifier after '^' for implicit field projection");
                         None
                     }
                 }
@@ -2246,7 +2343,9 @@ impl Parser {
                 match self.peek() {
                     TokenKind::Lower(_) => {
                         let tok = self.advance();
-                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                        let TokenKind::Lower(name) = tok.kind else {
+                            unreachable!()
+                        };
                         Some(Spanned::new(
                             ExprKind::CollectFold(name),
                             Span::new(start.start, tok.span.end),
@@ -2288,11 +2387,8 @@ impl Parser {
                     );
                     return None;
                 }
-                let end_tok = self
-                    .expect(
-                        &TokenKind::RParen,
-                        "unclosed '(' — expected matching ')'",
-                    );
+                let end_tok =
+                    self.expect(&TokenKind::RParen, "unclosed '(' — expected matching ')'");
                 self.delimiter_depth -= 1;
                 let end_tok = end_tok.ok()?;
                 // Keep the inner expression but update span to include parens.
@@ -2394,16 +2490,17 @@ impl Parser {
             // constructor itself; the alias is also brought into type scope.
             if self.at(&TokenKind::Type) {
                 let type_kw = self.advance(); // consume `type`
-                let (tname, _tspan) = self
-                    .expect_upper("expected type name after 'type'")
-                    .ok()?;
+                let (tname, _tspan) = self.expect_upper("expected type name after 'type'").ok()?;
                 let mut params = Vec::new();
                 while matches!(self.peek(), TokenKind::Lower(_)) {
                     let tok = self.advance();
-                    let TokenKind::Lower(p) = tok.kind else { unreachable!() };
+                    let TokenKind::Lower(p) = tok.kind else {
+                        unreachable!()
+                    };
                     params.push(p);
                 }
-                self.expect(&TokenKind::Eq, "expected '=' in type alias").ok()?;
+                self.expect(&TokenKind::Eq, "expected '=' in type alias")
+                    .ok()?;
                 // Parse the alias body with `record_value_sig_type` set so a
                 // `Lower` on the next line (a following record field) is not
                 // absorbed as a type argument of the alias body.
@@ -2423,15 +2520,13 @@ impl Parser {
                 // `parse_type_union`. Other bodies (records, applications like
                 // `Maybe (Int 1)`) are untouched.
                 let ty = match spine_as_constructor(&ty) {
-                    Some(ctor) if !matches!(ty.node, TypeKind::Variant { .. }) => {
-                        Spanned::new(
-                            TypeKind::Variant {
-                                constructors: vec![ctor],
-                                rest: None,
-                            },
-                            ty.span,
-                        )
-                    }
+                    Some(ctor) if !matches!(ty.node, TypeKind::Variant { .. }) => Spanned::new(
+                        TypeKind::Variant {
+                            constructors: vec![ctor],
+                            rest: None,
+                        },
+                        ty.span,
+                    ),
                     _ => ty,
                 };
                 let ty_end = ty.span.end;
@@ -2459,17 +2554,18 @@ impl Parser {
             // `rec.Name.<Ctor>` and the type `Name` enters type scope.
             if self.at(&TokenKind::Data) {
                 let data_kw = self.advance(); // consume `data`
-                let (dname, _dspan) = self
-                    .expect_upper("expected type name after 'data'")
-                    .ok()?;
+                let (dname, _dspan) = self.expect_upper("expected type name after 'data'").ok()?;
                 let mut params = Vec::new();
                 while matches!(self.peek(), TokenKind::Lower(_)) {
                     let tok = self.advance();
-                    let TokenKind::Lower(p) = tok.kind else { unreachable!() };
+                    let TokenKind::Lower(p) = tok.kind else {
+                        unreachable!()
+                    };
                     params.push(p);
                 }
                 self.skip_newlines();
-                self.expect(&TokenKind::Eq, "expected '=' in data declaration").ok()?;
+                self.expect(&TokenKind::Eq, "expected '=' in data declaration")
+                    .ok()?;
                 self.skip_newlines();
                 let mut constructors = vec![self.parse_constructor_def()?];
                 loop {
@@ -2520,9 +2616,7 @@ impl Parser {
                 let aspan = self.span();
                 let api_col = self.cur_column();
                 self.advance(); // consume `api`
-                let (aname, _) = self
-                    .expect_upper("expected API name after 'api'")
-                    .ok()?;
+                let (aname, _) = self.expect_upper("expected API name after 'api'").ok()?;
                 self.expect(&TokenKind::Where, "expected 'where' after api name")
                     .ok()?;
                 let entries = self.parse_api_route_entries(api_col);
@@ -2546,10 +2640,11 @@ impl Parser {
             // the type with `record_value_sig_type` set so a following field
             // on the next line is not absorbed as a type arg. Mirrors the
             // top-level `:`-vs-`=` disambiguation in `parse_source_or_view`.
-            if matches!(self.peek(), TokenKind::StarIdent(_))
-            {
+            if matches!(self.peek(), TokenKind::StarIdent(_)) {
                 let tok = self.advance();
-                let TokenKind::StarIdent(sname) = tok.kind else { unreachable!() };
+                let TokenKind::StarIdent(sname) = tok.kind else {
+                    unreachable!()
+                };
                 let sspan = tok.span;
                 let bare_name = sname.trim_start_matches('*').to_string();
 
@@ -2562,17 +2657,22 @@ impl Parser {
                     } else {
                         None
                     };
-                    self.expect(&TokenKind::Le, "expected '<=' in subset constraint").ok()?;
+                    self.expect(&TokenKind::Le, "expected '<=' in subset constraint")
+                        .ok()?;
                     let right_relation = match self.peek() {
                         TokenKind::StarIdent(_) => {
                             let t = self.advance();
-                            let TokenKind::StarIdent(n) = t.kind else { unreachable!() };
+                            let TokenKind::StarIdent(n) = t.kind else {
+                                unreachable!()
+                            };
                             n.trim_start_matches('*').to_string()
                         }
                         TokenKind::Star => {
                             self.advance();
                             let (n, _) = self
-                                .expect_lower("expected relation name after '*' in subset constraint")
+                                .expect_lower(
+                                    "expected relation name after '*' in subset constraint",
+                                )
                                 .ok()?;
                             n
                         }
@@ -2678,12 +2778,13 @@ impl Parser {
                 // The type↔name separator is a gap: 2+ spaces (checked via
                 // `gap_before_current`) or a newline. Skip the newline so
                 // `Type\n  name` resolves the name after the break.
-                let had_gap = self.gap_before_current()
-                    || matches!(self.peek(), TokenKind::Newline);
+                let had_gap =
+                    self.gap_before_current() || matches!(self.peek(), TokenKind::Newline);
                 if had_gap {
                     self.skip_newlines();
                 }
-                let is_sig = ty.is_some() && had_gap
+                let is_sig = ty.is_some()
+                    && had_gap
                     && matches!(self.peek(), TokenKind::Lower(_) | TokenKind::StarIdent(_));
                 if is_sig {
                     let ty = ty.unwrap();
@@ -2693,7 +2794,9 @@ impl Parser {
                         // source IS the declaration — emit a SourceDecl field
                         // directly, mirroring the `*name : Rel T` colon path.
                         let t = self.advance();
-                        let TokenKind::StarIdent(n) = t.kind else { unreachable!() };
+                        let TokenKind::StarIdent(n) = t.kind else {
+                            unreachable!()
+                        };
                         let bare = n.trim_start_matches('*').to_string();
                         let mut migrations = Vec::new();
                         while let Some(m) = self.parse_source_field_migration() {
@@ -2745,9 +2848,7 @@ impl Parser {
                 continue;
             }
             let field_col = self.cur_column();
-            let (fname, _) = self
-                .expect_lower("expected field name in record")
-                .ok()?;
+            let (fname, _) = self.expect_lower("expected field name in record").ok()?;
             self.skip_newlines();
             // A bare lambda (`greet \name -> …`) or do-block (`run do …`) field
             // value. Field values normally use `parse_postfix` so a value can't
@@ -2875,7 +2976,11 @@ impl Parser {
         // being absorbed as one of its fields. Restore after.
         let using_fn = self.parse_expr()?;
         self.block_indent = prev_block_indent;
-        Some(crate::ast::SourceMigration { from_ty, to_ty, using_fn })
+        Some(crate::ast::SourceMigration {
+            from_ty,
+            to_ty,
+            using_fn,
+        })
     }
 
     fn parse_list_expr(&mut self, start: Span) -> Option<Expr> {
@@ -2963,7 +3068,9 @@ impl Parser {
             let mut ty_params = Vec::new();
             while !this.at(&TokenKind::Arrow) && !this.at_eof() {
                 this.skip_newlines();
-                if this.at(&TokenKind::Arrow) { break; }
+                if this.at(&TokenKind::Arrow) {
+                    break;
+                }
                 // Stop consuming params if we've crossed back to column 0 outside
                 // any delimiter — this prevents eating into the next declaration
                 // when `->` is missing.
@@ -3015,8 +3122,11 @@ impl Parser {
 
             let scrutinee = this.parse_expr()?;
             this.skip_newlines();
-            this.expect(&TokenKind::Of, "expected 'of' after scrutinee in 'case' expression")
-                .ok()?;
+            this.expect(
+                &TokenKind::Of,
+                "expected 'of' after scrutinee in 'case' expression",
+            )
+            .ok()?;
 
             let arms = this.parse_block(|p| p.parse_case_arm());
 
@@ -3039,11 +3149,8 @@ impl Parser {
             return None;
         }
         let pat = self.parse_pat()?;
-        self.expect(
-            &TokenKind::Arrow,
-            "expected '->' after pattern in case arm",
-        )
-        .ok()?;
+        self.expect(&TokenKind::Arrow, "expected '->' after pattern in case arm")
+            .ok()?;
         let scope_mark = self.bound_vars.len();
         self.push_pat_vars(&pat);
         let body = self.parse_expr();
@@ -3098,8 +3205,11 @@ impl Parser {
             let api_span = this.span();
             let api = this.parse_route_component_path()?;
             this.skip_newlines();
-            this.expect(&TokenKind::Where, "expected 'where' after API name in 'serve'")
-                .ok()?;
+            this.expect(
+                &TokenKind::Where,
+                "expected 'where' after API name in 'serve'",
+            )
+            .ok()?;
             let handlers = this.parse_block(|p| p.parse_serve_handler());
             let end = this.prev_span();
             Some(Spanned::new(
@@ -3120,9 +3230,11 @@ impl Parser {
         if self.at_eof() {
             return None;
         }
-        let (endpoint, endpoint_span) =
-            self.expect_upper("expected endpoint constructor name").ok()?;
-        self.expect(&TokenKind::Eq, "expected '=' after endpoint name").ok()?;
+        let (endpoint, endpoint_span) = self
+            .expect_upper("expected endpoint constructor name")
+            .ok()?;
+        self.expect(&TokenKind::Eq, "expected '=' after endpoint name")
+            .ok()?;
         let body = self.parse_expr()?;
         Some(ServeHandler {
             endpoint,
@@ -3294,20 +3406,21 @@ impl Parser {
         let diag_count = self.diagnostics.len();
 
         if let Some(pat) = self.try_parse_pat()
-            && self.eat(&TokenKind::LArrow) {
-                // Committed to a bind statement — `<-` was consumed.
-                // If the expression fails, return None without trying
-                // to re-parse as an expression statement.
-                let expr = self.parse_expr()?;
-                let end_sp = expr.span;
-                // Names bound by this bind are in scope for the rest of the
-                // do-block (popped by `parse_do_expr`).
-                self.push_pat_vars(&pat);
-                return Some(Spanned::new(
-                    StmtKind::Bind { pat, expr },
-                    Span::new(start.start, end_sp.end),
-                ));
-            }
+            && self.eat(&TokenKind::LArrow)
+        {
+            // Committed to a bind statement — `<-` was consumed.
+            // If the expression fails, return None without trying
+            // to re-parse as an expression statement.
+            let expr = self.parse_expr()?;
+            let end_sp = expr.span;
+            // Names bound by this bind are in scope for the rest of the
+            // do-block (popped by `parse_do_expr`).
+            self.push_pat_vars(&pat);
+            return Some(Spanned::new(
+                StmtKind::Bind { pat, expr },
+                Span::new(start.start, end_sp.end),
+            ));
+        }
 
         // Not a bind — restore and parse as expression statement.
         self.restore(saved);
@@ -3365,7 +3478,9 @@ impl Parser {
         // (parens, record fields, list elements) flows through this entry
         // point, so guarding it alone prevents stack overflow on pathological
         // input like `((((x))))`.
-        if !self.enter_recursion() { return None; }
+        if !self.enter_recursion() {
+            return None;
+        }
         let result = self.parse_pat_inner();
         self.recursion_depth -= 1;
         result
@@ -3387,8 +3502,11 @@ impl Parser {
                 self.expect(&TokenKind::LParen, "expected '(' after `the`")
                     .ok()?;
                 let ty = self.parse_type()?;
-                self.expect(&TokenKind::RParen, "expected ')' after the type in `the (Type) pat`")
-                    .ok()?;
+                self.expect(
+                    &TokenKind::RParen,
+                    "expected ')' after the type in `the (Type) pat`",
+                )
+                .ok()?;
                 self.skip_newlines();
                 let inner = self.parse_pat()?;
                 let end = inner.span;
@@ -3402,7 +3520,9 @@ impl Parser {
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(name) = tok.kind else {
+                    unreachable!()
+                };
                 // `base.Ctor` pattern (hard gate): lowercase `base` qualifier
                 // before a dotted Upper constructor. Reuses the qualified-ctor
                 // machinery with qualifier `base`.
@@ -3412,7 +3532,9 @@ impl Parser {
                 {
                     self.advance(); // consume `.`
                     let ctor_tok = self.advance();
-                    let TokenKind::Upper(ctor) = ctor_tok.kind else { unreachable!() };
+                    let TokenKind::Upper(ctor) = ctor_tok.kind else {
+                        unreachable!()
+                    };
                     let payload = if self.can_start_pat_atom() {
                         self.parse_pat_atom()?
                     } else {
@@ -3432,18 +3554,21 @@ impl Parser {
             }
             TokenKind::Upper(_) => {
                 let tok = self.advance();
-                let TokenKind::Upper(mut name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(mut name) = tok.kind else {
+                    unreachable!()
+                };
                 // Qualified constructor: `Type.Ctor`. The leading `Type`
                 // segment(s) form the qualifier (resolution/confinement
                 // context); `name` is the final ctor tag. Loops to allow
                 // deeper qualification (`a.b.Ctor` → qualifier `a.b`).
                 let mut qualifier: Option<Name> = None;
-                while self.at(&TokenKind::Dot)
-                    && matches!(self.peek_ahead(1), TokenKind::Upper(_))
+                while self.at(&TokenKind::Dot) && matches!(self.peek_ahead(1), TokenKind::Upper(_))
                 {
                     self.advance(); // consume `.`
                     let ctor_tok = self.advance();
-                    let TokenKind::Upper(seg) = ctor_tok.kind else { unreachable!() };
+                    let TokenKind::Upper(seg) = ctor_tok.kind else {
+                        unreachable!()
+                    };
                     qualifier = Some(match qualifier {
                         None => name.clone(),
                         Some(q) => format!("{q}.{name}"),
@@ -3526,21 +3651,28 @@ impl Parser {
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
                     .ok()?;
-                Some(Spanned::new(inner.node, Span::new(start.start, end_tok.span.end)))
+                Some(Spanned::new(
+                    inner.node,
+                    Span::new(start.start, end_tok.span.end),
+                ))
             }
             TokenKind::Minus => {
                 let minus_tok = self.advance();
                 match self.peek() {
                     TokenKind::Int(_) => {
                         let tok = self.advance();
-                        let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                        let TokenKind::Int(n) = tok.kind else {
+                            unreachable!()
+                        };
                         let neg = format!("-{}", n);
                         let span = Span::new(minus_tok.span.start, tok.span.end);
                         Some(Spanned::new(PatKind::Lit(Literal::Int(neg)), span))
                     }
                     TokenKind::Float(_) => {
                         let tok = self.advance();
-                        let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                        let TokenKind::Float(f) = tok.kind else {
+                            unreachable!()
+                        };
                         let span = Span::new(minus_tok.span.start, tok.span.end);
                         Some(Spanned::new(PatKind::Lit(Literal::Float(-f)), span))
                     }
@@ -3552,22 +3684,30 @@ impl Parser {
             }
             TokenKind::Int(_) => {
                 let tok = self.advance();
-                let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                let TokenKind::Int(n) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Int(n)), tok.span))
             }
             TokenKind::Float(_) => {
                 let tok = self.advance();
-                let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                let TokenKind::Float(f) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Float(f)), tok.span))
             }
             TokenKind::Text(_) => {
                 let tok = self.advance();
-                let TokenKind::Text(s) = tok.kind else { unreachable!() };
+                let TokenKind::Text(s) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Text(s)), tok.span))
             }
             TokenKind::Bytes(_) => {
                 let tok = self.advance();
-                let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
+                let TokenKind::Bytes(b) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
             }
             _ => {
@@ -3606,7 +3746,9 @@ impl Parser {
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Var(name), tok.span))
             }
             TokenKind::Upper(_) => {
@@ -3616,14 +3758,17 @@ impl Parser {
                 // arguments still requires parentheses. May be qualified
                 // (`Just Color.Red`): capture the qualifier as above.
                 let tok = self.advance();
-                let TokenKind::Upper(mut name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(mut name) = tok.kind else {
+                    unreachable!()
+                };
                 let mut qualifier: Option<Name> = None;
-                while self.at(&TokenKind::Dot)
-                    && matches!(self.peek_ahead(1), TokenKind::Upper(_))
+                while self.at(&TokenKind::Dot) && matches!(self.peek_ahead(1), TokenKind::Upper(_))
                 {
                     self.advance();
                     let ctor_tok = self.advance();
-                    let TokenKind::Upper(seg) = ctor_tok.kind else { unreachable!() };
+                    let TokenKind::Upper(seg) = ctor_tok.kind else {
+                        unreachable!()
+                    };
                     qualifier = Some(match qualifier {
                         None => name.clone(),
                         Some(q) => format!("{q}.{name}"),
@@ -3667,21 +3812,28 @@ impl Parser {
                 let end_tok = self
                     .expect(&TokenKind::RParen, "expected ')' to close pattern group")
                     .ok()?;
-                Some(Spanned::new(inner.node, Span::new(start.start, end_tok.span.end)))
+                Some(Spanned::new(
+                    inner.node,
+                    Span::new(start.start, end_tok.span.end),
+                ))
             }
             TokenKind::Minus => {
                 let minus_tok = self.advance();
                 match self.peek() {
                     TokenKind::Int(_) => {
                         let tok = self.advance();
-                        let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                        let TokenKind::Int(n) = tok.kind else {
+                            unreachable!()
+                        };
                         let neg = format!("-{}", n);
                         let span = Span::new(minus_tok.span.start, tok.span.end);
                         Some(Spanned::new(PatKind::Lit(Literal::Int(neg)), span))
                     }
                     TokenKind::Float(_) => {
                         let tok = self.advance();
-                        let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                        let TokenKind::Float(f) = tok.kind else {
+                            unreachable!()
+                        };
                         let span = Span::new(minus_tok.span.start, tok.span.end);
                         Some(Spanned::new(PatKind::Lit(Literal::Float(-f)), span))
                     }
@@ -3693,22 +3845,30 @@ impl Parser {
             }
             TokenKind::Int(_) => {
                 let tok = self.advance();
-                let TokenKind::Int(n) = tok.kind else { unreachable!() };
+                let TokenKind::Int(n) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Int(n)), tok.span))
             }
             TokenKind::Float(_) => {
                 let tok = self.advance();
-                let TokenKind::Float(f) = tok.kind else { unreachable!() };
+                let TokenKind::Float(f) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Float(f)), tok.span))
             }
             TokenKind::Text(_) => {
                 let tok = self.advance();
-                let TokenKind::Text(s) = tok.kind else { unreachable!() };
+                let TokenKind::Text(s) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Text(s)), tok.span))
             }
             TokenKind::Bytes(_) => {
                 let tok = self.advance();
-                let TokenKind::Bytes(b) = tok.kind else { unreachable!() };
+                let TokenKind::Bytes(b) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
             }
             _ => {
@@ -3728,8 +3888,9 @@ impl Parser {
                 if self.at(&TokenKind::RBrace) {
                     break;
                 }
-                let (fname, fname_span) =
-                    self.expect_lower("expected field name in record pattern").ok()?;
+                let (fname, fname_span) = self
+                    .expect_lower("expected field name in record pattern")
+                    .ok()?;
                 self.skip_newlines();
                 // Field pattern value: `name pattern` (whitespace-separated, no
                 // `:`). No punning — every field binds an explicit pattern.
@@ -3793,7 +3954,8 @@ impl Parser {
                 self.error("expected one or more type variables after 'forall'");
                 return None;
             }
-            self.expect(&TokenKind::Dot, "expected '.' after forall variables").ok()?;
+            self.expect(&TokenKind::Dot, "expected '.' after forall variables")
+                .ok()?;
             self.skip_newlines();
             // Guard the recursive body parse: `forall a. forall a. …` would
             // otherwise recurse unbounded and overflow the stack (every other
@@ -3806,7 +3968,10 @@ impl Parser {
             let body = body?;
             let span = Span::new(start.start, body.span.end);
             return Some(Spanned::new(
-                TypeKind::Forall { vars, ty: Box::new(body) },
+                TypeKind::Forall {
+                    vars,
+                    ty: Box::new(body),
+                },
                 span,
             ));
         }
@@ -3819,7 +3984,10 @@ impl Parser {
         let saved = self.save();
         self.skip_newlines();
         if self.eat(&TokenKind::Arrow) {
-            if !self.enter_recursion() { self.restore(saved); return None; }
+            if !self.enter_recursion() {
+                self.restore(saved);
+                return None;
+            }
             self.skip_newlines();
             let rhs = self.parse_type_function(); // right-associative
             self.recursion_depth -= 1;
@@ -3868,7 +4036,10 @@ impl Parser {
             };
             constructors.push(ctor);
         }
-        let end = constructors.last().map(|_| self.span().end).unwrap_or(start);
+        let end = constructors
+            .last()
+            .map(|_| self.span().end)
+            .unwrap_or(start);
         Some(Spanned::new(
             TypeKind::Variant {
                 constructors,
@@ -3933,7 +4104,9 @@ impl Parser {
                     Some(arg) => arg,
                     None => fail!(),
                 };
-                if !self.enter_recursion() { fail!() }
+                if !self.enter_recursion() {
+                    fail!()
+                }
                 spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
@@ -3968,8 +4141,8 @@ impl Parser {
             // While parsing an `api` route's response type, a leading `Upper`
             // on the next line is the next route's constructor name, never a
             // type argument — stop regardless of indentation.
-            let next_is_route_entry = self.stop_type_app_at_route_entry
-                && matches!(self.peek(), TokenKind::Upper(_));
+            let next_is_route_entry =
+                self.stop_type_app_at_route_entry && matches!(self.peek(), TokenKind::Upper(_));
             if !self.at_eof()
                 && !next_starts_decl
                 && !next_is_value_field
@@ -3981,7 +4154,9 @@ impl Parser {
                     Some(arg) => arg,
                     None => fail!(),
                 };
-                if !self.enter_recursion() { fail!() }
+                if !self.enter_recursion() {
+                    fail!()
+                }
                 spine_charged += 1;
                 let span = Span::new(func.span.start, arg.span.end);
                 func = Spanned::new(
@@ -4006,13 +4181,15 @@ impl Parser {
 
     fn can_start_type_atom(&self) -> bool {
         if self.stop_type_at_headers
-            && matches!(self.peek(), TokenKind::Lower(s) if s == "headers" || s == "rateLimit") {
-                return false;
-            }
+            && matches!(self.peek(), TokenKind::Lower(s) if s == "headers" || s == "rateLimit")
+        {
+            return false;
+        }
         if self.stop_type_at_migrate_clauses
-            && matches!(self.peek(), TokenKind::Lower(s) if s == "to" || s == "using") {
-                return false;
-            }
+            && matches!(self.peek(), TokenKind::Lower(s) if s == "to" || s == "using")
+        {
+            return false;
+        }
         matches!(
             self.peek(),
             TokenKind::Upper(_)
@@ -4042,7 +4219,9 @@ impl Parser {
         match self.peek() {
             TokenKind::Upper(_) => {
                 let tok = self.advance();
-                let TokenKind::Upper(name) = tok.kind else { unreachable!() };
+                let TokenKind::Upper(name) = tok.kind else {
+                    unreachable!()
+                };
                 if name == "IO" && matches!(self.peek(), TokenKind::LBrace | TokenKind::Underscore)
                     // `IO {}` is IO of the unit record type `{}`, not an
                     // effect row — only reject when the brace has contents.
@@ -4059,15 +4238,20 @@ impl Parser {
                 }
                 if name == "IO" {
                     // `IO a` — plain IO monad type, effects untracked.
-                    if !self.enter_recursion() { return None; }
+                    if !self.enter_recursion() {
+                        return None;
+                    }
                     let inner = self.parse_type_atom();
                     self.recursion_depth -= 1;
                     let inner = inner?;
                     let span = Span::new(tok.span.start, inner.span.end);
-                    Some(Spanned::new(TypeKind::IO { ty: Box::new(inner) }, span))
-                } else if (name == "Float" || name == "Int")
-                    && self.can_start_unit_type_arg()
-                {
+                    Some(Spanned::new(
+                        TypeKind::IO {
+                            ty: Box::new(inner),
+                        },
+                        span,
+                    ))
+                } else if (name == "Float" || name == "Int") && self.can_start_unit_type_arg() {
                     // `Float M`, `Float u`, `Float (M / S^2)` — the unit is a
                     // regular type-argument position parsed as a unit
                     // expression. A bare Upper/Lower identifier is a unit
@@ -4092,7 +4276,9 @@ impl Parser {
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
+                let TokenKind::Lower(name) = tok.kind else {
+                    unreachable!()
+                };
                 Some(Spanned::new(TypeKind::Var(name), tok.span))
             }
             TokenKind::Underscore => {
@@ -4194,7 +4380,9 @@ impl Parser {
             if self.at(&TokenKind::RBrace) || self.at(&TokenKind::Pipe) {
                 break;
             }
-            let (fname, _) = self.expect_lower("expected field name in record type").ok()?;
+            let (fname, _) = self
+                .expect_lower("expected field name in record type")
+                .ok()?;
             self.skip_newlines();
             let ty = self.parse_type_atom()?;
             fields.push(Field {
@@ -4206,7 +4394,9 @@ impl Parser {
 
         self.skip_newlines();
         let rest = if self.eat(&TokenKind::Pipe) {
-            let (rname, _) = self.expect_lower("expected row variable after '|' in record type").ok()?;
+            let (rname, _) = self
+                .expect_lower("expected row variable after '|' in record type")
+                .ok()?;
             Some(rname)
         } else {
             None
@@ -4221,7 +4411,6 @@ impl Parser {
             Span::new(start.start, end_tok.span.end),
         ))
     }
-
 
     fn parse_type_scheme(&mut self) -> Option<TypeScheme> {
         // Parse optional constraints: (TraitName args* =>)*
@@ -4242,5 +4431,3 @@ impl Parser {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
-
-

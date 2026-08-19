@@ -287,7 +287,11 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             }
         }
         TypeKind::Variant { constructors, rest } => {
-            let mut s = String::from("<");
+            // `A {} | B {}` — two or more `Ctor {…}` joined by ` | `. No `<>`
+            // wrapper. A variant in a larger type may need parens (e.g.
+            // `(A {} | B {}) -> Int 1`); render the bare form and let the
+            // parent-position precedence logic add parens where required.
+            let mut s = String::new();
             for (i, c) in constructors.iter().enumerate() {
                 if i > 0 {
                     s.push_str(" | ");
@@ -297,13 +301,17 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             if let Some(r) = rest {
                 if !constructors.is_empty() {
                     s.push_str(" | ");
-                } else {
-                    s.push_str("| ");
                 }
                 s.push_str(r);
             }
-            s.push('>');
-            s
+            // A variant binds loosest (below `->`), so parenthesise it whenever
+            // it sits inside an application, a function parameter, or an atom
+            // position — `Maybe (A {} | B {})`, `(A {} | B {}) -> Int 1`.
+            if ctx > TyPrec::Function {
+                format!("({s})")
+            } else {
+                s
+            }
         }
         TypeKind::IO { ty } => {
             let s = format!("IO {}", render_type_atom(ty));

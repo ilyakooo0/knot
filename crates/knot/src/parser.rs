@@ -290,6 +290,30 @@ fn fold_rel_type_app(ty: Type) -> Type {
     }
 }
 
+/// Read a parsed type-application spine as a variant constructor
+/// (`Circle {radius (Float 1)}`). A constructor is `App(Named(Upper), Record)`
+/// — the payload is the record type. Anything else (a type variable, a real
+/// type application like `Maybe (Int 1)` whose argument isn't a record, a
+/// function type, …) is NOT a constructor, so the spine keeps its `App` meaning
+/// and no variant is formed. Bare `Name` (no `{}`) is not a constructor —
+/// fieldless constructors are written `Name {}`.
+fn spine_as_constructor(ty: &Type) -> Option<ConstructorDef> {
+    match &ty.node {
+        TypeKind::App { func, arg } => {
+            let TypeKind::Named(name) = &func.node else { return None };
+            if !name.chars().next().is_some_and(|c| c.is_uppercase()) {
+                return None;
+            }
+            let TypeKind::Record { fields, rest: None } = &arg.node else { return None };
+            Some(ConstructorDef {
+                name: name.clone(),
+                fields: fields.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Lex + parse a standalone type-annotation string into an `ast::Type`.
 /// Returns `None` on any lex/parse error or trailing tokens.
 pub fn parse_type_str(source: &str) -> Option<Type> {
@@ -3795,8 +3819,48 @@ impl Parser {
         }
     }
 
+    /// A variant type is two or more `Ctor {…}` constructors joined by `|`:
+    /// `Circle {radius (Float 1)} | Square {side (Float 1)}`. The first
+    /// constructor parses (via `parse_type_app`) as a type application
+    /// `App(Named, Record)`; only when a `|` follows do we reinterpret the
+    /// spine as a constructor and parse the rest. A lone `Ctor {…}` (no `|`)
+    /// keeps its type-application meaning, so `type T = A {}` is unchanged.
+    /// Parentheses group a variant inside a larger type: `(A {} | B {}) -> Int 1`.
+    fn parse_type_union(&mut self) -> Option<Type> {
+        let first = self.parse_type_app()?;
+        // A variant needs at least one `|` after a constructor-shaped spine.
+        let Some(first_ctor) = spine_as_constructor(&first) else {
+            return Some(first);
+        };
+        let saved = self.save();
+        self.skip_newlines();
+        if !self.at(&TokenKind::Pipe) {
+            self.restore(saved);
+            return Some(first);
+        }
+        let start = first.span.start;
+        let mut constructors = vec![first_ctor];
+        while self.eat(&TokenKind::Pipe) {
+            self.skip_newlines();
+            let spine = self.parse_type_app()?;
+            let Some(ctor) = spine_as_constructor(&spine) else {
+                self.error("expected a constructor (`Name {…}`) after '|' in variant type");
+                return None;
+            };
+            constructors.push(ctor);
+        }
+        let end = constructors.last().map(|_| self.span().end).unwrap_or(start);
+        Some(Spanned::new(
+            TypeKind::Variant {
+                constructors,
+                rest: None,
+            },
+            Span::new(start, end),
+        ))
+    }
+
     fn parse_type_refined(&mut self) -> Option<Type> {
-        let base = self.parse_type_app()?;
+        let base = self.parse_type_union()?;
         if self.eat(&TokenKind::Where) {
             // The predicate re-enters the expression grammar, which can loop
             // back here via a postfix `: Type` annotation. Charge the recursion
@@ -4059,10 +4123,6 @@ impl Parser {
                     Span::new(start.start, end_tok.span.end),
                 ))
             }
-            TokenKind::Lt => {
-                self.advance();
-                self.parse_variant_type(start)
-            }
             _ => {
                 self.error("expected type");
                 None
@@ -4143,59 +4203,6 @@ impl Parser {
         ))
     }
 
-    fn parse_variant_type(&mut self, start: Span) -> Option<Type> {
-        // Already consumed `<`.
-        self.skip_newlines();
-
-        let mut constructors = Vec::new();
-        let mut rest = None;
-
-        loop {
-            self.skip_newlines();
-            if self.at(&TokenKind::Gt) {
-                break;
-            }
-            if self.at(&TokenKind::Pipe) {
-                self.advance();
-                self.skip_newlines();
-                // Could be a rest variable or another constructor.
-                if matches!(self.peek(), TokenKind::Lower(_)) {
-                    // Check if this is followed by `>` — if so, it's a rest variable.
-                    if matches!(self.peek_ahead(1), TokenKind::Gt) {
-                        let tok = self.advance();
-                        let TokenKind::Lower(name) = tok.kind else { unreachable!() };
-                        rest = Some(name);
-                        break;
-                    }
-                }
-                // Fall through to parse as constructor.
-            }
-            if let TokenKind::Upper(_) = self.peek() {
-                constructors.push(self.parse_constructor_def()?);
-            } else if matches!(self.peek(), TokenKind::Lower(_)) {
-                // Rest variable.
-                let tok = self.advance();
-                let TokenKind::Lower(name) = tok.kind else { unreachable!() };
-                rest = Some(name);
-                break;
-            } else {
-                break;
-            }
-            self.skip_newlines();
-            if !self.at(&TokenKind::Pipe) && !self.at(&TokenKind::Gt) {
-                break;
-            }
-        }
-
-        self.skip_newlines();
-        let end_tok = self
-            .expect(&TokenKind::Gt, "expected '>' to close variant type")
-            .ok()?;
-        Some(Spanned::new(
-            TypeKind::Variant { constructors, rest },
-            Span::new(start.start, end_tok.span.end),
-        ))
-    }
 
     fn parse_type_scheme(&mut self) -> Option<TypeScheme> {
         // Parse optional constraints: (TraitName args* =>)*

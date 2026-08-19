@@ -773,6 +773,13 @@ struct CtorInfo {
 struct DataInfo {
     params: Vec<String>,
     ctors: Vec<(String, Vec<(String, ast::Type)>)>,
+    /// True when this "data type" came from a `type X = A {} | B {}` variant
+    /// alias rather than a nominal `data X = …`. A structural variant's type is
+    /// the constructor-set `Ty::Variant` (so two aliases with the same
+    /// constructor set are the same type), not a nominal `Ty::Con(X)`. Its
+    /// constructors still resolve qualified (`X.Ctor`) and via `with`-import,
+    /// exactly like `data` — only the *type* it produces differs.
+    structural: bool,
 }
 
 /// A type name brought into scope by a `with` peel over a record containing an
@@ -2277,7 +2284,14 @@ impl Infer {
             // single-variant data types with matching field shapes unify
             // (defeating nominal typing). Pure `type` aliases stay transparent.
             (Ty::Alias(name, inner), _) => {
-                if self.data_types.contains_key(name) {
+                // A nominal `data` type unifies by name (`Con`); a structural
+                // variant alias (`type X = A {} | B {}`) unwraps to its
+                // constructor-set so two aliases with the same set unify.
+                let nominal = self
+                    .data_types
+                    .get(name)
+                    .is_some_and(|d| !d.structural);
+                if nominal {
                     let nominal = Ty::Con(name.clone(), vec![]);
                     self.unify_dir(&nominal, &t2, span, t1_provided);
                 } else {
@@ -2286,7 +2300,11 @@ impl Infer {
                 }
             }
             (_, Ty::Alias(name, inner)) => {
-                if self.data_types.contains_key(name) {
+                let nominal = self
+                    .data_types
+                    .get(name)
+                    .is_some_and(|d| !d.structural);
+                if nominal {
                     let nominal = Ty::Con(name.clone(), vec![]);
                     self.unify_dir(&t1, &nominal, span, t1_provided);
                 } else {
@@ -4678,6 +4696,30 @@ impl Infer {
         true
     }
 
+    /// The structural variant type for a `type X = A {} | B {}` alias, or `None`
+    /// if `name` is not a structural variant. The result is the constructor-set
+    /// `Ty::Variant` (each constructor mapped to its record payload), so two
+    /// aliases with the same constructor set unify — unlike a nominal
+    /// `Ty::Con(X)`. `X.Ctor {…}` yields this type.
+    fn structural_variant_ty(&mut self, name: &str) -> Option<Ty> {
+        let info = self.data_types.get(name)?.clone();
+        if !info.structural {
+            return None;
+        }
+        let ctor_set: FieldMap = info
+            .ctors
+            .iter()
+            .map(|(cname, cfields)| {
+                let cfield_tys: FieldMap = cfields
+                    .iter()
+                    .map(|(fname, fty)| (fname.clone(), self.ast_type_to_ty(fty)))
+                    .collect();
+                (cname.clone(), Ty::Record(cfield_tys, None))
+            })
+            .collect();
+        Some(Ty::Variant(ctor_set, None))
+    }
+
     fn instantiate_ctor(
         &mut self,
         name: &str,
@@ -4716,8 +4758,13 @@ impl Infer {
             .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
             .collect();
 
+        // Structural variant (`type X = A {} | B {}`): the constructor yields
+        // the constructor-set `Ty::Variant`, resolved via X's `data_types` entry.
+        let structural_ty = self.structural_variant_ty(&info.data_type);
         let data_ty = if info.data_type == "Bool" {
             Ty::Bool
+        } else if let Some(set) = structural_ty {
+            set
         } else {
             Ty::Con(info.data_type.clone(), param_tys)
         };
@@ -4764,8 +4811,11 @@ impl Infer {
             .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
             .collect();
 
+        let structural_ty = self.structural_variant_ty(data_name);
         let data_ty = if data_name == "Bool" {
             Ty::Bool
+        } else if let Some(set) = structural_ty {
+            set
         } else {
             Ty::Con(data_name.to_string(), param_tys)
         };
@@ -9204,6 +9254,41 @@ impl Infer {
         }
     }
 
+    /// Register a structural variant alias's constructors (`type X = A {} | B {}`)
+    /// exactly like a nominal `data X = …` declaration does: each constructor
+    /// goes into the global `constructors` map (for qualified `X.Ctor` and
+    /// `with`-import resolution) and `X` goes into `data_types` — but flagged
+    /// `structural`, so instantiation yields the constructor-set `Ty::Variant`
+    /// rather than a nominal `Ty::Con(X)`. The alias itself is handled by the
+    /// ordinary alias path, which resolves the `Variant` body to `Ty::Variant`.
+    fn register_structural_variant(&mut self, name: &str, ctors: &[ast::ConstructorDef]) {
+        let mut ctor_list = Vec::new();
+        for ctor in ctors {
+            let fields: Vec<(String, ast::Type)> = ctor
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), f.value.clone()))
+                .collect();
+            self.constructors
+                .entry(ctor.name.clone())
+                .or_default()
+                .push(CtorInfo {
+                    data_type: name.to_string(),
+                    data_params: vec![],
+                    fields: fields.clone(),
+                });
+            ctor_list.push((ctor.name.clone(), fields));
+        }
+        self.data_types.insert(
+            name.to_string(),
+            DataInfo {
+                params: vec![],
+                ctors: ctor_list,
+                structural: true,
+            },
+        );
+    }
+
     // ── Declaration collection (phase 1) ─────────────────────────
 
     fn collect_types(&mut self, program: &ast::Expr) {
@@ -9220,6 +9305,14 @@ impl Infer {
                         (**predicate).clone(),
                     ));
                 } else {
+                    // A variant alias `type X = A {} | B {}` registers X's
+                    // constructors exactly like `data X = …` — qualified
+                    // (`X.Ctor`) and `with`-import resolution both work — but
+                    // its *type* is the structural constructor-set, so two
+                    // aliases with the same constructors are the same type.
+                    if let ast::TypeKind::Variant { constructors, .. } = &ty.node {
+                        self.register_structural_variant(name, constructors);
+                    }
                     alias_decls.push((name.to_string(), ty.clone(), span));
                 }
             } else {
@@ -9498,6 +9591,7 @@ impl Infer {
                     DataInfo {
                         params: params.to_vec(),
                         ctors: ctor_list,
+                        structural: false,
                     },
                 );
             }
@@ -9763,9 +9857,9 @@ impl Infer {
                     ("Nothing".into(), vec![]),
                     ("Just".into(), vec![("value".into(), ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span))]),
                 ],
+                structural: false,
             },
         );
-
         // Built-in ADT: data Bool = True {} | False {}
         self.constructors.insert(
             "True".into(),
@@ -9791,9 +9885,9 @@ impl Infer {
                     ("True".into(), vec![]),
                     ("False".into(), vec![]),
                 ],
+                structural: false,
             },
         );
-
         // Built-in ADT: data Level = Debug {} | Info {} | Warn {} | Error {}
         // (log severity; first-class value — pass/compute/pattern-match it).
         for ctor in ["Debug", "Info", "Warn", "Error"] {
@@ -9816,10 +9910,10 @@ impl Infer {
                     ("Warn".into(), vec![]),
                     ("Error".into(), vec![]),
                 ],
+                structural: false,
             },
         );
         self.builtin_data_types.insert("Level".into());
-
         // Built-in ADT: data Result e a = Err {error: e} | Ok {value: a}
         self.constructors.insert(
             "Err".into(),
@@ -9851,9 +9945,9 @@ impl Infer {
                     ("Err".into(), vec![("error".into(), ast::Type::new(ast::TypeKind::Var("e".into()), dummy_span))]),
                     ("Ok".into(), vec![("value".into(), ast::Type::new(ast::TypeKind::Var("a".into()), dummy_span))]),
                 ],
+                structural: false,
             },
         );
-
         // Built-in ADT: data List a = Nil {} | Cons {head: a, tail: List a}
         // A singly-linked list. `tail` is self-referential (`List a`), so the
         // recursion lives in the type, not in codegen. Registered as an
@@ -9892,9 +9986,9 @@ impl Infer {
                     ("Nil".into(), vec![]),
                     ("Cons".into(), vec![("head".into(), a_var()), ("tail".into(), list_a_ty())]),
                 ],
+                structural: false,
             },
         );
-
         // Built-in type: RefinementError = {typeName: Text, violations: [{field: Maybe Text, message: Text}]}
         // Register as a type alias so field access (e.typeName) works.
         self.aliases.insert(
@@ -9913,7 +10007,6 @@ impl Infer {
                 None,
             ),
         );
-
         // Built-in type: HttpError = {status: Int 1, message: Text}
         // Used as the error type for serve handler return values: every
         // handler returns `Result HttpError T`, where Err carries a custom
@@ -9928,7 +10021,6 @@ impl Infer {
                 None,
             ),
         );
-
         // Built-in type: RequestCtx — passed to a route's `rateLimit` key
         // function. Carries client metadata and a header lookup function.
         self.aliases.insert(
@@ -9948,7 +10040,6 @@ impl Infer {
                 None,
             ),
         );
-
         // ── strip / dress: top-level unit rebranding ────────────────────
         // `strip` removes a value's unit; `dress` attaches one. Both are
         // unconstrained top-level functions (no trait), identity at runtime.

@@ -14,20 +14,20 @@
 
     -- Round-trip: encode then decode. parseJson returns `Maybe a` so malformed
     -- input is recoverable rather than fatal — match on the result.
-    with { json (base.toJson { x 10 y 20 }) } (the (Maybe {x (Int 1) y (Int 1)} of
+    with { json (base.toJson { x 10 y 20 }) } (do
+      base.println json
+      case (the (Maybe {x (Int 1) y (Int 1)}) (base.parseJson json)) of
         Maybe.Just { value value } -> base.println (base.show value)
         Maybe.Nothing {} -> base.println "parse failed"
 
       -- Parse a JSON array
-      case base.parseJson "[1, 2, 3]" : Maybe [Int 1] of
+      case (the (Maybe (Rel (Int 1))) (base.parseJson "[1, 2, 3]")) of
         Maybe.Just { value value } -> base.println (base.show value)
         Maybe.Nothing {} -> base.println "parse failed"
 
       -- Malformed input decodes to Nothing instead of crashing the program
-      case base.parseJson "not valid json" : Maybe [Int 1] of
+      case (the (Maybe (Rel (Int 1))) (base.parseJson "not valid json")) of
         Maybe.Just { value value } -> base.println (base.show value)
         Maybe.Nothing {} -> base.println "parse failed (as expected)"
 
-      yield {}) do
-      base.println json
-      case base.parseJson json)))
+      yield {})))

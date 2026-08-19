@@ -13,13 +13,13 @@ Rel Todo  *todos
   ]
 
   -- Group pending todos by owner and count them
-  with { workload (do
+  workload <- (do
     t <- *todos
     where t.done == 0
     groupBy { owner t.owner }
-    yield { owner t.owner count (base.count t) }) } (do
+    yield { owner t.owner count (base.count t) })
 
-    base.println "Pending work per person:"
-    w <- workload
-    base.println (w.owner ++ ": " ++ base.show w.count)
-    yield {}))
+  base.println "Pending work per person:"
+  w <- workload
+  base.println (w.owner ++ ": " ++ base.show w.count)
+  yield {})

@@ -255,10 +255,9 @@ impl<'src> Lexer<'src> {
             self.pos += 3;
         }
 
-        // Block-comment toggles: a line holding ONLY a bare `--` (no text) opens
-        // or closes a block comment; a line holding ONLY a bare `---` opens or
-        // closes a documentation block. Neither emits a token for its own line.
-        let mut in_block_comment = false;
+        // Doc-block toggle: a line holding ONLY a bare `---` (no text) opens or
+        // closes a documentation block. `--` is always a line comment — a bare
+        // `--` is just an empty comment line, never a block toggle.
         let mut in_doc_block = false;
 
         loop {
@@ -282,19 +281,15 @@ impl<'src> Lexer<'src> {
                 }
             }
 
-            // Comments: `--` line/block, `---` doc line/block.
+            // Comments: `--` line, `---` doc line/block.
             if self.check(b'-') && self.peek_at(1) == Some(b'-') {
                 let is_doc = self.peek_at(2) == Some(b'-');
                 let marker_len = if is_doc { 3 } else { 2 };
                 let after = self.pos + marker_len;
-                // A bare marker (only whitespace then a line end / EOF) toggles a
-                // block. Anything else on the line is a line comment / doc line.
-                if self.only_blank_until_line_end(after) {
-                    if is_doc {
-                        in_doc_block = !in_doc_block;
-                    } else {
-                        in_block_comment = !in_block_comment;
-                    }
+                // A bare `---` (only whitespace then a line end / EOF) toggles a
+                // doc block. A bare `--` is just an empty line comment.
+                if is_doc && self.only_blank_until_line_end(after) {
+                    in_doc_block = !in_doc_block;
                     self.skip_line_comment();
                     continue;
                 }
@@ -308,23 +303,8 @@ impl<'src> Lexer<'src> {
                     });
                     continue;
                 }
-                // `-- text`: an ordinary line comment — skip it.
+                // `-- text` or a bare `--`: an ordinary line comment — skip it.
                 self.skip_line_comment();
-                continue;
-            }
-
-            // Inside a block comment, swallow everything until the closing bare
-            // `--` line (handled above, so this branch just skips content).
-            if in_block_comment {
-                if self.at_end() {
-                    self.diagnostics
-                        .push(Diagnostic::error("unterminated block comment").label(
-                            self.span_from(self.pos),
-                            "block comment opened here never closed",
-                        ));
-                    break;
-                }
-                self.advance();
                 continue;
             }
 
@@ -1231,28 +1211,23 @@ mod tests {
     }
 
     #[test]
-    fn block_comment_toggle() {
-        // bare `--` opens and closes; the middle is swallowed entirely.
-        let k = kinds("a\n--\nthis is hidden\nso is this\n--\nb");
-        assert!(
-            k.iter()
-                .any(|t| matches!(t, TokenKind::Lower(n) if n == "a"))
-        );
-        assert!(
-            k.iter()
-                .any(|t| matches!(t, TokenKind::Lower(n) if n == "b"))
-        );
-        assert!(
-            k.iter()
-                .all(|t| !matches!(t, TokenKind::Lower(n) if n == "this" || n == "hidden"))
-        );
-    }
-
-    #[test]
     fn doc_block_toggle() {
         let k = kinds("---\n# Title\n\nSome *markdown* docs.\n---\nadd");
         assert!(has_doc(&k, "# Title"));
         assert!(has_doc(&k, "Some *markdown* docs."));
+    }
+
+    #[test]
+    fn bare_dashes_are_empty_line_comments() {
+        // A bare `--` is an empty line comment, NOT a block-comment toggle —
+        // content on the following lines is still lexed.
+        let k = kinds("a\n--\nb\n--\nc");
+        for name in ["a", "b", "c"] {
+            assert!(
+                k.iter().any(|t| matches!(t, TokenKind::Lower(n) if n == name)),
+                "expected `{name}` to be lexed"
+            );
+        }
     }
 
     #[test]

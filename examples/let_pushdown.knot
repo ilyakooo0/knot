@@ -8,12 +8,12 @@ Rel Item  *items
 
 -- Append `union items new` hidden behind a with.
 appendDemo (do
-  items <- full *items
+  items <- *items
   with {extra [{name "Charlie" price 30}]} with {merged (base.union items extra)} *items = merged)
 
 -- Conditional update do-block update body bound to a with.
 discountDemo (do
-  items <- full *items
+  items <- *items
   with {discounted (do
     i <- items
     yield (case i.price > 20 of
@@ -22,18 +22,18 @@ discountDemo (do
 
 -- Filter only do-block filter body bound to a with.
 pruneDemo (do
-  items <- full *items
+  items <- *items
   with {kept (do i <- items; where i.price > 0; yield i)} *items = kept)
 }
 (do
   full *items = [{name "Alice" price 10} {name "Bob" price 25}]
   appendDemo
-  rows1 <- full *items
+  rows1 <- *items
   base.println ("after append: " ++ base.show rows1)
   discountDemo
-  rows2 <- full *items
+  rows2 <- *items
   base.println ("after discount: " ++ base.show rows2)
   pruneDemo
-  rows3 <- full *items
+  rows3 <- *items
   base.println ("after prune: " ++ base.show rows3)
   yield {})

@@ -13,9 +13,9 @@
 --     runtime, reports the type it was expected to produce plus the local
 --     bindings in scope.
 with {
--- A type-witness function `\(the (Type) From)` binds a type argument, which the
+-- A type-witness function `\(Type  From)` binds a type argument, which the
 -- caller supplies positionally. `showInto From x` shows x at type From.
-showInto (\(the (Type) From) -> \x -> base.show x)
+showInto (\(Type  From) -> \x -> base.show x)
 }
 (do
   -- `_` as a TYPE ARGUMENT: inferred (here, from nothing constraining it to a

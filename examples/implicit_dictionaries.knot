@@ -19,7 +19,7 @@ intOrdDesc {compare (\a b -> case a < b of
     Bool.True {} -> (0 - 1)
     Bool.False {} -> 0)}
 
-(a -> a -> Int 1  ^compare) => a -> a -> a -> a  clamp
+((a -> a -> Int 1)  ^compare) => a -> a -> a -> a  clamp
 clamp (\lo hi x -> case ((^compare) x lo) < 0 of
   Bool.True {} -> lo
   Bool.False {} -> case ((^compare) x hi) > 0 of

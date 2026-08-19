@@ -49,7 +49,7 @@ nextId (\rows -> case rows of
   Cons _ _ -> base.count rows + 1)
 
 addTask (\title owner -> do
-  rows <- full *tasks
+  rows <- *tasks
   with {id (nextId rows)}
     (*tasks = base.union rows [{id id title title owner owner priority (Priority.Medium {}) done (Active.No {})}]))
 
@@ -57,15 +57,15 @@ findById (\tid rows -> base.filter (\t -> t.id == tid) rows)
 
 srv (serve Tasks where
   List = \{} -> do
-    rows <- full *tasks
+    rows <- *tasks
     yield (Result.Ok {value rows})
 
   Get = \{id id} -> do
-    rows <- full *tasks
+    rows <- *tasks
     yield (Result.Ok {value (findById id rows)})
 
   Search = \{q q limit limit} -> do
-    rows <- full *tasks
+    rows <- *tasks
     base.println ("search q=" ++ q ++ " limit=" ++ base.show limit)
     yield (Result.Ok {value rows})
 
@@ -80,11 +80,11 @@ srv (serve Tasks where
 
   Audit = \{id id authorization authorization} -> do
     base.println ("audit for task " ++ base.show id ++ " with auth " ++ authorization)
-    rows <- full *tasks
+    rows <- *tasks
     yield (Result.Ok {value (findById id rows)})
 
   Summary = \{} -> do
-    rows <- full *tasks
+    rows <- *tasks
     yield (Result.Ok {value (base.count rows)}))
 
 }

@@ -20,7 +20,7 @@ Rel {customer Text amount (Int 1)}  *orders
 
   -- Print current state
   base.println "People:"
-  base.println (base.show (full *people))
+  base.println (base.show (*people))
   base.println "Orders:"
-  base.println (base.show (full *orders))
+  base.println (base.show (*orders))
   yield {})

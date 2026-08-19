@@ -4,20 +4,20 @@ Todo  {title Text owner Text done (Int 1)}
 Rel Todo  *todos
 
 add (\title owner -> do
-  todos <- full *todos
+  todos <- *todos
   *todos = base.union todos [{title title owner owner done 0}])
 
 complete (\title -> do
-  todos <- full *todos
+  todos <- *todos
   *todos = do
     t <- todos
     yield (case t.title == title of
       Bool.True {} -> (base.unify t {done 1})
       Bool.False {} -> t))
 
-pending (\owner -> do
-  todos <- full *todos
-  with {result (do t <- todos; where t.done == 0; where t.owner == owner; yield t.title)} yield result)
+pending (\owner ->
+  with {todos *todos}
+  (do t <- todos; where t.done == 0; where t.owner == owner; yield t.title))
 }
 (do
   add "Write parser" "Alice"

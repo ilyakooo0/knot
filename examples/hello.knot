@@ -5,6 +5,6 @@ Rel Person  *people
 }
 (do
   full *people = [{name "Alice" age 30} {name "Bob" age 25} {name "Carol" age 35}]
-  p <- full *people
+  p <- *people
   where p.age > 27
   yield p.name)

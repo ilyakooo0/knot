@@ -13,7 +13,7 @@ Rel {name Text members (Rel Person)}  *teams
 
   -- Read nested members: bind the team, then bind its members field.
   base.println "Before:"
-  teams <- full *teams
+  teams <- *teams
   base.forEach teams (\t -> do
     base.forEach t.members (\m -> base.println ("  " ++ t.name ++ ": " ++ m.name)))
 
@@ -26,7 +26,7 @@ Rel {name Text members (Rel Person)}  *teams
       yield m) })
 
   base.println "After:"
-  teams2 <- full *teams
+  teams2 <- *teams
   base.forEach teams2 (\t -> do
     base.forEach t.members (\m -> base.println ("  " ++ t.name ++ ": " ++ m.name)))
 

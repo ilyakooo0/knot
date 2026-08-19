@@ -3,6 +3,6 @@
 with {
 Person  {name Text age (Int 1) email Text}
 Rel Person  *people
-Rel {customer Text amount (Int 1)}  *orders
+Rel {customer Text amount Int 1}  *orders
 }
 (main)

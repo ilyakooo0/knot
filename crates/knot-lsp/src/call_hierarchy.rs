@@ -17,7 +17,11 @@ use crate::utils::{
 fn decl_info(decl: &knot::ast::RecordField) -> (&str, &str, &ast::Expr, Span) {
     let dspan = decl.value.span;
     match &decl.value.node {
-        ExprKind::DataCtor { name, .. } => (name.as_str(), "data", &decl.value, dspan),
+        ExprKind::TypeCtor { name, ty, .. }
+            if matches!(ty.node, knot::ast::TypeKind::Variant { .. }) =>
+        {
+            (name.as_str(), "data", &decl.value, dspan)
+        }
         ExprKind::SourceDecl { name, .. } => (name.as_str(), "source", &decl.value, dspan),
         _ => (decl.name.as_str(), "fn", &decl.value, dspan),
     }

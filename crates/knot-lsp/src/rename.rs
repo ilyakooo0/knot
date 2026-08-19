@@ -835,13 +835,15 @@ fn field_sites_in_decl<F: FnMut(&str, Span)>(decl: &ast::RecordField, source: &s
         field_sites_in_type(&scheme.ty, source, f);
     }
     match &decl.value.node {
-        ast::ExprKind::DataCtor { constructors, .. } => {
+        ast::ExprKind::TypeCtor { name: _, ty, .. }
+            if let knot::ast::TypeKind::Variant { constructors, .. } = &ty.node =>
+        {
             // Constructor fields appear sequentially in source order, so a
             // single running cursor across all constructors keeps each
             // field-name search confined to its own slot. The search starts
-            // after the `=` — the header (`data Pair a = …`) contains type
+            // after the `=` — the header (`type Pair a = …`) contains type
             // parameter tokens that can collide with field names (renaming
-            // field `a` in `data Pair a = Pair {a: Int}` must not match the
+            // field `a` in `type Pair a = Pair {a: Int} | …` must not match the
             // type parameter `a`).
             let decl_text = safe_slice(source, dspan);
             let mut search_start = decl_text

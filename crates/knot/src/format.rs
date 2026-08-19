@@ -606,9 +606,7 @@ fn forces_multiline(e: &Expr) -> bool {
             f.sig.is_some()
                 || matches!(
                     f.value.node,
-                    ExprKind::SourceDecl { .. }
-                        | ExprKind::TypeCtor { .. }
-                        | ExprKind::DataCtor { .. }
+                    ExprKind::SourceDecl { .. } | ExprKind::TypeCtor { .. }
                 )
                 || forces_multiline(&f.value)
         }),
@@ -832,26 +830,7 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             };
             format!("type {}{} = {}", name, params, render_type(ty))
         }
-        ExprKind::DataCtor {
-            name,
-            params,
-            constructors,
-        } => {
-            // Renders the embedded `data` line. As with `TypeCtor`, the record
-            // renderers emit the field-name line first, so here we emit only
-            // the `data Name … = Ctor {…} | …` part.
-            let params = if params.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", params.join(" "))
-            };
-            let ctors = constructors
-                .iter()
-                .map(render_constructor)
-                .collect::<Vec<_>>()
-                .join(" | ");
-            format!("data {}{} = {}", name, params, ctors)
-        }
+
         ExprKind::SourceDecl {
             name,
             ty,

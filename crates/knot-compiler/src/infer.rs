@@ -785,17 +785,9 @@ struct CtorInfo {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct DataInfo {
     params: Vec<String>,
     ctors: Vec<(String, Vec<(String, ast::Type)>)>,
-    /// True when this "data type" came from a `type X = A {} | B {}` variant
-    /// alias rather than a nominal `data X = …`. A structural variant's type is
-    /// the constructor-set `Ty::Variant` (so two aliases with the same
-    /// constructor set are the same type), not a nominal `Ty::Con(X)`. Its
-    /// constructors still resolve qualified (`X.Ctor`) and via `with`-import,
-    /// exactly like `data` — only the *type* it produces differs.
-    structural: bool,
 }
 
 /// A type name brought into scope by a `with` peel over a record containing an
@@ -2317,11 +2309,9 @@ impl Infer {
             // single-variant data types with matching field shapes unify
             // (defeating nominal typing). Pure `type` aliases stay transparent.
             (Ty::Alias(name, inner), _) => {
-                // A nominal `data` type unifies by name (`Con`); a structural
-                // variant alias (`type X = A {} | B {}`) unwraps to its
-                // constructor-set so two aliases with the same set unify.
-                let nominal = self.data_types.get(name).is_some_and(|d| !d.structural);
-                if nominal {
+                // A nominal variant/data type (`type X = A {} | B {}`) unifies
+                // by name (`Con`); a transparent alias unwraps to its body.
+                if self.data_types.contains_key(name) {
                     let nominal = Ty::Con(name.clone(), vec![]);
                     self.unify_dir(&nominal, &t2, span, t1_provided);
                 } else {
@@ -2330,8 +2320,7 @@ impl Infer {
                 }
             }
             (_, Ty::Alias(name, inner)) => {
-                let nominal = self.data_types.get(name).is_some_and(|d| !d.structural);
-                if nominal {
+                if self.data_types.contains_key(name) {
                     let nominal = Ty::Con(name.clone(), vec![]);
                     self.unify_dir(&t1, &nominal, span, t1_provided);
                 } else {
@@ -6252,35 +6241,34 @@ impl Infer {
                     let mut type_scope: HashMap<String, RecordTypeBinding> = HashMap::new();
                     self.with_alias_saves.push(Vec::new());
                     for f in field_exprs {
-                        match &f.value.node {
-                            ast::ExprKind::TypeCtor { name, params, ty } => {
-                                // Embedded `type` alias: resolve the body now and
-                                // inject it into the global `aliases` map for the
-                                // DURATION of this `with` body only (saved and
-                                // restored below). This makes the confined alias
-                                // behave byte-for-byte like a top-level alias.
-                                // Parameterized aliases stay as TyCons.
-                                if params.is_empty() {
-                                    let resolved = self.ast_type_to_ty(ty);
-                                    let save = (name.clone(), self.aliases.get(name).cloned());
-                                    self.with_alias_saves
-                                        .last_mut()
-                                        .expect("frame just pushed")
-                                        .push(save);
-                                    self.aliases.insert(name.clone(), resolved);
-                                } else {
-                                    type_scope.insert(name.clone(), RecordTypeBinding::TyCon);
-                                }
-                            }
-                            ast::ExprKind::DataCtor { name, params, .. } => {
+                        if let ast::ExprKind::TypeCtor { name, params, ty } = &f.value.node {
+                            // Embedded `type` decl. A variant body
+                            // (`type X = A {} | B {}`) is NOMINAL — register
+                            // it as a data type in this scope, never as a
+                            // transparent alias. A non-variant alias body is
+                            // resolved now and injected into the global
+                            // `aliases` map for the DURATION of this `with`
+                            // body only (saved and restored below), behaving
+                            // byte-for-byte like a top-level alias.
+                            // Parameterized aliases stay as TyCons.
+                            if matches!(ty.node, ast::TypeKind::Variant { .. }) {
                                 type_scope.insert(
                                     name.clone(),
                                     RecordTypeBinding::Data {
                                         params: params.clone(),
                                     },
                                 );
+                            } else if params.is_empty() {
+                                let resolved = self.ast_type_to_ty(ty);
+                                let save = (name.clone(), self.aliases.get(name).cloned());
+                                self.with_alias_saves
+                                    .last_mut()
+                                    .expect("frame just pushed")
+                                    .push(save);
+                                self.aliases.insert(name.clone(), resolved);
+                            } else {
+                                type_scope.insert(name.clone(), RecordTypeBinding::TyCon);
                             }
-                            _ => {}
                         }
                     }
                     self.record_type_scopes.push(type_scope);
@@ -7077,11 +7065,58 @@ impl Infer {
                 handlers,
             } => self.infer_serve(api, *api_span, handlers, expr.span),
 
-            ast::ExprKind::TypeCtor {
-                name: _, params, ..
-            } => {
-                // A first-class (erased) type-constructor value from an
-                // embedded `type` alias line. Statically its type is the alias's
+            ast::ExprKind::TypeCtor { name, params, ty } => {
+                // A first-class (erased) `type` declaration embedded in a
+                // record value literal. Two cases:
+                //
+                // VARIANT body (`type X = A {} | B {}`): the field is fully
+                // erased at runtime (compiles to unit), but statically its type
+                // is a RECORD of constructor functions `{Ctor: payload -> Name,
+                // …}` so `rec.Name.Ctor` resolves via ordinary structural field
+                // access. This is the old embedded-`data` behaviour.
+                //
+                // CONFINEMENT: nothing is registered into the global
+                // `constructors`/`data_types`/`aliases` maps. The type `Name`
+                // and its constructors are reachable ONLY through the record
+                // value (`rec.Name.Ctor`) or a `with` peel (which pushes them
+                // into the scoped type env for the body).
+                if let ast::TypeKind::Variant { constructors, .. } = &ty.node {
+                    // Freshen the type params (each use site gets its own vars).
+                    let saved_annotation_vars = self.annotation_vars.clone();
+                    self.annotation_vars.clear();
+                    let param_tys: Vec<Ty> = params
+                        .iter()
+                        .map(|p| {
+                            let v = self.fresh_var();
+                            self.annotation_vars.insert(p.clone(), v);
+                            Ty::Var(v)
+                        })
+                        .collect();
+                    let data_ty = Ty::Con(name.clone(), param_tys);
+
+                    // Build the namespace record: each ctor maps to its function
+                    // type `payload -> data_ty` — including nullary ctors, which
+                    // keep the `{} -> data_ty` form because the applied syntax is
+                    // always `rec.Name.Ctor {}` (a record application), matching
+                    // how `Ctor {}` is typed through the App arm.
+                    let mut ns_fields = IndexMap::new();
+                    for ctor in constructors {
+                        let field_tys: FieldMap = ctor
+                            .fields
+                            .iter()
+                            .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
+                            .collect();
+                        let record_ty = Ty::Record(field_tys, None);
+                        ns_fields.insert(
+                            ctor.name.clone(),
+                            Ty::Fun(Box::new(record_ty), Box::new(data_ty.clone())),
+                        );
+                    }
+                    self.annotation_vars = saved_annotation_vars;
+                    return Ty::Record(ns_fields, None);
+                }
+
+                // NON-variant alias body: statically its type is the alias's
                 // KIND: `Type` (0 params), `Type -> Type` (1 param), …, one
                 // `Type ->` per type parameter, ending in `Type`. The "Type"
                 // here is the same opaque named type knot already accepts in
@@ -7091,65 +7126,9 @@ impl Infer {
                 // map. The alias name is reachable only via the record value
                 // (`rec.Name`) or a `with` peel (scoped type env), so it never
                 // leaks into the enclosing type namespace.
-
                 (0..params.len()).fold(Ty::Con("Type".into(), vec![]), |acc, _| {
                     Ty::Fun(Box::new(Ty::Con("Type".into(), vec![])), Box::new(acc))
                 })
-            }
-
-            ast::ExprKind::DataCtor {
-                name,
-                params,
-                constructors,
-            } => {
-                // A first-class (erased) `data` declaration embedded in a
-                // record value literal. The field is fully erased at runtime
-                // (compiles to unit), but statically its type is a RECORD of
-                // constructor functions `{Ctor: payload -> Name, …}` so that
-                // `rec.Name.Ctor` resolves via ordinary structural field
-                // access.
-                //
-                // CONFINEMENT: unlike a top-level `data` decl, this registers
-                // NOTHING into the global `constructors`/`data_types` maps.
-                // The type `Name` and its constructors are reachable ONLY
-                // through the record value (`rec.Name.Ctor`) or a `with` peel
-                // (which pushes them into the scoped type env for the body).
-                // The namespace record is built directly from the AST decl,
-                // exactly as `instantiate_ctor` would, but self-contained.
-                //
-                // Freshen the type params (each use site gets its own vars).
-                let saved_annotation_vars = self.annotation_vars.clone();
-                self.annotation_vars.clear();
-                let param_tys: Vec<Ty> = params
-                    .iter()
-                    .map(|p| {
-                        let v = self.fresh_var();
-                        self.annotation_vars.insert(p.clone(), v);
-                        Ty::Var(v)
-                    })
-                    .collect();
-                let data_ty = Ty::Con(name.clone(), param_tys);
-
-                // Build the namespace record: each ctor maps to its function
-                // type `payload -> data_ty` — including nullary ctors, which
-                // keep the `{} -> data_ty` form because the applied syntax is
-                // always `rec.Name.Ctor {}` (a record application), matching
-                // how `Ctor {}` is typed through the App arm.
-                let mut ns_fields = IndexMap::new();
-                for ctor in constructors {
-                    let field_tys: FieldMap = ctor
-                        .fields
-                        .iter()
-                        .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
-                        .collect();
-                    let record_ty = Ty::Record(field_tys, None);
-                    ns_fields.insert(
-                        ctor.name.clone(),
-                        Ty::Fun(Box::new(record_ty), Box::new(data_ty.clone())),
-                    );
-                }
-                self.annotation_vars = saved_annotation_vars;
-                Ty::Record(ns_fields, None)
             }
 
             ast::ExprKind::SourceDecl { name, ty, .. } => {
@@ -9136,13 +9115,12 @@ impl Infer {
         }
     }
 
-    /// Register a named variant alias's constructors (`type X = A {} | B {}`)
-    /// exactly like a nominal `data X = …` declaration does: each constructor
-    /// goes into the global `constructors` map (for qualified `X.Ctor` and
-    /// `with`-import resolution) and `X` goes into `data_types` as a NOMINAL
-    /// type (`structural: false`), so `X` unifies by name (`Ty::Con(X)`) and two
-    /// variant types are distinct even with the same constructor set. Only
-    /// ANONYMOUS variants (`A {} | B {}` not bound to a name) are structural.
+    /// Register a named variant's constructors (`type X = A {} | B {}`): each
+    /// constructor goes into the global `constructors` map (for qualified
+    /// `X.Ctor` and `with`-import resolution) and `X` goes into `data_types` as
+    /// a NOMINAL type, so `X` unifies by name (`Ty::Con(X)`) and two variant
+    /// types are distinct even with the same constructor set. Only ANONYMOUS
+    /// variants (`A {} | B {}` not bound to a name) are structural.
     fn register_named_variant(&mut self, name: &str, ctors: &[ast::ConstructorDef]) {
         let mut ctor_list = Vec::new();
         for ctor in ctors {
@@ -9166,7 +9144,6 @@ impl Infer {
             DataInfo {
                 params: vec![],
                 ctors: ctor_list,
-                structural: false,
             },
         );
     }
@@ -9468,7 +9445,6 @@ impl Infer {
                     DataInfo {
                         params: params.to_vec(),
                         ctors: ctor_list,
-                        structural: false,
                     },
                 );
             }
@@ -9741,7 +9717,6 @@ impl Infer {
                         )],
                     ),
                 ],
-                structural: false,
             },
         );
         // Built-in ADT: data Bool = True {} | False {}
@@ -9766,7 +9741,6 @@ impl Infer {
             DataInfo {
                 params: vec![],
                 ctors: vec![("True".into(), vec![]), ("False".into(), vec![])],
-                structural: false,
             },
         );
         // Built-in ADT: data Level = Debug {} | Info {} | Warn {} | Error {}
@@ -9791,7 +9765,6 @@ impl Infer {
                     ("Warn".into(), vec![]),
                     ("Error".into(), vec![]),
                 ],
-                structural: false,
             },
         );
         self.builtin_data_types.insert("Level".into());
@@ -9838,7 +9811,6 @@ impl Infer {
                         )],
                     ),
                 ],
-                structural: false,
             },
         );
         // Built-in ADT: data List a = Nil {} | Cons {head: a, tail: List a}
@@ -9887,7 +9859,6 @@ impl Infer {
                         vec![("head".into(), a_var()), ("tail".into(), list_a_ty())],
                     ),
                 ],
-                structural: false,
             },
         );
         // Built-in type: RefinementError = {typeName: Text, violations: [{field: Maybe Text, message: Text}]}
@@ -12927,7 +12898,6 @@ fn value_references_source_inner(
         }
         ast::ExprKind::Lit(_) | ast::ExprKind::Constructor(_) => false,
         ast::ExprKind::TypeCtor { .. }
-        | ast::ExprKind::DataCtor { .. }
         | ast::ExprKind::SourceDecl { .. }
         | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } => false,
@@ -14256,7 +14226,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
     match &mut expr.node {
         Lit(_) | Var(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) => {}
         TypeHole => {}
-        TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
+        TypeCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         RouteDecl { .. } => {}
         Record(fields) => {
             for fl in fields {
@@ -14538,29 +14508,27 @@ fn expr_references_var(expr: &ast::Expr, name: &str) -> bool {
     found
 }
 
-/// Visit every `DataCtor` (`data`) marker in the program.
+/// Visit every variant declaration (`type X = A {} | B {}`) in the program.
 fn for_each_data_ctor<'a>(
     program: &'a ast::Expr,
     f: &mut impl FnMut(&'a str, &'a [ast::Name], &'a [ast::ConstructorDef], Span),
 ) {
     walk_exprs_read(program, &mut |e| {
-        if let ast::ExprKind::DataCtor {
-            name,
-            params,
-            constructors,
-        } = &e.node
+        if let ast::ExprKind::TypeCtor { name, params, ty } = &e.node
+            && let ast::TypeKind::Variant { constructors, .. } = &ty.node
         {
             f(name, params, constructors, e.span);
         }
     });
 }
 
-/// Visit every `DataCtor` (`data`) marker, additionally yielding the `with`
-/// nesting depth at which it is declared (0 = top level, +1 per enclosing
-/// `with`). Used to detect SAME-SCOPE duplicate type declarations: two `data`
-/// decls with the same name at the SAME depth are a compile error (they would
-/// otherwise silently clobber each other in the global type env). Nested
-/// scopes (different depths) may reuse a name — those are distinct types.
+/// Visit every variant declaration (`type X = A {} | B {}`), additionally
+/// yielding the `with` nesting depth at which it is declared (0 = top level,
+/// +1 per enclosing `with`). Used to detect SAME-SCOPE duplicate type
+/// declarations: two variant decls with the same name at the SAME depth are a
+/// compile error (they would otherwise silently clobber each other in the
+/// global type env). Nested scopes (different depths) may reuse a name — those
+/// are distinct types.
 fn for_each_data_ctor_scoped<'a>(
     program: &'a ast::Expr,
     f: &mut impl FnMut(&'a str, &'a [ast::Name], &'a [ast::ConstructorDef], Span, usize),
@@ -14571,11 +14539,8 @@ fn for_each_data_ctor_scoped<'a>(
         f: &mut impl FnMut(&'a str, &'a [ast::Name], &'a [ast::ConstructorDef], Span, usize),
     ) {
         use ast::ExprKind::*;
-        if let DataCtor {
-            name,
-            params,
-            constructors,
-        } = &e.node
+        if let TypeCtor { name, params, ty } = &e.node
+            && let ast::TypeKind::Variant { constructors, .. } = &ty.node
         {
             f(name, params, constructors, e.span, depth);
             return; // do not descend into the decl's own subexpressions
@@ -14701,8 +14666,7 @@ fn for_each_named_fn<'a>(
         for fl in fields {
             if !matches!(
                 fl.value.node,
-                ast::ExprKind::DataCtor { .. }
-                    | ast::ExprKind::TypeCtor { .. }
+                ast::ExprKind::TypeCtor { .. }
                     | ast::ExprKind::SourceDecl { .. }
                     | ast::ExprKind::RouteDecl { .. }
                     | ast::ExprKind::SubsetConstraint { .. }

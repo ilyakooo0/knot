@@ -245,9 +245,8 @@ fn hash_field_signature(field: &ast::RecordField) -> u64 {
             ("source_sig", name).hash(&mut h);
             strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
         }
-        // Data / route / etc.: shape *is* the signature — full hash.
-        ExprKind::DataCtor { .. }
-        | ExprKind::TypeCtor { .. }
+        // Type / route / etc.: shape *is* the signature — full hash.
+        ExprKind::TypeCtor { .. }
         | ExprKind::RouteDecl { .. }
         | ExprKind::SubsetConstraint { .. } => return hash_field(field),
         _ => {
@@ -279,21 +278,24 @@ fn hash_structure(program: &Expr) -> u64 {
                 ("source", name).hash(&mut h);
                 strip_spans(&format!("{:?}", ty.node)).hash(&mut h);
             }
-            ExprKind::DataCtor {
-                name, constructors, ..
-            } => {
-                ("data", name).hash(&mut h);
-                for c in constructors {
-                    c.name.hash(&mut h);
-                    for f in &c.fields {
-                        f.name.hash(&mut h);
-                        strip_spans(&format!("{:?}", f.value.node)).hash(&mut h);
+            ExprKind::TypeCtor { name, ty, .. } => {
+                match &ty.node {
+                    // Variant `type X = A {} | B {}`: hash the ctor structure.
+                    knot::ast::TypeKind::Variant { constructors, .. } => {
+                        ("data", name).hash(&mut h);
+                        for c in constructors {
+                            c.name.hash(&mut h);
+                            for f in &c.fields {
+                                f.name.hash(&mut h);
+                                strip_spans(&format!("{:?}", f.value.node)).hash(&mut h);
+                            }
+                        }
+                    }
+                    _ => {
+                        ("alias", name).hash(&mut h);
+                        strip_spans(&format!("{:?}", field.value.node)).hash(&mut h);
                     }
                 }
-            }
-            ExprKind::TypeCtor { name, .. } => {
-                ("alias", name).hash(&mut h);
-                strip_spans(&format!("{:?}", field.value.node)).hash(&mut h);
             }
             ExprKind::RouteDecl { name, .. } => {
                 ("route", name).hash(&mut h);
@@ -331,15 +333,10 @@ fn collect_field_deps(field: &ast::RecordField) -> HashSet<String> {
         ExprKind::SourceDecl { ty, .. } => {
             collect_type_names(ty, &mut deps);
         }
+        // `TypeCtor` covers both aliases and variants: `collect_type_names`
+        // recurses into a variant body's constructor field types already.
         ExprKind::TypeCtor { ty, .. } => {
             collect_type_names(ty, &mut deps);
-        }
-        ExprKind::DataCtor { constructors, .. } => {
-            for ctor in constructors {
-                for f in &ctor.fields {
-                    collect_type_names(&f.value, &mut deps);
-                }
-            }
         }
         ExprKind::RouteDecl { name, entries } => {
             deps.insert(name.clone());

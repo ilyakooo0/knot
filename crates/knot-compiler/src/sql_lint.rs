@@ -195,7 +195,6 @@ fn lint_expr(
         | ExprKind::CollectFold(_)
         | ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. }
-        | ExprKind::DataCtor { .. }
         | ExprKind::SourceDecl { .. }
         | ExprKind::SubsetConstraint { .. }
         | ExprKind::RouteDecl { .. } => {}
@@ -942,7 +941,6 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         | ExprKind::CollectFold(_)
         | ExprKind::TypeHole => false,
         ExprKind::TypeCtor { .. }
-        | ExprKind::DataCtor { .. }
         | ExprKind::SourceDecl { .. }
         | ExprKind::SubsetConstraint { .. }
         | ExprKind::RouteDecl { .. } => false,

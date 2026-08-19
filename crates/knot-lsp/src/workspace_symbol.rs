@@ -26,17 +26,20 @@ pub(crate) fn build_workspace_symbol_entries(
     let mut out = Vec::new();
     for decl in top_fields(program) {
         let (name, kind, container) = match &decl.value.node {
-            ExprKind::DataCtor { name, .. } => (name.clone(), SymbolKind::STRUCT, None),
             ExprKind::TypeCtor { name, ty, .. } => {
-                // Refined types: surface `where` predicate in the container so
-                // the workspace symbol picker shows it inline.
-                let container = match &ty.node {
-                    knot::ast::TypeKind::Refined { predicate, .. } => source
-                        .get(predicate.span.start..predicate.span.end)
-                        .map(|s| format!("refined where {}", s.trim())),
-                    _ => None,
-                };
-                (name.clone(), SymbolKind::TYPE_PARAMETER, container)
+                // A variant `type X = A {} | B {}` is a data type (STRUCT); any
+                // other alias is a TYPE_PARAMETER. Refined types: surface the
+                // `where` predicate in the container so the picker shows it.
+                match &ty.node {
+                    knot::ast::TypeKind::Variant { .. } => (name.clone(), SymbolKind::STRUCT, None),
+                    knot::ast::TypeKind::Refined { predicate, .. } => {
+                        let container = source
+                            .get(predicate.span.start..predicate.span.end)
+                            .map(|s| format!("refined where {}", s.trim()));
+                        (name.clone(), SymbolKind::TYPE_PARAMETER, container)
+                    }
+                    _ => (name.clone(), SymbolKind::TYPE_PARAMETER, None),
+                }
             }
             ExprKind::SourceDecl { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
             ExprKind::RouteDecl { name, .. } => (format!("route {name}"), SymbolKind::MODULE, None),

@@ -497,9 +497,8 @@ impl ServerConfig {
 /// `true`/`false` lex as `Bool` literals and are included because renaming a
 /// symbol *to* them would re-lex as a literal.
 pub const KEYWORDS: &[&str] = &[
-    "data", "type", "route", "serve", "migrate", "where", "do", "yield", "if", "then", "else",
-    "case", "of", "not", "full", "atomic", "deriving", "with", "unit", "refine", "forall", "true",
-    "false",
+    "type", "route", "serve", "migrate", "where", "do", "yield", "if", "then", "else", "case",
+    "of", "not", "full", "atomic", "deriving", "with", "unit", "refine", "forall", "true", "false",
 ];
 
 /// Context tag for a snippet — used by `handle_completion` to filter snippets
@@ -618,24 +617,6 @@ pub const SNIPPETS: &[(&str, &str, &str, SnippetContext)] = &[
         SnippetContext::Expression,
     ),
     // ── Top-level declaration snippets ─────────────────────────────────
-    (
-        "data",
-        "data declaration",
-        "data ${1:Name} = ${2:Ctor} {${3:field}: ${4:Type}}",
-        SnippetContext::TopLevel,
-    ),
-    (
-        "data-deriving",
-        "data declaration with deriving",
-        "data ${1:Name} = ${2:Ctor} {${3:field}: ${4:Type}} deriving (${5:Eq, Show})",
-        SnippetContext::TopLevel,
-    ),
-    (
-        "data-enum",
-        "data declaration (enum-style)",
-        "data ${1:Name} = ${2:A} | ${3:B} | ${4:C}",
-        SnippetContext::TopLevel,
-    ),
     (
         "type",
         "type alias",

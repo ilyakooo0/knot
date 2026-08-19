@@ -68,7 +68,6 @@ pub(crate) fn handle_inlay_hint(
         // Classify the field: marker vs named-function, and whether it has a sig.
         let (fname, fsig, is_relation_marker) = match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => continue,
@@ -337,7 +336,6 @@ fn add_closing_label_hints(
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -510,7 +508,6 @@ fn add_record_pattern_field_hints(
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -532,11 +529,12 @@ fn add_record_pattern_field_hints(
         let mut tooltip_source = String::from("destructured record");
         if let Some(ctor_name) = ctor_opt.as_deref() {
             'ctor_lookup: for d in top_fields(&doc.module) {
-                if let ast::ExprKind::DataCtor {
-                    constructors,
+                if let ast::ExprKind::TypeCtor {
                     name: data_name,
+                    ty,
                     ..
                 } = &d.value.node
+                    && let knot::ast::TypeKind::Variant { constructors, .. } = &ty.node
                 {
                     for c in constructors {
                         if c.name == ctor_name {
@@ -693,7 +691,6 @@ fn add_unit_literal_hints(
     fn collect_literals_in_decl(decl: &ast::RecordField, out: &mut Vec<(Span, ast::Expr)>) {
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -839,7 +836,6 @@ fn add_parameter_name_hints(
     ) {
         let body = match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => return,
@@ -1081,7 +1077,6 @@ fn add_monad_context_hints(
     ) {
         let body = match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => return,
@@ -1193,7 +1188,6 @@ fn add_constraint_hints(
     ) {
         let body = match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => return,

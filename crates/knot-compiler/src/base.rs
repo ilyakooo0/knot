@@ -448,7 +448,7 @@ fn shift_expr_spans(e: &mut ast::Expr, offset: usize) {
         | ImplicitRef(_)
         | CollectFold(_)
         | TypeHole => {}
-        TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
+        TypeCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         RouteDecl { .. } => {}
     }
 }

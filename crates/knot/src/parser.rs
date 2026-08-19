@@ -631,7 +631,6 @@ impl Parser {
             | TokenKind::Full
             | TokenKind::Atomic
             | TokenKind::With
-            | TokenKind::Data
             | TokenKind::Type
             | TokenKind::Serve
             | TokenKind::Migrate
@@ -940,46 +939,6 @@ impl Parser {
             _ => self.parse_unit_atom(),
         }
     }
-
-    // ── data ─────────────────────────────────────────────────────────
-
-    fn parse_constructor_def(&mut self) -> Option<ConstructorDef> {
-        let (name, _) = self.expect_upper("expected constructor name").ok()?;
-        let mut fields = Vec::new();
-        if self.eat(&TokenKind::LBrace) {
-            self.skip_newlines();
-            if !self.at(&TokenKind::RBrace) {
-                // Constructor payload fields use the record-type syntax:
-                // whitespace-separated `name Type` pairs, no `:` or `,`; each
-                // field type is a single atom (compound types parenthesized).
-                loop {
-                    self.skip_newlines();
-                    if self.at(&TokenKind::RBrace) {
-                        break;
-                    }
-                    let (fname, _) = self
-                        .expect_lower("expected field name in constructor")
-                        .ok()?;
-                    self.skip_newlines();
-                    let ty = self.parse_type_atom()?;
-                    fields.push(Field {
-                        name: fname,
-                        value: ty,
-                    });
-                }
-            }
-            self.expect(
-                &TokenKind::RBrace,
-                "expected '}' to close constructor fields",
-            )
-            .ok()?;
-        }
-        Some(ConstructorDef { name, fields })
-    }
-
-    // ── type alias ───────────────────────────────────────────────────
-
-    // ── source / view ────────────────────────────────────────────────
 
     // ── subset constraint ────────────────────────────────────────────
 
@@ -2541,55 +2500,6 @@ impl Parser {
                         Span {
                             start: type_kw.span.start,
                             end: ty_end,
-                        },
-                    ),
-                    sig: None,
-                    doc: pending_doc.take(),
-                });
-                continue;
-            }
-            // `data Name p1 … = Ctor {…} | …` — an embedded data declaration.
-            // Contributes a field named `Name` whose value is the (erased)
-            // data-constructor namespace: the ctors become reachable as
-            // `rec.Name.<Ctor>` and the type `Name` enters type scope.
-            if self.at(&TokenKind::Data) {
-                let data_kw = self.advance(); // consume `data`
-                let (dname, _dspan) = self.expect_upper("expected type name after 'data'").ok()?;
-                let mut params = Vec::new();
-                while matches!(self.peek(), TokenKind::Lower(_)) {
-                    let tok = self.advance();
-                    let TokenKind::Lower(p) = tok.kind else {
-                        unreachable!()
-                    };
-                    params.push(p);
-                }
-                self.skip_newlines();
-                self.expect(&TokenKind::Eq, "expected '=' in data declaration")
-                    .ok()?;
-                self.skip_newlines();
-                let mut constructors = vec![self.parse_constructor_def()?];
-                loop {
-                    let saved = self.save();
-                    self.skip_newlines();
-                    if !self.eat(&TokenKind::Pipe) {
-                        self.restore(saved);
-                        break;
-                    }
-                    self.skip_newlines();
-                    constructors.push(self.parse_constructor_def()?);
-                }
-                let data_end = self.prev_span().end;
-                fields.push(RecordField {
-                    name: dname.clone(),
-                    value: Spanned::new(
-                        ExprKind::DataCtor {
-                            name: dname,
-                            params,
-                            constructors,
-                        },
-                        Span {
-                            start: data_kw.span.start,
-                            end: data_end,
                         },
                     ),
                     sig: None,

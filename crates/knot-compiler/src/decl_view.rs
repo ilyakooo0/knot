@@ -104,23 +104,23 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
     if let Record(fields) = &e.node {
         for fl in fields {
             match &fl.value.node {
-                DataCtor {
-                    params,
-                    constructors,
-                    ..
-                } => out.push(DeclView {
-                    name: fl.name.as_str(),
-                    span: fl.value.span,
-                    kind: DeclViewKind::Data {
-                        params,
-                        ctors: constructors,
-                    },
-                }),
-                TypeCtor { params, ty, .. } => out.push(DeclView {
-                    name: fl.name.as_str(),
-                    span: fl.value.span,
-                    kind: DeclViewKind::TypeAlias { params, ty },
-                }),
+                TypeCtor { params, ty, .. } => {
+                    // A variant `type X = A {} | B {}` is a nominal data type —
+                    // surface it as `DeclViewKind::Data` so codegen registers
+                    // constructor order / `Ord`. Any other body is an alias.
+                    let kind = match &ty.node {
+                        ast::TypeKind::Variant { constructors, .. } => DeclViewKind::Data {
+                            params,
+                            ctors: constructors,
+                        },
+                        _ => DeclViewKind::TypeAlias { params, ty },
+                    };
+                    out.push(DeclView {
+                        name: fl.name.as_str(),
+                        span: fl.value.span,
+                        kind,
+                    });
+                }
                 SourceDecl { ty, migrations, .. } => out.push(DeclView {
                     name: fl.name.as_str(),
                     span: fl.value.span,

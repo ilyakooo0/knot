@@ -6126,18 +6126,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.call_rt(builder, "knot_value_unit", &[])
             }
 
-            ast::ExprKind::DataCtor { constructors, .. } => {
-                // An embedded `data` declaration is erased to unit like a type
-                // constructor, but its constructors stay reachable through
-                // field access (`rec.Name.Ctor`). Register them so the
-                // FieldAccess / compile_app arms emit the constructor value
-                // directly instead of a runtime `knot_record_field` on unit.
-                for c in constructors {
-                    self.embedded_ctors.insert(c.name.clone());
-                }
-                self.call_rt(builder, "knot_value_unit", &[])
-            }
-
             ast::ExprKind::SourceDecl { .. } => {
                 // A source-relation declaration embedded in a record is a
                 // static marker: it compiles to unit. Reads/writes through
@@ -6318,7 +6306,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .iter()
                 .all(|h| self.collect_direct_write_targets(&h.body, out)),
             Lit(_) | Constructor(_) | SourceRef { .. } => true,
-            TypeCtor { .. } | DataCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => true,
+            TypeCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => true,
         }
     }
 
@@ -13387,7 +13375,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::TypeHole => false,
             ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_) => false,
             ast::ExprKind::TypeCtor { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::SourceDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => false,
             ast::ExprKind::RouteDecl { .. } => false,
@@ -18519,7 +18506,6 @@ fn beta_reduce_inner(
         | Refine(_)
         | Serve { .. }
         | TypeCtor { .. }
-        | DataCtor { .. }
         | SourceDecl { .. } => return expr.clone(),
     };
     ast::Spanned {
@@ -18554,7 +18540,6 @@ fn substitute_inner(
         | CollectFold(_)
         | TypeHole
         | TypeCtor { .. }
-        | DataCtor { .. }
         | SourceDecl { .. }
         | SubsetConstraint { .. }
         | RouteDecl { .. } => return Some(expr.clone()),
@@ -18679,7 +18664,6 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
         | CollectFold(_)
         | TypeHole
         | TypeCtor { .. }
-        | DataCtor { .. }
         | SourceDecl { .. }
         | SubsetConstraint { .. }
         | RouteDecl { .. } => false,
@@ -18728,7 +18712,6 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
         | CollectFold(_)
         | TypeHole
         | TypeCtor { .. }
-        | DataCtor { .. }
         | SourceDecl { .. }
         | SubsetConstraint { .. }
         | RouteDecl { .. } => {}
@@ -19835,7 +19818,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::CollectFold(_) => {}
         ast::ExprKind::TypeHole => {}
-        ast::ExprKind::TypeCtor { .. } | ast::ExprKind::DataCtor { .. } => {}
+        ast::ExprKind::TypeCtor { .. } => {}
         ast::ExprKind::Record(fields) => {
             for f in fields {
                 collect_free_vars(&f.value, bound, free);
@@ -19991,7 +19974,6 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::TypeHole => false,
         ast::ExprKind::TypeCtor { .. }
-        | ast::ExprKind::DataCtor { .. }
         | ast::ExprKind::SourceDecl { .. }
         | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } => false,
@@ -20083,7 +20065,6 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::TypeHole => false,
         ast::ExprKind::TypeCtor { .. }
-        | ast::ExprKind::DataCtor { .. }
         | ast::ExprKind::SourceDecl { .. }
         | ast::ExprKind::SubsetConstraint { .. } => false,
         ast::ExprKind::RouteDecl { .. } => false,
@@ -20409,7 +20390,6 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::TypeHole => "_".to_string(),
         ast::ExprKind::Constructor(name) => name.clone(),
         ast::ExprKind::TypeCtor { name, .. } => name.clone(),
-        ast::ExprKind::DataCtor { name, .. } => name.clone(),
         ast::ExprKind::SourceDecl { name, .. } => format!("*{}", name),
         ast::ExprKind::SubsetConstraint { sub, sup } => {
             let path = |p: &ast::RelationPath| match &p.field {

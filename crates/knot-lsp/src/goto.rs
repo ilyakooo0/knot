@@ -21,7 +21,7 @@ fn type_decl_name_span(program: &ast::Expr, source: &str, type_name: &str) -> Op
     for decl in top_fields(program) {
         let dspan = decl.value.span;
         let is_match = match &decl.value.node {
-            ExprKind::DataCtor { name, .. } | ExprKind::TypeCtor { name, .. } => name == type_name,
+            ExprKind::TypeCtor { name, .. } => name == type_name,
             _ => false,
         };
         if is_match {

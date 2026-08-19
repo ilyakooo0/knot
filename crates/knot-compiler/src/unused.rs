@@ -223,7 +223,6 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         ExprKind::CollectFold(_) => {}
         ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. }
-        | ExprKind::DataCtor { .. }
         | ExprKind::SourceDecl { .. }
         | ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } => {}

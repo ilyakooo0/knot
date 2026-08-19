@@ -272,16 +272,16 @@ impl<'a> TokenCollector<'a> {
             self.visit_type(&scheme.ty);
         }
         match &decl.value.node {
-            ast::ExprKind::DataCtor {
-                name, constructors, ..
-            } => {
+            ast::ExprKind::TypeCtor { name, ty, .. }
+                if let knot::ast::TypeKind::Variant { constructors, .. } = &ty.node =>
+            {
                 let name_span = find_word_in_source(self.source, name, dspan.start, dspan.end);
                 if let Some(s) = name_span {
                     self.add(s, TOK_STRUCT, MOD_DECLARATION);
                 }
                 // Constructors appear after the `=`. Searching from the decl
                 // start would match the TYPE name first for self-named
-                // constructors (`data Person = Person {…}`), emitting an
+                // constructors (`type Person = Person {…} | …`), emitting an
                 // overlapping token on the type name and none on the actual
                 // constructor. Advance past each hit so a constructor name
                 // appearing in a previous constructor's field types doesn't
@@ -297,7 +297,7 @@ impl<'a> TokenCollector<'a> {
                     // Bound the name search to the window *before* this
                     // constructor's first field type. Otherwise a later
                     // constructor whose name also appears as a field type in an
-                    // earlier constructor (`data T = A {x: B} | B {y: Int}`)
+                    // earlier constructor (`type T = A {x: B} | B {y: Int}`)
                     // would match that field-type occurrence instead of the
                     // real constructor. The name always precedes the fields.
                     let search_end = ctor
@@ -571,15 +571,9 @@ impl<'a> TokenCollector<'a> {
                 }
             }
             // Highlight the alias body's type (the alias name token itself is
-            // emitted by the record-field path); no value exprs inside.
+            // emitted by the record-field path); no value exprs inside. For a
+            // variant body, `visit_type` recurses into constructor field types.
             ast::ExprKind::TypeCtor { ty, .. } => self.visit_type(ty),
-            ast::ExprKind::DataCtor { constructors, .. } => {
-                for c in constructors {
-                    for f in &c.fields {
-                        self.visit_type(&f.value);
-                    }
-                }
-            }
             // A source-declaration field's type is highlighted (`*todos : [Todo]`
             // highlights `Todo`).
             ast::ExprKind::SourceDecl { ty, .. } => self.visit_type(ty),

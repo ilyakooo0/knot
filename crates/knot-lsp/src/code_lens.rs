@@ -23,9 +23,7 @@ pub(crate) fn handle_code_lens(
     for decl in top_fields(&doc.module) {
         let dspan = decl.value.span;
         let decl_name = match &decl.value.node {
-            ExprKind::SourceDecl { name, .. }
-            | ExprKind::DataCtor { name, .. }
-            | ExprKind::RouteDecl { name, .. } => name.as_str(),
+            ExprKind::SourceDecl { name, .. } | ExprKind::RouteDecl { name, .. } => name.as_str(),
             ExprKind::SubsetConstraint { .. } => continue,
             _ => decl.name.as_str(),
         };

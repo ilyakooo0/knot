@@ -39,11 +39,11 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
         let selection_range = range;
 
         match &decl.value.node {
-            ExprKind::DataCtor {
-                name, constructors, ..
-            } => {
+            ExprKind::TypeCtor { name, ty, .. }
+                if let knot::ast::TypeKind::Variant { constructors, .. } = &ty.node =>
+            {
                 // Start the search after the `=` so a self-named constructor
-                // (`data Circle = Circle {…}`) anchors on the constructor token,
+                // (`type Circle = Circle {…} | …`) anchors on the constructor token,
                 // not the type name before the `=`. Advance past each hit so a
                 // name reused in an earlier constructor's field types can't
                 // steal a later constructor's span. Mirrors semantic_tokens.rs.

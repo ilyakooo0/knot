@@ -75,33 +75,32 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
         let name_span =
             |name: &str| find_word_in_source(source, name, dspan.start, dspan.end).unwrap_or(dspan);
         match &decl.value.node {
-            ExprKind::DataCtor {
-                name, constructors, ..
-            } => {
+            ExprKind::TypeCtor { name, ty, .. } => {
                 resolver.define(name, name_span(name));
-                // Start the search after the `=` so a self-named constructor
-                // (`data Circle = Circle {…}`) anchors on the constructor
-                // token, not the type name before the `=`. Advance past each
-                // hit so a name reused in an earlier constructor's field types
-                // can't steal a later constructor's span. Mirrors
+                // A variant `type X = A {} | B {}` also defines each
+                // constructor. Start the search after the `=` so a self-named
+                // constructor (`type Circle = Circle {…} | …`) anchors on the
+                // constructor token, not the type name before the `=`. Advance
+                // past each hit so a name reused in an earlier constructor's
+                // field types can't steal a later constructor's span. Mirrors
                 // document_symbol.rs / semantic_tokens.rs.
-                let mut search_from = source
-                    .get(dspan.start..dspan.end.min(source.len()))
-                    .and_then(|t| t.find('='))
-                    .map(|p| dspan.start + p + 1)
-                    .unwrap_or(dspan.start);
-                for ctor in constructors {
-                    let ctor_span = find_word_in_source(source, &ctor.name, search_from, dspan.end)
-                        .unwrap_or(dspan);
-                    resolver.define(&ctor.name, ctor_span);
-                    // Skip past this constructor's `{…}` field block so a type
-                    // name reused inside the fields (`data T = A {x: B} | B {}`)
-                    // can't be mistaken for the next constructor's token.
-                    search_from = advance_past_field_block(source, ctor_span.end, dspan.end);
+                if let knot::ast::TypeKind::Variant { constructors, .. } = &ty.node {
+                    let mut search_from = source
+                        .get(dspan.start..dspan.end.min(source.len()))
+                        .and_then(|t| t.find('='))
+                        .map(|p| dspan.start + p + 1)
+                        .unwrap_or(dspan.start);
+                    for ctor in constructors {
+                        let ctor_span =
+                            find_word_in_source(source, &ctor.name, search_from, dspan.end)
+                                .unwrap_or(dspan);
+                        resolver.define(&ctor.name, ctor_span);
+                        // Skip past this constructor's `{…}` field block so a type
+                        // name reused inside the fields (`type T = A {x: B} | B {}`)
+                        // can't be mistaken for the next constructor's token.
+                        search_from = advance_past_field_block(source, ctor_span.end, dspan.end);
+                    }
                 }
-            }
-            ExprKind::TypeCtor { name, .. } => {
-                resolver.define(name, name_span(name));
             }
             ExprKind::SourceDecl { name, .. } => {
                 let span = name_span(name);
@@ -165,13 +164,6 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
             }
             ExprKind::TypeCtor { ty, .. } => {
                 resolver.resolve_type(ty, source);
-            }
-            ExprKind::DataCtor { constructors, .. } => {
-                for ctor in constructors {
-                    for f in &ctor.fields {
-                        resolver.resolve_type(&f.value, source);
-                    }
-                }
             }
             ExprKind::RouteDecl { entries, .. } => {
                 for entry in entries {
@@ -541,13 +533,6 @@ impl<'a> DefResolver<'a> {
             // A type-constructor field references a TYPE, not a value — resolve
             // its alias body's type so type refs inside it are navigable.
             ast::ExprKind::TypeCtor { ty, .. } => self.resolve_type(ty, self.source),
-            ast::ExprKind::DataCtor { constructors, .. } => {
-                for c in constructors {
-                    for f in &c.fields {
-                        self.resolve_type(&f.value, self.source);
-                    }
-                }
-            }
             // A source-declaration field's type is navigable (`*todos : [Todo]`
             // references the `Todo` type).
             ast::ExprKind::SourceDecl { ty, .. } => self.resolve_type(ty, self.source),
@@ -588,12 +573,9 @@ pub fn build_details(program: &Expr) -> HashMap<String, String> {
 
     for decl in top_fields(program) {
         match &decl.value.node {
-            ExprKind::DataCtor {
-                name,
-                params,
-                constructors,
-                ..
-            } => {
+            ExprKind::TypeCtor {
+                name, params, ty, ..
+            } if let knot::ast::TypeKind::Variant { constructors, .. } = &ty.node => {
                 let params_str = if params.is_empty() {
                     String::new()
                 } else {
@@ -614,7 +596,7 @@ pub fn build_details(program: &Expr) -> HashMap<String, String> {
                         }
                     })
                     .collect();
-                let detail = format!("data {name}{params_str} = {}", ctors.join(" | "));
+                let detail = format!("type {name}{params_str} = {}", ctors.join(" | "));
                 details.insert(name.clone(), detail.clone());
                 for ctor in constructors {
                     let fields: Vec<String> = ctor

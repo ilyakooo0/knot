@@ -150,7 +150,7 @@ impl TypeEnv {
         > = HashMap::new();
 
         // First pass: collect type aliases and data types from every
-        // `TypeCtor`/`DataCtor` record-field marker in the program.
+        // `TypeCtor` record-field marker in the program.
         for (name, params, ty, span) in collect_type_ctors(program) {
             if params.is_empty() {
                 alias_ast_types.insert(name.clone(), ty.clone());
@@ -473,7 +473,6 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
         | ExprKind::CollectFold(_)
         | ExprKind::TypeHole
         | ExprKind::TypeCtor { .. }
-        | ExprKind::DataCtor { .. }
         | ExprKind::SourceDecl { .. }
         | ExprKind::SubsetConstraint { .. }
         | ExprKind::RouteDecl { .. } => {}
@@ -485,23 +484,24 @@ fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
 fn collect_type_ctors(program: &Expr) -> Vec<(String, Vec<Name>, Type, Span)> {
     let mut out = Vec::new();
     walk_exprs(program, &mut |e| {
-        if let ExprKind::TypeCtor { name, params, ty } = &e.node {
+        // Skip variant bodies (`type X = A {} | B {}`) — those are nominal
+        // data types, collected by `collect_data_ctors`, not transparent aliases.
+        if let ExprKind::TypeCtor { name, params, ty } = &e.node
+            && !matches!(ty.node, TypeKind::Variant { .. })
+        {
             out.push((name.clone(), params.clone(), ty.clone(), e.span));
         }
     });
     out
 }
 
-/// Collect every `DataCtor` (`data`) marker in the program:
+/// Collect every variant declaration (`type X = A {} | B {}`) in the program:
 /// `(name, params, constructors, span)`.
 fn collect_data_ctors(program: &Expr) -> Vec<(String, Vec<Name>, Vec<ConstructorDef>, Span)> {
     let mut out = Vec::new();
     walk_exprs(program, &mut |e| {
-        if let ExprKind::DataCtor {
-            name,
-            params,
-            constructors,
-        } = &e.node
+        if let ExprKind::TypeCtor { name, params, ty } = &e.node
+            && let TypeKind::Variant { constructors, .. } = &ty.node
         {
             out.push((name.clone(), params.clone(), constructors.clone(), e.span));
         }
@@ -529,16 +529,14 @@ fn collect_type_and_data_refs<'a>(
     aliases: &mut HashMap<&'a str, &'a Type>,
     data_decls: &mut HashMap<&'a str, &'a Vec<ConstructorDef>>,
 ) {
-    match &e.node {
-        ExprKind::TypeCtor { name, ty, .. } => {
+    if let ExprKind::TypeCtor { name, ty, .. } = &e.node {
+        // A variant `type X = A {} | B {}` is a NOMINAL data decl; any
+        // other `type` body is a transparent alias.
+        if let TypeKind::Variant { constructors, .. } = &ty.node {
+            data_decls.insert(name.as_str(), constructors);
+        } else {
             aliases.insert(name.as_str(), ty);
         }
-        ExprKind::DataCtor {
-            name, constructors, ..
-        } => {
-            data_decls.insert(name.as_str(), constructors);
-        }
-        _ => {}
     }
     // Recurse into children (mirrors walk_exprs).
     match &e.node {

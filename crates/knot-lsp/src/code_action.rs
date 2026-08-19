@@ -57,7 +57,6 @@ pub(crate) fn handle_code_action(
             && !matches!(
                 decl.value.node,
                 ast::ExprKind::SourceDecl { .. }
-                    | ast::ExprKind::DataCtor { .. }
                     | ast::ExprKind::TypeCtor { .. }
                     | ast::ExprKind::RouteDecl { .. }
                     | ast::ExprKind::SubsetConstraint { .. }
@@ -304,7 +303,6 @@ pub(crate) fn handle_code_action(
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -504,7 +502,6 @@ pub(crate) fn handle_code_action(
         }
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -754,7 +751,6 @@ fn find_add_wildcard_arm_at(
     for decl in top_fields(module) {
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -849,7 +845,6 @@ fn find_wrap_in_err_at(
     for decl in top_fields(module) {
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -947,7 +942,6 @@ fn selection_matches_expr_node(module: &ast::Expr, source: &str, lo: usize, hi: 
         .iter()
         .any(|decl| match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => false,
@@ -1019,11 +1013,10 @@ fn find_case_actions(
             let type_name = extract_principal_type_name(&type_str);
 
             if let Some(type_name) = type_name {
-                // Find the data declaration for this type
+                // Find the variant declaration for this type
                 for decl in top_fields(&doc.module) {
-                    if let ast::ExprKind::DataCtor {
-                        name, constructors, ..
-                    } = &decl.value.node
+                    if let ast::ExprKind::TypeCtor { name, ty, .. } = &decl.value.node
+                        && let knot::ast::TypeKind::Variant { constructors, .. } = &ty.node
                     {
                         if *name != type_name {
                             continue;
@@ -1615,7 +1608,6 @@ pub(crate) fn enclosing_do_stmt_range(
         }
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -1696,7 +1688,6 @@ fn find_flip_binary_at(module: &ast::Expr, source: &str, offset: usize) -> Optio
     for decl in top_fields(module) {
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -1803,7 +1794,6 @@ fn find_pipe_conversion_at(
     for decl in top_fields(module) {
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => {}

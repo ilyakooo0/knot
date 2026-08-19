@@ -296,23 +296,24 @@ pub(crate) fn handle_completion(
         let mut all_fields = HashSet::new();
         for decl in top_fields(&doc.module) {
             match &decl.value.node {
-                ast::ExprKind::TypeCtor { ty, .. } => {
-                    if let TypeKind::Record { fields: fs, .. } = &ty.node {
+                ast::ExprKind::TypeCtor { ty, .. } => match &ty.node {
+                    TypeKind::Record { fields: fs, .. } => {
                         for f in fs {
                             all_fields.insert(f.name.clone());
                         }
                     }
-                }
+                    TypeKind::Variant { constructors, .. } => {
+                        for ctor in constructors {
+                            for f in &ctor.fields {
+                                all_fields.insert(f.name.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                },
                 ast::ExprKind::SourceDecl { ty, .. } => {
                     if let TypeKind::Record { fields: fs, .. } = &ty.node {
                         for f in fs {
-                            all_fields.insert(f.name.clone());
-                        }
-                    }
-                }
-                ast::ExprKind::DataCtor { constructors, .. } => {
-                    for ctor in constructors {
-                        for f in &ctor.fields {
                             all_fields.insert(f.name.clone());
                         }
                     }
@@ -348,51 +349,40 @@ pub(crate) fn handle_completion(
     if in_type_context {
         // Only suggest types: data types, type aliases, built-in types
         for decl in top_fields(&doc.module) {
-            match &decl.value.node {
-                ast::ExprKind::DataCtor { name, .. } => {
-                    items.push(CompletionItem {
-                        label: name.clone(),
-                        kind: Some(CompletionItemKind::STRUCT),
-                        detail: doc.details.get(name).cloned(),
-                        ..Default::default()
-                    });
-                }
-                ast::ExprKind::TypeCtor { name, ty, .. } => {
-                    // Refined-type aliases get their predicate inline as the
-                    // detail string so the user sees what the value must
-                    // satisfy without having to navigate to the declaration.
-                    let (detail, doc_md) = match &ty.node {
-                        TypeKind::Refined { base, predicate } => {
-                            let base_str = format_type_kind(&base.node);
-                            let pred_src = doc
-                                .source
-                                .get(predicate.span.start..predicate.span.end)
-                                .map(|s| s.trim().to_string())
-                                .unwrap_or_else(|| "…".into());
-                            (
-                                Some(format!("refined {base_str} where {pred_src}")),
-                                Some(format!(
-                                    "Refined type. Values of `{name}` must satisfy `{pred_src}`."
-                                )),
-                            )
-                        }
-                        _ => (doc.details.get(name).cloned(), None),
-                    };
-                    let documentation = doc_md.map(|s| {
-                        Documentation::MarkupContent(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: s,
-                        })
-                    });
-                    items.push(CompletionItem {
-                        label: name.clone(),
-                        kind: Some(CompletionItemKind::STRUCT),
-                        detail,
-                        documentation,
-                        ..Default::default()
-                    });
-                }
-                _ => {}
+            if let ast::ExprKind::TypeCtor { name, ty, .. } = &decl.value.node {
+                // Refined-type aliases get their predicate inline as the
+                // detail string so the user sees what the value must
+                // satisfy without having to navigate to the declaration.
+                let (detail, doc_md) = match &ty.node {
+                    TypeKind::Refined { base, predicate } => {
+                        let base_str = format_type_kind(&base.node);
+                        let pred_src = doc
+                            .source
+                            .get(predicate.span.start..predicate.span.end)
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_else(|| "…".into());
+                        (
+                            Some(format!("refined {base_str} where {pred_src}")),
+                            Some(format!(
+                                "Refined type. Values of `{name}` must satisfy `{pred_src}`."
+                            )),
+                        )
+                    }
+                    _ => (doc.details.get(name).cloned(), None),
+                };
+                let documentation = doc_md.map(|s| {
+                    Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: s,
+                    })
+                });
+                items.push(CompletionItem {
+                    label: name.clone(),
+                    kind: Some(CompletionItemKind::STRUCT),
+                    detail,
+                    documentation,
+                    ..Default::default()
+                });
             }
         }
         for ty in &["Int", "Float", "Text", "Bool", "IO", "Maybe", "Result"] {
@@ -445,34 +435,28 @@ pub(crate) fn handle_completion(
     // Declarations from current document with type details
     for decl in top_fields(&doc.module) {
         match &decl.value.node {
-            ast::ExprKind::DataCtor {
-                name, constructors, ..
-            } => {
+            ast::ExprKind::TypeCtor { name, ty, .. } => {
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::STRUCT),
                     detail: doc.details.get(name).cloned(),
                     ..Default::default()
                 });
-                for ctor in constructors {
-                    let snippet = build_constructor_snippet(&ctor.name, &ctor.fields);
-                    items.push(CompletionItem {
-                        label: ctor.name.clone(),
-                        kind: Some(CompletionItemKind::ENUM_MEMBER),
-                        detail: doc.details.get(&ctor.name).cloned(),
-                        insert_text: snippet,
-                        insert_text_format: Some(InsertTextFormat::SNIPPET),
-                        ..Default::default()
-                    });
+                // A variant `type X = A {} | B {}` also offers each constructor
+                // as a snippet completion.
+                if let TypeKind::Variant { constructors, .. } = &ty.node {
+                    for ctor in constructors {
+                        let snippet = build_constructor_snippet(&ctor.name, &ctor.fields);
+                        items.push(CompletionItem {
+                            label: ctor.name.clone(),
+                            kind: Some(CompletionItemKind::ENUM_MEMBER),
+                            detail: doc.details.get(&ctor.name).cloned(),
+                            insert_text: snippet,
+                            insert_text_format: Some(InsertTextFormat::SNIPPET),
+                            ..Default::default()
+                        });
+                    }
                 }
-            }
-            ast::ExprKind::TypeCtor { name, .. } => {
-                items.push(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(CompletionItemKind::STRUCT),
-                    detail: doc.details.get(name).cloned(),
-                    ..Default::default()
-                });
             }
             ast::ExprKind::SourceDecl { name, .. } => {
                 items.push(CompletionItem {
@@ -834,16 +818,13 @@ fn route_completions(doc: &DocumentState) -> Vec<CompletionItem> {
     }
 
     for decl in top_fields(&doc.module) {
-        match &decl.value.node {
-            ast::ExprKind::DataCtor { name, .. } | ast::ExprKind::TypeCtor { name, .. } => {
-                items.push(CompletionItem {
-                    label: name.clone(),
-                    kind: Some(CompletionItemKind::STRUCT),
-                    detail: doc.details.get(name).cloned(),
-                    ..Default::default()
-                });
-            }
-            _ => {}
+        if let ast::ExprKind::TypeCtor { name, .. } = &decl.value.node {
+            items.push(CompletionItem {
+                label: name.clone(),
+                kind: Some(CompletionItemKind::STRUCT),
+                detail: doc.details.get(name).cloned(),
+                ..Default::default()
+            });
         }
     }
 
@@ -873,7 +854,6 @@ fn find_enclosing_do_span(module: &ast::Expr, offset: usize) -> Option<Span> {
         }
         match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => {}
@@ -908,7 +888,6 @@ fn detect_snippet_context(doc: &DocumentState, offset: usize, in_atomic: bool) -
         }
         let body: &ast::Expr = match &decl.value.node {
             ast::ExprKind::SourceDecl { .. }
-            | ast::ExprKind::DataCtor { .. }
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => continue,
@@ -1435,15 +1414,17 @@ fn extract_fields_from_type_str_inner(
                     return fields.iter().map(|f| f.name.clone()).collect();
                 }
             }
-            // Data type with a single constructor — expose its fields
-            ast::ExprKind::DataCtor {
-                name, constructors, ..
-            } if name == type_str && constructors.len() == 1 => {
-                return constructors[0]
-                    .fields
-                    .iter()
-                    .map(|f| f.name.clone())
-                    .collect();
+            // Variant with a single constructor — expose its fields
+            ast::ExprKind::TypeCtor { name, ty, .. } if name == type_str => {
+                if let TypeKind::Variant { constructors, .. } = &ty.node
+                    && constructors.len() == 1
+                {
+                    return constructors[0]
+                        .fields
+                        .iter()
+                        .map(|f| f.name.clone())
+                        .collect();
+                }
             }
             _ => {}
         }
@@ -1568,11 +1549,8 @@ fn function_constraint_summary(module: &ast::Expr, name: &str) -> Option<String>
 /// bullet list. Returns None if `name` is not a top-level data type.
 fn data_constructor_summary(module: &ast::Expr, name: &str) -> Option<String> {
     for decl in top_fields(module) {
-        if let ast::ExprKind::DataCtor {
-            name: dn,
-            constructors,
-            ..
-        } = &decl.value.node
+        if let ast::ExprKind::TypeCtor { name: dn, ty, .. } = &decl.value.node
+            && let TypeKind::Variant { constructors, .. } = &ty.node
         {
             if dn != name {
                 continue;

@@ -288,25 +288,13 @@ pub enum ExprKind {
         ty: Type,
     },
 
-    /// A first-class, erased `data` declaration embedded in a record value
-    /// literal (`{data Status = Open {} | Done {}, …}`). The record field
-    /// `Status` is fully ERASED at runtime (compiles to unit, like `TypeCtor`),
-    /// but its constructors are reachable in value scope as `rec.Status.Open`,
-    /// `rec.Status.Done`, … and the data type name enters type scope so it can
-    /// be referenced in annotations (`x : Status`).
-    DataCtor {
-        name: Name,
-        params: Vec<Name>,
-        constructors: Vec<ConstructorDef>,
-    },
-
     /// A persisted source-relation declaration embedded in a record value
     /// literal (`{*todos : [Todo], …}`). The record field is literally named
     /// `*todos` (the `*` is part of the field NAME, not a prefix operator).
     /// Reading `db.*todos` yields the relation value `[Todo]`; writing
     /// `db.*todos = …` is a source write. The source's qualified identity is
     /// `<record>.<field>` (e.g. `db.*todos`), used for the schema lockfile,
-    /// migrations, effects, and the physical table name. Like `DataCtor`, the
+    /// migrations, effects, and the physical table name. Like `TypeCtor`, the
     /// record field itself is a marker — the source is registered statically
     /// and resolved by path, not carried as a runtime value.
     SourceDecl {
@@ -333,7 +321,7 @@ pub enum ExprKind {
     /// A `route Name where …` declaration embedded in a record value literal
     /// (`{route Api where …, …}`). Mirrors a top-level route declaration.
     /// The field is a pure marker — it contributes no runtime value (erased
-    /// like `DataCtor`); the route's entries and endpoint constructors are
+    /// like `TypeCtor`); the route's entries and endpoint constructors are
     /// registered statically under the record path (`rec.Api`) and resolved
     /// by path at `serve rec.Api` / `fetch url (rec.Api.Ctor …)` call sites.
     RouteDecl {

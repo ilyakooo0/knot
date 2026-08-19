@@ -710,7 +710,7 @@ fn recurse_into_children(expr: &mut Expr, io_fns: &IoFns, source_vars: &HashSet<
         | ExprKind::ImplicitRef(_)
         | ExprKind::CollectFold(_)
         | ExprKind::TypeHole => {}
-        ExprKind::TypeCtor { .. } | ExprKind::DataCtor { .. } | ExprKind::SourceDecl { .. } => {}
+        ExprKind::TypeCtor { .. } | ExprKind::SourceDecl { .. } => {}
         ExprKind::SubsetConstraint { .. } => {}
         ExprKind::RouteDecl { .. } => {}
         ExprKind::Record(fields) => {

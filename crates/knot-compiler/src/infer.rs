@@ -9115,39 +9115,6 @@ impl Infer {
         }
     }
 
-    /// Register a named variant's constructors (`type X = A {} | B {}`): each
-    /// constructor goes into the global `constructors` map (for qualified
-    /// `X.Ctor` and `with`-import resolution) and `X` goes into `data_types` as
-    /// a NOMINAL type, so `X` unifies by name (`Ty::Con(X)`) and two variant
-    /// types are distinct even with the same constructor set. Only ANONYMOUS
-    /// variants (`A {} | B {}` not bound to a name) are structural.
-    fn register_named_variant(&mut self, name: &str, ctors: &[ast::ConstructorDef]) {
-        let mut ctor_list = Vec::new();
-        for ctor in ctors {
-            let fields: Vec<(String, ast::Type)> = ctor
-                .fields
-                .iter()
-                .map(|f| (f.name.clone(), f.value.clone()))
-                .collect();
-            self.constructors
-                .entry(ctor.name.clone())
-                .or_default()
-                .push(CtorInfo {
-                    data_type: name.to_string(),
-                    data_params: vec![],
-                    fields: fields.clone(),
-                });
-            ctor_list.push((ctor.name.clone(), fields));
-        }
-        self.data_types.insert(
-            name.to_string(),
-            DataInfo {
-                params: vec![],
-                ctors: ctor_list,
-            },
-        );
-    }
-
     // ── Declaration collection (phase 1) ─────────────────────────
 
     fn collect_types(&mut self, program: &ast::Expr) {
@@ -9156,6 +9123,14 @@ impl Infer {
         let mut alias_decls: Vec<(String, ast::Type, Span)> = Vec::new();
         let mut refined_alias_decls: Vec<(String, ast::Type, ast::Expr)> = Vec::new();
         for_each_type_ctor(program, &mut |name, params, ty, span| {
+            // A variant body (`type X = A {} | B {}`, any arity) is a NOMINAL
+            // data type, registered by the `for_each_data_ctor` block below
+            // (which threads the type params through). It is NOT a transparent
+            // alias — skip it here entirely so it never lands in `aliases` /
+            // `param_aliases`.
+            if matches!(ty.node, ast::TypeKind::Variant { .. }) {
+                return;
+            }
             if params.is_empty() {
                 if let ast::TypeKind::Refined { base, predicate } = &ty.node {
                     refined_alias_decls.push((
@@ -9164,18 +9139,7 @@ impl Infer {
                         (**predicate).clone(),
                     ));
                 } else {
-                    // A named variant `type X = A {} | B {}` registers X's
-                    // constructors exactly like `data X = …` — qualified
-                    // (`X.Ctor`) and `with`-import resolution both work, and X
-                    // is a nominal type (distinct from any other variant). It is
-                    // NOT a transparent alias: it goes into `data_types`, not
-                    // `aliases`, so `X` resolves nominally (`Ty::Con(X)`) via the
-                    // data-type path rather than unwrapping to its ctor-set.
-                    if let ast::TypeKind::Variant { constructors, .. } = &ty.node {
-                        self.register_named_variant(name, constructors);
-                    } else {
-                        alias_decls.push((name.to_string(), ty.clone(), span));
-                    }
+                    alias_decls.push((name.to_string(), ty.clone(), span));
                 }
             } else {
                 // Parameterized alias: keep the AST body + param names so

@@ -48,3 +48,6 @@ examples/trait_replacement
 *.schema.lock
 __pycache__/
 *.pyc
+
+# Hermes agent workspace (local tooling/notes)
+/.hermes/

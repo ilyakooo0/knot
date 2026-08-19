@@ -336,6 +336,7 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // parseJson call targets: app_span -> resolved type name (for compile-time
     // FromJSON dispatch) + wire schema (for Maybe-aware decoding)
     from_json_targets: crate::infer::FromJsonTargets,
+    string_lit_bytes: crate::infer::StringLitBytes,
 
     // `with` expression span -> field names bound in its body. Codegen
     // projects exactly these fields out of the record into locals.
@@ -721,6 +722,7 @@ pub fn compile(
     refined_types: &crate::infer::RefinedTypeInfoMap,
     refined_field_preds: &crate::infer::RefinedFieldPredsMap,
     from_json_targets: &crate::infer::FromJsonTargets,
+    string_lit_bytes: &crate::infer::StringLitBytes,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
@@ -756,6 +758,7 @@ pub fn compile(
             refined_types,
             refined_field_preds,
             from_json_targets,
+            string_lit_bytes,
             type_info,
             elem_pushdown_ok,
             show_unit_strings,
@@ -796,6 +799,7 @@ pub fn compile_with<M: cranelift_module::Module>(
     refined_types: &crate::infer::RefinedTypeInfoMap,
     refined_field_preds: &crate::infer::RefinedFieldPredsMap,
     from_json_targets: &crate::infer::FromJsonTargets,
+    string_lit_bytes: &crate::infer::StringLitBytes,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
@@ -830,6 +834,7 @@ pub fn compile_with<M: cranelift_module::Module>(
         refined_types,
         refined_field_preds,
         from_json_targets,
+        string_lit_bytes,
         type_info,
         elem_pushdown_ok,
         show_unit_strings,
@@ -864,6 +869,7 @@ fn compile_inner<M: cranelift_module::Module>(
     refined_types: &crate::infer::RefinedTypeInfoMap,
     refined_field_preds: &crate::infer::RefinedFieldPredsMap,
     from_json_targets: &crate::infer::FromJsonTargets,
+    string_lit_bytes: &crate::infer::StringLitBytes,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
@@ -934,6 +940,7 @@ fn compile_inner<M: cranelift_module::Module>(
         })
         .collect();
     cg.from_json_targets = from_json_targets.clone();
+    cg.string_lit_bytes = string_lit_bytes.clone();
     cg.with_fields = with_fields.clone();
     cg.implicit_refs = implicit_refs.clone();
     cg.implicit_dict_args = implicit_dict_args.clone();
@@ -1302,6 +1309,7 @@ pub fn jit_compile_typed(source: &str, expected: Option<&str>) -> Option<JitComp
             refine_targets,
             refined_type_info: refined_types,
             from_json_targets,
+            string_lit_bytes,
             elem_pushdown_ok,
             show_unit_strings,
             sum_float_spans,
@@ -1348,6 +1356,7 @@ pub fn jit_compile_typed(source: &str, expected: Option<&str>) -> Option<JitComp
             &refined_types,
             &_refined_field_preds,
             &from_json_targets,
+            &string_lit_bytes,
             &type_info,
             &elem_pushdown_ok,
             &show_unit_strings,
@@ -1502,6 +1511,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             refined_predicate_fns: HashMap::new(),
             source_refinements: HashMap::new(),
             from_json_targets: HashMap::new(),
+            string_lit_bytes: HashSet::new(),
             with_fields: HashMap::new(),
             implicit_refs: HashMap::new(),
             implicit_dict_args: HashMap::new(),
@@ -4774,7 +4784,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // `todo_types` map (which infer records at the whole-`base.todo` span).
         let outer_span = expr.span;
         match &expr.node {
-            ast::ExprKind::Lit(lit) => self.compile_lit(builder, lit),
+            ast::ExprKind::Lit(lit) => self.compile_lit(builder, lit, expr.span),
 
             // `_` in value position: a TypeHole behaves exactly like
             // `base.todo` — report the expected type + scope and exit.
@@ -6499,7 +6509,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 params: Vec::new(),
                 select_columns,
                 order_by: Vec::new(),
-                limit: Some(SqlParamSource::Literal(ast::Literal::Int("1".to_string()))),
+                limit: Some(SqlParamSource::Literal(
+                    ast::Literal::Int("1".to_string()),
+                    ast::Span::new(0, 0),
+                )),
                 offset: None,
                 distinct: false,
                 group_by: Vec::new(),
@@ -6657,7 +6670,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // already set the bound above (`take 0` → empty → Nothing); only the
         // bare case needs the explicit 1.
         if plan.limit.is_none() {
-            plan.limit = Some(SqlParamSource::Literal(ast::Literal::Int("1".to_string())));
+            plan.limit = Some(SqlParamSource::Literal(
+                ast::Literal::Int("1".to_string()),
+                ast::Span::new(0, 0),
+            ));
         }
         let query = Query {
             plan,
@@ -9931,7 +9947,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                 }
                 ast::PatKind::Lit(lit) => {
-                    let lit_val = self.compile_lit(builder, lit);
+                    let lit_val = self.compile_lit(builder, lit, arm.pat.span);
                     let eq_i32 = self.call_rt_typed(
                         builder,
                         "knot_value_eq_i32",
@@ -10184,7 +10200,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::PatKind::Var(name) => env.set(crate::infer::Binding::User(name.clone()), val),
             ast::PatKind::Wildcard => {}
             ast::PatKind::Lit(lit) => {
-                let lit_val = self.compile_lit(builder, lit);
+                let lit_val = self.compile_lit(builder, lit, pat.span);
                 let eq_i32 =
                     self.call_rt_typed(builder, "knot_value_eq_i32", &[val, lit_val], types::I32);
                 let is_eq = builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
@@ -11693,7 +11709,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // A literal pattern binds nothing but is *refutable*: a
                 // mismatched value must skip (like the do/case paths), not be
                 // silently accepted. Mirror the constructor arm's fail/skip.
-                let lit_val = self.compile_lit(builder, lit);
+                let lit_val = self.compile_lit(builder, lit, pat.span);
                 let eq_i32 =
                     self.call_rt_typed(builder, "knot_value_eq_i32", &[val, lit_val], types::I32);
                 let is_match = builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);
@@ -12252,7 +12268,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                             })
                                         {
                                             let params_ok = frag.params.iter().all(|p| match p {
-                                                SqlParamSource::Literal(_)
+                                                SqlParamSource::Literal(..)
                                                 | SqlParamSource::Expr(_) => true,
                                                 SqlParamSource::Var(v) => {
                                                     v != bind_var
@@ -13059,7 +13075,12 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
     // ── Literal compilation ───────────────────────────────────────
 
-    fn compile_lit(&mut self, builder: &mut FunctionBuilder, lit: &ast::Literal) -> Value {
+    fn compile_lit(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        lit: &ast::Literal,
+        span: ast::Span,
+    ) -> Value {
         match lit {
             ast::Literal::Int(n) => {
                 if let Ok(small) = n.parse::<i64>() {
@@ -13075,9 +13096,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.call_rt(builder, "knot_value_float", &[n_val])
             }
             ast::Literal::Text(s) => {
-                let (ptr, len) = self.string_ptr(builder, s);
-                let slot = self.text_literal_slot(builder, s);
-                self.call_rt(builder, "knot_value_text_intern", &[ptr, len, slot])
+                // A string literal is polymorphic over Text/Bytes; emit per its
+                // resolved type. `Bytes` → the UTF-8 bytes of the string.
+                if self.string_lit_bytes.contains(&span) {
+                    let (ptr, len) = self.string_ptr(builder, s);
+                    self.call_rt(builder, "knot_value_bytes", &[ptr, len])
+                } else {
+                    let (ptr, len) = self.string_ptr(builder, s);
+                    let slot = self.text_literal_slot(builder, s);
+                    self.call_rt(builder, "knot_value_text_intern", &[ptr, len, slot])
+                }
             }
             ast::Literal::Bytes(b) => {
                 let (ptr, len) = self.bytes_ptr(builder, b);
@@ -15164,7 +15192,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             ast::ExprKind::Lit(lit) => Some(SqlFragment {
                 sql: "?".to_string(),
-                params: vec![SqlParamSource::Literal(lit.clone())],
+                params: vec![SqlParamSource::Literal(lit.clone(), expr.span)],
             }),
             ast::ExprKind::Var(name) => {
                 if bind_aliases.contains_key(name.as_str()) {
@@ -15450,7 +15478,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         if let ast::ExprKind::Lit(lit) = &expr.node {
             return Some(SqlFragment {
                 sql: "?".to_string(),
-                params: vec![SqlParamSource::Literal(lit.clone())],
+                params: vec![SqlParamSource::Literal(lit.clone(), expr.span)],
             });
         }
         None
@@ -15873,7 +15901,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         }
 
         let param = match &value_side.node {
-            ast::ExprKind::Lit(lit) => SqlParamSource::Literal(lit.clone()),
+            ast::ExprKind::Lit(lit) => SqlParamSource::Literal(lit.clone(), value_side.span),
             ast::ExprKind::Var(name) => SqlParamSource::Var(name.as_str().to_string()),
             ast::ExprKind::FieldAccess { expr, field } => {
                 if let ast::ExprKind::Var(var_name) = &expr.node {
@@ -16011,7 +16039,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             ast::ExprKind::Lit(lit) => Some(SqlFragment {
                 sql: "?".to_string(),
-                params: vec![SqlParamSource::Literal(lit.clone())],
+                params: vec![SqlParamSource::Literal(lit.clone(), expr.span)],
             }),
             ast::ExprKind::Var(name) => {
                 if name == bind_var {
@@ -16226,7 +16254,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         };
         for param in params {
             let val = match param {
-                SqlParamSource::Literal(lit) => self.compile_lit(builder, lit),
+                SqlParamSource::Literal(lit, span) => self.compile_lit(builder, lit, *span),
                 // Var/FieldAccess names that aren't local bindings are
                 // top-level constants — resolve them through compile_expr
                 // (env → global_fns), matching the Expr-style fallback that
@@ -16448,7 +16476,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         // (safe fallback, same policy as runtime spec parse errors) instead
         // of panicking in codegen.
         let resolvable = value_sources.iter().all(|p| match p {
-            SqlParamSource::Literal(_) | SqlParamSource::Expr(_) => true,
+            SqlParamSource::Literal(..) | SqlParamSource::Expr(_) => true,
             SqlParamSource::Var(v) | SqlParamSource::FieldAccess(v, _) => {
                 env.bindings
                     .contains_key(&crate::infer::Binding::User(v.clone()))
@@ -17209,7 +17237,7 @@ fn field_access_of(bv: &str, e: &ast::Expr) -> Option<String> {
 /// references the same row on both sides — not a constant filter).
 fn simple_value_param(bv: &str, e: &ast::Expr) -> Option<SqlParamSource> {
     match &e.node {
-        ast::ExprKind::Lit(lit) => Some(SqlParamSource::Literal(lit.clone())),
+        ast::ExprKind::Lit(lit) => Some(SqlParamSource::Literal(lit.clone(), e.span)),
         ast::ExprKind::Var(name) if !name.is_user(bv) => {
             Some(SqlParamSource::Var(name.as_str().to_string()))
         }
@@ -17298,7 +17326,7 @@ struct SetOpSubquery {
 
 #[derive(Clone)]
 enum SqlParamSource {
-    Literal(ast::Literal),
+    Literal(ast::Literal, ast::Span),
     Var(String),
     FieldAccess(String, String), // (var_name, field_name)
     /// Arbitrary expression compiled at runtime.  Used for computed
@@ -18876,7 +18904,7 @@ fn pat_captures(pat: &ast::Pat, free_vars: &HashSet<String>) -> bool {
 /// Convert an expression to a SQL parameter source (literal int or variable).
 fn expr_to_sql_param(expr: &ast::Expr) -> Option<SqlParamSource> {
     match &expr.node {
-        ast::ExprKind::Lit(lit) => Some(SqlParamSource::Literal(lit.clone())),
+        ast::ExprKind::Lit(lit) => Some(SqlParamSource::Literal(lit.clone(), expr.span)),
         ast::ExprKind::Var(name) => Some(SqlParamSource::Var(name.as_str().to_string())),
         _ => None,
     }
@@ -19554,7 +19582,7 @@ fn bind_do_pattern<M: cranelift_module::Module>(
         }
         ast::PatKind::Lit(lit) => {
             // Filter: only rows matching the literal value continue
-            let lit_val = cg.compile_lit(builder, lit);
+            let lit_val = cg.compile_lit(builder, lit, pat.span);
             let eq_i32 =
                 cg.call_rt_typed(builder, "knot_value_eq_i32", &[val, lit_val], types::I32);
             let is_match = builder.ins().icmp_imm(IntCC::NotEqual, eq_i32, 0);

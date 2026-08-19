@@ -219,6 +219,11 @@ pub struct FromJsonTarget {
 /// Maps parseJson call-site spans to their resolved target info.
 pub type FromJsonTargets = HashMap<Span, FromJsonTarget>;
 
+/// Spans of string literals that resolved to `Bytes` (as opposed to `Text`).
+/// Codegen emits these as byte strings; literals absent from the set emit as
+/// text.
+pub type StringLitBytes = HashSet<Span>;
+
 /// Maps a `with` expression's span to the field names bound in its body.
 /// Codegen cannot re-derive these — the record's field names come from its
 /// *type*, not the AST — yet it must project each field into a local binding.
@@ -979,6 +984,11 @@ struct Infer {
     /// `+`/`<`/`++`/unary-`-`/`==` operator checks.
     known_impls: HashSet<(String, String)>,
 
+    /// Unification variables introduced by `Text` literals. A string literal is
+    /// polymorphic over `Text` and `Bytes`: unification binds the var to either,
+    /// and a var still unresolved at the end of inference defaults to `Text`.
+    string_lit_vars: HashMap<TyVar, Span>,
+
     /// Top-level functions carrying signature-level `^`-field constraints:
     /// name → ordered `(field, field_type)` list. The function's stored scheme
     /// has already been elaborated to take a leading dictionary record per
@@ -1243,6 +1253,7 @@ impl Infer {
             from_json_calls: Vec::new(),
             show_calls: Vec::new(),
             known_impls: HashSet::new(),
+            string_lit_vars: HashMap::new(),
             implicit_dict_fns: HashMap::new(),
             fold_dict_fields: HashMap::new(),
             implicit_dict_args: HashMap::new(),
@@ -2086,6 +2097,37 @@ impl Infer {
         self.subst.insert(v, ty);
     }
 
+    /// Bind a unification variable, but if it came from a string literal
+    /// (`string_lit_vars`) restrict the target to `Text` or `Bytes`. A string
+    /// literal is polymorphic over exactly those two; unifying it with anything
+    /// else is a type error naming the literal. Left unconstrained, it defaults
+    /// to `Text` at the end of inference.
+    fn bind_string_lit_var(&mut self, v: TyVar, applied_other: &Ty, raw_other: &Ty, span: Span) {
+        if self.string_lit_vars.contains_key(&v) {
+            match applied_other {
+                Ty::Error => {}
+                // Pinned by context: resolve to that string-like type.
+                Ty::Text | Ty::Bytes => {}
+                // Unified only with a polymorphic variable (e.g. `println`'s
+                // `a`): defer — the consumer pins no concrete type, so the var
+                // may still be resolved by a later constraint; if it never is,
+                // the end-of-inference check reports it as ambiguous.
+                Ty::Var(_) => {}
+                _ => {
+                    self.error(
+                        format!(
+                            "string literal must be Text or Bytes, found {}",
+                            self.display_ty(applied_other)
+                        ),
+                        span,
+                    );
+                    return;
+                }
+            }
+        }
+        self.bind_var(v, raw_other.clone(), span);
+    }
+
     // ── Unification ──────────────────────────────────────────────
 
     /// `snippet ⊑ expected` — is the snippet's inferred type usable where the
@@ -2400,11 +2442,11 @@ impl Infer {
             }
             (Ty::Var(v), _) => {
                 let v = *v;
-                self.bind_var(v, raw2.clone(), span);
+                self.bind_string_lit_var(v, &t2, raw2, span);
             }
             (_, Ty::Var(v)) => {
                 let v = *v;
-                self.bind_var(v, raw1.clone(), span);
+                self.bind_string_lit_var(v, &t1, raw1, span);
             }
             (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Float)
@@ -5649,7 +5691,7 @@ impl Infer {
 
     fn infer_expr_inner(&mut self, expr: &ast::Expr) -> Ty {
         match &expr.node {
-            ast::ExprKind::Lit(lit) => self.literal_type(lit),
+            ast::ExprKind::Lit(lit) => self.literal_type(lit, expr.span),
 
             ast::ExprKind::Var(name) if name == "__yield" || name == "yield" => {
                 // ∀m a. a -> App(m, a)  — monadic yield (from do-desugaring)
@@ -8240,7 +8282,7 @@ impl Infer {
         }
     }
 
-    fn literal_type(&mut self, lit: &ast::Literal) -> Ty {
+    fn literal_type(&mut self, lit: &ast::Literal, span: Span) -> Ty {
         match lit {
             // Numeric literals are unit-polymorphic: `1.5` has type
             // `Float <u>` for a fresh unit variable `u`, so it unifies with
@@ -8251,7 +8293,15 @@ impl Infer {
             // dimensionless.
             ast::Literal::Int(_) => Ty::int_with_unit(UnitTy::var(self.fresh_unit_var())),
             ast::Literal::Float(_) => Ty::float_with_unit(UnitTy::var(self.fresh_unit_var())),
-            ast::Literal::Text(_) => Ty::Text,
+            // String literals are polymorphic over `Text` and `Bytes`: a fresh
+            // variable that unification may bind to either. Left unconstrained
+            // (no context forces a choice) it defaults to `Text`; `Bytes` is
+            // opt-in via a Bytes-demanding context or `the (Bytes)`.
+            ast::Literal::Text(_) => {
+                let v = self.fresh_var();
+                self.string_lit_vars.insert(v, span);
+                Ty::Var(v)
+            }
             ast::Literal::Bytes(_) => Ty::Bytes,
         }
     }
@@ -8438,7 +8488,7 @@ impl Infer {
                 self.unify(&record_ty, expected, pat.span);
             }
             ast::PatKind::Lit(lit) => {
-                let lit_ty = self.literal_type(lit);
+                let lit_ty = self.literal_type(lit, pat.span);
                 // Matching a literal against a refined scrutinee (`case n of 0
                 // -> …`, n : Nat) only tests the value; it introduces nothing,
                 // so use symmetric unification (mirrors binary operators).
@@ -12950,6 +13000,7 @@ pub struct CheckOutput {
     pub refine_targets: RefineTargets,
     pub refined_type_info: RefinedTypeInfoMap,
     pub from_json_targets: FromJsonTargets,
+    pub string_lit_bytes: StringLitBytes,
     pub elem_pushdown_ok: ElemPushdownOk,
     pub show_unit_strings: ShowUnitStrings,
     pub sum_float_spans: SumFloatSpans,
@@ -13684,6 +13735,28 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
     // Phase 4d: Compress substitution chains for faster resolution
     infer.compress_substitution();
 
+    // Phase 4e: a string literal whose Text|Bytes type was never pinned by its
+    // context defaults to `Text` (the natural type of a string literal);
+    // `Bytes` is opt-in via a Bytes-demanding context or `the (Bytes)`.
+    let unresolved_string_lits: Vec<TyVar> = infer
+        .string_lit_vars
+        .keys()
+        .filter(|v| matches!(infer.apply(&Ty::Var(**v)), Ty::Var(_)))
+        .copied()
+        .collect();
+    for v in unresolved_string_lits {
+        infer.bind_var(v, Ty::Text, infer.string_lit_vars[&v]);
+    }
+
+    // Record which string literals resolved to `Bytes` so codegen emits them
+    // as byte strings rather than interned text.
+    let string_lit_bytes: StringLitBytes = infer
+        .string_lit_vars
+        .iter()
+        .filter(|(v, _)| matches!(infer.apply(&Ty::Var(**v)), Ty::Bytes))
+        .map(|(_, span)| *span)
+        .collect();
+
     // Phase 5: Resolve monad types from desugared do-blocks
     let mut monad_info = MonadInfo::new();
     let monad_vars = infer.monad_vars.clone();
@@ -13996,6 +14069,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         refine_targets,
         refined_type_info,
         from_json_targets,
+        string_lit_bytes,
         elem_pushdown_ok,
         show_unit_strings,
         sum_float_spans,

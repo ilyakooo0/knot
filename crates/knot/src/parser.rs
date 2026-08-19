@@ -57,17 +57,8 @@ pub struct Parser {
     /// stack overflow on pathological input.
     recursion_depth: usize,
     /// Stack of locally-bound identifiers (lambda params, do-bind names,
-    /// case pattern binders). Used by
-    /// `maybe_time_unit` to suppress the `2 ms`/`5 seconds` literal sugar
-    /// when the would-be unit name is actually a bound variable, so
-    /// `\ms -> g 2 ms` applies `g` to `2` and `ms` rather than desugaring
-    /// to `g (2 * 1)`.
+    /// case pattern binders).
     bound_vars: Vec<Name>,
-    /// Top-level declaration names that collide with time-unit words
-    /// (`ms`/`seconds`/...). Populated by a pre-scan in `parse_file_expr` so
-    /// that `maybe_time_unit` can suppress sugar for `ms = 5; ... 2 ms`
-    /// (where `ms` is a user-defined top-level value, not the unit).
-    top_level_names: HashSet<String>,
     /// Display column (chars from the start of its line) of each token,
     /// indexed by token position. Precomputed in a single O(source) pass so
     /// layout queries during parsing are O(1) instead of O(line-length) —
@@ -119,7 +110,6 @@ impl Parser {
             delimiter_depth: 0,
             recursion_depth: 0,
             bound_vars: Vec::new(),
-            top_level_names: HashSet::new(),
             token_cols,
             eof_col,
         }
@@ -222,7 +212,7 @@ impl Parser {
         self.skip_newlines();
         self.block_indent = 0;
         self.block_delim = 0;
-        self.top_level_names = self.scan_top_level_names();
+        self.reject_top_level_unit_names();
 
         let expr = if self.at_eof() {
             let span = self.eof_span();
@@ -381,7 +371,15 @@ impl Parser {
     /// to it when the binder's scope ends.
     fn push_pat_vars(&mut self, pat: &Pat) {
         match &pat.node {
-            PatKind::Var(n) => self.bound_vars.push(n.clone()),
+            PatKind::Var(n) => {
+                if Self::TIME_UNITS.contains(&n.as_str()) {
+                    self.error_at(
+                        pat.span,
+                        format!("`{n}` is a time-unit word and cannot be declared as a name"),
+                    );
+                }
+                self.bound_vars.push(n.clone());
+            }
             PatKind::Wildcard | PatKind::Lit(_) => {}
             PatKind::Constructor { payload, .. } => self.push_pat_vars(payload),
             PatKind::Record(fields) => {
@@ -406,26 +404,21 @@ impl Parser {
         }
     }
 
-    fn is_bound_var(&self, name: &str) -> bool {
-        self.bound_vars.iter().any(|v| v == name)
-    }
+    /// Time-unit words (`ms`, `seconds`, …). Declaring a value with one of
+    /// these names is a compile error — otherwise `2 seconds` would silently
+    /// become application of a user `seconds` instead of the unit sugar.
+    const TIME_UNITS: &[&str] = &["ms", "seconds", "minutes", "hours", "days", "weeks"];
 
-    /// Pre-scan the token stream for names that collide with time-unit words
-    /// (`ms`, `seconds`, `minutes`, `hours`, `days`, `weeks`) and are actually
-    /// user-defined values rather than the built-in unit. This lets
-    /// `maybe_time_unit` suppress unit sugar for those names. Covers
-    /// top-level declarations (column-0 `name =`/`name :`, optionally
-    /// behind a `*`/`&`/`export` sigil).
-    fn scan_top_level_names(&self) -> HashSet<String> {
-        const TIME_UNITS: &[&str] = &["ms", "seconds", "minutes", "hours", "days", "weeks"];
-        let mut names = HashSet::new();
-
+    /// Pre-scan the token stream for top-level declarations whose name is a
+    /// time-unit word and reject them. Covers column-0 `name =`/`name :`,
+    /// optionally behind a `*`/`&` sigil.
+    fn reject_top_level_unit_names(&mut self) {
         let n = self.tokens.len();
         for i in 0..n {
             let TokenKind::Lower(s) = &self.tokens[i].kind else {
                 continue;
             };
-            if !TIME_UNITS.contains(&s.as_str()) {
+            if !Self::TIME_UNITS.contains(&s.as_str()) {
                 continue;
             }
             // Must be followed by `=` or `:` to be a declaration name.
@@ -444,10 +437,13 @@ impl Parser {
                 )
                 && self.token_cols[i - 1] == 0;
             if self.token_cols[i] == 0 || preceded_by_sigil_at_col0 {
-                names.insert(s.clone());
+                let span = self.tokens[i].span;
+                self.error_at(
+                    span,
+                    format!("`{s}` is a time-unit word and cannot be declared as a name"),
+                );
             }
         }
-        names
     }
 }
 
@@ -2052,9 +2048,6 @@ impl Parser {
     /// (inference and codegen unwrap the wrapper and see only the multiplication).
     fn maybe_time_unit(&mut self, lit: Expr) -> Option<Expr> {
         let factor: Option<&str> = match self.peek() {
-            // A locally-bound variable named like a time unit is NOT unit
-            // sugar: `\ms -> g 2 ms` must apply `g` to `2` and `ms`.
-            TokenKind::Lower(u) if self.is_bound_var(u) || self.top_level_names.contains(u) => None,
             TokenKind::Lower(u) => match u.as_str() {
                 "ms" => Some("1"),
                 "seconds" => Some("1000"),

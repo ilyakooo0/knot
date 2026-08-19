@@ -6,7 +6,7 @@ See `DESIGN.md` for the full language specification.
 
 ## Project Structure
 
-Cargo workspace (members: `crates/*` and `tools/migrate`):
+Cargo workspace (members: `crates/*`):
 
 ```
 crates/
@@ -14,8 +14,6 @@ crates/
   knot-runtime/      Rust staticlib linked into compiled programs (value representation, SQLite persistence)
   knot-compiler/     Cranelift-based compiler producing native executables (CLI binary: knot)
   knot-lsp/          Language server for editor integration (binary: knot-lsp)
-tools/
-  migrate/           Schema-migration tool/library (knot-migrate) used by the compiler's migration path
 examples/            Example .knot programs
 ```
 
@@ -23,11 +21,11 @@ examples/            Example .knot programs
 
 ```sh
 cargo build                  # Build all crates
-cargo test                   # Run all tests (57 migrate + 18 runtime = 75 total)
+cargo test                   # Run all tests
 cargo test -p knot-runtime   # Run only runtime tests
 ```
 
-Note: unit tests currently live only in `knot-migrate` (57) and `knot-runtime` (18, the index-extraction suite). The `knot`, `knot-compiler`, and `knot-lsp` crates have no `#[test]` functions; their correctness is exercised end-to-end by building and running the programs under `examples/`.
+Note: unit tests currently live only in `knot-runtime`. The `knot`, `knot-compiler`, and `knot-lsp` crates have no `#[test]` functions; their correctness is exercised end-to-end by building and running the programs under `examples/`.
 
 ## Compiling Knot Programs
 

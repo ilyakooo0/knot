@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*", "tools/migrate"]
+members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]

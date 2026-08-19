@@ -9,7 +9,7 @@
 -- `Bool` column panics in the storage layer (pre-existing runtime issue).
 with {
 
-data Active = Yes {} | No {}
+type Active = Yes {} | No {}
 
 -- Version 1 of the schema people had just a name.
 type PersonV1 = {name Text}

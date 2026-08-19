@@ -4696,30 +4696,6 @@ impl Infer {
         true
     }
 
-    /// The structural variant type for a `type X = A {} | B {}` alias, or `None`
-    /// if `name` is not a structural variant. The result is the constructor-set
-    /// `Ty::Variant` (each constructor mapped to its record payload), so two
-    /// aliases with the same constructor set unify — unlike a nominal
-    /// `Ty::Con(X)`. `X.Ctor {…}` yields this type.
-    fn structural_variant_ty(&mut self, name: &str) -> Option<Ty> {
-        let info = self.data_types.get(name)?.clone();
-        if !info.structural {
-            return None;
-        }
-        let ctor_set: FieldMap = info
-            .ctors
-            .iter()
-            .map(|(cname, cfields)| {
-                let cfield_tys: FieldMap = cfields
-                    .iter()
-                    .map(|(fname, fty)| (fname.clone(), self.ast_type_to_ty(fty)))
-                    .collect();
-                (cname.clone(), Ty::Record(cfield_tys, None))
-            })
-            .collect();
-        Some(Ty::Variant(ctor_set, None))
-    }
-
     fn instantiate_ctor(
         &mut self,
         name: &str,
@@ -4758,13 +4734,8 @@ impl Infer {
             .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
             .collect();
 
-        // Structural variant (`type X = A {} | B {}`): the constructor yields
-        // the constructor-set `Ty::Variant`, resolved via X's `data_types` entry.
-        let structural_ty = self.structural_variant_ty(&info.data_type);
         let data_ty = if info.data_type == "Bool" {
             Ty::Bool
-        } else if let Some(set) = structural_ty {
-            set
         } else {
             Ty::Con(info.data_type.clone(), param_tys)
         };
@@ -4811,11 +4782,8 @@ impl Infer {
             .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
             .collect();
 
-        let structural_ty = self.structural_variant_ty(data_name);
         let data_ty = if data_name == "Bool" {
             Ty::Bool
-        } else if let Some(set) = structural_ty {
-            set
         } else {
             Ty::Con(data_name.to_string(), param_tys)
         };
@@ -9254,14 +9222,14 @@ impl Infer {
         }
     }
 
-    /// Register a structural variant alias's constructors (`type X = A {} | B {}`)
+    /// Register a named variant alias's constructors (`type X = A {} | B {}`)
     /// exactly like a nominal `data X = …` declaration does: each constructor
     /// goes into the global `constructors` map (for qualified `X.Ctor` and
-    /// `with`-import resolution) and `X` goes into `data_types` — but flagged
-    /// `structural`, so instantiation yields the constructor-set `Ty::Variant`
-    /// rather than a nominal `Ty::Con(X)`. The alias itself is handled by the
-    /// ordinary alias path, which resolves the `Variant` body to `Ty::Variant`.
-    fn register_structural_variant(&mut self, name: &str, ctors: &[ast::ConstructorDef]) {
+    /// `with`-import resolution) and `X` goes into `data_types` as a NOMINAL
+    /// type (`structural: false`), so `X` unifies by name (`Ty::Con(X)`) and two
+    /// variant types are distinct even with the same constructor set. Only
+    /// ANONYMOUS variants (`A {} | B {}` not bound to a name) are structural.
+    fn register_named_variant(&mut self, name: &str, ctors: &[ast::ConstructorDef]) {
         let mut ctor_list = Vec::new();
         for ctor in ctors {
             let fields: Vec<(String, ast::Type)> = ctor
@@ -9284,7 +9252,7 @@ impl Infer {
             DataInfo {
                 params: vec![],
                 ctors: ctor_list,
-                structural: true,
+                structural: false,
             },
         );
     }
@@ -9305,15 +9273,18 @@ impl Infer {
                         (**predicate).clone(),
                     ));
                 } else {
-                    // A variant alias `type X = A {} | B {}` registers X's
+                    // A named variant `type X = A {} | B {}` registers X's
                     // constructors exactly like `data X = …` — qualified
-                    // (`X.Ctor`) and `with`-import resolution both work — but
-                    // its *type* is the structural constructor-set, so two
-                    // aliases with the same constructors are the same type.
+                    // (`X.Ctor`) and `with`-import resolution both work, and X
+                    // is a nominal type (distinct from any other variant). It is
+                    // NOT a transparent alias: it goes into `data_types`, not
+                    // `aliases`, so `X` resolves nominally (`Ty::Con(X)`) via the
+                    // data-type path rather than unwrapping to its ctor-set.
                     if let ast::TypeKind::Variant { constructors, .. } = &ty.node {
-                        self.register_structural_variant(name, constructors);
+                        self.register_named_variant(name, constructors);
+                    } else {
+                        alias_decls.push((name.to_string(), ty.clone(), span));
                     }
-                    alias_decls.push((name.to_string(), ty.clone(), span));
                 }
             } else {
                 // Parameterized alias: keep the AST body + param names so

@@ -1,5 +1,5 @@
 with {
-data Priority = Low {} | Medium {} | High {} | Critical {}
+type Priority = Low {} | Medium {} | High {} | Critical {}
 
 type Todo = {title Text owner Text priority Priority}
 

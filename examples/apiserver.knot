@@ -11,9 +11,9 @@
 --   curl localhost:8080/summary
 with {
 
-data Priority = Low {} | Medium {} | High {} | Critical {}
+type Priority = Low {} | Medium {} | High {} | Critical {}
 
-data Active = Yes {} | No {}
+type Active = Yes {} | No {}
 
 type Task = {id (Int 1) title Text owner Text priority Priority done Active}
 

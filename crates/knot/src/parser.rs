@@ -3399,6 +3399,46 @@ impl Parser {
 
     fn parse_pat_inner(&mut self) -> Option<Pat> {
         let start = self.span();
+        // Type-prefix annotation: `Type  name` — a type, a gap (2+ spaces), then
+        // the bound name. e.g. `\(Int 1  x) -> x + 1`. Only fires when the cursor
+        // unambiguously starts a type (Upper/`{`/`(`/`forall`/`_`) AND a type +
+        // gap + lowercase name follow; otherwise it backtracks to a normal
+        // pattern. This is the pattern-position analogue of the `Type  name`
+        // signature form.
+        if matches!(
+            self.peek(),
+            TokenKind::Upper(_)
+                | TokenKind::LBrace
+                | TokenKind::LParen
+                | TokenKind::Forall
+                | TokenKind::Underscore
+        ) {
+            let saved = self.save();
+            let diag_len = self.diagnostics.len();
+            let saved_flag = self.record_value_sig_type;
+            self.record_value_sig_type = true;
+            let ty = self.parse_type();
+            self.record_value_sig_type = saved_flag;
+            let had_gap = self.gap_before_current() || matches!(self.peek(), TokenKind::Newline);
+            if had_gap {
+                self.skip_newlines();
+            }
+            if let (Some(ty), true) = (ty, had_gap)
+                && let TokenKind::Lower(_) = self.peek()
+            {
+                let inner = self.parse_pat()?;
+                let end = inner.span;
+                return Some(Spanned::new(
+                    PatKind::Annot {
+                        pat: Box::new(inner),
+                        ty: Box::new(ty),
+                    },
+                    Span::new(start.start, end.end),
+                ));
+            }
+            self.restore(saved);
+            self.diagnostics.truncate(diag_len);
+        }
         match self.peek() {
             TokenKind::Underscore => {
                 let tok = self.advance();

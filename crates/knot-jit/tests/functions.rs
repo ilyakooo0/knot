@@ -126,6 +126,25 @@ fn forall_rank2() {
     );
 }
 
+#[test]
+fn lambda_param_type_prefix() {
+    // `\(T  x)` — a type-prefix param annotation (gap-separated), the
+    // pattern-position analogue of the `Type  name` signature form.
+    assert_show(
+        "with {\naddOne (\\(Int 1  x) -> x + 1)\n}\n(base.show (addOne 41))",
+        "42",
+    );
+}
+
+#[test]
+fn lambda_param_type_prefix_forall() {
+    // The prefix form also carries a `forall` type.
+    assert_show(
+        "with {\napplyTwice (\\((forall a. a -> a)  f) -> {asText (f \"text\") asInt (f 42)})\n}\n(base.show (applyTwice (\\y -> y)))",
+        "{asInt 42 asText text}",
+    );
+}
+
 // ── Type annotations & inference ─────────────────────────────────────────
 
 #[test]

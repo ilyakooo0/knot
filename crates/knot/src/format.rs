@@ -1499,7 +1499,9 @@ fn render_pat(p: &Pat) -> String {
             format!("Cons {} {}", render_pat_atom(head), render_pat_atom(tail))
         }
         PatKind::Annot { pat, ty } => {
-            format!("(the ({}) {})", render_type(ty), render_pat(pat))
+            // Type-prefix form: `Type  name` (gap-separated), matching the
+            // `Type  name` signature idiom.
+            format!("({}  {})", render_type(ty), render_pat(pat))
         }
     }
 }

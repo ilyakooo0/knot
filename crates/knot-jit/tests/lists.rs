@@ -102,7 +102,7 @@ fn append() {
 #[test]
 fn relation_roundtrip() {
     assert_show_set(
-        "base.list.toRelation (base.list.fromRelation [1 2 3])",
+        "base.list.toRelation (base.list.fromRelation [1  2  3])",
         &["1", "2", "3"],
     );
 }
@@ -110,7 +110,7 @@ fn relation_roundtrip() {
 #[test]
 fn from_relation_preserves_sorted_order() {
     assert_show(
-        "base.list.head (base.list.fromRelation (base.sortBy (\\n -> n) [3 1 2]))",
+        "base.list.head (base.list.fromRelation (base.sortBy (\\n -> n) [3  1  2]))",
         "Just {value 1}",
     );
 }

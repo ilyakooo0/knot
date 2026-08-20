@@ -38,7 +38,7 @@ fn shadowing_inner_scope_rejected() {
 
 #[test]
 fn pipe_forward() {
-    assert_show("[3 1 2] |> base.sortBy (\\n -> n)", "[1, 2, 3]");
+    assert_show("[3  1  2] |> base.sortBy (\\n -> n)", "[1, 2, 3]");
     assert_show("5 |> (\\n -> n * n)", "25");
 }
 
@@ -47,7 +47,7 @@ fn pipe_forward() {
 #[test]
 fn hof_composition() {
     assert_show_set(
-        "base.map (\\n -> n + 1) (base.filter (\\n -> n % 2 == 0) [1 2 3 4 5 6])",
+        "base.map (\\n -> n + 1) (base.filter (\\n -> n % 2 == 0) [1  2  3  4  5  6])",
         &["3", "5", "7"],
     );
 }
@@ -68,8 +68,8 @@ pos (\x -> case x > 0 of
   Bool.False {} -> Maybe.Nothing {})
 }
 (do
-  base.println (base.show (base.traverse pos [1 2 3]))
-  base.println (base.show (base.traverse pos [1 (-2) 3]))
+  base.println (base.show (base.traverse pos [1  2  3]))
+  base.println (base.show (base.traverse pos [1  (-2)  3]))
   yield {})"#,
         "\"Just {value [1, 2, 3]}\"\n\"Nothing\"\n{}",
     );

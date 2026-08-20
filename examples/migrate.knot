@@ -23,6 +23,6 @@ Rel PersonV2  *people
 
 }
 (do
-  full *people = [{name "Alice" active (Active.Yes {})} {name "Bob" active (Active.No {})}]
+  full *people = [{name "Alice" active (Active.Yes {})}  {name "Bob" active (Active.No {})}]
   rows <- *people
   base.println (base.show rows))

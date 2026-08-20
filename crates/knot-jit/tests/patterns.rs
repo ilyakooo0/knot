@@ -64,8 +64,8 @@ fn bool_case_exhaustive() {
 fn comprehension_cross_product() {
     assert_show(
         "base.sortBy (\\p -> p) (do
-           a <- [1 2]
-           b <- [10 20]
+           a <- [1  2]
+           b <- [10  20]
            yield (a + b))",
         "[11, 12, 21, 22]",
     );
@@ -92,7 +92,7 @@ fn comprehension_equi_join() {
 fn comprehension_with_let_and_where() {
     assert_show(
         "(do
-           x <- [1 2 3 4 5]
+           x <- [1  2  3  4  5]
            where x % 2 == 0
            yield (x * 10))",
         "[20, 40]",
@@ -104,8 +104,8 @@ fn comprehension_nested_yield_relation() {
     // flatMap: each element expands to a sub-relation
     assert_show(
         "(do
-           n <- [1 2 3]
-           m <- [n (n * 10)]
+           n <- [1  2  3]
+           m <- [n  (n * 10)]
            yield m)",
         "[1, 10, 2, 20, 3, 30]",
     );

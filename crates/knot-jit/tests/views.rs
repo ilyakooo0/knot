@@ -16,7 +16,7 @@ directReports (do
   yield {manager m.manager report m.report})
 }
 (do
-  full *manages = [{manager "A" report "B"} {manager "A" report "C"} {manager "B" report "D"}]
+  full *manages = [{manager "A" report "B"}  {manager "A" report "C"}  {manager "B" report "D"}]
   base.println (base.show (base.count directReports))
   yield {})"#,
         "\"3\"\n{}",
@@ -58,7 +58,7 @@ amounts (do
   yield {amount r.amount})
 }
 (do
-  full *sales = [{region "x" amount 10} {region "y" amount 20} {region "x" amount 5}]
+  full *sales = [{region "x" amount 10}  {region "y" amount 20}  {region "x" amount 5}]
   base.println (base.show {sum (base.sum (do r <- amounts; yield r.amount))})
   yield {})"#,
         // a query field iterated in an aggregate comprehension over the source

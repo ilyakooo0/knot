@@ -33,7 +33,7 @@ PersonV1  {name Text}
 Rel PersonV1  *people
 }
 (do
-  full *people = [{name "Alice"} {name "Bob"}]
+  full *people = [{name "Alice"}  {name "Bob"}]
   base.println (base.show (base.count *people))
   yield {})"#,
     );

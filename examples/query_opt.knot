@@ -97,7 +97,7 @@ pipeCountWhere (do
     {name "Dave" dept "Sales" salary 60} 
     {name "Eve" dept "Eng" salary 100}
   ]
-  full *departments = [{name "Eng" budget 500} {name "Sales" budget 200}]
+  full *departments = [{name "Eng" budget 500}  {name "Sales" budget 200}]
   countDemo
   filterDemo
   joinDemo

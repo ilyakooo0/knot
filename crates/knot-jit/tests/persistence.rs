@@ -14,7 +14,7 @@ Todo  {owner Text done (Int 1)}
 Rel Todo  *todos
 }
 (do
-  full *todos = [{owner "x" done 0} {owner "x" done 1} {owner "y" done 0}]
+  full *todos = [{owner "x" done 0}  {owner "x" done 1}  {owner "y" done 0}]
   groups <- (do
     t <- *todos
     where t.done == 0
@@ -37,7 +37,7 @@ C  {n (Int 1)}
 Rel C  *cs
 }
 (do
-  full *cs = [{n 1} {n 2} {n 3}]
+  full *cs = [{n 1}  {n 2}  {n 3}]
   rows <- *cs
   base.println (base.show (base.count rows))
   base.println (base.show (base.sum (base.map (\c -> c.n) rows)))
@@ -85,7 +85,7 @@ fn traverse_io() {
     assert_stdout(
         "traverse",
         r#"(do
-  r <- (base.traverse (\n -> base.println (base.show (n * 2))) [1 2])
+  r <- (base.traverse (\n -> base.println (base.show (n * 2))) [1  2])
   base.println (base.show r)
   yield {})"#,
         "\"2\"\n\"4\"\n\"[{}, {}]\"\n{}",
@@ -136,7 +136,7 @@ Account  {name Text balance (Int 1)}
 Rel Account  *accounts
 }
 (do
-  full *accounts = [{name "from" balance 100} {name "to" balance 0}]
+  full *accounts = [{name "from" balance 100}  {name "to" balance 0}]
   _ <- atomic do
     rows <- *accounts
     *accounts = base.map (\a ->

@@ -679,7 +679,7 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             let mut s = String::from("[");
             for (i, it) in items.iter().enumerate() {
                 if i > 0 {
-                    s.push(' ');
+                    s.push_str("  ");
                 }
                 s.push_str(&render_expr_inline(it, Prec::Lowest));
             }

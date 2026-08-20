@@ -18,7 +18,7 @@ fn empty_relation() {
 
 #[test]
 fn scalar_relation() {
-    assert_show_set("[1 2 3]", &["1", "2", "3"]);
+    assert_show_set("[1  2  3]", &["1", "2", "3"]);
 }
 
 #[test]
@@ -41,30 +41,30 @@ fn nested_relation_field() {
 
 #[test]
 fn filter_basic() {
-    assert_show_set("base.filter (\\n -> n > 2) [1 2 3 4]", &["3", "4"]);
+    assert_show_set("base.filter (\\n -> n > 2) [1  2  3  4]", &["3", "4"]);
 }
 
 #[test]
 fn filter_none() {
-    assert_show("base.filter (\\n -> n > 100) [1 2 3]", "[]");
+    assert_show("base.filter (\\n -> n > 100) [1  2  3]", "[]");
 }
 
 #[test]
 fn map_basic() {
-    assert_show_set("base.map (\\n -> n * 2) [1 2 3]", &["2", "4", "6"]);
+    assert_show_set("base.map (\\n -> n * 2) [1  2  3]", &["2", "4", "6"]);
 }
 
 #[test]
 fn map_to_record() {
     assert_show_set(
-        "base.map (\\n -> {sq (n * n)}) [1 2 3]",
+        "base.map (\\n -> {sq (n * n)}) [1  2  3]",
         &["{sq 1}", "{sq 4}", "{sq 9}"],
     );
 }
 
 #[test]
 fn fold_sum() {
-    assert_show("base.fold (\\a b -> a + b) 0 [1 2 3 4]", "10");
+    assert_show("base.fold (\\a b -> a + b) 0 [1  2  3  4]", "10");
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn fold_empty() {
 fn bind_flatmap() {
     // base.bind takes the function first, then the relation.
     assert_show_set(
-        "base.bind (\\n -> [n (n * 10)]) [1 2 3]",
+        "base.bind (\\n -> [n  (n * 10)]) [1  2  3]",
         &["1", "10", "2", "20", "3", "30"],
     );
 }
@@ -85,7 +85,7 @@ fn bind_flatmap() {
 
 #[test]
 fn count_basic() {
-    assert_show("base.count [1 2 3 4]", "4");
+    assert_show("base.count [1  2  3  4]", "4");
 }
 
 #[test]
@@ -95,18 +95,18 @@ fn count_empty() {
 
 #[test]
 fn count_where() {
-    assert_show("base.countWhere (\\n -> n % 2 == 0) [1 2 3 4 5 6]", "3");
+    assert_show("base.countWhere (\\n -> n % 2 == 0) [1  2  3  4  5  6]", "3");
 }
 
 #[test]
 fn sum_ints() {
-    assert_show("base.sum [1 2 3 4]", "10");
+    assert_show("base.sum [1  2  3  4]", "10");
 }
 
 #[test]
 fn avg_floats() {
     // base.avg takes a projection function: (a -> Float u) -> [a] -> Float u.
-    assert_show("base.avg (\\x -> x) [1.0 2.0 3.0]", "2.0");
+    assert_show("base.avg (\\x -> x) [1.0  2.0  3.0]", "2.0");
 }
 
 #[test]
@@ -137,36 +137,36 @@ fn min_max_scalars() {
 
 #[test]
 fn union_relations() {
-    assert_show_set("base.union [1 2] [3 4]", &["1", "2", "3", "4"]);
+    assert_show_set("base.union [1  2] [3  4]", &["1", "2", "3", "4"]);
 }
 
 #[test]
 fn inter_relations() {
-    assert_show_set("base.inter [1 2 3] [2 3 4]", &["2", "3"]);
+    assert_show_set("base.inter [1  2  3] [2  3  4]", &["2", "3"]);
 }
 
 #[test]
 fn diff_relations() {
-    assert_show_set("base.diff [1 2 3] [2]", &["1", "3"]);
+    assert_show_set("base.diff [1  2  3] [2]", &["1", "3"]);
 }
 
 // ── membership / quantifiers ─────────────────────────────────────────────
 
 #[test]
 fn elem_present() {
-    assert_show("base.elem 2 [1 2 3]", "True");
+    assert_show("base.elem 2 [1  2  3]", "True");
 }
 
 #[test]
 fn elem_absent() {
-    assert_show("base.elem 9 [1 2 3]", "False");
+    assert_show("base.elem 9 [1  2  3]", "False");
 }
 
 #[test]
 fn any_all() {
-    assert_show("base.any (\\n -> n > 2) [1 2 3]", "True");
-    assert_show("base.all (\\n -> n > 0) [1 2 3]", "True");
-    assert_show("base.all (\\n -> n > 1) [1 2 3]", "False");
+    assert_show("base.any (\\n -> n > 2) [1  2  3]", "True");
+    assert_show("base.all (\\n -> n > 0) [1  2  3]", "True");
+    assert_show("base.all (\\n -> n > 1) [1  2  3]", "False");
 }
 
 #[test]
@@ -178,15 +178,15 @@ fn single_row() {
 fn single_empty_or_many() {
     // Nullary constructors show without a payload: `Nothing`, not `Nothing {}`.
     assert_show("base.single (the (Rel (Int 1)) [])", "Nothing");
-    assert_show("base.single [1 2]", "Nothing");
+    assert_show("base.single [1  2]", "Nothing");
 }
 
 #[test]
 fn head_findfirst() {
     // Constructor payloads show with `: ` separators (field-style).
-    assert_show("base.head [5 6]", "Just {value 5}");
+    assert_show("base.head [5  6]", "Just {value 5}");
     // findFirst is relation-FIRST: [a] -> (a -> Bool) -> Maybe a.
-    assert_show("base.findFirst [1 2 3] (\\n -> n > 1)", "Just {value 2}");
+    assert_show("base.findFirst [1  2  3] (\\n -> n > 1)", "Just {value 2}");
 }
 
 // ── ordering / slicing (sorted relations have a fixed iteration order) ───
@@ -201,13 +201,13 @@ fn sort_by() {
 
 #[test]
 fn sort_by_desc() {
-    assert_show("base.sortByDesc (\\n -> n) [1 3 2]", "[3, 2, 1]");
+    assert_show("base.sortByDesc (\\n -> n) [1  3  2]", "[3, 2, 1]");
 }
 
 #[test]
 fn take_drop_sorted() {
-    assert_show("base.take 2 (base.sortBy (\\n -> n) [3 1 2])", "[1, 2]");
-    assert_show("base.drop 1 (base.sortBy (\\n -> n) [3 1 2])", "[2, 3]");
+    assert_show("base.take 2 (base.sortBy (\\n -> n) [3  1  2])", "[1, 2]");
+    assert_show("base.drop 1 (base.sortBy (\\n -> n) [3  1  2])", "[2, 3]");
 }
 
 #[test]
@@ -271,20 +271,20 @@ fn upsert_inserts() {
 #[test]
 fn comprehension_filter() {
     assert_show_set(
-        "(do\n  n <- [1 2 3 4 5]\n  where n % 2 == 0\n  yield n)",
+        "(do\n  n <- [1  2  3  4  5]\n  where n % 2 == 0\n  yield n)",
         &["2", "4"],
     );
 }
 
 #[test]
 fn comprehension_map() {
-    assert_show_set("(do\n  n <- [1 2 3]\n  yield (n * n))", &["1", "4", "9"]);
+    assert_show_set("(do\n  n <- [1  2  3]\n  yield (n * n))", &["1", "4", "9"]);
 }
 
 #[test]
 fn comprehension_join() {
     assert_show_set(
-        "(do\n  a <- [1 2]\n  b <- [10 20]\n  yield (a + b))",
+        "(do\n  a <- [1  2]\n  b <- [10  20]\n  yield (a + b))",
         &["11", "21", "12", "22"],
     );
 }

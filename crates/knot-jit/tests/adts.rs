@@ -77,7 +77,7 @@ fn adt_equality() {
 #[test]
 fn adt_in_relation() {
     assert_show_set(
-        "[(Maybe.Just {value 1}) (Maybe.Nothing {}) (Maybe.Just {value 2})]",
+        "[(Maybe.Just {value 1})  (Maybe.Nothing {})  (Maybe.Just {value 2})]",
         &["Just {value 1}", "Nothing", "Just {value 2}"],
     );
 }
@@ -87,7 +87,7 @@ fn match_filters_constructor() {
     // base.match keeps only rows of the given constructor, returning payloads.
     assert_show_set(
         "with {\nEvt  Click {x (Int 1)}  Key {code (Int 1)}\n}\n\
-         (base.match Evt.Click [(Evt.Click {x 1}) (Evt.Key {code 9}) (Evt.Click {x 2})])",
+         (base.match Evt.Click [(Evt.Click {x 1})  (Evt.Key {code 9})  (Evt.Click {x 2})])",
         &["{x 1}", "{x 2}"],
     );
 }

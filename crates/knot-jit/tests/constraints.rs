@@ -14,7 +14,7 @@ Rel {customer Text amount (Int 1)}  *orders
 *orders.customer <= *people.name
 }
 (do
-  full *people = [{name "Alice" age 30 email "a@x"} {name "Bob" age 25 email "b@x"}]
+  full *people = [{name "Alice" age 30 email "a@x"}  {name "Bob" age 25 email "b@x"}]
   full *orders = [{customer "Alice" amount 100}]
   base.println (base.show (base.count *orders))
   yield {})"#,
@@ -66,7 +66,7 @@ Rel Person  *people
 *people <= *people.email
 }
 (do
-  full *people = [{name "A" email "dup@x"} {name "B" email "dup@x"}]
+  full *people = [{name "A" email "dup@x"}  {name "B" email "dup@x"}]
   base.println "wrote"
   yield {})"#,
         dir.path(),

@@ -22,7 +22,7 @@ fn record_show() {
 
 #[test]
 fn relation_map() {
-    assert_show("base.map (\\n -> n * 2) [1 2 3]", "[2, 4, 6]");
+    assert_show("base.map (\\n -> n * 2) [1  2  3]", "[2, 4, 6]");
 }
 
 #[test]

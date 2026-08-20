@@ -7,8 +7,8 @@ Rel {name Text members (Rel Person)}  *teams
 }
 (do
   full *teams = [
-    { name "Engineering" members [{ name "Alice" age 30 } { name "Bob" age 25 } { name "Eve" age 22 }] } 
-    { name "Design" members [{ name "Carol" age 35 } { name "Eve" age 22 }] }
+    { name "Engineering" members [{ name "Alice" age 30 }  { name "Bob" age 25 }  { name "Eve" age 22 }] } 
+    { name "Design" members [{ name "Carol" age 35 }  { name "Eve" age 22 }] }
   ]
 
   -- Read nested members: bind the team, then bind its members field.

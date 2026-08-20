@@ -291,7 +291,7 @@ seedTeams (do
     } 
     {
       name "Customer Success"
-      members [{name "Iris Patel" role "Lead"} {name "Pat Young" role "Senior"}]
+      members [{name "Iris Patel" role "Lead"}  {name "Pat Young" role "Senior"}]
     }
   ]
   yield {})

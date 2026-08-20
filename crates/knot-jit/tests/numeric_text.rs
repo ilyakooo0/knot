@@ -84,21 +84,21 @@ fn trim_full_unicode() {
 #[test]
 fn distinct_dedups() {
     // distinct preserves first-occurrence order (does not sort)
-    assert_show("base.distinct [3 1 3 2 1]", "[3, 1, 2]");
-    assert_show("base.distinct [1 1 1]", "[1]");
+    assert_show("base.distinct [3  1  3  2  1]", "[3, 1, 2]");
+    assert_show("base.distinct [1  1  1]", "[1]");
     assert_show("base.distinct []", "[]");
 }
 
 #[test]
 fn sort_by_desc() {
-    assert_show("base.sortByDesc (\\x -> x) [1 3 2]", "[3, 2, 1]");
+    assert_show("base.sortByDesc (\\x -> x) [1  3  2]", "[3, 2, 1]");
 }
 
 #[test]
 fn upsert_by_replaces_or_appends() {
     // replace matching
     assert_show(
-        "base.upsertBy (\\r -> r.id == 1) {id 1 v 99} [{id 1 v 5} {id 2 v 6}]",
+        "base.upsertBy (\\r -> r.id == 1) {id 1 v 99} [{id 1 v 5}  {id 2 v 6}]",
         "[{id 1 v 99}, {id 2 v 6}]",
     );
     // append when no match
@@ -112,18 +112,18 @@ fn upsert_by_replaces_or_appends() {
 fn single_maybe() {
     assert_show("base.single [42]", "Just {value 42}");
     assert_show("base.single []", "Nothing");
-    assert_show("base.single [1 2]", "Nothing"); // more than one
+    assert_show("base.single [1  2]", "Nothing"); // more than one
 }
 
 #[test]
 fn elem_membership() {
-    assert_show("base.elem 2 [1 2 3]", "True");
-    assert_show("base.elem 9 [1 2 3]", "False");
+    assert_show("base.elem 2 [1  2  3]", "True");
+    assert_show("base.elem 9 [1  2  3]", "False");
 }
 
 #[test]
 fn count_where() {
-    assert_show("base.countWhere (\\x -> x > 2) [1 2 3 4]", "2");
+    assert_show("base.countWhere (\\x -> x > 2) [1  2  3  4]", "2");
 }
 
 // ── Record / misc ──────────────────────────────────────────────────────────

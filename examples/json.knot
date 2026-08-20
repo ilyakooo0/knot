@@ -9,7 +9,7 @@
   base.println (base.toJson { name "Alice" age 30 })
 
   -- Encode a relation (becomes JSON array)
-  with { nums [{ x 1 } { x 2 } { x 3 }] } (do
+  with { nums [{ x 1 }  { x 2 }  { x 3 }] } (do
     base.println (base.toJson nums)
 
     -- Round-trip: encode then decode. parseJson returns `Maybe a` so malformed

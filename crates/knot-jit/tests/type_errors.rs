@@ -92,7 +92,7 @@ fn cross_scope_shadowing() {
 #[test]
 fn unit_mismatch() {
     assert_compile_err(
-        "with { unit Ms unit Usd } ((the (Int Ms) 100) + (the (Int Usd) 50))",
+        "with {  unit Ms  unit Usd } ((the (Int Ms) 100) + (the (Int Usd) 50))",
         "",
     );
 }

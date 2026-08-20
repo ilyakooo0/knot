@@ -1,7 +1,7 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 with {
-Sale  {item Text qty (Int 1) price (Int 1)}
+Sale  {item Text  qty (Int 1)  price (Int 1)}
 Rel Sale  *sales
 }
 (main)

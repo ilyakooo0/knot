@@ -46,16 +46,15 @@ fn custom_adt() {
 #[test]
 fn custom_adt_payload() {
     assert_show(
-        "with {\nShape  Circle {radius (Int 1)}  Rect {w (Int 1) h (Int 1)}\n}\n(Shape.Rect {w 3 h 4})",
-        "Rect {h 4 w 3}",
+        "with {\nShape  Circle {radius (Int 1)}  Rect {w (Int 1)  h (Int 1)}\n}\n(Shape.Rect {w 3  h 4})",
+        "Rect {h 4  w 3}",
     );
 }
 
 #[test]
 fn case_on_custom_adt() {
     assert_show(
-        "with {\nShape  Circle {radius (Int 1)}  Rect {w (Int 1) h (Int 1)}\n}\n\
-         (case Shape.Rect {w 3 h 4} of\n  Shape.Circle {radius r} -> r * r\n  Shape.Rect {w ww h hh} -> ww * hh)",
+        "with {\nShape  Circle {radius (Int 1)}  Rect {w (Int 1)  h (Int 1)}\n}\n(case Shape.Rect {w 3  h 4} of\n  Shape.Circle {radius r} -> r * r\n  Shape.Rect {w ww  h hh} -> ww * hh)",
         "12",
     );
 }

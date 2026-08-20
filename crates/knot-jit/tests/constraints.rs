@@ -8,14 +8,14 @@ fn subset_constraint_accepts_valid() {
     assert_stdout(
         "subset_ok",
         r#"with {
-Person  {name Text age (Int 1) email Text}
+Person  {name Text  age (Int 1)  email Text}
 Rel Person  *people
-Rel {customer Text amount (Int 1)}  *orders
+Rel {customer Text  amount (Int 1)}  *orders
 *orders.customer <= *people.name
 }
 (do
-  full *people = [{name "Alice" age 30 email "a@x"}  {name "Bob" age 25 email "b@x"}]
-  full *orders = [{customer "Alice" amount 100}]
+  full *people = [{name "Alice"  age 30  email "a@x"}  {name "Bob"  age 25  email "b@x"}]
+  full *orders = [{customer "Alice"  amount 100}]
   base.println (base.show (base.count *orders))
   yield {})"#,
         "\"1\"\n{}",
@@ -29,14 +29,14 @@ fn subset_constraint_rejects_orphan() {
     e2e::build_in_dir(
         "subset_orphan",
         r#"with {
-Person  {name Text age (Int 1) email Text}
+Person  {name Text  age (Int 1)  email Text}
 Rel Person  *people
-Rel {customer Text amount (Int 1)}  *orders
+Rel {customer Text  amount (Int 1)}  *orders
 *orders.customer <= *people.name
 }
 (do
-  full *people = [{name "Alice" age 30 email "a@x"}]
-  full *orders = [{customer "Nobody" amount 100}]
+  full *people = [{name "Alice"  age 30  email "a@x"}]
+  full *orders = [{customer "Nobody"  amount 100}]
   base.println "wrote"
   yield {})"#,
         dir.path(),
@@ -61,12 +61,12 @@ fn uniqueness_constraint_rejects_duplicate() {
     e2e::build_in_dir(
         "subset_uniq",
         r#"with {
-Person  {name Text email Text}
+Person  {name Text  email Text}
 Rel Person  *people
 *people <= *people.email
 }
 (do
-  full *people = [{name "A" email "dup@x"}  {name "B" email "dup@x"}]
+  full *people = [{name "A"  email "dup@x"}  {name "B"  email "dup@x"}]
   base.println "wrote"
   yield {})"#,
         dir.path(),

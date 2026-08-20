@@ -76,7 +76,7 @@ fn bytes_from_hex() {
 #[test]
 fn tojson_nested_records_and_lists() {
     assert_show(
-        "base.toJson {a [1  2] b {c \"x\"}}",
+        "base.toJson {a [1  2]  b {c \"x\"}}",
         "{\"a\":[1,2],\"b\":{\"c\":\"x\"}}",
     );
 }

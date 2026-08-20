@@ -10,21 +10,21 @@ fn persisted_relation_groupby() {
     assert_stdout(
         "groupby",
         r#"with {
-Todo  {owner Text done (Int 1)}
+Todo  {owner Text  done (Int 1)}
 Rel Todo  *todos
 }
 (do
-  full *todos = [{owner "x" done 0}  {owner "x" done 1}  {owner "y" done 0}]
+  full *todos = [{owner "x"  done 0}  {owner "x"  done 1}  {owner "y"  done 0}]
   groups <- (do
     t <- *todos
     where t.done == 0
     groupBy {owner t.owner}
-    yield {owner t.owner count (base.count t)})
+    yield {owner t.owner  count (base.count t)})
   base.println (base.show groups)
   yield {})"#,
         // Set semantics: identical rows are deduped on write (INSERT OR
         // IGNORE), so distinct open rows only. owners x and y each have 1.
-        "\"[{count 1 owner x}, {count 1 owner y}]\"\n{}",
+        "\"[{count 1  owner x}, {count 1  owner y}]\"\n{}",
     );
 }
 
@@ -132,11 +132,11 @@ fn atomic_transfer() {
     assert_stdout(
         "atomic",
         r#"with {
-Account  {name Text balance (Int 1)}
+Account  {name Text  balance (Int 1)}
 Rel Account  *accounts
 }
 (do
-  full *accounts = [{name "from" balance 100}  {name "to" balance 0}]
+  full *accounts = [{name "from"  balance 100}  {name "to"  balance 0}]
   _ <- atomic do
     rows <- *accounts
     *accounts = base.map (\a ->
@@ -148,6 +148,6 @@ Rel Account  *accounts
     yield {}
   base.println (base.show *accounts)
   yield {})"#,
-        "\"[{balance 60 name from}, {balance 40 name to}]\"\n{}",
+        "\"[{balance 60  name from}, {balance 40  name to}]\"\n{}",
     );
 }

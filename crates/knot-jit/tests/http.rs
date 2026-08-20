@@ -87,7 +87,7 @@ fn http_hello_world() {
         "http_hello",
         r#"with {
 api Api where
-  Root get / -> Text
+  Root  get / -> Text
 }
 (base.listen 18081 (serve Api where
   Root = \{} -> yield (Result.Ok {value "hi there"})))"#,
@@ -102,7 +102,7 @@ fn http_path_param() {
         "http_param",
         r#"with {
 api Api where
-  GetUser get /users/{id (Int 1)} -> Text
+  GetUser  get /users/{id (Int 1)} -> Text
 }
 (base.listen 18082 (serve Api where
   GetUser = \{id id} -> yield (Result.Ok {value ("user " ++ base.show id)})))"#,
@@ -117,7 +117,7 @@ fn http_unmatched_route_404() {
         "http_404",
         r#"with {
 api Api where
-  Root get / -> Text
+  Root  get / -> Text
 }
 (base.listen 18083 (serve Api where
   Root = \{} -> yield (Result.Ok {value "root"})))"#,
@@ -132,10 +132,10 @@ fn http_json_body() {
         "http_json",
         r#"with {
 api Api where
-  CreateUser post /users ={name Text age (Int 1)} -> Text
+  CreateUser  post /users ={name Text  age (Int 1)} -> Text
 }
 (base.listen 18084 (serve Api where
-  CreateUser = \{name name age age} -> yield (Result.Ok {value ("created " ++ name)})))"#,
+  CreateUser = \{name name  age age} -> yield (Result.Ok {value ("created " ++ name)})))"#,
         18084,
         |base| {
             assert_eq!(
@@ -152,10 +152,10 @@ fn http_result_err_sets_status() {
         "http_err",
         r#"with {
 api Api where
-  Find get /thing -> Text
+  Find  get /thing -> Text
 }
 (base.listen 18086 (serve Api where
-  Find = \{} -> yield (Result.Err {error {status 404 message "no such thing"}})))"#,
+  Find = \{} -> yield (Result.Err {error {status 404  message "no such thing"}})))"#,
         18086,
         |base| {
             assert_eq!(status(base, "/thing"), "404");

@@ -2,7 +2,7 @@
 -- folds the arithmetic into the aggregate, emitting a single
 -- `SELECT SUM(<arith>) FROM <table>` instead of shipping every row.
 with {
-Line  {product Text price (Int 1) qty (Int 1)}
+Line  {product Text  price (Int 1)  qty (Int 1)}
 
 Rel Line  *lines
 
@@ -17,7 +17,7 @@ avgDemo (do
 }
 
 do
-  full *lines = [{product "widget" price 5 qty 2}  {product "gadget" price 9 qty 1}  {product "gizmo" price 5 qty 3}]
+  full *lines = [{product "widget"  price 5  qty 2}  {product "gadget"  price 9  qty 1}  {product "gizmo"  price 5  qty 3}]
   totalDemo
   avgDemo
   yield {}

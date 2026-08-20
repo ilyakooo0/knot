@@ -11,11 +11,11 @@
   base.println (base.bytesToHex (base.hash "abc"))
 
   -- Records: equal records hash equal
-  base.println (base.bytesToHex (base.hash { x 1 y 2 }))
-  base.println (base.bytesToHex (base.hash { x 1 y 2 }))
+  base.println (base.bytesToHex (base.hash {  x 1  y 2 }))
+  base.println (base.bytesToHex (base.hash {  x 1  y 2 }))
 
   -- Different records hash differently
-  base.println (base.bytesToHex (base.hash { x 1 y 3 }))
+  base.println (base.bytesToHex (base.hash {  x 1  y 3 }))
 
   -- Numbers, booleans, lists also work
   base.println (base.bytesToHex (base.hash 42))

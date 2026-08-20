@@ -1,6 +1,6 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 with {
-Rel {manager Text report Text}  *manages
+Rel {manager Text  report Text}  *manages
 }
 (main)

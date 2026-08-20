@@ -121,8 +121,8 @@ fn implicit_field_ambiguous_rejected() {
 #[test]
 fn forall_rank2() {
     assert_show(
-        "with {\napplyTwice (\\(the ((forall a. a -> a)) f) -> {asText (f \"text\") asInt (f 42)})\n}\n(applyTwice (\\y -> y))",
-        "{asInt 42 asText text}",
+        "with {\napplyTwice (\\(the ((forall a. a -> a)) f) -> {asText (f \"text\")  asInt (f 42)})\n}\n(applyTwice (\\y -> y))",
+        "{asInt 42  asText text}",
     );
 }
 
@@ -140,8 +140,8 @@ fn lambda_param_type_prefix() {
 fn lambda_param_type_prefix_forall() {
     // The prefix form also carries a `forall` type.
     assert_show(
-        "with {\napplyTwice (\\((forall a. a -> a)  f) -> {asText (f \"text\") asInt (f 42)})\n}\n(base.show (applyTwice (\\y -> y)))",
-        "{asInt 42 asText text}",
+        "with {\napplyTwice (\\((forall a. a -> a)  f) -> {asText (f \"text\")  asInt (f 42)})\n}\n(base.show (applyTwice (\\y -> y)))",
+        "{asInt 42  asText text}",
     );
 }
 

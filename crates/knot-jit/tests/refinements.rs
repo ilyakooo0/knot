@@ -11,10 +11,7 @@ use harness::assert_show;
 #[test]
 fn refine_accepts_valid() {
     assert_show(
-        "with { Nat  Int 1 where \\x -> x >= 0}
-         (case refine (the (Int 1) 5) of
-            Result.Ok {value n} -> n
-            Result.Err {error _} -> (0 - 1))",
+        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (case refine (the (Int 1) 5) of\n            Result.Ok {value n} -> n\n            Result.Err {error _} -> (0 - 1))",
         "5",
     );
 }
@@ -22,10 +19,7 @@ fn refine_accepts_valid() {
 #[test]
 fn refine_rejects_invalid() {
     assert_show(
-        "with { Nat  Int 1 where \\x -> x >= 0}
-         (case refine (the (Int 1) (0 - 3)) of
-            Result.Ok {value n} -> 1
-            Result.Err {error _} -> 0)",
+        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (case refine (the (Int 1) (0 - 3)) of\n            Result.Ok {value n} -> 1\n            Result.Err {error _} -> 0)",
         "0",
     );
 }
@@ -40,7 +34,7 @@ fn refine_per_field_record() {
         "refine_field_ok",
         r#"with {
 VP  {age (Int 1 where \x -> x >= 0 && x <= 150)}
-{age (Int 1)} -> Result {typeName Text violations (Rel {field (Maybe Text) message Text})} VP  asVP
+{age (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} VP  asVP
 asVP (\r -> refine r)
 }
 (case asVP {age 30} of
@@ -52,7 +46,7 @@ asVP (\r -> refine r)
         "refine_field_bad",
         r#"with {
 VP  {age (Int 1 where \x -> x >= 0 && x <= 150)}
-{age (Int 1)} -> Result {typeName Text violations (Rel {field (Maybe Text) message Text})} VP  asVP
+{age (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} VP  asVP
 asVP (\r -> refine r)
 }
 (case asVP {age 200} of
@@ -68,15 +62,15 @@ fn refine_cross_field() {
     assert_stdout(
         "refine_cross",
         r#"with {
-R  {lo (Int 1) hi (Int 1)} where \r -> r.lo <= r.hi
-{lo (Int 1) hi (Int 1)} -> Result {typeName Text violations (Rel {field (Maybe Text) message Text})} R  asR
+R  {lo (Int 1)  hi (Int 1)} where \r ->  r.lo <=  r.hi
+{lo (Int 1)  hi (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} R  asR
 asR (\r -> refine r)
 }
 (do
-  (case asR {lo 5 hi 2} of
+  (case asR {lo 5  hi 2} of
     Result.Ok {value _} -> base.println "ok"
     Result.Err {error _} -> base.println "bad")
-  (case asR {lo 1 hi 9} of
+  (case asR {lo 1  hi 9} of
     Result.Ok {value _} -> base.println "ok"
     Result.Err {error _} -> base.println "bad")
   yield {})"#,
@@ -94,11 +88,11 @@ fn write_validation_rejects_violation() {
     e2e::build_in_dir(
         "refine_write",
         r#"with {
-Nat  Int 1 where \x -> x >= 0
-Rel {name Text age Nat}  *people
+Nat  Int 1 where \x ->  x >= 0
+Rel {name Text  age Nat}  *people
 }
 (do
-  full *people = [{name "a" age (0 - 5)}]
+  full *people = [{name "a"  age (0 - 5)}]
   base.println "wrote"
   yield {})"#,
         dir.path(),
@@ -121,11 +115,11 @@ fn write_validation_accepts_valid() {
     assert_stdout(
         "refine_ok",
         r#"with {
-Nat  Int 1 where \x -> x >= 0
-Rel {name Text age Nat}  *people
+Nat  Int 1 where \x ->  x >= 0
+Rel {name Text  age Nat}  *people
 }
 (do
-  full *people = [{name "a" age 30}]
+  full *people = [{name "a"  age 30}]
   base.println (base.show (base.count *people))
   yield {})"#,
         "\"1\"\n{}",

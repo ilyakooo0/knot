@@ -98,13 +98,13 @@ fn sort_by_desc() {
 fn upsert_by_replaces_or_appends() {
     // replace matching
     assert_show(
-        "base.upsertBy (\\r -> r.id == 1) {id 1 v 99} [{id 1 v 5}  {id 2 v 6}]",
-        "[{id 1 v 99}, {id 2 v 6}]",
+        "base.upsertBy (\\r -> r.id == 1) {id 1  v 99} [{id 1  v 5}  {id 2  v 6}]",
+        "[{id 1  v 99}, {id 2  v 6}]",
     );
     // append when no match
     assert_show(
-        "base.upsertBy (\\r -> r.id == 9) {id 9 v 0} [{id 1 v 5}]",
-        "[{id 1 v 5}, {id 9 v 0}]",
+        "base.upsertBy (\\r -> r.id == 9) {id 9  v 0} [{id 1  v 5}]",
+        "[{id 1  v 5}, {id 9  v 0}]",
     );
 }
 
@@ -131,7 +131,7 @@ fn count_where() {
 #[test]
 fn unify_right_biased() {
     // right-biased record merge
-    assert_show("base.unify {a 1 b 2} {b 99 c 3}", "{a 1 b 99 c 3}");
+    assert_show("base.unify {a 1  b 2} {b 99  c 3}", "{a 1  b 99  c 3}");
 }
 
 #[test]

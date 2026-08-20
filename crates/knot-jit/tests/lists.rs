@@ -10,7 +10,7 @@ fn nil_and_cons() {
     assert_show("base.list.nil {}", "Nil");
     assert_show(
         "base.list.cons 1 (base.list.nil {})",
-        "Cons {head 1 tail Nil}",
+        "Cons {head 1  tail Nil}",
     );
 }
 
@@ -18,7 +18,7 @@ fn nil_and_cons() {
 fn cons_chain() {
     assert_show(
         "base.list.cons 1 (base.list.cons 2 (base.list.nil {}))",
-        "Cons {head 1 tail Cons {head 2 tail Nil}}",
+        "Cons {head 1  tail Cons {head 2  tail Nil}}",
     );
 }
 
@@ -45,7 +45,7 @@ fn tail() {
     // tail returns a Maybe (Nothing on empty, Just <list> otherwise).
     assert_show(
         "base.list.tail (base.list.cons 1 (base.list.cons 2 (base.list.nil {})))",
-        "Just {value Cons {head 2 tail Nil}}",
+        "Just {value Cons {head 2  tail Nil}}",
     );
     assert_show("base.list.tail (base.list.nil {})", "Nothing");
 }
@@ -63,7 +63,7 @@ fn length() {
 fn map() {
     assert_show(
         "base.list.map (\\n -> n * 2) (base.list.cons 1 (base.list.cons 2 (base.list.nil {})))",
-        "Cons {head 2 tail Cons {head 4 tail Nil}}",
+        "Cons {head 2  tail Cons {head 4  tail Nil}}",
     );
 }
 
@@ -71,7 +71,7 @@ fn map() {
 fn filter() {
     assert_show(
         "base.list.filter (\\n -> n > 1) (base.list.cons 1 (base.list.cons 2 (base.list.cons 3 (base.list.nil {}))))",
-        "Cons {head 2 tail Cons {head 3 tail Nil}}",
+        "Cons {head 2  tail Cons {head 3  tail Nil}}",
     );
 }
 
@@ -87,7 +87,7 @@ fn fold() {
 fn reverse() {
     assert_show(
         "base.list.reverse (base.list.cons 1 (base.list.cons 2 (base.list.cons 3 (base.list.nil {}))))",
-        "Cons {head 3 tail Cons {head 2 tail Cons {head 1 tail Nil}}}",
+        "Cons {head 3  tail Cons {head 2  tail Cons {head 1  tail Nil}}}",
     );
 }
 
@@ -95,7 +95,7 @@ fn reverse() {
 fn append() {
     assert_show(
         "base.list.append (base.list.cons 1 (base.list.nil {})) (base.list.cons 2 (base.list.nil {}))",
-        "Cons {head 1 tail Cons {head 2 tail Nil}}",
+        "Cons {head 1  tail Cons {head 2  tail Nil}}",
     );
 }
 

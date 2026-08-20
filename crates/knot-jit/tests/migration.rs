@@ -47,9 +47,9 @@ Rel PersonV1  *people
         r#"with {
 Active  Yes {}  No {}
 PersonV1  {name Text}
-PersonV2  {name Text active Active}
+PersonV2  {name Text  active Active}
 Rel PersonV2  *people
-  migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
+  migrate  from PersonV1  to PersonV2  using \p -> {name p.name  active (Active.Yes {})}
 }
 (do
   base.println (base.show (base.count *people))
@@ -84,9 +84,9 @@ Rel PersonV1  *people
         r#"with {
 Active  Yes {}  No {}
 PersonV1  {name Text}
-PersonV2  {name Text active Active}
+PersonV2  {name Text  active Active}
 Rel PersonV2  *people
-  migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
+  migrate  from PersonV1  to PersonV2  using \p -> {name p.name  active (Active.Yes {})}
 }
 (do
   people <- *people
@@ -94,7 +94,7 @@ Rel PersonV2  *people
   yield {})"#,
     );
     // Fixed: the migrated ADT field renders its constructor.
-    assert_eq!(out, "\"[{active Yes name Alice}]\"\n{}");
+    assert_eq!(out, "\"[{active Yes  name Alice}]\"\n{}");
 }
 
 #[test]
@@ -110,12 +110,12 @@ fn migrate_lockfile_roundtrip() {
     let src = r#"with {
 Active  Yes {}  No {}
 PersonV1  {name Text}
-PersonV2  {name Text active Active}
+PersonV2  {name Text  active Active}
 Rel PersonV2  *people
-  migrate from PersonV1 to PersonV2 using \p -> {name p.name active (Active.Yes {})}
+  migrate  from PersonV1  to PersonV2  using \p -> {name p.name  active (Active.Yes {})}
 }
 (do
-  full *people = [{name "A" active (Active.No {})}]
+  full *people = [{name "A"  active (Active.No {})}]
   base.println (base.show (base.count *people))
   yield {})"#;
     build_and_run(&dir, "mig_lock", src);

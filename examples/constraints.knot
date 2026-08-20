@@ -1,22 +1,22 @@
 -- Example: subset constraints
 with {
-Person  {name Text age (Int 1) email Text}
+Person  {name Text  age (Int 1)  email Text}
 
 Rel Person  *people
-Rel {customer Text amount (Int 1)}  *orders
+Rel {customer Text  amount (Int 1)}  *orders
 
--- Referential integrity every order's customer must be a person's name
+-- Referential  integrity every  order's customer  must be  a person's  name
 *orders.customer <= *people.name
 
--- Uniqueness email uniquely identifies a person
+-- Uniqueness  email uniquely  identifies a  person
 *people <= *people.email
 }
 (do
   -- Insert some people
-  full *people = [{ name "Alice" age 30 email "alice@example.com" }  { name "Bob" age 25 email "bob@example.com" }]
+  full *people = [{  name "Alice"  age 30  email "alice@example.com" }  {  name "Bob"  age 25  email "bob@example.com" }]
 
   -- Insert a valid order (Alice exists in people)
-  full *orders = [{ customer "Alice" amount 100 }]
+  full *orders = [{  customer "Alice"  amount 100 }]
 
   -- Print current state
   base.println "People:"

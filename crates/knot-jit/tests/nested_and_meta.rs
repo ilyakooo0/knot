@@ -9,15 +9,15 @@ use harness::{assert_show, assert_show_set};
 #[test]
 fn nested_relation_construction() {
     assert_show(
-        "{team \"eng\" members [{name \"a\"}]}",
-        "{members [{name a}] team eng}",
+        "{team \"eng\"  members [{name \"a\"}]}",
+        "{members [{name a}]  team eng}",
     );
 }
 
 #[test]
 fn nested_relation_count() {
     assert_show(
-        "base.count {team \"eng\" members [{name \"a\"}  {name \"b\"}]}.members",
+        "base.count {team \"eng\"  members [{name \"a\"}  {name \"b\"}]}.members",
         "2",
     );
 }
@@ -67,7 +67,7 @@ fn extract_scalar() {
 #[test]
 fn extract_record() {
     // extract produces evaluable knot source: records use space separators.
-    assert_show("base.extract {x 1 y 2}", "{x 1 y 2}");
+    assert_show("base.extract {x 1  y 2}", "{x 1  y 2}");
 }
 
 #[test]

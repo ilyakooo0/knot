@@ -5,18 +5,18 @@ Priority  Low {}  Medium {}  High {}  Critical {}
 Status  Open {}  InProgress {assignee Text}  Done {}  Blocked {reason Text}
 Department  Engineering {}  Design {}  Marketing {}  Sales {}  Support {}
 Active  Yes {}  No {}
-Employee  {name Text age (Int 1) salary (Float 1) dept Department active Active}
-Project  {name Text lead Text budget (Float 1) priority Priority}
-Ticket  {title Text project Text status Status priority Priority points (Int 1)}
-Customer  {name Text email Text tier Tier}
+Employee  {name Text  age (Int 1)  salary (Float 1)  dept Department  active Active}
+Project  {name Text  lead Text  budget (Float 1)  priority Priority}
+Ticket  {title Text  project Text  status Status  priority Priority  points (Int 1)}
+Customer  {name Text  email Text  tier Tier}
 Tier  Free {}  Pro {}  Enterprise {}
-Order  {customer Text product Text quantity (Int 1) total (Float 1)}
-Product  {name Text price (Float 1) category Category inStock Active}
+Order  {customer Text  product Text  quantity (Int 1)  total (Float 1)}
+Product  {name Text  price (Float 1)  category Category  inStock Active}
 Category  Electronics {}  Books {}  Clothing {}  Food {}  Software {}
-Team  {name Text members (Rel {name Text role Text})}
-LogEntry  {timestamp (Int 1) level Level message Text source Text}
+Team  {name Text  members (Rel {name Text  role Text})}
+LogEntry  {timestamp (Int 1)  level Level  message Text  source Text}
 Level  Debug {}  Info {}  Warn {}  Error {}
-Metric  {name Text value (Float 1) tags Text}
+Metric  {name Text  value (Float 1)  tags Text}
 Rel Employee  *employees
 Rel Project  *projects
 Rel Ticket  *tickets

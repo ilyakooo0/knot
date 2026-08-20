@@ -2666,6 +2666,26 @@ impl Parser {
                 sig,
                 doc: pending_doc.take(),
             });
+            // Plain value fields are GAP-separated: the next field must follow a
+            // gap (2+ spaces) or a newline. A single space stays inside the
+            // field (the name↔value separator). `{name "a"  age 30}`, not
+            // `{name "a" age 30}`. (Special fields above — type decls, routes,
+            // sources — `continue` before this point and are unaffected.)
+            let sep = self.save();
+            let sep_diag = self.diagnostics.len();
+            let on_newline = matches!(self.peek(), TokenKind::Newline);
+            self.skip_newlines();
+            if !self.at(&TokenKind::RBrace)
+                && !on_newline
+                && !self.at_layout_boundary()
+                && !self.gap_before_current()
+            {
+                self.restore(sep);
+                self.diagnostics.truncate(sep_diag);
+                self.error(
+                    "record fields are separated by a gap (2+ spaces): `{name \"a\"  age 30}`, not `{name \"a\" age 30}`",
+                );
+            }
         }
 
         // Leftover sigs name signature-only fields: `name : Type` with no
@@ -3844,6 +3864,22 @@ impl Parser {
                     name_span: fname_span,
                     pattern,
                 });
+                // Record-pattern fields are GAP-separated like record literals:
+                // the next field follows a gap (2+ spaces) or a newline.
+                let sep = self.save();
+                let sep_diag = self.diagnostics.len();
+                let on_newline = matches!(self.peek(), TokenKind::Newline);
+                self.skip_newlines();
+                if !self.at(&TokenKind::RBrace)
+                    && !on_newline
+                    && !self.gap_before_current()
+                {
+                    self.restore(sep);
+                    self.diagnostics.truncate(sep_diag);
+                    self.error(
+                        "record fields are separated by a gap (2+ spaces): `{name n  age a}`, not `{name n age a}`",
+                    );
+                }
             }
         }
         self.skip_newlines();
@@ -4345,7 +4381,25 @@ impl Parser {
                 name: fname,
                 value: ty,
             });
-            // No separator: the next field (if any) is the next lowercase ident.
+            // Fields are GAP-separated: the next field (a lowercase ident) must
+            // follow a gap (2+ spaces) or a newline. A single space stays inside
+            // the field (the name↔value separator), so `{name Text age Int 1}`
+            // errors — write `{name Text  age Int 1}`.
+            let sep = self.save();
+            let sep_diag = self.diagnostics.len();
+            let on_newline = matches!(self.peek(), TokenKind::Newline);
+            self.skip_newlines();
+            if !self.at(&TokenKind::RBrace)
+                && !self.at(&TokenKind::Pipe)
+                && !on_newline
+                && !self.gap_before_current()
+            {
+                self.restore(sep);
+                self.diagnostics.truncate(sep_diag);
+                self.error(
+                    "record fields are separated by a gap (2+ spaces): `{name Text  age Int 1}`, not `{name Text age Int 1}`",
+                );
+            }
         }
 
         self.skip_newlines();

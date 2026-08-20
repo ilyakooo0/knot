@@ -314,7 +314,7 @@ fn adt_field_missing_rejected() {
     assert_eq!(
         subsumes(
             "with {\nPriority  Low {}  High {}\nWrap  W {n (Int 1)}\n}\n(Wrap.W {n 7})",
-            "Wrap  W {n (Int 1) extra Text}\nWrap"
+            "Wrap  W {n (Int 1)  extra Text}\nWrap"
         ),
         Some(false)
     );

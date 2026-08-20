@@ -5,13 +5,13 @@
 -- then projects that field out of the lexically-innermost in-scope record.
 -- No trait decl, no impl, no constraint — the dictionary is just a value.
 with {
--- Two "Render dictionaries", one per type. (Field is named `render`, not
+-- Two "Render dictionaries",  one per  type. (Field is named `render`, not
 -- `show`: knot forbids shadowing, so a field may not reuse a stdlib name.)
 intRender {render (\n -> "int:" ++ base.show n)}
 textRender {render (\s -> "text:" ++ s)}
 
--- "Multiple constraints" is just a record with several fields.
-greeter {greet (\n -> "hi " ++ base.show n) farewell (\n -> "bye " ++ base.show n)}
+-- "Multiple constraints"  is just  a record with  several fields.
+greeter {greet (\n -> "hi " ++ base.show n)  farewell (\n -> "bye " ++ base.show n)}
 }
 (do
   -- `^render` resolves to whichever dictionary is lexically in scope.

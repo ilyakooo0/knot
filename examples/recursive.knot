@@ -1,17 +1,17 @@
 -- Query fields: read-only computed views over source relations.
 -- A `name <query>` field is recomputed on each access — never persisted.
 with {
-Rel {manager Text report Text}  *manages
+Rel {manager Text  report Text}  *manages
 
 directReports (do
   m <- *manages
-  yield {manager m.manager report m.report})
+  yield {manager m.manager  report m.report})
 }
 (do
   full *manages = [
-    {manager "Alice" report "Bob"}
-    {manager "Alice" report "Carol"}
-    {manager "Bob" report "Dave"}
+    {manager "Alice"  report "Bob"}
+    {manager "Alice"  report "Carol"}
+    {manager "Bob"  report "Dave"}
   ]
   base.println "Direct reports:"
   rows <- base.run directReports

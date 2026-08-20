@@ -6,12 +6,12 @@
 -- tests (`_stm_filter_tests` in knot-runtime). This program exists primarily
 -- as an end-to-end compile/run check on the codegen specialization path.
 with {
-Account  {id (Int 1) balance (Int 1)}
+Account  {id (Int 1)  balance (Int 1)}
 Rel Account  *accounts
 
--- The `single (filter (\a -> a.id == ?) rows)` pattern is what the codegen
--- recognizes as a `"id" = ?` simple equality; inside an atomic block the
--- runtime tracks this as a `Cols([(id, Eq, ?)])` read filter on accounts.
+-- The `single (filter (\a -> a.id == ?) rows)`  pattern is  what the  codegen
+--  recognizes as  a `"id" = ?`  simple equality;  inside an atomic  block the
+--  runtime tracks  this as  a `Cols([(id, Eq, ?)])`  read filter  on accounts.
 findById (\aid rows -> base.single (base.filter (\a -> a.id == aid) rows))
 
 setBalance (\aid newBalance rows -> do
@@ -25,11 +25,11 @@ credit (\aid amount -> atomic do
   -- The `single (filter ...)` lookup is what the runtime SQL pushdown turns
   -- into a `WHERE "id" = ?` query — codegen extracts the predicate and the
   -- runtime calls `knot_stm_track_read_pred` to register a row-level filter.
-  with { lookup (findById aid rows) }
+  with {  lookup (findById aid rows) }
     (*accounts = setBalance aid amount rows))
 }
 (do
-  full *accounts = [{id 1 balance 0}  {id 2 balance 0}  {id 3 balance 0}]
+  full *accounts = [{id 1  balance 0}  {id 2  balance 0}  {id 3  balance 0}]
   credit 1 100
   credit 2 50
   credit 3 25

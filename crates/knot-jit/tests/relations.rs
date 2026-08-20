@@ -24,16 +24,16 @@ fn scalar_relation() {
 #[test]
 fn record_relation() {
     assert_show_set(
-        "[{name \"Ada\" age 36}  {name \"Grace\" age 17}]",
-        &["{age 36 name Ada}", "{age 17 name Grace}"],
+        "[{name \"Ada\"  age 36}  {name \"Grace\"  age 17}]",
+        &["{age 36  name Ada}", "{age 17  name Grace}"],
     );
 }
 
 #[test]
 fn nested_relation_field() {
     assert_show(
-        "{team \"eng\" members [{name \"a\"}]}",
-        "{members [{name a}] team eng}",
+        "{team \"eng\"  members [{name \"a\"}]}",
+        "{members [{name a}]  team eng}",
     );
 }
 
@@ -114,7 +114,7 @@ fn min_on() {
     // minOn/maxOn return the bare projected key (b), NOT Maybe — and panic on
     // an empty relation (see the note at the bottom of this file).
     assert_show(
-        "base.minOn (\\p -> p.age) [{name \"a\" age 30}  {name \"b\" age 25}]",
+        "base.minOn (\\p -> p.age) [{name \"a\"  age 30}  {name \"b\"  age 25}]",
         "25",
     );
 }
@@ -122,7 +122,7 @@ fn min_on() {
 #[test]
 fn max_on_basic() {
     assert_show(
-        "base.maxOn (\\p -> p.age) [{name \"a\" age 30}  {name \"b\" age 25}]",
+        "base.maxOn (\\p -> p.age) [{name \"a\"  age 30}  {name \"b\"  age 25}]",
         "30",
     );
 }
@@ -194,8 +194,8 @@ fn head_findfirst() {
 #[test]
 fn sort_by() {
     assert_show(
-        "base.sortBy (\\p -> p.age) [{n \"a\" age 30}  {n \"b\" age 20}]",
-        "[{age 20 n b}, {age 30 n a}]",
+        "base.sortBy (\\p -> p.age) [{n \"a\"  age 30}  {n \"b\"  age 20}]",
+        "[{age 20  n b}, {age 30  n a}]",
     );
 }
 
@@ -227,42 +227,42 @@ fn reverse_text() {
 
 #[test]
 fn record_field_access() {
-    assert_show("{x 3 y 4}.x", "3");
+    assert_show("{x 3  y 4}.x", "3");
 }
 
 #[test]
 fn record_nested_access() {
-    assert_show("{addr {city \"London\" zip \"E1\"}}.addr.city", "London");
+    assert_show("{addr {city \"London\"  zip \"E1\"}}.addr.city", "London");
 }
 
 #[test]
 fn unify_replaces_field() {
-    assert_show("base.unify {x 3 y 4} {x 10}", "{x 10 y 4}");
+    assert_show("base.unify {x 3  y 4} {x 10}", "{x 10  y 4}");
 }
 
 #[test]
 fn unify_adds_field() {
-    assert_show("base.unify {x 3} {z 5}", "{x 3 z 5}");
+    assert_show("base.unify {x 3} {z 5}", "{x 3  z 5}");
 }
 
 #[test]
 fn unify_right_biased() {
-    assert_show("base.unify {a 1 b 2} {b 20 c 30}", "{a 1 b 20 c 30}");
+    assert_show("base.unify {a 1  b 2} {b 20  c 30}", "{a 1  b 20  c 30}");
 }
 
 #[test]
 fn upsert_replaces() {
     assert_show(
-        "base.upsertBy (\\c -> c.user == \"a\") {user \"a\" n 5} [{user \"a\" n 1}]",
-        "[{n 5 user a}]",
+        "base.upsertBy (\\c -> c.user == \"a\") {user \"a\"  n 5} [{user \"a\"  n 1}]",
+        "[{n 5  user a}]",
     );
 }
 
 #[test]
 fn upsert_inserts() {
     assert_show_set(
-        "base.upsertBy (\\c -> c.user == \"b\") {user \"b\" n 1} [{user \"a\" n 1}]",
-        &["{n 1 user a}", "{n 1 user b}"],
+        "base.upsertBy (\\c -> c.user == \"b\") {user \"b\"  n 1} [{user \"a\"  n 1}]",
+        &["{n 1  user a}", "{n 1  user b}"],
     );
 }
 

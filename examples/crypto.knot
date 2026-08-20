@@ -9,25 +9,25 @@
   -- Encrypt is Maybe — Nothing if the public key is unusable (wrong length or
   -- a low-order point). Keys often come from a peer, so this is a value to
   -- handle, not a crash.
-  with { message (base.textToBytes "Hello, cryptography!") } (do
+  with {  message (base.textToBytes "Hello, cryptography!") } (do
     encrypted <- base.encrypt keys.publicKey message
     case encrypted of
       Maybe.Nothing {} -> base.println "  Encryption failed: bad public key"
-      Maybe.Just { value ciphertext } -> do
+      Maybe.Just {  value ciphertext } -> do
         base.println ("  Ciphertext: " ++ base.bytesToHex ciphertext)
 
         -- Decrypt is Maybe too — Nothing on a wrong key or tampered ciphertext.
         case base.decrypt keys.privateKey ciphertext of
           Maybe.Nothing {} -> base.println "  Decryption failed: wrong key or tampered ciphertext"
-          Maybe.Just { value decrypted } -> case base.bytesToText decrypted of
+          Maybe.Just {  value decrypted } -> case base.bytesToText decrypted of
             Maybe.Just t -> base.println ("  Decrypted: " ++ t.value)
             Maybe.Nothing -> base.println "  Decrypted: <invalid utf-8>"
 
         -- Tampering with the ciphertext is caught by the authentication tag.
-        with { tampered (base.bytesConcat (base.bytesSlice 0 40 ciphertext) (base.textToBytes "XXXX")) } (do
+        with {  tampered (base.bytesConcat (base.bytesSlice 0 40 ciphertext) (base.textToBytes "XXXX")) } (do
           case base.decrypt keys.privateKey tampered of
             Maybe.Nothing {} -> base.println "  Tampered ciphertext rejected"
-            Maybe.Just { value _ } -> base.println "  BUG: tampered ciphertext decrypted"
+            Maybe.Just {  value _ } -> base.println "  BUG: tampered ciphertext decrypted"
           yield {})
 
     -- Signing key pair generation (Ed25519)
@@ -38,15 +38,15 @@
     -- Sign is Maybe — Nothing if the private key is not 32 bytes.
     case base.sign sigKeys.privateKey message of
       Maybe.Nothing {} -> base.println "  Signing failed: bad private key"
-      Maybe.Just { value sig } -> do
+      Maybe.Just {  value sig } -> do
         base.println ("  Signature: " ++ base.bytesToHex sig)
 
-        with { valid (base.verify sigKeys.publicKey message sig) } (do
+        with {  valid (base.verify sigKeys.publicKey message sig) } (do
           base.println ("  Valid: " ++ base.show valid)
 
           -- Verify with wrong message should fail
-          with { wrongMsg (base.textToBytes "Wrong message") } (do
-            with { invalid (base.verify sigKeys.publicKey wrongMsg sig) } (do
+          with {  wrongMsg (base.textToBytes "Wrong message") } (do
+            with {  invalid (base.verify sigKeys.publicKey wrongMsg sig) } (do
               base.println ("  Invalid (wrong msg): " ++ base.show invalid)
               yield {})))
 

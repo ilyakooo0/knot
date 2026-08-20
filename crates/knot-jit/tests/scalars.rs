@@ -185,7 +185,7 @@ fn json_scalars() {
 #[test]
 fn json_record() {
     assert_show(
-        "base.toJson {name \"a\" age 3}",
+        "base.toJson {name \"a\"  age 3}",
         "{\"age\":3,\"name\":\"a\"}",
     );
 }
@@ -222,7 +222,7 @@ fn unit_arithmetic_consistent() {
 fn unit_mismatch_rejected() {
     // Adding incompatible units is a compile error.
     assert_compile_err(
-        "with { unit Ms unit Usd } ((the (Int Ms) 100) + (the (Int Usd) 50))",
+        "with {  unit Ms  unit Usd } ((the (Int Ms) 100) + (the (Int Usd) 50))",
         "",
     );
 }
@@ -232,7 +232,7 @@ fn unit_mismatch_rejected() {
 #[test]
 fn show_nested_structure() {
     assert_show(
-        "{point {x 1 y 2} tags [\"a\"  \"b\"]}",
-        "{point {x 1 y 2} tags [a, b]}",
+        "{point {x 1  y 2}  tags [\"a\"  \"b\"]}",
+        "{point {x 1  y 2}  tags [a, b]}",
     );
 }

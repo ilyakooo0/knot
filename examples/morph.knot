@@ -22,27 +22,27 @@ intToText {Int 1 -> Text  into
 textToFloat {Text -> Float 1  into
              into (\s -> 2.5)}
 
--- The ambient conversion scope base.morph.<from-type>.<to-type>.into
-conv { morph {
-  text { int  { into textToInt.into }
-         float { into textToFloat.into } }
-  int  { text { into intToText.into } }
+-- The  ambient conversion  scope base.morph.<from-type>.<to-type>.into
+conv {  morph {
+  text {  int  {  into textToInt.into }
+         float {  into textToFloat.into } }
+  int  {  text {  into intToText.into } }
 } }
 
--- Argument-type-directed distinct source types. (These are annotated too,
+-- Argument-type-directed  distinct source  types. (These are annotated too,
 -- because `text.int` and `text.float` below share the Text source — an
 -- un-annotated Text `into` would be ambiguous. The annotation is what lets
 -- the result type pick.)
 Int 1  argInt
-argInt  (with conv ((^into) "hi"))   -- Text arg, wants Int 1
+argInt  (with conv ((^into) "hi"))   -- Text  arg, wants Int 1
 Text  argText
-argText (with conv ((^into) 41))     -- Int arg,  wants Text
+argText (with conv ((^into) 41))     -- Int  arg,  wants Text
 
--- Result-type-directed same source (Text), annotation picks the target.
+-- Result-type-directed  same source (Text),  annotation picks the  target.
 Int 1  asInt
-asInt   (with conv ((^into) "hi"))   -- wants Int 1   -> morph.text.int.into
+asInt   (with conv ((^into) "hi"))   --  wants Int 1   ->  morph.text.int.into
 Float 1  asFloat
-asFloat (with conv ((^into) "hi"))   -- wants Float 1 -> morph.text.float.into
+asFloat (with conv ((^into) "hi"))   --  wants Float 1 ->  morph.text.float.into
 }
 (do
   base.println (base.show argInt)    -- "2"   (length of "hi")

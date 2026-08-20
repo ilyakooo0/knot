@@ -1,7 +1,7 @@
 -- schema.lock (auto-generated, do not edit)
 -- Commit to source control.
 with {
-Todo  {title Text owner Text done (Int 1)}
+Todo  {title Text  owner Text  done (Int 1)}
 Rel Todo  *todos
 }
 (main)

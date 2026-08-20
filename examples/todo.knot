@@ -1,11 +1,11 @@
 with {
-Todo  {title Text owner Text done (Int 1)}
+Todo  {title Text  owner Text  done (Int 1)}
 
 Rel Todo  *todos
 
 add (\title owner -> do
   todos <- *todos
-  *todos = base.union todos [{title title owner owner done 0}])
+  *todos = base.union todos [{title title  owner owner  done 0}])
 
 complete (\title -> do
   todos <- *todos

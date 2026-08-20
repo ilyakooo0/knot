@@ -1,23 +1,23 @@
 with {
-Todo  {title Text owner Text done (Int 1)}
+Todo  {title Text  owner Text  done (Int 1)}
 
 Rel Todo  *todos
 }
 (do
   full *todos = [
-    { title "Write parser" owner "Alice" done 0 } 
-    { title "Write codegen" owner "Alice" done 0 } 
-    { title "Write runtime" owner "Bob" done 0 } 
-    { title "Fix bug" owner "Alice" done 1 } 
-    { title "Deploy" owner "Bob" done 1 }
+    {  title "Write parser"  owner "Alice"  done 0 } 
+    {  title "Write codegen"  owner "Alice"  done 0 } 
+    {  title "Write runtime"  owner "Bob"  done 0 } 
+    {  title "Fix bug"  owner "Alice"  done 1 } 
+    {  title "Deploy"  owner "Bob"  done 1 }
   ]
 
   -- Group pending todos by owner and count them
   workload <- (do
     t <- *todos
     where t.done == 0
-    groupBy { owner t.owner }
-    yield { owner t.owner count (base.count t) })
+    groupBy {  owner t.owner }
+    yield {  owner t.owner  count (base.count t) })
 
   base.println "Pending work per person:"
   w <- workload

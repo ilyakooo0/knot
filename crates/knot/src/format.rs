@@ -254,7 +254,7 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
             let mut s = String::from("{");
             for (i, f) in fields.iter().enumerate() {
                 if i > 0 {
-                    s.push(' ');
+                    s.push_str("  ");
                 }
                 s.push_str(&f.name);
                 s.push(' ');
@@ -995,7 +995,7 @@ fn render_record_inline(fields: &[RecordField]) -> String {
     let mut s = String::from("{");
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
-            s.push(' ');
+            s.push_str("  ");
         }
         // A type-constructor field renders as the bare embedded `type` alias
         // line — the field name is the alias name, so no separate `name value`.

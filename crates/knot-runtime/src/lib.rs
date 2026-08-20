@@ -8624,7 +8624,7 @@ fn extract_source(v: *mut Value) -> String {
                 .iter()
                 .map(|f| format!("{} {}", f.name, extract_source(f.value)))
                 .collect();
-            format!("{{{}}}", inner.join(" "))
+            format!("{{{}}}", inner.join("  "))
         }
         Value::Relation(rows) => {
             let inner: Vec<String> = rows.iter().map(|r| extract_source(*r)).collect();
@@ -8825,16 +8825,17 @@ pub extern "C-unwind" fn knot_value_show(v: *mut Value) -> *mut Value {
                     Value::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
                     Value::Unit => out.push_str("{}"),
                     Value::Record(fields) => {
-                        // {name v name v} — whitespace-separated, matching the
-                        // record-literal surface syntax. Push in reverse so
-                        // tasks pop in forward (source) order.
+                        // {name v  name v} — fields are GAP-separated (2+
+                        // spaces), matching the record-literal surface syntax so
+                        // the output round-trips as valid source. Push in
+                        // reverse so tasks pop in forward (source) order.
                         stack.push(Task::Lit("}".to_string()));
                         for (i, f) in fields.iter().enumerate().rev() {
                             stack.push(Task::Render(f.value));
                             let sep = if i == 0 {
                                 format!("{} ", f.name)
                             } else {
-                                format!(" {} ", f.name)
+                                format!("  {} ", f.name)
                             };
                             stack.push(Task::Lit(sep));
                         }
@@ -22971,7 +22972,7 @@ mod extract_source_tests {
     #[test]
     fn record_() {
         let r = record(&[("a", alloc_int(1)), ("b", text("x"))]);
-        assert_eq!(extract_source(r), "{a 1 b \"x\"}");
+        assert_eq!(extract_source(r), "{a 1  b \"x\"}");
     }
     #[test]
     fn record_nested() {

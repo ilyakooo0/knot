@@ -2895,12 +2895,14 @@ impl Parser {
     }
 
     fn parse_list_expr(&mut self, start: Span) -> Option<Expr> {
-        // Already consumed `[`. Elements are SPACE-separated (no commas), so
-        // each is parsed with `parse_postfix` — the same non-greedy parse used
-        // for record field values — so one element can't absorb the next as a
-        // function application. `[1 2 3]`, `[{x 1} {x 2}]`, and
-        // `[Just {value 1} Nothing {}]` all work; anything needing a binop or
-        // application must be parenthesized: `[(1 + 2) (f x)]`.
+        // Already consumed `[`. Elements are GAP-separated (2+ spaces, or one
+        // per line): `[1  2  3]`, `[{x 1}  {x 2}]`. A single space does NOT
+        // separate elements (it stays inside an element, e.g. `{name "a"}`), so
+        // `[1 2 3]` is invalid — elements must be gap-separated. Each element
+        // is parsed with `parse_postfix` (the same non-greedy parse used for
+        // record field values), so one element can't absorb the next as a
+        // function application; anything needing a binop or application must be
+        // parenthesized: `[(1 + 2)  (f x)]`.
         self.skip_newlines();
         let mut elems = Vec::new();
         loop {
@@ -2911,6 +2913,13 @@ impl Parser {
             let e = self.parse_postfix()?;
             elems.push(e);
             self.skip_newlines();
+            // The next element must follow a gap (2+ spaces); a newline already
+            // consumed by `skip_newlines` counts as a separator.
+            if !self.at(&TokenKind::RBracket) && !self.gap_before_current() {
+                self.error(
+                    "list elements are separated by a gap (2+ spaces): `[1  2  3]`, not `[1 2 3]`",
+                );
+            }
         }
         let end_tok = self
             .expect(&TokenKind::RBracket, "expected ']' to close list")

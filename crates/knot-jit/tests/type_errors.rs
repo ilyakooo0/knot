@@ -39,7 +39,7 @@ fn annotation_mismatch() {
 
 #[test]
 fn mixed_relation_literal() {
-    assert_compile_err("[1 \"two\"]", "");
+    assert_compile_err("[1  \"two\"]", "");
 }
 
 #[test]

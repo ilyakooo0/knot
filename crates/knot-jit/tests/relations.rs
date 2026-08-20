@@ -24,7 +24,7 @@ fn scalar_relation() {
 #[test]
 fn record_relation() {
     assert_show_set(
-        "[{name \"Ada\" age 36} {name \"Grace\" age 17}]",
+        "[{name \"Ada\" age 36}  {name \"Grace\" age 17}]",
         &["{age 36 name Ada}", "{age 17 name Grace}"],
     );
 }
@@ -114,7 +114,7 @@ fn min_on() {
     // minOn/maxOn return the bare projected key (b), NOT Maybe — and panic on
     // an empty relation (see the note at the bottom of this file).
     assert_show(
-        "base.minOn (\\p -> p.age) [{name \"a\" age 30} {name \"b\" age 25}]",
+        "base.minOn (\\p -> p.age) [{name \"a\" age 30}  {name \"b\" age 25}]",
         "25",
     );
 }
@@ -122,7 +122,7 @@ fn min_on() {
 #[test]
 fn max_on_basic() {
     assert_show(
-        "base.maxOn (\\p -> p.age) [{name \"a\" age 30} {name \"b\" age 25}]",
+        "base.maxOn (\\p -> p.age) [{name \"a\" age 30}  {name \"b\" age 25}]",
         "30",
     );
 }
@@ -194,7 +194,7 @@ fn head_findfirst() {
 #[test]
 fn sort_by() {
     assert_show(
-        "base.sortBy (\\p -> p.age) [{n \"a\" age 30} {n \"b\" age 20}]",
+        "base.sortBy (\\p -> p.age) [{n \"a\" age 30}  {n \"b\" age 20}]",
         "[{age 20 n b}, {age 30 n a}]",
     );
 }
@@ -293,7 +293,7 @@ fn comprehension_join() {
 
 #[test]
 fn mixed_type_relation_rejected() {
-    assert_compile_err("[1 \"two\"]", "");
+    assert_compile_err("[1  \"two\"]", "");
 }
 
 // ── minOn/maxOn on an empty relation (not asserted — aborts the process) ───

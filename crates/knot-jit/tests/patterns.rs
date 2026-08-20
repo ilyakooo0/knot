@@ -75,15 +75,7 @@ fn comprehension_cross_product() {
 fn comprehension_equi_join() {
     // join employees to departments on a shared key
     assert_show(
-        "with {
-           emps [{name \"a\" dept \"eng\"} {name \"b\" dept \"ops\"} {name \"c\" dept \"eng\"}]
-           depts [{dname \"eng\" floor 3} {dname \"ops\" floor 1}]
-         }
-         (base.sortBy (\\r -> r.name) (do
-            e <- emps
-            d <- depts
-            where e.dept == d.dname
-            yield {name e.name floor d.floor}))",
+        "with {\n           emps [{name \"a\" dept \"eng\"}  {name \"b\" dept \"ops\"}  {name \"c\" dept \"eng\"}]\n           depts [{dname \"eng\" floor 3}  {dname \"ops\" floor 1}]\n         }\n         (base.sortBy (\\r -> r.name) (do\n            e <- emps\n            d <- depts\n            where e.dept == d.dname\n            yield {name e.name floor d.floor}))",
         "[{floor 3 name a}, {floor 1 name b}, {floor 3 name c}]",
     );
 }

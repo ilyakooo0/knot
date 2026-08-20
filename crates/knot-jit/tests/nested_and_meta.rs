@@ -17,7 +17,7 @@ fn nested_relation_construction() {
 #[test]
 fn nested_relation_count() {
     assert_show(
-        "base.count {team \"eng\" members [{name \"a\"} {name \"b\"}]}.members",
+        "base.count {team \"eng\" members [{name \"a\"}  {name \"b\"}]}.members",
         "2",
     );
 }
@@ -25,7 +25,7 @@ fn nested_relation_count() {
 #[test]
 fn nested_relation_map() {
     assert_show_set(
-        "base.map (\\m -> m.name) {members [{name \"a\"} {name \"b\"}]}.members",
+        "base.map (\\m -> m.name) {members [{name \"a\"}  {name \"b\"}]}.members",
         &["a", "b"],
     );
 }

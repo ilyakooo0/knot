@@ -232,7 +232,7 @@ fn unit_mismatch_rejected() {
 #[test]
 fn show_nested_structure() {
     assert_show(
-        "{point {x 1 y 2} tags [\"a\" \"b\"]}",
+        "{point {x 1 y 2} tags [\"a\"  \"b\"]}",
         "{point {x 1 y 2} tags [a, b]}",
     );
 }

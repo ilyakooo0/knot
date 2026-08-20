@@ -989,6 +989,15 @@ struct Infer {
     /// and a var still unresolved at the end of inference defaults to `Text`.
     string_lit_vars: HashMap<TyVar, Span>,
 
+    /// List-literal container polymorphism: the fresh var standing for a list
+    /// literal `[a b c]`'s whole type, mapped to its element type var. A list
+    /// literal is polymorphic over the container — `Vec a`, `Rel a`, or
+    /// `List a` — sharing the element type. Unification binds the var to one of
+    /// those (matching the element); a var still unresolved at the end of
+    /// inference defaults to `Rel` (a relation, the natural type of a list
+    /// literal).
+    list_lit_vars: HashMap<TyVar, (Span, TyVar)>,
+
     /// Top-level functions carrying signature-level `^`-field constraints:
     /// name → ordered `(field, field_type)` list. The function's stored scheme
     /// has already been elaborated to take a leading dictionary record per
@@ -1254,6 +1263,7 @@ impl Infer {
             show_calls: Vec::new(),
             known_impls: HashSet::new(),
             string_lit_vars: HashMap::new(),
+            list_lit_vars: HashMap::new(),
             implicit_dict_fns: HashMap::new(),
             fold_dict_fields: HashMap::new(),
             implicit_dict_args: HashMap::new(),
@@ -2128,6 +2138,52 @@ impl Infer {
         self.bind_var(v, raw_other.clone(), span);
     }
 
+    /// Bind a unification variable, but if it came from a list literal
+    /// (`list_lit_vars`) restrict the target to a `Vec`/`Rel`/`List` of the
+    /// literal's element type. A list literal is polymorphic over the
+    /// container; unifying it with anything else is a type error naming the
+    /// literal. Left unconstrained, it defaults to `Rel` at the end of
+    /// inference. `Vec` and `Rel` share the relation runtime representation, so
+    /// both resolve to a relation value; `List` builds a Cons/Nil chain.
+    fn bind_list_lit_var(&mut self, v: TyVar, applied_other: &Ty, raw_other: &Ty, span: Span) {
+        if let Some((_, elem_var)) = self.list_lit_vars.get(&v).copied() {
+            let elem = Ty::Var(elem_var);
+            match applied_other {
+                Ty::Error => {}
+                // Pinned by context to a supported container. Unify the element
+                // so the literal's elements constrain the container's parameter.
+                Ty::Relation(e) => self.unify(&elem, e, span),
+                Ty::Con(name, args)
+                    if (name == "Vec" || name == "List") && args.len() == 1 =>
+                {
+                    let arg = args[0].clone();
+                    self.unify(&elem, &arg, span);
+                }
+                // A polymorphic var (e.g. `println`'s `a`) defers the choice.
+                Ty::Var(_) => {}
+                // A monad-application bind (`App(m, elem)` from a do-block /
+                // comprehension) has an unresolved container var — defer the
+                // container choice, but unify the element so iteration over the
+                // literal propagates the element type (units included).
+                Ty::App(f, e) if matches!(**f, Ty::Var(_)) => {
+                    let e = e.clone();
+                    self.unify(&elem, &e, span);
+                }
+                _ => {
+                    self.error(
+                        format!(
+                            "list literal must be a Vec, Rel, or List, found {}",
+                            self.display_ty(applied_other)
+                        ),
+                        span,
+                    );
+                    return;
+                }
+            }
+        }
+        self.bind_var(v, raw_other.clone(), span);
+    }
+
     // ── Unification ──────────────────────────────────────────────
 
     /// `snippet ⊑ expected` — is the snippet's inferred type usable where the
@@ -2442,11 +2498,19 @@ impl Infer {
             }
             (Ty::Var(v), _) => {
                 let v = *v;
-                self.bind_string_lit_var(v, &t2, raw2, span);
+                if self.list_lit_vars.contains_key(&v) {
+                    self.bind_list_lit_var(v, &t2, raw2, span);
+                } else {
+                    self.bind_string_lit_var(v, &t2, raw2, span);
+                }
             }
             (_, Ty::Var(v)) => {
                 let v = *v;
-                self.bind_string_lit_var(v, &t1, raw1, span);
+                if self.list_lit_vars.contains_key(&v) {
+                    self.bind_list_lit_var(v, &t1, raw1, span);
+                } else {
+                    self.bind_string_lit_var(v, &t1, raw1, span);
+                }
             }
             (Ty::Int, Ty::Int)
             | (Ty::Float, Ty::Float)
@@ -6368,12 +6432,20 @@ impl Infer {
             }
 
             ast::ExprKind::List(elems) => {
-                let elem_ty = self.fresh();
+                // Container-polymorphic: `[a b c]` is a `Vec`/`Rel`/`List` of
+                // the element type. A fresh var stands for the whole literal
+                // type; unification pins it to one container, and it defaults
+                // to `Rel` when unconstrained (mirrors the string-literal
+                // Text/Bytes polymorphism).
+                let elem_var = self.fresh_var();
+                let elem_ty = Ty::Var(elem_var);
                 for e in elems {
                     let t = self.infer_expr(e);
                     self.unify(&elem_ty, &t, e.span);
                 }
-                Ty::Relation(Box::new(elem_ty))
+                let container = self.fresh_var();
+                self.list_lit_vars.insert(container, (expr.span, elem_var));
+                Ty::Var(container)
             }
 
             ast::ExprKind::Lambda {
@@ -13001,6 +13073,12 @@ pub struct CheckOutput {
     pub refined_type_info: RefinedTypeInfoMap,
     pub from_json_targets: FromJsonTargets,
     pub string_lit_bytes: StringLitBytes,
+    /// Spans of list literals that resolved to the `List` (Cons/Nil) container;
+    /// codegen builds these as a cons chain rather than a relation/vec.
+    pub list_lit_lists: HashSet<Span>,
+    /// Spans of list literals that resolved to `Vec`; these keep the relation
+    /// representation but skip dedup (a Vec is ordered and allows duplicates).
+    pub list_lit_vecs: HashSet<Span>,
     pub elem_pushdown_ok: ElemPushdownOk,
     pub show_unit_strings: ShowUnitStrings,
     pub sum_float_spans: SumFloatSpans,
@@ -13803,6 +13881,39 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         infer.bind_var(v, Ty::Text, infer.string_lit_vars[&v]);
     }
 
+    // Phase 4e2: a list literal whose container was never pinned by its context
+    // defaults to `Rel` (a relation, the natural type of a list literal); `Vec`
+    // and `List` are opt-in via a container-demanding context or `the`.
+    let unresolved_list_lits: Vec<TyVar> = infer
+        .list_lit_vars
+        .keys()
+        .filter(|v| matches!(infer.apply(&Ty::Var(**v)), Ty::Var(_)))
+        .copied()
+        .collect();
+    for v in unresolved_list_lits {
+        let (span, elem_var) = infer.list_lit_vars[&v];
+        infer.bind_var(v, Ty::Relation(Box::new(Ty::Var(elem_var))), span);
+    }
+
+    // Record which list literals resolved to `List` (a Cons/Nil chain) so
+    // codegen builds them differently from the relation/vec representation.
+    let list_lit_lists: HashSet<Span> = infer
+        .list_lit_vars
+        .iter()
+        .filter(|(v, _)| matches!(infer.apply(&Ty::Var(**v)), Ty::Con(n, _) if n == "List"))
+        .map(|(_, (span, _))| *span)
+        .collect();
+
+    // Record which list literals resolved to `Vec` — an ordered sequence that
+    // (unlike a relation) preserves duplicates and order, so codegen skips the
+    // relation dedup.
+    let list_lit_vecs: HashSet<Span> = infer
+        .list_lit_vars
+        .iter()
+        .filter(|(v, _)| matches!(infer.apply(&Ty::Var(**v)), Ty::Con(n, _) if n == "Vec"))
+        .map(|(_, (span, _))| *span)
+        .collect();
+
     // Record which string literals resolved to `Bytes` so codegen emits them
     // as byte strings rather than interned text.
     let string_lit_bytes: StringLitBytes = infer
@@ -14125,6 +14236,8 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         refined_type_info,
         from_json_targets,
         string_lit_bytes,
+        list_lit_lists,
+        list_lit_vecs,
         elem_pushdown_ok,
         show_unit_strings,
         sum_float_spans,

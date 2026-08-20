@@ -338,6 +338,13 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     from_json_targets: crate::infer::FromJsonTargets,
     string_lit_bytes: crate::infer::StringLitBytes,
 
+    /// List-literal spans that resolved to the `List` (Cons/Nil) container;
+    /// these compile as a cons chain rather than a relation/vec.
+    list_lit_lists: HashSet<ast::Span>,
+    /// List-literal spans that resolved to `Vec`: relation representation but
+    /// no dedup (ordered, allows duplicates).
+    list_lit_vecs: HashSet<ast::Span>,
+
     // `with` expression span -> field names bound in its body. Codegen
     // projects exactly these fields out of the record into locals.
     with_fields: crate::infer::WithFields,
@@ -723,6 +730,8 @@ pub fn compile(
     refined_field_preds: &crate::infer::RefinedFieldPredsMap,
     from_json_targets: &crate::infer::FromJsonTargets,
     string_lit_bytes: &crate::infer::StringLitBytes,
+    list_lit_lists: &HashSet<ast::Span>,
+    list_lit_vecs: &HashSet<ast::Span>,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
@@ -759,6 +768,8 @@ pub fn compile(
             refined_field_preds,
             from_json_targets,
             string_lit_bytes,
+            list_lit_lists,
+            list_lit_vecs,
             type_info,
             elem_pushdown_ok,
             show_unit_strings,
@@ -800,6 +811,8 @@ pub fn compile_with<M: cranelift_module::Module>(
     refined_field_preds: &crate::infer::RefinedFieldPredsMap,
     from_json_targets: &crate::infer::FromJsonTargets,
     string_lit_bytes: &crate::infer::StringLitBytes,
+    list_lit_lists: &HashSet<ast::Span>,
+    list_lit_vecs: &HashSet<ast::Span>,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
@@ -835,6 +848,8 @@ pub fn compile_with<M: cranelift_module::Module>(
         refined_field_preds,
         from_json_targets,
         string_lit_bytes,
+        list_lit_lists,
+        list_lit_vecs,
         type_info,
         elem_pushdown_ok,
         show_unit_strings,
@@ -870,6 +885,8 @@ fn compile_inner<M: cranelift_module::Module>(
     refined_field_preds: &crate::infer::RefinedFieldPredsMap,
     from_json_targets: &crate::infer::FromJsonTargets,
     string_lit_bytes: &crate::infer::StringLitBytes,
+    list_lit_lists: &HashSet<ast::Span>,
+    list_lit_vecs: &HashSet<ast::Span>,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
@@ -941,6 +958,8 @@ fn compile_inner<M: cranelift_module::Module>(
         .collect();
     cg.from_json_targets = from_json_targets.clone();
     cg.string_lit_bytes = string_lit_bytes.clone();
+    cg.list_lit_lists = list_lit_lists.clone();
+    cg.list_lit_vecs = list_lit_vecs.clone();
     cg.with_fields = with_fields.clone();
     cg.implicit_refs = implicit_refs.clone();
     cg.implicit_dict_args = implicit_dict_args.clone();
@@ -1310,6 +1329,8 @@ pub fn jit_compile_typed(source: &str, expected: Option<&str>) -> Option<JitComp
             refined_type_info: refined_types,
             from_json_targets,
             string_lit_bytes,
+            list_lit_lists,
+            list_lit_vecs,
             elem_pushdown_ok,
             show_unit_strings,
             sum_float_spans,
@@ -1357,6 +1378,8 @@ pub fn jit_compile_typed(source: &str, expected: Option<&str>) -> Option<JitComp
             &_refined_field_preds,
             &from_json_targets,
             &string_lit_bytes,
+            &list_lit_lists,
+            &list_lit_vecs,
             &type_info,
             &elem_pushdown_ok,
             &show_unit_strings,
@@ -1512,6 +1535,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
             source_refinements: HashMap::new(),
             from_json_targets: HashMap::new(),
             string_lit_bytes: HashSet::new(),
+            list_lit_lists: HashSet::new(),
+            list_lit_vecs: HashSet::new(),
             with_fields: HashMap::new(),
             implicit_refs: HashMap::new(),
             implicit_dict_args: HashMap::new(),
@@ -5461,26 +5486,36 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
 
             ast::ExprKind::List(elems) => {
-                let rel = if elems.is_empty() {
-                    self.call_rt(builder, "knot_relation_empty", &[])
+                // `List` (Cons/Nil ADT): build a cons chain, innermost-last.
+                if self.list_lit_lists.contains(&expr.span) {
+                    let nil = self.call_rt(builder, "knot_list_nil", &[db]);
+                    let mut acc = nil;
+                    for elem in elems.iter().rev() {
+                        let val = self.compile_expr(builder, elem, env, db);
+                        acc = self.call_rt(builder, "knot_list_cons", &[val, acc]);
+                    }
+                    acc
                 } else {
-                    let cap = builder.ins().iconst(self.ptr_type, elems.len() as i64);
-                    self.call_rt(builder, "knot_relation_with_capacity", &[cap])
-                };
-                for elem in elems {
-                    let val = self.compile_expr(builder, elem, env, db);
-                    self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
-                }
-                if elems.len() > 1 {
-                    // A relation is a set: `[1, 1, 2]` holds two rows, not
-                    // three. Every other path that builds a relation (union,
-                    // map, comprehensions, writes) already dedups.
-                    self.call_rt(builder, "knot_relation_dedup", &[rel])
-                } else {
-                    rel
+                    let rel = if elems.is_empty() {
+                        self.call_rt(builder, "knot_relation_empty", &[])
+                    } else {
+                        let cap = builder.ins().iconst(self.ptr_type, elems.len() as i64);
+                        self.call_rt(builder, "knot_relation_with_capacity", &[cap])
+                    };
+                    for elem in elems {
+                        let val = self.compile_expr(builder, elem, env, db);
+                        self.call_rt_void(builder, "knot_relation_push", &[rel, val]);
+                    }
+                    // A `Rel` literal is a set — dedup (`[1 1 2]` holds two
+                    // rows). A `Vec` literal is an ordered sequence that keeps
+                    // duplicates and order, so it skips the dedup.
+                    if elems.len() > 1 && !self.list_lit_vecs.contains(&expr.span) {
+                        self.call_rt(builder, "knot_relation_dedup", &[rel])
+                    } else {
+                        rel
+                    }
                 }
             }
-
             ast::ExprKind::BinOp { op, lhs, rhs } => {
                 if matches!(op, ast::BinOp::Pipe) {
                     // Check for: source |> match Constructor → SQL-level match.

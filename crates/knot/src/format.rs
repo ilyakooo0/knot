@@ -947,7 +947,6 @@ fn render_literal(l: &Literal) -> String {
             }
         }
         Literal::Text(s) => format!("\"{}\"", escape_text(s)),
-        Literal::Bytes(bytes) => format!("b\"{}\"", escape_bytes(bytes)),
     }
 }
 
@@ -963,22 +962,6 @@ fn escape_text(s: &str) -> String {
             '\0' => out.push_str("\\0"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02x}", c as u32)),
             c => out.push(c),
-        }
-    }
-    out
-}
-
-fn escape_bytes(bs: &[u8]) -> String {
-    let mut out = String::with_capacity(bs.len());
-    for &b in bs {
-        match b {
-            b'\\' => out.push_str("\\\\"),
-            b'"' => out.push_str("\\\""),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            0x20..=0x7e => out.push(b as char),
-            _ => out.push_str(&format!("\\x{:02x}", b)),
         }
     }
     out

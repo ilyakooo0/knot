@@ -14,7 +14,6 @@ pub enum TokenKind {
     Int(String),
     Float(f64),
     Text(String),
-    Bytes(Vec<u8>),
 
     // Identifiers
     Lower(String),
@@ -109,7 +108,6 @@ impl TokenKind {
             TokenKind::Int(_) => "integer literal",
             TokenKind::Float(_) => "float literal",
             TokenKind::Text(_) => "string literal",
-            TokenKind::Bytes(_) => "byte string literal",
             TokenKind::Lower(_) => "identifier",
             TokenKind::Upper(_) => "type name",
             TokenKind::Serve => "'serve'",
@@ -215,7 +213,6 @@ fn follows_prefix_minus(prev: &[Token]) -> bool {
             TokenKind::Int(_)
                 | TokenKind::Float(_)
                 | TokenKind::Text(_)
-                | TokenKind::Bytes(_)
                 | TokenKind::Lower(_)
                 | TokenKind::Upper(_)
                 | TokenKind::RParen
@@ -524,11 +521,6 @@ impl<'src> Lexer<'src> {
 
     fn lex_token(&mut self) -> Option<TokenKind> {
         let ch = self.bytes[self.pos];
-
-        // Byte string literal: b"..."
-        if ch == b'b' && self.peek_at(1) == Some(b'"') {
-            return Some(self.lex_byte_string());
-        }
 
         // Identifiers and keywords. Accept non-ASCII Unicode letters as an
         // identifier start (`café`, `α`) too — the byte-level gate uses the
@@ -888,154 +880,6 @@ impl<'src> Lexer<'src> {
                     let ch = self.source[self.pos..].chars().next().unwrap();
                     self.pos += ch.len_utf8();
                     value.push(ch);
-                }
-            }
-        }
-    }
-
-    // ── Byte strings ─────────────────────────────────────────────────
-
-    fn lex_byte_string(&mut self) -> TokenKind {
-        let start = self.pos;
-        self.advance(); // skip 'b'
-        self.advance(); // skip opening '"'
-
-        let mut value = Vec::new();
-
-        loop {
-            match self.peek() {
-                None | Some(b'\n') | Some(b'\r') => {
-                    // CR (alone or as part of CRLF) terminates the byte
-                    // string just like \n — matches the regular-string lexer
-                    // (line 507) so byte-string literals can't silently eat a
-                    // line ending.
-                    let span = self.span_from(start);
-                    self.diagnostics.push(
-                        Diagnostic::error("unterminated byte string literal")
-                            .label(span, "byte string starts here"),
-                    );
-                    return TokenKind::Bytes(value);
-                }
-                Some(b'"') => {
-                    self.advance();
-                    return TokenKind::Bytes(value);
-                }
-                Some(b'\\') => {
-                    self.advance();
-                    match self.peek() {
-                        Some(b'\\') => {
-                            self.advance();
-                            value.push(b'\\');
-                        }
-                        Some(b'"') => {
-                            self.advance();
-                            value.push(b'"');
-                        }
-                        Some(b'n') => {
-                            self.advance();
-                            value.push(b'\n');
-                        }
-                        Some(b't') => {
-                            self.advance();
-                            value.push(b'\t');
-                        }
-                        Some(b'r') => {
-                            self.advance();
-                            value.push(b'\r');
-                        }
-                        Some(b'0') => {
-                            self.advance();
-                            value.push(0);
-                        }
-                        Some(b'x') => {
-                            self.advance();
-                            // Hex escape: \xHH
-                            let h1 = self.peek().and_then(|b| (b as char).to_digit(16));
-                            if let Some(d1) = h1 {
-                                let first_hex_byte = self.bytes[self.pos];
-                                self.advance();
-                                let h2 = self.peek().and_then(|b| (b as char).to_digit(16));
-                                if let Some(d2) = h2 {
-                                    self.advance();
-                                    value.push((d1 * 16 + d2) as u8);
-                                } else {
-                                    let span = Span::new(self.pos - 3, self.pos);
-                                    self.diagnostics.push(
-                                        Diagnostic::error("invalid hex escape in byte string")
-                                            .label(span, "expected two hex digits after \\x"),
-                                    );
-                                    // Error recovery: emit the literal hex char (e.g.
-                                    // `b'5'` for `\x5`) rather than the digit *value*
-                                    // (`0x05`) so the recovered bytes resemble what
-                                    // the user typed.
-                                    let _ = d1;
-                                    value.push(first_hex_byte);
-                                }
-                            } else {
-                                // Span only the `\x`, not a trailing terminator
-                                // (`"`/newline/EOF) — recovery below never
-                                // consumes those, so they must not be underlined.
-                                let bad_end = match self.peek() {
-                                    Some(b'"') | Some(b'\n') | Some(b'\r') | None => self.pos,
-                                    Some(_) => {
-                                        self.pos
-                                            + self.source[self.pos..]
-                                                .chars()
-                                                .next()
-                                                .map_or(1, |c| c.len_utf8())
-                                    }
-                                };
-                                let span = Span::new(self.pos - 2, bad_end);
-                                self.diagnostics.push(
-                                    Diagnostic::error("invalid hex escape in byte string")
-                                        .label(span, "expected two hex digits after \\x"),
-                                );
-                                // Error recovery: advance past the bad character
-                                // and emit it as a literal byte so the byte string
-                                // isn't silently shortened (consistent with other
-                                // escape error recovery paths) — but never consume
-                                // a closing `"` or a line break; those must
-                                // terminate the byte string via the normal
-                                // branches, otherwise one bad escape cascades
-                                // into a bogus "unterminated" diagnostic that
-                                // swallows the rest of the line.
-                                match self.peek() {
-                                    Some(b'"') | Some(b'\n') | Some(b'\r') | None => {}
-                                    Some(b) => {
-                                        self.advance();
-                                        value.push(b);
-                                    }
-                                }
-                            }
-                        }
-                        Some(b'\n') | Some(b'\r') => {
-                            // Backslash at end of line — never consume the
-                            // line break as an "unknown escape" (that would
-                            // swallow the whole next line into the byte
-                            // string). Leave it for the unterminated branch.
-                        }
-                        Some(_) => {
-                            let esc_start = self.pos - 1;
-                            // Advance by one full UTF-8 character (not just one byte)
-                            let ch = self.source[self.pos..].chars().next().unwrap();
-                            self.pos += ch.len_utf8();
-                            let span = Span::new(esc_start, self.pos);
-                            self.diagnostics.push(
-                                Diagnostic::error("unknown escape sequence in byte string")
-                                    .label(span, "unknown escape"),
-                            );
-                            // Error recovery: emit the escaped character's bytes
-                            // so the byte string isn't silently shortened.
-                            let mut buf = [0u8; 4];
-                            let encoded = ch.encode_utf8(&mut buf);
-                            value.extend_from_slice(encoded.as_bytes());
-                        }
-                        None => {}
-                    }
-                }
-                Some(b) => {
-                    self.advance();
-                    value.push(b);
                 }
             }
         }

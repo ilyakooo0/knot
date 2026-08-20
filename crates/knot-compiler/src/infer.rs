@@ -8374,7 +8374,6 @@ impl Infer {
                 self.string_lit_vars.insert(v, span);
                 Ty::Var(v)
             }
-            ast::Literal::Bytes(_) => Ty::Bytes,
         }
     }
 

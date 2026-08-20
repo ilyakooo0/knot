@@ -503,7 +503,6 @@ impl<'a> DefResolver<'a> {
                     ast::Literal::Int(_) => "Int",
                     ast::Literal::Float(_) => "Float",
                     ast::Literal::Text(_) => "Text",
-                    ast::Literal::Bytes(_) => "Bytes",
                 };
                 self.literals.push((expr.span, ty.to_string()));
             }

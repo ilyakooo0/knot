@@ -1196,7 +1196,7 @@ impl Parser {
                 segments.push(PathSegment::Literal(seg));
             } else if matches!(
                 self.peek(),
-                TokenKind::Int(_) | TokenKind::Float(_) | TokenKind::Text(_) | TokenKind::Bytes(_)
+                TokenKind::Int(_) | TokenKind::Float(_) | TokenKind::Text(_)
             ) {
                 // A literal can't be a path segment. Report and consume it so
                 // the segment isn't silently dropped (the leading `/` was
@@ -1844,7 +1844,6 @@ impl Parser {
             TokenKind::Int(_)
             | TokenKind::Float(_)
             | TokenKind::Text(_)
-            | TokenKind::Bytes(_)
             | TokenKind::Upper(_)
             | TokenKind::LParen
             | TokenKind::LBrace
@@ -2168,13 +2167,6 @@ impl Parser {
                     unreachable!()
                 };
                 Some(Spanned::new(ExprKind::Lit(Literal::Text(s)), tok.span))
-            }
-            TokenKind::Bytes(_) => {
-                let tok = self.advance();
-                let TokenKind::Bytes(b) = tok.kind else {
-                    unreachable!()
-                };
-                Some(Spanned::new(ExprKind::Lit(Literal::Bytes(b)), tok.span))
             }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
@@ -3391,7 +3383,6 @@ impl Parser {
                 | TokenKind::Int(_)
                 | TokenKind::Float(_)
                 | TokenKind::Text(_)
-                | TokenKind::Bytes(_)
                 | TokenKind::Minus
         )
     }
@@ -3675,13 +3666,6 @@ impl Parser {
                 };
                 Some(Spanned::new(PatKind::Lit(Literal::Text(s)), tok.span))
             }
-            TokenKind::Bytes(_) => {
-                let tok = self.advance();
-                let TokenKind::Bytes(b) = tok.kind else {
-                    unreachable!()
-                };
-                Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
-            }
             _ => {
                 self.error("expected pattern");
                 None
@@ -3704,7 +3688,6 @@ impl Parser {
                 | TokenKind::Int(_)
                 | TokenKind::Float(_)
                 | TokenKind::Text(_)
-                | TokenKind::Bytes(_)
         )
     }
 
@@ -3827,13 +3810,6 @@ impl Parser {
                     unreachable!()
                 };
                 Some(Spanned::new(PatKind::Lit(Literal::Text(s)), tok.span))
-            }
-            TokenKind::Bytes(_) => {
-                let tok = self.advance();
-                let TokenKind::Bytes(b) = tok.kind else {
-                    unreachable!()
-                };
-                Some(Spanned::new(PatKind::Lit(Literal::Bytes(b)), tok.span))
             }
             _ => {
                 self.error("expected pattern atom");

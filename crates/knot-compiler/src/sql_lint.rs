@@ -1183,7 +1183,6 @@ fn try_sql_column_expr(bind_var: &str, body: &Expr, schema: &str) -> Option<()> 
             None
         }
         ExprKind::Lit(Literal::Int(_) | Literal::Float(_) | Literal::Text(_)) => Some(()),
-        ExprKind::Lit(_) => None,
         ExprKind::BinOp { op, lhs, rhs } => {
             match op {
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Concat => {

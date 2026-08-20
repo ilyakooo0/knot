@@ -611,7 +611,6 @@ fn render_predicate_expr(expr: &ast::Expr) -> String {
                 ast::Literal::Int(s) => s.clone(),
                 ast::Literal::Float(f) => format!("{f}"),
                 ast::Literal::Text(t) => format!("{t:?}"),
-                ast::Literal::Bytes(_) => return None,
             },
             ast::ExprKind::Var(n) => n.as_str().to_string(),
             ast::ExprKind::Constructor(n) => n.clone(),

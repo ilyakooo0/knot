@@ -370,7 +370,6 @@ pub enum Literal {
     Int(String),
     Float(f64),
     Text(String),
-    Bytes(Vec<u8>),
 }
 
 // ── Operators ──────────────────────────────────────────────────────

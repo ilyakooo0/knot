@@ -5,7 +5,7 @@
   base.println (base.bytesToHex (base.hash (base.textToBytes "abc")))
 
   -- Bytes: BLAKE3 of empty bytes — expected af1349b9...3262
-  base.println (base.bytesToHex (base.hash b""))
+  base.println (base.bytesToHex (base.hash ""))
 
   -- Text: hashes raw UTF-8 bytes (same digest as bytes form above)
   base.println (base.bytesToHex (base.hash "abc"))

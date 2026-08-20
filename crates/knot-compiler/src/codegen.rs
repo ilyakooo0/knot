@@ -708,7 +708,6 @@ fn format_literal_display(lit: &ast::Literal) -> Option<String> {
             let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
             Some(format!("\"{}\"", escaped))
         }
-        ast::Literal::Bytes(_) => None,
     }
 }
 
@@ -13142,10 +13141,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     self.call_rt(builder, "knot_value_text_intern", &[ptr, len, slot])
                 }
             }
-            ast::Literal::Bytes(b) => {
-                let (ptr, len) = self.bytes_ptr(builder, b);
-                self.call_rt(builder, "knot_value_bytes", &[ptr, len])
-            }
         }
     }
 
@@ -13342,14 +13337,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
     }
 
     /// Get the pointer and length of a byte string constant as Cranelift Values.
-    fn bytes_ptr(&mut self, builder: &mut FunctionBuilder, b: &[u8]) -> (Value, Value) {
-        let data_id = self.ensure_bytes(b);
-        let gv = self.module.declare_data_in_func(data_id, builder.func);
-        let ptr = builder.ins().global_value(self.ptr_type, gv);
-        let len = builder.ins().iconst(self.ptr_type, b.len() as i64);
-        (ptr, len)
-    }
-
     /// Get a Cranelift `Value` holding the address of the 8-byte
     /// zero-initialized slot dedicated to caching the interned `Value*`
     /// for `s`.  On first use the slot is null and the runtime's
@@ -13379,19 +13366,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
         };
         let gv = self.module.declare_data_in_func(data_id, builder.func);
         builder.ins().global_value(self.ptr_type, gv)
-    }
-
-    fn ensure_bytes(&mut self, b: &[u8]) -> DataId {
-        let name = format!(".bytes.{}", self.string_counter);
-        self.string_counter += 1;
-        let data_id = self
-            .module
-            .declare_data(&name, Linkage::Local, false, false)
-            .unwrap();
-        let mut desc = DataDescription::new();
-        desc.define(b.to_vec().into_boxed_slice());
-        self.module.define_data(data_id, &desc).unwrap();
-        data_id
     }
 
     // ── Set-expression analysis ──────────────────────────────────
@@ -14715,7 +14689,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 ast::Literal::Int(s) => Some(s.clone()),
                 ast::Literal::Float(f) => Some(format!("{}", f)),
                 ast::Literal::Text(t) => Some(format!("'{}'", t.replace('\'', "''"))),
-                ast::Literal::Bytes(_) => None,
             };
         }
         // Aggregate over the group var.
@@ -16879,7 +16852,7 @@ fn expr_is_promote_safe(expr: &ast::Expr) -> bool {
             // need promotion.  (Text literals can be cached, but the
             // compiler doesn't currently emit the cached path for
             // yield-position literals.)
-            ast::Literal::Text(_) | ast::Literal::Bytes(_) => false,
+            ast::Literal::Text(_) => false,
         },
         // Bare `True` and `False` constructors compile to the Bool
         // singletons (see codegen's special-case for Constructor("True"
@@ -19116,7 +19089,6 @@ fn try_sql_arithmetic_expr(
             ast::Literal::Int(n) => Some(n.to_string()),
             ast::Literal::Float(f) => Some(f.to_string()),
             ast::Literal::Text(s) => Some(format!("'{}'", s.replace('\'', "''"))),
-            _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
             let sql_op = match op {
@@ -19308,10 +19280,6 @@ pub(crate) fn infer_sql_expr_type(
             ast::Literal::Int(_) => Some("int".to_string()),
             ast::Literal::Float(_) => Some("float".to_string()),
             ast::Literal::Text(_) => Some("text".to_string()),
-            // A bool literal is emitted as SQL `1`/`0`; it must be typed
-            // `bool` (not `int`) so the column reads back through
-            // `ColType::Bool` -> `Value::Bool`, matching the bool-column path.
-            _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
             match op {
@@ -19378,7 +19346,6 @@ fn try_multi_table_arithmetic_expr(
             ast::Literal::Int(n) => Some(n.to_string()),
             ast::Literal::Float(f) => Some(f.to_string()),
             ast::Literal::Text(s) => Some(format!("'{}'", s.replace('\'', "''"))),
-            _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
             let sql_op = match op {
@@ -19434,10 +19401,6 @@ fn infer_multi_table_sql_expr_type(
             ast::Literal::Int(_) => Some("int".to_string()),
             ast::Literal::Float(_) => Some("float".to_string()),
             ast::Literal::Text(_) => Some("text".to_string()),
-            // A bool literal is emitted as SQL `1`/`0`; it must be typed
-            // `bool` (not `int`) so the column reads back through
-            // `ColType::Bool` -> `Value::Bool`, matching the bool-column path.
-            _ => None,
         },
         ast::ExprKind::BinOp { op, lhs, rhs } => {
             match op {
@@ -20340,7 +20303,6 @@ pub(crate) fn sql_scalar_kind(
             ast::Literal::Int(_) => SqlScalarKind::Int,
             ast::Literal::Float(_) => SqlScalarKind::Float,
             ast::Literal::Text(_) => SqlScalarKind::Text,
-            _ => SqlScalarKind::Other,
         })),
         ast::ExprKind::Var(_) => Ok(None),
         ast::ExprKind::UnaryOp {
@@ -20580,10 +20542,6 @@ fn pretty_lit(lit: &ast::Literal) -> String {
             }
         }
         ast::Literal::Text(s) => format!("\"{}\"", s),
-        ast::Literal::Bytes(b) => {
-            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
-            format!("b\"{}\"", hex)
-        }
     }
 }
 

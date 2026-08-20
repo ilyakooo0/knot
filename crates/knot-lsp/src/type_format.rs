@@ -171,7 +171,6 @@ fn format_expr_brief_d(expr: &ast::ExprKind, depth: usize) -> String {
         ast::ExprKind::Lit(ast::Literal::Int(n)) => n.to_string(),
         ast::ExprKind::Lit(ast::Literal::Float(f)) => f.to_string(),
         ast::ExprKind::Lit(ast::Literal::Text(s)) => format!("\"{}\"", s),
-        ast::ExprKind::Lit(ast::Literal::Bytes(_)) => "b\"…\"".into(),
         ast::ExprKind::Lambda { params, body, .. } => {
             let ps: Vec<String> = params
                 .iter()
@@ -293,7 +292,6 @@ fn format_pat_brief_d(pat: &ast::PatKind, depth: usize) -> String {
         ast::PatKind::Lit(ast::Literal::Int(n)) => n.to_string(),
         ast::PatKind::Lit(ast::Literal::Float(f)) => f.to_string(),
         ast::PatKind::Lit(ast::Literal::Text(s)) => format!("\"{s}\""),
-        ast::PatKind::Lit(ast::Literal::Bytes(_)) => "<bytes>".into(),
         ast::PatKind::Constructor { name, payload, .. } => match &payload.node {
             // `Open {}` — nullary constructor; drop the empty payload to keep
             // the brief rendering tight.

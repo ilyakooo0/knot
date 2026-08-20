@@ -1,7 +1,7 @@
 -- ByteString example
 
-with {  raw (b"hello") } (do
-  -- Byte string literals
+with {  raw (base.textToBytes "hello") } (do
+  -- A Bytes value comes from a regular string via textToBytes
   base.println (base.bytesLength raw)        -- 5
 
   -- Convert text -> bytes (always succeeds)
@@ -43,8 +43,8 @@ with {  raw (b"hello") } (do
             Maybe.Just {  value byte } -> base.println byte
             Maybe.Nothing {} -> base.println "<out of bounds>"  -- raw has only 5 bytes
 
-          -- Hex escapes in literals
-          with {  withHex (b"\x48\x49") } (do
+          -- Bytes literals: a string via textToBytes
+          with {  withHex (base.textToBytes "HI") } (do
             case base.bytesToText withHex of
               Maybe.Just {  value t } -> base.println t   -- HI
               Maybe.Nothing {} -> base.println "<invalid utf-8>"

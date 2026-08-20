@@ -4035,10 +4035,22 @@ impl Parser {
                 break;
             }
             if self.can_start_type_atom() {
+                // A compound argument — a unit-carrying type (`Int 1`), a record
+                // (`{…}`), or a nested application — must be parenthesized in
+                // argument position: `Maybe (Int 1)`, not `Maybe Int 1`, whose
+                // trailing `1` reads as Maybe's second argument.
+                let arg_parenthesized = matches!(self.peek(), TokenKind::LParen);
                 let arg = match self.parse_type_atom() {
                     Some(arg) => arg,
                     None => fail!(),
                 };
+                if !arg_parenthesized
+                    && matches!(arg.node, TypeKind::UnitAnnotated { .. })
+                {
+                    self.error(
+                        "parenthesize a unit-carrying type argument: write `Maybe (Int 1)`, not `Maybe Int 1`",
+                    );
+                }
                 if !self.enter_recursion() {
                     fail!()
                 }

@@ -2,7 +2,7 @@
 //! rejected at compile time with a diagnostic.
 
 mod harness;
-use harness::assert_compile_err;
+use harness::{assert_compile_err, assert_show};
 
 #[test]
 fn int_plus_text() {
@@ -64,6 +64,21 @@ fn field_on_missing() {
 #[test]
 fn ambiguous_morph_projection() {
     assert_compile_err("(^into) \"42\"", "ambiguous projection");
+}
+
+#[test]
+fn unparenthesized_unit_type_argument() {
+    // `Maybe Int 1` reads ambiguously (is `1` Maybe's or Int's argument?) — a
+    // unit-carrying type used as a type argument must be parenthesized.
+    assert_compile_err(
+        "with {\nf (\\(Maybe Int 1  x) -> 0)\n}\n(f 0)",
+        "parenthesize a unit-carrying type argument",
+    );
+    // The parenthesized form is accepted.
+    assert_show(
+        "with {\nf (\\(Maybe (Int 1)  x) -> x)\n}\n(f (Maybe.Just {value 3}))",
+        "Just {value 3}",
+    );
 }
 
 #[test]

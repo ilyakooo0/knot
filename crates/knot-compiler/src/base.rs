@@ -120,9 +120,9 @@ textToBytesFromHex { Text -> Maybe Bytes  into
                      into bytesFromHex }
 intToFloat  { Int 1 -> Float 1  into
               into intToFloat }
-textToInt   { Text -> Maybe Int 1  into
+textToInt   { Text -> Maybe (Int 1)  into
               into textToInt }
-textToFloat { Text -> Maybe Float 1  into
+textToFloat { Text -> Maybe (Float 1)  into
               into textToFloat }
 intToText   { Int 1 -> Text  into
               into (\n -> show n) }

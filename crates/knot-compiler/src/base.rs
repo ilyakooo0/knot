@@ -317,7 +317,7 @@ pub(crate) fn prelude_base_record() -> ast::Expr {
         if let ast::ExprKind::Record(base_fields) = &mut base_field.value.node {
             for name in BASE_STDLIB_FNS {
                 base_fields.push(ast::RecordField {
-                    name: (*name).to_string(),
+                    name: knot::ast::FieldName::Named((*name).to_string()),
                     // Reference the stdlib fn by its FLATTENED `base.<name>`
                     // key — a `Var` string containing a dot, unutterable in
                     // user source, so it always resolves to the stdlib fn and

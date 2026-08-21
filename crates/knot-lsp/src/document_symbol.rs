@@ -234,10 +234,10 @@ fn build_symbols(doc: &DocumentState) -> Vec<DocumentSymbol> {
             }
             _ => {
                 // A named function field.
-                let name = &decl.name;
+                let name = decl.name.expect_named();
                 let declared = decl.sig.as_ref().map(format_type_scheme);
                 symbols.push(DocumentSymbol {
-                    name: name.clone(),
+                    name: name.to_string(),
                     detail: detail_for(doc, name, declared),
                     kind: SymbolKind::FUNCTION,
                     tags: None,

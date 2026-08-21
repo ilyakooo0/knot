@@ -109,7 +109,7 @@ fn render_constructor(c: &ConstructorDef) -> String {
         if i > 0 {
             s.push(' ');
         }
-        s.push_str(&f.name);
+        s.push_str(&f.name.to_string());
         s.push(' ');
         s.push_str(&render_type(&f.value));
     }
@@ -125,7 +125,7 @@ fn render_route_entry(p: &mut Printer, e: &RouteEntry) {
             if i > 0 {
                 p.write(" ");
             }
-            p.write(&f.name);
+            p.write(&f.name.to_string());
             p.write(" ");
             p.write(&render_type(&f.value));
         }
@@ -155,7 +155,7 @@ fn render_route_entry(p: &mut Printer, e: &RouteEntry) {
             if i > 0 {
                 p.write(" ");
             }
-            p.write(&f.name);
+            p.write(&f.name.to_string());
             p.write(" ");
             p.write(&render_type(&f.value));
         }
@@ -167,7 +167,7 @@ fn render_route_entry(p: &mut Printer, e: &RouteEntry) {
             if i > 0 {
                 p.write(" ");
             }
-            p.write(&f.name);
+            p.write(&f.name.to_string());
             p.write(" ");
             p.write(&render_type(&f.value));
         }
@@ -183,7 +183,7 @@ fn render_route_entry(p: &mut Printer, e: &RouteEntry) {
             if i > 0 {
                 p.write(" ");
             }
-            p.write(&f.name);
+            p.write(&f.name.to_string());
             p.write(" ");
             p.write(&render_type(&f.value));
         }
@@ -256,7 +256,7 @@ fn render_type_prec(t: &Type, ctx: TyPrec) -> String {
                 if i > 0 {
                     s.push_str("  ");
                 }
-                s.push_str(&f.name);
+                s.push_str(&f.name.to_string());
                 s.push(' ');
                 s.push_str(&render_type_atom(&f.value));
             }
@@ -999,10 +999,10 @@ fn render_record_inline(fields: &[RecordField]) -> String {
         if let Some(sig) = &f.sig {
             s.push_str(&render_type_scheme(sig));
             s.push_str("  ");
-            s.push_str(&f.name);
+            s.push_str(&f.name.to_string());
             s.push(' ');
         }
-        s.push_str(&f.name);
+        s.push_str(&f.name.to_string());
         s.push(' ');
         s.push_str(&render_expr_inline(&f.value, Prec::Atom));
     }
@@ -1348,10 +1348,10 @@ fn render_record_block(p: &mut Printer, fields: &[RecordField]) {
             if let Some(sig) = &f.sig {
                 p.write(&render_type_scheme(sig));
                 p.write("  ");
-                p.write(&f.name);
+                p.write(&f.name.to_string());
                 p.newline();
             }
-            p.write(&f.name);
+            p.write(&f.name.to_string());
             p.write(" ");
             render_expr(p, &f.value, Prec::Atom);
             p.newline();
@@ -1457,7 +1457,7 @@ fn render_pat(p: &Pat) -> String {
                 if i > 0 {
                     s.push(' ');
                 }
-                s.push_str(&f.name);
+                s.push_str(&f.name.to_string());
                 // The parser always produces `Some` here (no punning exists);
                 // `None` is unreachable but handled defensively as a bare name.
                 if let Some(sub) = &f.pattern {

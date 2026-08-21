@@ -61,7 +61,7 @@ pub(crate) fn handle_code_action(
                     | ast::ExprKind::RouteDecl { .. }
                     | ast::ExprKind::SubsetConstraint { .. }
             );
-        if is_unannotated_fn && let Some(inferred) = doc.type_info.get(&decl.name) {
+        if is_unannotated_fn && let Some(inferred) = doc.type_info.get(decl.name.expect_named()) {
             let signature = inferred.clone();
             // Signatures are type-first and live on their own line above the
             // binding: insert `Sig  name\n` at the start of the decl's line,
@@ -1488,7 +1488,7 @@ fn find_inline_actions(
         // elsewhere in the record can't occur in a single-field record.
         let name_span = crate::utils::find_word_in_source(
             &doc.source,
-            &field.name,
+            field.name.expect_named(),
             record.span.start,
             field.value.span.start,
         );
@@ -1519,7 +1519,7 @@ fn find_inline_actions(
             let mut usage_spans: Vec<Span> = Vec::new();
             let mut from = body_start;
             while let Some(sp) =
-                crate::utils::find_word_in_source(&doc.source, &field.name, from, body_end)
+                crate::utils::find_word_in_source(&doc.source, field.name.expect_named(), from, body_end)
             {
                 // Skip the field name itself if it re-occurs (it can't — the
                 // record sits before the body — but the scan is cheap).

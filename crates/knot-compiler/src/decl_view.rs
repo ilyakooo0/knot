@@ -116,23 +116,23 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
                         _ => DeclViewKind::TypeAlias { params, ty },
                     };
                     out.push(DeclView {
-                        name: fl.name.as_str(),
+                        name: fl.name.expect_named(),
                         span: fl.value.span,
                         kind,
                     });
                 }
                 SourceDecl { ty, migrations, .. } => out.push(DeclView {
-                    name: fl.name.as_str(),
+                    name: fl.name.expect_named(),
                     span: fl.value.span,
                     kind: DeclViewKind::Source { ty, migrations },
                 }),
                 RouteDecl { entries, .. } => out.push(DeclView {
-                    name: fl.name.as_str(),
+                    name: fl.name.expect_named(),
                     span: fl.value.span,
                     kind: DeclViewKind::Route { entries },
                 }),
                 SubsetConstraint { sub, sup } => out.push(DeclView {
-                    name: fl.name.as_str(),
+                    name: fl.name.expect_named(),
                     span: fl.value.span,
                     kind: DeclViewKind::Subset { sub, sup },
                 }),
@@ -154,7 +154,7 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
                     let is_required_const =
                         fl.sig.is_some() && matches!(&fl.value.node, Record(fs) if fs.is_empty());
                     out.push(DeclView {
-                        name: fl.name.as_str(),
+                        name: fl.name.expect_named(),
                         span: fl.value.span,
                         kind: DeclViewKind::Fun {
                             ty: fl.sig.as_ref(),

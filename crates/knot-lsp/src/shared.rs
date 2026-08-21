@@ -1079,7 +1079,7 @@ pub(crate) fn find_enclosing_type_scheme(
         if let Some(scheme) = &decl.sig
             && scheme_contains_offset(scheme, offset)
         {
-            return Some((scheme, decl.name.as_str()));
+            return Some((scheme, decl.name.expect_named()));
         }
     }
     None

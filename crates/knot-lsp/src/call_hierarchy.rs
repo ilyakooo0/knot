@@ -23,7 +23,7 @@ fn decl_info(decl: &knot::ast::RecordField) -> (&str, &str, &ast::Expr, Span) {
             (name.as_str(), "data", &decl.value, dspan)
         }
         ExprKind::SourceDecl { name, .. } => (name.as_str(), "source", &decl.value, dspan),
-        _ => (decl.name.as_str(), "fn", &decl.value, dspan),
+        _ => (decl.name.expect_named(), "fn", &decl.value, dspan),
     }
 }
 

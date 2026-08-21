@@ -265,11 +265,11 @@ fn collect_fun_bodies<'a>(
         if let ExprKind::Record(fields) = &record.node {
             for f in fields {
                 if matches!(f.value.node, ExprKind::Lambda { .. }) {
-                    fun_bodies.push((f.name.as_str(), &f.value));
+                    fun_bodies.push((f.name.expect_named(), &f.value));
                     if let Some(ts) = &f.sig
                         && type_returns_io(&ts.ty)
                     {
-                        fun_sig_io.insert(f.name.clone());
+                        fun_sig_io.insert(f.name.expect_named().to_string());
                     }
                 }
                 // Recurse into field values (nested `with`s).

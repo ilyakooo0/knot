@@ -372,7 +372,7 @@ impl<'a> TokenCollector<'a> {
                 // (rather than an arbitrary `name.len() + 20` byte window that
                 // could end mid-codepoint, e.g. `f : Café -> Int`).
                 if let Some(s) =
-                    find_word_in_source(self.source, &decl.name, dspan.start, dspan.end)
+                    find_word_in_source(self.source, decl.name.expect_named(), dspan.start, dspan.end)
                 {
                     self.add(s, TOK_FUNCTION, MOD_DECLARATION);
                 }
@@ -524,17 +524,17 @@ impl<'a> TokenCollector<'a> {
                     // appears in source before the `:` that separates it from
                     // the value, so search backwards from the value's span start.
                     let val_start = self.strip_parens(f.value.span).start;
-                    if val_start > f.name.len() {
+                    if val_start > f.name.expect_named().len() {
                         // Look for `name:` before the value — find the last
                         // occurrence of the field name before the value start.
                         let search_end = val_start;
-                        let search_start = search_end.saturating_sub(f.name.len() + 1);
+                        let search_start = search_end.saturating_sub(f.name.expect_named().len() + 1);
                         if let Some(name_start) =
-                            self.source[search_start..search_end].rfind(f.name.as_str())
+                            self.source[search_start..search_end].rfind(f.name.expect_named())
                         {
                             let abs_start = search_start + name_start;
-                            let abs_end = abs_start + f.name.len();
-                            if self.source.get(abs_start..abs_end) == Some(f.name.as_str()) {
+                            let abs_end = abs_start + f.name.expect_named().len();
+                            if self.source.get(abs_start..abs_end) == Some(f.name.expect_named()) {
                                 self.add(Span::new(abs_start, abs_end), TOK_PROPERTY, 0);
                             }
                         }

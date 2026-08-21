@@ -2457,7 +2457,7 @@ impl Parser {
                     .ok()?;
                 let entries = self.parse_api_route_entries(api_col);
                 fields.push(RecordField {
-                    name: aname.clone(),
+                    name: crate::ast::FieldName::Named(aname.clone()),
                     value: Spanned::new(
                         ExprKind::RouteDecl {
                             name: aname,
@@ -2531,7 +2531,7 @@ impl Parser {
                     // `db.*name`. `fields.len()` guarantees uniqueness.
                     let marker_name = format!("*{}#subset{}", bare_name, fields.len());
                     fields.push(RecordField {
-                        name: marker_name,
+                        name: crate::ast::FieldName::Named(marker_name),
                         value: Spanned::new(
                             ExprKind::SubsetConstraint {
                                 sub: crate::ast::RelationPath {
@@ -2618,7 +2618,7 @@ impl Parser {
                         // scheme to the underlying type.
                         let ty_inner = ty.ty.clone();
                         fields.push(RecordField {
-                            name: bare.clone(),
+                            name: crate::ast::FieldName::Named(bare.clone()),
                             value: Spanned::new(
                                 ExprKind::SourceDecl {
                                     name: bare,
@@ -2664,7 +2664,7 @@ impl Parser {
                 let tspan = self.span();
                 self.advance();
                 fields.push(RecordField {
-                    name: tname.clone(),
+                    name: crate::ast::FieldName::Named(tname.clone()),
                     value: Spanned::new(ExprKind::Constructor(tname), tspan),
                     sig: None,
                     doc: pending_doc.take(),
@@ -2675,14 +2675,16 @@ impl Parser {
             // `_ value` — an absent key: a stored field with no usable name.
             // `_` is not a valid identifier, so the field is unreachable by
             // `.field` access; it is reachable only by `^` (implicit projection)
-            // or `<>` (collecting fold), which match by type, not name. Absent
-            // keys never conflict, so a record may hold any number of them.
-            let (fname, _) = if self.at(&TokenKind::Underscore) {
+            // or `<>` (collecting fold), which search into its record value.
+            // Absent keys never conflict, so a record may hold any number.
+            let (fname, fname_span) = if self.at(&TokenKind::Underscore) {
                 let sp = self.advance().span;
-                ("_".to_string(), sp)
+                (crate::ast::FieldName::Absent, sp)
             } else {
-                self.expect_lower("expected field name in record").ok()?
+                let (n, sp) = self.expect_lower("expected field name in record").ok()?;
+                (crate::ast::FieldName::Named(n), sp)
             };
+            let _ = fname_span;
             self.skip_newlines();
             // A bare lambda (`greet \name -> …`) or do-block (`run do …`) field
             // value. Field values normally use `parse_postfix` so a value can't
@@ -2711,11 +2713,14 @@ impl Parser {
                 self.error("expected field value after field name in record");
                 return None;
             };
-            // Attach any pending sig for this field name.
-            let sig = pending_sigs
-                .iter()
-                .position(|(n, _)| *n == fname)
-                .map(|i| pending_sigs.remove(i).1);
+            // Attach any pending sig for this field name. Absent keys have no
+            // name, so they can never carry a sig — skip the lookup for them.
+            let sig = fname.as_name().and_then(|n| {
+                pending_sigs
+                    .iter()
+                    .position(|(sn, _)| sn == n)
+                    .map(|i| pending_sigs.remove(i).1)
+            });
             fields.push(RecordField {
                 name: fname,
                 value,
@@ -2751,7 +2756,7 @@ impl Parser {
         // sig-present + empty-record as "no body" and produces `Fun{body:None}`.
         for (sname, sty) in pending_sigs {
             fields.push(RecordField {
-                name: sname,
+                name: crate::ast::FieldName::Named(sname),
                 value: Spanned::new(ExprKind::Record(Vec::new()), start),
                 sig: Some(sty),
                 doc: None,
@@ -2870,7 +2875,7 @@ impl Parser {
 
         let ty_end = ty.span.end;
         Some(RecordField {
-            name: tname.clone(),
+            name: crate::ast::FieldName::Named(tname.clone()),
             value: Spanned::new(
                 ExprKind::TypeCtor { name: tname, params, ty },
                 Span { start: start.start, end: ty_end },
@@ -3298,7 +3303,7 @@ impl Parser {
                 let mut value_fields: Vec<RecordField> = Vec::new();
                 for f in fields {
                     if let ExprKind::Constructor(tname) = &f.value.node
-                        && tname == &f.name
+                        && f.name.as_name() == Some(tname.as_str())
                     {
                         types.push(tname.clone());
                         continue;
@@ -3317,10 +3322,16 @@ impl Parser {
             // suppresses unit sugar on collisions (`with {ms: 5} g 2 ms`
             // applies `g` to `2` and `ms`, not `g (2 ms)`).
             let pushed = if let ExprKind::Record(fields) = &record.node {
+                let mut n = 0;
                 for f in fields {
-                    this.bound_vars.push(f.name.clone());
+                    // Only named fields bind a variable; an absent key has no
+                    // name to bind.
+                    if let Some(name) = f.name.as_name() {
+                        this.bound_vars.push(name.to_string());
+                        n += 1;
+                    }
                 }
-                fields.len()
+                n
             } else {
                 0
             };

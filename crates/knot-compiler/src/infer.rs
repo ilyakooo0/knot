@@ -6262,12 +6262,12 @@ impl Infer {
                 // Absent keys (`_`) never conflict: any number may appear.
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for f in fields {
-                    if f.name == "_" {
-                        continue;
-                    }
-                    if !seen.insert(f.name.clone()) {
+                    let Some(fname) = f.name.as_name() else {
+                        continue; // absent keys (`_`) never conflict
+                    };
+                    if !seen.insert(fname.to_string()) {
                         self.error(
-                            format!("duplicate field '{}' in record literal", f.name),
+                            format!("duplicate field '{fname}' in record literal"),
                             f.value.span,
                         );
                     }
@@ -6317,21 +6317,25 @@ impl Infer {
                 // absent list. An absent field's value must be a record —
                 // `^`/`<>` search INTO it, so a non-record value could never be
                 // reached and is an error.
-                let typed: Vec<Ty> = fields.iter().map(|f| field_ty(f)).collect();
-                drop(field_ty); // end the closure's `&mut self` borrow
+                // Scope `field_ty` so its `&mut self` borrow ends before the
+                // partition loop (which calls `self.apply` / `self.error`).
+                let typed: Vec<Ty> = fields.iter().map(&mut field_ty).collect();
                 let mut field_tys: FieldMap = FieldMap::new();
                 let mut absent_tys: Vec<Ty> = Vec::new();
                 for (f, ty) in fields.iter().zip(typed) {
-                    if f.name == "_" {
-                        if !matches!(self.apply(&ty).peel_alias(), Ty::Record(..)) {
-                            self.error(
-                                "an absent key (`_`) must hold a record value — its fields are searched by `^`/`<>`, so a non-record value would be unreachable".to_string(),
-                                f.value.span,
-                            );
+                    match f.name.as_name() {
+                        None => {
+                            if !matches!(self.apply(&ty).peel_alias(), Ty::Record(..)) {
+                                self.error(
+                                    "an absent key (`_`) must hold a record value — its fields are searched by `^`/`<>`, so a non-record value would be unreachable".to_string(),
+                                    f.value.span,
+                                );
+                            }
+                            absent_tys.push(ty);
                         }
-                        absent_tys.push(ty);
-                    } else {
-                        field_tys.insert(f.name.clone(), ty);
+                        Some(fname) => {
+                            field_tys.insert(fname.to_string(), ty);
+                        }
                     }
                 }
                 Ty::Record(field_tys, absent_tys, None)
@@ -6512,18 +6516,6 @@ impl Infer {
                 let record_ty = if let ast::ExprKind::Record(field_exprs) = &record.node {
                     let mut field_tys: Vec<(String, Ty)> = Vec::with_capacity(field_exprs.len());
                     let mut absent_tys: Vec<Ty> = Vec::new();
-                    // Push a field type into the named list, or the absent list
-                    // when the field is `_`-keyed (tracked separately in the
-                    // record type so any number may coexist).
-                    macro_rules! push_field {
-                        ($name:expr, $ty:expr) => {
-                            if $name == "_" {
-                                absent_tys.push($ty);
-                            } else {
-                                field_tys.push(($name, $ty));
-                            }
-                        };
-                    }
                     for f in field_exprs {
                         // Required CLI constant (sig-only field, empty-record
                         // placeholder value): take the sig type as the field
@@ -6537,7 +6529,10 @@ impl Infer {
                             let sig_ty = self.ast_type_to_ty(&sig.ty);
                             self.in_type_annotation = saved_flag;
                             self.annotation_unit_vars = saved_unit_vars;
-                            push_field!(f.name.clone(), sig_ty);
+                            // Sig-only fields are always named (an absent key
+                            // cannot carry a sig), so this pushes to the named
+                            // list directly.
+                            field_tys.push((f.name.expect_named().to_string(), sig_ty));
                             continue;
                         }
                         // A `with` field named `base` collides with the
@@ -6556,20 +6551,27 @@ impl Infer {
                             );
                             continue;
                         }
+                        // Absent keys have no name, so they are never masked by
+                        // name and can never self-reference by name — both
+                        // mechanisms below are named-only.
+                        let fname = f.name.as_name();
                         // Save any enclosing `with` frame that binds this
                         // field's name (innermost-to-outermost), masking it
-                        // only while THIS field's value is inferred.
+                        // only while THIS field's value is inferred. Absent
+                        // keys have no name to mask.
                         let mut masked: Vec<(usize, HashMap<String, Scheme>, _)> = Vec::new();
-                        for idx in (0..self.scopes.len()).rev() {
-                            let is_with = self.with_scope_stack[idx]
-                                .as_ref()
-                                .is_some_and(|(_, fs)| fs.contains_key(&f.name));
-                            if is_with {
-                                let frame = self.with_scope_stack[idx]
-                                    .take()
-                                    .expect("checked Some above");
-                                let scope = std::mem::take(&mut self.scopes[idx]);
-                                masked.push((idx, scope, frame));
+                        if let Some(fname) = fname {
+                            for idx in (0..self.scopes.len()).rev() {
+                                let is_with = self.with_scope_stack[idx]
+                                    .as_ref()
+                                    .is_some_and(|(_, fs)| fs.contains_key(fname));
+                                if is_with {
+                                    let frame = self.with_scope_stack[idx]
+                                        .take()
+                                        .expect("checked Some above");
+                                    let scope = std::mem::take(&mut self.scopes[idx]);
+                                    masked.push((idx, scope, frame));
+                                }
                             }
                         }
                         // Recursive query field: a relation-valued field whose
@@ -6577,12 +6579,14 @@ impl Infer {
                         // fixpoint. Pre-bind the name to a fresh relation-type
                         // var so the self-reference resolves during value
                         // inference (letrec-style); the inferred value type
-                        // unifies with it below.
-                        let self_referencing = expr_references_var(&f.value, &f.name);
+                        // unifies with it below. Absent keys have no name to
+                        // self-reference, so this is named-only.
+                        let self_referencing =
+                            fname.is_some_and(|n| expr_references_var(&f.value, n));
                         let rec_var = if self_referencing {
                             let elem = self.fresh();
                             let rel = Ty::Relation(Box::new(elem));
-                            self.bind_at(&f.name, Scheme::mono(rel.clone()), f.value.span);
+                            self.bind_at(fname.expect("checked"), Scheme::mono(rel.clone()), f.value.span);
                             Some(rel)
                         } else {
                             None
@@ -6596,11 +6600,11 @@ impl Infer {
                             self.scopes[idx] = scope;
                             self.with_scope_stack[idx] = Some(frame);
                         }
-                        field_tys.push((f.name.clone(), val_ty));
-                        // Absent (`_`) fields go to the absent list instead.
-                        if f.name == "_" {
-                            let ty = field_tys.pop().expect("just pushed").1;
-                            absent_tys.push(ty);
+                        // Absent (`_`) fields go to the positional absent list;
+                        // named fields to the name-keyed list.
+                        match f.name.as_name() {
+                            None => absent_tys.push(val_ty),
+                            Some(fname) => field_tys.push((fname.to_string(), val_ty)),
                         }
                     }
                     Ty::Record(field_tys.into_iter().collect(), absent_tys, None)
@@ -6697,7 +6701,10 @@ impl Infer {
                 let prev_let_bindings = self.let_bindings.clone();
                 if let ast::ExprKind::Record(field_exprs) = &record.node {
                     for f in field_exprs {
-                        self.let_bindings.insert(f.name.clone(), f.value.clone());
+                        // Absent keys have no name to bind under.
+                        if let Some(n) = f.name.as_name() {
+                            self.let_bindings.insert(n.to_string(), f.value.clone());
+                        }
                     }
                 }
                 // Type imports (`with {Maybe …} body`): bring each named data
@@ -7765,7 +7772,16 @@ impl Infer {
                 if let Ty::Record(expected_fields, _,  None) = resolved.peel_alias() {
                     let expected_fields = expected_fields.clone();
                     let mut field_tys = IndexMap::new();
+                    let mut absent_tys = Vec::new();
                     for f in fields {
+                        // Absent keys have no name; check the value and route
+                        // the type to the positional absent list.
+                        if f.name.is_absent() {
+                            let val_ty = self.infer_expr(&f.value);
+                            absent_tys.push(val_ty);
+                            continue;
+                        }
+                        let fname = f.name.expect_named().to_string();
                         // Required CLI constant (sig-only field, empty-record
                         // placeholder value): take the sig type, skip the value.
                         let is_required_const = f.sig.is_some()
@@ -7778,7 +7794,7 @@ impl Infer {
                             let sig_ty = self.ast_type_to_ty(&sig.ty);
                             self.in_type_annotation = saved_flag;
                             self.annotation_unit_vars = saved_unit_vars;
-                            field_tys.insert(f.name.clone(), sig_ty);
+                            field_tys.insert(fname.clone(), sig_ty);
                             continue;
                         }
                         // A field with a sig line is checked against its sig
@@ -7791,16 +7807,16 @@ impl Infer {
                             self.in_type_annotation = saved_flag;
                             self.annotation_unit_vars = saved_unit_vars;
                             self.check_expr(&f.value, &sig_ty);
-                            field_tys.insert(f.name.clone(), sig_ty);
-                        } else if let Some(exp_ty) = expected_fields.get(&f.name) {
+                            field_tys.insert(fname.clone(), sig_ty);
+                        } else if let Some(exp_ty) = expected_fields.get(&fname) {
                             self.check_expr(&f.value, exp_ty);
-                            field_tys.insert(f.name.clone(), exp_ty.clone());
+                            field_tys.insert(fname.clone(), exp_ty.clone());
                         } else {
                             let val_ty = self.infer_expr(&f.value);
-                            field_tys.insert(f.name.clone(), val_ty);
+                            field_tys.insert(fname.clone(), val_ty);
                         }
                     }
-                    self.unify_dir(expected, &Ty::Record(field_tys, vec![],  None), expr.span, false);
+                    self.unify_dir(expected, &Ty::Record(field_tys, absent_tys,  None), expr.span, false);
                 } else {
                     let inferred = self.infer_expr(expr);
                     // `expected` is on the required side here (t1), so pass
@@ -12123,7 +12139,7 @@ impl Infer {
         {
             for fl in fields {
                 if let Some(lit) = crate::codegen::extract_literal(&fl.value) {
-                    self.const_literals.insert(fl.name.clone(), lit);
+                    self.const_literals.insert(fl.name.expect_named().to_string(), lit);
                 }
             }
         }
@@ -14029,9 +14045,20 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                     if let ast::ExprKind::Record(field_exprs) = &record.node {
                         let mut field_tys: Vec<(String, Ty)> =
                             Vec::with_capacity(field_exprs.len());
+                        let mut absent_idx = 0usize;
                         for f in field_exprs {
                             let val_ty = infer.infer_expr(&f.value);
-                            field_tys.push((f.name.clone(), val_ty));
+                            // Absent keys bind under their reserved `_i` name,
+                            // matching the record type's absent-list position.
+                            let name = match f.name.as_name() {
+                                None => {
+                                    let s = format!("_{absent_idx}");
+                                    absent_idx += 1;
+                                    s
+                                }
+                                Some(n) => n.to_string(),
+                            };
+                            field_tys.push((name, val_ty));
                         }
                         infer
                             .with_fields
@@ -14063,7 +14090,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                         // mechanism) and record the field names.
                         infer
                             .with_fields
-                            .push((cur.span, fields.iter().map(|f| f.name.clone()).collect()));
+                            .push((cur.span, fields.iter().filter_map(|f| f.name.as_name().map(str::to_string)).collect()));
                         // The `With` inference arm is skipped here, so push its
                         // type-import scope (`with {Maybe …}`) around the body
                         // inference ourselves — else bare ctors never resolve.
@@ -15225,7 +15252,7 @@ fn for_each_named_fn<'a>(
                     | ast::ExprKind::RouteDecl { .. }
                     | ast::ExprKind::SubsetConstraint { .. }
             ) {
-                f(&fl.name, fl.sig.as_ref(), Some(&fl.value));
+                f(fl.name.expect_named(), fl.sig.as_ref(), Some(&fl.value));
             }
         }
     }

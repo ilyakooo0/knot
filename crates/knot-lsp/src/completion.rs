@@ -474,12 +474,12 @@ pub(crate) fn handle_completion(
             ast::ExprKind::SubsetConstraint { .. } => {}
             _ => {
                 // A named function field.
-                let name = &decl.name;
+                let name = decl.name.expect_named();
                 let snippet = build_function_call_snippet(&doc.module, name);
                 items.push(CompletionItem {
-                    label: name.clone(),
+                    label: name.to_string(),
                     kind: Some(CompletionItemKind::FUNCTION),
-                    detail: doc.type_info.get(name.as_str()).cloned(),
+                    detail: doc.type_info.get(name).cloned(),
                     insert_text: snippet,
                     insert_text_format: Some(InsertTextFormat::SNIPPET),
                     ..Default::default()

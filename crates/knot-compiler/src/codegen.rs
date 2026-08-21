@@ -5015,12 +5015,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let mut absent_idx = 0usize;
                     for f in fields {
                         let val = self.compile_expr(builder, &f.value, env, db);
-                        let name = if f.name == "_" {
-                            let s = format!("_{absent_idx}");
-                            absent_idx += 1;
-                            s
-                        } else {
-                            f.name.clone()
+                        let name = match f.name.as_name() {
+                            None => {
+                                let s = format!("_{absent_idx}");
+                                absent_idx += 1;
+                                s
+                            }
+                            Some(n) => n.to_string(),
                         };
                         compiled.push((name, val));
                     }
@@ -5240,12 +5241,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 if stmts.last().is_some_and(|s| matches!(&s.node,
                                     ast::StmtKind::Expr(e) if e.node.as_yield_arg().is_some())))
                             || self.desugared_monad_kind(&f.value) == Some(MonadKind::Relation);
-                        if rel_valued {
-                            rel_fields.push(f.name.clone());
+                        // Relation-valued fields are tracked by NAME for lazy
+                        // projection. Absent keys have no name and are reached
+                        // only via `^`/`<>` search, never by-name projection —
+                        // skip them here.
+                        if rel_valued && let Some(fname) = f.name.as_name() {
+                            rel_fields.push(fname.to_string());
                             // Lazy iff the query reads a source/derived (not a
                             // constant list literal).
                             if !matches!(&f.value.node, ast::ExprKind::List(_)) {
-                                lazy_rel_fields.push(f.name.clone());
+                                lazy_rel_fields.push(fname.to_string());
                             }
                         }
                     }
@@ -5258,14 +5263,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let mut compiled_fields: Vec<(String, Value)> =
                         Vec::with_capacity(field_exprs.len());
                     let mut absent_idx = 0usize;
-                    let mut field_name = |f: &ast::RecordField| {
-                        if f.name == "_" {
+                    let mut field_name = |f: &ast::RecordField| match f.name.as_name() {
+                        None => {
                             let s = format!("_{absent_idx}");
                             absent_idx += 1;
                             s
-                        } else {
-                            f.name.clone()
                         }
+                        Some(n) => n.to_string(),
                     };
                     for f in field_exprs {
                         // Skip LAZY relation fields: not materialized into the
@@ -5286,7 +5290,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             && matches!(&f.value.node, ast::ExprKind::Record(fs) if fs.is_empty())
                         {
                             let v = if let Some((func_id, 0)) =
-                                self.global_fns.get(f.name.as_str()).copied()
+                                self.global_fns.get(f.name.expect_named()).copied()
                             {
                                 let func_ref =
                                     self.module.declare_func_in_func(func_id, builder.func);
@@ -5311,18 +5315,20 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         // argument-position captures keep working. (Per-site
                         // field aliases never appear in a field value's free
                         // vars — they're `Binding::Internal`, not a user name —
-                        // so only the bare name needs removal.)
-                        if field_env
-                            .bindings
-                            .contains_key(&crate::infer::Binding::User(f.name.clone()))
+                        // so only the bare name needs removal.) Absent keys
+                        // have no name to mask.
+                        if let Some(fname) = f.name.as_name()
+                            && field_env
+                                .bindings
+                                .contains_key(&crate::infer::Binding::User(fname.to_string()))
                             && self
                                 .with_fields
                                 .values()
-                                .any(|fs| fs.iter().any(|n| n == &f.name))
+                                .any(|fs| fs.iter().any(|n| n == fname))
                         {
                             field_env
                                 .bindings
-                                .remove(&crate::infer::Binding::User(f.name.clone()));
+                                .remove(&crate::infer::Binding::User(fname.to_string()));
                         }
                         let v = self.compile_expr(builder, &f.value, &mut field_env, db);
                         compiled_fields.push((field_name(f), v));
@@ -5389,7 +5395,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         // actually contain a free `Var(f.name)`. (NOT
                         // `expr_references_var`, which conservatively returns
                         // true for comprehensions/other nodes it doesn't model.)
-                        if !expr_mentions_free_var(&f.value, &f.name) {
+                        if !expr_mentions_free_var(&f.value, f.name.expect_named()) {
                             continue;
                         }
                         let key = format!("__withfix_{}_{}", expr.span.start, f.name);
@@ -5409,9 +5415,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         self.pending_query_fixpoints.push((
                             key.clone(),
                             f.value.clone(),
-                            f.name.clone(),
+                            f.name.expect_named().to_string(),
                         ));
-                        fixpoint_frame.insert(f.name.clone(), key);
+                        fixpoint_frame.insert(f.name.expect_named().to_string(), key);
                     }
                 }
                 let pushed_fixpoint = !fixpoint_frame.is_empty();
@@ -5473,8 +5479,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let pure_field_names: Vec<String> = if let ast::ExprKind::Record(fes) = &record.node
                 {
                     fes.iter()
-                        .filter(|f| !io_scope.get(&f.name).copied().unwrap_or(false))
-                        .map(|f| f.name.clone())
+                        // Absent keys have no name; they aren't IO-scope keyed.
+                        .filter_map(|f| f.name.as_name())
+                        .filter(|n| !io_scope.get(*n).copied().unwrap_or(false))
+                        .map(|n| n.to_string())
                         .collect()
                 } else {
                     Vec::new()
@@ -5497,16 +5505,19 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let mut let_added: Vec<String> = Vec::new();
                 if let ast::ExprKind::Record(field_exprs) = &record.node {
                     for f in field_exprs {
-                        let is_pure = pure_field_names.iter().any(|n| n == &f.name);
+                        // `let_bindings` are keyed by name; absent keys have no
+                        // name to inline under, so skip them.
+                        let Some(fname) = f.name.as_name() else { continue };
+                        let is_pure = pure_field_names.iter().any(|n| n == fname);
                         // Recursive (fixpoint) fields are routed to a global
                         // fixpoint fn, NOT inlined — inlining would loop.
                         let is_fixpoint = self
                             .fixpoint_rel_fields
                             .last()
-                            .is_some_and(|fr| pushed_fixpoint && fr.contains_key(&f.name));
-                        if is_pure && !is_fixpoint && !self.let_bindings.contains_key(&f.name) {
-                            self.let_bindings.insert(f.name.clone(), f.value.clone());
-                            let_added.push(f.name.clone());
+                            .is_some_and(|fr| pushed_fixpoint && fr.contains_key(fname));
+                        if is_pure && !is_fixpoint && !self.let_bindings.contains_key(fname) {
+                            self.let_bindings.insert(fname.to_string(), f.value.clone());
+                            let_added.push(fname.to_string());
                         }
                     }
                 }
@@ -7701,7 +7712,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     {
                         let overlay = if let ast::ExprKind::Record(fes) = &record.node {
                             fes.iter()
-                                .map(|f| (f.name.clone(), f.value.clone()))
+                                .map(|f| (f.name.expect_named().to_string(), f.value.clone()))
                                 .collect()
                         } else {
                             Vec::new()
@@ -12828,7 +12839,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                              that field",
                                         ),
                                     );
-                                    f.name.clone()
+                                    f.name.expect_named().to_string()
                                 }
                             })
                             .collect(),
@@ -14867,7 +14878,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             && let Some(ty) = lookup_col_type_from_schema(&gschema, col)
                         {
                             let col_sql = format!("{}.{}", alias, quote_sql_ident(col));
-                            group_keys.push((kf.name.clone(), col_sql, ty));
+                            group_keys.push((kf.name.expect_named().to_string(), col_sql, ty));
                             continue;
                         }
                         return None;
@@ -14910,7 +14921,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             .find(|(n, _, _)| n == col || n == &field.name)
                         {
                             select_columns.push(SqlSelectColumn {
-                                result_field: field.name.clone(),
+                                result_field: field.name.expect_named().to_string(),
                                 alias: alias.clone(),
                                 source_col: col.clone(),
                                 type_str: cty.clone(),
@@ -14924,9 +14935,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let (agg_sql, agg_ty) =
                         self.group_aggregate_sql(&gvar, &alias, &gschema, &field.value)?;
                     select_columns.push(SqlSelectColumn {
-                        result_field: field.name.clone(),
+                        result_field: field.name.expect_named().to_string(),
                         alias: alias.clone(),
-                        source_col: field.name.clone(),
+                        source_col: field.name.expect_named().to_string(),
                         type_str: agg_ty,
                         sql_expr: Some(agg_sql),
                     });
@@ -14945,7 +14956,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         && let Some(type_str) = lookup_col_type_from_schema(schema, col_name)
                     {
                         select_columns.push(SqlSelectColumn {
-                            result_field: field.name.clone(),
+                            result_field: field.name.expect_named().to_string(),
                             alias: alias.clone(),
                             source_col: col_name.clone(),
                             type_str,
@@ -14962,9 +14973,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let type_str = infer_multi_table_sql_expr_type(&bind_to_schema, &field.value)
                         .unwrap_or_else(|| "float".to_string());
                     select_columns.push(SqlSelectColumn {
-                        result_field: field.name.clone(),
+                        result_field: field.name.expect_named().to_string(),
                         alias: String::new(),
-                        source_col: field.name.clone(),
+                        source_col: field.name.expect_named().to_string(),
                         type_str,
                         sql_expr: Some(sql_expr),
                     });
@@ -18824,7 +18835,10 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
             let mut new_bound = bound.clone();
             if let Record(fields) = &record.node {
                 for f in fields {
-                    new_bound.insert(f.name.clone());
+                    // Absent keys have no name to mark bound.
+                    if let Some(n) = f.name.as_name() {
+                        new_bound.insert(n.to_string());
+                    }
                 }
             }
             collect_free_vars_set(body, &new_bound, free);
@@ -19260,7 +19274,7 @@ fn analyze_map_select(
             {
                 let type_str = lookup_col_type_from_schema(schema, col_name)?;
                 cols.push(SqlSelectColumn {
-                    result_field: field.name.clone(),
+                    result_field: field.name.expect_named().to_string(),
                     alias: alias.to_string(),
                     source_col: col_name.clone(),
                     type_str,
@@ -19274,9 +19288,9 @@ fn analyze_map_select(
             let type_str = infer_sql_expr_type(bind_var, &field.value, schema)
                 .unwrap_or_else(|| "float".to_string());
             cols.push(SqlSelectColumn {
-                result_field: field.name.clone(),
+                result_field: field.name.expect_named().to_string(),
                 alias: alias.to_string(),
-                source_col: field.name.clone(),
+                source_col: field.name.expect_named().to_string(),
                 type_str,
                 sql_expr: Some(sql_expr),
             });
@@ -19744,7 +19758,7 @@ fn collect_docs_expr(expr: &ast::Expr, out: &mut Vec<(String, String)>) {
     if let ast::ExprKind::Record(fields) = &expr.node {
         for f in fields {
             if let Some(doc) = &f.doc {
-                out.push((f.name.clone(), doc.clone()));
+                out.push((f.name.expect_named().to_string(), doc.clone()));
             }
             // Recurse into the field's value so docs on nested `with {…}` /
             // record fields are collected as well.
@@ -19929,7 +19943,10 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
             let mut new_bound = bound.clone();
             if let ast::ExprKind::Record(fields) = &record.node {
                 for f in fields {
-                    new_bound.insert(f.name.as_str());
+                    // Absent keys have no name to mark bound.
+                    if let Some(n) = f.name.as_name() {
+                        new_bound.insert(n);
+                    }
                 }
             }
             collect_free_vars(body, &new_bound, free);

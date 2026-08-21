@@ -383,7 +383,7 @@ pub fn extract_doc_comments(source: &str, program: &Expr) -> HashMap<String, Str
     for decl in top_fields(program) {
         let name = match &decl.value.node {
             ExprKind::SubsetConstraint { .. } => continue,
-            _ => decl.name.clone(),
+            _ => decl.name.expect_named().to_string(),
         };
 
         let decl_line = offset_to_position(source, decl.value.span.start).line as usize;

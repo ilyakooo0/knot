@@ -44,7 +44,7 @@ pub(crate) fn build_workspace_symbol_entries(
             ExprKind::SourceDecl { name, .. } => (format!("*{name}"), SymbolKind::VARIABLE, None),
             ExprKind::RouteDecl { name, .. } => (format!("route {name}"), SymbolKind::MODULE, None),
             ExprKind::SubsetConstraint { .. } => continue,
-            _ => (decl.name.clone(), SymbolKind::FUNCTION, None),
+            _ => (decl.name.expect_named().to_string(), SymbolKind::FUNCTION, None),
         };
         out.push(WorkspaceSymbolEntry {
             name,

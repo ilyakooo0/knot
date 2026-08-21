@@ -126,7 +126,7 @@ pub fn resolve_definitions(program: &Expr, source: &str) -> Definitions {
             _ => {
                 // A named function field: register its name and any extra
                 // signature/body-line occurrences.
-                let name = &decl.name;
+                let name = decl.name.expect_named();
                 let span = name_span(name);
                 resolver.define(name, span);
                 resolver.register_extra_definition_tokens(dspan, name, span);
@@ -640,13 +640,13 @@ pub fn build_details(program: &Expr) -> HashMap<String, String> {
             }
             _ => {
                 // A named function field, type-first: `Sig  name`.
-                let name = &decl.name;
+                let name = decl.name.expect_named();
                 let detail = decl
                     .sig
                     .as_ref()
                     .map(|t| format!("{}  {}", format_type_scheme(t), name))
-                    .unwrap_or_else(|| name.clone());
-                details.insert(name.clone(), detail);
+                    .unwrap_or_else(|| name.to_string());
+                details.insert(name.to_string(), detail);
             }
         }
     }

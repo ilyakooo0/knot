@@ -617,12 +617,84 @@ pub struct Field<T> {
 /// type-first `Type  name` sig line:
 ///   {Text  name
 ///    name "a"}
+/// A record field's name. Most fields are `Named`; an absent key (`_`) is
+/// `Absent` — it has no usable name, so `.field` access can never reach it and
+/// `^`/`<>` search into its (record) value. Modelled as an enum (not the magic
+/// string `"_"`) so the compiler forces every site to handle the absent case.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FieldName {
+    Named(Name),
+    Absent,
+}
+
+impl FieldName {
+    /// The field's name, or `None` for an absent key.
+    pub fn as_name(&self) -> Option<&str> {
+        match self {
+            FieldName::Named(n) => Some(n),
+            FieldName::Absent => None,
+        }
+    }
+
+    /// True for an absent key (`_`).
+    pub fn is_absent(&self) -> bool {
+        matches!(self, FieldName::Absent)
+    }
+
+    /// The name of a field that must be named in this context (a sig-only
+    /// constant, a self-referencing field, a `let`-inlined value, …). Absent
+    /// keys are filtered out before these contexts, so reaching one here is a
+    /// compiler bug.
+    pub fn expect_named(&self) -> &str {
+        self.as_name()
+            .expect("compiler bug: absent (`_`) field in a named-only context")
+    }
+}
+
+impl std::fmt::Display for FieldName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FieldName::Named(n) => write!(f, "{n}"),
+            FieldName::Absent => write!(f, "_"),
+        }
+    }
+}
+
+// Compare a field name against a plain `&str` name — true only for a matching
+// `Named` field (an absent key never equals any name). Lets existing
+// `f.name == "base"` checks keep working unchanged.
+impl PartialEq<&str> for FieldName {
+    fn eq(&self, other: &&str) -> bool {
+        matches!(self, FieldName::Named(n) if n == other)
+    }
+}
+impl PartialEq<str> for FieldName {
+    fn eq(&self, other: &str) -> bool {
+        matches!(self, FieldName::Named(n) if n == other)
+    }
+}
+impl PartialEq<String> for FieldName {
+    fn eq(&self, other: &String) -> bool {
+        matches!(self, FieldName::Named(n) if n == other)
+    }
+}
+impl PartialEq<FieldName> for &str {
+    fn eq(&self, other: &FieldName) -> bool {
+        other == self
+    }
+}
+impl PartialEq<FieldName> for String {
+    fn eq(&self, other: &FieldName) -> bool {
+        other == self
+    }
+}
+
 /// The sig (when present) is enforced against the value's type. It is a full
 /// type scheme so a field function can take implicit-field constraints:
 /// `{(Text  ^name) => {} -> Text  greet  greet \_ -> ^name}`.
 #[derive(Debug, Clone)]
 pub struct RecordField {
-    pub name: Name,
+    pub name: FieldName,
     pub value: Expr,
     pub sig: Option<TypeScheme>,
     /// Markdown documentation attached via `---` doc comments immediately

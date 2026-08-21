@@ -71,7 +71,7 @@ pub(crate) fn handle_inlay_hint(
             | ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::RouteDecl { .. }
             | ast::ExprKind::SubsetConstraint { .. } => continue,
-            _ => (decl.name.as_str(), decl.sig.as_ref(), false),
+            _ => (decl.name.expect_named(), decl.sig.as_ref(), false),
         };
         if let (name, None, marker) = (fname, fsig, is_relation_marker)
             && let Some(inferred) = doc.type_info.get(name)
@@ -257,7 +257,7 @@ fn add_dirty_decl_telemetry(
         }
         let name = match &decl.value.node {
             ast::ExprKind::SubsetConstraint { .. } => continue,
-            _ => decl.name.clone(),
+            _ => decl.name.expect_named().to_string(),
         };
         if !doc.dirty_decl_closure.contains(&name) {
             continue;
@@ -1149,7 +1149,7 @@ fn add_constraint_hints(
 
     fn constraints_for_callee(program: &knot::ast::Expr, name: &str) -> Option<Vec<String>> {
         for decl in top_fields(program) {
-            match (&decl.name, &decl.sig) {
+            match (decl.name.expect_named(), &decl.sig) {
                 (n, Some(scheme)) if n == name => {
                     let cs: Vec<String> = scheme
                         .constraints

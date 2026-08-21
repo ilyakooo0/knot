@@ -684,11 +684,12 @@ pub fn check_with_chain_shadowing(program: &Expr) -> Vec<knot::diagnostic::Diagn
                 // repeated across two outer layers shadows within the chain.
                 if let ExprKind::Record(fields) = &record.node {
                     for f in fields {
-                        if outer.insert(f.name.clone(), f.value.span).is_some() {
+                        // Absent keys have no name, so they can never shadow.
+                        let Some(fname) = f.name.as_name() else { continue };
+                        if outer.insert(fname.to_string(), f.value.span).is_some() {
                             diags.push(
                                 knot::diagnostic::Diagnostic::error(format!(
-                                    "`{}` is already defined in an enclosing scope, and shadowing is not allowed",
-                                    f.name
+                                    "`{fname}` is already defined in an enclosing scope, and shadowing is not allowed",
                                 ))
                                 .label(f.value.span, "shadows an earlier `with` binding of this name"),
                             );
@@ -702,7 +703,8 @@ pub fn check_with_chain_shadowing(program: &Expr) -> Vec<knot::diagnostic::Diagn
                 // Its fields must not repeat any outer layer's name.
                 if let ExprKind::Record(fields) = &record.node {
                     for f in fields {
-                        if outer.contains_key(&f.name) {
+                        let Some(fname) = f.name.as_name() else { continue };
+                        if outer.contains_key(fname) {
                             diags.push(
                                 knot::diagnostic::Diagnostic::error(format!(
                                     "`{}` is already defined in an enclosing scope, and shadowing is not allowed",

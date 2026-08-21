@@ -444,7 +444,7 @@ impl PunField for ast::Field<ast::Expr> {
 
 impl PunField for ast::RecordField {
     fn field_name(&self) -> &str {
-        &self.name
+        self.name.expect_named()
     }
     fn field_value(&self) -> &ast::Expr {
         &self.value
@@ -949,9 +949,9 @@ fn field_sites_in_expr<F: FnMut(&str, Span)>(expr: &ast::Expr, source: &str, f: 
                 // token doubles as a variable reference and is handled by
                 // the symbol-rename path instead.
                 if let Some(span) =
-                    find_word_in_source(source, &fld.name, search_start, fld.value.span.start)
+                    find_word_in_source(source, fld.name.expect_named(), search_start, fld.value.span.start)
                 {
-                    f(&fld.name, span);
+                    f(fld.name.expect_named(), span);
                 }
                 search_start = fld.value.span.end;
             }

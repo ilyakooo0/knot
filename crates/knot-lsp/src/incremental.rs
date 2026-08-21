@@ -204,7 +204,7 @@ fn top_fields(program: &Expr) -> Vec<&ast::RecordField> {
 fn field_key(field: &ast::RecordField, index: usize) -> String {
     match &field.value.node {
         ExprKind::SubsetConstraint { .. } => format!("__subset#{index}"),
-        _ => field.name.clone(),
+        _ => field.name.expect_named().to_string(),
     }
 }
 
@@ -251,7 +251,7 @@ fn hash_field_signature(field: &ast::RecordField) -> u64 {
         | ExprKind::SubsetConstraint { .. } => return hash_field(field),
         _ => {
             // A named function field: hash the sig when present, else the body.
-            ("fun_sig", &field.name).hash(&mut h);
+            ("fun_sig", field.name.expect_named()).hash(&mut h);
             match &field.sig {
                 Some(ts) => {
                     strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
@@ -302,7 +302,7 @@ fn hash_structure(program: &Expr) -> u64 {
                 strip_spans(&format!("{:?}", field.value.node)).hash(&mut h);
             }
             other => {
-                ("fun", &field.name).hash(&mut h);
+                ("fun", field.name.expect_named()).hash(&mut h);
                 if let Some(ts) = &field.sig {
                     strip_spans(&format!("{:?}", ts.ty.node)).hash(&mut h);
                 } else {

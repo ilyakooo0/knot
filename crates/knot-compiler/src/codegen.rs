@@ -344,6 +344,7 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     /// List-literal spans that resolved to `Vec`: relation representation but
     /// no dedup (ordered, allows duplicates).
     list_lit_vecs: HashSet<ast::Span>,
+    int_lit_floats: HashSet<ast::Span>,
 
     // `with` expression span -> field names bound in its body. Codegen
     // projects exactly these fields out of the record into locals.
@@ -731,6 +732,7 @@ pub fn compile(
     string_lit_bytes: &crate::infer::StringLitBytes,
     list_lit_lists: &HashSet<ast::Span>,
     list_lit_vecs: &HashSet<ast::Span>,
+    int_lit_floats: &HashSet<ast::Span>,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
@@ -769,6 +771,7 @@ pub fn compile(
             string_lit_bytes,
             list_lit_lists,
             list_lit_vecs,
+            int_lit_floats,
             type_info,
             elem_pushdown_ok,
             show_unit_strings,
@@ -812,6 +815,7 @@ pub fn compile_with<M: cranelift_module::Module>(
     string_lit_bytes: &crate::infer::StringLitBytes,
     list_lit_lists: &HashSet<ast::Span>,
     list_lit_vecs: &HashSet<ast::Span>,
+    int_lit_floats: &HashSet<ast::Span>,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
@@ -849,6 +853,7 @@ pub fn compile_with<M: cranelift_module::Module>(
         string_lit_bytes,
         list_lit_lists,
         list_lit_vecs,
+        int_lit_floats,
         type_info,
         elem_pushdown_ok,
         show_unit_strings,
@@ -886,6 +891,7 @@ fn compile_inner<M: cranelift_module::Module>(
     string_lit_bytes: &crate::infer::StringLitBytes,
     list_lit_lists: &HashSet<ast::Span>,
     list_lit_vecs: &HashSet<ast::Span>,
+    int_lit_floats: &HashSet<ast::Span>,
     type_info: &crate::infer::TypeInfo,
     elem_pushdown_ok: &crate::infer::ElemPushdownOk,
     show_unit_strings: &crate::infer::ShowUnitStrings,
@@ -959,6 +965,7 @@ fn compile_inner<M: cranelift_module::Module>(
     cg.string_lit_bytes = string_lit_bytes.clone();
     cg.list_lit_lists = list_lit_lists.clone();
     cg.list_lit_vecs = list_lit_vecs.clone();
+    cg.int_lit_floats = int_lit_floats.clone();
     cg.with_fields = with_fields.clone();
     cg.implicit_refs = implicit_refs.clone();
     cg.implicit_dict_args = implicit_dict_args.clone();
@@ -1330,6 +1337,7 @@ pub fn jit_compile_typed(source: &str, expected: Option<&str>) -> Option<JitComp
             string_lit_bytes,
             list_lit_lists,
             list_lit_vecs,
+            int_lit_floats,
             elem_pushdown_ok,
             show_unit_strings,
             sum_float_spans,
@@ -1379,6 +1387,7 @@ pub fn jit_compile_typed(source: &str, expected: Option<&str>) -> Option<JitComp
             &string_lit_bytes,
             &list_lit_lists,
             &list_lit_vecs,
+            &int_lit_floats,
             &type_info,
             &elem_pushdown_ok,
             &show_unit_strings,
@@ -1536,6 +1545,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             string_lit_bytes: HashSet::new(),
             list_lit_lists: HashSet::new(),
             list_lit_vecs: HashSet::new(),
+            int_lit_floats: HashSet::new(),
             with_fields: HashMap::new(),
             implicit_refs: HashMap::new(),
             implicit_dict_args: HashMap::new(),
@@ -13117,7 +13127,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
     ) -> Value {
         match lit {
             ast::Literal::Int(n) => {
-                if let Ok(small) = n.parse::<i64>() {
+                // An integer literal is polymorphic over Int/Float; emit per its
+                // resolved base. `Float` → an f64.
+                if self.int_lit_floats.contains(&span) {
+                    let f: f64 = n.parse().unwrap_or(0.0);
+                    let n_val = builder.ins().f64const(f);
+                    self.call_rt(builder, "knot_value_float", &[n_val])
+                } else if let Ok(small) = n.parse::<i64>() {
                     let n_val = builder.ins().iconst(types::I64, small);
                     self.call_rt(builder, "knot_value_int", &[n_val])
                 } else {

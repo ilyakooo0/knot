@@ -362,6 +362,16 @@ impl UnitTy {
         }
     }
 
+    /// If this unit is exactly a single unresolved var (`UnitTy::var(v)`),
+    /// return that var.
+    fn only_var(&self) -> Option<UnitVar> {
+        if self.bases.is_empty() && self.vars.len() == 1 {
+            self.vars.keys().next().copied()
+        } else {
+            None
+        }
+    }
+
     fn is_dimensionless(&self) -> bool {
         self.bases.is_empty() && self.vars.is_empty()
     }
@@ -500,6 +510,12 @@ enum Ty {
     Bool,
     Bytes,
     Uuid,
+    /// An integer literal `42` — a whole number, polymorphic over `Int` and
+    /// `Float`, carrying its unit directly. Structurally numeric (unit
+    /// arithmetic reads the unit via `unit_of`), but the Int/Float base is
+    /// deferred to end of inference, defaulting to `Int` unless a
+    /// Float-demanding context pinned it to `Float`.
+    NumLit(UnitTy),
     /// Function type.
     Fun(Box<Ty>, Box<Ty>),
     /// Record with named fields and optional row variable (open record).
@@ -575,6 +591,9 @@ impl Ty {
     fn is_int_like(&self) -> bool {
         match self.peel_alias() {
             Ty::Int => true,
+            // An integer literal is numeric (int-like by default) until pinned
+            // to Float.
+            Ty::NumLit(_) => true,
             Ty::Con(name, args) => {
                 name == "Int" && args.len() == 1 && matches!(args[0].peel_alias(), Ty::Unit(_))
             }
@@ -586,6 +605,8 @@ impl Ty {
     fn is_float_like(&self) -> bool {
         match self.peel_alias() {
             Ty::Float => true,
+            // An integer literal could be Float.
+            Ty::NumLit(_) => true,
             Ty::Con(name, args) => {
                 name == "Float" && args.len() == 1 && matches!(args[0].peel_alias(), Ty::Unit(_))
             }
@@ -593,10 +614,18 @@ impl Ty {
         }
     }
 
+    /// True for any numeric type (`Int`/`Float`, unit-bearing or not, or an
+    /// integer literal).
+    fn is_numeric(&self) -> bool {
+        self.is_int_like() || self.is_float_like()
+    }
+
     /// Extract the `UnitTy` from `Con("Int"/"Float", [Unit(u)])`, peeling
     /// aliases. Returns `None` for plain `Int`/`Float` or anything else.
     fn unit_of(&self) -> Option<&UnitTy> {
         match self.peel_alias() {
+            // An integer literal carries its unit directly.
+            Ty::NumLit(u) => Some(u),
             Ty::Con(name, args) if (name == "Int" || name == "Float") && args.len() == 1 => {
                 match args[0].peel_alias() {
                     Ty::Unit(u) => Some(u),
@@ -654,6 +683,14 @@ fn default_free_unit_vars(ty: &Ty) -> Ty {
             u.vars.clear();
             u.normalize();
             Ty::Unit(u)
+        }
+        // An integer literal: default its unit var to dimensionless and its base
+        // to `Int`.
+        Ty::NumLit(u) => {
+            let mut u = u.clone();
+            u.vars.clear();
+            u.normalize();
+            Ty::int_with_unit(u)
         }
         Ty::Fun(p, r) => Ty::Fun(
             Box::new(default_free_unit_vars(p)),
@@ -998,6 +1035,13 @@ struct Infer {
     /// literal).
     list_lit_vars: HashMap<TyVar, (Span, TyVar)>,
 
+    /// Integer-literal base polymorphism. Each integer literal's `Ty::NumLit(u)`
+    /// carries a fresh unit var `u`; this maps `u` to the literal's span. A
+    /// whole number is valid as `Int` or `Float`; `num_lit_float_units` records
+    /// which literals resolved to `Float` (the rest default to `Int`).
+    num_lit_spans: HashMap<UnitVar, Span>,
+    num_lit_float_units: HashSet<UnitVar>,
+
     /// Top-level functions carrying signature-level `^`-field constraints:
     /// name → ordered `(field, field_type)` list. The function's stored scheme
     /// has already been elaborated to take a leading dictionary record per
@@ -1264,6 +1308,8 @@ impl Infer {
             known_impls: HashSet::new(),
             string_lit_vars: HashMap::new(),
             list_lit_vars: HashMap::new(),
+            num_lit_spans: HashMap::new(),
+            num_lit_float_units: HashSet::new(),
             implicit_dict_fns: HashMap::new(),
             fold_dict_fields: HashMap::new(),
             implicit_dict_args: HashMap::new(),
@@ -1935,6 +1981,9 @@ impl Infer {
                 }
             }
             Ty::Relation(inner) => Ty::Relation(Box::new(self.apply_impl(inner, excluded))),
+            // An integer literal: resolve its unit var through the unit
+            // substitution, keeping the deferred Int/Float base.
+            Ty::NumLit(u) => Ty::NumLit(self.apply_unit(u)),
             Ty::Con(name, args) => {
                 let applied_args: Vec<Ty> =
                     args.iter().map(|a| self.apply_impl(a, excluded)).collect();
@@ -2510,6 +2559,44 @@ impl Infer {
                     self.bind_list_lit_var(v, &t1, raw1, span);
                 } else {
                     self.bind_string_lit_var(v, &t1, raw1, span);
+                }
+            }
+            // ── Integer-literal base polymorphism ─────────────────────────
+            // `NumLit(u)` is a whole number, polymorphic over Int/Float. Against
+            // a concrete numeric, unify the units; against a Float it also marks
+            // the literal as Float (recorded by its unit var).
+            (Ty::NumLit(u), other) | (other, Ty::NumLit(u)) if other.is_numeric() => {
+                let u = u.clone();
+                let other = other.clone();
+                if other.is_float_like() && !other.is_int_like() {
+                    // Pure Float (not a NumLit) — mark the literal as Float.
+                    if let Some(v) = u.only_var() {
+                        self.num_lit_float_units.insert(v);
+                    }
+                }
+                if let Some(u2) = other.unit_of().cloned() {
+                    self.unify_units(&u, &u2, span);
+                }
+            }
+            (Ty::NumLit(u1), Ty::NumLit(u2)) => {
+                let (u1, u2) = (u1.clone(), u2.clone());
+                self.unify_units(&u1, &u2, span);
+            }
+            // An integer literal against a `Num`-polymorphic numeric
+            // (`App(f, Unit u)` with a var constructor `f`, e.g. `dress`'s
+            // `a 1`): bind the constructor var to `Int` (the literal's default)
+            // and unify the units.
+            (Ty::NumLit(u), Ty::App(f, a)) | (Ty::App(f, a), Ty::NumLit(u))
+                if matches!(**f, Ty::Var(_)) && matches!(&**a, Ty::Unit(_)) =>
+            {
+                let u = u.clone();
+                let f = (**f).clone();
+                let a = (**a).clone();
+                if let Ty::Var(fv) = f {
+                    self.bind_var(fv, Ty::TyCon("Int".into()), span);
+                }
+                if let Ty::Unit(u2) = a {
+                    self.unify_units(&u, &u2, span);
                 }
             }
             (Ty::Int, Ty::Int)
@@ -4544,6 +4631,11 @@ impl Infer {
             },
             Ty::Int => "Int".into(),
             Ty::Float => "Float".into(),
+            // An integer literal with a deferred Int/Float base — display as its
+            // default `Int` form (with its unit).
+            Ty::NumLit(u) => {
+                self.display_ty_inner(&Ty::int_with_unit(self.apply_unit(u)), in_fun)
+            }
             Ty::Text => "Text".into(),
             Ty::Bool => "Bool".into(),
             Ty::Bytes => "Bytes".into(),
@@ -5049,6 +5141,10 @@ impl Infer {
         let mut expected = ret;
         for a in args.iter().rev() {
             let arg_ty = self.infer_expr(a);
+            // An integer-literal argument defaults to Int when disambiguating a
+            // `^field` projection — otherwise it would match both the Int and
+            // Float candidates (it unifies with either) and read as ambiguous.
+            let arg_ty = self.default_num_lit(arg_ty, a.span);
             expected = Ty::Fun(Box::new(arg_ty), Box::new(expected));
         }
         let field_ty = self.resolve_implicit_ref(name, &expected, head_span);
@@ -5061,6 +5157,23 @@ impl Infer {
             result = self.apply(&rest);
         }
         result
+    }
+
+    /// Resolve a `NumLit` (integer literal) to its concrete base: `Float <u>`
+    /// if the literal was pinned to Float, else `Int <u>` (the default).
+    /// Non-`NumLit` types pass through unchanged.
+    fn default_num_lit(&mut self, ty: Ty, _span: Span) -> Ty {
+        match self.apply(&ty) {
+            Ty::NumLit(u) => {
+                let u = self.apply_unit(&u);
+                if u.only_var().is_some_and(|v| self.num_lit_float_units.contains(&v)) {
+                    Ty::float_with_unit(u)
+                } else {
+                    Ty::int_with_unit(u)
+                }
+            }
+            t => t,
+        }
     }
 
     fn try_infer_implicit_ref_app(&mut self, expr: &ast::Expr) -> Option<Ty> {
@@ -8363,7 +8476,16 @@ impl Infer {
             // binds to that unit rather than laundering it away. When the
             // context leaves `u` unconstrained, codegen defaults it to
             // dimensionless.
-            ast::Literal::Int(_) => Ty::int_with_unit(UnitTy::var(self.fresh_unit_var())),
+            // Integer literals are polymorphic over `Int` and `Float` (a whole
+            // number is valid as either): a `NumLit(u)` for a fresh unit var `u`,
+            // numeric-structured so unit arithmetic sees the unit immediately,
+            // with the Int/Float base deferred to end of inference (defaults to
+            // `Int <u>`; `Float` is opt-in via a Float-demanding context).
+            ast::Literal::Int(_) => {
+                let u = self.fresh_unit_var();
+                self.num_lit_spans.insert(u, span);
+                Ty::NumLit(UnitTy::var(u))
+            }
             ast::Literal::Float(_) => Ty::float_with_unit(UnitTy::var(self.fresh_unit_var())),
             // String literals are polymorphic over `Text` and `Bytes`: a fresh
             // variable that unification may bind to either. Left unconstrained
@@ -12793,6 +12915,11 @@ fn display_ty_clean_inner(
                 "Float".into()
             }
         }
+        // An integer literal with a deferred Int/Float base — render as its
+        // default `Int` form (with its unit).
+        Ty::NumLit(u) => {
+            display_ty_clean_inner(&Ty::int_with_unit(u.clone()), names, unit_names, in_fun, wire)
+        }
         Ty::Text => "Text".into(),
         Ty::Bool => "Bool".into(),
         Ty::Bytes => "Bytes".into(),
@@ -13078,6 +13205,9 @@ pub struct CheckOutput {
     /// Spans of list literals that resolved to `Vec`; these keep the relation
     /// representation but skip dedup (a Vec is ordered and allows duplicates).
     pub list_lit_vecs: HashSet<Span>,
+    /// Spans of integer literals that resolved to `Float`; codegen emits these
+    /// as floats (`knot_value_float`) rather than ints.
+    pub int_lit_floats: HashSet<Span>,
     pub elem_pushdown_ok: ElemPushdownOk,
     pub show_unit_strings: ShowUnitStrings,
     pub sum_float_spans: SumFloatSpans,
@@ -13913,6 +14043,14 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         .map(|(_, (span, _))| *span)
         .collect();
 
+    // Record which integer literals resolved to `Float` so codegen emits a
+    // float (`knot_value_float`) rather than an int.
+    let int_lit_floats: HashSet<Span> = infer
+        .num_lit_float_units
+        .iter()
+        .filter_map(|v| infer.num_lit_spans.get(v).copied())
+        .collect();
+
     // Record which string literals resolved to `Bytes` so codegen emits them
     // as byte strings rather than interned text.
     let string_lit_bytes: StringLitBytes = infer
@@ -14237,6 +14375,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         string_lit_bytes,
         list_lit_lists,
         list_lit_vecs,
+        int_lit_floats,
         elem_pushdown_ok,
         show_unit_strings,
         sum_float_spans,

@@ -142,6 +142,18 @@ fn strip_dress_units() {
 }
 
 #[test]
+fn int_literal_int_float_polymorphism() {
+    // An integer literal is Int by default…
+    assert_show("42", "42");
+    assert_show("base.show (40 + 2)", "42");
+    // …but Float when a Float context demands it.
+    assert_show("base.show (the (Float 1) 42)", "42.0");
+    assert_show("base.show ((the (Float 1) 42) + 0.5)", "42.5");
+    // A lambda-param `*` still composes units (the literal is dimensionless).
+    assert_show("base.show ((\\x -> x * 2) 21)", "42");
+}
+
+#[test]
 fn not_and_id() {
     assert_show("base.id 5", "5");
     // not is a reserved keyword; Bool negation is via !=/case. base.id only here.

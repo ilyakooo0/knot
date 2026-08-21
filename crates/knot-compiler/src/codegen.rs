@@ -5036,7 +5036,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         let val = self.compile_expr(builder, &f.value, env, db);
                         let name = match f.name.as_name() {
                             None => {
-                                let s = format!("_{absent_idx}");
+                                let s = ast::RecordKey::Absent(absent_idx).as_storage_key();
                                 absent_idx += 1;
                                 s
                             }
@@ -5210,7 +5210,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     ),
                 };
                 for field in &path {
-                    let (key_ptr, key_len) = self.string_ptr(builder, field);
+                    let (key_ptr, key_len) = self.string_ptr(builder, &field.as_storage_key());
                     val = self.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len]);
                 }
                 val
@@ -5284,7 +5284,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let mut absent_idx = 0usize;
                     let mut field_name = |f: &ast::RecordField| match f.name.as_name() {
                         None => {
-                            let s = format!("_{absent_idx}");
+                            let s = ast::RecordKey::Absent(absent_idx).as_storage_key();
                             absent_idx += 1;
                             s
                         }
@@ -6871,7 +6871,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         &mut self,
         builder: &mut FunctionBuilder,
         root: &crate::infer::Binding,
-        path: &[String],
+        path: &[ast::RecordKey],
         span: ast::Span,
         env: &mut Env,
     ) -> Value {
@@ -6882,7 +6882,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             )
         });
         for field in path {
-            let (key_ptr, key_len) = self.string_ptr(builder, field);
+            let (key_ptr, key_len) = self.string_ptr(builder, &field.as_storage_key());
             val = self.call_rt(builder, "knot_record_field", &[val, key_ptr, key_len]);
         }
         val

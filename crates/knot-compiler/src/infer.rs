@@ -260,13 +260,21 @@ pub type WithFields = HashMap<Span, Vec<String>>;
 /// projection per path element.
 /// Maps a `^name` (`ImplicitRef`) span to its resolved dictionary root (a
 /// user field name for the innermost `with` frame, an internal alias for
-/// deeper frames) plus the remaining field path to project.
-pub type ImplicitRefs = HashMap<Span, (Binding, Vec<String>)>;
+/// deeper frames) plus the remaining field path to project. Each path element
+/// is a typed `RecordKey` (named or absent-by-index); the `"_{i}"` storage
+/// string is produced only at codegen's runtime-storage boundary.
+pub type ImplicitRefs = HashMap<Span, (Binding, Vec<ast::RecordKey>)>;
 
 /// Callsite resolutions for implicit dictionaries: application span → the
 /// `(root_binding, field_path)` of the in-scope record supplying the
 /// dictionary. Codegen splices the projected record as the leading argument.
-pub type ImplicitDictArgs = HashMap<Span, (Binding, Vec<String>)>;
+pub type ImplicitDictArgs = HashMap<Span, (Binding, Vec<ast::RecordKey>)>;
+
+/// One `with` frame on `with_scope_stack`: the `with` expression's span, its
+/// NAMED field → scheme map (for direct `field_schemes.get(name)` lookups), and
+/// its ABSENT (`_`) field types positionally (the typed form of the old `_i`
+/// string keys; `^`/`<>` BFS's into them as search roots).
+type WithFrame = (Span, HashMap<String, Scheme>, Vec<Ty>);
 
 /// Callsite resolutions for FOLD dictionaries: application span → the field
 /// name plus the UNIQUE synthetic span of each collected `field` fragment's
@@ -1086,7 +1094,7 @@ struct Infer {
     /// dictionary. Codegen splices the projected record as the leading
     /// argument at that application. Keyed by the application's span (the
     /// outermost `App` node's span).
-    implicit_dict_args: HashMap<Span, (Binding, Vec<String>)>,
+    implicit_dict_args: HashMap<Span, (Binding, Vec<ast::RecordKey>)>,
 
     /// For each implicit-dict function, the subset of its constraint fields
     /// declared with the FOLD marker `(<>field)` (vs single-match `(^field)`).
@@ -1231,8 +1239,11 @@ struct Infer {
     /// detect that a variable resolved to a `with` FIELD and redirect codegen's
     /// flat-`Env` lookup to that `with` site's unique alias (see the `Var` arm
     /// and `InternalName::WithField`). A `None` scope entry keeps the two stacks
-    /// aligned when a non-`with` construct pushes a scope.
-    with_scope_stack: Vec<Option<(Span, HashMap<String, Scheme>)>>,
+    /// aligned when a non-`with` construct pushes a scope. The third tuple
+    /// element is the `with` record's ABSENT (`_`) field types, positionally —
+    /// the typed form of what used to be `_i` string keys in `field_schemes`.
+    /// `^`/`<>` BFS's into them as search roots.
+    with_scope_stack: Vec<Option<WithFrame>>,
     /// Stack of per-`with` constructor-import scopes (one frame per enclosing
     /// `with {Type …}` that names types). Each frame maps a constructor NAME to
     /// the data type it belongs to, so a bare `Just {value v}` inside the body
@@ -4207,7 +4218,7 @@ impl Infer {
         self.with_scope_stack
             .iter()
             .flatten()
-            .any(|(_, fields)| fields.contains_key(name))
+            .any(|(_, fields, ..)| fields.contains_key(name))
     }
 
     fn lookup_instantiate_at(&mut self, name: &str, span: Span) -> Option<Ty> {
@@ -5281,7 +5292,7 @@ impl Infer {
         field: &str,
         field_ty: &Ty,
         span: Span,
-    ) -> Option<(Binding, Vec<String>)> {
+    ) -> Option<(Binding, Vec<ast::RecordKey>)> {
         // Candidate 0: an enclosing `with` frame that binds `field`. Snapshot
         // the frames first (immutable scan) so the speculative unify below can
         // borrow `self` mutably.
@@ -5291,7 +5302,7 @@ impl Infer {
             .zip(self.scopes.iter())
             .rev()
             .filter_map(|(with_frame, scope)| {
-                if let Some((with_span, field_schemes)) = with_frame
+                if let Some((with_span, field_schemes, ..)) = with_frame
                     && let Some(scheme) = field_schemes.get(field)
                 {
                     return Some((*with_span, scheme.ty.clone(), true));
@@ -5327,21 +5338,21 @@ impl Infer {
         // General case: BFS in-scope record bindings for one with a `field`
         // unifying with `field_ty`. The dict is the record projected along the
         // path to `field`, minus the field itself.
-        let mut candidates: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
+        let mut candidates: Vec<(Binding, Vec<ast::RecordKey>, Ty)> = Vec::new();
         'scopes: for scope in self.scopes.iter().rev() {
             for (bind_name, scheme) in scope {
                 let root_ty = self.apply(&scheme.ty);
-                let mut frontier: Vec<(Vec<String>, Ty)> = match root_ty.peel_alias() {
+                let mut frontier: Vec<(Vec<ast::RecordKey>, Ty)> = match root_ty.peel_alias() {
                     Ty::Record(fields, _,  _) => fields
                         .iter()
-                        .map(|(f, t)| (vec![f.clone()], t.clone()))
+                        .map(|(f, t)| (vec![ast::RecordKey::Named(f.clone())], t.clone()))
                         .collect(),
                     _ => Vec::new(),
                 };
                 while !frontier.is_empty() {
-                    let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
+                    let mut next: Vec<(Vec<ast::RecordKey>, Ty)> = Vec::new();
                     for (path, fty) in frontier {
-                        if *path.last().expect("non-empty path") == field {
+                        if matches!(path.last().expect("non-empty path"), ast::RecordKey::Named(n) if n == field) {
                             candidates.push((
                                 Binding::User(bind_name.clone()),
                                 path.clone(),
@@ -5351,7 +5362,7 @@ impl Infer {
                         if let Ty::Record(sub, _,  _) = self.apply(&fty).peel_alias().clone() {
                             for (f, t) in sub {
                                 let mut p = path.clone();
-                                p.push(f);
+                                p.push(ast::RecordKey::Named(f));
                                 next.push((p, t));
                             }
                         }
@@ -5468,9 +5479,9 @@ impl Infer {
         // alias), and the innermost such `with` wins (nested shadows, siblings
         // don't collide). A direct NON-`with` binding keeps its historical
         // meaning — the BFS field projection off that binding.
-        let mut with_candidate: Option<(Binding, Vec<String>, Ty)> = None;
+        let mut with_candidate: Option<(Binding, Vec<ast::RecordKey>, Ty)> = None;
         for (with_frame, scope) in self.with_scope_stack.iter().zip(self.scopes.iter()).rev() {
-            if let Some((with_span, field_schemes)) = with_frame
+            if let Some((with_span, field_schemes, ..)) = with_frame
                 && let Some(scheme) = field_schemes.get(name)
             {
                 let alias = Binding::Internal(InternalName::WithField {
@@ -5505,7 +5516,7 @@ impl Infer {
         let mut searched: Vec<String> = Vec::new();
         // Name-matching fields, one inner Vec per record, innermost record
         // first. Each entry: (root binding, field path, field type).
-        let mut by_record: Vec<Vec<(Binding, Vec<String>, Ty)>> = Vec::new();
+        let mut by_record: Vec<Vec<(Binding, Vec<ast::RecordKey>, Ty)>> = Vec::new();
         if let Some((root, path, field_ty)) = with_candidate {
             // The direct `with`-field candidate is the innermost binding.
             by_record.push(vec![(root, path, field_ty)]);
@@ -5520,35 +5531,35 @@ impl Infer {
         // like a named record binding below. `_i` itself never matches `name`
         // (it isn't a valid identifier), so this only ever descends INTO it.
         for (with_frame, _scope) in self.with_scope_stack.iter().zip(self.scopes.iter()).rev() {
-            let Some((with_span, field_schemes)) = with_frame else {
+            let Some((with_span, _field_schemes, absent_fields)) = with_frame else {
                 continue;
             };
             let root = Binding::Internal(InternalName::WithRecord {
                 span_start: with_span.start,
             });
-            let mut group: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
-            // Seed the frontier with the frame's absent fields (the `_i`
-            // entries), then descend into nested records.
-            let mut frontier: Vec<(Vec<String>, Ty)> = field_schemes
+            let mut group: Vec<(Binding, Vec<ast::RecordKey>, Ty)> = Vec::new();
+            // Seed the frontier with the frame's absent fields (typed
+            // `RecordKey::Absent(i)`), then descend into nested records.
+            let mut frontier: Vec<(Vec<ast::RecordKey>, Ty)> = absent_fields
                 .iter()
-                .filter(|(k, _)| k.starts_with('_'))
-                .map(|(k, s)| (vec![k.clone()], s.ty.clone()))
+                .enumerate()
+                .map(|(i, t)| (vec![ast::RecordKey::Absent(i)], t.clone()))
                 .collect();
             while !frontier.is_empty() {
-                let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
+                let mut next: Vec<(Vec<ast::RecordKey>, Ty)> = Vec::new();
                 for (path, field_ty) in frontier.drain(..) {
-                    if *path.last().expect("non-empty path") == name {
+                    if matches!(path.last().expect("non-empty path"), ast::RecordKey::Named(n) if n == name) {
                         group.push((root.clone(), path.clone(), field_ty.clone()));
                     }
                     if let Ty::Record(sub, sub_absent, _) = self.apply(&field_ty).peel_alias() {
                         for (f, t) in sub.iter().rev() {
                             let mut p = path.clone();
-                            p.push(f.clone());
+                            p.push(ast::RecordKey::Named(f.clone()));
                             next.push((p, t.clone()));
                         }
                         for (i, t) in sub_absent.iter().enumerate().rev() {
                             let mut p = path.clone();
-                            p.push(format!("_{i}"));
+                            p.push(ast::RecordKey::Absent(i));
                             next.push((p, t.clone()));
                         }
                     }
@@ -5565,28 +5576,28 @@ impl Infer {
                 let Ty::Record(fields, absent, _) = root_ty.peel_alias() else {
                     continue;
                 };
-                let mut group: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
+                let mut group: Vec<(Binding, Vec<ast::RecordKey>, Ty)> = Vec::new();
                 // Seed the frontier with named fields AND absent (`_`) fields.
-                // An absent field is stored under the reserved name `_i` (its
-                // positional index) at codegen, so its path element is that
-                // name; `^name` descends into it like any nested record, but
-                // its own name never matches a `^name` lookup (it has none).
-                let mut frontier: Vec<(Vec<String>, Ty)> = fields
+                // An absent field is a typed `RecordKey::Absent(i)` (its
+                // positional index); `^name` descends into it like any nested
+                // record, but its own name never matches a `^name` lookup (it
+                // has none).
+                let mut frontier: Vec<(Vec<ast::RecordKey>, Ty)> = fields
                     .iter()
                     .rev()
-                    .map(|(f, t)| (vec![f.clone()], t.clone()))
+                    .map(|(f, t)| (vec![ast::RecordKey::Named(f.clone())], t.clone()))
                     .chain(
                         absent
                             .iter()
                             .enumerate()
                             .rev()
-                            .map(|(i, t)| (vec![format!("_{i}")], t.clone())),
+                            .map(|(i, t)| (vec![ast::RecordKey::Absent(i)], t.clone())),
                     )
                     .collect();
                 while !frontier.is_empty() {
-                    let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
+                    let mut next: Vec<(Vec<ast::RecordKey>, Ty)> = Vec::new();
                     for (path, field_ty) in frontier.drain(..) {
-                        if *path.last().expect("non-empty path") == name {
+                        if matches!(path.last().expect("non-empty path"), ast::RecordKey::Named(n) if n == name) {
                             group.push((
                                 Binding::User(bind_name.clone()),
                                 path.clone(),
@@ -5596,12 +5607,12 @@ impl Infer {
                         if let Ty::Record(sub, sub_absent, _) = self.apply(&field_ty).peel_alias() {
                             for (f, t) in sub.iter().rev() {
                                 let mut p = path.clone();
-                                p.push(f.clone());
+                                p.push(ast::RecordKey::Named(f.clone()));
                                 next.push((p, t.clone()));
                             }
                             for (i, t) in sub_absent.iter().enumerate().rev() {
                                 let mut p = path.clone();
-                                p.push(format!("_{i}"));
+                                p.push(ast::RecordKey::Absent(i));
                                 next.push((p, t.clone()));
                             }
                         }
@@ -5617,14 +5628,17 @@ impl Infer {
         // Type-check record-by-record (innermost first), stopping at the first
         // record whose fields produce at least one match. Collect all matches
         // within that record so same-record ambiguity is still reported.
-        type Winner = (Binding, Vec<String>, Ty, HashMap<TyVar, Ty>);
+        type Winner = (Binding, Vec<ast::RecordKey>, Ty, HashMap<TyVar, Ty>);
         let mut winners: Vec<Winner> = Vec::new();
         for group in &by_record {
             for (root, path, field_ty) in group {
                 searched.push(format!(
                     "{}.{} : {}",
                     root,
-                    path.join("."),
+                    path.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("."),
                     self.display_ty(field_ty)
                 ));
                 if let Some(trial) = self.try_implicit_candidate(field_ty, expected, span) {
@@ -5652,7 +5666,10 @@ impl Infer {
                         format!(
                             "{}.{} : {}",
                             root,
-                            path.join("."),
+                            path.iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join("."),
                             self.display_ty(field_ty)
                         )
                     })
@@ -5696,11 +5713,11 @@ impl Infer {
     /// Each result is `(root_binding, field_path, field_ty)` — the same
     /// triple `implicit_refs` records for `^`, so codegen can emit the
     /// projection chain `root.path…name` unchanged.
-    fn collect_all_implicit_fields(&mut self, name: &str) -> Vec<(Binding, Vec<String>, Ty)> {
+    fn collect_all_implicit_fields(&mut self, name: &str) -> Vec<(Binding, Vec<ast::RecordKey>, Ty)> {
         // Gather (root, path, ty) candidates from every scope, innermost
         // first. Mirrors the `with`-frame + record-BFS logic in
         // `resolve_implicit_ref`, but keeps walking outward.
-        let mut candidates: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
+        let mut candidates: Vec<(Binding, Vec<ast::RecordKey>, Ty)> = Vec::new();
 
         // Pass 1: `with`-frame records. A `with {svcA {log …}}` frame binds
         // `svcA` as a field of the with-record. The runtime dictionary for a
@@ -5728,7 +5745,7 @@ impl Infer {
             .enumerate()
             .rev()
         {
-            let Some((with_span, field_schemes)) = with_frame else {
+            let Some((with_span, field_schemes, absent_fields)) = with_frame else {
                 continue;
             };
             let field_root = |fname: &str| -> Binding {
@@ -5746,53 +5763,58 @@ impl Infer {
                 candidates.push((field_root(name), Vec::new(), scheme.ty.clone()));
             }
             // BFS into record-typed fields for a nested `…log` at any depth.
-            let mut frontier: Vec<(Vec<String>, Ty)> = field_schemes
+            // Seed with the with's named fields AND its absent (`_`) fields
+            // (typed `RecordKey::Absent(i)` at depth 1).
+            let mut frontier: Vec<(Vec<ast::RecordKey>, Ty)> = field_schemes
                 .iter()
-                .map(|(f, s)| (vec![f.clone()], self.apply(&s.ty).clone()))
+                .map(|(f, s)| (vec![ast::RecordKey::Named(f.clone())], self.apply(&s.ty).clone()))
+                .chain(absent_fields.iter().enumerate().map(|(i, t)| {
+                    (vec![ast::RecordKey::Absent(i)], self.apply(t).clone())
+                }))
                 .collect();
             loop {
-                let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
+                let mut next: Vec<(Vec<ast::RecordKey>, Ty)> = Vec::new();
                 let mut descended = false;
                 for (path, field_ty) in &frontier {
                     // Depth-1 paths are the with's DIRECT fields, already
                     // collected by the `field_schemes.get(name)` lookup above —
                     // re-collecting them here would double-count. Only nested
                     // (`outer.parts`, depth ≥ 2) matches belong to the BFS.
-                    if path.len() > 1 && *path.last().expect("non-empty path") == name {
+                    if path.len() > 1 && matches!(path.last().expect("non-empty path"), ast::RecordKey::Named(n) if n == name) {
                         // Root at the FIRST path element's BARE field name,
                         // matching `^`'s record-BFS root (`bind_name`): the
                         // `with` binds each field into the flat `Env`, which
                         // prototypes into nested bodies, so a bare `Var(app)`
                         // resolves the outer record correctly across nesting.
-                        // Exception: an absent (`_i`) first element is NOT a
-                        // bound field — it lives only inside the with-record
-                        // value. Root at the with-record alias and keep the
-                        // full `_i…` path so codegen projects `_i` from the
-                        // record before descending to `name`.
-                        let is_absent = path[0].strip_prefix('_')
-                            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
-                        let (root, rest): (Binding, Vec<String>) = if is_absent {
-                            (
+                        // Exception: an ABSENT first element is NOT a bound
+                        // field — it lives only inside the with-record value.
+                        // Root at the with-record alias and keep the full path
+                        // so codegen projects `_i` from the record before
+                        // descending to `name`.
+                        let (root, rest): (Binding, Vec<ast::RecordKey>) = match &path[0] {
+                            ast::RecordKey::Absent(_) => (
                                 Binding::Internal(InternalName::WithRecord {
                                     span_start: with_span.start,
                                 }),
                                 path.clone(),
-                            )
-                        } else {
-                            (Binding::User(path[0].clone()), path[1..].to_vec())
+                            ),
+                            ast::RecordKey::Named(first) => (
+                                Binding::User(first.clone()),
+                                path[1..].to_vec(),
+                            ),
                         };
                         candidates.push((root, rest, field_ty.clone()));
                     }
                     if let Ty::Record(sub, sub_absent, _) = self.apply(field_ty).peel_alias().clone() {
                         for (f, t) in sub.iter() {
                             let mut p = path.clone();
-                            p.push(f.clone());
+                            p.push(ast::RecordKey::Named(f.clone()));
                             next.push((p, t.clone()));
                             descended = true;
                         }
                         for (i, t) in sub_absent.iter().enumerate() {
                             let mut p = path.clone();
-                            p.push(format!("_{i}"));
+                            p.push(ast::RecordKey::Absent(i));
                             next.push((p, t.clone()));
                             descended = true;
                         }
@@ -5816,11 +5838,11 @@ impl Infer {
             .with_scope_stack
             .iter()
             .flatten()
-            .flat_map(|(_, fm)| fm.keys().map(String::as_str))
+            .flat_map(|(_, fm, ..)| fm.keys().map(String::as_str))
             .collect();
         for scope in self.scopes.iter().rev() {
             // (path-to-current-record, record_fields) frontier per binding.
-            let mut frontier: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
+            let mut frontier: Vec<(Binding, Vec<ast::RecordKey>, Ty)> = Vec::new();
             for (bind_name, scheme) in scope {
                 if with_field_names.contains(bind_name.as_str()) {
                     continue;
@@ -5844,14 +5866,14 @@ impl Infer {
                     for (f, t) in fields.iter().rev() {
                         frontier.push((
                             Binding::User(bind_name.clone()),
-                            vec![f.clone()],
+                            vec![ast::RecordKey::Named(f.clone())],
                             t.clone(),
                         ));
                     }
                     for (i, t) in absent.iter().enumerate().rev() {
                         frontier.push((
                             Binding::User(bind_name.clone()),
-                            vec![format!("_{i}")],
+                            vec![ast::RecordKey::Absent(i)],
                             t.clone(),
                         ));
                     }
@@ -5859,22 +5881,22 @@ impl Infer {
             }
             // BFS descend until no frontier entry has a record-typed field.
             loop {
-                let mut next: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
+                let mut next: Vec<(Binding, Vec<ast::RecordKey>, Ty)> = Vec::new();
                 let mut descended = false;
                 for (root, path, field_ty) in &frontier {
-                    if *path.last().expect("non-empty path") == name {
+                    if matches!(path.last().expect("non-empty path"), ast::RecordKey::Named(n) if n == name) {
                         candidates.push((root.clone(), path.clone(), field_ty.clone()));
                     }
                     if let Ty::Record(sub, sub_absent, _) = self.apply(field_ty).peel_alias().clone() {
                         for (f, t) in sub.iter().rev() {
                             let mut p = path.clone();
-                            p.push(f.clone());
+                            p.push(ast::RecordKey::Named(f.clone()));
                             next.push((root.clone(), p, t.clone()));
                             descended = true;
                         }
                         for (i, t) in sub_absent.iter().enumerate().rev() {
                             let mut p = path.clone();
-                            p.push(format!("_{i}"));
+                            p.push(ast::RecordKey::Absent(i));
                             next.push((root.clone(), p, t.clone()));
                             descended = true;
                         }
@@ -5969,7 +5991,12 @@ impl Infer {
                 e = ast::Expr {
                     node: ast::ExprKind::FieldAccess {
                         expr: Box::new(e),
-                        field: field.clone(),
+                        // `FieldAccess.field` is a source-level `Name`, so the
+                        // storage key is the faithful spelling for an absent
+                        // element here. This synthesized expr is only used to
+                        // recover the candidate's TYPE; codegen projects via
+                        // the typed path in `implicit_refs` instead.
+                        field: field.as_storage_key(),
                     },
                     span,
                 };
@@ -6172,7 +6199,7 @@ impl Infer {
                         .enumerate()
                         .rev()
                     {
-                        if let Some((with_span, field_schemes)) = with_frame
+                        if let Some((with_span, field_schemes, ..)) = with_frame
                             && let Some(scheme) = field_schemes.get(name.as_str())
                             && Some(idx) != innermost_with_idx
                         {
@@ -6613,7 +6640,7 @@ impl Infer {
                             for idx in (0..self.scopes.len()).rev() {
                                 let is_with = self.with_scope_stack[idx]
                                     .as_ref()
-                                    .is_some_and(|(_, fs)| fs.contains_key(fname));
+                                    .is_some_and(|(_, fs, ..)| fs.contains_key(fname));
                                 if is_with {
                                     let frame = self.with_scope_stack[idx]
                                         .take()
@@ -6686,21 +6713,15 @@ impl Infer {
                 // flat runtime `Env`).
                 *self.with_scope_stack.last_mut().expect("just pushed") = Some((
                     expr.span,
+                    // Named fields only — `field_schemes.get(name)` lookups are
+                    // by real identifier and never want an absent entry.
                     fields
                         .iter()
                         .map(|(n, t)| (n.clone(), Scheme::mono(t.clone())))
-                        // Absent fields join the frame under their reserved `_i`
-                        // storage names so `^`/`<>` BFS (which seeds from this
-                        // map) descends into them. `_i` is not a valid
-                        // identifier, so these never collide with real fields or
-                        // match a direct `field_schemes.get(name)` lookup.
-                        .chain(
-                            absent
-                                .iter()
-                                .enumerate()
-                                .map(|(i, t)| (format!("_{i}"), Scheme::mono(t.clone()))),
-                        )
                         .collect(),
+                    // Absent (`_`) field types, positionally. `^`/`<>` BFS's
+                    // into them as search roots (typed `RecordKey::Absent(i)`).
+                    absent.clone(),
                 ));
                 // Peel the record's embedded `type`/`data` declarations into a
                 // scoped type env, confined to this `with` body. Only when the
@@ -14094,20 +14115,15 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                     if let ast::ExprKind::Record(field_exprs) = &record.node {
                         let mut field_tys: Vec<(String, Ty)> =
                             Vec::with_capacity(field_exprs.len());
-                        let mut absent_idx = 0usize;
+                        let mut absent_tys: Vec<Ty> = Vec::new();
                         for f in field_exprs {
                             let val_ty = infer.infer_expr(&f.value);
-                            // Absent keys bind under their reserved `_i` name,
-                            // matching the record type's absent-list position.
-                            let name = match f.name.as_name() {
-                                None => {
-                                    let s = format!("_{absent_idx}");
-                                    absent_idx += 1;
-                                    s
-                                }
-                                Some(n) => n.to_string(),
-                            };
-                            field_tys.push((name, val_ty));
+                            match f.name.as_name() {
+                                // Named fields bind into scope; absent (`_`)
+                                // fields go to the positional absent list.
+                                None => absent_tys.push(val_ty),
+                                Some(n) => field_tys.push((n.to_string(), val_ty)),
+                            }
                         }
                         infer
                             .with_fields
@@ -14122,6 +14138,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                                 .iter()
                                 .map(|(n, t)| (n.clone(), Scheme::mono(t.clone())))
                                 .collect(),
+                            absent_tys,
                         ));
                         collapsed_withs.push(cur.span);
                     }
@@ -14150,7 +14167,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                         // top-level `with {f …} (… ^f …)` failed where the same
                         // nested `with` worked. Mirrored from the `With` arm.
                         let mut field_schemes: HashMap<String, Scheme> = HashMap::new();
-                        let mut absent_idx = 0usize;
+                        let mut absent_tys: Vec<Ty> = Vec::new();
                         for f in fields {
                             match f.name.as_name() {
                                 Some(n) => {
@@ -14158,23 +14175,20 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                                         field_schemes.insert(n.to_string(), scheme.clone());
                                     }
                                 }
-                                // Absent keys join under their reserved `_i`
-                                // storage name (as in the `With` arm) so `^`/`<>`
-                                // BFS descends into them. They are not bound in
-                                // scope under `_i`, so infer the value's type
-                                // directly (it is a decl-record field, already
-                                // inferred — this is cheap and idempotent).
+                                // Absent (`_`) fields go to the positional
+                                // absent list so `^`/`<>` BFS descends into
+                                // them. They are not bound in scope, so infer
+                                // the value's type directly (it is a decl-record
+                                // field, already inferred — cheap + idempotent).
                                 None => {
                                     let val_ty = infer.infer_expr(&f.value);
-                                    field_schemes
-                                        .insert(format!("_{absent_idx}"), Scheme::mono(val_ty));
-                                    absent_idx += 1;
+                                    absent_tys.push(val_ty);
                                 }
                             }
                         }
                         infer.push_scope();
                         *infer.with_scope_stack.last_mut().expect("just pushed") =
-                            Some((cur.span, field_schemes));
+                            Some((cur.span, field_schemes, absent_tys));
                         // The `With` inference arm is skipped here, so push its
                         // type-import scope (`with {Maybe …}`) around the body
                         // inference ourselves — else bare ctors never resolve.

@@ -689,6 +689,48 @@ impl PartialEq<FieldName> for String {
     }
 }
 
+/// One element of a record-projection path (`root.a.b.name`). Unlike the AST's
+/// `FieldName` (which only marks a field absent, no position), a `RecordKey`
+/// carries the absent field's positional INDEX, because a path/storage key must
+/// distinguish `_0` from `_1`. This is the typed form of what used to be the
+/// magic storage string `"_{i}"`: the string now appears only at the single
+/// runtime-storage boundary (`as_storage_key`), and inference manipulates the
+/// typed key everywhere else.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RecordKey {
+    /// A normal named field.
+    Named(Name),
+    /// An absent (`_`) field, by positional index within its record's absent
+    /// list.
+    Absent(usize),
+}
+
+impl RecordKey {
+    /// True for an absent key.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, RecordKey::Absent(_))
+    }
+
+    /// The runtime storage key for this path element. This is THE single place
+    /// the `"_{i}"` storage string is produced — the runtime record is genuinely
+    /// string-keyed, so the conversion lives here and nowhere else.
+    pub fn as_storage_key(&self) -> String {
+        match self {
+            RecordKey::Named(n) => n.clone(),
+            RecordKey::Absent(i) => format!("_{i}"),
+        }
+    }
+}
+
+impl std::fmt::Display for RecordKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecordKey::Named(n) => write!(f, "{n}"),
+            RecordKey::Absent(i) => write!(f, "_{i}"),
+        }
+    }
+}
+
 /// The sig (when present) is enforced against the value's type. It is a full
 /// type scheme so a field function can take implicit-field constraints:
 /// `{(Text  ^name) => {} -> Text  greet  greet \_ -> ^name}`.

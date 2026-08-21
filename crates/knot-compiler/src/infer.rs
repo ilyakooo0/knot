@@ -14091,6 +14091,41 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                         infer
                             .with_fields
                             .push((cur.span, fields.iter().filter_map(|f| f.name.as_name().map(str::to_string)).collect()));
+                        // Push a `with_scope_stack` frame for this innermost
+                        // top-level `with`. Its fields are already bound as
+                        // decls in an enclosing scope, so the new scope stays
+                        // EMPTY (re-`bind_at`ing them would trip the
+                        // shadow check) — the frame's `field_schemes` is what
+                        // `resolve_implicit_ref`'s `with_candidate` reads to
+                        // resolve a direct `^field` reference. Without this the
+                        // top-level `with {f …} (… ^f …)` failed where the same
+                        // nested `with` worked. Mirrored from the `With` arm.
+                        let mut field_schemes: HashMap<String, Scheme> = HashMap::new();
+                        let mut absent_idx = 0usize;
+                        for f in fields {
+                            match f.name.as_name() {
+                                Some(n) => {
+                                    if let Some(scheme) = infer.lookup(n) {
+                                        field_schemes.insert(n.to_string(), scheme.clone());
+                                    }
+                                }
+                                // Absent keys join under their reserved `_i`
+                                // storage name (as in the `With` arm) so `^`/`<>`
+                                // BFS descends into them.
+                                None => {
+                                    if let Some(scheme) =
+                                        infer.lookup(&format!("_{absent_idx}"))
+                                    {
+                                        field_schemes
+                                            .insert(format!("_{absent_idx}"), scheme.clone());
+                                    }
+                                    absent_idx += 1;
+                                }
+                            }
+                        }
+                        infer.push_scope();
+                        *infer.with_scope_stack.last_mut().expect("just pushed") =
+                            Some((cur.span, field_schemes));
                         // The `With` inference arm is skipped here, so push its
                         // type-import scope (`with {Maybe …}`) around the body
                         // inference ourselves — else bare ctors never resolve.
@@ -14100,6 +14135,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                         if pushed {
                             infer.with_ctor_imports.pop();
                         }
+                        infer.pop_scope();
                     } else {
                         // Non-literal operand (`with base …`, `with someRecord …`):
                         // the fields are NOT decls, so there is nothing to skip

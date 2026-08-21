@@ -4290,6 +4290,10 @@ impl Infer {
         let ast::ExprKind::Constructor(name) = &head_expr.node else {
             return None;
         };
+        // Record the head constructor's span so codegen erases it — including
+        // nested heads reached via the arity recursion below (the `Int` in
+        // `Maybe Int`), not just the top-level head the caller records.
+        self.type_arg_spans.insert(head_expr.span);
         let arity = self.type_head_arity(name);
         let mut consumed = 1;
         let mut ty = knot::ast::Spanned {

@@ -143,6 +143,16 @@ fn type_witness_unit_annotated_and_hole_args() {
         "with {\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT _ 42))",
         "42",
     );
+    // A parenthesized parameterized/nested type argument also works: the inner
+    // type-head spans are erased with the type.
+    assert_show(
+        "with {\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT (Maybe Int) (Maybe.Just {value 3})))",
+        "Just {value 3}",
+    );
+    assert_show(
+        "with {\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT (Maybe (Int 1)) (Maybe.Just {value 3})))",
+        "Just {value 3}",
+    );
 }
 
 #[test]

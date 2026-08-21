@@ -4252,6 +4252,8 @@ impl Infer {
             "Int" | "Float" | "Text" | "Bool" | "Bytes" | "Uuid" => 0,
             "Maybe" => 1,
             "Result" => 2,
+            // Builtin single-parameter containers usable as type arguments.
+            "Rel" | "Vec" | "List" => 1,
             _ => {
                 if let Some(info) = self.data_types.get(name) {
                     info.params.len()

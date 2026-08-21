@@ -127,6 +127,25 @@ fn forall_rank2() {
 }
 
 #[test]
+fn type_witness_unit_annotated_and_hole_args() {
+    // A type-witness function `\(Type  T)` takes a type argument positionally.
+    // Beyond a bare head (`Int`), the argument may be unit-annotated (`Float 1`,
+    // `(Float 1)`) or a `_` hole.
+    assert_show(
+        "with {\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT Float 1 42))",
+        "42",
+    );
+    assert_show(
+        "with {\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT (Float 1) 42))",
+        "42",
+    );
+    assert_show(
+        "with {\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT _ 42))",
+        "42",
+    );
+}
+
+#[test]
 fn lambda_param_type_prefix() {
     // `\(T  x)` — a type-prefix param annotation (gap-separated), the
     // pattern-position analogue of the `Type  name` signature form.

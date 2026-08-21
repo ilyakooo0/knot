@@ -53,6 +53,31 @@ fn flatten_spine(expr: &ast::Expr) -> Vec<&ast::Expr> {
     spine
 }
 
+/// True if a value-spine element can be a unit argument to a numeric-base type
+/// argument: the `1` literal, a unit atom (an uppercase/lowercase name, e.g.
+/// `Ms`, `u`), or a `_` hole.
+fn is_unit_arg(expr: &ast::Expr) -> bool {
+    match &expr.node {
+        ast::ExprKind::Lit(ast::Literal::Int(n)) => n == "1",
+        ast::ExprKind::Constructor(_) | ast::ExprKind::Var(_) => true,
+        ast::ExprKind::TypeHole => true,
+        _ => false,
+    }
+}
+
+/// Map a value-spine unit argument to its `UnitExpr` AST.
+fn unit_arg_to_ast(expr: &ast::Expr) -> ast::UnitExpr {
+    match &expr.node {
+        ast::ExprKind::Lit(ast::Literal::Int(n)) if n == "1" => ast::UnitExpr::Dimensionless,
+        ast::ExprKind::Constructor(name) => ast::UnitExpr::Named(name.clone()),
+        ast::ExprKind::Var(ast::Binding::User(name)) => {
+            ast::UnitExpr::Named(name.clone())
+        }
+        ast::ExprKind::TypeHole => ast::UnitExpr::Hole,
+        _ => ast::UnitExpr::Dimensionless,
+    }
+}
+
 // ── Monad info (shared with codegen) ──────────────────────────────
 
 /// Which monad a desugared do-block targets.
@@ -4244,7 +4269,7 @@ impl Infer {
     /// next `n` spine elements (each recursively a complete type). Returns the
     /// type AST and the number of spine elements consumed. `None` if the head
     /// is not a type.
-    fn consume_type_arg(&self, spine: &[&ast::Expr]) -> Option<(ast::Type, usize)> {
+    fn consume_type_arg(&mut self, spine: &[&ast::Expr]) -> Option<(ast::Type, usize)> {
         use knot::ast::TypeKind;
         let head = spine.first()?;
         let mut head_expr = *head;
@@ -4269,13 +4294,25 @@ impl Infer {
         let mut consumed = 1;
         let mut ty = knot::ast::Spanned {
             node: if name == "Int" || name == "Float" {
-                // Bare numeric base as a type argument means dimensionless.
+                // A numeric base as a type argument. Optionally followed by a
+                // unit argument (`1`, a unit atom like `Ms`, or a unit var) —
+                // `Float 1`, `Int Ms`. Bare (no unit) means dimensionless.
+                let unit = match spine.get(consumed) {
+                    Some(u_expr) if is_unit_arg(u_expr) => {
+                        consumed += 1;
+                        // The unit argument is erased with the type: record its
+                        // span so codegen drops it from the value spine.
+                        self.type_arg_spans.insert(u_expr.span);
+                        unit_arg_to_ast(u_expr)
+                    }
+                    _ => knot::ast::UnitExpr::Dimensionless,
+                };
                 TypeKind::UnitAnnotated {
                     base: Box::new(knot::ast::Spanned {
                         node: TypeKind::Named(name.clone()),
                         span: head.span,
                     }),
-                    unit: knot::ast::UnitExpr::Dimensionless,
+                    unit,
                 }
             } else {
                 TypeKind::Named(name.clone())

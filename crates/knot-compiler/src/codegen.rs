@@ -6778,11 +6778,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let mut i = 0;
         while i < flat.len() {
             let e = flat[i];
-            if matches!(
+            // Drop an erased type argument: a constructor / `_` hole, or a unit
+            // argument (`1` literal, or a unit-name constructor) consumed as
+            // part of a `Float 1`/`Int Ms` type argument.
+            let is_erased = (matches!(
                 &e.node,
                 ast::ExprKind::Constructor(_) | ast::ExprKind::TypeHole
-            ) && self.type_arg_spans.contains(&e.span)
-            {
+            ) || matches!(&e.node, ast::ExprKind::Lit(ast::Literal::Int(n)) if n == "1"))
+                && self.type_arg_spans.contains(&e.span);
+            if is_erased {
                 i += 1;
             } else {
                 break;

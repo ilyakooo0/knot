@@ -2247,7 +2247,8 @@ impl Parser {
                 }
             }
             TokenKind::Caret => {
-                // ^name — implicit field projection
+                // ^name — implicit field projection; ^_ — absent-field
+                // projection (type-directed).
                 self.advance();
                 match self.peek() {
                     TokenKind::Lower(_) => {
@@ -2257,6 +2258,13 @@ impl Parser {
                         };
                         Some(Spanned::new(
                             ExprKind::ImplicitRef(name),
+                            Span::new(start.start, tok.span.end),
+                        ))
+                    }
+                    TokenKind::Underscore => {
+                        let tok = self.advance();
+                        Some(Spanned::new(
+                            ExprKind::ImplicitRef("_".to_string()),
                             Span::new(start.start, tok.span.end),
                         ))
                     }
@@ -2672,7 +2680,17 @@ impl Parser {
                 continue;
             }
             let field_col = self.cur_column();
-            let (fname, _) = self.expect_lower("expected field name in record").ok()?;
+            // `_ value` — an absent key: a stored field with no usable name.
+            // `_` is not a valid identifier, so the field is unreachable by
+            // `.field` access; it is reachable only by `^` (implicit projection)
+            // or `<>` (collecting fold), which match by type, not name. Absent
+            // keys never conflict, so a record may hold any number of them.
+            let (fname, _) = if self.at(&TokenKind::Underscore) {
+                let sp = self.advance().span;
+                ("_".to_string(), sp)
+            } else {
+                self.expect_lower("expected field name in record").ok()?
+            };
             self.skip_newlines();
             // A bare lambda (`greet \name -> …`) or do-block (`run do …`) field
             // value. Field values normally use `parse_postfix` so a value can't

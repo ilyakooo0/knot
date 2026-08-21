@@ -1969,25 +1969,31 @@ impl Infer {
                 Box::new(self.apply_impl(p, excluded)),
                 Box::new(self.apply_impl(r, excluded)),
             ),
-            Ty::Record(fields, _,  row) => {
+            Ty::Record(fields, absent, row) => {
                 let mut applied: FieldMap = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), self.apply_impl(v, excluded)))
                     .collect();
+                let applied_absent: Vec<Ty> = absent
+                    .iter()
+                    .map(|t| self.apply_impl(t, excluded))
+                    .collect();
                 if let Some(rv) = row {
                     let resolved = self.apply_impl(&Ty::Var(*rv), excluded);
                     match resolved {
-                        Ty::Record(extra, _,  rest) => {
+                        Ty::Record(extra, extra_absent, rest) => {
                             for (k, v) in extra {
                                 applied.entry(k).or_insert(v);
                             }
-                            Ty::Record(applied, vec![],  rest)
+                            let mut merged_absent = applied_absent;
+                            merged_absent.extend(extra_absent);
+                            Ty::Record(applied, merged_absent, rest)
                         }
-                        Ty::Var(rv2) => Ty::Record(applied, vec![],  Some(rv2)),
-                        _ => Ty::Record(applied, vec![],  None),
+                        Ty::Var(rv2) => Ty::Record(applied, applied_absent, Some(rv2)),
+                        _ => Ty::Record(applied, applied_absent, None),
                     }
                 } else {
-                    Ty::Record(applied, vec![],  None)
+                    Ty::Record(applied, applied_absent, None)
                 }
             }
             Ty::Variant(ctors, row) => {
@@ -2680,8 +2686,8 @@ impl Infer {
                     self.unify_dir(a, b, span, t1_provided);
                 }
             }
-            (Ty::Record(f1, _,  r1), Ty::Record(f2, _,  r2)) => {
-                self.unify_records(f1, *r1, f2, *r2, span, t1_provided);
+            (Ty::Record(f1, a1, r1), Ty::Record(f2, a2, r2)) => {
+                self.unify_records(f1, a1, *r1, f2, a2, *r2, span, t1_provided);
             }
             // ── Higher-kinded type support ─────────────────────
             (Ty::TyCon(a), Ty::TyCon(b)) if a == b => {}
@@ -3123,12 +3129,33 @@ impl Infer {
     fn unify_records(
         &mut self,
         f1: &FieldMap,
+        a1: &[Ty],
         r1: Option<TyVar>,
         f2: &FieldMap,
+        a2: &[Ty],
         r2: Option<TyVar>,
         span: Span,
         t1_provided: bool,
     ) {
+        // Absent (`_`-keyed) fields are positional and nameless, so they unify
+        // elementwise in order. For closed records both lists must have the
+        // same length; an open row tail may absorb the length difference, so
+        // only the common prefix is unified here (row-tail absent unification
+        // is not yet supported — an open row with absent fields on both sides
+        // is rejected below by the closed-record path when lengths differ).
+        if a1.len() != a2.len() && r1.is_none() && r2.is_none() {
+            self.error(
+                format!(
+                    "record absent-field counts don't match: {} vs {}",
+                    a1.len(),
+                    a2.len()
+                ),
+                span,
+            );
+        }
+        for (t1, t2) in a1.iter().zip(a2.iter()) {
+            self.unify_dir(t1, t2, span, t1_provided);
+        }
         // Unify common fields (IndexMap lookup is O(1), no HashSet needed)
         for (key, ty1) in f1 {
             if let Some(ty2) = f2.get(key) {
@@ -5427,6 +5454,13 @@ impl Infer {
     /// (root binding, field path) is recorded in `implicit_refs` keyed by
     /// `span` so codegen can lower `^name` to a projection chain.
     fn resolve_implicit_ref(&mut self, name: &str, expected: &Ty, span: Span) -> Ty {
+        // `^_` — absent-field projection. Absent fields carry no name, so they
+        // are matched purely by expected type across the absent lists of all
+        // in-scope records. The projection path element is the reserved storage
+        // name `_i` (the field's positional index in its record's absent list).
+        if name == "_" {
+            return self.resolve_absent_ref(expected, span);
+        }
         // A `with` binds each of the record's fields DIRECTLY into its body
         // scope. The record-BFS below only finds fields nested inside
         // record-typed bindings, so it misses a `with` field whose value is
@@ -5586,6 +5620,92 @@ impl Infer {
             span,
         );
         Ty::Error
+    }
+
+    /// `^_` — project an absent (`_`-keyed) field, matched purely by expected
+    /// type. Searches the absent-field lists of all in-scope records,
+    /// innermost scope first. Each candidate's projection path is the reserved
+    /// storage name `_i` (its positional index in the record's absent list),
+    /// which codegen emits at the record literal. Exactly one type-match is
+    /// required; zero is "no absent field matches", more than one is ambiguous.
+    fn resolve_absent_ref(&mut self, expected: &Ty, span: Span) -> Ty {
+        // Collect candidates (root, path, field_ty), one group per record,
+        // innermost record first — mirroring `resolve_implicit_ref`.
+        let mut by_record: Vec<Vec<(Binding, Vec<String>, Ty)>> = Vec::new();
+        for scope in self.scopes.iter().rev() {
+            for (bind_name, scheme) in scope {
+                let root_ty = self.apply(&scheme.ty);
+                let Ty::Record(_, absent, _) = root_ty.peel_alias() else {
+                    continue;
+                };
+                if absent.is_empty() {
+                    continue;
+                }
+                let group: Vec<(Binding, Vec<String>, Ty)> = absent
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .map(|(i, t)| {
+                        (
+                            Binding::User(bind_name.clone()),
+                            vec![format!("_{i}")],
+                            t.clone(),
+                        )
+                    })
+                    .collect();
+                by_record.push(group);
+            }
+        }
+
+        // Type-check record-by-record, stopping at the first record with a
+        // match (collect all matches within it for ambiguity reporting).
+        type Winner = (Binding, Vec<String>, Ty, HashMap<TyVar, Ty>);
+        let mut winners: Vec<Winner> = Vec::new();
+        for group in &by_record {
+            for (root, path, field_ty) in group {
+                if let Some(trial) = self.try_implicit_candidate(field_ty, expected, span) {
+                    winners.push((root.clone(), path.clone(), field_ty.clone(), trial));
+                }
+            }
+            if !winners.is_empty() {
+                break;
+            }
+        }
+
+        match winners.len() {
+            1 => {
+                let (root, path, field_ty, trial) = winners.pop().expect("one winner");
+                for (v, t) in trial {
+                    self.subst.insert(v, t);
+                }
+                self.implicit_refs.insert(span, (root, path));
+                field_ty
+            }
+            n if n > 1 => {
+                let options = winners
+                    .iter()
+                    .map(|(root, _, field_ty, _)| {
+                        format!("{}._ : {}", root, self.display_ty(field_ty))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.error(
+                    format!(
+                        "ambiguous projection '^_': {n} absent fields match the expected type ({options}); disambiguate with an explicit type"
+                    ),
+                    span,
+                );
+                Ty::Error
+            }
+            _ => {
+                self.error(
+                    "no in-scope record has an absent field ('_') matching the expected type"
+                        .to_string(),
+                    span,
+                );
+                Ty::Error
+            }
+        }
     }
 
     /// Collect EVERY in-scope record field named `name`, across ALL enclosing
@@ -6181,8 +6301,12 @@ impl Infer {
                 }
                 // Detect duplicate field names — `BTreeMap::collect` would
                 // silently keep only the last entry, masking a user error.
+                // Absent keys (`_`) never conflict: any number may appear.
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for f in fields {
+                    if f.name == "_" {
+                        continue;
+                    }
                     if !seen.insert(f.name.clone()) {
                         self.error(
                             format!("duplicate field '{}' in record literal", f.name),
@@ -6190,48 +6314,58 @@ impl Infer {
                         );
                     }
                 }
-                let field_tys: FieldMap = fields
-                    .iter()
-                    .map(|f| {
-                        // A signature-only field (`name : Type`, no `=`) is a
-                        // required CLI constant: the parser gave it an
-                        // empty-record placeholder value that must NOT be
-                        // checked against the sig (it would fail). Take the
-                        // sig type as the field type and skip the value.
-                        let is_required_const = f.sig.is_some()
-                            && matches!(&f.value.node, ast::ExprKind::Record(fs) if fs.is_empty());
-                        if is_required_const {
-                            let sig = f.sig.as_ref().unwrap();
-                            let saved_flag = self.in_type_annotation;
-                            let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
-                            self.in_type_annotation = true;
-                            let sig_ty = self.ast_type_to_ty(&sig.ty);
-                            self.in_type_annotation = saved_flag;
-                            self.annotation_unit_vars = saved_unit_vars;
-                            return (f.name.clone(), sig_ty);
-                        }
-                        let val_ty = self.infer_expr(&f.value);
-                        // A field with a standalone sig line (`name : Type`)
-                        // must have a value whose type matches the sig —
-                        // enforced exactly like an inline `(expr : Type)`
-                        // ascription: lowercase unit names are polymorphic unit
-                        // variables, then the value type is unified against the
-                        // sig type at the value's span.
-                        if let Some(sig) = &f.sig {
-                            let saved_flag = self.in_type_annotation;
-                            let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
-                            self.in_type_annotation = true;
-                            let sig_ty = self.ast_type_to_ty(&sig.ty);
-                            self.in_type_annotation = saved_flag;
-                            self.annotation_unit_vars = saved_unit_vars;
-                            self.unify(&val_ty, &sig_ty, f.value.span);
-                            (f.name.clone(), sig_ty)
-                        } else {
-                            (f.name.clone(), val_ty)
-                        }
-                    })
-                    .collect();
-                Ty::Record(field_tys, vec![],  None)
+                // Field type for a single field, honouring its sig if present.
+                let mut field_ty = |f: &ast::RecordField| {
+                    // A signature-only field (`name : Type`, no `=`) is a
+                    // required CLI constant: the parser gave it an
+                    // empty-record placeholder value that must NOT be
+                    // checked against the sig (it would fail). Take the
+                    // sig type as the field type and skip the value.
+                    let is_required_const = f.sig.is_some()
+                        && matches!(&f.value.node, ast::ExprKind::Record(fs) if fs.is_empty());
+                    if is_required_const {
+                        let sig = f.sig.as_ref().unwrap();
+                        let saved_flag = self.in_type_annotation;
+                        let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
+                        self.in_type_annotation = true;
+                        let sig_ty = self.ast_type_to_ty(&sig.ty);
+                        self.in_type_annotation = saved_flag;
+                        self.annotation_unit_vars = saved_unit_vars;
+                        return sig_ty;
+                    }
+                    let val_ty = self.infer_expr(&f.value);
+                    // A field with a standalone sig line (`name : Type`)
+                    // must have a value whose type matches the sig —
+                    // enforced exactly like an inline `(expr : Type)`
+                    // ascription: lowercase unit names are polymorphic unit
+                    // variables, then the value type is unified against the
+                    // sig type at the value's span.
+                    if let Some(sig) = &f.sig {
+                        let saved_flag = self.in_type_annotation;
+                        let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
+                        self.in_type_annotation = true;
+                        let sig_ty = self.ast_type_to_ty(&sig.ty);
+                        self.in_type_annotation = saved_flag;
+                        self.annotation_unit_vars = saved_unit_vars;
+                        self.unify(&val_ty, &sig_ty, f.value.span);
+                        sig_ty
+                    } else {
+                        val_ty
+                    }
+                };
+                // Partition: named fields go into the name-keyed map; absent
+                // (`_`) fields go into the positional absent list.
+                let mut field_tys: FieldMap = FieldMap::new();
+                let mut absent_tys: Vec<Ty> = Vec::new();
+                for f in fields {
+                    let ty = field_ty(f);
+                    if f.name == "_" {
+                        absent_tys.push(ty);
+                    } else {
+                        field_tys.insert(f.name.clone(), ty);
+                    }
+                }
+                Ty::Record(field_tys, absent_tys, None)
             }
 
             ast::ExprKind::FieldAccess { expr: e, field } => {
@@ -6408,6 +6542,19 @@ impl Infer {
                 // are never masked, so ordinary locals stay visible too.
                 let record_ty = if let ast::ExprKind::Record(field_exprs) = &record.node {
                     let mut field_tys: Vec<(String, Ty)> = Vec::with_capacity(field_exprs.len());
+                    let mut absent_tys: Vec<Ty> = Vec::new();
+                    // Push a field type into the named list, or the absent list
+                    // when the field is `_`-keyed (tracked separately in the
+                    // record type so any number may coexist).
+                    macro_rules! push_field {
+                        ($name:expr, $ty:expr) => {
+                            if $name == "_" {
+                                absent_tys.push($ty);
+                            } else {
+                                field_tys.push(($name, $ty));
+                            }
+                        };
+                    }
                     for f in field_exprs {
                         // Required CLI constant (sig-only field, empty-record
                         // placeholder value): take the sig type as the field
@@ -6421,7 +6568,7 @@ impl Infer {
                             let sig_ty = self.ast_type_to_ty(&sig.ty);
                             self.in_type_annotation = saved_flag;
                             self.annotation_unit_vars = saved_unit_vars;
-                            field_tys.push((f.name.clone(), sig_ty));
+                            push_field!(f.name.clone(), sig_ty);
                             continue;
                         }
                         // A `with` field named `base` collides with the
@@ -6481,8 +6628,13 @@ impl Infer {
                             self.with_scope_stack[idx] = Some(frame);
                         }
                         field_tys.push((f.name.clone(), val_ty));
+                        // Absent (`_`) fields go to the absent list instead.
+                        if f.name == "_" {
+                            let ty = field_tys.pop().expect("just pushed").1;
+                            absent_tys.push(ty);
+                        }
                     }
-                    Ty::Record(field_tys.into_iter().collect(), vec![],  None)
+                    Ty::Record(field_tys.into_iter().collect(), absent_tys, None)
                 } else {
                     // Non-literal operand: nothing to mask (no field values
                     // visible), infer as-is.

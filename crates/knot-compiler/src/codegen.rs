@@ -5006,14 +5006,26 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     let n_val = builder.ins().iconst(self.ptr_type, 0);
                     self.call_rt(builder, "knot_record_empty", &[n_val])
                 } else {
-                    // Compile all field values (preserving evaluation order)
-                    let mut compiled: Vec<(&str, Value)> = Vec::with_capacity(n);
+                    // Compile all field values (preserving evaluation order).
+                    // Absent (`_`) fields are stored under reserved names
+                    // `_0`, `_1`, … (their positional index among `_` fields),
+                    // matching the absent-list order in the record type, so
+                    // `^_` can project them while `.field` cannot.
+                    let mut compiled: Vec<(String, Value)> = Vec::with_capacity(n);
+                    let mut absent_idx = 0usize;
                     for f in fields {
                         let val = self.compile_expr(builder, &f.value, env, db);
-                        compiled.push((&f.name, val));
+                        let name = if f.name == "_" {
+                            let s = format!("_{absent_idx}");
+                            absent_idx += 1;
+                            s
+                        } else {
+                            f.name.clone()
+                        };
+                        compiled.push((name, val));
                     }
                     // Sort by field name at compile time (pre-sorted for runtime)
-                    compiled.sort_by_key(|(name, _)| *name);
+                    compiled.sort_by(|(a, _), (b, _)| a.cmp(b));
 
                     let ptr_bytes = self.ptr_type.bytes() as i32;
                     let slot_size = (3 * n as u32) * ptr_bytes as u32;

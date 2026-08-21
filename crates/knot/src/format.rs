@@ -819,6 +819,8 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             let s = format!("refine {}", render_expr_inline(inner, Prec::App));
             paren_if(parent > Prec::Lowest, s)
         }
+        // A type used as an expression (a type-witness argument): `(Type)`.
+        ExprKind::TypeLiteral(ty) => format!("({})", render_type(ty)),
         ExprKind::TypeCtor { name, params, ty } => {
             // Renders the keyword-free type declaration `Name params…  Body`.
             // A variant body renders its constructors gap-separated (`Ctor {}

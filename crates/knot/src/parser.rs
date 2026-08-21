@@ -491,6 +491,30 @@ impl Parser {
         tok
     }
 
+    /// Lookahead: does the current `(` group contain a top-level `->` before its
+    /// matching `)` (i.e. is it a function type, not a parenthesized value)?
+    /// Scans tokens without consuming, tracking delimiter nesting.
+    fn paren_is_fn_type(&self) -> bool {
+        let mut depth = 0i32;
+        let mut i = self.pos; // at the token after `(`
+        while let Some(tok) = self.tokens.get(i) {
+            match &tok.kind {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                    if depth == 0 {
+                        return false; // matching close, no top-level `->` found
+                    }
+                    depth -= 1;
+                }
+                TokenKind::Arrow if depth == 0 => return true,
+                TokenKind::Eof => return false,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// Is there a gap (2+ spaces, or a newline) immediately before
     /// the current token? This is the type-annotation separator: in a
     /// signature `Type  name` the gap ends the type and precedes the
@@ -2277,6 +2301,36 @@ impl Parser {
                         ExprKind::Record(vec![]),
                         Span::new(start.start, self.prev_span().end),
                     ));
+                }
+                // Type-literal: a parenthesized function type or `forall` used
+                // as a type argument (`base.the (Int 1 -> Int 1) f`,
+                // `base.the (forall a. a -> a) f`). These are never valid
+                // expressions, so speculate `parse_type` and backtrack to
+                // `parse_expr` on failure. Other parenthesized types that ARE
+                // value-shaped (`(Int 1)`, `(Maybe Int)`) stay expressions —
+                // the type-witness diversion reinterprets them.
+                // A lambda `(\x -> …)` also contains a top-level `->` but is a
+                // value, not a type — don't speculate it as a fn type.
+                let is_lambda = matches!(self.peek(), TokenKind::Backslash);
+                if !is_lambda
+                    && (matches!(self.peek(), TokenKind::Forall) || self.paren_is_fn_type())
+                {
+                    let saved = self.save();
+                    let diag_len = self.diagnostics.len();
+                    let tr = self.parse_type();
+                    if let Some(ty) = tr
+                        && self.at(&TokenKind::RParen)
+                    {
+                        let end_tok = self.expect(&TokenKind::RParen, "unclosed '('").ok()?;
+                        self.delimiter_depth -= 1;
+                        return Some(Spanned::new(
+                            ExprKind::TypeLiteral(ty),
+                            Span::new(start.start, end_tok.span.end),
+                        ));
+                    }
+                    self.restore(saved);
+                    // Roll back speculative parse errors before trying expression.
+                    self.diagnostics.truncate(diag_len);
                 }
                 let Some(inner) = self.parse_expr() else {
                     self.delimiter_depth -= 1;

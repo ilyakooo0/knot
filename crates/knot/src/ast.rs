@@ -195,6 +195,12 @@ pub enum ExprKind {
     /// at compile time and errors at runtime with the expected type + scope.
     TypeHole,
 
+    /// A type used as an expression — a type argument to a type-witness
+    /// function (`base.the (Int 1 -> Int 1) f`, `base.the (forall a. a -> a) f`).
+    /// Only meaningful as an argument to a type-witness parameter; erased at
+    /// codegen (the type has no runtime representation).
+    TypeLiteral(Type),
+
     /// `{name: "Alice", age: 30}`
     Record(Vec<RecordField>),
 

@@ -413,6 +413,7 @@ impl TypeEnv {
 fn walk_exprs(e: &Expr, f: &mut impl FnMut(&Expr)) {
     f(e);
     match &e.node {
+        ExprKind::TypeLiteral(_) => {}
         ExprKind::App { func, arg } => {
             walk_exprs(func, f);
             walk_exprs(arg, f);

@@ -193,6 +193,7 @@ fn lint_expr(
         | ExprKind::SourceRef { .. }
         | ExprKind::ImplicitRef(_)
         | ExprKind::CollectFold(_)
+        | ExprKind::TypeLiteral(_)
         | ExprKind::TypeHole => {}
         ExprKind::TypeCtor { .. }
         | ExprKind::SourceDecl { .. }
@@ -939,6 +940,7 @@ fn references_source(expr: &Expr, source_name: &str) -> bool {
         | ExprKind::Constructor(_)
         | ExprKind::ImplicitRef(_)
         | ExprKind::CollectFold(_)
+        | ExprKind::TypeLiteral(_)
         | ExprKind::TypeHole => false,
         ExprKind::TypeCtor { .. }
         | ExprKind::SourceDecl { .. }

@@ -554,6 +554,7 @@ impl<'a> TokenCollector<'a> {
                 self.visit_expr(inner);
                 self.visit_type(ty);
             }
+            ast::ExprKind::TypeLiteral(ty) => self.visit_type(ty),
             ast::ExprKind::Serve {
                 api_span, handlers, ..
             } => {

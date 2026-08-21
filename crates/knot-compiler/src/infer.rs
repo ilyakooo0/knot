@@ -4289,6 +4289,12 @@ impl Infer {
                 1,
             ));
         }
+        // A type literal — the full type was parsed at the `(` site. Consumed
+        // whole, span erased with the type.
+        if let ast::ExprKind::TypeLiteral(ty) = &head_expr.node {
+            self.type_arg_spans.insert(head_expr.span);
+            return Some((ty.clone(), 1));
+        }
         let ast::ExprKind::Constructor(name) = &head_expr.node else {
             return None;
         };
@@ -5912,6 +5918,16 @@ impl Infer {
     fn infer_expr_inner(&mut self, expr: &ast::Expr) -> Ty {
         match &expr.node {
             ast::ExprKind::Lit(lit) => self.literal_type(lit, expr.span),
+            // A type literal is only meaningful as a type-witness argument,
+            // consumed by the application diversion before inference reaches
+            // here. Standalone it's an error.
+            ast::ExprKind::TypeLiteral(_) => {
+                self.error(
+                    "a type can only appear as an argument to a type-witness function (e.g. `base.the (Type) value`)".into(),
+                    expr.span,
+                );
+                Ty::Error
+            }
 
             ast::ExprKind::Var(name) if name == "__yield" || name == "yield" => {
                 // ∀m a. a -> App(m, a)  — monadic yield (from do-desugaring)
@@ -13121,6 +13137,8 @@ fn value_references_source_inner(
         ast::ExprKind::SourceRef { name, .. } => name == source_name,
         // `^x` reads a record field, never a source relation directly.
         ast::ExprKind::ImplicitRef(_) => false,
+        // A type literal has no expression content.
+        ast::ExprKind::TypeLiteral(_) => false,
         // `<>x` likewise reads record fields, never a source relation.
         ast::ExprKind::CollectFold(_) => false,
         // `_` hole reads nothing.
@@ -14608,6 +14626,7 @@ fn walk_expr_children_mut(expr: &mut ast::Expr, f: &mut impl FnMut(&mut ast::Exp
     match &mut expr.node {
         Lit(_) | Var(_) | Constructor(_) | SourceRef { .. } | ImplicitRef(_) | CollectFold(_) => {}
         TypeHole => {}
+        TypeLiteral(_) => {}
         TypeCtor { .. } | SourceDecl { .. } | SubsetConstraint { .. } => {}
         RouteDecl { .. } => {}
         Record(fields) => {

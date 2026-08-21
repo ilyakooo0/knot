@@ -4824,6 +4824,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // `base.todo` — report the expected type + scope and exit.
             ast::ExprKind::TypeHole => self.emit_todo(builder, expr.span, env),
 
+            // A type literal is erased — consumed by the type-witness diversion
+            // before codegen. Unreachable in compiled code.
+            ast::ExprKind::TypeLiteral(_) => unreachable!("type literal in codegen"),
+
             ast::ExprKind::Var(name) if name == "__empty" => {
                 self.compile_monadic_empty(builder, expr.span, db)
             }
@@ -6288,6 +6292,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // `<>x` likewise only reads record fields.
             CollectFold(_) => true,
             TypeHole => true,
+            TypeLiteral(_) => true,
             // A route declaration marker carries no value and never writes.
             RouteDecl { .. } => true,
             Atomic(inner) | Refine(inner) => self.collect_direct_write_targets(inner, out),
@@ -6745,6 +6750,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 ast::ExprKind::TypeHole => {
                     return self.type_arg_spans.contains(&cur.span);
                 }
+                // A type literal consumed as a type argument (erased).
+                ast::ExprKind::TypeLiteral(_) => {
+                    return self.type_arg_spans.contains(&cur.span);
+                }
                 _ => return false,
             }
         }
@@ -6783,7 +6792,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // part of a `Float 1`/`Int Ms` type argument.
             let is_erased = (matches!(
                 &e.node,
-                ast::ExprKind::Constructor(_) | ast::ExprKind::TypeHole
+                ast::ExprKind::Constructor(_)
+                    | ast::ExprKind::TypeHole
+                    | ast::ExprKind::TypeLiteral(_)
             ) || matches!(&e.node, ast::ExprKind::Lit(ast::Literal::Int(n)) if n == "1"))
                 && self.type_arg_spans.contains(&e.span);
             if is_erased {
@@ -13419,6 +13430,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             ast::ExprKind::ImplicitRef(_) => false,
             ast::ExprKind::CollectFold(_) => false,
             ast::ExprKind::TypeHole => false,
+            ast::ExprKind::TypeLiteral(_) => false,
             ast::ExprKind::Lit(_) | ast::ExprKind::Var(_) | ast::ExprKind::Constructor(_) => false,
             ast::ExprKind::TypeCtor { .. }
             | ast::ExprKind::SourceDecl { .. }
@@ -18380,7 +18392,7 @@ fn beta_reduce_inner(
             }
             Var(name.clone())
         }
-        ImplicitRef(_) | CollectFold(_) | TypeHole => expr.node.clone(),
+        ImplicitRef(_) | CollectFold(_) | TypeHole | TypeLiteral(_) => expr.node.clone(),
         SubsetConstraint { .. } => expr.node.clone(),
         RouteDecl { .. } => expr.node.clone(),
         With {
@@ -18584,6 +18596,7 @@ fn substitute_inner(
         | ImplicitRef(_)
         | CollectFold(_)
         | TypeHole
+        | TypeLiteral(_)
         | TypeCtor { .. }
         | SourceDecl { .. }
         | SubsetConstraint { .. }
@@ -18708,6 +18721,7 @@ fn expr_mentions_var(expr: &ast::Expr, var: &str) -> bool {
         | ImplicitRef(_)
         | CollectFold(_)
         | TypeHole
+        | TypeLiteral(_)
         | TypeCtor { .. }
         | SourceDecl { .. }
         | SubsetConstraint { .. }
@@ -18756,6 +18770,7 @@ fn collect_free_vars_set(expr: &ast::Expr, bound: &HashSet<String>, free: &mut H
         | ImplicitRef(_)
         | CollectFold(_)
         | TypeHole
+        | TypeLiteral(_)
         | TypeCtor { .. }
         | SourceDecl { .. }
         | SubsetConstraint { .. }
@@ -19853,6 +19868,7 @@ fn collect_free_vars(expr: &ast::Expr, bound: &HashSet<&str>, free: &mut Vec<Str
         ast::ExprKind::ImplicitRef(_) => {}
         ast::ExprKind::CollectFold(_) => {}
         ast::ExprKind::TypeHole => {}
+        ast::ExprKind::TypeLiteral(_) => {}
         ast::ExprKind::TypeCtor { .. } => {}
         ast::ExprKind::Record(fields) => {
             for f in fields {
@@ -20008,6 +20024,7 @@ pub(crate) fn expr_refs_var(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::TypeHole => false,
+        | ast::ExprKind::TypeLiteral(_) => false,
         ast::ExprKind::TypeCtor { .. }
         | ast::ExprKind::SourceDecl { .. }
         | ast::ExprKind::SubsetConstraint { .. } => false,
@@ -20099,6 +20116,7 @@ fn expr_uses_var_as_value(expr: &ast::Expr, var: &str) -> bool {
         | ast::ExprKind::ImplicitRef(_)
         | ast::ExprKind::CollectFold(_)
         | ast::ExprKind::TypeHole => false,
+        | ast::ExprKind::TypeLiteral(_) => false,
         ast::ExprKind::TypeCtor { .. }
         | ast::ExprKind::SourceDecl { .. }
         | ast::ExprKind::SubsetConstraint { .. } => false,
@@ -20422,6 +20440,7 @@ fn pretty_expr(expr: &ast::Expr) -> String {
         ast::ExprKind::ImplicitRef(name) => format!("^{name}"),
         ast::ExprKind::CollectFold(name) => format!("<>{name}"),
         ast::ExprKind::TypeHole => "_".to_string(),
+        ast::ExprKind::TypeLiteral(ty) => format!("({})", knot::format::render_type(ty)),
         ast::ExprKind::Constructor(name) => name.clone(),
         ast::ExprKind::TypeCtor { name, .. } => name.clone(),
         ast::ExprKind::SourceDecl { name, .. } => format!("*{}", name),

@@ -2247,8 +2247,7 @@ impl Parser {
                 }
             }
             TokenKind::Caret => {
-                // ^name — implicit field projection; ^_ — absent-field
-                // projection (type-directed).
+                // ^name — implicit field projection
                 self.advance();
                 match self.peek() {
                     TokenKind::Lower(_) => {
@@ -2258,13 +2257,6 @@ impl Parser {
                         };
                         Some(Spanned::new(
                             ExprKind::ImplicitRef(name),
-                            Span::new(start.start, tok.span.end),
-                        ))
-                    }
-                    TokenKind::Underscore => {
-                        let tok = self.advance();
-                        Some(Spanned::new(
-                            ExprKind::ImplicitRef("_".to_string()),
                             Span::new(start.start, tok.span.end),
                         ))
                     }

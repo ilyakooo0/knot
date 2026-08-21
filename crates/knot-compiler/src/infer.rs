@@ -5454,13 +5454,6 @@ impl Infer {
     /// (root binding, field path) is recorded in `implicit_refs` keyed by
     /// `span` so codegen can lower `^name` to a projection chain.
     fn resolve_implicit_ref(&mut self, name: &str, expected: &Ty, span: Span) -> Ty {
-        // `^_` — absent-field projection. Absent fields carry no name, so they
-        // are matched purely by expected type across the absent lists of all
-        // in-scope records. The projection path element is the reserved storage
-        // name `_i` (the field's positional index in its record's absent list).
-        if name == "_" {
-            return self.resolve_absent_ref(expected, span);
-        }
         // A `with` binds each of the record's fields DIRECTLY into its body
         // scope. The record-BFS below only finds fields nested inside
         // record-typed bindings, so it misses a `with` field whose value is
@@ -5520,14 +5513,26 @@ impl Infer {
         for scope in self.scopes.iter().rev() {
             for (bind_name, scheme) in scope {
                 let root_ty = self.apply(&scheme.ty);
-                let Ty::Record(fields, _,  _) = root_ty.peel_alias() else {
+                let Ty::Record(fields, absent, _) = root_ty.peel_alias() else {
                     continue;
                 };
                 let mut group: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
+                // Seed the frontier with named fields AND absent (`_`) fields.
+                // An absent field is stored under the reserved name `_i` (its
+                // positional index) at codegen, so its path element is that
+                // name; `^name` descends into it like any nested record, but
+                // its own name never matches a `^name` lookup (it has none).
                 let mut frontier: Vec<(Vec<String>, Ty)> = fields
                     .iter()
                     .rev()
                     .map(|(f, t)| (vec![f.clone()], t.clone()))
+                    .chain(
+                        absent
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .map(|(i, t)| (vec![format!("_{i}")], t.clone())),
+                    )
                     .collect();
                 while !frontier.is_empty() {
                     let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
@@ -5539,10 +5544,15 @@ impl Infer {
                                 field_ty.clone(),
                             ));
                         }
-                        if let Ty::Record(sub, _,  _) = self.apply(&field_ty).peel_alias() {
+                        if let Ty::Record(sub, sub_absent, _) = self.apply(&field_ty).peel_alias() {
                             for (f, t) in sub.iter().rev() {
                                 let mut p = path.clone();
                                 p.push(f.clone());
+                                next.push((p, t.clone()));
+                            }
+                            for (i, t) in sub_absent.iter().enumerate().rev() {
+                                let mut p = path.clone();
+                                p.push(format!("_{i}"));
                                 next.push((p, t.clone()));
                             }
                         }
@@ -5620,92 +5630,6 @@ impl Infer {
             span,
         );
         Ty::Error
-    }
-
-    /// `^_` — project an absent (`_`-keyed) field, matched purely by expected
-    /// type. Searches the absent-field lists of all in-scope records,
-    /// innermost scope first. Each candidate's projection path is the reserved
-    /// storage name `_i` (its positional index in the record's absent list),
-    /// which codegen emits at the record literal. Exactly one type-match is
-    /// required; zero is "no absent field matches", more than one is ambiguous.
-    fn resolve_absent_ref(&mut self, expected: &Ty, span: Span) -> Ty {
-        // Collect candidates (root, path, field_ty), one group per record,
-        // innermost record first — mirroring `resolve_implicit_ref`.
-        let mut by_record: Vec<Vec<(Binding, Vec<String>, Ty)>> = Vec::new();
-        for scope in self.scopes.iter().rev() {
-            for (bind_name, scheme) in scope {
-                let root_ty = self.apply(&scheme.ty);
-                let Ty::Record(_, absent, _) = root_ty.peel_alias() else {
-                    continue;
-                };
-                if absent.is_empty() {
-                    continue;
-                }
-                let group: Vec<(Binding, Vec<String>, Ty)> = absent
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .map(|(i, t)| {
-                        (
-                            Binding::User(bind_name.clone()),
-                            vec![format!("_{i}")],
-                            t.clone(),
-                        )
-                    })
-                    .collect();
-                by_record.push(group);
-            }
-        }
-
-        // Type-check record-by-record, stopping at the first record with a
-        // match (collect all matches within it for ambiguity reporting).
-        type Winner = (Binding, Vec<String>, Ty, HashMap<TyVar, Ty>);
-        let mut winners: Vec<Winner> = Vec::new();
-        for group in &by_record {
-            for (root, path, field_ty) in group {
-                if let Some(trial) = self.try_implicit_candidate(field_ty, expected, span) {
-                    winners.push((root.clone(), path.clone(), field_ty.clone(), trial));
-                }
-            }
-            if !winners.is_empty() {
-                break;
-            }
-        }
-
-        match winners.len() {
-            1 => {
-                let (root, path, field_ty, trial) = winners.pop().expect("one winner");
-                for (v, t) in trial {
-                    self.subst.insert(v, t);
-                }
-                self.implicit_refs.insert(span, (root, path));
-                field_ty
-            }
-            n if n > 1 => {
-                let options = winners
-                    .iter()
-                    .map(|(root, _, field_ty, _)| {
-                        format!("{}._ : {}", root, self.display_ty(field_ty))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                self.error(
-                    format!(
-                        "ambiguous projection '^_': {n} absent fields match the expected type ({options}); disambiguate with an explicit type"
-                    ),
-                    span,
-                );
-                Ty::Error
-            }
-            _ => {
-                self.error(
-                    "no in-scope record has an absent field ('_') matching the expected type"
-                        .to_string(),
-                    span,
-                );
-                Ty::Error
-            }
-        }
     }
 
     /// Collect EVERY in-scope record field named `name`, across ALL enclosing
@@ -5795,10 +5719,16 @@ impl Infer {
                         let rest: Vec<String> = path[1..].to_vec();
                         candidates.push((root, rest, field_ty.clone()));
                     }
-                    if let Ty::Record(sub, _,  _) = self.apply(field_ty).peel_alias().clone() {
+                    if let Ty::Record(sub, sub_absent, _) = self.apply(field_ty).peel_alias().clone() {
                         for (f, t) in sub.iter() {
                             let mut p = path.clone();
                             p.push(f.clone());
+                            next.push((p, t.clone()));
+                            descended = true;
+                        }
+                        for (i, t) in sub_absent.iter().enumerate() {
+                            let mut p = path.clone();
+                            p.push(format!("_{i}"));
                             next.push((p, t.clone()));
                             descended = true;
                         }
@@ -5846,11 +5776,18 @@ impl Infer {
                         root_ty.clone(),
                     ));
                 }
-                if let Ty::Record(fields, _,  _) = root_ty.peel_alias() {
+                if let Ty::Record(fields, absent, _) = root_ty.peel_alias() {
                     for (f, t) in fields.iter().rev() {
                         frontier.push((
                             Binding::User(bind_name.clone()),
                             vec![f.clone()],
+                            t.clone(),
+                        ));
+                    }
+                    for (i, t) in absent.iter().enumerate().rev() {
+                        frontier.push((
+                            Binding::User(bind_name.clone()),
+                            vec![format!("_{i}")],
                             t.clone(),
                         ));
                     }
@@ -5864,10 +5801,16 @@ impl Infer {
                     if *path.last().expect("non-empty path") == name {
                         candidates.push((root.clone(), path.clone(), field_ty.clone()));
                     }
-                    if let Ty::Record(sub, _,  _) = self.apply(field_ty).peel_alias().clone() {
+                    if let Ty::Record(sub, sub_absent, _) = self.apply(field_ty).peel_alias().clone() {
                         for (f, t) in sub.iter().rev() {
                             let mut p = path.clone();
                             p.push(f.clone());
+                            next.push((root.clone(), p, t.clone()));
+                            descended = true;
+                        }
+                        for (i, t) in sub_absent.iter().enumerate().rev() {
+                            let mut p = path.clone();
+                            p.push(format!("_{i}"));
                             next.push((root.clone(), p, t.clone()));
                             descended = true;
                         }
@@ -6353,13 +6296,24 @@ impl Infer {
                         val_ty
                     }
                 };
-                // Partition: named fields go into the name-keyed map; absent
-                // (`_`) fields go into the positional absent list.
+                // Compute each field's type first (ending the closure's `&mut
+                // self` borrow), then partition. Named fields go into the
+                // name-keyed map; absent (`_`) fields go into the positional
+                // absent list. An absent field's value must be a record —
+                // `^`/`<>` search INTO it, so a non-record value could never be
+                // reached and is an error.
+                let typed: Vec<Ty> = fields.iter().map(|f| field_ty(f)).collect();
+                drop(field_ty); // end the closure's `&mut self` borrow
                 let mut field_tys: FieldMap = FieldMap::new();
                 let mut absent_tys: Vec<Ty> = Vec::new();
-                for f in fields {
-                    let ty = field_ty(f);
+                for (f, ty) in fields.iter().zip(typed) {
                     if f.name == "_" {
+                        if !matches!(self.apply(&ty).peel_alias(), Ty::Record(..)) {
+                            self.error(
+                                "an absent key (`_`) must hold a record value — its fields are searched by `^`/`<>`, so a non-record value would be unreachable".to_string(),
+                                f.value.span,
+                            );
+                        }
                         absent_tys.push(ty);
                     } else {
                         field_tys.insert(f.name.clone(), ty);

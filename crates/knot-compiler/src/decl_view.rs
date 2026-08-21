@@ -103,6 +103,12 @@ fn collect<'a>(e: &'a ast::Expr, out: &mut Vec<DeclView<'a>>) {
     use ast::ExprKind::*;
     if let Record(fields) = &e.node {
         for fl in fields {
+            // Absent (`_`) keys are anonymous embeds, not named declarations —
+            // a `DeclView` is keyed by name, so there is nothing to build for
+            // them. Skip rather than panic via `expect_named`.
+            if fl.name.is_absent() {
+                continue;
+            }
             match &fl.value.node {
                 TypeCtor { params, ty, .. } => {
                     // A variant `type X = A {} | B {}` is a nominal data type —

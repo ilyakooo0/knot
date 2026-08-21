@@ -495,6 +495,13 @@ struct PendingIoThunk {
     func_id: FuncId,
     stmts: Vec<ast::Stmt>,
     free_vars: Vec<String>,
+    /// Internal `with`-aliases (`WithField` / `WithRecord`) referenced by `^`
+    /// inside the do-block. These are `Binding::Internal`, not user names, so
+    /// `find_free_vars` never sees them — but a `^field` resolved to such an
+    /// alias must still find it inside the thunk. Captured into the closure env
+    /// under a synthetic record key and rebound as the `Binding` on the other
+    /// side (fixes the `^field`-in-`do` panic).
+    captured_aliases: Vec<crate::infer::Binding>,
     /// Captured free vars that were relation-valued locals at the capture
     /// site (`io_relation_vars`). Seeded into `closure_relation_vars` while
     /// the thunk body is compiled so `x <- name` binds keep per-row
@@ -3988,6 +3995,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let func_id = thunk.func_id;
         let stmts = thunk.stmts.clone();
         let free_vars = thunk.free_vars.clone();
+        let captured_aliases = thunk.captured_aliases.clone();
         let captured_rel_vars = thunk.captured_rel_vars.clone();
         let captured_fixpoint_fields = thunk.captured_fixpoint_fields.clone();
 
@@ -4006,16 +4014,27 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let db = builder.block_params(entry)[0];
             let closure_env = builder.block_params(entry)[1];
 
-            // Unpack free variables from closure env (env is always a named
-            // record; single capture is index 0) — same pattern as lambdas.
-            if !free_vars.is_empty() {
-                let mut sorted_vars: Vec<&str> = free_vars.iter().map(|s| s.as_str()).collect();
-                sorted_vars.sort();
-                for (i, var_name) in sorted_vars.iter().enumerate() {
+            // Unpack captured bindings from the closure env (always a named
+            // record; sorted by key on both sides). User free vars rebind as
+            // `Binding::User`, internal `with`-aliases as their `Binding` — the
+            // alias itself is carried alongside the key, so it rebinds directly.
+            let captures: Vec<(String, crate::infer::Binding)> = free_vars
+                .iter()
+                .map(|v| (v.clone(), crate::infer::Binding::User(v.clone())))
+                .chain(
+                    captured_aliases
+                        .iter()
+                        .map(|b| (alias_capture_key(b), b.clone())),
+                )
+                .collect();
+            if !captures.is_empty() {
+                let mut sorted: Vec<&(String, crate::infer::Binding)> = captures.iter().collect();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                for (i, (_, binding)) in sorted.iter().enumerate() {
                     let idx = builder.ins().iconst(cg.ptr_type, i as i64);
                     let field_val =
                         cg.call_rt(builder, "knot_record_field_by_index", &[closure_env, idx]);
-                    env.set(crate::infer::Binding::User(var_name.to_string()), field_val);
+                    env.set((*binding).clone(), field_val);
                 }
             }
 
@@ -11169,6 +11188,26 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     .contains_key(&crate::infer::Binding::User(v.clone()))
             })
             .collect();
+        // `^field` references inside the do-block resolve to `Binding::Internal`
+        // `with`-aliases (`WithField` / `WithRecord`), which `find_free_vars`
+        // (user names only) never reports. Collect every internal alias that
+        // roots an `implicit_refs` resolution whose span lies inside this
+        // do-block, so the thunk can capture + rebind it. Span range covers all
+        // statements.
+        let (lo, hi) = stmts.iter().fold((usize::MAX, 0usize), |(lo, hi), s| {
+            (lo.min(s.span.start), hi.max(s.span.end))
+        });
+        let mut captured_aliases: Vec<crate::infer::Binding> = self
+            .implicit_refs
+            .iter()
+            .filter(|(span, _)| span.start >= lo && span.end <= hi)
+            .filter_map(|(_, (root, _))| match root {
+                crate::infer::Binding::Internal(_) => Some(root.clone()),
+                crate::infer::Binding::User(_) => None,
+            })
+            .collect();
+        captured_aliases.sort_by_key(alias_capture_key);
+        captured_aliases.dedup();
         // Relation-valued locals captured into this thunk must stay
         // per-row-iterable inside it. The thunk body is compiled later
         // (`define_io_thunk_function`), after the enclosing scope that
@@ -11197,6 +11236,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             func_id,
             stmts: stmts.to_vec(),
             free_vars: free_vars.clone(),
+            captured_aliases: captured_aliases.clone(),
             captured_rel_vars,
             captured_fixpoint_fields: self.fixpoint_rel_fields.clone(),
         });
@@ -11205,14 +11245,27 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let func_ref = self.module.declare_func_in_func(func_id, builder.func);
         let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
 
-        let env_val = if free_vars.is_empty() {
+        // Unified capture list: user free vars keyed by name, plus internal
+        // `with`-aliases keyed by their synthetic capture key. The thunk body
+        // rebinds each by index in the same (sorted) order.
+        let captures: Vec<(String, crate::infer::Binding)> = free_vars
+            .iter()
+            .map(|v| (v.clone(), crate::infer::Binding::User(v.clone())))
+            .chain(
+                captured_aliases
+                    .iter()
+                    .map(|b| (alias_capture_key(b), b.clone())),
+            )
+            .collect();
+
+        let env_val = if captures.is_empty() {
             builder.ins().iconst(self.ptr_type, 0) // null env
         } else {
             // Always a named record of captures (single capture = 1-field
             // record) so `extract` recovers each name; single is index 0.
-            let n = free_vars.len();
-            let mut sorted_vars: Vec<&str> = free_vars.iter().map(|s| s.as_str()).collect();
-            sorted_vars.sort();
+            let n = captures.len();
+            let mut sorted: Vec<&(String, crate::infer::Binding)> = captures.iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
             let ptr_bytes = self.ptr_type.bytes() as i32;
             let slot_size = (3 * n as u32) * ptr_bytes as u32;
@@ -11221,15 +11274,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 slot_size,
                 3,
             ));
-            for (i, var_name) in sorted_vars.iter().enumerate() {
-                let val = match env.get(&crate::infer::Binding::User(var_name.to_string())) {
+            for (i, (key, binding)) in sorted.iter().enumerate() {
+                let val = match env.get(binding) {
                     Some(v) => v,
                     None => {
-                        let msg = format!("codegen: undefined captured variable '{}'", var_name);
+                        let msg = format!("codegen: undefined captured variable '{key}'");
                         self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
                     }
                 };
-                let (key_ptr, key_len) = self.string_ptr(builder, var_name);
+                let (key_ptr, key_len) = self.string_ptr(builder, key);
                 let base = (i as i32) * (3 * ptr_bytes);
                 builder.ins().stack_store(key_ptr, slot, base);
                 builder.ins().stack_store(key_len, slot, base + ptr_bytes);
@@ -19850,6 +19903,24 @@ fn collect_pat_var_names(pat: &ast::Pat, out: &mut HashSet<String>) {
             collect_pat_var_names(tail, out);
         }
         ast::PatKind::Annot { pat, .. } => collect_pat_var_names(pat, out),
+    }
+}
+
+/// Encode an internal `with`-alias `Binding` as a closure-env record-field key.
+/// The capture env is a record keyed by strings, but an alias isn't a user
+/// identifier — this span-qualified form is unique and can never collide with a
+/// user name (a user can't write `\0`). The thunk rebinds the `Binding` directly
+/// (it carries the alias alongside the key), so no decoder is needed.
+fn alias_capture_key(b: &crate::infer::Binding) -> String {
+    use crate::infer::InternalName;
+    match b {
+        crate::infer::Binding::Internal(InternalName::WithField { span_start, field }) => {
+            format!("\0withfield:{span_start}:{field}")
+        }
+        crate::infer::Binding::Internal(InternalName::WithRecord { span_start }) => {
+            format!("\0withrecord:{span_start}")
+        }
+        crate::infer::Binding::User(name) => name.clone(),
     }
 }
 

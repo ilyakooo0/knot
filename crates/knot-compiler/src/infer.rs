@@ -5510,6 +5510,55 @@ impl Infer {
             // The direct `with`-field candidate is the innermost binding.
             by_record.push(vec![(root, path, field_ty)]);
         }
+        // A `with` record's ABSENT (`_`) fields are reachable search roots too:
+        // `with {_ {port …}}` embeds the record anonymously, and `^port` should
+        // descend into it exactly as if it were nested under a named field. The
+        // whole `with` record is bound at codegen under the per-site `WithRecord`
+        // alias (codegen's `With` arm), so root the projection there. The frame's
+        // `field_schemes` already carries each absent field under its reserved
+        // `_i` storage name (see the `With` arm); BFS into each `_i` value just
+        // like a named record binding below. `_i` itself never matches `name`
+        // (it isn't a valid identifier), so this only ever descends INTO it.
+        for (with_frame, _scope) in self.with_scope_stack.iter().zip(self.scopes.iter()).rev() {
+            let Some((with_span, field_schemes)) = with_frame else {
+                continue;
+            };
+            let root = Binding::Internal(InternalName::WithRecord {
+                span_start: with_span.start,
+            });
+            let mut group: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
+            // Seed the frontier with the frame's absent fields (the `_i`
+            // entries), then descend into nested records.
+            let mut frontier: Vec<(Vec<String>, Ty)> = field_schemes
+                .iter()
+                .filter(|(k, _)| k.starts_with('_'))
+                .map(|(k, s)| (vec![k.clone()], s.ty.clone()))
+                .collect();
+            while !frontier.is_empty() {
+                let mut next: Vec<(Vec<String>, Ty)> = Vec::new();
+                for (path, field_ty) in frontier.drain(..) {
+                    if *path.last().expect("non-empty path") == name {
+                        group.push((root.clone(), path.clone(), field_ty.clone()));
+                    }
+                    if let Ty::Record(sub, sub_absent, _) = self.apply(&field_ty).peel_alias() {
+                        for (f, t) in sub.iter().rev() {
+                            let mut p = path.clone();
+                            p.push(f.clone());
+                            next.push((p, t.clone()));
+                        }
+                        for (i, t) in sub_absent.iter().enumerate().rev() {
+                            let mut p = path.clone();
+                            p.push(format!("_{i}"));
+                            next.push((p, t.clone()));
+                        }
+                    }
+                }
+                frontier = next;
+            }
+            if !group.is_empty() {
+                by_record.push(group);
+            }
+        }
         for scope in self.scopes.iter().rev() {
             for (bind_name, scheme) in scope {
                 let root_ty = self.apply(&scheme.ty);
@@ -14111,14 +14160,14 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
                                 }
                                 // Absent keys join under their reserved `_i`
                                 // storage name (as in the `With` arm) so `^`/`<>`
-                                // BFS descends into them.
+                                // BFS descends into them. They are not bound in
+                                // scope under `_i`, so infer the value's type
+                                // directly (it is a decl-record field, already
+                                // inferred — this is cheap and idempotent).
                                 None => {
-                                    if let Some(scheme) =
-                                        infer.lookup(&format!("_{absent_idx}"))
-                                    {
-                                        field_schemes
-                                            .insert(format!("_{absent_idx}"), scheme.clone());
-                                    }
+                                    let val_ty = infer.infer_expr(&f.value);
+                                    field_schemes
+                                        .insert(format!("_{absent_idx}"), Scheme::mono(val_ty));
                                     absent_idx += 1;
                                 }
                             }
@@ -15281,6 +15330,12 @@ fn for_each_named_fn<'a>(
         && let ast::ExprKind::Record(fields) = &record.node
     {
         for fl in fields {
+            // Absent (`_`) keys are anonymous embeds, not named declarations —
+            // they have no name to register, so skip them. (Reaching one used
+            // to panic via `expect_named`.)
+            let Some(fl_name) = fl.name.as_name() else {
+                continue;
+            };
             if !matches!(
                 fl.value.node,
                 ast::ExprKind::TypeCtor { .. }
@@ -15288,7 +15343,7 @@ fn for_each_named_fn<'a>(
                     | ast::ExprKind::RouteDecl { .. }
                     | ast::ExprKind::SubsetConstraint { .. }
             ) {
-                f(fl.name.expect_named(), fl.sig.as_ref(), Some(&fl.value));
+                f(fl_name, fl.sig.as_ref(), Some(&fl.value));
             }
         }
     }

@@ -5251,8 +5251,22 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                 }
                 let record_val = if let ast::ExprKind::Record(field_exprs) = &record.node {
-                    let mut compiled_fields: Vec<(&String, Value)> =
+                    // Absent (`_`) fields are stored under reserved names `_i`
+                    // (positional index among `_` fields), matching the record
+                    // type's absent list and the `Record` arm, so `^`/`<>` can
+                    // project them by that path.
+                    let mut compiled_fields: Vec<(String, Value)> =
                         Vec::with_capacity(field_exprs.len());
+                    let mut absent_idx = 0usize;
+                    let mut field_name = |f: &ast::RecordField| {
+                        if f.name == "_" {
+                            let s = format!("_{absent_idx}");
+                            absent_idx += 1;
+                            s
+                        } else {
+                            f.name.clone()
+                        }
+                    };
                     for f in field_exprs {
                         // Skip LAZY relation fields: not materialized into the
                         // record (resolved via `let_bindings` inlining or the
@@ -5281,7 +5295,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             } else {
                                 self.compile_expr(builder, &f.value, &mut env.clone(), db)
                             };
-                            compiled_fields.push((&f.name, v));
+                            compiled_fields.push((field_name(f), v));
                             continue;
                         }
                         let mut field_env = env.clone();
@@ -5311,13 +5325,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 .remove(&crate::infer::Binding::User(f.name.clone()));
                         }
                         let v = self.compile_expr(builder, &f.value, &mut field_env, db);
-                        compiled_fields.push((&f.name, v));
+                        compiled_fields.push((field_name(f), v));
                     }
                     // Assemble the record from the compiled field values,
                     // sorted by field name exactly like the `Record` arm
                     // (runtime expects pre-sorted pairs).
                     let mut compiled_sorted = compiled_fields;
-                    compiled_sorted.sort_by_key(|(name, _)| name.as_str());
+                    compiled_sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
                     let n = compiled_sorted.len();
                     let ptr_bytes = self.ptr_type.bytes() as i32;
                     let slot_size = (3 * n as u32) * ptr_bytes as u32;

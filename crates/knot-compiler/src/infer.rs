@@ -5715,8 +5715,23 @@ impl Infer {
                         // `with` binds each field into the flat `Env`, which
                         // prototypes into nested bodies, so a bare `Var(app)`
                         // resolves the outer record correctly across nesting.
-                        let root = Binding::User(path[0].clone());
-                        let rest: Vec<String> = path[1..].to_vec();
+                        // Exception: an absent (`_i`) first element is NOT a
+                        // bound field — it lives only inside the with-record
+                        // value. Root at the with-record alias and keep the
+                        // full `_i…` path so codegen projects `_i` from the
+                        // record before descending to `name`.
+                        let is_absent = path[0].strip_prefix('_')
+                            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()));
+                        let (root, rest): (Binding, Vec<String>) = if is_absent {
+                            (
+                                Binding::Internal(InternalName::WithRecord {
+                                    span_start: with_span.start,
+                                }),
+                                path.clone(),
+                            )
+                        } else {
+                            (Binding::User(path[0].clone()), path[1..].to_vec())
+                        };
                         candidates.push((root, rest, field_ty.clone()));
                     }
                     if let Ty::Record(sub, sub_absent, _) = self.apply(field_ty).peel_alias().clone() {
@@ -6595,8 +6610,8 @@ impl Infer {
                     self.infer_expr(record)
                 };
                 let resolved = self.apply(&record_ty);
-                let fields = match &resolved {
-                    Ty::Record(fields, _,  _) => fields.clone(),
+                let (fields, absent) = match &resolved {
+                    Ty::Record(fields, absent, _) => (fields.clone(), absent.clone()),
                     other => {
                         let shown = self.display_ty(other);
                         self.error(
@@ -6621,6 +6636,17 @@ impl Infer {
                     fields
                         .iter()
                         .map(|(n, t)| (n.clone(), Scheme::mono(t.clone())))
+                        // Absent fields join the frame under their reserved `_i`
+                        // storage names so `^`/`<>` BFS (which seeds from this
+                        // map) descends into them. `_i` is not a valid
+                        // identifier, so these never collide with real fields or
+                        // match a direct `field_schemes.get(name)` lookup.
+                        .chain(
+                            absent
+                                .iter()
+                                .enumerate()
+                                .map(|(i, t)| (format!("_{i}"), Scheme::mono(t.clone()))),
+                        )
                         .collect(),
                 ));
                 // Peel the record's embedded `type`/`data` declarations into a

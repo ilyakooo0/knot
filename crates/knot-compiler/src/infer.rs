@@ -543,11 +543,13 @@ enum Ty {
     NumLit(UnitTy),
     /// Function type.
     Fun(Box<Ty>, Box<Ty>),
-    /// Record with named fields and optional row variable (open record).
-    /// Fields keep source definition order (IndexMap) so implicit-field `^name`
-    /// resolution can try them bottom-to-top; record-type equality is by-key,
-    /// so order is not semantic.
-    Record(FieldMap, Option<TyVar>),
+    /// Record with named fields, absent (unnamed `_`-keyed) fields, and an
+    /// optional row variable (open record). Named fields keep source definition
+    /// order (IndexMap) so implicit-field `^name` resolution can try them
+    /// bottom-to-top; record-type equality is by-key, so order is not semantic.
+    /// Absent fields carry no name — they are stored positionally and reachable
+    /// only via `^`/`<>` (type-matched), never by `.field`.
+    Record(FieldMap, Vec<Ty>, Option<TyVar>),
     /// Relation (set) type: [T].
     Relation(Box<Ty>),
     /// Named algebraic data type with optional type arguments.
@@ -594,7 +596,7 @@ enum Ty {
 
 impl Ty {
     fn unit() -> Ty {
-        Ty::Record(IndexMap::new(), None)
+        Ty::Record(IndexMap::new(), vec![],  None)
     }
 
     /// Strip outer `Ty::Alias` wrappers to expose the underlying type.
@@ -721,10 +723,14 @@ fn default_free_unit_vars(ty: &Ty) -> Ty {
             Box::new(default_free_unit_vars(p)),
             Box::new(default_free_unit_vars(r)),
         ),
-        Ty::Record(fields, row) => Ty::Record(
+        Ty::Record(fields, absent, row) => Ty::Record(
             fields
                 .iter()
                 .map(|(n, t)| (n.clone(), default_free_unit_vars(t)))
+                .collect(),
+            absent
+                .iter()
+                .map(default_free_unit_vars)
                 .collect(),
             *row,
         ),
@@ -1639,7 +1645,7 @@ impl Infer {
             // scalar field matches a literal-derived `Int <var>`). Closed
             // records only — an open row variable means extra unknown fields a
             // whole-record `where` predicate might not expect.
-            (Ty::Record(bfields, None), Ty::Record(vfields, None)) => {
+            (Ty::Record(bfields, _,  None), Ty::Record(vfields, _,  None)) => {
                 bfields.len() == vfields.len()
                     && bfields.iter().all(|(name, bty)| {
                         vfields
@@ -1927,7 +1933,7 @@ impl Infer {
                 self.collect_refined_names(p, out);
                 self.collect_refined_names(r, out);
             }
-            Ty::Record(fields, _) | Ty::Variant(fields, _) => {
+            Ty::Record(fields, _,  _) | Ty::Variant(fields, _) => {
                 for v in fields.values() {
                     self.collect_refined_names(v, out);
                 }
@@ -1963,7 +1969,7 @@ impl Infer {
                 Box::new(self.apply_impl(p, excluded)),
                 Box::new(self.apply_impl(r, excluded)),
             ),
-            Ty::Record(fields, row) => {
+            Ty::Record(fields, _,  row) => {
                 let mut applied: FieldMap = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), self.apply_impl(v, excluded)))
@@ -1971,17 +1977,17 @@ impl Infer {
                 if let Some(rv) = row {
                     let resolved = self.apply_impl(&Ty::Var(*rv), excluded);
                     match resolved {
-                        Ty::Record(extra, rest) => {
+                        Ty::Record(extra, _,  rest) => {
                             for (k, v) in extra {
                                 applied.entry(k).or_insert(v);
                             }
-                            Ty::Record(applied, rest)
+                            Ty::Record(applied, vec![],  rest)
                         }
-                        Ty::Var(rv2) => Ty::Record(applied, Some(rv2)),
-                        _ => Ty::Record(applied, None),
+                        Ty::Var(rv2) => Ty::Record(applied, vec![],  Some(rv2)),
+                        _ => Ty::Record(applied, vec![],  None),
                     }
                 } else {
-                    Ty::Record(applied, None)
+                    Ty::Record(applied, vec![],  None)
                 }
             }
             Ty::Variant(ctors, row) => {
@@ -2107,7 +2113,7 @@ impl Infer {
                 }
             }
             Ty::Fun(p, r) => self.occurs_in(var, p) || self.occurs_in(var, r),
-            Ty::Record(fields, row) => {
+            Ty::Record(fields, _,  row) => {
                 if fields.values().any(|v| self.occurs_in(var, v)) {
                     return true;
                 }
@@ -2383,7 +2389,7 @@ impl Infer {
                     self.widen_refined_vars(x, y, depth + 1);
                 }
             }
-            (Ty::Record(f1, _), Ty::Record(f2, _)) => {
+            (Ty::Record(f1, _,  _), Ty::Record(f2, _,  _)) => {
                 let common: Vec<(Ty, Ty)> = f1
                     .iter()
                     .filter_map(|(k, x)| f2.get(k).map(|y| (x.clone(), y.clone())))
@@ -2674,7 +2680,7 @@ impl Infer {
                     self.unify_dir(a, b, span, t1_provided);
                 }
             }
-            (Ty::Record(f1, r1), Ty::Record(f2, r2)) => {
+            (Ty::Record(f1, _,  r1), Ty::Record(f2, _,  r2)) => {
                 self.unify_records(f1, *r1, f2, *r2, span, t1_provided);
             }
             // ── Higher-kinded type support ─────────────────────
@@ -2805,8 +2811,8 @@ impl Infer {
                 let b = (**b).clone();
                 self.unify_dir(&b, &t2, span, t1_provided);
             }
-            (Ty::Relation(_), Ty::Record(fields, None))
-            | (Ty::Record(fields, None), Ty::Relation(_))
+            (Ty::Relation(_), Ty::Record(fields, _,  None))
+            | (Ty::Record(fields, _,  None), Ty::Relation(_))
                 if self.in_io_do && fields.is_empty() => {}
 
             // ── Row-polymorphic variants ────────────────────────
@@ -3092,7 +3098,7 @@ impl Infer {
         let mut tail = row;
         while let Some(rv) = tail {
             match self.apply(&Ty::Var(rv)) {
-                Ty::Record(extra, rest) => {
+                Ty::Record(extra, _,  rest) => {
                     for (k, v) in extra {
                         match all.get(&k) {
                             Some(existing) => {
@@ -3185,7 +3191,7 @@ impl Infer {
                         span,
                     );
                 }
-                let target = Ty::Record(only2, None);
+                let target = Ty::Record(only2, vec![],  None);
                 self.bind_var(rv, target, span);
             }
             (None, Some(rv)) => {
@@ -3196,7 +3202,7 @@ impl Infer {
                         span,
                     );
                 }
-                let target = Ty::Record(only1, None);
+                let target = Ty::Record(only1, vec![],  None);
                 self.bind_var(rv, target, span);
             }
             (Some(rv1), Some(rv2)) => {
@@ -3217,17 +3223,17 @@ impl Infer {
                         // keep the rigid tail intact and bind the free row
                         // var to a record using the skolem as its tail.
                         (true, false) if only2.is_empty() => {
-                            let target = Ty::Record(only1, Some(rv1));
+                            let target = Ty::Record(only1, vec![],  Some(rv1));
                             self.bind_var(rv2, target, span);
                         }
                         (false, true) if only1.is_empty() => {
-                            let target = Ty::Record(only2, Some(rv2));
+                            let target = Ty::Record(only2, vec![],  Some(rv2));
                             self.bind_var(rv1, target, span);
                         }
                         _ => {
                             let fresh = self.fresh_var();
-                            let t1 = Ty::Record(only2, Some(fresh));
-                            let t2 = Ty::Record(only1, Some(fresh));
+                            let t1 = Ty::Record(only2, vec![],  Some(fresh));
+                            let t2 = Ty::Record(only1, vec![],  Some(fresh));
                             self.bind_var(rv1, t1, span);
                             self.bind_var(rv2, t2, span);
                         }
@@ -3402,7 +3408,7 @@ impl Infer {
                     (fname.clone(), ty)
                 })
                 .collect();
-            ctors.insert(ctor_name.clone(), Ty::Record(field_tys, None));
+            ctors.insert(ctor_name.clone(), Ty::Record(field_tys, vec![],  None));
         }
         self.annotation_vars = saved_annotation_vars;
         Some(Ty::Variant(ctors, None))
@@ -3591,7 +3597,7 @@ impl Infer {
                 Box::new(self.subst_ty(p, mapping)),
                 Box::new(self.subst_ty(r, mapping)),
             ),
-            Ty::Record(fields, row) => {
+            Ty::Record(fields, _,  row) => {
                 let mut new_fields: FieldMap = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), self.subst_ty(v, mapping)))
@@ -3600,7 +3606,7 @@ impl Infer {
                     if let Some(replacement) = mapping.get(&rv) {
                         match replacement {
                             Ty::Var(new_rv) => Some(*new_rv),
-                            Ty::Record(extra_fields, extra_row) => {
+                            Ty::Record(extra_fields, _,  extra_row) => {
                                 // Merge fields from the replacement record
                                 for (k, v) in extra_fields {
                                     new_fields.entry(k.clone()).or_insert_with(|| v.clone());
@@ -3613,7 +3619,7 @@ impl Infer {
                         Some(rv)
                     }
                 });
-                Ty::Record(new_fields, new_row)
+                Ty::Record(new_fields, vec![],  new_row)
             }
             Ty::Variant(ctors, row) => {
                 let mut new_ctors: FieldMap = ctors
@@ -3686,12 +3692,12 @@ impl Infer {
             Ty::Relation(inner) => {
                 Ty::Relation(Box::new(self.subst_unit_vars_in_ty(inner, mapping)))
             }
-            Ty::Record(fields, row) => {
+            Ty::Record(fields, _,  row) => {
                 let new_fields = fields
                     .iter()
                     .map(|(k, v)| (k.clone(), self.subst_unit_vars_in_ty(v, mapping)))
                     .collect();
-                Ty::Record(new_fields, *row)
+                Ty::Record(new_fields, vec![],  *row)
             }
             Ty::Variant(ctors, row) => {
                 let new_ctors = ctors
@@ -3775,7 +3781,7 @@ impl Infer {
                 self.collect_free_unit_vars(r, out);
             }
             Ty::Relation(inner) => self.collect_free_unit_vars(inner, out),
-            Ty::Record(fields, row) => {
+            Ty::Record(fields, _,  row) => {
                 for v in fields.values() {
                     self.collect_free_unit_vars(v, out);
                 }
@@ -3960,7 +3966,7 @@ impl Infer {
                 self.collect_free_vars(p, out);
                 self.collect_free_vars(r, out);
             }
-            Ty::Record(fields, row) => {
+            Ty::Record(fields, _,  row) => {
                 for v in fields.values() {
                     self.collect_free_vars(v, out);
                 }
@@ -4505,7 +4511,7 @@ impl Infer {
                     .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
                     .collect();
                 let row_var = rest.as_ref().map(|name| self.annotation_var(name));
-                Ty::Record(field_tys, row_var)
+                Ty::Record(field_tys, vec![],  row_var)
             }
             ast::TypeKind::Relation(inner) => Ty::Relation(Box::new(self.ast_type_to_ty(inner))),
             ast::TypeKind::Function { param, result } => Ty::Fun(
@@ -4549,7 +4555,7 @@ impl Infer {
                             .iter()
                             .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
                             .collect();
-                        (c.name.clone(), Ty::Record(field_tys, None))
+                        (c.name.clone(), Ty::Record(field_tys, vec![],  None))
                     })
                     .collect();
                 let row_var = rest.as_ref().map(|name| self.annotation_var(name));
@@ -4700,7 +4706,7 @@ impl Infer {
                 );
                 if in_fun { format!("({})", s) } else { s }
             }
-            Ty::Record(fields, row) => {
+            Ty::Record(fields, _,  row) => {
                 if fields.is_empty() && row.is_none() {
                     return "{}".into();
                 }
@@ -4923,7 +4929,7 @@ impl Infer {
         } else {
             Ty::Con(info.data_type.clone(), param_tys)
         };
-        let record_ty = Ty::Record(field_tys, None);
+        let record_ty = Ty::Record(field_tys, vec![],  None);
 
         self.annotation_vars = saved_annotation_vars;
         Some((data_ty, record_ty))
@@ -4962,7 +4968,7 @@ impl Infer {
         } else {
             Ty::Con(data_name.to_string(), param_tys)
         };
-        let record_ty = Ty::Record(field_tys, None);
+        let record_ty = Ty::Record(field_tys, vec![],  None);
 
         self.annotation_vars = saved_annotation_vars;
         Some((data_ty, record_ty))
@@ -4999,7 +5005,7 @@ impl Infer {
         for field in fields {
             let resolved = self.apply(&ty);
             let next = match resolved.peel_alias() {
-                Ty::Record(fmap, _) => fmap.get(&field).cloned()?,
+                Ty::Record(fmap, _,  _) => fmap.get(&field).cloned()?,
                 _ => return None,
             };
             ty = next;
@@ -5068,7 +5074,7 @@ impl Infer {
                 }
                 let dict_ty = self.apply(&dict_tys[i]);
                 let field_ty = match dict_ty.peel_alias() {
-                    Ty::Record(fields, _) => fields.get(field).cloned().unwrap_or(dict_ty),
+                    Ty::Record(fields, _,  _) => fields.get(field).cloned().unwrap_or(dict_ty),
                     _ => dict_ty,
                 };
                 if let Some((root, path)) = self.resolve_dict(field, &field_ty, expr.span) {
@@ -5131,7 +5137,7 @@ impl Infer {
             }
             let dict_ty = self.apply(&dict_tys[i]);
             let field_ty = match dict_ty.peel_alias() {
-                Ty::Record(fields, _) => fields.get(field).cloned().unwrap_or(dict_ty),
+                Ty::Record(fields, _,  _) => fields.get(field).cloned().unwrap_or(dict_ty),
                 _ => dict_ty,
             };
             if let Some((root, path)) = self.resolve_dict(field, &field_ty, expr.span) {
@@ -5299,7 +5305,7 @@ impl Infer {
             for (bind_name, scheme) in scope {
                 let root_ty = self.apply(&scheme.ty);
                 let mut frontier: Vec<(Vec<String>, Ty)> = match root_ty.peel_alias() {
-                    Ty::Record(fields, _) => fields
+                    Ty::Record(fields, _,  _) => fields
                         .iter()
                         .map(|(f, t)| (vec![f.clone()], t.clone()))
                         .collect(),
@@ -5315,7 +5321,7 @@ impl Infer {
                                 fty.clone(),
                             ));
                         }
-                        if let Ty::Record(sub, _) = self.apply(&fty).peel_alias().clone() {
+                        if let Ty::Record(sub, _,  _) = self.apply(&fty).peel_alias().clone() {
                             for (f, t) in sub {
                                 let mut p = path.clone();
                                 p.push(f);
@@ -5480,7 +5486,7 @@ impl Infer {
         for scope in self.scopes.iter().rev() {
             for (bind_name, scheme) in scope {
                 let root_ty = self.apply(&scheme.ty);
-                let Ty::Record(fields, _) = root_ty.peel_alias() else {
+                let Ty::Record(fields, _,  _) = root_ty.peel_alias() else {
                     continue;
                 };
                 let mut group: Vec<(Binding, Vec<String>, Ty)> = Vec::new();
@@ -5499,7 +5505,7 @@ impl Infer {
                                 field_ty.clone(),
                             ));
                         }
-                        if let Ty::Record(sub, _) = self.apply(&field_ty).peel_alias() {
+                        if let Ty::Record(sub, _,  _) = self.apply(&field_ty).peel_alias() {
                             for (f, t) in sub.iter().rev() {
                                 let mut p = path.clone();
                                 p.push(f.clone());
@@ -5669,7 +5675,7 @@ impl Infer {
                         let rest: Vec<String> = path[1..].to_vec();
                         candidates.push((root, rest, field_ty.clone()));
                     }
-                    if let Ty::Record(sub, _) = self.apply(field_ty).peel_alias().clone() {
+                    if let Ty::Record(sub, _,  _) = self.apply(field_ty).peel_alias().clone() {
                         for (f, t) in sub.iter() {
                             let mut p = path.clone();
                             p.push(f.clone());
@@ -5720,7 +5726,7 @@ impl Infer {
                         root_ty.clone(),
                     ));
                 }
-                if let Ty::Record(fields, _) = root_ty.peel_alias() {
+                if let Ty::Record(fields, _,  _) = root_ty.peel_alias() {
                     for (f, t) in fields.iter().rev() {
                         frontier.push((
                             Binding::User(bind_name.clone()),
@@ -5738,7 +5744,7 @@ impl Infer {
                     if *path.last().expect("non-empty path") == name {
                         candidates.push((root.clone(), path.clone(), field_ty.clone()));
                     }
-                    if let Ty::Record(sub, _) = self.apply(field_ty).peel_alias().clone() {
+                    if let Ty::Record(sub, _,  _) = self.apply(field_ty).peel_alias().clone() {
                         for (f, t) in sub.iter().rev() {
                             let mut p = path.clone();
                             p.push(f.clone());
@@ -6225,7 +6231,7 @@ impl Infer {
                         }
                     })
                     .collect();
-                Ty::Record(field_tys, None)
+                Ty::Record(field_tys, vec![],  None)
             }
 
             ast::ExprKind::FieldAccess { expr: e, field } => {
@@ -6370,6 +6376,7 @@ impl Infer {
                 let rv = self.fresh_var();
                 let constraint = Ty::Record(
                     IndexMap::from([(field.clone(), field_ty.clone())]),
+                    vec![],
                     Some(rv),
                 );
                 self.unify(&base_ty, &constraint, e.span);
@@ -6475,7 +6482,7 @@ impl Infer {
                         }
                         field_tys.push((f.name.clone(), val_ty));
                     }
-                    Ty::Record(field_tys.into_iter().collect(), None)
+                    Ty::Record(field_tys.into_iter().collect(), vec![],  None)
                 } else {
                     // Non-literal operand: nothing to mask (no field values
                     // visible), infer as-is.
@@ -6483,7 +6490,7 @@ impl Infer {
                 };
                 let resolved = self.apply(&record_ty);
                 let fields = match &resolved {
-                    Ty::Record(fields, _) => fields.clone(),
+                    Ty::Record(fields, _,  _) => fields.clone(),
                     other => {
                         let shown = self.display_ty(other);
                         self.error(
@@ -7392,14 +7399,14 @@ impl Infer {
                             .iter()
                             .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
                             .collect();
-                        let record_ty = Ty::Record(field_tys, None);
+                        let record_ty = Ty::Record(field_tys, vec![],  None);
                         ns_fields.insert(
                             ctor.name.clone(),
                             Ty::Fun(Box::new(record_ty), Box::new(data_ty.clone())),
                         );
                     }
                     self.annotation_vars = saved_annotation_vars;
-                    return Ty::Record(ns_fields, None);
+                    return Ty::Record(ns_fields, vec![],  None);
                 }
 
                 // NON-variant alias body: statically its type is the alias's
@@ -7451,7 +7458,7 @@ impl Infer {
                         Ty::Fun(Box::new(input_ty), Box::new(Ty::Con(name.clone(), vec![]))),
                     );
                 }
-                Ty::Record(ns_fields, None)
+                Ty::Record(ns_fields, vec![],  None)
             }
         }
     }
@@ -7623,7 +7630,7 @@ impl Infer {
                 // mismatch lights up just the offending field value, not the
                 // whole record literal.
                 let resolved = self.apply(expected);
-                if let Ty::Record(expected_fields, None) = resolved.peel_alias() {
+                if let Ty::Record(expected_fields, _,  None) = resolved.peel_alias() {
                     let expected_fields = expected_fields.clone();
                     let mut field_tys = IndexMap::new();
                     for f in fields {
@@ -7661,7 +7668,7 @@ impl Infer {
                             field_tys.insert(f.name.clone(), val_ty);
                         }
                     }
-                    self.unify_dir(expected, &Ty::Record(field_tys, None), expr.span, false);
+                    self.unify_dir(expected, &Ty::Record(field_tys, vec![],  None), expr.span, false);
                 } else {
                     let inferred = self.infer_expr(expr);
                     // `expected` is on the required side here (t1), so pass
@@ -7840,7 +7847,7 @@ impl Infer {
         for hf in &entry.request_headers {
             input_fields.insert(hf.name.clone(), self.ast_type_to_ty(&hf.value));
         }
-        Ty::Record(input_fields, None)
+        Ty::Record(input_fields, vec![],  None)
     }
 
     /// Build the expected type of a single endpoint handler.
@@ -7866,8 +7873,9 @@ impl Infer {
                     Ty::Record(
                         IndexMap::from([
                             ("body".into(), resp),
-                            ("headers".into(), Ty::Record(hdrs, None)),
+                            ("headers".into(), Ty::Record(hdrs, vec![],  None)),
                         ]),
+                        vec![],
                         None,
                     )
                 }
@@ -7959,7 +7967,7 @@ impl Infer {
                 for (k, v) in f2 {
                     merged.insert(k, v);
                 }
-                Some(Ty::Record(merged, tail2))
+                Some(Ty::Record(merged, vec![],  tail2))
             }
             (Ok((f1, Some(_))), Ok((f2, tail2))) => {
                 // Open left: the base's other fields live in its row tail, so we
@@ -7976,11 +7984,11 @@ impl Infer {
                 for (k, v) in &f2 {
                     merged.insert(k.clone(), v.clone());
                 }
-                let result = Ty::Record(merged.clone(), Some(rest));
+                let result = Ty::Record(merged.clone(), vec![],  Some(rest));
                 // Constrain the base: it must contain the merged known fields,
                 // with the same fresh tail (so its other fields flow into
                 // `rest`).
-                let base_constraint = Ty::Record(merged, Some(rest));
+                let base_constraint = Ty::Record(merged, vec![],  Some(rest));
                 let base_ty = self.apply(&left_ty).clone();
                 self.unify(&base_ty, &base_constraint, args[0].span);
                 // A right tail beyond the fresh one is not expressible here;
@@ -8001,7 +8009,7 @@ impl Infer {
     /// error is a genuinely non-record argument.
     fn record_fields(ty: &Ty) -> Result<(FieldMap, Option<TyVar>), String> {
         match ty.peel_alias() {
-            Ty::Record(fields, tail) => Ok((fields.clone(), *tail)),
+            Ty::Record(fields, _,  tail) => Ok((fields.clone(), *tail)),
             other => Err(format!(
                 "unify expects record arguments, got {}",
                 match other {
@@ -8070,10 +8078,12 @@ impl Infer {
             let opts_ty = self.infer_expr(args[1]);
             let header_row = Ty::Record(
                 IndexMap::from([("name".into(), Ty::Text), ("value".into(), Ty::Text)]),
+                vec![],
                 None,
             );
             let expected_opts = Ty::Record(
                 IndexMap::from([("headers".into(), Ty::Relation(Box::new(header_row)))]),
+                vec![],
                 None,
             );
             self.unify(&opts_ty, &expected_opts, args[1].span);
@@ -8114,7 +8124,7 @@ impl Infer {
                     .iter()
                     .map(|(name, ty)| (name.clone(), self.ast_type_to_ty(ty)))
                     .collect();
-                let expected_record = Ty::Record(field_tys, None);
+                let expected_record = Ty::Record(field_tys, vec![],  None);
                 self.unify(record_ty, &expected_record, ctor_arg.span);
             }
         }
@@ -8133,10 +8143,12 @@ impl Infer {
                         .iter()
                         .map(|f| (f.name.clone(), self.ast_type_to_ty(&f.value)))
                         .collect(),
+                    vec![],
                     None,
                 );
                 Ty::Record(
                     IndexMap::from([("body".into(), raw_body_ty), ("headers".into(), headers_ty)]),
+                    vec![],
                     None,
                 )
             }
@@ -8144,6 +8156,7 @@ impl Infer {
         };
         let err_ty = Ty::Record(
             IndexMap::from([("message".into(), Ty::Text), ("status".into(), Ty::Int)]),
+            vec![],
             None,
         );
         let result_adt = Ty::Con("Result".into(), vec![err_ty, ok_ty]);
@@ -8516,7 +8529,7 @@ impl Infer {
                     for (k, v) in f2 {
                         merged.insert(k, v);
                     }
-                    let merged = Ty::Record(merged, tail1.or(tail2));
+                    let merged = Ty::Record(merged, vec![],  tail1.or(tail2));
                     self.unify(&Ty::Var(d.result), &merged, d.span);
                 }
                 (Err(msg), _) | (_, Err(msg)) => {
@@ -8736,7 +8749,7 @@ impl Infer {
                     }
                 }
                 let row_var = self.fresh_var();
-                let record_ty = Ty::Record(field_types, Some(row_var));
+                let record_ty = Ty::Record(field_types, vec![],  Some(row_var));
                 self.unify(&record_ty, expected, pat.span);
             }
             ast::PatKind::Lit(lit) => {
@@ -9702,7 +9715,7 @@ impl Infer {
                         .collect();
                     if params.is_empty() {
                         self.aliases
-                            .insert(name.to_string(), Ty::Record(field_tys, None));
+                            .insert(name.to_string(), Ty::Record(field_tys, vec![],  None));
                     }
                 }
 
@@ -9758,7 +9771,7 @@ impl Infer {
             Ty::Con(name, _) => Some(name.clone()),
             Ty::IO(_) => Some("IO".into()),
             Ty::Fun(_, _) => Some("Fun".into()),
-            Ty::Record(_, _) => Some("Record".into()),
+            Ty::Record(_, _,  _) => Some("Record".into()),
             Ty::Variant(_, _) => Some("Variant".into()),
             Ty::App(_, _) => Some("App".into()),
             // Units are erased at runtime, so trait dispatch on a unit-typed
@@ -10141,10 +10154,12 @@ impl Infer {
                                 ("field".into(), Ty::Con("Maybe".into(), vec![Ty::Text])),
                                 ("message".into(), Ty::Text),
                             ]),
+                            vec![],
                             None,
                         ))),
                     ),
                 ]),
+                vec![],
                 None,
             ),
         );
@@ -10156,6 +10171,7 @@ impl Infer {
             "HttpError".into(),
             Ty::Record(
                 IndexMap::from([("status".into(), Ty::Int), ("message".into(), Ty::Text)]),
+                vec![],
                 None,
             ),
         );
@@ -10175,6 +10191,7 @@ impl Infer {
                         ),
                     ),
                 ]),
+                vec![],
                 None,
             ),
         );
@@ -10608,6 +10625,7 @@ impl Infer {
             let b = self.fresh_var();
             let err_ty = Ty::Record(
                 IndexMap::from([("message".into(), Ty::Text), ("status".into(), Ty::Int)]),
+                vec![],
                 None,
             );
             let result_ty = Ty::Con("Result".into(), vec![err_ty.clone(), Ty::Var(b)]);
@@ -11787,6 +11805,7 @@ impl Infer {
                 ("privateKey".into(), Ty::Bytes),
                 ("publicKey".into(), Ty::Bytes),
             ]),
+            vec![],
             None,
         );
         self.bind_top(
@@ -12385,10 +12404,12 @@ impl Infer {
                 ("requests".into(), Ty::Int),
                 ("window".into(), Ty::int_with_unit(UnitTy::named("Ms"))),
             ]),
+            vec![],
             None,
         );
         let expected = Ty::Record(
             IndexMap::from([("key".into(), key_ty), ("limit".into(), limit_ty)]),
+            vec![],
             None,
         );
         self.check_expr(expr, &expected);
@@ -12683,7 +12704,7 @@ fn collect_unit_vars_ordered(ty: &Ty, out: &mut Vec<UnitVar>) {
             collect_unit_vars_ordered(p, out);
             collect_unit_vars_ordered(r, out);
         }
-        Ty::Record(fields, _) => {
+        Ty::Record(fields, _,  _) => {
             for t in fields.values() {
                 collect_unit_vars_ordered(t, out);
             }
@@ -12742,7 +12763,7 @@ fn correspond_vars(
             correspond_vars(f1, f2, ty_map, unit_map);
             correspond_vars(a1, a2, ty_map, unit_map);
         }
-        (Ty::Record(f1, r1), Ty::Record(f2, r2)) => {
+        (Ty::Record(f1, _,  r1), Ty::Record(f2, _,  r2)) => {
             for (k, v) in f1 {
                 if let Some(w) = f2.get(k) {
                     correspond_vars(v, w, ty_map, unit_map);
@@ -12808,7 +12829,7 @@ fn collect_vars_ordered(ty: &Ty, out: &mut Vec<TyVar>) {
             collect_vars_ordered(p, out);
             collect_vars_ordered(r, out);
         }
-        Ty::Record(fields, row) => {
+        Ty::Record(fields, _,  row) => {
             for t in fields.values() {
                 collect_vars_ordered(t, out);
             }
@@ -12998,7 +13019,7 @@ fn display_ty_clean_inner(
             );
             if in_fun { format!("({})", s) } else { s }
         }
-        Ty::Record(fields, row) => {
+        Ty::Record(fields, _,  row) => {
             if fields.is_empty() && row.is_none() {
                 return "{}".into();
             }
@@ -13638,7 +13659,7 @@ fn walk_expected(
                     .iter()
                     .all(|a| walk_expected(infer, a, var, host, snippet_data, span))
         }
-        Ty::Record(fields, _) | Ty::Variant(fields, _) => fields
+        Ty::Record(fields, _,  _) | Ty::Variant(fields, _) => fields
             .values()
             .all(|f| walk_expected(infer, f, var, host, snippet_data, span)),
         Ty::Relation(inner) | Ty::IO(inner) => {
@@ -15187,12 +15208,12 @@ fn ty_to_wire_descriptor(ty: &Ty) -> String {
             let inner = ctors
                 .get("Just")
                 .and_then(|payload| match payload.peel_alias() {
-                    Ty::Record(fields, _) => fields.get("value").map(ty_to_wire_descriptor),
+                    Ty::Record(fields, _,  _) => fields.get("value").map(ty_to_wire_descriptor),
                     _ => None,
                 });
             format!("?{}", inner.unwrap_or_else(|| "*".to_string()))
         }
-        Ty::Record(fields, _) => {
+        Ty::Record(fields, _,  _) => {
             let inner: Vec<String> = fields
                 .iter()
                 .map(|(n, t)| format!("{}:{}", n, ty_to_wire_descriptor(t)))
@@ -15215,7 +15236,7 @@ fn ty_to_type_name(ty: &Ty) -> Option<String> {
         Ty::Uuid => Some("Uuid".to_string()),
         Ty::Con(name, _) => Some(name.clone()),
         Ty::Relation(_) => Some("Relation".to_string()),
-        Ty::Record(_, _) => Some("Record".to_string()),
+        Ty::Record(_, _,  _) => Some("Record".to_string()),
         _ => None,
     }
 }

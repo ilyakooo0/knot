@@ -1789,6 +1789,12 @@ impl Parser {
         }
 
         loop {
+            // A `match` scrutinee ends at the first gap: application arguments
+            // are single-space-separated, so a gap means the scrutinee is done
+            // and the first arm's pattern follows (`match x  Pat  body`).
+            if self.scrutinee_no_newline_app && self.gap_before_current() {
+                break;
+            }
             if self.can_start_atom() {
                 let arg = match self.parse_postfix() {
                     Some(arg) => arg,
@@ -3201,7 +3207,14 @@ impl Parser {
         }
         let scope_mark = self.bound_vars.len();
         self.push_pat_vars(&pat);
+        // The arm body is a single-space-separated expression: a gap ends it
+        // (the next token after a gap is the next arm's pattern). Same rule as
+        // the scrutinee — this is what makes inline arms `Pat  body  Pat  body`
+        // parse.
+        let saved_scrut = self.scrutinee_no_newline_app;
+        self.scrutinee_no_newline_app = true;
         let body = self.parse_expr();
+        self.scrutinee_no_newline_app = saved_scrut;
         self.bound_vars.truncate(scope_mark);
         let body = body?;
         Some(CaseArm { pat, body })

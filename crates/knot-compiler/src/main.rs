@@ -225,6 +225,23 @@ fn main() {
     }
 
     match args[1].as_str() {
+        // Print every leaf field of the global `base` record with its inferred
+        // type, one parseable sig line per field (`num.int.neg : Int u -> Int u`).
+        // Runs inference on the trivial program `base` so `bind_base_record`
+        // populates the record's type, then walks it.
+        "base" => {
+            let source = "base".to_string();
+            let lexer = knot::lexer::Lexer::new(&source);
+            let (tokens, _) = lexer.tokenize();
+            let parser = knot::parser::Parser::new(source.clone(), tokens);
+            let (mut program, _) = parser.parse_file_expr();
+            desugar::desugar(&mut program);
+            let out = infer::check(&mut program);
+            for (path, ty) in &out.base_fields {
+                println!("{path} : {ty}");
+            }
+            process::exit(0);
+        }
         // Hidden dev hook: evaluate a pure snippet to Bool via the in-process
         // JIT (exercises the compile-time const-eval path directly).
         "__const-eval" => {
@@ -648,6 +665,7 @@ fn cmd_build(
         trace_bindings,
         compile_expected_types,
         file_body_type: _file_body_type,
+        base_fields: _base_fields,
         refined_field_preds,
     } = infer::check(&mut program);
     // The expected-type descriptor of each `compile` call is knot source-type

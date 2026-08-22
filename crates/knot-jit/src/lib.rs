@@ -112,6 +112,7 @@ pub fn compile_and_run(
         trace_bindings,
         compile_expected_types: _compile_expected_types,
         file_body_type,
+        base_fields: _base_fields,
         refined_field_preds,
     } = match expected_src {
         Some(exp) => infer::check_with_expected(&mut program, exp),

@@ -1362,6 +1362,7 @@ pub fn jit_compile_typed(source: &str, expected: Option<&str>) -> Option<JitComp
             trace_bindings,
             compile_expected_types: _compile_expected_types,
             file_body_type,
+            base_fields: _base_fields,
             refined_field_preds: _refined_field_preds,
         } = match expected {
             Some(exp) => crate::infer::check_with_expected(&mut program, exp),

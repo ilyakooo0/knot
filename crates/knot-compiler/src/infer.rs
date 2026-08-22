@@ -1147,6 +1147,10 @@ struct Infer {
     /// Route constructor → response type mapping (for `fetch` return type resolution).
     fetch_response_types: HashMap<String, ast::Type>,
 
+    /// The inferred type of the global `base` record, captured in
+    /// `bind_base_record` so `knot base` can enumerate its fields and types.
+    base_record_ty: Option<Ty>,
+
     /// Route constructor → response header fields (for `fetch` response wrapping).
     fetch_response_headers: HashMap<String, Vec<ast::Field<ast::Type>>>,
 
@@ -1365,6 +1369,7 @@ impl Infer {
             trace_types: Vec::new(),
             trace_scopes: Vec::new(),
             fetch_response_types: HashMap::new(),
+            base_record_ty: None,
             route_entries_by_api: HashMap::new(),
             fetch_response_headers: HashMap::new(),
             route_types: HashSet::new(),
@@ -12203,6 +12208,9 @@ impl Infer {
         let resolved = self.apply(&inferred);
         self.pop_scope();
         self.scopes.pop(); // the temporary stdlib scope
+        // Capture the base record's type so `knot base` can enumerate its
+        // fields and types (see `CheckOutput::base_fields`).
+        self.base_record_ty = Some(resolved.clone());
         let scheme = self.generalize(&resolved);
         self.bind_top("base", scheme);
     }
@@ -13284,7 +13292,7 @@ fn display_ty_clean_inner(
                     var_letter(names.get(rv).copied().unwrap_or(*rv as usize))
                 ));
             }
-            format!("{{{}}}", parts.join(" "))
+            format!("{{{}}}", parts.join("  "))
         }
         Ty::Relation(inner) => format!(
             "Rel {}",
@@ -13313,7 +13321,21 @@ fn display_ty_clean_inner(
             } else {
                 let args_str: Vec<String> = args
                     .iter()
-                    .map(|a| display_ty_clean_inner(a, names, unit_names, false, wire))
+                    .map(|a| {
+                        let s = display_ty_clean_inner(a, names, unit_names, false, wire);
+                        // A unit-annotated numeric arg (`Int 1`, `Float M`) is
+                        // two tokens, so it must be parenthesized to re-parse as
+                        // a single type argument: `Maybe (Int 1)`, not
+                        // `Maybe Int 1` (which reads `1` as a stray token).
+                        // Detect by the RENDERED string: any arg that renders
+                        // with an internal space is multi-token and needs parens
+                        // (the structural match misses alias/Assoc/NumLit wraps).
+                        if s.contains(' ') {
+                            format!("({s})")
+                        } else {
+                            s
+                        }
+                    })
                     .collect();
                 format!("{} {}", name, args_str.join(" "))
             }
@@ -13341,10 +13363,17 @@ fn display_ty_clean_inner(
             display_ty_clean_inner(a, names, unit_names, false, wire)
         ),
         Ty::IO(inner) => {
-            format!(
-                "IO {}",
-                display_ty_clean_inner(inner, names, unit_names, false, wire)
-            )
+            let s = display_ty_clean_inner(inner, names, unit_names, false, wire);
+            // A record/variant/`Fun` payload is multi-token (`{a Text  b Int}`,
+            // `<A | B>`, `a -> b`) and must be parenthesized to re-parse as IO's
+            // single argument: `IO ({…})`, not `IO {…}` (which the parser reads
+            // as `IO` applied to a malformed record). Single-token payloads
+            // (`Text`, `a`, `Int 1` is NOT single-token but IS one applicand —
+            // handled because the inner render already groups it) stay bare.
+            match inner.peel_alias() {
+                Ty::Record(..) | Ty::Variant(..) | Ty::Fun(..) => format!("IO ({s})"),
+                _ => format!("IO {s}"),
+            }
         }
         Ty::Forall(vars, inner) => {
             if vars.is_empty() {
@@ -13549,6 +13578,11 @@ pub struct CheckOutput {
     pub compile_expected_types: CompileExpectedTypes,
     /// The inferred type of the program's body expression, if it has one.
     pub file_body_type: Option<String>,
+    /// Every leaf field of the global `base` record as `(dotted_path,
+    /// wire_type)` — e.g. `("num.int.neg", "Int u -> Int u")`. The type is
+    /// rendered via `display_ty_wire` so each line re-parses as knot source.
+    /// Populated for `knot base`.
+    pub base_fields: Vec<(String, String)>,
     pub refined_field_preds: RefinedFieldPredsMap,
 }
 
@@ -14715,6 +14749,20 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         let unit_var_map = unit_var_map_for(&applied);
         display_ty_clean(&applied, &var_map, &unit_var_map)
     });
+    // Enumerate the `base` record's leaf fields for `knot base`. Walk the
+    // record type recursively, building dotted paths (`num.int.neg`), and
+    // render each leaf's type via `display_ty_wire` so the line re-parses as
+    // knot source (`Int 1`, not bare `Int`).
+    let base_fields = infer
+        .base_record_ty
+        .as_ref()
+        .map(|ty| {
+            let applied = default_free_unit_vars(&infer.apply(ty));
+            let mut out = Vec::new();
+            collect_base_fields(&applied, "", &mut out);
+            out
+        })
+        .unwrap_or_default();
     let elem_pushdown_ok = infer.elem_pushdown_ok.clone();
     let with_fields: WithFields = infer.with_fields.iter().cloned().collect();
     let type_arg_spans: TypeArgSpans = infer.type_arg_spans.clone();
@@ -14756,6 +14804,7 @@ fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutp
         trace_bindings,
         compile_expected_types,
         file_body_type,
+        base_fields,
         refined_field_preds: infer.refined_field_preds.clone(),
     }
 }
@@ -14769,6 +14818,34 @@ fn takes_two_args(ty: &Ty) -> bool {
         Ty::Forall(_, body) => takes_two_args(body),
         Ty::Fun(_, rest) => matches!(rest.as_ref(), Ty::Fun(..)),
         _ => false,
+    }
+}
+
+/// Recursively collect the `base` record's leaf fields as `(dotted_path,
+/// wire_type)` pairs for `knot base`. Record-typed fields recurse (the path
+/// extends with `.field`); everything else is a leaf whose type is rendered
+/// via `display_ty_wire` so the line re-parses as knot source.
+fn collect_base_fields(ty: &Ty, prefix: &str, out: &mut Vec<(String, String)>) {
+    if let Ty::Record(fields, _, _) = ty {
+        for (name, field_ty) in fields {
+            let path = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}.{name}")
+            };
+            collect_base_fields(field_ty, &path, out);
+        }
+    } else {
+        // Render each leaf with a PER-FIELD var map so its type variables start
+        // at `a` (the shared whole-record map would push stdlib fields past
+        // index 26, producing `t70` — not valid knot source). This keeps every
+        // emitted line re-parseable.
+        let field_names = var_map_for(ty);
+        let field_unit_names = unit_var_map_for(ty);
+        out.push((
+            prefix.to_string(),
+            display_ty_wire(ty, &field_names, &field_unit_names),
+        ));
     }
 }
 

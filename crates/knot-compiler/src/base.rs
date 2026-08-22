@@ -102,6 +102,17 @@ vec {
 count vecCount
 }
 
+-- Num namespace (`base.num.*`): numeric negation, resolved TYPE-DIRECTED via
+-- `^neg`. Each impl has an EXPLICIT concrete signature so the `^` resolver's
+-- unify-based match picks by the argument's numeric type (an un-annotated body
+-- could infer polymorphic and mis-dispatch — see `morph`). Both wrap the
+-- `valueNegate` runtime primitive; the signature is what steers `^neg`.
+-- Numeric negation is written `(^neg) x` (unary `-x` was removed).
+num {
+int   { Int u -> Int u    neg  neg valueNegate }
+float { Float u -> Float u  neg  neg valueNegate }
+}
+
 -- Morph namespace (`base.morph.*`): type-directed conversions resolved by the
 -- `^into` projection. Each `<from>To<to>` record holds an `into : S -> T`
 -- function with an EXPLICIT concrete signature (an un-annotated body could

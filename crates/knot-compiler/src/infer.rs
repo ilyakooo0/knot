@@ -10499,6 +10499,29 @@ impl Infer {
         // readLine : IO {console} Text
         self.bind_top("readLine", Scheme::mono(Ty::IO(Box::new(Ty::Text))));
 
+        // valueNegate : ∀a. Num a => a -> a — the negation primitive behind
+        // `base.num.*`'s `neg` impls (which annotate it concretely so `^neg`
+        // dispatches Int vs Float). Polymorphic here; the `Num` constraint is
+        // what `UnaryOp::Neg` used to require before the `-x` surface form was
+        // removed in favour of `neg`.
+        {
+            let a = self.fresh_var();
+            self.bind_top(
+                "valueNegate",
+                Scheme {
+                    vars: vec![a],
+                    unit_vars: vec![],
+                    constraints: vec![TyConstraint {
+                        trait_name: "Num".into(),
+                        type_var: a,
+                        span: Span::new(0, 0),
+                    }],
+                    unit_binops: vec![],
+                    ty: Ty::Fun(Box::new(Ty::Var(a)), Box::new(Ty::Var(a))),
+                },
+            );
+        }
+
         // show : ∀a. a -> Text
         let a = self.fresh_var();
         self.bind_top(

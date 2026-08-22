@@ -2708,6 +2708,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // via `^count` etc. Internal-only (bare keys): user code reaches
             // them only through the `vec` namespace record.
             "vecCount",
+            // Numeric negation primitive (`base.num.*`'s `neg` impls), runtime
+            // `knot_value_negate` (Int/Float/unit dispatch). Internal-only:
+            // user code reaches it through the `num` namespace via `^neg`.
+            "valueNegate",
         ];
         for name in &stdlib_names {
             self.register_stdlib_fn(name);
@@ -3472,6 +3476,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.define_stdlib_sum();
         self.define_stdlib_count();
         self.define_stdlib_vec_count();
+        // Numeric negation primitive for `base.num.*`'s `neg` impls. 1-arg,
+        // `knot_value_negate` dispatches Int/Float/unit at runtime.
+        self.define_stdlib_fn_1("valueNegate", "knot_value_negate");
         self.define_stdlib_fn_2("union", "knot_relation_union", true);
         self.define_stdlib_fn_2("bind", "knot_relation_bind", true);
         self.define_stdlib_fn_2("avg", "knot_relation_avg", true);

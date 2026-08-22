@@ -1734,24 +1734,6 @@ impl Parser {
                 let lit = self.parse_postfix_from(lit)?;
                 self.parse_application_from(lit)
             }
-            TokenKind::Minus => {
-                if !self.enter_recursion() {
-                    return None;
-                }
-                let start = self.span();
-                self.advance();
-                let operand = self.parse_unary();
-                self.recursion_depth -= 1;
-                let operand = operand?;
-                let span = Span::new(start.start, operand.span.end);
-                Some(Spanned::new(
-                    ExprKind::UnaryOp {
-                        op: UnaryOp::Neg,
-                        operand: Box::new(operand),
-                    },
-                    span,
-                ))
-            }
             TokenKind::Not => {
                 if !self.enter_recursion() {
                     return None;

@@ -7180,27 +7180,20 @@ fn value_to_hash_bytes(v: *mut Value, buf: &mut Vec<u8>) {
                         buf.extend_from_slice(&n.to_le_bytes());
                     }
                     Value::Float(f) => {
-                        // An integral Float must hash identically to the equal
-                        // Int, since `values_equal` treats `Int(2) == Float(2.0)`.
-                        // `float_as_exact_i64` is the shared basis for that
-                        // equality rule (and avoids the 2^63 saturation trap).
-                        // `-0.0` is canonicalized to `+0.0` by `alloc_float`,
-                        // so it hashes as `Int(0)` correctly. NaN/±inf/out-of-
-                        // range fall through to the raw-bits branch.
-                        if let Some(i) = float_as_exact_i64(*f) {
-                            buf.push(0);
-                            buf.extend_from_slice(&i.to_le_bytes());
+                        // Raw bits; canonicalize NaN so all NaN bit patterns hash
+                        // the same (matching `values_equal`'s NaN == NaN). There
+                        // is no Int↔Float canonicalization: the type checker and
+                        // the declared-type read path (`read_sql_column`) keep Int
+                        // and Float disjoint, so a Float never needs to collide
+                        // with an Int. `-0.0` is canonicalized to `+0.0` by
+                        // `alloc_float`, so both zeros hash identically.
+                        buf.push(1);
+                        let bits = if f.is_nan() {
+                            f64::NAN.to_bits()
                         } else {
-                            buf.push(1);
-                            // Raw bits otherwise; canonicalize NaN so all NaN
-                            // bit patterns hash the same.
-                            let bits = if f.is_nan() {
-                                f64::NAN.to_bits()
-                            } else {
-                                f.to_bits()
-                            };
-                            buf.extend_from_slice(&bits.to_le_bytes());
-                        }
+                            f.to_bits()
+                        };
+                        buf.extend_from_slice(&bits.to_le_bytes());
                     }
                     Value::Text(s) => {
                         buf.push(2);
@@ -7388,18 +7381,11 @@ fn values_equal(a: *mut Value, b: *mut Value) -> bool {
                     return false;
                 }
             }
-            // Int↔Float equality must agree with `value_to_hash_bytes`, which
-            // canonicalizes an integral Float by casting it to i64. Casting the
-            // Int to f64 instead (lossy past 2^53) makes `==` non-transitive
-            // and breaks the "equal values hash equally" contract:
-            // `Int(2^53+1)` would equal `Float(2^53.0)` yet hash differently.
-            // Use the exact-round-trip basis: equal only when the Float is
-            // integral, fits i64, and equals the Int.
-            (Value::Int(x), Value::Float(y)) | (Value::Float(y), Value::Int(x)) => {
-                if float_as_exact_i64(*y) != Some(*x) {
-                    return false;
-                }
-            }
+            // Int and Float never meet here: the type checker unifies the two
+            // operands of `==` to one type, and every relation read path
+            // (`read_sql_column`) decodes by the DECLARED column type, panicking
+            // on a storage-type mismatch — so a heterogeneous Int/Float pair
+            // cannot reach `values_equal`. A mixed pair falls to `_ => false`.
             (Value::Text(x), Value::Text(y)) => {
                 if x != y {
                     return false;
@@ -23200,5 +23186,38 @@ mod show_tests {
         // field-context display quotes Text
         assert_eq!(format_value(text("hi")), "\"hi\"");
         assert_eq!(format_value(alloc(Value::Unit)), "{}");
+    }
+
+    #[test]
+    fn int_and_float_are_disjoint_in_eq_and_hash() {
+        // The Int↔Float cross-type arm was removed from `values_equal` and the
+        // matching integral-Float→Int canonicalization from
+        // `value_to_hash_bytes`: the type checker unifies `==` operands, and the
+        // declared-type read path (`read_sql_column`) panics on a storage-type
+        // mismatch, so a heterogeneous Int/Float pair never reaches either. This
+        // test pins the new invariant: even a numerically-equal Int and Float
+        // compare unequal AND hash to different bytes.
+        let i = alloc_int(2);
+        let f = alloc_float(2.0);
+        assert!(!values_equal(i, f), "Int(2) and Float(2.0) must be unequal");
+        assert!(!values_equal(f, i), "symmetric");
+        let mut hi = Vec::new();
+        let mut hf = Vec::new();
+        value_to_hash_bytes(i, &mut hi);
+        value_to_hash_bytes(f, &mut hf);
+        assert_ne!(hi, hf, "Int(2) and Float(2.0) must hash differently");
+    }
+
+    #[test]
+    fn float_nan_hashes_canonically_and_compares_equal() {
+        // NaN == NaN stays true and all NaN bit patterns hash identically.
+        let nan1 = alloc_float(f64::NAN);
+        let nan2 = alloc_float(f64::from_bits(0x7ff8_0000_0000_0001)); // a different NaN payload
+        assert!(values_equal(nan1, nan2));
+        let mut h1 = Vec::new();
+        let mut h2 = Vec::new();
+        value_to_hash_bytes(nan1, &mut h1);
+        value_to_hash_bytes(nan2, &mut h2);
+        assert_eq!(h1, h2, "all NaN bit patterns must hash identically");
     }
 }

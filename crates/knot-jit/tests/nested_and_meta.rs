@@ -37,7 +37,7 @@ fn deeply_nested() {
 
 #[test]
 fn nested_empty() {
-    assert_show("{members (the (Rel {name Text}) [])}", "{members []}");
+    assert_show("{members (base.the (Rel {name Text}) [])}", "{members []}");
 }
 
 // ── base.hash ────────────────────────────────────────────────────────────

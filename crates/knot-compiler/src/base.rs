@@ -40,6 +40,14 @@ max (\a b -> match a > b
   Bool.True {}  a
   Bool.False {}  b)
 
+-- `the (Type) value`: type ascription as a regular type-witness function. The
+-- leading `\(Type  T)` parameter is an erased type argument (no runtime
+-- representation); `the` returns its value argument unchanged, so
+-- `base.the (Int 1) 41` is `41` checked to be an `Int 1`. The compiler consumes
+-- the type argument at the call site (the type-witness diversion) and erases it.
+_  the
+the (\(Type  T) -> \x -> x)
+
 Bool -> IO {} -> IO {}  when
 when (\cond action -> match cond
   Bool.True {}  action

@@ -193,36 +193,36 @@ fn json_record() {
 #[test]
 fn json_parse_roundtrip() {
     assert_show(
-        "(the (Maybe (Int 1)) (base.parseJson \"42\"))",
+        "(base.the (Maybe (Int 1)) (base.parseJson \"42\"))",
         "Just {value 42}",
     );
 }
 
 #[test]
 fn json_parse_invalid() {
-    assert_show("(the (Maybe (Int 1)) (base.parseJson \"{bad\"))", "Nothing");
+    assert_show("(base.the (Maybe (Int 1)) (base.parseJson \"{bad\"))", "Nothing");
 }
 
 // ── Units of measure ─────────────────────────────────────────────────────
 
 #[test]
 fn strip_with_unit() {
-    assert_show("base.stripUnit (the (Int Ms) 250)", "250");
-    assert_show("base.stripFloatUnit (the (Float Ms) 2.5)", "2.5");
+    assert_show("base.stripUnit (base.the (Int Ms) 250)", "250");
+    assert_show("base.stripFloatUnit (base.the (Float Ms) 2.5)", "2.5");
 }
 
 #[test]
 fn unit_arithmetic_consistent() {
     // Same-unit arithmetic keeps the unit; show renders just the number here
     // (dimensionless check), but the point is it type-checks.
-    assert_show("(the (Int Ms) 100) + (the (Int Ms) 50)", "150");
+    assert_show("(base.the (Int Ms) 100) + (base.the (Int Ms) 50)", "150");
 }
 
 #[test]
 fn unit_mismatch_rejected() {
     // Adding incompatible units is a compile error.
     assert_compile_err(
-        "with {  unit Ms  unit Usd } ((the (Int Ms) 100) + (the (Int Usd) 50))",
+        "with {  unit Ms  unit Usd } ((base.the (Int Ms) 100) + (base.the (Int Usd) 50))",
         "",
     );
 }

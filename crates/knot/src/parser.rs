@@ -2143,35 +2143,6 @@ impl Parser {
     fn parse_atom_inner(&mut self) -> Option<Expr> {
         let start = self.span();
         match self.peek() {
-            // `the (Type) expr` — the inline type annotation. `the` is a
-            // keyword (its first argument is a *type*, which no knot function
-            // type can express); it produces the same `Annot` node as a
-            // declaration signature.
-            TokenKind::The => {
-                self.advance(); // consume `the`
-                self.skip_newlines();
-                self.expect(
-                    &TokenKind::LParen,
-                    "expected '(' after `the` — write `the (Type) expr`",
-                )
-                .ok()?;
-                let ty = self.parse_type()?;
-                self.expect(
-                    &TokenKind::RParen,
-                    "expected ')' after the type in `the (Type) expr`",
-                )
-                .ok()?;
-                self.skip_newlines();
-                let expr = self.parse_atom()?;
-                let span = Span::new(start.start, expr.span.end);
-                Some(Spanned::new(
-                    ExprKind::Annot {
-                        expr: Box::new(expr),
-                        ty,
-                    },
-                    span,
-                ))
-            }
             TokenKind::Int(_) => {
                 let tok = self.advance();
                 let TokenKind::Int(n) = tok.kind else {
@@ -3631,31 +3602,6 @@ impl Parser {
                 let tok = self.advance();
                 Some(Spanned::new(PatKind::Wildcard, tok.span))
             }
-            // Annotated pattern: `the (Type) pat`. The pattern-position form of
-            // the `the (Type) expr` annotation — enables lambda params like
-            // `\\(the (forall a. a -> a) f) -> …` with no `:`.
-            TokenKind::The => {
-                self.advance(); // consume `the`
-                self.skip_newlines();
-                self.expect(&TokenKind::LParen, "expected '(' after `the`")
-                    .ok()?;
-                let ty = self.parse_type()?;
-                self.expect(
-                    &TokenKind::RParen,
-                    "expected ')' after the type in `the (Type) pat`",
-                )
-                .ok()?;
-                self.skip_newlines();
-                let inner = self.parse_pat()?;
-                let end = inner.span;
-                Some(Spanned::new(
-                    PatKind::Annot {
-                        pat: Box::new(inner),
-                        ty: Box::new(ty),
-                    },
-                    Span::new(start.start, end.end),
-                ))
-            }
             TokenKind::Lower(_) => {
                 let tok = self.advance();
                 let TokenKind::Lower(name) = tok.kind else {
@@ -3850,7 +3796,6 @@ impl Parser {
             TokenKind::Lower(_)
                 | TokenKind::Upper(_)
                 | TokenKind::Underscore
-                | TokenKind::The
                 | TokenKind::LBrace
                 | TokenKind::LBracket
                 | TokenKind::LParen

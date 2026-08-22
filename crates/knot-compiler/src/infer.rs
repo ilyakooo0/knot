@@ -53,6 +53,24 @@ fn flatten_spine(expr: &ast::Expr) -> Vec<&ast::Expr> {
     spine
 }
 
+/// Fully flatten a type-argument application into left-to-right tokens. Unlike
+/// `flatten_spine` (left-spine only), this also flattens RIGHT-nested
+/// constructor applications: the parser builds `Result Text Int` as
+/// `App(Result, App(Text, Int))`, which a left-spine flatten reads as
+/// `[Result, App(Text, Int)]` — breaking arity-driven consumption. Here the
+/// whole constructor tree becomes `[Result, Text, Int]`. Type *literals*,
+/// records, and unit-carrying numeric bases are left atomic (their internal
+/// structure is consumed by `consume_type_arg`'s own recursion / unit handling).
+fn flatten_type_tokens<'a>(expr: &'a ast::Expr, out: &mut Vec<&'a ast::Expr>) {
+    match &expr.node {
+        ast::ExprKind::App { func, arg } => {
+            flatten_type_tokens(func, out);
+            flatten_type_tokens(arg, out);
+        }
+        _ => out.push(expr),
+    }
+}
+
 /// True if a value-spine element can be a unit argument to a numeric-base type
 /// argument: the `1` literal, a unit atom (an uppercase/lowercase name, e.g.
 /// `Ms`, `u`), or a `_` hole.
@@ -4344,6 +4362,36 @@ impl Infer {
             self.type_arg_spans.insert(head_expr.span);
             return Some((ty.clone(), 1));
         }
+        // A record TYPE used as a type argument (`Rel {name Text}`): the parser
+        // produced a record *expression* whose field values are themselves type
+        // expressions. Reinterpret each field value as a type.
+        if let ast::ExprKind::Record(fields) = &head_expr.node {
+            let mut ty_fields = Vec::new();
+            for f in fields {
+                let Some(name) = f.name.as_name() else { return None };
+                let fval_flat = flatten_spine(&f.value);
+                let (fty, fconsumed) = self.consume_type_arg(&fval_flat)?;
+                if fconsumed != fval_flat.len() {
+                    return None;
+                }
+                self.type_arg_spans.insert(f.value.span);
+                ty_fields.push(knot::ast::Field {
+                    name: name.to_string(),
+                    value: fty,
+                });
+            }
+            self.type_arg_spans.insert(head_expr.span);
+            return Some((
+                knot::ast::Spanned {
+                    node: TypeKind::Record {
+                        fields: ty_fields,
+                        rest: None,
+                    },
+                    span: head_expr.span,
+                },
+                1,
+            ));
+        }
         let ast::ExprKind::Constructor(name) = &head_expr.node else {
             return None;
         };
@@ -4381,11 +4429,13 @@ impl Infer {
             span: head.span,
         };
         for _ in 0..arity {
-            let sub = spine.get(consumed)?;
-            let sub_flat = flatten_spine(sub);
-            let (sub_ty, sub_consumed) = self.consume_type_arg(&sub_flat)?;
-            if sub_consumed != sub_flat.len() {
-                // The type argument itself must be a complete type (no trailing).
+            // Consume one complete type from the remaining token stream and
+            // advance by its token count. Callers pass a fully-flattened stream
+            // (`flatten_type_tokens`), so a right-nested `Result Text (Int 1)`
+            // arrives as `[Result, Text, Int, 1]`; `Text` consumes 1 token, then
+            // `Int` consumes 2 (itself + its `1` unit), all contiguous.
+            let (sub_ty, sub_consumed) = self.consume_type_arg(&spine[consumed..])?;
+            if sub_consumed == 0 {
                 return None;
             }
             ty = knot::ast::Spanned {
@@ -4395,7 +4445,7 @@ impl Infer {
                 },
                 span: head.span,
             };
-            consumed += 1;
+            consumed += sub_consumed;
         }
         Some((ty, consumed))
     }
@@ -7138,7 +7188,8 @@ impl Infer {
                             // trailing value args. `Int 42` → type `Int`, value
                             // `42`; `const2 Int Text 99` → type `Int`, trailing
                             // `Text 99`; `f (Maybe Int) x` → type `Maybe Int`.
-                            let flat = flatten_spine(arg);
+                            let mut flat: Vec<&ast::Expr> = Vec::new();
+                            flatten_type_tokens(arg, &mut flat);
                             if let Some((ty_ast, consumed)) = self.consume_type_arg(&flat) {
                                 let type_span = ty_ast.span;
                                 let mut pending: Vec<&ast::Expr> =
@@ -7206,6 +7257,53 @@ impl Infer {
                                 let _ = type_span;
                                 return result;
                             }
+                        }
+                    }
+
+                    // Π-lite type argument against an ALREADY-INSTANTIATED
+                    // witness type `Type -> rest` (no `Forall` wrapper): a
+                    // `base.` field access instantiates the field's scheme,
+                    // dropping the `Forall`. Consume and erase the leading type
+                    // argument, then CHECK the value against it: the witness
+                    // type IS the value's type (`the : Type -> a -> a`), so
+                    // unify `rest` with `T -> T`. `base.the (Text) 42` thus
+                    // fails (`42` is not `Text`); `base.the (Int 1) 41` yields
+                    // `41 : Int 1`.
+                    if let Ty::Fun(witness_slot, rest) = &func_applied
+                        && matches!(self.apply(witness_slot), Ty::Con(ref n, _) if n == "Type")
+                    {
+                        let mut flat: Vec<&ast::Expr> = Vec::new();
+                        flatten_type_tokens(arg, &mut flat);
+                        if let Some((ty_ast, consumed)) = self.consume_type_arg(&flat) {
+                            self.type_arg_spans.insert(ty_ast.span);
+                            let ascribed = self.ast_type_to_ty(&ty_ast);
+                            // The witness type is the value's type: pin `rest`
+                            // (`a -> a`) to `ascribed -> ascribed`. The result of
+                            // consuming ONLY the type argument is the partially
+                            // applied function `ascribed -> ascribed`, awaiting
+                            // the value. Then apply any trailing value args.
+                            let partial = Ty::Fun(
+                                Box::new(ascribed.clone()),
+                                Box::new(ascribed.clone()),
+                            );
+                            self.unify(rest, &partial, ty_ast.span);
+                            let mut result = partial;
+                            let mut value_args = flat.into_iter().skip(consumed).peekable();
+                            // The first value arg (if present in this same app)
+                            // is CHECKED against the ascribed type.
+                            if let Some(first) = value_args.next() {
+                                self.check_expr(first, &ascribed);
+                                result = ascribed.clone();
+                            }
+                            for a in value_args {
+                                let a_ty = self.infer_expr(a);
+                                let res = self.fresh();
+                                let expected =
+                                    Ty::Fun(Box::new(a_ty), Box::new(res.clone()));
+                                self.unify(&result, &expected, a.span);
+                                result = self.apply(&res);
+                            }
+                            return result;
                         }
                     }
 

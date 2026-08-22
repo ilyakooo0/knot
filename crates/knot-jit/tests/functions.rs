@@ -121,7 +121,7 @@ fn implicit_field_ambiguous_rejected() {
 #[test]
 fn forall_rank2() {
     assert_show(
-        "with {\n_  applyTwice\napplyTwice (\\(the ((forall a. a -> a)) f) -> {asText (f \"text\")  asInt (f 42)})\n}\n(applyTwice (\\y -> y))",
+        "with {\n_  applyTwice\napplyTwice (\\((forall a. a -> a)  f) -> {asText (f \"text\")  asInt (f 42)})\n}\n(applyTwice (\\y -> y))",
         "{asInt 42  asText text}",
     );
 }
@@ -178,17 +178,17 @@ fn lambda_param_type_prefix_forall() {
 
 #[test]
 fn explicit_annotation() {
-    assert_show("(the (Int 1) 42)", "42");
+    assert_show("(base.the (Int 1) 42)", "42");
 }
 
 #[test]
 fn annotation_mismatch_rejected() {
-    assert_compile_err("(the (Text) 42)", "");
+    assert_compile_err("(base.the (Text) 42)", "");
 }
 
 #[test]
 fn wildcard_annotation() {
-    assert_show("(the (Int _) 42)", "42");
+    assert_show("(base.the (Int _) 42)", "42");
 }
 
 // ── Numeric edge cases ───────────────────────────────────────────────────

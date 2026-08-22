@@ -82,10 +82,6 @@ pub enum TokenKind {
     At,
     Underscore,
     Question,
-    /// `the` — the inline type-annotation form: `the (Type) expr`. A keyword,
-    /// not a value, because its first argument is a *type* (no knot function
-    /// type can express that).
-    The,
     Newline,
     /// Gap: a run of two or more spaces/tabs within a line (a newline is
     /// `Newline`, separately). This is the type-annotation separator —
@@ -157,7 +153,6 @@ impl TokenKind {
             TokenKind::At => "'@'",
             TokenKind::Underscore => "'_'",
             TokenKind::Question => "'?'",
-            TokenKind::The => "'the'",
             TokenKind::Newline => "newline",
             TokenKind::Gap => "gap",
             TokenKind::Semicolon => "';'",
@@ -180,7 +175,6 @@ impl TokenKind {
             TokenKind::With => Some("with"),
             TokenKind::Refine => Some("refine"),
             TokenKind::Forall => Some("forall"),
-            TokenKind::The => Some("the"),
             _ => None,
         }
     }
@@ -573,7 +567,6 @@ impl<'src> Lexer<'src> {
                 "with" => return TokenKind::With,
                 "refine" => return TokenKind::Refine,
                 "forall" => return TokenKind::Forall,
-                "the" => return TokenKind::The,
                 _ => {}
             }
             TokenKind::Lower(text.to_owned())

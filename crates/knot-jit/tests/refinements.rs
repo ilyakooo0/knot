@@ -11,7 +11,7 @@ use harness::assert_show;
 #[test]
 fn refine_accepts_valid() {
     assert_show(
-        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (match refine (the (Int 1) 5)\n            Result.Ok {value n}  n\n            Result.Err {error _}  (0 - 1))",
+        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (match refine (base.the (Int 1) 5)\n            Result.Ok {value n}  n\n            Result.Err {error _}  (0 - 1))",
         "5",
     );
 }
@@ -19,7 +19,7 @@ fn refine_accepts_valid() {
 #[test]
 fn refine_rejects_invalid() {
     assert_show(
-        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (match refine (the (Int 1) (0 - 3))\n            Result.Ok {value n}  1\n            Result.Err {error _}  0)",
+        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (match refine (base.the (Int 1) (0 - 3))\n            Result.Ok {value n}  1\n            Result.Err {error _}  0)",
         "0",
     );
 }

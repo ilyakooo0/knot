@@ -9,7 +9,7 @@
 --     whose parameter type matches x);
 --
 --   * by the EXPECTED RESULT type — when the surrounding context demands a
---     concrete type (the (Float 1 = (^into) x`) e.g. an annotation `v), so two
+--     concrete type (base.the (Float 1 = (^into) x`) e.g. an annotation `v), so two
 --     morphs sharing x's source type (`text.int` vs `text.float`) are
 --     disambiguated by which one produces the required target. This is the
 --     bidirectional (check-mode) path: the contextual expected type threads

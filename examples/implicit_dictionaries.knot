@@ -1,4 +1,4 @@
--- Implicit dictionaries: `(the (T) ^field) =>` signature constraints.
+-- Implicit dictionaries: `(base.the (T) ^field) =>` signature constraints.
 --
 -- `clamp` needs a `compare` dictionary but doesn't name it. The compiler
 -- resolves the dictionary from lexical scope at each full-arity callsite.

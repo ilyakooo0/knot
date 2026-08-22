@@ -85,7 +85,7 @@ Rel Person  *people
 
 #[test]
 fn morph_into_text_to_bytes() {
-    // base.morph.<from>To<to>.into is consumed via the (^into) projection.
+    // base.morph.<from>To<to>.into is consumed via base.the (^into) projection.
     // A direct call to the record's `into` field converts Text -> Bytes.
     assert_stdout(
         "morph_tb",

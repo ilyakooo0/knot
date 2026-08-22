@@ -22,7 +22,7 @@ fn list_literal_container_polymorphism() {
     assert_show("base.vec.count [1  1  2]", "3");
     // `List` context (via `the`): builds a Cons/Nil chain.
     assert_show(
-        "the (List (Int 1)) [1  2  3]",
+        "base.the (List (Int 1)) [1  2  3]",
         "Cons {head 1  tail Cons {head 2  tail Cons {head 3  tail Nil}}}",
     );
     // Iteration in a comprehension still works (binds as a relation).

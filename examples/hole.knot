@@ -5,7 +5,7 @@
 --   * TYPE position — an inferrable type. As a type argument to a
 --     type-witness function it is consumed and erased (no runtime
 --     representation), and unification fills it in from the value argument
---     or the surrounding context. (the (_ -> Text`, already works the same way.) `_` in a plain type annotation, e.g.
+--     or the surrounding context. (base.the (_ -> Text`, already works the same way.) `_` in a plain type annotation, e.g.
 --     `f)
 --
 --   * VALUE position — behaves exactly like `base.todo`: a polymorphic

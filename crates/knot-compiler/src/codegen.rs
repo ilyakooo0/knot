@@ -6637,7 +6637,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
         let mut i = 0;
         while i < flat.len() {
             let e = flat[i];
-            // Drop an erased type argument: a constructor / `_` hole, or a unit
+            // Drop an erased type argument: a constructor / `_` hole / type
+            // literal / record type (`Rel {name Text}` — the record's span is
+            // recorded when the record-as-type is consumed), or a unit
             // argument (`1` literal, or a unit-name constructor) consumed as
             // part of a `Float 1`/`Int Ms` type argument.
             let is_erased = (matches!(
@@ -6645,6 +6647,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 ast::ExprKind::Constructor(_)
                     | ast::ExprKind::TypeHole
                     | ast::ExprKind::TypeLiteral(_)
+                    | ast::ExprKind::Record(_)
             ) || matches!(&e.node, ast::ExprKind::Lit(ast::Literal::Int(n)) if n == "1"))
                 && self.type_arg_spans.contains(&e.span);
             if is_erased {

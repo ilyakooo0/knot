@@ -137,7 +137,7 @@ fn unify_right_biased() {
 #[test]
 fn strip_dress_units() {
     // strip drops the unit, dress adds one (dimensionless round-trip)
-    assert_show("base.strip (the (Int 1) 42)", "42");
+    assert_show("base.strip (base.the (Int 1) 42)", "42");
     assert_show("base.dress 7", "7");
 }
 
@@ -147,8 +147,8 @@ fn int_literal_int_float_polymorphism() {
     assert_show("42", "42");
     assert_show("base.show (40 + 2)", "42");
     // …but Float when a Float context demands it.
-    assert_show("base.show (the (Float 1) 42)", "42.0");
-    assert_show("base.show ((the (Float 1) 42) + 0.5)", "42.5");
+    assert_show("base.show (base.the (Float 1) 42)", "42.0");
+    assert_show("base.show ((base.the (Float 1) 42) + 0.5)", "42.5");
     // A lambda-param `*` still composes units (the literal is dimensionless).
     assert_show("base.show ((\\x -> x * 2) 21)", "42");
 }

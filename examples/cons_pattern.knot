@@ -1,11 +1,9 @@
 -- Pattern-matching on relations with `[]` and `Cons head tail`.
 with {
-_  sumList
 sumList (\xs -> match xs
   []  0
   Cons h t  h + sumList t)
 
-_  firstOr
 firstOr (\xs default -> match xs
   []  default
   Cons h _  h)

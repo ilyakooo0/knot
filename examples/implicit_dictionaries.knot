@@ -19,12 +19,11 @@ intOrdDesc {compare (\a b -> match a < b
     Bool.True {}  (0 - 1)
     Bool.False {}  0)}
 
-((a -> a -> Int 1)  ^compare) =>  a ->  a ->  a ->  a  clamp
-clamp (\lo hi x -> match ((^compare) x lo) < 0
+clamp (the (((a -> a -> Int 1)  ^compare) =>  a ->  a ->  a ->  a) (\lo hi x -> match ((^compare) x lo) < 0
   Bool.True {}  lo
   Bool.False {}  match ((^compare) x hi) > 0
     Bool.True {}  hi
-    Bool.False {}  x)
+    Bool.False {}  x))
 }
 (do
     base.println (base.show (with intOrd (clamp 0 10 42)))

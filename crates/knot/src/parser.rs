@@ -46,10 +46,6 @@ pub struct Parser {
     /// same-line application, but the indented arms below are NOT application
     /// arguments.
     scrutinee_no_newline_app: bool,
-    /// Inside a `with { ... }` block's record. Named-function fields there
-    /// require a type signature (`name (\…)` with no sig is rejected); ad-hoc
-    /// record literals (e.g. dictionary payloads like `{compare (\…)}`) do not.
-    in_with_block: bool,
     /// Indentation level of the current block (set by `parse_block`).
     /// Used by `parse_application` to allow multi-line function application
     /// when continuation lines are indented past the block indent.
@@ -123,7 +119,6 @@ impl Parser {
             record_value_sig_type: false,
             in_case_arm_pat: false,
             scrutinee_no_newline_app: false,
-            in_with_block: false,
             block_indent: usize::MAX,
             block_delim: 0,
             delimiter_depth: 0,
@@ -2155,7 +2150,9 @@ impl Parser {
                     "expected '(' after `the` — write `the (Type) expr`",
                 )
                 .ok()?;
-                let ty = self.parse_type()?;
+                // Parse a full type scheme so `the` can carry `(...) =>`
+                // constraints (implicit-field / trait), not just a bare type.
+                let scheme = self.parse_type_scheme()?;
                 self.expect(
                     &TokenKind::RParen,
                     "expected ')' after the type in `the (Type) expr`",
@@ -2167,7 +2164,8 @@ impl Parser {
                 Some(Spanned::new(
                     ExprKind::Annot {
                         expr: Box::new(expr),
-                        ty,
+                        ty: scheme.ty,
+                        constraints: scheme.constraints,
                     },
                     span,
                 ))
@@ -2407,14 +2405,6 @@ impl Parser {
         // The sig is attached to its value field and enforced by the checker;
         // the sig-line layout is preserved through the formatter.
         let mut fields: Vec<RecordField> = Vec::new();
-        let mut pending_sigs: Vec<(Name, TypeScheme)> = Vec::new();
-        // Whether THIS record is a `with { ... }` block. `parse_with_expr` sets
-        // the flag just before parsing its record; we capture it here and clear
-        // it immediately so nested record-literal field values (e.g. dictionary
-        // payloads `{compare (\…)}`) do NOT inherit the named-function sig
-        // requirement — only the `with` block's own fields require sigs.
-        let is_with_record = self.in_with_block;
-        self.in_with_block = false;
         // Markdown docs from `---` doc comments, accumulated until attached to
         // the immediately-following field. Consecutive doc lines/blocks merge
         // into one block separated by a blank line.
@@ -2642,47 +2632,14 @@ impl Parser {
                         });
                         continue;
                     }
-                    let (sname, _) = self.expect_lower("expected field name in record").unwrap();
-                    // One-line sig+value: `TYPE  NAME  BODY`. If a gap and an
-                    // expression follow the name ON THE SAME LINE, the value is
-                    // inline — parse it now and emit a complete field with the
-                    // sig attached. Otherwise (newline/`}` next) it's the
-                    // classic two-line form: stash the sig in `pending_sigs`
-                    // for a later value field to pick up.
-                    let inline_value = self.gap_before_current()
-                        && !matches!(self.peek(), TokenKind::Newline | TokenKind::RBrace)
-                        && !self.at_layout_boundary();
-                    if inline_value {
-                        let Some(value) = (if self.at(&TokenKind::Backslash) || self.at(&TokenKind::Do)
-                        {
-                            let prev_bi = self.block_indent;
-                            let prev_bd = self.block_delim;
-                            self.block_indent = self.cur_column();
-                            self.block_delim = self.delimiter_depth;
-                            let v = if self.at(&TokenKind::Backslash) {
-                                self.parse_lambda()
-                            } else {
-                                self.parse_do_expr()
-                            };
-                            self.block_indent = prev_bi;
-                            self.block_delim = prev_bd;
-                            v
-                        } else {
-                            self.parse_postfix()
-                        }) else {
-                            self.error("expected field value after field name in record");
-                            return None;
-                        };
-                        fields.push(RecordField {
-                            name: crate::ast::FieldName::Named(sname),
-                            value,
-                            sig: Some(ty),
-                            doc: pending_doc.take(),
-                        });
-                    } else {
-                        pending_sigs.push((sname, ty));
-                    }
-                    continue;
+                    // A `Type  name` sig-prefix is no longer source syntax — a
+                    // field's type is written on the value with `the (Type)`:
+                    // `name (the (Type) value)`. A type followed by a lowercase
+                    // name that isn't a `*source` declaration is rejected.
+                    self.error(
+                        "declaration signatures are written with `the (Type)` on the value: `name (the (Type) value)` — not `Type  name`",
+                    );
+                    return None;
                 }
                 // Not a sig — roll back the speculative type parse AND any
                 // diagnostics it emitted.
@@ -2734,24 +2691,6 @@ impl Parser {
             };
             let _ = fname_span;
             self.skip_newlines();
-            // A named FUNCTION field requires a type signature: the value may be
-            // a lambda only when a `Type  name` sig precedes it (pending or
-            // attached). `name (\args -> …)` (bare or parenthesized) with no sig
-            // is rejected — write `Type  name` first (`_  name` defers to the
-            // checker). A lambda value is `\…` or `(\…`.
-            let is_lambda_value = self.at(&TokenKind::Backslash)
-                || (self.at(&TokenKind::LParen)
-                    && matches!(self.peek_ahead(1), TokenKind::Backslash));
-            if is_with_record
-                && is_lambda_value
-                && let Some(n) = fname.as_name()
-                && !pending_sigs.iter().any(|(sn, _)| sn == n)
-            {
-                self.error(format!(
-                    "named function `{n}` requires a type signature: write `Type  {n}` (or `_  {n}` to derive the type) before the `{n} (\\…)` value"
-                ));
-                return None;
-            }
             // A bare lambda (`greet \name -> …`) or do-block (`run do …`) field
             // value. Field values normally use `parse_postfix` so a value can't
             // greedily absorb a following field as a function application — but
@@ -2779,14 +2718,34 @@ impl Parser {
                 self.error("expected field value after field name in record");
                 return None;
             };
-            // Attach any pending sig for this field name. Absent keys have no
-            // name, so they can never carry a sig — skip the lookup for them.
-            let sig = fname.as_name().and_then(|n| {
-                pending_sigs
-                    .iter()
-                    .position(|(sn, _)| sn == n)
-                    .map(|i| pending_sigs.remove(i).1)
-            });
+            // A `the (Type) value` field: the ascription IS the field's
+            // signature. Peel the `Annot` off the value into `sig` so the
+            // field is typed exactly as if it had a `Type  name` prefix — this
+            // is the replacement for the removed prefix form. The inner value
+            // (usually a lambda) becomes the bare field value.
+            //
+            // Only peel when the field is FUNCTION-like — the value is a
+            // lambda, or the scheme carries `(...) =>` constraints (implicit
+            // dict / morph / neg resolvers, which read the sig at the field
+            // level). A plain value ascription (`p (the (P) {})`) keeps its
+            // `Annot` on the value so it is checked STRICTLY (bidirectionally),
+            // whereas a field sig permits record subsumption (a narrower value
+            // record against a wider sig). Peeling that case would silently
+            // weaken the check.
+            let mut sig = None;
+            let value = if let ExprKind::Annot { expr: inner, ty, constraints } = &value.node {
+                let function_like = !constraints.is_empty()
+                    || matches!(ty.node, TypeKind::Function { .. } | TypeKind::Forall { .. })
+                    || matches!(inner.node, ExprKind::Lambda { .. });
+                if function_like {
+                    sig = Some(TypeScheme { constraints: constraints.clone(), ty: ty.clone() });
+                    (**inner).clone()
+                } else {
+                    value
+                }
+            } else {
+                value
+            };
             fields.push(RecordField {
                 name: fname,
                 value,
@@ -2813,16 +2772,6 @@ impl Parser {
                     "record fields are separated by a gap (2+ spaces): `{name \"a\"  age 30}`, not `{name \"a\" age 30}`",
                 );
             }
-        }
-
-        // A sig with no value is an error: there are no signature-only /
-        // CLI-constant fields. Every `Type  name` sig must be followed by a
-        // value (on the next line, or inline as `Type  name  value`).
-        if let Some((sname, _sty)) = pending_sigs.first() {
-            self.error(format!(
-                "`{sname}` has a type signature but no value"
-            ));
-            return None;
         }
 
         self.skip_newlines();
@@ -3380,11 +3329,7 @@ impl Parser {
         }
         let result = self.in_context("with expression", |this| {
             this.advance(); // consume `with`
-            let saved_with = this.in_with_block;
-            this.in_with_block = true;
-            let record = this.parse_postfix();
-            this.in_with_block = saved_with;
-            let record = record?;
+            let record = this.parse_postfix()?;
             // Lift type-import markers (`Maybe` in `with {Maybe}`) out of the
             // record into `types`; the remaining value fields form the `with`
             // record. A marker is a field whose value is `Constructor(name)`.

@@ -34,8 +34,7 @@ fn refine_per_field_record() {
         "refine_field_ok",
         r#"with {
 VP  {age (Int 1 where \x -> x >= 0 && x <= 150)}
-{age (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} VP  asVP
-asVP (\r -> refine r)
+asVP (the ({age (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} VP) (\r -> refine r))
 }
 (match asVP {age 30}
   Result.Ok {value _}  base.println "ok"
@@ -46,8 +45,7 @@ asVP (\r -> refine r)
         "refine_field_bad",
         r#"with {
 VP  {age (Int 1 where \x -> x >= 0 && x <= 150)}
-{age (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} VP  asVP
-asVP (\r -> refine r)
+asVP (the ({age (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} VP) (\r -> refine r))
 }
 (match asVP {age 200}
   Result.Ok {value _}  base.println "ok"
@@ -63,8 +61,7 @@ fn refine_cross_field() {
         "refine_cross",
         r#"with {
 R  {lo (Int 1)  hi (Int 1)} where \r ->  r.lo <=  r.hi
-{lo (Int 1)  hi (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} R  asR
-asR (\r -> refine r)
+asR (the ({lo (Int 1)  hi (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} R) (\r -> refine r))
 }
 (do
   (match asR {lo 5  hi 2}

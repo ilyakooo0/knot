@@ -567,7 +567,7 @@ fn as_let_in(e: &Expr) -> Option<(&Pat, Option<&Type>, &Expr, &Expr)> {
         && let ExprKind::Lambda { params, body, .. } = &func.node
         && params.len() == 1
     {
-        if let ExprKind::Annot { expr, ty } = &arg.node {
+        if let ExprKind::Annot { expr, ty, .. } = &arg.node {
             return Some((&params[0], Some(ty), expr, body));
         }
         return Some((&params[0], None, arg, body));
@@ -806,14 +806,15 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             };
             paren_if(parent > Prec::App, format!("{} {}", num, unit_name))
         }
-        ExprKind::Annot { expr, ty } => {
+        ExprKind::Annot { expr, ty, constraints } => {
             // `the (Type) expr`. `the` binds tighter than application, so a
             // multi-token inner expr is parenthesised by annot_inner_needs_parens.
             let mut inner = render_expr_inline(expr, Prec::Lowest);
             if annot_inner_needs_parens(expr, true) {
                 inner = format!("({})", inner);
             }
-            format!("(the ({}) {})", render_type(ty), inner)
+            let scheme = TypeScheme { constraints: constraints.clone(), ty: ty.clone() };
+            format!("(the ({}) {})", render_type_scheme(&scheme), inner)
         }
         ExprKind::Refine(inner) => {
             let s = format!("refine {}", render_expr_inline(inner, Prec::App));
@@ -995,12 +996,17 @@ fn render_record_inline(fields: &[RecordField]) -> String {
             s.push_str(&render_expr_inline(&f.value, Prec::Atom));
             continue;
         }
-        // Type-first signature line `Type  name`, then the `name value` field.
+        // A field with a signature renders as `name (the (SIG) value)` — the
+        // `the`-ascription is the (sole) signature syntax now that the
+        // `Type  name` prefix is removed.
         if let Some(sig) = &f.sig {
-            s.push_str(&render_type_scheme(sig));
-            s.push_str("  ");
             s.push_str(&f.name.to_string());
-            s.push(' ');
+            s.push_str(" (the (");
+            s.push_str(&render_type_scheme(sig));
+            s.push_str(") ");
+            s.push_str(&render_expr_inline(&f.value, Prec::Atom));
+            s.push(')');
+            continue;
         }
         s.push_str(&f.name.to_string());
         s.push(' ');
@@ -1161,10 +1167,11 @@ fn render_expr_block(p: &mut Printer, e: &Expr, parent: Prec) {
                 p.write(")");
             }
         }
-        ExprKind::Annot { expr, ty } => {
+        ExprKind::Annot { expr, ty, constraints } => {
             // `(the (Type) expr)`.
             p.write("(the (");
-            p.write(&render_type(ty));
+            let scheme = TypeScheme { constraints: constraints.clone(), ty: ty.clone() };
+            p.write(&render_type_scheme(&scheme));
             p.write(") ");
             let inner_parens = annot_inner_needs_parens(expr, false);
             if inner_parens {
@@ -1343,13 +1350,18 @@ fn render_record_block(p: &mut Printer, fields: &[RecordField]) {
                 p.newline();
                 continue;
             }
-            // A field with an explicit type signature keeps its sig-line
-            // layout: type-first `Type  name` on its own line, then `name value`.
+            // A field with an explicit type signature renders as
+            // `name (the (SIG) value)` — the `the`-ascription is the (sole)
+            // signature syntax now that the `Type  name` prefix is removed.
             if let Some(sig) = &f.sig {
-                p.write(&render_type_scheme(sig));
-                p.write("  ");
                 p.write(&f.name.to_string());
+                p.write(" (the (");
+                p.write(&render_type_scheme(sig));
+                p.write(") ");
+                render_expr(p, &f.value, Prec::Atom);
+                p.write(")");
                 p.newline();
+                continue;
             }
             p.write(&f.name.to_string());
             p.write(" ");

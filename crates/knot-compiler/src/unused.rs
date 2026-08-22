@@ -296,9 +296,24 @@ fn walk_expr(e: &Expr, r: &mut Refs) {
         }
         ExprKind::Atomic(inner) => walk_expr(inner, r),
         ExprKind::TimeUnitLit { value, .. } => walk_expr(value, r),
-        ExprKind::Annot { expr, ty } => {
+        ExprKind::Annot { expr, ty, constraints } => {
             walk_expr(expr, r);
             walk_type(ty, r);
+            for c in constraints {
+                match c {
+                    Constraint::Trait { args, .. } => {
+                        for a in args {
+                            walk_type(a, r);
+                        }
+                    }
+                    Constraint::ImplicitField { ty: cty, .. } => walk_type(cty, r),
+                    Constraint::CollectField { ty: cty, .. } => {
+                        if let Some(t) = cty {
+                            walk_type(t, r);
+                        }
+                    }
+                }
+            }
         }
         ExprKind::Refine(inner) => walk_expr(inner, r),
         ExprKind::Serve { handlers, .. } => {

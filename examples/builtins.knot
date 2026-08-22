@@ -1,8 +1,7 @@
 with {
-Int 1 -> Int 1 -> Maybe (Int 1)  safeDiv
-safeDiv (\x y -> match y == 0
+safeDiv (the (Int 1 -> Int 1 -> Maybe (Int 1)) (\x y -> match y == 0
   Bool.True {}  Maybe.Nothing {}
-  Bool.False {}  Maybe.Just {value (x / y)})
+  Bool.False {}  Maybe.Just {value (x / y)}))
 
 nums [1  2  3  4  5]
 

@@ -274,8 +274,14 @@ pub enum ExprKind {
     /// re-render the surface syntax instead of the raw multiplication.
     TimeUnitLit { value: Box<Expr>, unit_name: Name },
 
-    /// `the (Type) expr` — type annotation on expression.
-    Annot { expr: Box<Expr>, ty: Type },
+    /// `the (Type) expr` — type annotation on expression. `constraints` holds
+    /// any `(...) =>` scheme constraints (implicit-field / trait) written in
+    /// the `the (...)`; empty for a plain type.
+    Annot {
+        expr: Box<Expr>,
+        ty: Type,
+        constraints: Vec<Constraint>,
+    },
 
     /// `refine expr` — runtime refinement check, returns Result.
     Refine(Box<Expr>),

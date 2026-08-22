@@ -3,12 +3,10 @@ Todo  {title Text  owner Text  done (Int 1)}
 
 Rel Todo  *todos
 
-_  add
 add (\title owner -> do
   todos <- *todos
   *todos = base.union todos [{title title  owner owner  done 0}])
 
-_  complete
 complete (\title -> do
   todos <- *todos
   *todos = do
@@ -17,7 +15,6 @@ complete (\title -> do
       Bool.True {}  (base.unify t {done 1})
       Bool.False {}  t))
 
-_  pending
 pending (\owner ->
   with {todos *todos}
   (do t <- todos; where t.done == 0; where t.owner == owner; yield t.title))

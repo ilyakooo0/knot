@@ -10,7 +10,6 @@ api Api where
   CreateTodo  post /todos ={title Text  owner Text  priority Text} -> Todo
   GetCount  get /admin/count -> Int 1
 
-_  addTodo
 addTodo (\title owner priority -> do
   rows <- *todos
   *todos = base.union rows [{title title  owner owner  priority (Priority.Low {})}])

@@ -18549,9 +18549,10 @@ fn substitute_inner(
             value: Box::new(substitute_inner(v, var, value, value_fv)?),
             unit_name: unit_name.clone(),
         },
-        Annot { expr: e, ty } => Annot {
+        Annot { expr: e, ty, constraints } => Annot {
             expr: Box::new(substitute_inner(e, var, value, value_fv)?),
             ty: ty.clone(),
+            constraints: constraints.clone(),
         },
         Refine(e) => Refine(Box::new(substitute_inner(e, var, value, value_fv)?)),
         // Constructs that introduce binders the substituter doesn't rewrite.

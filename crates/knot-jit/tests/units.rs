@@ -62,7 +62,7 @@ fn unit_mismatch_comparison_rejected() {
 fn unit_polymorphic_function() {
     // A unit hole `_` binds the unit by unification; the unit flows through.
     assert_prog(
-        "with {\n_  double\ndouble (\\(the (Int _) n) -> n + n)\n}\n(base.show (double (the (Int M) 5)))",
+        "with {\ndouble (\\(the (Int _) n) -> n + n)\n}\n(base.show (double (the (Int M) 5)))",
         "10",
     );
 }

@@ -550,9 +550,23 @@ impl<'a> TokenCollector<'a> {
             ast::ExprKind::TimeUnitLit { value, .. } => {
                 self.visit_expr(value);
             }
-            ast::ExprKind::Annot { expr: inner, ty } => {
+            ast::ExprKind::Annot { expr: inner, ty, constraints } => {
                 self.visit_expr(inner);
                 self.visit_type(ty);
+                for c in constraints {
+                    match c {
+                        ast::Constraint::Trait { args, .. } => {
+                            for a in args {
+                                self.visit_type(a);
+                            }
+                        }
+                        ast::Constraint::ImplicitField { ty: cty, .. } => self.visit_type(cty),
+                        ast::Constraint::CollectField { ty: Some(cty), .. } => {
+                            self.visit_type(cty)
+                        }
+                        ast::Constraint::CollectField { ty: None, .. } => {}
+                    }
+                }
             }
             ast::ExprKind::TypeLiteral(ty) => self.visit_type(ty),
             ast::ExprKind::Serve {

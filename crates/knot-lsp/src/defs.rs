@@ -508,8 +508,24 @@ impl<'a> DefResolver<'a> {
                 self.literals.push((expr.span, ty.to_string()));
             }
             ast::ExprKind::TimeUnitLit { value, .. } => self.resolve_expr(value),
-            ast::ExprKind::Annot { expr: inner, ty } => {
+            ast::ExprKind::Annot { expr: inner, ty, constraints } => {
                 self.resolve_type(ty, self.source);
+                for c in constraints {
+                    match c {
+                        ast::Constraint::Trait { args, .. } => {
+                            for a in args {
+                                self.resolve_type(a, self.source);
+                            }
+                        }
+                        ast::Constraint::ImplicitField { ty: cty, .. } => {
+                            self.resolve_type(cty, self.source)
+                        }
+                        ast::Constraint::CollectField { ty: Some(cty), .. } => {
+                            self.resolve_type(cty, self.source)
+                        }
+                        ast::Constraint::CollectField { ty: None, .. } => {}
+                    }
+                }
                 self.resolve_expr(inner);
             }
             ast::ExprKind::Refine(inner) => self.resolve_expr(inner),

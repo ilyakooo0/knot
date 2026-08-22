@@ -12,17 +12,14 @@ Rel Account  *accounts
 -- The `single (filter (\a -> a.id == ?) rows)`  pattern is  what the  codegen
 --  recognizes as  a `"id" = ?`  simple equality;  inside an atomic  block the
 --  runtime tracks  this as  a `Cols([(id, Eq, ?)])`  read filter  on accounts.
-_  findById
 findById (\aid rows -> base.single (base.filter (\a -> a.id == aid) rows))
 
-_  setBalance
 setBalance (\aid newBalance rows -> do
   r <- rows
   yield (match r.id == aid
     Bool.True {}  (base.unify r {balance newBalance})
     Bool.False {}  r))
 
-_  credit
 credit (\aid amount -> atomic do
   rows <- *accounts
   -- The `single (filter ...)` lookup is what the runtime SQL pushdown turns

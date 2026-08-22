@@ -7473,7 +7473,7 @@ impl Infer {
             // infer the wrapped multiplication directly.
             ast::ExprKind::TimeUnitLit { value, .. } => self.infer_expr(value),
 
-            ast::ExprKind::Annot { expr: inner, ty } => {
+            ast::ExprKind::Annot { expr: inner, ty, .. } => {
                 let inner_ty = self.infer_expr(inner);
                 // Treat lowercase unit names in an inline ascription as
                 // polymorphic unit variables (as in a signature), not as
@@ -7732,7 +7732,7 @@ impl Infer {
                     Self::peel_implicit_ref_app(expr).expect("matched above");
                 self.resolve_implicit_ref_app(name, &args, head_span, expr.span, expected.clone());
             }
-            ast::ExprKind::Annot { expr: inner, ty } => {
+            ast::ExprKind::Annot { expr: inner, ty, .. } => {
                 // See the infer-mode `Annot` arm: lowercase units in an inline
                 // ascription must be polymorphic unit variables, not concrete.
                 let saved_flag = self.in_type_annotation;

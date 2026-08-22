@@ -5,11 +5,8 @@ Employee  {name Text  dept Text  salary (Int 1)}
 Rel Employee  *employees
 
 -- Helper  functions used  inside lambda  bodies.
-_  isHighEarner
 isHighEarner (\e -> e.salary > 75)
-_  salaryOf
 salaryOf (\e -> e.salary)
-_  inDept
 inDept (\name e -> e.dept == name)
 
 -- 1.  filter where the  predicate body  calls a  helper function.

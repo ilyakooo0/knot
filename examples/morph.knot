@@ -15,12 +15,9 @@
 --     bidirectional (check-mode) path: the contextual expected type threads
 --     through the enclosing `with` into the application's result.
 with {
-textToInt {Text -> Int 1  into
-           into (\s -> base.length s)}
-intToText {Int 1 -> Text  into
-           into (\n -> base.show n)}
-textToFloat {Text -> Float 1  into
-             into (\s -> 2.5)}
+textToInt {into (the (Text -> Int 1) (\s -> base.length s))}
+intToText {into (the (Int 1 -> Text) (\n -> base.show n))}
+textToFloat {into (the (Text -> Float 1) (\s -> 2.5))}
 
 -- The  ambient conversion  scope base.morph.<from-type>.<to-type>.into
 conv {  morph {
@@ -33,16 +30,12 @@ conv {  morph {
 -- because `text.int` and `text.float` below share the Text source — an
 -- un-annotated Text `into` would be ambiguous. The annotation is what lets
 -- the result type pick.)
-Int 1  argInt
-argInt  (with conv ((^into) "hi"))   -- Text  arg, wants Int 1
-Text  argText
-argText (with conv ((^into) 41))     -- Int  arg,  wants Text
+argInt  (the (Int 1) (with conv ((^into) "hi")))   -- Text  arg, wants Int 1
+argText (the (Text) (with conv ((^into) 41)))     -- Int  arg,  wants Text
 
 -- Result-type-directed  same source (Text),  annotation picks the  target.
-Int 1  asInt
-asInt   (with conv ((^into) "hi"))   --  wants Int 1   ->  morph.text.int.into
-Float 1  asFloat
-asFloat (with conv ((^into) "hi"))   --  wants Float 1 ->  morph.text.float.into
+asInt   (the (Int 1) (with conv ((^into) "hi")))   --  wants Int 1   ->  morph.text.int.into
+asFloat (the (Float 1) (with conv ((^into) "hi")))   --  wants Float 1 ->  morph.text.float.into
 }
 (do
   base.println (base.show argInt)    -- "2"   (length of "hi")

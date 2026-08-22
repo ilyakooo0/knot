@@ -30,25 +30,21 @@ pub(crate) const PRELUDE_SPAN_OFFSET: usize = 1 << 40;
 const PRELUDE_SOURCE: &str = r#"
 {
 base {
-_  min
 min (\a b -> match a < b
   Bool.True {}  a
   Bool.False {}  b)
 
-_  max
 max (\a b -> match a > b
   Bool.True {}  a
   Bool.False {}  b)
 
-Bool -> IO {} -> IO {}  when
-when (\cond action -> match cond
+when (the (Bool -> IO {} -> IO {}) (\cond action -> match cond
   Bool.True {}  action
-  Bool.False {}  yield {})
+  Bool.False {}  yield {}))
 
-Bool -> IO {} -> IO {}  unless
-unless (\cond action -> match cond
+unless (the (Bool -> IO {} -> IO {}) (\cond action -> match cond
   Bool.True {}  yield {}
-  Bool.False {}  action)
+  Bool.False {}  action))
 
 -- Structured logging. `log` carries a `(<>logCtx)` fold constraint: at each
 -- callsite the compiler merges every in-scope `logCtx` record (`base.unify`
@@ -58,20 +54,15 @@ unless (\cond action -> match cond
 -- (`emitLog`). The `debug`/`info`/`warn`/`error` wrappers fix the level; each
 -- is self-contained (a record field can't reference a sibling bare) and
 -- re-declares the constraint so the caller's context threads through.
-(<>logCtx) => Level -> Text -> IO {}  log
-log (\level msg -> emitLog level msg ^logCtx)
+log (the ((<>logCtx) => Level -> Text -> IO {}) (\level msg -> emitLog level msg ^logCtx))
 
-(<>logCtx) => Text -> IO {}  debug
-debug (\msg -> emitLog (Level.Debug {}) msg ^logCtx)
+debug (the ((<>logCtx) => Text -> IO {}) (\msg -> emitLog (Level.Debug {}) msg ^logCtx))
 
-(<>logCtx) => Text -> IO {}  info
-info (\msg -> emitLog (Level.Info {}) msg ^logCtx)
+info (the ((<>logCtx) => Text -> IO {}) (\msg -> emitLog (Level.Info {}) msg ^logCtx))
 
-(<>logCtx) => Text -> IO {}  warn
-warn (\msg -> emitLog (Level.Warn {}) msg ^logCtx)
+warn (the ((<>logCtx) => Text -> IO {}) (\msg -> emitLog (Level.Warn {}) msg ^logCtx))
 
-(<>logCtx) => Text -> IO {}  error
-error (\msg -> emitLog (Level.Error {}) msg ^logCtx)
+error (the ((<>logCtx) => Text -> IO {}) (\msg -> emitLog (Level.Error {}) msg ^logCtx))
 
 -- List ADT namespace (`base.list.*`). Each field is a codegen builtin
 -- (`Var(listX)` resolves to the registered knot_list_* function value), so
@@ -111,8 +102,8 @@ count vecCount
 -- `valueNegate` runtime primitive; the signature is what steers `^neg`.
 -- Numeric negation is written `(^neg) x` (unary `-x` was removed).
 num {
-int   { Int u -> Int u  neg  valueNegate }
-float { Float u -> Float u  neg  valueNegate }
+int   { neg (the (Int u -> Int u) valueNegate) }
+float { neg (the (Float u -> Float u) valueNegate) }
 }
 
 -- Morph namespace (`base.morph.*`): type-directed conversions resolved by the
@@ -123,26 +114,16 @@ float { Float u -> Float u  neg  valueNegate }
 -- `Maybe`. Conversions needing a primitive not exposed as a base builtin are
 -- written as lambdas over the existing builtins.
 morph {
-textToBytes { Text -> Bytes  into
-              into textToBytes }
-bytesToText { Bytes -> Maybe Text  into
-              into bytesToText }
-bytesToHex  { Bytes -> Text  into
-              into bytesToHex }
-textToBytesFromHex { Text -> Maybe Bytes  into
-                     into bytesFromHex }
-intToFloat  { Int 1 -> Float 1  into
-              into intToFloat }
-textToInt   { Text -> Maybe (Int 1)  into
-              into textToInt }
-textToFloat { Text -> Maybe (Float 1)  into
-              into textToFloat }
-intToText   { Int 1 -> Text  into
-              into (\n -> show n) }
-floatToText { Float 1 -> Text  into
-              into (\f -> show f) }
-boolToText  { Bool -> Text  into
-              into (\b -> show b) }
+textToBytes { into (the (Text -> Bytes) textToBytes) }
+bytesToText { into (the (Bytes -> Maybe Text) bytesToText) }
+bytesToHex  { into (the (Bytes -> Text) bytesToHex) }
+textToBytesFromHex { into (the (Text -> Maybe Bytes) bytesFromHex) }
+intToFloat  { into (the (Int 1 -> Float 1) intToFloat) }
+textToInt   { into (the (Text -> Maybe (Int 1)) textToInt) }
+textToFloat { into (the (Text -> Maybe (Float 1)) textToFloat) }
+intToText   { into (the (Int 1 -> Text) (\n -> show n)) }
+floatToText { into (the (Float 1 -> Text) (\f -> show f)) }
+boolToText  { into (the (Bool -> Text) (\b -> show b)) }
 }
 }
 }

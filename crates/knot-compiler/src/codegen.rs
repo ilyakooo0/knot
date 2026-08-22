@@ -5527,8 +5527,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 }
             }
 
-            ast::ExprKind::Lambda { params, body, .. } => {
-                self.compile_lambda(builder, params, body, env, db)
+            ast::ExprKind::Lambda { .. } => {
+                // Peel erased type-witness layers (`\(T : Type) -> …`): they
+                // have no runtime parameter, so a witness-only outer lambda
+                // must not become a 0-param closure that swallows the first
+                // application. `value_lambda_chain` skips witness layers and
+                // returns the real value params + body.
+                let (vparams, vbody) = value_lambda_chain(expr);
+                self.compile_lambda(builder, &vparams, vbody, env, db)
             }
 
             ast::ExprKind::App { func, arg } => {

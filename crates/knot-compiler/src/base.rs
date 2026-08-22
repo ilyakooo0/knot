@@ -109,10 +109,8 @@ count vecCount
 -- `valueNegate` runtime primitive; the signature is what steers `^neg`.
 -- Numeric negation is written `(^neg) x` (unary `-x` was removed).
 num {
-int   { Int u -> Int u  neg
-        neg valueNegate }
-float { Float u -> Float u  neg
-        neg valueNegate }
+int   { Int u -> Int u  neg  valueNegate }
+float { Float u -> Float u  neg  valueNegate }
 }
 
 -- Morph namespace (`base.morph.*`): type-directed conversions resolved by the

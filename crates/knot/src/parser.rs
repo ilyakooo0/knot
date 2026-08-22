@@ -2615,7 +2615,45 @@ impl Parser {
                         continue;
                     }
                     let (sname, _) = self.expect_lower("expected field name in record").unwrap();
-                    pending_sigs.push((sname, ty));
+                    // One-line sig+value: `TYPE  NAME  BODY`. If a gap and an
+                    // expression follow the name ON THE SAME LINE, the value is
+                    // inline — parse it now and emit a complete field with the
+                    // sig attached. Otherwise (newline/`}` next) it's the
+                    // classic two-line form: stash the sig in `pending_sigs`
+                    // for a later value field to pick up.
+                    let inline_value = self.gap_before_current()
+                        && !matches!(self.peek(), TokenKind::Newline | TokenKind::RBrace)
+                        && !self.at_layout_boundary();
+                    if inline_value {
+                        let Some(value) = (if self.at(&TokenKind::Backslash) || self.at(&TokenKind::Do)
+                        {
+                            let prev_bi = self.block_indent;
+                            let prev_bd = self.block_delim;
+                            self.block_indent = self.cur_column();
+                            self.block_delim = self.delimiter_depth;
+                            let v = if self.at(&TokenKind::Backslash) {
+                                self.parse_lambda()
+                            } else {
+                                self.parse_do_expr()
+                            };
+                            self.block_indent = prev_bi;
+                            self.block_delim = prev_bd;
+                            v
+                        } else {
+                            self.parse_postfix()
+                        }) else {
+                            self.error("expected field value after field name in record");
+                            return None;
+                        };
+                        fields.push(RecordField {
+                            name: crate::ast::FieldName::Named(sname),
+                            value,
+                            sig: Some(ty),
+                            doc: pending_doc.take(),
+                        });
+                    } else {
+                        pending_sigs.push((sname, ty));
+                    }
                     continue;
                 }
                 // Not a sig — roll back the speculative type parse AND any

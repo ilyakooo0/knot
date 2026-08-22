@@ -382,42 +382,6 @@ directReports (do
 
 See `examples/recursive.knot`.
 
-### Required CLI arguments — signature-only constants
-
-A `with`-level binding with a type signature but **no value** is a *required
-command-line argument*. The compiled program reads `--name=value` at startup;
-the value is parsed and checked against the declared type (including any
-refinement predicate), and a missing or invalid argument aborts with a clear
-error and `--help` output listing every required flag.
-
-```knot
-with {
-type Port = Int 1 where \p -> p > 0 && p < 65536
-
--- no value on the right — these are required CLI args
-port     : Port
-host     : Text
-greeting : Text
-}
-(do
-  base.println (greeting ++ " from " ++ host ++ " on port " ++ base.show port))
-```
-
-```sh
-$ ./program
-Error: missing required argument --port
-  pass --port=<value> on the command line, or run --help for usage
-
-$ ./program --port=8080 --host=localhost --greeting=Hello
-"Hello from localhost on port 8080"
-
-$ ./program --port=99999 --host=x --greeting=y
-Error: value supplied for --port does not satisfy 'Port' predicate
-```
-
-Only scalar-ish types (integers, floats, text, bools, and refinements of
-those) can be CLI-overridden. See `examples/required_args.knot`.
-
 ### Implicit field projection — `^field` and dictionary constraints
 
 `^field` is an *implicit reference*: it resolves to some field named `field`
@@ -735,18 +699,11 @@ one server. See `examples/routes.knot` and `examples/apiserver.knot`.
 
 **Refined types.** `type Port = Int 1 where \p -> p > 0 && p < 65536` is a
 nominal type whose predicate is checked at boundaries — relation writes,
-HTTP body decoding, explicit `refine expr`, and CLI-argument parsing. Route
+HTTP body decoding, and explicit `refine expr`. Route
 handlers auto-return HTTP 400 on validation failure. Compile-time constants
 are checked against the predicate at build time (no `refine` needed), and an
 SMT solver (Z3) proves subtyping between refined types, so a *more* refined
-value is accepted where a *less* refined one is required. See
-`examples/required_args.knot`.
-
-**Required CLI arguments.** A `with`-level binding with a signature but no
-value becomes a required `--name=value` flag on the compiled binary, parsed
-and checked against its declared (possibly refined) type at startup. Missing
-or invalid arguments abort with a clear error and a `--help` listing. See
-`examples/required_args.knot`.
+value is accepted where a *less* refined one is required.
 
 **Debugging primitives.** `base.todo` (an `∀a. a` unimplemented hole that
 aborts with a full context report) and `base.trace` (an `∀a. a -> a`
@@ -781,19 +738,16 @@ JSON encode/decode, file I/O, structured leveled logging
 `examples/bytes.knot`, `examples/hash.knot`, `examples/uuid.knot`,
 `examples/json.knot`, `examples/crypto.knot`, `examples/log_test.knot`.
 
-**Runtime CLI.** Every compiled program accepts a common set of flags, plus
-any required-argument constants declared in the source:
+**Runtime CLI.** Every compiled program accepts a common set of flags:
 
 ```sh
 ./my_program                     # run main
 ./my_program --debug             # turn on base.debug output
-./my_program --help              # print usage + any required CLI arguments
+./my_program --help              # print usage
 ./my_program --http-max-body-bytes=32M   # cap HTTP body size (K/M/G suffixes)
-./my_program --port=8080         # supply a required CLI argument
 ```
 
-Required-argument constants can also be supplied at build time
-(`knot build foo.knot --port=8080`). The compiler ships with
+The compiler ships with
 `knot fmt [--check] [--stdout] <file.knot>` for in-place formatting and
 `knot build <file.knot> [-o <path>]` for compilation.
 

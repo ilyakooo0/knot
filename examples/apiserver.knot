@@ -41,6 +41,7 @@ api Tasks where
   Echo    post /echo ={title Text  owner Text} -> Task @{xRequestId Text}
   Audit   get  /tasks/{id (Int 1)}/audit @{authorization Text} -> Rel Task
   Summary  get  /summary -> Int 1
+    _  key
     rateLimit {key (\i c -> Maybe.Just {value "global"})
                limit {requests 100  window 60000}}
 

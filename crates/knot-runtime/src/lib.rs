@@ -3639,61 +3639,6 @@ pub extern "C-unwind" fn knot_override_lookup(
     }
 }
 
-/// Look up a CLI override that *must* be supplied (no in-source default).
-/// Behaves like `knot_override_lookup`, but exits with an error if the user
-/// did not pass the flag. Used for body-less top-level constant declarations.
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_override_required_lookup(
-    name_ptr: *const u8,
-    name_len: usize,
-    type_tag: i32,
-) -> *mut Value {
-    let result = knot_override_lookup(name_ptr, name_len, type_tag);
-    if !result.is_null() {
-        return result;
-    }
-    let name = unsafe { str_from_raw(name_ptr, name_len) };
-    eprintln!(
-        "Error: missing required argument --{}\n  pass --{}=<value> on the command line, or run --help for usage",
-        name, name
-    );
-    std::process::exit(1);
-}
-
-/// Run a refinement predicate against a CLI-supplied value. Exits if it fails.
-/// `type_label` is the refined type name (or empty for inline refinements).
-#[unsafe(no_mangle)]
-pub extern "C-unwind" fn knot_override_refinement_check(
-    db: *mut c_void,
-    value: *mut Value,
-    predicate: *mut Value,
-    name_ptr: *const u8,
-    name_len: usize,
-    type_label_ptr: *const u8,
-    type_label_len: usize,
-) -> *mut Value {
-    let result = knot_value_call(db, predicate, value);
-    match unsafe { as_ref(result) } {
-        Value::Bool(true) => value,
-        _ => {
-            let name = unsafe { str_from_raw(name_ptr, name_len) };
-            let label = unsafe { str_from_raw(type_label_ptr, type_label_len) };
-            if label.is_empty() {
-                eprintln!(
-                    "Error: value supplied for --{} does not satisfy its refinement predicate",
-                    name
-                );
-            } else {
-                eprintln!(
-                    "Error: value supplied for --{} does not satisfy '{}' predicate",
-                    name, label
-                );
-            }
-            std::process::exit(1);
-        }
-    }
-}
-
 /// Decode a default-value string emitted by the compiler.
 ///
 /// The compiler escapes `\` as `\\` and `,` as `\c` so the entry
@@ -3721,8 +3666,6 @@ fn decode_default_value(s: &str) -> String {
 
 /// Per-entry kind decoded from the help descriptor.
 enum DefaultKind {
-    /// `name:type:!` — body-less constant; must be supplied on the CLI.
-    Required,
     /// `name:type:=<value>` — has an in-source default we can display.
     Default(String),
     /// `name:type` — has a default but it isn't a literal we can render.
@@ -3732,7 +3675,6 @@ enum DefaultKind {
 /// Check for `--help` and print available constant overrides.
 ///
 /// `desc` is a compile-time string. Each comma-separated entry is one of:
-///   `name:type:!`           (required CLI arg)
 ///   `name:type:=<value>`    (overridable, default from source)
 ///   `name:type`             (overridable, default not displayable)
 /// If `--help` is found, prints usage and exits.
@@ -3756,7 +3698,6 @@ pub extern "C-unwind" fn knot_override_check_help(desc_ptr: *const u8, desc_len:
             let mut parts = entry.splitn(3, ':');
             if let (Some(name), Some(ty)) = (parts.next(), parts.next()) {
                 let kind = match parts.next() {
-                    Some("!") => DefaultKind::Required,
                     Some(rest) if rest.starts_with('=') => {
                         DefaultKind::Default(decode_default_value(&rest[1..]))
                     }
@@ -3781,7 +3722,6 @@ pub extern "C-unwind" fn knot_override_check_help(desc_ptr: *const u8, desc_len:
 
     for (name, ty, kind) in &overrides {
         let label = match kind {
-            DefaultKind::Required => "(required)".to_string(),
             DefaultKind::Default(v) => format!("(default: {})", v),
             DefaultKind::OpaqueDefault => "(default from source)".to_string(),
         };

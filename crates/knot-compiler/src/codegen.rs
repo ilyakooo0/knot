@@ -273,9 +273,6 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // Compile-time constant overrides: name -> raw string value (parsed during codegen)
     compile_time_overrides: HashMap<String, String>,
 
-    // Body-less top-level constants that must be supplied as CLI arguments at run time.
-    required_constants: Vec<RequiredConstant>,
-
     // Whether we are inside compile_io_do_eager — when true, Yield compiles to
     // the raw inner value rather than wrapping in knot_relation_singleton.
     in_io_eager: bool,
@@ -442,27 +439,6 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     io_do_tail_iterated: bool,
 }
 
-/// A top-level constant declared as a signature with no body
-/// (e.g. `port : Int 1` or `host : Text`). The value must be supplied
-/// at run time via a `--<name>=<value>` CLI argument.
-#[derive(Clone)]
-struct RequiredConstant {
-    name: String,
-    /// Base scalar type for argv parsing: "Int" / "Float" / "Text" / "Bool".
-    base_type: String,
-    /// Optional refinement predicate to validate the parsed value against.
-    refinement: Option<RequiredRefinement>,
-}
-
-#[derive(Clone)]
-struct RequiredRefinement {
-    /// Display label for the refinement (the refined type's name, or the
-    /// constant's own name for inline `Int where ...` annotations).
-    type_label: String,
-    /// Predicate AST — typically a lambda like `\x -> x > 0`.
-    predicate: ast::Expr,
-}
-
 /// Role of a constructor in a nullable-encoded ADT.
 /// Currently unused — nullable encoding is disabled to avoid representation
 /// mismatch with SQLite-read values (see collect_declarations).
@@ -573,13 +549,11 @@ struct LoopInfo {
 /// as the alias name, so matching the rendered string alone would drop it and
 /// leave the constant with no `knot_override_lookup` call — the flag would be
 /// accepted and silently ignored. Resolving through `type_aliases` keeps this
-/// in step with `classify_required_constant_type`, which already does so for
-/// body-less constants.
+/// correct for aliased scalars.
 ///
 /// Refined aliases are deliberately excluded: nothing here runs their
 /// predicate, so honouring the flag would let a CLI value in through a check
-/// the type promises. (Body-less constants take the refined path instead,
-/// which validates via `knot_override_refinement_check`.)
+/// the type promises.
 fn scalar_override_type(
     ty_str: &str,
     type_aliases: &HashMap<String, ResolvedType>,
@@ -605,58 +579,6 @@ fn scalar_override_type(
         }
     };
     Some(format!("{prefix}{resolved}"))
-}
-
-/// Classify the type annotation on a body-less constant declaration.
-///
-/// Returns `Some((base_type_str, refinement))` when the type resolves to a
-/// scalar primitive (or a refined alias of one); the `base_type_str` is
-/// `"Int"`, `"Float"`, `"Text"`, or `"Bool"` for argv parsing. Returns `None`
-/// when the type is unsupported (e.g. a record, relation, or unknown alias).
-fn classify_required_constant_type(
-    ty: &ast::Type,
-    const_name: &str,
-    type_aliases: &HashMap<String, ResolvedType>,
-    refined_types: &HashMap<String, ast::Expr>,
-) -> Option<(String, Option<RequiredRefinement>)> {
-    match &ty.node {
-        ast::TypeKind::Refined { base, predicate } => {
-            // Inline refinement: `name : Int 1 where \x -> x > 0`. The refined type
-            // has no name of its own, so we use the constant's name as the label.
-            let (base_type, _) =
-                classify_required_constant_type(base, const_name, type_aliases, refined_types)?;
-            Some((
-                base_type,
-                Some(RequiredRefinement {
-                    type_label: const_name.to_string(),
-                    predicate: (**predicate).clone(),
-                }),
-            ))
-        }
-        ast::TypeKind::Named(name) => match name.as_str() {
-            "Int" => Some(("Int".to_string(), None)),
-            "Float" => Some(("Float".to_string(), None)),
-            "Text" => Some(("Text".to_string(), None)),
-            "Bool" => Some(("Bool".to_string(), None)),
-            _ => {
-                let resolved = type_aliases.get(name)?;
-                let base_type = match resolved {
-                    ResolvedType::Int => "Int",
-                    ResolvedType::Float => "Float",
-                    ResolvedType::Text => "Text",
-                    ResolvedType::Bool => "Bool",
-                    _ => return None,
-                }
-                .to_string();
-                let refinement = refined_types.get(name).map(|pred| RequiredRefinement {
-                    type_label: name.clone(),
-                    predicate: pred.clone(),
-                });
-                Some((base_type, refinement))
-            }
-        },
-        _ => None,
-    }
 }
 
 /// Render a constant's default-value expression as a short string for
@@ -994,57 +916,6 @@ fn compile_inner<M: cranelift_module::Module>(
     }
     cg.declare_runtime_fns();
     cg.collect_declarations(program);
-    // Register body-less top-level constants as required CLI arguments.
-    // Each becomes a 0-param user_fn whose body reads --<name>=value at startup,
-    // exits if missing, and runs any attached refinement predicate.
-    for decl in decl_views(program) {
-        if let DeclViewKind::Fun {
-            body: None,
-            ty: Some(ts),
-        } = decl.kind
-        {
-            let name = decl.name;
-            if name == "main" {
-                continue;
-            }
-            // Already registered (e.g. by a duplicate decl) — skip.
-            if cg.global_fns.contains_key(name) {
-                continue;
-            }
-            let classified =
-                classify_required_constant_type(&ts.ty, name, &cg.type_aliases, &cg.refined_types);
-            let (base_type, refinement) = match classified {
-                Some(v) => v,
-                None => {
-                    cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
-                        format!(
-                            "constant '{}' has no body, so it must be supplied as a CLI argument; \
-                             this requires a scalar type (Int, Float, Text, Bool) or a refined alias of one",
-                            name
-                        ),
-                    ).label(ts.ty.span, "unsupported type for required CLI constant"));
-                    continue;
-                }
-            };
-            // Register a 0-param user function for this constant so references resolve.
-            let mut sig = cg.module.make_signature();
-            sig.params.push(AbiParam::new(cg.ptr_type)); // db
-            sig.returns.push(AbiParam::new(cg.ptr_type));
-            let func_name = format!("knot_user_{}", name);
-            let func_id = cg
-                .module
-                .declare_function(&func_name, Linkage::Local, &sig)
-                .unwrap();
-            cg.global_fns.insert(name.to_string(), (func_id, 0));
-            cg.overridable_constants
-                .insert(name.to_string(), base_type.clone());
-            cg.required_constants.push(RequiredConstant {
-                name: name.to_string(),
-                base_type,
-                refinement,
-            });
-        }
-    }
     // Compute overridable constants: 0-param Fun declarations with scalar types
     for decl in decl_views(program) {
         if let DeclViewKind::Fun {
@@ -1536,7 +1407,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
             overridable_constants: HashMap::new(),
             overridable_defaults: HashMap::new(),
             compile_time_overrides: HashMap::new(),
-            required_constants: Vec::new(),
             in_io_eager: false,
             atomic_retry_block: None,
             io_loop_skip_block: None,
@@ -1722,12 +1592,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // CLI constant overrides
         self.declare_rt("knot_override_lookup", &[p, p, types::I32], &[p]);
-        self.declare_rt("knot_override_required_lookup", &[p, p, types::I32], &[p]);
-        self.declare_rt(
-            "knot_override_refinement_check",
-            &[p, p, p, p, p, p, p],
-            &[p],
-        );
         self.declare_rt("knot_override_check_help", &[p, p], &[]);
 
         // STM tracking
@@ -3658,12 +3522,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 self.define_trampoline(tramp);
             }
         }
-
-        // Body-less top-level constants — supplied at run time as CLI args.
-        let required: Vec<RequiredConstant> = self.required_constants.clone();
-        for constant in &required {
-            self.define_required_constant(constant);
-        }
     }
 
     /// Temporarily move ctx/builder_ctx out of self so the FunctionBuilder
@@ -3783,76 +3641,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             let result = cg.compile_expr(builder, &body_owned, &mut env, db);
             builder.ins().return_(&[result]);
-        });
-    }
-
-    /// Generate the body of a body-less top-level constant. The function reads
-    /// the value from the matching `--<name>=value` CLI argument, exits with
-    /// a clear error if the argument is missing, and runs any attached
-    /// refinement predicate before returning.
-    fn define_required_constant(&mut self, constant: &RequiredConstant) {
-        let (func_id, _) = self.global_fns[constant.name.as_str()];
-        let mut sig = self.module.make_signature();
-        sig.params.push(AbiParam::new(self.ptr_type)); // db
-        sig.returns.push(AbiParam::new(self.ptr_type));
-
-        let name_owned = constant.name.clone();
-        let base_type = constant.base_type.clone();
-        let refinement = constant.refinement.clone();
-        let compile_time_val = self.compile_time_overrides.get(&constant.name).cloned();
-
-        self.build_function(func_id, sig, |cg, builder, entry| {
-            let db = builder.block_params(entry)[0];
-
-            // Compile-time override: emit the value directly, skip the lookup.
-            if let Some(val_str) = &compile_time_val {
-                let val = cg.emit_override_literal(builder, val_str, &base_type);
-                if let Some(refine) = &refinement {
-                    let mut env = Env::new();
-                    let pred_fn = cg.compile_expr(builder, &refine.predicate, &mut env, db);
-                    let (name_ptr, name_len) = cg.string_ptr(builder, &name_owned);
-                    let (label_ptr, label_len) = cg.string_ptr(builder, &refine.type_label);
-                    let checked = cg.call_rt(
-                        builder,
-                        "knot_override_refinement_check",
-                        &[db, val, pred_fn, name_ptr, name_len, label_ptr, label_len],
-                    );
-                    builder.ins().return_(&[checked]);
-                } else {
-                    builder.ins().return_(&[val]);
-                }
-                return;
-            }
-
-            // Runtime: look up the required CLI argument (exits if missing).
-            let type_tag: i64 = match base_type.as_str() {
-                "Int" => 0,
-                "Float" => 1,
-                "Text" => 2,
-                "Bool" => 3,
-                _ => unreachable!("base_type must be a primitive scalar"),
-            };
-            let (name_ptr, name_len) = cg.string_ptr(builder, &name_owned);
-            let tag = builder.ins().iconst(types::I32, type_tag);
-            let val = cg.call_rt(
-                builder,
-                "knot_override_required_lookup",
-                &[name_ptr, name_len, tag],
-            );
-
-            if let Some(refine) = &refinement {
-                let mut env = Env::new();
-                let pred_fn = cg.compile_expr(builder, &refine.predicate, &mut env, db);
-                let (label_ptr, label_len) = cg.string_ptr(builder, &refine.type_label);
-                let checked = cg.call_rt(
-                    builder,
-                    "knot_override_refinement_check",
-                    &[db, val, pred_fn, name_ptr, name_len, label_ptr, label_len],
-                );
-                builder.ins().return_(&[checked]);
-            } else {
-                builder.ins().return_(&[val]);
-            }
         });
     }
 
@@ -4499,26 +4287,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             // Check --help for overridable constants (exclude compile-time overrides).
             // Entry format:
-            //   `name:type:!`           — required (no default)
             //   `name:type:=<value>`    — has displayable default (escape `\` and `,`
             //                             as `\\` and `\c` so the entry separator is
             //                             unambiguous; colons inside the value are
             //                             preserved by `splitn(3, ':')` at runtime)
             //   `name:type`             — has default but not displayable
-            let required_names: HashSet<String> = cg
-                .required_constants
-                .iter()
-                .map(|c| c.name.clone())
-                .collect();
             let descriptor = {
                 let mut entries: Vec<String> = cg
                     .overridable_constants
                     .iter()
                     .filter(|(name, _)| !cg.compile_time_overrides.contains_key(*name))
                     .map(|(name, ty)| {
-                        if required_names.contains(name) {
-                            format!("{}:{}:!", name, ty)
-                        } else if let Some(def) = cg.overridable_defaults.get(name) {
+                        if let Some(def) = cg.overridable_defaults.get(name) {
                             let escaped = def.replace('\\', "\\\\").replace(',', "\\c");
                             format!("{}:{}:={}", name, ty, escaped)
                         } else {

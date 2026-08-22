@@ -6,6 +6,7 @@
 -- system). Errors short-circuit through bind.
 with {
 -- Test  basic do-block  chaining with Result
+_  safeDivide
 safeDivide (\x y -> match y == 0
   Bool.True {}  Result.Err {error "division by zero"}
   Bool.False {}  Result.Ok {value (x / y)})

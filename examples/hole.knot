@@ -15,6 +15,7 @@
 with {
 -- A  type-witness function `\(Type  From)`  binds a  type argument,  which the
 --  caller supplies  positionally. `showInto From  x` shows  x at  type From.
+_  showInto
 showInto (\(Type  From) -> \x -> base.show x)
 }
 (do

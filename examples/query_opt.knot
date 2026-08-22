@@ -40,6 +40,7 @@ allEmployees (do
   employees <- *employees
   with {result (do e <- employees; yield e)} yield result)
 
+_  printQuery
 printQuery (\label results -> do
   base.println (label ++ ":")
   r <- results

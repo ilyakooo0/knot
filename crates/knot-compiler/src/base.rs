@@ -30,10 +30,12 @@ pub(crate) const PRELUDE_SPAN_OFFSET: usize = 1 << 40;
 const PRELUDE_SOURCE: &str = r#"
 {
 base {
+_  min
 min (\a b -> match a < b
   Bool.True {}  a
   Bool.False {}  b)
 
+_  max
 max (\a b -> match a > b
   Bool.True {}  a
   Bool.False {}  b)

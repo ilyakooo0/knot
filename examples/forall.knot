@@ -10,10 +10,12 @@ with {
 --  it at  two different  types (Text and Int). An  ordinary `\x ->  x` is
 --  monomorphic once  inferred; only  a `forall`-typed  parameter lets the  callee
 --  choose a  fresh instantiation  at each  call. Returns  a record of  both.
+_  applyTwice
 applyTwice (\(the ((forall a. a -> a)) f) -> {asText (f "text")  asInt (f 42)})
 
 -- A  higher-rank argument where the  passed function  turns anything  into a
 --  singleton list,  used at Int  and Text.
+_  wrapAny
 wrapAny (\(the ((forall a. a -> Rel a)) f) -> {nums (f 7)  words (f "seven")})
 
 }

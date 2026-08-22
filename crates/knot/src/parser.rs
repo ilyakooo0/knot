@@ -46,6 +46,10 @@ pub struct Parser {
     /// same-line application, but the indented arms below are NOT application
     /// arguments.
     scrutinee_no_newline_app: bool,
+    /// Inside a `with { ... }` block's record. Named-function fields there
+    /// require a type signature (`name (\…)` with no sig is rejected); ad-hoc
+    /// record literals (e.g. dictionary payloads like `{compare (\…)}`) do not.
+    in_with_block: bool,
     /// Indentation level of the current block (set by `parse_block`).
     /// Used by `parse_application` to allow multi-line function application
     /// when continuation lines are indented past the block indent.
@@ -119,6 +123,7 @@ impl Parser {
             record_value_sig_type: false,
             in_case_arm_pat: false,
             scrutinee_no_newline_app: false,
+            in_with_block: false,
             block_indent: usize::MAX,
             block_delim: 0,
             delimiter_depth: 0,
@@ -2403,6 +2408,13 @@ impl Parser {
         // the sig-line layout is preserved through the formatter.
         let mut fields: Vec<RecordField> = Vec::new();
         let mut pending_sigs: Vec<(Name, TypeScheme)> = Vec::new();
+        // Whether THIS record is a `with { ... }` block. `parse_with_expr` sets
+        // the flag just before parsing its record; we capture it here and clear
+        // it immediately so nested record-literal field values (e.g. dictionary
+        // payloads `{compare (\…)}`) do NOT inherit the named-function sig
+        // requirement — only the `with` block's own fields require sigs.
+        let is_with_record = self.in_with_block;
+        self.in_with_block = false;
         // Markdown docs from `---` doc comments, accumulated until attached to
         // the immediately-following field. Consecutive doc lines/blocks merge
         // into one block separated by a blank line.
@@ -2722,6 +2734,24 @@ impl Parser {
             };
             let _ = fname_span;
             self.skip_newlines();
+            // A named FUNCTION field requires a type signature: the value may be
+            // a lambda only when a `Type  name` sig precedes it (pending or
+            // attached). `name (\args -> …)` (bare or parenthesized) with no sig
+            // is rejected — write `Type  name` first (`_  name` defers to the
+            // checker). A lambda value is `\…` or `(\…`.
+            let is_lambda_value = self.at(&TokenKind::Backslash)
+                || (self.at(&TokenKind::LParen)
+                    && matches!(self.peek_ahead(1), TokenKind::Backslash));
+            if is_with_record
+                && is_lambda_value
+                && let Some(n) = fname.as_name()
+                && !pending_sigs.iter().any(|(sn, _)| sn == n)
+            {
+                self.error(format!(
+                    "named function `{n}` requires a type signature: write `Type  {n}` (or `_  {n}` to derive the type) before the `{n} (\\…)` value"
+                ));
+                return None;
+            }
             // A bare lambda (`greet \name -> …`) or do-block (`run do …`) field
             // value. Field values normally use `parse_postfix` so a value can't
             // greedily absorb a following field as a function application — but
@@ -2785,18 +2815,14 @@ impl Parser {
             }
         }
 
-        // Leftover sigs name signature-only fields: `name : Type` with no
-        // value. These are required CLI constants — body-less `Fun` decls the
-        // codegen registers as startup `--name=value` lookups. Emit each as a
-        // field with an empty-record placeholder value; the lowering recognises
-        // sig-present + empty-record as "no body" and produces `Fun{body:None}`.
-        for (sname, sty) in pending_sigs {
-            fields.push(RecordField {
-                name: crate::ast::FieldName::Named(sname),
-                value: Spanned::new(ExprKind::Record(Vec::new()), start),
-                sig: Some(sty),
-                doc: None,
-            });
+        // A sig with no value is an error: there are no signature-only /
+        // CLI-constant fields. Every `Type  name` sig must be followed by a
+        // value (on the next line, or inline as `Type  name  value`).
+        if let Some((sname, _sty)) = pending_sigs.first() {
+            self.error(format!(
+                "`{sname}` has a type signature but no value"
+            ));
+            return None;
         }
 
         self.skip_newlines();
@@ -3354,7 +3380,11 @@ impl Parser {
         }
         let result = self.in_context("with expression", |this| {
             this.advance(); // consume `with`
-            let record = this.parse_postfix()?;
+            let saved_with = this.in_with_block;
+            this.in_with_block = true;
+            let record = this.parse_postfix();
+            this.in_with_block = saved_with;
+            let record = record?;
             // Lift type-import markers (`Maybe` in `with {Maybe}`) out of the
             // record into `types`; the remaining value fields form the `with`
             // record. A marker is a field whose value is `Constructor(name)`.

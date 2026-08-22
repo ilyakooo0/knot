@@ -1,9 +1,0 @@
-with {
-Port  Int 1 where \p ->  p > 0 &&  p < 65536
-
-Port  port
-Text  host
-Text  greeting
-}
-(do
-  base.println (greeting ++ " from " ++ host ++ " on port " ++ base.show port))

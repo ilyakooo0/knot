@@ -121,7 +121,7 @@ fn implicit_field_ambiguous_rejected() {
 #[test]
 fn forall_rank2() {
     assert_show(
-        "with {\napplyTwice (\\(the ((forall a. a -> a)) f) -> {asText (f \"text\")  asInt (f 42)})\n}\n(applyTwice (\\y -> y))",
+        "with {\n_  applyTwice\napplyTwice (\\(the ((forall a. a -> a)) f) -> {asText (f \"text\")  asInt (f 42)})\n}\n(applyTwice (\\y -> y))",
         "{asInt 42  asText text}",
     );
 }
@@ -132,25 +132,25 @@ fn type_witness_unit_annotated_and_hole_args() {
     // Beyond a bare head (`Int`), the argument may be unit-annotated (`Float 1`,
     // `(Float 1)`) or a `_` hole.
     assert_show(
-        "with {\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT Float 1 42))",
+        "with {\n_  asT\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT Float 1 42))",
         "42",
     );
     assert_show(
-        "with {\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT (Float 1) 42))",
+        "with {\n_  asT\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT (Float 1) 42))",
         "42",
     );
     assert_show(
-        "with {\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT _ 42))",
+        "with {\n_  asT\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT _ 42))",
         "42",
     );
     // A parenthesized parameterized/nested type argument also works: the inner
     // type-head spans are erased with the type.
     assert_show(
-        "with {\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT (Maybe Int) (Maybe.Just {value 3})))",
+        "with {\n_  asT\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT (Maybe Int) (Maybe.Just {value 3})))",
         "Just {value 3}",
     );
     assert_show(
-        "with {\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT (Maybe (Int 1)) (Maybe.Just {value 3})))",
+        "with {\n_  asT\nasT ((\\(Type  T)  x -> x))\n}\n(base.show (asT (Maybe (Int 1)) (Maybe.Just {value 3})))",
         "Just {value 3}",
     );
 }
@@ -160,7 +160,7 @@ fn lambda_param_type_prefix() {
     // `\(T  x)` — a type-prefix param annotation (gap-separated), the
     // pattern-position analogue of the `Type  name` signature form.
     assert_show(
-        "with {\naddOne (\\(Int 1  x) -> x + 1)\n}\n(base.show (addOne 41))",
+        "with {\n_  addOne\naddOne (\\(Int 1  x) -> x + 1)\n}\n(base.show (addOne 41))",
         "42",
     );
 }
@@ -169,7 +169,7 @@ fn lambda_param_type_prefix() {
 fn lambda_param_type_prefix_forall() {
     // The prefix form also carries a `forall` type.
     assert_show(
-        "with {\napplyTwice (\\((forall a. a -> a)  f) -> {asText (f \"text\")  asInt (f 42)})\n}\n(base.show (applyTwice (\\y -> y)))",
+        "with {\n_  applyTwice\napplyTwice (\\((forall a. a -> a)  f) -> {asText (f \"text\")  asInt (f 42)})\n}\n(base.show (applyTwice (\\y -> y)))",
         "{asInt 42  asText text}",
     );
 }

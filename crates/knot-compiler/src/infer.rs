@@ -6355,30 +6355,12 @@ impl Infer {
                 }
                 // Field type for a single field, honouring its sig if present.
                 let mut field_ty = |f: &ast::RecordField| {
-                    // A signature-only field (`name : Type`, no `=`) is a
-                    // required CLI constant: the parser gave it an
-                    // empty-record placeholder value that must NOT be
-                    // checked against the sig (it would fail). Take the
-                    // sig type as the field type and skip the value.
-                    let is_required_const = f.sig.is_some()
-                        && matches!(&f.value.node, ast::ExprKind::Record(fs) if fs.is_empty());
-                    if is_required_const {
-                        let sig = f.sig.as_ref().unwrap();
-                        let saved_flag = self.in_type_annotation;
-                        let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);
-                        self.in_type_annotation = true;
-                        let sig_ty = self.ast_type_to_ty(&sig.ty);
-                        self.in_type_annotation = saved_flag;
-                        self.annotation_unit_vars = saved_unit_vars;
-                        return sig_ty;
-                    }
                     let val_ty = self.infer_expr(&f.value);
-                    // A field with a standalone sig line (`name : Type`)
-                    // must have a value whose type matches the sig —
-                    // enforced exactly like an inline `(expr : Type)`
-                    // ascription: lowercase unit names are polymorphic unit
-                    // variables, then the value type is unified against the
-                    // sig type at the value's span.
+                    // A field with a sig (`Type  name`) must have a value whose
+                    // type matches the sig — enforced exactly like an inline
+                    // `(expr : Type)` ascription: lowercase unit names are
+                    // polymorphic unit variables, then the value type is unified
+                    // against the sig type at the value's span.
                     if let Some(sig) = &f.sig {
                         let saved_flag = self.in_type_annotation;
                         let saved_unit_vars = std::mem::take(&mut self.annotation_unit_vars);

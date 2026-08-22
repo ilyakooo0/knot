@@ -34,6 +34,18 @@ pub struct Parser {
     /// type-variable argument. (Contrast record TYPES, where the next field is
     /// `Lower :` and the existing `next_starts_decl` guard already stops.)
     record_value_sig_type: bool,
+    /// Inside a `match` arm's pattern. Suppresses the `Type  name` annotation
+    /// speculation (`parse_pat_inner`) so that a record pattern followed by a
+    /// gap and a bare-var body — `match r` / `{name n}  n` — reads as
+    /// record-pattern + body, not as an annotated pattern `(_ : {name n})`
+    /// bound to `n`. A `match` arm pattern is never a type annotation.
+    in_case_arm_pat: bool,
+    /// Suppress the cross-newline application continuation. Set while parsing a
+    /// `match` scrutinee, which is a complete single-line expression ending at
+    /// the newline before the arms block — `match base.show x` keeps its
+    /// same-line application, but the indented arms below are NOT application
+    /// arguments.
+    scrutinee_no_newline_app: bool,
     /// Indentation level of the current block (set by `parse_block`).
     /// Used by `parse_application` to allow multi-line function application
     /// when continuation lines are indented past the block indent.
@@ -105,6 +117,8 @@ impl Parser {
             stop_type_app_at_route_entry: false,
             stop_type_at_migrate_clauses: false,
             record_value_sig_type: false,
+            in_case_arm_pat: false,
+            scrutinee_no_newline_app: false,
             block_indent: usize::MAX,
             block_delim: 0,
             delimiter_depth: 0,
@@ -638,8 +652,7 @@ impl Parser {
             }
             TokenKind::Where
             | TokenKind::Do
-            | TokenKind::Case
-            | TokenKind::Of
+            | TokenKind::Match
             | TokenKind::Not
             | TokenKind::Full
             | TokenKind::Atomic
@@ -788,10 +801,6 @@ impl Parser {
                     TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace | TokenKind::Comma
                 )
             {
-                break;
-            }
-            // Keywords that cannot start a new block item terminate the block.
-            if matches!(self.peek(), TokenKind::Of) {
                 break;
             }
             // Peek past newlines to check if the next item is still in
@@ -1405,7 +1414,7 @@ impl Parser {
         }
         match self.peek() {
             TokenKind::Backslash => self.parse_lambda(),
-            TokenKind::Case => self.parse_case(),
+            TokenKind::Match => self.parse_case(),
             TokenKind::Do => self.parse_do_expr(),
             TokenKind::Serve => self.parse_serve_expr(),
             TokenKind::StarIdent(_) => {
@@ -1671,7 +1680,7 @@ impl Parser {
             }
             let rhs = if matches!(
                 self.peek(),
-                TokenKind::Case
+                TokenKind::Match
                     | TokenKind::Do
                     | TokenKind::Backslash
                     | TokenKind::Atomic
@@ -1813,7 +1822,8 @@ impl Parser {
             // instead of O(n²).
             let saved = self.save();
             self.skip_newlines();
-            if self.pos != saved.0
+            if !self.scrutinee_no_newline_app
+                && self.pos != saved.0
                 && !self.at_eof()
                 && self.can_start_atom()
                 && self.cur_column() > self.block_indent
@@ -3138,16 +3148,18 @@ impl Parser {
         if !self.enter_recursion_cost(DELIMITER_RECURSION_COST) {
             return None;
         }
-        let result = self.in_context("case expression", |this| {
-            this.advance(); // consume `case`
+        let result = self.in_context("match expression", |this| {
+            this.advance(); // consume `match`
 
-            let scrutinee = this.parse_expr()?;
+            // The scrutinee is a complete single-line expression: it keeps its
+            // same-line application (`match base.show x`) but must NOT continue
+            // across the newline into the indented arms block.
+            let saved_scrut = this.scrutinee_no_newline_app;
+            this.scrutinee_no_newline_app = true;
+            let scrutinee = this.parse_expr();
+            this.scrutinee_no_newline_app = saved_scrut;
+            let scrutinee = scrutinee?;
             this.skip_newlines();
-            this.expect(
-                &TokenKind::Of,
-                "expected 'of' after scrutinee in 'case' expression",
-            )
-            .ok()?;
 
             let arms = this.parse_block(|p| p.parse_case_arm());
 
@@ -3169,9 +3181,24 @@ impl Parser {
         if self.at_eof() {
             return None;
         }
-        let pat = self.parse_pat()?;
-        self.expect(&TokenKind::Arrow, "expected '->' after pattern in case arm")
-            .ok()?;
+        // Parse the arm pattern with annotation speculation suppressed, so a
+        // record pattern + gap + bare-var body (`{name n}  n`) reads as
+        // record-pattern + body, not a `Type  name` annotated pattern.
+        let saved_case_arm = self.in_case_arm_pat;
+        self.in_case_arm_pat = true;
+        let pat = self.parse_pat();
+        self.in_case_arm_pat = saved_case_arm;
+        let pat = pat?;
+        // Arm separator is a GAP, not `->`: either a newline (the body starts on
+        // The pattern ends at the gap; the body is the expression that follows.
+        if matches!(self.peek(), TokenKind::Newline) {
+            // Newline-separated: the line break is the gap. Consume it and any
+            // further blank lines so the body parses from its own line.
+            self.skip_newlines();
+        } else if !self.gap_before_current() {
+            self.error("expected a gap (2+ spaces) between the pattern and the body in a case arm: `{Pat  body}`");
+            return None;
+        }
         let scope_mark = self.bound_vars.len();
         self.push_pat_vars(&pat);
         let body = self.parse_expr();
@@ -3520,14 +3547,16 @@ impl Parser {
         // gap + lowercase name follow; otherwise it backtracks to a normal
         // pattern. This is the pattern-position analogue of the `Type  name`
         // signature form.
-        if matches!(
-            self.peek(),
-            TokenKind::Upper(_)
-                | TokenKind::LBrace
-                | TokenKind::LParen
-                | TokenKind::Forall
-                | TokenKind::Underscore
-        ) {
+        if !self.in_case_arm_pat
+            && matches!(
+                self.peek(),
+                TokenKind::Upper(_)
+                    | TokenKind::LBrace
+                    | TokenKind::LParen
+                    | TokenKind::Forall
+                    | TokenKind::Underscore
+            )
+        {
             let saved = self.save();
             let diag_len = self.diagnostics.len();
             let saved_flag = self.record_value_sig_type;
@@ -3601,7 +3630,7 @@ impl Parser {
                     let TokenKind::Upper(ctor) = ctor_tok.kind else {
                         unreachable!()
                     };
-                    let payload = if self.can_start_pat_atom() {
+                    let payload = if self.can_start_pat_atom() && !self.gap_before_current() {
                         self.parse_pat_atom()?
                     } else {
                         Spanned::new(PatKind::Record(vec![]), ctor_tok.span)
@@ -3672,8 +3701,11 @@ impl Parser {
                     ));
                 }
                 // Constructor pattern: Upper payload
-                // Payload can be a record pattern `{...}` or a variable.
-                let payload = if self.can_start_pat_atom() {
+                // Payload can be a record pattern `{...}` or a variable. The
+                // payload must follow WITHOUT a gap (a single space) — a gap is
+                // the match-arm separator, so `Maybe.Nothing  0` is the nullary
+                // pattern `Maybe.Nothing` with body `0`, not a payload `0`.
+                let payload = if self.can_start_pat_atom() && !self.gap_before_current() {
                     self.parse_pat_atom()?
                 } else {
                     // No payload — use empty record pattern.

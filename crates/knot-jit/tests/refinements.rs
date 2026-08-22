@@ -11,7 +11,7 @@ use harness::assert_show;
 #[test]
 fn refine_accepts_valid() {
     assert_show(
-        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (case refine (the (Int 1) 5) of\n            Result.Ok {value n} -> n\n            Result.Err {error _} -> (0 - 1))",
+        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (match refine (the (Int 1) 5)\n            Result.Ok {value n}  n\n            Result.Err {error _}  (0 - 1))",
         "5",
     );
 }
@@ -19,7 +19,7 @@ fn refine_accepts_valid() {
 #[test]
 fn refine_rejects_invalid() {
     assert_show(
-        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (case refine (the (Int 1) (0 - 3)) of\n            Result.Ok {value n} -> 1\n            Result.Err {error _} -> 0)",
+        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (match refine (the (Int 1) (0 - 3))\n            Result.Ok {value n}  1\n            Result.Err {error _}  0)",
         "0",
     );
 }
@@ -37,9 +37,9 @@ VP  {age (Int 1 where \x -> x >= 0 && x <= 150)}
 {age (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} VP  asVP
 asVP (\r -> refine r)
 }
-(case asVP {age 30} of
-  Result.Ok {value _} -> base.println "ok"
-  Result.Err {error _} -> base.println "bad")"#,
+(match asVP {age 30}
+  Result.Ok {value _}  base.println "ok"
+  Result.Err {error _}  base.println "bad")"#,
         "\"ok\"\n{}",
     );
     assert_stdout(
@@ -49,9 +49,9 @@ VP  {age (Int 1 where \x -> x >= 0 && x <= 150)}
 {age (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} VP  asVP
 asVP (\r -> refine r)
 }
-(case asVP {age 200} of
-  Result.Ok {value _} -> base.println "ok"
-  Result.Err {error _} -> base.println "bad")"#,
+(match asVP {age 200}
+  Result.Ok {value _}  base.println "ok"
+  Result.Err {error _}  base.println "bad")"#,
         "\"bad\"\n{}",
     );
 }
@@ -67,12 +67,12 @@ R  {lo (Int 1)  hi (Int 1)} where \r ->  r.lo <=  r.hi
 asR (\r -> refine r)
 }
 (do
-  (case asR {lo 5  hi 2} of
-    Result.Ok {value _} -> base.println "ok"
-    Result.Err {error _} -> base.println "bad")
-  (case asR {lo 1  hi 9} of
-    Result.Ok {value _} -> base.println "ok"
-    Result.Err {error _} -> base.println "bad")
+  (match asR {lo 5  hi 2}
+    Result.Ok {value _}  base.println "ok"
+    Result.Err {error _}  base.println "bad")
+  (match asR {lo 1  hi 9}
+    Result.Ok {value _}  base.println "ok"
+    Result.Err {error _}  base.println "bad")
   yield {})"#,
         "\"bad\"\n\"ok\"\n{}",
     );

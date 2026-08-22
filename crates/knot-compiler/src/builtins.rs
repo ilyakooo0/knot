@@ -50,7 +50,7 @@ pub const PURE_BUILTINS: &[&str] = &[
     "union",
     "count",
     "filter",
-    "match",
+    "filterCtor",
     "map",
     "fold",
     "single",

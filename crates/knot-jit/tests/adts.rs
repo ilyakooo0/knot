@@ -1,4 +1,4 @@
-//! ADTs, case-expressions, Maybe/Result, and base.match.
+//! ADTs, match-expressions, Maybe/Result, and base.match.
 
 mod harness;
 use harness::{assert_compile_err, assert_show, assert_show_set};
@@ -14,7 +14,7 @@ fn adt_construction_and_show() {
 #[test]
 fn case_on_maybe() {
     assert_show(
-        "(case Maybe.Just {value 5} of\n  Maybe.Just {value v} -> v\n  Maybe.Nothing {} -> 0)",
+        "(match Maybe.Just {value 5}\n  Maybe.Just {value v}  v\n  Maybe.Nothing {}  0)",
         "5",
     );
 }
@@ -22,7 +22,7 @@ fn case_on_maybe() {
 #[test]
 fn case_on_nothing() {
     assert_show(
-        "(case Maybe.Nothing {} of\n  Maybe.Just {value v} -> v\n  Maybe.Nothing {} -> 0)",
+        "(match Maybe.Nothing {}\n  Maybe.Just {value v}  v\n  Maybe.Nothing {}  0)",
         "0",
     );
 }
@@ -30,7 +30,7 @@ fn case_on_nothing() {
 #[test]
 fn case_bool() {
     assert_show(
-        "(case (3 > 2) of\n  Bool.True {} -> \"yes\"\n  Bool.False {} -> \"no\")",
+        "(match (3 > 2)\n  Bool.True {}  \"yes\"\n  Bool.False {}  \"no\")",
         "yes",
     );
 }
@@ -54,7 +54,7 @@ fn custom_adt_payload() {
 #[test]
 fn case_on_custom_adt() {
     assert_show(
-        "with {\nShape  Circle {radius (Int 1)}  Rect {w (Int 1)  h (Int 1)}\n}\n(case Shape.Rect {w 3  h 4} of\n  Shape.Circle {radius r} -> r * r\n  Shape.Rect {w ww  h hh} -> ww * hh)",
+        "with {\nShape  Circle {radius (Int 1)}  Rect {w (Int 1)  h (Int 1)}\n}\n(match Shape.Rect {w 3  h 4}\n  Shape.Circle {radius r}  r * r\n  Shape.Rect {w ww  h hh}  ww * hh)",
         "12",
     );
 }
@@ -62,7 +62,7 @@ fn case_on_custom_adt() {
 #[test]
 fn case_non_exhaustive_rejected() {
     assert_compile_err(
-        "(case Maybe.Just {value 5} of\n  Maybe.Just {value v} -> v)",
+        "(match Maybe.Just {value 5}\n  Maybe.Just {value v}  v)",
         "",
     );
 }
@@ -83,19 +83,19 @@ fn adt_in_relation() {
 
 #[test]
 fn match_filters_constructor() {
-    // base.match keeps only rows of the given constructor, returning payloads.
+    // base.filterCtor keeps only rows of the given constructor, returning payloads.
     assert_show_set(
         "with {\nEvt  Click {x (Int 1)}  Key {code (Int 1)}\n}\n\
-         (base.match Evt.Click [(Evt.Click {x 1})  (Evt.Key {code 9})  (Evt.Click {x 2})])",
+         (base.filterCtor Evt.Click [(Evt.Click {x 1})  (Evt.Key {code 9})  (Evt.Click {x 2})])",
         &["{x 1}", "{x 2}"],
     );
 }
 
 #[test]
 fn maybe_map_via_case() {
-    // Maybe map, written structurally with case.
+    // Maybe map, written structurally with match.
     assert_show(
-        "(case Maybe.Just {value 3} of\n  Maybe.Just {value v} -> Maybe.Just {value (v * 2)}\n  Maybe.Nothing {} -> Maybe.Nothing {})",
+        "(match Maybe.Just {value 3}\n  Maybe.Just {value v}  Maybe.Just {value (v * 2)}\n  Maybe.Nothing {}  Maybe.Nothing {})",
         "Just {value 6}",
     );
 }
@@ -103,7 +103,7 @@ fn maybe_map_via_case() {
 #[test]
 fn result_error_prop() {
     assert_show(
-        "(case Result.Err {error \"nope\"} of\n  Result.Ok {value v} -> base.show v\n  Result.Err {error e} -> \"err: \" ++ e)",
+        "(match Result.Err {error \"nope\"}\n  Result.Ok {value v}  base.show v\n  Result.Err {error e}  \"err: \" ++ e)",
         "err: nope",
     );
 }

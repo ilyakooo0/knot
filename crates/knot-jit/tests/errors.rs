@@ -11,12 +11,12 @@ fn result_do_block_all_ok() {
         "with {
 Int 1 -> Result Text (Int 1)  f
                f (\\x -> Result.Ok {value (x + 1)}) }
-         (case (do
+         (match (do
             a <- f 1
             b <- f a
-            yield b) of
-            Result.Ok {value v} -> v
-            Result.Err {error _} -> (0 - 1))",
+            yield b)
+            Result.Ok {value v}  v
+            Result.Err {error _}  (0 - 1))",
         "3",
     );
 }
@@ -27,15 +27,15 @@ fn result_do_block_short_circuits_on_err() {
     assert_show(
         "with {
 Int 1 -> Result Text (Int 1)  f
-               f (\\x -> case x == 0 of
-                          Bool.True {} -> Result.Err {error \"stop\"}
-                          Bool.False {} -> Result.Ok {value x}) }
-         (case (do
+               f (\\x -> match x == 0
+                          Bool.True {}  Result.Err {error \"stop\"}
+                          Bool.False {}  Result.Ok {value x}) }
+         (match (do
             a <- f 0
             b <- f a
-            yield b) of
-            Result.Ok {value v} -> v
-            Result.Err {error _} -> 99)",
+            yield b)
+            Result.Ok {value v}  v
+            Result.Err {error _}  99)",
         "99",
     );
 }
@@ -45,15 +45,15 @@ fn maybe_bind_short_circuits_on_nothing() {
     assert_show(
         "with {
 Int 1 -> Maybe (Int 1)  f
-               f (\\x -> case x == 0 of
-                          Bool.True {} -> Maybe.Nothing {}
-                          Bool.False {} -> Maybe.Just {value x}) }
-         (case (do
+               f (\\x -> match x == 0
+                          Bool.True {}  Maybe.Nothing {}
+                          Bool.False {}  Maybe.Just {value x}) }
+         (match (do
             a <- f 0
             b <- f a
-            yield b) of
-            Maybe.Just {value v} -> v
-            Maybe.Nothing {} -> 7)",
+            yield b)
+            Maybe.Just {value v}  v
+            Maybe.Nothing {}  7)",
         "7",
     );
 }

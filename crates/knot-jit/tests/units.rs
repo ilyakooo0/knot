@@ -72,7 +72,7 @@ fn unit_polymorphic_function() {
 #[test]
 fn refine_valid_value() {
     assert_prog(
-        "with {\nNat  Int 1 where \\x ->  x >= 0\n}\n(case refine (the (Int 1) 5) of\n  Result.Ok {value n} -> n\n  Result.Err {error e} -> (0 - 1))",
+        "with {\nNat  Int 1 where \\x ->  x >= 0\n}\n(match refine (the (Int 1) 5)\n  Result.Ok {value n}  n\n  Result.Err {error e}  (0 - 1))",
         "5",
     );
 }
@@ -80,7 +80,7 @@ fn refine_valid_value() {
 #[test]
 fn refine_invalid_value() {
     assert_prog(
-        "with {\nNat  Int 1 where \\x ->  x >= 0\n}\n(case refine (the (Int 1) (0 - 5)) of\n  Result.Ok {value n} -> n\n  Result.Err {error e} -> (0 - 1))",
+        "with {\nNat  Int 1 where \\x ->  x >= 0\n}\n(match refine (the (Int 1) (0 - 5))\n  Result.Ok {value n}  n\n  Result.Err {error e}  (0 - 1))",
         "-1",
     );
 }
@@ -89,7 +89,7 @@ fn refine_invalid_value() {
 fn refined_subtype_of_base() {
     // A refined value is usable where its base type is expected.
     assert_prog(
-        "with {\nNat  Int 1 where \\x ->  x >= 0\n}\n(case refine (the (Int 1) 5) of\n  Result.Ok {value n} -> n + 10\n  Result.Err {error e} -> 0)",
+        "with {\nNat  Int 1 where \\x ->  x >= 0\n}\n(match refine (the (Int 1) 5)\n  Result.Ok {value n}  n + 10\n  Result.Err {error e}  0)",
         "15",
     );
 }
@@ -97,7 +97,7 @@ fn refined_subtype_of_base() {
 #[test]
 fn strip_refined() {
     assert_prog(
-        "with {\nNat  Int 1 where \\x ->  x >= 0\n}\n(case refine (the (Int 1) 7) of\n  Result.Ok {value n} -> base.strip n\n  Result.Err {error e} -> 0)",
+        "with {\nNat  Int 1 where \\x ->  x >= 0\n}\n(match refine (the (Int 1) 7)\n  Result.Ok {value n}  base.strip n\n  Result.Err {error e}  0)",
         "7",
     );
 }

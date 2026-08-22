@@ -1,12 +1,12 @@
 -- Pattern-matching on relations with `[]` and `Cons head tail`.
 with {
-sumList (\xs -> case xs of
-  [] -> 0
-  Cons h t -> h + sumList t)
+sumList (\xs -> match xs
+  []  0
+  Cons h t  h + sumList t)
 
-firstOr (\xs default -> case xs of
-  [] -> default
-  Cons h _ -> h)
+firstOr (\xs default -> match xs
+  []  default
+  Cons h _  h)
 }
 (do
   base.println (base.show (sumList [1  2  3  4]))

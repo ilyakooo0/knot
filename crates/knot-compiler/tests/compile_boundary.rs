@@ -187,7 +187,7 @@ fn adt_contravariant_host_wider_rejected() {
     // Host may pass {Low, High, Medium}; the snippet matches only {Low, High}.
     assert_eq!(
         subsumes(
-            "with {\nPriority  Low {}  High {}\n}\n(\\p -> case p of\n  Priority.Low {} -> \"l\"\n  Priority.High {} -> \"h\")",
+            "with {\nPriority  Low {}  High {}\n}\n(\\p -> match p\n  Priority.Low {}  \"l\"\n  Priority.High {}  \"h\")",
             "Priority  Low {}  High {}  Medium {}\nPriority -> Text"
         ),
         Some(false)
@@ -199,7 +199,7 @@ fn adt_contravariant_snippet_wider_accepted() {
     // Snippet matches {Low, High, Medium}; the host passes only {Low, High}.
     assert_eq!(
         subsumes(
-            "with {\nPriority  Low {}  High {}  Medium {}\n}\n(\\p -> case p of\n  Priority.Low {} -> \"l\"\n  Priority.High {} -> \"h\"\n  Priority.Medium {} -> \"m\")",
+            "with {\nPriority  Low {}  High {}  Medium {}\n}\n(\\p -> match p\n  Priority.Low {}  \"l\"\n  Priority.High {}  \"h\"\n  Priority.Medium {}  \"m\")",
             "Priority  Low {}  High {}\nPriority -> Text"
         ),
         Some(true)
@@ -210,7 +210,7 @@ fn adt_contravariant_snippet_wider_accepted() {
 fn adt_contravariant_identical_accepted() {
     assert_eq!(
         subsumes(
-            "with {\nPriority  Low {}  High {}\n}\n(\\p -> case p of\n  Priority.Low {} -> \"l\"\n  Priority.High {} -> \"h\")",
+            "with {\nPriority  Low {}  High {}\n}\n(\\p -> match p\n  Priority.Low {}  \"l\"\n  Priority.High {}  \"h\")",
             "Priority  Low {}  High {}\nPriority -> Text"
         ),
         Some(true)
@@ -273,7 +273,7 @@ fn adt_inside_relation_wider_rejected() {
 fn adt_invariant_identical_accepted() {
     assert_eq!(
         subsumes(
-            "with {\nPriority  Low {}  High {}\n}\n(\\p -> case p of\n  Priority.Low {} -> (Priority.Low {})\n  Priority.High {} -> (Priority.High {}))",
+            "with {\nPriority  Low {}  High {}\n}\n(\\p -> match p\n  Priority.Low {}  (Priority.Low {})\n  Priority.High {}  (Priority.High {}))",
             "Priority  Low {}  High {}\nPriority -> Priority"
         ),
         Some(true)
@@ -284,7 +284,7 @@ fn adt_invariant_identical_accepted() {
 fn adt_invariant_narrower_rejected() {
     assert_eq!(
         subsumes(
-            "with {\nPriority  Low {}\n}\n(\\p -> case p of\n  Priority.Low {} -> (Priority.Low {}))",
+            "with {\nPriority  Low {}\n}\n(\\p -> match p\n  Priority.Low {}  (Priority.Low {}))",
             "Priority  Low {}  High {}\nPriority -> Priority"
         ),
         Some(false)

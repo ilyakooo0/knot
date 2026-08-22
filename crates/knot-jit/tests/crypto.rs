@@ -14,13 +14,13 @@ fn encrypt_decrypt_roundtrip() {
   keys <- base.generateKeyPair
   with {  msg (base.textToBytes "secret") } (do
     enc <- base.encrypt keys.publicKey msg
-    case enc of
-      Maybe.Nothing {} -> base.println "ENCRYPT-FAILED"
-      Maybe.Just {value ct} -> case base.decrypt keys.privateKey ct of
-        Maybe.Nothing {} -> base.println "DECRYPT-FAILED"
-        Maybe.Just {value pt} -> case base.bytesToText pt of
-          Maybe.Just {value t} -> base.println t
-          Maybe.Nothing {} -> base.println "BAD-UTF8"
+    match enc
+      Maybe.Nothing {}  base.println "ENCRYPT-FAILED"
+      Maybe.Just {value ct}  match base.decrypt keys.privateKey ct
+        Maybe.Nothing {}  base.println "DECRYPT-FAILED"
+        Maybe.Just {value pt}  match base.bytesToText pt
+          Maybe.Just {value t}  base.println t
+          Maybe.Nothing {}  base.println "BAD-UTF8"
     yield {}))"#,
         "\"secret\"\n{}",
     );
@@ -33,13 +33,13 @@ fn decrypt_rejects_tampered_ciphertext() {
         r#"(do
   keys <- base.generateKeyPair
   enc <- base.encrypt keys.publicKey (base.textToBytes "data")
-  case enc of
-    Maybe.Nothing {} -> base.println "ENCRYPT-FAILED"
-    Maybe.Just {value ct} ->
+  match enc
+    Maybe.Nothing {}  base.println "ENCRYPT-FAILED"
+    Maybe.Just {value ct}
       with {  tampered (base.bytesConcat (base.bytesSlice 0 40 ct) (base.textToBytes "XXXX")) } (do
-        case base.decrypt keys.privateKey tampered of
-          Maybe.Nothing {} -> base.println "rejected"
-          Maybe.Just {value _} -> base.println "BUG-DECRYPTED"
+        match base.decrypt keys.privateKey tampered
+          Maybe.Nothing {}  base.println "rejected"
+          Maybe.Just {value _}  base.println "BUG-DECRYPTED"
         yield {})
   yield {})"#,
         "\"rejected\"\n{}",
@@ -54,11 +54,11 @@ fn decrypt_with_wrong_key_fails() {
   alice <- base.generateKeyPair
   bob <- base.generateKeyPair
   enc <- base.encrypt alice.publicKey (base.textToBytes "for alice")
-  case enc of
-    Maybe.Nothing {} -> base.println "ENCRYPT-FAILED"
-    Maybe.Just {value ct} -> case base.decrypt bob.privateKey ct of
-      Maybe.Nothing {} -> base.println "rejected"
-      Maybe.Just {value _} -> base.println "BUG-WRONGKEY"
+  match enc
+    Maybe.Nothing {}  base.println "ENCRYPT-FAILED"
+    Maybe.Just {value ct}  match base.decrypt bob.privateKey ct
+      Maybe.Nothing {}  base.println "rejected"
+      Maybe.Just {value _}  base.println "BUG-WRONGKEY"
   yield {})"#,
         "\"rejected\"\n{}",
     );
@@ -71,9 +71,9 @@ fn sign_verify_roundtrip() {
         r#"(do
   keys <- base.generateSigningKeyPair
   with {  msg (base.textToBytes "message") } (do
-    case base.sign keys.privateKey msg of
-      Maybe.Nothing {} -> base.println "SIGN-FAILED"
-      Maybe.Just {value sig} ->
+    match base.sign keys.privateKey msg
+      Maybe.Nothing {}  base.println "SIGN-FAILED"
+      Maybe.Just {value sig}
         with {  ok (base.verify keys.publicKey msg sig) } (do
           base.println (base.show ok)
           yield {})
@@ -88,9 +88,9 @@ fn verify_rejects_wrong_message() {
         "crypto_verifybad",
         r#"(do
   keys <- base.generateSigningKeyPair
-  case base.sign keys.privateKey (base.textToBytes "original") of
-    Maybe.Nothing {} -> base.println "SIGN-FAILED"
-    Maybe.Just {value sig} ->
+  match base.sign keys.privateKey (base.textToBytes "original")
+    Maybe.Nothing {}  base.println "SIGN-FAILED"
+    Maybe.Just {value sig}
       with {  bad (base.verify keys.publicKey (base.textToBytes "forged") sig) } (do
         base.println (base.show bad)
         yield {})

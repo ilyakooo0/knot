@@ -1,5 +1,5 @@
 //! Numeric and Text utility builtins: abs, floor, clamp, intMin/intMax,
-//! intToFloat, textToInt/textToFloat, the ASCII trim/case family, distinct,
+//! intToFloat, textToInt/textToFloat, the ASCII trim/match family, distinct,
 //! sortByDesc, upsertBy, single, elem, unify, strip/dress, not, id, countWhere.
 //!
 //! Pure value layer — runs in the JIT harness.
@@ -58,7 +58,7 @@ fn text_to_float() {
     assert_show("base.textToFloat \"nope\"", "Nothing");
 }
 
-// ── ASCII trim / case ──────────────────────────────────────────────────────
+// ── ASCII trim / match ──────────────────────────────────────────────────────
 
 #[test]
 fn trim_ascii_variants() {
@@ -156,5 +156,5 @@ fn int_literal_int_float_polymorphism() {
 #[test]
 fn not_and_id() {
     assert_show("base.id 5", "5");
-    // not is a reserved keyword; Bool negation is via !=/case. base.id only here.
+    // not is a reserved keyword; Bool negation is via !=/match. base.id only here.
 }

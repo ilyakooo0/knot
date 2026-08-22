@@ -114,7 +114,7 @@ fn bool_logic() {
     assert_show("(3 < 2) || (1 > 0)", "True");
     // `not` is a reserved keyword and `base.not` is rejected too ("keyword
     // cannot be used as a variable name") — Boolean negation is the `!=`
-    // operator / a `case` on Bool, not a callable builtin. Not asserted here.
+    // operator / a `match` on Bool, not a callable builtin. Not asserted here.
 }
 
 // ── Bytes ────────────────────────────────────────────────────────────────
@@ -162,9 +162,9 @@ fn bytes_concat_slice() {
 #[test]
 fn bytes_invalid_utf8() {
     // 0xff is never valid UTF-8. bytesFromHex gives Maybe Bytes, so unwrap via
-    // a case before decoding to Text.
+    // a match before decoding to Text.
     assert_show(
-        "(case base.bytesFromHex \"ff\" of\n  Maybe.Just {value b} -> base.bytesToText b\n  Maybe.Nothing {} -> Maybe.Just {value \"unexpected\"})",
+        "(match base.bytesFromHex \"ff\"\n  Maybe.Just {value b}  base.bytesToText b\n  Maybe.Nothing {}  Maybe.Just {value \"unexpected\"})",
         "Nothing",
     );
 }

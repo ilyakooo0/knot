@@ -96,9 +96,9 @@ fn traverse_io() {
 fn compile_result_ok() {
     assert_stdout(
         "compile_ok",
-        r#"(case (the (Result Text (Int 1)) (base.compile "40 + 2")) of
-  Result.Ok {value v} -> base.println ("ok: " ++ base.show v)
-  Result.Err {error e} -> base.println ("err: " ++ e))"#,
+        r#"(match (the (Result Text (Int 1)) (base.compile "40 + 2"))
+  Result.Ok {value v}  base.println ("ok: " ++ base.show v)
+  Result.Err {error e}  base.println ("err: " ++ e))"#,
         "\"ok: 42\"\n{}",
     );
 }
@@ -107,9 +107,9 @@ fn compile_result_ok() {
 fn compile_result_err_on_mismatch() {
     assert_stdout(
         "compile_err",
-        r#"(case (the (Result Text (Int 1)) (base.compile "\"text\"")) of
-  Result.Ok {value v} -> base.println "ok"
-  Result.Err {error e} -> base.println "err")"#,
+        r#"(match (the (Result Text (Int 1)) (base.compile "\"text\""))
+  Result.Ok {value v}  base.println "ok"
+  Result.Err {error e}  base.println "err")"#,
         "\"err\"\n{}",
     );
 }
@@ -118,9 +118,9 @@ fn compile_result_err_on_mismatch() {
 fn compile_err_on_invalid_source() {
     assert_stdout(
         "compile_bad",
-        r#"(case (the (Result Text (Int 1)) (base.compile "1 +")) of
-  Result.Ok {value v} -> base.println "ok"
-  Result.Err {error e} -> base.println "err")"#,
+        r#"(match (the (Result Text (Int 1)) (base.compile "1 +"))
+  Result.Ok {value v}  base.println "ok"
+  Result.Err {error e}  base.println "err")"#,
         "\"err\"\n{}",
     );
 }
@@ -140,11 +140,11 @@ Rel Account  *accounts
   _ <- atomic do
     rows <- *accounts
     *accounts = base.map (\a ->
-      case a.name == "from" of
-        Bool.True {} -> (base.unify a {balance (a.balance - 40)})
-        Bool.False {} -> (case a.name == "to" of
-          Bool.True {} -> (base.unify a {balance (a.balance + 40)})
-          Bool.False {} -> a)) rows
+      match a.name == "from"
+        Bool.True {}  (base.unify a {balance (a.balance - 40)})
+        Bool.False {}  (match a.name == "to"
+          Bool.True {}  (base.unify a {balance (a.balance + 40)})
+          Bool.False {}  a)) rows
     yield {}
   base.println (base.show *accounts)
   yield {})"#,

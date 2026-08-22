@@ -10,9 +10,9 @@ use harness::assert_show;
 fn nested_adt_pattern() {
     assert_show(
         "with { M  J {v (Int 1)}  N {} }
-         (case (M.J {v 5}) of
-            M.J {v n} -> n
-            M.N {} -> 0)",
+         (match (M.J {v 5})
+            M.J {v n}  n
+            M.N {}  0)",
         "5",
     );
 }
@@ -20,10 +20,10 @@ fn nested_adt_pattern() {
 #[test]
 fn literal_pattern_in_case() {
     assert_show(
-        "(case 2 of
-           1 -> \"one\"
-           2 -> \"two\"
-           _ -> \"other\")",
+        "(match 2
+           1  \"one\"
+           2  \"two\"
+           _  \"other\")",
         "two",
     );
 }
@@ -32,7 +32,7 @@ fn literal_pattern_in_case() {
 fn record_pattern_partial() {
     // bind only the fields you need
     assert_show(
-        "(case {name \"a\"  age 30} of\n           {name n} -> n)",
+        "(match {name \"a\"  age 30}\n           {name n}  n)",
         "a",
     );
 }
@@ -40,9 +40,9 @@ fn record_pattern_partial() {
 #[test]
 fn wildcard_binds_nothing() {
     assert_show(
-        "(case (Maybe.Just {value 9}) of
-           Maybe.Just {value _} -> \"some\"
-           Maybe.Nothing {} -> \"none\")",
+        "(match (Maybe.Just {value 9})
+           Maybe.Just {value _}  \"some\"
+           Maybe.Nothing {}  \"none\")",
         "some",
     );
 }
@@ -50,9 +50,9 @@ fn wildcard_binds_nothing() {
 #[test]
 fn bool_case_exhaustive() {
     assert_show(
-        "(case (1 < 2) of
-           Bool.True {} -> \"yes\"
-           Bool.False {} -> \"no\")",
+        "(match (1 < 2)
+           Bool.True {}  \"yes\"
+           Bool.False {}  \"no\")",
         "yes",
     );
 }

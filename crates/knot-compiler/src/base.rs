@@ -30,23 +30,23 @@ pub(crate) const PRELUDE_SPAN_OFFSET: usize = 1 << 40;
 const PRELUDE_SOURCE: &str = r#"
 {
 base {
-min (\a b -> case a < b of
-  Bool.True {} -> a
-  Bool.False {} -> b)
+min (\a b -> match a < b
+  Bool.True {}  a
+  Bool.False {}  b)
 
-max (\a b -> case a > b of
-  Bool.True {} -> a
-  Bool.False {} -> b)
+max (\a b -> match a > b
+  Bool.True {}  a
+  Bool.False {}  b)
 
 Bool -> IO {} -> IO {}  when
-when (\cond action -> case cond of
-  Bool.True {} -> action
-  Bool.False {} -> yield {})
+when (\cond action -> match cond
+  Bool.True {}  action
+  Bool.False {}  yield {})
 
 Bool -> IO {} -> IO {}  unless
-unless (\cond action -> case cond of
-  Bool.True {} -> yield {}
-  Bool.False {} -> action)
+unless (\cond action -> match cond
+  Bool.True {}  yield {}
+  Bool.False {}  action)
 
 -- Structured logging. `log` carries a `(<>logCtx)` fold constraint: at each
 -- callsite the compiler merges every in-scope `logCtx` record (`base.unify`
@@ -190,7 +190,7 @@ pub(crate) const BASE_STDLIB_FNS: &[&str] = &[
     "length",
     "listDir",
     "map",
-    "match",
+    "filterCtor",
     "maxOn",
     "minOn",
     "not",

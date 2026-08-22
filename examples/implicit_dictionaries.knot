@@ -3,28 +3,28 @@
 -- `clamp` needs a `compare` dictionary but doesn't name it. The compiler
 -- resolves the dictionary from lexical scope at each full-arity callsite.
 with {
-intOrd {compare (\a b -> case a > b of
-  Bool.True {} -> 1
-  Bool.False {} -> case a < b of
-    Bool.True {} -> (0 - 1)
-    Bool.False {} -> 0)}
-textOrd {compare (\a b -> case a > b of
-  Bool.True {} -> 1
-  Bool.False {} -> case a < b of
-    Bool.True {} -> (0 - 1)
-    Bool.False {} -> 0)}
-intOrdDesc {compare (\a b -> case a < b of
-  Bool.True {} -> 1
-  Bool.False {} -> case a > b of
-    Bool.True {} -> (0 - 1)
-    Bool.False {} -> 0)}
+intOrd {compare (\a b -> match a > b
+  Bool.True {}  1
+  Bool.False {}  match a < b
+    Bool.True {}  (0 - 1)
+    Bool.False {}  0)}
+textOrd {compare (\a b -> match a > b
+  Bool.True {}  1
+  Bool.False {}  match a < b
+    Bool.True {}  (0 - 1)
+    Bool.False {}  0)}
+intOrdDesc {compare (\a b -> match a < b
+  Bool.True {}  1
+  Bool.False {}  match a > b
+    Bool.True {}  (0 - 1)
+    Bool.False {}  0)}
 
 ((a -> a -> Int 1)  ^compare) =>  a ->  a ->  a ->  a  clamp
-clamp (\lo hi x -> case ((^compare) x lo) < 0 of
-  Bool.True {} -> lo
-  Bool.False {} -> case ((^compare) x hi) > 0 of
-    Bool.True {} -> hi
-    Bool.False {} -> x)
+clamp (\lo hi x -> match ((^compare) x lo) < 0
+  Bool.True {}  lo
+  Bool.False {}  match ((^compare) x hi) > 0
+    Bool.True {}  hi
+    Bool.False {}  x)
 }
 (do
     base.println (base.show (with intOrd (clamp 0 10 42)))

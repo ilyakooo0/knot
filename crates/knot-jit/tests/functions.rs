@@ -63,9 +63,9 @@ fn traverse_maybe_and_result() {
         "traverse_maybe",
         r#"with {
 Int 1 -> Maybe (Int 1)  pos
-pos (\x -> case x > 0 of
-  Bool.True {} -> Maybe.Just {value x}
-  Bool.False {} -> Maybe.Nothing {})
+pos (\x -> match x > 0
+  Bool.True {}  Maybe.Just {value x}
+  Bool.False {}  Maybe.Nothing {})
 }
 (do
   base.println (base.show (base.traverse pos [1  2  3]))
@@ -79,9 +79,9 @@ pos (\x -> case x > 0 of
 
 #[test]
 fn when_unless() {
-    // when/unless are IO-conditional; here we just confirm a case on Bool.
+    // when/unless are IO-conditional; here we just confirm a match on Bool.
     assert_show(
-        "(case (2 > 1) of\n  Bool.True {} -> 1\n  Bool.False {} -> 0)",
+        "(match (2 > 1)\n  Bool.True {}  1\n  Bool.False {}  0)",
         "1",
     );
 }
@@ -89,7 +89,7 @@ fn when_unless() {
 #[test]
 fn case_as_expression() {
     assert_show(
-        "base.length (case (1 == 1) of\n  Bool.True {} -> \"yes\"\n  Bool.False {} -> \"nope\")",
+        "base.length (match (1 == 1)\n  Bool.True {}  \"yes\"\n  Bool.False {}  \"nope\")",
         "3",
     );
 }

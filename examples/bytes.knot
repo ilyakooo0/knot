@@ -9,20 +9,20 @@ with {  raw (base.textToBytes "hello") } (do
     base.println (base.bytesLength encoded)    -- 5
 
     -- Convert bytes -> text — Maybe, returns Nothing on invalid UTF-8
-    case base.bytesToText encoded of
-      Maybe.Just {  value t } -> base.println t   -- world
-      Maybe.Nothing {} -> base.println "<invalid utf-8>"
+    match base.bytesToText encoded
+      Maybe.Just {  value t }  base.println t   -- world
+      Maybe.Nothing {}  base.println "<invalid utf-8>"
 
     -- Hex encoding always succeeds
     with {  hex (base.bytesToHex raw) } (do
       base.println hex                      -- 68656c6c6f
 
       -- Hex decoding is Maybe — returns Nothing on odd-length / non-hex input
-      case base.bytesFromHex hex of
-        Maybe.Just {  value decoded } -> case base.bytesToText decoded of
-          Maybe.Just {  value t } -> base.println t -- hello
-          Maybe.Nothing {} -> base.println "<invalid utf-8>"
-        Maybe.Nothing {} -> base.println "<invalid hex>"
+      match base.bytesFromHex hex
+        Maybe.Just {  value decoded }  match base.bytesToText decoded
+          Maybe.Just {  value t }  base.println t -- hello
+          Maybe.Nothing {}  base.println "<invalid utf-8>"
+        Maybe.Nothing {}  base.println "<invalid hex>"
 
       -- Concatenation
       with {  combined (base.bytesConcat raw encoded) } (do
@@ -30,24 +30,24 @@ with {  raw (base.textToBytes "hello") } (do
 
         -- Slicing
         with {  slice (base.bytesSlice 0 5 combined) } (do
-          case base.bytesToText slice of
-            Maybe.Just {  value t } -> base.println t   -- hello
-            Maybe.Nothing {} -> base.println "<invalid utf-8>"
+          match base.bytesToText slice
+            Maybe.Just {  value t }  base.println t   -- hello
+            Maybe.Nothing {}  base.println "<invalid utf-8>"
 
           -- Byte access is Maybe — Nothing when the index is out of bounds
-          case base.bytesGet 0 raw of
-            Maybe.Just {  value byte } -> base.println byte  -- 104 (ascii 'h')
-            Maybe.Nothing {} -> base.println "<out of bounds>"
+          match base.bytesGet 0 raw
+            Maybe.Just {  value byte }  base.println byte  -- 104 (ascii 'h')
+            Maybe.Nothing {}  base.println "<out of bounds>"
 
-          case base.bytesGet 10 raw of
-            Maybe.Just {  value byte } -> base.println byte
-            Maybe.Nothing {} -> base.println "<out of bounds>"  -- raw has only 5 bytes
+          match base.bytesGet 10 raw
+            Maybe.Just {  value byte }  base.println byte
+            Maybe.Nothing {}  base.println "<out of bounds>"  -- raw has only 5 bytes
 
           -- Bytes literals: a string via textToBytes
           with {  withHex (base.textToBytes "HI") } (do
-            case base.bytesToText withHex of
-              Maybe.Just {  value t } -> base.println t   -- HI
-              Maybe.Nothing {} -> base.println "<invalid utf-8>"
+            match base.bytesToText withHex
+              Maybe.Just {  value t }  base.println t   -- HI
+              Maybe.Nothing {}  base.println "<invalid utf-8>"
 
             -- JSON encoding wraps bytes so they round-trip through parseJson.
             base.println (base.toJson raw)             -- {"__knot_bytes":"aGVsbG8="}

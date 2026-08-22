@@ -11,9 +11,9 @@ complete (\title -> do
   todos <- *todos
   *todos = do
     t <- todos
-    yield (case t.title == title of
-      Bool.True {} -> (base.unify t {done 1})
-      Bool.False {} -> t))
+    yield (match t.title == title
+      Bool.True {}  (base.unify t {done 1})
+      Bool.False {}  t))
 
 pending (\owner ->
   with {todos *todos}

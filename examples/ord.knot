@@ -7,46 +7,46 @@
 with {
 --  compare a  b == 1  when a >  b, -1  when a <  b, 0  when equal.
 intOrd {
-  compare (\a b -> case a > b of
-    Bool.True {} -> 1
-    Bool.False {} -> case a < b of
-      Bool.True {} -> (0 - 1)
-      Bool.False {} -> 0)
-  max     (\a b -> case a > b of
-    Bool.True {} -> a
-    Bool.False {} -> b)
+  compare (\a b -> match a > b
+    Bool.True {}  1
+    Bool.False {}  match a < b
+      Bool.True {}  (0 - 1)
+      Bool.False {}  0)
+  max     (\a b -> match a > b
+    Bool.True {}  a
+    Bool.False {}  b)
 }
 
 textOrd {
-  compare (\a b -> case a > b of
-    Bool.True {} -> 1
-    Bool.False {} -> case a < b of
-      Bool.True {} -> (0 - 1)
-      Bool.False {} -> 0)
-  max     (\a b -> case a > b of
-    Bool.True {} -> a
-    Bool.False {} -> b)
+  compare (\a b -> match a > b
+    Bool.True {}  1
+    Bool.False {}  match a < b
+      Bool.True {}  (0 - 1)
+      Bool.False {}  0)
+  max     (\a b -> match a > b
+    Bool.True {}  a
+    Bool.False {}  b)
 }
 
 -- A  different ordering  for the  same type  descending.
 intOrdDesc {
-  compare (\a b -> case a < b of
-    Bool.True {} -> 1
-    Bool.False {} -> case a > b of
-      Bool.True {} -> (0 - 1)
-      Bool.False {} -> 0)
-  max     (\a b -> case a < b of
-    Bool.True {} -> a
-    Bool.False {} -> b)
+  compare (\a b -> match a < b
+    Bool.True {}  1
+    Bool.False {}  match a > b
+      Bool.True {}  (0 - 1)
+      Bool.False {}  0)
+  max     (\a b -> match a < b
+    Bool.True {}  a
+    Bool.False {}  b)
 }
 
 -- `clamp  lo hi  ord x`  is generic  pass any  type's Ord  dictionary.
 clamp (\lo hi ord x ->
-  case ((ord.compare x lo) == (0 - 1)) of
-    Bool.True {} -> lo
-    Bool.False {} -> case ((ord.compare x hi) == 1) of
-      Bool.True {} -> hi
-      Bool.False {} -> x)
+  match ((ord.compare x lo) == (0 - 1))
+    Bool.True {}  lo
+    Bool.False {}  match ((ord.compare x hi) == 1)
+      Bool.True {}  hi
+      Bool.False {}  x)
 }
 (do
   -- Same function, different types — just different dictionaries.

@@ -11247,11 +11247,11 @@ impl Infer {
             },
         );
 
-        // match : ∀a b. (a -> b) -> [b] -> [a]
+        // filterCtor : ∀a b. (a -> b) -> [b] -> [a]
         let a = self.fresh_var();
         let b = self.fresh_var();
         self.bind_top(
-            "match",
+            "filterCtor",
             Scheme::poly(
                 vec![a, b],
                 Ty::Fun(

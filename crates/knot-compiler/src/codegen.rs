@@ -2586,7 +2586,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             "map",
             "fold",
             "forEach",
-            "match",
+            "filterCtor",
             "single",
             "any",
             "all",
@@ -3465,7 +3465,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         self.define_stdlib_fn_2("traverse", "knot_relation_traverse", true);
         self.define_stdlib_fn_2("take", "knot_take", false);
         self.define_stdlib_fn_2("drop", "knot_drop", false);
-        self.define_stdlib_fn_2("match", "knot_relation_match", false);
+        self.define_stdlib_fn_2("filterCtor", "knot_relation_match", false);
         self.define_stdlib_fn_2("sortBy", "knot_relation_sort_by", true);
         self.define_stdlib_fn_2("sortByDesc", "knot_relation_sort_by_desc", true);
         self.define_stdlib_fn_2("contains", "knot_text_contains", false);
@@ -5611,7 +5611,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     } = &rhs.node
                         && let (ast::ExprKind::Var(fn_name), ast::ExprKind::Constructor(ctor_name)) =
                             (&match_fn.node, &match_arg.node)
-                        && fn_name == "match"
+                        && fn_name == "filterCtor"
                         && !env.bindings.contains_key(fn_name)
                         && !(self.top_fn_names.contains(fn_name.as_str())
                             && self.global_fns.contains_key(fn_name.as_str()))
@@ -7952,7 +7952,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // Special case: match Constructor SourceRef → SQL-level filtered read
         if let ast::ExprKind::Var(name) = &func_expr.node
-            && name == "match"
+            && name == "filterCtor"
             && args.len() == 2
             && !user_shadows_special
             && let ast::ExprKind::Constructor(ctor_name) = &args[0].node

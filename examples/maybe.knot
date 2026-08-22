@@ -5,9 +5,9 @@
 -- dispatch structurally to the intrinsic Maybe bind/yield/empty.
 with {
 -- Test  a simple  do-block that  uses Maybe  as the  monad
-safeDivide (\x y -> case y == 0 of
-  Bool.True {} -> Maybe.Nothing {}
-  Bool.False {} -> Maybe.Just {value (x / y)})
+safeDivide (\x y -> match y == 0
+  Bool.True {}  Maybe.Nothing {}
+  Bool.False {}  Maybe.Just {value (x / y)})
 
 result1 (do
   a <- Maybe.Just {value 10}

@@ -6,7 +6,7 @@
 --   curl localhost:8080/tasks/1
 --   curl -X POST localhost:8080/tasks -d '{"title":"write docs","owner":"alice"}'
 --   curl 'localhost:8080/search?q=docs&limit=5'
---   curl localhost:8080/tasks/1/audit -H 'authorization: Bearer secret'
+--   curl localhost:8080/tasks/1/audit -H 'authorization: Bearer ***'
 --   curl -i -X POST localhost:8080/echo -d '{"title":"x","owner":"y"}'   # see X-Request-Id header
 --   curl localhost:8080/summary
 with {
@@ -44,9 +44,9 @@ api Tasks where
     rateLimit {key (\i c -> Maybe.Just {value "global"})
                limit {requests 100  window 60000}}
 
-nextId (\rows -> case rows of
-  [] -> 1
-  Cons _ _ -> base.count rows + 1)
+nextId (\rows -> match rows
+  []  1
+  Cons _ _  base.count rows + 1)
 
 addTask (\title owner -> do
   rows <- *tasks

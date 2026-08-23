@@ -2378,7 +2378,6 @@ impl Parser {
         // The sig is attached to its value field and enforced by the checker;
         // the sig-line layout is preserved through the formatter.
         let mut fields: Vec<RecordField> = Vec::new();
-        let mut pending_sigs: Vec<(Name, TypeScheme)> = Vec::new();
         // Whether THIS record is a `with { ... }` block. `parse_with_expr` sets
         // the flag just before parsing its record; we capture it here and clear
         // it immediately so nested record-literal field values (e.g. dictionary
@@ -2614,12 +2613,12 @@ impl Parser {
                         continue;
                     }
                     let (sname, _) = self.expect_lower("expected field name in record").unwrap();
-                    // One-line sig+value: `TYPE  NAME  BODY`. If a gap and an
-                    // expression follow the name ON THE SAME LINE, the value is
-                    // inline — parse it now and emit a complete field with the
-                    // sig attached. Otherwise (newline/`}` next) it's the
-                    // classic two-line form: stash the sig in `pending_sigs`
-                    // for a later value field to pick up.
+                    // A signature is part of its declaration: `TYPE  NAME  BODY`
+                    // on one logical line. If a gap and an expression follow the
+                    // name on the same line, the value is inline — parse it now
+                    // and emit a complete field with the sig attached. Otherwise
+                    // (newline/`}` next) it's a standalone sig line, which is
+                    // rejected below (no separate type declarations).
                     let inline_value = self.gap_before_current()
                         && !matches!(self.peek(), TokenKind::Newline | TokenKind::RBrace)
                         && !self.at_layout_boundary();
@@ -2651,7 +2650,14 @@ impl Parser {
                             doc: pending_doc.take(),
                         });
                     } else {
-                        pending_sigs.push((sname, ty));
+                        // A standalone type-signature line (`Type  name` with the
+                        // body on a following line) is NOT allowed: the type and
+                        // body are a single declaration — write
+                        // `Type  name  body` on one logical line.
+                        self.error(format!(
+                            "`{sname}` has a type signature but no value: write the body on the same line — `Type  {sname}  body`"
+                        ));
+                        return None;
                     }
                     continue;
                 }
@@ -2705,21 +2711,20 @@ impl Parser {
             };
             let _ = fname_span;
             self.skip_newlines();
-            // A named FUNCTION field requires a type signature: the value may be
-            // a lambda only when a `Type  name` sig precedes it (pending or
-            // attached). `name (\args -> …)` (bare or parenthesized) with no sig
-            // is rejected — write `Type  name` first (`_  name` defers to the
-            // checker). A lambda value is `\…` or `(\…`.
+            // A named FUNCTION field requires a type signature on the same
+            // declaration: the value may be a lambda only when written as
+            // `Type  name  (\\args -> …)`. A bare `name (\\args -> …)` value field
+            // carries no sig and is rejected — write `Type  name  (\\…)` (or
+            // `_  name  (\\…)` to derive the type). A lambda value is `\\…` or `(\\…`.
             let is_lambda_value = self.at(&TokenKind::Backslash)
                 || (self.at(&TokenKind::LParen)
                     && matches!(self.peek_ahead(1), TokenKind::Backslash));
             if is_with_record
                 && is_lambda_value
                 && let Some(n) = fname.as_name()
-                && !pending_sigs.iter().any(|(sn, _)| sn == n)
             {
                 self.error(format!(
-                    "named function `{n}` requires a type signature: write `Type  {n}` (or `_  {n}` to derive the type) before the `{n} (\\…)` value"
+                    "named function `{n}` requires a type signature: write `Type  {n}  (\\\\…)` (or `_  {n}  (\\\\…)` to derive the type)"
                 ));
                 return None;
             }
@@ -2750,18 +2755,10 @@ impl Parser {
                 self.error("expected field value after field name in record");
                 return None;
             };
-            // Attach any pending sig for this field name. Absent keys have no
-            // name, so they can never carry a sig — skip the lookup for them.
-            let sig = fname.as_name().and_then(|n| {
-                pending_sigs
-                    .iter()
-                    .position(|(sn, _)| sn == n)
-                    .map(|i| pending_sigs.remove(i).1)
-            });
             fields.push(RecordField {
                 name: fname,
                 value,
-                sig,
+                sig: None,
                 doc: pending_doc.take(),
             });
             // Plain value fields are GAP-separated: the next field must follow a
@@ -2784,16 +2781,6 @@ impl Parser {
                     "record fields are separated by a gap (2+ spaces): `{name \"a\"  age 30}`, not `{name \"a\" age 30}`",
                 );
             }
-        }
-
-        // A sig with no value is an error: there are no signature-only /
-        // CLI-constant fields. Every `Type  name` sig must be followed by a
-        // value (on the next line, or inline as `Type  name  value`).
-        if let Some((sname, _sty)) = pending_sigs.first() {
-            self.error(format!(
-                "`{sname}` has a type signature but no value"
-            ));
-            return None;
         }
 
         self.skip_newlines();

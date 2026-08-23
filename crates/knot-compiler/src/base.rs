@@ -30,13 +30,11 @@ pub(crate) const PRELUDE_SPAN_OFFSET: usize = 1 << 40;
 const PRELUDE_SOURCE: &str = r#"
 {
 base {
-_  min
-min (\a b -> match a < b
+_  min  (\a b -> match a < b
   Bool.True {}  a
   Bool.False {}  b)
 
-_  max
-max (\a b -> match a > b
+_  max  (\a b -> match a > b
   Bool.True {}  a
   Bool.False {}  b)
 
@@ -45,16 +43,13 @@ max (\a b -> match a > b
 -- representation); `the` returns its value argument unchanged, so
 -- `base.the (Int 1) 41` is `41` checked to be an `Int 1`. The compiler consumes
 -- the type argument at the call site (the type-witness diversion) and erases it.
-_  the
-the (\(Type  T) -> \x -> x)
+_  the  (\(Type  T) -> \x -> x)
 
-Bool -> IO {} -> IO {}  when
-when (\cond action -> match cond
+Bool -> IO {} -> IO {}  when  (\cond action -> match cond
   Bool.True {}  action
   Bool.False {}  yield {})
 
-Bool -> IO {} -> IO {}  unless
-unless (\cond action -> match cond
+Bool -> IO {} -> IO {}  unless  (\cond action -> match cond
   Bool.True {}  yield {}
   Bool.False {}  action)
 
@@ -66,20 +61,15 @@ unless (\cond action -> match cond
 -- (`emitLog`). The `debug`/`info`/`warn`/`error` wrappers fix the level; each
 -- is self-contained (a record field can't reference a sibling bare) and
 -- re-declares the constraint so the caller's context threads through.
-(<>logCtx) => Level -> Text -> IO {}  log
-log (\level msg -> emitLog level msg ^logCtx)
+(<>logCtx) => Level -> Text -> IO {}  log  (\level msg -> emitLog level msg ^logCtx)
 
-(<>logCtx) => Text -> IO {}  debug
-debug (\msg -> emitLog (Level.Debug {}) msg ^logCtx)
+(<>logCtx) => Text -> IO {}  debug  (\msg -> emitLog (Level.Debug {}) msg ^logCtx)
 
-(<>logCtx) => Text -> IO {}  info
-info (\msg -> emitLog (Level.Info {}) msg ^logCtx)
+(<>logCtx) => Text -> IO {}  info  (\msg -> emitLog (Level.Info {}) msg ^logCtx)
 
-(<>logCtx) => Text -> IO {}  warn
-warn (\msg -> emitLog (Level.Warn {}) msg ^logCtx)
+(<>logCtx) => Text -> IO {}  warn  (\msg -> emitLog (Level.Warn {}) msg ^logCtx)
 
-(<>logCtx) => Text -> IO {}  error
-error (\msg -> emitLog (Level.Error {}) msg ^logCtx)
+(<>logCtx) => Text -> IO {}  error  (\msg -> emitLog (Level.Error {}) msg ^logCtx)
 
 -- List ADT namespace (`base.list.*`). Each field is a codegen builtin
 -- (`Var(listX)` resolves to the registered knot_list_* function value), so
@@ -131,26 +121,16 @@ float { Float u -> Float u  neg  valueNegate }
 -- `Maybe`. Conversions needing a primitive not exposed as a base builtin are
 -- written as lambdas over the existing builtins.
 morph {
-textToBytes { Text -> Bytes  into
-              into textToBytes }
-bytesToText { Bytes -> Maybe Text  into
-              into bytesToText }
-bytesToHex  { Bytes -> Text  into
-              into bytesToHex }
-textToBytesFromHex { Text -> Maybe Bytes  into
-                     into bytesFromHex }
-intToFloat  { Int 1 -> Float 1  into
-              into intToFloat }
-textToInt   { Text -> Maybe (Int 1)  into
-              into textToInt }
-textToFloat { Text -> Maybe (Float 1)  into
-              into textToFloat }
-intToText   { Int 1 -> Text  into
-              into (\n -> show n) }
-floatToText { Float 1 -> Text  into
-              into (\f -> show f) }
-boolToText  { Bool -> Text  into
-              into (\b -> show b) }
+textToBytes { Text -> Bytes  into  textToBytes }
+bytesToText { Bytes -> Maybe Text  into  bytesToText }
+bytesToHex  { Bytes -> Text  into  bytesToHex }
+textToBytesFromHex { Text -> Maybe Bytes  into  bytesFromHex }
+intToFloat  { Int 1 -> Float 1  into  intToFloat }
+textToInt   { Text -> Maybe (Int 1)  into  textToInt }
+textToFloat { Text -> Maybe (Float 1)  into  textToFloat }
+intToText   { Int 1 -> Text  into  (\n -> show n) }
+floatToText { Float 1 -> Text  into  (\f -> show f) }
+boolToText  { Bool -> Text  into  (\b -> show b) }
 }
 }
 }

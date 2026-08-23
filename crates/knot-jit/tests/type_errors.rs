@@ -71,12 +71,12 @@ fn unparenthesized_unit_type_argument() {
     // `Maybe Int 1` reads ambiguously (is `1` Maybe's or Int's argument?) — a
     // unit-carrying type used as a type argument must be parenthesized.
     assert_compile_err(
-        "with {\n_  f\nf (\\(Maybe Int 1  x) -> 0)\n}\n(f 0)",
+        "with {\n_  f  (\\(Maybe Int 1  x) -> 0)\n}\n(f 0)",
         "parenthesize a unit-carrying type argument",
     );
     // The parenthesized form is accepted.
     assert_show(
-        "with {\n_  f\nf (\\(Maybe (Int 1)  x) -> x)\n}\n(f (Maybe.Just {value 3}))",
+        "with {\n_  f  (\\(Maybe (Int 1)  x) -> x)\n}\n(f (Maybe.Just {value 3}))",
         "Just {value 3}",
     );
 }

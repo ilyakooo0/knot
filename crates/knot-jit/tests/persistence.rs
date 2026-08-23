@@ -66,10 +66,8 @@ fn morph_resolution() {
     assert_stdout(
         "morph",
         r#"with {
-Maybe (Int 1)  asInt
-asInt ((^into) "42")
-Text  asText
-asText ((^into) 7)
+Maybe (Int 1)  asInt  ((^into) "42")
+Text  asText  ((^into) 7)
 }
 (do
   base.println (base.show asInt)

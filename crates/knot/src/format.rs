@@ -995,12 +995,14 @@ fn render_record_inline(fields: &[RecordField]) -> String {
             s.push_str(&render_expr_inline(&f.value, Prec::Atom));
             continue;
         }
-        // Type-first signature line `Type  name`, then the `name value` field.
+        // Single-line signature declaration: `Type  name  value`.
         if let Some(sig) = &f.sig {
             s.push_str(&render_type_scheme(sig));
             s.push_str("  ");
             s.push_str(&f.name.to_string());
-            s.push(' ');
+            s.push_str("  ");
+            s.push_str(&render_expr_inline(&f.value, Prec::Atom));
+            continue;
         }
         s.push_str(&f.name.to_string());
         s.push(' ');
@@ -1343,13 +1345,16 @@ fn render_record_block(p: &mut Printer, fields: &[RecordField]) {
                 p.newline();
                 continue;
             }
-            // A field with an explicit type signature keeps its sig-line
-            // layout: type-first `Type  name` on its own line, then `name value`.
+            // A field with an explicit type signature is a single declaration:
+            // `Type  name  value` on one logical line.
             if let Some(sig) = &f.sig {
                 p.write(&render_type_scheme(sig));
                 p.write("  ");
                 p.write(&f.name.to_string());
+                p.write("  ");
+                render_expr(p, &f.value, Prec::Atom);
                 p.newline();
+                continue;
             }
             p.write(&f.name.to_string());
             p.write(" ");

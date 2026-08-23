@@ -41,8 +41,7 @@ intOrdDesc {
 }
 
 -- `clamp  lo hi  ord x`  is generic  pass any  type's Ord  dictionary.
-_  clamp
-clamp (\lo hi ord x ->
+_  clamp  (\lo hi ord x ->
   match ((ord.compare x lo) == (0 - 1))
     Bool.True {}  lo
     Bool.False {}  match ((ord.compare x hi) == 1)

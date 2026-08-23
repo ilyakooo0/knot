@@ -4720,6 +4720,30 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
                         let null = builder.ins().iconst(self.ptr_type, 0);
                         let (src_ptr, src_len) = self.string_ptr(builder, fn_name);
+                        // A user-declared fn referenced bare (no env binding —
+                        // e.g. a sibling field referenced from another field's
+                        // body) builds a trampoline whose default `source` is
+                        // the bare NAME. But the same fn projected out of a
+                        // `with` record into the main body's env carries its
+                        // lambda body as source, so `show`/`extract` render the
+                        // body. Carry the body as `extract_source` here too, so
+                        // a first-class user-fn reference renders its body
+                        // consistently regardless of resolution path. (show uses
+                        // extract_source first when present; a lambda body has
+                        // no ctor qualifier, so it shows the body verbatim.)
+                        if self.is_user_global_fn(fn_name) {
+                            let body_src = self
+                                .fun_bodies
+                                .get(fn_name)
+                                .map(pretty_expr)
+                                .unwrap_or_else(|| fn_name.to_string());
+                            let (x_ptr, x_len) = self.string_ptr(builder, &body_src);
+                            return self.call_rt(
+                                builder,
+                                "knot_value_function_full",
+                                &[fn_addr, null, src_ptr, src_len, x_ptr, x_len],
+                            );
+                        }
                         return self.call_rt(
                             builder,
                             "knot_value_function",

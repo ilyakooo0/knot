@@ -11,7 +11,7 @@ use harness::assert_show;
 #[test]
 fn refine_accepts_valid() {
     assert_show(
-        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (match (refine (base.the (Int 1) 5))\n            Result.Ok {value n}  n\n            Result.Err {error _}  (0 - 1))",
+        "with { Nat  Int 1 | \\x ->  x >= 0}\n         (match (refine (base.the (Int 1) 5))\n            Result.Ok {value n}  n\n            Result.Err {error _}  (0 - 1))",
         "5",
     );
 }
@@ -19,7 +19,7 @@ fn refine_accepts_valid() {
 #[test]
 fn refine_rejects_invalid() {
     assert_show(
-        "with { Nat  Int 1 where \\x ->  x >= 0}\n         (match (refine (base.the (Int 1) (0 - 3)))\n            Result.Ok {value n}  1\n            Result.Err {error _}  0)",
+        "with { Nat  Int 1 | \\x ->  x >= 0}\n         (match (refine (base.the (Int 1) (0 - 3)))\n            Result.Ok {value n}  1\n            Result.Err {error _}  0)",
         "0",
     );
 }
@@ -33,7 +33,7 @@ fn refine_per_field_record() {
     assert_stdout(
         "refine_field_ok",
         r#"with {
-VP  {age (Int 1 where \x -> x >= 0 && x <= 150)}
+VP  {age (Int 1 | \x -> x >= 0 && x <= 150)}
 {age (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} VP  asVP  (\r -> refine r)
 }
 (match (asVP {age 30})
@@ -44,7 +44,7 @@ VP  {age (Int 1 where \x -> x >= 0 && x <= 150)}
     assert_stdout(
         "refine_field_bad",
         r#"with {
-VP  {age (Int 1 where \x -> x >= 0 && x <= 150)}
+VP  {age (Int 1 | \x -> x >= 0 && x <= 150)}
 {age (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} VP  asVP  (\r -> refine r)
 }
 (match (asVP {age 200})
@@ -60,7 +60,7 @@ fn refine_cross_field() {
     assert_stdout(
         "refine_cross",
         r#"with {
-R  {lo (Int 1)  hi (Int 1)} where \r ->  r.lo <=  r.hi
+R  {lo (Int 1)  hi (Int 1)} | \r ->  r.lo <=  r.hi
 {lo (Int 1)  hi (Int 1)} -> Result {typeName Text  violations (Rel {field (Maybe Text)  message Text})} R  asR  (\r -> refine r)
 }
 (do
@@ -85,7 +85,7 @@ fn write_validation_rejects_violation() {
     e2e::build_in_dir(
         "refine_write",
         r#"with {
-Nat  Int 1 where \x ->  x >= 0
+Nat  Int 1 | \x ->  x >= 0
 Rel {name Text  age Nat}  *people
 }
 (do
@@ -112,7 +112,7 @@ fn write_validation_accepts_valid() {
     assert_stdout(
         "refine_ok",
         r#"with {
-Nat  Int 1 where \x ->  x >= 0
+Nat  Int 1 | \x ->  x >= 0
 Rel {name Text  age Nat}  *people
 }
 (do

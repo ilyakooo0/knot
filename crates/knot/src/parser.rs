@@ -4159,10 +4159,15 @@ impl Parser {
 
     fn parse_type_refined(&mut self) -> Option<Type> {
         let base = self.parse_type_union()?;
-        if self.eat(&TokenKind::Where) {
+        // The refinement predicate is introduced by `|`. This is disjoint from
+        // the variant-type `|`: `parse_type_union` consumes `|` only after a
+        // constructor-shaped spine (`Name {…}`), and a refinement base is never
+        // constructor-shaped (a constructor spine requires a record argument),
+        // so a `|` reaching here always opens a predicate.
+        if self.eat(&TokenKind::Pipe) {
             // The predicate re-enters the expression grammar, which can loop
             // back here via a postfix `: Type` annotation. Charge the recursion
-            // budget across the predicate so deeply chained `where` clauses trip
+            // budget across the predicate so deeply chained `|` clauses trip
             // MAX_RECURSION_DEPTH instead of overflowing the native stack.
             if !self.enter_recursion() {
                 return None;

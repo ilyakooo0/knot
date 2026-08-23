@@ -547,7 +547,7 @@ pub enum TypeKind {
     /// application spines. The `base` is `Named "Int"`/`Named "Float"`.
     UnitAnnotated { base: Box<Type>, unit: UnitExpr },
 
-    /// `T where \x -> predicate` — refined type.
+    /// `T | \x -> predicate` — refined type.
     Refined {
         base: Box<Type>,
         predicate: Box<Expr>,

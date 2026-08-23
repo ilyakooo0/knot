@@ -2306,7 +2306,18 @@ impl Parser {
                     // Roll back speculative parse errors before trying expression.
                     self.diagnostics.truncate(diag_len);
                 }
-                let Some(inner) = self.parse_expr() else {
+                let Some(inner) = ({
+                    // Inside a parenthesized group the closing `)` ends the
+                    // expression unambiguously, so a `match` scrutinee's
+                    // no-newline-application suppression does not apply: an
+                    // indented newline may continue an application here (e.g.
+                    // `match (add 3\n  4)  …`), exactly as outside a scrutinee.
+                    let saved_scrut = self.scrutinee_no_newline_app;
+                    self.scrutinee_no_newline_app = false;
+                    let inner = self.parse_expr();
+                    self.scrutinee_no_newline_app = saved_scrut;
+                    inner
+                }) else {
                     self.delimiter_depth -= 1;
                     return None;
                 };
@@ -2326,14 +2337,24 @@ impl Parser {
             TokenKind::LBrace => {
                 self.advance();
                 self.delimiter_depth += 1;
+                // A braced group is self-delimiting, so lift any `match`
+                // scrutinee newline-application suppression inside it (see the
+                // `LParen` arm).
+                let saved_scrut = self.scrutinee_no_newline_app;
+                self.scrutinee_no_newline_app = false;
                 let result = self.parse_record_or_update(start);
+                self.scrutinee_no_newline_app = saved_scrut;
                 self.delimiter_depth -= 1;
                 result
             }
             TokenKind::LBracket => {
                 self.advance();
                 self.delimiter_depth += 1;
+                // Same as the `LBrace` arm: a bracketed group is self-delimiting.
+                let saved_scrut = self.scrutinee_no_newline_app;
+                self.scrutinee_no_newline_app = false;
                 let result = self.parse_list_expr(start);
+                self.scrutinee_no_newline_app = saved_scrut;
                 self.delimiter_depth -= 1;
                 result
             }

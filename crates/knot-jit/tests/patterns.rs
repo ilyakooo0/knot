@@ -101,3 +101,25 @@ fn comprehension_nested_yield_relation() {
         "[1, 10, 2, 20, 3, 30]",
     );
 }
+
+#[test]
+fn match_scrutinee_parenthesized_multiline_application() {
+    // A parenthesized multi-line APPLICATION may be a `match` scrutinee: the
+    // closing `)` ends the scrutinee unambiguously, so the scrutinee's
+    // no-newline-application suppression does not apply inside the parens.
+    // (Previously `match (add 3\n  4)  …` failed with "unclosed '('".)
+    assert_show(
+        "with {\n_  add  (\\a b -> a + b)\n}\n(base.show (match (add 3\n  4)  _  \"done\"))",
+        "done",
+    );
+    // Record and list scrutinees with multi-line applications inside too.
+    assert_show(
+        "with {\n_  add  (\\a b -> a + b)\n}\n(base.show (match {v (add 1\n  2)}\n  {v n}  n))",
+        "3",
+    );
+    // A BARE scrutinee still ends at the newline (the arms are not swallowed).
+    assert_show(
+        "with {\n_  x  5\n}\n(base.show (match x\n  5  \"five\"\n  _  \"other\"))",
+        "five",
+    );
+}

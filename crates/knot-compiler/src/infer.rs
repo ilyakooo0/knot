@@ -3891,7 +3891,21 @@ impl Infer {
         let applied = self.apply(ty);
         let env_fv = self.free_vars_in_env();
         let ty_fv = self.free_vars(&applied);
-        let gen_vars: Vec<TyVar> = ty_fv.difference(&env_fv).copied().collect();
+        // String- and list-literal variables are use-resolved (Text|Bytes,
+        // Vec|Rel|List) and defaulted if unconstrained — NOT genuinely
+        // polymorphic. Quantifying them into the scheme would re-instantiate a
+        // FRESH var at each use site, escaping the `bind_string_lit_var` /
+        // container guards and letting one bound name be used at conflicting
+        // types (`useT s; useI s`). Keep them monomorphic: leave them out of
+        // the quantified set so the single variable is resolved once by its
+        // uses and conflicting uses are a type error.
+        let gen_vars: Vec<TyVar> = ty_fv
+            .difference(&env_fv)
+            .copied()
+            .filter(|v| {
+                !self.string_lit_vars.contains_key(v) && !self.list_lit_vars.contains_key(v)
+            })
+            .collect();
         let gen_set: HashSet<TyVar> = gen_vars.iter().copied().collect();
         // B7: Track monad vars that are being let-generalized (quantified
         // into a local let-binding's scheme). At Phase 5, if such a var is

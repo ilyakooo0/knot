@@ -2925,47 +2925,30 @@ impl Parser {
         Some(crate::ast::ConstructorDef { name, fields })
     }
 
-    /// Parse an optional `migrate from T to U using f` clause hanging off a
+    /// Parse an optional `migrate to U using f` clause hanging off a
     /// record-embedded source field. Returns `None` when the next token is not
-    /// `migrate`. Mirrors `parse_migrate`'s clause handling but with no
-    /// relation name (the source field supplies it).
+    /// `migrate`. The pre-migration schema is not named — it is derived from
+    /// the schema lock's last recorded schema for the source.
     fn parse_source_field_migration(&mut self) -> Option<crate::ast::SourceMigration> {
         self.skip_newlines();
         if !self.at(&TokenKind::Migrate) {
             return None;
         }
+        let migrate_start = self.span().start;
         self.advance(); // consume `migrate`
-        self.skip_newlines(); // allow `migrate\n  from …` multi-line clauses
+        self.skip_newlines(); // allow `migrate\n  to …` multi-line clauses
 
         let prev_block_indent = self.block_indent;
         self.block_indent = self.cur_column();
 
-        if !matches!(self.peek(), TokenKind::Lower(s) if s == "from") {
-            self.error("expected 'from' in source migration");
+        if !matches!(self.peek(), TokenKind::Lower(s) if s == "to") {
+            self.error("expected 'to' in source migration");
             self.block_indent = prev_block_indent;
             return None;
         }
         self.advance();
 
         self.stop_type_at_migrate_clauses = true;
-        let from_ty = match self.parse_type() {
-            Some(t) => t,
-            None => {
-                self.stop_type_at_migrate_clauses = false;
-                self.block_indent = prev_block_indent;
-                return None;
-            }
-        };
-
-        self.skip_newlines();
-        if !matches!(self.peek(), TokenKind::Lower(s) if s == "to") {
-            self.error("expected 'to' in source migration");
-            self.stop_type_at_migrate_clauses = false;
-            self.block_indent = prev_block_indent;
-            return None;
-        }
-        self.advance();
-
         let to_ty = match self.parse_type() {
             Some(t) => t,
             None => {
@@ -2989,10 +2972,11 @@ impl Parser {
         // being absorbed as one of its fields. Restore after.
         let using_fn = self.parse_expr()?;
         self.block_indent = prev_block_indent;
+        let span = crate::ast::Span::new(migrate_start, using_fn.span.end);
         Some(crate::ast::SourceMigration {
-            from_ty,
             to_ty,
             using_fn,
+            span,
         })
     }
 

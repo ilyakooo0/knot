@@ -305,10 +305,10 @@ pub enum ExprKind {
         /// Field name WITHOUT the leading `*` (e.g. `todos`).
         name: Name,
         ty: Type,
-        /// Migrations attached to the source:
-        /// `*todos : [Todo] migrate from A to B using f migrate from B to C using g`.
-        /// Mirrors top-level `migrate` decls (cumulative — all historical
-        /// migrations are kept) but hangs off the source field itself.
+        /// The pending migration attached to the source:
+        /// `*todos : [Todo] migrate to B using f`. At most one is staged at a
+        /// time (rewritten until `knot lock` promotes it into the schema lock);
+        /// its pre-migration schema is derived from the lock, not named here.
         migrations: Vec<SourceMigration>,
     },
 
@@ -743,12 +743,16 @@ pub struct RecordField {
 }
 
 /// A migration attached to a record-embedded source field:
-/// `*todos : [Todo] migrate from Old to New using f`.
+/// `*todos : [Todo] migrate to New using f`. The pre-migration schema is not
+/// named — it is derived from the last schema recorded in the schema lock.
 #[derive(Debug, Clone)]
 pub struct SourceMigration {
-    pub from_ty: Type,
     pub to_ty: Type,
     pub using_fn: Expr,
+    /// Span covering the whole `migrate to … using …` clause (from the
+    /// `migrate` keyword to the end of `using_fn`). `knot lock` excises this
+    /// exact range to strip the clause from the source.
+    pub span: Span,
 }
 
 /// A constructor in a `data` declaration: `Circle {radius: Float}`.

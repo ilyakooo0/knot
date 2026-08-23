@@ -355,6 +355,14 @@ fn main() {
         "fmt" => {
             cmd_fmt(&args[2..]);
         }
+        "lock" => {
+            if args.len() < 3 {
+                eprintln!("Error: missing source file");
+                eprintln!("Usage: knot lock <file.knot>");
+                process::exit(1);
+            }
+            cmd_lock(&args[2]);
+        }
         "--help" | "-h" | "help" => print_usage(),
         other => {
             eprintln!("Unknown command: {}", other);
@@ -376,6 +384,9 @@ fn print_usage() {
     );
     eprintln!(
         "  knot fmt [--check] [--stdout] <file.knot>              Format a source file in place ('-' reads stdin, writes stdout)"
+    );
+    eprintln!(
+        "  knot lock <file.knot>                                   Commit pending schema migrations into <file>.schema.lock"
     );
     eprintln!("  knot help                                              Show this help message");
 }
@@ -855,12 +866,97 @@ fn cmd_build(
         let _ = std::fs::remove_file(crt);
     }
 
-    // Update schema lockfile from the (prelude-wrapped, desugared) program.
-    if let Err(e) = lockfile::update(&source_path, &source, &program) {
-        eprintln!("Warning: {}", e);
-    }
+    // The schema lock is NEVER written during build — it is append-only and
+    // updated only by `knot lock` (which promotes the pending migration into
+    // history). See `cmd_lock`.
 
     eprintln!("Compiled: {}", output_path.display());
+}
+
+/// `knot lock <file.knot>` — commit the source's pending schema migrations
+/// into `<file>.schema.lock` (append-only) and strip the `migrate` clauses
+/// from the source. The lock is the owned migration history; it is never
+/// written during `knot build`.
+fn cmd_lock(source_file: &str) {
+    let source_path = PathBuf::from(source_file);
+    let source = std::fs::read_to_string(&source_path).unwrap_or_else(|e| {
+        eprintln!("Error reading {}: {}", source_path.display(), e);
+        process::exit(1);
+    });
+
+    // Lex + parse + type-env (no desugar needed — the lock only reads
+    // declarations, and spans must align with the ORIGINAL source text for the
+    // excision below).
+    let lexer = knot::lexer::Lexer::new(&source);
+    let (tokens, lex_diags) = lexer.tokenize();
+    let parser = knot::parser::Parser::new(source.clone(), tokens);
+    let (program, parse_diags) = parser.parse_file_expr();
+    let has_errors = lex_diags
+        .iter()
+        .chain(parse_diags.iter())
+        .any(|d| d.severity == knot::diagnostic::Severity::Error);
+    if has_errors {
+        let filename = source_path.display().to_string();
+        for diag in lex_diags.iter().chain(parse_diags.iter()) {
+            eprintln!("{}", diag.render(&source, &filename));
+        }
+        process::exit(1);
+    }
+    let type_env = types::TypeEnv::from_program(&program);
+
+    let pending = lockfile::pending_migrations(&program);
+
+    // `knot lock` snapshots the current schemas. There is work to do when a
+    // source is not yet recorded in the lock (first lock, or a new source)
+    // OR a migration is pending. Sources already recorded with no pending
+    // migration are left as-is (the lock is append-only).
+    let prior = lockfile::committed_migrations(&source_path);
+    let recorded = lockfile::locked_sources(&source_path);
+    let unrecorded: Vec<&String> = type_env
+        .source_schemas
+        .keys()
+        .filter(|n| !recorded.contains(*n))
+        .collect();
+    if pending.is_empty() && unrecorded.is_empty() {
+        eprintln!("knot lock: nothing to commit in {}", source_file);
+        return;
+    }
+
+    // Append the pending migrations to the lock's committed history and
+    // regenerate the lock with the current source's schemas.
+    let lock_path = lockfile::lockfile_path(&source_path);
+    let prior_schemas = lockfile::locked_schemas(&source_path);
+    if let Err(e) = lockfile::write_lock(&lock_path, &source, &program, &type_env, &prior, &prior_schemas) {
+        eprintln!("Error writing lock: {}", e);
+        process::exit(1);
+    }
+
+    // Strip each `migrate` clause from the source by its recorded span.
+    // Process in reverse source order so earlier excisions don't shift later
+    // spans.
+    let mut edits: Vec<knot::ast::Span> =
+        pending.values().map(|p| p.clause_span).collect();
+    edits.sort_by(|a, b| b.start.cmp(&a.start));
+    let mut new_source = source.clone();
+    for span in edits {
+        if span.start <= span.end && span.end <= new_source.len() {
+            new_source.replace_range(span.start..span.end, "");
+        }
+    }
+    if new_source != source {
+        std::fs::write(&source_path, &new_source).unwrap_or_else(|e| {
+            eprintln!("Error writing {}: {}", source_path.display(), e);
+            process::exit(1);
+        });
+    }
+
+    let mut names: Vec<&str> = pending.keys().map(|s| s.as_str()).collect();
+    names.sort();
+    eprintln!(
+        "knot lock: committed migration(s) for {} into {}",
+        names.join(", "),
+        lock_path.display()
+    );
 }
 
 /// Runtime library embedded at build time. The build.rs copies

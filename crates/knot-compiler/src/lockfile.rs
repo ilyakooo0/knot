@@ -12,18 +12,27 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Lockfile path: `examples/todo.knot` → `examples/todo.schema.lock`
-fn lockfile_path(source_path: &Path) -> PathBuf {
+pub fn lockfile_path(source_path: &Path) -> PathBuf {
     let stem = source_path.file_stem().unwrap_or_default();
     let mut name = stem.to_os_string();
     name.push(".schema.lock");
     source_path.with_file_name(name)
 }
 
+/// One committed migration: the schema a source was upgraded FROM, the schema
+/// it was upgraded TO, and the `using` fn source that transformed each row.
+#[derive(Clone)]
+pub struct CommittedMigration {
+    pub from_schema: String,
+    pub to_schema: String,
+    pub using_src: String,
+}
+
 struct SchemaInfo {
-    /// source_name → schema descriptor ("col:type,col:type,...")
+    /// source_name → last committed schema descriptor ("col:type,col:type,...")
     sources: HashMap<String, String>,
-    /// relation_name → Vec<(from_schema, to_schema)>
-    migrations: HashMap<String, Vec<(String, String)>>,
+    /// source_name → ordered committed migration chain (oldest first)
+    migrations: HashMap<String, Vec<CommittedMigration>>,
 }
 
 /// Classification of a schema change.
@@ -379,13 +388,23 @@ fn is_nested_field(ty: &str) -> bool {
     ty.trim_start().starts_with('[')
 }
 
+/// Parse the schema lock into an ordered per-source history. The lock stores,
+/// per source, every committed schema version in order; each version after the
+/// first carries the `migrate to … using …` that produced it. The last schema
+/// for a source is its current committed schema; the migrations form the
+/// ordered chain (oldest first).
+///
+/// Unlike the rest of the compiler (which uses `TypeEnv::from_program`), this
+/// walks the parsed AST directly: `TypeEnv` discards the migration's `using`
+/// fn source, which the lock must preserve so `knot build` can re-bake the full
+/// chain into the binary.
 fn parse_lockfile(lock_path: &Path) -> Result<SchemaInfo, String> {
     let content = std::fs::read_to_string(lock_path)
         .map_err(|e| format!("cannot read {}: {}", lock_path.display(), e))?;
 
     let lexer = knot::lexer::Lexer::new(&content);
     let (tokens, _) = lexer.tokenize();
-    let parser = knot::parser::Parser::new(content, tokens);
+    let parser = knot::parser::Parser::new(content.clone(), tokens);
     let (program, diags) = parser.parse_file_expr();
 
     if diags.iter().any(|d| d.severity == Severity::Error) {
@@ -396,10 +415,76 @@ fn parse_lockfile(lock_path: &Path) -> Result<SchemaInfo, String> {
     }
 
     let env = TypeEnv::from_program(&program);
+
+    // Current committed schemas come from the parseable `Rel T  *name`
+    // declarations (re-resolved by TypeEnv). The committed migration chain
+    // comes from the `migrate_history [...]` section, which stores raw schema
+    // descriptors + `using` source verbatim — old schemas are NOT re-parsable
+    // type expressions (a descriptor erases the record/ADT structure), so they
+    // are kept as opaque strings and never resolved.
+    let migrations = collect_migrate_history(&program);
+
     Ok(SchemaInfo {
         sources: env.source_schemas,
-        migrations: env.migrate_schemas,
+        migrations,
     })
+}
+
+/// Extract the committed migration chain from the lock's
+/// `migrate_history [{source "name"  from "…"  to "…"  using "…"}  …]` call.
+/// Entries are positional string records; order is preserved (oldest first).
+fn collect_migrate_history(program: &Expr) -> HashMap<String, Vec<CommittedMigration>> {
+    let mut out: HashMap<String, Vec<CommittedMigration>> = HashMap::new();
+    walk_for_history(program, &mut out);
+    out
+}
+
+fn walk_for_history(e: &Expr, out: &mut HashMap<String, Vec<CommittedMigration>>) {
+    match &e.node {
+        ExprKind::With { record, body, .. } => {
+            walk_for_history(record, out);
+            walk_for_history(body, out);
+        }
+        ExprKind::Record(fields) => {
+            for f in fields {
+                walk_for_history(&f.value, out);
+            }
+        }
+        ExprKind::List(items) => {
+            for item in items {
+                if let Some((name, step)) = history_entry(item) {
+                    out.entry(name).or_default().push(step);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parse one `{source "…"  from "…"  to "…"  using "…"}` record literal into a
+/// committed migration. Returns `None` for any other shape.
+fn history_entry(e: &Expr) -> Option<(String, CommittedMigration)> {
+    let ExprKind::Record(fields) = &e.node else {
+        return None;
+    };
+    let get = |key: &str| -> Option<String> {
+        fields.iter().find_map(|f| {
+            if f.name == *key
+                && let ExprKind::Lit(knot::ast::Literal::Text(s)) = &f.value.node
+            {
+                return Some(s.clone());
+            }
+            None
+        })
+    };
+    Some((
+        get("source")?,
+        CommittedMigration {
+            from_schema: get("from")?,
+            to_schema: get("to")?,
+            using_src: get("using")?,
+        },
+    ))
 }
 
 /// Diff source schemas against the lockfile. Returns diagnostics
@@ -421,91 +506,69 @@ pub fn check(source_path: &Path, program: &Expr, type_env: &TypeEnv) -> Vec<Diag
         return diags;
     };
 
-    // Detect breaking schema changes
+    // Diff each committed (locked) schema against the current source schema.
+    // Every difference is a schema change requiring an explicit pending
+    // `migrate … to … using …` block — there are no safe auto-applied changes.
     for (name, old_schema) in &old.sources {
         match type_env.source_schemas.get(name) {
-            Some(new_schema) if new_schema == old_schema => {}
+            Some(new_schema) if new_schema == old_schema => {
+                // No schema change. A staged migrate block here is a mistake.
+                if type_env.migrate_schemas.contains_key(name) {
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "migrate block for '*{}' but the schema is unchanged from the lock",
+                            name
+                        ))
+                        .label(find_source_span(program, name), "no schema change")
+                        .note("remove the migrate block, or change the schema it targets"),
+                    );
+                }
+            }
             Some(new_schema) => {
-                let change = classify_schema_change(old_schema, new_schema);
-                match change {
-                    SchemaChange::Identical => {}
-                    SchemaChange::Safe => {
-                        // Safe change — lockfile will auto-update, no migrate block needed
-                    }
-                    SchemaChange::Breaking => {
-                        if let Some(migrations) = type_env.migrate_schemas.get(name) {
-                            // Validate migration chain: first from must match lockfile,
-                            // last to must match source, chain must be contiguous
-                            if migrations.is_empty() {
-                                diags.push(
-                                    Diagnostic::error(format!(
-                                        "breaking schema change for '*{}' requires a migrate block",
-                                        name
-                                    ))
-                                    .label(find_source_span(program, name), "schema changed")
-                                    .note(format!("lockfile: {}", old_schema))
-                                    .note(format!("source:   {}", new_schema))
-                                    .note(format!(
-                                        "add: migrate *{} from {{...}} to {{...}} using (\\old -> ...)",
-                                        name
-                                    )),
-                                );
-                            } else {
-                                let first_from = &migrations[0].0;
-                                let last_to = &migrations[migrations.len() - 1].1;
-
-                                if classify_schema_change(first_from, old_schema)
-                                    != SchemaChange::Identical
-                                    || classify_schema_change(last_to, new_schema)
-                                        != SchemaChange::Identical
-                                {
-                                    let first_span = find_migrate_span(program, name);
-                                    diags.push(
-                                        Diagnostic::error(format!(
-                                            "migrate block for '*{}' doesn't match the schema change",
-                                            name
-                                        ))
-                                        .label(first_span, "here")
-                                        .note(format!("lockfile schema: {}", old_schema))
-                                        .note(format!("source schema:   {}", new_schema))
-                                        .note(format!("migrate from:    {}", first_from))
-                                        .note(format!("migrate to:      {}", last_to)),
-                                    );
-                                }
-
-                                // Validate chain contiguity
-                                for i in 1..migrations.len() {
-                                    if classify_schema_change(
-                                        &migrations[i - 1].1,
-                                        &migrations[i].0,
-                                    ) != SchemaChange::Identical
-                                    {
-                                        diags.push(
-                                            Diagnostic::error(format!(
-                                                "migration chain for '*{}' is not contiguous: step {} 'to' doesn't match step {} 'from'",
-                                                name, i, i + 1
-                                            ))
-                                            .note(format!("step {} to:   {}", i, migrations[i - 1].1))
-                                            .note(format!("step {} from: {}", i + 1, migrations[i].0)),
-                                        );
-                                    }
-                                }
-                            }
-                        } else {
+                // Schema changed. A pending migrate block must be present and
+                // must target the current source schema; its `from` is the
+                // lock's last schema (derived, not named). Pending migrations
+                // are uncommitted until `knot lock` — warn.
+                match type_env.migrate_schemas.get(name) {
+                    Some(pending_to) => {
+                        if classify_schema_change(pending_to, new_schema)
+                            != SchemaChange::Identical
+                        {
                             diags.push(
                                 Diagnostic::error(format!(
-                                    "breaking schema change for '*{}' requires a migrate block",
+                                    "migrate block for '*{}' doesn't match the source schema",
                                     name
                                 ))
-                                .label(find_source_span(program, name), "schema changed")
-                                .note(format!("lockfile: {}", old_schema))
-                                .note(format!("source:   {}", new_schema))
-                                .note(format!(
-                                    "add: migrate *{} from {{...}} to {{...}} using (\\old -> ...)",
+                                .label(find_source_span(program, name), "here")
+                                .note(format!("source schema:  {}", new_schema))
+                                .note(format!("migrate to:     {}", pending_to)),
+                            );
+                        } else {
+                            diags.push(
+                                Diagnostic::warning(format!(
+                                    "uncommitted migration for '*{}' — run `knot lock` to commit it",
                                     name
-                                )),
+                                ))
+                                .label(find_source_span(program, name), "pending migration")
+                                .note(format!("from (lock): {}", old_schema))
+                                .note(format!("to (source): {}", new_schema)),
                             );
                         }
+                    }
+                    None => {
+                        diags.push(
+                            Diagnostic::error(format!(
+                                "schema change for '*{}' requires a migrate block",
+                                name
+                            ))
+                            .label(find_source_span(program, name), "schema changed")
+                            .note(format!("lock:   {}", old_schema))
+                            .note(format!("source: {}", new_schema))
+                            .note(format!(
+                                "add: migrate *{} to {{...}} using (\\old -> ...)",
+                                name
+                            )),
+                        );
                     }
                 }
             }
@@ -518,30 +581,90 @@ pub fn check(source_path: &Path, program: &Expr, type_env: &TypeEnv) -> Vec<Diag
         }
     }
 
-    // Ensure lockfile migrations aren't removed from source
-    for (name, lock_migrations) in &old.migrations {
-        let source_migrations = type_env.migrate_schemas.get(name);
-        for (lock_from, lock_to) in lock_migrations {
-            let still_present = source_migrations.is_some_and(|sm| {
-                sm.iter().any(|(f, t)| {
-                    classify_schema_change(f, lock_from) == SchemaChange::Identical
-                        && classify_schema_change(t, lock_to) == SchemaChange::Identical
-                })
-            });
-            if !still_present {
-                diags.push(
-                    Diagnostic::error(format!(
-                        "migration for '*{}' removed from source but present in lockfile",
-                        name
-                    ))
-                    .note(format!("from: {} -> to: {}", lock_from, lock_to))
-                    .note("remove from lockfile explicitly to prune old migrations"),
-                );
+    diags
+}
+
+/// The committed migration chain per source, read from the lock. Codegen
+/// bakes this into the binary so a stale database fast-forwards through every
+/// committed step at startup. Returns an empty map when there is no lockfile
+/// or it fails to parse (the `check` pass reports parse errors separately).
+pub fn committed_migrations(source_path: &Path) -> HashMap<String, Vec<CommittedMigration>> {
+    let lock_path = lockfile_path(source_path);
+    if !lock_path.exists() {
+        return HashMap::new();
+    }
+    match parse_lockfile(&lock_path) {
+        Ok(info) => info.migrations,
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// The set of source names recorded in the lock (i.e. having a committed
+/// current schema). Used by `knot lock` to detect unrecorded sources.
+pub fn locked_sources(source_path: &Path) -> HashSet<String> {
+    locked_schemas(source_path).into_keys().collect()
+}
+
+/// The committed current schema per source, read from the lock. Codegen uses
+/// a source's recorded schema as the `from` of its pending migration's first
+/// step (the lock holds the baseline the migration upgrades FROM).
+pub fn locked_schemas(source_path: &Path) -> HashMap<String, String> {
+    let lock_path = lockfile_path(source_path);
+    if !lock_path.exists() {
+        return HashMap::new();
+    }
+    match parse_lockfile(&lock_path) {
+        Ok(info) => info.sources,
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// A pending (uncommitted) migration staged on a source, with the span needed
+/// to excise its `migrate` clause from the source text at `knot lock`.
+pub struct PendingMigration {
+    /// Span of the whole `migrate to … using …` clause (excised by `knot lock`).
+    pub clause_span: Span,
+    /// The `using` fn (rendered into the lock's history).
+    pub using_fn: Expr,
+}
+
+/// The pending migrations staged in the current source, one per source that
+/// has a `migrate to … using …` block. Used by `knot lock` to promote them.
+pub fn pending_migrations(program: &Expr) -> HashMap<String, PendingMigration> {
+    let mut out = HashMap::new();
+    collect_pending(program, &mut out);
+    out
+}
+
+fn collect_pending(e: &Expr, out: &mut HashMap<String, PendingMigration>) {
+    match &e.node {
+        ExprKind::Record(fields) => {
+            for f in fields {
+                if let ExprKind::SourceDecl {
+                    name,
+                    migrations,
+                    ..
+                } = &f.value.node
+                {
+                    if let Some(m) = migrations.first() {
+                        out.insert(
+                            name.clone(),
+                            PendingMigration {
+                                clause_span: m.span,
+                                using_fn: m.using_fn.clone(),
+                            },
+                        );
+                    }
+                }
+                collect_pending(&f.value, out);
             }
         }
+        ExprKind::With { record, body, .. } => {
+            collect_pending(record, out);
+            collect_pending(body, out);
+        }
+        _ => {}
     }
-
-    diags
 }
 
 /// Sources present in the lockfile but absent from the current source —
@@ -566,27 +689,25 @@ pub fn dropped_sources(source_path: &Path, type_env: &TypeEnv) -> Vec<String> {
         .collect()
 }
 
-/// Write the lockfile after a successful compile.
-/// Only writes if there are source declarations to track.
-pub fn update(source_path: &Path, source_text: &str, program: &Expr) -> Result<(), String> {
-    let has_sources = decl_views(program)
-        .iter()
-        .any(|d| matches!(d.kind, DeclViewKind::Source { .. }))
-        || !record_embedded_sources(program).is_empty();
-
-    let lock_path = lockfile_path(source_path);
-
-    // Even when no sources remain in the codebase, prune a pre-existing
-    // lockfile. Codegen already emitted a startup DROP for the removed
-    // sources into this build's binary (computed from the pre-prune
-    // lockfile), so keeping the entry would re-drop on every subsequent
-    // build and fire the orphan warning forever. Rewriting with no sources
-    // yields a header-only lockfile.
-    if !has_sources && !lock_path.exists() {
-        return Ok(());
-    }
-
-    let content = generate(program, source_text);
+/// The schema lock is append-only and is NEVER written during `knot build`.
+/// It is written only by `knot lock` (see `cmd_lock` in main.rs), which
+/// promotes the pending migration into history. This writer regenerates the
+/// full lock content from the committed history plus the current source.
+///
+/// `history` is the committed per-source migration chain read from the
+/// existing lock (empty on first lock); `program`/`type_env` describe the
+/// current source (which, at `knot lock` time, includes the migration being
+/// committed). The emitted lock records, per source, every committed schema
+/// version in order followed by the current schema.
+pub fn write_lock(
+    lock_path: &Path,
+    source_text: &str,
+    program: &Expr,
+    type_env: &TypeEnv,
+    history: &HashMap<String, Vec<CommittedMigration>>,
+    prior_schemas: &HashMap<String, String>,
+) -> Result<(), String> {
+    let content = generate(program, source_text, type_env, history, prior_schemas);
     // Atomic write: write to a temp file then rename, so a crash mid-write
     // doesn't leave a corrupt lockfile that hard-errors every compile.
     let tmp_path = lock_path.with_extension("lock.tmp");
@@ -639,27 +760,31 @@ fn find_source_span(program: &Expr, name: &str) -> Span {
         .unwrap_or(Span::new(0, 0))
 }
 
-fn find_migrate_span(program: &Expr, name: &str) -> Span {
-    record_embedded_sources(program)
-        .into_iter()
-        .find_map(|(n, _, span)| (n == name).then_some(span))
-        .unwrap_or(Span::new(0, 0))
-}
-
 /// Bounds-checked slice of `source_text` at `span`; `None` when the span is
 /// synthetic/out-of-range (post-desugar nodes can carry placeholder spans).
 fn slice_span(source_text: &str, span: Span) -> Option<&str> {
     source_text.get(span.start..span.end)
 }
 
-/// Generate lockfile content by extracting declarations from source text.
-/// Emitted as a `with { … } (main)` expression so it re-parses under the
-/// file-as-expression grammar (top-level `type`/`data`/`*source`/`migrate`
-/// lines are no longer valid standalone syntax).
-fn generate(program: &Expr, source_text: &str) -> String {
+/// Generate lockfile content recording the full committed history. Emitted as
+/// a `with { … } (main)` expression so it re-parses under the
+/// file-as-expression grammar. Per source, emits every committed schema
+/// version (oldest first) followed by the current schema, with a
+/// `migrate to … using …` clause on each version after the first.
+/// Generate lockfile content: a parseable section with the current schema per
+/// source, plus a `migrate_history` section holding the committed chain as raw
+/// schema descriptors. Emitted as a `with { … } (main)` expression.
+fn generate(
+    program: &Expr,
+    source_text: &str,
+    type_env: &TypeEnv,
+    history: &HashMap<String, Vec<CommittedMigration>>,
+    prior_schemas: &HashMap<String, String>,
+) -> String {
     let mut body = String::new();
 
-    // Type aliases (non-parameterized) and data declarations
+    // Type aliases (non-parameterized) and data declarations — copied verbatim
+    // from source so the lock's current-schema type expressions resolve.
     for decl in decl_views(program) {
         let emit = matches!(decl.kind,
             DeclViewKind::TypeAlias { params, .. } if params.is_empty())
@@ -670,61 +795,97 @@ fn generate(program: &Expr, source_text: &str) -> String {
         }
     }
 
-    // Sources embedded in record-let literals (`db = { Rel Todo  *todos, … }`)
-    // synthesize an equivalent type-first `<ty>  *name` declaration.
-    for (name, ty, _) in record_embedded_sources(program) {
-        body.push_str(&format!("{}  *{}\n", knot::format::render_type(&ty), name));
+    // Current schema per source (type-first `<ty>  *name`), re-resolvable by
+    // `TypeEnv` on the next read. This is the schema `check` diffs against.
+    let sources = record_embedded_sources(program);
+    for (name, ty, _) in &sources {
+        body.push_str(&format!("{}  *{}\n", knot::format::render_type(ty), name));
     }
 
-    // Migrations attached to record-embedded source fields
-    // (`{ *todos : [Todo] migrate from A to B using f }`). Synthesize the
-    // equivalent `migrate *name …` line so the lockfile records the
-    // migration the same way regardless of where it was declared.
-    collect_record_migrations(program, &mut body);
+    // Committed migration history as raw descriptors. Includes the migration
+    // being committed now (the pending block on the source), appended last.
+    body.push_str("migrate_history [\n");
+    for (name, chain) in history {
+        for step in chain {
+            body.push_str(&history_entry_src(name, step));
+        }
+    }
+    for (name, _, _) in &sources {
+        // The pending migration being committed: from = the lock's recorded
+        // current schema before this lock (the baseline it upgrades), to =
+        // current source schema.
+        if let Some(using_src) = record_embedded_using_fn(program, name)
+            && let Some(to_schema) = type_env.source_schemas.get(name)
+        {
+            let from_schema = prior_schemas.get(name).cloned().unwrap_or_default();
+            body.push_str(&history_entry_src(
+                name,
+                &CommittedMigration {
+                    from_schema,
+                    to_schema: to_schema.clone(),
+                    using_src,
+                },
+            ));
+        }
+    }
+    body.push_str("]\n");
 
     let mut out = String::new();
-    out.push_str("-- schema.lock (auto-generated, do not edit)\n");
-    out.push_str("-- Commit to source control.\n");
+    out.push_str("-- schema.lock (append-only — written only by `knot lock`)\n");
+    out.push_str("-- Commit to source control. Do not edit by hand.\n");
     out.push_str("with {\n");
     out.push_str(&body);
     out.push_str("}\n(main)\n");
     out
 }
 
-/// Recursively walk record literals and emit a `migrate` line for every
-/// migration attached to a `*name` source field.
-fn collect_record_migrations(e: &Expr, out: &mut String) {
-    match &e.node {
-        ExprKind::Record(fields) => {
-            for f in fields {
-                if let ExprKind::SourceDecl {
-                    name: _,
-                    migrations,
-                    ..
-                } = &f.value.node
-                {
-                    for m in migrations {
-                        // The lockfile is re-parsed by parse_file_expr, whose
-                        // migration clause (parse_source_field_migration) has
-                        // NO relation name — the `*name` source field supplies
-                        // it. Emit the nameless form. The migration must hang
-                        // DIRECTLY off the `*name : T` field — no blank line,
-                        // or the field-parse ends and the clause won't attach.
-                        out.push_str(&format!(
-                            "migrate\n  from {}\n  to {}\n  using {}\n",
-                            knot::format::render_type(&m.from_ty),
-                            knot::format::render_type(&m.to_ty),
-                            knot::format::render_expr_source(&m.using_fn),
-                        ));
+/// Render one committed migration as a `{source …  from …  to …  using …}`
+/// string-record entry of the `migrate_history` list.
+fn history_entry_src(name: &str, step: &CommittedMigration) -> String {
+    format!(
+        "  {{source \"{}\"  from \"{}\"  to \"{}\"  using \"{}\"}}\n",
+        name,
+        escape_lock_string(&step.from_schema),
+        escape_lock_string(&step.to_schema),
+        escape_lock_string(&step.using_src),
+    )
+}
+
+/// Escape a string for embedding in a knot text literal in the lock.
+fn escape_lock_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Find the `using` fn source of the pending migration on a record-embedded
+/// source field, if present.
+fn record_embedded_using_fn(program: &Expr, name: &str) -> Option<String> {
+    fn walk(e: &Expr, name: &str, out: &mut Option<String>) {
+        match &e.node {
+            ExprKind::Record(fields) => {
+                for f in fields {
+                    if let ExprKind::SourceDecl {
+                        name: n,
+                        migrations,
+                        ..
+                    } = &f.value.node
+                    {
+                        if *n == *name
+                            && let Some(m) = migrations.first()
+                        {
+                            *out = Some(knot::format::render_expr_source(&m.using_fn));
+                        }
                     }
+                    walk(&f.value, name, out);
                 }
-                collect_record_migrations(&f.value, out);
             }
+            ExprKind::With { record, body, .. } => {
+                walk(record, name, out);
+                walk(body, name, out);
+            }
+            _ => {}
         }
-        ExprKind::With { record, body, .. } => {
-            collect_record_migrations(record, out);
-            collect_record_migrations(body, out);
-        }
-        _ => {}
     }
+    let mut out = None;
+    walk(program, name, &mut out);
+    out
 }

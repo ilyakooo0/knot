@@ -98,8 +98,11 @@ pub struct TypeEnv {
     pub constructors: HashMap<String, Vec<(String, ResolvedType)>>,
     /// source_name -> schema descriptor string ("col:type,col:type,...")
     pub source_schemas: HashMap<String, String>,
-    /// relation_name -> Vec<(old_schema, new_schema)> from `migrate` declarations
-    pub migrate_schemas: HashMap<String, Vec<(String, String)>>,
+    /// relation_name -> target schema of the pending `migrate … to …` block.
+    /// The pre-migration schema is not in the AST — it is derived from the
+    /// schema lock's last recorded schema, so only the target is recorded here.
+    /// At most one pending migration per source (rewritten until `knot lock`).
+    pub migrate_schemas: HashMap<String, String>,
     /// Associated type definitions: assoc_type_name -> definitions from impls
     #[allow(dead_code)]
     pub associated_types: HashMap<String, Vec<AssocTypeDef>>,
@@ -123,7 +126,7 @@ impl TypeEnv {
         let mut aliases = HashMap::new();
         let mut constructors = HashMap::new();
         let mut source_schemas = HashMap::new();
-        let mut migrate_schemas: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        let mut migrate_schemas: HashMap<String, String> = HashMap::new();
         let associated_types: HashMap<String, Vec<AssocTypeDef>> = HashMap::new();
 
         let mut refined_types: HashMap<String, Expr> = HashMap::new();
@@ -367,13 +370,6 @@ impl TypeEnv {
                             ResolvedType::Relation(inner) => *inner,
                             other => other,
                         };
-                        let old_resolved = unwrap_relation(resolve_type(
-                            &m.from_ty,
-                            &aliases,
-                            &associated_types,
-                            &single_variant_params,
-                            &multi_variant_params,
-                        ));
                         let new_resolved = unwrap_relation(resolve_type(
                             &m.to_ty,
                             &aliases,
@@ -381,12 +377,11 @@ impl TypeEnv {
                             &single_variant_params,
                             &multi_variant_params,
                         ));
-                        let old_schema = relation_inner_schema(&old_resolved);
                         let new_schema = relation_inner_schema(&new_resolved);
-                        migrate_schemas
-                            .entry(name.clone())
-                            .or_default()
-                            .push((old_schema, new_schema));
+                        // Only the pending target schema is recorded; the
+                        // pre-migration schema is derived from the schema lock
+                        // (see `lockfile`). One pending migration per source.
+                        migrate_schemas.insert(name.clone(), new_schema);
                     }
                 }
                 _ => {}
@@ -802,8 +797,8 @@ pub fn check_reserved_field_names(program: &Expr) -> Vec<knot::diagnostic::Diagn
         diags: Vec::new(),
     };
     // Every record-embedded source (`{ *todos : [Todo] migrate … }`) persists
-    // a table — walk the source element type and both sides of every attached
-    // migrate clause.
+    // a table — walk the source element type and the target of every attached
+    // migrate clause (the pre-migration schema lives in the lock, not the AST).
     let mut sources: Vec<(&str, &knot::ast::Type, &[knot::ast::SourceMigration])> = Vec::new();
     walk_record_sources(program, &mut |name, ty, migrations| {
         sources.push((name, ty, migrations));
@@ -812,7 +807,6 @@ pub fn check_reserved_field_names(program: &Expr) -> Vec<knot::diagnostic::Diagn
         walker.relation = name.to_string();
         walker.walk(ty, &mut HashSet::new());
         for m in migrations {
-            walker.walk(&m.from_ty, &mut HashSet::new());
             walker.walk(&m.to_ty, &mut HashSet::new());
         }
     }

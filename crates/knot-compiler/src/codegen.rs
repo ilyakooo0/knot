@@ -174,8 +174,20 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // Database path baked into the compiled binary
     db_path: String,
 
-    // Migration schemas: relation_name -> Vec<(old_schema, new_schema)>
-    migrate_schemas: HashMap<String, Vec<(String, String)>>,
+    // Committed migration chain from the schema lock: relation_name -> ordered
+    // steps (oldest first). Baked into the binary so a stale database
+    // fast-forwards through every committed step at startup. The PENDING
+    // (uncommitted) migration is collected separately from the source AST.
+    migrate_chains: HashMap<String, Vec<crate::lockfile::CommittedMigration>>,
+
+    // Pending (uncommitted) migration targets from the source: relation_name
+    // -> the target schema of the staged `migrate to …` block. Baked as the
+    // final step after the committed chain.
+    pending_targets: HashMap<String, String>,
+
+    // Committed current schemas from the lock: relation_name -> schema. The
+    // `from` of a pending migration's first step (the baseline it upgrades).
+    locked_schemas: HashMap<String, String>,
 
     // Sources dropped from the codebase but still in the schema lockfile —
     // codegen emits a `knot_source_drop` call for each so the stored table is
@@ -880,7 +892,9 @@ fn compile_inner<M: cranelift_module::Module>(
             cg.scalar_sources.insert(name.clone());
         }
     }
-    cg.migrate_schemas = type_env.migrate_schemas.clone();
+    cg.migrate_chains = crate::lockfile::committed_migrations(std::path::Path::new(source_file));
+    cg.pending_targets = type_env.migrate_schemas.clone();
+    cg.locked_schemas = crate::lockfile::locked_schemas(std::path::Path::new(source_file));
     // Sources the codebase no longer declares but the schema lockfile still
     // tracks: emit a startup DROP for each so removed relations don't linger.
     cg.dropped_sources =
@@ -1394,7 +1408,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
             pending_trampolines: Vec::new(),
             io_thunk_counter: 0,
             db_path: String::new(),
-            migrate_schemas: HashMap::new(),
+            migrate_chains: HashMap::new(),
+            pending_targets: HashMap::new(),
+            locked_schemas: HashMap::new(),
             dropped_sources: Vec::new(),
             diagnostics: Vec::new(),
             data_constructors: HashMap::new(),
@@ -4381,92 +4397,112 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // use the runtime's structural comparison directly, so no
             // ord-compare dispatcher is registered.
 
-            // Apply pending migrations (before source init)
-            let migrate_schemas = cg.migrate_schemas.clone();
-            let mut migrate_counters: HashMap<String, usize> = HashMap::new();
-            // Collect migration sites from record-embedded source fields
-            // (`{ *todos : [Todo] migrate from A to B using f }`), keyed by
-            // bare relation name in `migrate_schemas`.
-            let mut migrate_sites: Vec<(String, ast::Expr)> = Vec::new();
+            // Apply migrations (before source init). The full chain per source
+            // = committed steps (from the schema lock) + the pending step (the
+            // source's staged `migrate to … using …`). Committed `using` fns
+            // are stored as source text in the lock and re-parsed here; the
+            // pending `using` fn is a live AST expr. A stale database
+            // fast-forwards through the whole chain at startup.
+            let migrate_chains = cg.migrate_chains.clone();
+            let pending_targets = cg.pending_targets.clone();
+
+            // Collect the pending migration site (relation + using AST) from
+            // record-embedded source fields and top-level source decls.
+            let mut pending_sites: Vec<(String, ast::Expr)> = Vec::new();
             for decl in &decls {
                 if let DeclViewKind::Fun {
                     body: Some(body), ..
                 } = decl.kind
                 {
-                    collect_record_migrations(body, &mut migrate_sites);
+                    collect_record_migrations(body, &mut pending_sites);
                 }
-                // Top-level `with`-block sources carry their `migrate` clauses
-                // directly on the SourceDecl — collect those too, or a source
-                // declared at the top level never gets its migration emitted.
                 if let DeclViewKind::Source { migrations, .. } = decl.kind {
-                    // `migrate_schemas` is keyed by the bare relation name;
-                    // the decl name carries the leading `*`.
                     let bare = decl.name.strip_prefix('*').unwrap_or(decl.name);
                     for m in migrations {
-                        migrate_sites.push((bare.to_string(), m.using_fn.clone()));
+                        pending_sites.push((bare.to_string(), m.using_fn.clone()));
                     }
                 }
             }
-            for (relation, using_fn) in &migrate_sites {
-                let relation = relation.clone();
-                let using_fn = using_fn.clone();
-                if let Some(migrations) = migrate_schemas.get(&relation) {
-                    let idx = migrate_counters.entry(relation.clone()).or_insert(0);
-                    if let Some((old_schema, new_schema)) = migrations.get(*idx) {
-                        let (name_ptr, name_len) = cg.string_ptr(builder, &relation);
-                        let (old_ptr, old_len) = cg.string_ptr(builder, old_schema);
-                        let (new_ptr, new_len) = cg.string_ptr(builder, new_schema);
 
-                        // Compile the using expression (typically a lambda)
-                        let mut env = Env::new();
-                        let migrate_fn_val = cg.compile_expr(builder, &using_fn, &mut env, db);
+            // Every relation that has a committed chain and/or a pending step.
+            let mut relations: Vec<String> = migrate_chains.keys().cloned().collect();
+            for (rel, _) in &pending_sites {
+                if !relations.contains(rel) {
+                    relations.push(rel.clone());
+                }
+            }
+            relations.sort();
 
-                        // Validate refinements on the transformed rows
-                        // before committing the migration. Every other
-                        // write path (set/replace/append/view/scalar)
-                        // calls emit_refinement_checks; migrate was the
-                        // sole exception, so a `migrate … using` could
-                        // persist values violating a refined type (e.g.
-                        // negative into a Nat column). The runtime's
-                        // knot_source_migrate_preview returns the
-                        // transformed rows without writing, in the same
-                        // value shape set/replace validate; if there are
-                        // no refinements on this source the check is a
-                        // no-op.
-                        if cg.source_refinements.contains_key(&relation) {
-                            let preview = cg.call_rt(
-                                builder,
-                                "knot_source_migrate_preview",
-                                &[
-                                    db,
-                                    name_ptr,
-                                    name_len,
-                                    old_ptr,
-                                    old_len,
-                                    new_ptr,
-                                    new_len,
-                                    migrate_fn_val,
-                                ],
-                            );
-                            cg.emit_refinement_checks(builder, &relation, preview, &mut env, db);
+            for relation in relations {
+                // Assemble (old_schema, new_schema, using_fn) steps: committed
+                // chain first, then the pending step (if any).
+                let mut steps: Vec<(String, String, ast::Expr)> = Vec::new();
+                if let Some(chain) = migrate_chains.get(&relation) {
+                    for step in chain {
+                        match parse_migration_fn(&step.using_src) {
+                            Some(f) => steps.push((
+                                step.from_schema.clone(),
+                                step.to_schema.clone(),
+                                f,
+                            )),
+                            None => {
+                                cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
+                                    format!(
+                                        "committed migration for '*{}' in the schema lock has an unparseable `using` fn",
+                                        relation
+                                    ),
+                                ));
+                            }
                         }
+                    }
+                }
+                if let Some((_, using_ast)) = pending_sites.iter().find(|(r, _)| *r == relation) {
+                    // Pending step: from = the lock's recorded current schema
+                    // (the baseline this migration upgrades), to = the pending
+                    // target recorded by TypeEnv. The committed chain is empty
+                    // for a first migration, so the baseline comes from the
+                    // lock's recorded schema, not the chain.
+                    let from = cg
+                        .locked_schemas
+                        .get(&relation)
+                        .cloned()
+                        .unwrap_or_default();
+                    let to = pending_targets.get(&relation).cloned().unwrap_or_default();
+                    steps.push((from, to, using_ast.clone()));
+                }
 
-                        cg.call_rt_void(
+                for (old_schema, new_schema, using_fn) in steps {
+                    let (name_ptr, name_len) = cg.string_ptr(builder, &relation);
+                    let (old_ptr, old_len) = cg.string_ptr(builder, &old_schema);
+                    let (new_ptr, new_len) = cg.string_ptr(builder, &new_schema);
+
+                    let mut env = Env::new();
+                    let migrate_fn_val = cg.compile_expr(builder, &using_fn, &mut env, db);
+
+                    // Validate refinements on the transformed rows before
+                    // committing the migration (see the longer comment that was
+                    // here): preview returns the transformed rows without
+                    // writing; a no-op when the source has no refinements.
+                    if cg.source_refinements.contains_key(&relation) {
+                        let preview = cg.call_rt(
                             builder,
-                            "knot_source_migrate",
+                            "knot_source_migrate_preview",
                             &[
-                                db,
-                                name_ptr,
-                                name_len,
-                                old_ptr,
-                                old_len,
-                                new_ptr,
-                                new_len,
+                                db, name_ptr, name_len, old_ptr, old_len, new_ptr, new_len,
                                 migrate_fn_val,
                             ],
                         );
-                        *idx += 1;
+                        cg.emit_refinement_checks(builder, &relation, preview, &mut env, db);
                     }
+
+                    cg.call_rt_void(
+                        builder,
+                        "knot_source_migrate",
+                        &[
+                            db, name_ptr, name_len, old_ptr, old_len, new_ptr, new_len,
+                            migrate_fn_val,
+                        ],
+                    );
                 }
             }
 
@@ -20775,6 +20811,33 @@ fn collect_record_migrations(body: &ast::Expr, out: &mut Vec<(String, ast::Expr)
             }
         }
     }
+}
+
+/// Re-parse a committed migration's `using` fn from the schema lock back into
+/// an AST expression. The lock stores it as source text (a bare lambda such as
+/// `\old -> {name old.name}`); a file-as-expression parse recovers the lambda.
+/// Data constructors referenced by the fn (e.g. `Active.Yes {}`) resolve
+/// against the global constructor registry at compile time, so the snippet
+/// needs no lexical environment. Returns `None` when the snippet doesn't parse
+/// as a single expression.
+fn parse_migration_fn(using_src: &str) -> Option<ast::Expr> {
+    let lexer = knot::lexer::Lexer::new(using_src);
+    let (tokens, lex_diags) = lexer.tokenize();
+    if lex_diags
+        .iter()
+        .any(|d| d.severity == knot::diagnostic::Severity::Error)
+    {
+        return None;
+    }
+    let parser = knot::parser::Parser::new(using_src.to_string(), tokens);
+    let (program, parse_diags) = parser.parse_file_expr();
+    if parse_diags
+        .iter()
+        .any(|d| d.severity == knot::diagnostic::Severity::Error)
+    {
+        return None;
+    }
+    Some(program)
 }
 
 /// Convert route path segments to a pattern string like "/todos/{owner:text}".

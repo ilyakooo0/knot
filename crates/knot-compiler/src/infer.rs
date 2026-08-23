@@ -10054,6 +10054,42 @@ impl Infer {
             RelMarker::Source { name, ty } => {
                 self.annotation_vars.clear();
                 let resolved = self.ast_type_to_ty(ty);
+                // A source relation's element must be a record (or an ADT, which
+                // stores one wide row per constructor). Scalar elements
+                // (`Rel (Int 1) *nums`) are rejected: the codegen/type halves
+                // disagreed on whether such a source is a single value or a
+                // relation — producing a runtime crash (`cannot convert Relation
+                // to SQL`) on an ordinary `full *nums = [1  2  3]` write.
+                // Restricting sources to records removes the ambiguity. Scalar
+                // *list/comprehension* values are unaffected — only persisted
+                // `*sources` require record elements.
+                if let Ty::Relation(inner) = self.apply(&resolved) {
+                    let inner = self.apply(&inner);
+                    // Reject scalar elements (Int/Float/Text/Bool/Bytes/Uuid and
+                    // their unit-bearing Con forms). Accept records and any
+                    // other named Con (a user record or ADT type).
+                    let is_scalar = matches!(
+                        inner.peel_alias(),
+                        Ty::Int
+                            | Ty::Float
+                            | Ty::Text
+                            | Ty::Bool
+                            | Ty::Bytes
+                            | Ty::Uuid
+                            | Ty::NumLit(_)
+                    ) || inner.is_int_like()
+                        || inner.is_float_like();
+                    if is_scalar {
+                        self.error(
+                            format!(
+                                "source `*{}` must hold records (or an ADT), not `{}` — a relation of scalars can't be persisted",
+                                name,
+                                self.display_ty(&inner)
+                            ),
+                            ty.span,
+                        );
+                    }
+                }
                 self.source_types.insert(name.to_string(), resolved);
             }
         });

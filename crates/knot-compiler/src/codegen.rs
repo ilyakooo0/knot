@@ -12875,7 +12875,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
         params: &[ast::Pat],
         body: &ast::Expr,
         env: &mut Env,
-        _db: Value,
+        db: Value,
         source_override: Option<String>,
     ) -> Value {
         // Curry multi-param lambdas: \a b c -> body  =>  \a -> \b -> \c -> body
@@ -12899,7 +12899,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 &params[0..1],
                 &inner_lambda,
                 env,
-                _db,
+                db,
                 Some(source_text),
             );
         }
@@ -12928,6 +12928,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 env.bindings
                     .contains_key(&crate::infer::Binding::User(v.clone()))
                     || (!self.global_fns.contains_key(v) && !is_builtin_name(v))
+                    // A user-declared global (a top-level `with`-field: a
+                    // constant or named function) referenced free in the body
+                    // is captured too, so `extract` can bind it in the `with`
+                    // block and the extracted source is self-contained
+                    // (re-evaluable in a fresh scope). Builtins and stdlib fns
+                    // (`base.*`) are excluded: they ship with the prelude, so
+                    // the extracted source resolves them without a binding.
+                    || self.is_user_global_fn(v)
             })
             .collect();
         // Relation-valued locals captured into this lambda must stay
@@ -12991,8 +12999,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 let val = match env.get(&crate::infer::Binding::User(var_name.to_string())) {
                     Some(v) => v,
                     None => {
-                        let msg = format!("codegen: undefined captured variable '{}'", var_name);
-                        self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
+                        // A captured user-declared global: no local SSA value,
+                        // so emit the value the `Var` arm would — call a 0-arg
+                        // constant, or build a first-class function value (a
+                        // trampoline) for a named function.
+                        if self.is_user_global_fn(var_name) {
+                            self.emit_user_global_value(builder, var_name, db)
+                        } else {
+                            let msg = format!("codegen: undefined captured variable '{}'", var_name);
+                            self.push_codegen_error(builder, ast::Span::new(0, 0), msg)
+                        }
                     }
                 };
                 let (key_ptr, key_len) = self.string_ptr(builder, var_name);
@@ -13017,6 +13033,64 @@ impl<M: cranelift_module::Module> Codegen<M> {
             "knot_value_function",
             &[fn_addr, env_val, src_ptr, src_len],
         )
+    }
+
+    /// Is `name` a user-declared global (a top-level `with`-field) that a
+    /// closure should capture for `extract`? User decls are keyed by their
+    /// bare name in `global_fns`. Excludes builtins, stdlib fns (`base.*`),
+    /// `main`, and codegen-internal wrappers (`__withfix_*`, fixpoints) — those
+    /// resolve without a `with`-binding, so capturing them would only bloat the
+    /// extracted source (or, for internal fns, reference an un-re-bindable name).
+    fn is_user_global_fn(&self, name: &str) -> bool {
+        name != "main"
+            && !name.starts_with("base.")
+            && !name.starts_with("__")
+            && !is_builtin_name(name)
+            && self.global_fns.contains_key(name)
+            // Only genuine user declarations have a body recorded; stdlib and
+            // internal registrations don't populate `fun_bodies`.
+            && self.fun_bodies.contains_key(name)
+    }
+
+    /// Emit the runtime value of a user-declared global, mirroring the `Var`
+    /// arm: call a 0-arg constant, or build a first-class function value (a
+    /// trampoline) for a named function.
+    fn emit_user_global_value(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        name: &str,
+        db: Value,
+    ) -> Value {
+        let (func_id, n_params) = self.global_fns[name];
+        if n_params == 0 {
+            let func_ref = self.module.declare_func_in_func(func_id, builder.func);
+            let call = builder.ins().call(func_ref, &[db]);
+            builder.inst_results(call)[0]
+        } else {
+            let trampoline_id = self.get_or_create_trampoline(name, n_params);
+            let func_ref = self
+                .module
+                .declare_func_in_func(trampoline_id, builder.func);
+            let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
+            let null = builder.ins().iconst(self.ptr_type, 0);
+            let (src_ptr, src_len) = self.string_ptr(builder, name);
+            // Give the captured fn an `extract_source` of its body, so a
+            // closure that captures it extracts the body's source inline
+            // (self-contained) rather than the bare name — which would be
+            // self-referential inside the `with {name <value>}` binding
+            // `extract` wraps the capture in.
+            let body_src = self
+                .fun_bodies
+                .get(name)
+                .map(pretty_expr)
+                .unwrap_or_else(|| name.to_string());
+            let (x_ptr, x_len) = self.string_ptr(builder, &body_src);
+            self.call_rt(
+                builder,
+                "knot_value_function_full",
+                &[fn_addr, null, src_ptr, src_len, x_ptr, x_len],
+            )
+        }
     }
 
     // ── Literal compilation ───────────────────────────────────────

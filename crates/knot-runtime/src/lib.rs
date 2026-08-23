@@ -8497,7 +8497,17 @@ fn wrap_with_env(source: &str, env: *mut Value) -> String {
         }
         let inner: Vec<String> = fields
             .iter()
-            .map(|f| format!("{} {}", f.name, extract_source(f.value)))
+            .map(|f| {
+                // A function-valued capture must be emitted in the sig'd field
+                // form (`_  name  body`) — a bare `name <lambda>` is a parse
+                // error under the single-line-sig rule (named functions require
+                // a signature). `_` defers the type to the checker.
+                if matches!(unsafe { as_ref(f.value) }, Value::Function(_)) {
+                    format!("_  {}  {}", f.name, extract_source(f.value))
+                } else {
+                    format!("{} {}", f.name, extract_source(f.value))
+                }
+            })
             .collect();
         format!("with {{{}}} ({})", inner.join(" "), source)
     } else {
@@ -22947,11 +22957,13 @@ mod extract_source_tests {
     }
     #[test]
     fn closure_capture_is_function() {
-        // A captured dependency that is itself a closure re-extracts.
+        // A captured dependency that is itself a closure re-extracts — in the
+        // sig'd field form (`_  name  body`), since a bare `name <lambda>` is a
+        // parse error under the single-line-sig rule.
         let dep = func("\\n -> n + 1", std::ptr::null_mut());
         let env = record(&[("inc", dep)]);
         let f = func("\\x -> inc x", env);
-        assert_eq!(extract_source(f), "with {inc \\n -> n + 1} (\\x -> inc x)");
+        assert_eq!(extract_source(f), "with {_  inc  \\n -> n + 1} (\\x -> inc x)");
     }
 
     // ── curried builtins (c1) ───────────────────────────────────────

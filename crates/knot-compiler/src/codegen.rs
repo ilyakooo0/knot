@@ -207,6 +207,15 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // Trampolines for user functions used as values: fn_name -> trampoline_func_id
     user_fn_trampolines: HashMap<String, FuncId>,
 
+    // Fns whose global-capture env is currently being built (a guard against
+    // infinite recursion on mutually recursive fn dependencies: building f's
+    // env captures helper, whose trampoline captures helper's deps, which may
+    // include f again). A dep already in progress is captured as a bare
+    // trampoline value with an empty env — the trampoline itself still calls
+    // the right fn, and its own env is built when that fn is emitted
+    // independently, so the cyclic reference resolves at call time.
+    capture_env_in_progress: std::collections::HashSet<String>,
+
     // Do-blocks sitting in the value position of a `set`/`replace`, keyed by
     // span. These are relational comprehensions even when they bind from a
     // source (`x <- *rel`), which `is_io_do_block` would otherwise read as IO.
@@ -1394,6 +1403,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             fetch_route_entries: HashMap::new(),
             type_aliases: HashMap::new(),
             user_fn_trampolines: HashMap::new(),
+            capture_env_in_progress: std::collections::HashSet::new(),
             relational_do_spans: HashSet::new(),
             in_memory_source_reads: HashMap::new(),
             monad_info: HashMap::new(),
@@ -13120,7 +13130,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
             // Match the closure value a `with` record projects into the main
             // body's env: `source` is the fn's body and the env captures the
-            // fn's own global-const dependencies, so `extract` re-derives the
+            // fn's own global dependencies, so `extract` re-derives the
             // self-contained `with {deps} (body)` form rather than the bare
             // name (which would be self-referential inside the binding) or a
             // body missing its captured deps.
@@ -13129,20 +13139,33 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .get(name)
                 .map(pretty_expr)
                 .unwrap_or_else(|| name.to_string());
+            // Capture every user-global-fn dependency — consts (0-arg, captured
+            // by value) AND fns (captured as their trampoline value, which
+            // recursively captures its own deps). The old `*p == 0` filter only
+            // captured consts, so a fn-valued dep (`helper = \x -> …`) was
+            // dropped and `extract` produced a bare body that referenced it
+            // unbound. `capture_env_in_progress` breaks cycles: a dep already
+            // being captured gets a bare trampoline (empty env) — it still
+            // calls the right fn, and its own env is built when that fn is
+            // emitted on its own.
             let deps: Vec<String> = self
                 .fun_bodies
                 .get(name)
                 .map(|body| {
                     find_free_vars(body, &[])
                         .into_iter()
-                        .filter(|v| {
-                            self.is_user_global_fn(v)
-                                && self.global_fns.get(v.as_str()).is_some_and(|(_, p)| *p == 0)
-                        })
+                        .filter(|v| self.is_user_global_fn(v))
                         .collect()
                 })
                 .unwrap_or_default();
-            let env_val = self.build_global_capture_env(builder, &deps, db);
+            let env_val = if self.capture_env_in_progress.contains(name) {
+                builder.ins().iconst(self.ptr_type, 0)
+            } else {
+                self.capture_env_in_progress.insert(name.to_string());
+                let env = self.build_global_capture_env(builder, &deps, db);
+                self.capture_env_in_progress.remove(name);
+                env
+            };
             let (src_ptr, src_len) = self.string_ptr(builder, &body_src);
             self.call_rt(
                 builder,

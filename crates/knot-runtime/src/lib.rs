@@ -13187,6 +13187,100 @@ pub extern "C-unwind" fn knot_schema_init(db: *mut c_void) {
 ///   drop & recreate the table, insert transformed rows, update stored schema.
 /// - If no stored schema: new table, skip.
 /// - Otherwise: error (unexpected schema).
+///
+/// Rows per read/transform/insert page during a migration. Bounds peak memory:
+/// at most one chunk of read rows plus one chunk of transformed rows are live
+/// at once, regardless of table size.
+const MIGRATE_CHUNK: i64 = 4096;
+
+/// Create an empty table for `schema` under `table_name` (used for the temp
+/// table a migration streams into). Mirrors the table-creation half of
+/// `knot_source_init` for both ADT and record schemas. `name` is the bare
+/// relation name (for the unique-index name).
+fn create_new_table(conn: &rusqlite::Connection, table_name: &str, name: &str, schema: &str) {
+    let table = quote_ident(table_name);
+    if is_adt_schema(schema) {
+        let adt = parse_adt_schema(schema);
+        let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
+        for f in &adt.all_fields {
+            col_defs.push(format!("{} {}", quote_ident(&f.name), adt.col_sql_type(f)));
+        }
+        let create_sql = format!("CREATE TABLE {} ({});", table, col_defs.join(", "));
+        debug_sql(&create_sql);
+        conn.execute_batch(&create_sql)
+            .expect("knot runtime: failed to create table during migration");
+
+        // Unique index with COALESCE for NULLs (same as knot_source_init)
+        let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
+            .chain(
+                adt.all_fields
+                    .iter()
+                    .map(|f| null_safe_coalesce(&quote_ident(&f.name), f.ty)),
+            )
+            .collect();
+        let idx_sql = format!(
+            "CREATE UNIQUE INDEX {} ON {} ({});",
+            quote_ident(&format!("_knot_{}_unique", name)),
+            table,
+            coalesced.join(", ")
+        );
+        debug_sql(&idx_sql);
+        if let Err(e) = conn.execute_batch(&idx_sql) {
+            log::log_warn(&format!(
+                "knot runtime: failed to create unique index during migration for {}: {}",
+                name,
+                json_escape(&e.to_string())
+            ));
+        }
+    } else {
+        let rec = parse_record_schema(schema);
+        init_record_table(conn, table_name, &rec);
+    }
+}
+
+/// Insert `rows` into `table_name` (the temp table during a migration),
+/// dispatching on the schema shape. Mirrors the insert half of the migration.
+fn insert_rows(
+    conn: &rusqlite::Connection,
+    table_name: &str,
+    name: &str,
+    schema: &str,
+    rows: &[*mut Value],
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let table = quote_ident(table_name);
+    if is_adt_schema(schema) {
+        let adt = parse_adt_schema(schema);
+        let mut col_names = vec![quote_ident("_tag")];
+        for f in &adt.all_fields {
+            col_names.push(quote_ident(&f.name));
+        }
+        let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
+        let insert_sql = format!(
+            "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+            table,
+            col_names.join(", "),
+            placeholders.join(", ")
+        );
+        debug_sql(&insert_sql);
+        let mut stmt = conn
+            .prepare(&insert_sql)
+            .expect("knot runtime: failed to prepare insert during migration");
+        for row_ptr in rows {
+            let params = adt_row_to_params(*row_ptr, &adt);
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            stmt.execute(param_refs.as_slice())
+                .expect("knot runtime: failed to insert row during migration");
+        }
+    } else {
+        let rec = parse_record_schema(schema);
+        write_record_rows(conn, table_name, &rec, rows);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_source_migrate(
     db: *mut c_void,
@@ -13250,45 +13344,18 @@ pub extern "C-unwind" fn knot_source_migrate(
 
     log::log_info(&format!("Migrating source '{}'...", name));
 
-    // 1. Read all rows using old schema
-    let old_data = knot_source_read(db, name_ptr, name_len, old_schema_ptr, old_schema_len);
-    let old_rows = match unsafe { as_ref(old_data) } {
-        Value::Relation(rows) => rows.clone(),
-        _ => panic!("knot runtime: expected relation during migration"),
-    };
+    // Chunked migration: the old table is read, transformed, and written one
+    // page at a time (MIGRATE_CHUNK rows) so peak memory is one chunk, not the
+    // whole relation. The new rows go into a TEMP table that is swapped into
+    // place at the end (drop old + rename), so reads never see a partial table
+    // and the whole thing stays in one savepoint.
+    let table_name = format!("_knot_{}", name);
+    let tmp_table_name = format!("_knot_{}_migrating", name);
+    let table = quote_ident(&table_name);
+    let tmp_table = quote_ident(&tmp_table_name);
 
-    // 2. Transform each row through the migration function.
-    //
-    // Scalar (and relation-of-scalar) sources store each value as a
-    // `{_value: x}` row, but the migrate function operates on the bare scalar
-    // (its declared `from`/`to` element type). Unwrap the stored `_value`
-    // field before applying the function, and re-wrap the result so the
-    // record-based writer below (which expects `{_value: x}` rows) stores it
-    // correctly. Record/ADT sources pass their rows through unchanged.
     let old_is_scalar = is_scalar_value_schema(old_schema);
     let new_is_scalar = is_scalar_value_schema(new_schema);
-    let mut new_rows: Vec<*mut Value> = Vec::with_capacity(old_rows.len());
-    for row in &old_rows {
-        let input = if old_is_scalar {
-            knot_record_field(*row, "_value".as_ptr(), 6)
-        } else {
-            *row
-        };
-        let out = knot_value_call(db, migrate_fn, input);
-        let new_row = if new_is_scalar {
-            alloc(Value::Record(vec![RecordField {
-                name: "_value".into(),
-                value: out,
-            }]))
-        } else {
-            out
-        };
-        new_rows.push(new_row);
-    }
-
-    // 3. Drop old table + index and recreate with new schema (in a transaction)
-    let table_name = format!("_knot_{}", name);
-    let table = quote_ident(&table_name);
 
     db_ref
         .conn
@@ -13299,9 +13366,48 @@ pub extern "C-unwind" fn knot_source_migrate(
     // mid-migration (bad insert, failed CREATE) doesn't leave the table
     // half-dropped/half-rebuilt on a connection a `catch_unwind` site keeps
     // using — and the savepoint isn't left dangling.
+    let mut total_rows = 0usize;
     with_savepoint_rollback(db_ref, "knot_migrate", || {
-        // Drop old child tables (for nested relation fields) before dropping parent.
-        // Recurse to handle grandchild+ tables (deepest first).
+        // Create the EMPTY new-shape table under the temp name, then stream old
+        // rows into it page by page. DDL up-front so inserts can target it.
+        create_new_table(&db_ref.conn, &tmp_table_name, name, new_schema);
+
+        // Page the old table by rowid; transform each chunk and append it to the
+        // temp table. Peak memory = one chunk of read rows + one chunk of
+        // transformed rows.
+        let mut after_rowid = 0i64;
+        loop {
+            let (chunk, last) =
+                read_source_rows(&db_ref.conn, name, old_schema, Some((after_rowid, MIGRATE_CHUNK)));
+            if chunk.is_empty() {
+                break;
+            }
+            after_rowid = last.expect("paged read returns a cursor");
+
+            let mut new_rows: Vec<*mut Value> = Vec::with_capacity(chunk.len());
+            for row in &chunk {
+                let input = if old_is_scalar {
+                    knot_record_field(*row, "_value".as_ptr(), 6)
+                } else {
+                    *row
+                };
+                let out = knot_value_call(db, migrate_fn, input);
+                let new_row = if new_is_scalar {
+                    alloc(Value::Record(vec![RecordField {
+                        name: "_value".into(),
+                        value: out,
+                    }]))
+                } else {
+                    out
+                };
+                new_rows.push(new_row);
+            }
+            total_rows += new_rows.len();
+            insert_rows(&db_ref.conn, &tmp_table_name, name, new_schema, &new_rows);
+        }
+
+        // Swap the temp table into place: drop the old table (and any nested
+        // child tables) and rename the temp table to the real name.
         fn drop_nested_tables(
             conn: &rusqlite::Connection,
             parent_table: &str,
@@ -13328,91 +13434,12 @@ pub extern "C-unwind" fn knot_source_migrate(
             .execute_batch(&drop_sql)
             .expect("knot runtime: failed to drop table during migration");
 
-        if is_adt_schema(new_schema) {
-            // ADT schema: recreate using the same logic as knot_source_init
-            let adt = parse_adt_schema(new_schema);
-            let mut col_defs = vec![format!("{} TEXT NOT NULL", quote_ident("_tag"))];
-            let mut col_names = vec![quote_ident("_tag")];
-            for f in &adt.all_fields {
-                col_defs.push(format!("{} {}", quote_ident(&f.name), adt.col_sql_type(f)));
-                col_names.push(quote_ident(&f.name));
-            }
-
-            let create_sql = format!("CREATE TABLE {} ({});", table, col_defs.join(", "));
-            debug_sql(&create_sql);
-            db_ref
-                .conn
-                .execute_batch(&create_sql)
-                .expect("knot runtime: failed to create table during migration");
-
-            // Unique index with COALESCE for NULLs (same as knot_source_init)
-            let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
-                .chain(
-                    adt.all_fields
-                        .iter()
-                        .map(|f| null_safe_coalesce(&quote_ident(&f.name), f.ty)),
-                )
-                .collect();
-            let idx_sql = format!(
-                "CREATE UNIQUE INDEX {} ON {} ({});",
-                quote_ident(&format!("_knot_{}_unique", name)),
-                table,
-                coalesced.join(", ")
-            );
-            debug_sql(&idx_sql);
-            if let Err(e) = db_ref.conn.execute_batch(&idx_sql) {
-                log::log_warn(&format!(
-                    "knot runtime: failed to create unique index during migration for {}: {}",
-                    name,
-                    json_escape(&e.to_string())
-                ));
-            }
-
-            // Insert transformed rows (ADT: constructor values)
-            if !new_rows.is_empty() {
-                let placeholders: Vec<String> = col_names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| format!("?{}", i + 1))
-                    .collect();
-                let insert_sql = format!(
-                    "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-                    table,
-                    col_names.join(", "),
-                    placeholders.join(", ")
-                );
-                debug_sql(&insert_sql);
-
-                let mut stmt = db_ref
-                    .conn
-                    .prepare_cached(&insert_sql)
-                    .expect("knot runtime: failed to prepare insert during migration");
-
-                for row_ptr in &new_rows {
-                    // Type-aware serialization via adt_row_to_params — the same
-                    // path every other ADT write uses. The previous type-blind
-                    // value_to_sql_param serialized payload-bearing constructor
-                    // fields (json columns) as their bare tag string, permanently
-                    // discarding the payload, and skipped the nested-relation
-                    // set-semantics dedup that value_to_sqlite performs.
-                    let params = adt_row_to_params(*row_ptr, &adt);
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
-                        .iter()
-                        .map(|p| p as &dyn rusqlite::types::ToSql)
-                        .collect();
-                    stmt.execute(param_refs.as_slice())
-                        .expect("knot runtime: failed to insert row during migration");
-                }
-            }
-        } else {
-            // Record schema — use init_record_table + write_record_rows so that
-            // nested relation fields (child tables) and _id AUTOINCREMENT are
-            // handled correctly, and value_to_sqlite is used for type-aware
-            // serialization.
-            let new_rec = parse_record_schema(new_schema);
-            init_record_table(&db_ref.conn, &table_name, &new_rec);
-            write_record_rows(&db_ref.conn, &table_name, &new_rec, &new_rows);
-        }
+        let rename_sql = format!("ALTER TABLE {} RENAME TO {};", tmp_table, table);
+        debug_sql(&rename_sql);
+        db_ref
+            .conn
+            .execute_batch(&rename_sql)
+            .expect("knot runtime: failed to swap migrated table into place");
 
         // 5. Update stored schema
         db_ref
@@ -13438,7 +13465,7 @@ pub extern "C-unwind" fn knot_source_migrate(
     log::log_info(&format!(
         "Migrated source '{}': {} rows",
         name,
-        old_rows.len()
+        total_rows
     ));
 }
 
@@ -14659,7 +14686,36 @@ pub extern "C-unwind" fn knot_source_read(
         stm_track_read(name);
     }
 
+    let (rows, _) = read_source_rows(&db_ref.conn, name, schema, None);
+    alloc(Value::Relation(rows))
+}
+
+/// Read a source's rows, optionally paged by SQLite's implicit `rowid`.
+///
+/// `page` is `Some((after_rowid, limit))` to read up to `limit` rows with
+/// `rowid > after_rowid` (ordered by rowid), or `None` to read the whole table.
+/// Paging is what lets a migration stream the old table in bounded-memory
+/// chunks instead of materialising every row at once. Every source table has a
+/// stable `rowid` (none is declared `WITHOUT ROWID`).
+///
+/// Returns the reconstructed rows plus the largest `rowid` seen this page (the
+/// cursor for the next page; `None` when the page was empty or paging is off).
+fn read_source_rows(
+    conn: &rusqlite::Connection,
+    name: &str,
+    schema: &str,
+    page: Option<(i64, i64)>,
+) -> (Vec<*mut Value>, Option<i64>) {
     let table = quote_ident(&format!("_knot_{}", name));
+    // When paging, append `rowid` as the last selected column so the caller can
+    // advance the cursor; the row builders below never read it (they index only
+    // the schema columns).
+    let page_sql: String = match page {
+        Some((after, limit)) => {
+            format!(" WHERE rowid > {} ORDER BY rowid LIMIT {}", after, limit)
+        }
+        None => String::new(),
+    };
 
     if is_adt_schema(schema) {
         let adt = parse_adt_schema(schema);
@@ -14670,19 +14726,25 @@ pub extern "C-unwind" fn knot_source_read(
             .enumerate()
             .map(|(i, f)| (f.name.as_str(), i))
             .collect();
-        // SELECT _tag + all fields from the wide table
+        // SELECT _tag + all fields from the wide table (+ rowid when paging).
         let mut select_cols = vec![quote_ident("_tag")];
         for f in &adt.all_fields {
             select_cols.push(quote_ident(&f.name));
         }
-        let sql = format!("SELECT {} FROM {}", select_cols.join(", "), table);
+        let rowid_idx = if page.is_some() {
+            select_cols.push("rowid".to_string());
+            Some(select_cols.len() - 1)
+        } else {
+            None
+        };
+        let sql = format!("SELECT {} FROM {}{}", select_cols.join(", "), table, page_sql);
         debug_sql(&sql);
 
-        let mut stmt = db_ref
-            .conn
-            .prepare_cached(&sql)
+        let mut stmt = conn
+            .prepare(&sql)
             .unwrap_or_else(|e| panic!("knot runtime: query error: {}", e));
         let mut rows: Vec<*mut Value> = Vec::new();
+        let mut last_rowid: Option<i64> = None;
         let mut result_rows = stmt
             .query([])
             .unwrap_or_else(|e| panic!("knot runtime: query exec error: {}", e));
@@ -14691,6 +14753,9 @@ pub extern "C-unwind" fn knot_source_read(
             .next()
             .unwrap_or_else(|e| panic!("knot runtime: row fetch error: {}", e))
         {
+            if let Some(idx) = rowid_idx {
+                last_rowid = Some(row.get(idx).unwrap());
+            }
             let tag: String = row.get(0).unwrap();
             // Find the constructor spec for this tag
             let ctor = adt.constructors.iter().find(|c| c.name == tag);
@@ -14733,10 +14798,10 @@ pub extern "C-unwind" fn knot_source_read(
             };
             rows.push(alloc(Value::Constructor(intern_str(&tag), payload)));
         }
-        alloc(Value::Relation(rows))
+        (rows, last_rowid)
     } else {
         let rec = parse_record_schema(schema);
-        read_record_table(&db_ref.conn, &format!("_knot_{}", name), &rec)
+        read_record_table_paged(conn, &format!("_knot_{}", name), &rec, page)
     }
 }
 
@@ -15416,10 +15481,26 @@ fn read_record_table(
     table_name: &str,
     schema: &RecordSchema,
 ) -> *mut Value {
+    let (rows, _) = read_record_table_paged(conn, table_name, schema, None);
+    alloc(Value::Relation(rows))
+}
+
+/// Paged variant of `read_record_table`: returns the reconstructed rows plus the
+/// largest `rowid` seen this page (the cursor for the next page). `page` is
+/// `Some((after_rowid, limit))` to read up to `limit` rows with
+/// `rowid > after_rowid` (ordered by rowid) — used to stream a migration — or
+/// `None` to read the whole table. When paging, `rowid` is selected as an extra
+/// trailing column so the caller can advance the cursor.
+fn read_record_table_paged(
+    conn: &rusqlite::Connection,
+    table_name: &str,
+    schema: &RecordSchema,
+    page: Option<(i64, i64)>,
+) -> (Vec<*mut Value>, Option<i64>) {
     let table = quote_ident(table_name);
     let has_children = !schema.nested.is_empty();
 
-    // Build SELECT: _id (if has children) + scalar columns
+    // Build SELECT: _id (if has children) + scalar columns (+ rowid when paging).
     let mut select_cols: Vec<String> = Vec::new();
     if has_children {
         select_cols.push(quote_ident("_id"));
@@ -15428,21 +15509,34 @@ fn read_record_table(
         select_cols.push(quote_ident(&c.name));
     }
 
+    let (page_sql, rowid_idx): (String, Option<usize>) = match page {
+        Some((after, limit)) => {
+            select_cols.push("rowid".to_string());
+            (
+                format!(" WHERE rowid > {} ORDER BY rowid LIMIT {}", after, limit),
+                Some(select_cols.len() - 1),
+            )
+        }
+        None => (String::new(), None),
+    };
+
     let sql = format!(
-        "SELECT {} FROM {}",
+        "SELECT {} FROM {}{}",
         if select_cols.is_empty() {
             "1".to_string()
         } else {
             select_cols.join(", ")
         },
-        table
+        table,
+        page_sql
     );
     debug_sql(&sql);
 
     let mut stmt = conn
-        .prepare_cached(&sql)
+        .prepare(&sql)
         .unwrap_or_else(|e| panic!("knot runtime: query error: {}", e));
     let mut rows: Vec<*mut Value> = Vec::new();
+    let mut last_rowid: Option<i64> = None;
     let mut result_rows = stmt
         .query([])
         .unwrap_or_else(|e| panic!("knot runtime: query exec error: {}", e));
@@ -15451,6 +15545,9 @@ fn read_record_table(
         .next()
         .unwrap_or_else(|e| panic!("knot runtime: row fetch error: {}", e))
     {
+        if let Some(idx) = rowid_idx {
+            last_rowid = Some(row.get(idx).unwrap());
+        }
         let total_fields = schema.columns.len() + schema.nested.len();
         let record = knot_record_empty(total_fields);
         let col_offset = if has_children { 1 } else { 0 }; // skip _id column
@@ -15476,7 +15573,7 @@ fn read_record_table(
         rows.push(record);
     }
 
-    alloc(Value::Relation(rows))
+    (rows, last_rowid)
 }
 
 /// Read child rows for a nested relation field, filtered by parent_id.

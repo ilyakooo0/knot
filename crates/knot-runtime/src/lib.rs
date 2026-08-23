@@ -13243,7 +13243,6 @@ fn create_new_table(conn: &rusqlite::Connection, table_name: &str, name: &str, s
 fn insert_rows(
     conn: &rusqlite::Connection,
     table_name: &str,
-    name: &str,
     schema: &str,
     rows: &[*mut Value],
 ) {
@@ -13403,7 +13402,7 @@ pub extern "C-unwind" fn knot_source_migrate(
                 new_rows.push(new_row);
             }
             total_rows += new_rows.len();
-            insert_rows(&db_ref.conn, &tmp_table_name, name, new_schema, &new_rows);
+            insert_rows(&db_ref.conn, &tmp_table_name, new_schema, &new_rows);
         }
 
         // Swap the temp table into place: drop the old table (and any nested

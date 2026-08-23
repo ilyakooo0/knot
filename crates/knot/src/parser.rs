@@ -854,6 +854,12 @@ impl Parser {
             } else if self.eat(&TokenKind::Slash) {
                 let rhs = self.parse_unit_power()?;
                 lhs = UnitExpr::Div(Box::new(lhs), Box::new(rhs));
+            } else if self.at(&TokenKind::Caret) {
+                // `^` power was removed: a unit power is written with `*`
+                // (`M ^ 2` → `M * M`), which is also the form arithmetic
+                // produces. Point the user at it.
+                self.error("`^` unit power is gone — write the product instead: `M ^ 2` is `M * M`");
+                return None;
             } else {
                 break;
             }
@@ -862,33 +868,7 @@ impl Parser {
     }
 
     fn parse_unit_power(&mut self) -> Option<UnitExpr> {
-        let base = self.parse_unit_atom()?;
-        if self.eat(&TokenKind::Caret) {
-            // Parse integer exponent (possibly negative)
-            let neg = self.eat(&TokenKind::Minus);
-            match self.peek() {
-                TokenKind::Int(_) => {
-                    let tok = self.advance();
-                    let TokenKind::Int(n) = tok.kind else {
-                        unreachable!()
-                    };
-                    let exp: i32 = match n.parse() {
-                        Ok(e) => e,
-                        Err(_) => {
-                            self.error("unit exponent out of range (must fit in i32)");
-                            return None;
-                        }
-                    };
-                    Some(UnitExpr::Pow(Box::new(base), if neg { -exp } else { exp }))
-                }
-                _ => {
-                    self.error("expected integer exponent after '^'");
-                    None
-                }
-            }
-        } else {
-            Some(base)
-        }
+        self.parse_unit_atom()
     }
 
     fn parse_unit_atom(&mut self) -> Option<UnitExpr> {
@@ -4377,11 +4357,11 @@ impl Parser {
                         span,
                     ))
                 } else if (name == "Float" || name == "Int") && self.can_start_unit_type_arg() {
-                    // `Float M`, `Float u`, `Float (M / S^2)` — the unit is a
+                    // `Float M`, `Float u`, `Float (M / S)` — the unit is a
                     // regular type-argument position parsed as a unit
                     // expression. A bare Upper/Lower identifier is a unit
                     // (`M`, `u`); a parenthesized form carries the algebraic
-                    // operators `* / ^`. A `(` could also start a parenthesized
+                    // operators `* /`. A `(` could also start a parenthesized
                     // type (`Float (Int -> Text)` is application, not a unit),
                     // so save/restore on failure.
                     let saved = self.save();

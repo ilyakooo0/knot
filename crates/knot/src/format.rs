@@ -429,10 +429,6 @@ fn render_unit_expr_prec(u: &UnitExpr, ctx: u8) -> String {
             );
             if ctx > 1 { format!("({})", s) } else { s }
         }
-        UnitExpr::Pow(a, n) => {
-            let s = format!("{}^{}", render_unit_expr_prec(a, 3), n);
-            if ctx > 2 { format!("({})", s) } else { s }
-        }
         UnitExpr::Hole => "_".into(),
     }
 }

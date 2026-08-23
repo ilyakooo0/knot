@@ -3115,6 +3115,21 @@ impl Parser {
             for p in &params {
                 this.push_pat_vars(p);
             }
+            // Offside rule: a body that wraps to a following line must be
+            // indented past the enclosing block's indent (the column where the
+            // declaration/statement containing this lambda began). A body on
+            // the same line as `->` is free. `block_indent` is `usize::MAX`
+            // outside any layout block, where the rule doesn't apply.
+            let body_on_new_line = matches!(this.peek(), TokenKind::Newline);
+            if body_on_new_line {
+                this.skip_newlines();
+                if this.block_indent != usize::MAX && this.cur_column() <= this.block_indent {
+                    this.error(
+                        "lambda body on a following line must be indented past the enclosing block",
+                    );
+                    return None;
+                }
+            }
             let body = this.parse_expr();
             this.bound_vars.truncate(scope_mark);
             let body = body?;
@@ -3171,6 +3186,9 @@ impl Parser {
         if self.at_eof() {
             return None;
         }
+        // The column where this arm's pattern begins: a body that wraps to a
+        // following line must be indented past it (offside rule).
+        let arm_col = self.cur_column();
         // Parse the arm pattern with annotation speculation suppressed, so a
         // record pattern + gap + bare-var body (`{name n}  n`) reads as
         // record-pattern + body, not a `Type  name` annotated pattern.
@@ -3182,9 +3200,14 @@ impl Parser {
         // Arm separator is a GAP, not `->`: either a newline (the body starts on
         // The pattern ends at the gap; the body is the expression that follows.
         if matches!(self.peek(), TokenKind::Newline) {
-            // Newline-separated: the line break is the gap. Consume it and any
-            // further blank lines so the body parses from its own line.
+            // Newline-separated: the line break is the gap. The body must be
+            // indented past the pattern's column (a same-or-less-indented
+            // newline ends the arm, it does not continue it).
             self.skip_newlines();
+            if self.cur_column() <= arm_col {
+                self.error("case-arm body on a following line must be indented past the arm's pattern");
+                return None;
+            }
         } else if !self.gap_before_current() {
             self.error("expected a gap (2+ spaces) between the pattern and the body in a case arm: `{Pat  body}`");
             return None;

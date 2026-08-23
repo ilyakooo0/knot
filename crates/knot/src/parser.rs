@@ -4139,15 +4139,16 @@ impl Parser {
 
     fn parse_type_refined(&mut self) -> Option<Type> {
         let base = self.parse_type_union()?;
-        // The refinement predicate is introduced by `|`. This is disjoint from
-        // the variant-type `|`: `parse_type_union` consumes `|` only after a
-        // constructor-shaped spine (`Name {…}`), and a refinement base is never
-        // constructor-shaped (a constructor spine requires a record argument),
-        // so a `|` reaching here always opens a predicate.
-        if self.eat(&TokenKind::Pipe) {
+        // The refinement predicate is a lambda, introduced directly by `\`.
+        // A `\` can't appear in a data declaration or anywhere else in type
+        // position, so it's an unambiguous opener — no `|` delimiter is needed.
+        // Requiring a lambda (rather than any expression) is what makes this
+        // work: a bare-identifier predicate (`Int 1 pos`) would be ambiguous
+        // with type application, but a lambda is not.
+        if self.at(&TokenKind::Backslash) {
             // The predicate re-enters the expression grammar, which can loop
             // back here via a postfix `: Type` annotation. Charge the recursion
-            // budget across the predicate so deeply chained `|` clauses trip
+            // budget across the predicate so deeply chained lambdas trip
             // MAX_RECURSION_DEPTH instead of overflowing the native stack.
             if !self.enter_recursion() {
                 return None;

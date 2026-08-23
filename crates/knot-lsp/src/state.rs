@@ -626,7 +626,7 @@ pub const SNIPPETS: &[(&str, &str, &str, SnippetContext)] = &[
     (
         "type-refined",
         "refined type alias",
-        "type ${1:Name} = ${2:Int 1} | \\\\${3:x} -> ${4:cond}",
+        "type ${1:Name} = ${2:Int 1} \\\\${3:x} -> ${4:cond}",
         SnippetContext::TopLevel,
     ),
     (

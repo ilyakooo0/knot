@@ -631,7 +631,7 @@ pub(crate) fn handle_code_action(
                     start: insert_pos,
                     end: insert_pos,
                 },
-                new_text: " | \\x -> True".to_string(),
+                new_text: " \\x -> True".to_string(),
             }],
         );
         let _ = alias_span;

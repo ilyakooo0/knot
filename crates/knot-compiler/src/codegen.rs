@@ -4705,6 +4705,15 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 };
                 let fn_name: &str = &resolved_key;
                 if let Some((func_id, n_params)) = self.global_fns.get(fn_name).copied() {
+                    if self.is_user_global_fn(fn_name) {
+                        // A user-declared global referenced bare (no env
+                        // binding): emit its value uniformly — a 0-arg constant
+                        // call, or a first-class fn value whose `source`/`env`
+                        // match the closure a `with` record would project, so
+                        // show/extract render the body (with its captured
+                        // global-const deps) regardless of resolution path.
+                        return self.emit_user_global_value(builder, fn_name, db);
+                    }
                     if n_params == 0 {
                         // 0-param function is a constant — call it directly
                         let func_ref = self.module.declare_func_in_func(func_id, builder.func);
@@ -4720,30 +4729,6 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
                         let null = builder.ins().iconst(self.ptr_type, 0);
                         let (src_ptr, src_len) = self.string_ptr(builder, fn_name);
-                        // A user-declared fn referenced bare (no env binding —
-                        // e.g. a sibling field referenced from another field's
-                        // body) builds a trampoline whose default `source` is
-                        // the bare NAME. But the same fn projected out of a
-                        // `with` record into the main body's env carries its
-                        // lambda body as source, so `show`/`extract` render the
-                        // body. Carry the body as `extract_source` here too, so
-                        // a first-class user-fn reference renders its body
-                        // consistently regardless of resolution path. (show uses
-                        // extract_source first when present; a lambda body has
-                        // no ctor qualifier, so it shows the body verbatim.)
-                        if self.is_user_global_fn(fn_name) {
-                            let body_src = self
-                                .fun_bodies
-                                .get(fn_name)
-                                .map(pretty_expr)
-                                .unwrap_or_else(|| fn_name.to_string());
-                            let (x_ptr, x_len) = self.string_ptr(builder, &body_src);
-                            return self.call_rt(
-                                builder,
-                                "knot_value_function_full",
-                                &[fn_addr, null, src_ptr, src_len, x_ptr, x_len],
-                            );
-                        }
                         return self.call_rt(
                             builder,
                             "knot_value_function",
@@ -6665,13 +6650,16 @@ impl<M: cranelift_module::Module> Codegen<M> {
             // literal / record type (`Rel {name Text}` — the record's span is
             // recorded when the record-as-type is consumed), or a unit
             // argument (`1` literal, or a unit-name constructor) consumed as
-            // part of a `Float 1`/`Int Ms` type argument.
+            // part of a `Float 1`/`Int Ms` type argument. A compound unit
+            // (`(M / S)`) arrives as a `BinOp`; its group span is recorded, so
+            // match it here too.
             let is_erased = (matches!(
                 &e.node,
                 ast::ExprKind::Constructor(_)
                     | ast::ExprKind::TypeHole
                     | ast::ExprKind::TypeLiteral(_)
                     | ast::ExprKind::Record(_)
+                    | ast::ExprKind::BinOp { .. }
             ) || matches!(&e.node, ast::ExprKind::Lit(ast::Literal::Int(n)) if n == "1"))
                 && self.type_arg_spans.contains(&e.span);
             if is_erased {
@@ -13076,6 +13064,40 @@ impl<M: cranelift_module::Module> Codegen<M> {
             && self.fun_bodies.contains_key(name)
     }
 
+    /// Build a named-record env capturing `vars` (each a user-declared global,
+    /// resolved via `emit_user_global_value`) so a closure value's `extract`
+    /// can bind each by name in a `with` block. Returns null when `vars` is
+    /// empty. Mirrors the capture-record layout in `compile_lambda_inner`.
+    fn build_global_capture_env(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        vars: &[String],
+        db: Value,
+    ) -> Value {
+        if vars.is_empty() {
+            return builder.ins().iconst(self.ptr_type, 0);
+        }
+        let n = vars.len();
+        let ptr_bytes = self.ptr_type.bytes() as i32;
+        let slot_size = (3 * n as u32) * ptr_bytes as u32;
+        let slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            slot_size,
+            3,
+        ));
+        for (i, var_name) in vars.iter().enumerate() {
+            let val = self.emit_user_global_value(builder, var_name, db);
+            let (key_ptr, key_len) = self.string_ptr(builder, var_name);
+            let base = (i as i32) * (3 * ptr_bytes);
+            builder.ins().stack_store(key_ptr, slot, base);
+            builder.ins().stack_store(key_len, slot, base + ptr_bytes);
+            builder.ins().stack_store(val, slot, base + 2 * ptr_bytes);
+        }
+        let data_ptr = builder.ins().stack_addr(self.ptr_type, slot, 0);
+        let count = builder.ins().iconst(self.ptr_type, n as i64);
+        self.call_rt(builder, "knot_record_from_pairs", &[data_ptr, count])
+    }
+
     /// Emit the runtime value of a user-declared global, mirroring the `Var`
     /// arm: call a 0-arg constant, or build a first-class function value (a
     /// trampoline) for a named function.
@@ -13096,23 +13118,36 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .module
                 .declare_func_in_func(trampoline_id, builder.func);
             let fn_addr = builder.ins().func_addr(self.ptr_type, func_ref);
-            let null = builder.ins().iconst(self.ptr_type, 0);
-            let (src_ptr, src_len) = self.string_ptr(builder, name);
-            // Give the captured fn an `extract_source` of its body, so a
-            // closure that captures it extracts the body's source inline
-            // (self-contained) rather than the bare name — which would be
-            // self-referential inside the `with {name <value>}` binding
-            // `extract` wraps the capture in.
+            // Match the closure value a `with` record projects into the main
+            // body's env: `source` is the fn's body and the env captures the
+            // fn's own global-const dependencies, so `extract` re-derives the
+            // self-contained `with {deps} (body)` form rather than the bare
+            // name (which would be self-referential inside the binding) or a
+            // body missing its captured deps.
             let body_src = self
                 .fun_bodies
                 .get(name)
                 .map(pretty_expr)
                 .unwrap_or_else(|| name.to_string());
-            let (x_ptr, x_len) = self.string_ptr(builder, &body_src);
+            let deps: Vec<String> = self
+                .fun_bodies
+                .get(name)
+                .map(|body| {
+                    find_free_vars(body, &[])
+                        .into_iter()
+                        .filter(|v| {
+                            self.is_user_global_fn(v)
+                                && self.global_fns.get(v.as_str()).is_some_and(|(_, p)| *p == 0)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let env_val = self.build_global_capture_env(builder, &deps, db);
+            let (src_ptr, src_len) = self.string_ptr(builder, &body_src);
             self.call_rt(
                 builder,
-                "knot_value_function_full",
-                &[fn_addr, null, src_ptr, src_len, x_ptr, x_len],
+                "knot_value_function",
+                &[fn_addr, env_val, src_ptr, src_len],
             )
         }
     }

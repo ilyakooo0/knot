@@ -73,12 +73,19 @@ fn flatten_type_tokens<'a>(expr: &'a ast::Expr, out: &mut Vec<&'a ast::Expr>) {
 
 /// True if a value-spine element can be a unit argument to a numeric-base type
 /// argument: the `1` literal, a unit atom (an uppercase/lowercase name, e.g.
-/// `Ms`, `u`), or a `_` hole.
+/// `Ms`, `u`), a `_` hole, or a compound unit expression built from those with
+/// `*` and `/` (e.g. `(M / S)`, `(M * S)`). Units need no declaration — any
+/// name is a valid unit.
 fn is_unit_arg(expr: &ast::Expr) -> bool {
     match &expr.node {
         ast::ExprKind::Lit(ast::Literal::Int(n)) => n == "1",
         ast::ExprKind::Constructor(_) | ast::ExprKind::Var(_) => true,
         ast::ExprKind::TypeHole => true,
+        // A compound unit in value-spine form: `Mul`/`Div` over unit atoms
+        // (the parens are transparent, so `(M / S)` arrives as a `BinOp`).
+        ast::ExprKind::BinOp { op, lhs, rhs } if matches!(op, ast::BinOp::Mul | ast::BinOp::Div) => {
+            is_unit_arg(lhs) && is_unit_arg(rhs)
+        }
         _ => false,
     }
 }
@@ -92,6 +99,16 @@ fn unit_arg_to_ast(expr: &ast::Expr) -> ast::UnitExpr {
             ast::UnitExpr::Named(name.clone())
         }
         ast::ExprKind::TypeHole => ast::UnitExpr::Hole,
+        // Compound unit in value-spine form: `(M / S)` arrives as a `BinOp`.
+        ast::ExprKind::BinOp { op, lhs, rhs } => {
+            let l = unit_arg_to_ast(lhs);
+            let r = unit_arg_to_ast(rhs);
+            match op {
+                ast::BinOp::Mul => ast::UnitExpr::Mul(Box::new(l), Box::new(r)),
+                ast::BinOp::Div => ast::UnitExpr::Div(Box::new(l), Box::new(r)),
+                _ => ast::UnitExpr::Dimensionless,
+            }
+        }
         _ => ast::UnitExpr::Dimensionless,
     }
 }

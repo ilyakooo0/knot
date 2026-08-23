@@ -1,5 +1,5 @@
 with {
-Int 1 -> Int 1 -> Maybe (Int 1)  safeDiv  (\x y -> match y == 0
+Int 1 -> Int 1 -> Maybe (Int 1)  safeDiv  (\x y -> match (y == 0)
   Bool.True {}  Maybe.Nothing {}
   Bool.False {}  Maybe.Just {value (x / y)})
 

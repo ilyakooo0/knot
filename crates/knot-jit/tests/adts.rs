@@ -14,7 +14,7 @@ fn adt_construction_and_show() {
 #[test]
 fn case_on_maybe() {
     assert_show(
-        "(match Maybe.Just {value 5}\n  Maybe.Just {value v}  v\n  Maybe.Nothing {}  0)",
+        "(match (Maybe.Just {value 5})\n  Maybe.Just {value v}  v\n  Maybe.Nothing {}  0)",
         "5",
     );
 }
@@ -22,7 +22,7 @@ fn case_on_maybe() {
 #[test]
 fn case_on_nothing() {
     assert_show(
-        "(match Maybe.Nothing {}\n  Maybe.Just {value v}  v\n  Maybe.Nothing {}  0)",
+        "(match (Maybe.Nothing {})\n  Maybe.Just {value v}  v\n  Maybe.Nothing {}  0)",
         "0",
     );
 }
@@ -54,7 +54,7 @@ fn custom_adt_payload() {
 #[test]
 fn case_on_custom_adt() {
     assert_show(
-        "with {\nShape  Circle {radius (Int 1)}  Rect {w (Int 1)  h (Int 1)}\n}\n(match Shape.Rect {w 3  h 4}\n  Shape.Circle {radius r}  r * r\n  Shape.Rect {w ww  h hh}  ww * hh)",
+        "with {\nShape  Circle {radius (Int 1)}  Rect {w (Int 1)  h (Int 1)}\n}\n(match (Shape.Rect {w 3  h 4})\n  Shape.Circle {radius r}  r * r\n  Shape.Rect {w ww  h hh}  ww * hh)",
         "12",
     );
 }
@@ -62,7 +62,7 @@ fn case_on_custom_adt() {
 #[test]
 fn case_non_exhaustive_rejected() {
     assert_compile_err(
-        "(match Maybe.Just {value 5}\n  Maybe.Just {value v}  v)",
+        "(match (Maybe.Just {value 5})\n  Maybe.Just {value v}  v)",
         "",
     );
 }
@@ -95,7 +95,7 @@ fn match_filters_constructor() {
 fn maybe_map_via_case() {
     // Maybe map, written structurally with match.
     assert_show(
-        "(match Maybe.Just {value 3}\n  Maybe.Just {value v}  Maybe.Just {value (v * 2)}\n  Maybe.Nothing {}  Maybe.Nothing {})",
+        "(match (Maybe.Just {value 3})\n  Maybe.Just {value v}  Maybe.Just {value (v * 2)}\n  Maybe.Nothing {}  Maybe.Nothing {})",
         "Just {value 6}",
     );
 }
@@ -103,7 +103,7 @@ fn maybe_map_via_case() {
 #[test]
 fn result_error_prop() {
     assert_show(
-        "(match Result.Err {error \"nope\"}\n  Result.Ok {value v}  base.show v\n  Result.Err {error e}  \"err: \" ++ e)",
+        "(match (Result.Err {error \"nope\"})\n  Result.Ok {value v}  base.show v\n  Result.Err {error e}  \"err: \" ++ e)",
         "err: nope",
     );
 }

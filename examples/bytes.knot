@@ -9,7 +9,7 @@ with {  raw (base.textToBytes "hello") } (do
     base.println (base.bytesLength encoded)    -- 5
 
     -- Convert bytes -> text — Maybe, returns Nothing on invalid UTF-8
-    match base.bytesToText encoded
+    match (base.bytesToText encoded)
       Maybe.Just {  value t }  base.println t   -- world
       Maybe.Nothing {}  base.println "<invalid utf-8>"
 
@@ -18,8 +18,8 @@ with {  raw (base.textToBytes "hello") } (do
       base.println hex                      -- 68656c6c6f
 
       -- Hex decoding is Maybe — returns Nothing on odd-length / non-hex input
-      match base.bytesFromHex hex
-        Maybe.Just {  value decoded }  match base.bytesToText decoded
+      match (base.bytesFromHex hex)
+        Maybe.Just {  value decoded }  match (base.bytesToText decoded)
           Maybe.Just {  value t }  base.println t -- hello
           Maybe.Nothing {}  base.println "<invalid utf-8>"
         Maybe.Nothing {}  base.println "<invalid hex>"
@@ -30,22 +30,22 @@ with {  raw (base.textToBytes "hello") } (do
 
         -- Slicing
         with {  slice (base.bytesSlice 0 5 combined) } (do
-          match base.bytesToText slice
+          match (base.bytesToText slice)
             Maybe.Just {  value t }  base.println t   -- hello
             Maybe.Nothing {}  base.println "<invalid utf-8>"
 
           -- Byte access is Maybe — Nothing when the index is out of bounds
-          match base.bytesGet 0 raw
+          match (base.bytesGet 0 raw)
             Maybe.Just {  value byte }  base.println byte  -- 104 (ascii 'h')
             Maybe.Nothing {}  base.println "<out of bounds>"
 
-          match base.bytesGet 10 raw
+          match (base.bytesGet 10 raw)
             Maybe.Just {  value byte }  base.println byte
             Maybe.Nothing {}  base.println "<out of bounds>"  -- raw has only 5 bytes
 
           -- Bytes literals: a string via textToBytes
           with {  withHex (base.textToBytes "HI") } (do
-            match base.bytesToText withHex
+            match (base.bytesToText withHex)
               Maybe.Just {  value t }  base.println t   -- HI
               Maybe.Nothing {}  base.println "<invalid utf-8>"
 

@@ -22,7 +22,7 @@ fn wrong_arg_type() {
 #[test]
 fn non_exhaustive_case() {
     assert_compile_err(
-        "(match Maybe.Nothing {}\n  Maybe.Just {value v}  v)",
+        "(match (Maybe.Nothing {})\n  Maybe.Just {value v}  v)",
         "",
     );
 }

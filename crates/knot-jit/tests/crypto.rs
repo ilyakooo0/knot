@@ -14,11 +14,11 @@ fn encrypt_decrypt_roundtrip() {
   keys <- base.generateKeyPair
   with {  msg (base.textToBytes "secret") } (do
     enc <- base.encrypt keys.publicKey msg
-    match enc
+    match (enc)
       Maybe.Nothing {}  base.println "ENCRYPT-FAILED"
-      Maybe.Just {value ct}  match base.decrypt keys.privateKey ct
+      Maybe.Just {value ct}  match (base.decrypt keys.privateKey ct)
         Maybe.Nothing {}  base.println "DECRYPT-FAILED"
-        Maybe.Just {value pt}  match base.bytesToText pt
+        Maybe.Just {value pt}  match (base.bytesToText pt)
           Maybe.Just {value t}  base.println t
           Maybe.Nothing {}  base.println "BAD-UTF8"
     yield {}))"#,
@@ -33,11 +33,11 @@ fn decrypt_rejects_tampered_ciphertext() {
         r#"(do
   keys <- base.generateKeyPair
   enc <- base.encrypt keys.publicKey (base.textToBytes "data")
-  match enc
+  match (enc)
     Maybe.Nothing {}  base.println "ENCRYPT-FAILED"
     Maybe.Just {value ct}
       with {  tampered (base.bytesConcat (base.bytesSlice 0 40 ct) (base.textToBytes "XXXX")) } (do
-        match base.decrypt keys.privateKey tampered
+        match (base.decrypt keys.privateKey tampered)
           Maybe.Nothing {}  base.println "rejected"
           Maybe.Just {value _}  base.println "BUG-DECRYPTED"
         yield {})
@@ -54,9 +54,9 @@ fn decrypt_with_wrong_key_fails() {
   alice <- base.generateKeyPair
   bob <- base.generateKeyPair
   enc <- base.encrypt alice.publicKey (base.textToBytes "for alice")
-  match enc
+  match (enc)
     Maybe.Nothing {}  base.println "ENCRYPT-FAILED"
-    Maybe.Just {value ct}  match base.decrypt bob.privateKey ct
+    Maybe.Just {value ct}  match (base.decrypt bob.privateKey ct)
       Maybe.Nothing {}  base.println "rejected"
       Maybe.Just {value _}  base.println "BUG-WRONGKEY"
   yield {})"#,
@@ -71,7 +71,7 @@ fn sign_verify_roundtrip() {
         r#"(do
   keys <- base.generateSigningKeyPair
   with {  msg (base.textToBytes "message") } (do
-    match base.sign keys.privateKey msg
+    match (base.sign keys.privateKey msg)
       Maybe.Nothing {}  base.println "SIGN-FAILED"
       Maybe.Just {value sig}
         with {  ok (base.verify keys.publicKey msg sig) } (do
@@ -88,7 +88,7 @@ fn verify_rejects_wrong_message() {
         "crypto_verifybad",
         r#"(do
   keys <- base.generateSigningKeyPair
-  match base.sign keys.privateKey (base.textToBytes "original")
+  match (base.sign keys.privateKey (base.textToBytes "original"))
     Maybe.Nothing {}  base.println "SIGN-FAILED"
     Maybe.Just {value sig}
       with {  bad (base.verify keys.publicKey (base.textToBytes "forged") sig) } (do

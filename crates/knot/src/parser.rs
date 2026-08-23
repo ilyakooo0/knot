@@ -45,7 +45,7 @@ pub struct Parser {
     /// the newline before the arms block — `match base.show x` keeps its
     /// same-line application, but the indented arms below are NOT application
     /// arguments.
-    scrutinee_no_newline_app: bool,
+    no_newline_app: bool,
     /// Inside a `with { ... }` block's record. Named-function fields there
     /// require a type signature (`name (\…)` with no sig is rejected); ad-hoc
     /// record literals (e.g. dictionary payloads like `{compare (\…)}`) do not.
@@ -122,7 +122,7 @@ impl Parser {
             stop_type_at_migrate_clauses: false,
             record_value_sig_type: false,
             in_case_arm_pat: false,
-            scrutinee_no_newline_app: false,
+            no_newline_app: false,
             in_with_block: false,
             block_indent: usize::MAX,
             block_delim: 0,
@@ -1797,7 +1797,7 @@ impl Parser {
             // A `match` scrutinee ends at the first gap: application arguments
             // are single-space-separated, so a gap means the scrutinee is done
             // and the first arm's pattern follows (`match x  Pat  body`).
-            if self.scrutinee_no_newline_app && self.gap_before_current() {
+            if self.no_newline_app && self.gap_before_current() {
                 break;
             }
             if self.can_start_atom() {
@@ -1833,7 +1833,7 @@ impl Parser {
             // instead of O(n²).
             let saved = self.save();
             self.skip_newlines();
-            if !self.scrutinee_no_newline_app
+            if !self.no_newline_app
                 && self.pos != saved.0
                 && !self.at_eof()
                 && self.can_start_atom()
@@ -2312,10 +2312,10 @@ impl Parser {
                     // no-newline-application suppression does not apply: an
                     // indented newline may continue an application here (e.g.
                     // `match (add 3\n  4)  …`), exactly as outside a scrutinee.
-                    let saved_scrut = self.scrutinee_no_newline_app;
-                    self.scrutinee_no_newline_app = false;
+                    let saved_scrut = self.no_newline_app;
+                    self.no_newline_app = false;
                     let inner = self.parse_expr();
-                    self.scrutinee_no_newline_app = saved_scrut;
+                    self.no_newline_app = saved_scrut;
                     inner
                 }) else {
                     self.delimiter_depth -= 1;
@@ -2340,10 +2340,10 @@ impl Parser {
                 // A braced group is self-delimiting, so lift any `match`
                 // scrutinee newline-application suppression inside it (see the
                 // `LParen` arm).
-                let saved_scrut = self.scrutinee_no_newline_app;
-                self.scrutinee_no_newline_app = false;
+                let saved_scrut = self.no_newline_app;
+                self.no_newline_app = false;
                 let result = self.parse_record_or_update(start);
-                self.scrutinee_no_newline_app = saved_scrut;
+                self.no_newline_app = saved_scrut;
                 self.delimiter_depth -= 1;
                 result
             }
@@ -2351,10 +2351,10 @@ impl Parser {
                 self.advance();
                 self.delimiter_depth += 1;
                 // Same as the `LBrace` arm: a bracketed group is self-delimiting.
-                let saved_scrut = self.scrutinee_no_newline_app;
-                self.scrutinee_no_newline_app = false;
+                let saved_scrut = self.no_newline_app;
+                self.no_newline_app = false;
                 let result = self.parse_list_expr(start);
-                self.scrutinee_no_newline_app = saved_scrut;
+                self.no_newline_app = saved_scrut;
                 self.delimiter_depth -= 1;
                 result
             }
@@ -3177,13 +3177,19 @@ impl Parser {
         let result = self.in_context("match expression", |this| {
             this.advance(); // consume `match`
 
-            // The scrutinee is a complete single-line expression: it keeps its
-            // same-line application (`match base.show x`) but must NOT continue
-            // across the newline into the indented arms block.
-            let saved_scrut = this.scrutinee_no_newline_app;
-            this.scrutinee_no_newline_app = true;
+            // The scrutinee must be parenthesized: `match (expr)`. The parens
+            // delimit the scrutinee expression itself. We still suppress
+            // newline-application while parsing it, because the closing `)` is
+            // a complete atom and the application parser would otherwise apply
+            // the following indented arm to it (`match (x)\n  5` → `(x) 5`).
+            if !this.at(&TokenKind::LParen) {
+                this.error("the match scrutinee must be parenthesized: `match (expr)`");
+                return None;
+            }
+            let saved_scrut = this.no_newline_app;
+            this.no_newline_app = true;
             let scrutinee = this.parse_expr();
-            this.scrutinee_no_newline_app = saved_scrut;
+            this.no_newline_app = saved_scrut;
             let scrutinee = scrutinee?;
             this.skip_newlines();
 
@@ -3239,10 +3245,10 @@ impl Parser {
         // (the next token after a gap is the next arm's pattern). Same rule as
         // the scrutinee — this is what makes inline arms `Pat  body  Pat  body`
         // parse.
-        let saved_scrut = self.scrutinee_no_newline_app;
-        self.scrutinee_no_newline_app = true;
+        let saved_scrut = self.no_newline_app;
+        self.no_newline_app = true;
         let body = self.parse_expr();
-        self.scrutinee_no_newline_app = saved_scrut;
+        self.no_newline_app = saved_scrut;
         self.bound_vars.truncate(scope_mark);
         let body = body?;
         Some(CaseArm { pat, body })

@@ -138,9 +138,9 @@ Rel Account  *accounts
   _ <- atomic do
     rows <- *accounts
     *accounts = base.map (\a ->
-      match a.name == "from"
+      match (a.name == "from")
         Bool.True {}  (base.unify a {balance (a.balance - 40)})
-        Bool.False {}  (match a.name == "to"
+        Bool.False {}  (match (a.name == "to")
           Bool.True {}  (base.unify a {balance (a.balance + 40)})
           Bool.False {}  a)) rows
     yield {}

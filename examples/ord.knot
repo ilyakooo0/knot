@@ -7,35 +7,35 @@
 with {
 --  compare a  b == 1  when a >  b, -1  when a <  b, 0  when equal.
 intOrd {
-  compare (\a b -> match a > b
+  compare (\a b -> match (a > b)
     Bool.True {}  1
-    Bool.False {}  match a < b
+    Bool.False {}  match (a < b)
       Bool.True {}  (0 - 1)
       Bool.False {}  0)
-  max     (\a b -> match a > b
+  max     (\a b -> match (a > b)
     Bool.True {}  a
     Bool.False {}  b)
 }
 
 textOrd {
-  compare (\a b -> match a > b
+  compare (\a b -> match (a > b)
     Bool.True {}  1
-    Bool.False {}  match a < b
+    Bool.False {}  match (a < b)
       Bool.True {}  (0 - 1)
       Bool.False {}  0)
-  max     (\a b -> match a > b
+  max     (\a b -> match (a > b)
     Bool.True {}  a
     Bool.False {}  b)
 }
 
 -- A  different ordering  for the  same type  descending.
 intOrdDesc {
-  compare (\a b -> match a < b
+  compare (\a b -> match (a < b)
     Bool.True {}  1
-    Bool.False {}  match a > b
+    Bool.False {}  match (a > b)
       Bool.True {}  (0 - 1)
       Bool.False {}  0)
-  max     (\a b -> match a < b
+  max     (\a b -> match (a < b)
     Bool.True {}  a
     Bool.False {}  b)
 }

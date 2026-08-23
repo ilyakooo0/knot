@@ -20,7 +20,7 @@ fn nested_adt_pattern() {
 #[test]
 fn literal_pattern_in_case() {
     assert_show(
-        "(match 2
+        "(match (2)
            1  \"one\"
            2  \"two\"
            _  \"other\")",
@@ -32,7 +32,7 @@ fn literal_pattern_in_case() {
 fn record_pattern_partial() {
     // bind only the fields you need
     assert_show(
-        "(match {name \"a\"  age 30}\n           {name n}  n)",
+        "(match ({name \"a\"  age 30})\n           {name n}  n)",
         "a",
     );
 }
@@ -104,22 +104,20 @@ fn comprehension_nested_yield_relation() {
 
 #[test]
 fn match_scrutinee_parenthesized_multiline_application() {
-    // A parenthesized multi-line APPLICATION may be a `match` scrutinee: the
-    // closing `)` ends the scrutinee unambiguously, so the scrutinee's
-    // no-newline-application suppression does not apply inside the parens.
-    // (Previously `match (add 3\n  4)  …` failed with "unclosed '('".)
+    // The `match` scrutinee must be parenthesized: `match (expr)`. Inside the
+    // parens an application may span multiple lines (`match (add 3\n  4)`).
     assert_show(
         "with {\n_  add  (\\a b -> a + b)\n}\n(base.show (match (add 3\n  4)  _  \"done\"))",
         "done",
     );
     // Record and list scrutinees with multi-line applications inside too.
     assert_show(
-        "with {\n_  add  (\\a b -> a + b)\n}\n(base.show (match {v (add 1\n  2)}\n  {v n}  n))",
+        "with {\n_  add  (\\a b -> a + b)\n}\n(base.show (match ({v (add 1\n  2)})\n  {v n}  n))",
         "3",
     );
-    // A BARE scrutinee still ends at the newline (the arms are not swallowed).
+    // An atom scrutinee is parenthesized too: `match (x)`.
     assert_show(
-        "with {\n_  x  5\n}\n(base.show (match x\n  5  \"five\"\n  _  \"other\"))",
+        "with {\n_  x  5\n}\n(base.show (match (x)\n  5  \"five\"\n  _  \"other\"))",
         "five",
     );
 }

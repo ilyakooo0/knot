@@ -30,11 +30,11 @@ pub(crate) const PRELUDE_SPAN_OFFSET: usize = 1 << 40;
 const PRELUDE_SOURCE: &str = r#"
 {
 base {
-_  min  (\a b -> match a < b
+_  min  (\a b -> match (a < b)
   Bool.True {}  a
   Bool.False {}  b)
 
-_  max  (\a b -> match a > b
+_  max  (\a b -> match (a > b)
   Bool.True {}  a
   Bool.False {}  b)
 
@@ -45,11 +45,11 @@ _  max  (\a b -> match a > b
 -- the type argument at the call site (the type-witness diversion) and erases it.
 _  the  (\(Type  T) -> \x -> x)
 
-Bool -> IO {} -> IO {}  when  (\cond action -> match cond
+Bool -> IO {} -> IO {}  when  (\cond action -> match (cond)
   Bool.True {}  action
   Bool.False {}  yield {})
 
-Bool -> IO {} -> IO {}  unless  (\cond action -> match cond
+Bool -> IO {} -> IO {}  unless  (\cond action -> match (cond)
   Bool.True {}  yield {}
   Bool.False {}  action)
 

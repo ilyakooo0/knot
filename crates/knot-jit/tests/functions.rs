@@ -62,7 +62,7 @@ fn traverse_maybe_and_result() {
     assert_stdout(
         "traverse_maybe",
         r#"with {
-Int 1 -> Maybe (Int 1)  pos  (\x -> match x > 0
+Int 1 -> Maybe (Int 1)  pos  (\x -> match (x > 0)
   Bool.True {}  Maybe.Just {value x}
   Bool.False {}  Maybe.Nothing {})
 }

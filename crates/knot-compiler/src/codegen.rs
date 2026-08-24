@@ -7941,11 +7941,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         ) && let Some(frag) =
                             self.try_compile_sql_expr(&filter_bind, filter_body, &schema)
                         {
-                            let arg_sql = if matches!(name, "minOn" | "maxOn") {
-                                col_sql_for_minmax(&col_sql, &agg_bind, agg_body, &schema)
-                            } else {
-                                col_sql
-                            };
+                            let arg_sql = col_sql;
                             let result_flag = if matches!(name, "minOn" | "maxOn") {
                                 minmax_result_is_text(&agg_bind, agg_body, &schema)
                             } else {
@@ -13704,11 +13700,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 // Use unqualified column names for direct SQL aggregate
                 let col_sql = extract_sql_field_access(&bind_var, body, "", schema)?;
                 let (func, _rt_fn) = aggregate_sql_func_runtime(fn_name)?;
-                let arg_sql = if matches!(fn_name, "minOn" | "maxOn") {
-                    col_sql_for_minmax(&col_sql, &bind_var, body, schema)
-                } else {
-                    col_sql
-                };
+                let arg_sql = col_sql;
                 let result_flag = if matches!(fn_name, "minOn" | "maxOn") {
                     minmax_result_is_text(&bind_var, body, schema)
                 } else {
@@ -13999,7 +13991,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
-                    let arg_sql = col_sql_for_minmax(&col_sql, bind_var, body, &schema);
+                    let arg_sql = col_sql;
                     let is_text = minmax_result_is_text(bind_var, body, &schema);
                     aggregate = Some(("MIN", arg_sql, is_text));
                 }
@@ -14014,7 +14006,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
-                    let arg_sql = col_sql_for_minmax(&col_sql, bind_var, body, &schema);
+                    let arg_sql = col_sql;
                     let is_text = minmax_result_is_text(bind_var, body, &schema);
                     aggregate = Some(("MAX", arg_sql, is_text));
                 }
@@ -14487,7 +14479,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
-                    let arg_sql = col_sql_for_minmax(&col_sql, bind_var, body, &schema);
+                    let arg_sql = col_sql;
                     let is_text = minmax_result_is_text(bind_var, body, &schema);
                     aggregate = Some(("MIN", arg_sql, is_text));
                 }
@@ -14500,7 +14492,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     }
                     bind_aliases.insert(bind_var.clone(), alias.clone());
                     let col_sql = extract_sql_field_access(bind_var, body, &alias, &schema)?;
-                    let arg_sql = col_sql_for_minmax(&col_sql, bind_var, body, &schema);
+                    let arg_sql = col_sql;
                     let is_text = minmax_result_is_text(bind_var, body, &schema);
                     aggregate = Some(("MAX", arg_sql, is_text));
                 }
@@ -17102,27 +17094,20 @@ pub(crate) fn sum_result_is_float(bind_var: &str, body: &ast::Expr, schema: &str
     )
 }
 
-/// Whether a `sortBy` projection is safe to push to SQL `ORDER BY`: not an
-/// Int-typed CASE (collation loss, see `int_case_projection_pushable`) and not
+/// Whether a `sortBy` projection is safe to push to SQL `ORDER BY`: not
 /// Float/tag/bool. Float sort keys fall back to the faithful in-memory sort
 /// because SQLite orders floats differently from Knot's `total_cmp` (NaN sorts
 /// as NULL and -0.0/+0.0 are conflated). `tag` and `bool` keys likewise fall
 /// back: SQLite would order them by their TEXT/`1`/`0` storage, which does not
 /// match the declared `Ord` for those types — the same reason
 /// `minmax_pushdown_type_ok` and `try_compile_sql_comparison` treat tag/bool
-/// ordering as unsound and keep it in memory.
+/// ordering as unsound and keep it in memory. Int keys (native INTEGER) order
+/// numerically and push down.
 pub(crate) fn sortby_projection_pushable(bind_var: &str, body: &ast::Expr, schema: &str) -> bool {
     !matches!(
         infer_sql_expr_type(bind_var, body, schema).as_deref(),
         Some("float") | Some("tag") | Some("bool")
     )
-}
-
-/// Column SQL for use inside MIN/MAX. Int columns are native SQLite INTEGERs,
-/// which MIN/MAX order numerically with no collation — so the expression is
-/// returned unchanged for every column type.
-fn col_sql_for_minmax(col_sql: &str, _bind_var: &str, _body: &ast::Expr, _schema: &str) -> String {
-    col_sql.to_string()
 }
 
 /// Escape a SQL identifier by wrapping in double quotes, doubling internal `"`.

@@ -581,7 +581,98 @@ pub fn check(source_path: &Path, program: &Expr, type_env: &TypeEnv) -> Vec<Diag
         }
     }
 
+    // A committed migration's `using` fn is baked into the binary and compiled
+    // without type inference — it only ever runs against the lock's recorded
+    // schemas. If it references a data type that no longer exists in source
+    // (deleted after the migration was committed), the binary can't be built.
+    // Detect that here, with the actual type name, rather than letting codegen
+    // fail with a misleading "constructor must be applied to a record".
+    diags.extend(check_committed_using_types(&old, type_env));
+
     diags
+}
+
+/// Error for every committed migration whose `using` fn references a data type
+/// the source no longer declares. `using` fns are stored as source text in the
+/// lock and compiled verbatim, so a referenced type must still exist.
+fn check_committed_using_types(old: &SchemaInfo, type_env: &TypeEnv) -> Vec<Diagnostic> {
+    // Data-type names declared in the current source (`Active` in
+    // `Active.Yes {}`). A qualified ctor `Type.Ctor` references `Type`. ADT
+    // names live in `aliases` (single-variant) and `multi_variant_params`.
+    let declared: HashSet<&str> = type_env
+        .aliases
+        .keys()
+        .map(String::as_str)
+        .chain(type_env.multi_variant_params.keys().map(String::as_str))
+        .collect();
+    let mut diags = Vec::new();
+    for (source, chain) in &old.migrations {
+        for step in chain {
+            let Some(using) = parse_using_expr(&step.using_src) else {
+                continue;
+            };
+            let mut referenced = Vec::new();
+            collect_qualified_ctor_types(&using, &mut referenced);
+            for ty_name in referenced {
+                if !declared.contains(ty_name.as_str()) {
+                    diags.push(Diagnostic::error(format!(
+                        "committed migration for '*{source}' references data type '{ty_name}', which is no longer declared"
+                    ))
+                    .note(format!("using fn: {}", step.using_src))
+                    .note("re-declare the type, or squash the migration history with a fresh baseline"));
+                }
+            }
+        }
+    }
+    diags
+}
+
+/// Parse a stored `using` fn source string into an expression. `None` when it
+/// doesn't parse (a separate diagnostic already covers unparseable history).
+fn parse_using_expr(using_src: &str) -> Option<Expr> {
+    let lexer = knot::lexer::Lexer::new(using_src);
+    let (tokens, lex_diags) = lexer.tokenize();
+    if lex_diags.iter().any(|d| d.severity == Severity::Error) {
+        return None;
+    }
+    let parser = knot::parser::Parser::new(using_src.to_string(), tokens);
+    let (program, parse_diags) = parser.parse_file_expr();
+    if parse_diags.iter().any(|d| d.severity == Severity::Error) {
+        return None;
+    }
+    Some(program)
+}
+
+/// Collect the data-type names referenced by qualified constructors
+/// (`Type.Ctor`) in a `using` fn's AST.
+fn collect_qualified_ctor_types(e: &Expr, out: &mut Vec<String>) {
+    if let ExprKind::FieldAccess { expr, .. } = &e.node
+        && let ExprKind::Constructor(type_name) = &expr.node
+    {
+        out.push(type_name.clone());
+    }
+    match &e.node {
+        ExprKind::Record(fields) => {
+            for f in fields {
+                collect_qualified_ctor_types(&f.value, out);
+            }
+        }
+        ExprKind::With { record, body, .. } => {
+            collect_qualified_ctor_types(record, out);
+            collect_qualified_ctor_types(body, out);
+        }
+        ExprKind::App { func, arg } => {
+            collect_qualified_ctor_types(func, out);
+            collect_qualified_ctor_types(arg, out);
+        }
+        ExprKind::Lambda { body, .. } => collect_qualified_ctor_types(body, out),
+        ExprKind::List(items) => {
+            for i in items {
+                collect_qualified_ctor_types(i, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The committed migration chain per source, read from the lock. Codegen

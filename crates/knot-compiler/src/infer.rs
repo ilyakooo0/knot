@@ -6515,6 +6515,22 @@ impl Infer {
                     );
                     return Ty::Error;
                 }
+                // `Type.Ctor` where `Type` names no data type in scope — the
+                // type was deleted (or never declared). Name it plainly rather
+                // than letting the bare `Type` fall through to codegen, which
+                // would report the misleading "constructor must be applied to a
+                // record" for a constructor that doesn't exist.
+                if let ast::ExprKind::Constructor(type_name) = &e.node {
+                    eprintln!("DBG FieldAccess-Ctor base={} field={} in_data_types={}", type_name, field, self.data_types.contains_key(type_name));
+                    self.error(
+                        format!(
+                            "unknown data type '{}' — it isn't declared in this scope (deleted or moved?)",
+                            type_name
+                        ),
+                        expr.span,
+                    );
+                    return Ty::Error;
+                }
                 // `base.<server-form>` — `fetch`/`fetchWith`/`listen`/`listenOn`
                 // are compile-time special forms (route-table / HTTP macros),
                 // not `base` record fields, so the generic record-read below

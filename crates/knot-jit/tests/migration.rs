@@ -243,3 +243,46 @@ Rel PersonV2  *people
         "reading a field absent from the old row must fail the build"
     );
 }
+
+/// Deleting a data type that a committed migration's `using` fn still
+/// references is caught at lock-check time with a clear error naming the type
+/// — not a misleading codegen "constructor must be applied to a record".
+#[test]
+fn migrate_committed_using_dangling_type() {
+    let dir = dir_for("mig_dangle");
+    build_and_run(&dir, "mig_dangle", V1);
+    lock_in_dir(dir.path(), "mig_dangle");
+    build_in_dir("mig_dangle", V2_PENDING, dir.path());
+    lock_in_dir(dir.path(), "mig_dangle");
+
+    // Delete the `Active` data type entirely — but the committed migration's
+    // `using` fn (`Active.Yes {}`) still references it.
+    let deleted = r#"with {
+PersonV1  {name Text}
+PersonV2  {name Text  active Active}
+Rel PersonV2  *people
+}
+(do
+  yield {})"#;
+    std::fs::write(dir.join("mig_dangle.knot"), deleted).unwrap();
+    let build = std::process::Command::new(knot_bin())
+        .arg("build")
+        .arg(dir.join("mig_dangle.knot"))
+        .arg("-o")
+        .arg(dir.join("mig_dangle"))
+        .output()
+        .expect("knot build");
+    assert!(
+        !build.status.success(),
+        "deleting a type a committed migration references must fail the build"
+    );
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("references data type 'Active'"),
+        "error names the deleted type: {stderr}"
+    );
+    assert!(
+        !stderr.contains("must be applied to a record"),
+        "must not fall through to the misleading codegen message: {stderr}"
+    );
+}

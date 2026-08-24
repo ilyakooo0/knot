@@ -2581,10 +2581,11 @@ impl Parser {
                 if is_sig {
                     let ty = ty.unwrap();
                     if matches!(self.peek(), TokenKind::StarIdent(_)) {
-                        // Type-first source declaration: `Rel T  *name` (with
-                        // optional `migrate from … to … using …` clauses). The
-                        // source IS the declaration — emit a SourceDecl field
-                        // directly, mirroring the `*name : Rel T` colon path.
+                        // Type-first source declaration: `Rel T  *name` (with an
+                        // optional `migrate to … using …` clause). The source IS
+                        // the declaration — emit a SourceDecl field directly. This
+                        // is the only source-declaration form; there is no
+                        // `*name : Rel T` colon form.
                         let t = self.advance();
                         let TokenKind::StarIdent(n) = t.kind else {
                             unreachable!()

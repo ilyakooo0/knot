@@ -1341,6 +1341,12 @@ thread_local! {
 /// Database path — set in knot_db_open so spawned threads can open their own connections.
 static DB_PATH: Mutex<String> = Mutex::new(String::new());
 
+/// Fork identity for an uncommitted migration, set by codegen via
+/// `knot_db_set_fork` before the first `knot_db_open`. When non-empty, the
+/// first DB open is routed to `<main>.fork-<token>` (copied from the main DB
+/// on first use) so an uncommitted migration never touches the main DB.
+static FORK_TOKEN: Mutex<String> = Mutex::new(String::new());
+
 /// Count of live detached `fork`ed threads.  Incremented when a thread is
 /// spawned, decremented when it exits (via a drop guard so panics still
 /// decrement).  `knot_threads_join` waits on `ACTIVE_FORKS_CVAR` until the
@@ -13111,9 +13117,43 @@ pub extern "C-unwind" fn knot_fs_list_dir(path: *mut Value) -> *mut Value {
 
 // ── Database operations ───────────────────────────────────────────
 
+/// Set the fork identity for an uncommitted migration. Codegen emits this
+/// before the first `knot_db_open` when the binary carries a pending
+/// migration; the first open is then routed to a fork of the main DB.
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn knot_db_set_fork(token_ptr: *const u8, token_len: usize) {
+    let token = unsafe { str_from_raw(token_ptr, token_len) };
+    *FORK_TOKEN.lock().unwrap_or_else(|e| e.into_inner()) = token.to_string();
+}
+
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *mut c_void {
-    let path = unsafe { str_from_raw(path_ptr, path_len) };
+    let raw_path = unsafe { str_from_raw(path_ptr, path_len) };
+    // Route to a fork when an uncommitted migration is present. Only the FIRST
+    // open forks: subsequent opens (spawned threads, the db explorer) reuse the
+    // already-resolved global path. Forking copies the whole main DB file on
+    // first use; the same token reuses the existing fork.
+    let path: String = {
+        let token = FORK_TOKEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if token.is_empty() {
+            raw_path.to_string()
+        } else {
+            let fork_path = format!("{}.fork-{}", raw_path, token);
+            if !std::path::Path::new(&fork_path).exists() {
+                if std::path::Path::new(raw_path).exists() {
+                    std::fs::copy(raw_path, &fork_path).unwrap_or_else(|e| {
+                        panic!("knot runtime: failed to fork database: {}", e)
+                    });
+                }
+                log::log_info(&format!(
+                    "running on uncommitted fork {}, main DB untouched",
+                    fork_path
+                ));
+            }
+            fork_path
+        }
+    };
+    let path = path.as_str();
     // Store path globally so spawned threads can open their own connections.
     // Only record it on the FIRST open: a later `knot_db_open` (e.g. the `db`
     // explorer or a second connection) must not redirect the global path that
@@ -13849,25 +13889,6 @@ fn sql_null_default(ty: ColType) -> Option<*mut Value> {
 /// stored column and the in-memory view telling the same story.
 ///
 /// `None` for the column types `sql_null_default` has no value for.
-fn sql_null_default_literal(ty: ColType) -> Option<String> {
-    Some(match ty {
-        // Int columns are `TEXT COLLATE KNOT_INT` — the literal is text.
-        ColType::Int => "'0'".to_string(),
-        ColType::Float => "0.0".to_string(),
-        ColType::Text => "''".to_string(),
-        ColType::Bool => "0".to_string(),
-        ColType::Bytes => "X''".to_string(),
-        // `Nothing` in the storage JSON encoding, taken from the encoder itself
-        // so it cannot drift from what `read_sql_column` parses back out.
-        ColType::Json => sql_text_literal(&value_to_json_db(make_nothing())),
-        ColType::Tag => return None,
-    })
-}
-
-/// Quote a string as a SQL text literal (single quotes doubled).
-fn sql_text_literal(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
 
 /// Read a column value from a SQLite row, mapping SQL NULL to the column
 /// type's default value (see `sql_null_default`).
@@ -14116,382 +14137,6 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
     }
 }
 
-/// Add a column to an existing table and fill it in for the rows that predate
-/// it, so they hold the value `read_sql_column` defaults them to (see
-/// `sql_null_default_literal`). Returns false if the change could not be
-/// applied, which the caller reports as a breaking schema change.
-///
-/// For record and child tables only, where every column belongs to every row.
-/// `auto_apply_adt_change` adds columns to a wide ADT table without backfilling
-/// — see the comment there.
-fn add_column_backfilled(conn: &Connection, table: &str, col: &ColumnSpec) -> bool {
-    let sql = format!(
-        "ALTER TABLE {} ADD COLUMN {} {};",
-        quote_ident(table),
-        quote_ident(&col.name),
-        sql_type(col.ty)
-    );
-    debug_sql(&sql);
-    if conn.execute_batch(&sql).is_err() {
-        return false;
-    }
-
-    let Some(default) = sql_null_default_literal(col.ty) else {
-        // No default for this column type (an enum tag): leave the rows NULL.
-        // `read_sql_column` reports them, pointing at a `migrate` block.
-        return true;
-    };
-    let backfill = format!(
-        "UPDATE {} SET {} = {} WHERE {} IS NULL;",
-        quote_ident(table),
-        quote_ident(&col.name),
-        default,
-        quote_ident(&col.name)
-    );
-    debug_sql(&backfill);
-    conn.execute_batch(&backfill).is_ok()
-}
-
-/// Try to auto-apply a safe schema change (e.g. adding ADT constructors).
-/// Returns true if the change was applied, false if it's a breaking change.
-fn auto_apply_schema_change(conn: &Connection, name: &str, stored: &str, compiled: &str) -> bool {
-    let table = format!("_knot_{}", name);
-    let stored_is_adt = is_adt_schema(stored);
-    let compiled_is_adt = is_adt_schema(compiled);
-
-    if stored_is_adt != compiled_is_adt {
-        return false;
-    }
-
-    if stored_is_adt {
-        auto_apply_adt_change(conn, &table, name, stored, compiled)
-    } else {
-        auto_apply_record_change(conn, &table, name, stored, compiled)
-    }
-}
-
-fn auto_apply_adt_change(
-    conn: &Connection,
-    table: &str,
-    name: &str,
-    stored: &str,
-    compiled: &str,
-) -> bool {
-    let old_adt = parse_adt_schema(stored);
-    let new_adt = parse_adt_schema(compiled);
-
-    // Every old constructor must exist in new with identical fields
-    for old_ctor in &old_adt.constructors {
-        match new_adt
-            .constructors
-            .iter()
-            .find(|c| c.name == old_ctor.name)
-        {
-            Some(new_ctor) => {
-                if old_ctor.fields.len() != new_ctor.fields.len() {
-                    return false;
-                }
-                // Match fields by name, not by position: the wide table is
-                // name-addressed, so reordering a constructor's fields is not a
-                // breaking change (mirrors `auto_apply_record_change`).
-                for of in &old_ctor.fields {
-                    match new_ctor.fields.iter().find(|nf| nf.name == of.name) {
-                        Some(nf)
-                            if std::mem::discriminant(&of.ty) == std::mem::discriminant(&nf.ty) => {
-                        }
-                        _ => return false,
-                    }
-                }
-            }
-            None => return false,
-        }
-    }
-
-    // A field shared with the old schema that now requires a *different*
-    // column affinity cannot be auto-migrated in place. The common case is a
-    // field transitioning non-conflicting → conflicting (BLOB) when a new
-    // constructor reuses an existing field name with a different type: the
-    // existing column keeps its old (e.g. REAL) affinity, so the new
-    // constructor's values are silently coerced on write and then panic on
-    // read with the per-constructor type. Treat any affinity change as a
-    // breaking change so the caller demands an explicit `migrate` block
-    // instead of corrupting the relation.
-    for nf in &new_adt.all_fields {
-        if let Some(of) = old_adt.all_fields.iter().find(|f| f.name == nf.name)
-            && old_adt.col_sql_type(of) != new_adt.col_sql_type(nf)
-        {
-            return false;
-        }
-    }
-
-    // Add new columns for new constructor fields. Unlike the record and child
-    // tables, these are deliberately NOT backfilled: control only reaches here
-    // when every *old* constructor kept exactly its old fields, so a new column
-    // can only belong to a new constructor — no stored row carries that tag and
-    // there is nothing to fill in. NULL in the wide table keeps meaning "this
-    // row is a different constructor", which the unknown-constructor read path
-    // relies on. (Adding a field to an *existing* constructor is rejected as
-    // breaking by the loop above, which is what sends the user to a `migrate`
-    // block.)
-    let old_field_names: HashSet<&str> =
-        old_adt.all_fields.iter().map(|f| f.name.as_str()).collect();
-    for f in &new_adt.all_fields {
-        if !old_field_names.contains(f.name.as_str()) {
-            let sql = format!(
-                "ALTER TABLE {} ADD COLUMN {} {};",
-                quote_ident(table),
-                quote_ident(&f.name),
-                new_adt.col_sql_type(f)
-            );
-            debug_sql(&sql);
-            if conn.execute_batch(&sql).is_err() {
-                return false;
-            }
-        }
-    }
-
-    // Drop and recreate unique index with full column set
-    let drop_idx = format!(
-        "DROP INDEX IF EXISTS {};",
-        quote_ident(&format!("{}_unique", table))
-    );
-    debug_sql(&drop_idx);
-    let _ = conn.execute_batch(&drop_idx);
-
-    let coalesced: Vec<String> = std::iter::once(quote_ident("_tag"))
-        .chain(
-            new_adt
-                .all_fields
-                .iter()
-                .map(|f| null_safe_coalesce(&quote_ident(&f.name), f.ty)),
-        )
-        .collect();
-    let idx_sql = format!(
-        "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
-        quote_ident(&format!("{}_unique", table)),
-        quote_ident(table),
-        coalesced.join(", ")
-    );
-    debug_sql(&idx_sql);
-    let _ = conn.execute_batch(&idx_sql);
-
-    // Update stored schema
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO _knot_schema (name, schema) VALUES (?1, ?2);",
-        rusqlite::params![name, compiled],
-    );
-
-    true
-}
-
-/// Recursively migrate a child table when its inner schema changes.
-/// Handles added columns (ALTER TABLE ADD COLUMN), removed columns (breaking),
-/// type changes (breaking), and nested-within-nested fields.
-fn auto_apply_child_change(
-    conn: &Connection,
-    parent_table: &str,
-    old_nf: &NestedField,
-    new_nf: &NestedField,
-) -> bool {
-    let child_table = child_table_name(parent_table, &new_nf.name);
-
-    // Check that all old columns still exist with same type
-    for old_col in &old_nf.columns {
-        match new_nf.columns.iter().find(|c| c.name == old_col.name) {
-            Some(new_col) => {
-                if old_col.ty != new_col.ty {
-                    return false;
-                }
-            }
-            None => return false,
-        }
-    }
-
-    // Any removed nested sub-fields → breaking
-    for old_sub in &old_nf.nested {
-        if !new_nf.nested.iter().any(|n| n.name == old_sub.name) {
-            return false;
-        }
-    }
-
-    // A leaf child gaining its own nested children → breaking. `init_child_table`
-    // creates leaf children WITHOUT the `_id`/`_content_hash` columns that a child
-    // with grandchildren needs (see line ~10851), and SQLite cannot add a
-    // PRIMARY KEY/AUTOINCREMENT column via ALTER TABLE. Proceeding would build a
-    // unique index on the nonexistent `_content_hash` (silently dropping set
-    // dedup) and create grandchild tables whose FK references a nonexistent `_id`.
-    // Mirror the parent-level guard in `auto_apply_record_change`; force an
-    // explicit `migrate` block instead.
-    if old_nf.nested.is_empty() && !new_nf.nested.is_empty() {
-        return false;
-    }
-
-    // Add new columns to the child table, backfilling existing child rows
-    let old_col_names: HashSet<&str> = old_nf.columns.iter().map(|c| c.name.as_str()).collect();
-    for c in &new_nf.columns {
-        if !old_col_names.contains(c.name.as_str()) && !add_column_backfilled(conn, &child_table, c)
-        {
-            return false;
-        }
-    }
-
-    // Drop and recreate unique index with full column set
-    let drop_idx = format!(
-        "DROP INDEX IF EXISTS {};",
-        quote_ident(&format!("{}_unique", child_table))
-    );
-    debug_sql(&drop_idx);
-    let _ = conn.execute_batch(&drop_idx);
-
-    // Rebuild using the SAME scheme as `init_child_table`: children with their
-    // own nested children index on `(_parent_id, _content_hash)` (whole-element
-    // identity), leaf children on `(_parent_id, scalar cols)`. Using scalar
-    // columns for a child that has children would silently merge elements that
-    // differ only in grandchild content.
-    let mut unique_cols = vec![quote_ident("_parent_id")];
-    if new_nf.nested.is_empty() {
-        for c in &new_nf.columns {
-            // NULL-coalesced — same scheme as `init_child_table`.
-            unique_cols.push(null_safe_coalesce(&quote_ident(&c.name), c.ty));
-        }
-    } else {
-        unique_cols.push(quote_ident("_content_hash"));
-    }
-    if unique_cols.len() > 1 {
-        let idx_sql = format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
-            quote_ident(&format!("{}_unique", child_table)),
-            quote_ident(&child_table),
-            unique_cols.join(", ")
-        );
-        debug_sql(&idx_sql);
-        let _ = conn.execute_batch(&idx_sql);
-    }
-
-    // Recurse into nested-within-nested fields
-    for new_sub in &new_nf.nested {
-        if let Some(old_sub) = old_nf.nested.iter().find(|n| n.name == new_sub.name)
-            && !auto_apply_child_change(conn, &child_table, old_sub, new_sub)
-        {
-            return false;
-        }
-    }
-
-    // Initialize any brand-new nested sub-tables
-    let old_sub_names: HashSet<&str> = old_nf.nested.iter().map(|n| n.name.as_str()).collect();
-    for sub in &new_nf.nested {
-        if !old_sub_names.contains(sub.name.as_str()) {
-            init_child_table(conn, &child_table, sub);
-        }
-    }
-
-    true
-}
-
-fn auto_apply_record_change(
-    conn: &Connection,
-    table: &str,
-    name: &str,
-    stored: &str,
-    compiled: &str,
-) -> bool {
-    let old_rec = parse_record_schema(stored);
-    let new_rec = parse_record_schema(compiled);
-
-    // Every old column must exist in new with same type
-    for old_col in &old_rec.columns {
-        match new_rec.columns.iter().find(|c| c.name == old_col.name) {
-            Some(new_col) => {
-                if old_col.ty != new_col.ty {
-                    return false;
-                }
-            }
-            None => return false,
-        }
-    }
-
-    // Adding nested fields to a table that had none → breaking.
-    // The parent table needs `_id INTEGER PRIMARY KEY AUTOINCREMENT` for
-    // child table FK references, and SQLite cannot add a PRIMARY KEY via
-    // ALTER TABLE.
-    if old_rec.nested.is_empty() && !new_rec.nested.is_empty() {
-        return false;
-    }
-
-    // Any removed nested fields → breaking
-    for old_nf in &old_rec.nested {
-        if !new_rec.nested.iter().any(|n| n.name == old_nf.name) {
-            return false;
-        }
-    }
-
-    // Add new columns, backfilling the rows written before the field existed
-    let old_col_names: HashSet<&str> = old_rec.columns.iter().map(|c| c.name.as_str()).collect();
-    for c in &new_rec.columns {
-        if !old_col_names.contains(c.name.as_str()) && !add_column_backfilled(conn, table, c) {
-            return false;
-        }
-    }
-
-    // Drop and recreate unique index with full column set
-    let drop_idx = format!(
-        "DROP INDEX IF EXISTS {};",
-        quote_ident(&format!("{}_unique", table))
-    );
-    debug_sql(&drop_idx);
-    let _ = conn.execute_batch(&drop_idx);
-
-    // Rebuild the unique index using the SAME scheme as `init_record_table`:
-    // tables with nested children index on `_content_hash` (whole-record
-    // identity), flat tables index on their NULL-coalesced scalar columns.
-    // Ignoring `new_rec.nested` here would drop the content-hash uniqueness on
-    // a table with children and replace it with scalar-column uniqueness,
-    // silently merging parents that differ only in nested content.
-    let unique_cols: Vec<String> = if new_rec.nested.is_empty() {
-        new_rec
-            .columns
-            .iter()
-            .map(|c| null_safe_coalesce(&quote_ident(&c.name), c.ty))
-            .collect()
-    } else {
-        vec![quote_ident("_content_hash")]
-    };
-    if !unique_cols.is_empty() {
-        let idx_sql = format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
-            quote_ident(&format!("{}_unique", table)),
-            quote_ident(table),
-            unique_cols.join(", ")
-        );
-        debug_sql(&idx_sql);
-        let _ = conn.execute_batch(&idx_sql);
-    }
-
-    // Migrate existing child tables whose inner schema changed
-    let old_nested_names: HashSet<&str> = old_rec.nested.iter().map(|n| n.name.as_str()).collect();
-    for new_nf in &new_rec.nested {
-        if let Some(old_nf) = old_rec.nested.iter().find(|n| n.name == new_nf.name)
-            && !auto_apply_child_change(conn, table, old_nf, new_nf)
-        {
-            return false;
-        }
-    }
-
-    // Initialize any new child tables for nested relations
-    for nf in &new_rec.nested {
-        if !old_nested_names.contains(nf.name.as_str()) {
-            init_child_table(conn, table, nf);
-        }
-    }
-
-    // Update stored schema
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO _knot_schema (name, schema) VALUES (?1, ?2);",
-        rusqlite::params![name, compiled],
-    );
-
-    true
-}
 
 /// Initialize a source table. Creates it if it doesn't exist.
 #[unsafe(no_mangle)]
@@ -14589,13 +14234,15 @@ pub extern "C-unwind" fn knot_source_init(
 
     if let Some(ref stored_schema) = stored
         && stored_schema != schema
-        && !auto_apply_schema_change(&db_ref.conn, name, stored_schema, schema)
     {
+        // No safe auto-apply: a stored schema differing from the compiled one
+        // must be covered by a baked migration (which runs before source
+        // init). Reaching here means the change has no migration.
         panic!(
-            "knot runtime: schema mismatch for source '*{}'.\n\
-                     Stored:   {}\n\
-                     Compiled: {}\n\
-                     Add a `migrate *{} from {{...}} to {{...}} using (\\old -> ...)` block to your source.",
+            "knot runtime: schema mismatch for source '*{}'.\\n\\
+                     Stored:   {}\\n\\
+                     Compiled: {}\\n\\
+                     Add a `migrate *{} to {{...}} using (\\old -> ...)` block to your source and run `knot lock`.",
             name, stored_schema, schema, name
         );
     }

@@ -1347,78 +1347,66 @@ The compiler checks stratification.
 
 ## Schema Evolution
 
-The compiler maintains a **schema lockfile** (`schema.lock`) that records the persisted schema. The lockfile uses the same syntax as source code — it's valid Knot containing only type declarations, data definitions, and relation signatures.
+The compiler maintains a **schema lock** (`<name>.schema.lock`) that owns the migration history. The lock is **append-only** and is **never written during `knot build`** — it is updated only by `knot lock`. It is valid Knot: a `with { … } (main)` expression holding the current type/data/relation declarations, plus a `migrate_history` section recording each committed migration as raw schema descriptors.
 
-### The Lockfile
+### The Lock
 
 ```knot
--- schema.lock (auto-generated, do not edit)
--- Commit to source control.
+-- schema.lock (append-only — written only by `knot lock`)
+-- Commit to source control. Do not edit by hand.
+with {
+Priority  Low {}  Medium {}  High {}  Critical {}
 
-data Priority = Low {} | Medium {} | High {} | Critical {}
+Person  {name Text  age (Int 1)  email Text}
 
-data Status
-  = Open {}
-  | InProgress {assignee: Text}
-  | Resolved {resolution: Text}
+Rel Person  *people
 
-*people : [{name: Text, age: Int 1}]
-  migrate from {name: Text, age: Int 1}
-  to {name: Text, age: Int 1, email: Text}
-  using (\old -> (base.unify old {email (old.name ++ "@unknown.com")}))
-
-*todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
+migrate_history [
+  {source "people"  from "name:text,age:int"  to "name:text,age:int,email:text"  using "\old -> {name old.name  age old.age  email (old.name ++ \"@unknown.com\")}"}
+]
+}
+(main)
 ```
 
-Since it's valid Knot, it can be parsed by the same compiler frontend — no separate schema format. Migrations are recorded in the lockfile so the compiler can detect if a migration is accidentally removed from source.
+The source file holds **only the current schema** — never migration history. The lock holds every committed schema and migration, so the full chain can be baked into the binary at build time.
 
 ### How It Works
 
-On each compile, the compiler diffs the source types against `schema.lock`:
+A source's schema lives only in source. To change it:
+
+1. **Edit the schema** and add a pending `migrate to New using <fn>` block. There is **no `from`** — it is derived from the lock's last recorded schema. `using` is a hand-written function applied to each stored row (no auto-derived transforms).
+2. **`knot build`** reads the lock as a build input. A pending migration produces an **uncommitted-migration warning**; the binary bakes the committed chain plus the pending step. Running it applies the migration on a **fork** of the database (a content-hashed copy), so the **main DB is never touched** by uncommitted work. Re-running the same pending migration reuses the fork; editing the `using` fn forks fresh.
+3. **`knot lock`** commits: it appends the migration to the lock's `migrate_history`, snapshots the current schema, and strips the `migrate` block from source. The next run of the committed binary fast-forwards the **main** DB through the locked chain.
+
+On each compile, the compiler diffs the source schema against the lock's last schema:
 
 | Change | Compiler action |
 |--------|-----------------|
-| Add `Maybe` field to record | Auto-update lockfile |
-| Add variant to ADT | Auto-update lockfile |
-| Add new relation | Auto-add to lockfile |
-| Add new `migrate` block | Auto-add to lockfile |
-| Remove field or variant | Error: require `migrate` |
-| Add non-Maybe field | Error: require `migrate` |
-| Change field type | Error: require `migrate` |
-| Remove a `migrate` block | Error: migration exists in lockfile |
+| Schema unchanged | OK (a staged `migrate` block here is an error) |
+| Schema changed + pending `migrate` block | Warning: uncommitted migration (run `knot lock`) |
+| Schema changed, no `migrate` block | Error: schema change requires a migrate block |
 | Remove relation | Warning (data will be orphaned) |
+
+There are no "safe" auto-applied changes — **every** schema change is an explicit migration with a hand-written `using` function.
 
 ### Migrations
 
-Breaking changes require a `migrate` block:
+A change requires a `migrate` block naming only the target:
 
 ```knot
-*people : [{name: Text, age: Int 1}]
-  migrate from {name: Text, age: Int 1}
-  to {name: Text, age: Int 1, email: Text}
-  using (\old -> (base.unify old {email (old.name ++ "@unknown.com")}))
+Person  {name Text  age (Int 1)  email Text}
+
+Rel Person  *people
+  migrate to Person using \old -> {name old.name  age old.age  email (old.name ++ "@unknown.com")}
 ```
 
-ADT migrations use pattern matching:
-
-```knot
-data Priority = Low {} | High {}
-data Status = Open {} | InProgress {assignee: Text} | Resolved {resolution: Text}
-*todos : [{title: Text, owner: Text, priority: Priority, status: Status}]
-  migrate from {title: Text, owner: Text, priority: Priority, status: Status}
-  to {title: Text, owner: Text, priority: Priority, status: Status}
-  using (\old -> (base.unify old {status (case old.status of
-    Status.InProgress {assignee a} -> Status.Resolved {resolution ("closed by " ++ a)}
-    other -> other)}))
-```
-
-After a successful compile, `schema.lock` is updated.
+The `using` function is type-checked against the lock's last schema (its input) and the new source schema (its output).
 
 ### Runtime
 
-The runtime stores the compiled schema version in the database. On startup it compares against the stored version and applies any pending migrations in order. Already-applied migrations are skipped.
+The runtime stores each source's schema in the database. On startup the binary applies its baked migration chain (committed + pending) in order, skipping already-applied steps. With a pending migration present, the binary opens a content-hashed **fork** of the database instead of the main file and logs a warning; the main DB is only migrated once the migration is committed via `knot lock` and the binary rebuilt.
 
-`migrate` blocks accumulate in source code. The lockfile tracks all migrations — if a migration present in the lockfile is missing from source, the compiler rejects the build. This prevents accidental deletion. Old migrations can be pruned only by explicitly removing them from both source and lockfile.
+Committed history is append-only: `knot lock` only ever adds to `migrate_history`. A source holds at most one pending `migrate` block at a time — rewriting it before locking replaces the single pending jump (last-locked → current). History is never edited or removed by the tooling.
 
 ## Type System
 

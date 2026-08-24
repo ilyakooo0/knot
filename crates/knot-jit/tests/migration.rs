@@ -1,12 +1,12 @@
-//! Schema evolution (`migrate from V1 to V2 using <fn>`).
+//! Schema evolution under the schema-lock-owned migration model.
 //!
-//! Two REAL, REPRODUCED bugs are documented by these tests (asserted against
-//! current behavior, each marked). They are genuine defects, not semantics to
-//! bless — see the inline comments.
-//!
-//! A v1 program persists rows under the old shape; a v2 program (SAME binary
-//! name, so it shares `prog.db`) with a `migrate` declaration reads them back
-//! upgraded.
+//! The lock (`<name>.schema.lock`) is the append-only, build-input owner of
+//! migration history. Source holds only the current schema plus at most one
+//! pending `migrate to … using …` block (no `from` — derived from the lock).
+//! `knot lock` snapshots schemas and promotes pending migrations into the
+//! lock, stripping the clause from source. A binary carrying an uncommitted
+//! migration opens a content-hashed FORK of the database, never touching the
+//! main DB; `knot lock` commits and the next run fast-forwards the main DB.
 
 mod e2e;
 use e2e::{TempDir, build_in_dir, knot_bin, run_bin};
@@ -15,127 +15,170 @@ fn dir_for(name: &str) -> TempDir {
     TempDir::fresh(name)
 }
 
+/// Run `knot lock <file>` in `dir`, asserting success.
+fn lock_in_dir(dir: &std::path::Path, name: &str) {
+    let out = std::process::Command::new(knot_bin())
+        .arg("lock")
+        .arg(dir.join(format!("{name}.knot")))
+        .output()
+        .expect("knot lock");
+    assert!(
+        out.status.success(),
+        "knot lock failed for {name}:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Build `src` as `dir/<name>` and run it, returning trimmed stdout.
 fn build_and_run(dir: &TempDir, name: &str, src: &str) -> String {
     build_in_dir(name, src, dir.path());
     run_bin(&dir.join(name), dir.path())
 }
 
-#[test]
-fn migrate_backfills_new_field_count() {
-    let dir = dir_for("mig_count");
-    // v1: people have only a name. Rows persisted under PersonV1.
-    let out1 = build_and_run(
-        &dir,
-        "mig_count",
-        r#"with {
-PersonV1  {name Text}
-Rel PersonV1  *people
-}
-(do
-  full *people = [{name "Alice"}  {name "Bob"}]
-  base.println (base.show (base.count *people))
-  yield {})"#,
-    );
-    assert_eq!(out1, "\"2\"\n{}");
-
-    // v2 (same binary name → same db): add `active`, backfill via migrate.
-    // The migration RUNS: both legacy rows survive the upgrade.
-    let out2 = build_and_run(
-        &dir,
-        "mig_count",
-        r#"with {
+const V1: &str = r#"with {
 Active  Yes {}  No {}
-PersonV1  {name Text}
-PersonV2  {name Text  active Active}
-Rel PersonV2  *people
-  migrate  from PersonV1  to PersonV2  using \p -> {name p.name  active (Active.Yes {})}
-}
-(do
-  base.println (base.show (base.count *people))
-  yield {})"#,
-    );
-    assert_eq!(out2, "\"2\"\n{}");
-}
-
-#[test]
-fn migrate_backfilled_adt_field_renders_constructor() {
-    // Rows upgraded by `migrate` render their backfilled ADT field with its
-    // constructor — `{active Yes name Alice}` — matching a directly-built
-    // `Active.Yes {}`. This requires the `migrate` fn to actually run: the
-    // codegen must emit `knot_source_migrate` for top-level `with`-block
-    // sources (previously only record-embedded sources were collected, so the
-    // migration never ran and `active` stayed empty).
-    let dir = dir_for("mig_show");
-    build_and_run(
-        &dir,
-        "mig_show",
-        r#"with {
 PersonV1  {name Text}
 Rel PersonV1  *people
 }
 (do
   full *people = [{name "Alice"}]
-  yield {})"#,
-    );
-    let out = build_and_run(
-        &dir,
-        "mig_show",
-        r#"with {
-Active  Yes {}  No {}
-PersonV1  {name Text}
-PersonV2  {name Text  active Active}
-Rel PersonV2  *people
-  migrate  from PersonV1  to PersonV2  using \p -> {name p.name  active (Active.Yes {})}
-}
-(do
-  people <- *people
-  base.println (base.show people)
-  yield {})"#,
-    );
-    // Fixed: the migrated ADT field renders its constructor.
-    assert_eq!(out, "\"[{active Yes  name Alice}]\"\n{}");
-}
-
-#[test]
-fn migrate_lockfile_roundtrip() {
-    // Regression: a program with a `migrate` declaration, once run (writing
-    // `prog.schema.lock`), must rebuild cleanly. The lockfile writer and
-    // parser used to disagree on migration syntax (writer emitted
-    // `migrate *name from …`, parser accepted only the nameless
-    // `migrate from …` form, and rejected a multi-line clause), so the
-    // lockfile couldn't be re-read. Fixed: writer emits the nameless form,
-    // parser skips newlines after `migrate`.
-    let dir = dir_for("mig_lock");
-    let src = r#"with {
-Active  Yes {}  No {}
-PersonV1  {name Text}
-PersonV2  {name Text  active Active}
-Rel PersonV2  *people
-  migrate  from PersonV1  to PersonV2  using \p -> {name p.name  active (Active.Yes {})}
-}
-(do
-  full *people = [{name "A"  active (Active.No {})}]
-  base.println (base.show (base.count *people))
   yield {})"#;
-    build_and_run(&dir, "mig_lock", src);
-    assert!(
-        dir.join("mig_lock.schema.lock").exists(),
-        "lockfile written"
-    );
 
-    // Rebuild the same source: must succeed and still read the migrated row.
+const V2_PENDING: &str = r#"with {
+Active  Yes {}  No {}
+PersonV1  {name Text}
+PersonV2  {name Text  active Active}
+Rel PersonV2  *people
+  migrate to PersonV2 using \p -> {name p.name  active (Active.Yes {})}
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+
+/// The full lifecycle: lock a v1 baseline, change the schema with a pending
+/// migration, run it on a fork (main untouched), then `knot lock` and run the
+/// committed binary, which fast-forwards the main DB.
+#[test]
+fn migrate_lock_lifecycle() {
+    let dir = dir_for("mig_life");
+    // v1: build, run (creates main DB with Alice), lock the baseline.
+    build_and_run(&dir, "mig_life", V1);
+    lock_in_dir(dir.path(), "mig_life");
+    let main_before = std::fs::read(dir.join("mig_life.db")).unwrap();
+
+    // v2 with a pending migration runs on a FORK: migrated rows visible, but
+    // the main DB file is byte-identical and a fork file appears.
+    let out = build_and_run(&dir, "mig_life", V2_PENDING);
+    assert_eq!(out, "\"[{active Yes  name Alice}]\"\n{}");
+    assert_eq!(
+        std::fs::read(dir.join("mig_life.db")).unwrap(),
+        main_before,
+        "uncommitted run must not touch the main DB"
+    );
+    let forks: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().contains(".fork-"))
+        .collect();
+    assert_eq!(forks.len(), 1, "exactly one fork for the pending migration");
+
+    // `knot lock` commits: the migrate clause is stripped from source and the
+    // lock records the migration. Rebuild + run fast-forwards the MAIN DB.
+    lock_in_dir(dir.path(), "mig_life");
+    let stripped = std::fs::read_to_string(dir.join("mig_life.knot")).unwrap();
+    assert!(
+        !stripped.contains("migrate"),
+        "knot lock strips the migrate clause from source"
+    );
+    let lock = std::fs::read_to_string(dir.join("mig_life.schema.lock")).unwrap();
+    assert!(lock.contains("migrate_history"), "lock records the history");
+    assert!(lock.contains("name:text"), "lock records the from-schema");
+
+    // The committed binary no longer carries the pending migration; running it
+    // migrates the main DB (no fork token) — but the source no longer has the
+    // migrate clause, so this run is a no-op over the already-locked schema.
+    let out2 = build_and_run(&dir, "mig_life", &stripped);
+    assert_eq!(out2, "\"[{active Yes  name Alice}]\"\n{}");
+}
+
+/// An uncommitted run forks; re-running the SAME pending migration reuses the
+/// fork; EDITING the `using` fn (same target schema) forks fresh.
+#[test]
+fn migrate_fork_identity() {
+    let dir = dir_for("mig_forkid");
+    build_and_run(&dir, "mig_forkid", V1);
+    lock_in_dir(dir.path(), "mig_forkid");
+
+    let fork_count = |dir: &TempDir| {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".fork-"))
+            .count()
+    };
+
+    build_and_run(&dir, "mig_forkid", V2_PENDING);
+    assert_eq!(fork_count(&dir), 1);
+    // Same pending content → the existing fork is reused, no new fork.
+    build_and_run(&dir, "mig_forkid", V2_PENDING);
+    assert_eq!(fork_count(&dir), 1);
+    // Edit ONLY the using fn (Active.Yes → Active.No, same target schema) → a
+    // fresh fork.
+    let edited = V2_PENDING.replace("Active.Yes {}", "Active.No {}");
+    let out = build_and_run(&dir, "mig_forkid", &edited);
+    assert_eq!(out, "\"[{active No  name Alice}]\"\n{}");
+    assert_eq!(fork_count(&dir), 2, "edited using-fn forks fresh");
+}
+
+/// Building a source whose schema drifted from the lock without a migrate
+/// block is a compile error; a pending migration produces the uncommitted
+/// warning instead.
+#[test]
+fn migrate_drift_requires_block() {
+    let dir = dir_for("mig_drift");
+    build_and_run(&dir, "mig_drift", V1);
+    lock_in_dir(dir.path(), "mig_drift");
+
+    // Schema changed (added `active`) but NO migrate block → build fails.
+    let no_block = r#"with {
+Active  Yes {}  No {}
+PersonV2  {name Text  active Active}
+Rel PersonV2  *people
+}
+(do
+  yield {})"#;
+    std::fs::write(dir.join("mig_drift.knot"), no_block).unwrap();
     let build = std::process::Command::new(knot_bin())
         .arg("build")
-        .arg(dir.join("mig_lock.knot"))
+        .arg(dir.join("mig_drift.knot"))
         .arg("-o")
-        .arg(dir.join("mig_lock"))
+        .arg(dir.join("mig_drift"))
         .output()
         .expect("knot build");
     assert!(
-        build.status.success(),
-        "rebuild failed (lockfile round-trip broke): {}",
-        String::from_utf8_lossy(&build.stderr)
+        !build.status.success(),
+        "schema drift without a migrate block must fail"
     );
-    assert_eq!(run_bin(&dir.join("mig_lock"), dir.path()), "\"1\"\n{}");
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("requires a migrate block"),
+        "error names the missing migrate block: {stderr}"
+    );
+
+    // With the pending block the build succeeds and warns (uncommitted).
+    std::fs::write(dir.join("mig_drift.knot"), V2_PENDING).unwrap();
+    let build = std::process::Command::new(knot_bin())
+        .arg("build")
+        .arg(dir.join("mig_drift.knot"))
+        .arg("-o")
+        .arg(dir.join("mig_drift"))
+        .output()
+        .expect("knot build");
+    assert!(build.status.success());
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("uncommitted migration"),
+        "pending migration warns: {stderr}"
+    );
 }

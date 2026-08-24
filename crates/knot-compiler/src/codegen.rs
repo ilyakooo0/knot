@@ -189,6 +189,12 @@ pub struct Codegen<M: cranelift_module::Module = ObjectModule> {
     // `from` of a pending migration's first step (the baseline it upgrades).
     locked_schemas: HashMap<String, String>,
 
+    // Fork identity for an uncommitted migration: hash of the pending
+    // (to-schema, using-src) pairs, or empty when there is no pending
+    // migration. When set, the runtime routes the DB open to a fork file so
+    // the uncommitted migration never touches the main DB.
+    fork_token: String,
+
     // Sources dropped from the codebase but still in the schema lockfile —
     // codegen emits a `knot_source_drop` call for each so the stored table is
     // deleted on startup.
@@ -895,6 +901,30 @@ fn compile_inner<M: cranelift_module::Module>(
     cg.migrate_chains = crate::lockfile::committed_migrations(std::path::Path::new(source_file));
     cg.pending_targets = type_env.migrate_schemas.clone();
     cg.locked_schemas = crate::lockfile::locked_schemas(std::path::Path::new(source_file));
+    // Fork identity for uncommitted migrations: hash the pending (to-schema,
+    // using-src) pairs, sorted for determinism. Empty when nothing is pending
+    // (committed binary → main DB).
+    {
+        let mut pending = crate::lockfile::pending_migrations(program);
+        let mut parts: Vec<String> = pending
+            .drain()
+            .map(|(name, p)| {
+                let to = type_env.migrate_schemas.get(&name).cloned().unwrap_or_default();
+                format!(
+                    "{}|{}|{}",
+                    name,
+                    to,
+                    knot::format::render_expr_source(&p.using_fn)
+                )
+            })
+            .collect();
+        parts.sort();
+        cg.fork_token = if parts.is_empty() {
+            String::new()
+        } else {
+            fork_hash(&parts.join(""))
+        };
+    }
     // Sources the codebase no longer declares but the schema lockfile still
     // tracks: emit a startup DROP for each so removed relations don't linger.
     cg.dropped_sources =
@@ -1411,6 +1441,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
             migrate_chains: HashMap::new(),
             pending_targets: HashMap::new(),
             locked_schemas: HashMap::new(),
+            fork_token: String::new(),
             dropped_sources: Vec::new(),
             diagnostics: Vec::new(),
             data_constructors: HashMap::new(),
@@ -1580,6 +1611,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // Database
         self.declare_rt("knot_db_open", &[p, p], &[p]);
+        self.declare_rt("knot_db_set_fork", &[p, p], &[]);
         self.declare_rt("knot_db_close", &[p], &[]);
         self.declare_rt("knot_db_exec", &[p, p, p], &[]);
         self.declare_rt("knot_source_init", &[p, p, p, p, p], &[]);
@@ -4338,7 +4370,13 @@ impl<M: cranelift_module::Module> Codegen<M> {
             let (desc_ptr, desc_len) = cg.string_ptr(builder, &descriptor);
             cg.call_rt_void(builder, "knot_override_check_help", &[desc_ptr, desc_len]);
 
-            // Open database
+            // Open database. When the binary carries an uncommitted migration,
+            // route the open to a fork of the main DB (keyed by the pending
+            // migration's content hash) so it never touches the main DB.
+            if !cg.fork_token.is_empty() {
+                let (fork_ptr, fork_len) = cg.string_ptr(builder, &cg.fork_token.clone());
+                cg.call_rt_void(builder, "knot_db_set_fork", &[fork_ptr, fork_len]);
+            }
             let db_path = cg.db_path.clone();
             let (db_path_ptr, db_path_len) = cg.string_ptr(builder, &db_path);
             let db_open_ref = cg.import_rt(builder, "knot_db_open");
@@ -20838,6 +20876,18 @@ fn parse_migration_fn(using_src: &str) -> Option<ast::Expr> {
         return None;
     }
     Some(program)
+}
+
+/// Deterministic 64-bit FNV-1a hash of a string, hex-encoded. Identifies a
+/// pending migration's fork — same pending content → same fork (reused),
+/// changed content → a fresh fork. Not cryptographic; only needs stability.
+fn fork_hash(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", h)
 }
 
 /// Convert route path segments to a pattern string like "/todos/{owner:text}".

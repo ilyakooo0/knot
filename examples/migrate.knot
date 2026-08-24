@@ -1,9 +1,16 @@
--- Schema evolution with `migrate`.
+-- Schema evolution with `migrate` and the schema lock.
 --
--- A relation's stored schema can change over time. `migrate from Old to New
--- using <fn>` declares how rows written under the OLD shape are upgraded to
--- the NEW shape on read: `from`/`to` name the record types, `using` is the
--- upgrade function applied to each legacy row.
+-- A relation's stored schema can change over time. The source holds ONLY the
+-- current schema; history lives in `<name>.schema.lock` (append-only, owned by
+-- `knot lock`, never written by `knot build`). To change a schema:
+--
+--   1. Edit the schema and add a pending `migrate to New using <fn>` block
+--      (no `from` — it is derived from the lock's last schema). `using` is a
+--      hand-written upgrade applied to each stored row.
+--   2. `knot build` warns the migration is uncommitted, and running the binary
+--      applies it on a FORK of the database — the main DB is never touched.
+--   3. `knot lock` commits the migration into the lock and strips the block
+--      from this source. The next run fast-forwards the main DB.
 --
 -- NOTE: relation columns must use ADT flags, not the primitive `Bool` — a
 -- `Bool` column panics in the storage layer (pre-existing runtime issue).
@@ -11,15 +18,12 @@ with {
 
 Active  Yes {}  No {}
 
--- Version 1 of the  schema people  had just  a name.
-PersonV1  {name Text}
+-- The current schema: people have a name and an `active` flag. The previous
+-- version (name only) and the migration that upgraded it live in
+-- `examples/migrate.schema.lock`, committed by an earlier `knot lock`.
+Person  {name Text  active Active}
 
--- Version 2  adds an `active`  flag. Existing  rows stored  as PersonV1  are
---  upgraded by `using`,  which fills the  new field with  a default.
-PersonV2  {name Text  active Active}
-
-Rel PersonV2  *people
-  migrate  from PersonV1  to PersonV2  using \p -> {name p.name  active (Active.Yes {})}
+Rel Person  *people
 
 }
 (do

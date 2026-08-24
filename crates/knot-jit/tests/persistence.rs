@@ -171,3 +171,40 @@ Rel Shape  *shapes
         "\"[Circle {radius 3}, Square {side 2}, Point]\"\n{}",
     );
 }
+
+/// An Int column is stored as a native SQLite INTEGER, not as TEXT. (Ints were
+/// historically stored as `TEXT COLLATE KNOT_INT` — a leftover from when knot's
+/// Int was a bignum. `Int` is `i64` now, so it fits SQLite's INTEGER directly.)
+#[test]
+fn int_column_is_native_integer() {
+    let dir = e2e::TempDir::fresh("intstorage");
+    e2e::build_in_dir(
+        "intstorage",
+        r#"with {
+C  {n (Int 1)}
+Rel C  *cs
+}
+(do
+  full *cs = [{n 42}]
+  yield {})"#,
+        dir.path(),
+    );
+    e2e::run_bin(&dir.join("intstorage"), dir.path());
+
+    // Probe the physical storage type with SQLite's `typeof()` (via python3 —
+    // no sqlite3 CLI on this host, and the test crate has no rusqlite dep).
+    let probe = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); \
+             print(c.execute('select typeof(n), n from _knot_cs').fetchone())",
+        )
+        .arg(dir.join("intstorage.db"))
+        .output()
+        .expect("python3 sqlite probe");
+    let out = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        out.contains("('integer', 42)"),
+        "Int column must be a native INTEGER, got: {out}"
+    );
+}

@@ -8017,11 +8017,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                 .get(&plan.tables[0].source_name)
                                 .cloned()
                                 .unwrap_or_default();
-                            // MIN/MAX over an Int-typed CASE loses
-                            // the KNOT_INT collation, and Float
-                            // MIN/MAX diverges from total_cmp —
-                            // keep both in memory (see
-                            // minmax_pushdown_type_ok).
+                            // MIN/MAX over an Int-typed CASE and Float
+                            // MIN/MAX (diverges from total_cmp) stay in
+                            // memory — see minmax_pushdown_type_ok.
                             let case_ok = !matches!(name, "minOn" | "maxOn")
                                 || minmax_pushdown_type_ok(&agg_bind, agg_body, &schema);
                             if case_ok {
@@ -8051,11 +8049,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     });
                     if let Some((col_sql, col_ty)) = col_info {
                         let col_is_text = col_ty == "text";
-                        let arg_sql = if matches!(name, "minOn" | "maxOn") && col_ty == "int" {
-                            format!("{} COLLATE KNOT_INT", col_sql)
-                        } else {
-                            col_sql
-                        };
+                        // Int columns are native INTEGERs — MIN/MAX order them
+                        // numerically with no explicit collation.
+                        let arg_sql = col_sql;
                         let result_flag = if matches!(name, "minOn" | "maxOn") {
                             col_is_text
                         } else {
@@ -8383,8 +8379,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         if let Some(rewritten) =
                                                 rewrite_body_through_projection(&plan, &bind_var, body)
                                                 // Same ORDER BY guards as every other sortBy path:
-                                                // no Int CASE (KNOT_INT collation is lost through CASE)
-                                                // and no Float key (SQLite conflates -0.0/+0.0 and sorts
+                                                // no Int CASE and no Float key (SQLite conflates
+                                                // -0.0/+0.0 and sorts
                                                 // NaN as NULL, diverging from in-memory total_cmp) —
                                                 // fall back to in-memory otherwise.
                                                 && sortby_projection_pushable(&bind_var, &rewritten, &schema)
@@ -13769,9 +13765,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
             }
             "sortBy" | "sortByDesc" => {
                 // sortBy (\\m -> m.field) *source → SELECT * FROM source ORDER BY field
-                // ORDER BY CASE loses KNOT_INT collation for Int projections and
-                // SQL float ordering diverges from total_cmp — keep both in
-                // memory (see sortby_projection_pushable). sortByDesc emits the
+                // ORDER BY CASE over an Int projection and SQL float ordering
+                // (diverges from total_cmp) stay in memory — see
+                // sortby_projection_pushable. sortByDesc emits the
                 // same column with a DESC direction; the projection guard is
                 // direction-agnostic so it applies unchanged.
                 // A record-literal key `{k1: r.c1, k2: r.c2}` decomposes to a
@@ -13944,9 +13940,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     if is_count || aggregate.is_some() {
                         return None;
                     }
-                    // ORDER BY CASE loses KNOT_INT collation for Int projections
-                    // and SQL float ordering diverges from total_cmp — keep
-                    // both in memory (see sortby_projection_pushable).
+                    // ORDER BY CASE over an Int projection and SQL float
+                    // ordering (diverges from total_cmp) stay in memory —
+                    // see sortby_projection_pushable.
                     if !sortby_projection_pushable(bind_var, body, &schema) {
                         return None;
                     }
@@ -15430,16 +15426,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
         env: &Env,
         let_binds: &HashMap<String, ast::Expr>,
     ) -> Option<SqlFragment> {
-        // Type-witness gate: ints are stored as TEXT (and need the KNOT_INT
-        // cast around arithmetic) while floats are stored as REAL (and must
-        // NOT get the text cast — it would compare floats byte-wise). Fall
-        // back entirely when the comparison can't be typed.
+        // Type-witness gate: floats (total_cmp vs SQL NaN/signed-zero
+        // semantics), tag columns, and json columns must NOT push down an
+        // ordered/equality comparison — `sql_comparison_cast_mode` returns
+        // None for those, bailing to in-memory. Int comparisons push down
+        // directly; with native INTEGER columns/params no cast is needed.
         let col_ty = |v: &str, f: &str| {
             bind_schemas
                 .get(v)
                 .and_then(|schema| lookup_col_type_from_schema(schema, f))
         };
-        let mode = sql_comparison_cast_mode(lhs, rhs, &col_ty)?;
+        sql_comparison_cast_mode(lhs, rhs, &col_ty)?;
         // Ordered comparisons on tag columns stay in memory (byte-wise
         // constructor-name order ≠ the type's Ord).
         if matches!(op, "<" | ">" | "<=" | ">=")
@@ -15449,40 +15446,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
         }
         let l = Self::try_compile_sql_atom(bind_aliases, lhs, env, let_binds)?;
         let r = Self::try_compile_sql_atom(bind_aliases, rhs, env, let_binds)?;
-        // Comparisons involving Int arithmetic compare numerically: SQLite
-        // arithmetic on TEXT-stored Int columns produces INTEGER, but
-        // params/columns are TEXT — INTEGER vs TEXT comparison orders by
-        // storage class, not value. Casting both sides to NUMERIC compares
-        // by value; on i64 overflow SQLite switches the arithmetic result
-        // to REAL, which then compares by its approximate real value
-        // (in-memory panics on overflow; the approximation is the closest
-        // faithful SQL behavior — unlike the previous CAST-to-TEXT, the
-        // overflow text can no longer satisfy arbitrary KNOT_INT filters).
-        // Without arithmetic, the plain TEXT comparison stays under the
-        // columns' KNOT_INT collation (exact, including BigInt-as-TEXT rows).
-        let (l_sql, r_sql) = match mode {
-            SqlCastMode::CastInt => {
-                if cast_arithmetic_for_where(&l.sql) != l.sql
-                    || cast_arithmetic_for_where(&r.sql) != r.sql
-                {
-                    (
-                        format!("CAST({} AS NUMERIC)", l.sql),
-                        format!("CAST({} AS NUMERIC)", r.sql),
-                    )
-                } else {
-                    (l.sql.clone(), r.sql.clone())
-                }
-            }
-            SqlCastMode::Plain => (l.sql.clone(), r.sql.clone()),
-            SqlCastMode::NoArith => {
-                if cast_arithmetic_for_where(&l.sql) != l.sql
-                    || cast_arithmetic_for_where(&r.sql) != r.sql
-                {
-                    return None;
-                }
-                (l.sql.clone(), r.sql.clone())
-            }
-        };
+        // Int columns, Int params, and Int arithmetic results are all native
+        // SQLite INTEGERs, so a comparison needs no cast — INTEGER-to-INTEGER
+        // (or REAL after an i64-overflow promotion) compares numerically.
+        let (l_sql, r_sql) = (l.sql.clone(), r.sql.clone());
         let mut params = l.params;
         params.extend(r.params);
         Some(SqlFragment {
@@ -15704,10 +15671,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             Self::try_compile_sql_comparison(bind_var, rhs, lhs, rev, schema)
                         })
                         .or_else(|| {
-                            // Type-witness gate: decide between the KNOT_INT
-                            // text-cast (ints stored as TEXT) and plain numeric
-                            // SQL (floats stored as REAL); fall back entirely
-                            // when the comparison can't be typed.
+                            // Type-witness gate: floats, tag, and json columns
+                            // bail to in-memory (returns None). Int comparisons
+                            // push down directly — native INTEGERs, no cast.
                             let col_ty = |v: &str, f: &str| {
                                 if v == bind_var {
                                     lookup_col_type_from_schema(schema, f)
@@ -15715,7 +15681,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                                     None
                                 }
                             };
-                            let mode = sql_comparison_cast_mode(lhs, rhs, &col_ty)?;
+                            sql_comparison_cast_mode(lhs, rhs, &col_ty)?;
                             // Ordered comparisons on tag columns stay in
                             // memory (byte-wise name order ≠ Ord).
                             if matches!(sql_op, "<" | ">" | "<=" | ">=")
@@ -15726,32 +15692,10 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             }
                             let l = Self::try_compile_single_table_atom(bind_var, lhs)?;
                             let r = Self::try_compile_single_table_atom(bind_var, rhs)?;
-                            // See try_compile_multi_table_comparison for
-                            // the CastInt/NUMERIC rationale (overflow-safe
-                            // numeric comparison around Int arithmetic).
-                            let (l_sql, r_sql) = match mode {
-                                SqlCastMode::CastInt => {
-                                    if cast_arithmetic_for_where(&l.sql) != l.sql
-                                        || cast_arithmetic_for_where(&r.sql) != r.sql
-                                    {
-                                        (
-                                            format!("CAST({} AS NUMERIC)", l.sql),
-                                            format!("CAST({} AS NUMERIC)", r.sql),
-                                        )
-                                    } else {
-                                        (l.sql.clone(), r.sql.clone())
-                                    }
-                                }
-                                SqlCastMode::Plain => (l.sql.clone(), r.sql.clone()),
-                                SqlCastMode::NoArith => {
-                                    if cast_arithmetic_for_where(&l.sql) != l.sql
-                                        || cast_arithmetic_for_where(&r.sql) != r.sql
-                                    {
-                                        return None;
-                                    }
-                                    (l.sql.clone(), r.sql.clone())
-                                }
-                            };
+                            // Int columns/params/arithmetic are all native
+                            // INTEGERs — no cast needed (see
+                            // try_compile_multi_table_comparison).
+                            let (l_sql, r_sql) = (l.sql.clone(), r.sql.clone());
                             let mut params = l.params;
                             params.extend(r.params);
                             Some(SqlFragment {
@@ -15919,33 +15863,18 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             if !self.elem_pushdown_ok.literal.contains(&arg.span) {
                                 return None;
                             }
-                            // An arithmetic needle (e.g. `x.a + x.b`)
-                            // evaluates to an INTEGER in SQLite, but Int list
-                            // elements bind as TEXT, so a raw `8 IN ('10','20')`
-                            // is a storage-class mismatch that never matches.
-                            // Cast both the needle and every element to
-                            // NUMERIC (mirrors the comparison path's CastInt
-                            // handling). A bare-column needle keeps its TEXT
-                            // affinity/collation, so only arithmetic needs it.
-                            let needle_arith = cast_arithmetic_for_where(&needle.sql) != needle.sql;
+                            // Int needles (column, arithmetic, or literal) and
+                            // Int list elements are all native INTEGERs — an
+                            // IN-list compares numerically with no cast.
                             let mut parts = Vec::with_capacity(elems.len());
                             let mut params = needle.params;
                             for e in elems {
                                 let frag = Self::try_compile_single_table_atom(bind_var, e)?;
-                                parts.push(if needle_arith {
-                                    format!("CAST({} AS NUMERIC)", frag.sql)
-                                } else {
-                                    frag.sql
-                                });
+                                parts.push(frag.sql);
                                 params.extend(frag.params);
                             }
-                            let needle_sql = if needle_arith {
-                                format!("CAST({} AS NUMERIC)", needle.sql)
-                            } else {
-                                needle.sql
-                            };
                             return Some(SqlFragment {
-                                sql: format!("{} IN ({})", needle_sql, parts.join(", ")),
+                                sql: format!("{} IN ({})", needle.sql, parts.join(", ")),
                                 params,
                             });
                         }
@@ -17189,22 +17118,10 @@ pub(crate) fn sortby_projection_pushable(bind_var: &str, body: &ast::Expr, schem
     )
 }
 
-/// Wrap a column SQL expression for use inside MIN/MAX so integer-typed
-/// columns sort numerically rather than lexicographically. Knot stores
-/// `Int` columns as `TEXT COLLATE KNOT_INT`, but SQLite does not propagate
-/// column collation through MIN/MAX, so we add `COLLATE KNOT_INT`
-/// explicitly when the projection is a simple Int field access. For
-/// Float/Text columns and arithmetic expressions, the expression is
-/// returned unchanged.
-fn col_sql_for_minmax(col_sql: &str, bind_var: &str, body: &ast::Expr, schema: &str) -> String {
-    if let ast::ExprKind::FieldAccess { expr, field } = &body.node
-        && let ast::ExprKind::Var(name) = &expr.node
-        && name == bind_var
-        && let Some(ty) = lookup_col_type_from_schema(schema, field)
-        && ty == "int"
-    {
-        return format!("{} COLLATE KNOT_INT", col_sql);
-    }
+/// Column SQL for use inside MIN/MAX. Int columns are native SQLite INTEGERs,
+/// which MIN/MAX order numerically with no collation — so the expression is
+/// returned unchanged for every column type.
+fn col_sql_for_minmax(col_sql: &str, _bind_var: &str, _body: &ast::Expr, _schema: &str) -> String {
     col_sql.to_string()
 }
 
@@ -19073,27 +18990,6 @@ fn expr_to_sql_param(expr: &ast::Expr) -> Option<SqlParamSource> {
     }
 }
 
-/// Wrap arithmetic/function SQL expressions in CAST for correct WHERE comparison.
-/// SQLite arithmetic on TEXT columns (INT stored as TEXT COLLATE KNOT_INT)
-/// produces INTEGER results, but parameters are TEXT. Without CAST,
-/// SQLite's type affinity puts INTEGER before TEXT, breaking `>` / `<`.
-/// Also wraps built-in functions like LENGTH() that return INTEGER.
-fn cast_arithmetic_for_where(sql: &str) -> String {
-    // Arithmetic atoms are wrapped in parentheses by try_compile_sql_atom;
-    // both those and Int-returning builtins (LENGTH, ABS, scalar min/max)
-    // yield INTEGER results that need the same CAST-to-TEXT treatment for
-    // correct WHERE comparison against TEXT-stored Int columns/params.
-    let int_fn = sql.starts_with("LENGTH(")
-        || sql.starts_with("ABS(")
-        || sql.starts_with("min(")
-        || sql.starts_with("max(");
-    if (sql.starts_with('(') && !sql.starts_with("(CAST")) || int_fn {
-        format!("CAST({} AS TEXT) COLLATE KNOT_INT", sql)
-    } else {
-        sql.to_string()
-    }
-}
-
 /// Extract a SQL column reference from a lambda body like `\x -> x.price`.
 /// Returns the SQL fragment e.g. `t0."price"` (or just `"price"` if alias is empty).
 /// Peel a curried application into (head, args): `f a b` → (f, [a, b]).
@@ -19159,8 +19055,8 @@ fn escape_glob_pattern(s: &str) -> String {
 /// Decompose a record-literal sort key `{k1: r.c1, k2: r.c2, ...}` (every value a
 /// simple field access on the bind var) into ORDER BY columns. Records compare
 /// field-by-field in literal order (see `compare_values`), which matches SQL
-/// `ORDER BY c1, c2, ...`; each column's declared collation (e.g. KNOT_INT for
-/// Int columns) applies automatically, as with the single-column sortBy path.
+/// `ORDER BY c1, c2, ...`; each column's declared type (native INTEGER for
+/// Int columns) orders automatically, as with the single-column sortBy path.
 /// Returns None when any value is not a simple field access on `bind_var`, or
 /// any key column's type is float/tag/bool (per-column projection guard —
 /// same byte-identical rule as single-key sortBy).
@@ -20360,23 +20256,6 @@ pub(crate) enum SqlScalarKind {
     Other,
 }
 
-/// How a pushed-down comparison over (possibly arithmetic) atoms must be
-/// emitted.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum SqlCastMode {
-    /// Integer (or text) comparison: arithmetic atoms get the
-    /// `CAST(... AS TEXT) COLLATE KNOT_INT` wrapper (Knot Ints are stored
-    /// as TEXT in SQLite).
-    CastInt,
-    /// Float comparison: emit plain numeric SQL — floats are stored as
-    /// REAL and params bind as REAL, so native numeric comparison is
-    /// correct. The KNOT_INT text-cast would compare floats byte-wise.
-    Plain,
-    /// No type witness found: only safe to push down when no atom would
-    /// have received the cast wrapper (i.e. no arithmetic involved).
-    NoArith,
-}
-
 /// Strip wrappers that don't affect the runtime value.
 fn strip_expr_wrappers(expr: &ast::Expr) -> &ast::Expr {
     match &expr.node {
@@ -20524,29 +20403,30 @@ pub(crate) fn sql_scalar_kind(
     }
 }
 
-/// Decide how a pushed-down comparison between `lhs` and `rhs` must be
-/// emitted, or `None` when it must fall back to in-memory evaluation.
+/// Gate: may a comparison between `lhs` and `rhs` be pushed down to SQL?
+/// Returns `Some(())` when pushdown is safe, `None` for in-memory fallback.
+/// Int, Text, and untyped (param-only) comparisons push down directly — with
+/// native INTEGER columns/params no cast is needed. Float, tag (ordered), and
+/// json comparisons must stay in memory (they return `None` here or are
+/// rejected by the caller's tag/json checks).
 pub(crate) fn sql_comparison_cast_mode(
     lhs: &ast::Expr,
     rhs: &ast::Expr,
     col_ty: &dyn Fn(&str, &str) -> Option<String>,
-) -> Option<SqlCastMode> {
+) -> Option<()> {
     let l = sql_scalar_kind(lhs, col_ty).ok()?;
     let r = sql_scalar_kind(rhs, col_ty).ok()?;
     let joined = join_sql_kinds(l, r).ok()?;
-    Some(match joined {
+    match joined {
         // Float comparisons must stay in memory: Knot compares floats with
         // total_cmp (-0.0 < +0.0, NaN orderable) while SQL says
         // -0.0 = 0.0 and stores NaN as NULL, so pushed comparisons would
         // silently drop NaN rows and conflate signed zeros.
-        Some(SqlScalarKind::Float) => return None,
-        // Text comparisons must use SQLite's default BINARY (byte-wise)
-        // collation, matching Knot's Text semantics. The KNOT_INT collation
-        // compares numerically, so e.g. `"0" ++ "7" == "7"` would match.
-        Some(SqlScalarKind::Text) => SqlCastMode::Plain,
-        Some(_) => SqlCastMode::CastInt,
-        None => SqlCastMode::NoArith,
-    })
+        Some(SqlScalarKind::Float) => None,
+        // Int, Text (BINARY byte-wise collation matches Knot's Text
+        // semantics), and untyped param-only comparisons all push down.
+        _ => Some(()),
+    }
 }
 
 /// True when a comparison side contains a field access on a "tag"

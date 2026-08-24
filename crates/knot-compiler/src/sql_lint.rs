@@ -10,7 +10,7 @@ use knot::ast::*;
 use knot::diagnostic::Diagnostic;
 
 use crate::codegen::{
-    SqlCastMode, beta_reduce, divisor_is_nonzero_int_literal, divisor_is_nonzero_literal,
+    beta_reduce, divisor_is_nonzero_int_literal, divisor_is_nonzero_literal,
     expr_has_tag_column, expr_refs_var, lookup_col_type_from_schema, minmax_pushdown_type_ok,
     sortby_projection_pushable, sql_comparison_cast_mode,
 };
@@ -661,7 +661,7 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
                                 None
                             }
                         };
-                        let mode = sql_comparison_cast_mode(lhs, rhs, &col_ty)?;
+                        sql_comparison_cast_mode(lhs, rhs, &col_ty)?;
                         // Ordered comparisons on tag columns stay in memory
                         // (byte-wise name order ≠ Ord) — mirror codegen.
                         if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge)
@@ -670,11 +670,9 @@ fn try_compile_sql_expr(bind_var: &str, expr: &Expr, schema: &str) -> Option<()>
                         {
                             return None;
                         }
-                        if matches!(mode, SqlCastMode::NoArith)
-                            && (atom_would_need_cast(lhs) || atom_would_need_cast(rhs))
-                        {
-                            return None;
-                        }
+                        // Int columns/params/arithmetic are native INTEGERs, so
+                        // even untyped (NoArith) arithmetic pushes down with no
+                        // cast — mirror codegen, which no longer bails on it.
                         try_sql_atom(bind_var, lhs)?;
                         try_sql_atom(bind_var, rhs)
                     })
@@ -859,20 +857,6 @@ fn try_sql_atom(bind_var: &str, expr: &Expr) -> Option<()> {
             }
         }
     }
-}
-
-/// Mirror of codegen's `cast_arithmetic_for_where` applicability: an atom
-/// would receive the KNOT_INT text-cast when it compiles to a parenthesized
-/// arithmetic expression. (LENGTH() is no longer pushed down, so App
-/// expressions never need the cast here.)
-fn atom_would_need_cast(expr: &Expr) -> bool {
-    matches!(
-        &expr.node,
-        ExprKind::BinOp {
-            op: BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod | BinOp::Concat,
-            ..
-        }
-    )
 }
 
 /// Look up a column's schema type. Delegates to codegen's

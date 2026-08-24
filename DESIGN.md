@@ -1427,6 +1427,8 @@ Committed history is append-only: `knot lock` only ever adds to `migrate_history
 
 `Uuid` is a primitive (not an ADT) so it can be the column type of a source relation without any wrapper constructor. UUIDv7 values are time-ordered, which makes them well-suited as primary keys — inserts append to the right edge of any index built on the column.
 
+**SQLite storage.** Source-relation columns map to native SQLite storage classes: `Int` → `INTEGER`, `Float` → `REAL`, `Bool` → `INTEGER` (0/1), `Text`/`Uuid`/enum tags → `TEXT`, `Bytes` → `BLOB`, and nested records / payload-bearing ADTs / non-record nested relations → JSON in a `TEXT` column. (`Int` was historically stored as `TEXT` with a numeric collation — a leftover from when `Int` was a bignum. It is `i64` now, so it uses SQLite's native `INTEGER` directly.)
+
 ### Row Polymorphism
 
 Functions can be generic over records and relations with specific fields:

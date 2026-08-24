@@ -1637,7 +1637,7 @@ impl PartialEq for SqlVal {
             (SqlVal::Real(a), SqlVal::Real(b)) => a == b,
             (SqlVal::Text(a), SqlVal::Text(b)) => a == b,
             (SqlVal::Blob(a), SqlVal::Blob(b)) => a == b,
-            // Cross-type integer/text compare (BigInts stored as TEXT in SQLite)
+            // Cross-type integer/text compare via numeric parse on the text side.
             (SqlVal::Int(a), SqlVal::Text(b)) | (SqlVal::Text(b), SqlVal::Int(a)) => {
                 b.parse::<i64>().map(|n| n == *a).unwrap_or(false)
             }
@@ -1675,7 +1675,7 @@ impl SqlVal {
             return SqlVal::Null;
         }
         match unsafe { as_ref(v) } {
-            Value::Int(n) => SqlVal::Text(n.to_string()),
+            Value::Int(n) => SqlVal::Int(*n),
             Value::Float(n) => SqlVal::Real(*n),
             Value::Text(s) => SqlVal::Text((**s).to_string()),
             Value::Bool(b) => SqlVal::Int(*b as i64),
@@ -1687,10 +1687,9 @@ impl SqlVal {
     }
 
     /// Canonical hashable form for use as an `EQ_WATCHERS` index key.
-    /// Mirrors `PartialEq for SqlVal` so values that compare equal hash equal —
-    /// notably collapses `Text("5")` and `Int(5)` (BigInts stored as TEXT) into
-    /// the same `SqlValKey::Int(5)`. NaN comparisons are exact (different bit
-    /// patterns hash differently), so a watcher keyed on NaN will never wake.
+    /// Mirrors `PartialEq for SqlVal` so values that compare equal hash equal.
+    /// NaN comparisons are exact (different bit patterns hash differently), so
+    /// a watcher keyed on NaN will never wake.
     fn to_key(&self) -> SqlValKey {
         match self {
             SqlVal::Null => SqlValKey::Null,
@@ -1703,6 +1702,10 @@ impl SqlVal {
                 let f = if *f == 0.0 { 0.0 } else { *f };
                 SqlValKey::RealBits(f.to_bits())
             }
+            // A numeric-looking TEXT value hashes as Int so it matches an Int
+            // watcher key. (Holdover from when Int columns were stored as TEXT;
+            // harmless for genuine text columns because their watchers compare
+            // byte-wise via the `text_col` path before reaching a key lookup.)
             SqlVal::Text(s) => match s.parse::<i64>() {
                 Ok(n) => SqlValKey::Int(n),
                 Err(_) => SqlValKey::Text(s.clone()),
@@ -1713,7 +1716,7 @@ impl SqlVal {
 }
 
 /// Hashable canonical form of `SqlVal` for indexing watchers by equality.
-/// Built via `SqlVal::to_key` — collapses BigInt-as-TEXT into `Int`.
+/// Built via `SqlVal::to_key`.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum SqlValKey {
     Null,
@@ -1800,7 +1803,7 @@ enum ReadFilter {
 
 /// SQLite-compatible partial ordering on `SqlVal`. Returns `None` for incompatible
 /// types so callers can fall back to "wake conservatively". Mirrors the type-coercion
-/// rules already in `PartialEq for SqlVal` (notably Int↔Text for BigInt-as-TEXT).
+/// rules already in `PartialEq for SqlVal` (notably Int↔Text numeric parse).
 fn sql_partial_cmp(a: &SqlVal, b: &SqlVal) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
     match (a, b) {
@@ -1809,12 +1812,12 @@ fn sql_partial_cmp(a: &SqlVal, b: &SqlVal) -> Option<std::cmp::Ordering> {
         (SqlVal::Int(x), SqlVal::Real(y)) => (*x as f64).partial_cmp(y),
         (SqlVal::Real(x), SqlVal::Int(y)) => x.partial_cmp(&(*y as f64)),
         (SqlVal::Text(x), SqlVal::Text(y)) => {
-            // Int columns are stored as TEXT (`SqlVal::from_knot` serializes
-            // Int as Text), so numeric texts must compare numerically —
-            // "5" < "10" — not lexicographically. Mirrors `SqlVal::to_key`'s
-            // i64-parse collapse: i64 first, then f64; plain string order
-            // only when NEITHER side parses as a number. Mixed numeric /
-            // non-numeric is unknown → None (callers wake conservatively).
+            // Two numeric-looking texts compare numerically ("5" < "10"), not
+            // lexicographically. Genuine TEXT columns are compared byte-wise
+            // by `cmp_for_col` before reaching here, so this path is only
+            // reached for non-column values. Plain string order applies only
+            // when NEITHER side parses as a number; mixed numeric/non-numeric
+            // is unknown → None (callers wake conservatively).
             match (x.parse::<i64>(), y.parse::<i64>()) {
                 (Ok(a), Ok(b)) => Some(a.cmp(&b)),
                 _ => match (x.parse::<f64>(), y.parse::<f64>()) {
@@ -1824,7 +1827,7 @@ fn sql_partial_cmp(a: &SqlVal, b: &SqlVal) -> Option<std::cmp::Ordering> {
                 },
             }
         }
-        // BigInts are stored as TEXT in SQLite — handle Int ↔ Text via numeric parse.
+        // Int ↔ Text via numeric parse on the text side.
         (SqlVal::Int(x), SqlVal::Text(y)) => y.parse::<i64>().ok().map(|n| x.cmp(&n)),
         (SqlVal::Text(x), SqlVal::Int(y)) => x.parse::<i64>().ok().map(|n| n.cmp(y)),
         // Real ↔ Text via numeric parse on the text side.
@@ -1841,13 +1844,11 @@ fn sql_partial_cmp(a: &SqlVal, b: &SqlVal) -> Option<std::cmp::Ordering> {
 /// Column-mode-aware comparison used by STM row-level wake filtering.
 /// `text_col = true` means the column is a genuine TEXT column (BINARY
 /// collation): Text/Text must compare byte-wise to match SQLite, NOT via the
-/// numeric-parse heuristic (which is correct only for `KNOT_INT`-collated Int
-/// columns stored as TEXT). All other type pairs (and `text_col = false`)
-/// delegate to `sql_partial_cmp`. See `TEXT_COLUMNS`.
+/// numeric-parse heuristic in `sql_partial_cmp`. All other type pairs (and
+/// `text_col = false`) delegate to `sql_partial_cmp`. See `TEXT_COLUMNS`.
 fn cmp_for_col(a: &SqlVal, b: &SqlVal, text_col: bool) -> Option<std::cmp::Ordering> {
     // Genuine TEXT column (BINARY collation): compare byte-wise to match
-    // SQLite, NOT via the numeric-parse heuristic (correct only for
-    // `KNOT_INT`-collated Int columns stored as TEXT). See `TEXT_COLUMNS`.
+    // SQLite, NOT via `sql_partial_cmp`'s numeric-parse heuristic.
     if text_col && let (SqlVal::Text(x), SqlVal::Text(y)) = (a, b) {
         return Some(x.cmp(y));
     }
@@ -2051,7 +2052,7 @@ impl WriteEvent {
                             // handled inside the matcher. `text_col` selects
                             // byte-wise Text/Text comparison for genuine TEXT
                             // columns (BINARY collation) vs the numeric-parse
-                            // heuristic used for `KNOT_INT`-stored Int columns.
+                            // heuristic for non-column values.
                             let preds_with_idx: Vec<(Option<usize>, &ColPred, bool)> = preds
                                 .iter()
                                 .map(|(c, p)| (rows.col_index(c), p, col_is_text(table, c)))
@@ -2128,15 +2129,14 @@ fn get_source_schema(name: &str) -> Option<Arc<RecordSchema>> {
 
 /// Registry of columns stored as genuine TEXT (BINARY collation in SQLite) —
 /// `ColType::Text`, `Tag`, or `Json` — keyed by `(source, column)`. Int columns
-/// are *also* stored as TEXT but use the `KNOT_INT` collation (numeric order),
-/// so they must NOT appear here.
+/// are native INTEGERs, so they never appear here.
 ///
-/// STM row-level wake filtering mirrors SQLite's comparison semantics: for a
-/// numeric (`KNOT_INT`) column `"100" < "99"` is FALSE (numeric), but for a
-/// genuine TEXT column it is TRUE (byte order, `'1' < '9'`). Without knowing
-/// which columns are genuinely text, the wake path can't tell — so it is
-/// resolved once (at `knot_source_init`) and consulted by the filter
-/// comparison (`col_pred_matches`) and watcher routing (`classify_filter`).
+/// STM row-level wake filtering mirrors SQLite's comparison semantics: for an
+/// INTEGER column `100 < 99` is FALSE (numeric), but for a genuine TEXT column
+/// `"100" < "99"` is TRUE (byte order, `'1' < '9'`). Without knowing which
+/// columns are genuinely text, the wake path can't tell — so it is resolved
+/// once (at `knot_source_init`) and consulted by the filter comparison
+/// (`col_pred_matches`) and watcher routing (`classify_filter`).
 static TEXT_COLUMNS: std::sync::LazyLock<
     std::sync::RwLock<std::collections::HashSet<(String, String)>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
@@ -2852,10 +2852,9 @@ fn eq_cross_key(val: &SqlVal) -> Option<SqlValKey> {
                 None
             }
         }
-        // Integers are stored in SQLite as TEXT, so an integer write row reaches
-        // the wake path as `Text("5")`, not `Int(5)` (mirrors `to_key`'s
-        // numeric-text parse). Probe its float-equivalent EQ key so a Real-keyed
-        // watcher (`r.col == 5.0`) still wakes on an integer write of `5`.
+        // A numeric-looking TEXT row value: probe its float-equivalent EQ key
+        // so a Real-keyed watcher (`r.col == 5.0`) still wakes on a write of
+        // `5`. (Only reached for non-Int columns — Int rows are `SqlVal::Int`.)
         SqlVal::Text(s) => s
             .parse::<i64>()
             .ok()
@@ -2916,11 +2915,12 @@ fn wake_range_index(idx: &RangeIndex, row_val: &SqlVal) {
         wake_all_int_less(idx);
         return;
     }
-    // Integer rows (native `Int` or the integer-valued TEXT storage form) are
-    // only exactly f64-representable when |n| < 2^53; beyond that `as f64`
-    // rounds, so the cross-type Real-threshold probe below would compare
-    // against a forged value and could miss a genuine wakeup. Over-wake every
-    // watcher on this column instead (mirrors `eq_cross_key`'s guard).
+    // An integer row value is only exactly f64-representable when |n| < 2^53;
+    // beyond that `as f64` rounds, so the cross-type Real-threshold probe below
+    // would compare against a forged value and could miss a genuine wakeup.
+    // Over-wake every watcher on this column instead (mirrors `eq_cross_key`'s
+    // guard). Int rows are `SqlVal::Int`; the `Text` arm is a conservative
+    // fallback for a numeric-looking genuine-text value.
     let int_row: Option<i64> = match row_val {
         SqlVal::Int(n) => Some(*n),
         SqlVal::Text(s) => s.parse::<i64>().ok(),
@@ -6863,22 +6863,12 @@ pub extern "C-unwind" fn knot_relation_group_by(
         col_names.push(quote_ident(&ks.name));
     }
     let col_str = col_names.join(", ");
+    // Int keys are native INTEGERs (see `value_to_sqlite`), so ORDER BY sorts
+    // them numerically with no explicit collation on either the temp-table or
+    // the VALUES-CTE path — the two paths order Int groups identically.
     let order_cols: Vec<String> = key_specs
         .iter()
-        .map(|ks| {
-            let ident = quote_ident(&ks.name);
-            // Int keys are encoded as TEXT (see `value_to_sqlite`), so an
-            // uncollated ORDER BY sorts them lexically ("10" < "9"). Force the
-            // numeric KNOT_INT collation explicitly: the temp-table fallback
-            // gets it from the column's declared `TEXT COLLATE KNOT_INT` type,
-            // but the VALUES-CTE fast path's columns have no declared collation,
-            // so without this the two paths would order Int groups differently.
-            if matches!(ks.ty, ColType::Int) {
-                format!("{} COLLATE KNOT_INT", ident)
-            } else {
-                ident
-            }
-        })
+        .map(|ks| quote_ident(&ks.name))
         .collect();
     // Append `_idx` (original input order) as the final ORDER BY term so rows
     // sharing the same key keep a deterministic, input order within their group.
@@ -12875,8 +12865,8 @@ fn apply_wire_type_checked(v: *mut Value, desc: &str) -> Option<*mut Value> {
     // representable i64 (integral, finite, in range) — exactly what
     // `coerce_json_field` can convert. A fractional or out-of-range float for an
     // int field is a decode error, not a silent passthrough: stored as-is it
-    // would land in the `TEXT COLLATE KNOT_INT` column as a SQLite REAL (see
-    // `value_to_sqlite`), breaking numeric ordering against the int-as-TEXT rows.
+    // would land in the INTEGER column as a SQLite REAL (see `value_to_sqlite`),
+    // breaking numeric ordering against the integer rows.
     let accepted = match desc {
         "int" => match unsafe { as_ref(v) } {
             Value::Int(_) => true,
@@ -13165,15 +13155,6 @@ pub extern "C-unwind" fn knot_db_open(path_ptr: *const u8, path_len: usize) -> *
         }
     }
     let conn = Connection::open(path).expect("knot runtime: failed to open database");
-    conn.create_collation("KNOT_INT", |a: &str, b: &str| {
-        match (a.parse::<i64>(), b.parse::<i64>()) {
-            (Ok(pa), Ok(pb)) => pa.cmp(&pb),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-            (Err(_), Err(_)) => a.cmp(b),
-        }
-    })
-    .expect("knot runtime: failed to create KNOT_INT collation");
     conn.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; PRAGMA foreign_keys=ON;",
     )
@@ -13825,8 +13806,11 @@ fn parse_record_schema(spec: &str) -> RecordSchema {
 /// Values of different storage classes are never considered equal by SQLite.
 fn null_safe_coalesce(col: &str, ty: ColType) -> String {
     match ty {
-        // Int stored as TEXT, Bool stored as INTEGER — INTEGER sentinel can't match either
-        ColType::Int | ColType::Bool => format!("COALESCE({}, -9223372036854775808)", col),
+        // Int and Bool are both stored as INTEGER — a TEXT sentinel can't match
+        // either. (Previously Int was TEXT, so it shared Bool's INTEGER sentinel;
+        // with native INTEGER storage that sentinel would collide with a real
+        // i64::MIN value, so both now use a TEXT sentinel.)
+        ColType::Int | ColType::Bool => format!("COALESCE({}, '')", col),
         // Float stored as REAL — TEXT sentinel can't match REAL
         ColType::Float => format!("COALESCE({}, '')", col),
         // Bytes stored as BLOB — TEXT sentinel can't match BLOB
@@ -13838,7 +13822,7 @@ fn null_safe_coalesce(col: &str, ty: ColType) -> String {
 
 fn sql_type(ty: ColType) -> &'static str {
     match ty {
-        ColType::Int => "TEXT COLLATE KNOT_INT",
+        ColType::Int => "INTEGER",
         ColType::Float => "REAL",
         ColType::Text => "TEXT",
         ColType::Bool => "INTEGER",
@@ -14604,13 +14588,12 @@ pub extern "C-unwind" fn knot_source_query_sum(
 
     // For an Int-typed column, SQLite can hand back a REAL even though the
     // statically expected type is Int: integer SUM silently promotes to REAL
-    // on i64 accumulation overflow, and summing the TEXT-stored ints used by
-    // the KNOT_INT encoding can likewise yield a REAL. Returning that Float
-    // verbatim would break downstream Int arithmetic / show / JSON. Coerce
-    // back to Int when the value is integral and fits i64; a value outside
-    // i64 range is a genuine overflow the runtime's i64 (checked-arithmetic)
-    // ints cannot represent, so panic with a clear message — matching how
-    // ordinary integer overflow is reported elsewhere — rather than silently
+    // on i64 accumulation overflow. Returning that Float verbatim would break
+    // downstream Int arithmetic / show / JSON. Coerce back to Int when the
+    // value is integral and fits i64; a value outside i64 range is a genuine
+    // overflow the runtime's i64 (checked-arithmetic) ints cannot represent, so
+    // panic with a clear message — matching how ordinary integer overflow is
+    // reported elsewhere — rather than silently
     // producing a wrong-typed or precision-lossy Float.
     let int_from_real = |f: f64| -> *mut Value {
         if f.fract() == 0.0 && f >= i64::MIN as f64 && f < 9_223_372_036_854_775_808.0 {
@@ -14733,12 +14716,13 @@ pub extern "C-unwind" fn knot_source_query_value(
                     if is_text != 0 {
                         Ok(alloc(Value::Text(Arc::from(s))))
                     } else {
-                        // Int columns are stored as TEXT COLLATE KNOT_INT, so a
-                        // MIN/MAX over an Int column comes back as Text. Parse
-                        // it back to an Int. A value that doesn't fit i64 cannot
-                        // be represented by the runtime's i64 ints — panic with
-                        // the same clear migration message as `read_sql_column`
-                        // rather than silently degrading to a lossy Float.
+                        // Defensive: an Int-column aggregate comes back as
+                        // ValueRef::Integer (handled above), so a Text here means
+                        // a numeric-looking value from a column the compiler did
+                        // not mark is_text. Parse it back to an Int. A value that
+                        // doesn't fit i64 cannot be represented by the runtime's
+                        // i64 ints — panic rather than silently degrading to a
+                        // lossy Float.
                         if let Ok(n) = s.parse::<i64>() {
                             Ok(alloc_int(n))
                         } else {
@@ -17044,7 +17028,7 @@ fn value_to_sql_param(v: *mut Value) -> rusqlite::types::Value {
         return rusqlite::types::Value::Null;
     }
     match unsafe { as_ref(v) } {
-        Value::Int(n) => rusqlite::types::Value::Text(n.to_string()),
+        Value::Int(n) => rusqlite::types::Value::Integer(*n),
         Value::Float(n) => float_to_sqlite_real(*n),
         Value::Text(s) => rusqlite::types::Value::Text((**s).to_string()),
         Value::Bool(b) => rusqlite::types::Value::Integer(*b as i64),
@@ -17063,7 +17047,7 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
         return rusqlite::types::Value::Null;
     }
     match (unsafe { as_ref(v) }, ty) {
-        (Value::Int(n), _) => rusqlite::types::Value::Text(n.to_string()),
+        (Value::Int(n), _) => rusqlite::types::Value::Integer(*n),
         (Value::Float(n), _) => float_to_sqlite_real(*n),
         (Value::Text(s), _) => rusqlite::types::Value::Text((**s).to_string()),
         (Value::Bool(b), _) => rusqlite::types::Value::Integer(*b as i64),
@@ -19093,7 +19077,7 @@ fn coerce_json_field(v: *mut Value, ty: &str) -> *mut Value {
     // peer that writes an integer with a decimal point (`30.0`) fails the
     // `as_i64()` probe in `json_to_value_impl` and decodes to `Value::Float`.
     // Left untouched, the value persists as SQLite `REAL` instead of the
-    // int-as-TEXT (`COLLATE KNOT_INT`) encoding every other Int row uses,
+    // INTEGER encoding every other Int row uses,
     // corrupting numeric ordering/comparison in that column. Demote integral
     // floats back to `Int` here.
     if ty == "int"

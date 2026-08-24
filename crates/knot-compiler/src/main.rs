@@ -678,7 +678,13 @@ fn cmd_build(
         file_body_type: _file_body_type,
         base_fields: _base_fields,
         refined_field_preds,
-    } = infer::check(&mut program);
+    } = infer::check_with_migrations(
+        &mut program,
+        // Old (pre-migration) type per source, derived from the schema lock so
+        // a pending migration's `using` fn is checked as `Old -> New` at build
+        // time instead of aborting at runtime. Empty when there's no lock.
+        crate::lockfile::migration_from_types(&source_path),
+    );
     // The expected-type descriptor of each `compile` call is knot source-type
     // syntax (from `display_ty_clean`). For ADTs the bare NAME alone is
     // insufficient — the JIT must compare constructor sets, and `Priority` says

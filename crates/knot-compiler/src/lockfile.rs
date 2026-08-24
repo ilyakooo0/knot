@@ -599,6 +599,42 @@ pub fn committed_migrations(source_path: &Path) -> HashMap<String, Vec<Committed
     }
 }
 
+/// The old (pre-migration) type for each source recorded in the lock, as a
+/// knot source-syntax type string — e.g. `people -> "PersonV1"`. Used by
+/// `main` to type-check a pending migration's `using` fn as `Old -> New`.
+///
+/// The lock's `Rel T *name` declaration names the source's current (i.e.
+/// pre-migration) type `T` directly, so this is a plain read of that type —
+/// the lock keeps every historical type declaration verbatim, so `T` resolves
+/// even after the source has moved on to a newer type.
+pub fn migration_from_types(source_path: &Path) -> HashMap<String, String> {
+    let lock_path = lockfile_path(source_path);
+    if !lock_path.exists() {
+        return HashMap::new();
+    }
+    let Ok(src) = std::fs::read_to_string(&lock_path) else {
+        return HashMap::new();
+    };
+    let lexer = knot::lexer::Lexer::new(&src);
+    let (tokens, lex_diags) = lexer.tokenize();
+    if lex_diags.iter().any(|d| d.severity == Severity::Error) {
+        return HashMap::new();
+    }
+    let parser = knot::parser::Parser::new(src.clone(), tokens);
+    let (program, parse_diags) = parser.parse_file_expr();
+    if parse_diags.iter().any(|d| d.severity == Severity::Error) {
+        return HashMap::new();
+    }
+    // Each `Rel T *name` SourceDecl in the lock names the source's recorded
+    // type. Render `T` back to source syntax so infer re-resolves it (the
+    // lock's own declarations keep it in scope).
+    let mut out = HashMap::new();
+    for (name, ty, _) in record_embedded_sources(&program) {
+        out.insert(name, knot::format::render_type(&ty));
+    }
+    out
+}
+
 /// The set of source names recorded in the lock (i.e. having a committed
 /// current schema). Used by `knot lock` to detect unrecorded sources.
 pub fn locked_sources(source_path: &Path) -> HashSet<String> {

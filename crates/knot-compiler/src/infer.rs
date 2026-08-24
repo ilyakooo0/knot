@@ -1083,6 +1083,14 @@ struct Infer {
     /// Each entry records (app_span, return_type_var).
     from_json_calls: Vec<(Span, TyVar)>,
 
+    /// Pending-migration `using` fns to type-check against the lock's prior
+    /// schema: source name -> the old type as a knot source string (e.g.
+    /// "PersonV1"). Threaded in from `main` (which reads the schema lock); the
+    /// `SourceDecl` arm checks each migration's `using` as `Old -> New` so a
+    /// wrong-shape migration is a compile error, not a runtime abort. Empty
+    /// when there is no lock or no pending migrations.
+    migration_using_from: HashMap<String, String>,
+
     /// Tracks `show` application sites so their argument's unit of measure can
     /// be resolved after inference. Each entry records (app_span, arg_ty); the
     /// arg type is recorded unresolved because a unit variable may only be
@@ -1385,6 +1393,7 @@ impl Infer {
             compile_calls: Vec::new(),
             file_body_ty: None,
             from_json_calls: Vec::new(),
+            migration_using_from: HashMap::new(),
             show_calls: Vec::new(),
             known_impls: HashSet::new(),
             string_lit_vars: HashMap::new(),
@@ -7755,6 +7764,8 @@ impl Infer {
                 // follow-up) so it participates in schema/migrations, and give
                 // the field the type of a source READ (`IO {Reads name} [T]`)
                 // so `db.*todos` resolves through ordinary field access.
+                // (The pending migration's `using` fn is type-checked in
+                // `collect_sources`, the phase that registers sources.)
                 self.annotation_vars.clear();
                 let resolved = self.ast_type_to_ty(ty);
                 self.source_types.insert(name.clone(), resolved.clone());
@@ -7784,6 +7795,52 @@ impl Infer {
                 }
                 Ty::Record(ns_fields, vec![],  None)
             }
+        }
+    }
+
+    /// Type-check a pending migration's `using` fn as `Old -> New`. `from_src`
+    /// is the old type as a knot source string (derived from the schema lock by
+    /// the caller — never written in source). The new (target) element type is
+    /// the source's own declared type (`resolved`, a `Relation(elem)`); the
+    /// lambda maps one old row to one new row. A wrong-shape migration fails
+    /// here as a compile error instead of aborting at runtime.
+    fn check_migration_using(
+        &mut self,
+        name: &str,
+        from_src: &str,
+        m: &ast::SourceMigration,
+        resolved: &Ty,
+    ) {
+        // Target element type: unwrap `Relation(elem)` -> `elem`.
+        let to_elem = match resolved {
+            Ty::Relation(inner) => (**inner).clone(),
+            other => other.clone(),
+        };
+        // The old type must resolve in this context. When it doesn't (the type
+        // was removed from source after migrating), we can't reconstruct its
+        // shape here — skip rather than emit a spurious cascade.
+        let from_ast = match knot::parser::parse_type_str(from_src) {
+            Some(t) => t,
+            None => return,
+        };
+        let from_elem = self.ast_type_to_ty(&from_ast);
+        if matches!(from_elem, Ty::Error) {
+            return;
+        }
+        let expected = Ty::Fun(Box::new(from_elem), Box::new(to_elem));
+        let errors_before = self.errors.len();
+        self.check_expr(&m.using_fn, &expected);
+        // Attach migration context to any error the check produced, so the
+        // user knows it's the `using` fn's shape that's wrong, and what the
+        // migration must produce.
+        if self.errors.len() > errors_before {
+            self.error(
+                format!(
+                    "migration for '*{}': the `using` fn must map each old row to the new schema",
+                    name
+                ),
+                m.span,
+            );
         }
     }
 
@@ -10067,7 +10124,11 @@ impl Infer {
 
     fn collect_sources(&mut self, program: &ast::Expr) {
         for_each_relation_marker(program, &mut |m| match m {
-            RelMarker::Source { name, ty } => {
+            RelMarker::Source {
+                name,
+                ty,
+                migrations,
+            } => {
                 self.annotation_vars.clear();
                 let resolved = self.ast_type_to_ty(ty);
                 // A source relation's element must be a record (or an ADT, which
@@ -10106,7 +10167,18 @@ impl Infer {
                         );
                     }
                 }
-                self.source_types.insert(name.to_string(), resolved);
+                self.source_types.insert(name.to_string(), resolved.clone());
+
+                // Type-check the pending migration's `using` fn as `Old -> New`:
+                // `Old` is the lock's recorded type (derived, never written in
+                // source); `New` is this source's element type. A wrong-shape
+                // migration is a compile error here, not a runtime abort after
+                // the migration has started writing.
+                if let Some(from_src) = self.migration_using_from.get(name).cloned() {
+                    for m in migrations {
+                        self.check_migration_using(name, &from_src, m, &resolved);
+                    }
+                }
             }
         });
     }
@@ -13745,7 +13817,19 @@ pub struct CheckOutput {
 /// Runs on a grown stack: a desugared `do` block nests one `__bind` per
 /// statement, and `infer_expr` recurses through every level.
 pub fn check(program: &mut ast::Expr) -> CheckOutput {
-    crate::stack::grow(|| check_inner(program, None))
+    crate::stack::grow(|| check_inner(program, None, HashMap::new()))
+}
+
+/// Like `check`, but additionally type-checks each pending migration's `using`
+/// fn against the lock's prior schema. `migration_using_from` maps source name
+/// -> the old type as a knot source string (derived from the schema lock by
+/// the caller). Each pending `migrate to New using f` is checked as
+/// `f : Old -> New`, so a wrong-shape migration is a compile error.
+pub fn check_with_migrations(
+    program: &mut ast::Expr,
+    migration_using_from: HashMap<String, String>,
+) -> CheckOutput {
+    crate::stack::grow(|| check_inner(program, None, migration_using_from))
 }
 
 // ── Compile-snippet subsumption (Option A) ─────────────────────────────────
@@ -13768,7 +13852,7 @@ static SUBSUMPTION_VERDICT: std::sync::Mutex<Option<bool>> = std::sync::Mutex::n
 /// `take_subsumption_verdict` after this returns.
 pub fn check_with_expected(program: &mut ast::Expr, expected_src: &str) -> CheckOutput {
     let src = expected_src.to_string();
-    crate::stack::grow(|| check_inner(program, Some(&src)))
+    crate::stack::grow(|| check_inner(program, Some(&src), HashMap::new()))
 }
 
 /// Read (and clear) the verdict produced by the last `check_with_expected`.
@@ -14195,8 +14279,13 @@ fn check_adt_ctors(
     })
 }
 
-fn check_inner(program: &mut ast::Expr, expected_src: Option<&str>) -> CheckOutput {
+fn check_inner(
+    program: &mut ast::Expr,
+    expected_src: Option<&str>,
+    migration_using_from: HashMap<String, String>,
+) -> CheckOutput {
     let mut infer = Infer::new();
+    infer.migration_using_from = migration_using_from;
 
     // Every user-written numeric type must carry an explicit unit (bare
     // `Int`/`Float` is rejected). Value annotations already enforce this via
@@ -15320,7 +15409,11 @@ fn collect_pat_names(pat: &ast::Pat, out: &mut Vec<String>) {
 /// A relation marker found in a record literal: a persisted source (`*name`),
 /// view, or derived (`&name`) relation.
 enum RelMarker<'a> {
-    Source { name: &'a str, ty: &'a ast::Type },
+    Source {
+        name: &'a str,
+        ty: &'a ast::Type,
+        migrations: &'a [ast::SourceMigration],
+    },
 }
 
 /// Read-only recursion over every sub-expression.
@@ -15537,8 +15630,18 @@ fn for_each_data_ctor_scoped<'a>(
 /// Visit every source declaration (`*name : Type`).
 fn for_each_relation_marker<'a>(program: &'a ast::Expr, f: &mut impl FnMut(RelMarker<'a>)) {
     walk_exprs_read(program, &mut |e| {
-        if let ast::ExprKind::SourceDecl { name, ty, .. } = &e.node {
-            f(RelMarker::Source { name, ty });
+        if let ast::ExprKind::SourceDecl {
+            name,
+            ty,
+            migrations,
+            ..
+        } = &e.node
+        {
+            f(RelMarker::Source {
+                name,
+                ty,
+                migrations,
+            });
         }
     });
 }

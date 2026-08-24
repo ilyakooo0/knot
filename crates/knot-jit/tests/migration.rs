@@ -182,3 +182,64 @@ Rel PersonV2  *people
         "pending migration warns: {stderr}"
     );
 }
+
+/// A pending migration whose `using` fn produces the wrong shape is a
+/// compile-time type error (`Old -> New`), not a runtime abort after the
+/// migration starts writing.
+#[test]
+fn migrate_using_shape_checked() {
+    let dir = dir_for("mig_using");
+    build_and_run(&dir, "mig_using", V1);
+    lock_in_dir(dir.path(), "mig_using");
+
+    // The `using` fn yields `{wrongfield}` — not the target `{name, active}`.
+    let bad_using = r#"with {
+Active  Yes {}  No {}
+PersonV1  {name Text}
+PersonV2  {name Text  active Active}
+Rel PersonV2  *people
+  migrate to PersonV2 using \p -> {wrongfield p.name}
+}
+(do
+  yield {})"#;
+    std::fs::write(dir.join("mig_using.knot"), bad_using).unwrap();
+    let build = std::process::Command::new(knot_bin())
+        .arg("build")
+        .arg(dir.join("mig_using.knot"))
+        .arg("-o")
+        .arg(dir.join("mig_using"))
+        .output()
+        .expect("knot build");
+    assert!(
+        !build.status.success(),
+        "a wrong-shape using fn must fail the build"
+    );
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        stderr.contains("using") && stderr.contains("migration"),
+        "error names the migration's using fn: {stderr}"
+    );
+
+    // Reading a field the old row lacks is also caught at build time.
+    let bad_read = r#"with {
+Active  Yes {}  No {}
+PersonV1  {name Text}
+PersonV2  {name Text  active Active}
+Rel PersonV2  *people
+  migrate to PersonV2 using \p -> {name p.nonexistent  active (Active.Yes {})}
+}
+(do
+  yield {})"#;
+    std::fs::write(dir.join("mig_using.knot"), bad_read).unwrap();
+    let build = std::process::Command::new(knot_bin())
+        .arg("build")
+        .arg(dir.join("mig_using.knot"))
+        .arg("-o")
+        .arg(dir.join("mig_using"))
+        .output()
+        .expect("knot build");
+    assert!(
+        !build.status.success(),
+        "reading a field absent from the old row must fail the build"
+    );
+}

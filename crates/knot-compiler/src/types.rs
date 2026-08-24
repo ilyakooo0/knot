@@ -377,7 +377,7 @@ impl TypeEnv {
                             &single_variant_params,
                             &multi_variant_params,
                         ));
-                        let new_schema = relation_inner_schema(&new_resolved);
+                        let new_schema = relation_inner_schema(&new_resolved, &aliases);
                         // Only the pending target schema is recorded; the
                         // pre-migration schema is derived from the schema lock
                         // (see `lockfile`). One pending migration per source.
@@ -1940,7 +1940,7 @@ fn schema_for_source(
                 single_variant_params,
                 multi_variant_params,
             );
-            relation_inner_schema(&resolved)
+            relation_inner_schema(&resolved, aliases)
         }
         _ => {
             // The type might be a named alias that resolves to a Relation
@@ -1954,7 +1954,7 @@ fn schema_for_source(
                 multi_variant_params,
             );
             if let ResolvedType::Relation(inner) = &resolved {
-                return relation_inner_schema(inner);
+                return relation_inner_schema(inner, aliases);
             }
             // Non-relation source type (e.g. `*counter : Int 1`):
             // wrap as a single-column `_value` schema.
@@ -1968,9 +1968,18 @@ fn schema_for_source(
 /// wrapped as a single-column `_value:<scalar>` schema, matching how scalar
 /// sources are stored. Without this wrapping the runtime sees a bare type
 /// name like `"text"` and panics in `parse_record_schema`.
-fn relation_inner_schema(inner: &ResolvedType) -> String {
+fn relation_inner_schema(inner: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -> String {
     match inner {
         ResolvedType::Record(_) | ResolvedType::Adt(_) => schema_descriptor(inner),
+        // A bare ADT name (`Rel S *t` where `data S = Open {} | Closed {}`)
+        // resolves to `Named("S")` — `resolve_type` keeps multi-variant ADTs
+        // named so nested references keep the type name. For the source's
+        // schema we need the ADT's structure, so re-resolve the name through
+        // the alias table. A genuinely unknown name falls through to scalar.
+        ResolvedType::Named(name) => match aliases.get(name) {
+            Some(adt @ ResolvedType::Adt(_)) => schema_descriptor(adt),
+            _ => format!("_value:{}", col_type_str(inner)),
+        },
         // A relation-of-relations element (`*tags : [[Text]]`, `*grid : [[R]]`)
         // is itself a relation and can never live in a scalar column. Store it
         // in a single `_value:json` column, the same round-trip used for

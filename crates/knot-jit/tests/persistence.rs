@@ -149,3 +149,25 @@ Rel Account  *accounts
         "\"[{balance 60  name from}, {balance 40  name to}]\"\n{}",
     );
 }
+
+/// A source whose element is a variant ADT persists as one wide row per
+/// constructor (a `_tag` column plus nullable per-constructor payload columns).
+/// This used to core-dump at runtime ("cannot convert Relation to SQL") because
+/// a bare ADT name resolves to `Named`, falling to the `_value:text` scalar
+/// fallback — `relation_inner_schema` now re-resolves the ADT structure.
+#[test]
+fn persisted_adt_element_source() {
+    assert_stdout(
+        "persistadt",
+        r#"with {
+Shape  Circle {radius (Int 1)}  Square {side (Int 1)}  Point {}
+Rel Shape  *shapes
+}
+(do
+  full *shapes = [Shape.Circle {radius 3}  Shape.Square {side 2}  Shape.Point {}]
+  rows <- *shapes
+  base.println (base.show rows)
+  yield {})"#,
+        "\"[Circle {radius 3}, Square {side 2}, Point]\"\n{}",
+    );
+}

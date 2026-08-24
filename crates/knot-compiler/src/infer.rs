@@ -7839,7 +7839,13 @@ impl Infer {
             Some(t) => t,
             None => return,
         };
-        let from_elem = self.ast_type_to_ty(&from_ast);
+        // The lock records the from-type as the full relation (`Rel S`); the
+        // using fn maps one ROW, so unwrap to the element type (`S`).
+        let from_resolved = self.ast_type_to_ty(&from_ast);
+        let from_elem = match self.apply(&from_resolved) {
+            Ty::Relation(inner) => self.apply(&inner),
+            other => other,
+        };
         if matches!(from_elem, Ty::Error) {
             return;
         }

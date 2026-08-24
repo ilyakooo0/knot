@@ -637,6 +637,27 @@ enum Ty {
     Error,
 }
 
+/// The first sub-type of `ty` that has no SQLite storage form (`Fun` or `IO`),
+/// or `None` if the whole type is persistable. Recurses through records,
+/// variants, named types, aliases, and nested relations so a function buried
+/// in a payload (`{f {g (Int -> Int)}}`) is caught, not just a top-level
+/// function field. Open/incomplete types (`Var`, `Forall`, `TyCon`, `App`,
+/// `Assoc`, `Error`) are treated as persistable — they either resolve away or
+/// are already an error.
+fn first_unpersistable(ty: &Ty) -> Option<Ty> {
+    match ty {
+        Ty::Fun(..) | Ty::IO(_) => Some(ty.clone()),
+        Ty::Record(fields, absent, _) => fields
+            .values()
+            .chain(absent.iter())
+            .find_map(first_unpersistable),
+        Ty::Variant(ctors, _) => ctors.values().find_map(first_unpersistable),
+        Ty::Con(_, args) => args.iter().find_map(first_unpersistable),
+        Ty::Relation(inner) | Ty::Alias(_, inner) => first_unpersistable(inner),
+        _ => None,
+    }
+}
+
 impl Ty {
     fn unit() -> Ty {
         Ty::Record(IndexMap::new(), vec![],  None)
@@ -10184,6 +10205,22 @@ impl Infer {
                                 "source `*{}` must hold records (or an ADT), not `{}` — a relation of scalars can't be persisted",
                                 name,
                                 self.display_ty(&inner)
+                            ),
+                            ty.span,
+                        );
+                    }
+                    // A function value can't be persisted. A field typed
+                    // `Int -> Int` (or `IO`, etc.) used to slip through the
+                    // schema catch-all as `fn:text`, then crash at runtime
+                    // (`cannot convert Function to SQL`) — or, nested in a
+                    // record/variant payload, serialize to a dead display
+                    // string that crashed on call. Reject it at build time.
+                    if let Some(bad) = first_unpersistable(&inner) {
+                        self.error(
+                            format!(
+                                "source `*{}` field type `{}` can't be persisted — functions and IO actions have no storage form",
+                                name,
+                                self.display_ty(&bad)
                             ),
                             ty.span,
                         );

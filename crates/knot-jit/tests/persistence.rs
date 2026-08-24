@@ -208,3 +208,40 @@ Rel C  *cs
         "Int column must be a native INTEGER, got: {out}"
     );
 }
+
+/// A function value can't be persisted. A source whose element type contains a
+/// function field must be a **compile error**, not a runtime crash: the schema
+/// catch-all used to type it `fn:text`, then `full *rs = [{f (\n -> n)}]`
+/// aborted the process with `cannot convert Function to SQL`. Nested functions
+/// (inside a record/variant payload) must also be rejected — they used to
+/// serialize to a dead display string that crashed on call.
+#[test]
+fn function_field_is_a_compile_error() {
+    // Top-level function field.
+    let dir = e2e::TempDir::fresh("fnfield");
+    let src = r#"with {
+R  {name Text  f (Int 1 -> Int 1)}
+Rel R  *rs
+}
+(do
+  full *rs = [{name "x"  f (\n -> n + 1)}]
+  yield {})"#;
+    let src_path = dir.join("fnfield.knot");
+    std::fs::write(&src_path, src).unwrap();
+    let build = std::process::Command::new(e2e::knot_bin())
+        .arg("build")
+        .arg(&src_path)
+        .arg("-o")
+        .arg(dir.join("fnfield"))
+        .output()
+        .expect("knot build");
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        !build.status.success(),
+        "function field must fail the build, not crash at runtime.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("function"),
+        "error should name the function field: {stderr}"
+    );
+}

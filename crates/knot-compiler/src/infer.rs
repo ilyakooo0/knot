@@ -643,18 +643,31 @@ enum Ty {
 /// in a payload (`{f {g (Int -> Int)}}`) is caught, not just a top-level
 /// function field. Open/incomplete types (`Var`, `Forall`, `TyCon`, `App`,
 /// `Assoc`, `Error`) are treated as persistable — they either resolve away or
-/// are already an error.
-fn first_unpersistable(ty: &Ty) -> Option<Ty> {
-    match ty {
-        Ty::Fun(..) | Ty::IO(_) => Some(ty.clone()),
-        Ty::Record(fields, absent, _) => fields
-            .values()
-            .chain(absent.iter())
-            .find_map(first_unpersistable),
-        Ty::Variant(ctors, _) => ctors.values().find_map(first_unpersistable),
-        Ty::Con(_, args) => args.iter().find_map(first_unpersistable),
-        Ty::Relation(inner) | Ty::Alias(_, inner) => first_unpersistable(inner),
-        _ => None,
+/// are already an error. Named ADTs (`Con`) are expanded to their structural
+/// `Variant` so a function in a *constructor payload* is caught too.
+impl Infer {
+    fn first_unpersistable(&mut self, ty: &Ty) -> Option<Ty> {
+        match ty {
+            Ty::Fun(..) | Ty::IO(_) => Some(ty.clone()),
+            Ty::Record(fields, absent, _) => fields
+                .values()
+                .chain(absent.iter())
+                .find_map(|t| self.first_unpersistable(t)),
+            Ty::Variant(ctors, _) => ctors
+                .values()
+                .find_map(|t| self.first_unpersistable(t)),
+            Ty::Con(name, args) => {
+                // Type args first (e.g. `Maybe (Int -> Int)`), then the named
+                // ADT's own constructor payloads (e.g. `Wrap {g (Int -> Int)}`).
+                if let Some(bad) = args.iter().find_map(|t| self.first_unpersistable(t)) {
+                    return Some(bad);
+                }
+                let variant = self.con_to_variant(name, args)?;
+                self.first_unpersistable(&variant)
+            }
+            Ty::Relation(inner) | Ty::Alias(_, inner) => self.first_unpersistable(inner),
+            _ => None,
+        }
     }
 }
 
@@ -10215,7 +10228,7 @@ impl Infer {
                     // (`cannot convert Function to SQL`) — or, nested in a
                     // record/variant payload, serialize to a dead display
                     // string that crashed on call. Reject it at build time.
-                    if let Some(bad) = first_unpersistable(&inner) {
+                    if let Some(bad) = self.first_unpersistable(&inner) {
                         self.error(
                             format!(
                                 "source `*{}` field type `{}` can't be persisted — functions and IO actions have no storage form",

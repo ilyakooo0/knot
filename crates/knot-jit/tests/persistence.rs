@@ -245,3 +245,38 @@ Rel R  *rs
         "error should name the function field: {stderr}"
     );
 }
+
+/// A function buried in a named ADT's constructor payload (`f : S` where
+/// `S.Wrap {g (Int -> Int)}`) must also be rejected: the field type is the
+/// nominal `Con("S")`, so a check that only walks type *args* misses it — the
+/// JSON path then silently dropped the payload (storing just `"Wrap"`).
+#[test]
+fn function_in_adt_payload_is_a_compile_error() {
+    let dir = e2e::TempDir::fresh("fnadt");
+    let src = r#"with {
+S  Wrap {g (Int 1 -> Int 1)}  Nope {}
+R  {name Text  f S}
+Rel R  *rs
+}
+(do
+  full *rs = [{name "x"  f (S.Wrap {g (\n -> n)})}]
+  yield {})"#;
+    let src_path = dir.join("fnadt.knot");
+    std::fs::write(&src_path, src).unwrap();
+    let build = std::process::Command::new(e2e::knot_bin())
+        .arg("build")
+        .arg(&src_path)
+        .arg("-o")
+        .arg(dir.join("fnadt"))
+        .output()
+        .expect("knot build");
+    let stderr = String::from_utf8_lossy(&build.stderr);
+    assert!(
+        !build.status.success(),
+        "fn in an ADT constructor payload must fail the build.\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("can't be persisted"),
+        "error should say the field can't be persisted: {stderr}"
+    );
+}

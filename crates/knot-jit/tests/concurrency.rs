@@ -61,3 +61,36 @@ fn sleep_pauses() {
         "\"a\"\n\"b\"\n{}",
     );
 }
+
+/// An `atomic` expression passed as a function argument (e.g. `base.fork`)
+/// must be deferred into an IO thunk the callee runs — not executed eagerly at
+/// the call site. `compile_arg_expr` deferred `Set`/`FullSet` but not `Atomic`,
+/// so `base.fork (atomic do …)` ran the atomic body on the *main* thread while
+/// building fork's argument; a panic inside it had no `catch_unwind` to land
+/// in and aborted the whole process (also leaking the write lock). With the
+/// deferral, the body runs on the fork's worker thread, where the fork's
+/// `catch_unwind` catches the panic and releases the lock.
+#[test]
+fn fork_atomic_panic_is_caught_on_worker() {
+    // The worker panics inside atomic; main must survive and still be able to
+    // read the source (proving the write lock was released, not leaked).
+    assert_stdout_unordered(
+        "forkatomic",
+        r#"with {
+C  {n (Int 1)}
+Rel C  *cs
+}
+(do
+  full *cs = [{n 1}]
+  base.fork (atomic do
+    full *cs = [{n 2}]
+    base.println (base.show (9223372036854775807 + 1))
+    yield {})
+  base.sleep 300
+  rows <- *cs
+  base.println (base.show (base.count rows))
+  base.println "survived"
+  yield {})"#,
+        &["\"1\"", "\"survived\"", "{}"],
+    );
+}

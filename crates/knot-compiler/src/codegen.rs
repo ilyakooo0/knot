@@ -11217,7 +11217,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
     ) -> Value {
         if matches!(
             &expr.node,
-            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. }
+            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } | ast::ExprKind::Atomic(_)
         ) {
             let do_stmts = vec![ast::Spanned::new(
                 ast::StmtKind::Expr(expr.clone()),

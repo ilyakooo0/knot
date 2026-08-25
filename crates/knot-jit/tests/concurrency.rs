@@ -64,12 +64,9 @@ fn sleep_pauses() {
 
 /// An `atomic` expression passed as a function argument (e.g. `base.fork`)
 /// must be deferred into an IO thunk the callee runs — not executed eagerly at
-/// the call site. `compile_arg_expr` deferred `Set`/`FullSet` but not `Atomic`,
-/// so `base.fork (atomic do …)` ran the atomic body on the *main* thread while
-/// building fork's argument; a panic inside it had no `catch_unwind` to land
-/// in and aborted the whole process (also leaking the write lock). With the
-/// deferral, the body runs on the fork's worker thread, where the fork's
-/// `catch_unwind` catches the panic and releases the lock.
+/// the call site. With the deferral, the body runs on the fork's worker
+/// thread, where the fork's `catch_unwind` catches the panic and releases the
+/// lock.
 #[test]
 fn fork_atomic_panic_is_caught_on_worker() {
     // The worker panics inside atomic; main must survive and still be able to

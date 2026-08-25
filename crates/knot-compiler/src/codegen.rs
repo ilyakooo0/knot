@@ -11215,10 +11215,17 @@ impl<M: cranelift_module::Module> Codegen<M> {
         env: &mut Env,
         db: Value,
     ) -> Value {
-        if matches!(
-            &expr.node,
-            ast::ExprKind::Set { .. } | ast::ExprKind::FullSet { .. } | ast::ExprKind::Atomic(_)
-        ) {
+        // Defer any IO-yielding expression into a thunk the callee runs. The
+        // leaf kinds (Set/FullSet/Atomic) are the obvious cases, but a
+        // `match`/`if`/`do`/`with` whose *branches* yield IO must defer too —
+        // otherwise the side effect fires while the argument is being built,
+        // even when the callee drops the result. `expr_is_io` is the
+        // type-directed criterion (any IO-typed expression), not the leaf
+        // node kind. A `Lambda` is excluded: it is a *function value* the
+        // callee may call (e.g. `base.traverse (\n -> println …) xs`), not an
+        // IO computation — deferring it would hand the callee an IO thunk
+        // where it expects a function ("cannot call IO, expected Function").
+        if self.expr_is_io(expr) && !matches!(&expr.node, ast::ExprKind::Lambda { .. }) {
             let do_stmts = vec![ast::Spanned::new(
                 ast::StmtKind::Expr(expr.clone()),
                 expr.span,

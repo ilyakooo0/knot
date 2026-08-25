@@ -220,3 +220,66 @@ fn precedence() {
 fn comparison_chains_via_and() {
     assert_show("(1 < 2) && (2 < 3)", "True");
 }
+
+// ── IO laziness in argument position ─────────────────────────────────────
+
+/// Any IO-yielding expression passed as a function argument must be deferred
+/// into an IO thunk the callee runs — not executed eagerly at the call site.
+/// `compile_arg_expr` deferred only `Set`/`FullSet`/`Atomic` leaf nodes; a
+/// `match`/`if`/`do`/`with` whose *branches* yield IO fell through to
+/// `compile_expr` and ran the side effect while the argument was being built,
+/// even when the callee dropped the result. Deferral must be driven by
+/// `expr_is_io` (any IO-typed expression), not the leaf node kind.
+#[test]
+fn io_arg_to_dropping_fn_does_not_run() {
+    // `ignore` drops its argument; the side effect must NOT fire.
+    assert_stdout(
+        "ioarg_match",
+        r#"with {
+_  ignore  (\io -> 7)
+}
+(do
+  ignore (match (Bool.True {})
+    (Bool.True {})   (base.println "FIRED")
+    (Bool.False {})  (base.println "other"))
+  base.println "done"
+  yield {})"#,
+        "\"done\"\n{}",
+    );
+}
+
+/// A `do`-block IO passed to a dropping function must not run its writes.
+#[test]
+fn io_arg_do_block_to_dropping_fn_does_not_run() {
+    assert_stdout(
+        "ioarg_do",
+        r#"with {
+_  ignore  (\io -> 7)
+}
+(do
+  ignore (do
+    base.println "FIRED"
+    yield {})
+  base.println "done"
+  yield {})"#,
+        "\"done\"\n{}",
+    );
+}
+
+/// A callee that RUNS the IO argument still executes it (deferred, not lost).
+#[test]
+fn io_arg_to_running_fn_still_runs() {
+    assert_stdout(
+        "ioarg_run",
+        r#"with {
+_  runIt  (\io -> base.run io)
+}
+(do
+  runIt (match (Bool.True {})
+    (Bool.True {})   (base.println "ran")
+    (Bool.False {})  (base.println "other"))
+  base.println "done"
+  yield {})"#,
+        "\"ran\"\n\"done\"\n{}",
+    );
+}

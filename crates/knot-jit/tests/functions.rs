@@ -283,3 +283,22 @@ _  runIt  (\io -> base.run io)
         "\"ran\"\n\"done\"\n{}",
     );
 }
+
+/// An IO *builtin passed as a function* (a function value, not an IO
+/// computation) must NOT be deferred into a thunk — the callee calls it.
+/// `expr_is_io` returns true for `base.println` (a FieldAccess on base with an
+/// IO builtin); deferring it handed the callee an IO thunk where it expected a
+/// function ("cannot call IO, expected Function"). Only IO-*computation* forms
+/// defer, not function values. `base.traverse` runs the fn per element, so the
+/// effects fire only if `base.println` reaches it as a callable fn.
+#[test]
+fn io_builtin_passed_as_function_is_not_deferred() {
+    assert_stdout(
+        "iofn",
+        r#"(do
+  base.traverse base.println [1  2]
+  base.println "done"
+  yield {})"#,
+        "1\n2\n\"done\"\n{}",
+    );
+}

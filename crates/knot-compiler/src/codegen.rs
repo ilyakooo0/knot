@@ -11215,17 +11215,27 @@ impl<M: cranelift_module::Module> Codegen<M> {
         env: &mut Env,
         db: Value,
     ) -> Value {
-        // Defer any IO-yielding expression into a thunk the callee runs. The
+        // Defer an IO-*computation* argument into a thunk the callee runs. The
         // leaf kinds (Set/FullSet/Atomic) are the obvious cases, but a
         // `match`/`if`/`do`/`with` whose *branches* yield IO must defer too —
         // otherwise the side effect fires while the argument is being built,
-        // even when the callee drops the result. `expr_is_io` is the
-        // type-directed criterion (any IO-typed expression), not the leaf
-        // node kind. A `Lambda` is excluded: it is a *function value* the
-        // callee may call (e.g. `base.traverse (\n -> println …) xs`), not an
-        // IO computation — deferring it would hand the callee an IO thunk
-        // where it expects a function ("cannot call IO, expected Function").
-        if self.expr_is_io(expr) && !matches!(&expr.node, ast::ExprKind::Lambda { .. }) {
+        // even when the callee drops the result. Only these composite forms
+        // defer: a `Var`/`FieldAccess`/`Lambda` is a *function value* the
+        // callee calls (`base.traverse base.println xs`, `base.traverse
+        // (\n -> …) xs`), not an IO computation — deferring it hands the
+        // callee an IO thunk where it expects a function ("cannot call IO,
+        // expected Function"). `expr_is_io` gates the composite forms so a
+        // value-returning `match`/`with` is NOT deferred.
+        let is_io_computation = matches!(
+            &expr.node,
+            ast::ExprKind::Set { .. }
+                | ast::ExprKind::FullSet { .. }
+                | ast::ExprKind::Atomic(_)
+                | ast::ExprKind::Do(_)
+                | ast::ExprKind::Case { .. }
+                | ast::ExprKind::With { .. }
+        ) && self.expr_is_io(expr);
+        if is_io_computation {
             let do_stmts = vec![ast::Spanned::new(
                 ast::StmtKind::Expr(expr.clone()),
                 expr.span,

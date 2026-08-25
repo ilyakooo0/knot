@@ -15954,7 +15954,63 @@ fn insert_adt_value(
     stmt.execute(&param_refs[..])
         .expect("knot runtime: failed to insert ADT child row");
 
+    // If the insert was ignored, a row with this hash already exists — verify
+    // it's the same content, not a collision.
+    if conn.changes() == 0 {
+        let content_cols: Vec<String> = std::iter::once(quote_ident("_tag"))
+            .chain(adt.all_fields.iter().map(|f| quote_ident(&f.name)))
+            .collect();
+        guard_hash_collision(conn, child_table, &hash_bytes, &content_cols, &params[1..]);
+    }
+
     hash_bytes
+}
+
+/// Guard against a content-hash collision. `INSERT OR IGNORE` on the `_hash`
+/// primary key silently merges two *different* values that happen to hash alike;
+/// this verifies the stored row's content matches what we tried to insert and
+/// panics loudly on mismatch (a collision should crash, not corrupt).
+///
+/// `content_cols` are the non-`_hash` column names and `content_params` the
+/// values we attempted to write, in the same order. Called only when the insert
+/// was ignored (a row with this `_hash` already existed).
+fn guard_hash_collision(
+    conn: &rusqlite::Connection,
+    child_table: &str,
+    hash: &[u8],
+    content_cols: &[String],
+    content_params: &[rusqlite::types::Value],
+) {
+    let cols = content_cols.join(", ");
+    let sql = format!(
+        "SELECT {} FROM {} WHERE {} = ?1;",
+        cols,
+        quote_ident(child_table),
+        quote_ident("_hash")
+    );
+    let existing: Vec<rusqlite::types::Value> = conn
+        .query_row(&sql, [rusqlite::types::Value::Blob(hash.to_vec())], |row| {
+            (0..content_cols.len())
+                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                .collect::<Result<_, _>>()
+        })
+        .expect("knot runtime: collision guard read failed");
+
+    // NULL-vs-value and typed comparison via SQL semantics: compare with `IS`.
+    for (i, (col, attempted)) in content_cols.iter().zip(content_params).enumerate() {
+        let same = match (&existing[i], attempted) {
+            (rusqlite::types::Value::Null, rusqlite::types::Value::Null) => true,
+            (a, b) => a == b,
+        };
+        if !same {
+            panic!(
+                "knot runtime: content-hash COLLISION in '{}' column '{}' — two distinct values \
+                 share a hash. Existing: {:?}, attempted: {:?}. This should be astronomically \
+                 impossible; if you see it, the value encoding or hash is broken.",
+                child_table, col, existing[i], attempted
+            );
+        }
+    }
 }
 
 /// Upsert a nested-record value into its content-addressed child table and
@@ -16009,6 +16065,14 @@ fn insert_rec_value(
         params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
     stmt.execute(&param_refs[..])
         .expect("knot runtime: failed to insert rec child row");
+
+    // If the insert was ignored, a row with this hash already exists — verify
+    // it's the same content, not a collision.
+    if conn.changes() == 0 {
+        let content_cols: Vec<String> =
+            schema.columns.iter().map(|c| quote_ident(&c.name)).collect();
+        guard_hash_collision(conn, child_table, &hash_bytes, &content_cols, &params[1..]);
+    }
 
     hash_bytes
 }
@@ -23550,5 +23614,61 @@ mod show_tests {
         value_to_hash_bytes(nan1, &mut h1);
         value_to_hash_bytes(nan2, &mut h2);
         assert_eq!(h1, h2, "all NaN bit patterns must hash identically");
+    }
+
+    // ── guard_hash_collision ────────────────────────────────────────
+
+    fn setup_child() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (\"_hash\" BLOB PRIMARY KEY, \"city\" TEXT, \"zip\" INTEGER);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn collision_guard_passes_when_content_matches() {
+        let conn = setup_child();
+        let hash = vec![0xAB; 32];
+        conn.execute(
+            "INSERT INTO t (\"_hash\", \"city\", \"zip\") VALUES (?1, 'paris', 75001);",
+            [rusqlite::types::Value::Blob(hash.clone())],
+        )
+        .unwrap();
+        // Same content under the same hash: no panic.
+        guard_hash_collision(
+            &conn,
+            "t",
+            &hash,
+            &["\"city\"".to_string(), "\"zip\"".to_string()],
+            &[
+                rusqlite::types::Value::Text("paris".to_string()),
+                rusqlite::types::Value::Integer(75001),
+            ],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "COLLISION")]
+    fn collision_guard_panics_when_content_differs() {
+        let conn = setup_child();
+        let hash = vec![0xAB; 32];
+        conn.execute(
+            "INSERT INTO t (\"_hash\", \"city\", \"zip\") VALUES (?1, 'paris', 75001);",
+            [rusqlite::types::Value::Blob(hash.clone())],
+        )
+        .unwrap();
+        // Different content under the same hash: a collision — must panic.
+        guard_hash_collision(
+            &conn,
+            "t",
+            &hash,
+            &["\"city\"".to_string(), "\"zip\"".to_string()],
+            &[
+                rusqlite::types::Value::Text("lyon".to_string()),
+                rusqlite::types::Value::Integer(69001),
+            ],
+        );
     }
 }

@@ -238,6 +238,78 @@ Rel Entry  *es
     );
 }
 
+/// A nested-record field is content-addressed into a child table with real
+/// columns (no JSON): the parent holds a BLOB hash, the child holds the fields.
+#[test]
+fn persisted_record_field_is_content_addressed() {
+    let dir = e2e::TempDir::fresh("recref");
+    e2e::build_in_dir(
+        "recref",
+        r#"with {
+Entry  {name Text  addr {city Text  zip (Int 1)}}
+Rel Entry  *es
+}
+(do
+  full *es = [{name "a"  addr {city "paris"  zip 75001}}]
+  yield {})"#,
+        dir.path(),
+    );
+    e2e::run_bin(&dir.join("recref"), dir.path());
+
+    let probe = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); \
+             pt=c.execute('select typeof(addr) from _knot_es').fetchone()[0]; \
+             child=c.execute('select city, zip, typeof(zip) from \"_knot_es__/addr\"').fetchone(); \
+             print((pt, child))",
+        )
+        .arg(dir.join("recref.db"))
+        .output()
+        .expect("python3 sqlite probe");
+    let out = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        out.contains("'blob'") && out.contains("('paris', 75001, 'integer')"),
+        "record field must be a blob hash + real child columns, got: {out}"
+    );
+}
+
+/// A scalar-relation field is stored in a `_parent_id`-keyed child table with a
+/// bare `_value` column (no JSON array, no wrapper record in the source).
+#[test]
+fn persisted_scalar_relation_field_is_child_table() {
+    let dir = e2e::TempDir::fresh("relscalar");
+    e2e::build_in_dir(
+        "relscalar",
+        r#"with {
+Entry  {name Text  tags (Rel Text)}
+Rel Entry  *es
+}
+(do
+  full *es = [{name "a"  tags ["x"  "y"]}]
+  yield {})"#,
+        dir.path(),
+    );
+    e2e::run_bin(&dir.join("relscalar"), dir.path());
+
+    let probe = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); \
+             rows=c.execute('select _value, typeof(_value) from \"_knot_es__/tags\" order by _value').fetchall(); \
+             cols=[r[1] for r in c.execute('pragma table_info(\"_knot_es__/tags\")')]; \
+             print((rows, cols))",
+        )
+        .arg(dir.join("relscalar.db"))
+        .output()
+        .expect("python3 sqlite probe");
+    let out = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        out.contains("[('x', 'text'), ('y', 'text')]") && out.contains("'_parent_id'") && out.contains("'_value'"),
+        "scalar relation must be a _parent_id child with a text _value column, got: {out}"
+    );
+}
+
 /// Payload columns are real, indexable columns on the child table (the point of
 /// the content-addressed encoding over JSON): a pushdown filter on a payload
 /// field runs against the `radius` INTEGER column.

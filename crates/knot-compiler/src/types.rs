@@ -1981,18 +1981,16 @@ fn relation_inner_schema(inner: &ResolvedType, aliases: &HashMap<String, Resolve
             _ => format!("_value:{}", col_type_str(inner)),
         },
         // A relation-of-relations element (`*tags : [[Text]]`, `*grid : [[R]]`)
-        // is itself a relation and can never live in a scalar column. Store it
-        // in a single `_value:json` column, the same round-trip used for
-        // relation-typed *record* fields (`format_schema_field`). Without this,
-        // `col_type_str` falls through to `"text"`, the schema becomes
-        // `_value:text`, the program compiles clean, and every write panics at
-        // runtime ("cannot convert Relation to SQL").
-        ResolvedType::Relation(_) => "_value:json".to_string(),
+        // is itself a relation — a composite. Store it as a `_value` field with
+        // the recursive relation descriptor (a child table), not a bare `json`.
+        ResolvedType::Relation(_) => format!("_value:{}", field_type_desc(inner, aliases)),
         _ => format!("_value:{}", col_type_str(inner)),
     }
 }
 
 /// Column type string for a resolved type used as a record field.
+/// Scalars/enum-ADTs are stored in-row; this only ever returns a flat token.
+/// Composite types are handled by `field_type_desc` (the recursive descriptor).
 fn col_type_str(ty: &ResolvedType) -> &'static str {
     match ty {
         ResolvedType::Int => "int",
@@ -2001,17 +1999,49 @@ fn col_type_str(ty: &ResolvedType) -> &'static str {
         ResolvedType::Bool => "bool",
         ResolvedType::Bytes => "bytes",
         ResolvedType::Uuid => "text",
+        // Enum-like ADTs (all nullary) get the "tag" type. Payload ADTs,
+        // records, and relations are composite — they take a child-table
+        // descriptor via `field_type_desc`, never a bare `col_type_str`.
+        ResolvedType::Adt(_) => "tag",
+        _ => "text",
+    }
+}
+
+/// Recursive field-type descriptor. Every field type is one of:
+///   <scalar>          int | float | text | bool | bytes   (in-row column)
+///   tag               enum ADT (all nullary)              (in-row TEXT column)
+///   adt#C:f=T;..|C2   payload ADT   → content-hash child table (_hash,_tag,cols)
+///   rec#f=T;..        record        → content-hash child table (_hash,cols)
+///   [T]               relation      → _parent_id child table, one row/element
+/// where `T` is any of these, recursively. Composites become child tables
+/// terminating at scalars — no `json` token remains.
+fn field_type_desc(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -> String {
+    // Resolve a named reference to its structural type (record aliases inline;
+    // multi-variant ADTs stay named so we re-resolve here).
+    let resolved = match ty {
+        ResolvedType::Named(n) => aliases.get(n).unwrap_or(ty),
+        other => other,
+    };
+    match resolved {
+        ResolvedType::Relation(inner) => format!("[{}]", field_type_desc(inner, aliases)),
         ResolvedType::Adt(ctors) => {
-            // Enum-like ADTs (all nullary) get the "tag" type
-            if ctors.iter().all(|(_, fields)| fields.is_empty()) {
-                "tag"
+            if ctors.iter().all(|(_, f)| f.is_empty()) {
+                "tag".to_string()
             } else {
-                "json" // payload-bearing ADTs round-trip through JSON
+                format!("adt{}", adt_descriptor(ctors, aliases))
             }
         }
-        // Nested records round-trip through JSON to preserve structure
-        ResolvedType::Record(_) => "json",
-        _ => "text",
+        ResolvedType::Record(fields) => {
+            // `rec#[...]` wraps the field list in brackets so the outer
+            // `,`-split (which respects `[...]`) keeps the whole record
+            // descriptor intact. The runtime strips `rec#` then the brackets.
+            let specs: Vec<String> = fields
+                .iter()
+                .map(|(fname, fty)| format!("{}:{}", fname, field_type_desc(fty, aliases)))
+                .collect();
+            format!("rec#[{}]", specs.join(","))
+        }
+        other => col_type_str(other).to_string(),
     }
 }
 
@@ -2035,35 +2065,10 @@ fn format_schema_field(
     ty: &ResolvedType,
     aliases: &HashMap<String, ResolvedType>,
 ) -> String {
-    if let ResolvedType::Relation(inner) = ty {
-        match inner.as_ref() {
-            ResolvedType::Record(_) => {
-                format!("{}:[{}]", name, schema_descriptor(inner, aliases))
-            }
-            _ => format!("{}:json", name),
-        }
-    } else {
-        // A named ADT field (`sh Shape`) resolves to `Named` — multi-variant
-        // ADTs stay named so nested references resolve. Re-resolve through the
-        // alias table to decide the storage. An enum-like ADT (all nullary)
-        // stores as a `tag` column. A payload-bearing ADT stores as a content-
-        // addressed reference (`adt`): the column holds the value's content
-        // hash, and the value itself lives in a per-field child table keyed by
-        // that hash — making payload columns indexable/pushdown-able where the
-        // old JSON encoding was opaque. The descriptor carries the ADT's
-        // constructor schema (`#Ctor:f=t|...`) so the runtime can build the
-        // child table; it reuses the direct-relation ADT grammar.
-        let resolved = match ty {
-            ResolvedType::Named(n) => aliases.get(n).unwrap_or(ty),
-            other => other,
-        };
-        match resolved {
-            ResolvedType::Adt(ctors) if !ctors.iter().all(|(_, f)| f.is_empty()) => {
-                format!("{}:adt{}", name, adt_descriptor(ctors, aliases))
-            }
-            other => format!("{}:{}", name, col_type_str(other)),
-        }
-    }
+    // The whole field type is described recursively: composites (payload ADT,
+    // record, relation) become child-table descriptors, scalars/enum-ADTs a
+    // flat column token. No `json` fallback remains.
+    format!("{}:{}", name, field_type_desc(ty, aliases))
 }
 
 /// The `#Ctor1:f1=t1;f2=t2|Ctor2|...` descriptor for an ADT's constructors.
@@ -2078,13 +2083,7 @@ fn adt_descriptor(ctors: &[(String, Vec<(String, ResolvedType)>)], aliases: &Has
             } else {
                 let field_specs: Vec<String> = fields
                     .iter()
-                    .map(|(fname, fty)| {
-                        if let ResolvedType::Relation(inner) = fty {
-                            format!("{}=[{}]", fname, schema_descriptor(inner, aliases))
-                        } else {
-                            format!("{}={}", fname, col_type_str(fty))
-                        }
-                    })
+                    .map(|(fname, fty)| format!("{}={}", fname, field_type_desc(fty, aliases)))
                     .collect();
                 format!("{}:{}", ctor_name, field_specs.join(";"))
             }

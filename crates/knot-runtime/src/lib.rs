@@ -13593,6 +13593,24 @@ pub extern "C-unwind" fn knot_source_migrate_preview(
 /// Types: "int", "float", "text", "bool", "tag"
 /// Nested relations: "col:[inner_schema]"
 /// ADT schema format: "#Ctor1:f1=t1;f2=t2|Ctor2|Ctor3:f3=t3"
+/// How a field's value is physically stored. Recursive: composites become
+/// child tables whose own fields are described by the same type.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum FieldStore {
+    /// An in-row column (scalar or enum-ADT tag).
+    Column(ColType),
+    /// Content-addressed payload ADT: parent column holds the value's 32-byte
+    /// content hash; the value lives in a child table keyed by `_hash` with
+    /// `_tag` + per-constructor payload columns.
+    AdtRef(AdtSpec),
+    /// Content-addressed record: parent column holds the content hash; fields
+    /// live in a child table keyed by `_hash` (no `_tag`).
+    RecRef(RecordSchema),
+    /// A relation: no parent column; elements live in a `_parent_id`-keyed
+    /// child table, one row per element.
+    RelRef(Box<RecordSchema>),
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct ColumnSpec {
     name: String,
@@ -13600,6 +13618,10 @@ struct ColumnSpec {
     /// Constructor schema when `ty == ColType::AdtRef` (kept out of the `Copy`
     /// `ColType`); `None` for every other column type.
     adt: Option<AdtSpec>,
+    /// Recursive store for composite fields. When present, this overrides the
+    /// flat `ty`/`adt` for read/write/init of this field. `None` while the
+    /// recursive descriptor is being phased in.
+    store: Option<Box<FieldStore>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -13625,9 +13647,15 @@ enum ColType {
     /// columns (queryable/pushdown-able). The constructor schema travels in
     /// `ColumnSpec::adt` (kept out of this `Copy` enum).
     AdtRef,
+    /// A content-addressed nested record: the parent column holds the value's
+    /// 32-byte content hash (BLOB); the record's fields live in a child table
+    /// keyed by `_hash` (no `_tag`). The field schema travels in
+    /// `ColumnSpec::store` (`FieldStore::RecRef`).
+    RecRef,
 }
 
 /// A nested relation field stored in a child table.
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct NestedField {
     name: String,
     /// Scalar columns in the child table
@@ -13637,6 +13665,7 @@ struct NestedField {
 }
 
 /// Parsed record schema with both scalar columns and nested relation fields.
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct RecordSchema {
     /// Scalar (non-relation) columns stored directly in this table
     columns: Vec<ColumnSpec>,
@@ -13688,6 +13717,70 @@ fn is_adt_schema(spec: &str) -> bool {
     spec.starts_with('#')
 }
 
+/// Parse a recursive field-type descriptor into a `FieldStore`. Grammar:
+///   int|float|text|bool|bytes|tag   → Column (in-row)
+///   json                            → Column(Json) (legacy; phased out)
+///   adt#C:f=T;..|C2                 → AdtRef (content-hash child)
+///   rec#f=T;..                      → RecRef (content-hash child, no _tag)
+///   [T]                             → RelRef (_parent_id child)
+/// where `T` recurses through this same function.
+fn parse_field_store(type_str: &str) -> FieldStore {
+    if let Some(adt_spec) = type_str.strip_prefix("adt") {
+        FieldStore::AdtRef(parse_adt_schema(adt_spec))
+    } else if let Some(rec_spec) = type_str.strip_prefix("rec") {
+        // `rec#[f:t,..]` — strip `rec`, the `#`, then the protective brackets.
+        let body = rec_spec.strip_prefix('#').unwrap_or(rec_spec);
+        let inner = body
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(body);
+        FieldStore::RecRef(parse_record_schema(inner))
+    } else if type_str.starts_with('[') && type_str.ends_with(']') {
+        // A relation element is a single anonymous field `_value` whose type is
+        // the inner descriptor — so `[T]` becomes a child RecordSchema with one
+        // column. For a record element the inner is already `rec#..`/a field
+        // list; for a scalar/JSON element it's a bare token.
+        let inner = &type_str[1..type_str.len() - 1];
+        FieldStore::RelRef(Box::new(parse_relation_element_schema(inner)))
+    } else {
+        FieldStore::Column(parse_col_type(type_str))
+    }
+}
+
+/// Parse the inner schema of a relation `[T]`. `T` is either a record field
+/// list (`name:text,age:int` — the legacy record-element form), a `rec#..` /
+/// `adt#..` composite, or a bare scalar/json token. Returns a child
+/// `RecordSchema` whose `columns`/`nested` describe one element row.
+fn parse_relation_element_schema(inner: &str) -> RecordSchema {
+    // Legacy record-element form: `[name:text,age:int]` (a bare field list, no
+    // `rec#` prefix). Treat it as the child schema directly.
+    if !inner.starts_with("rec#")
+        && !inner.starts_with("adt#")
+        && inner.contains(':')
+        && !inner.starts_with('[')
+    {
+        return parse_record_schema(inner);
+    }
+    // Otherwise the element is a single value of type `inner`: wrap it as a
+    // one-field record schema with the field name `_value`.
+    let store = parse_field_store(inner);
+    let (ty, adt) = match &store {
+        FieldStore::Column(ct) => (*ct, None),
+        FieldStore::AdtRef(spec) => (ColType::AdtRef, Some(spec.clone())),
+        _ => (ColType::Bytes, None), // placeholder; `store` drives behavior
+    };
+    RecordSchema {
+        columns: vec![ColumnSpec {
+            name: "_value".to_string(),
+            ty,
+            adt,
+            store: Some(Box::new(store)),
+        }],
+        nested: Vec::new(),
+    }
+}
+
+
 /// True for the single-column `_value:<scalar>` schema used by scalar (and
 /// relation-of-scalar) sources. Such sources store each value as a
 /// `{_value: x}` row in SQLite but expose the bare scalar `x` to user code,
@@ -13713,24 +13806,20 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
                 .map(|f| {
                     let mut fp = f.splitn(2, '=');
                     let fname = fp.next().unwrap().to_string();
-                    let fty = match fp.next().unwrap_or("text") {
-                        "int" => ColType::Int,
-                        "float" => ColType::Float,
-                        "text" => ColType::Text,
-                        "bool" => ColType::Bool,
-                        "bytes" => ColType::Bytes,
-                        "tag" => ColType::Tag,
-                        // Record / payload-ADT constructor fields round-trip
-                        // through JSON (the compiler's `col_type_str` emits
-                        // "json" for them).
-                        "json" => ColType::Json,
-                        s if s.starts_with('[') => ColType::Json,
-                        other => panic!("knot runtime: unknown ADT field type '{}'", other),
+                    let fty_str = fp.next().unwrap_or("text");
+                    // Recursive: a payload field may itself be a scalar, tag,
+                    // rec#.., adt#.., or [..] child descriptor.
+                    let store = parse_field_store(fty_str);
+                    let (ty, adt) = match &store {
+                        FieldStore::Column(ct) => (*ct, None),
+                        FieldStore::AdtRef(spec) => (ColType::AdtRef, Some(spec.clone())),
+                        _ => (ColType::Bytes, None), // placeholder; `store` drives behavior
                     };
                     ColumnSpec {
                         name: fname,
-                        ty: fty,
-                        adt: None,
+                        ty,
+                        adt,
+                        store: Some(Box::new(store)),
                     }
                 })
                 .collect()
@@ -13747,7 +13836,8 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
                     all_fields.push(ColumnSpec {
                         name: f.name.clone(),
                         ty: f.ty,
-                        adt: None,
+                        adt: f.adt.clone(),
+                        store: f.store.clone(),
                     });
                 }
                 Some(existing) if *existing != f.ty => {
@@ -13819,30 +13909,44 @@ fn parse_record_schema(spec: &str) -> RecordSchema {
         });
         let name = part[..colon].to_string();
         let type_str = &part[colon + 1..];
-        if type_str.starts_with('[') && type_str.ends_with(']') {
-            // Nested relation: parse child schema recursively
-            let inner = &type_str[1..type_str.len() - 1];
-            let child = parse_record_schema(inner);
-            nested.push(NestedField {
-                name,
-                columns: child.columns,
-                nested: child.nested,
-            });
-        } else if let Some(adt_spec) = type_str.strip_prefix("adt") {
-            // Content-addressed payload-ADT field: `field:adt#Ctor:f=t|...`.
-            // The column stores the value's content hash (BLOB); the value
-            // lives in a per-field child table built from `AdtSpec`.
-            columns.push(ColumnSpec {
-                name,
-                ty: ColType::AdtRef,
-                adt: Some(parse_adt_schema(adt_spec)),
-            });
-        } else {
-            columns.push(ColumnSpec {
-                name,
-                ty: parse_col_type(type_str),
-                adt: None,
-            });
+        let store = parse_field_store(type_str);
+        match store {
+            // A relation field lives in a `_parent_id` child table — keep it in
+            // `nested` for the existing child-table read/write machinery.
+            FieldStore::RelRef(child) => {
+                nested.push(NestedField {
+                    name,
+                    columns: child.columns,
+                    nested: child.nested,
+                });
+            }
+            // Content-addressed payload ADT: parent column holds the hash.
+            FieldStore::AdtRef(spec) => {
+                columns.push(ColumnSpec {
+                    name,
+                    ty: ColType::AdtRef,
+                    adt: Some(spec.clone()),
+                    store: Some(Box::new(FieldStore::AdtRef(spec))),
+                });
+            }
+            // Content-addressed record: parent column holds the hash, no _tag.
+            FieldStore::RecRef(rec) => {
+                columns.push(ColumnSpec {
+                    name,
+                    ty: ColType::RecRef,
+                    adt: None,
+                    store: Some(Box::new(FieldStore::RecRef(rec))),
+                });
+            }
+            // In-row scalar/tag/(legacy json) column.
+            FieldStore::Column(ct) => {
+                columns.push(ColumnSpec {
+                    name,
+                    ty: ct,
+                    adt: None,
+                    store: None,
+                });
+            }
         }
     }
     RecordSchema { columns, nested }
@@ -13882,6 +13986,7 @@ fn sql_type(ty: ColType) -> &'static str {
         ColType::Json => "TEXT",
         // The parent's reference column holds the value's 32-byte content hash.
         ColType::AdtRef => "BLOB",
+        ColType::RecRef => "BLOB",
     }
 }
 
@@ -13916,6 +14021,7 @@ fn sql_null_default(ty: ColType) -> Option<*mut Value> {
         ColType::Tag => return None,
         // Like Tag: a payload-ADT reference has no meaningful "empty" value.
         ColType::AdtRef => return None,
+        ColType::RecRef => return None,
     })
 }
 
@@ -14011,6 +14117,12 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
             "{}: AdtRef column read before content-addressed storage is implemented",
             mismatch()
         ),
+        // RecRef columns are read via the store-aware path (`read_field_value`),
+        // never this flat per-column decode.
+        ColType::RecRef => panic!(
+            "{}: RecRef column read via flat decode — should go through read_field_value",
+            mismatch()
+        ),
     }
 }
 
@@ -14049,10 +14161,18 @@ fn init_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &Rec
         }
     }
 
-    // Content-addressed child table for each payload-ADT (`AdtRef`) field.
+    // Content-addressed child table for each ref (payload-ADT / record) field.
     for c in &schema.columns {
-        if c.ty == ColType::AdtRef {
-            init_adt_child_table(conn, table_name, c);
+        if let Some(store) = &c.store {
+            match store.as_ref() {
+                FieldStore::AdtRef(_) | FieldStore::RecRef(_) => {
+                    init_ref_child_table(conn, table_name, &c.name, store);
+                }
+                FieldStore::RelRef(child_schema) => {
+                    init_rel_child_table(conn, table_name, &c.name, child_schema);
+                }
+                FieldStore::Column(_) => {}
+            }
         }
     }
 
@@ -14189,21 +14309,30 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
     }
 }
 
-/// Create the content-addressed child table for a payload-ADT (`AdtRef`) field.
-/// Layout: `_hash BLOB PRIMARY KEY` (the value's content hash), `_tag TEXT` (the
-/// constructor name), then one nullable column per payload field across all
-/// constructors. Content-addressing means two parents holding the *same* ADT
-/// value share one child row; `insert_adt_value` upserts by hash.
-fn init_adt_child_table(conn: &rusqlite::Connection, parent_table: &str, c: &ColumnSpec) {
-    let child_name = child_table_name(parent_table, &c.name);
+/// Create the content-addressed child table for a payload-ADT (`AdtRef`) or
+/// record (`RecRef`) field. Layout: `_hash BLOB PRIMARY KEY`, then for an ADT a
+/// `_tag TEXT` discriminator plus one nullable column per payload field; for a
+/// record just its columns (no `_tag`). Content-addressing means two parents
+/// holding the *same* value share one child row; the write path upserts by hash.
+/// Recurses: a child column that is itself a ref gets its own child table.
+fn init_ref_child_table(conn: &rusqlite::Connection, parent_table: &str, name: &str, store: &FieldStore) {
+    let child_name = child_table_name(parent_table, name);
     let child = quote_ident(&child_name);
-    let spec = c.adt.as_ref().expect("AdtRef column without ADT schema");
 
-    let mut col_defs = vec![
-        "\"_hash\" BLOB PRIMARY KEY".to_string(),
-        "\"_tag\" TEXT NOT NULL".to_string(),
-    ];
-    for f in &spec.all_fields {
+    let (has_tag, cols): (bool, &[ColumnSpec]) = match store {
+        FieldStore::AdtRef(spec) => (true, &spec.all_fields),
+        FieldStore::RecRef(rec) => (false, &rec.columns),
+        other => panic!(
+            "knot runtime: init_ref_child_table called with non-ref store {:?}",
+            other
+        ),
+    };
+
+    let mut col_defs = vec!["\"_hash\" BLOB PRIMARY KEY".to_string()];
+    if has_tag {
+        col_defs.push("\"_tag\" TEXT NOT NULL".to_string());
+    }
+    for f in cols {
         col_defs.push(format!("{} {}", quote_ident(&f.name), sql_type(f.ty)));
     }
 
@@ -14211,11 +14340,68 @@ fn init_adt_child_table(conn: &rusqlite::Connection, parent_table: &str, c: &Col
     debug_sql(&sql);
     conn.execute_batch(&sql).unwrap_or_else(|e| {
         panic!(
-            "knot runtime: failed to create ADT child table '{}': {}",
+            "knot runtime: failed to create ref child table '{}': {}",
             child_name, e
         )
     });
+
+    // Recurse: a ref-typed child column gets its own content-addressed child
+    // table; a relation-typed child column gets a `_parent_id` child table.
+    for f in cols {
+        if let Some(store) = &f.store {
+            match store.as_ref() {
+                FieldStore::AdtRef(_) | FieldStore::RecRef(_) => {
+                    init_ref_child_table(conn, &child_name, &f.name, store);
+                }
+                FieldStore::RelRef(child_schema) => {
+                    init_rel_child_table(conn, &child_name, &f.name, child_schema);
+                }
+                FieldStore::Column(_) => {}
+            }
+        }
+    }
 }
+
+/// Create the `_parent_id`-keyed child table for a relation field, recursing
+/// into the element schema's own ref/relation columns.
+fn init_rel_child_table(conn: &rusqlite::Connection, parent_table: &str, name: &str, schema: &RecordSchema) {
+    let child_name = child_table_name(parent_table, name);
+    let child = quote_ident(&child_name);
+
+    let mut col_defs = vec!["_parent_id INTEGER NOT NULL".to_string()];
+    for c in &schema.columns {
+        col_defs.push(format!("{} {}", quote_ident(&c.name), sql_type(c.ty)));
+    }
+    let sql = format!("CREATE TABLE IF NOT EXISTS {} ({});", child, col_defs.join(", "));
+    debug_sql(&sql);
+    conn.execute_batch(&sql).unwrap_or_else(|e| {
+        panic!(
+            "knot runtime: failed to create relation child table '{}': {}",
+            child_name, e
+        )
+    });
+
+    for c in &schema.columns {
+        if let Some(store) = &c.store {
+            match store.as_ref() {
+                FieldStore::AdtRef(_) | FieldStore::RecRef(_) => {
+                    init_ref_child_table(conn, &child_name, &c.name, store);
+                }
+                FieldStore::RelRef(child_schema) => {
+                    init_rel_child_table(conn, &child_name, &c.name, child_schema);
+                }
+                FieldStore::Column(_) => {}
+            }
+        }
+    }
+    for nf in &schema.nested {
+        init_rel_child_table(conn, &child_name, &nf.name, &RecordSchema {
+            columns: nf.columns.clone(),
+            nested: nf.nested.clone(),
+        });
+    }
+}
+
 
 
 /// Initialize a source table. Creates it if it doesn't exist.
@@ -15289,9 +15475,51 @@ fn read_adt_value(
     alloc(Value::Constructor(intern_str(&tag), payload))
 }
 
-/// Read one record field from a query row. Scalar/JSON columns go through
-/// `read_sql_column`; an `AdtRef` column holds a content hash that is resolved
-/// against its child table (which needs `conn` and the parent table name).
+/// Look up a nested-record value in its content-addressed child table by hash
+/// and rebuild the `Record`. The child row is the record's columns (no `_tag`).
+/// A column that is itself a ref recurses (resolved against its own child).
+fn read_rec_value(
+    conn: &rusqlite::Connection,
+    child_table: &str,
+    schema: &RecordSchema,
+    hash: &[u8],
+) -> *mut Value {
+    let select_cols: Vec<String> = schema.columns.iter().map(|c| quote_ident(&c.name)).collect();
+    let sql = format!(
+        "SELECT {} FROM {} WHERE {} = ?1 LIMIT 1;",
+        select_cols.join(", "),
+        quote_ident(child_table),
+        quote_ident("_hash")
+    );
+    debug_sql(&sql);
+    let mut stmt = conn
+        .prepare_cached(&sql)
+        .expect("knot runtime: failed to prepare rec child read");
+    let mut result = stmt
+        .query([rusqlite::types::Value::Blob(hash.to_vec())])
+        .expect("knot runtime: rec child read exec error");
+    let row = result
+        .next()
+        .expect("knot runtime: rec child row fetch error")
+        .unwrap_or_else(|| {
+            panic!(
+                "knot runtime: rec child table '{}' has no row for a referenced hash",
+                child_table
+            )
+        });
+
+    let record = knot_record_empty(schema.columns.len());
+    for (i, col) in schema.columns.iter().enumerate() {
+        let val = read_field_value(conn, child_table, row, i, col);
+        let name = col.name.as_bytes();
+        knot_record_set_field(record, name.as_ptr(), name.len(), val);
+    }
+    record
+}
+
+/// Read one record field from a query row. In-row columns go through
+/// `read_sql_column`; a ref column (payload ADT / record) holds a content hash
+/// resolved against its child table (needs `conn` and the parent table name).
 fn read_field_value(
     conn: &rusqlite::Connection,
     table_name: &str,
@@ -15299,21 +15527,26 @@ fn read_field_value(
     col_idx: usize,
     col: &ColumnSpec,
 ) -> *mut Value {
-    if col.ty == ColType::AdtRef {
-        let hash: Vec<u8> = row.get(col_idx).unwrap_or_else(|_| {
-            panic!(
-                "knot runtime: AdtRef column '{}' is not a content-hash blob",
-                col.name
-            )
-        });
-        read_adt_value(
-            conn,
-            &child_table_name(table_name, &col.name),
-            col.adt.as_ref().expect("AdtRef without schema"),
-            &hash,
-        )
-    } else {
-        read_sql_column(row, col_idx, col.ty)
+    match col.store.as_deref() {
+        Some(FieldStore::AdtRef(spec)) => {
+            let hash: Vec<u8> = row.get(col_idx).unwrap_or_else(|_| {
+                panic!(
+                    "knot runtime: AdtRef column '{}' is not a content-hash blob",
+                    col.name
+                )
+            });
+            read_adt_value(conn, &child_table_name(table_name, &col.name), spec, &hash)
+        }
+        Some(FieldStore::RecRef(rec)) => {
+            let hash: Vec<u8> = row.get(col_idx).unwrap_or_else(|_| {
+                panic!(
+                    "knot runtime: RecRef column '{}' is not a content-hash blob",
+                    col.name
+                )
+            });
+            read_rec_value(conn, &child_table_name(table_name, &col.name), rec, &hash)
+        }
+        _ => read_sql_column(row, col_idx, col.ty),
     }
 }
 
@@ -15451,11 +15684,22 @@ fn read_child_table(
         .unwrap_or_else(|e| panic!("knot runtime: child row fetch error: {}", e))
     {
         let total_fields = nf.columns.len() + nf.nested.len();
+        // A scalar/composite element relation wraps each element as a single
+        // `_value` column; unwrap it back to the bare element value.
+        let scalar_elem = nf.columns.len() == 1
+            && nf.columns[0].name == "_value"
+            && nf.nested.is_empty();
         let record = knot_record_empty(total_fields);
         let col_offset = if has_children { 1 } else { 0 };
 
+        if scalar_elem {
+            let val = read_field_value(conn, table_name, row, col_offset, &nf.columns[0]);
+            rows.push(val);
+            continue;
+        }
+
         for (i, col) in nf.columns.iter().enumerate() {
-            let val = read_sql_column(row, i + col_offset, col.ty);
+            let val = read_field_value(conn, table_name, row, i + col_offset, col);
             let name = col.name.as_bytes();
             knot_record_set_field(record, name.as_ptr(), name.len(), val);
         }
@@ -15543,23 +15787,79 @@ fn delete_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &R
     for nf in &schema.nested {
         delete_child_table(conn, table_name, nf);
     }
-    // Wipe content-addressed ADT child tables. Persistence is a full rewrite
-    // (delete-all + reinsert), so every ADT child row is about to be re-derived
-    // by `write_record_rows`/`insert_adt_value`; leaving them would accumulate
-    // stale rows across rewrites.
+    // Wipe content-addressed ref child tables (payload ADT / record).
+    // Persistence is a full rewrite (delete-all + reinsert), so every child row
+    // is about to be re-derived by the write path; leaving them would
+    // accumulate stale rows across rewrites. Recurses into nested refs.
     for c in &schema.columns {
-        if c.ty == ColType::AdtRef {
-            let child = child_table_name(table_name, &c.name);
-            let sql = format!("DELETE FROM {};", quote_ident(&child));
-            debug_sql(&sql);
-            conn.execute_batch(&sql)
-                .expect("knot runtime: failed to delete ADT child rows");
+        if let Some(store) = &c.store {
+            delete_ref_child_tree(conn, table_name, &c.name, store);
         }
     }
     let sql = format!("DELETE FROM {};", quote_ident(table_name));
     debug_sql(&sql);
     conn.execute_batch(&sql)
         .expect("knot runtime: failed to delete rows");
+}
+
+/// Recursively wipe a ref field's child table and any deeper ref/relation
+/// child tables beneath it. Persistence is a full rewrite, so this is a plain
+/// DELETE on each table (children first), not a refcounted reclaim.
+fn delete_ref_child_tree(conn: &rusqlite::Connection, parent_table: &str, name: &str, store: &FieldStore) {
+    let child = child_table_name(parent_table, name);
+    match store {
+        FieldStore::AdtRef(spec) => {
+            // Recurse into payload columns that are themselves refs/relations.
+            for f in &spec.all_fields {
+                if let Some(sub) = &f.store {
+                    delete_ref_child_tree(conn, &child, &f.name, sub);
+                }
+            }
+        }
+        FieldStore::RecRef(rec) => {
+            for c in &rec.columns {
+                if let Some(sub) = &c.store {
+                    delete_ref_child_tree(conn, &child, &c.name, sub);
+                }
+            }
+            for nf in &rec.nested {
+                delete_rel_child_tree(conn, &child, nf);
+            }
+        }
+        FieldStore::RelRef(rel) => {
+            // Wipe the relation's element child table (and its nested refs).
+            for c in &rel.columns {
+                if let Some(sub) = &c.store {
+                    delete_ref_child_tree(conn, &child, &c.name, sub);
+                }
+            }
+            for nf in &rel.nested {
+                delete_rel_child_tree(conn, &child, nf);
+            }
+        }
+        FieldStore::Column(_) => return,
+    }
+    let sql = format!("DELETE FROM {};", quote_ident(&child));
+    debug_sql(&sql);
+    conn.execute_batch(&sql)
+        .expect("knot runtime: failed to delete ref child rows");
+}
+
+/// Wipe a relation (`nested`) child table and its subtree.
+fn delete_rel_child_tree(conn: &rusqlite::Connection, parent_table: &str, nf: &NestedField) {
+    let child = child_table_name(parent_table, &nf.name);
+    for c in &nf.columns {
+        if let Some(sub) = &c.store {
+            delete_ref_child_tree(conn, &child, &c.name, sub);
+        }
+    }
+    for grandchild in &nf.nested {
+        delete_rel_child_tree(conn, &child, grandchild);
+    }
+    let sql = format!("DELETE FROM {};", quote_ident(&child));
+    debug_sql(&sql);
+    conn.execute_batch(&sql)
+        .expect("knot runtime: failed to delete relation child rows");
 }
 
 fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &NestedField) {
@@ -15657,6 +15957,91 @@ fn insert_adt_value(
     hash_bytes
 }
 
+/// Upsert a nested-record value into its content-addressed child table and
+/// return its 32-byte content hash. Like `insert_adt_value` but with no `_tag`:
+/// the child row is `_hash` + the record's columns. A column that is itself a
+/// ref recurses (its value is content-hashed/upserted into its own child).
+fn insert_rec_value(
+    conn: &rusqlite::Connection,
+    child_table: &str,
+    schema: &RecordSchema,
+    value: *mut Value,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    value_to_hash_bytes(value, &mut buf);
+    let hash_bytes = blake3::hash(&buf).as_bytes().to_vec();
+
+    let fields = match unsafe { as_ref(value) } {
+        Value::Record(fields) => fields,
+        _ => panic!(
+            "knot runtime: RecRef value must be a Record, got {}",
+            type_name(value)
+        ),
+    };
+    let field_map: HashMap<&str, *mut Value> =
+        fields.iter().map(|f| (&*f.name, f.value)).collect();
+
+    // [hash, col1, col2, ...]
+    let mut params: Vec<rusqlite::types::Value> =
+        Vec::with_capacity(1 + schema.columns.len());
+    params.push(rusqlite::types::Value::Blob(hash_bytes.clone()));
+    for col in &schema.columns {
+        let fv = field_map.get(col.name.as_str()).copied().unwrap_or(std::ptr::null_mut());
+        params.push(write_field_param(conn, child_table, col, fv));
+    }
+
+    let col_names: Vec<String> = std::iter::once(quote_ident("_hash"))
+        .chain(schema.columns.iter().map(|c| quote_ident(&c.name)))
+        .collect();
+    let placeholders: Vec<String> =
+        (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
+    let sql = format!(
+        "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
+        quote_ident(child_table),
+        col_names.join(", "),
+        placeholders.join(", ")
+    );
+    debug_sql(&sql);
+    let mut stmt = conn
+        .prepare_cached(&sql)
+        .expect("knot runtime: failed to prepare rec child insert");
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+    stmt.execute(&param_refs[..])
+        .expect("knot runtime: failed to insert rec child row");
+
+    hash_bytes
+}
+
+/// Produce the SQL param for one field value, recursing into ref-typed fields
+/// (content-hash upsert) and falling back to `value_to_sqlite` for in-row
+/// columns. `parent_table`/`col` locate the child table for a ref field.
+fn write_field_param(
+    conn: &rusqlite::Connection,
+    parent_table: &str,
+    col: &ColumnSpec,
+    value: *mut Value,
+) -> rusqlite::types::Value {
+    match col.store.as_deref() {
+        Some(FieldStore::AdtRef(spec)) => rusqlite::types::Value::Blob(insert_adt_value(
+            conn,
+            &child_table_name(parent_table, &col.name),
+            spec,
+            value,
+        )),
+        Some(FieldStore::RecRef(rec)) => rusqlite::types::Value::Blob(insert_rec_value(
+            conn,
+            &child_table_name(parent_table, &col.name),
+            rec,
+            value,
+        )),
+        // A relation column has no in-row param (it lives in a `_parent_id`
+        // child table written separately); callers skip it for params.
+        Some(FieldStore::RelRef(_)) => rusqlite::types::Value::Null,
+        _ => value_to_sqlite(value, col.ty),
+    }
+}
+
 /// Insert rows into a record table and its child tables.
 fn write_record_rows(
     conn: &rusqlite::Connection,
@@ -15748,8 +16133,9 @@ fn write_record_rows(
             fields.iter().map(|f| (&*f.name, f.value)).collect();
 
         // Build scalar params, then the `_content_hash` of the whole record
-        // (last param) for tables with children. An `AdtRef` field is written
-        // as its content hash after upserting the value into the child table.
+        // (last param) for tables with children. A ref field (payload ADT /
+        // record) is written as its content hash after upserting the value into
+        // the child table.
         let mut params: Vec<rusqlite::types::Value> = schema
             .columns
             .iter()
@@ -15757,16 +16143,7 @@ fn write_record_rows(
                 let value = field_map.get(col.name.as_str()).unwrap_or_else(|| {
                     panic!("knot runtime: missing field '{}' in record", col.name)
                 });
-                if col.ty == ColType::AdtRef {
-                    rusqlite::types::Value::Blob(insert_adt_value(
-                        conn,
-                        &child_table_name(table_name, &col.name),
-                        col.adt.as_ref().expect("AdtRef without schema"),
-                        *value,
-                    ))
-                } else {
-                    value_to_sqlite(*value, col.ty)
-                }
+                write_field_param(conn, table_name, col, *value)
             })
             .collect();
         if has_children {
@@ -15898,21 +16275,24 @@ fn write_child_rows(
 
     for row_ptr in rows {
         let row = unsafe { as_ref(*row_ptr) };
-        let fields = match row {
-            Value::Record(fields) => fields,
-            _ => panic!("knot runtime: child rows must be Records"),
+        // A relation element is normally a Record; a scalar/composite element
+        // (e.g. `[Text]`, `[[..]]`) is wrapped as the single `_value` column.
+        let (field_map, scalar_elem): (HashMap<&str, *mut Value>, bool) = match row {
+            Value::Record(fields) => (fields.iter().map(|f| (&*f.name, f.value)).collect(), false),
+            _ => (HashMap::new(), true),
         };
-
-        let field_map: HashMap<&str, *mut Value> =
-            fields.iter().map(|f| (&*f.name, f.value)).collect();
 
         let mut params: Vec<rusqlite::types::Value> =
             vec![rusqlite::types::Value::Integer(parent_id)];
         for col in &nf.columns {
-            let value = field_map.get(col.name.as_str()).unwrap_or_else(|| {
-                panic!("knot runtime: missing field '{}' in child record", col.name)
-            });
-            params.push(value_to_sqlite(*value, col.ty));
+            let value = if scalar_elem && col.name == "_value" {
+                *row_ptr
+            } else {
+                *field_map.get(col.name.as_str()).unwrap_or_else(|| {
+                    panic!("knot runtime: missing field '{}' in child record", col.name)
+                })
+            };
+            params.push(write_field_param(conn, table_name, col, value));
         }
         if has_children {
             params.push(rusqlite::types::Value::Text(record_content_hash_hex(

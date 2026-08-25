@@ -198,6 +198,122 @@ Rel Entry  *es
     );
 }
 
+/// A payload-ADT field is content-addressed: two entries holding the *same*
+/// value share one row in the child table (`_knot_es__/sh`), keyed by the
+/// value's 32-byte content hash, and the parent's `sh` column is a BLOB ref.
+#[test]
+fn persisted_adt_field_is_content_addressed() {
+    let dir = e2e::TempDir::fresh("adtrefdedup");
+    e2e::build_in_dir(
+        "adtrefdedup",
+        r#"with {
+Shape  Circle {radius (Int 1)}  Point {}
+Entry  {name Text  sh Shape}
+Rel Entry  *es
+}
+(do
+  full *es = [{name "a"  sh (Shape.Circle {radius 3})}  {name "b"  sh (Shape.Circle {radius 3})}  {name "c"  sh (Shape.Point {})}]
+  yield {})"#,
+        dir.path(),
+    );
+    e2e::run_bin(&dir.join("adtrefdedup"), dir.path());
+
+    let probe = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); \
+             n=c.execute('select count(*) from \"_knot_es__/sh\"').fetchone()[0]; \
+             typeof=c.execute('select typeof(sh) from _knot_es limit 1').fetchone()[0]; \
+             refs=c.execute('select count(distinct sh) from _knot_es').fetchone()[0]; \
+             print((n, typeof, refs))",
+        )
+        .arg(dir.join("adtrefdedup.db"))
+        .output()
+        .expect("python3 sqlite probe");
+    let out = String::from_utf8_lossy(&probe.stdout);
+    // 3 entries, but Circle{radius 3} is shared: 2 child rows, 2 distinct refs.
+    assert!(
+        out.contains("(2, 'blob', 2)"),
+        "expected 2 deduped child rows + 2 distinct blob refs, got: {out}"
+    );
+}
+
+/// Payload columns are real, indexable columns on the child table (the point of
+/// the content-addressed encoding over JSON): a pushdown filter on a payload
+/// field runs against the `radius` INTEGER column.
+#[test]
+fn persisted_adt_field_payload_column_is_real() {
+    let dir = e2e::TempDir::fresh("adtrefcol");
+    e2e::build_in_dir(
+        "adtrefcol",
+        r#"with {
+Shape  Circle {radius (Int 1)}  Point {}
+Entry  {name Text  sh Shape}
+Rel Entry  *es
+}
+(do
+  full *es = [{name "a"  sh (Shape.Circle {radius 3})}]
+  yield {})"#,
+        dir.path(),
+    );
+    e2e::run_bin(&dir.join("adtrefcol"), dir.path());
+
+    let probe = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); \
+             cols=[r[1] for r in c.execute('pragma table_info(\"_knot_es__/sh\")')]; \
+             ty=c.execute('select typeof(radius) from \"_knot_es__/sh\"').fetchone()[0]; \
+             print((cols, ty))",
+        )
+        .arg(dir.join("adtrefcol.db"))
+        .output()
+        .expect("python3 sqlite probe");
+    let out = String::from_utf8_lossy(&probe.stdout);
+    assert!(
+        out.contains("'radius'") && out.contains("'integer'"),
+        "child table must expose a real INTEGER `radius` column, got: {out}"
+    );
+}
+
+/// Rewriting the source wipes and re-derives the ADT child table — no stale
+/// child rows accumulate across a full rewrite (the reclaim path: persistence
+/// is delete-all + reinsert, and `delete_record_table` wipes the ADT child).
+#[test]
+fn persisted_adt_field_rewrite_reclaims_child_rows() {
+    let dir = e2e::TempDir::fresh("adtrefrewrite");
+    e2e::build_in_dir(
+        "adtrefrewrite",
+        r#"with {
+Shape  Circle {radius (Int 1)}  Point {}
+Entry  {name Text  sh Shape}
+Rel Entry  *es
+}
+(do
+  full *es = [{name "a"  sh (Shape.Circle {radius 3})}]
+  full *es = [{name "b"  sh (Shape.Point {})}]
+  yield {})"#,
+        dir.path(),
+    );
+    e2e::run_bin(&dir.join("adtrefrewrite"), dir.path());
+
+    let probe = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); \
+             print(c.execute('select _tag, radius from \"_knot_es__/sh\"').fetchall())",
+        )
+        .arg(dir.join("adtrefrewrite.db"))
+        .output()
+        .expect("python3 sqlite probe");
+    let out = String::from_utf8_lossy(&probe.stdout);
+    // After the rewrite, only Point remains — the Circle child row is gone.
+    assert!(
+        out.contains("[('Point', None)]"),
+        "expected only the Point child row after rewrite, got: {out}"
+    );
+}
+
 /// An Int column is stored as a native SQLite INTEGER, not as TEXT. (Ints were
 /// historically stored as `TEXT COLLATE KNOT_INT` — a leftover from when knot's
 /// Int was a bignum. `Int` is `i64` now, so it fits SQLite's INTEGER directly.)

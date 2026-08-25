@@ -2045,17 +2045,52 @@ fn format_schema_field(
     } else {
         // A named ADT field (`sh Shape`) resolves to `Named` — multi-variant
         // ADTs stay named so nested references resolve. Re-resolve through the
-        // alias table to decide the storage: a payload-bearing ADT round-trips
-        // through `json` (the `__knot_ctor` marker reconstructs it), an
-        // enum-like ADT stores as a `tag`. Without this, `col_type_str` falls
-        // to the `_ => "text"` catch-all and the payload is silently dropped
-        // (the column holds just the constructor name).
+        // alias table to decide the storage. An enum-like ADT (all nullary)
+        // stores as a `tag` column. A payload-bearing ADT stores as a content-
+        // addressed reference (`adt`): the column holds the value's content
+        // hash, and the value itself lives in a per-field child table keyed by
+        // that hash — making payload columns indexable/pushdown-able where the
+        // old JSON encoding was opaque. The descriptor carries the ADT's
+        // constructor schema (`#Ctor:f=t|...`) so the runtime can build the
+        // child table; it reuses the direct-relation ADT grammar.
         let resolved = match ty {
             ResolvedType::Named(n) => aliases.get(n).unwrap_or(ty),
             other => other,
         };
-        format!("{}:{}", name, col_type_str(resolved))
+        match resolved {
+            ResolvedType::Adt(ctors) if !ctors.iter().all(|(_, f)| f.is_empty()) => {
+                format!("{}:adt{}", name, adt_descriptor(ctors, aliases))
+            }
+            other => format!("{}:{}", name, col_type_str(other)),
+        }
     }
+}
+
+/// The `#Ctor1:f1=t1;f2=t2|Ctor2|...` descriptor for an ADT's constructors.
+/// Shared by the direct-relation schema (`Rel Shape`) and the content-addressed
+/// ADT-field form (`field:adt#...`).
+fn adt_descriptor(ctors: &[(String, Vec<(String, ResolvedType)>)], aliases: &HashMap<String, ResolvedType>) -> String {
+    let parts: Vec<String> = ctors
+        .iter()
+        .map(|(ctor_name, fields)| {
+            if fields.is_empty() {
+                ctor_name.clone()
+            } else {
+                let field_specs: Vec<String> = fields
+                    .iter()
+                    .map(|(fname, fty)| {
+                        if let ResolvedType::Relation(inner) = fty {
+                            format!("{}=[{}]", fname, schema_descriptor(inner, aliases))
+                        } else {
+                            format!("{}={}", fname, col_type_str(fty))
+                        }
+                    })
+                    .collect();
+                format!("{}:{}", ctor_name, field_specs.join(";"))
+            }
+        })
+        .collect();
+    format!("#{}", parts.join("|"))
 }
 
 fn schema_descriptor(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -> String {
@@ -2066,28 +2101,8 @@ fn schema_descriptor(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>)
             .collect::<Vec<_>>()
             .join(","),
         ResolvedType::Adt(ctors) => {
-            // Direct ADT relation: generate #Ctor1:f1=t1;f2=t2|Ctor2|...
-            let parts: Vec<String> = ctors
-                .iter()
-                .map(|(ctor_name, fields)| {
-                    if fields.is_empty() {
-                        ctor_name.clone()
-                    } else {
-                        let field_specs: Vec<String> = fields
-                            .iter()
-                            .map(|(fname, fty)| {
-                                if let ResolvedType::Relation(inner) = fty {
-                                    format!("{}=[{}]", fname, schema_descriptor(inner, aliases))
-                                } else {
-                                    format!("{}={}", fname, col_type_str(fty))
-                                }
-                            })
-                            .collect();
-                        format!("{}:{}", ctor_name, field_specs.join(";"))
-                    }
-                })
-                .collect();
-            format!("#{}", parts.join("|"))
+            // Direct ADT relation: #Ctor1:f1=t1;f2=t2|Ctor2|...
+            adt_descriptor(ctors, aliases)
         }
         other => col_type_str(other).to_string(),
     }

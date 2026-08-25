@@ -1970,14 +1970,14 @@ fn schema_for_source(
 /// name like `"text"` and panics in `parse_record_schema`.
 fn relation_inner_schema(inner: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -> String {
     match inner {
-        ResolvedType::Record(_) | ResolvedType::Adt(_) => schema_descriptor(inner),
+        ResolvedType::Record(_) | ResolvedType::Adt(_) => schema_descriptor(inner, aliases),
         // A bare ADT name (`Rel S *t` where `data S = Open {} | Closed {}`)
         // resolves to `Named("S")` — `resolve_type` keeps multi-variant ADTs
         // named so nested references keep the type name. For the source's
         // schema we need the ADT's structure, so re-resolve the name through
         // the alias table. A genuinely unknown name falls through to scalar.
         ResolvedType::Named(name) => match aliases.get(name) {
-            Some(adt @ ResolvedType::Adt(_)) => schema_descriptor(adt),
+            Some(adt @ ResolvedType::Adt(_)) => schema_descriptor(adt, aliases),
             _ => format!("_value:{}", col_type_str(inner)),
         },
         // A relation-of-relations element (`*tags : [[Text]]`, `*grid : [[R]]`)
@@ -2030,24 +2030,39 @@ fn col_type_str(ty: &ResolvedType) -> &'static str {
 ///   reconstructs relations of constructors and scalars faithfully, and
 ///   `m <- t.field` binds iterate the in-memory relation read back from
 ///   the column.
-fn format_schema_field(name: &str, ty: &ResolvedType) -> String {
+fn format_schema_field(
+    name: &str,
+    ty: &ResolvedType,
+    aliases: &HashMap<String, ResolvedType>,
+) -> String {
     if let ResolvedType::Relation(inner) = ty {
         match inner.as_ref() {
             ResolvedType::Record(_) => {
-                format!("{}:[{}]", name, schema_descriptor(inner))
+                format!("{}:[{}]", name, schema_descriptor(inner, aliases))
             }
             _ => format!("{}:json", name),
         }
     } else {
-        format!("{}:{}", name, col_type_str(ty))
+        // A named ADT field (`sh Shape`) resolves to `Named` — multi-variant
+        // ADTs stay named so nested references resolve. Re-resolve through the
+        // alias table to decide the storage: a payload-bearing ADT round-trips
+        // through `json` (the `__knot_ctor` marker reconstructs it), an
+        // enum-like ADT stores as a `tag`. Without this, `col_type_str` falls
+        // to the `_ => "text"` catch-all and the payload is silently dropped
+        // (the column holds just the constructor name).
+        let resolved = match ty {
+            ResolvedType::Named(n) => aliases.get(n).unwrap_or(ty),
+            other => other,
+        };
+        format!("{}:{}", name, col_type_str(resolved))
     }
 }
 
-fn schema_descriptor(ty: &ResolvedType) -> String {
+fn schema_descriptor(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -> String {
     match ty {
         ResolvedType::Record(fields) => fields
             .iter()
-            .map(|(name, ty)| format_schema_field(name, ty))
+            .map(|(name, ty)| format_schema_field(name, ty, aliases))
             .collect::<Vec<_>>()
             .join(","),
         ResolvedType::Adt(ctors) => {
@@ -2062,7 +2077,7 @@ fn schema_descriptor(ty: &ResolvedType) -> String {
                             .iter()
                             .map(|(fname, fty)| {
                                 if let ResolvedType::Relation(inner) = fty {
-                                    format!("{}=[{}]", fname, schema_descriptor(inner))
+                                    format!("{}=[{}]", fname, schema_descriptor(inner, aliases))
                                 } else {
                                     format!("{}={}", fname, col_type_str(fty))
                                 }

@@ -172,6 +172,32 @@ Rel Shape  *shapes
     );
 }
 
+/// A payload-bearing ADT used as a *field inside a record* must round-trip its
+/// payload through JSON, not collapse to the bare constructor name. A named
+/// ADT field type resolves to `ResolvedType::Named` (multi-variant ADTs stay
+/// named so nested references resolve), which made `col_type_str` fall to the
+/// `_ => "text"` catch-all — storing just `"Circle"` and dropping the payload,
+/// so reading it back gave `Unit` and matching on the payload panicked
+/// ("expected Record in field access, got Unit"). The fix re-resolves the
+/// named ADT and routes payload-bearing ones to `json` (enums stay `tag`).
+#[test]
+fn persisted_adt_field_in_record_keeps_payload() {
+    assert_stdout(
+        "persistadtfield",
+        r#"with {
+Shape  Circle {radius (Int 1)}  Square {side (Int 1)}  Point {}
+Entry  {name Text  sh Shape}
+Rel Entry  *es
+}
+(do
+  full *es = [{name "a"  sh (Shape.Circle {radius 3})}  {name "b"  sh (Shape.Point {})}]
+  rows <- *es
+  base.println (base.show rows)
+  yield {})"#,
+        "\"[{name a  sh Circle {radius 3}}, {name b  sh Point}]\"\n{}",
+    );
+}
+
 /// An Int column is stored as a native SQLite INTEGER, not as TEXT. (Ints were
 /// historically stored as `TEXT COLLATE KNOT_INT` — a leftover from when knot's
 /// Int was a bignum. `Int` is `i64` now, so it fits SQLite's INTEGER directly.)

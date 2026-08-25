@@ -14245,37 +14245,15 @@ fn child_table_name(parent_table: &str, field: &str) -> String {
 fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &NestedField) {
     let child_table_name = child_table_name(parent_table, &nf.name);
     let child_table = quote_ident(&child_table_name);
-    let has_children = !nf.nested.is_empty();
+    let link_table = quote_ident(&format!("{}{}", child_table_name, "__link"));
 
-    let mut col_defs = vec!["_parent_id INTEGER NOT NULL".to_string()];
-    let mut unique_cols = vec![quote_ident("_parent_id")];
-
-    if has_children {
-        col_defs.push("_id INTEGER PRIMARY KEY AUTOINCREMENT".to_string());
-        // Child identity for elements that themselves have nested children is the
-        // hash of the *whole* element (scalars + nested content), scoped to the
-        // parent — mirrors `init_record_table`'s parent treatment. Without this,
-        // two child elements under one parent that differ only in grandchild
-        // content collapse onto a single child row under INSERT OR IGNORE and have
-        // their grandchildren merged. Indexed on `(_parent_id, _content_hash)`
-        // below instead of the scalar columns.
-        col_defs.push("_content_hash TEXT".to_string());
-    }
-
+    // Element table: content-addressed (`_hash` PK), one row per distinct
+    // element value, shared across all parents that reference it. A relation
+    // element's own nested relations/recs become child tables off this one.
+    let mut col_defs = vec!["\"_hash\" BLOB PRIMARY KEY".to_string()];
     for c in &nf.columns {
         col_defs.push(format!("{} {}", quote_ident(&c.name), sql_type(c.ty)));
-        if !has_children {
-            // NULL-coalesced for set semantics with NULL-bearing rows — see
-            // the matching comment in `init_record_table`. `_parent_id` stays
-            // raw (NOT NULL by definition). Children index on `_content_hash`.
-            unique_cols.push(null_safe_coalesce(&quote_ident(&c.name), c.ty));
-        }
     }
-
-    if has_children {
-        unique_cols.push(quote_ident("_content_hash"));
-    }
-
     let sql = format!(
         "CREATE TABLE IF NOT EXISTS {} ({});",
         child_table,
@@ -14284,26 +14262,56 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
     debug_sql(&sql);
     conn.execute_batch(&sql).unwrap_or_else(|e| {
         panic!(
-            "knot runtime: failed to create child table '{}': {}",
+            "knot runtime: failed to create element table '{}': {}",
             child_table_name, e
         )
     });
 
-    // Unique index for set semantics within each parent row: (_parent_id,
-    // scalar_cols) for leaf children, (_parent_id, _content_hash) for children
-    // that have their own nested children.
-    if unique_cols.len() > 1 {
-        let idx_sql = format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
-            quote_ident(&format!("{}_unique", child_table_name)),
-            child_table,
-            unique_cols.join(", ")
-        );
-        debug_sql(&idx_sql);
-        let _ = conn.execute_batch(&idx_sql);
-    }
+    // Link table: many-to-many edges `(parent_key, elem_hash)`. `parent_key` is
+    // the parent row's `_content_hash` (full content incl. relations, computed
+    // bottom-up); `elem_hash` references the element table's `_hash`.
+    let link_sql = format!(
+        "CREATE TABLE IF NOT EXISTS {} (\"_parent_key\" BLOB NOT NULL, \"_elem_hash\" BLOB NOT NULL);",
+        link_table
+    );
+    debug_sql(&link_sql);
+    conn.execute_batch(&link_sql).unwrap_or_else(|e| {
+        panic!(
+            "knot runtime: failed to create link table '{}{}': {}",
+            child_table_name, "__link", e
+        )
+    });
+    // An edge is unique per (parent, element); index for the read lookup by
+    // parent_key.
+    let idx_sql = format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} (\"_parent_key\", \"_elem_hash\");",
+        quote_ident(&format!("{}{}_link_unique", child_table_name, "__link")),
+        link_table
+    );
+    debug_sql(&idx_sql);
+    let _ = conn.execute_batch(&idx_sql);
+    let parent_idx = format!(
+        "CREATE INDEX IF NOT EXISTS {} ON {} (\"_parent_key\");",
+        quote_ident(&format!("{}{}_link_parent", child_table_name, "__link")),
+        link_table
+    );
+    let _ = conn.execute_batch(&parent_idx);
 
-    // Recurse for deeper nesting
+    // Recurse: an element's own composite fields become child tables keyed off
+    // the element table.
+    for c in &nf.columns {
+        if let Some(store) = &c.store {
+            match store.as_ref() {
+                FieldStore::AdtRef(_) | FieldStore::RecRef(_) => {
+                    init_ref_child_table(conn, &child_table_name, &c.name, store);
+                }
+                FieldStore::RelRef(child_schema) => {
+                    init_rel_child_table(conn, &child_table_name, &c.name, child_schema);
+                }
+                FieldStore::Column(_) => {}
+            }
+        }
+    }
     for grandchild in &nf.nested {
         init_child_table(conn, &child_table_name, grandchild);
     }
@@ -15185,6 +15193,7 @@ pub extern "C-unwind" fn knot_source_read_where(
         let mut select_cols: Vec<String> = Vec::new();
         if has_children {
             select_cols.push(quote_ident("_id"));
+            select_cols.push(quote_ident("_content_hash"));
         }
         for c in &rec.columns {
             select_cols.push(quote_ident(&c.name));
@@ -15217,7 +15226,7 @@ pub extern "C-unwind" fn knot_source_read_where(
         {
             let total_fields = rec.columns.len() + rec.nested.len();
             let record = knot_record_empty(total_fields);
-            let col_offset = if has_children { 1 } else { 0 };
+            let col_offset = if has_children { 2 } else { 0 }; // skip _id + _content_hash
 
             for (i, col) in rec.columns.iter().enumerate() {
                 let val = read_sql_column(row, i + col_offset, col.ty);
@@ -15226,10 +15235,10 @@ pub extern "C-unwind" fn knot_source_read_where(
             }
 
             if has_children {
-                let parent_id: i64 = row.get(0).unwrap();
+                let parent_key: String = row.get(1).expect("knot runtime: parent _content_hash missing");
                 for nf in &rec.nested {
                     let child_table_name = child_table_name(&table_name, &nf.name);
-                    let val = read_child_table(&db_ref.conn, &child_table_name, nf, parent_id);
+                    let val = read_child_table(&db_ref.conn, &child_table_name, nf, &parent_key);
                     let fname = nf.name.as_bytes();
                     knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
                 }
@@ -15565,10 +15574,12 @@ fn read_record_table_paged(
     let table = quote_ident(table_name);
     let has_children = !schema.nested.is_empty();
 
-    // Build SELECT: _id (if has children) + scalar columns (+ rowid when paging).
+    // Build SELECT: _id + _content_hash (if has children) + scalar columns
+    // (+ rowid when paging). `_content_hash` is the link-table parent key.
     let mut select_cols: Vec<String> = Vec::new();
     if has_children {
         select_cols.push(quote_ident("_id"));
+        select_cols.push(quote_ident("_content_hash"));
     }
     for c in &schema.columns {
         select_cols.push(quote_ident(&c.name));
@@ -15615,7 +15626,7 @@ fn read_record_table_paged(
         }
         let total_fields = schema.columns.len() + schema.nested.len();
         let record = knot_record_empty(total_fields);
-        let col_offset = if has_children { 1 } else { 0 }; // skip _id column
+        let col_offset = if has_children { 2 } else { 0 }; // skip _id + _content_hash
 
         // Read scalar columns. An AdtRef column holds the value's content hash;
         // resolve it against the child table to rebuild the Constructor.
@@ -15625,12 +15636,13 @@ fn read_record_table_paged(
             knot_record_set_field(record, name.as_ptr(), name.len(), val);
         }
 
-        // Read nested relation fields from child tables
+        // Read nested relation fields from child tables, keyed by the parent's
+        // `_content_hash` (column index 1).
         if has_children {
-            let parent_id: i64 = row.get(0).unwrap();
+            let parent_key: String = row.get(1).expect("knot runtime: parent _content_hash missing");
             for nf in &schema.nested {
                 let child_table_name = child_table_name(table_name, &nf.name);
-                let val = read_child_table(conn, &child_table_name, nf, parent_id);
+                let val = read_child_table(conn, &child_table_name, nf, &parent_key);
                 let name = nf.name.as_bytes();
                 knot_record_set_field(record, name.as_ptr(), name.len(), val);
             }
@@ -15642,32 +15654,31 @@ fn read_record_table_paged(
     (rows, last_rowid)
 }
 
-/// Read child rows for a nested relation field, filtered by parent_id.
+/// Read the elements of a nested relation field for one parent, joining the
+/// field's link table (edges keyed by the parent's `_content_hash`) to the
+/// content-addressed element table on `_elem_hash = _hash`.
 fn read_child_table(
     conn: &rusqlite::Connection,
     table_name: &str,
     nf: &NestedField,
-    parent_id: i64,
+    parent_key: &str,
 ) -> *mut Value {
     let table = quote_ident(table_name);
-    let has_children = !nf.nested.is_empty();
+    let link = quote_ident(&format!("{}{}", table_name, "__link"));
 
-    let mut select_cols: Vec<String> = Vec::new();
-    if has_children {
-        select_cols.push(quote_ident("_id"));
-    }
+    let mut select_cols: Vec<String> = vec![format!("e.{}", quote_ident("_hash"))];
     for c in &nf.columns {
-        select_cols.push(quote_ident(&c.name));
+        select_cols.push(format!("e.{}", quote_ident(&c.name)));
     }
 
     let sql = format!(
-        "SELECT {} FROM {} WHERE _parent_id = ?1",
-        if select_cols.is_empty() {
-            "1".to_string()
-        } else {
-            select_cols.join(", ")
-        },
-        table
+        "SELECT {} FROM {} l JOIN {} e ON l.{} = e.{} WHERE l.{} = ?1",
+        select_cols.join(", "),
+        link,
+        table,
+        quote_ident("_elem_hash"),
+        quote_ident("_hash"),
+        quote_ident("_parent_key")
     );
     debug_sql(&sql);
 
@@ -15676,13 +15687,19 @@ fn read_child_table(
         .unwrap_or_else(|e| panic!("knot runtime: child query error: {}", e));
     let mut rows: Vec<*mut Value> = Vec::new();
     let mut result_rows = stmt
-        .query(rusqlite::params![parent_id])
+        .query(rusqlite::params![parent_key])
         .unwrap_or_else(|e| panic!("knot runtime: child query exec error: {}", e));
 
     while let Some(row) = result_rows
         .next()
         .unwrap_or_else(|e| panic!("knot runtime: child row fetch error: {}", e))
     {
+        // Column 0 is the element's `_hash`; its columns start at index 1.
+        let elem_hash: Vec<u8> = row.get(0).expect("knot runtime: element _hash missing");
+        // The link-table parent key is the hex form of the content hash (matching
+        // `record_content_hash_hex`); encode without pulling in a `hex` crate.
+        let elem_key: String = elem_hash.iter().map(|b| format!("{:02x}", b)).collect();
+
         let total_fields = nf.columns.len() + nf.nested.len();
         // A scalar/composite element relation wraps each element as a single
         // `_value` column; unwrap it back to the bare element value.
@@ -15690,28 +15707,24 @@ fn read_child_table(
             && nf.columns[0].name == "_value"
             && nf.nested.is_empty();
         let record = knot_record_empty(total_fields);
-        let col_offset = if has_children { 1 } else { 0 };
 
         if scalar_elem {
-            let val = read_field_value(conn, table_name, row, col_offset, &nf.columns[0]);
+            let val = read_field_value(conn, table_name, row, 1, &nf.columns[0]);
             rows.push(val);
             continue;
         }
 
         for (i, col) in nf.columns.iter().enumerate() {
-            let val = read_field_value(conn, table_name, row, i + col_offset, col);
+            let val = read_field_value(conn, table_name, row, i + 1, col);
             let name = col.name.as_bytes();
             knot_record_set_field(record, name.as_ptr(), name.len(), val);
         }
 
-        if has_children {
-            let child_id: i64 = row.get(0).unwrap();
-            for grandchild in &nf.nested {
-                let gc_table = child_table_name(table_name, &grandchild.name);
-                let val = read_child_table(conn, &gc_table, grandchild, child_id);
-                let name = grandchild.name.as_bytes();
-                knot_record_set_field(record, name.as_ptr(), name.len(), val);
-            }
+        for grandchild in &nf.nested {
+            let gc_table = child_table_name(table_name, &grandchild.name);
+            let val = read_child_table(conn, &gc_table, grandchild, &elem_key);
+            let name = grandchild.name.as_bytes();
+            knot_record_set_field(record, name.as_ptr(), name.len(), val);
         }
 
         rows.push(record);
@@ -15868,47 +15881,66 @@ fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nest
     for grandchild in &nf.nested {
         delete_child_table(conn, &child_table, grandchild);
     }
-    let sql = format!("DELETE FROM {};", quote_ident(&child_table));
+    // Wipe the link table (edges) and the element table (content-addressed rows).
+    let link = quote_ident(&format!("{}{}", child_table, "__link"));
+    let sql = format!("DELETE FROM {}; DELETE FROM {};", link, quote_ident(&child_table));
     debug_sql(&sql);
     conn.execute_batch(&sql)
         .expect("knot runtime: failed to delete child rows");
 }
 
-/// Delete child rows for a specific parent _id, recursing for deeper nesting.
+/// Delete the relation elements belonging to one parent (keyed by the parent's
+/// `_content_hash`), recursing into deeper nesting. Removes the parent's edges
+/// from the link table, then reclaims element rows whose last edge disappeared.
 fn delete_child_rows_for_parent(
     conn: &rusqlite::Connection,
     child_table: &str,
-    parent_id: i64,
+    parent_key: &str,
     nf: &NestedField,
 ) {
-    // If this child has its own children, collect its _ids first and recurse
-    if !nf.nested.is_empty() {
-        let select_sql = format!(
-            "SELECT _id FROM {} WHERE _parent_id = ?1;",
-            quote_ident(child_table)
+    let link = quote_ident(&format!("{}{}", child_table, "__link"));
+    let elem = quote_ident(child_table);
+
+    // The element hashes this parent links to (needed to recurse into nested
+    // children keyed by each element's content hash, then to reclaim orphans).
+    let elem_hashes: Vec<Vec<u8>> = {
+        let sel = format!(
+            "SELECT \"_elem_hash\" FROM {} WHERE \"_parent_key\" = ?1;",
+            link
         );
-        if let Ok(mut stmt) = conn.prepare(&select_sql) {
-            let ids: Vec<i64> = stmt
-                .query_map([parent_id], |row| row.get::<_, i64>(0))
-                .into_iter()
-                .flatten()
-                .filter_map(|r| r.ok())
-                .collect();
-            for grandchild in &nf.nested {
-                let gc_table = child_table_name(child_table, &grandchild.name);
-                for &child_id in &ids {
-                    delete_child_rows_for_parent(conn, &gc_table, child_id, grandchild);
-                }
-            }
+        let mut stmt = conn.prepare(&sel).expect("knot runtime: link select failed");
+        let v = stmt
+            .query_map([parent_key], |row| row.get::<_, Vec<u8>>(0))
+            .expect("knot runtime: link select query failed")
+            .filter_map(|r| r.ok())
+            .collect();
+        v
+    };
+
+    // Recurse into each element's own nested relations, keyed by the element's
+    // content hash (hex, matching `record_content_hash_hex`).
+    for eh in &elem_hashes {
+        let elem_key: String = eh.iter().map(|b| format!("{:02x}", b)).collect();
+        for grandchild in &nf.nested {
+            let gc_table = child_table_name(child_table, &grandchild.name);
+            delete_child_rows_for_parent(conn, &gc_table, &elem_key, grandchild);
         }
     }
-    let sql = format!(
-        "DELETE FROM {} WHERE _parent_id = ?1;",
-        quote_ident(child_table)
+
+    // Remove this parent's edges.
+    let del_edges = format!("DELETE FROM {} WHERE \"_parent_key\" = ?1;", link);
+    debug_sql(&del_edges);
+    conn.execute(&del_edges, [parent_key])
+        .expect("knot runtime: failed to delete link edges");
+
+    // Reclaim element rows no longer referenced by any edge.
+    let del_orphans = format!(
+        "DELETE FROM {} WHERE \"_hash\" NOT IN (SELECT \"_elem_hash\" FROM {});",
+        elem, link
     );
-    debug_sql(&sql);
-    conn.execute(&sql, [parent_id])
-        .expect("knot runtime: failed to delete child rows for parent");
+    debug_sql(&del_orphans);
+    conn.execute(&del_orphans, [])
+        .expect("knot runtime: failed to reclaim orphaned elements");
 }
 
 /// Upsert a payload-ADT value into its content-addressed child table and return
@@ -16162,22 +16194,6 @@ fn write_record_rows(
     );
     debug_sql(&insert_sql);
 
-    // Prepare a SELECT to look up existing _id when INSERT OR IGNORE skips a
-    // duplicate. Match on `_content_hash` (the full-record key, last param) so a
-    // genuine full-record duplicate reuses its parent, while a record differing
-    // only in nested content gets a fresh parent.
-    let select_id_sql = if has_children {
-        let hash_idx = col_names.len() + 1;
-        Some(format!(
-            "SELECT _id FROM {} WHERE {} IS ?{} LIMIT 1;",
-            table,
-            quote_ident("_content_hash"),
-            hash_idx
-        ))
-    } else {
-        None
-    };
-
     let mut stmt = conn
         .prepare_cached(&insert_sql)
         .expect("knot runtime: failed to prepare insert");
@@ -16211,9 +16227,10 @@ fn write_record_rows(
             })
             .collect();
         if has_children {
-            params.push(rusqlite::types::Value::Text(record_content_hash_hex(
-                *row_ptr,
-            )));
+            // The parent's link-table key is its full-content hash (the same
+            // value pushed as the `_content_hash` param above). Compute it once.
+            let parent_key = record_content_hash_hex(*row_ptr);
+            params.push(rusqlite::types::Value::Text(parent_key.clone()));
         }
 
         if !params.is_empty() {
@@ -16228,24 +16245,9 @@ fn write_record_rows(
                 .unwrap_or_else(|e| panic!("knot runtime: insert error: {}", e));
         }
 
-        // Write nested relation fields to child tables
+        // Write nested relation fields to child tables (element upsert + link edges).
         if has_children {
-            let parent_id = if conn.changes() == 0 {
-                // INSERT OR IGNORE skipped this row (duplicate) — look up existing _id
-                if let Some(ref sql) = select_id_sql {
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
-                        .iter()
-                        .map(|p| p as &dyn rusqlite::types::ToSql)
-                        .collect();
-                    conn.query_row(sql, param_refs.as_slice(), |row| row.get::<_, i64>(0))
-                        .expect("knot runtime: failed to look up existing parent _id")
-                } else {
-                    // No scalar columns — DEFAULT VALUES always inserts, so this shouldn't happen
-                    conn.last_insert_rowid()
-                }
-            } else {
-                conn.last_insert_rowid()
-            };
+            let parent_key = record_content_hash_hex(*row_ptr);
             for nf in &schema.nested {
                 let child_table = child_table_name(table_name, &nf.name);
                 let child_val = field_map
@@ -16255,87 +16257,61 @@ fn write_record_rows(
                 if !child_val.is_null()
                     && let Value::Relation(child_rows) = unsafe { as_ref(child_val) }
                 {
-                    write_child_rows(conn, &child_table, nf, parent_id, child_rows);
+                    write_child_rows(conn, &child_table, nf, &parent_key, child_rows);
                 }
             }
         }
     }
 }
 
-/// Insert rows into a child table for a nested relation field.
+/// Insert elements into a content-addressed element table and record
+/// `(parent_key, elem_hash)` edges in the field's link table. `parent_key` is
+/// the parent row's `_content_hash` (hex string, matching the stored column).
 fn write_child_rows(
     conn: &rusqlite::Connection,
     table_name: &str,
     nf: &NestedField,
-    parent_id: i64,
+    parent_key: &str,
     rows: &[*mut Value],
 ) {
     if rows.is_empty() {
         return;
     }
 
-    let has_children = !nf.nested.is_empty();
+    // Element dedup is by content hash (the element table's `_hash` PK). Dedup
+    // structurally in memory first so we don't compute/insert the same element
+    // twice for one parent.
+    let deduped_storage = in_memory_dedup(rows.to_vec());
+    let rows: &[*mut Value] = &deduped_storage;
 
-    // When the element type has no scalar columns AND no nested children, there
-    // is no DB unique index to dedup against (`init_child_table` builds one only
-    // when there is at least one scalar column, or a `_content_hash` index when
-    // the element has children; a UNIQUE index on `_parent_id` alone would
-    // wrongly collapse all of a parent's distinct elements). A childless,
-    // column-less element is indistinguishable from any other, so without this
-    // `INSERT OR IGNORE` — with nothing to ignore on — would store duplicate
-    // child rows, violating Knot's set semantics. Dedup structurally in memory.
-    // (Elements with children dedup in the DB via the `_content_hash` index.)
-    let deduped_storage;
-    let rows: &[*mut Value] = if nf.columns.is_empty() && !has_children {
-        deduped_storage = in_memory_dedup(rows.to_vec());
-        &deduped_storage
-    } else {
-        rows
-    };
+    let elem_table = quote_ident(table_name);
+    let link_table = quote_ident(&format!("{}{}", table_name, "__link"));
 
-    let table = quote_ident(table_name);
-
-    let mut col_names = vec![quote_ident("_parent_id")];
+    // Element upsert: `_hash` + element columns.
+    let mut col_names = vec![quote_ident("_hash")];
     for c in &nf.columns {
         col_names.push(quote_ident(&c.name));
     }
-    // Elements with their own children append `_content_hash` (whole-element
-    // identity) as the LAST column/param — mirrors `write_record_rows`.
-    if has_children {
-        col_names.push(quote_ident("_content_hash"));
-    }
     let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
-
-    let insert_sql = format!(
+    let insert_elem_sql = format!(
         "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
-        table,
+        elem_table,
         col_names.join(", "),
         placeholders.join(", ")
     );
-    debug_sql(&insert_sql);
+    let insert_edge_sql = format!(
+        "INSERT OR IGNORE INTO {} (\"_parent_key\", \"_elem_hash\") VALUES (?1, ?2);",
+        link_table
+    );
+    debug_sql(&insert_elem_sql);
+    debug_sql(&insert_edge_sql);
 
-    // Prepare a SELECT to look up the existing _id when INSERT OR IGNORE skips a
-    // duplicate. Match the composite UNIQUE index `(_parent_id, _content_hash)`
-    // exactly — `_parent_id` (param 1) AND `_content_hash` (the whole-element
-    // key, last param) — so the lookup can only ever resolve to a row under the
-    // same parent, and a genuine full-element duplicate reuses its child row
-    // while an element differing only in grandchild content gets a fresh one.
-    let select_id_sql = if has_children {
-        let hash_idx = col_names.len();
-        Some(format!(
-            "SELECT _id FROM {} WHERE {} = ?1 AND {} IS ?{} LIMIT 1;",
-            table,
-            quote_ident("_parent_id"),
-            quote_ident("_content_hash"),
-            hash_idx
-        ))
-    } else {
-        None
-    };
-
-    let mut stmt = conn
-        .prepare_cached(&insert_sql)
-        .expect("knot runtime: failed to prepare child insert");
+    let mut elem_stmt = conn
+        .prepare_cached(&insert_elem_sql)
+        .expect("knot runtime: failed to prepare element insert");
+    let mut edge_stmt = conn
+        .prepare_cached(&insert_edge_sql)
+        .expect("knot runtime: failed to prepare link insert");
 
     for row_ptr in rows {
         let row = unsafe { as_ref(*row_ptr) };
@@ -16346,8 +16322,14 @@ fn write_child_rows(
             _ => (HashMap::new(), true),
         };
 
+        // Element content hash (bottom-up: any nested composites are hashed in
+        // by `value_to_hash_bytes`).
+        let mut buf = Vec::new();
+        value_to_hash_bytes(*row_ptr, &mut buf);
+        let elem_hash = blake3::hash(&buf).as_bytes().to_vec();
+
         let mut params: Vec<rusqlite::types::Value> =
-            vec![rusqlite::types::Value::Integer(parent_id)];
+            vec![rusqlite::types::Value::Blob(elem_hash.clone())];
         for col in &nf.columns {
             let value = if scalar_elem && col.name == "_value" {
                 *row_ptr
@@ -16358,47 +16340,44 @@ fn write_child_rows(
             };
             params.push(write_field_param(conn, table_name, col, value));
         }
-        if has_children {
-            params.push(rusqlite::types::Value::Text(record_content_hash_hex(
-                *row_ptr,
-            )));
-        }
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
             .iter()
             .map(|p| p as &dyn rusqlite::types::ToSql)
             .collect();
-        stmt.execute(param_refs.as_slice())
-            .unwrap_or_else(|e| panic!("knot runtime: child insert error: {}", e));
+        elem_stmt
+            .execute(param_refs.as_slice())
+            .unwrap_or_else(|e| panic!("knot runtime: element insert error: {}", e));
 
-        // Recurse for deeper nesting
-        if has_children {
-            let child_id = if conn.changes() == 0 {
-                // INSERT OR IGNORE skipped this row (duplicate) — look up existing _id
-                if let Some(ref sql) = select_id_sql {
-                    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params
-                        .iter()
-                        .map(|p| p as &dyn rusqlite::types::ToSql)
-                        .collect();
-                    conn.query_row(sql, param_refs.as_slice(), |row| row.get::<_, i64>(0))
-                        .expect("knot runtime: failed to look up existing child _id")
-                } else {
-                    conn.last_insert_rowid()
-                }
+        // Guard: if the element insert was ignored, the existing row must hold
+        // the same content (not a collision).
+        if conn.changes() == 0 {
+            let content_cols: Vec<String> =
+                nf.columns.iter().map(|c| quote_ident(&c.name)).collect();
+            guard_hash_collision(conn, table_name, &elem_hash, &content_cols, &params[1..]);
+        }
+
+        // Record the membership edge.
+        edge_stmt
+            .execute(rusqlite::params![
+                rusqlite::types::Value::Text(parent_key.to_string()),
+                rusqlite::types::Value::Blob(elem_hash)
+            ])
+            .unwrap_or_else(|e| panic!("knot runtime: link insert error: {}", e));
+
+        // Recurse: the element's own composite fields become children off the
+        // element table (keyed by the element's hash).
+        for grandchild in &nf.nested {
+            let gc_table = child_table_name(table_name, &grandchild.name);
+            let gc_val = if scalar_elem {
+                std::ptr::null_mut()
             } else {
-                conn.last_insert_rowid()
+                field_map.get(grandchild.name.as_str()).copied().unwrap_or(std::ptr::null_mut())
             };
-            for grandchild in &nf.nested {
-                let gc_table = child_table_name(table_name, &grandchild.name);
-                let gc_val = field_map
-                    .get(grandchild.name.as_str())
-                    .copied()
-                    .unwrap_or(std::ptr::null_mut());
-                if !gc_val.is_null()
-                    && let Value::Relation(gc_rows) = unsafe { as_ref(gc_val) }
-                {
-                    write_child_rows(conn, &gc_table, grandchild, child_id, gc_rows);
-                }
+            if !gc_val.is_null()
+                && let Value::Relation(gc_rows) = unsafe { as_ref(gc_val) }
+            {
+                write_child_rows(conn, &gc_table, grandchild, &record_content_hash_hex(*row_ptr), gc_rows);
             }
         }
     }
@@ -18954,6 +18933,7 @@ pub extern "C-unwind" fn knot_view_read(
     let mut select_cols: Vec<String> = Vec::new();
     if has_children {
         select_cols.push(quote_ident("_id"));
+        select_cols.push(quote_ident("_content_hash"));
     }
     for c in &rec_schema.columns {
         select_cols.push(quote_ident(&c.name));
@@ -18995,8 +18975,8 @@ pub extern "C-unwind" fn knot_view_read(
         .query(param_refs.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: view_read exec error: {}", e));
 
-    // Scalar columns start after the leading `_id` when children are present.
-    let col_offset = if has_children { 1 } else { 0 };
+    // Scalar columns start after the leading `_id` + `_content_hash` when children are present.
+    let col_offset = if has_children { 2 } else { 0 };
     while let Some(row) = result_rows
         .next()
         .unwrap_or_else(|e| panic!("knot runtime: view_read fetch error: {}", e))
@@ -19012,12 +18992,12 @@ pub extern "C-unwind" fn knot_view_read(
         }
 
         // Nested relation fields, reassembled from their child tables keyed on
-        // the parent `_id` (same path as `read_record_table`).
+        // the parent `_content_hash` (same path as `read_record_table`).
         if has_children {
-            let parent_id: i64 = row.get(0).unwrap();
+            let parent_key: String = row.get(1).expect("knot runtime: parent _content_hash missing");
             for nf in &rec_schema.nested {
                 let child_table_name = child_table_name(&table_name, &nf.name);
-                let val = read_child_table(&db_ref.conn, &child_table_name, nf, parent_id);
+                let val = read_child_table(&db_ref.conn, &child_table_name, nf, &parent_key);
                 let name_bytes = nf.name.as_bytes();
                 knot_record_set_field(record, name_bytes.as_ptr(), name_bytes.len(), val);
             }
@@ -19178,11 +19158,12 @@ pub extern "C-unwind" fn knot_view_write(
         // 1. Delete rows matching the view's constant filter.
         //    For sources with nested relations, delete child rows first to avoid orphans.
         if !rec_schema.nested.is_empty() {
-            // Collect _ids of parent rows about to be deleted
+            // Collect the `_content_hash` keys of parent rows about to be deleted
+            // (the link-table parent key).
             let select_sql = if filter_where.is_empty() {
-                format!("SELECT _id FROM {};", table)
+                format!("SELECT \"_content_hash\" FROM {};", table)
             } else {
-                format!("SELECT _id FROM {} WHERE {};", table, filter_where)
+                format!("SELECT \"_content_hash\" FROM {} WHERE {};", table, filter_where)
             };
             let sql_params: Vec<rusqlite::types::Value> = filter_values
                 .iter()
@@ -19195,19 +19176,19 @@ pub extern "C-unwind" fn knot_view_write(
             let mut stmt = db_ref
                 .conn
                 .prepare(&select_sql)
-                .expect("knot runtime: view_write select _id failed");
-            let ids: Vec<i64> = stmt
-                .query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))
-                .expect("knot runtime: view_write query _id failed")
+                .expect("knot runtime: view_write select _content_hash failed");
+            let keys: Vec<String> = stmt
+                .query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+                .expect("knot runtime: view_write query _content_hash failed")
                 .filter_map(|r| r.ok())
                 .collect();
             drop(stmt);
 
-            // Delete child rows for each parent _id
+            // Delete child rows (edges + orphaned elements) for each parent key.
             for nf in &rec_schema.nested {
                 let child_table = child_table_name(&table_name, &nf.name);
-                for &parent_id in &ids {
-                    delete_child_rows_for_parent(&db_ref.conn, &child_table, parent_id, nf);
+                for parent_key in &keys {
+                    delete_child_rows_for_parent(&db_ref.conn, &child_table, parent_key, nf);
                 }
             }
         }

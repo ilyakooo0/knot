@@ -274,8 +274,9 @@ Rel Entry  *es
     );
 }
 
-/// A scalar-relation field is stored in a `_parent_id`-keyed child table with a
-/// bare `_value` column (no JSON array, no wrapper record in the source).
+/// A scalar-relation field is stored as a content-addressed element table
+/// (`_hash` + `_value`) plus a many-to-many link table (`_parent_key`,
+/// `_elem_hash`). Shared elements are stored once; membership is edges.
 #[test]
 fn persisted_scalar_relation_field_is_child_table() {
     let dir = e2e::TempDir::fresh("relscalar");
@@ -286,7 +287,7 @@ Entry  {name Text  tags (Rel Text)}
 Rel Entry  *es
 }
 (do
-  full *es = [{name "a"  tags ["x"  "y"]}]
+  full *es = [{name "a"  tags ["x"  "y"]}  {name "b"  tags ["y"  "z"]}]
   yield {})"#,
         dir.path(),
     );
@@ -296,17 +297,25 @@ Rel Entry  *es
         .arg("-c")
         .arg(
             "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); \
-             rows=c.execute('select _value, typeof(_value) from \"_knot_es__/tags\" order by _value').fetchall(); \
-             cols=[r[1] for r in c.execute('pragma table_info(\"_knot_es__/tags\")')]; \
-             print((rows, cols))",
+             elems=c.execute('select _value, typeof(_value) from \"_knot_es__/tags\" order by _value').fetchall(); \
+             ecols=[r[1] for r in c.execute('pragma table_info(\"_knot_es__/tags\")')]; \
+             lcols=[r[1] for r in c.execute('pragma table_info(\"_knot_es__/tags__link\")')]; \
+             nlinks=c.execute('select count(*) from \"_knot_es__/tags__link\"').fetchone()[0]; \
+             print((elems, ecols, lcols, nlinks))",
         )
         .arg(dir.join("relscalar.db"))
         .output()
         .expect("python3 sqlite probe");
     let out = String::from_utf8_lossy(&probe.stdout);
+    // "y" is shared by both parents → exactly 3 distinct elements (x,y,z),
+    // 4 edges (a→x, a→y, b→y, b→z), element table keyed by _hash with a text
+    // _value, link table with _parent_key/_elem_hash.
     assert!(
-        out.contains("[('x', 'text'), ('y', 'text')]") && out.contains("'_parent_id'") && out.contains("'_value'"),
-        "scalar relation must be a _parent_id child with a text _value column, got: {out}"
+        out.contains("[('x', 'text'), ('y', 'text'), ('z', 'text')]")
+            && out.contains("'_hash'") && out.contains("'_value'")
+            && out.contains("'_parent_key'") && out.contains("'_elem_hash'")
+            && out.contains(", 4)"),
+        "scalar relation must be a content-addressed element table + link edges, got: {out}"
     );
 }
 

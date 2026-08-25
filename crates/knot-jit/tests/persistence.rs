@@ -280,3 +280,51 @@ Rel R  *rs
         "error should say the field can't be persisted: {stderr}"
     );
 }
+
+/// SUM over an Int column that overflows i64 must produce a clean overflow
+/// panic (matching checked-arithmetic overflow elsewhere), not a raw
+/// `query_sum error: integer overflow` followed by "failed to initiate panic,
+/// aborting". SQLite's `SUM()` over native INTEGER errors on overflow instead
+/// of promoting to REAL, so the runtime's REAL-coercion path never fires —
+/// the error must be caught and reported as the intended overflow.
+#[test]
+fn int_sum_overflow_panics_cleanly() {
+    let dir = e2e::TempDir::fresh("sumovf");
+    e2e::build_in_dir(
+        "sumovf",
+        r#"with {
+E  {n (Int 1)}
+Rel E  *emps
+}
+(do
+  full *emps = [{n 9223372036854775807}  {n 1}]
+  base.println (base.show (*emps |> base.map (\e -> e.n) |> base.sum))
+  yield {})"#,
+        dir.path(),
+    );
+    let out = std::process::Command::new(dir.path().join("sumovf"))
+        .current_dir(dir.path())
+        .output()
+        .expect("run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "overflowing Int SUM must fail, got stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+    assert!(
+        stderr.contains("outside the i64 range") || stderr.contains("overflow"),
+        "should report an overflow with a clear message, not a crash-abort.\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("query_sum error"),
+        "should not surface the raw SQLite error: {stderr}"
+    );
+    // Note: the process still aborts with "failed to initiate panic" because
+    // every panic that crosses Cranelift-generated code fails to unwind on this
+    // platform — the *intended* checked-arith overflow (`i64::MAX + 1` in pure
+    // knot) aborts the same way. That is the existing, general JIT-panic
+    // behavior, not something this fix changes; the fix is that the *message*
+    // is the clean overflow report, not the raw SQLite error.
+}

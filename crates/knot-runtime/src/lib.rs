@@ -14663,7 +14663,21 @@ pub extern "C-unwind" fn knot_source_query_sum(
                 }),
             }
         })
-        .unwrap_or_else(|e| panic!("knot runtime: query_sum error: {}\n  SQL: {}", e, sql))
+        .unwrap_or_else(|e| {
+            // SQLite's SUM() over a native INTEGER column *errors* on i64
+            // accumulation overflow (it does not promote to REAL, as the older
+            // TEXT-int storage did). That error is a genuine integer overflow —
+            // the runtime's checked-arithmetic ints can't represent the sum —
+            // so report it the same way as every other integer overflow instead
+            // of surfacing the raw SQLite error.
+            let msg = e.to_string();
+            if msg.contains("integer overflow") {
+                panic!(
+                    "knot runtime: integer SUM result is outside the i64 range (overflow)"
+                );
+            }
+            panic!("knot runtime: query_sum error: {}\n  SQL: {}", e, sql)
+        })
 }
 
 /// Execute a SQL aggregate query (e.g. MIN, MAX) and return the result

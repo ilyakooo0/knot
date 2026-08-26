@@ -9707,9 +9707,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
                 .source_schemas
                 .get(source_name)
                 .map(|full| {
-                    split_schema_fields(full).iter().all(|part| {
-                        let name = part.split(':').next().unwrap_or("");
-                        cols.contains(name)
+                    split_schema_fields(full).iter().all(|(name, _ty)| {
+                        cols.contains(name.as_str())
                     })
                 })
                 .unwrap_or(false),
@@ -17554,11 +17553,14 @@ impl SqlQueryPlan {
     }
 
     fn build_result_schema(&self) -> String {
-        self.select_columns
+        // New descriptor format: `{name Kind  name2 Kind2}` (gap-separated).
+        // `type_str` is already the field's kind descriptor.
+        let specs: Vec<String> = self
+            .select_columns
             .iter()
-            .map(|c| format!("{}:{}", c.result_field, c.type_str))
-            .collect::<Vec<_>>()
-            .join(",")
+            .map(|c| format!("{} {}", c.result_field, c.type_str))
+            .collect();
+        format!("{{{}}}", specs.join("  "))
     }
 }
 
@@ -17887,54 +17889,47 @@ fn rewrite_body_through_projection(
 }
 
 pub(crate) fn lookup_col_type_from_schema(schema: &str, col_name: &str) -> Option<String> {
-    // ADT-relation schemas (`#Ctor:field=type;field=type|Ctor2:...|Nullary`)
-    // describe a wide table where each constructor's fields are columns. The
-    // record-schema parser below can't read this shape (it splits on top-level
-    // commas and `:`), so it would return `None` for every ADT field — which
-    // silently bypasses the float/json/tag pushdown guards in callers, pushing
-    // e.g. a float `<` comparison into SQL where -0.0/NaN semantics diverge.
-    if let Some(adt) = schema.strip_prefix('#') {
-        for ctor in adt.split('|') {
-            let fields = match ctor.split_once(':') {
-                Some((_name, fields)) => fields,
-                None => continue, // nullary constructor — no fields
-            };
-            for field in fields.split(';') {
-                if let Some((name, ty)) = field.split_once('=')
-                    && name == col_name
-                {
-                    return Some(ty.to_string());
+    // ADT-relation schemas (`(Ctor{field Kind} | Ctor2 | ...)`) describe a wide
+    // table where each constructor's payload fields are columns. The record
+    // parser below can't read this shape, so handle it first.
+    let t = schema.trim();
+    if t.starts_with('(') && t.ends_with(')') {
+        // Walk each `Ctor{...}` payload and look up the field.
+        let inner = &t[1..t.len() - 1];
+        for ctor in split_top_level(inner, '|') {
+            let ctor = ctor.trim();
+            if let Some(brace) = ctor.find('{') {
+                let fields_str = &ctor[brace..];
+                for (name, ty) in parse_schema_columns(fields_str) {
+                    if name == col_name {
+                        return Some(ty);
+                    }
                 }
             }
         }
         return None;
     }
-    for part in split_schema_fields(schema) {
-        // A field part lacking a `:` (malformed/unexpected) must be skipped,
-        // not abort the whole lookup — `?` here would poison every later column.
-        let Some(colon) = part.find(':') else {
-            continue;
-        };
-        let name = &part[..colon];
-        let ty = &part[colon + 1..];
+    for (name, ty) in parse_schema_columns(schema) {
         if name == col_name {
-            return Some(ty.to_string());
+            return Some(ty);
         }
     }
     None
 }
 
-pub(crate) fn split_schema_fields(s: &str) -> Vec<&str> {
+/// Split a descriptor body on `sep` at the top nesting level (respecting
+/// `{...}`/`(...)`/`[...]`).
+fn split_top_level(s: &str, sep: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
     let mut start = 0;
     for (i, c) in s.char_indices() {
         match c {
-            '[' => depth += 1,
-            ']' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth = depth.saturating_sub(1),
+            c if c == sep && depth == 0 => {
                 parts.push(&s[start..i]);
-                start = i + 1;
+                start = i + c.len_utf8();
             }
             _ => {}
         }
@@ -17943,16 +17938,71 @@ pub(crate) fn split_schema_fields(s: &str) -> Vec<&str> {
     parts
 }
 
+pub(crate) fn split_schema_fields(s: &str) -> Vec<(String, String)> {
+    parse_schema_columns(s)
+}
+
+/// Parse a `{name Kind  name2 Kind2}` record descriptor into (name, Kind) pairs.
 fn parse_schema_columns(schema: &str) -> Vec<(String, String)> {
-    split_schema_fields(schema)
-        .into_iter()
-        .filter_map(|part| {
-            let colon = part.find(':')?;
-            let name = part[..colon].to_string();
-            let ty = part[colon + 1..].to_string();
-            Some((name, ty))
-        })
-        .collect()
+    let t = schema.trim();
+    let inner = match t.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // skip whitespace
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        // field name
+        let name_start = i;
+        while i < bytes.len() && ((bytes[i] as char).is_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        let name = &inner[name_start..i];
+        // skip ws
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        // kind: balanced bracket group or a bare scalar ident
+        let kind_start = i;
+        if i < bytes.len() && (bytes[i] == b'{' || bytes[i] == b'(' || bytes[i] == b'[') {
+            let open = bytes[i];
+            let close = match open {
+                b'{' => b'}',
+                b'(' => b')',
+                _ => b']',
+            };
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == open {
+                    depth += 1;
+                } else if bytes[i] == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                i += 1;
+            }
+        } else {
+            while i < bytes.len() && ((bytes[i] as char).is_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+        }
+        let kind = &inner[kind_start..i];
+        if !name.is_empty() {
+            out.push((name.to_string(), kind.to_string()));
+        }
+    }
+    out
 }
 
 // ── Pipe chain analysis ───────────────────────────────────────────

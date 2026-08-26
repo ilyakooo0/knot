@@ -93,7 +93,7 @@ fn migrate_lock_lifecycle() {
     );
     let lock = std::fs::read_to_string(dir.join("mig_life.schema.lock")).unwrap();
     assert!(lock.contains("migrate_history"), "lock records the history");
-    assert!(lock.contains("name:text"), "lock records the from-schema");
+    assert!(lock.contains("{name Text}"), "lock records the from-schema");
 
     // The committed binary no longer carries the pending migration; running it
     // migrates the main DB (no fork token) — but the source no longer has the

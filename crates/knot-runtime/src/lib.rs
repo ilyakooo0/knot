@@ -13720,6 +13720,11 @@ struct AdtSpec {
 }
 
 impl AdtSpec {
+    /// True if any constructor carries a payload (→ content-addressed child
+    /// table); all-bare ctors → enum (in-row tag).
+    fn is_payload(&self) -> bool {
+        self.constructors.iter().any(|c| !c.fields.is_empty())
+    }
     /// SQL column type for a wide-table field. A field whose name is reused
     /// across constructors with differing types gets BLOB affinity so SQLite
     /// stores each constructor's value verbatim, without coercing it toward the
@@ -13735,140 +13740,177 @@ impl AdtSpec {
     }
 }
 
-/// Determine if a schema descriptor is an ADT schema (starts with '#')
+/// Determine if a schema descriptor is an ADT schema (the `(Ctor | ...)` form).
 fn is_adt_schema(spec: &str) -> bool {
-    spec.starts_with('#')
+    spec.trim_start().starts_with('(')
 }
 
-/// Parse a recursive field-type descriptor into a `FieldStore`. Grammar:
-///   int|float|text|bool|bytes|tag   → Column (in-row)
-///   json                            → Column(Json) (legacy; phased out)
-///   adt#C:f=T;..|C2                 → AdtRef (content-hash child)
-///   rec#f=T;..                      → RecRef (content-hash child, no _tag)
-///   [T]                             → RelRef (content-addressed element + link tables)
-/// where `T` recurses through this same function.
-fn parse_field_store(type_str: &str) -> FieldStore {
-    if let Some(adt_spec) = type_str.strip_prefix("adt") {
-        FieldStore::AdtRef(parse_adt_schema(adt_spec))
-    } else if let Some(rec_spec) = type_str.strip_prefix("rec") {
-        // `rec#[f:t,..]` — strip `rec`, the `#`, then the protective brackets.
-        let body = rec_spec.strip_prefix('#').unwrap_or(rec_spec);
-        let inner = body
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(body);
-        FieldStore::RecRef(parse_record_schema(inner))
-    } else if type_str.starts_with('[') && type_str.ends_with(']') {
-        // A relation element is a single anonymous field `_value` whose type is
-        // the inner descriptor — so `[T]` becomes a child RecordSchema with one
-        // column. For a record element the inner is already `rec#..`/a field
-        // list; for a scalar/JSON element it's a bare token.
-        let inner = &type_str[1..type_str.len() - 1];
-        FieldStore::RelRef(Box::new(parse_relation_element_schema(inner)))
-    } else {
-        FieldStore::Column(parse_col_type(type_str))
+// ── Descriptor parser (knot-type syntax) ──────────────────────────
+//
+// The descriptor is knot's own type syntax, name-free and canonical:
+//   scalar    Int | Float | Text | Bool | Bytes | Uuid
+//   record    {field Kind  field2 Kind2}     (gap-separated, two spaces)
+//   relation  (Rel Kind)
+//   ADT       (Ctor | Ctor{field Kind})      (payload ctor carries an inline record)
+// A payload-ADT field (any ctor with `{..}`) is content-addressed into a child
+// table; an all-bare-ctor ADT is an in-row enum tag. The parser is a small
+// recursive-descent reader over this grammar.
+
+/// A cursor over the descriptor string. `peek`/`bump`/`expect`/`ident` skip
+/// leading whitespace first, so callers never handle it.
+struct Cursor<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+impl<'a> Cursor<'a> {
+    fn new(s: &'a str) -> Self {
+        Cursor { s: s.as_bytes(), i: 0 }
+    }
+    fn skip_ws(&mut self) {
+        while self.i < self.s.len() && (self.s[self.i] as char).is_whitespace() {
+            self.i += 1;
+        }
+    }
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_ws();
+        self.s.get(self.i).copied()
+    }
+    fn bump(&mut self) -> Option<u8> {
+        self.skip_ws();
+        let c = self.s.get(self.i).copied();
+        if c.is_some() {
+            self.i += 1;
+        }
+        c
+    }
+    fn expect(&mut self, c: u8) {
+        if self.bump() != Some(c) {
+            panic!("knot runtime: descriptor parse error, expected '{}'", c as char);
+        }
+    }
+    /// Read an identifier (constructor or field name): alphanumeric + `_`.
+    fn ident(&mut self) -> String {
+        self.skip_ws();
+        let start = self.i;
+        while self.i < self.s.len() {
+            let c = self.s[self.i] as char;
+            if c.is_alphanumeric() || c == '_' {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        self.s[start..self.i].iter().map(|&b| b as char).collect()
     }
 }
 
-/// Parse the inner schema of a relation `[T]`. `T` is either a record field
-/// list (`name:text,age:int` — the legacy record-element form), a `rec#..` /
-/// `adt#..` composite, or a bare scalar/json token. Returns a child
-/// `RecordSchema` whose `columns`/`nested` describe one element row.
-fn parse_relation_element_schema(inner: &str) -> RecordSchema {
-    // Record element: either the legacy bare field list `[name:text,age:int]`
-    // or the recursive `rec#[name:text,legs:int]`. Both are the child schema
-    // directly (the element IS the record).
-    if let Some(rec) = inner.strip_prefix("rec#") {
-        let body = rec
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(rec);
-        return parse_record_schema(body);
-    }
-    if !inner.starts_with("adt#")
-        && inner.contains(':')
-        && !inner.starts_with('[')
-    {
-        return parse_record_schema(inner);
-    }
-    // Otherwise the element is a single value of type `inner`: wrap it as a
-    // one-field record schema with the field name `_value`.
-    let store = parse_field_store(inner);
-    let (ty, adt) = match &store {
-        FieldStore::Column(ct) => (*ct, None),
-        FieldStore::AdtRef(spec) => (ColType::AdtRef, Some(spec.clone())),
-        _ => (ColType::Bytes, None), // placeholder; `store` drives behavior
-    };
-    RecordSchema {
-        columns: vec![ColumnSpec {
-            name: "_value".to_string(),
-            ty,
-            adt,
-            store: Some(Box::new(store)),
-        }],
-        nested: Vec::new(),
+/// Parse a field-type descriptor into a `FieldStore`, recursing.
+fn parse_field_store(p: &mut Cursor) -> FieldStore {
+    match p.peek() {
+        Some(b'(') => {
+            p.bump(); // '('
+            p.peek(); // position at first content char
+            if p.s[p.i..].starts_with(b"Rel") {
+                p.i += 3; // consume Rel
+                let inner = parse_field_store(p);
+                p.expect(b')');
+                FieldStore::RelRef(Box::new(relation_element_schema(inner)))
+            } else {
+                let adt = parse_adt_body(p);
+                p.expect(b')');
+                if adt.is_payload() {
+                    FieldStore::AdtRef(adt)
+                } else {
+                    FieldStore::Column(ColType::Tag)
+                }
+            }
+        }
+        Some(b'{') => FieldStore::RecRef(parse_record_body(p)),
+        Some(_) => FieldStore::Column(parse_col_type(&p.ident())),
+        None => panic!("knot runtime: unexpected end of schema descriptor"),
     }
 }
 
-
-/// True for the single-column `_value:<scalar>` schema used by scalar (and
-/// relation-of-scalar) sources. Such sources store each value as a
-/// `{_value: x}` row in SQLite but expose the bare scalar `x` to user code,
-/// so the migration transform must unwrap/rewrap around the `_value` column.
-fn is_scalar_value_schema(spec: &str) -> bool {
-    spec.starts_with("_value:") && !spec.contains(',') && !spec.contains('[')
+/// Parse a `{field Kind  ...}` record body (the `{` is current).
+fn parse_record_body(p: &mut Cursor) -> RecordSchema {
+    p.expect(b'{');
+    let mut columns = Vec::new();
+    let mut nested = Vec::new();
+    loop {
+        if p.peek() == Some(b'}') {
+            p.bump();
+            break;
+        }
+        let name = p.ident();
+        let store = parse_field_store(p);
+        match store {
+            FieldStore::RelRef(child) => nested.push(NestedField {
+                name,
+                columns: child.columns,
+                nested: child.nested,
+            }),
+            FieldStore::AdtRef(spec) => columns.push(ColumnSpec {
+                name,
+                ty: ColType::AdtRef,
+                adt: Some(spec.clone()),
+                store: Some(Box::new(FieldStore::AdtRef(spec))),
+            }),
+            FieldStore::RecRef(rec) => columns.push(ColumnSpec {
+                name,
+                ty: ColType::RecRef,
+                adt: None,
+                store: Some(Box::new(FieldStore::RecRef(rec))),
+            }),
+            FieldStore::Column(ct) => columns.push(ColumnSpec {
+                name,
+                ty: ct,
+                adt: None,
+                store: None,
+            }),
+        }
+    }
+    RecordSchema { columns, nested }
 }
 
-/// Parse an ADT schema descriptor: "#Ctor1:f1=t1;f2=t2|Ctor2|Ctor3:f3=t3"
-fn parse_adt_schema(spec: &str) -> AdtSpec {
-    let body = &spec[1..]; // strip '#'
+/// Parse the ctor list of an ADT (after the opening `(`): `Ctor | Ctor{...}`.
+fn parse_adt_body(p: &mut Cursor) -> AdtSpec {
     let mut constructors = Vec::new();
     let mut field_types: HashMap<String, ColType> = HashMap::new();
     let mut conflicting_fields: HashSet<String> = HashSet::new();
     let mut all_fields: Vec<ColumnSpec> = Vec::new();
-
-    for ctor_part in split_respecting_brackets(body, '|') {
-        let mut parts = ctor_part.splitn(2, ':');
-        let name = parts.next().unwrap().to_string();
-        let fields: Vec<ColumnSpec> = if let Some(field_spec) = parts.next() {
-            split_respecting_brackets(field_spec, ';')
-                .iter()
-                .map(|f| {
-                    let mut fp = f.splitn(2, '=');
-                    let fname = fp.next().unwrap().to_string();
-                    let fty_str = fp.next().unwrap_or("text");
-                    // Recursive: a payload field may itself be a scalar, tag,
-                    // rec#.., adt#.., or [..] child descriptor.
-                    let store = parse_field_store(fty_str);
-                    let (ty, adt) = match &store {
-                        FieldStore::Column(ct) => (*ct, None),
-                        FieldStore::AdtRef(spec) => (ColType::AdtRef, Some(spec.clone())),
-                        _ => (ColType::Bytes, None), // placeholder; `store` drives behavior
-                    };
-                    ColumnSpec {
-                        name: fname,
-                        ty,
-                        adt,
-                        store: Some(Box::new(store)),
-                    }
-                })
-                .collect()
+    loop {
+        if p.peek() == Some(b')') {
+            break;
+        }
+        let name = p.ident();
+        // Optional payload record `{..}` immediately after the ctor name. A
+        // payload field that is itself a relation parses into the record's
+        // `nested`; fold those back in as RelRef columns so the payload keeps
+        // its relation fields.
+        let fields: Vec<ColumnSpec> = if p.peek() == Some(b'{') {
+            let rec = parse_record_body(p);
+            let mut cols = rec.columns;
+            for nf in rec.nested {
+                let store = FieldStore::RelRef(Box::new(RecordSchema {
+                    columns: nf.columns,
+                    nested: nf.nested,
+                }));
+                cols.push(ColumnSpec {
+                    name: nf.name,
+                    ty: ColType::Bytes, // placeholder; store drives behavior
+                    adt: None,
+                    store: Some(Box::new(store)),
+                });
+            }
+            cols
         } else {
             Vec::new()
         };
-
-        // Add unique fields to the all_fields list, tracking type conflicts
-        // where the same field name recurs with a different column type.
         for f in &fields {
             match field_types.get(&f.name) {
                 None => {
                     field_types.insert(f.name.clone(), f.ty);
-                    all_fields.push(ColumnSpec {
-                        name: f.name.clone(),
-                        ty: f.ty,
-                        adt: f.adt.clone(),
-                        store: f.store.clone(),
-                    });
+                    all_fields.push(f.clone());
                 }
                 Some(existing) if *existing != f.ty => {
                     conflicting_fields.insert(f.name.clone());
@@ -13876,10 +13918,11 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
                 Some(_) => {}
             }
         }
-
         constructors.push(CtorSpec { name, fields });
+        if p.peek() == Some(b'|') {
+            p.bump();
+        }
     }
-
     AdtSpec {
         constructors,
         all_fields,
@@ -13887,15 +13930,58 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
     }
 }
 
-/// Split a string by `sep` while respecting `[...]` bracket nesting.
+/// A relation element of kind `inner` becomes a one-`_value`-column record
+/// schema (scalar/enum/ADT/relation element) or the record itself (record
+/// element). A relation element (`Rel (Rel Int)`) nests as a `_value` RelRef.
+fn relation_element_schema(inner: FieldStore) -> RecordSchema {
+    match inner {
+        FieldStore::RecRef(rec) => rec,
+        store => {
+            let (ty, adt) = match &store {
+                FieldStore::Column(ct) => (*ct, None),
+                FieldStore::AdtRef(spec) => (ColType::AdtRef, Some(spec.clone())),
+                _ => (ColType::Bytes, None), // RelRef: store drives behavior
+            };
+            RecordSchema {
+                columns: vec![ColumnSpec {
+                    name: "_value".to_string(),
+                    ty,
+                    adt,
+                    store: Some(Box::new(store)),
+                }],
+                nested: Vec::new(),
+            }
+        }
+    }
+}
+
+/// True for the single-column `{_value <scalar>}` schema used by scalar (and
+/// relation-of-scalar) sources.
+fn is_scalar_value_schema(spec: &str) -> bool {
+    let t = spec.trim();
+    t.starts_with("{_value ") && t.ends_with('}')
+}
+
+/// Parse a top-level ADT schema descriptor `(Ctor | Ctor{...})` into an
+/// `AdtSpec`. Used by the direct-ADT-relation path (`Rel Shape`).
+fn parse_adt_schema(spec: &str) -> AdtSpec {
+    let mut p = Cursor::new(spec.trim());
+    p.expect(b'(');
+    let adt = parse_adt_body(&mut p);
+    p.expect(b')');
+    adt
+}
+
+/// Split a string by `sep` while respecting `[...]`/`{...}`/`(...)` nesting.
+/// (Used by the TUI's descriptor rendering.)
 pub(crate) fn split_respecting_brackets(s: &str, sep: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut depth = 0usize;
     let mut start = 0;
     for (i, c) in s.char_indices() {
         match c {
-            '[' => depth += 1,
-            ']' => depth = depth.saturating_sub(1),
+            '[' | '{' | '(' => depth += 1,
+            ']' | '}' | ')' => depth = depth.saturating_sub(1),
             c if c == sep && depth == 0 => {
                 parts.push(&s[start..i]);
                 start = i + c.len_utf8();
@@ -13909,77 +13995,26 @@ pub(crate) fn split_respecting_brackets(s: &str, sep: char) -> Vec<&str> {
 
 fn parse_col_type(s: &str) -> ColType {
     match s {
-        "int" => ColType::Int,
-        "float" => ColType::Float,
-        "text" => ColType::Text,
-        "bool" => ColType::Bool,
-        "bytes" => ColType::Bytes,
-        "tag" => ColType::Tag,
-        "json" => ColType::Json,
+        "Int" => ColType::Int,
+        "Float" => ColType::Float,
+        "Text" => ColType::Text,
+        "Bool" => ColType::Bool,
+        "Bytes" => ColType::Bytes,
+        "Uuid" => ColType::Text,
         other => panic!("knot runtime: unknown column type '{}'", other),
     }
 }
 
 fn parse_record_schema(spec: &str) -> RecordSchema {
-    if spec.is_empty() {
+    let t = spec.trim();
+    if t.is_empty() {
         return RecordSchema {
             columns: Vec::new(),
             nested: Vec::new(),
         };
     }
-    let mut columns = Vec::new();
-    let mut nested = Vec::new();
-    for part in split_respecting_brackets(spec, ',') {
-        // Find the first ':' (field name separator)
-        let colon = part.find(':').unwrap_or_else(|| {
-            panic!(
-                "knot runtime: malformed schema field '{}' (full schema: '{}')",
-                part, spec
-            )
-        });
-        let name = part[..colon].to_string();
-        let type_str = &part[colon + 1..];
-        let store = parse_field_store(type_str);
-        match store {
-            // A relation field lives in element+link tables — keep it in
-            // `nested` for the link-table read/write machinery.
-            FieldStore::RelRef(child) => {
-                nested.push(NestedField {
-                    name,
-                    columns: child.columns,
-                    nested: child.nested,
-                });
-            }
-            // Content-addressed payload ADT: parent column holds the hash.
-            FieldStore::AdtRef(spec) => {
-                columns.push(ColumnSpec {
-                    name,
-                    ty: ColType::AdtRef,
-                    adt: Some(spec.clone()),
-                    store: Some(Box::new(FieldStore::AdtRef(spec))),
-                });
-            }
-            // Content-addressed record: parent column holds the hash, no _tag.
-            FieldStore::RecRef(rec) => {
-                columns.push(ColumnSpec {
-                    name,
-                    ty: ColType::RecRef,
-                    adt: None,
-                    store: Some(Box::new(FieldStore::RecRef(rec))),
-                });
-            }
-            // In-row scalar/tag/(legacy json) column.
-            FieldStore::Column(ct) => {
-                columns.push(ColumnSpec {
-                    name,
-                    ty: ct,
-                    adt: None,
-                    store: None,
-                });
-            }
-        }
-    }
-    RecordSchema { columns, nested }
+    let mut p = Cursor::new(t);
+    parse_record_body(&mut p)
 }
 
 /// Build a COALESCE expression that maps NULL to a sentinel value for use in

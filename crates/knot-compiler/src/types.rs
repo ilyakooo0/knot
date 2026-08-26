@@ -1945,8 +1945,8 @@ fn schema_for_source(
                 return relation_inner_schema(inner, aliases);
             }
             // Non-relation source type (e.g. `*counter : Int 1`):
-            // wrap as a single-column `_value` schema.
-            format!("_value:{}", col_type_str(&resolved))
+            // wrap as a single-column `{_value ...}` schema.
+            record_desc(&[("_value".to_string(), resolved)], aliases)
         }
     }
 }
@@ -1966,43 +1966,25 @@ fn relation_inner_schema(inner: &ResolvedType, aliases: &HashMap<String, Resolve
         // the alias table. A genuinely unknown name falls through to scalar.
         ResolvedType::Named(name) => match aliases.get(name) {
             Some(adt @ ResolvedType::Adt(_)) => schema_descriptor(adt, aliases),
-            _ => format!("_value:{}", col_type_str(inner)),
+            _ => record_desc(&[("_value".to_string(), inner.clone())], aliases),
         },
-        // A relation-of-relations element (`*tags : [[Text]]`, `*grid : [[R]]`)
-        // is itself a relation — a composite. Store it as a `_value` field with
-        // the recursive relation descriptor (a child table), not a bare `json`.
-        ResolvedType::Relation(_) => format!("_value:{}", field_type_desc(inner, aliases)),
-        _ => format!("_value:{}", col_type_str(inner)),
+        // A relation-of-relations element (`Rel (Rel Int)`) is itself a
+        // relation — store it as a `_value` field with the recursive descriptor.
+        ResolvedType::Relation(_) => record_desc(&[("_value".to_string(), inner.clone())], aliases),
+        _ => record_desc(&[("_value".to_string(), inner.clone())], aliases),
     }
 }
 
-/// Column type string for a resolved type used as a record field.
-/// Scalars/enum-ADTs are stored in-row; this only ever returns a flat token.
-/// Composite types are handled by `field_type_desc` (the recursive descriptor).
-fn col_type_str(ty: &ResolvedType) -> &'static str {
-    match ty {
-        ResolvedType::Int => "int",
-        ResolvedType::Float => "float",
-        ResolvedType::Text => "text",
-        ResolvedType::Bool => "bool",
-        ResolvedType::Bytes => "bytes",
-        ResolvedType::Uuid => "text",
-        // Enum-like ADTs (all nullary) get the "tag" type. Payload ADTs,
-        // records, and relations are composite — they take a child-table
-        // descriptor via `field_type_desc`, never a bare `col_type_str`.
-        ResolvedType::Adt(_) => "tag",
-        _ => "text",
-    }
-}
-
-/// Recursive field-type descriptor. Every field type is one of:
-///   <scalar>          int | float | text | bool | bytes   (in-row column)
-///   tag               enum ADT (all nullary)              (in-row TEXT column)
-///   adt#C:f=T;..|C2   payload ADT   → content-hash child table (_hash,_tag,cols)
-///   rec#f=T;..        record        → content-hash child table (_hash,cols)
-///   [T]               relation      → _parent_id child table, one row/element
-/// where `T` is any of these, recursively. Composites become child tables
-/// terminating at scalars — no `json` token remains.
+/// The schema descriptor IS the field's type rendered as knot type syntax —
+/// name-free (aliases/ADTs inlined structurally) so it survives the type being
+/// deleted from source. Storage layout is derived by the runtime from this
+/// type; the descriptor carries no storage encoding of its own.
+///
+///   Int | Float | Text | Bool | Bytes | Uuid   scalar
+///   {name Text  addr {city Text}}                record (gap-separated)
+///   (Rel Text)                                     relation
+///   (Red | Blue)                                   enum ADT
+///   (Circle{radius Int} | Point)                   payload ADT
 fn field_type_desc(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -> String {
     // Resolve a named reference to its structural type (record aliases inline;
     // multi-variant ADTs stay named so we re-resolve here).
@@ -2011,25 +1993,44 @@ fn field_type_desc(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -
         other => other,
     };
     match resolved {
-        ResolvedType::Relation(inner) => format!("[{}]", field_type_desc(inner, aliases)),
+        ResolvedType::Relation(inner) => format!("(Rel {})", field_type_desc(inner, aliases)),
         ResolvedType::Adt(ctors) => {
-            if ctors.iter().all(|(_, f)| f.is_empty()) {
-                "tag".to_string()
-            } else {
-                format!("adt{}", adt_descriptor(ctors, aliases))
-            }
-        }
-        ResolvedType::Record(fields) => {
-            // `rec#[...]` wraps the field list in brackets so the outer
-            // `,`-split (which respects `[...]`) keeps the whole record
-            // descriptor intact. The runtime strips `rec#` then the brackets.
-            let specs: Vec<String> = fields
+            // Inline-variant form: `(A | B)` for enums, `(C{..} | D)` for payload.
+            let parts: Vec<String> = ctors
                 .iter()
-                .map(|(fname, fty)| format!("{}:{}", fname, field_type_desc(fty, aliases)))
+                .map(|(ctor_name, fields)| {
+                    if fields.is_empty() {
+                        ctor_name.clone()
+                    } else {
+                        format!("{}{}", ctor_name, record_desc(fields, aliases))
+                    }
+                })
                 .collect();
-            format!("rec#[{}]", specs.join(","))
+            format!("({})", parts.join(" | "))
         }
-        other => col_type_str(other).to_string(),
+        ResolvedType::Record(fields) => record_desc(fields, aliases),
+        other => scalar_type_str(other).to_string(),
+    }
+}
+
+/// `{name Kind  name2 Kind2}` — a record type, gap-separated, no `:`/`,`.
+fn record_desc(fields: &[(String, ResolvedType)], aliases: &HashMap<String, ResolvedType>) -> String {
+    let specs: Vec<String> = fields
+        .iter()
+        .map(|(fname, fty)| format!("{} {}", fname, field_type_desc(fty, aliases)))
+        .collect();
+    format!("{{{}}}", specs.join("  "))
+}
+
+fn scalar_type_str(ty: &ResolvedType) -> &'static str {
+    match ty {
+        ResolvedType::Int => "Int",
+        ResolvedType::Float => "Float",
+        ResolvedType::Text => "Text",
+        ResolvedType::Bool => "Bool",
+        ResolvedType::Bytes => "Bytes",
+        ResolvedType::Uuid => "Uuid",
+        _ => "Text",
     }
 }
 
@@ -2048,50 +2049,12 @@ fn field_type_desc(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -
 ///   reconstructs relations of constructors and scalars faithfully, and
 ///   `m <- t.field` binds iterate the in-memory relation read back from
 ///   the column.
-fn format_schema_field(
-    name: &str,
-    ty: &ResolvedType,
-    aliases: &HashMap<String, ResolvedType>,
-) -> String {
-    // The whole field type is described recursively: composites (payload ADT,
-    // record, relation) become child-table descriptors, scalars/enum-ADTs a
-    // flat column token. No `json` fallback remains.
-    format!("{}:{}", name, field_type_desc(ty, aliases))
-}
-
-/// The `#Ctor1:f1=t1;f2=t2|Ctor2|...` descriptor for an ADT's constructors.
-/// Shared by the direct-relation schema (`Rel Shape`) and the content-addressed
-/// ADT-field form (`field:adt#...`).
-fn adt_descriptor(ctors: &[(String, Vec<(String, ResolvedType)>)], aliases: &HashMap<String, ResolvedType>) -> String {
-    let parts: Vec<String> = ctors
-        .iter()
-        .map(|(ctor_name, fields)| {
-            if fields.is_empty() {
-                ctor_name.clone()
-            } else {
-                let field_specs: Vec<String> = fields
-                    .iter()
-                    .map(|(fname, fty)| format!("{}={}", fname, field_type_desc(fty, aliases)))
-                    .collect();
-                format!("{}:{}", ctor_name, field_specs.join(";"))
-            }
-        })
-        .collect();
-    format!("#{}", parts.join("|"))
-}
-
 fn schema_descriptor(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -> String {
     match ty {
-        ResolvedType::Record(fields) => fields
-            .iter()
-            .map(|(name, ty)| format_schema_field(name, ty, aliases))
-            .collect::<Vec<_>>()
-            .join(","),
-        ResolvedType::Adt(ctors) => {
-            // Direct ADT relation: #Ctor1:f1=t1;f2=t2|Ctor2|...
-            adt_descriptor(ctors, aliases)
-        }
-        other => col_type_str(other).to_string(),
+        ResolvedType::Record(fields) => record_desc(fields, aliases),
+        // Direct ADT relation (`Rel Shape`): the inline-variant form.
+        ResolvedType::Adt(ctors) => field_type_desc(&ResolvedType::Adt(ctors.clone()), aliases),
+        other => scalar_type_str(other).to_string(),
     }
 }
 

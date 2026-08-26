@@ -13725,7 +13725,7 @@ fn is_adt_schema(spec: &str) -> bool {
 ///   json                            → Column(Json) (legacy; phased out)
 ///   adt#C:f=T;..|C2                 → AdtRef (content-hash child)
 ///   rec#f=T;..                      → RecRef (content-hash child, no _tag)
-///   [T]                             → RelRef (_parent_id child)
+///   [T]                             → RelRef (content-addressed element + link tables)
 /// where `T` recurses through this same function.
 fn parse_field_store(type_str: &str) -> FieldStore {
     if let Some(adt_spec) = type_str.strip_prefix("adt") {
@@ -13921,8 +13921,8 @@ fn parse_record_schema(spec: &str) -> RecordSchema {
         let type_str = &part[colon + 1..];
         let store = parse_field_store(type_str);
         match store {
-            // A relation field lives in a `_parent_id` child table — keep it in
-            // `nested` for the existing child-table read/write machinery.
+            // A relation field lives in element+link tables — keep it in
+            // `nested` for the link-table read/write machinery.
             FieldStore::RelRef(child) => {
                 nested.push(NestedField {
                     name,
@@ -14172,15 +14172,18 @@ fn init_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &Rec
     }
 
     // Content-addressed child table for each ref (payload-ADT / record) field.
+    // Relation fields live in `schema.nested` (handled by `init_child_table`),
+    // never here — a RelRef column in `schema.columns` is a bug.
     for c in &schema.columns {
         if let Some(store) = &c.store {
             match store.as_ref() {
                 FieldStore::AdtRef(_) | FieldStore::RecRef(_) => {
                     init_ref_child_table(conn, table_name, &c.name, store);
                 }
-                FieldStore::RelRef(child_schema) => {
-                    init_rel_child_table(conn, table_name, &c.name, child_schema);
-                }
+                FieldStore::RelRef(_) => panic!(
+                    "knot runtime: relation field '{}' must live in schema.nested, not columns",
+                    c.name
+                ),
                 FieldStore::Column(_) => {}
             }
         }
@@ -14399,48 +14402,6 @@ fn init_ref_child_table(conn: &rusqlite::Connection, parent_table: &str, name: &
         }
     }
 }
-
-/// Create the `_parent_id`-keyed child table for a relation field, recursing
-/// into the element schema's own ref/relation columns.
-fn init_rel_child_table(conn: &rusqlite::Connection, parent_table: &str, name: &str, schema: &RecordSchema) {
-    let child_name = child_table_name(parent_table, name);
-    let child = quote_ident(&child_name);
-
-    let mut col_defs = vec!["_parent_id INTEGER NOT NULL".to_string()];
-    for c in &schema.columns {
-        col_defs.push(format!("{} {}", quote_ident(&c.name), sql_type(c.ty)));
-    }
-    let sql = format!("CREATE TABLE IF NOT EXISTS {} ({});", child, col_defs.join(", "));
-    debug_sql(&sql);
-    conn.execute_batch(&sql).unwrap_or_else(|e| {
-        panic!(
-            "knot runtime: failed to create relation child table '{}': {}",
-            child_name, e
-        )
-    });
-
-    for c in &schema.columns {
-        if let Some(store) = &c.store {
-            match store.as_ref() {
-                FieldStore::AdtRef(_) | FieldStore::RecRef(_) => {
-                    init_ref_child_table(conn, &child_name, &c.name, store);
-                }
-                FieldStore::RelRef(child_schema) => {
-                    init_rel_child_table(conn, &child_name, &c.name, child_schema);
-                }
-                FieldStore::Column(_) => {}
-            }
-        }
-    }
-    for nf in &schema.nested {
-        init_rel_child_table(conn, &child_name, &nf.name, &RecordSchema {
-            columns: nf.columns.clone(),
-            nested: nf.nested.clone(),
-        });
-    }
-}
-
-
 
 /// Initialize a source table. Creates it if it doesn't exist.
 #[unsafe(no_mangle)]
@@ -15972,6 +15933,30 @@ fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nest
         .expect("knot runtime: failed to delete child rows");
 }
 
+/// Reclaim content-addressed ref child rows (payload ADT / record) that are no
+/// longer referenced by any remaining parent row's ref column. Used on the
+/// incremental per-parent delete path: after parent rows are removed, a shared
+/// child value survives only while some parent's ref column still points at it.
+fn reclaim_unref_ref_children(conn: &rusqlite::Connection, table_name: &str, schema: &RecordSchema) {
+    for c in &schema.columns {
+        match c.store.as_deref() {
+            Some(FieldStore::AdtRef(_)) | Some(FieldStore::RecRef(_)) => {
+                let child = child_table_name(table_name, &c.name);
+                let sql = format!(
+                    "DELETE FROM {} WHERE \"_hash\" NOT IN (SELECT {} FROM {});",
+                    quote_ident(&child),
+                    quote_ident(&c.name),
+                    quote_ident(table_name)
+                );
+                debug_sql(&sql);
+                conn.execute_batch(&sql)
+                    .expect("knot runtime: failed to reclaim unreferenced ref child rows");
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Delete the relation elements belonging to one parent (keyed by the parent's
 /// `_content_hash`), recursing into deeper nesting. Removes the parent's edges
 /// from the link table, then reclaims element rows whose last edge disappeared.
@@ -16261,8 +16246,8 @@ fn write_field_param(
             rec,
             value,
         )),
-        // A relation column has no in-row param (it lives in a `_parent_id`
-        // child table written separately); callers skip it for params.
+        // A relation column has no in-row param (it lives in element+link
+        // tables written separately); callers skip it for params.
         Some(FieldStore::RelRef(_)) => rusqlite::types::Value::Null,
         _ => value_to_sqlite(value, col.ty),
     }
@@ -17344,11 +17329,6 @@ pub extern "C-unwind" fn knot_source_diff_write(
     }
 }
 
-/// Check whether a SQLite table has a column with the given name.
-fn table_has_column(conn: &rusqlite::Connection, table: &str, col: &str) -> bool {
-    table_column_names(conn, table).iter().any(|n| n == col)
-}
-
 /// List a SQLite table's column names in declaration order.
 fn table_column_names(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
     let sql = format!("PRAGMA table_info({})", quote_ident(table));
@@ -17416,164 +17396,37 @@ pub extern "C-unwind" fn knot_source_delete_where(
         );
     }
 
-    // Cascade delete to child tables (nested relation fields) before
-    // deleting parent rows.  Discover ALL descendant tables by querying
-    // SQLite metadata for tables matching the `{parent}__{...}` pattern
-    // (including grandchildren like `{parent}__{field}__{subfield}`).
-    // Delete deepest tables first so FK ordering is respected.
+    // Cascade delete to child tables before deleting parent rows. Under the
+    // link model, relation children are keyed by the parent's `_content_hash`
+    // (not a rowid `_parent_id`), so drive the cascade from the source schema:
+    // collect the doomed parents' content-hash keys, reclaim their relation
+    // edges + orphaned elements (recursively), then the parent DELETE runs and
+    // unreferenced ref (ADT/record) children are reclaimed.
     let qt = quote_ident(&table);
-    let mut descendant_tables: Vec<String> = {
-        let prefix = format!("{}__", table);
-        let mut stmt = match db_ref
-            .conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?1")
-        {
-            Ok(s) => s,
-            Err(e) => {
-                rollback_delete_where(db_ref);
-                panic!(
-                    "knot runtime: failed to prepare descendant table query: {}",
-                    e
-                );
-            }
-        };
-        stmt.query_map([format!("{}%", prefix)], |row| row.get::<_, String>(0))
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.ok())
-            .filter(|n| n.starts_with(&prefix))
-            // Only include child tables that actually have a `_parent_id`
-            // column. An unrelated source whose name shares the `__`
-            // prefix (e.g. source `users__archive` produces table
-            // `_knot_users__archive`, a MAIN table without `_parent_id`)
-            // must NOT be treated as a child of `_knot_users`.
-            .filter(|n| table_has_column(&db_ref.conn, n, "_parent_id"))
-            .collect()
-    };
-    // Determine each descendant's immediate parent table. A nested field name
-    // may itself contain `__`, so the hierarchy CANNOT be inferred by counting
-    // `__` segments — `T__a__b` is a direct child whose field is `a__b` unless
-    // `T__a` is itself a real table (in which case it's a grandchild). Resolve
-    // this by taking the longest prefix (cut at a `__` boundary) that is an
-    // actual table; that prefix is the immediate parent.
-    let known_tables: HashSet<String> = descendant_tables
-        .iter()
-        .cloned()
-        .chain(std::iter::once(table.clone()))
-        .collect();
-    let immediate_parent = |ct: &str| -> Option<String> {
-        let bytes = ct.as_bytes();
-        let mut best: Option<&str> = None;
-        let mut i = 0usize;
-        while i + 1 < bytes.len() {
-            if bytes[i] == b'_' && bytes[i + 1] == b'_' {
-                let prefix = &ct[..i];
-                if prefix != ct && known_tables.contains(prefix) {
-                    best = Some(prefix); // longest match wins as we scan left→right
-                }
-            }
-            i += 1;
-        }
-        match best {
-            Some(p) if p == table => {
-                // If the best parent is the root but the table name has
-                // more `__` segments after the root prefix, the real
-                // intermediate parent is missing (likely an unrelated
-                // source table filtered out for lacking `_parent_id`).
-                // Exclude this table from the cascade.
-                let suffix = &ct[table.len() + 2..];
-                if suffix.contains("__") {
-                    None
-                } else {
-                    Some(p.to_string())
-                }
-            }
-            Some(p) => Some(p.to_string()),
-            None => None,
-        }
-    };
-    let parent_of: HashMap<String, String> = descendant_tables
-        .iter()
-        .filter_map(|ct| immediate_parent(ct).map(|p| (ct.clone(), p)))
-        .collect();
-    // Only cascade to tables whose parent chain is unbroken.
-    descendant_tables.retain(|ct| parent_of.contains_key(ct));
-    // Depth = length of the parent chain to the root `table`. Sort ascending so
-    // a grandchild's orphan check runs only after its intermediate parent rows
-    // are already deleted within this cascade.
-    let depth_of = |ct: &str| -> usize {
-        let mut depth = 0usize;
-        let mut cur = ct.to_string();
-        while cur != table {
-            match parent_of.get(&cur) {
-                Some(p) if *p != cur => {
-                    depth += 1;
-                    cur = p.clone();
-                }
-                _ => break,
-            }
-        }
-        depth
-    };
-    descendant_tables.sort_by_key(|t| depth_of(t));
-    if !descendant_tables.is_empty() {
-        // Collect _ids of parent rows that will be deleted
-        let id_sql = format!("SELECT _id FROM {} WHERE NOT ({});", qt, where_clause);
-        debug_sql(&id_sql);
-        {
-            // Collect the _ids of parent rows that will be deleted. A failure
-            // here must NOT silently skip the cascade: the parent DELETE below
-            // still runs, so orphaned child rows would be left with a dangling
-            // _parent_id. Roll back and surface the error, matching the cascade
-            // DELETE and parent DELETE error paths. (The previous `if let Ok`
-            // swallowed a prepare failure, and `filter_map(|r| r.ok())` dropped
-            // per-row errors, both of which produced an empty `ids` and a
-            // partial cascade.)
-            let ids: Vec<i64> = match (|| -> rusqlite::Result<Vec<i64>> {
-                let mut stmt = db_ref.conn.prepare(&id_sql)?;
-                let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, i64>(0))?;
+    if let Some(rec_schema) = get_source_schema(name) {
+        if !rec_schema.nested.is_empty() {
+            // Collect the doomed parents' `_content_hash` keys (the link-table
+            // parent key). A failure here must NOT silently skip the cascade.
+            let key_sql = format!("SELECT \"_content_hash\" FROM {} WHERE NOT ({});", qt, where_clause);
+            debug_sql(&key_sql);
+            let keys: Vec<String> = match (|| -> rusqlite::Result<Vec<String>> {
+                let mut stmt = db_ref.conn.prepare(&key_sql)?;
+                let rows = stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))?;
                 rows.collect()
             })() {
-                Ok(ids) => ids,
+                Ok(k) => k,
                 Err(e) => {
                     rollback_delete_where(db_ref);
                     panic!(
                         "knot runtime: delete_where cascade error: {}\n  SQL: {}",
-                        e, id_sql
+                        e, key_sql
                     );
                 }
             };
-            if !ids.is_empty() {
-                for ct in &descendant_tables {
-                    let parent_table = &parent_of[ct];
-                    let del = if parent_table == &table {
-                        // Direct child: the root rows aren't deleted yet, so
-                        // delete by the explicit list of doomed parent _ids.
-                        format!(
-                            "DELETE FROM {} WHERE _parent_id IN ({})",
-                            quote_ident(ct),
-                            ids.iter()
-                                .map(|id| id.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        )
-                    } else {
-                        // Deeper descendant: its intermediate parent rows are
-                        // already gone, so delete rows orphaned by that.
-                        format!(
-                            "DELETE FROM {} WHERE _parent_id NOT IN (SELECT _id FROM {})",
-                            quote_ident(ct),
-                            quote_ident(parent_table)
-                        )
-                    };
-                    debug_sql(&del);
-                    if let Err(e) = db_ref.conn.execute_batch(&del) {
-                        rollback_delete_where(db_ref);
-                        panic!(
-                            "knot runtime: delete_where cascade error: {}\n  SQL: {}",
-                            e, del
-                        );
-                    }
+            for parent_key in &keys {
+                for nf in &rec_schema.nested {
+                    let child_table = child_table_name(&table, &nf.name);
+                    delete_child_rows_for_parent(&db_ref.conn, &child_table, parent_key, nf);
                 }
             }
         }
@@ -17625,6 +17478,12 @@ pub extern "C-unwind" fn knot_source_delete_where(
         // DELETE fails (e.g. subset-constraint BEFORE DELETE trigger).
         rollback_delete_where(db_ref);
         panic!("knot runtime: delete_where error: {}\n  SQL: {}", e, sql);
+    }
+
+    // Reclaim content-addressed ref child rows (payload ADT / record) no longer
+    // referenced by any remaining parent row's ref column.
+    if let Some(rec_schema) = get_source_schema(name) {
+        reclaim_unref_ref_children(&db_ref.conn, &table, &rec_schema);
     }
 
     db_ref
@@ -19376,6 +19235,12 @@ pub extern "C-unwind" fn knot_view_write(
         if !rows.is_empty() {
             write_record_rows(&db_ref.conn, &table_name, &rec_schema, rows);
         }
+
+        // 3. Reclaim content-addressed ref child rows (payload ADT / record) no
+        //    longer referenced by any remaining parent row. Runs after delete +
+        //    insert so both surviving and newly-written parents count as
+        //    references.
+        reclaim_unref_ref_children(&db_ref.conn, &table_name, &rec_schema);
     });
 
     db_ref

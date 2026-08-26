@@ -17396,9 +17396,9 @@ pub extern "C-unwind" fn knot_source_delete_where(
         );
     }
 
-    // Cascade delete to child tables before deleting parent rows. Under the
-    // link model, relation children are keyed by the parent's `_content_hash`
-    // (not a rowid `_parent_id`), so drive the cascade from the source schema:
+    // Cascade delete to child tables before deleting parent rows. Relation
+    // children are keyed by the parent's `_content_hash` (not a rowid), so drive
+    // the cascade from the source schema:
     // collect the doomed parents' content-hash keys, reclaim their relation
     // edges + orphaned elements (recursively), then the parent DELETE runs and
     // unreferenced ref (ADT/record) children are reclaimed.
@@ -18573,7 +18573,7 @@ pub extern "C-unwind" fn knot_constraint_register(
                 format!("{ch} IS NEW.{ch}")
             } else {
                 cols.iter()
-                    .filter(|c| c.as_str() != "_id" && c.as_str() != "_parent_id")
+                    .filter(|c| c.as_str() != "_id")
                     .map(|c| {
                         let q = quote_ident(c);
                         format!("{q} IS NEW.{q}")

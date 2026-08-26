@@ -286,3 +286,51 @@ Rel PersonV2  *people
         "must not fall through to the misleading codegen message: {stderr}"
     );
 }
+
+/// A source may stage at most one pending migration (its `from` is derived from
+/// the lock, which is unambiguous only for a single step). Two `migrate` clauses
+/// on one source are a build error — and `knot lock` rejects them too (both parse
+/// the same source through the same diagnostic).
+#[test]
+fn multiple_pending_migrations_on_one_source_is_an_error() {
+    let dir = dir_for("mig_two_pending");
+    let two = r#"with {
+V1  {name Text}
+V2  {name Text  active Text}
+V3  {name Text  active Text  extra Text}
+Rel V3  *people
+  migrate to V2 using \p -> {name p.name  active "yes"}
+  migrate to V3 using \p -> {name p.name  active p.active  extra "x"}
+}
+(do
+  yield {})"#;
+    std::fs::write(dir.join("mig_two_pending.knot"), two).unwrap();
+
+    // knot build
+    let build = std::process::Command::new(knot_bin())
+        .arg("build")
+        .arg(dir.join("mig_two_pending.knot"))
+        .arg("-o")
+        .arg(dir.join("mig_two_pending"))
+        .output()
+        .expect("knot build");
+    assert!(!build.status.success(), "two pending migrations must fail the build");
+    assert!(
+        String::from_utf8_lossy(&build.stderr).contains("more than one pending `migrate` clause"),
+        "build error names the problem: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
+    // knot lock
+    let lock = std::process::Command::new(knot_bin())
+        .arg("lock")
+        .arg(dir.join("mig_two_pending.knot"))
+        .output()
+        .expect("knot lock");
+    assert!(!lock.status.success(), "two pending migrations must fail the lock");
+    assert!(
+        String::from_utf8_lossy(&lock.stderr).contains("more than one pending `migrate` clause"),
+        "lock error names the problem: {}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+}

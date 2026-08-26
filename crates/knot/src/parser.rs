@@ -2593,6 +2593,19 @@ impl Parser {
                         let bare = n.trim_start_matches('*').to_string();
                         let mut migrations = Vec::new();
                         while let Some(m) = self.parse_source_field_migration() {
+                            // At most one pending migration per source: a staged
+                            // `migrate` derives its pre-migration schema from the
+                            // lock, which only works for a single step. A second
+                            // block before `knot lock` would have an ambiguous `from`.
+                            if !migrations.is_empty() {
+                                self.error_at(
+                                    m.span,
+                                    format!(
+                                        "source '*{}' has more than one pending `migrate` clause",
+                                        bare
+                                    ),
+                                );
+                            }
                             migrations.push(m);
                         }
                         // A source type is a plain Type; the sig branch parsed a

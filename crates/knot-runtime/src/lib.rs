@@ -13752,10 +13752,17 @@ fn parse_field_store(type_str: &str) -> FieldStore {
 /// `adt#..` composite, or a bare scalar/json token. Returns a child
 /// `RecordSchema` whose `columns`/`nested` describe one element row.
 fn parse_relation_element_schema(inner: &str) -> RecordSchema {
-    // Legacy record-element form: `[name:text,age:int]` (a bare field list, no
-    // `rec#` prefix). Treat it as the child schema directly.
-    if !inner.starts_with("rec#")
-        && !inner.starts_with("adt#")
+    // Record element: either the legacy bare field list `[name:text,age:int]`
+    // or the recursive `rec#[name:text,legs:int]`. Both are the child schema
+    // directly (the element IS the record).
+    if let Some(rec) = inner.strip_prefix("rec#") {
+        let body = rec
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(rec);
+        return parse_record_schema(body);
+    }
+    if !inner.starts_with("adt#")
         && inner.contains(':')
         && !inner.starts_with('[')
     {

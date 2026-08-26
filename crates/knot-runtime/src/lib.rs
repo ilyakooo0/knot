@@ -13972,27 +13972,6 @@ fn parse_adt_schema(spec: &str) -> AdtSpec {
     adt
 }
 
-/// Split a string by `sep` while respecting `[...]`/`{...}`/`(...)` nesting.
-/// (Used by the TUI's descriptor rendering.)
-pub(crate) fn split_respecting_brackets(s: &str, sep: char) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut start = 0;
-    for (i, c) in s.char_indices() {
-        match c {
-            '[' | '{' | '(' => depth += 1,
-            ']' | '}' | ')' => depth = depth.saturating_sub(1),
-            c if c == sep && depth == 0 => {
-                parts.push(&s[start..i]);
-                start = i + c.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(&s[start..]);
-    parts
-}
-
 fn parse_col_type(s: &str) -> ColType {
     match s {
         "Int" => ColType::Int,
@@ -14192,7 +14171,7 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
 }
 
 /// Create a record table and any child tables for nested relation fields.
-/// Tables with nested children get `_id INTEGER PRIMARY KEY AUTOINCREMENT`.
+/// Tables with nested children get a `_content_hash TEXT` identity column.
 fn init_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &RecordSchema) {
     let table = quote_ident(table_name);
     let has_children = !schema.nested.is_empty();
@@ -14201,13 +14180,12 @@ fn init_record_table(conn: &rusqlite::Connection, table_name: &str, schema: &Rec
     let mut unique_cols: Vec<String> = Vec::new();
 
     if has_children {
-        col_defs.push("_id INTEGER PRIMARY KEY AUTOINCREMENT".to_string());
         // Parent identity for tables with nested children is the hash of the
         // *whole* record (scalars + nested content), not the scalar columns
         // alone. Without this, two records that differ only in their nested
         // fields collapse onto one parent under INSERT OR IGNORE and have their
         // children merged. `_content_hash` is internal (never read back into a
-        // Knot value — `read_record_table` selects only `_id` + scalar columns).
+        // Knot value — `read_record_table` selects only scalar columns).
         col_defs.push("_content_hash TEXT".to_string());
     }
 
@@ -14454,6 +14432,13 @@ fn init_ref_child_table(conn: &rusqlite::Connection, parent_table: &str, name: &
                 }
                 FieldStore::Column(_) => {}
             }
+        }
+    }
+    // A record's relation fields live in `nested` (not `columns`): create their
+    // child tables too, so the write/read/reclaim paths find them.
+    if let FieldStore::RecRef(rec) = store {
+        for nf in &rec.nested {
+            init_child_table(conn, &child_name, nf);
         }
     }
 }
@@ -15241,7 +15226,6 @@ pub extern "C-unwind" fn knot_source_read_where(
 
         let mut select_cols: Vec<String> = Vec::new();
         if has_children {
-            select_cols.push(quote_ident("_id"));
             select_cols.push(quote_ident("_content_hash"));
         }
         for c in &rec.columns {
@@ -15275,7 +15259,7 @@ pub extern "C-unwind" fn knot_source_read_where(
         {
             let total_fields = rec.columns.len() + rec.nested.len();
             let record = knot_record_empty(total_fields);
-            let col_offset = if has_children { 2 } else { 0 }; // skip _id + _content_hash
+            let col_offset = if has_children { 1 } else { 0 }; // skip _content_hash
 
             for (i, col) in rec.columns.iter().enumerate() {
                 let val = read_sql_column(row, i + col_offset, col.ty);
@@ -15284,7 +15268,7 @@ pub extern "C-unwind" fn knot_source_read_where(
             }
 
             if has_children {
-                let parent_key: String = row.get(1).expect("knot runtime: parent _content_hash missing");
+                let parent_key: String = row.get(0).expect("knot runtime: parent _content_hash missing");
                 for nf in &rec.nested {
                     let child_table_name = child_table_name(&table_name, &nf.name);
                     let val = read_child_table(&db_ref.conn, &child_table_name, nf, &parent_key);
@@ -15563,9 +15547,16 @@ fn read_rec_value(
     hash: &[u8],
 ) -> *mut Value {
     let select_cols: Vec<String> = schema.columns.iter().map(|c| quote_ident(&c.name)).collect();
+    // A record whose fields are all relations has no scalar columns — select a
+    // constant so the SQL is valid (we only need the row's existence + hash).
+    let select_list = if select_cols.is_empty() {
+        "1".to_string()
+    } else {
+        select_cols.join(", ")
+    };
     let sql = format!(
         "SELECT {} FROM {} WHERE {} = ?1 LIMIT 1;",
-        select_cols.join(", "),
+        select_list,
         quote_ident(child_table),
         quote_ident("_hash")
     );
@@ -15586,10 +15577,19 @@ fn read_rec_value(
             )
         });
 
-    let record = knot_record_empty(schema.columns.len());
+    let total = schema.columns.len() + schema.nested.len();
+    let record = knot_record_empty(total);
     for (i, col) in schema.columns.iter().enumerate() {
         let val = read_field_value(conn, child_table, row, i, col);
         let name = col.name.as_bytes();
+        knot_record_set_field(record, name.as_ptr(), name.len(), val);
+    }
+    // Relation fields live in child tables keyed by this row's `_hash`.
+    let key = hash.iter().map(|b| format!("{:02x}", b)).collect::<String>();
+    for nf in &schema.nested {
+        let child = child_table_name(child_table, &nf.name);
+        let val = read_child_table(conn, &child, nf, &key);
+        let name = nf.name.as_bytes();
         knot_record_set_field(record, name.as_ptr(), name.len(), val);
     }
     record
@@ -15647,7 +15647,6 @@ fn read_record_table_paged(
     // (+ rowid when paging). `_content_hash` is the link-table parent key.
     let mut select_cols: Vec<String> = Vec::new();
     if has_children {
-        select_cols.push(quote_ident("_id"));
         select_cols.push(quote_ident("_content_hash"));
     }
     for c in &schema.columns {
@@ -15695,7 +15694,7 @@ fn read_record_table_paged(
         }
         let total_fields = schema.columns.len() + schema.nested.len();
         let record = knot_record_empty(total_fields);
-        let col_offset = if has_children { 2 } else { 0 }; // skip _id + _content_hash
+        let col_offset = if has_children { 1 } else { 0 }; // skip _content_hash
 
         // Read scalar columns. An AdtRef column holds the value's content hash;
         // resolve it against the child table to rebuild the Constructor.
@@ -15706,9 +15705,9 @@ fn read_record_table_paged(
         }
 
         // Read nested relation fields from child tables, keyed by the parent's
-        // `_content_hash` (column index 1).
+        // `_content_hash` (column index 0).
         if has_children {
-            let parent_key: String = row.get(1).expect("knot runtime: parent _content_hash missing");
+            let parent_key: String = row.get(0).expect("knot runtime: parent _content_hash missing");
             for nf in &schema.nested {
                 let child_table_name = child_table_name(table_name, &nf.name);
                 let val = read_child_table(conn, &child_table_name, nf, &parent_key);
@@ -15932,10 +15931,19 @@ fn delete_ref_child_tree(conn: &rusqlite::Connection, parent_table: &str, name: 
             }
         }
         FieldStore::RelRef(rel) => {
-            // Wipe the relation's element child table (and its nested refs).
+            // Wipe the relation's element child table (and its nested refs). An
+            // element that is itself a relation (Rel (Rel T)) has `_value` as a
+            // RelRef — a relation child, not a ref child.
             for c in &rel.columns {
                 if let Some(sub) = &c.store {
-                    delete_ref_child_tree(conn, &child, &c.name, sub);
+                    match sub.as_ref() {
+                        FieldStore::RelRef(inner) => delete_rel_child_tree(conn, &child, &NestedField {
+                            name: c.name.clone(),
+                            columns: inner.columns.clone(),
+                            nested: inner.nested.clone(),
+                        }),
+                        _ => delete_ref_child_tree(conn, &child, &c.name, sub),
+                    }
                 }
             }
             for nf in &rel.nested {
@@ -15955,7 +15963,17 @@ fn delete_rel_child_tree(conn: &rusqlite::Connection, parent_table: &str, nf: &N
     let child = child_table_name(parent_table, &nf.name);
     for c in &nf.columns {
         if let Some(sub) = &c.store {
-            delete_ref_child_tree(conn, &child, &c.name, sub);
+            match sub.as_ref() {
+                // A relation element that is itself a relation (Rel (Rel T)):
+                // its `_value` column is a RelRef, which is a relation child
+                // (element+link tables), not a content-addressed ref child.
+                FieldStore::RelRef(rel) => delete_rel_child_tree(conn, &child, &NestedField {
+                    name: c.name.clone(),
+                    columns: rel.columns.clone(),
+                    nested: rel.nested.clone(),
+                }),
+                _ => delete_ref_child_tree(conn, &child, &c.name, sub),
+            }
         }
     }
     for grandchild in &nf.nested {
@@ -16279,6 +16297,23 @@ fn insert_rec_value(
         guard_hash_collision(conn, child_table, &hash_bytes, &content_cols, &params[1..]);
     }
 
+    // Relation fields live in child tables keyed by this row's `_hash`. Write
+    // each relation's elements + link edges (replacing any prior set).
+    let key: String = hash_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    for nf in &schema.nested {
+        let child = child_table_name(child_table, &nf.name);
+        let rel_val = field_map.get(nf.name.as_str()).copied().unwrap_or(std::ptr::null_mut());
+        let elems: &[*mut Value] = if rel_val.is_null() {
+            &[]
+        } else {
+            match unsafe { as_ref(rel_val) } {
+                Value::Relation(rows) => rows.as_slice(),
+                _ => &[],
+            }
+        };
+        write_child_rows(conn, &child, nf, &key, elems);
+    }
+
     hash_bytes
 }
 
@@ -16354,11 +16389,9 @@ fn write_record_rows(
     }
     let placeholders: Vec<String> = (1..=insert_cols.len()).map(|i| format!("?{}", i)).collect();
 
-    // Use INSERT OR IGNORE to handle duplicate rows gracefully, then (for tables
-    // with children) look up the existing _id if the insert was ignored.
-    // `insert_cols` is never empty here: the unit-type case (no scalars, no
-    // children) returned early above, and children always contribute
-    // `_content_hash`.
+    // Use INSERT OR IGNORE to handle duplicate rows gracefully. `insert_cols` is
+    // never empty here: the unit-type case (no scalars, no children) returned
+    // early above, and children always contribute `_content_hash`.
     let insert_sql = format!(
         "INSERT OR IGNORE INTO {} ({}) VALUES ({});",
         table,
@@ -18631,7 +18664,7 @@ pub extern "C-unwind" fn knot_constraint_register(
                 format!("{ch} IS NEW.{ch}")
             } else {
                 cols.iter()
-                    .filter(|c| c.as_str() != "_id")
+                    .filter(|c| c.as_str() != "_content_hash")
                     .map(|c| {
                         let q = quote_ident(c);
                         format!("{q} IS NEW.{q}")
@@ -18997,14 +19030,13 @@ pub extern "C-unwind" fn knot_view_read(
 
     // Build the SELECT column list. When the view exposes nested relation
     // fields (stored in child tables `_knot_<name>__<field>`), also select the
-    // parent `_id` so each row can be joined to its child rows — the same shape
-    // `read_record_table` and `knot_view_write` use for nested sources.
+    // parent `_content_hash` so each row can be joined to its child rows — the
+    // same shape `read_record_table` and `knot_view_write` use for nested sources.
     let table_name = format!("_knot_{}", name);
     let has_children = !rec_schema.nested.is_empty();
 
     let mut select_cols: Vec<String> = Vec::new();
     if has_children {
-        select_cols.push(quote_ident("_id"));
         select_cols.push(quote_ident("_content_hash"));
     }
     for c in &rec_schema.columns {
@@ -19047,8 +19079,8 @@ pub extern "C-unwind" fn knot_view_read(
         .query(param_refs.as_slice())
         .unwrap_or_else(|e| panic!("knot runtime: view_read exec error: {}", e));
 
-    // Scalar columns start after the leading `_id` + `_content_hash` when children are present.
-    let col_offset = if has_children { 2 } else { 0 };
+    // Scalar columns start after the leading `_content_hash` when children are present.
+    let col_offset = if has_children { 1 } else { 0 };
     while let Some(row) = result_rows
         .next()
         .unwrap_or_else(|e| panic!("knot runtime: view_read fetch error: {}", e))
@@ -19066,7 +19098,7 @@ pub extern "C-unwind" fn knot_view_read(
         // Nested relation fields, reassembled from their child tables keyed on
         // the parent `_content_hash` (same path as `read_record_table`).
         if has_children {
-            let parent_key: String = row.get(1).expect("knot runtime: parent _content_hash missing");
+            let parent_key: String = row.get(0).expect("knot runtime: parent _content_hash missing");
             for nf in &rec_schema.nested {
                 let child_table_name = child_table_name(&table_name, &nf.name);
                 let val = read_child_table(&db_ref.conn, &child_table_name, nf, &parent_key);

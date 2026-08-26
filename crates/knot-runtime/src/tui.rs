@@ -43,47 +43,99 @@ struct AdtCtor {
 }
 
 // ── Schema parsing ───────────────────────────────────────────────
+//
+// The descriptor is knot-type syntax (see `field_type_desc` in the compiler):
+//   scalar    Int | Float | Text | Bool | Bytes | Uuid
+//   record    {field Kind  field2 Kind2}
+//   relation  (Rel Kind)
+//   ADT       (Ctor | Ctor{field Kind})
+// The TUI only needs field names and a display string per field, so we parse
+// shallowly: top-level record fields, or an ADT's constructors.
 
 fn parse_schema_kind(schema: &str) -> SchemaKind {
-    if schema.is_empty() {
+    let t = schema.trim();
+    if t.is_empty() {
         return SchemaKind::Unit;
     }
-    if let Some(body) = schema.strip_prefix('#') {
+    if t.starts_with('(') && t.ends_with(')') {
+        // ADT: split top-level `|`, each ctor is `Name` or `Name{...}`.
+        let inner = &t[1..t.len() - 1];
         let mut ctors = Vec::new();
-        for ctor_part in crate::split_respecting_brackets(body, '|') {
+        for ctor_part in split_toplevel(inner, '|') {
+            let ctor_part = ctor_part.trim();
             if ctor_part.is_empty() {
                 continue;
             }
-            let mut parts = ctor_part.splitn(2, ':');
-            let name = parts.next().unwrap().to_string();
-            let fields = if let Some(field_spec) = parts.next() {
-                crate::split_respecting_brackets(field_spec, ';')
-                    .into_iter()
-                    .map(|f| {
-                        let mut fp = f.splitn(2, '=');
-                        let fname = fp.next().unwrap().to_string();
-                        let fty = fp.next().unwrap_or("text").to_string();
-                        (fname, fty)
-                    })
-                    .collect()
+            if let Some(brace) = ctor_part.find('{') {
+                let name = ctor_part[..brace].trim().to_string();
+                let fields = parse_record_fields(&ctor_part[brace..]);
+                ctors.push(AdtCtor { name, fields });
             } else {
-                Vec::new()
-            };
-            ctors.push(AdtCtor { name, fields });
+                ctors.push(AdtCtor { name: ctor_part.to_string(), fields: Vec::new() });
+            }
         }
         SchemaKind::Adt(ctors)
     } else {
-        let fields: Vec<(String, String)> = crate::split_respecting_brackets(schema, ',')
-            .into_iter()
-            .filter_map(|part| {
-                let colon = part.find(':')?;
-                let name = part[..colon].to_string();
-                let ty = part[colon + 1..].to_string();
-                Some((name, ty))
-            })
-            .collect();
-        SchemaKind::Record(fields)
+        SchemaKind::Record(parse_record_fields(t))
     }
+}
+
+/// Parse `{name Kind  name2 Kind2}` into (name, kind) pairs.
+fn parse_record_fields(s: &str) -> Vec<(String, String)> {
+    let t = s.trim();
+    let inner = match t.strip_prefix('{').and_then(|x| x.strip_suffix('}')) {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let bytes = inner.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() { i += 1; }
+        if i >= bytes.len() { break; }
+        let name_start = i;
+        while i < bytes.len() && ((bytes[i] as char).is_alphanumeric() || bytes[i] == b'_') { i += 1; }
+        let name = &inner[name_start..i];
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() { i += 1; }
+        let kind_start = i;
+        if i < bytes.len() && (bytes[i] == b'{' || bytes[i] == b'(' || bytes[i] == b'[') {
+            let open = bytes[i];
+            let close = match open { b'{' => b'}', b'(' => b')', _ => b']' };
+            let mut depth = 0usize;
+            while i < bytes.len() {
+                if bytes[i] == open { depth += 1; }
+                else if bytes[i] == close { depth -= 1; if depth == 0 { i += 1; break; } }
+                i += 1;
+            }
+        } else {
+            while i < bytes.len() && ((bytes[i] as char).is_alphanumeric() || bytes[i] == b'_') { i += 1; }
+        }
+        let kind = &inner[kind_start..i];
+        if !name.is_empty() {
+            out.push((name.to_string(), kind.to_string()));
+        }
+    }
+    out
+}
+
+/// Split on `sep` at the top nesting level (respecting `{...}`/`(...)`/`[...]`).
+fn split_toplevel(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth = depth.saturating_sub(1),
+            c if c == sep && depth == 0 => {
+                parts.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
 }
 
 // ── Data loading ─────────────────────────────────────────────────

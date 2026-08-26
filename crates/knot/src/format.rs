@@ -850,8 +850,7 @@ fn render_expr_inline(e: &Expr, parent: Prec) -> String {
             let mut s = format!("{}  *{}", render_type(ty), name);
             for m in migrations {
                 s.push_str(&format!(
-                    " migrate to {} using {}",
-                    render_type(&m.to_ty),
+                    " migrate from _ using {}",
                     render_expr_inline(&m.using_fn, Prec::Lowest)
                 ));
             }

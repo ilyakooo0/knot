@@ -4,9 +4,10 @@
 -- current schema; history lives in `<name>.schema.lock` (append-only, owned by
 -- `knot lock`, never written by `knot build`). To change a schema:
 --
---   1. Edit the schema and add a pending `migrate to New using <fn>` block
---      (no `from` — it is derived from the lock's last schema). `using` is a
---      hand-written upgrade applied to each stored row.
+--   1. Edit the schema and add a pending `migrate from _ using <fn>` block
+--      (the old schema is derived from the lock's last schema; the target is
+--      this source's declared type). `using` is a hand-written upgrade applied
+--      to each stored row.
 --   2. `knot build` warns the migration is uncommitted, and running the binary
 --      applies it on a FORK of the database — the main DB is never touched.
 --   3. `knot lock` commits the migration into the lock and strips the block

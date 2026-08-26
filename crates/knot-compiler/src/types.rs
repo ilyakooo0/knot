@@ -355,7 +355,7 @@ impl TypeEnv {
                         &single_variant_params,
                         &multi_variant_params,
                     );
-                    source_schemas.insert(name.clone(), schema);
+                    source_schemas.insert(name.clone(), schema.clone());
                     let refinements = collect_source_refinements(
                         ty,
                         &refined_types,
@@ -365,23 +365,13 @@ impl TypeEnv {
                     if !refinements.is_empty() {
                         source_refinements.insert(name.clone(), refinements);
                     }
-                    for m in migrations {
-                        let unwrap_relation = |r: ResolvedType| match r {
-                            ResolvedType::Relation(inner) => *inner,
-                            other => other,
-                        };
-                        let new_resolved = unwrap_relation(resolve_type(
-                            &m.to_ty,
-                            &aliases,
-                            &associated_types,
-                            &single_variant_params,
-                            &multi_variant_params,
-                        ));
-                        let new_schema = relation_inner_schema(&new_resolved, &aliases);
+                    for _m in migrations {
+                        // The migration's target is the source's own declared
+                        // schema (`migrate from _ using f` carries no `to`).
                         // Only the pending target schema is recorded; the
                         // pre-migration schema is derived from the schema lock
                         // (see `lockfile`). One pending migration per source.
-                        migrate_schemas.insert(name.clone(), new_schema);
+                        migrate_schemas.insert(name.clone(), schema.clone());
                     }
                 }
                 _ => {}
@@ -797,18 +787,16 @@ pub fn check_reserved_field_names(program: &Expr) -> Vec<knot::diagnostic::Diagn
         diags: Vec::new(),
     };
     // Every record-embedded source (`{ *todos : [Todo] migrate … }`) persists
-    // a table — walk the source element type and the target of every attached
-    // migrate clause (the pre-migration schema lives in the lock, not the AST).
+    // a table — walk the source element type (the migration's target is the
+    // source's own type; the pre-migration schema lives in the lock, not the
+    // AST, so there's no separate `to` type to walk).
     let mut sources: Vec<(&str, &knot::ast::Type, &[knot::ast::SourceMigration])> = Vec::new();
     walk_record_sources(program, &mut |name, ty, migrations| {
         sources.push((name, ty, migrations));
     });
-    for (name, ty, migrations) in sources {
+    for (name, ty, _migrations) in sources {
         walker.relation = name.to_string();
         walker.walk(ty, &mut HashSet::new());
-        for m in migrations {
-            walker.walk(&m.to_ty, &mut HashSet::new());
-        }
     }
     walker.diags
 }

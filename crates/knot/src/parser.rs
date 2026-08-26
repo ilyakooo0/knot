@@ -2955,23 +2955,22 @@ impl Parser {
         let prev_block_indent = self.block_indent;
         self.block_indent = self.cur_column();
 
-        if !matches!(self.peek(), TokenKind::Lower(s) if s == "to") {
-            self.error("expected 'to' in source migration");
+        // `migrate from _ using <fn>` — the old schema is the lock's recorded
+        // one (not named in source; `_` marks where it plugs in), and the
+        // target is the source's own declared type, so no `to` annotation.
+        if !matches!(self.peek(), TokenKind::Lower(s) if s == "from") {
+            self.error("expected 'from' in source migration");
             self.block_indent = prev_block_indent;
             return None;
         }
         self.advance();
-
-        self.stop_type_at_migrate_clauses = true;
-        let to_ty = match self.parse_type() {
-            Some(t) => t,
-            None => {
-                self.stop_type_at_migrate_clauses = false;
-                self.block_indent = prev_block_indent;
-                return None;
-            }
-        };
-        self.stop_type_at_migrate_clauses = false;
+        self.skip_newlines();
+        if !matches!(self.peek(), TokenKind::Underscore) {
+            self.error("expected '_' in source migration (the old schema is derived from the schema lock)");
+            self.block_indent = prev_block_indent;
+            return None;
+        }
+        self.advance();
 
         self.skip_newlines();
         if !matches!(self.peek(), TokenKind::Lower(s) if s == "using") {
@@ -2987,11 +2986,7 @@ impl Parser {
         let using_fn = self.parse_expr()?;
         self.block_indent = prev_block_indent;
         let span = crate::ast::Span::new(migrate_start, using_fn.span.end);
-        Some(crate::ast::SourceMigration {
-            to_ty,
-            using_fn,
-            span,
-        })
+        Some(crate::ast::SourceMigration { using_fn, span })
     }
 
     fn parse_list_expr(&mut self, start: Span) -> Option<Expr> {

@@ -2,7 +2,7 @@
 //!
 //! The lock (`<name>.schema.lock`) is the append-only, build-input owner of
 //! migration history. Source holds only the current schema plus at most one
-//! pending `migrate to … using …` block (no `from` — derived from the lock).
+//! pending `migrate from _ using …` block (the old schema is derived from the lock).
 //! `knot lock` snapshots schemas and promotes pending migrations into the
 //! lock, stripping the clause from source. A binary carrying an uncommitted
 //! migration opens a content-hashed FORK of the database, never touching the
@@ -49,7 +49,7 @@ Active  Yes {}  No {}
 PersonV1  {name Text}
 PersonV2  {name Text  active Active}
 Rel PersonV2  *people
-  migrate to PersonV2 using \p -> {name p.name  active (Active.Yes {})}
+  migrate from _ using \p -> {name p.name  active (Active.Yes {})}
 }
 (do
   rows <- *people
@@ -198,7 +198,7 @@ Active  Yes {}  No {}
 PersonV1  {name Text}
 PersonV2  {name Text  active Active}
 Rel PersonV2  *people
-  migrate to PersonV2 using \p -> {wrongfield p.name}
+  migrate from _ using \p -> {wrongfield p.name}
 }
 (do
   yield {})"#;
@@ -226,7 +226,7 @@ Active  Yes {}  No {}
 PersonV1  {name Text}
 PersonV2  {name Text  active Active}
 Rel PersonV2  *people
-  migrate to PersonV2 using \p -> {name p.nonexistent  active (Active.Yes {})}
+  migrate from _ using \p -> {name p.nonexistent  active (Active.Yes {})}
 }
 (do
   yield {})"#;
@@ -299,8 +299,8 @@ V1  {name Text}
 V2  {name Text  active Text}
 V3  {name Text  active Text  extra Text}
 Rel V3  *people
-  migrate to V2 using \p -> {name p.name  active "yes"}
-  migrate to V3 using \p -> {name p.name  active p.active  extra "x"}
+  migrate from _ using \p -> {name p.name  active "yes"}
+  migrate from _ using \p -> {name p.name  active p.active  extra "x"}
 }
 (do
   yield {})"#;
@@ -360,7 +360,7 @@ Rel V1  *people
 V1  {name Text}
 V2  {name Text  active Text}
 Rel V2  *people
-  migrate to V2 using \p -> {name p.name  active "UP"}
+  migrate from _ using \p -> {name p.name  active "UP"}
 }
 (do
   yield {})"#;
@@ -372,7 +372,7 @@ Rel V2  *people
 V1  {name Text}
 V2  {name Text  active Text}
 Rel V1  *people
-  migrate to V1 using \p -> {name p.name}
+  migrate from _ using \p -> {name p.name}
 }
 (do
   yield {})"#;

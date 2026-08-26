@@ -743,13 +743,13 @@ pub struct RecordField {
 }
 
 /// A migration attached to a record-embedded source field:
-/// `*todos : [Todo] migrate to New using f`. The pre-migration schema is not
-/// named — it is derived from the last schema recorded in the schema lock.
+/// `*todos : [Todo] migrate from _ using f`. The pre-migration schema (`from _`)
+/// is not named — it is derived from the last schema recorded in the schema
+/// lock. The target schema is the source's own declared type.
 #[derive(Debug, Clone)]
 pub struct SourceMigration {
-    pub to_ty: Type,
     pub using_fn: Expr,
-    /// Span covering the whole `migrate to … using …` clause (from the
+    /// Span covering the whole `migrate from _ using …` clause (from the
     /// `migrate` keyword to the end of `using_fn`). `knot lock` excises this
     /// exact range to strip the clause from the source.
     pub span: Span,

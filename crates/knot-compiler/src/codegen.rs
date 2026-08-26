@@ -1635,7 +1635,8 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
         // Schema tracking
         self.declare_rt("knot_schema_init", &[p], &[]);
-        self.declare_rt("knot_source_migrate", &[p, p, p, p, p, p, p, p], &[]);
+        // migrate carries its chain step index (I64) as the migration cursor.
+        self.declare_rt("knot_source_migrate", &[p, p, p, p, p, p, p, types::I64, p], &[]);
         self.declare_rt(
             "knot_source_migrate_preview",
             &[p, p, p, p, p, p, p, p],
@@ -4509,13 +4510,14 @@ impl<M: cranelift_module::Module> Codegen<M> {
                     steps.push((from, to, using_ast.clone()));
                 }
 
-                for (old_schema, new_schema, using_fn) in steps {
+                for (step_idx, (old_schema, new_schema, using_fn)) in steps.iter().enumerate() {
                     let (name_ptr, name_len) = cg.string_ptr(builder, &relation);
                     let (old_ptr, old_len) = cg.string_ptr(builder, &old_schema);
                     let (new_ptr, new_len) = cg.string_ptr(builder, &new_schema);
 
                     let mut env = Env::new();
                     let migrate_fn_val = cg.compile_expr(builder, &using_fn, &mut env, db);
+                    let step_val = builder.ins().iconst(types::I64, step_idx as i64);
 
                     // Validate refinements on the transformed rows before
                     // committing the migration (see the longer comment that was
@@ -4538,7 +4540,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                         "knot_source_migrate",
                         &[
                             db, name_ptr, name_len, old_ptr, old_len, new_ptr, new_len,
-                            migrate_fn_val,
+                            step_val, migrate_fn_val,
                         ],
                     );
                 }

@@ -13215,16 +13215,40 @@ pub extern "C-unwind" fn knot_db_exec(db: *mut c_void, sql_ptr: *const u8, sql_l
 // ── Schema tracking ──────────────────────────────────────────────
 
 /// Create the schema metadata table that tracks each source's column layout.
+/// `applied` counts how many committed migration steps the source has run — the
+/// cursor that makes position in the chain explicit, so a schema that repeats
+/// (e.g. a revert `A → B → A`) is unambiguous.
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn knot_schema_init(db: *mut c_void) {
     let db_ref = unsafe { &*(db as *mut KnotDb) };
     let sql =
-        "CREATE TABLE IF NOT EXISTS _knot_schema (name TEXT PRIMARY KEY, schema TEXT NOT NULL);";
+        "CREATE TABLE IF NOT EXISTS _knot_schema (name TEXT PRIMARY KEY, schema TEXT NOT NULL, applied INTEGER NOT NULL DEFAULT 0);";
     debug_sql(sql);
     db_ref
         .conn
         .execute_batch(sql)
         .expect("knot runtime: failed to create schema tracking table");
+    // Bootstrap: an existing DB has rows without the `applied` column. Add it
+    // in place (no data change; existing rows get the default 0).
+    if !table_column_names(&db_ref.conn, "_knot_schema")
+        .iter()
+        .any(|c| c == "applied")
+    {
+        db_ref
+            .conn
+            .execute_batch("ALTER TABLE _knot_schema ADD COLUMN applied INTEGER NOT NULL DEFAULT 0;")
+            .expect("knot runtime: failed to add applied column to _knot_schema");
+    }
+}
+
+/// Read a source's stored `(schema, applied)` cursor, or `None` if absent.
+fn read_schema_cursor(conn: &rusqlite::Connection, name: &str) -> Option<(String, i64)> {
+    conn.query_row(
+        "SELECT schema, applied FROM _knot_schema WHERE name = ?1;",
+        rusqlite::params![name],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )
+    .ok()
 }
 
 /// Apply a migration to a source relation.
@@ -13337,6 +13361,7 @@ pub extern "C-unwind" fn knot_source_migrate(
     old_schema_len: usize,
     new_schema_ptr: *const u8,
     new_schema_len: usize,
+    step_idx: i64,
     migrate_fn: *mut Value,
 ) {
     let _wl = write_lock_guard();
@@ -13345,48 +13370,43 @@ pub extern "C-unwind" fn knot_source_migrate(
     let old_schema = unsafe { str_from_raw(old_schema_ptr, old_schema_len) };
     let new_schema = unsafe { str_from_raw(new_schema_ptr, new_schema_len) };
 
-    // Check stored schema
-    let stored: Option<String> = db_ref
-        .conn
-        .query_row(
-            "SELECT schema FROM _knot_schema WHERE name = ?1;",
-            rusqlite::params![name],
-            |row| row.get(0),
-        )
-        .ok();
-
-    // A schema is a comma-separated `col:type` list. Compare by column set so a
-    // migrate step is a no-op not only when `stored == new_schema` (this step
-    // already applied) but also when a LATER migration in the chain already
-    // ran — i.e. `stored` still contains every column of `new_schema`.
-    let cols = |s: &str| -> std::collections::HashSet<String> {
-        s.split(',')
-            .filter(|c| !c.is_empty())
-            .map(|c| c.split(':').next().unwrap_or(c).to_string())
-            .collect()
+    // Read the (schema, applied) cursor. `applied` is how many committed steps
+    // this source has already run — the position in the chain. Step `step_idx`
+    // runs iff it is the next pending step (`applied == step_idx`); a step with
+    // `applied > step_idx` already ran (skip). This makes position explicit, so
+    // a schema that repeats in the chain (a revert `A → B → A`) is unambiguous.
+    //
+    // The stored schema is a consistency check, not the driver: before running,
+    // `stored` must equal this step's `old_schema`. Mismatch = genuine drift.
+    let cursor = read_schema_cursor(&db_ref.conn, name);
+    let (stored, applied) = match &cursor {
+        Some((s, a)) => (Some(s.clone()), *a),
+        None => (None, 0),
     };
-    let new_cols = cols(new_schema);
-    let stored_at_or_past_new = stored
-        .as_deref()
-        .map(|s| {
-            let sc = cols(s);
-            !new_cols.is_empty() && new_cols.iter().all(|c| sc.contains(c))
-        })
-        .unwrap_or(false);
 
+    if applied > step_idx {
+        // Already applied this step (chain position is past it).
+        return;
+    }
+    if applied < step_idx {
+        // A prior step hasn't run yet — the chain is applied in order, so this
+        // step can't run. This should be impossible (codegen emits in order);
+        // surface it rather than silently skip.
+        panic!(
+            "knot runtime: migration step {} for source '{}' ran out of order (applied = {})",
+            step_idx, name, applied
+        );
+    }
+    // applied == step_idx: this is the next pending step.
     match &stored {
-        Some(s) if s == new_schema => return,
-        Some(s) if s == old_schema => {}
-        // A later migration already ran (stored is at/past `new`) — this step
-        // is a no-op. Without this, chained migrations (2+ migrate blocks for
-        // one source) panic on the second run.
-        Some(_) if stored_at_or_past_new => return,
-        Some(s) => panic!(
-            "knot runtime: source '{}' has schema '{}', expected '{}' (pre-migration) or '{}' (post-migration).\n\
-             Check your migrate block.",
-            name, s, old_schema, new_schema
-        ),
+        // Fresh source with no recorded schema: nothing to migrate.
         None => return,
+        Some(s) if s == old_schema => {}
+        Some(s) => panic!(
+            "knot runtime: source '{}' has schema '{}', expected '{}' (pre-migration) for step {}.\n\
+             Check your migrate block.",
+            name, s, old_schema, step_idx
+        ),
     }
 
     log::log_info(&format!("Migrating source '{}'...", name));
@@ -13488,12 +13508,12 @@ pub extern "C-unwind" fn knot_source_migrate(
             .execute_batch(&rename_sql)
             .expect("knot runtime: failed to swap migrated table into place");
 
-        // 5. Update stored schema
+        // 5. Update stored schema and advance the migration cursor.
         db_ref
             .conn
             .execute(
-                "INSERT OR REPLACE INTO _knot_schema (name, schema) VALUES (?1, ?2);",
-                rusqlite::params![name, new_schema],
+                "INSERT OR REPLACE INTO _knot_schema (name, schema, applied) VALUES (?1, ?2, ?3);",
+                rusqlite::params![name, new_schema, step_idx + 1],
             )
             .expect("knot runtime: failed to update schema after migration");
     });
@@ -14512,11 +14532,14 @@ pub extern "C-unwind" fn knot_source_init(
         );
     }
 
-    // Record current schema
+    // Record current schema. Preserve the migration cursor (`applied`): a plain
+    // INSERT OR REPLACE would reset it to 0 on every init. Update only the
+    // schema on conflict; a first insert defaults `applied` to 0.
     db_ref
         .conn
         .execute(
-            "INSERT OR REPLACE INTO _knot_schema (name, schema) VALUES (?1, ?2);",
+            "INSERT INTO _knot_schema (name, schema, applied) VALUES (?1, ?2, 0) \
+             ON CONFLICT(name) DO UPDATE SET schema = excluded.schema;",
             rusqlite::params![name, schema],
         )
         .expect("knot runtime: failed to record schema");

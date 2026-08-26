@@ -334,3 +334,64 @@ Rel V3  *people
         String::from_utf8_lossy(&lock.stderr)
     );
 }
+
+/// A revert chain (`A → B → A`) revisits a schema. The migration cursor
+/// (`applied` step count) makes position explicit, so the committed binary
+/// replays the chain once on a stale DB and is a no-op on subsequent runs —
+/// the same schema appearing twice does not confuse resumability.
+#[test]
+fn migrate_revert_chain_is_idempotent() {
+    let dir = dir_for("mig_revert");
+    let v1 = r#"with {
+V1  {name Text}
+Rel V1  *people
+}
+(do
+  full *people = [{name "alice"}  {name "bob"}]
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    // Baseline.
+    build_and_run(&dir, "mig_revert", v1);
+    lock_in_dir(dir.path(), "mig_revert");
+
+    // Up to V2, lock.
+    let v2 = r#"with {
+V1  {name Text}
+V2  {name Text  active Text}
+Rel V2  *people
+  migrate to V2 using \p -> {name p.name  active "UP"}
+}
+(do
+  yield {})"#;
+    build_and_run(&dir, "mig_revert", v2);
+    lock_in_dir(dir.path(), "mig_revert");
+
+    // Revert to V1, lock.
+    let v1_revert = r#"with {
+V1  {name Text}
+V2  {name Text  active Text}
+Rel V1  *people
+  migrate to V1 using \p -> {name p.name}
+}
+(do
+  yield {})"#;
+    build_and_run(&dir, "mig_revert", v1_revert);
+    lock_in_dir(dir.path(), "mig_revert");
+
+    // Committed binary (no pending clause): first run replays the chain on the
+    // stale main DB, second run is a no-op. Both must show the reverted data.
+    let committed = r#"with {
+V1  {name Text}
+V2  {name Text  active Text}
+Rel V1  *people
+}
+(do
+  rows <- *people
+  base.println (base.show rows)
+  yield {})"#;
+    let out1 = build_and_run(&dir, "mig_revert", committed);
+    assert_eq!(out1, "\"[{name alice}, {name bob}]\"\n{}", "first run lands on reverted schema");
+    let out2 = build_and_run(&dir, "mig_revert", committed);
+    assert_eq!(out2, out1, "second run is idempotent");
+}

@@ -15947,9 +15947,19 @@ fn delete_rel_child_tree(conn: &rusqlite::Connection, parent_table: &str, nf: &N
 
 fn delete_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &NestedField) {
     let child_table = child_table_name(parent_table, &nf.name);
-    // Recurse to delete grandchildren first
+    // Recurse to wipe deeper levels first: nested relation fields, and any
+    // RelRef column (e.g. a relation-of-relations `_value`).
     for grandchild in &nf.nested {
         delete_child_table(conn, &child_table, grandchild);
+    }
+    for c in &nf.columns {
+        if let Some(FieldStore::RelRef(rel)) = c.store.as_deref() {
+            delete_child_table(conn, &child_table, &NestedField {
+                name: c.name.clone(),
+                columns: rel.columns.clone(),
+                nested: rel.nested.clone(),
+            });
+        }
     }
     // Wipe the link table (edges) and the element table (content-addressed rows).
     let link = quote_ident(&format!("{}{}", child_table, "__link"));

@@ -14259,6 +14259,11 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
     // element's own nested relations/recs become child tables off this one.
     let mut col_defs = vec!["\"_hash\" BLOB PRIMARY KEY".to_string()];
     for c in &nf.columns {
+        // A relation-typed field has no in-row column — its elements live in a
+        // link/element table pair keyed by this row's `_hash`.
+        if matches!(c.store.as_deref(), Some(FieldStore::RelRef(_))) {
+            continue;
+        }
         col_defs.push(format!("{} {}", quote_ident(&c.name), sql_type(c.ty)));
     }
     let sql = format!(
@@ -14305,7 +14310,8 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
     let _ = conn.execute_batch(&parent_idx);
 
     // Recurse: an element's own composite fields become child tables keyed off
-    // the element table.
+    // the element table. A relation-typed field uses the link model (keyed by
+    // this row's `_hash`), same as a top-level relation field.
     for c in &nf.columns {
         if let Some(store) = &c.store {
             match store.as_ref() {
@@ -14313,7 +14319,11 @@ fn init_child_table(conn: &rusqlite::Connection, parent_table: &str, nf: &Nested
                     init_ref_child_table(conn, &child_table_name, &c.name, store);
                 }
                 FieldStore::RelRef(child_schema) => {
-                    init_rel_child_table(conn, &child_table_name, &c.name, child_schema);
+                    init_child_table(conn, &child_table_name, &NestedField {
+                        name: c.name.clone(),
+                        columns: child_schema.columns.clone(),
+                        nested: child_schema.nested.clone(),
+                    });
                 }
                 FieldStore::Column(_) => {}
             }
@@ -15705,6 +15715,10 @@ fn read_child_table(
 
     let mut select_cols: Vec<String> = vec![format!("e.{}", quote_ident("_hash"))];
     for c in &nf.columns {
+        // Relation-typed fields have no in-row column on the element table.
+        if matches!(c.store.as_deref(), Some(FieldStore::RelRef(_))) {
+            continue;
+        }
         select_cols.push(format!("e.{}", quote_ident(&c.name)));
     }
 
@@ -15746,7 +15760,20 @@ fn read_child_table(
         let record = knot_record_empty(total_fields);
 
         if scalar_elem {
-            let val = read_field_value(conn, table_name, row, 1, &nf.columns[0]);
+            // The `_value` column may itself be a relation (relation-of-
+            // relations): resolve it via the inner link table keyed by this
+            // element's content hash, not the (NULL) in-row blob.
+            let val = match nf.columns[0].store.as_deref() {
+                Some(FieldStore::RelRef(rel)) => {
+                    let inner_table = child_table_name(table_name, "_value");
+                    read_child_table(conn, &inner_table, &NestedField {
+                        name: "_value".to_string(),
+                        columns: rel.columns.clone(),
+                        nested: rel.nested.clone(),
+                    }, &elem_key)
+                }
+                _ => read_field_value(conn, table_name, row, 1, &nf.columns[0]),
+            };
             rows.push(val);
             continue;
         }
@@ -16377,9 +16404,13 @@ fn write_child_rows(
     let elem_table = quote_ident(table_name);
     let link_table = quote_ident(&format!("{}{}", table_name, "__link"));
 
-    // Element upsert: `_hash` + element columns.
+    // Element upsert: `_hash` + non-relation element columns (relation fields
+    // have no in-row column).
     let mut col_names = vec![quote_ident("_hash")];
     for c in &nf.columns {
+        if matches!(c.store.as_deref(), Some(FieldStore::RelRef(_))) {
+            continue;
+        }
         col_names.push(quote_ident(&c.name));
     }
     let placeholders: Vec<String> = (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
@@ -16421,6 +16452,11 @@ fn write_child_rows(
         let mut params: Vec<rusqlite::types::Value> =
             vec![rusqlite::types::Value::Blob(elem_hash.clone())];
         for col in &nf.columns {
+            // A relation-typed field has no in-row column — skip it (its
+            // elements go to a link/element table pair below).
+            if matches!(col.store.as_deref(), Some(FieldStore::RelRef(_))) {
+                continue;
+            }
             let value = if scalar_elem && col.name == "_value" {
                 *row_ptr
             } else {
@@ -16457,6 +16493,7 @@ fn write_child_rows(
 
         // Recurse: the element's own composite fields become children off the
         // element table (keyed by the element's hash).
+        let elem_key = record_content_hash_hex(*row_ptr);
         for grandchild in &nf.nested {
             let gc_table = child_table_name(table_name, &grandchild.name);
             let gc_val = if scalar_elem {
@@ -16467,7 +16504,22 @@ fn write_child_rows(
             if !gc_val.is_null()
                 && let Value::Relation(gc_rows) = unsafe { as_ref(gc_val) }
             {
-                write_child_rows(conn, &gc_table, grandchild, &record_content_hash_hex(*row_ptr), gc_rows);
+                write_child_rows(conn, &gc_table, grandchild, &elem_key, gc_rows);
+            }
+        }
+        // A scalar/composite element whose `_value` is itself a relation
+        // (relation-of-relations, `[[..]]`): the inner relation is the `_value`
+        // column's RelRef store, not a `nested` entry — recurse into it.
+        if scalar_elem && !nf.columns.is_empty() && nf.columns[0].name == "_value" {
+            if let Some(FieldStore::RelRef(rel)) = nf.columns[0].store.as_deref() {
+                if let Value::Relation(inner_rows) = row {
+                    let inner_table = child_table_name(table_name, "_value");
+                    write_child_rows(conn, &inner_table, &NestedField {
+                        name: "_value".to_string(),
+                        columns: rel.columns.clone(),
+                        nested: rel.nested.clone(),
+                    }, &elem_key, inner_rows);
+                }
             }
         }
     }

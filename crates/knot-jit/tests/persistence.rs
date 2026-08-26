@@ -381,6 +381,27 @@ Rel Entry  *es
     );
 }
 
+/// A relation-of-relations field (`grid (Rel (Rel Int))`) round-trips with full
+/// content — each inner relation is content-addressed as an element, and its own
+/// elements go to a nested link/element table. Previously the inner relations
+/// were silently dropped (read back as empty).
+#[test]
+fn persisted_relation_of_relations_round_trips() {
+    assert_stdout(
+        "relofrel",
+        r#"with {
+Entry  {name Text  grid (Rel (Rel (Int 1)))}
+Rel Entry  *es
+}
+(do
+  full *es = [{name "a"  grid [[1  2]  [3]]}]
+  rows <- *es
+  base.println (base.show rows)
+  yield {})"#,
+        "\"[{grid [[1, 2], [3]]  name a}]\"\n{}\n",
+    );
+}
+
 /// Payload columns are real, indexable columns on the child table (the point of
 /// the content-addressed encoding over JSON): a pushdown filter on a payload
 /// field runs against the `radius` INTEGER column.

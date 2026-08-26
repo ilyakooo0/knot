@@ -14348,6 +14348,11 @@ fn init_ref_child_table(conn: &rusqlite::Connection, parent_table: &str, name: &
         col_defs.push("\"_tag\" TEXT NOT NULL".to_string());
     }
     for f in cols {
+        // A relation-typed payload field has no in-row column — its elements
+        // live in a link/element table pair keyed by this row's `_hash`.
+        if matches!(f.store.as_deref(), Some(FieldStore::RelRef(_))) {
+            continue;
+        }
         col_defs.push(format!("{} {}", quote_ident(&f.name), sql_type(f.ty)));
     }
 
@@ -14361,7 +14366,8 @@ fn init_ref_child_table(conn: &rusqlite::Connection, parent_table: &str, name: &
     });
 
     // Recurse: a ref-typed child column gets its own content-addressed child
-    // table; a relation-typed child column gets a `_parent_id` child table.
+    // table; a relation-typed child column gets a link/element table pair keyed
+    // by this row's `_hash`.
     for f in cols {
         if let Some(store) = &f.store {
             match store.as_ref() {
@@ -14369,7 +14375,11 @@ fn init_ref_child_table(conn: &rusqlite::Connection, parent_table: &str, name: &
                     init_ref_child_table(conn, &child_name, &f.name, store);
                 }
                 FieldStore::RelRef(child_schema) => {
-                    init_rel_child_table(conn, &child_name, &f.name, child_schema);
+                    init_child_table(conn, &child_name, &NestedField {
+                        name: f.name.clone(),
+                        columns: child_schema.columns.clone(),
+                        nested: child_schema.nested.clone(),
+                    });
                 }
                 FieldStore::Column(_) => {}
             }
@@ -15436,8 +15446,15 @@ fn read_adt_value(
     adt: &AdtSpec,
     hash: &[u8],
 ) -> *mut Value {
+    // Only non-relation payload fields are columns; RelRef fields are resolved
+    // via their link table below.
+    let col_fields: Vec<&ColumnSpec> = adt
+        .all_fields
+        .iter()
+        .filter(|f| !matches!(f.store.as_deref(), Some(FieldStore::RelRef(_))))
+        .collect();
     let mut select_cols = vec![quote_ident("_tag")];
-    for f in &adt.all_fields {
+    for f in &col_fields {
         select_cols.push(quote_ident(&f.name));
     }
     let sql = format!(
@@ -15465,11 +15482,11 @@ fn read_adt_value(
         });
 
     let tag: String = row.get(0).unwrap();
-    let field_idx: HashMap<&str, usize> = adt
-        .all_fields
+    // Read position of each non-relation payload field (1-based after _tag).
+    let field_idx: HashMap<&str, usize> = col_fields
         .iter()
         .enumerate()
-        .map(|(i, f)| (f.name.as_str(), i))
+        .map(|(i, f)| (f.name.as_str(), i + 1))
         .collect();
     let ctor = adt
         .constructors
@@ -15480,9 +15497,22 @@ fn read_adt_value(
         alloc(Value::Unit)
     } else {
         let record = knot_record_empty(ctor.fields.len());
+        let parent_key: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
         for field in &ctor.fields {
-            let col_idx = *field_idx.get(field.name.as_str()).unwrap();
-            let val = read_sql_column(row, col_idx + 1, field.ty);
+            let val = match field.store.as_deref() {
+                Some(FieldStore::RelRef(rel)) => {
+                    let rel_table = child_table_name(child_table, &field.name);
+                    read_child_table(conn, &rel_table, &NestedField {
+                        name: field.name.clone(),
+                        columns: rel.columns.clone(),
+                        nested: rel.nested.clone(),
+                    }, &parent_key)
+                }
+                _ => {
+                    let col_idx = *field_idx.get(field.name.as_str()).unwrap();
+                    read_sql_column(row, col_idx, field.ty)
+                }
+            };
             let fname = field.name.as_bytes();
             knot_record_set_field(record, fname.as_ptr(), fname.len(), val);
         }
@@ -15773,6 +15803,12 @@ fn adt_row_to_params(row_ptr: *mut Value, adt: &AdtSpec) -> Vec<rusqlite::types:
 
             // For each field in the wide table
             for field in &adt.all_fields {
+                // A relation payload field has no in-row column; emit a Null
+                // placeholder (filtered out by content-addressed callers).
+                if matches!(field.store.as_deref(), Some(FieldStore::RelRef(_))) {
+                    params.push(rusqlite::types::Value::Null);
+                    continue;
+                }
                 if let Some(&ty) = ctor_field_tys.get(field.name.as_str()) {
                     // This field belongs to this constructor — extract from payload
                     let payload_ref = unsafe { as_ref(*payload) };
@@ -15966,15 +16002,34 @@ fn insert_adt_value(
     let hash = blake3::hash(&buf);
     let hash_bytes = hash.as_bytes().to_vec();
 
-    // [hash, _tag, field1, field2, ...]
+    // Only scalar/ref payload fields become columns; RelRef (relation) payload
+    // fields have no in-row column and are written as element+link tables below.
+    let col_fields: Vec<&ColumnSpec> = adt
+        .all_fields
+        .iter()
+        .filter(|f| !matches!(f.store.as_deref(), Some(FieldStore::RelRef(_))))
+        .collect();
+
+    // [hash, _tag, <scalar/ref field columns only>]
     let mut params: Vec<rusqlite::types::Value> =
-        Vec::with_capacity(2 + adt.all_fields.len());
+        Vec::with_capacity(2 + col_fields.len());
     params.push(rusqlite::types::Value::Blob(hash_bytes.clone()));
     params.extend(adt_row_to_params(value, adt));
 
+    // `adt_row_to_params` emits a param per `all_fields` entry; drop the ones
+    // for RelRef fields so params align with `col_fields`.
+    let mut col_params: Vec<rusqlite::types::Value> = Vec::with_capacity(1 + col_fields.len());
+    col_params.push(params[1].clone()); // _tag
+    for (i, f) in adt.all_fields.iter().enumerate() {
+        if matches!(f.store.as_deref(), Some(FieldStore::RelRef(_))) {
+            continue;
+        }
+        col_params.push(params[2 + i].clone());
+    }
+
     let col_names: Vec<String> = std::iter::once(quote_ident("_hash"))
         .chain(std::iter::once(quote_ident("_tag")))
-        .chain(adt.all_fields.iter().map(|f| quote_ident(&f.name)))
+        .chain(col_fields.iter().map(|f| quote_ident(&f.name)))
         .collect();
     let placeholders: Vec<String> =
         (1..=col_names.len()).map(|i| format!("?{}", i)).collect();
@@ -15985,11 +16040,14 @@ fn insert_adt_value(
         placeholders.join(", ")
     );
     debug_sql(&sql);
+    let mut all_params: Vec<rusqlite::types::Value> = Vec::with_capacity(col_names.len());
+    all_params.push(rusqlite::types::Value::Blob(hash_bytes.clone()));
+    all_params.extend(col_params);
     let mut stmt = conn
         .prepare_cached(&sql)
         .expect("knot runtime: failed to prepare ADT child insert");
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-        params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+        all_params.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
     stmt.execute(&param_refs[..])
         .expect("knot runtime: failed to insert ADT child row");
 
@@ -15997,9 +16055,34 @@ fn insert_adt_value(
     // it's the same content, not a collision.
     if conn.changes() == 0 {
         let content_cols: Vec<String> = std::iter::once(quote_ident("_tag"))
-            .chain(adt.all_fields.iter().map(|f| quote_ident(&f.name)))
+            .chain(col_fields.iter().map(|f| quote_ident(&f.name)))
             .collect();
-        guard_hash_collision(conn, child_table, &hash_bytes, &content_cols, &params[1..]);
+        guard_hash_collision(conn, child_table, &hash_bytes, &content_cols, &all_params[1..]);
+    }
+
+    // Write relation payload fields (RelRef) as element+link tables keyed by
+    // this ADT row's content hash.
+    let parent_key: String = hash_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    if let Value::Constructor(_, payload) = unsafe { as_ref(value) } {
+        let payload_fields: HashMap<&str, *mut Value> = match unsafe { as_ref(*payload) } {
+            Value::Record(fields) => fields.iter().map(|f| (&*f.name, f.value)).collect(),
+            _ => HashMap::new(),
+        };
+        for f in &adt.all_fields {
+            if let Some(FieldStore::RelRef(rel)) = f.store.as_deref() {
+                let rel_table = child_table_name(child_table, &f.name);
+                let rel_val = payload_fields.get(f.name.as_str()).copied().unwrap_or(std::ptr::null_mut());
+                if !rel_val.is_null()
+                    && let Value::Relation(rel_rows) = unsafe { as_ref(rel_val) }
+                {
+                    write_child_rows(conn, &rel_table, &NestedField {
+                        name: f.name.clone(),
+                        columns: rel.columns.clone(),
+                        nested: rel.nested.clone(),
+                    }, &parent_key, rel_rows);
+                }
+            }
+        }
     }
 
     hash_bytes

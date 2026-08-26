@@ -319,6 +319,68 @@ Rel Entry  *es
     );
 }
 
+/// A relation nested inside an ADT payload field (`Circle {tags (Rel Tag), ..}`)
+/// is stored as element+link tables keyed by the ADT child row's `_hash` — the
+/// link model lets a content-addressed value own a collection. The ADT child
+/// has no column for the relation field.
+#[test]
+fn persisted_adt_payload_relation_round_trips() {
+    assert_stdout(
+        "adtpayloadrel",
+        r#"with {
+Tag  {value Text}
+Shape  Circle {tags (Rel Tag)  radius (Int 1)}  Point {}
+Entry  {name Text  sh Shape}
+Rel Entry  *es
+}
+(do
+  full *es = [{name "a"  sh (Shape.Circle {tags [{value "x"}  {value "y"}]  radius 5})}]
+  rows <- *es
+  base.println (base.show rows)
+  yield {})"#,
+        "\"[{name a  sh Circle {radius 5  tags [{value x}, {value y}]}}]\"\n{}\n",
+    );
+
+    // Physical layout: the ADT child has no `tags` column; the relation lives in
+    // element+link tables beneath it.
+    let dir = e2e::TempDir::fresh("adtpayloadrel");
+    e2e::build_in_dir(
+        "adtpayloadrel",
+        r#"with {
+Tag  {value Text}
+Shape  Circle {tags (Rel Tag)  radius (Int 1)}  Point {}
+Entry  {name Text  sh Shape}
+Rel Entry  *es
+}
+(do
+  full *es = [{name "a"  sh (Shape.Circle {tags [{value "x"}]  radius 5})}]
+  yield {})"#,
+        dir.path(),
+    );
+    e2e::run_bin(&dir.join("adtpayloadrel"), dir.path());
+    let probe = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(
+            "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); \
+             shcols=[r[1] for r in c.execute('pragma table_info(\"_knot_es__/sh\")')]; \
+             tags=c.execute('select value from \"_knot_es__/sh__/tags\"').fetchall(); \
+             nlinks=c.execute('select count(*) from \"_knot_es__/sh__/tags__link\"').fetchone()[0]; \
+             print((shcols, tags, nlinks))",
+        )
+        .arg(dir.join("adtpayloadrel.db"))
+        .output()
+        .expect("python3 sqlite probe");
+    let out = String::from_utf8_lossy(&probe.stdout);
+    // sh child columns are exactly [_hash, _tag, radius] (no `tags` column);
+    // the relation's element table holds ('x',) and 1 edge links it.
+    assert!(
+        out.contains("['_hash', '_tag', 'radius']")
+            && out.contains("[('x',)]")
+            && out.contains(", 1)"),
+        "ADT-payload relation: no tags column on the ADT child, element+link beneath, got: {out}"
+    );
+}
+
 /// Payload columns are real, indexable columns on the child table (the point of
 /// the content-addressed encoding over JSON): a pushdown filter on a payload
 /// field runs against the `radius` INTEGER column.

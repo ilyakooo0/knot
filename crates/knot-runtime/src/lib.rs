@@ -13606,8 +13606,11 @@ enum FieldStore {
     /// Content-addressed record: parent column holds the content hash; fields
     /// live in a child table keyed by `_hash` (no `_tag`).
     RecRef(RecordSchema),
-    /// A relation: no parent column; elements live in a `_parent_id`-keyed
-    /// child table, one row per element.
+    /// A relation: no parent column. Elements are content-addressed into an
+    /// element table (keyed by `_hash`), and membership is recorded as
+    /// `(_parent_key, _elem_hash)` edges in a link table, where `_parent_key`
+    /// is the parent's `_content_hash`. The `Box<RecordSchema>` describes one
+    /// element's shape.
     RelRef(Box<RecordSchema>),
 }
 

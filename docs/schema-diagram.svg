@@ -1,0 +1,159 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="760" viewBox="0 0 1180 760" font-family="monospace">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3 L0,6 Z" fill="#555"/>
+    </marker>
+    <marker id="hasharr" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L9,3 L0,6 Z" fill="#b8930a"/>
+    </marker>
+    <style>
+      .tbl{fill:#ffffff;stroke:#333;stroke-width:1.5}
+      .hdr{font-size:13px;font-weight:bold;fill:#fff}
+      .col{font-size:11.5px;fill:#222}
+      .pk{fill:#0a6b2d;font-weight:bold}
+      .fk{fill:#b8930a}
+      .ref{font-size:10.5px;fill:#b8930a;font-style:italic}
+      .title{font-size:16px;font-weight:bold;fill:#111}
+      .note{font-size:11px;fill:#555}
+    </style>
+  </defs>
+
+  <text class="title" x="20" y="30">*es — physical schema (every descriptor shape)</text>
+  <text class="note" x="20" y="50">parent + content-addressed children; links join parent._content_hash → element._hash (BLAKE3)</text>
+
+  <!-- parent table -->
+  <g>
+    <rect class="tbl" x="20" y="80" width="300" height="178" rx="4"/>
+    <rect x="20" y="80" width="300" height="26" fill="#38618c" rx="4"/>
+    <text class="hdr" x="30" y="98">_knot_es  (parent)</text>
+    <text class="col pk" x="30" y="122">_content_hash  TEXT   ‹identity›</text>
+    <text class="col" x="30" y="140">name   TEXT      scalar</text>
+    <text class="col" x="30" y="156">i      INTEGER   scalar</text>
+    <text class="col" x="30" y="172">f      REAL      scalar</text>
+    <text class="col" x="30" y="188">col    TEXT      tag (Red|Green|Blue)</text>
+    <text class="col fk" x="30" y="204">sh     BLOB →    hash → _knot_es__/sh</text>
+    <text class="col fk" x="30" y="220">addr   BLOB →    hash → _knot_es__/addr</text>
+    <text class="col fk" x="30" y="244">tags/pets/grid → via __link edges ↓</text>
+  </g>
+
+  <!-- sh child (payload ADT) -->
+  <g>
+    <rect class="tbl" x="420" y="80" width="300" height="106" rx="4"/>
+    <rect x="420" y="80" width="300" height="26" fill="#5a4a8c" rx="4"/>
+    <text class="hdr" x="430" y="98">_knot_es__/sh  (payload ADT)</text>
+    <text class="col pk" x="430" y="122">_hash   BLOB PK</text>
+    <text class="col" x="430" y="140">_tag    TEXT   (Circle|Point)</text>
+    <text class="col" x="430" y="156">radius  INTEGER</text>
+    <text class="col" x="430" y="172">fill    TEXT   (nested tag)</text>
+  </g>
+
+  <!-- addr child (inline record) -->
+  <g>
+    <rect class="tbl" x="420" y="210" width="300" height="72" rx="4"/>
+    <rect x="420" y="210" width="300" height="26" fill="#5a4a8c" rx="4"/>
+    <text class="hdr" x="430" y="228">_knot_es__/addr  (inline record)</text>
+    <text class="col pk" x="430" y="252">_hash  BLOB PK</text>
+    <text class="col" x="430" y="268">city   TEXT</text>
+  </g>
+
+  <!-- tags element + link -->
+  <g>
+    <rect class="tbl" x="820" y="80" width="330" height="72" rx="4"/>
+    <rect x="820" y="80" width="330" height="26" fill="#2d6b4f" rx="4"/>
+    <text class="hdr" x="830" y="98">_knot_es__/tags  (element)</text>
+    <text class="col pk" x="830" y="122">_hash   BLOB PK</text>
+    <text class="col" x="830" y="140">_value  TEXT</text>
+  </g>
+  <g>
+    <rect class="tbl" x="820" y="170" width="330" height="72" rx="4"/>
+    <rect x="820" y="170" width="330" height="26" fill="#8c6d2d" rx="4"/>
+    <text class="hdr" x="830" y="188">_knot_es__/tags__link  (edge)</text>
+    <text class="col fk" x="830" y="212">_parent_key  BLOB = parent._content_hash</text>
+    <text class="col fk" x="830" y="228">_elem_hash   BLOB = element._hash</text>
+  </g>
+
+  <!-- pets element + link -->
+  <g>
+    <rect class="tbl" x="820" y="270" width="330" height="88" rx="4"/>
+    <rect x="820" y="270" width="330" height="26" fill="#2d6b4f" rx="4"/>
+    <text class="hdr" x="830" y="288">_knot_es__/pets  (element, record)</text>
+    <text class="col pk" x="830" y="312">_hash  BLOB PK</text>
+    <text class="col" x="830" y="328">name   TEXT</text>
+    <text class="col" x="830" y="344">legs   INTEGER</text>
+  </g>
+  <g>
+    <rect class="tbl" x="820" y="376" width="330" height="72" rx="4"/>
+    <rect x="820" y="376" width="330" height="26" fill="#8c6d2d" rx="4"/>
+    <text class="hdr" x="830" y="394">_knot_es__/pets__link  (edge)</text>
+    <text class="col fk" x="830" y="418">_parent_key  BLOB</text>
+    <text class="col fk" x="830" y="434">_elem_hash   BLOB</text>
+  </g>
+
+  <!-- grid: rel of rel -->
+  <g>
+    <rect class="tbl" x="20" y="330" width="300" height="72" rx="4"/>
+    <rect x="20" y="330" width="300" height="26" fill="#2d6b4f" rx="4"/>
+    <text class="hdr" x="30" y="348">_knot_es__/grid  (inner relation)</text>
+    <text class="col pk" x="30" y="372">_hash  BLOB PK   (no _value — it IS a rel)</text>
+  </g>
+  <g>
+    <rect class="tbl" x="20" y="420" width="300" height="72" rx="4"/>
+    <rect x="20" y="420" width="300" height="26" fill="#8c6d2d" rx="4"/>
+    <text class="hdr" x="30" y="438">_knot_es__/grid__link</text>
+    <text class="col fk" x="30" y="462">_parent_key  BLOB = parent._content_hash</text>
+    <text class="col fk" x="30" y="478">_elem_hash   BLOB = inner-rel._hash</text>
+  </g>
+  <g>
+    <rect class="tbl" x="420" y="330" width="300" height="72" rx="4"/>
+    <rect x="420" y="330" width="300" height="26" fill="#2d6b4f" rx="4"/>
+    <text class="hdr" x="430" y="348">_knot_es__/grid__/_value  (Int elem)</text>
+    <text class="col pk" x="430" y="372">_hash   BLOB PK</text>
+    <text class="col" x="430" y="388">_value  INTEGER</text>
+  </g>
+  <g>
+    <rect class="tbl" x="420" y="420" width="300" height="72" rx="4"/>
+    <rect x="420" y="420" width="300" height="26" fill="#8c6d2d" rx="4"/>
+    <text class="hdr" x="430" y="438">_knot_es__/grid__/_value__link</text>
+    <text class="col fk" x="430" y="462">_parent_key  BLOB = inner-rel._hash</text>
+    <text class="col fk" x="430" y="478">_elem_hash   BLOB = Int._hash</text>
+  </g>
+
+  <!-- _knot_schema meta -->
+  <g>
+    <rect class="tbl" x="820" y="470" width="330" height="88" rx="4"/>
+    <rect x="820" y="470" width="330" height="26" fill="#666" rx="4"/>
+    <text class="hdr" x="830" y="488">_knot_schema  (meta)</text>
+    <text class="col pk" x="830" y="512">name     TEXT PK</text>
+    <text class="col" x="830" y="528">schema   TEXT   (the descriptor)</text>
+    <text class="col" x="830" y="544">applied  INTEGER (migration cursor)</text>
+  </g>
+
+  <!-- edges: parent -> sh / addr (BLOB hash refs) -->
+  <path d="M320 210 C 370 210, 380 130, 420 130" stroke="#b8930a" stroke-width="1.5" fill="none" marker-end="url(#hasharr)"/>
+  <path d="M320 224 C 370 224, 380 246, 420 246" stroke="#b8930a" stroke-width="1.5" fill="none" marker-end="url(#hasharr)"/>
+
+  <!-- edges: parent _content_hash -> link tables -->
+  <path d="M170 258 C 170 300, 600 205, 820 205" stroke="#555" stroke-width="1.5" fill="none" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+  <path d="M170 258 C 170 320, 600 410, 820 410" stroke="#555" stroke-width="1.5" fill="none" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+  <path d="M150 258 C 150 330, 120 410, 160 420" stroke="#555" stroke-width="1.5" fill="none" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+
+  <!-- link -> element -->
+  <path d="M985 170 L 985 152" stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M985 376 L 985 358" stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M170 420 L 170 402" stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <path d="M320 456 C 370 456, 380 366, 420 366" stroke="#555" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+  <!-- legend -->
+  <g>
+    <rect x="20" y="540" width="700" height="200" fill="#f7f7f7" stroke="#ccc" rx="6"/>
+    <text class="title" x="34" y="566" font-size="13">legend</text>
+    <text class="col" x="34" y="590">scalar (Text/Int/Float) — inline in the parent row</text>
+    <text class="col" x="34" y="610">(A | B)      all-nullary variant — TEXT ctor name ("tag"), inline in parent</text>
+    <text class="col" x="34" y="630">(C{..} | D)  payload variant — child table, parent holds BLOB hash</text>
+    <text class="col" x="34" y="650">{..}         inline record — child table, parent holds BLOB hash</text>
+    <text class="col" x="34" y="670">(Rel T)      relation field — element table + __link edge table</text>
+    <text class="col" x="34" y="690">(Rel (Rel T)) nested relation — two element levels + two __link tables</text>
+    <text class="ref" x="34" y="716">— solid gray arrow: __link edge (_parent_key → _elem_hash)</text>
+    <text class="ref" x="34" y="732">— dashed gold arrow: parent BLOB column → child _hash (payload-ADT / record)</text>
+  </g>
+</svg>

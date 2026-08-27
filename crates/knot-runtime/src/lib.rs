@@ -12677,13 +12677,6 @@ fn json_to_value(json: &serde_json::Value) -> *mut Value {
     json_to_value_impl(json, true)
 }
 
-/// Storage decoding for SQLite JSON columns: `null` decodes to Unit, matching
-/// the storage encoding where only Unit produces `null` (Maybe constructors
-/// are stored with the `__knot_ctor` marker).
-fn json_to_value_db(json: &serde_json::Value) -> *mut Value {
-    json_to_value_impl(json, false)
-}
-
 fn json_to_value_impl(json: &serde_json::Value, wire: bool) -> *mut Value {
     match json {
         serde_json::Value::Null => {
@@ -13656,18 +13649,11 @@ enum ColType {
     Bytes,
     /// Stored as TEXT, reconstructed as Constructor on read
     Tag,
-    /// Value stored as JSON text in SQLite. Used for:
-    /// - record-valued fields (`{x: Float, y: Float}` inside a row),
-    /// - nested relations of *non-record* element type (e.g. `tags: [Text]`,
-    ///   `shapes: [Shape]`) — the whole relation is serialized as one JSON
-    ///   column (descriptor `field:json`); only record-element nested
-    ///   relations take the `field:[child_schema]` child-table form.
-    Json,
     /// A payload-bearing ADT stored as a content-addressed reference: the
     /// parent column holds the value's 32-byte content hash (BLOB), and the
     /// value lives in a per-field child table keyed by that hash with `_tag` +
-    /// payload columns. Unlike `Json`, the payload columns are real, indexable
-    /// columns (queryable/pushdown-able). The constructor schema travels in
+    /// payload columns. The payload columns are real, indexable columns
+    /// (queryable/pushdown-able). The constructor schema travels in
     /// `ColumnSpec::adt` (kept out of this `Copy` enum).
     AdtRef,
     /// A content-addressed nested record: the parent column holds the value's
@@ -14027,7 +14013,6 @@ fn sql_type(ty: ColType) -> &'static str {
         ColType::Bool => "INTEGER",
         ColType::Bytes => "BLOB",
         ColType::Tag => "TEXT",
-        ColType::Json => "TEXT",
         // The parent's reference column holds the value's 32-byte content hash.
         ColType::AdtRef => "BLOB",
         ColType::RecRef => "BLOB",
@@ -14061,7 +14046,6 @@ fn sql_null_default(ty: ColType) -> Option<*mut Value> {
         ColType::Text => alloc(Value::Text(Arc::from(""))),
         ColType::Bool => alloc_bool(false),
         ColType::Bytes => alloc(Value::Bytes(Arc::from(&[][..]))),
-        ColType::Json => make_nothing(),
         ColType::Tag => return None,
         // Like Tag: a payload-ADT reference has no meaningful "empty" value.
         ColType::AdtRef => return None,
@@ -14146,14 +14130,6 @@ fn read_sql_column(row: &rusqlite::Row, i: usize, ty: ColType) -> *mut Value {
             // Read TEXT but reconstruct as a Constructor with Unit payload
             let tag: String = row.get(i).unwrap_or_else(|_| panic!("{}", mismatch()));
             alloc(Value::Constructor(intern_str(&tag), alloc(Value::Unit)))
-        }
-        ColType::Json => {
-            // Read TEXT and parse as JSON back into a Knot value (typically a relation)
-            let s: String = row.get(i).unwrap_or_else(|_| panic!("{}", mismatch()));
-            match serde_json::from_str::<serde_json::Value>(&s) {
-                Ok(json) => json_to_value_db(&json),
-                Err(e) => panic!("{}: failed to parse JSON column value: {}", mismatch(), e),
-            }
         }
         // Step 1 (routing) only declares the column; nothing writes AdtRef yet,
         // so a read can't produce one. Steps 2–3 add the child-table write/read.
@@ -14507,7 +14483,7 @@ pub extern "C-unwind" fn knot_source_init(
         // compares them byte-wise, matching SQLite. `_tag` is also text but is
         // an internal column watchers don't filter on by name.
         for f in &adt.all_fields {
-            if matches!(f.ty, ColType::Text | ColType::Tag | ColType::Json) {
+            if matches!(f.ty, ColType::Text | ColType::Tag) {
                 register_text_column(name, &f.name);
             }
         }
@@ -14516,7 +14492,7 @@ pub extern "C-unwind" fn knot_source_init(
         let rec = Arc::new(parse_record_schema(schema));
         init_record_table(&db_ref.conn, &format!("_knot_{}", name), &rec);
         for c in &rec.columns {
-            if matches!(c.ty, ColType::Text | ColType::Tag | ColType::Json) {
+            if matches!(c.ty, ColType::Text | ColType::Tag) {
                 register_text_column(name, &c.name);
             }
         }
@@ -15441,16 +15417,6 @@ pub extern "C-unwind" fn knot_source_match(
         }
         alloc(Value::Relation(rows))
     }
-}
-
-/// Read all rows from a record table, including nested relation fields from child tables.
-fn read_record_table(
-    conn: &rusqlite::Connection,
-    table_name: &str,
-    schema: &RecordSchema,
-) -> *mut Value {
-    let (rows, _) = read_record_table_paged(conn, table_name, schema, None);
-    alloc(Value::Relation(rows))
 }
 
 /// Look up a payload-ADT value in its content-addressed child table by hash and
@@ -17855,35 +17821,7 @@ fn value_to_sqlite(v: *mut Value, ty: ColType) -> rusqlite::types::Value {
         (Value::Constructor(tag, _), ColType::Tag) => {
             rusqlite::types::Value::Text(ctor_leaf(tag).to_string())
         }
-        (Value::Constructor(_, _), ColType::Json) => {
-            rusqlite::types::Value::Text(value_to_json_db(v))
-        }
         (Value::Constructor(tag, _), _) => rusqlite::types::Value::Text(ctor_leaf(tag).to_string()),
-        (Value::Relation(rows), ColType::Json) => {
-            // Nested relations stored as JSON columns keep set semantics:
-            // dedup rows before serializing, mirroring the INSERT OR IGNORE
-            // dedup that child-table storage gets from its UNIQUE index.
-            //
-            // The serialized text also participates in the parent table's
-            // `_unique` index, so it must be *canonical*: two logically-equal
-            // set values (e.g. `["a","b"]` and `["b","a"]`) must produce
-            // identical text, or the parent row would spuriously duplicate.
-            // `value_to_hash_bytes` already defines the canonical set order
-            // (it sorts+dedups rows), so order the deduped rows by that same
-            // key before serializing. Matches how every other identity path
-            // (dedup, union, `values_equal`, child-table `_content_hash`)
-            // treats relations as unordered sets.
-            let mut deduped = in_memory_dedup(rows.clone());
-            deduped.sort_by(|a, b| {
-                let mut ka = Vec::new();
-                let mut kb = Vec::new();
-                value_to_hash_bytes(*a, &mut ka);
-                value_to_hash_bytes(*b, &mut kb);
-                ka.cmp(&kb)
-            });
-            rusqlite::types::Value::Text(value_to_json_db(alloc(Value::Relation(deduped))))
-        }
-        (Value::Record(_), ColType::Json) => rusqlite::types::Value::Text(value_to_json_db(v)),
         _ => panic!("knot runtime: cannot convert {} to SQL", brief_value(v)),
     }
 }

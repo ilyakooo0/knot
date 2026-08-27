@@ -14,8 +14,8 @@
 --   3. `knot lock` commits the migration into the lock and strips the block
 --      from this source. The next run fast-forwards the main DB.
 --
--- NOTE: relation columns must use ADT flags, not the primitive `Bool` — a
--- `Bool` column panics in the storage layer (pre-existing runtime issue).
+-- relation columns use ADT flags — `Active  Yes {}  No {}` — and `active` is
+-- typed `Active`.
 with {
 
 Active  Yes {}  No {}

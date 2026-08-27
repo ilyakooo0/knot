@@ -1951,11 +1951,12 @@ fn schema_for_source(
     }
 }
 
-/// Schema for the inner type of a relation. Records/ADTs delegate to
-/// `schema_descriptor`; primitive inner types (e.g. `*tags : [Text]`) get
-/// wrapped as a single-column `_value:<scalar>` schema, matching how scalar
-/// sources are stored. Without this wrapping the runtime sees a bare type
-/// name like `"text"` and panics in `parse_record_schema`.
+/// Schema for the inner (element) type of a relation *field* — e.g. the `Text`
+/// in `tags (Rel Text)` or the `Pet` in `pets (Rel Pet)`. Records/ADTs
+/// delegate to `schema_descriptor`; scalar elements get wrapped as a
+/// single-column `{_value <scalar>}` schema so the element table has a real
+/// column. (A relation of scalars is allowed as a *field*; only a top-level
+/// scalar *source* like `Rel Int *n` is rejected, in the typechecker.)
 fn relation_inner_schema(inner: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -> String {
     match inner {
         ResolvedType::Record(_) | ResolvedType::Adt(_) => schema_descriptor(inner, aliases),
@@ -2030,25 +2031,21 @@ fn scalar_type_str(ty: &ResolvedType) -> &'static str {
         ResolvedType::Bool => "Bool",
         ResolvedType::Bytes => "Bytes",
         ResolvedType::Uuid => "Uuid",
+        // Fallback for non-scalars (`Named`/`Function`/`Unit`). Reached only on
+        // an already-failing build: the typechecker emits the real diagnostic
+        // (unpersistable fn/IO field, scalar source, dangling migration
+        // reference) and codegen still computes a best-effort descriptor that
+        // is never used. Degrade to Text rather than panic so the clean error
+        // is what the user sees.
         _ => "Text",
     }
 }
 
-/// Format a single field for a schema descriptor.
-///
-/// Contract with the runtime's `parse_record_schema`:
-/// - Nested relations of *record* element type are inlined as
-///   `field:[child_schema]` and stored in child tables.
-/// - Nested relations of any other element type (ADTs, scalars) are stored
-///   as a `json` column holding the whole relation. Child tables only
-///   support record-shaped rows (`_parent_id` + scalar columns), so the
-///   `[...]` form must not be emitted for non-record elements — the runtime
-///   used to panic at table init on descriptors like `tags:[text]` or
-///   `shapes:[#Circle:...|Dot]`. The Json column round-trip
-///   (`value_to_json`/`json_to_value` with the `__knot_ctor` marker)
-///   reconstructs relations of constructors and scalars faithfully, and
-///   `m <- t.field` binds iterate the in-memory relation read back from
-///   the column.
+/// The schema descriptor IS the source's type rendered as knot type syntax.
+/// The runtime's `parse_record_schema` reads it back and derives the physical
+/// layout: scalars map to in-row columns, records/payload-ADTs become
+/// content-addressed child tables (parent holds a `_hash` BLOB), and relation
+/// fields become element + `__link` table pairs.
 fn schema_descriptor(ty: &ResolvedType, aliases: &HashMap<String, ResolvedType>) -> String {
     match ty {
         ResolvedType::Record(fields) => record_desc(fields, aliases),

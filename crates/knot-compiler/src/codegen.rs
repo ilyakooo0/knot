@@ -4438,9 +4438,9 @@ impl<M: cranelift_module::Module> Codegen<M> {
 
             // Apply migrations (before source init). The full chain per source
             // = committed steps (from the schema lock) + the pending step (the
-            // source's staged migration clause). Committed `using` fns
+            // source's staged migration clause). Committed migration fns
             // are stored as source text in the lock and re-parsed here; the
-            // pending `using` fn is a live AST expr. A stale database
+            // pending migration fn is a live AST expr. A stale database
             // fast-forwards through the whole chain at startup.
             let migrate_chains = cg.migrate_chains.clone();
             let pending_targets = cg.pending_targets.clone();
@@ -4487,7 +4487,7 @@ impl<M: cranelift_module::Module> Codegen<M> {
                             None => {
                                 cg.diagnostics.push(knot::diagnostic::Diagnostic::error(
                                     format!(
-                                        "committed migration for '*{}' in the schema lock has an unparseable `using` fn",
+                                        "committed migration for '*{}' in the schema lock has an unparseable migration fn",
                                         relation
                                     ),
                                 ));
@@ -21007,7 +21007,7 @@ fn collect_record_migrations(body: &ast::Expr, out: &mut Vec<(String, ast::Expr)
     }
 }
 
-/// Re-parse a committed migration's `using` fn from the schema lock back into
+/// Re-parse a committed migration's migration fn from the schema lock back into
 /// an AST expression. The lock stores it as source text (a bare lambda such as
 /// `\old -> {name old.name}`); a file-as-expression parse recovers the lambda.
 /// Data constructors referenced by the fn (e.g. `Active.Yes {}`) resolve

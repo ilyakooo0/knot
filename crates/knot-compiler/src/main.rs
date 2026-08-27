@@ -681,7 +681,7 @@ fn cmd_build(
     } = infer::check_with_migrations(
         &mut program,
         // Old (pre-migration) type per source, derived from the schema lock so
-        // a pending migration's `using` fn is checked as `Old -> New` at build
+        // a pending migration's migration fn is checked as `Old -> New` at build
         // time instead of aborting at runtime. Empty when there's no lock.
         crate::lockfile::migration_from_types(&source_path),
     );

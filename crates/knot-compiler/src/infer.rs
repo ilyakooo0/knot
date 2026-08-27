@@ -1117,10 +1117,10 @@ struct Infer {
     /// Each entry records (app_span, return_type_var).
     from_json_calls: Vec<(Span, TyVar)>,
 
-    /// Pending-migration `using` fns to type-check against the lock's prior
+    /// Pending-migration fns to type-check against the lock's prior
     /// schema: source name -> the old type as a knot source string (e.g.
     /// "PersonV1"). Threaded in from `main` (which reads the schema lock); the
-    /// `SourceDecl` arm checks each migration's `using` as `Old -> New` so a
+    /// `SourceDecl` arm checks each migration's lambda as `Old -> New` so a
     /// wrong-shape migration is a compile error, not a runtime abort. Empty
     /// when there is no lock or no pending migrations.
     migration_using_from: HashMap<String, String>,
@@ -7814,7 +7814,7 @@ impl Infer {
                 // follow-up) so it participates in schema/migrations, and give
                 // the field the type of a source READ (`IO {Reads name} [T]`)
                 // so `db.*todos` resolves through ordinary field access.
-                // (The pending migration's `using` fn is type-checked in
+                // (The pending migration's lambda is type-checked in
                 // `collect_sources`, the phase that registers sources.)
                 self.annotation_vars.clear();
                 let resolved = self.ast_type_to_ty(ty);
@@ -7848,7 +7848,7 @@ impl Infer {
         }
     }
 
-    /// Type-check a pending migration's `using` fn as `Old -> New`. `from_src`
+    /// Type-check a pending migration's migration fn as `Old -> New`. `from_src`
     /// is the old type as a knot source string (derived from the schema lock by
     /// the caller — never written in source). The new (target) element type is
     /// the source's own declared type (`resolved`, a `Relation(elem)`); the
@@ -7874,7 +7874,7 @@ impl Infer {
             None => return,
         };
         // The lock records the from-type as the full relation (`Rel S`); the
-        // using fn maps one ROW, so unwrap to the element type (`S`).
+        // The migration fn maps one ROW, so unwrap to the element type (`S`).
         let from_resolved = self.ast_type_to_ty(&from_ast);
         let from_elem = match self.apply(&from_resolved) {
             Ty::Relation(inner) => self.apply(&inner),
@@ -7887,12 +7887,12 @@ impl Infer {
         let errors_before = self.errors.len();
         self.check_expr(&m.using_fn, &expected);
         // Attach migration context to any error the check produced, so the
-        // user knows it's the `using` fn's shape that's wrong, and what the
+        // user knows it's the migration fn's shape that's wrong, and what the
         // migration must produce.
         if self.errors.len() > errors_before {
             self.error(
                 format!(
-                    "migration for '*{}': the `using` fn must map each old row to the new schema",
+                    "migration for '*{}': the migration fn must map each old row to the new schema",
                     name
                 ),
                 m.span,
@@ -10241,7 +10241,7 @@ impl Infer {
                 }
                 self.source_types.insert(name.to_string(), resolved.clone());
 
-                // Type-check the pending migration's `using` fn as `Old -> New`:
+                // Type-check the pending migration's migration fn as `Old -> New`:
                 // `Old` is the lock's recorded type (derived, never written in
                 // source); `New` is this source's element type. A wrong-shape
                 // migration is a compile error here, not a runtime abort after
@@ -13892,10 +13892,10 @@ pub fn check(program: &mut ast::Expr) -> CheckOutput {
     crate::stack::grow(|| check_inner(program, None, HashMap::new()))
 }
 
-/// Like `check`, but additionally type-checks each pending migration's `using`
-/// fn against the lock's prior schema. `migration_using_from` maps source name
+/// Like `check`, but additionally type-checks each pending migration's lambda
+/// against the lock's prior schema. `migration_using_from` maps source name
 /// -> the old type as a knot source string (derived from the schema lock by
-/// the caller). Each pending `migrate to New using f` is checked as
+/// the caller). Each pending migration `\old -> …` is checked as
 /// `f : Old -> New`, so a wrong-shape migration is a compile error.
 pub fn check_with_migrations(
     program: &mut ast::Expr,

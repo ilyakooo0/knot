@@ -20,7 +20,7 @@ pub fn lockfile_path(source_path: &Path) -> PathBuf {
 }
 
 /// One committed migration: the schema a source was upgraded FROM, the schema
-/// it was upgraded TO, and the `using` fn source that transformed each row.
+/// it was upgraded TO, and the migration fn source that transformed each row.
 #[derive(Clone)]
 pub struct CommittedMigration {
     pub from_schema: String,
@@ -43,8 +43,8 @@ struct SchemaInfo {
 /// ordered chain (oldest first).
 ///
 /// Unlike the rest of the compiler (which uses `TypeEnv::from_program`), this
-/// walks the parsed AST directly: `TypeEnv` discards the migration's `using`
-/// fn source, which the lock must preserve so `knot build` can re-bake the full
+/// walks the parsed AST directly: `TypeEnv` discards the migration's lambda
+/// source, which the lock must preserve so `knot build` can re-bake the full
 /// chain into the binary.
 fn parse_lockfile(lock_path: &Path) -> Result<SchemaInfo, String> {
     let content = std::fs::read_to_string(lock_path)
@@ -67,7 +67,7 @@ fn parse_lockfile(lock_path: &Path) -> Result<SchemaInfo, String> {
     // Current committed schemas come from the parseable `Rel T  *name`
     // declarations (re-resolved by TypeEnv). The committed migration chain
     // comes from the `migrate_history [...]` section, which stores raw schema
-    // descriptors + `using` source verbatim — old schemas are NOT re-parsable
+    // descriptors + migration-fn source verbatim — old schemas are NOT re-parsable
     // type expressions (a descriptor erases the record/ADT structure), so they
     // are kept as opaque strings and never resolved.
     let migrations = collect_migrate_history(&program);
@@ -215,7 +215,7 @@ pub fn check(source_path: &Path, program: &Expr, type_env: &TypeEnv) -> Vec<Diag
         }
     }
 
-    // A committed migration's `using` fn is baked into the binary and compiled
+    // A committed migration's migration fn is baked into the binary and compiled
     // without type inference — it only ever runs against the lock's recorded
     // schemas. If it references a data type that no longer exists in source
     // (deleted after the migration was committed), the binary can't be built.
@@ -226,8 +226,8 @@ pub fn check(source_path: &Path, program: &Expr, type_env: &TypeEnv) -> Vec<Diag
     diags
 }
 
-/// Error for every committed migration whose `using` fn references a data type
-/// the source no longer declares. `using` fns are stored as source text in the
+/// Error for every committed migration whose migration fn references a data type
+/// the source no longer declares. migration fns are stored as source text in the
 /// lock and compiled verbatim, so a referenced type must still exist.
 fn check_committed_using_types(old: &SchemaInfo, type_env: &TypeEnv) -> Vec<Diagnostic> {
     // Data-type names declared in the current source (`Active` in
@@ -252,7 +252,7 @@ fn check_committed_using_types(old: &SchemaInfo, type_env: &TypeEnv) -> Vec<Diag
                     diags.push(Diagnostic::error(format!(
                         "committed migration for '*{source}' references data type '{ty_name}', which is no longer declared"
                     ))
-                    .note(format!("using fn: {}", step.using_src))
+                    .note(format!("migration fn: {}", step.using_src))
                     .note("re-declare the type, or squash the migration history with a fresh baseline"));
                 }
             }
@@ -261,7 +261,7 @@ fn check_committed_using_types(old: &SchemaInfo, type_env: &TypeEnv) -> Vec<Diag
     diags
 }
 
-/// Parse a stored `using` fn source string into an expression. `None` when it
+/// Parse a stored migration fn source string into an expression. `None` when it
 /// doesn't parse (a separate diagnostic already covers unparseable history).
 fn parse_using_expr(using_src: &str) -> Option<Expr> {
     let lexer = knot::lexer::Lexer::new(using_src);
@@ -278,7 +278,7 @@ fn parse_using_expr(using_src: &str) -> Option<Expr> {
 }
 
 /// Collect the data-type names referenced by qualified constructors
-/// (`Type.Ctor`) in a `using` fn's AST.
+/// (`Type.Ctor`) in a migration fn's AST.
 fn collect_qualified_ctor_types(e: &Expr, out: &mut Vec<String>) {
     if let ExprKind::FieldAccess { expr, .. } = &e.node
         && let ExprKind::Constructor(type_name) = &expr.node
@@ -326,7 +326,7 @@ pub fn committed_migrations(source_path: &Path) -> HashMap<String, Vec<Committed
 
 /// The old (pre-migration) type for each source recorded in the lock, as a
 /// knot source-syntax type string — e.g. `people -> "PersonV1"`. Used by
-/// `main` to type-check a pending migration's `using` fn as `Old -> New`.
+/// `main` to type-check a pending migration's migration fn as `Old -> New`.
 ///
 /// The lock's `Rel T *name` declaration names the source's current (i.e.
 /// pre-migration) type `T` directly, so this is a plain read of that type —
@@ -385,7 +385,7 @@ pub fn locked_schemas(source_path: &Path) -> HashMap<String, String> {
 pub struct PendingMigration {
     /// Span of the whole `migrate to … using …` clause (excised by `knot lock`).
     pub clause_span: Span,
-    /// The `using` fn (rendered into the lock's history).
+    /// The migration fn (rendered into the lock's history).
     pub using_fn: Expr,
 }
 
@@ -617,7 +617,7 @@ fn escape_lock_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Find the `using` fn source of the pending migration on a record-embedded
+/// Find the migration fn source of the pending migration on a record-embedded
 /// source field, if present.
 fn record_embedded_using_fn(program: &Expr, name: &str) -> Option<String> {
     fn walk(e: &Expr, name: &str, out: &mut Option<String>) {

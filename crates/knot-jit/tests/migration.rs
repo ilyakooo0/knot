@@ -104,7 +104,7 @@ fn migrate_lock_lifecycle() {
 }
 
 /// An uncommitted run forks; re-running the SAME pending migration reuses the
-/// fork; EDITING the `using` fn (same target schema) forks fresh.
+/// fork; EDITING the migration fn (same target schema) forks fresh.
 #[test]
 fn migrate_fork_identity() {
     let dir = dir_for("mig_forkid");
@@ -124,7 +124,7 @@ fn migrate_fork_identity() {
     // Same pending content → the existing fork is reused, no new fork.
     build_and_run(&dir, "mig_forkid", V2_PENDING);
     assert_eq!(fork_count(&dir), 1);
-    // Edit ONLY the using fn (Active.Yes → Active.No, same target schema) → a
+    // Edit ONLY the migration fn (Active.Yes → Active.No, same target schema) → a
     // fresh fork.
     let edited = V2_PENDING.replace("Active.Yes {}", "Active.No {}");
     let out = build_and_run(&dir, "mig_forkid", &edited);
@@ -184,7 +184,7 @@ Rel PersonV2  *people
     );
 }
 
-/// A pending migration whose `using` fn produces the wrong shape is a
+/// A pending migration whose lambda produces the wrong shape is a
 /// compile-time type error (`Old -> New`), not a runtime abort after the
 /// migration starts writing.
 #[test]
@@ -193,7 +193,7 @@ fn migrate_using_shape_checked() {
     build_and_run(&dir, "mig_using", V1);
     lock_in_dir(dir.path(), "mig_using");
 
-    // The `using` fn yields `{wrongfield}` — not the target `{name, active}`.
+    // The migration lambda yields `{wrongfield}` — not the target `{name, active}`.
     let bad_using = r#"with {
 Active  Yes {}  No {}
 PersonV1  {name Text}
@@ -213,12 +213,12 @@ Rel PersonV2  *people
         .expect("knot build");
     assert!(
         !build.status.success(),
-        "a wrong-shape using fn must fail the build"
+        "a wrong-shape migration fn must fail the build"
     );
     let stderr = String::from_utf8_lossy(&build.stderr);
     assert!(
-        stderr.contains("using") && stderr.contains("migration"),
-        "error names the migration's using fn: {stderr}"
+        stderr.contains("migration fn") && stderr.contains("new schema"),
+        "error names the migration fn: {stderr}"
     );
 
     // Reading a field the old row lacks is also caught at build time.
@@ -245,7 +245,7 @@ Rel PersonV2  *people
     );
 }
 
-/// Deleting a data type that a committed migration's `using` fn still
+/// Deleting a data type that a committed migration's lambda still
 /// references is caught at lock-check time with a clear error naming the type
 /// — not a misleading codegen "constructor must be applied to a record".
 #[test]
@@ -257,7 +257,7 @@ fn migrate_committed_using_dangling_type() {
     lock_in_dir(dir.path(), "mig_dangle");
 
     // Delete the `Active` data type entirely — but the committed migration's
-    // `using` fn (`Active.Yes {}`) still references it.
+    // migration lambda (`Active.Yes {}`) still references it.
     let deleted = r#"with {
 PersonV1  {name Text}
 PersonV2  {name Text  active Active}

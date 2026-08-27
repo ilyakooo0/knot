@@ -1820,9 +1820,6 @@ impl Parser {
             // While parsing a route's response type (including a refined
             // type's `where` predicate), `headers`/`rateLimit` are clause
             // keywords and must not be consumed as application arguments.
-            // Likewise, while parsing a migrate `from`/`to` type (including a
-            // refined type's `where` predicate expression), `to`/`using` are
-            // clause keywords and must not be eaten as application arguments.
             TokenKind::Lower(n) => {
                 n != "yield"
                     && !(self.stop_type_at_headers && (n == "headers" || n == "rateLimit"))
@@ -2364,7 +2361,7 @@ impl Parser {
                 break;
             }
             // A nested record value used as a field value (e.g. a migration's
-            // `using` fn `\r -> {title r.title …}`) must terminate when the
+            // lambda `\r -> {title r.title …}`) must terminate when the
             // next field sits at/below the enclosing block indent — otherwise
             // it would greedily absorb an OUTER record's following field.
             if self.at_layout_boundary() {
@@ -2706,7 +2703,7 @@ impl Parser {
             // Route them to their parsers, and pin `block_indent`/`block_delim`
             // to the field's column so the value's body terminates at the next
             // field (same column) via `at_layout_boundary` instead of absorbing
-            // it. Mirrors the `using` clause in `parse_source_migration`.
+            // it. Mirrors the migration lambda in `parse_source_field_migration`.
             let Some(value) = (if self.at(&TokenKind::Backslash) || self.at(&TokenKind::Do) {
                 let prev_bi = self.block_indent;
                 let prev_bd = self.block_delim;
